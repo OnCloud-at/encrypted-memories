@@ -188,6 +188,11 @@ final class ProjectHygieneTests: XCTestCase {
         XCTAssertFalse(postClone.contains("DEVELOPMENT_TEAM"))
         XCTAssertTrue(postClone.contains("install-xcodegen.sh"))
         XCTAssertTrue(postClone.contains("update-proton-sdk.sh 0.24.0"))
+        XCTAssertTrue(
+            postClone.contains(
+                "defaults write com.apple.dt.Xcode IDESkipPackagePluginFingerprintValidatation -bool YES"
+            )
+        )
         XCTAssertTrue(postClone.contains("\"$xcodegen\" generate --spec project.yml"))
         XCTAssertTrue(postClone.contains("encryptedmemories_pin_generated_project_packages"))
         XCTAssertTrue(postClone.contains("cmp \"$generated_lock\" XcodeCloud/Package.resolved"))

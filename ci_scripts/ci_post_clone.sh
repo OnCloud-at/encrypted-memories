@@ -7,6 +7,9 @@ cd "$repository_path"
 tools_root="${CI_DERIVED_DATA_PATH:-$HOME/Library/Caches}/EncryptedMemoriesTools"
 xcodegen="$(bash ./scripts/install-xcodegen.sh "$tools_root/xcodegen")"
 
+# Xcode Cloud cannot present ProtonCore's package plug-in trust prompt.
+defaults write com.apple.dt.Xcode IDESkipPackagePluginFingerprintValidatation -bool YES
+
 bash ./scripts/update-proton-sdk.sh 0.24.0
 "$xcodegen" generate --spec project.yml
 
