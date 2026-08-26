@@ -28,7 +28,7 @@ xcrun swift test \
   --package-path "$ROOT/Packages/EncryptedMemoriesKit" \
   --scratch-path "$PHOTOS_SCRATCH" \
   --cache-path "$ENCRYPTED_MEMORIES_SWIFTPM_CACHE" \
-  --parallel --num-workers 1
+  --no-parallel
 
 # sdk-swift is a local path dependency, so SwiftPM does not execute its own test target while
 # testing EncryptedMemoriesKit. Keep a separate invocation in the canonical gate or those tests vanish.
@@ -37,6 +37,6 @@ xcrun swift test \
   --package-path "$ROOT/Vendor/sdk-swift" \
   --scratch-path "$SDK_SCRATCH" \
   --cache-path "$ENCRYPTED_MEMORIES_SWIFTPM_CACHE" \
-  --parallel --num-workers 1
+  --no-parallel
 
 echo "[tests] all package suites passed"
