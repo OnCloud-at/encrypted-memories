@@ -109,7 +109,8 @@ jobs:
             [[ -n "${!name}" ]] || { echo "$name is unavailable" >&2; exit 1; }
           done
           rclone=$(bash scripts/install-rclone.sh "$RUNNER_TEMP/rclone")
-          export PATH="$(dirname "$rclone"):$PATH"
+          PATH="$(dirname "$rclone"):$PATH"
+          export PATH
           repository_revision=$(git rev-parse HEAD)
           released_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
           zsh scripts/rollback-ml-model-release.sh \
