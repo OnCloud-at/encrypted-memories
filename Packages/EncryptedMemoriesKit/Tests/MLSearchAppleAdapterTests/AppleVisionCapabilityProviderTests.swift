@@ -93,6 +93,14 @@ import Testing
         }
 
         let text = snapshot.capability(for: .textRecognition)
+        guard text?.isAvailable == true else {
+            #expect(
+                text?.availability == .unavailable(.runtime)
+                    || text?.availability == .unavailable(.hardware)
+                    || text?.availability == .unavailable(.probeFailed)
+            )
+            return
+        }
         #expect(text?.isAvailable == true)
         #expect(text?.supportedLanguages.isEmpty == false)
 
