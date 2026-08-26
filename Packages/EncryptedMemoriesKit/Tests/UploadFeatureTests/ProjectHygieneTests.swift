@@ -191,45 +191,70 @@ final class ProjectHygieneTests: XCTestCase {
         XCTAssertEqual(rebuild.components(separatedBy: "IOS_BUNDLE_ID=").count - 1, 1)
     }
 
-    func testAppleDistributionRequiresExplicitPromotionOfTrustedBuilds() throws {
-        let postClone = try String(
-            contentsOf: repoRoot.appendingPathComponent("ci_scripts/ci_post_clone.sh"),
-            encoding: .utf8
-        )
-        XCTAssertFalse(postClone.contains("DEVELOPMENT_TEAM"))
-        XCTAssertTrue(postClone.contains("install-xcodegen.sh"))
-        XCTAssertTrue(postClone.contains("update-proton-sdk.sh 0.24.0"))
-        XCTAssertTrue(
-            postClone.contains(
-                "defaults write com.apple.dt.Xcode IDESkipPackagePluginFingerprintValidatation -bool YES"
-            )
-        )
-        XCTAssertTrue(postClone.contains("\"$xcodegen\" generate --spec project.yml"))
-        XCTAssertTrue(postClone.contains("encryptedmemories_pin_generated_project_packages"))
-        XCTAssertTrue(postClone.contains("cmp \"$generated_lock\" XcodeCloud/Package.resolved"))
-        XCTAssertTrue(
-            postClone.contains(
-                "cmp EncryptedMemories.xcworkspace/xcshareddata/swiftpm/Package.resolved XcodeCloud/Package.resolved"
-            ))
-
+    func testAppleDistributionUsesReviewedGitHubPromotionWorkflows() throws {
         let buildPaths = try String(
             contentsOf: repoRoot.appendingPathComponent("scripts/build-paths.sh"),
             encoding: .utf8
         )
+        XCTAssertTrue(buildPaths.contains("BuildSupport/Package.resolved"))
         XCTAssertTrue(buildPaths.contains("local sdk_lock=\"$canonical_lock\""))
 
-        for path in [
-            ".github/workflows/apple-release.yml",
-            ".github/workflows/apple-app-store.yml",
-            ".github/workflows/apple-ci.yml",
-            "fastlane/Fastfile",
-            "scripts/archive-app-store.sh",
-        ] {
-            XCTAssertFalse(
-                FileManager.default.fileExists(atPath: repoRoot.appendingPathComponent(path).path),
-                "Apple distribution must stay in Xcode Cloud; the fallback belongs in private operations"
-            )
-        }
+        let internalWorkflow = try String(
+            contentsOf: repoRoot.appendingPathComponent(".github/workflows/testflight-internal.yml"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(internalWorkflow.contains("workflow_dispatch:"))
+        XCTAssertTrue(internalWorkflow.contains("environment: testflight-internal"))
+        XCTAssertTrue(internalWorkflow.contains("api_platform: IOS"))
+        XCTAssertTrue(internalWorkflow.contains("api_platform: MAC_OS"))
+        XCTAssertTrue(internalWorkflow.contains("archive_and_upload.sh"))
+        XCTAssertTrue(internalWorkflow.contains("distribute-internal"))
+
+        let externalWorkflow = try String(
+            contentsOf: repoRoot.appendingPathComponent(".github/workflows/testflight-external.yml"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(externalWorkflow.contains("environment: testflight-external"))
+        XCTAssertTrue(externalWorkflow.contains("distribute-external"))
+
+        let releaseWorkflow = try String(
+            contentsOf: repoRoot.appendingPathComponent(".github/workflows/app-store-release.yml"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(releaseWorkflow.contains("environment: app-store-production"))
+        XCTAssertTrue(releaseWorkflow.contains("first_release_with_in_app_purchases"))
+        XCTAssertTrue(releaseWorkflow.contains("prepare-app-store"))
+
+        let publishWorkflow = try String(
+            contentsOf: repoRoot.appendingPathComponent(".github/workflows/app-store-publish.yml"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(publishWorkflow.contains("environment: app-store-production"))
+        XCTAssertTrue(publishWorkflow.contains("release-app-store"))
+
+        let archiveScript = try String(
+            contentsOf: repoRoot.appendingPathComponent(".github/scripts/archive_and_upload.sh"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(archiveScript.contains("xcodebuild archive"))
+        XCTAssertTrue(archiveScript.contains("xcodebuild -exportArchive"))
+        XCTAssertTrue(archiveScript.contains("-disableAutomaticPackageResolution"))
+        XCTAssertTrue(archiveScript.contains("<string>app-store-connect</string>"))
+        XCTAssertTrue(archiveScript.contains("<string>export</string>"))
+        XCTAssertTrue(archiveScript.contains("xcrun altool --upload-package"))
+        XCTAssertTrue(archiveScript.contains("pkgutil --check-signature"))
+        XCTAssertTrue(archiveScript.contains("scheme=\"EncryptedMemoriesMobile\""))
+        XCTAssertTrue(archiveScript.contains("scheme=\"EncryptedMemories\""))
+
+        let connectScript = try String(
+            contentsOf: repoRoot.appendingPathComponent(".github/scripts/app_store_connect.rb"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(connectScript.contains("/v1/betaAppReviewSubmissions"))
+        XCTAssertTrue(connectScript.contains("/v1/reviewSubmissions"))
+        XCTAssertTrue(connectScript.contains("/v1/appStoreVersionReleaseRequests"))
+        XCTAssertTrue(connectScript.contains("iosBuildsAvailableForAppleSiliconMac: false"))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: repoRoot.appendingPathComponent("ci_scripts").path))
 
         for locale in ["en-US", "de-DE"] {
             XCTAssertTrue(
@@ -240,12 +265,12 @@ final class ProjectHygieneTests: XCTestCase {
         }
 
         let resolved = try Data(
-            contentsOf: repoRoot.appendingPathComponent("XcodeCloud/Package.resolved")
+            contentsOf: repoRoot.appendingPathComponent("BuildSupport/Package.resolved")
         )
         XCTAssertNoThrow(try JSONSerialization.jsonObject(with: resolved))
     }
 
-    func testXcodeCloudWorkspaceReferencesTheGeneratedProject() throws {
+    func testWorkspaceReferencesTheGeneratedProject() throws {
         let workspace = try String(
             contentsOf: repoRoot.appendingPathComponent(
                 "EncryptedMemories.xcworkspace/contents.xcworkspacedata"

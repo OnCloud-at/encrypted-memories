@@ -55,13 +55,13 @@ encryptedmemories_release_build_lock() {
 encryptedmemories_pin_generated_project_packages() {
   local root="$1"
   local photos_lock="$root/Packages/EncryptedMemoriesKit/Package.resolved"
-  local canonical_lock="$root/XcodeCloud/Package.resolved"
+  local canonical_lock="$root/BuildSupport/Package.resolved"
   local sdk_lock="$canonical_lock"
   local project_destination="$root/EncryptedMemories.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved"
   local workspace_destination="$root/EncryptedMemories.xcworkspace/xcshareddata/swiftpm/Package.resolved"
 
   if [[ ! -f "$sdk_lock" ]]; then
-    # The committed merged lock is authoritative for app and Xcode Cloud builds.
+    # The committed merged lock is authoritative for local and GitHub builds.
     sdk_lock="$root/Vendor/sdk-swift/Package.resolved"
   fi
 
