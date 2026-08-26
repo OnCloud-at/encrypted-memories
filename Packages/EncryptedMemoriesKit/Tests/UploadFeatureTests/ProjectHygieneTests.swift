@@ -323,7 +323,6 @@ final class ProjectHygieneTests: XCTestCase {
             "EncryptedMemories",
             "EncryptedMemoriesMobile",
             "EncryptedMemoriesMobileTests",
-            "EncryptedMemoriesMarketingUITests",
         ] {
             let block = targetBlock(named: target, in: projectYML)
             XCTAssertFalse(block.isEmpty, "project.yml must define \(target)")

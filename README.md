@@ -1,5 +1,22 @@
 # Encrypted Memories
 
+<p align="center">
+  <strong>Private memories. One calm, native experience.</strong><br>
+  A fast, end-to-end encrypted photo library for macOS, iPhone, and iPad.
+</p>
+
+<p align="center">
+  <img src="site/assets/library.webp" alt="Encrypted Memories on macOS" width="31%">
+  <img src="site/assets/iphone-library.webp" alt="Encrypted Memories on iPhone" width="31%">
+  <img src="site/assets/ipad-library-device.webp" alt="Encrypted Memories on iPad" width="31%">
+</p>
+
+<p align="center">
+  <a href="https://github.com/OnCloud-at/encrypted-memories/wiki/Quick-Start">Get started</a>
+  ·
+  <a href="https://github.com/OnCloud-at/encrypted-memories/wiki/Device-and-Feature-Support">See supported features</a>
+</p>
+
 Encrypted Memories is an independent photo client for Proton Drive. It requires an existing Proton account and does not create accounts.
 
 The app uses Proton Drive's end-to-end encrypted storage and browser-based session fork authentication. Shared feature modules implement library, backup, albums, search, map, cache, and viewer behavior once for macOS, iOS, and iPadOS. Platform targets provide native AppKit or UIKit presentation around those modules.
