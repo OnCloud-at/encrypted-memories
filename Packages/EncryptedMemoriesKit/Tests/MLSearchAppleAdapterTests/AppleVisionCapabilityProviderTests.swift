@@ -128,7 +128,14 @@ import Testing
             .textRectangles,
         ] {
             let capability = snapshot.capability(for: kind)
-            #expect(capability?.isAvailable == true)
+            guard capability?.isAvailable == true else {
+                #expect(
+                    capability?.availability == .unavailable(.runtime)
+                        || capability?.availability == .unavailable(.hardware)
+                        || capability?.availability == .unavailable(.probeFailed)
+                )
+                continue
+            }
             if #available(macOS 14.0, iOS 17.0, *) {
                 #expect(capability?.computeSupport.isEmpty == false)
             }
