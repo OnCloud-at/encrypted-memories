@@ -56,8 +56,15 @@ encryptedmemories_pin_generated_project_packages() {
   local root="$1"
   local photos_lock="$root/Packages/EncryptedMemoriesKit/Package.resolved"
   local sdk_lock="$root/Vendor/sdk-swift/Package.resolved"
+  local canonical_lock="$root/XcodeCloud/Package.resolved"
   local project_destination="$root/EncryptedMemories.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved"
   local workspace_destination="$root/EncryptedMemories.xcworkspace/xcshareddata/swiftpm/Package.resolved"
+
+  if [[ ! -f "$sdk_lock" && -f "$canonical_lock" ]]; then
+    # Xcode Cloud restores the SDK after checkout, so its local lock is absent at first run.
+    # The committed merged lock already contains the reviewed SDK dependency pins.
+    sdk_lock="$canonical_lock"
+  fi
 
   for lock_file in "$photos_lock" "$sdk_lock"; do
     if [[ ! -f "$lock_file" ]]; then
