@@ -167,7 +167,10 @@ final class ProjectHygieneTests: XCTestCase {
             "iOS/iPadOS and macOS must use the same universal-purchase bundle identifier"
         )
         XCTAssertTrue(project.contains("PRODUCT_BUNDLE_IDENTIFIER: at.oncloud.encryptedmemories.tests"))
-        XCTAssertTrue(project.contains("PRODUCT_BUNDLE_IDENTIFIER: at.oncloud.encryptedmemories.marketing-ui-tests"))
+        XCTAssertFalse(
+            project.contains("PRODUCT_BUNDLE_IDENTIFIER: at.oncloud.encryptedmemories.marketing-ui-tests"),
+            "The private marketing UI test target must not be present in the public project"
+        )
 
         let rebuild = try String(
             contentsOf: repoRoot.appendingPathComponent("scripts/rebuild.sh"),
