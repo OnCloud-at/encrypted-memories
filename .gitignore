@@ -1,0 +1,81 @@
+# Build output
+build/
+.build/
+DerivedData/
+*.xcresult
+*.dSYM/
+*.app/
+*.ipa
+*.log
+*.abi.json
+*.swiftdoc
+*.swiftmodule
+*.swiftsourceinfo
+
+# Xcode local state
+xcuserdata/
+*.xcuserstate
+*.xccheckout
+*.xcscmblueprint
+*.moved-aside
+
+# Generated Xcode project (regenerated from project.yml via xcodegen)
+EncryptedMemories.xcodeproj/
+
+# Vendored SDK clone (re-clone via: git clone --branch 0.24.0 https://github.com/ProtonDriveApps/sdk-swift Vendor/sdk-swift)
+Vendor/
+
+# macOS
+.DS_Store
+._*
+.AppleDouble
+.LSOverride
+.localized
+Icon?
+__MACOSX/
+.Spotlight-V100/
+.Trashes/
+.fseventsd/
+.DocumentRevisions-V100/
+.TemporaryItems/
+.VolumeIcon.icns
+
+# Local source snapshots and archives
+Archiv.zip
+*.zip
+
+# Local Markdown notes and reports. Public documentation must be allow-listed.
+*.md
+!/README.md
+!/SECURITY.md
+!/Wiki/
+!/Wiki/**/*.md
+!/Tools/MLModels/README.md
+!/Tools/MLModels/SigLIP2/README.md
+
+# Private release operations stay outside the public repository.
+/APPLE_RELEASE_SETUP.rst
+/fastlane/
+/scripts/archive-app-store.sh
+
+# Local development and private review output
+.claude/
+.wrangler/
+artifacts/
+reports/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# SwiftPM
+Packages/*/.build/
+Packages/*/.swiftpm/xcode/xcuserdata/
+*.resolved
+!/Packages/EncryptedMemoriesKit/Package.resolved
+!/XcodeCloud/Package.resolved
+
+# Local marketing production material. Only site/ is published through GitHub Pages.
+/Marketing/
+/site/assets/*.m4v
+/site/assets/*.mov
+/site/assets/*.mp4

@@ -1,0 +1,1 @@
+Please test sign-in, the photo timeline, albums, backup, search, and optional StoreKit tips on every platform available to you. Report the app version, build number, device, OS version, and exact reproduction steps with each issue.

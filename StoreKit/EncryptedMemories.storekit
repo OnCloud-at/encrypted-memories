@@ -1,0 +1,94 @@
+{
+  "products" : [
+    {
+      "displayPrice" : "1.99",
+      "familyShareable" : false,
+      "internalID" : "10000001",
+      "localizations" : [
+        {
+          "description" : "A small one-time tip to support independent development.",
+          "displayName" : "Small Tip",
+          "locale" : "en_US"
+        },
+        {
+          "description" : "Ein kleines einmaliges Trinkgeld zur Unterstützung der unabhängigen Entwicklung.",
+          "displayName" : "Kleines Trinkgeld",
+          "locale" : "de_DE"
+        }
+      ],
+      "productID" : "at.oncloud.encryptedmemories.tip.small",
+      "referenceName" : "Small Tip",
+      "type" : "Consumable"
+    },
+    {
+      "displayPrice" : "4.99",
+      "familyShareable" : false,
+      "internalID" : "10000002",
+      "localizations" : [
+        {
+          "description" : "A medium one-time tip to support independent development.",
+          "displayName" : "Medium Tip",
+          "locale" : "en_US"
+        },
+        {
+          "description" : "Ein mittleres einmaliges Trinkgeld zur Unterstützung der unabhängigen Entwicklung.",
+          "displayName" : "Mittleres Trinkgeld",
+          "locale" : "de_DE"
+        }
+      ],
+      "productID" : "at.oncloud.encryptedmemories.tip.medium",
+      "referenceName" : "Medium Tip",
+      "type" : "Consumable"
+    },
+    {
+      "displayPrice" : "9.99",
+      "familyShareable" : false,
+      "internalID" : "10000003",
+      "localizations" : [
+        {
+          "description" : "A large one-time tip to support independent development.",
+          "displayName" : "Large Tip",
+          "locale" : "en_US"
+        },
+        {
+          "description" : "Ein großes einmaliges Trinkgeld zur Unterstützung der unabhängigen Entwicklung.",
+          "displayName" : "Großes Trinkgeld",
+          "locale" : "de_DE"
+        }
+      ],
+      "productID" : "at.oncloud.encryptedmemories.tip.large",
+      "referenceName" : "Large Tip",
+      "type" : "Consumable"
+    },
+    {
+      "displayPrice" : "24.99",
+      "familyShareable" : false,
+      "internalID" : "10000004",
+      "localizations" : [
+        {
+          "description" : "An extra-large one-time tip to support independent development.",
+          "displayName" : "Extra-Large Tip",
+          "locale" : "en_US"
+        },
+        {
+          "description" : "Ein besonders großes einmaliges Trinkgeld zur Unterstützung der unabhängigen Entwicklung.",
+          "displayName" : "Besonders großes Trinkgeld",
+          "locale" : "de_DE"
+        }
+      ],
+      "productID" : "at.oncloud.encryptedmemories.tip.extra_large",
+      "referenceName" : "Extra-Large Tip",
+      "type" : "Consumable"
+    }
+  ],
+  "settings" : {
+
+  },
+  "subscriptionGroups" : [
+
+  ],
+  "version" : {
+    "major" : 1,
+    "minor" : 0
+  }
+}

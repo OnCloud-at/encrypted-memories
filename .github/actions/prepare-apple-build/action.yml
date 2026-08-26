@@ -1,0 +1,50 @@
+name: Prepare Apple build
+description: Install pinned XcodeGen, restore the reviewed SDK, and generate the Xcode project.
+
+inputs:
+  sdk-version:
+    description: Reviewed Proton Drive SDK tag.
+    required: false
+    default: "0.24.0"
+
+runs:
+  using: composite
+  steps:
+    - name: Install pinned XcodeGen
+      shell: bash
+      run: |
+        set -euo pipefail
+        executable="$(bash ./scripts/install-xcodegen.sh "$RUNNER_TEMP/xcodegen-install")"
+        bin_dir="$(dirname "$executable")"
+        echo "$bin_dir" >> "$GITHUB_PATH"
+        "$executable" --version
+
+    - name: Restore reviewed Proton Drive SDK
+      shell: bash
+      env:
+        SDK_VERSION: ${{ inputs.sdk-version }}
+      run: |
+        set -euo pipefail
+        bash ./scripts/update-proton-sdk.sh "$SDK_VERSION"
+
+    - name: Resolve and pin package graph
+      shell: bash
+      run: |
+        set -euo pipefail
+        source scripts/build-paths.sh
+        [[ -f Packages/EncryptedMemoriesKit/Package.resolved ]]
+        [[ -f XcodeCloud/Package.resolved ]]
+        swift package \
+          --package-path Packages/EncryptedMemoriesKit \
+          --scratch-path "$ENCRYPTED_MEMORIES_SPM_SCRATCH" \
+          --cache-path "$ENCRYPTED_MEMORIES_SWIFTPM_CACHE" \
+          resolve
+        git diff --exit-code -- Packages/EncryptedMemoriesKit/Package.resolved
+        xcodegen generate
+        encryptedmemories_pin_generated_project_packages "$GITHUB_WORKSPACE"
+        cmp \
+          EncryptedMemories.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved \
+          XcodeCloud/Package.resolved
+        cmp \
+          EncryptedMemories.xcworkspace/xcshareddata/swiftpm/Package.resolved \
+          XcodeCloud/Package.resolved

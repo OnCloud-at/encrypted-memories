@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://models.oncloud.at/schemas/release-manifest-v1.json",
+  "title": "Encrypted Memories model release manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "modelID",
+    "compatibilityKey",
+    "sourceRevision",
+    "descriptorVersion",
+    "embeddingDimension",
+    "role",
+    "capabilities",
+    "licenseIdentifier"
+  ],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "modelID": { "type": "string", "pattern": "^(?:[a-z0-9]|[a-z0-9](?:[a-z0-9]|-(?!-)){0,126}[a-z0-9])$" },
+    "compatibilityKey": { "enum": ["clip-dual-encoder-v1", "siglip-dual-encoder-v1"] },
+    "sourceRevision": { "type": "string", "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$" },
+    "descriptorVersion": { "type": "integer", "minimum": 1, "maximum": 65535 },
+    "embeddingDimension": { "type": "integer", "minimum": 1 },
+    "role": { "const": "dualEncoder" },
+    "capabilities": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "enum": ["imageEmbedding", "textEmbedding"] }
+    },
+    "licenseIdentifier": { "enum": ["MIT", "Apache-2.0"] }
+  }
+}

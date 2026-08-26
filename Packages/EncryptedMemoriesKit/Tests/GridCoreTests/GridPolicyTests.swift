@@ -1,0 +1,510 @@
+import CoreGraphics
+import GridCore
+import Testing
+
+@Suite struct CoreTelemetryEventTests {
+    @Test func eventIsPlainSendableValue() {
+        let event = CoreTelemetryEvent(name: "GridTransition", fields: ["event": "PLAN_BUILT"])
+
+        #expect(event == CoreTelemetryEvent(name: "GridTransition", fields: ["event": "PLAN_BUILT"]))
+        #expect(event.name == "GridTransition")
+        #expect(event.fields["event"] == "PLAN_BUILT")
+    }
+}
+
+@Suite struct GridTextureResidencyPolicyTests {
+    @Test func pinnedVisibleSurvivesEviction_offscreenEvicts() {
+        var policy = GridTextureResidencyPolicy<String>(capacity: 2, costCapacity: .max, uploadBudgetPerFrame: 10)
+        for id in ["a", "b", "c"] {
+            policy.beginFrame(pinned: [])
+            _ = policy.selectUploads(wanted: [id])
+            policy.completeUpload(id, cost: 1)
+        }
+
+        policy.beginFrame(pinned: ["a"])
+        let evicted = policy.evictToBudget()
+
+        #expect(policy.isResident("a"))
+        #expect(!policy.isResident("b"))
+        #expect(policy.isResident("c"))
+        #expect(evicted == ["b"])
+    }
+
+    @Test func evictionSkipsPinnedAndKeepsNewestNonPinnedResidents() {
+        var policy = GridTextureResidencyPolicy<Int>(capacity: 4, costCapacity: .max, uploadBudgetPerFrame: 10)
+        for id in 0..<8 {
+            policy.beginFrame(pinned: [])
+            _ = policy.selectUploads(wanted: [id])
+            policy.completeUpload(id, cost: 1)
+        }
+
+        policy.beginFrame(pinned: [0, 2])
+        let evicted = policy.evictToBudget()
+
+        #expect(evicted == [1, 3, 4, 5])
+        #expect(policy.residentCount == 4)
+        #expect(policy.isResident(0))
+        #expect(policy.isResident(2))
+        #expect(policy.isResident(6))
+        #expect(policy.isResident(7))
+        #expect(policy.evictionCount == 4)
+    }
+
+    @Test func largeResidencyEvictsOnlyNeededOldestSubsetWithinFrameBudget() {
+        var policy = GridTextureResidencyPolicy<String>(capacity: 4_096, costCapacity: .max, uploadBudgetPerFrame: 128)
+        let ids = (0..<4_192).map { "photo-\($0)" }
+        for id in ids {
+            policy.beginFrame(pinned: [])
+            _ = policy.selectUploads(wanted: [id])
+            policy.completeUpload(id, cost: 1)
+        }
+
+        let pinned = Set(ids.prefix(256))
+        policy.beginFrame(pinned: pinned)
+        let clock = ContinuousClock()
+        let start = clock.now
+        let evicted = policy.evictToBudget()
+        let elapsed = start.duration(to: clock.now)
+
+        #expect(evicted == Array(ids[256..<352]))
+        #expect(policy.residentCount == 4_096)
+        #expect(pinned.allSatisfy(policy.isResident))
+        #expect(elapsed < .milliseconds(50))
+    }
+
+    @Test func placeholderAndUploadDedupAreStable() {
+        var policy = GridTextureResidencyPolicy<String>(capacity: 10, costCapacity: .max, uploadBudgetPerFrame: 10)
+        #expect(policy.drawState("a") == .placeholder)
+
+        policy.beginFrame(pinned: [])
+        #expect(policy.selectUploads(wanted: ["a", "b"]) == ["a", "b"])
+        #expect(policy.selectUploads(wanted: ["a", "b", "c"]) == ["c"])
+        policy.completeUpload("a", cost: 1)
+
+        #expect(policy.drawState("a") == .real)
+        #expect(policy.selectUploads(wanted: ["a", "b", "c"]) == [])
+    }
+
+    @Test func uploadBudgetPreservesPriorityOrder() {
+        var policy = GridTextureResidencyPolicy<Int>(capacity: 100, costCapacity: .max, uploadBudgetPerFrame: 3)
+        let wanted = Array(0..<10)
+        #expect(policy.selectUploads(wanted: wanted) == [0, 1, 2])
+    }
+}
+
+@Suite struct GridTextureResidencyByteBudgetTests {
+    /// Uploads `id` at `cost` through the full select-and-complete path in its own frame.
+    private func upload<ID>(
+        _ id: ID, cost: Int, pinned: Set<ID> = [], into policy: inout GridTextureResidencyPolicy<ID>
+    ) {
+        policy.beginFrame(pinned: pinned)
+        _ = policy.selectUploads(wanted: [id])
+        policy.completeUpload(id, cost: cost)
+    }
+
+    @Test func byteBudgetEvictsLRUUntilUnderBothCountAndBytes() {
+        var policy = GridTextureResidencyPolicy<String>(capacity: 100, costCapacity: 1_000, uploadBudgetPerFrame: 10)
+        for (i, id) in ["a", "b", "c", "d"].enumerated() {
+            upload(id, cost: 400, into: &policy)
+            #expect(policy.residentCost == 400 * (i + 1))
+        }
+
+        policy.beginFrame(pinned: [])
+        let evicted = policy.evictToBudget()
+
+        // With 1,600 bytes resident and a 1,000-byte cap, the two oldest entries go (1,600 to 800 ≤ 1,000).
+        #expect(evicted == ["a", "b"])
+        #expect(policy.residentCost == 800)
+        #expect(policy.residentCount == 2)
+    }
+
+    @Test func byteEvictionShedsToSoftTargetKeepingPinnedAndNewestResidents() {
+        var policy = GridTextureResidencyPolicy<String>(capacity: 100, costCapacity: 1_000, uploadBudgetPerFrame: 20)
+        // A pinned visible tile + nine evictable tiles fill the cap exactly; a tenth pushes over it.
+        upload("visible", cost: 100, pinned: ["visible"], into: &policy)
+        for i in 0..<10 { upload("e\(i)", cost: 100, into: &policy) }  // 100 pinned + 1,000 = 1,100 total
+
+        policy.beginFrame(pinned: ["visible"])
+        #expect(policy.residentCost == 1_100)
+        let evicted = policy.evictToBudget()
+
+        // Over the hard cap to shed the oldest non-pinned down to the 10% headroom band (soft target 900), not to
+        // the exact ceiling: residency stops pinning at 100%, giving later uploads admission headroom. The pinned
+        // tile and the newest evictable tiles survive.
+        #expect(policy.softCostTarget == 900)
+        #expect(policy.residentCost <= policy.softCostTarget)
+        #expect(policy.residentCost == 900)
+        #expect(evicted == ["e0", "e1"])  // exactly the two oldest non-pinned
+        #expect(policy.isResident("visible"))  // pinned is never evicted
+        #expect(policy.isResident("e9"))  // newest non-pinned retained
+        #expect(!policy.isResident("e0") && !policy.isResident("e1"))
+    }
+
+    @Test func pinnedVisibleUploadIsAdmittedEvenWhenOffscreenResidencyFillsTheByteBudget() {
+        var policy = GridTextureResidencyPolicy<String>(capacity: 100, costCapacity: 1_000, uploadBudgetPerFrame: 20)
+        for i in 0..<10 { upload("off-\(i)", cost: 100, into: &policy) }  // offscreen fills the cap exactly
+        #expect(policy.residentCost == 1_000)
+
+        // A fresh visible frame pins the incoming tile. Even though total residency is at the ceiling, it
+        // is admitted against the (currently 0) pinned floor - offscreen residents never block a visible upload
+        // (they are evicted afterwards). Visible-first admission, structurally.
+        policy.beginFrame(pinned: ["incoming"])
+        #expect(policy.pinnedResidentCost == 0)
+        #expect(policy.canAdmitUpload("incoming", cost: 300))
+        // An unpinned overscan upload, by contrast, is refused at the ceiling this frame (a deferral, not saturation).
+        #expect(!policy.canAdmitUpload("overscan", cost: 300))
+    }
+
+    @Test func offscreenResidencyCannotStarveTheVisibleWorkingSetUnderScroll() {
+        var policy = GridTextureResidencyPolicy<Int>(capacity: 200, costCapacity: 2_000, uploadBudgetPerFrame: 32)
+        for i in -50..<0 { upload(i, cost: 100, into: &policy) }  // seed a large offscreen resident set
+
+        for frame in 0..<30 {
+            let visible = Array(frame * 4..<frame * 4 + 8)
+            policy.beginFrame(pinned: Set(visible))
+            for v in policy.selectUploads(wanted: visible) {
+                #expect(
+                    policy.canAdmitUpload(v, cost: 100),
+                    "visible tile \(v) must be admitted, never starved by offscreen")
+                policy.completeUpload(v, cost: 100)
+            }
+            _ = policy.evictToBudget()
+            #expect(Set(visible).allSatisfy(policy.isResident), "every visible tile stays resident")
+            #expect(policy.residentCost <= 2_000)
+        }
+    }
+
+    @Test func denseL5SoftTargetShedInOnePassOnHeterogeneousCostsNeverEvictsVisible() {
+        // 512 MB-ish budget with a large offscreen set of small (112 px ≈ 50 KB) tiles mixed with big
+        // carried-over (400 px ≈ 640 KB) tiles. Heterogeneous costs must not make one evictToBudget
+        // must shed to the soft target and never evict the pinned visible working set.
+        let budget = 512 * 1_000_000
+        let small = 112 * 112 * 4
+        let big = 400 * 400 * 4
+        var policy = GridTextureResidencyPolicy<Int>(capacity: 16_384, costCapacity: budget, uploadBudgetPerFrame: 48)
+
+        var id = 0
+        // Fill offscreen to just under the cap so the 750 visible uploads below push residency clearly over it.
+        while policy.residentCost < budget - 100 * small {
+            upload(id, cost: id % 7 == 0 ? big : small, into: &policy)
+            id += 1
+        }
+
+        let visible = Array(id..<id + 750)
+        policy.beginFrame(pinned: Set(visible))
+        for v in visible where policy.canAdmitUpload(v, cost: small) { policy.completeUpload(v, cost: small) }
+        #expect(Set(visible).allSatisfy(policy.isResident), "all 750 visible admitted against the pinned floor")
+        #expect(policy.residentCost > budget, "visible working set pushed residency over the hard cap")
+
+        let evicted = policy.evictToBudget()
+        #expect(policy.residentCost <= policy.softCostTarget, "one call sheds to the headroom band, no undershoot")
+        #expect(policy.residentCost <= budget)
+        #expect(!evicted.isEmpty)
+        #expect(Set(visible).allSatisfy(policy.isResident), "the visible working set is never evicted")
+        #expect(evicted.allSatisfy { !visible.contains($0) }, "only offscreen residents are shed")
+    }
+
+    @Test func evictionCannotGoBelowPinnedFloorEvenWhenOverByteBudget() {
+        var policy = GridTextureResidencyPolicy<String>(capacity: 100, costCapacity: 1_000, uploadBudgetPerFrame: 10)
+        // Force an over-budget pinned set by bypassing admission (completeUpload directly).
+        for id in ["p1", "p2", "p3"] { upload(id, cost: 600, pinned: ["p1", "p2", "p3"], into: &policy) }
+
+        policy.beginFrame(pinned: ["p1", "p2", "p3"])
+        let evicted = policy.evictToBudget()
+
+        #expect(evicted.isEmpty)  // pinned is never evicted
+        #expect(policy.residentCost == 1_800)  // still over - admission is what prevents this state
+    }
+
+    @Test func admissionRefusesPinnedUploadBeyondPinnedResidentByteFloor() {
+        var policy = GridTextureResidencyPolicy<String>(capacity: 100, costCapacity: 1_000, uploadBudgetPerFrame: 10)
+        upload("visible-a", cost: 600, pinned: ["visible-a", "visible-b"], into: &policy)
+
+        policy.beginFrame(pinned: ["visible-a", "visible-b"])
+        #expect(policy.pinnedResidentCost == 600)
+        #expect(policy.canAdmitUpload("visible-b", cost: 400))  // 600 + 400 fits exactly
+        #expect(!policy.canAdmitUpload("visible-b", cost: 500))  // 600 + 500 can never fit - refuse
+    }
+
+    @Test func admissionRefusesUnpinnedUploadThatWouldOvershootTotals() {
+        var policy = GridTextureResidencyPolicy<String>(capacity: 2, costCapacity: 1_000, uploadBudgetPerFrame: 10)
+        upload("resident", cost: 900, into: &policy)
+
+        policy.beginFrame(pinned: [])
+        #expect(policy.canAdmitUpload("small", cost: 100))
+        #expect(!policy.canAdmitUpload("big", cost: 200))  // would overshoot bytes right now
+
+        upload("second", cost: 50, into: &policy)
+        policy.beginFrame(pinned: [])
+        #expect(!policy.canAdmitUpload("third", cost: 10))  // would overshoot the count capacity
+    }
+
+    @Test func pinnedFloorRecomputesFromCurrentWindowEachFrame() {
+        var policy = GridTextureResidencyPolicy<String>(capacity: 100, costCapacity: 1_000, uploadBudgetPerFrame: 10)
+        upload("scrolled-away", cost: 800, pinned: ["scrolled-away"], into: &policy)
+
+        // Still pinned, so a large new upload cannot be admitted above the floor.
+        policy.beginFrame(pinned: ["scrolled-away", "incoming"])
+        #expect(!policy.canAdmitUpload("incoming", cost: 400))
+
+        // Window moved on: the texture is unpinned, the floor drops, and the new visible item is admitted.
+        policy.beginFrame(pinned: ["incoming"])
+        #expect(policy.pinnedResidentCost == 0)
+        #expect(policy.canAdmitUpload("incoming", cost: 400))
+    }
+
+    @Test func replacementAdmissionUsesPinnedFloorNotFullResidentTotal() {
+        var policy = GridTextureResidencyPolicy<String>(capacity: 100, costCapacity: 1_000, uploadBudgetPerFrame: 10)
+        upload("visible-soft", cost: 100, pinned: ["visible-soft"], into: &policy)
+        upload("offscreen", cost: 900, into: &policy)
+
+        policy.beginFrame(pinned: ["visible-soft"])
+        #expect(policy.residentCost == 1_000)
+        #expect(policy.pinnedResidentCost == 100)
+        #expect(policy.canReplaceResident("visible-soft", oldCost: 100, newCost: 500))
+        #expect(!policy.canReplaceResident("visible-soft", oldCost: 100, newCost: 1_100))
+        #expect(!policy.canReplaceResident("missing", oldCost: 100, newCost: 500))
+    }
+
+    @Test func admissionGatedFramesKeepResidencyByteBoundedUnderChurn() {
+        var policy = GridTextureResidencyPolicy<Int>(capacity: 50, costCapacity: 2_000, uploadBudgetPerFrame: 8)
+        // Simulate a scroll: each frame a fresh window of 6 items (3 visible + 3 overscan) shifted by 2.
+        for frame in 0..<40 {
+            let window = Array(frame * 2..<frame * 2 + 6)
+            policy.beginFrame(pinned: Set(window))
+            for id in policy.selectUploads(wanted: window) {
+                if policy.canAdmitUpload(id, cost: 300) {
+                    policy.completeUpload(id, cost: 300)
+                } else {
+                    policy.abandonUpload(id)
+                }
+            }
+            _ = policy.evictToBudget()
+            #expect(policy.residentCost <= 2_000)
+            #expect(policy.residentCount <= 50)
+            // The pinned floor must remain within the byte budget.
+            #expect(policy.pinnedResidentCost <= 2_000)
+        }
+    }
+
+    @Test func reducedBudgetShedsOffscreenDownToCeilingButKeepsVisiblePinned() {
+        var policy = GridTextureResidencyPolicy<String>(capacity: 100, costCapacity: 10_000, uploadBudgetPerFrame: 20)
+        for i in 0..<8 { upload("off-\(i)", cost: 1_000, into: &policy) }  // 8 offscreen @1000 = 8000
+        upload("visible", cost: 1_000, pinned: ["visible"], into: &policy)  // + pinned 1000 = 9000 total
+        policy.beginFrame(pinned: ["visible"])
+        #expect(policy.residentCost == 9_000)
+
+        // Reduced ceiling of 3000 bytes: shed offscreen LRU until resident bytes fit, keep the pinned visible.
+        let evicted = policy.evictToReducedBudget(maxCount: 100, maxCost: 3_000)
+        #expect(policy.residentCost <= 3_000)
+        #expect(policy.isResident("visible"), "the visible pinned texture must stay drawable")
+        #expect(evicted.allSatisfy { $0 != "visible" })
+    }
+
+    @Test func reducedBudgetToZeroKeepsOnlyVisibleAndClampsCannotGrow() {
+        var policy = GridTextureResidencyPolicy<String>(capacity: 100, costCapacity: 10_000, uploadBudgetPerFrame: 20)
+        for i in 0..<5 { upload("off-\(i)", cost: 500, into: &policy) }
+        upload("v1", cost: 500, pinned: ["v1", "v2"], into: &policy)
+        upload("v2", cost: 500, pinned: ["v1", "v2"], into: &policy)
+        policy.beginFrame(pinned: ["v1", "v2"])
+
+        // Critical purge: a 0 ceiling evicts every non-pinned texture, visible stay resident/drawable.
+        _ = policy.evictToReducedBudget(maxCount: 0, maxCost: 0)
+        #expect(policy.residentCount == 2)
+        #expect(policy.isResident("v1") && policy.isResident("v2"))
+
+        // Clamp: asking for a ceiling above the normal budget can never grow residency (a no-op here).
+        let evicted = policy.evictToReducedBudget(maxCount: .max, maxCost: .max)
+        #expect(evicted.isEmpty)
+        #expect(policy.residentCount == 2)
+    }
+}
+
+@Suite struct GridTextureStreamingPolicyTests {
+    @Test func targetOnlyTransitionSlotLeadsSourceAndOverscanAdmission() {
+        let transition = GridTextureStreamingPolicy.transitionWindow(
+            sourceVisibleIDs: ["shared", "source-only"],
+            targetVisibleIDs: ["target-only", "shared"],
+            overscanIDs: ["target-only", "overscan", "source-only"]
+        )
+
+        #expect(transition.visible == ["target-only", "shared", "source-only"])
+        #expect(transition.overscan == ["overscan"])
+    }
+
+    @Test func pinsVisibleAndOverscanForScrollReversalReuse() {
+        let window = GridTextureStreamingPolicy.window(
+            visibleIDs: ["visible-a", "visible-b"],
+            overscanIDs: ["above-a", "below-a"],
+            maxPinned: 100
+        )
+
+        #expect(window.priority == ["visible-a", "visible-b", "above-a", "below-a"])
+        #expect(window.pinned == ["visible-a", "visible-b", "above-a", "below-a"])
+    }
+
+    @Test func deduplicatesWhilePreservingVisibleFirstOrder() {
+        let window = GridTextureStreamingPolicy.window(
+            visibleIDs: ["a", "b"], overscanIDs: ["b", "c", "a"], maxPinned: 100)
+
+        #expect(window.priority == ["a", "b", "c"])
+        #expect(window.pinned == ["a", "b", "c"])
+    }
+
+    @Test func pinnedClampKeepsVisibleFirstThenNearestOverscanAndFullPriority() {
+        let window = GridTextureStreamingPolicy.window(
+            visibleIDs: ["v1", "v2"],
+            overscanIDs: ["o1", "o2", "o3"],
+            maxPinned: 3
+        )
+
+        // Overscan cannot make the protected set unbounded: only the nearest overscan stays pinned.
+        #expect(window.pinned == ["v1", "v2", "o1"])
+        // Everything remains in upload priority order and becomes evictable when the budget needs room.
+        #expect(window.priority == ["v1", "v2", "o1", "o2", "o3"])
+    }
+
+    @Test func pinnedClampDegradesToVisiblePrefixAtDenseLevels() {
+        let visible = (0..<6).map { "v\($0)" }
+        let window = GridTextureStreamingPolicy.window(visibleIDs: visible, overscanIDs: ["o1"], maxPinned: 4)
+
+        #expect(window.pinned == ["v0", "v1", "v2", "v3"])  // visible-first even when visible alone overflows
+        #expect(window.priority == visible + ["o1"])
+    }
+
+    @Test func overscanCanStayUploadPriorityWithoutBeingPinnedWhileVisibleIsCold() {
+        let window = GridTextureStreamingPolicy.window(
+            visibleIDs: ["v1", "v2"],
+            overscanIDs: ["o1", "o2"],
+            maxPinned: 4,
+            pinOverscan: false
+        )
+
+        #expect(window.priority == ["v1", "v2", "o1", "o2"])
+        #expect(window.pinned == ["v1", "v2"])
+    }
+}
+
+@Suite struct GridTextureBudgetTests {
+    @Test func budgetShapePreservesInjectedAdapterValues() {
+        let budget = GridTextureBudget(
+            maxUploadsPerFrame: 5,
+            maxUploadBytesPerFrame: 1_234,
+            maxCachedTextures: 17,
+            maxResidentBytes: 56_789,
+            overscanFraction: 0.75,
+            maxUploadMillisecondsPerFrame: 2.5
+        )
+
+        #expect(budget.maxUploadsPerFrame == 5)
+        #expect(budget.maxUploadBytesPerFrame == 1_234)
+        #expect(budget.maxUploadMillisecondsPerFrame == 2.5)
+        #expect(budget.maxCachedTextures == 17)
+        #expect(budget.maxResidentBytes == 56_789)
+        #expect(budget.overscanFraction == 0.75)
+    }
+}
+
+@Suite struct GridTextureUploadSizingTests {
+    // Representative macOS geometry (1200 pt-wide grid @2×): L5 = 30 cols ≈ 39 pt slot; L0 = 3 cols ≈ 389 pt.
+    private func pixels(
+        slot: CGFloat, scale: CGFloat = 2, headroom: CGFloat = 1.25, floor: Int = 96, cap: Int = 320
+    ) -> Int {
+        GridTextureUploadSizing.uploadPixels(
+            slotSidePoints: slot, backingScale: scale, headroom: headroom, floor: floor, cap: cap)
+    }
+
+    @Test func denseSlotUploadsWellBelowCap() {
+        // A 39 pt L5 tile @2× is 78 native px; even with headroom that is far below the 320 px cap.
+        let dense = pixels(slot: 39)
+        #expect(dense < 320)
+        #expect(dense == 98)  // round(39·2·1.25)
+        // A 58 pt L4 tile likewise stays well under the cap.
+        #expect(pixels(slot: 58) < 320)
+    }
+
+    @Test func sparseSlotSaturatesAtCapSoLargeLevelsKeepQuality() {
+        // A 389 pt L0 tile @2× wants ~973 px - clamped to the cap, i.e. identical to the fixed-320 behaviour.
+        #expect(pixels(slot: 389) == 320)
+        #expect(pixels(slot: 163) == 320)  // L2 (163 pt) also saturates
+        // The result can never exceed the cap regardless of slot size / scale.
+        #expect(pixels(slot: 10_000, scale: 3) == 320)
+    }
+
+    @Test func neverBelowTheCrispnessFloorNorAboveTheCap() {
+        // A pathologically tiny slot floors at 96 rather than uploading mush.
+        #expect(pixels(slot: 10) == 96)
+        #expect(pixels(slot: 0) == 96)
+        // Floor is itself clamped to the cap, so a small-cap adapter never overshoots.
+        #expect(pixels(slot: 10, floor: 96, cap: 64) == 64)
+    }
+
+    @Test func scalesWithBackingScale() {
+        // A non-Retina external display uploads half the native pixels of a Retina one for the same slot.
+        let retina = pixels(slot: 120, scale: 2)  // 120·2·1.25 = 300
+        let nonRetina = pixels(slot: 120, scale: 1)  // 120·1·1.25 = 150
+        #expect(retina == 300)
+        #expect(nonRetina == 150)
+        #expect(retina > nonRetina)
+    }
+
+    @Test func iOSSmallerCapStillSaturatesOnSparseLevels() {
+        // iPhone compact cap is 224; a large-tile level still saturates there (unchanged quality), a dense one
+        // resolves below it (the memory win).
+        #expect(pixels(slot: 389, cap: 224) == 224)
+        #expect(pixels(slot: 39, scale: 3, cap: 224) < 224)  // 39·3·1.25 = 146
+    }
+}
+
+@Suite struct GridSelectionControllerTests {
+    @Test func replaceToggleRangeAndClearMutateFlatSelection() {
+        let ids = Array(0..<10)
+        var selection = GridSelectionController<Int>()
+
+        selection.apply(.replace, flatIndex: 2, id: 2, orderedIDs: ids)
+        #expect(selection.selected == [2])
+        #expect(selection.anchorIndex == 2)
+
+        selection.apply(.toggle, flatIndex: 5, id: 5, orderedIDs: ids)
+        #expect(selection.selected == [2, 5])
+        #expect(selection.anchorIndex == 5)
+
+        selection.apply(.range, flatIndex: 7, id: 7, orderedIDs: ids)
+        #expect(selection.selected == [5, 6, 7])
+        #expect(selection.anchorIndex == 5)
+
+        let didClear = selection.clear()
+        #expect(didClear)
+        #expect(selection.selected.isEmpty)
+        #expect(selection.anchorIndex == nil)
+        let didClearAgain = selection.clear()
+        #expect(!didClearAgain)
+    }
+
+    @Test func rangeWithoutAnchorFallsBackToReplace() {
+        let ids = Array(0..<4)
+        var selection = GridSelectionController<Int>()
+
+        selection.apply(.range, flatIndex: 2, id: 2, orderedIDs: ids)
+
+        #expect(selection.selected == [2])
+        #expect(selection.anchorIndex == 2)
+    }
+
+    @Test func marqueeReplacesOrAddsToDragStartSelection() {
+        var selection = GridSelectionController<String>()
+
+        selection.apply(.replace, flatIndex: 0, id: "base", orderedIDs: ["base", "a", "b", "c"])
+        selection.marqueeBegan(additive: false)
+        let firstMarqueeChanged = selection.marqueeChanged(["a", "b"])
+        #expect(firstMarqueeChanged)
+        #expect(selection.selected == ["a", "b"])
+        let duplicateMarqueeChanged = selection.marqueeChanged(["a", "b"])
+        #expect(!duplicateMarqueeChanged)
+
+        selection.marqueeBegan(additive: true)
+        let additiveMarqueeChanged = selection.marqueeChanged(["c"])
+        #expect(additiveMarqueeChanged)
+        #expect(selection.selected == ["a", "b", "c"])
+    }
+}

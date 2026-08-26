@@ -1,0 +1,311 @@
+import Foundation
+import UploadCore
+
+/// How the sync run binds a local album to a Proton album.
+public enum AlbumSyncResolution: Sendable, Equatable {
+    /// Stored mapping if present; otherwise create a new Proton album. If a remote album already
+    /// carries the same name, throw `AlbumSyncError.nameConflict` so the UI can ask the user.
+    /// Automatic resolution never attaches by name alone.
+    case automatic
+    /// The user explicitly chose an existing Proton album (from the conflict dialog).
+    case attachToExisting(remoteAlbumID: String)
+    /// The user explicitly asked for a new album even though a name twin exists. The server may
+    /// still reject the duplicate name - that error surfaces honestly.
+    case createNew
+}
+
+/// Universal local-album to Proton-album sync engine. Platform-neutral: local albums come from an
+/// injected source (PhotoKit adapter on Apple platforms), backup goes through the injected
+/// executor (the standard upload/dedupe pipeline; media bytes are never uploaded twice), and
+/// remote album operations go through the injected backend ops.
+///
+/// v1 is strictly additive (`AlbumSyncMode.additive`): nothing is removed from Proton, ever.
+///
+/// Durability: the local and remote album mapping is persisted before any backup or attach work, so a
+/// crash mid-run can never cause a second album to be created for the same local album. Attach
+/// work is re-derived per run from the manifest + the album's current children (idempotent -
+/// "already a member" converges), so no separate pending-operation log is needed.
+public actor AlbumSyncRunner {
+    private let localSource: any AlbumSyncLocalAlbumSource
+    private let backup: any AlbumSyncBackupExecuting
+    private let remoteOps: any AlbumSyncRemoteAlbumOps
+    private let linkLookup: any AlbumSyncRemoteLinkLookup
+    private let mappingStore: AlbumSyncMappingStore?
+    private let now: @Sendable () -> Date
+
+    /// Photos per `attach` call - a progress-granularity choice (the backend further batches to
+    /// the API's own limit internally).
+    private let attachChunkSize: Int
+
+    private var onProgress: (@Sendable (AlbumSyncProgress) -> Void)?
+    private var progress = AlbumSyncProgress()
+    private var isRunning = false
+    private var stopRequested = false
+
+    public init(
+        localSource: any AlbumSyncLocalAlbumSource,
+        backup: any AlbumSyncBackupExecuting,
+        remoteOps: any AlbumSyncRemoteAlbumOps,
+        linkLookup: any AlbumSyncRemoteLinkLookup,
+        mappingStore: AlbumSyncMappingStore?,
+        attachChunkSize: Int = 50,
+        now: @Sendable @escaping () -> Date = { Date() }
+    ) {
+        self.localSource = localSource
+        self.backup = backup
+        self.remoteOps = remoteOps
+        self.linkLookup = linkLookup
+        self.mappingStore = mappingStore
+        self.attachChunkSize = max(1, attachChunkSize)
+        self.now = now
+    }
+
+    // MARK: - Observation
+
+    public func setOnProgress(_ callback: @Sendable @escaping (AlbumSyncProgress) -> Void) {
+        onProgress = callback
+    }
+
+    public var currentProgress: AlbumSyncProgress { progress }
+
+    // MARK: - Precheck (for the UI's conflict dialog)
+
+    public enum Precheck: Sendable, Equatable {
+        /// A stored mapping exists - sync continues into that album, no questions.
+        case mapped(remoteAlbumID: String)
+        /// No mapping, and remote albums with the exact same (trimmed) name exist.
+        case nameConflict([AlbumSyncRemoteAlbum])
+        /// No mapping, no name twin - `automatic` will create a fresh album.
+        case clear
+    }
+
+    /// What starting a sync for `album` would do. UI calls this to decide whether to show the
+    /// "use existing Proton album?" dialog before `sync`.
+    public func precheck(album: LocalAlbumSummary) async throws -> Precheck {
+        guard let mappingStore, mappingStore.isOperational() else {
+            throw AlbumSyncError.mappingStoreUnavailable
+        }
+        try await ensureAlbumPresent(albumID: album.id)
+        if let mapping = mappingStore.mapping(localAlbumID: album.id) {
+            return .mapped(remoteAlbumID: mapping.remoteAlbumID)
+        }
+        guard mappingStore.isOperational() else { throw AlbumSyncError.mappingStoreUnavailable }
+        let twins = try await nameTwins(of: album.title)
+        return twins.isEmpty ? .clear : .nameConflict(twins)
+    }
+
+    // MARK: - Sync
+
+    /// Runs one full additive sync of `album`. Throws `AlbumSyncError.nameConflict` when
+    /// `resolution == .automatic` and an unmapped name twin exists.
+    @discardableResult
+    public func sync(
+        album: LocalAlbumSummary, resolution: AlbumSyncResolution = .automatic
+    ) async throws -> AlbumSyncReport {
+        guard !isRunning else { throw AlbumSyncError.alreadyRunning }
+        guard let mappingStore, mappingStore.isOperational() else {
+            throw AlbumSyncError.mappingStoreUnavailable
+        }
+        isRunning = true
+        stopRequested = false
+        defer { isRunning = false }
+
+        do {
+            let report = try await run(album: album, resolution: resolution, mappingStore: mappingStore)
+            return report
+        } catch {
+            if progress.phase != .needsAttention {
+                progress.phase = .needsAttention
+                progress.message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                publish()
+            }
+            throw error
+        }
+    }
+
+    /// Requests a stop. The current attach chunk finishes; backup checkpoints and stops. Work
+    /// already done is durable server-side, so the next run resumes/converges.
+    public func stop() async {
+        stopRequested = true
+        await backup.stop()
+    }
+
+    // MARK: - Phases
+
+    private func run(
+        album: LocalAlbumSummary,
+        resolution: AlbumSyncResolution,
+        mappingStore: AlbumSyncMappingStore
+    ) async throws -> AlbumSyncReport {
+        progress = AlbumSyncProgress()
+        progress.localAlbumID = album.id
+        progress.albumTitle = album.title
+        progress.phase = .scanningLocal
+        publish()
+
+        // Read local album identifiers without asset bytes. Missing is not empty: a deleted PhotoKit
+        // collection must never be interpreted as a valid empty remote album.
+        let identifiers = try await requireAlbumContents(albumID: album.id)
+        progress.totalAssets = identifiers.count
+        publish()
+        try checkStop()
+
+        // Resolve the Proton album first and persist the mapping. Fail fast on conflicts so a crash
+        // cannot create a second album later.
+        try await ensureAlbumPresent(albumID: album.id)
+        let remoteAlbumID = try await resolveRemoteAlbum(
+            album: album, resolution: resolution, mappingStore: mappingStore)
+        try checkStop()
+
+        // Back up every album asset through the standard pipeline. The dedupe manifest remains the
+        // single duplicate authority, so already-backed-up assets cost one preflight lookup.
+        try await ensureAlbumPresent(albumID: album.id)
+        progress.phase = .backingUp
+        publish()
+        let updateBackupProgress: @Sendable (BackupSyncProgress) -> Void = { [weak self] snapshot in
+            Task { await self?.applyBackupProgress(snapshot) }
+        }
+        _ = try await backup.ensureBackedUp(localIdentifiers: identifiers, onProgress: updateBackupProgress)
+        try checkStop()
+
+        // Build the pure, idempotent attach plan from current members and manifest links.
+        progress.phase = .checkingAlbum
+        publish()
+        let links = await linkLookup.remoteLinks(for: identifiers)
+        try await ensureAlbumPresent(albumID: album.id)
+        let children = try await remoteOps.childMainLinkIDs(albumID: remoteAlbumID)
+        let plan = AlbumSyncPlanner.plan(
+            orderedLocalIdentifiers: identifiers,
+            remoteLinks: links,
+            existingChildLinkIDs: children
+        )
+        progress.alreadyMember = plan.alreadyMember
+        progress.unattachable = plan.missingRemote
+        progress.trashedSkipped = plan.trashedRemote
+        progress.attachTotal = plan.toAttach.count
+        publish()
+        try checkStop()
+
+        // Attach in chunks for progress and stop granularity. The backend batches to the API limit.
+        progress.phase = .attaching
+        publish()
+        var attachResult = AlbumSyncAttachResult()
+        var index = 0
+        while index < plan.toAttach.count {
+            try checkStop()
+            try await ensureAlbumPresent(albumID: album.id)
+            let chunk = Array(plan.toAttach[index..<min(index + attachChunkSize, plan.toAttach.count)])
+            let result = try await remoteOps.attach(chunk, albumID: remoteAlbumID)
+            attachResult += result
+            index += chunk.count
+            progress.attachDone = attachResult.attached
+            progress.alreadyMember = plan.alreadyMember + attachResult.alreadyMember
+            progress.attachFailed = attachResult.failed
+            progress.message = attachResult.firstFailureMessage
+            publish()
+        }
+
+        // Persist the run outcome on the mapping and settle the status.
+        try await ensureAlbumPresent(albumID: album.id)
+        let report = AlbumSyncReport(
+            remoteAlbumID: remoteAlbumID,
+            totalAssets: identifiers.count,
+            attached: attachResult.attached,
+            alreadyMember: plan.alreadyMember + attachResult.alreadyMember,
+            attachFailed: attachResult.failed,
+            unattachable: plan.missingRemote,
+            trashedSkipped: plan.trashedRemote
+        )
+        var mapping =
+            mappingStore.mapping(localAlbumID: album.id)
+            ?? AlbumSyncMapping(
+                localAlbumID: album.id, remoteAlbumID: remoteAlbumID, title: album.title, createdAt: now())
+        mapping.title = album.title
+        mapping.lastSyncedAt = now()
+        mapping.lastAttachedCount = report.attached
+        mapping.lastFailedCount = report.attachFailed + report.unattachable
+        guard mappingStore.upsert(mapping) else { throw AlbumSyncError.mappingStoreUnavailable }
+
+        progress.phase = report.isFullySynced ? .completed : .needsAttention
+        if !report.isFullySynced, progress.message == nil {
+            progress.message = attachResult.firstFailureMessage
+        }
+        publish()
+        return report
+    }
+
+    private func resolveRemoteAlbum(
+        album: LocalAlbumSummary,
+        resolution: AlbumSyncResolution,
+        mappingStore: AlbumSyncMappingStore
+    ) async throws -> String {
+        if let mapping = mappingStore.mapping(localAlbumID: album.id) {
+            return mapping.remoteAlbumID
+        }
+        guard mappingStore.isOperational() else { throw AlbumSyncError.mappingStoreUnavailable }
+        let name = album.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let remoteAlbumID: String
+        switch resolution {
+        case .automatic:
+            let twins = try await nameTwins(of: album.title)
+            guard twins.isEmpty else { throw AlbumSyncError.nameConflict(existing: twins) }
+            try await ensureAlbumPresent(albumID: album.id)
+            remoteAlbumID = try await remoteOps.createAlbum(name: name)
+        case .attachToExisting(let existingID):
+            try await ensureAlbumPresent(albumID: album.id)
+            remoteAlbumID = existingID
+        case .createNew:
+            try await ensureAlbumPresent(albumID: album.id)
+            remoteAlbumID = try await remoteOps.createAlbum(name: name)
+        }
+        guard
+            mappingStore.upsert(
+                AlbumSyncMapping(
+                    localAlbumID: album.id,
+                    remoteAlbumID: remoteAlbumID,
+                    title: album.title,
+                    createdAt: now()
+                ))
+        else {
+            throw AlbumSyncError.mappingStoreUnavailable
+        }
+        return remoteAlbumID
+    }
+
+    private func nameTwins(of title: String) async throws -> [AlbumSyncRemoteAlbum] {
+        let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let remote = try await remoteOps.listAlbums()
+        return remote.filter { $0.title.trimmingCharacters(in: .whitespacesAndNewlines) == trimmed }
+    }
+
+    private func requireAlbumContents(albumID: String) async throws -> [String] {
+        switch try await localSource.albumContents(albumID: albumID) {
+        case .present(let identifiers): identifiers
+        case .missing: throw AlbumSyncError.localAlbumMissing
+        }
+    }
+
+    private func ensureAlbumPresent(albumID: String) async throws {
+        guard try await localSource.albumExists(albumID: albumID) else {
+            throw AlbumSyncError.localAlbumMissing
+        }
+    }
+
+    // MARK: - Helpers
+
+    private func applyBackupProgress(_ snapshot: BackupSyncProgress) {
+        guard progress.phase == .backingUp else { return }
+        progress.backedUp = snapshot.backedUp
+        progress.backupFailed = snapshot.failed
+        publish()
+    }
+
+    private func checkStop() throws {
+        if stopRequested { throw AlbumSyncError.stopped }
+        if Task.isCancelled { throw AlbumSyncError.stopped }
+    }
+
+    private func publish() {
+        onProgress?(progress)
+    }
+}

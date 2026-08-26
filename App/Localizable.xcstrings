@@ -1,0 +1,2165 @@
+{
+  "sourceLanguage": "en",
+  "strings": {
+    "settings.photos_backup_section": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Photos Library" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Foto-Mediathek" } }
+      }
+    },
+    "settings.backup_uploads_section": {
+      "extractionState": "manual",
+      "comment": "Backup tab section for the manual upload queue's pre-upload check.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Uploads" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Uploads" } }
+      }
+    },
+    "settings.backup_tab": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Backup" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Backup" } }
+      }
+    },
+    "settings.backup_folders_section": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Folders" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Ordner" } }
+      }
+    },
+    "settings.backup_no_folders": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "No folders selected yet. Added folders are backed up to Proton Drive, encrypted." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Noch keine Ordner ausgewählt. Hinzugefügte Ordner werden verschlüsselt in Proton Drive gesichert." } }
+      }
+    },
+    "settings.backup_add_folder": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Add Folder…" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Ordner hinzufügen…" } }
+      }
+    },
+    "settings.backup_add_folder_prompt": {
+      "extractionState": "manual",
+      "comment": "Confirm button of the folder picker panel.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Back Up Folder" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Ordner sichern" } }
+      }
+    },
+    "settings.backup_full_disk_access_setup": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "The first click opens Full Disk Access settings. Grant access, return here, then click Add Folder again." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Beim ersten Klick werden die Einstellungen für Festplattenvollzugriff geöffnet. Erteile den Zugriff, kehre hierher zurück und klicke erneut auf Ordner hinzufügen." } }
+      }
+    },
+    "settings.backup_folder_stale": {
+      "extractionState": "manual",
+      "comment": "Shown under a folder whose sandbox bookmark no longer resolves.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Access must be renewed - please add this folder again" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Zugriff muss erneuert werden - bitte Ordner erneut hinzufügen" } }
+      }
+    },
+    "settings.backup_folder_error_permission %@": {
+      "extractionState": "manual",
+      "comment": "Shown when a registered backup folder cannot be read. %@ is the affected name.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Backup stopped because %@ could not be read. Check its permissions and try again." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Die Sicherung wurde beendet, weil %@ nicht gelesen werden konnte. Prüfen Sie die Berechtigungen und versuchen Sie es erneut." } }
+      }
+    },
+    "settings.backup_folder_error_missing %@": {
+      "extractionState": "manual",
+      "comment": "Shown when a registered backup folder or child disappears. %@ is the affected name.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Backup stopped because %@ is no longer available. Select the folder again and retry." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Die Sicherung wurde beendet, weil %@ nicht mehr verfügbar ist. Wählen Sie den Ordner erneut aus und versuchen Sie es noch einmal." } }
+      }
+    },
+    "settings.backup_folder_error_transient %@": {
+      "extractionState": "manual",
+      "comment": "Shown for another file-system error during folder backup. %@ is the affected name.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Backup could not finish reading %@. Try again." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Die Sicherung konnte %@ nicht vollständig lesen. Versuchen Sie es erneut." } }
+      }
+    },
+    "settings.backup_status_section": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Backup status" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Backup-Status" } }
+      }
+    },
+    "settings.backup_unavailable": {
+      "extractionState": "manual",
+      "comment": "Shown when the duplicate-protection store could not be opened; backup is disabled rather than risking double uploads.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Backup is unavailable because duplicate protection could not be initialized." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Backup ist nicht verfügbar, weil der Duplikatschutz nicht initialisiert werden konnte." } }
+      }
+    },
+    "settings.backup_sync_now": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Back up now" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Jetzt sichern" } }
+      }
+    },
+    "settings.albumsync_section": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Photos Albums" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Foto-Alben" } }
+      }
+    },
+    "settings.backup_stop": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Stop" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Stoppen" } }
+      }
+    },
+    "settings.backup_backed_up %lld %lld": {
+      "extractionState": "manual",
+      "comment": "First %lld: proven backed-up count. Second %lld: total. The ONLY number presented as backed up.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "%lld of %lld backed up" } },
+        "de": { "stringUnit": { "state": "translated", "value": "%lld von %lld gesichert" } }
+      }
+    },
+    "settings.backup_row_skipped_deleted %lld": {
+      "extractionState": "manual",
+      "comment": "Items whose identical remote copy is trashed/deleted - deliberately NOT re-uploaded.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Skipped (deleted in Proton Drive): %lld" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Übersprungen (in Proton Drive gelöscht): %lld" } }
+      }
+    },
+    "settings.backup_row_source_missing %lld": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "No longer on this Mac: %lld" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Nicht mehr auf diesem Mac: %lld" } }
+      }
+    },
+    "settings.backup_row_blocked %lld": {
+      "extractionState": "manual",
+      "comment": "Items parked behind a remote upload draft; re-checked automatically.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Will be re-checked later: %lld" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Werden später erneut geprüft: %lld" } }
+      }
+    },
+    "settings.backup_row_failed %lld": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Need attention: %lld" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Benötigen Aufmerksamkeit: %lld" } }
+      }
+    },
+    "action.delete": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Delete"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Löschen"
+          }
+        }
+      }
+    },
+    "albums.cover_failed_title": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Cover Not Changed" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Cover nicht geändert" } }
+      }
+    },
+    "albums.cover_failed_message %@": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "The album cover couldn't be changed. Your selection is still available.\n\n%@" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Das Albumcover konnte nicht geändert werden. Deine Auswahl ist weiterhin verfügbar.\n\n%@" } }
+      }
+    },
+    "alert.trash_action_failed_title": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Action Failed"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Aktion fehlgeschlagen"
+          }
+        }
+      }
+    },
+    "alert.trash_failed_message": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "The photos couldn't be moved to Recently Deleted. They are still in your library."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Die Fotos konnten nicht in „Zuletzt gelöscht“ verschoben werden. Sie sind weiterhin in deiner Mediathek."
+          }
+        }
+      }
+    },
+    "alert.restore_failed_message": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "The photos couldn't be restored. They are still in Recently Deleted."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Die Fotos konnten nicht wiederhergestellt werden. Sie sind weiterhin in „Zuletzt gelöscht“."
+          }
+        }
+      }
+    },
+    "action.refresh": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Refresh"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Aktualisieren"
+          }
+        }
+      }
+    },
+    "login.tagline": {
+      "extractionState": "manual",
+      "comment": "Product tagline under the app name on the login screen.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Your photos, end-to-end encrypted."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Ihre Fotos, Ende-zu-Ende-verschlüsselt."
+          }
+        }
+      }
+    },
+    "login.help_text": {
+      "extractionState": "manual",
+      "comment": "Explains the browser-based sign-in flow.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Opens your browser to sign in securely. No password is ever entered in this app."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Öffnet Ihren Browser zur sicheren Anmeldung. In dieser App wird niemals ein Passwort eingegeben."
+          }
+        }
+      }
+    },
+    "loading.building_library": {
+      "extractionState": "manual",
+      "comment": "Caption while the photo backend initializes.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Building your library…"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Ihre Mediathek wird aufgebaut …"
+          }
+        }
+      }
+    },
+    "error.library_open_failed": {
+      "extractionState": "manual",
+      "comment": "Title on the backend-error screen.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Couldn’t open your library"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Ihre Mediathek konnte nicht geöffnet werden"
+          }
+        }
+      }
+    },
+    "error.no_photos_library": {
+      "extractionState": "manual",
+      "comment": "Shown when the account has no photo share yet.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "No Photos library was found on this account yet."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Auf diesem Konto wurde noch keine Fotomediathek gefunden."
+          }
+        }
+      }
+    },
+    "menu.upload_photos": {
+      "extractionState": "manual",
+      "comment": "File menu item (⌘U).",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Upload Photos…"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Fotos hochladen …"
+          }
+        }
+      }
+    },
+    "menu.upload_folder": {
+      "extractionState": "manual",
+      "comment": "File menu item (⌘⇧U).",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Upload Folder…"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Ordner hochladen …"
+          }
+        }
+      }
+    },
+    "menu.show_uploads": {
+      "extractionState": "manual",
+      "comment": "Opens the upload queue.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Show Uploads"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Uploads anzeigen"
+          }
+        }
+      }
+    },
+    "menu.toggle_sidebar": {
+      "extractionState": "manual",
+      "comment": "View menu item (⌥⌘S).",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Toggle Sidebar"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Seitenleiste ein-/ausblenden"
+          }
+        }
+      }
+    },
+    "menu.refresh_library": {
+      "extractionState": "manual",
+      "comment": "View menu item (⌘⇧R).",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Refresh Library"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Mediathek aktualisieren"
+          }
+        }
+      }
+    },
+    "sidebar.all_photos": {
+      "extractionState": "manual",
+      "comment": "Sidebar item for the whole library.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "All Photos"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Alle Fotos"
+          }
+        }
+      }
+    },
+    "sidebar.map": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Map" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Karte" } }
+      }
+    },
+    "sidebar.albums_loading": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Loading albums…" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Alben werden geladen…" } }
+      }
+    },
+    "sidebar.albums_failed": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Retry loading albums" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Alben erneut laden" } }
+      }
+    },
+    "sidebar.albums": {
+      "extractionState": "manual",
+      "comment": "Sidebar section header for user albums.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Albums"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Alben"
+          }
+        }
+      }
+    },
+    "sidebar.no_albums": {
+      "extractionState": "manual",
+      "comment": "Disabled sidebar row shown when the account has no albums.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "No Albums"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Keine Alben"
+          }
+        }
+      }
+    },
+    "sidebar.recently_deleted": {
+      "extractionState": "manual",
+      "comment": "Sidebar item / title for the trash.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Recently Deleted"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Zuletzt gelöscht"
+          }
+        }
+      }
+    },
+    "export.button": {
+      "extractionState": "manual",
+      "comment": "Confirmation button in the export-folder chooser.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Export"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Exportieren"
+          }
+        }
+      }
+    },
+    "alert.trash_confirmation_title_one": {
+      "extractionState": "manual",
+      "comment": "Trash confirmation title (single photo).",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Move photo to Trash?"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Foto in den Papierkorb verschieben?"
+          }
+        }
+      }
+    },
+    "alert.trash_confirmation_title_other %lld": {
+      "extractionState": "manual",
+      "comment": "Trash confirmation title (multiple photos). %lld is the count.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Move %lld photos to Trash?"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%lld Fotos in den Papierkorb verschieben?"
+          }
+        }
+      }
+    },
+    "alert.trash_confirmation_message_one": {
+      "extractionState": "manual",
+      "comment": "Trash confirmation message (single photo).",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "The photo will move to Recently Deleted."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Das Foto wird nach „Zuletzt gelöscht“ verschoben."
+          }
+        }
+      }
+    },
+    "alert.trash_confirmation_message_other": {
+      "extractionState": "manual",
+      "comment": "Trash confirmation message (multiple photos).",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "The selected photos will move to Recently Deleted."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Die ausgewählten Fotos werden nach „Zuletzt gelöscht“ verschoben."
+          }
+        }
+      }
+    },
+    "alert.move_to_trash": {
+      "extractionState": "manual",
+      "comment": "Destructive confirmation button.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Move to Trash"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "In den Papierkorb verschieben"
+          }
+        }
+      }
+    },
+    "upload.uploaded": {
+      "extractionState": "manual",
+      "comment": "Banner shown after an upload lands in the library.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Uploaded"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Hochgeladen"
+          }
+        }
+      }
+    },
+    "library.refreshed": {
+      "extractionState": "manual",
+      "comment": "Banner shown after a manual library refresh.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Library refreshed"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Mediathek aktualisiert"
+          }
+        }
+      }
+    },
+    "upload.refreshing_after_upload": {
+      "extractionState": "manual",
+      "comment": "Banner while the library refreshes after an upload.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Upload complete, refreshing library…"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Upload abgeschlossen, Mediathek wird aktualisiert …"
+          }
+        }
+      }
+    },
+    "upload.waiting_for_refresh": {
+      "extractionState": "manual",
+      "comment": "Banner during a retry delay after upload.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Upload complete, waiting for library refresh…"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Upload abgeschlossen, warten auf Mediathek-Aktualisierung …"
+          }
+        }
+      }
+    },
+    "upload.not_yet_indexed": {
+      "extractionState": "manual",
+      "comment": "Banner when post-upload refresh retries are exhausted.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Upload completed, but the library hasn’t indexed it yet. Use Refresh Library."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Upload abgeschlossen, aber die Mediathek hat ihn noch nicht indexiert. Verwenden Sie „Mediathek aktualisieren“."
+          }
+        }
+      }
+    },
+    "library.refreshing": {
+      "extractionState": "manual",
+      "comment": "Banner during a manual library refresh.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Refreshing library…"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Mediathek wird aktualisiert …"
+          }
+        }
+      }
+    },
+    "library.refresh_failed": {
+      "extractionState": "manual",
+      "comment": "Banner when a manual refresh fails.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Library refresh failed"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Mediathek-Aktualisierung fehlgeschlagen"
+          }
+        }
+      }
+    },
+    "toolbar.back": {
+      "extractionState": "manual",
+      "comment": "Viewer back button.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Back"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Zurück"
+          }
+        }
+      }
+    },
+    "toolbar.back_to_library": {
+      "extractionState": "manual",
+      "comment": "Tooltip for the viewer back button.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Back to library"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Zurück zur Mediathek"
+          }
+        }
+      }
+    },
+    "toolbar.info": {
+      "extractionState": "manual",
+      "comment": "Info-panel toggle button.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Info"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Info"
+          }
+        }
+      }
+    },
+    "toolbar.download_original": {
+      "extractionState": "manual",
+      "comment": "Download-original button.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Download original"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Original laden"
+          }
+        }
+      }
+    },
+    "toolbar.download_burst_zip": {
+      "extractionState": "manual",
+      "comment": "Viewer download button when the current photo is part of a burst/series; export is a ZIP.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Download burst as ZIP"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Serie als ZIP laden"
+          }
+        }
+      }
+    },
+    "toolbar.favorite": {
+      "extractionState": "manual",
+      "comment": "Favorite button (not yet a favorite).",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Favorite"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Zu Favoriten hinzufügen"
+          }
+        }
+      }
+    },
+    "toolbar.remove_favorite": {
+      "extractionState": "manual",
+      "comment": "Favorite button (already a favorite).",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Remove favorite"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Aus Favoriten entfernen"
+          }
+        }
+      }
+    },
+    "toolbar.move_to_trash": {
+      "extractionState": "manual",
+      "comment": "Move-to-trash button in the viewer/grid.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Move to trash"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "In den Papierkorb verschieben"
+          }
+        }
+      }
+    },
+    "toolbar.restore_from_trash": {
+      "extractionState": "manual",
+      "comment": "Restore button in the trash view.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Restore from trash"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Aus dem Papierkorb wiederherstellen"
+          }
+        }
+      }
+    },
+    "toolbar.move_selected_to_trash": {
+      "extractionState": "manual",
+      "comment": "Delete-selected button in the grid.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Move selected to trash"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Auswahl in den Papierkorb verschieben"
+          }
+        }
+      }
+    },
+    "toolbar.smaller_thumbnails": {
+      "extractionState": "manual",
+      "comment": "Zoom-out button.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Smaller thumbnails"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Kleinere Vorschaubilder"
+          }
+        }
+      }
+    },
+    "toolbar.larger_thumbnails": {
+      "extractionState": "manual",
+      "comment": "Zoom-in button.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Larger thumbnails"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Größere Vorschaubilder"
+          }
+        }
+      }
+    },
+    "toolbar.upload": {
+      "extractionState": "manual",
+      "comment": "Upload menu title in the toolbar.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Upload"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Hochladen"
+          }
+        }
+      }
+    },
+    "toolbar.upload_menu_help": {
+      "extractionState": "manual",
+      "comment": "Tooltip for the upload menu.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Upload photos or a folder"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Fotos oder einen Ordner hochladen"
+          }
+        }
+      }
+    },
+    "a11y.download_selected_originals": {
+      "extractionState": "manual",
+      "comment": "VoiceOver label for the download button (nothing selected).",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Download selected originals"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Ausgewählte Originale laden"
+          }
+        }
+      }
+    },
+    "a11y.download_count_selected_originals %lld": {
+      "extractionState": "manual",
+      "comment": "VoiceOver label for the download button with a selection count.",
+      "localizations": {
+        "en": {
+          "variations": {
+            "plural": {
+              "one": {
+                "stringUnit": {
+                  "state": "translated",
+                  "value": "Download %lld selected original"
+                }
+              },
+              "other": {
+                "stringUnit": {
+                  "state": "translated",
+                  "value": "Download %lld selected originals"
+                }
+              }
+            }
+          }
+        },
+        "de": {
+          "variations": {
+            "plural": {
+              "one": {
+                "stringUnit": {
+                  "state": "translated",
+                  "value": "%lld ausgewähltes Original laden"
+                }
+              },
+              "other": {
+                "stringUnit": {
+                  "state": "translated",
+                  "value": "%lld ausgewählte Originale laden"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "toolbar.download_count_photos_help %lld": {
+      "extractionState": "manual",
+      "comment": "Tooltip when downloading several selected photos.",
+      "localizations": {
+        "en": {
+          "variations": {
+            "plural": {
+              "one": {
+                "stringUnit": {
+                  "state": "translated",
+                  "value": "Download %lld photo to a folder"
+                }
+              },
+              "other": {
+                "stringUnit": {
+                  "state": "translated",
+                  "value": "Download %lld photos to a folder"
+                }
+              }
+            }
+          }
+        },
+        "de": {
+          "variations": {
+            "plural": {
+              "one": {
+                "stringUnit": {
+                  "state": "translated",
+                  "value": "%lld Foto in einen Ordner laden"
+                }
+              },
+              "other": {
+                "stringUnit": {
+                  "state": "translated",
+                  "value": "%lld Fotos in einen Ordner laden"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "a11y.restore_selected_from_trash": {
+      "extractionState": "manual",
+      "comment": "VoiceOver label for restore (nothing selected).",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Restore selected from trash"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Ausgewählte aus dem Papierkorb wiederherstellen"
+          }
+        }
+      }
+    },
+    "a11y.restore_count_from_trash %lld": {
+      "extractionState": "manual",
+      "comment": "VoiceOver label for restore with a selection count.",
+      "localizations": {
+        "en": {
+          "variations": {
+            "plural": {
+              "one": {
+                "stringUnit": {
+                  "state": "translated",
+                  "value": "Restore %lld selected from trash"
+                }
+              },
+              "other": {
+                "stringUnit": {
+                  "state": "translated",
+                  "value": "Restore %lld selected from trash"
+                }
+              }
+            }
+          }
+        },
+        "de": {
+          "variations": {
+            "plural": {
+              "one": {
+                "stringUnit": {
+                  "state": "translated",
+                  "value": "%lld ausgewähltes Element aus dem Papierkorb wiederherstellen"
+                }
+              },
+              "other": {
+                "stringUnit": {
+                  "state": "translated",
+                  "value": "%lld ausgewählte Elemente aus dem Papierkorb wiederherstellen"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "upload.choose_photos_message": {
+      "extractionState": "manual",
+      "comment": "NSOpenPanel message when choosing files.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Choose photos or videos to upload"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Fotos oder Videos zum Hochladen auswählen"
+          }
+        }
+      }
+    },
+    "upload.choose_folder_message": {
+      "extractionState": "manual",
+      "comment": "NSOpenPanel message when choosing a folder.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Choose a folder to upload (media is discovered recursively)"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Ordner zum Hochladen auswählen (Medien werden rekursiv erfasst)"
+          }
+        }
+      }
+    },
+    "settings.library_tab": {
+      "extractionState": "manual",
+      "comment": "Settings tab label.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Library"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Mediathek"
+          }
+        }
+      }
+    },
+    "settings.account_tab": {
+      "extractionState": "manual",
+      "comment": "Settings tab label for account-level settings.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Proton Account"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Proton-Konto"
+          }
+        }
+      }
+    },
+    "sidebar.settings": {
+      "extractionState": "manual",
+      "comment": "Opens the macOS app settings from the bottom of the library sidebar.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Settings"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Einstellungen"
+          }
+        }
+      }
+    },
+    "settings.diagnostics_tab": {
+      "extractionState": "manual",
+      "comment": "Settings tab label for cache and library diagnostics.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Diagnostics"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Diagnose"
+          }
+        }
+      }
+    },
+    "settings.offline_library_toggle": {
+      "extractionState": "manual",
+      "comment": "Toggle label.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Offline Library"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Offline-Mediathek"
+          }
+        }
+      }
+    },
+    "settings.offline_library_help": {
+      "extractionState": "manual",
+      "comment": "Help text under the Offline Library toggle.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Opened photos are stored locally (encrypted) and stay available offline. Offline you only get thumbnails and photos you already opened - no videos."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Geöffnete Fotos bleiben lokal (verschlüsselt) gespeichert und sind auch offline verfügbar. Offline gibt es nur Thumbnails und bereits geöffnete Fotos – keine Videos."
+          }
+        }
+      }
+    },
+    "settings.library_offline_section": {
+      "extractionState": "manual",
+      "comment": "Section header.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Library / Offline"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Mediathek / Offline"
+          }
+        }
+      }
+    },
+    "settings.offline_cache_label": {
+      "extractionState": "manual",
+      "comment": "Label for the cache-size row.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Offline Cache"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Offline-Cache"
+          }
+        }
+      }
+    },
+    "settings.delete_offline_cache_button": {
+      "extractionState": "manual",
+      "comment": "Destructive button to clear the cache.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Delete Offline Cache…"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Offline-Cache löschen …"
+          }
+        }
+      }
+    },
+    "settings.cache_deletion_help": {
+      "extractionState": "manual",
+      "comment": "Explains cache-retention behavior.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Deletes everything cached on disk - thumbnails, previews, and originals - for the current account, as if you just signed in. Thumbnails re-crawl automatically."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Löscht alles lokal Gecachte - Thumbnails, Vorschauen und Originale - für den aktuellen Account, wie frisch eingeloggt. Thumbnails werden automatisch neu geladen."
+          }
+        }
+      }
+    },
+    "settings.sign_out_help": {
+      "extractionState": "manual",
+      "comment": "Explains the sign-out button in Settings.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Logs out of the Proton account on this Mac and removes its local data."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Meldet das Proton-Konto auf diesem Mac ab und entfernt dessen lokale Daten."
+          }
+        }
+      }
+    },
+    "settings.account_section": {
+      "extractionState": "manual",
+      "comment": "Settings section header for account actions.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Proton Account"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Proton-Konto"
+          }
+        }
+      }
+    },
+    "alert.delete_offline_cache_title": {
+      "extractionState": "manual",
+      "comment": "Confirmation dialog title.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Delete Offline Cache?"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Offline-Cache löschen?"
+          }
+        }
+      }
+    },
+    "alert.delete_offline_cache_message %@": {
+      "extractionState": "manual",
+      "comment": "Confirmation message. %@ is the cache size.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Everything cached on disk (%@) - thumbnails, previews, and originals - will be removed for this account. Thumbnails re-crawl automatically."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Alles lokal Gecachte (%@) - Thumbnails, Vorschauen und Originale - wird für diesen Account entfernt. Thumbnails werden automatisch neu geladen."
+          }
+        }
+      }
+    },
+    "settings.coverage_section": {
+      "extractionState": "manual",
+      "comment": "Developer-tab section header.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Coverage"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Abdeckung"
+          }
+        }
+      }
+    },
+    "settings.prefetch_section": {
+      "extractionState": "manual",
+      "comment": "Developer-tab section header.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Prefetch"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Prefetch"
+          }
+        }
+      }
+    },
+    "settings.storage_section": {
+      "extractionState": "manual",
+      "comment": "Settings section header for Proton storage quota.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Storage"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Speicher"
+          }
+        }
+      }
+    },
+    "settings.dev_total_assets": {
+      "extractionState": "manual",
+      "comment": "Developer-tab metric label.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Total assets"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Assets gesamt"
+          }
+        }
+      }
+    },
+    "settings.dev_metadata_rows": {
+      "extractionState": "manual",
+      "comment": "Developer-tab metric label.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Metadata rows"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Metadaten-Zeilen"
+          }
+        }
+      }
+    },
+    "settings.dev_thumbnails_on_disk": {
+      "extractionState": "manual",
+      "comment": "Developer-tab metric label.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Thumbnails on disk"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Thumbnails auf Disk"
+          }
+        }
+      }
+    },
+    "settings.dev_thumbnails_missing": {
+      "extractionState": "manual",
+      "comment": "Developer-tab metric label.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Thumbnails missing"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Thumbnails fehlend"
+          }
+        }
+      }
+    },
+    "settings.dev_disk_coverage": {
+      "extractionState": "manual",
+      "comment": "Developer-tab metric label.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Disk coverage"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Disk-Abdeckung"
+          }
+        }
+      }
+    },
+    "settings.dev_ram_decoded": {
+      "extractionState": "manual",
+      "comment": "Developer-tab metric label.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "RAM decoded (≤)"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "RAM dekodiert (≤)"
+          }
+        }
+      }
+    },
+    "settings.dev_prefetch_queue": {
+      "extractionState": "manual",
+      "comment": "Developer-tab metric label.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Prefetch queue"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Prefetch-Warteschlange"
+          }
+        }
+      }
+    },
+    "settings.dev_active_prefetch": {
+      "extractionState": "manual",
+      "comment": "Developer-tab metric label.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Active prefetch jobs"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Aktive Prefetch-Jobs"
+          }
+        }
+      }
+    },
+    "settings.dev_prefetch_pause_reason": {
+      "extractionState": "manual",
+      "comment": "Developer-tab metric label.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Prefetch pause reason"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Prefetch-Pause-Grund"
+          }
+        }
+      }
+    },
+    "settings.dev_failed_thumbnails": {
+      "extractionState": "manual",
+      "comment": "Developer-tab metric label.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Failed thumbnails"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Fehlgeschlagene Thumbnails"
+          }
+        }
+      }
+    },
+    "settings.dev_cache_size_disk": {
+      "extractionState": "manual",
+      "comment": "Developer-tab metric label.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Cache size (disk)"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Cache-Größe (Disk)"
+          }
+        }
+      }
+    },
+    "settings.dev_preview_cache_disk": {
+      "extractionState": "manual",
+      "comment": "Developer-tab metric label.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Preview cache (disk)"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Vorschau-Cache (Disk)"
+          }
+        }
+      }
+    },
+    "settings.dev_last_error": {
+      "extractionState": "manual",
+      "comment": "Developer-tab metric label.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Last error"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Letzter Fehler"
+          }
+        }
+      }
+    },
+    "settings.cache_limit_section": {
+      "extractionState": "manual",
+      "comment": "Header for the originals cache-size limit control.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Cache limit"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Cache-Limit"
+          }
+        }
+      }
+    },
+    "settings.cache_limit_bounded": {
+      "extractionState": "manual",
+      "comment": "Segmented option: bounded originals cache.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Limited"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Begrenzt"
+          }
+        }
+      }
+    },
+    "settings.cache_limit_unlimited": {
+      "extractionState": "manual",
+      "comment": "Segmented option: unbounded originals cache.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Unlimited"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Unbegrenzt"
+          }
+        }
+      }
+    },
+    "settings.cache_limit_help": {
+      "extractionState": "manual",
+      "comment": "Explains the originals cache limit + LRU eviction.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Full-resolution originals you open are kept locally. When limited, the least-recently-opened are removed once the cap is reached."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Geöffnete Originale in voller Auflösung werden lokal behalten. Bei „Begrenzt“ werden die am längsten nicht geöffneten entfernt, sobald das Limit erreicht ist."
+          }
+        }
+      }
+    },
+    "settings.disable_offline_title": {
+      "extractionState": "manual",
+      "comment": "Confirm dialog title for turning off the offline library.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Turn off Offline Library?"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Offline-Mediathek ausschalten?"
+          }
+        }
+      }
+    },
+    "settings.disable_offline_message %@": {
+      "extractionState": "manual",
+      "comment": "Confirm message. %@ is the size of cached originals to be deleted.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "This removes %@ of cached full-resolution originals. Thumbnails and previews are kept."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Dadurch werden %@ gecachte Originale in voller Auflösung entfernt. Thumbnails und Vorschauen bleiben erhalten."
+          }
+        }
+      }
+    },
+    "settings.disable_offline_confirm": {
+      "extractionState": "manual",
+      "comment": "Destructive confirm button: turn off offline + purge originals.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Turn Off & Delete"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Ausschalten & löschen"
+          }
+        }
+      }
+    },
+    "settings.dev_originals_cache_disk": {
+      "extractionState": "manual",
+      "comment": "Library-info metric label.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Originals cache (disk)"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Originale-Cache (Disk)"
+          }
+        }
+      }
+    },
+    "status.offline": {
+      "extractionState": "manual",
+      "comment": "Offline indicator pill shown when the device has no network.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Offline"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Offline"
+          }
+        }
+      }
+    },
+    "settings.storage_used": {
+      "extractionState": "manual",
+      "comment": "Label for used/total storage.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Used"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Belegt"
+          }
+        }
+      }
+    },
+    "settings.storage_unavailable": {
+      "extractionState": "manual",
+      "comment": "Fallback text when account storage quota is not available yet.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Storage information is not available yet."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Speicherinformationen sind noch nicht verfügbar."
+          }
+        }
+      }
+    },
+    "toolbar.favorite_selected": {
+      "extractionState": "manual",
+      "comment": "Toolbar action: favorite all selected photos.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Favorite Selected"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Auswahl favorisieren"
+          }
+        }
+      }
+    },
+    "toolbar.set_album_cover": {
+      "extractionState": "manual",
+      "comment": "Toolbar action: set the selected photo as the album cover.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Set as Album Cover"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Als Albumcover festlegen"
+          }
+        }
+      }
+    },
+    "export.confirm_many_title": {
+      "extractionState": "manual",
+      "comment": "Confirm dialog title for downloading many items as a ZIP.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Download as ZIP?"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Als ZIP herunterladen?"
+          }
+        }
+      }
+    },
+    "export.confirm_many_button": {
+      "extractionState": "manual",
+      "comment": "Confirm button for the ZIP download.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Download as ZIP"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Als ZIP herunterladen"
+          }
+        }
+      }
+    },
+    "export.confirm_many_message %lld": {
+      "extractionState": "manual",
+      "comment": "Confirm message. %lld is the item count.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%lld items will be downloaded as a single ZIP file."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%lld Elemente werden als eine ZIP-Datei geladen."
+          }
+        }
+      }
+    },
+    "export.series_zip_suffix": {
+      "extractionState": "manual",
+      "comment": "Filename suffix for a ZIP that contains all photos in one burst/series.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Series"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Serie"
+          }
+        }
+      }
+    },
+    "export.low_disk_title": {
+      "extractionState": "manual",
+      "comment": "Alert title when an export aborts for low disk.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Not Enough Disk Space"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Nicht genug Speicherplatz"
+          }
+        }
+      }
+    },
+    "export.failed_title": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Export Failed" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Export fehlgeschlagen" } }
+      }
+    },
+    "export.failed_message %@": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "The original couldn't be exported. No incomplete file was kept.\n\n%@" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Das Original konnte nicht exportiert werden. Es wurde keine unvollständige Datei behalten.\n\n%@" } }
+      }
+    },
+    "export.low_disk_message": {
+      "extractionState": "manual",
+      "comment": "Alert body when an export aborts for low disk.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "The download stopped because there isn’t enough free space. The incomplete ZIP was removed."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Der Download wurde abgebrochen, weil nicht genug freier Speicher vorhanden ist. Die unvollständige ZIP wurde entfernt."
+          }
+        }
+      }
+    },
+    "export.progress_percent %lld": {
+      "extractionState": "manual",
+      "comment": "Hover tooltip on the toolbar download ring. %lld is percent complete.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Download %lld%% complete"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Download zu %lld%% abgeschlossen"
+          }
+        }
+      }
+    },
+    "export.cancel": {
+      "extractionState": "manual",
+      "comment": "Menu item on the toolbar download ring to cancel the running download.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Cancel Download"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Download abbrechen"
+          }
+        }
+      }
+    },
+    "settings.photos_backup_denied_macos": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Photos access isn’t allowed. You can grant it in System Settings under Privacy & Security › Photos." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Zugriff auf Fotos ist nicht erlaubt. Du kannst ihn in den Systemeinstellungen unter Datenschutz & Sicherheit › Fotos erlauben." } }
+      }
+    }
+  },
+  "version": "1.0"
+}

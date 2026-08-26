@@ -1,0 +1,66 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://models.oncloud.at/schemas/model-release-qualification-v1.json",
+  "title": "Encrypted Memories immutable model qualification",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "modelID",
+    "sourceRevision",
+    "artifactRevision",
+    "converterRevision",
+    "qualificationCorpusRevision",
+    "xcodeBuild",
+    "coremltoolsVersion",
+    "hardwareModel",
+    "osVersion",
+    "peakResidentBytes",
+    "imageP95Milliseconds",
+    "textP95Milliseconds",
+    "reachedSeriousThermalState",
+    "neuralEngineExecutionVerified",
+    "gates"
+  ],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "modelID": { "type": "string", "pattern": "^(?:[a-z0-9]|[a-z0-9](?:[a-z0-9]|-(?!-)){0,126}[a-z0-9])$" },
+    "sourceRevision": { "type": "string", "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$" },
+    "artifactRevision": { "type": "string", "pattern": "^r1-[0-9a-f]{16}$" },
+    "converterRevision": { "type": "string", "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$" },
+    "qualificationCorpusRevision": { "type": "string", "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$" },
+    "xcodeBuild": { "type": "string", "minLength": 1 },
+    "coremltoolsVersion": { "type": "string", "minLength": 1 },
+    "hardwareModel": { "type": "string", "minLength": 1 },
+    "osVersion": { "type": "string", "minLength": 1 },
+    "peakResidentBytes": { "type": "integer", "minimum": 1 },
+    "imageP95Milliseconds": { "type": "number", "exclusiveMinimum": 0 },
+    "textP95Milliseconds": { "type": "number", "exclusiveMinimum": 0 },
+    "reachedSeriousThermalState": { "const": false },
+    "neuralEngineExecutionVerified": { "const": true },
+    "gates": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sourceCoreMLNumerics",
+        "tokenizerCompatibility",
+        "searchQuality",
+        "modelTokenizerPair",
+        "licenseAndProvenance",
+        "artifactSizeAndDisk",
+        "runtimeMacOS",
+        "runtimeIOSPhysical"
+      ],
+      "properties": {
+        "sourceCoreMLNumerics": { "const": true },
+        "tokenizerCompatibility": { "const": true },
+        "searchQuality": { "const": true },
+        "modelTokenizerPair": { "const": true },
+        "licenseAndProvenance": { "const": true },
+        "artifactSizeAndDisk": { "const": true },
+        "runtimeMacOS": { "const": true },
+        "runtimeIOSPhysical": { "const": true }
+      }
+    }
+  }
+}

@@ -1,0 +1,752 @@
+import Foundation
+import PhotosCore
+import XCTest
+
+@testable import UploadCore
+
+/// In-memory `UploadIdentityStore`.
+final class FakeIdentityStore: UploadIdentityStore, @unchecked Sendable {
+    private let lock = NSLock()
+    private var rows: [UploadSourceIdentity: UploadIdentityRecord] = [:]
+    private var failNextWrite = false
+
+    func rejectNextUpsert() {
+        lock.withLock { failNextWrite = true }
+    }
+
+    func record(for source: UploadSourceIdentity) -> UploadIdentityRecord? {
+        lock.withLock { rows[source] }
+    }
+
+    func trustedRecord(contentHash: String, hashKeyEpoch: String) -> UploadIdentityRecord? {
+        lock.withLock {
+            rows.values.first { row in
+                row.contentHash == contentHash
+                    && row.hashKeyEpoch == hashKeyEpoch
+                    && row.remoteLinkID != nil
+                    && (row.outcome == UploadIdentityManifestStore.Outcome.uploaded.rawValue
+                        || row.outcome == UploadIdentityManifestStore.Outcome.duplicateActive.rawValue)
+            }
+        }
+    }
+
+    @discardableResult
+    func upsert(_ record: UploadIdentityRecord) -> Bool {
+        lock.withLock {
+            if failNextWrite {
+                failNextWrite = false
+                return false
+            }
+            rows[record.source] = record
+            return true
+        }
+    }
+}
+
+/// Deterministic hasher: digest derived from the file path (or an explicit per-path content
+/// seed, so tests can make different paths carry identical content); counts invocations to
+/// prove cache hits never rehash.
+final class FakeHasher: UploadHashing, @unchecked Sendable {
+    private let lock = NSLock()
+    private(set) var hashCount = 0
+    var delay: Duration?
+    /// path to content seed. Paths sharing a seed hash identically (simulated identical bytes).
+    var contentSeeds: [String: String] = [:]
+
+    func sha1(of descriptor: UploadResourceDescriptor) async throws -> Data {
+        lock.withLock { hashCount += 1 }
+        if let delay {
+            try await Task.sleep(for: delay)
+        }
+        try Task.checkCancellation()
+        let path = descriptor.fileURL.path
+        let seed = lock.withLock { contentSeeds[path] } ?? path
+        var digest = Data(repeating: 0, count: 20)
+        for (i, byte) in seed.utf8.enumerated() {
+            digest[i % 20] ^= byte
+        }
+        return digest
+    }
+}
+
+/// Scripted duplicate checker: nameHash = "nh(<name>)", contentHash = "ch(<sha1>)"; canned remote
+/// items keyed by name hash; records every findDuplicates batch.
+final class FakeChecker: UploadDuplicateChecking, @unchecked Sendable {
+    private let lock = NSLock()
+    var epoch = "epoch-1"
+    var remoteItemsByNameHash: [String: [RemotePhotoDuplicate]] = [:]
+    var remoteItemsByContentHash: [String: RemotePhotoDuplicate] = [:]
+    var exactActiveDuplicates: [PhotoUID] = []
+    var findError: Error?
+    private(set) var findBatches: [[String]] = []
+    private(set) var nameHashCalls = 0
+    private var invalidationCount = 0
+    private var contentFindCount = 0
+    private var exactFindCount = 0
+
+    func nameHash(forCorrectedName name: String) async throws -> String {
+        lock.withLock { nameHashCalls += 1 }
+        return "nh(\(name))"
+    }
+
+    func contentHash(forSHA1Hex sha1Hex: String) async throws -> String {
+        "ch(\(sha1Hex))"
+    }
+
+    func findDuplicates(nameHashes: [String]) async throws -> [RemotePhotoDuplicate] {
+        if let findError { throw findError }
+        return lock.withLock {
+            findBatches.append(nameHashes)
+            return nameHashes.flatMap { hash in remoteItemsByNameHash[hash] ?? [] }
+        }
+    }
+
+    func findDuplicate(contentHash: String) async throws -> RemotePhotoDuplicate? {
+        lock.withLock {
+            contentFindCount += 1
+            return remoteItemsByContentHash[contentHash]
+        }
+    }
+
+    func findExactActiveDuplicates(correctedName: String, sha1Digest: Data) async -> [PhotoUID] {
+        lock.withLock {
+            exactFindCount += 1
+            return exactActiveDuplicates
+        }
+    }
+
+    func invalidateCachedRemoteState() async {
+        lock.withLock { invalidationCount += 1 }
+    }
+
+    func recordUploaded(contentHash: String, remoteLinkID: String) async {
+        lock.withLock {
+            remoteItemsByContentHash[contentHash] = RemotePhotoDuplicate(
+                nameHash: "",
+                contentHash: contentHash,
+                linkState: .active,
+                linkID: remoteLinkID
+            )
+        }
+    }
+
+    func hashKeyEpoch() async throws -> String { epoch }
+
+    var findCallCount: Int { lock.withLock { findBatches.count } }
+    var invalidateCallCount: Int { lock.withLock { invalidationCount } }
+    var contentFindCallCount: Int { lock.withLock { contentFindCount } }
+    var exactFindCallCount: Int { lock.withLock { exactFindCount } }
+}
+
+final class UploadDedupePipelineTests: XCTestCase {
+    private var store: FakeIdentityStore!
+    private var hasher: FakeHasher!
+    private var checker: FakeChecker!
+    private var pipeline: UploadDedupePipeline!
+
+    override func setUp() {
+        super.setUp()
+        store = FakeIdentityStore()
+        hasher = FakeHasher()
+        checker = FakeChecker()
+        pipeline = UploadDedupePipeline(store: store, hasher: hasher, checker: checker)
+    }
+
+    private func descriptor(
+        path: String = "/photos/IMG_1.HEIC",
+        filename: String? = nil,
+        size: Int64 = 1000,
+        mtime: TimeInterval = 1_700_000_000
+    ) -> UploadResourceDescriptor {
+        UploadResourceDescriptor(
+            source: .file(URL(fileURLWithPath: path)),
+            fileURL: URL(fileURLWithPath: path),
+            filename: filename ?? (path as NSString).lastPathComponent,
+            fileSize: size,
+            modificationDate: Date(timeIntervalSince1970: mtime)
+        )
+    }
+
+    /// The sha1 hex FakeHasher yields for a given content seed (or path when unseeded).
+    private func fakeSHA1Hex(seed: String) -> String {
+        var digest = Data(repeating: 0, count: 20)
+        for (i, byte) in seed.utf8.enumerated() { digest[i % 20] ^= byte }
+        return UploadContentSHA1.hexString(digest: digest)
+    }
+
+    func testSameContentUnderNewSourceSkipsViaManifestWithoutRemoteQuery() async throws {
+        hasher.contentSeeds["/sync1/IMG_1.HEIC"] = "shared-bytes"
+        hasher.contentSeeds["/sync2/renamed.HEIC"] = "shared-bytes"
+
+        let original = descriptor(path: "/sync1/IMG_1.HEIC")
+        let resolvedOriginal = try await pipeline.resolve(original)
+        XCTAssertEqual(resolvedOriginal.decision, .upload)
+        try await pipeline.recordUploaded(
+            original, identity: resolvedOriginal.identity,
+            remoteVolumeID: "vol", remoteLinkID: "link-a")
+        let findsAfterOriginal = checker.findCallCount
+
+        // Copied file: different path and different filename, identical bytes.
+        let copy = descriptor(path: "/sync2/renamed.HEIC")
+        let resolvedCopy = try await pipeline.resolve(copy)
+
+        XCTAssertEqual(resolvedCopy.decision, .skip(.knownFromManifest, remoteLinkID: "link-a"))
+        XCTAssertEqual(
+            checker.findCallCount, findsAfterOriginal,
+            "locally-proven content must not re-query the server")
+        let copyRow = store.record(for: copy.source)
+        XCTAssertEqual(copyRow?.outcome, UploadIdentityManifestStore.Outcome.duplicateActive.rawValue)
+        XCTAssertEqual(
+            copyRow?.remoteLinkID, "link-a",
+            "the copy source must adopt the original's remote link for future fast-path hits")
+    }
+
+    func testRemoteContentDuplicateWithDifferentNameSkipsWithoutUpload() async throws {
+        hasher.contentSeeds["/local/renamed-copy.HEIC"] = "already-remote-bytes"
+        let sha1 = fakeSHA1Hex(seed: "already-remote-bytes")
+        let contentHash = "ch(\(sha1))"
+        checker.remoteItemsByContentHash[contentHash] = RemotePhotoDuplicate(
+            nameHash: "nh(IMG_0001.HEIC)",
+            contentHash: contentHash,
+            linkState: .active,
+            linkID: "remote-existing"
+        )
+
+        let local = descriptor(path: "/local/renamed-copy.HEIC")
+        let result = try await pipeline.resolve(local)
+
+        XCTAssertEqual(checker.contentFindCallCount, 1, "renamed content still needs the account-wide fallback")
+
+        XCTAssertEqual(
+            result.decision, .skip(.activeDuplicate, remoteLinkID: "remote-existing"),
+            "remote content identity must win even when the name hash is different")
+        XCTAssertEqual(
+            checker.findBatches.count, 1,
+            "the cheap Proton name-hash check must precede the renamed-content fallback")
+        let row = store.record(for: local.source)
+        XCTAssertEqual(row?.outcome, UploadIdentityManifestStore.Outcome.duplicateActive.rawValue)
+        XCTAssertEqual(row?.remoteLinkID, "remote-existing")
+    }
+
+    func testExactNameAndContentDuplicateAvoidsAccountWideContentIndex() async throws {
+        let d = descriptor()
+        let contentHash = "ch(\(fakeSHA1Hex(seed: d.fileURL.path)))"
+        checker.remoteItemsByNameHash["nh(IMG_1.HEIC)"] = [
+            RemotePhotoDuplicate(
+                nameHash: "nh(IMG_1.HEIC)",
+                contentHash: contentHash,
+                linkState: .active,
+                linkID: "remote-existing"
+            )
+        ]
+        let result = try await pipeline.resolve(d)
+
+        XCTAssertEqual(result.decision, .skip(.activeDuplicate, remoteLinkID: "remote-existing"))
+        XCTAssertEqual(
+            checker.exactFindCallCount, 0,
+            "the batched normal path must not add one SDK request per duplicate")
+        XCTAssertEqual(
+            checker.contentFindCallCount, 0,
+            "the batched Proton name/content proof must not build the full remote content index")
+    }
+
+    func testSameNameDifferentContentStillUsesAccountWideFallback() async throws {
+        let d = descriptor()
+        let contentHash = "ch(\(fakeSHA1Hex(seed: d.fileURL.path)))"
+        checker.remoteItemsByNameHash["nh(IMG_1.HEIC)"] = [
+            RemotePhotoDuplicate(
+                nameHash: "nh(IMG_1.HEIC)",
+                contentHash: "different-content",
+                linkState: .active,
+                linkID: "name-collision"
+            )
+        ]
+        checker.remoteItemsByContentHash[contentHash] = RemotePhotoDuplicate(
+            nameHash: "nh(old-name.HEIC)",
+            contentHash: contentHash,
+            linkState: .active,
+            linkID: "actual-twin"
+        )
+
+        let result = try await pipeline.resolve(d)
+
+        XCTAssertEqual(result.decision, .skip(.activeDuplicate, remoteLinkID: "actual-twin"))
+        XCTAssertEqual(checker.contentFindCallCount, 1)
+        XCTAssertEqual(checker.exactFindCallCount, 0)
+    }
+
+    func testDraftOnlyCandidateDoesNotInvokeSDKExactActiveLookup() async throws {
+        let d = descriptor()
+        let contentHash = "ch(\(fakeSHA1Hex(seed: d.fileURL.path)))"
+        checker.remoteItemsByNameHash["nh(IMG_1.HEIC)"] = [
+            RemotePhotoDuplicate(
+                nameHash: "nh(IMG_1.HEIC)",
+                contentHash: contentHash,
+                linkState: .draft,
+                linkID: "draft",
+                clientUID: "other-client"
+            )
+        ]
+
+        let result = try await pipeline.resolve(d)
+
+        XCTAssertEqual(result.decision, .skip(.draftExists, remoteLinkID: "draft"))
+        XCTAssertEqual(checker.exactFindCallCount, 0)
+    }
+
+    func testOwnDraftSurvivesContentFallbackAsReplacementDecision() async throws {
+        let d = descriptor()
+        let contentHash = "ch(\(fakeSHA1Hex(seed: d.fileURL.path)))"
+        let draft = RemotePhotoDuplicate(
+            nameHash: "nh(IMG_1.HEIC)",
+            contentHash: contentHash,
+            linkState: .draft,
+            linkID: "stale-draft",
+            clientUID: "this-installation"
+        )
+        checker.remoteItemsByNameHash[draft.nameHash] = [draft]
+        checker.remoteItemsByContentHash[contentHash] = draft
+        pipeline = UploadDedupePipeline(
+            store: store,
+            hasher: hasher,
+            checker: checker,
+            currentClientUID: "this-installation"
+        )
+
+        let result = try await pipeline.resolve(d)
+
+        XCTAssertEqual(result.decision, .uploadReplacingDraft)
+        await pipeline.uploadDidFail(d)
+    }
+
+    func testPrecomputedDigestAvoidsReadingTheExportAgain() async throws {
+        let digest = Data(repeating: 0xA5, count: 20)
+        let missingURL = URL(fileURLWithPath: "/does-not-exist/photo.heic")
+        let descriptor = UploadResourceDescriptor(
+            source: .file(missingURL),
+            fileURL: missingURL,
+            filename: "photo.heic",
+            fileSize: 123,
+            modificationDate: Date(timeIntervalSince1970: 1),
+            precomputedSHA1Digest: digest
+        )
+
+        let actual = try await UploadFileHasher().sha1(of: descriptor)
+        XCTAssertEqual(actual, digest)
+    }
+
+    func testRemoteStateInvalidationPropagatesToContentIndexOwner() async {
+        XCTAssertEqual(checker.invalidateCallCount, 0)
+
+        await pipeline.invalidateCachedRemoteState()
+
+        XCTAssertEqual(
+            checker.invalidateCallCount, 1,
+            "stale-name invalidation must also drop backend content-index state")
+    }
+
+    func testDedupeUnavailableResolverFailsBeforeUploadDecision() async {
+        let resolver = DedupeUnavailableIdentityResolver(message: "dedupe unavailable")
+        do {
+            _ = try await resolver.resolve(descriptor())
+            XCTFail("expected fail-closed resolver to throw")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("dedupe unavailable"))
+        }
+    }
+
+    func testTrashedContentRowIsNeverTrustedAsBackedUp() async throws {
+        hasher.contentSeeds["/sync1/IMG_1.HEIC"] = "trashed-bytes"
+        hasher.contentSeeds["/sync2/IMG_1.HEIC"] = "trashed-bytes"
+        let contentHash = "ch(\(fakeSHA1Hex(seed: "trashed-bytes")))"
+        checker.remoteItemsByNameHash["nh(IMG_1.HEIC)"] = [
+            RemotePhotoDuplicate(
+                nameHash: "nh(IMG_1.HEIC)", contentHash: contentHash, linkState: .trashed, linkID: "t-1"
+            )
+        ]
+
+        let original = try await pipeline.resolve(descriptor(path: "/sync1/IMG_1.HEIC"))
+        XCTAssertEqual(original.decision, .skip(.trashedDuplicate, remoteLinkID: "t-1"))
+
+        // The copy shares the bytes, but the persisted trashed outcome must not satisfy the
+        // content lookup - the deletion stays respected and re-checked, never "backed up".
+        let copy = try await pipeline.resolve(descriptor(path: "/sync2/IMG_1.HEIC"))
+        XCTAssertEqual(copy.decision, .skip(.trashedDuplicate, remoteLinkID: "t-1"))
+    }
+
+    func testConcurrentIdenticalContentWaitsForUploadThenSkips() async throws {
+        hasher.contentSeeds["/sync1/IMG_1.HEIC"] = "dup-bytes"
+        hasher.contentSeeds["/sync2/copy.HEIC"] = "dup-bytes"
+
+        let first = descriptor(path: "/sync1/IMG_1.HEIC")
+        let resolvedFirst = try await pipeline.resolve(first)
+        XCTAssertEqual(resolvedFirst.decision, .upload, "first claims the content upload")
+
+        let second = descriptor(path: "/sync2/copy.HEIC")
+        let pipeline = self.pipeline!
+        let secondTask = Task { try await pipeline.resolve(second) }
+        try await Task.sleep(for: .milliseconds(50))  // let it reach the coalescing wait
+
+        try await pipeline.recordUploaded(
+            first, identity: resolvedFirst.identity,
+            remoteVolumeID: "vol", remoteLinkID: "link-a")
+        let resolvedSecond = try await secondTask.value
+
+        XCTAssertEqual(
+            resolvedSecond.decision, .skip(.knownFromManifest, remoteLinkID: "link-a"),
+            "identical bytes resolved concurrently must wait and then skip, not double-upload")
+    }
+
+    func testUploadedManifestWriteFailureReleasesWaiterAndForcesRemoteRecheck() async throws {
+        hasher.contentSeeds["/sync1/IMG_1.HEIC"] = "dup-bytes"
+        hasher.contentSeeds["/sync2/copy.HEIC"] = "dup-bytes"
+
+        let first = descriptor(path: "/sync1/IMG_1.HEIC")
+        let resolvedFirst = try await pipeline.resolve(first)
+        let second = descriptor(path: "/sync2/copy.HEIC")
+        let pipeline = self.pipeline!
+        let secondTask = Task { try await pipeline.resolve(second) }
+        try await Task.sleep(for: .milliseconds(50))
+
+        checker.remoteItemsByContentHash[resolvedFirst.identity.contentHash] = RemotePhotoDuplicate(
+            nameHash: resolvedFirst.identity.nameHash,
+            contentHash: resolvedFirst.identity.contentHash,
+            linkState: .active,
+            linkID: "server-link"
+        )
+        store.rejectNextUpsert()
+
+        do {
+            try await pipeline.recordUploaded(
+                first,
+                identity: resolvedFirst.identity,
+                remoteVolumeID: "vol",
+                remoteLinkID: "server-link"
+            )
+            XCTFail("an unpersisted upload outcome must not be reported as settled")
+        } catch {
+            // The waiter must be released to consult fresh server state.
+        }
+
+        let resolvedSecond = try await secondTask.value
+        XCTAssertEqual(resolvedSecond.decision, .skip(.activeDuplicate, remoteLinkID: "server-link"))
+        XCTAssertEqual(checker.invalidateCallCount, 1)
+    }
+
+    func testUploadFailureReleasesWaiterToUploadItself() async throws {
+        hasher.contentSeeds["/sync1/IMG_1.HEIC"] = "dup-bytes"
+        hasher.contentSeeds["/sync2/copy.HEIC"] = "dup-bytes"
+
+        let first = descriptor(path: "/sync1/IMG_1.HEIC")
+        let resolvedFirst = try await pipeline.resolve(first)
+        XCTAssertEqual(resolvedFirst.decision, .upload)
+
+        let second = descriptor(path: "/sync2/copy.HEIC")
+        let pipeline = self.pipeline!
+        let secondTask = Task { try await pipeline.resolve(second) }
+        try await Task.sleep(for: .milliseconds(50))
+
+        await pipeline.uploadDidFail(first)
+        let resolvedSecond = try await secondTask.value
+
+        XCTAssertEqual(
+            resolvedSecond.decision, .upload,
+            "after the owner's upload fails, a waiting identical item takes over")
+        await pipeline.uploadDidFail(second)  // settle the taken-over claim
+    }
+
+    func testFreshFileWithNoRemoteMatchUploads() async throws {
+        let result = try await pipeline.resolve(descriptor())
+
+        XCTAssertEqual(result.decision, .upload)
+        XCTAssertEqual(result.identity.correctedName, "IMG_1.HEIC")
+        XCTAssertEqual(result.identity.nameHash, "nh(IMG_1.HEIC)")
+        XCTAssertEqual(result.identity.contentHash, "ch(\(result.identity.sha1Hex))")
+        XCTAssertEqual(result.identity.sha1Digest.count, 20)
+        XCTAssertEqual(hasher.hashCount, 1)
+        // Identity persisted (crash-safe) without an outcome.
+        let row = store.record(for: .file(URL(fileURLWithPath: "/photos/IMG_1.HEIC")))
+        XCTAssertEqual(row?.sha1Hex, result.identity.sha1Hex)
+        XCTAssertNil(row?.outcome)
+    }
+
+    func testSecondResolveReusesCachedHashes() async throws {
+        let d = descriptor()
+        _ = try await pipeline.resolve(d)
+        await pipeline.uploadDidFail(d)
+        let nameHashCallsAfterFirst = checker.nameHashCalls
+        _ = try await pipeline.resolve(d)
+
+        XCTAssertEqual(hasher.hashCount, 1, "unchanged file must not rehash")
+        XCTAssertEqual(checker.nameHashCalls, nameHashCallsAfterFirst, "valid manifest row must reuse HMACs")
+    }
+
+    func testChangedSizeInvalidatesCachedHashes() async throws {
+        let first = descriptor(size: 1000)
+        _ = try await pipeline.resolve(first)
+        await pipeline.uploadDidFail(first)
+        _ = try await pipeline.resolve(descriptor(size: 1001))
+        XCTAssertEqual(hasher.hashCount, 2)
+    }
+
+    func testChangedModificationDateInvalidatesCachedHashes() async throws {
+        let first = descriptor(mtime: 1_700_000_000)
+        _ = try await pipeline.resolve(first)
+        await pipeline.uploadDidFail(first)
+        _ = try await pipeline.resolve(descriptor(mtime: 1_700_000_001))
+        XCTAssertEqual(hasher.hashCount, 2)
+    }
+
+    func testHashKeyEpochChangeRecomputesHMACsButNotSHA1() async throws {
+        let d = descriptor()
+        _ = try await pipeline.resolve(d)
+        await pipeline.uploadDidFail(d)
+        let callsAfterFirst = checker.nameHashCalls
+        checker.epoch = "epoch-2"
+        _ = try await pipeline.resolve(d)
+
+        XCTAssertEqual(hasher.hashCount, 1, "SHA-1 does not depend on the hash key")
+        XCTAssertGreaterThan(checker.nameHashCalls, callsAfterFirst, "HMACs must be recomputed for a new key epoch")
+    }
+
+    func testActiveDuplicateSkipsAndPersistsOutcome() async throws {
+        let d = descriptor()
+        // Resolve once to learn the content hash the fake produces, then plant the remote twin.
+        let probe = try await pipeline.resolve(d)
+        checker.remoteItemsByNameHash["nh(IMG_1.HEIC)"] = [
+            RemotePhotoDuplicate(
+                nameHash: "nh(IMG_1.HEIC)", contentHash: probe.identity.contentHash, linkState: .active,
+                linkID: "link-9")
+        ]
+        // New pipeline so the (empty) per-run duplicate cache from the probe doesn't linger.
+        pipeline = UploadDedupePipeline(store: store, hasher: hasher, checker: checker)
+
+        let result = try await pipeline.resolve(d)
+        XCTAssertEqual(result.decision, .skip(.activeDuplicate, remoteLinkID: "link-9"))
+
+        let row = store.record(for: d.source)
+        XCTAssertEqual(row?.outcome, UploadIdentityManifestStore.Outcome.duplicateActive.rawValue)
+        XCTAssertEqual(row?.remoteLinkID, "link-9")
+    }
+
+    func testManifestKnownDuplicateSkipsWithoutAnyRemoteCall() async throws {
+        let d = descriptor()
+        let probe = try await pipeline.resolve(d)
+        checker.remoteItemsByNameHash["nh(IMG_1.HEIC)"] = [
+            RemotePhotoDuplicate(
+                nameHash: "nh(IMG_1.HEIC)", contentHash: probe.identity.contentHash, linkState: .active,
+                linkID: "link-9")
+        ]
+        pipeline = UploadDedupePipeline(store: store, hasher: hasher, checker: checker)
+        _ = try await pipeline.resolve(d)  // records duplicateActive
+        let callsAfterConfirmation = checker.findCallCount
+        let hashesAfterConfirmation = hasher.hashCount
+
+        // Third resolve, fresh pipeline (fresh run): manifest fast path, no query, no hashing.
+        pipeline = UploadDedupePipeline(store: store, hasher: hasher, checker: checker)
+        let result = try await pipeline.resolve(d)
+
+        XCTAssertEqual(result.decision, .skip(.knownFromManifest, remoteLinkID: "link-9"))
+        XCTAssertEqual(checker.findCallCount, callsAfterConfirmation, "manifest hit must not re-query")
+        XCTAssertEqual(hasher.hashCount, hashesAfterConfirmation, "manifest hit must not rehash")
+    }
+
+    func testRecordUploadedEnablesManifestFastPathNextRun() async throws {
+        let d = descriptor()
+        let result = try await pipeline.resolve(d)
+        XCTAssertEqual(result.decision, .upload)
+        try await pipeline.recordUploaded(d, identity: result.identity, remoteVolumeID: "vol", remoteLinkID: "new-link")
+
+        pipeline = UploadDedupePipeline(store: store, hasher: hasher, checker: checker)
+        let second = try await pipeline.resolve(d)
+        XCTAssertEqual(second.decision, .skip(.knownFromManifest, remoteLinkID: "new-link"))
+    }
+
+    func testKnownUploadedResourceRevalidationUsesSDKExactActiveProof() async throws {
+        let d = descriptor()
+        let first = try await pipeline.resolve(d)
+        try await pipeline.recordUploaded(
+            d,
+            identity: first.identity,
+            remoteVolumeID: "vol",
+            remoteLinkID: "uploaded-link"
+        )
+        checker.exactActiveDuplicates = [PhotoUID(volumeID: "vol", nodeID: "uploaded-link")]
+        let detailedCallsBefore = checker.findCallCount
+        let contentCallsBefore = checker.contentFindCallCount
+
+        let decision = try await pipeline.revalidateKnownRemote(d)
+
+        XCTAssertEqual(decision, .skip(.activeDuplicate, remoteLinkID: "uploaded-link"))
+        XCTAssertEqual(checker.exactFindCallCount, 1)
+        XCTAssertEqual(
+            checker.findCallCount, detailedCallsBefore,
+            "an exact SDK proof must handle the one-item revalidation")
+        XCTAssertEqual(checker.contentFindCallCount, contentCallsBefore)
+    }
+
+    func testKnownUploadedResourceRevalidationDetectsLaterRemoteDeletion() async throws {
+        let d = descriptor()
+        let first = try await pipeline.resolve(d)
+        try await pipeline.recordUploaded(
+            d,
+            identity: first.identity,
+            remoteVolumeID: "vol",
+            remoteLinkID: "uploaded-link"
+        )
+        checker.remoteItemsByContentHash[first.identity.contentHash] = nil
+
+        let decision = try await pipeline.revalidateKnownRemote(d)
+
+        XCTAssertEqual(decision, .skip(.deletedRemotely, remoteLinkID: "uploaded-link"))
+        XCTAssertEqual(checker.invalidateCallCount, 1)
+        XCTAssertEqual(checker.findCallCount, 2, "revalidation must bypass the manifest and query current name state")
+        XCTAssertEqual(checker.contentFindCallCount, 2, "a name miss must consult the refreshed active-content index")
+    }
+
+    func testKnownUploadedResourceRevalidationReturnsCurrentTrashState() async throws {
+        let d = descriptor()
+        let first = try await pipeline.resolve(d)
+        try await pipeline.recordUploaded(
+            d,
+            identity: first.identity,
+            remoteVolumeID: "vol",
+            remoteLinkID: "uploaded-link"
+        )
+        checker.remoteItemsByNameHash[first.identity.nameHash] = [
+            RemotePhotoDuplicate(
+                nameHash: first.identity.nameHash,
+                contentHash: first.identity.contentHash,
+                linkState: .trashed,
+                linkID: "uploaded-link"
+            )
+        ]
+
+        let decision = try await pipeline.revalidateKnownRemote(d)
+
+        XCTAssertEqual(decision, .skip(.trashedDuplicate, remoteLinkID: "uploaded-link"))
+        XCTAssertEqual(checker.contentFindCallCount, 1, "an exact trash result needs no account-wide fallback")
+    }
+
+    func testTrashedOutcomeIsRecordedButRecheckedEveryRun() async throws {
+        let d = descriptor()
+        let probe = try await pipeline.resolve(d)
+        checker.remoteItemsByNameHash["nh(IMG_1.HEIC)"] = [
+            RemotePhotoDuplicate(
+                nameHash: "nh(IMG_1.HEIC)", contentHash: probe.identity.contentHash, linkState: .trashed,
+                linkID: "link-t")
+        ]
+        pipeline = UploadDedupePipeline(store: store, hasher: hasher, checker: checker)
+        let second = try await pipeline.resolve(d)
+        XCTAssertEqual(second.decision, .skip(.trashedDuplicate, remoteLinkID: "link-t"))
+        XCTAssertEqual(
+            store.record(for: d.source)?.outcome, UploadIdentityManifestStore.Outcome.duplicateTrashed.rawValue)
+
+        // The user empties the trash to next run must re-check and upload, not trust the manifest.
+        checker.remoteItemsByNameHash = [:]
+        let queriesBefore = checker.findCallCount
+        pipeline = UploadDedupePipeline(store: store, hasher: hasher, checker: checker)
+        let third = try await pipeline.resolve(d)
+        XCTAssertEqual(third.decision, .upload)
+        XCTAssertGreaterThan(checker.findCallCount, queriesBefore)
+    }
+
+    func testConcurrentDifferentPhotosWithSameFilenameSerializeWithoutDedupingBytes() async throws {
+        // Camera filenames repeat after a reset. Both photos must upload, but never concurrently
+        // under one name because a live first upload would look like a stale draft to the second.
+        let a = descriptor(path: "/a/IMG.jpg")
+        let b = descriptor(path: "/b/IMG.jpg")
+        let pipeline = self.pipeline!
+        let ra = try await pipeline.resolve(a)
+        XCTAssertEqual(ra.decision, .upload)
+
+        let second = Task { try await pipeline.resolve(b) }
+        try await Task.sleep(for: .milliseconds(50))
+        XCTAssertEqual(checker.findCallCount, 1, "second same-name item must wait behind the live upload")
+
+        try await pipeline.recordUploaded(
+            a,
+            identity: ra.identity,
+            remoteVolumeID: "vol",
+            remoteLinkID: "first-link"
+        )
+        let rb = try await second.value
+        XCTAssertEqual(rb.decision, .upload, "same filename with different bytes remains a new photo")
+        XCTAssertEqual(checker.findCallCount, 1, "the first upload refreshes the shared cached name view")
+        await pipeline.uploadDidFail(b)
+    }
+
+    func testConcurrentResolveOfSameSourceWaitsForFirstAttempt() async throws {
+        let d = descriptor()
+        let first = try await pipeline.resolve(d)
+        XCTAssertEqual(first.decision, .upload)
+
+        let pipeline = self.pipeline!
+        let duplicateCall = Task { try await pipeline.resolve(d) }
+        try await Task.sleep(for: .milliseconds(50))
+        XCTAssertEqual(checker.findCallCount, 1)
+
+        try await pipeline.recordUploaded(
+            d,
+            identity: first.identity,
+            remoteVolumeID: "vol",
+            remoteLinkID: "first-link"
+        )
+        let second = try await duplicateCall.value
+        XCTAssertEqual(second.decision, .skip(.knownFromManifest, remoteLinkID: "first-link"))
+    }
+
+    func testPrimeBatchesAtProtonSize() async throws {
+        let descriptors = (0..<200).map { descriptor(path: "/photos/IMG_\($0).HEIC") }
+        await pipeline.prime(descriptors)
+
+        XCTAssertEqual(
+            checker.findBatches.map(\.count).sorted(), [50, 150],
+            "prime must chunk at Proton's 150-hash batch size")
+        XCTAssertEqual(hasher.hashCount, 0, "prime must never hash file contents")
+        XCTAssertEqual(
+            checker.invalidateCallCount, 0,
+            "lookahead refreshes must not discard and rebuild the account-wide content index")
+
+        // Primed hashes are cache hits - resolving one must not add a query.
+        let queriesAfterPrime = checker.findCallCount
+        _ = try await pipeline.resolve(descriptors[0])
+        XCTAssertEqual(checker.findCallCount, queriesAfterPrime)
+    }
+
+    func testDuplicateCheckFailureSurfacesAsError() async {
+        checker.findError = UploadError.backend("duplicates endpoint down")
+        do {
+            _ = try await pipeline.resolve(descriptor())
+            XCTFail("expected error")
+        } catch {
+            // resolve must throw - the manager surfaces this as a failed item, never a blind upload
+        }
+    }
+
+    func testSDKExactMatchSafelyRecoversDetailedLookupFailure() async throws {
+        checker.findError = UploadError.backend("duplicates endpoint down")
+        checker.exactActiveDuplicates = [PhotoUID(volumeID: "vol", nodeID: "sdk-existing")]
+
+        let result = try await pipeline.resolve(descriptor())
+
+        XCTAssertEqual(result.decision, .skip(.activeDuplicate, remoteLinkID: "sdk-existing"))
+        XCTAssertEqual(checker.exactFindCallCount, 1)
+        XCTAssertEqual(checker.contentFindCallCount, 0)
+    }
+
+    func testResolveCancellationDuringHashingPropagates() async throws {
+        hasher.delay = .seconds(5)
+        let d = descriptor()
+        let pipeline = self.pipeline!
+        let task = Task { _ = try await pipeline.resolve(d) }
+        try await Task.sleep(for: .milliseconds(50))
+        task.cancel()
+        do {
+            _ = try await task.value
+            XCTFail("expected CancellationError")
+        } catch is CancellationError {
+            // expected
+        }
+    }
+}

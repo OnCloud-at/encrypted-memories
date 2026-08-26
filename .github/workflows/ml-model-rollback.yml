@@ -1,0 +1,209 @@
+name: ML model catalog rollback
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_pair_sha256:
+        description: "Historical catalog pair SHA-256"
+        required: true
+        type: string
+      confirmation:
+        description: "Type ROLLBACK"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash {0}
+
+concurrency:
+  group: ml-model-production
+  cancel-in-progress: false
+
+jobs:
+  rollback:
+    runs-on: macos-26
+    timeout-minutes: 45
+    environment: ml-model-production
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Validate request and decode signing key
+        env:
+          SOURCE_PAIR: ${{ inputs.source_pair_sha256 }}
+          CONFIRMATION: ${{ inputs.confirmation }}
+          SIGNING_KEY_BASE64: ${{ secrets.ML_CATALOG_ED25519_PRIVATE_KEY_BASE64 }}
+        run: |
+          set -euo pipefail
+          [[ "$CONFIRMATION" == ROLLBACK ]] || { echo "confirmation must equal ROLLBACK" >&2; exit 1; }
+          [[ ${#SOURCE_PAIR} == 64 && "$SOURCE_PAIR" != *[^0-9a-f]* ]] || {
+            echo "source_pair_sha256 must be 64 lowercase hexadecimal characters" >&2
+            exit 1
+          }
+          [[ -n "$SIGNING_KEY_BASE64" ]] || { echo "Catalog signing key is unavailable" >&2; exit 1; }
+          umask 077
+          printf '%s' "$SIGNING_KEY_BASE64" | base64 -D > "$RUNNER_TEMP/catalog-ed25519.key"
+          [[ "$(stat -f %z "$RUNNER_TEMP/catalog-ed25519.key")" == 32 ]]
+
+      - name: Read the current signed sequence
+        id: sequence
+        env:
+          MODEL_BASE_URL: ${{ vars.ML_MODEL_BASE_URL }}
+        run: |
+          set -euo pipefail
+          [[ "$MODEL_BASE_URL" == https://models.oncloud.at/models/ ]] || {
+            echo "ML_MODEL_BASE_URL must match the app's production model endpoint" >&2
+            exit 1
+          }
+          catalog_root=${MODEL_BASE_URL%models/}
+          current="$RUNNER_TEMP/current"
+          mkdir -p "$current"
+          curl --fail --silent --show-error --location \
+            "${catalog_root}active-pair.json?rollback-read=$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
+            --output "$current/active-pair.json"
+          python3 scripts/verify-ml-release-pair.py --pointer "$current/active-pair.json"
+          public_key='qXMyoYhp7TbPPXPAyEKDoy+kkl8He7I5RNXWgjNc5Kk='
+          xcrun swift scripts/verify-ml-catalog-signature.swift \
+            --pointer "$current/active-pair.json" "$public_key"
+          current_pair=$(jq -er '.payload.pairID' "$current/active-pair.json")
+          for name in catalog-v1.json catalog-v1.sig catalog-v2.json catalog-v2.sig release-pair.json; do
+            path=$(jq -er --arg name "$name" '.payload.objects[] | select(.name == $name) | .path' "$current/active-pair.json")
+            curl --fail --silent --show-error --location \
+              "$catalog_root$path?rollback-read=$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
+              --output "$current/$name"
+          done
+          python3 scripts/verify-ml-release-pair.py "$current" --expected-pair "$current_pair"
+          xcrun swift scripts/verify-ml-catalog-signature.swift "$current/catalog-v1.json" "$current/catalog-v1.sig" "$public_key"
+          xcrun swift scripts/verify-ml-catalog-signature.swift "$current/catalog-v2.json" "$current/catalog-v2.sig" "$public_key"
+          pointer_sequence=$(jq -er '.payload.catalogSequence' "$current/active-pair.json")
+          catalog_sequence=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["catalogSequence"])' "$current/catalog-v2.json")
+          [[ "$pointer_sequence" == "$catalog_sequence" ]] || { echo "Active pointer sequence does not match catalog" >&2; exit 1; }
+          sequence=$(python3 -c 'import sys; value=int(sys.argv[1]); assert 0 < value < 2**64-1; print(value + 1)' "$pointer_sequence")
+          echo "next=$sequence" >> "$GITHUB_OUTPUT"
+
+      - name: Verify, sign, and publish forward rollback
+        id: rollback
+        env:
+          SOURCE_PAIR: ${{ inputs.source_pair_sha256 }}
+          NEXT_SEQUENCE: ${{ steps.sequence.outputs.next }}
+          MODEL_BUCKET: ${{ vars.ML_MODEL_R2_BUCKET }}
+          ROLLBACK_OUTPUT_DIR: ${{ runner.temp }}/rollback-release
+          R2_ENDPOINT: ${{ secrets.ML_MODEL_R2_ENDPOINT }}
+          R2_ACCESS_KEY_ID: ${{ secrets.ML_MODEL_R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.ML_MODEL_R2_SECRET_ACCESS_KEY }}
+          RCLONE_CONFIG_R2_TYPE: s3
+          RCLONE_CONFIG_R2_PROVIDER: Cloudflare
+          RCLONE_CONFIG_R2_ACCESS_KEY_ID: ${{ secrets.ML_MODEL_R2_ACCESS_KEY_ID }}
+          RCLONE_CONFIG_R2_SECRET_ACCESS_KEY: ${{ secrets.ML_MODEL_R2_SECRET_ACCESS_KEY }}
+          RCLONE_CONFIG_R2_ENDPOINT: ${{ secrets.ML_MODEL_R2_ENDPOINT }}
+        run: |
+          set -euo pipefail
+          [[ -n "$MODEL_BUCKET" ]] || { echo "ML_MODEL_R2_BUCKET is unavailable" >&2; exit 1; }
+          for name in R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY R2_ENDPOINT RCLONE_CONFIG_R2_ACCESS_KEY_ID RCLONE_CONFIG_R2_SECRET_ACCESS_KEY RCLONE_CONFIG_R2_ENDPOINT; do
+            [[ -n "${!name}" ]] || { echo "$name is unavailable" >&2; exit 1; }
+          done
+          rclone=$(bash scripts/install-rclone.sh "$RUNNER_TEMP/rclone")
+          export PATH="$(dirname "$rclone"):$PATH"
+          repository_revision=$(git rev-parse HEAD)
+          released_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+          zsh scripts/rollback-ml-model-release.sh \
+            "$SOURCE_PAIR" \
+            "$NEXT_SEQUENCE" \
+            "$RUNNER_TEMP/catalog-ed25519.key" \
+            "$repository_revision" \
+            "$released_at" \
+            r2 \
+            "$MODEL_BUCKET"
+
+      - name: Verify public rollback activation
+        env:
+          MODEL_BASE_URL: ${{ vars.ML_MODEL_BASE_URL }}
+          PAIR_ID: ${{ steps.rollback.outputs.pair_id }}
+          CATALOG_SEQUENCE: ${{ steps.sequence.outputs.next }}
+          ROLLBACK_OUTPUT_DIR: ${{ runner.temp }}/rollback-release
+        run: |
+          set -euo pipefail
+          catalog_root=${MODEL_BASE_URL%models/}
+          public="$RUNNER_TEMP/public-rollback"
+          mkdir -p "$public"
+          verified=false
+          for attempt in {1..12}; do
+            if ! curl --fail --silent --show-error --location \
+              "${catalog_root}active-pair.json?rollback=${PAIR_ID}-${attempt}" \
+              --output "$public/active-pair.json"; then
+              sleep 10
+              continue
+            fi
+            if ! python3 scripts/verify-ml-release-pair.py --pointer "$public/active-pair.json" --expected-pair "$PAIR_ID"; then
+              sleep 10
+              continue
+            fi
+            if ! xcrun swift scripts/verify-ml-catalog-signature.swift \
+                --pointer "$public/active-pair.json" \
+                qXMyoYhp7TbPPXPAyEKDoy+kkl8He7I5RNXWgjNc5Kk=; then
+              sleep 10
+              continue
+            fi
+            objects_ok=true
+            for name in catalog-v1.json catalog-v1.sig catalog-v2.json catalog-v2.sig release-pair.json; do
+              path=$(jq -er --arg name "$name" '.payload.objects[] | select(.name == $name) | .path' "$public/active-pair.json")
+              if ! curl --fail --silent --show-error --location \
+                  "$catalog_root$path?rollback=$PAIR_ID-$attempt" \
+                  --output "$public/$name"; then
+                objects_ok=false
+                break
+              fi
+            done
+            if [[ "$objects_ok" != true ]]; then
+              sleep 10
+              continue
+            fi
+            if ! python3 scripts/verify-ml-release-pair.py "$public" --expected-pair "$PAIR_ID"; then
+              sleep 10
+              continue
+            fi
+            if cmp -s "$public/catalog-v1.json" "$ROLLBACK_OUTPUT_DIR/catalog-v1.json" \
+              && cmp -s "$public/catalog-v1.sig" "$ROLLBACK_OUTPUT_DIR/catalog-v1.sig" \
+              && cmp -s "$public/catalog-v2.json" "$ROLLBACK_OUTPUT_DIR/catalog-v2.json" \
+              && cmp -s "$public/catalog-v2.sig" "$ROLLBACK_OUTPUT_DIR/catalog-v2.sig" \
+              && cmp -s "$public/release-pair.json" "$ROLLBACK_OUTPUT_DIR/release-pair.json"; then
+              legacy_ok=true
+              for name in catalog-v1.json catalog-v1.sig catalog-v2.json catalog-v2.sig; do
+                if ! curl --fail --silent --show-error --location \
+                    "$catalog_root$name?rollback-legacy=$PAIR_ID-$attempt" \
+                    --output "$public/legacy-$name" \
+                  || ! cmp -s "$public/legacy-$name" "$ROLLBACK_OUTPUT_DIR/$name"; then
+                  legacy_ok=false
+                  break
+                fi
+              done
+              if [[ "$legacy_ok" == true ]]; then
+                verified=true
+                break
+              fi
+            fi
+            sleep 10
+          done
+          [[ "$verified" == true ]] || { echo "Public rollback pair did not converge" >&2; exit 1; }
+          public_key='qXMyoYhp7TbPPXPAyEKDoy+kkl8He7I5RNXWgjNc5Kk='
+          xcrun swift scripts/verify-ml-catalog-signature.swift "$public/catalog-v1.json" "$public/catalog-v1.sig" "$public_key"
+          xcrun swift scripts/verify-ml-catalog-signature.swift "$public/catalog-v2.json" "$public/catalog-v2.sig" "$public_key"
+          actual_sequence=$(jq -er '.payload.catalogSequence' "$public/active-pair.json")
+          [[ "$actual_sequence" == "$CATALOG_SEQUENCE" ]]
+      - name: Retain rollback evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ml-model-rollback-${{ steps.rollback.outputs.pair_id }}
+          path: ${{ runner.temp }}/rollback-release
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Remove ephemeral signing material
+        if: always()
+        run: rm -f "$RUNNER_TEMP/catalog-ed25519.key"

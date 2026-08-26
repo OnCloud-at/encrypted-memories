@@ -1,0 +1,119 @@
+name: Bug report
+description: Report a reproducible problem in Encrypted Memories.
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve Encrypted Memories. You can write in English or German.
+
+        GitHub Issues are only for reproducible bugs. For setup or usage questions, read the [Encrypted Memories Wiki](https://github.com/OnCloud-at/encrypted-memories/wiki).
+
+        Before you continue, [search open and closed issues](https://github.com/OnCloud-at/encrypted-memories/issues?q=is%3Aissue) for the same problem. Automated triage may send redacted excerpts from this public issue and selected public issues to the configured external HTTPS model endpoint. Never include personal, confidential, or sensitive data.
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched open and closed issues and did not find the same problem.
+          required: true
+        - label: I removed personal, confidential, and sensitive data.
+          required: true
+        - label: I acknowledge that redacted excerpts from this public issue and selected public issues may be sent to the configured external HTTPS model endpoint for automatic triage.
+          required: true
+        - label: This is a reproducible bug, not a usage question.
+          required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What happened?
+      description: Describe the problem and what you saw.
+      placeholder: The app…
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: How can we reproduce it?
+      description: Give the shortest sequence that causes the problem.
+      placeholder: |
+        1. Open…
+        2. Select…
+        3. See…
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect?
+      placeholder: I expected…
+    validations:
+      required: true
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - macOS
+        - iPhone
+        - iPad
+        - More than one platform
+    validations:
+      required: true
+
+  - type: input
+    id: app_version
+    attributes:
+      label: App version and build
+      description: Enter the version shown in Encrypted Memories settings.
+      placeholder: 1.0 (100)
+    validations:
+      required: true
+
+  - type: input
+    id: os_version
+    attributes:
+      label: Operating system version
+      placeholder: macOS 26.0 or iOS 26.0
+    validations:
+      required: true
+
+  - type: dropdown
+    id: frequency
+    attributes:
+      label: How often does it happen?
+      options:
+        - Every time
+        - Often
+        - Sometimes
+        - Once
+    validations:
+      required: true
+
+  - type: dropdown
+    id: impact
+    attributes:
+      label: Impact
+      description: Choose the closest match. A maintainer confirms the final priority.
+      options:
+        - Possible data loss, corruption, security, or privacy risk
+        - A core workflow is completely blocked
+        - A workflow is impaired, but a workaround exists
+        - Minor behavior or visual problem
+        - Unsure
+    validations:
+      required: true
+
+  - type: textarea
+    id: support_report
+    attributes:
+      label: Support report or additional context
+      description: Use the in-app bug report screen to save a support report, review it, then drag it here. This is optional.
+      placeholder: Attach the reviewed Encrypted-Memories-Support.json file, screenshots, or other useful details.

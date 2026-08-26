@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://models.oncloud.at/schemas/release-evidence-v1.json",
+  "title": "Encrypted Memories model release approval",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "modelID",
+    "sourceRevision",
+    "sourceURL",
+    "licenseIdentifier",
+    "licenseURL",
+    "noticeSHA256",
+    "rights"
+  ],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "modelID": { "type": "string", "pattern": "^(?:[a-z0-9]|[a-z0-9](?:[a-z0-9]|-(?!-)){0,126}[a-z0-9])$" },
+    "sourceRevision": { "type": "string", "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$" },
+    "sourceURL": { "type": "string", "format": "uri", "pattern": "^https://" },
+    "licenseIdentifier": { "enum": ["MIT", "Apache-2.0"] },
+    "licenseURL": { "type": "string", "format": "uri", "pattern": "^https://" },
+    "noticeSHA256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "rights": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "productUse",
+        "commercialUse",
+        "modification",
+        "formatConversion",
+        "redistribution",
+        "appStoreDistribution"
+      ],
+      "properties": {
+        "productUse": { "const": true },
+        "commercialUse": { "const": true },
+        "modification": { "const": true },
+        "formatConversion": { "const": true },
+        "redistribution": { "const": true },
+        "appStoreDistribution": { "const": true }
+      }
+    }
+  }
+}

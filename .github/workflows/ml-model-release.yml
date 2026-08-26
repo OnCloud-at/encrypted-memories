@@ -1,0 +1,440 @@
+name: ML model release
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/ml-model-release.yml"
+      - ".github/workflows/ml-model-rollback.yml"
+      - ".github/workflows/ml-model-preview.yml"
+      - "scripts/extract-ml-release-candidate.py"
+      - "scripts/install-rclone.sh"
+      - "scripts/prepare-ml-model-release.swift"
+      - "scripts/prepare-ml-model-rollback.swift"
+      - "scripts/rollback-ml-model-release.sh"
+      - "scripts/verify-ml-catalog-signature.swift"
+      - "scripts/tests/**"
+      - "Tools/MLModels/**"
+      - "Packages/EncryptedMemoriesKit/Sources/MLSearchCore/**"
+      - "Packages/EncryptedMemoriesKit/Sources/MLSearchAppleAdapter/**"
+      - "Packages/EncryptedMemoriesKit/Tests/MLSearchCoreTests/**"
+      - "Packages/EncryptedMemoriesKit/Tests/MLSearchAppleAdapterTests/**"
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Existing ml-model-* GitHub release tag"
+        required: true
+        type: string
+      confirmation:
+        description: "Type PUBLISH when retrying a release"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash {0}
+
+concurrency:
+  group: ml-model-${{ github.event_name == 'pull_request' && github.event.pull_request.number || 'production' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  validate:
+    name: Validate model release contracts
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.event_name == 'pull_request' && github.sha || github.event.release.tag_name || inputs.release_tag }}
+
+      - uses: ./.github/actions/prepare-apple-build
+
+      - name: Check release tools
+        run: |
+          set -euo pipefail
+          xcrun swiftc -typecheck scripts/prepare-ml-model-release.swift
+          xcrun swiftc -typecheck scripts/prepare-ml-model-rollback.swift
+          xcrun swiftc -typecheck scripts/verify-ml-catalog-signature.swift
+          python3 -m py_compile scripts/extract-ml-release-candidate.py
+          python3 -m py_compile scripts/verify-ml-release-pair.py
+          python3 -m unittest discover -s scripts/tests -p 'test_*.py'
+          bash -n scripts/install-rclone.sh
+          zsh -n scripts/rollback-ml-model-release.sh
+
+      - name: Test model release contracts
+        run: |
+          set -euo pipefail
+          source scripts/build-paths.sh
+          encryptedmemories_acquire_build_lock "model release contract tests"
+          swift test \
+            --package-path Packages/EncryptedMemoriesKit \
+            --scratch-path "$ENCRYPTED_MEMORIES_SPM_SCRATCH" \
+            --cache-path "$ENCRYPTED_MEMORIES_SWIFTPM_CACHE" \
+            --filter 'MLModelReleaseSchemaTests|MLRemoteModelCatalogTests|MLModelReleaseAutomationTests'
+
+  publish:
+    name: Publish signed catalog pair
+    if: github.event_name != 'pull_request'
+    needs: validate
+    runs-on: macos-26
+    timeout-minutes: 60
+    environment: ml-model-production
+    permissions:
+      contents: read
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.event.release.tag_name || inputs.release_tag }}
+
+      - name: Resolve immutable release input
+        id: release
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_TAG: ${{ github.event.release.tag_name }}
+          INPUT_TAG: ${{ inputs.release_tag }}
+          CONFIRMATION: ${{ inputs.confirmation }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag=${EVENT_TAG:-$INPUT_TAG}
+          [[ "$tag" == ml-model-* ]] || { echo "Release tag must start with ml-model-" >&2; exit 1; }
+          [[ "$tag" != ml-model-preview-* ]] || { echo "Preview tags cannot publish production models" >&2; exit 1; }
+          if [[ "$EVENT_NAME" == workflow_dispatch && "$CONFIRMATION" != PUBLISH ]]; then
+            echo "A manual retry requires confirmation=PUBLISH" >&2
+            exit 1
+          fi
+
+          release_json="$RUNNER_TEMP/github-release.json"
+          curl --fail --silent --show-error \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/releases/tags/$tag" \
+            --output "$release_json"
+
+          [[ "$(jq -r .draft "$release_json")" == false ]] || { echo "Draft releases cannot publish models" >&2; exit 1; }
+          [[ "$(jq -r .prerelease "$release_json")" == false ]] || { echo "Prereleases cannot publish production models" >&2; exit 1; }
+          asset_count=$(jq '[.assets[] | select(.name == "ml-release-candidate.tar.gz")] | length' "$release_json")
+          [[ "$asset_count" == 1 ]] || { echo "Release must contain one ml-release-candidate.tar.gz asset" >&2; exit 1; }
+
+          asset_id=$(jq -er '.assets[] | select(.name == "ml-release-candidate.tar.gz") | .id' "$release_json")
+          asset_digest=$(jq -er '.assets[] | select(.name == "ml-release-candidate.tar.gz") | .digest' "$release_json")
+          released_at=$(jq -er .published_at "$release_json")
+          commit=$(git rev-list -n 1 "$tag")
+          [[ "$commit" == "$(git rev-parse HEAD)" ]] || { echo "Checkout does not match the release tag" >&2; exit 1; }
+          [[ "$asset_digest" == sha256:* ]] || { echo "GitHub did not provide a SHA-256 asset digest" >&2; exit 1; }
+
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          echo "released_at=$released_at" >> "$GITHUB_OUTPUT"
+          echo "asset_id=$asset_id" >> "$GITHUB_OUTPUT"
+          echo "asset_sha256=${asset_digest#sha256:}" >> "$GITHUB_OUTPUT"
+
+      - name: Download and validate candidate archive
+        env:
+          ASSET_ID: ${{ steps.release.outputs.asset_id }}
+          ASSET_SHA256: ${{ steps.release.outputs.asset_sha256 }}
+          RELEASE_COMMIT: ${{ steps.release.outputs.commit }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/ml-release-candidate.tar.gz"
+          curl --fail --location --silent --show-error \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "Accept: application/octet-stream" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/releases/assets/$ASSET_ID" \
+            --output "$archive"
+          echo "$ASSET_SHA256  $archive" | shasum --algorithm 256 --check
+          python3 scripts/extract-ml-release-candidate.py "$archive" "$RUNNER_TEMP/candidate"
+          candidate_commit=$(tr -d '\r\n' < "$RUNNER_TEMP/candidate/source-repository-revision.txt")
+          [[ "$candidate_commit" == "$RELEASE_COMMIT" ]] || {
+            echo "Candidate does not match the release tag commit" >&2
+            exit 1
+          }
+
+      - name: Decode catalog signing key
+        env:
+          SIGNING_KEY_BASE64: ${{ secrets.ML_CATALOG_ED25519_PRIVATE_KEY_BASE64 }}
+        run: |
+          set -euo pipefail
+          [[ -n "$SIGNING_KEY_BASE64" ]] || { echo "Catalog signing key is unavailable" >&2; exit 1; }
+          umask 077
+          printf '%s' "$SIGNING_KEY_BASE64" | base64 -D > "$RUNNER_TEMP/catalog-ed25519.key"
+          [[ "$(stat -f %z "$RUNNER_TEMP/catalog-ed25519.key")" == 32 ]] || {
+            echo "Catalog signing key must decode to 32 raw bytes" >&2
+            exit 1
+          }
+
+      - name: Fetch and verify the active catalog pair
+        id: previous
+        env:
+          MODEL_BASE_URL: ${{ vars.ML_MODEL_BASE_URL }}
+        run: |
+          set -euo pipefail
+          [[ "$MODEL_BASE_URL" == https://models.oncloud.at/models/ ]] || {
+            echo "ML_MODEL_BASE_URL must match the app's production model endpoint" >&2
+            exit 1
+          }
+          catalog_root=${MODEL_BASE_URL%models/}
+          previous="$RUNNER_TEMP/previous"
+          mkdir -p "$previous"
+          cache_bust="read=$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          fetch() {
+            local path=$1
+            local output=$2
+            curl --silent --show-error --location --retry 3 --retry-all-errors \
+              --connect-timeout 15 --max-time 60 --output "$output" \
+              --write-out '%{http_code}' "$catalog_root$path?$cache_bust"
+          }
+          public_key='qXMyoYhp7TbPPXPAyEKDoy+kkl8He7I5RNXWgjNc5Kk='
+          previous_args=()
+          pointer_status=$(fetch active-pair.json "$previous/active-pair.json")
+
+          if [[ "$pointer_status" == 200 ]]; then
+            python3 scripts/verify-ml-release-pair.py --pointer "$previous/active-pair.json"
+            xcrun swift scripts/verify-ml-catalog-signature.swift \
+              --pointer "$previous/active-pair.json" "$public_key"
+            current_pair=$(jq -er '.payload.pairID' "$previous/active-pair.json")
+            for name in catalog-v1.json catalog-v1.sig catalog-v2.json catalog-v2.sig release-pair.json; do
+              path=$(jq -er --arg name "$name" '.payload.objects[] | select(.name == $name) | .path' "$previous/active-pair.json")
+              fetch "$path" "$previous/$name" | grep -qx '200' || {
+                echo "Active catalog object is unavailable: $path" >&2
+                exit 1
+              }
+            done
+            python3 scripts/verify-ml-release-pair.py "$previous" --expected-pair "$current_pair"
+            xcrun swift scripts/verify-ml-catalog-signature.swift "$previous/catalog-v1.json" "$previous/catalog-v1.sig" "$public_key"
+            xcrun swift scripts/verify-ml-catalog-signature.swift "$previous/catalog-v2.json" "$previous/catalog-v2.sig" "$public_key"
+            pointer_sequence=$(jq -er '.payload.catalogSequence' "$previous/active-pair.json")
+            catalog_sequence=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["catalogSequence"])' "$previous/catalog-v2.json")
+            [[ "$pointer_sequence" == "$catalog_sequence" ]] || {
+              echo "Active pointer sequence does not match catalog" >&2
+              exit 1
+            }
+            sequence=$(python3 -c 'import sys; value=int(sys.argv[1]); assert 0 < value < 2**64-1; print(value + 1)' "$pointer_sequence")
+            previous_args=(
+              --previous-catalog-v1 "$previous/catalog-v1.json"
+              --previous-signature-v1 "$previous/catalog-v1.sig"
+              --previous-catalog-v2 "$previous/catalog-v2.json"
+              --previous-signature-v2 "$previous/catalog-v2.sig"
+            )
+          elif [[ "$pointer_status" == 404 ]]; then
+            legacy_v1_status=$(fetch catalog-v1.json "$previous/catalog-v1.json")
+            legacy_v1_sig_status=$(fetch catalog-v1.sig "$previous/catalog-v1.sig")
+            legacy_v2_status=$(fetch catalog-v2.json "$previous/catalog-v2.json")
+            legacy_v2_sig_status=$(fetch catalog-v2.sig "$previous/catalog-v2.sig")
+            if [[ "$legacy_v2_status" == 200 ]]; then
+              [[ "$legacy_v1_status" == 200 && "$legacy_v1_sig_status" == 200 && "$legacy_v2_sig_status" == 200 ]] || {
+                echo "Legacy active catalog pair is incomplete" >&2
+                exit 1
+              }
+              xcrun swift scripts/verify-ml-catalog-signature.swift "$previous/catalog-v1.json" "$previous/catalog-v1.sig" "$public_key"
+              xcrun swift scripts/verify-ml-catalog-signature.swift "$previous/catalog-v2.json" "$previous/catalog-v2.sig" "$public_key"
+              sequence=$(python3 -c 'import json,sys; value=json.load(open(sys.argv[1]))["catalogSequence"]; assert isinstance(value,int) and 0 < value < 2**64-1; print(value + 1)' "$previous/catalog-v2.json")
+              previous_args=(
+                --previous-catalog-v1 "$previous/catalog-v1.json"
+                --previous-signature-v1 "$previous/catalog-v1.sig"
+                --previous-catalog-v2 "$previous/catalog-v2.json"
+                --previous-signature-v2 "$previous/catalog-v2.sig"
+              )
+            elif [[ "$legacy_v1_status" == 200 && "$legacy_v1_sig_status" == 200 && "$legacy_v2_status" == 404 && "$legacy_v2_sig_status" == 404 ]]; then
+              xcrun swift scripts/verify-ml-catalog-signature.swift \
+                "$previous/catalog-v1.json" "$previous/catalog-v1.sig" "$public_key"
+              sequence=1
+              previous_args=(
+                --previous-catalog-v1 "$previous/catalog-v1.json"
+                --previous-signature-v1 "$previous/catalog-v1.sig"
+              )
+            elif [[ "$legacy_v1_status" == 404 && "$legacy_v1_sig_status" == 404 && "$legacy_v2_status" == 404 && "$legacy_v2_sig_status" == 404 ]]; then
+              sequence=1
+            else
+              echo "Legacy active catalog endpoints returned an inconsistent state" >&2
+              exit 1
+            fi
+          else
+            echo "Active pointer returned unexpected HTTP status: $pointer_status" >&2
+            exit 1
+          fi
+
+          : > "$RUNNER_TEMP/previous-arguments"
+          if (( ${#previous_args[@]} > 0 )); then
+            printf '%s\0' "${previous_args[@]}" > "$RUNNER_TEMP/previous-arguments"
+          fi
+          echo "sequence=$sequence" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare and verify signed release
+        id: prepared
+        env:
+          CANDIDATE_ROOT: ${{ runner.temp }}/candidate
+          RELEASE_ROOT: ${{ runner.temp }}/release
+          MODEL_BUCKET: ${{ vars.ML_MODEL_R2_BUCKET }}
+          MODEL_BASE_URL: ${{ vars.ML_MODEL_BASE_URL }}
+          RELEASE_COMMIT: ${{ steps.release.outputs.commit }}
+          RELEASED_AT: ${{ steps.release.outputs.released_at }}
+          CATALOG_SEQUENCE: ${{ steps.previous.outputs.sequence }}
+        run: |
+          set -euo pipefail
+          [[ -n "$MODEL_BUCKET" && -n "$MODEL_BASE_URL" ]]
+          model_args=()
+          for directory in "$CANDIDATE_ROOT"/models/*; do
+            [[ -d "$directory" ]] || continue
+            model_args+=(--model "$(basename "$directory")=$directory")
+          done
+          retirement_args=()
+          retired_manifest="$CANDIDATE_ROOT/retired-models.json"
+          if [[ -f "$retired_manifest" ]]; then
+            retirement_args+=(--retired-models "$retired_manifest")
+          fi
+          (( ${#model_args[@]} > 0 || ${#retirement_args[@]} > 0 )) || {
+            echo "Candidate contains no model updates or retirements" >&2
+            exit 1
+          }
+          previous_args=()
+          while IFS= read -r -d '' argument; do previous_args+=("$argument"); done < "$RUNNER_TEMP/previous-arguments"
+          retry_args=()
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+            retry_args+=(--allow-unchanged-candidate)
+          fi
+
+          xcrun swift scripts/prepare-ml-model-release.swift \
+            --private-key "$RUNNER_TEMP/catalog-ed25519.key" \
+            --output "$RELEASE_ROOT" \
+            --bucket "$MODEL_BUCKET" \
+            --base-url "$MODEL_BASE_URL" \
+            --candidate-root "$CANDIDATE_ROOT" \
+            --evidence-dir "$CANDIDATE_ROOT/evidence" \
+            --qualification-dir "$CANDIDATE_ROOT/qualification" \
+            --notices-dir "$CANDIDATE_ROOT/notices" \
+            --repository-revision "$RELEASE_COMMIT" \
+            --released-at "$RELEASED_AT" \
+            --catalog-sequence "$CATALOG_SEQUENCE" \
+            "${retry_args[@]}" \
+            "${previous_args[@]}" \
+            "${retirement_args[@]}" \
+            "${model_args[@]}"
+
+          public_key='qXMyoYhp7TbPPXPAyEKDoy+kkl8He7I5RNXWgjNc5Kk='
+          xcrun swift scripts/verify-ml-catalog-signature.swift \
+            --pointer "$RELEASE_ROOT/active-pair.json" "$public_key"
+          xcrun swift scripts/verify-ml-catalog-signature.swift "$RELEASE_ROOT/catalog-v1.json" "$RELEASE_ROOT/catalog-v1.sig" "$public_key"
+          xcrun swift scripts/verify-ml-catalog-signature.swift "$RELEASE_ROOT/catalog-v2.json" "$RELEASE_ROOT/catalog-v2.sig" "$public_key"
+          zsh -n "$RELEASE_ROOT/publish-r2.sh"
+          pair_id=$(tr -d '\r\n' < "$RELEASE_ROOT/release-pair.sha256")
+          [[ ${#pair_id} == 64 && "$pair_id" != *[^0-9a-f]* ]] || { echo "Invalid catalog pair hash" >&2; exit 1; }
+          python3 scripts/verify-ml-release-pair.py "$RELEASE_ROOT" --expected-pair "$pair_id"
+          artifact_name="ml-model-release-$pair_id"
+          tar -C "$RELEASE_ROOT" -czf "$RUNNER_TEMP/$artifact_name.tar.gz" .
+          echo "artifact_name=$artifact_name" >> "$GITHUB_OUTPUT"
+          echo "pair_id=$pair_id" >> "$GITHUB_OUTPUT"
+
+      - name: Retain signed release evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ steps.prepared.outputs.artifact_name }}
+          path: ${{ runner.temp }}/${{ steps.prepared.outputs.artifact_name }}.tar.gz
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Publish immutable artifacts and activate the pair
+        env:
+          R2_ACCESS_KEY_ID: ${{ secrets.ML_MODEL_R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.ML_MODEL_R2_SECRET_ACCESS_KEY }}
+          R2_ENDPOINT: ${{ secrets.ML_MODEL_R2_ENDPOINT }}
+        run: |
+          set -euo pipefail
+          for name in R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY R2_ENDPOINT; do
+            [[ -n "${!name}" ]] || { echo "$name is unavailable" >&2; exit 1; }
+          done
+          "$RUNNER_TEMP/release/publish-r2.sh"
+
+      - name: Verify public activation
+        env:
+          MODEL_BASE_URL: ${{ vars.ML_MODEL_BASE_URL }}
+          PAIR_ID: ${{ steps.prepared.outputs.pair_id }}
+          CATALOG_SEQUENCE: ${{ steps.previous.outputs.sequence }}
+        run: |
+          set -euo pipefail
+          catalog_root=${MODEL_BASE_URL%models/}
+          public="$RUNNER_TEMP/public"
+          mkdir -p "$public"
+          verified=false
+          for attempt in {1..12}; do
+            if ! curl --fail --silent --show-error --location \
+              "${catalog_root}active-pair.json?release=${PAIR_ID}-${attempt}" \
+              --output "$public/active-pair.json"; then
+              sleep 10
+              continue
+            fi
+            if ! python3 scripts/verify-ml-release-pair.py --pointer "$public/active-pair.json" --expected-pair "$PAIR_ID"; then
+              sleep 10
+              continue
+            fi
+            if ! xcrun swift scripts/verify-ml-catalog-signature.swift \
+                --pointer "$public/active-pair.json" \
+                qXMyoYhp7TbPPXPAyEKDoy+kkl8He7I5RNXWgjNc5Kk=; then
+              sleep 10
+              continue
+            fi
+            objects_ok=true
+            for name in catalog-v1.json catalog-v1.sig catalog-v2.json catalog-v2.sig release-pair.json; do
+              path=$(jq -er --arg name "$name" '.payload.objects[] | select(.name == $name) | .path' "$public/active-pair.json")
+              if ! curl --fail --silent --show-error --location \
+                  "$catalog_root$path?release=$PAIR_ID-$attempt" \
+                  --output "$public/$name"; then
+                objects_ok=false
+                break
+              fi
+            done
+            if [[ "$objects_ok" != true ]]; then
+              sleep 10
+              continue
+            fi
+            if ! python3 scripts/verify-ml-release-pair.py "$public" --expected-pair "$PAIR_ID"; then
+              sleep 10
+              continue
+            fi
+            if cmp -s "$public/catalog-v1.json" "$RUNNER_TEMP/release/catalog-v1.json" \
+              && cmp -s "$public/catalog-v1.sig" "$RUNNER_TEMP/release/catalog-v1.sig" \
+              && cmp -s "$public/catalog-v2.json" "$RUNNER_TEMP/release/catalog-v2.json" \
+              && cmp -s "$public/catalog-v2.sig" "$RUNNER_TEMP/release/catalog-v2.sig" \
+              && cmp -s "$public/release-pair.json" "$RUNNER_TEMP/release/release-pair.json"; then
+              legacy_ok=true
+              for name in catalog-v1.json catalog-v1.sig catalog-v2.json catalog-v2.sig; do
+                if ! curl --fail --silent --show-error --location \
+                    "$catalog_root$name?release-legacy=$PAIR_ID-$attempt" \
+                    --output "$public/legacy-$name" \
+                  || ! cmp -s "$public/legacy-$name" "$RUNNER_TEMP/release/$name"; then
+                  legacy_ok=false
+                  break
+                fi
+              done
+              if [[ "$legacy_ok" == true ]]; then
+                verified=true
+                break
+              fi
+            fi
+            sleep 10
+          done
+          [[ "$verified" == true ]] || { echo "Public catalog pair did not converge" >&2; exit 1; }
+          public_key='qXMyoYhp7TbPPXPAyEKDoy+kkl8He7I5RNXWgjNc5Kk='
+          xcrun swift scripts/verify-ml-catalog-signature.swift "$public/catalog-v1.json" "$public/catalog-v1.sig" "$public_key"
+          xcrun swift scripts/verify-ml-catalog-signature.swift "$public/catalog-v2.json" "$public/catalog-v2.sig" "$public_key"
+          actual_pair=$(jq -er '.payload.pairID' "$public/active-pair.json")
+          actual_sequence=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["catalogSequence"])' "$public/catalog-v2.json")
+          [[ "$actual_pair" == "$PAIR_ID" && "$actual_sequence" == "$CATALOG_SEQUENCE" ]]
+
+      - name: Remove ephemeral signing material
+        if: always()
+        run: rm -f "$RUNNER_TEMP/catalog-ed25519.key"

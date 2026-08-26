@@ -1,0 +1,1026 @@
+diff --git a/Package.swift b/Package.swift
+index 63a763c..2948a2b 100644
+--- a/Package.swift
++++ b/Package.swift
+@@ -1,8 +1,12 @@
+ // swift-tools-version: 6.0
+ // The swift-tools-version declares the minimum version of Swift required to build this package.
+
++import Foundation
+ import PackageDescription
+
++let packageDirectory = URL(fileURLWithPath: #filePath).deletingLastPathComponent().path
++let sdkResourceLibrarySearchPath = "-L\(packageDirectory)/Resources"
++
+ let package = Package(
+     name: "ProtonDriveSDK",
+     platforms: [
+@@ -49,17 +53,11 @@ let package = Package(
+                 .linkedFramework("GSS"),
+                 .linkedLibrary("sqlite3"),
+                 .linkedLibrary("icucore"),
+-                .unsafeFlags([
+-                    // path used in normal builds
+-                    "-L${BUILD_DIR}/../../SourcePackages/checkouts/sdk-swift/Resources",
+-                    // path used in archive builds
+-                    "-L${BUILD_DIR}/../../../../../SourcePackages/checkouts/sdk-swift/Resources",
+-                ]),
++                .unsafeFlags([sdkResourceLibrarySearchPath]),
+                 .unsafeFlags([
+                     // the bootstrapper contains the code to start the dotNET runtime – it asks the system API
+                     // to spawn a new thread for garbage collector, allocate the memory to be managed by dotNET etc.
+-                    "-llibbootstrapperdll.osx-arm64.o",
+-                    "-llibbootstrapperdll.osx-x64.o",
++                    "-llibbootstrapperdll.osx-universal.o",
+                 ], .when(platforms: [.macOS])),
+             ],
+         ),
+@@ -67,12 +65,7 @@ let package = Package(
+             name: "ProtonDriveSDKTestingToolkit",
+             path: "TestingToolkit",
+             linkerSettings: [
+-                .unsafeFlags([
+-                    // path used in normal builds
+-                    "-L${BUILD_DIR}/../../SourcePackages/checkouts/sdk-swift/Resources",
+-                    // path used in archive builds
+-                    "-L${BUILD_DIR}/../../../../../SourcePackages/checkouts/sdk-swift/Resources",
+-                ]),
++                .unsafeFlags([sdkResourceLibrarySearchPath]),
+                 .unsafeFlags([
+                     // the bootstrapper contains the code to start the dotNET runtime – it asks the system API
+                     // to spawn a new thread for garbage collector, allocate the memory to be managed by dotNET etc.
+@@ -80,5 +73,14 @@ let package = Package(
+                 ], .when(platforms: [.iOS])),
+             ]
+         ),
++        .testTarget(
++            name: "ProtonDriveSDKTests",
++            dependencies: [
++                "ProtonDriveSDK",
++                "CProtonDriveSDK",
++                .product(name: "SwiftProtobuf", package: "swift-protobuf"),
++            ],
++            path: "Tests"
++        ),
+     ]
+ )
+diff --git a/Sources/CancellationTokenSource.swift b/Sources/CancellationTokenSource.swift
+index f8ba40e..763fcc7 100644
+--- a/Sources/CancellationTokenSource.swift
++++ b/Sources/CancellationTokenSource.swift
+@@ -1,6 +1,22 @@
++import Foundation
++
+ actor CancellationTokenSource {
++    private final class FreeGate: @unchecked Sendable {
++        private let lock = NSLock()
++        private var claimed = false
++
++        func claim() -> Bool {
++            lock.lock()
++            defer { lock.unlock() }
++            guard !claimed else { return false }
++            claimed = true
++            return true
++        }
++    }
++
+     let handle: ObjectHandle
+     private let logger: ProtonDriveSDK.Logger?
++    private nonisolated let freeGate = FreeGate()
+
+     init(logger: ProtonDriveSDK.Logger?) async throws {
+         self.logger = logger
+@@ -23,6 +39,7 @@ actor CancellationTokenSource {
+     }
+
+     nonisolated func free() {
++        guard freeGate.claim() else { return }
+         logger?.trace("CancellationTokenSource.free, handle: \(String(describing: handle))", category: "Cancellation")
+         let cancellationHandle = self.handle
+
+diff --git a/Sources/Client/ProtonDriveClient/Networking/HttpClientResponseProcessor.swift b/Sources/Client/ProtonDriveClient/Networking/HttpClientResponseProcessor.swift
+index 5f8c0a9..1f7ed24 100644
+--- a/Sources/Client/ProtonDriveClient/Networking/HttpClientResponseProcessor.swift
++++ b/Sources/Client/ProtonDriveClient/Networking/HttpClientResponseProcessor.swift
+@@ -63,16 +63,19 @@ enum HttpClientResponseProcessor {
+         releaseBox: () -> Void
+     ) async {
+         do {
+-            let (data, receivedBytes) = try await boxedDownloadStream.read(upTo: bufferSize)
+-            data.copyBytes(to: buffer, count: receivedBytes)
++            let result = try await boxedDownloadStream.read(upTo: bufferSize)
++            result.data.copyBytes(to: buffer, count: result.count)
+             let message = Google_Protobuf_Int32Value.with {
+-                $0.value = Int32(receivedBytes)
++                $0.value = Int32(result.count)
+             }
+             SDKResponseHandler.send(callbackPointer: callbackPointer, message: message)
+-            if bufferSize > receivedBytes {
++            if result.reachedEnd {
+                 releaseBox()
+             }
+         } catch {
++            // An error is terminal for this owner-managed response just like EOF. Leaving the box in
++            // the registry retains its AsyncBytes task and any app-side admission permit indefinitely.
++            releaseBox()
+             SDKResponseHandler.sendErrorToSDK(error, callbackPointer: callbackPointer)
+         }
+     }
+diff --git a/Sources/Client/ProtonDriveClient/Networking/Model/BoxedDownloadStream.swift b/Sources/Client/ProtonDriveClient/Networking/Model/BoxedDownloadStream.swift
+index 59a0465..9fbda49 100644
+--- a/Sources/Client/ProtonDriveClient/Networking/Model/BoxedDownloadStream.swift
++++ b/Sources/Client/ProtonDriveClient/Networking/Model/BoxedDownloadStream.swift
+@@ -1,6 +1,13 @@
+ import Foundation
++import Darwin
+
+ final class BoxedDownloadStream {
++    struct ReadResult {
++        let data: Data
++        let count: Int
++        let reachedEnd: Bool
++    }
++
+     enum Source {
+         case stream(AsyncBytesDownloadStream)
+         case file(FileHandleDownloadStream)
+@@ -13,7 +20,7 @@ final class BoxedDownloadStream {
+         self.logger = logger
+     }
+
+-    func read(upTo bufferSize: Int) async throws -> (Data, Int) {
++    func read(upTo bufferSize: Int) async throws -> ReadResult {
+         switch source {
+         case let .stream(asyncBytes):
+             return try await asyncBytes.read(upTo: bufferSize)
+@@ -30,39 +37,104 @@ final class BoxedDownloadStream {
+ final class AsyncBytesDownloadStream {
+     private let stream: AnyAsyncSequence<UInt8>
+     private var iterator: AnyAsyncIterator<UInt8>
++    private var bufferedByte: UInt8?
++    private var bufferedError: Error?
++    private var reachedEnd = false
+
+     init(stream: AnyAsyncSequence<UInt8>) {
+         self.stream = stream
+         self.iterator = stream.makeAsyncIterator()
+     }
+-
+-    func read(upTo bufferSize: Int) async throws -> (Data, Int) {
++
++    func read(upTo bufferSize: Int) async throws -> BoxedDownloadStream.ReadResult {
++        precondition(bufferSize > 0)
++        if reachedEnd {
++            return BoxedDownloadStream.ReadResult(data: Data(), count: 0, reachedEnd: true)
++        }
++        if let bufferedError {
++            self.bufferedError = nil
++            throw bufferedError
++        }
++
+         let pointer = UnsafeMutablePointer<UInt8>.allocate(capacity: bufferSize)
++        var dataOwnsPointer = false
++        defer {
++            if !dataOwnsPointer {
++                pointer.deallocate()
++            }
++        }
+         var receivedBytes = 0
+-        while let byte = try await self.iterator.next() {
++
++        if let bufferedByte {
++            pointer[receivedBytes] = bufferedByte
++            receivedBytes += 1
++            self.bufferedByte = nil
++        }
++
++        while receivedBytes < bufferSize, let byte = try await iterator.next() {
+             pointer[receivedBytes] = byte
+             receivedBytes += 1
+-            if receivedBytes == bufferSize {
+-                break
++        }
++
++        // The native consumer does not issue a final zero-byte read when the response length is an
++        // exact multiple of its buffer size. Peek one byte beyond a full buffer so that exact-boundary
++        // EOF is observable without losing the first byte of the next chunk.
++        if receivedBytes == bufferSize, !reachedEnd {
++            do {
++                if let nextByte = try await iterator.next() {
++                    bufferedByte = nextByte
++                } else {
++                    reachedEnd = true
++                }
++            } catch is CancellationError {
++                throw CancellationError()
++            } catch {
++                // The full buffer is valid and must not be discarded merely because the lookahead
++                // failed. Deliver it now and surface the terminal transport error on the next read.
++                bufferedError = error
+             }
++        } else if receivedBytes < bufferSize {
++            reachedEnd = true
+         }
+
+         let data = Data(bytesNoCopy: pointer, count: receivedBytes,
+                         deallocator: .custom { _, _ in pointer.deallocate() })
+-        return (data, receivedBytes)
++        dataOwnsPointer = true
++        return BoxedDownloadStream.ReadResult(
++            data: data,
++            count: receivedBytes,
++            reachedEnd: reachedEnd
++        )
+     }
+ }
+
+ final class FileHandleDownloadStream {
+     private let fileHandle: FileHandle
++    private let endOffset: UInt64?
+
+     init(fileHandle: FileHandle) {
+         self.fileHandle = fileHandle
++        var status = stat()
++        let descriptor = fileHandle.fileDescriptor
++        endOffset = fstat(descriptor, &status) == 0 && (status.st_mode & S_IFMT) == S_IFREG
++            ? UInt64(max(0, status.st_size))
++            : nil
+     }
+
+-    func read(upTo bufferSize: Int) async throws -> (Data, Int) {
++    func read(upTo bufferSize: Int) async throws -> BoxedDownloadStream.ReadResult {
+         let data = try fileHandle.read(upToCount: bufferSize) ?? Data()
+-        return (data, data.count)
++        let currentOffset = try? fileHandle.offset()
++        let reachedKnownEnd = if let currentOffset, let endOffset {
++            currentOffset >= endOffset
++        } else {
++            false
++        }
++        let reachedEnd = data.count < bufferSize || reachedKnownEnd
++        return BoxedDownloadStream.ReadResult(
++            data: data,
++            count: data.count,
++            reachedEnd: reachedEnd
++        )
+     }
+
+     deinit {
+diff --git a/Sources/Client/EncryptedMemoriesClient/EncryptedMemoriesClient.swift b/Sources/Client/EncryptedMemoriesClient/EncryptedMemoriesClient.swift
+index 8c0dd9f..18d2414 100644
+--- a/Sources/Client/EncryptedMemoriesClient/EncryptedMemoriesClient.swift
++++ b/Sources/Client/EncryptedMemoriesClient/EncryptedMemoriesClient.swift
+@@ -94,23 +94,33 @@ public actor EncryptedMemoriesClient: Sendable, ProtonSDKClient {
+     deinit {
+         CallbackHandleRegistry.shared.removeAll(ownedBy: sdkClientProvider)
+         guard clientHandle != 0 else { return }
+-        Self.freeEncryptedMemoriesClient(Int64(clientHandle), logger)
++        let handle = Int64(clientHandle)
++        let logger = logger
++        Task { await Self.freeEncryptedMemoriesClient(handle, logger) }
+     }
+
+-    private static func freeEncryptedMemoriesClient(_ clientHandle: Int64, _ logger: Logger?) {
+-        Task {
+-            let freeRequest = Proton_Drive_Sdk_DrivePhotosClientFreeRequest.with {
+-                $0.clientHandle = clientHandle
+-            }
+-            do {
+-                try await SDKRequestHandler.send(freeRequest, logger: logger) as Void
+-            } catch {
+-                // If the request to free the client failed, we have a memory leak, but not much else can be done.
+-                logger?.error(
+-                    "Proton_Drive_Sdk_DrivePhotosClientFreeRequest failed: \(error)",
+-                    category: "EncryptedMemoriesClient.freeEncryptedMemoriesClient"
+-                )
+-            }
++    /// Releases the native client before its entity-cache files are removed. App lifecycle code must use
++    /// this explicit boundary; `deinit` remains only a best-effort fallback for abandoned clients.
++    public func shutdown() async {
++        guard clientHandle != 0 else { return }
++        CallbackHandleRegistry.shared.removeAll(ownedBy: sdkClientProvider)
++        let handle = Int64(clientHandle)
++        await Self.freeEncryptedMemoriesClient(handle, logger)
++        clientHandle = 0
++    }
++
++    private static func freeEncryptedMemoriesClient(_ clientHandle: Int64, _ logger: Logger?) async {
++        let freeRequest = Proton_Drive_Sdk_DrivePhotosClientFreeRequest.with {
++            $0.clientHandle = clientHandle
++        }
++        do {
++            try await SDKRequestHandler.send(freeRequest, logger: logger) as Void
++        } catch {
++            // If the request to free the client failed, we have a memory leak, but not much else can be done.
++            logger?.error(
++                "Proton_Drive_Sdk_DrivePhotosClientFreeRequest failed: \(error)",
++                category: "EncryptedMemoriesClient.freeEncryptedMemoriesClient"
++            )
+         }
+     }
+ }
+@@ -141,6 +151,20 @@ extension EncryptedMemoriesClient {
+
+         return accumulator.items
+     }
++
++    public func emptyTrash() async throws {
++        let cancellationTokenSource = try await CancellationTokenSource(logger: logger)
++        defer {
++            cancellationTokenSource.free()
++        }
++
++        let request = Proton_Drive_Sdk_DrivePhotosClientEmptyTrashRequest.with {
++            $0.clientHandle = Int64(clientHandle)
++            $0.cancellationTokenSourceHandle = Int64(cancellationTokenSource.handle)
++        }
++
++        let _: Void = try await SDKRequestHandler.send(request, logger: logger)
++    }
+ }
+
+ // MARK: - Duplicates
+@@ -241,6 +265,7 @@ extension EncryptedMemoriesClient {
+         thumbnails: [ThumbnailData],
+         tags: [Int],
+         additionalMetadata: [AdditionalMetadata],
++        overrideExistingDraft: Bool = false,
+         expectedSHA1: Data? = nil,
+         cancellationToken: UUID,
+         progressCallback: @escaping ProgressCallback,
+@@ -257,6 +282,7 @@ extension EncryptedMemoriesClient {
+             thumbnails: thumbnails,
+             tags: tags,
+             additionalMetadata: additionalMetadata,
++            overrideExistingDraft: overrideExistingDraft,
+             expectedSHA1: expectedSHA1,
+             cancellationToken: cancellationToken,
+             progressCallback: progressCallback
+@@ -292,6 +318,7 @@ extension EncryptedMemoriesClient {
+         thumbnails: [ThumbnailData],
+         tags: [Int],
+         additionalMetadata: [AdditionalMetadata],
++        overrideExistingDraft: Bool = false,
+         expectedSHA1: Data? = nil,
+         cancellationToken: UUID,
+         progressCallback: @escaping ProgressCallback
+@@ -315,6 +342,7 @@ extension EncryptedMemoriesClient {
+             thumbnails: thumbnails,
+             tags: mappedTags,
+             additionalMetadata: additionalMetadata,
++            overrideExistingDraft: overrideExistingDraft,
+             expectedSHA1: expectedSHA1,
+             cancellationToken: cancellationToken,
+             progressCallback: progressCallback
+diff --git a/Sources/FileOperations/Downloads/DownloadThumbnailsManager.swift b/Sources/FileOperations/Downloads/DownloadThumbnailsManager.swift
+index 367242f..f6b161f 100644
+--- a/Sources/FileOperations/Downloads/DownloadThumbnailsManager.swift
++++ b/Sources/FileOperations/Downloads/DownloadThumbnailsManager.swift
+@@ -3,9 +3,18 @@ import Foundation
+ /// Handles file download operations for ProtonDrive
+ actor DownloadThumbnailsManager {
+
++    private final class ActiveDownload: @unchecked Sendable {
++        let tokenSource: CancellationTokenSource
++        let requestCancellation = SDKRequestHandler.RequestCancellation()
++
++        init(tokenSource: CancellationTokenSource) {
++            self.tokenSource = tokenSource
++        }
++    }
++
+     private let clientHandle: ObjectHandle
+     private let logger: Logger?
+-    private var activeDownloads: [UUID: CancellationTokenSource] = [:]
++    private var activeDownloads: [UUID: ActiveDownload] = [:]
+
+     init(clientHandle: ObjectHandle, logger: Logger?) {
+         self.clientHandle = clientHandle
+@@ -14,7 +23,8 @@ actor DownloadThumbnailsManager {
+
+     deinit {
+         activeDownloads.values.forEach {
+-            $0.free()
++            $0.requestCancellation.cancel()
++            $0.tokenSource.free()
+         }
+     }
+
+@@ -25,12 +35,18 @@ actor DownloadThumbnailsManager {
+         cancellationToken: UUID,
+         onThumbnailDownloaded: @escaping ThumbnailCallback
+     ) async throws {
+-        let cancellationTokenSource = try await CancellationTokenSource(logger: logger)
+-        activeDownloads[cancellationToken] = cancellationTokenSource
++        let activeDownload = try await beginDownload(cancellationToken)
++        let cancellationTokenSource = activeDownload.tokenSource
+
+         defer {
+-            if let cancellationTokenSource = activeDownloads[cancellationToken] {
+-                activeDownloads[cancellationToken] = nil
++            // Dictionary membership is the cleanup ownership token. An explicit token cancellation
++            // removes and frees it in `cancelDownload`; Task cancellation frees it from `onCancel`.
++            // Normal completion owns the remaining entry and frees it here exactly once.
++            let stillOwned = activeDownloads[cancellationToken] === activeDownload
++            if stillOwned {
++                activeDownloads.removeValue(forKey: cancellationToken)
++            }
++            if stillOwned, !Task.isCancelled {
+                 cancellationTokenSource.free()
+             }
+         }
+@@ -45,13 +61,21 @@ actor DownloadThumbnailsManager {
+
+         let callbackState = ThumbnailEnumerationCallbackWrapper(callback: onThumbnailDownloaded)
+
+-        let _: Void = try await SDKRequestHandler.send(
+-            thumbnailsRequest,
+-            state: WeakReference(value: callbackState),
+-            scope: .ownerManaged,
+-            owner: callbackState,
+-            logger: logger
+-        )
++        let _: Void = try await withTaskCancellationHandler {
++            try await SDKRequestHandler.sendCancellable(
++                thumbnailsRequest,
++                state: WeakReference(value: callbackState),
++                scope: .ownerManaged,
++                owner: callbackState,
++                requestCancellation: activeDownload.requestCancellation,
++                logger: logger
++            )
++        } onCancel: {
++            Task {
++                defer { cancellationTokenSource.free() }
++                try? await cancellationTokenSource.cancel()
++            }
++        }
+     }
+
+     func downloadPhotoThumbnails(
+@@ -60,12 +84,15 @@ actor DownloadThumbnailsManager {
+         cancellationToken: UUID,
+         onThumbnailDownloaded: @escaping ThumbnailCallback
+     ) async throws {
+-        let cancellationTokenSource = try await CancellationTokenSource(logger: logger)
+-        activeDownloads[cancellationToken] = cancellationTokenSource
++        let activeDownload = try await beginDownload(cancellationToken)
++        let cancellationTokenSource = activeDownload.tokenSource
+
+         defer {
+-            if let cancellationTokenSource = activeDownloads[cancellationToken] {
+-                activeDownloads[cancellationToken] = nil
++            let stillOwned = activeDownloads[cancellationToken] === activeDownload
++            if stillOwned {
++                activeDownloads.removeValue(forKey: cancellationToken)
++            }
++            if stillOwned, !Task.isCancelled {
+                 cancellationTokenSource.free()
+             }
+         }
+@@ -80,24 +107,42 @@ actor DownloadThumbnailsManager {
+
+         let callbackState = ThumbnailEnumerationCallbackWrapper(callback: onThumbnailDownloaded)
+
+-        let _: Void = try await SDKRequestHandler.send(
+-            thumbnailsRequest,
+-            state: WeakReference(value: callbackState),
+-            scope: .ownerManaged,
+-            owner: callbackState,
+-            logger: logger
+-        )
++        let _: Void = try await withTaskCancellationHandler {
++            try await SDKRequestHandler.sendCancellable(
++                thumbnailsRequest,
++                state: WeakReference(value: callbackState),
++                scope: .ownerManaged,
++                owner: callbackState,
++                requestCancellation: activeDownload.requestCancellation,
++                logger: logger
++            )
++        } onCancel: {
++            Task {
++                defer { cancellationTokenSource.free() }
++                try? await cancellationTokenSource.cancel()
++            }
++        }
+     }
+
+     func cancelDownload(with cancellationToken: UUID) async throws {
+-        guard let downloadCancellationToken = activeDownloads[cancellationToken] else {
++        guard let activeDownload = activeDownloads.removeValue(forKey: cancellationToken) else {
+             throw ProtonDriveSDKError(interopError: .noCancellationTokenForIdentifier(operation: "thumbnails download"))
+         }
+
+-        try await downloadCancellationToken.cancel()
+-        downloadCancellationToken.free()
++        activeDownload.requestCancellation.cancel()
++        defer { activeDownload.tokenSource.free() }
++        try await activeDownload.tokenSource.cancel()
++    }
+
+-        activeDownloads[cancellationToken] = nil
++    private func beginDownload(_ cancellationToken: UUID) async throws -> ActiveDownload {
++        let tokenSource = try await CancellationTokenSource(logger: logger)
++        guard activeDownloads[cancellationToken] == nil else {
++            tokenSource.free()
++            throw CancellationError()
++        }
++        let activeDownload = ActiveDownload(tokenSource: tokenSource)
++        activeDownloads[cancellationToken] = activeDownload
++        return activeDownload
+     }
+ }
+
+diff --git a/Sources/FileOperations/Downloads/cThumbnailEnumerationCallback.swift b/Sources/FileOperations/Downloads/cThumbnailEnumerationCallback.swift
+index 5f1da98..54a66ab 100644
+--- a/Sources/FileOperations/Downloads/cThumbnailEnumerationCallback.swift
++++ b/Sources/FileOperations/Downloads/cThumbnailEnumerationCallback.swift
+@@ -13,17 +13,13 @@ final class ThumbnailEnumerationCallbackWrapper: Sendable {
+ }
+
+ let cThumbnailEnumerationCallback: CCallback = { statePointer, byteArray in
+-    typealias BoxType = BoxedCompletionBlock<Int, WeakReference<ThumbnailEnumerationCallbackWrapper>>
++    // `downloadPhotoThumbnails` awaits `Void`, so SDKRequestHandler registers this exact result type.
++    // A mismatched generic makes the registry's checked cast reject every streamed thumbnail.
++    typealias BoxType = BoxedCompletionBlock<Void, WeakReference<ThumbnailEnumerationCallbackWrapper>>
++    guard let box = CallbackHandleRegistry.shared.get(statePointer, as: BoxType.self) else { return }
+     let fileThumbnail = Proton_Drive_Sdk_FileThumbnail(byteArray: byteArray)
+     let result = ThumbnailDataWithId(fileThumbnail: fileThumbnail)
+
+-    guard let stateRawPointer = UnsafeRawPointer(bitPattern: statePointer) else {
+-        let message = "cProgressCallback.statePointer is nil"
+-        assertionFailure(message)
+-        // there is no way we can inform the SDK back about the issue
+-        return
+-    }
+-    let stateTypedPointer = Unmanaged<BoxType>.fromOpaque(stateRawPointer)
+-    let weakWrapper: WeakReference<ThumbnailEnumerationCallbackWrapper> = stateTypedPointer.takeUnretainedValue().state
++    let weakWrapper: WeakReference<ThumbnailEnumerationCallbackWrapper> = box.state
+     weakWrapper.value?.callback(.success(result))
+ }
+diff --git a/Sources/FileOperations/Uploads/PhotoUploadsManager.swift b/Sources/FileOperations/Uploads/PhotoUploadsManager.swift
+index 81cd6ad..caf3935 100644
+--- a/Sources/FileOperations/Uploads/PhotoUploadsManager.swift
++++ b/Sources/FileOperations/Uploads/PhotoUploadsManager.swift
+@@ -30,6 +30,7 @@ actor PhotoUploadsManager {
+         thumbnails: [ThumbnailData],
+         tags: [Proton_Drive_Sdk_PhotoTag],
+         additionalMetadata: [AdditionalMetadata],
++        overrideExistingDraft: Bool,
+         expectedSHA1: Data? = nil,
+         cancellationToken: UUID,
+         progressCallback: @escaping ProgressCallback
+@@ -48,6 +49,7 @@ actor PhotoUploadsManager {
+             mainPhotoUid: mainPhotoUid,
+             tags: tags,
+             additionalMetadata: additionalMetadata,
++            overrideExistingDraft: overrideExistingDraft,
+             cancellationHandle: cancellationHandle
+         )
+
+@@ -156,6 +158,7 @@ actor PhotoUploadsManager {
+         mainPhotoUid: SDKNodeUid?,
+         tags: [Proton_Drive_Sdk_PhotoTag],
+         additionalMetadata: [AdditionalMetadata],
++        overrideExistingDraft: Bool,
+         cancellationHandle: ObjectHandle
+     ) async throws -> ObjectHandle {
+         let uploaderRequest = Proton_Drive_Sdk_DrivePhotosClientGetPhotoUploaderRequest.with {
+@@ -173,6 +176,7 @@ actor PhotoUploadsManager {
+                 }
+                 metadata.tags = tags
+             }
++            $0.overrideExistingDraftByOtherClient = overrideExistingDraft
+             $0.cancellationTokenSourceHandle = Int64(cancellationHandle)
+         }
+
+diff --git a/Sources/Plumbing/BoxedContinuation.swift b/Sources/Plumbing/BoxedContinuation.swift
+index c660a66..b7e2393 100644
+--- a/Sources/Plumbing/BoxedContinuation.swift
++++ b/Sources/Plumbing/BoxedContinuation.swift
+@@ -1,3 +1,5 @@
++import Foundation
++
+ protocol Resumable<ReturnType>: AnyObject {
+     associatedtype ReturnType
+     typealias Continuation = CheckedContinuation<ReturnType, any Error>
+@@ -13,9 +15,10 @@ extension Resumable where ReturnType == Void {
+ }
+
+ // Boxed completion
+-final class BoxedCompletionBlock<ResultType, StateType>: RegistryTracking, Resumable {
++final class BoxedCompletionBlock<ResultType, StateType>: RegistryTracking, RegistryCancellable, Resumable {
+     typealias CompletionBlock = (Result<ResultType, Error>) -> Void
+
++    private let lock = NSLock()
+     private var completionBlock: CompletionBlock?
+     let state: StateType
+     var registryHandleId: RegistryHandle?
+@@ -26,20 +29,24 @@ final class BoxedCompletionBlock<ResultType, StateType>: RegistryTracking, Resum
+     }
+
+     func resume(returning value: ResultType) {
+-        guard let completionBlock else {
+-            assertionFailure("Attempt at calling continuation twice, programmer's error, must fix")
+-            return
+-        }
++        guard let completionBlock = takeCompletionBlock() else { return }
+         completionBlock(.success(value))
+-        self.completionBlock = nil
+     }
+
+     func resume(throwing error: any Error) {
+-        guard let completionBlock else {
+-            assertionFailure("Attempt at calling continuation twice, programmer's error, must fix")
+-            return
+-        }
++        guard let completionBlock = takeCompletionBlock() else { return }
+         completionBlock(.failure(error))
+-        self.completionBlock = nil
++    }
++
++    func cancel() {
++        resume(throwing: CancellationError())
++    }
++
++    private func takeCompletionBlock() -> CompletionBlock? {
++        lock.lock()
++        defer { lock.unlock() }
++        let block = completionBlock
++        completionBlock = nil
++        return block
+     }
+ }
+diff --git a/Sources/Plumbing/Message+Packaging.swift b/Sources/Plumbing/Message+Packaging.swift
+index 7ab5dbb..0538398 100644
+--- a/Sources/Plumbing/Message+Packaging.swift
++++ b/Sources/Plumbing/Message+Packaging.swift
+@@ -247,6 +247,31 @@ extension Message {
+                 $0.payload = .drivePhotosClientEnumerateTimeline(request)
+             }
+
++        case let request as Proton_Drive_Sdk_DrivePhotosClientTrashNodesRequest:
++            Proton_Drive_Sdk_Request.with {
++                $0.payload = .drivePhotosClientTrashNodes(request)
++            }
++
++        case let request as Proton_Drive_Sdk_DrivePhotosClientDeleteNodesRequest:
++            Proton_Drive_Sdk_Request.with {
++                $0.payload = .drivePhotosClientDeleteNodes(request)
++            }
++
++        case let request as Proton_Drive_Sdk_DrivePhotosClientRestoreNodesRequest:
++            Proton_Drive_Sdk_Request.with {
++                $0.payload = .drivePhotosClientRestoreNodes(request)
++            }
++
++        case let request as Proton_Drive_Sdk_DrivePhotosClientEnumerateTrashRequest:
++            Proton_Drive_Sdk_Request.with {
++                $0.payload = .drivePhotosClientEnumerateTrash(request)
++            }
++
++        case let request as Proton_Drive_Sdk_DrivePhotosClientEmptyTrashRequest:
++            Proton_Drive_Sdk_Request.with {
++                $0.payload = .drivePhotosClientEmptyTrash(request)
++            }
++
+         case let request as Proton_Drive_Sdk_DrivePhotosClientLeaveSharedNodeRequest:
+             Proton_Drive_Sdk_Request.with {
+                 $0.payload = .drivePhotosClientLeaveSharedNode(request)
+diff --git a/Sources/Plumbing/SDKRequestHandler.swift b/Sources/Plumbing/SDKRequestHandler.swift
+index 155e460..4a5eaa5 100644
+--- a/Sources/Plumbing/SDKRequestHandler.swift
++++ b/Sources/Plumbing/SDKRequestHandler.swift
+@@ -5,6 +5,37 @@ import SwiftProtobuf
+ /// Sends requests to SDK and handles responses
+ enum SDKRequestHandler {
+
++    final class RequestCancellation: @unchecked Sendable {
++        private let lock = NSLock()
++        private var handle: RegistryHandle?
++        private var isCancelled = false
++
++        func install(_ handle: RegistryHandle?) {
++            guard let handle else { return }
++
++            lock.lock()
++            if isCancelled {
++                lock.unlock()
++                CallbackHandleRegistry.shared.cancel(handle)
++            } else {
++                self.handle = handle
++                lock.unlock()
++            }
++        }
++
++        func cancel() {
++            lock.lock()
++            isCancelled = true
++            let handle = handle
++            self.handle = nil
++            lock.unlock()
++
++            if let handle {
++                CallbackHandleRegistry.shared.cancel(handle)
++            }
++        }
++    }
++
+     // MARK: - Simple requests (without state)
+
+     /// Async/await API for request without state for types with the generics documented via InteropRequest protocol.
+@@ -69,15 +100,51 @@ enum SDKRequestHandler {
+         }
+     }
+
++    /// Async request whose Swift continuation is released when its task is cancelled.
++    /// The underlying operation still owns its native cancellation token separately.
++    static func sendCancellable<T: Message, U: Sendable, V>(
++        _ request: T,
++        state: V,
++        scope: CallbackScope = .operation,
++        owner: AnyObject? = nil,
++        requestCancellation: RequestCancellation = RequestCancellation(),
++        logger: Logger?
++    ) async throws -> U {
++        return try await withTaskCancellationHandler {
++            try await withCheckedThrowingContinuation { continuation in
++                let handle = send(
++                    request,
++                    state: state,
++                    logger: logger,
++                    scope: scope,
++                    owner: owner,
++                    registryBacked: true
++                ) { (result: Result<U, Error>) in
++                    switch result {
++                    case .success(let response):
++                        continuation.resume(returning: response)
++                    case .failure(let error):
++                        continuation.resume(throwing: error)
++                    }
++                }
++                requestCancellation.install(handle)
++            }
++        } onCancel: {
++            requestCancellation.cancel()
++        }
++    }
++
+     /// Completion block API for requests with state
++    @discardableResult
+     static func send<T: Message, U, V>(
+         _ request: T,
+         state: V,
+         logger: Logger?,
+         scope: CallbackScope = .operation,
+         owner: AnyObject? = nil,
++        registryBacked: Bool = false,
+         completionBlock: @escaping (Result<U, Error>) -> Void
+-    ) {
++    ) -> RegistryHandle? {
+         do {
+             // Put the request in an envelope
+             let envelopedRequestData = try request.packIntoRequest().serializedData()
+@@ -93,16 +160,38 @@ enum SDKRequestHandler {
+
+             // Switch to InteropTypes.BoxedStateType once we use it for all requests
+             let boxedState = BoxedCompletionBlock(completionBlock, state: state)
+-            let pointer = Unmanaged.passRetained(boxedState)
+-            boxedState.registryHandleId = CallbackHandleRegistry.shared.register(boxedState, scope: scope, owner: owner)
+-            let bindingsHandle = Int(rawPointer: pointer.toOpaque())
+-            proton_drive_sdk_handle_request(requestArray, bindingsHandle, sdkResponseCallbackWithState)
++            let registryHandle = CallbackHandleRegistry.shared.register(boxedState, scope: scope, owner: owner)
++            boxedState.registryHandleId = registryHandle
++            if registryBacked {
++                proton_drive_sdk_handle_request(
++                    requestArray,
++                    registryHandle,
++                    sdkResponseCallbackWithRegistryHandle
++                )
++            } else {
++                let pointer = Unmanaged.passRetained(boxedState)
++                proton_drive_sdk_handle_request(
++                    requestArray,
++                    Int(rawPointer: pointer.toOpaque()),
++                    sdkResponseCallbackWithState
++                )
++            }
++            return registryHandle
+         } catch {
+             completionBlock(.failure(error))
++            return nil
+         }
+     }
+ }
+
++/// Cancellable requests pass a registry ID instead of a retained raw address. Cancellation removes
++/// the entry, so a late native completion safely becomes a no-op without leaking or dereferencing freed memory.
++let sdkResponseCallbackWithRegistryHandle: CCallback = { handle, responseArray in
++    guard let rawBox = CallbackHandleRegistry.shared.remove(handle) else { return }
++    let temporaryPointer = Unmanaged.passRetained(rawBox).toOpaque()
++    sdkResponseCallbackWithState(Int(rawPointer: temporaryPointer), responseArray)
++}
++
+ /// C-compatible callback function for SDK responses.
+ let sdkResponseCallbackWithState: CCallback = { statePointer, responseArray in
+     guard let sdkPointer = UnsafeRawPointer(bitPattern: statePointer) else {
+diff --git a/Tests/BoxedDownloadStreamTests.swift b/Tests/BoxedDownloadStreamTests.swift
+new file mode 100644
+index 0000000..e5dab3a
+--- /dev/null
++++ b/Tests/BoxedDownloadStreamTests.swift
+@@ -0,0 +1,57 @@
++import Foundation
++import Testing
++@testable import ProtonDriveSDK
++
++@Suite("Download stream boundaries")
++struct BoxedDownloadStreamTests {
++    @Test(arguments: [0, 7, 8, 9, 16, 17])
++    func asyncBytesPreserveEveryByteAndReportExactEOF(length: Int) async throws {
++        let expected = Data((0 ..< length).map { UInt8($0 % 251) })
++        let stream = AsyncStream<UInt8> { continuation in
++            for byte in expected { continuation.yield(byte) }
++            continuation.finish()
++        }
++        let reader = AsyncBytesDownloadStream(stream: AnyAsyncSequence(stream))
++        var received = Data()
++
++        while true {
++            let result = try await reader.read(upTo: 8)
++            received.append(result.data)
++            if result.reachedEnd { break }
++        }
++
++        #expect(received == expected)
++    }
++
++    @Test func lookaheadErrorDoesNotDiscardTheFullBuffer() async throws {
++        struct ExpectedFailure: Error {}
++        let stream = AsyncThrowingStream<UInt8, any Error> { continuation in
++            for byte in UInt8(0) ..< UInt8(8) { continuation.yield(byte) }
++            continuation.finish(throwing: ExpectedFailure())
++        }
++        let reader = AsyncBytesDownloadStream(stream: AnyAsyncSequence(stream))
++
++        let fullBuffer = try await reader.read(upTo: 8)
++        #expect(fullBuffer.data == Data((0 ..< 8).map(UInt8.init)))
++        #expect(!fullBuffer.reachedEnd)
++        await #expect(throws: ExpectedFailure.self) {
++            _ = try await reader.read(upTo: 8)
++        }
++    }
++
++    @Test func exactSizeFileReportsEOFWithoutMutatingInitialOffset() async throws {
++        let url = FileManager.default.temporaryDirectory
++            .appendingPathComponent("ProtonDriveSDK-\(UUID().uuidString).bin")
++        defer { try? FileManager.default.removeItem(at: url) }
++        try Data((0 ..< 8).map(UInt8.init)).write(to: url)
++        let handle = try FileHandle(forReadingFrom: url)
++        try handle.seek(toOffset: 3)
++
++        let reader = FileHandleDownloadStream(fileHandle: handle)
++        #expect(try handle.offset() == 3)
++        let result = try await reader.read(upTo: 5)
++
++        #expect(result.data == Data((3 ..< 8).map(UInt8.init)))
++        #expect(result.reachedEnd)
++    }
++}
+diff --git a/Tests/CallbackHandleRegistryTests.swift b/Tests/CallbackHandleRegistryTests.swift
+new file mode 100644
+index 0000000..68ae8f1
+--- /dev/null
++++ b/Tests/CallbackHandleRegistryTests.swift
+@@ -0,0 +1,72 @@
++import Foundation
++import Testing
++@testable import ProtonDriveSDK
++
++@Suite("Callback registry cancellation")
++struct CallbackHandleRegistryTests {
++    @Test func cancellationRemovesHandleAndResumesExactlyOnce() {
++        let recorder = CompletionRecorder()
++        let box = BoxedCompletionBlock<Void, Void>({ recorder.record($0) }, state: ())
++        let handle = CallbackHandleRegistry.shared.register(box)
++        box.registryHandleId = handle
++
++        CallbackHandleRegistry.shared.cancel(handle)
++        CallbackHandleRegistry.shared.cancel(handle)
++
++        #expect(!CallbackHandleRegistry.shared.contains(handle))
++        #expect(recorder.count == 1)
++        #expect(recorder.wasCancelled)
++        #expect(CallbackHandleRegistry.shared.get(handle, as: BoxedCompletionBlock<Void, Void>.self) == nil,
++                "a late yield/terminal callback must become a no-op")
++    }
++
++    @Test func cancellationAndTerminalCompletionRaceStillResumeOnce() async {
++        let recorder = CompletionRecorder()
++        let box = BoxedCompletionBlock<Void, Void>({ recorder.record($0) }, state: ())
++        let handle = CallbackHandleRegistry.shared.register(box)
++        box.registryHandleId = handle
++
++        await withTaskGroup(of: Void.self) { group in
++            group.addTask { CallbackHandleRegistry.shared.cancel(handle) }
++            group.addTask {
++                (CallbackHandleRegistry.shared.remove(handle) as? BoxedCompletionBlock<Void, Void>)?
++                    .resume(returning: ())
++            }
++        }
++
++        #expect(recorder.count == 1)
++        #expect(!CallbackHandleRegistry.shared.contains(handle))
++    }
++
++    @Test func cancellationBeforeHandleInstallationCancelsTheLateRegistration() {
++        let recorder = CompletionRecorder()
++        let box = BoxedCompletionBlock<Void, Void>({ recorder.record($0) }, state: ())
++        let handle = CallbackHandleRegistry.shared.register(box)
++        box.registryHandleId = handle
++        let cancellation = SDKRequestHandler.RequestCancellation()
++
++        cancellation.cancel()
++        cancellation.install(handle)
++
++        #expect(!CallbackHandleRegistry.shared.contains(handle))
++        #expect(recorder.count == 1)
++        #expect(recorder.wasCancelled)
++    }
++}
++
++private final class CompletionRecorder: @unchecked Sendable {
++    private let lock = NSLock()
++    private var results: [Result<Void, Error>] = []
++
++    func record(_ result: Result<Void, Error>) {
++        lock.withLock { results.append(result) }
++    }
++
++    var count: Int { lock.withLock { results.count } }
++    var wasCancelled: Bool {
++        lock.withLock {
++            guard case let .failure(error)? = results.first else { return false }
++            return error is CancellationError
++        }
++    }
++}
+diff --git a/Tests/ThumbnailEnumerationCallbackTests.swift b/Tests/ThumbnailEnumerationCallbackTests.swift
+new file mode 100644
+index 0000000..d39e91d
+--- /dev/null
++++ b/Tests/ThumbnailEnumerationCallbackTests.swift
+@@ -0,0 +1,50 @@
++import CProtonDriveSDK
++import Foundation
++import SwiftProtobuf
++import Testing
++@testable import ProtonDriveSDK
++
++@Suite("Thumbnail enumeration callback")
++struct ThumbnailEnumerationCallbackTests {
++    @Test func voidRequestBoxDeliversStreamedThumbnail() throws {
++        let expectedUID = SDKNodeUid(volumeID: "volume", nodeID: "node")
++        let expectedData = Data([0x01, 0x02, 0x03])
++        let recorder = ThumbnailCallbackRecorder()
++        let wrapper = ThumbnailEnumerationCallbackWrapper(callback: recorder.record)
++        let box = BoxedCompletionBlock<Void, WeakReference<ThumbnailEnumerationCallbackWrapper>>(
++            nil,
++            state: WeakReference(value: wrapper)
++        )
++        let handle = CallbackHandleRegistry.shared.register(box)
++        defer { CallbackHandleRegistry.shared.remove(handle) }
++
++        var thumbnail = Proton_Drive_Sdk_FileThumbnail()
++        thumbnail.fileUid = expectedUID.sdkCompatibleIdentifier
++        thumbnail.data = expectedData
++        let bytes = ByteArray(data: try thumbnail.serializedData())
++        defer { bytes.deallocate() }
++
++        cThumbnailEnumerationCallback(handle, bytes)
++
++        let delivered = try #require(recorder.value)
++        #expect(delivered.fileUid.volumeID == expectedUID.volumeID)
++        #expect(delivered.fileUid.nodeID == expectedUID.nodeID)
++        guard case let .success(data) = delivered.result else {
++            Issue.record("expected thumbnail bytes")
++            return
++        }
++        #expect(data == expectedData)
++    }
++}
++
++private final class ThumbnailCallbackRecorder: @unchecked Sendable {
++    private let lock = NSLock()
++    private var storedValue: ThumbnailDataWithId?
++
++    func record(_ result: Result<ThumbnailDataWithId?, any Error>) {
++        guard case let .success(value?) = result else { return }
++        lock.withLock { storedValue = value }
++    }
++
++    var value: ThumbnailDataWithId? { lock.withLock { storedValue } }
++}

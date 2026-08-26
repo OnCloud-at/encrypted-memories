@@ -1,0 +1,43 @@
+included:
+  - App
+  - iOSApp
+  - iOSTests
+  - Marketing/UITests
+  - Packages/EncryptedMemoriesKit/Sources
+  - Packages/EncryptedMemoriesKit/Tests
+
+excluded:
+  - Packages/EncryptedMemoriesKit/Sources/MLSearchAppleAdapter/Resources
+  - Packages/EncryptedMemoriesKit/.build
+  - Vendor
+
+reporter: xcode
+strict: true
+
+only_rules:
+  - custom_rules
+  - duplicate_imports
+  - empty_xctest_method
+  - fatal_error_message
+  - orphaned_doc_comment
+  - trailing_newline
+  - trailing_whitespace
+  - unavailable_function
+  - unused_optional_binding
+  - yoda_condition
+
+custom_rules:
+  no_em_dash_in_comments:
+    name: Comment punctuation
+    regex: "—"
+    match_kinds:
+      - comment
+    message: "Use direct punctuation in code comments."
+    severity: error
+  no_internal_narrative_in_comments:
+    name: Public code comments
+    regex: "(?i)\\b(ai|ai-generated|artificial intelligence|chatbot|chatgpt|claude|codex|copilot|gemini|gpt|llm|paper|papers|research(?:er|ers|ing)?|study)\\b"
+    match_kinds:
+      - comment
+    message: "Keep comments focused on the code contract."
+    severity: error

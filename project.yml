@@ -1,0 +1,273 @@
+name: EncryptedMemories
+options:
+  bundleIdPrefix: at.oncloud.encryptedmemories
+  deploymentTarget:
+    macOS: "26.0"
+  createIntermediateGroups: true
+  # Unsupported system languages fall back to the English source catalog.
+  developmentLanguage: en
+
+settings:
+  base:
+    # ProtonCore exposes process-global crypto state that Swift 6 language mode rejects.
+    SWIFT_VERSION: "5.0"
+    MARKETING_VERSION: "1.0.0"
+    # Fallback for ad-hoc Xcode builds. scripts/rebuild.sh injects the exact Git commit count.
+    CURRENT_PROJECT_VERSION: "713"
+    DEAD_CODE_STRIPPING: YES
+    ENABLE_HARDENED_RUNTIME: YES
+    # App integration uses SDK types without Sendable annotations.
+    SWIFT_STRICT_CONCURRENCY: minimal
+
+packages:
+  ProtonDriveSDK:
+    path: Vendor/sdk-swift
+  EncryptedMemoriesKit:
+    path: Packages/EncryptedMemoriesKit
+  ProtonCore:
+    url: https://github.com/ProtonMail/protoncore_ios.git
+    # Proton Drive SDK 0.24.0 requires the exact ProtonCore version 37.3.0.
+    exactVersion: 37.3.0
+
+fileGroups:
+  - StoreKit
+  - TestFlight
+  - XcodeCloud
+
+targets:
+  EncryptedMemories:
+    type: application
+    platform: macOS
+    deploymentTarget: "26.0"
+    sources:
+      - App
+      - Shared/PrivacyInfo.xcprivacy
+    dependencies:
+      - package: EncryptedMemoriesKit
+        product: PhotosCore
+      - package: EncryptedMemoriesKit
+        product: LibraryRuntimeAppleAdapter
+      - package: EncryptedMemoriesKit
+        product: DesignSystem
+      - package: EncryptedMemoriesKit
+        product: ProtonAuth
+      - package: EncryptedMemoriesKit
+        product: ProtonDriveBackend
+      - package: EncryptedMemoriesKit
+        product: MediaCache
+      - package: EncryptedMemoriesKit
+        product: MediaByteCache
+      - package: EncryptedMemoriesKit
+        product: MediaLocationCore
+      - package: EncryptedMemoriesKit
+        product: GridCore
+      - package: EncryptedMemoriesKit
+        product: MetalRenderingCore
+      - package: EncryptedMemoriesKit
+        product: TimelineFeature
+      - package: EncryptedMemoriesKit
+        product: PhotoViewerFeature
+      - package: EncryptedMemoriesKit
+        product: AlbumsFeature
+      - package: EncryptedMemoriesKit
+        product: AlbumCore
+      - package: EncryptedMemoriesKit
+        product: AlbumSyncCore
+      - package: EncryptedMemoriesKit
+        product: UploadFeature
+      - package: EncryptedMemoriesKit
+        product: PhotoLibraryBackupAdapter
+      - package: EncryptedMemoriesKit
+        product: MapFeature
+      - package: EncryptedMemoriesKit
+        product: MLSearchCore
+      - package: EncryptedMemoriesKit
+        product: MLSearchAppleAdapter
+      - package: EncryptedMemoriesKit
+        product: MLSearchFeature
+      - package: ProtonCore
+        product: ProtonCoreCryptoPatchedGoImplementation
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: at.oncloud.encryptedmemories
+        APP_DISPLAY_NAME: "Encrypted Memories"
+        PRODUCT_NAME: "Encrypted Memories"
+        INFOPLIST_KEY_CFBundleName: $(PRODUCT_NAME)
+        INFOPLIST_KEY_CFBundleDisplayName: $(APP_DISPLAY_NAME)
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_LSApplicationCategoryType: "public.app-category.photography"
+        INFOPLIST_KEY_NSPrincipalClass: NSApplication
+        INFOPLIST_KEY_NSHumanReadableCopyright: "© 2026 Encrypted Memories contributors"
+        INFOPLIST_KEY_NSPhotoLibraryUsageDescription: "Encrypted Memories backs up the photos and videos in your Photos library to Proton Drive, end-to-end encrypted."
+        CODE_SIGN_ENTITLEMENTS: App/EncryptedMemories.entitlements
+        CODE_SIGN_STYLE: Automatic
+        ENABLE_HARDENED_RUNTIME: YES
+        OTHER_CODE_SIGN_FLAGS: "--options runtime"
+        # The vendored SDK stores its bootstrapper objects in this local Resources path.
+        LIBRARY_SEARCH_PATHS:
+          - $(inherited)
+          - $(SRCROOT)/Vendor/sdk-swift/Resources
+
+  EncryptedMemoriesMobile:
+    type: application
+    platform: iOS
+    deploymentTarget: "26.0"
+    sources:
+      - iOSApp
+      - Shared/PrivacyInfo.xcprivacy
+    dependencies:
+      - package: EncryptedMemoriesKit
+        product: PhotosCore
+      - package: EncryptedMemoriesKit
+        product: LibraryRuntimeAppleAdapter
+      - package: EncryptedMemoriesKit
+        product: ProtonAuth
+      - package: EncryptedMemoriesKit
+        product: ProtonDriveBackend
+      - package: EncryptedMemoriesKit
+        product: DesignSystemCore
+      - package: EncryptedMemoriesKit
+        product: GridCore
+      - package: EncryptedMemoriesKit
+        product: TimelineCore
+      - package: EncryptedMemoriesKit
+        product: TimelineUIKitAdapter
+      - package: EncryptedMemoriesKit
+        product: TimelineUIKitFeature
+      - package: EncryptedMemoriesKit
+        product: MediaByteCache
+      - package: EncryptedMemoriesKit
+        product: MediaDecodingCore
+      - package: EncryptedMemoriesKit
+        product: MediaFeedCore
+      - package: EncryptedMemoriesKit
+        product: MediaCacheCore
+      - package: EncryptedMemoriesKit
+        product: MediaCacheUIKitAdapter
+      - package: EncryptedMemoriesKit
+        product: MetalRenderingCore
+      - package: EncryptedMemoriesKit
+        product: MetalGridTextureCore
+      - package: EncryptedMemoriesKit
+        product: MetalGridTextureUIKitAdapter
+      - package: EncryptedMemoriesKit
+        product: AlbumsFeature
+      - package: EncryptedMemoriesKit
+        product: AlbumCore
+      - package: EncryptedMemoriesKit
+        product: AlbumSyncCore
+      - package: EncryptedMemoriesKit
+        product: UploadCore
+      - package: EncryptedMemoriesKit
+        product: UploadFeature
+      - package: EncryptedMemoriesKit
+        product: PhotoLibraryBackupAdapter
+      - package: EncryptedMemoriesKit
+        product: PhotoViewerCore
+      - package: EncryptedMemoriesKit
+        product: PhotoViewerUIKitAdapter
+      - package: EncryptedMemoriesKit
+        product: MediaLocationCore
+      - package: EncryptedMemoriesKit
+        product: MapUIKitAdapter
+      - package: EncryptedMemoriesKit
+        product: MLSearchCore
+      - package: EncryptedMemoriesKit
+        product: MLSearchAppleAdapter
+      - package: EncryptedMemoriesKit
+        product: MLSearchFeature
+      - package: ProtonCore
+        product: ProtonCoreCryptoPatchedGoImplementation
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: at.oncloud.encryptedmemories
+        APP_DISPLAY_NAME: "Memories"
+        PRODUCT_NAME: EncryptedMemoriesMobile
+        INFOPLIST_FILE: iOSApp/Info.plist
+        ENCRYPTED_MEMORIES_BUILD_COMMIT: unknown
+        TARGETED_DEVICE_FAMILY: "1,2"
+        SUPPORTS_MACCATALYST: NO
+        SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD: NO
+        SUPPORTS_XR_DESIGNED_FOR_IPHONE_IPAD: NO
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        # Link one platform-specific SDK bootstrapper at the final iOS app target.
+        LIBRARY_SEARCH_PATHS:
+          - $(inherited)
+          - $(SRCROOT)/Vendor/sdk-swift/Resources
+        OTHER_LDFLAGS[sdk=iphonesimulator*][arch=arm64]:
+          - $(inherited)
+          - -llibbootstrapperdll.iossimulator-arm64.o
+        OTHER_LDFLAGS[sdk=iphonesimulator*][arch=x86_64]:
+          - $(inherited)
+          - -llibbootstrapperdll.iossimulator-x64.o
+        OTHER_LDFLAGS[sdk=iphoneos*]:
+          - $(inherited)
+          - -llibbootstrapperdll.ios-arm64.o
+
+  EncryptedMemoriesMobileTests:
+    type: bundle.unit-test
+    platform: iOS
+    deploymentTarget: "26.0"
+    sources:
+      - iOSTests
+    dependencies:
+      - target: EncryptedMemoriesMobile
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: at.oncloud.encryptedmemories.tests
+        GENERATE_INFOPLIST_FILE: YES
+        TEST_HOST: $(BUILT_PRODUCTS_DIR)/EncryptedMemoriesMobile.app/EncryptedMemoriesMobile
+        BUNDLE_LOADER: $(TEST_HOST)
+        TARGETED_DEVICE_FAMILY: "1,2"
+        SUPPORTS_MACCATALYST: NO
+
+  EncryptedMemoriesMarketingUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    deploymentTarget: "26.0"
+    sources:
+      - Marketing/UITests
+    dependencies:
+      - target: EncryptedMemoriesMobile
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: at.oncloud.encryptedmemories.marketing-ui-tests
+        GENERATE_INFOPLIST_FILE: YES
+        TARGETED_DEVICE_FAMILY: "1,2"
+        SUPPORTS_MACCATALYST: NO
+
+schemes:
+  EncryptedMemories:
+    build:
+      targets:
+        EncryptedMemories: all
+    run:
+      config: Debug
+      storeKitConfiguration: StoreKit/EncryptedMemories.storekit
+
+  EncryptedMemoriesMobile:
+    build:
+      targets:
+        EncryptedMemoriesMobile: all
+    run:
+      config: Debug
+      storeKitConfiguration: StoreKit/EncryptedMemories.storekit
+
+  EncryptedMemoriesMobileTests:
+    build:
+      targets:
+        EncryptedMemoriesMobile: all
+        EncryptedMemoriesMobileTests: [test]
+    test:
+      targets:
+        - EncryptedMemoriesMobileTests
+
+  EncryptedMemoriesMarketingUITests:
+    build:
+      targets:
+        EncryptedMemoriesMobile: all
+        EncryptedMemoriesMarketingUITests: [test]
+    test:
+      targets:
+        - EncryptedMemoriesMarketingUITests

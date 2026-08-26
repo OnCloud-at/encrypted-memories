@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Help and how-to documentation
+    url: https://github.com/OnCloud-at/encrypted-memories/wiki
+    about: Read the Quick Start and screen guides. Please do not open GitHub Issues for questions.

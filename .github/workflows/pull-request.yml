@@ -1,0 +1,162 @@
+name: Pull request verification
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pull-request-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+
+jobs:
+  repository-hygiene:
+    name: Repository hygiene
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check whitespace
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          if [[ -n "$BASE_SHA" ]] && git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null; then
+            git diff --check "$BASE_SHA...$HEAD_SHA"
+          else
+            git diff-tree --check --root "$HEAD_SHA"
+          fi
+
+      - name: Scan the public tree for secrets
+        env:
+          GITLEAKS_VERSION: "8.30.1"
+          GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/gitleaks.tar.gz"
+          curl --fail --location --silent --show-error \
+            "https://github.com/gitleaks/gitleaks/releases/download/v$GITLEAKS_VERSION/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+            --output "$archive"
+          echo "$GITLEAKS_SHA256  $archive" | sha256sum --check
+          tar -xzf "$archive" -C "$RUNNER_TEMP" gitleaks
+          "$RUNNER_TEMP/gitleaks" dir --redact --no-banner .
+
+      - name: Enforce the public tree boundary
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: bash scripts/check-public-tree.sh "$BASE_SHA" "$HEAD_SHA"
+
+  code-quality:
+    name: Swift style
+    runs-on: macos-26
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: ./.github/actions/install-swiftlint
+
+      - name: Select Xcode 26.6
+        run: sudo xcode-select --switch /Applications/Xcode_26.6.app
+
+      - name: Lint changed Swift files
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          if [[ -n "$BASE_SHA" ]] && git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null; then
+            bash scripts/lint-swift.sh --diff "$BASE_SHA" "$HEAD_SHA"
+          else
+            bash scripts/lint-swift.sh --all
+          fi
+
+      - name: Check Swift formatting
+        run: bash scripts/check-swift-format.sh --all
+
+  package-tests:
+    name: Swift package tests
+    runs-on: macos-26
+    timeout-minutes: 90
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/prepare-apple-build
+      - run: bash ./scripts/verify-tests.sh
+      - if: always()
+        run: bash ./scripts/report-build-storage.sh
+
+  ios-app-tests:
+    name: iOS app tests
+    runs-on: macos-26
+    timeout-minutes: 90
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/prepare-apple-build
+      - run: bash ./scripts/verify-ios-app-tests.sh
+      - if: always()
+        run: bash ./scripts/report-build-storage.sh
+
+  architecture:
+    name: Shared architecture
+    runs-on: macos-26
+    timeout-minutes: 90
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/prepare-apple-build
+      - run: bash ./scripts/verify-universal-core.sh
+      - if: always()
+        run: bash ./scripts/report-build-storage.sh
+
+  macos-app-shell:
+    name: macOS app shell
+    runs-on: macos-26
+    timeout-minutes: 90
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/prepare-apple-build
+      - name: Build macOS app
+        run: bash ./scripts/verify-macos-app-shell.sh
+      - if: always()
+        run: bash ./scripts/report-build-storage.sh
+
+  ios-app-shell:
+    name: iOS app shell
+    runs-on: macos-26
+    timeout-minutes: 90
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/prepare-apple-build
+      - name: Build iOS app
+        run: bash ./scripts/verify-ios-app-shell.sh
+      - if: always()
+        run: bash ./scripts/report-build-storage.sh

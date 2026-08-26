@@ -1,0 +1,184 @@
+import XCTest
+
+/// Verifies that `PhotosCore` has no platform UI imports or public UI types.
+/// The target must remain usable on macOS, iOS, and iPadOS without UI dependencies.
+/// The scan reads source files and does not modify them.
+final class PhotosCorePlatformPurityTests: XCTestCase {
+    private var packageRoot: URL {
+        var url = URL(fileURLWithPath: #filePath)
+        for _ in 0..<3 { url.deleteLastPathComponent() }
+        return url
+    }
+
+    private var photosCoreSources: URL {
+        packageRoot.appendingPathComponent("Sources/PhotosCore")
+    }
+
+    /// Recursively collects every `.swift` file under the given directory.
+    private func swiftFiles(in directory: URL) throws -> [URL] {
+        var results: [URL] = []
+        let enumerator = FileManager.default.enumerator(
+            at: directory,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        )
+        guard let enumerator else { return [] }
+        for case let url as URL in enumerator {
+            var isDir: ObjCBool = false
+            if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir), !isDir.boolValue,
+                url.pathExtension == "swift"
+            {
+                results.append(url)
+            }
+        }
+        return results.sorted(by: { $0.lastPathComponent < $1.lastPathComponent })
+    }
+
+    /// Reads the contents of a file as UTF-8 text.
+    private func contents(of url: URL) throws -> String {
+        try String(contentsOf: url, encoding: .utf8)
+    }
+
+    /// Frameworks whose import would drag in platform UI / view-hosting concerns
+    /// and break the universal-Core contract.
+    private static let forbiddenFrameworkImports: [String] = [
+        "AppKit",
+        "UIKit",
+        "SwiftUI",
+        "AVKit",
+        "MetalKit",
+    ]
+
+    func testNoForbiddenFrameworkImports() throws {
+        let files = try swiftFiles(in: photosCoreSources)
+        XCTAssertFalse(files.isEmpty, "Expected to find .swift files under \(photosCoreSources.path)")
+
+        var violations: [String] = []
+        for file in files {
+            let source = try contents(of: file)
+            for line in source.split(whereSeparator: { $0.isNewline }) {
+                let trimmed = line.trimmingCharacters(in: .whitespaces)
+                guard trimmed.hasPrefix("import ") else { continue }
+                for framework in Self.forbiddenFrameworkImports {
+                    if trimmed.range(of: "\\b\(framework)\\b", options: .regularExpression) != nil {
+                        violations.append("\(file.lastPathComponent): \(trimmed)")
+                    }
+                }
+            }
+        }
+
+        XCTAssertTrue(
+            violations.isEmpty,
+            """
+            PhotosCore must not import platform UI frameworks. Found forbidden imports:
+            \(violations.joined(separator: "\n"))
+
+            Allowed imports: Foundation, CoreGraphics (value types), AVFoundation \
+            (cross-platform media), CryptoKit, SQLite3 (system SQLite C API). \
+            UI frameworks belong in Platform UI targets, not Core.
+            """
+        )
+    }
+
+    /// Tokens whose appearance anywhere in PhotosCore source would indicate a leaked
+    /// platform UI type. Word-boundary matched to avoid false positives on substrings.
+    private static let forbiddenTokens: [String] = [
+        "NSImage",
+        "UIImage",
+        "NSView",
+        "UIView",
+        "NSWorkspace",
+        "NSOpenPanel",
+        "UIApplication",
+        "NSApplication",
+    ]
+
+    func testNoForbiddenPublicAPITokens() throws {
+        let files = try swiftFiles(in: photosCoreSources)
+        XCTAssertFalse(files.isEmpty, "Expected to find .swift files under \(photosCoreSources.path)")
+
+        var violations: [String] = []
+        for file in files {
+            let source = try contents(of: file)
+            for token in Self.forbiddenTokens {
+                let pattern = "\\b\(token)\\b"
+                let range = NSRange(source.startIndex..., in: source)
+                guard let regex = try? NSRegularExpression(pattern: pattern) else { continue }
+                regex.enumerateMatches(in: source, range: range) { match, _, _ in
+                    guard let match else { return }
+                    if let matchRange = Range(match.range, in: source) {
+                        let line = source.lineNumber(for: matchRange.lowerBound)
+                        violations.append("\(file.lastPathComponent):\(line) → \(token)")
+                    }
+                }
+            }
+        }
+
+        XCTAssertTrue(
+            violations.isEmpty,
+            """
+            PhotosCore must not reference platform UI types. Found forbidden tokens:
+            \(violations.joined(separator: "\n"))
+
+            These types belong in Platform UI targets (AppKit/UIKit bridges), not in \
+            the universal Core layer.
+            """
+        )
+    }
+
+    /// Confirms the only frameworks imported by PhotosCore are the cross-platform
+    /// allowlist: Foundation, CoreGraphics, AVFoundation, CryptoKit, OSLog, SQLite3. A new
+    /// import here is a review trigger - the change should be intentional and documented.
+    private static let allowedFrameworkImports: Set<String> = [
+        "Foundation",
+        "CoreGraphics",
+        "AVFoundation",
+        "CryptoKit",  // timeline save-skip digest (TimelineMetadataStore)
+        "OSLog",  // cross-platform Apple signposts for package-wide performance diagnostics
+        "SQLite3",  // system SQLite C API backing library-v1.sqlite (TimelineMetadataStore)
+    ]
+
+    func testImportedFrameworksAreOnAllowlist() throws {
+        let files = try swiftFiles(in: photosCoreSources)
+        XCTAssertFalse(files.isEmpty, "Expected to find .swift files under \(photosCoreSources.path)")
+
+        var seen: Set<String> = []
+        for file in files {
+            let source = try contents(of: file)
+            for line in source.split(whereSeparator: { $0.isNewline }) {
+                let trimmed = line.trimmingCharacters(in: .whitespaces)
+                guard trimmed.hasPrefix("import ") else { continue }
+                // Strip `import ` prefix and any trailing attributes/module refs.
+                let remainder = trimmed.dropFirst("import ".count)
+                let moduleName = remainder.split(separator: " ").first.map(String.init) ?? String(remainder)
+                seen.insert(moduleName)
+            }
+        }
+
+        let unexpected = seen.subtracting(Self.allowedFrameworkImports)
+        XCTAssertTrue(
+            unexpected.isEmpty,
+            """
+            PhotosCore imports frameworks outside the cross-platform allowlist:
+            \(unexpected.sorted().joined(separator: ", "))
+
+            Allowed: Foundation, CoreGraphics, AVFoundation, CryptoKit, OSLog, SQLite3. \
+            Adding a new import requires updating PhotosCorePlatformPurityTests.allowList \
+            AND confirming the framework compiles on macOS 26+, iOS 26+, and iPadOS 26+.
+            """
+        )
+    }
+}
+
+private extension String {
+    /// Returns the 1-based line number for the given character index.
+    func lineNumber(for index: Index) -> Int {
+        var line = 1
+        var current = startIndex
+        while current < index {
+            if self[current] == "\n" { line += 1 }
+            current = self.index(after: current)
+        }
+        return line
+    }
+}

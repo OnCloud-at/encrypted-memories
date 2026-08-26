@@ -1,0 +1,565 @@
+import CoreGraphics
+import Foundation
+import GridCore
+import Testing
+
+@testable import TimelineFeature
+
+// Overview layer dissolve uses two settled grid layers, blended by opacity. There is no relocation, no per-cell
+// identity handoff, and no transition-component builder; these tests pin the pure deterministic model.
+@Suite struct OverviewLayerDissolveTests {
+    private let viewport = CGSize(width: 1000, height: 760)
+    private let normalLevelLeadingGap: CGFloat = 16
+    private func engine(_ n: Int = 6000) -> SquareTileGridEngine {
+        SquareTileGridEngine.testRegular(sectionCounts: [n])
+    }
+
+    private func plan(
+        _ s: Int, _ t: Int, mode: TileContentDisplayMode = .aspectFitInsideSquare,
+        _ e: SquareTileGridEngine
+    ) -> OverviewLayerDissolvePlan? {
+        e.overviewLayerDissolvePlan(
+            from: s, to: t, viewportSize: viewport, targetViewportSize: viewport, sourceScrollY: 4000,
+            sourceColumnPhase: nil,
+            preferredNormalMode: mode, anchorContentPoint: CGPoint(x: 500, y: 4380),
+            anchorViewportPoint: CGPoint(x: 500, y: 380), overscan: 300)
+    }
+
+    private func repoRoot() -> URL {
+        var u = URL(fileURLWithPath: #filePath)
+        for _ in 0..<5 { u.deleteLastPathComponent() }  // …/Tests/TimelineFeatureTests/X.swift to repo root
+        return u
+    }
+    private func source(_ name: String) -> String {
+        for target in ["TimelineFeature", "TimelineUIKitFeature", "GridCore", "MetalRenderingCore"] {
+            let rel = "Packages/EncryptedMemoriesKit/Sources/\(target)/\(name)"
+            if let source = try? String(contentsOf: repoRoot().appendingPathComponent(rel), encoding: .utf8) {
+                return source
+            }
+        }
+        return ""
+    }
+
+    private func renderBounds(
+        profile: GridLevelProfile, level: Int, fullWidth: CGFloat, sidebarInset: CGFloat
+    ) -> GridRenderBounds {
+        let metrics = profile.levels[level]
+        let margin: CGFloat = metrics.monthLabels ? 0 : 12
+        let leadingGap: CGFloat = sidebarInset > 0 && !metrics.monthLabels ? normalLevelLeadingGap : 0
+        return GridRenderBounds(
+            fullWidth: fullWidth, leadingInset: sidebarInset + leadingGap + margin, trailingInset: margin)
+    }
+
+    private func renderedRects(_ plan: GridFramePlan, bounds: GridRenderBounds) -> [Int: CGRect] {
+        Dictionary(
+            uniqueKeysWithValues: bounds.translate(
+                plan.visibleSlots.map {
+                    GridRenderSlot(index: $0.index, column: $0.column, row: $0.row, rect: $0.viewportRect)
+                }
+            ).map { ($0.index, $0.rect) })
+    }
+
+    private func assertRectMapsEqual(_ lhs: [Int: CGRect], _ rhs: [Int: CGRect], context: String) {
+        #expect(Set(lhs.keys) == Set(rhs.keys), "\(context): endpoint slot identities differ")
+        for key in lhs.keys {
+            guard let a = lhs[key], let b = rhs[key] else { continue }
+            #expect(abs(a.minX - b.minX) < 0.001, "\(context): minX differs for \(key)")
+            #expect(abs(a.minY - b.minY) < 0.001, "\(context): minY differs for \(key)")
+            #expect(abs(a.width - b.width) < 0.001, "\(context): width differs for \(key)")
+            #expect(abs(a.height - b.height) < 0.001, "\(context): height differs for \(key)")
+        }
+    }
+
+    // Builds only for the overview boundaries, never for normal-level focus-row relayout steps.
+    @Test func buildsOnlyForOverviewBoundaries() {
+        let e = engine()
+        #expect(plan(3, 4, e) != nil)
+        #expect(plan(4, 5, e) != nil)
+        #expect(plan(5, 4, e) != nil)
+        #expect(plan(2, 3, e) == nil)  // normal step, so not an overview dissolve
+        #expect(plan(0, 1, e) == nil)
+        #expect(plan(3, 5, e) == nil)  // non-adjacent
+    }
+
+    // Source and target rasters are computed once; advancing q changes only the blend, never the layouts.
+    @Test func plansAreStableAcrossProgress() {
+        let e = engine()
+        guard let p0 = plan(3, 4, e) else {
+            Issue.record("nil plan")
+            return
+        }
+        for step in 0...10 {
+            let pq = p0.withProgress(Double(step) / 10)
+            #expect(pq.source == p0.source)
+            #expect(pq.target == p0.target)
+            #expect(pq.sourceDisplayMode == p0.sourceDisplayMode)
+            #expect(pq.targetDisplayMode == p0.targetDisplayMode)
+            #expect(pq.targetScrollY == p0.targetScrollY)
+            #expect(pq.targetColumnPhase == p0.targetColumnPhase)
+        }
+    }
+
+    @Test func nativeMenuZoomUsesTheExistingShortPinchRoutes() {
+        let host = source("UIKitTimelineGridHost.swift")
+        let pinch = source("UIKitTimelineGridHostPinch.swift")
+        let proxy = source("GridProxy.swift")
+
+        #expect(host.contains("proxy?.zoomIn =") && host.contains("proxy?.zoomOut ="))
+        #expect(host.contains("proxy?.zoomAvailability ="))
+        #expect(pinch.contains("performDiscreteZoom(direction:"))
+        #expect(pinch.contains("beginShortPinchStep("))
+        #expect(pinch.contains("commitLiveZoom(to: targetLevel"))
+        #expect(proxy.contains("zoomAvailability"))
+    }
+
+    // The target overview grid is in its final position at every q.
+    @Test func targetPositionsAreFinalAtEveryProgress() {
+        let e = engine()
+        guard let p = plan(3, 4, e) else {
+            Issue.record("nil plan")
+            return
+        }
+        let finalRects = p.target.visibleSlots.map(\.viewportRect)
+        for step in 0...10 {
+            #expect(p.withProgress(Double(step) / 10).target.visibleSlots.map(\.viewportRect) == finalRects)
+        }
+        // Derive the overview column count from the engine at this width.
+        #expect(p.target.columns == e.resolvedMetrics(level: 4, width: viewport.width).columns)
+        #expect(p.targetLevel == 4 && p.sourceLevel == 3)
+    }
+
+    // Render-space endpoint guarantee: every overview-boundary dissolve uses per-level bounds, so q=0 matches the
+    // settled source frame and q=1 matches the settled target frame even when normal levels have side gutters and
+    // overview levels are edge-to-edge. This is profile/semantic coverage, not an L3/L4 special case.
+    @Test func overviewBoundaryEndpointsUsePerLevelRenderBoundsForEveryProfile() {
+        let profiles: [GridLevelProfile] = [.testRegularTimeline, .testCompactTimeline]
+        let fullWidths: [String: CGFloat] = ["regularTimeline": 1000, "compactTimeline": 420]
+        let sidebarInsets: [CGFloat] = [0, 84]
+        let height: CGFloat = 760
+        let overscan: CGFloat = 220
+
+        for profile in profiles {
+            let fullWidth = fullWidths[profile.id] ?? 1000
+            for sidebarInset in sidebarInsets {
+                let engine = SquareTileGridEngine(sectionCounts: [6000], profile: profile)
+                for sourceLevel in profile.levels.indices {
+                    for targetLevel in [sourceLevel - 1, sourceLevel + 1]
+                    where targetLevel >= 0 && targetLevel < profile.levels.count {
+                        guard engine.isOverviewBoundary(sourceLevel, targetLevel) else { continue }
+                        let sourceBounds = renderBounds(
+                            profile: profile, level: sourceLevel, fullWidth: fullWidth, sidebarInset: sidebarInset)
+                        let targetBounds = renderBounds(
+                            profile: profile, level: targetLevel, fullWidth: fullWidth, sidebarInset: sidebarInset)
+                        let sourceViewport = sourceBounds.viewport(height: height)
+                        let targetViewport = targetBounds.viewport(height: height)
+                        let sourceMaxY = max(
+                            0, engine.contentSize(level: sourceLevel, width: sourceViewport.width).height - height)
+                        let sourceScrollY = sourceMaxY * 0.37
+                        let anchorViewportPoint = CGPoint(
+                            x: min(sourceViewport.width - 1, sourceViewport.width * 0.54), y: height * 0.48)
+                        let anchorContentPoint = CGPoint(
+                            x: anchorViewportPoint.x, y: sourceScrollY + anchorViewportPoint.y)
+                        guard
+                            let plan = engine.overviewLayerDissolvePlan(
+                                from: sourceLevel,
+                                to: targetLevel,
+                                viewportSize: sourceViewport,
+                                targetViewportSize: targetViewport,
+                                sourceScrollY: sourceScrollY,
+                                sourceColumnPhase: nil,
+                                preferredNormalMode: .aspectFitInsideSquare,
+                                anchorContentPoint: anchorContentPoint,
+                                anchorViewportPoint: anchorViewportPoint,
+                                overscan: overscan
+                            )
+                        else {
+                            Issue.record("nil plan for \(profile.id) \(sourceLevel)->\(targetLevel)")
+                            continue
+                        }
+                        let sourceSettled = engine.framePlan(
+                            level: sourceLevel,
+                            viewportSize: sourceViewport,
+                            scrollOffset: CGPoint(x: 0, y: sourceScrollY),
+                            overscan: overscan,
+                            columnPhase: nil
+                        )
+                        let targetSettled = engine.framePlan(
+                            level: targetLevel,
+                            viewportSize: targetViewport,
+                            scrollOffset: CGPoint(x: 0, y: plan.targetScrollY),
+                            overscan: overscan,
+                            columnPhase: plan.targetColumnPhase
+                        )
+                        let context = "\(profile.id) \(sourceLevel)->\(targetLevel) sidebar=\(sidebarInset)"
+                        assertRectMapsEqual(
+                            renderedRects(plan.source, bounds: sourceBounds),
+                            renderedRects(sourceSettled, bounds: sourceBounds), context: "\(context) q0")
+                        assertRectMapsEqual(
+                            renderedRects(plan.target, bounds: targetBounds),
+                            renderedRects(targetSettled, bounds: targetBounds), context: "\(context) q1")
+                    }
+                }
+            }
+        }
+    }
+
+    @Test func coordinatorMapsOverviewTargetWithTargetBoundsWithoutScaling() {
+        let coord = source("MetalGridCoordinator.swift")
+        #expect(coord.contains("func renderBounds(forLevel lvl: Int) -> GridRenderBounds"))
+        #expect(coord.contains("targetBounds: renderBounds(forLevel: plan.targetLevel)"))
+        #expect(
+            coord.contains(
+                "private func mapDissolveTargetLayer(_ slots: [GridRenderSlot], targetBounds: GridRenderBounds)"))
+        #expect(coord.contains("targetBounds.translate(slots)"))
+        guard let start = coord.range(of: "private func mapDissolveTargetLayer"),
+            let end = coord.range(of: "// MARK: - Live resize", range: start.upperBound..<coord.endIndex)
+        else {
+            Issue.record("missing mapDissolveTargetLayer body")
+            return
+        }
+        let body = String(coord[start.lowerBound..<end.lowerBound])
+        #expect(!body.contains("scale"), "overview target mapping must not scale an already target-width plan")
+    }
+
+    // Source keeps its own display mode (not forced square); target is square because overview is square-only.
+    @Test func sourceKeepsModeTargetIsSquare() {
+        let e = engine()
+        guard let pAspect = plan(3, 4, mode: .aspectFitInsideSquare, e) else {
+            Issue.record("nil")
+            return
+        }
+        #expect(pAspect.sourceDisplayMode == .aspectFitInsideSquare)  // L3 source not square-cropped
+        #expect(pAspect.targetDisplayMode == .squareFillCrop)  // L4 target square-only
+        guard let pSquare = plan(3, 4, mode: .squareFillCrop, e) else {
+            Issue.record("nil")
+            return
+        }
+        #expect(pSquare.sourceDisplayMode == .squareFillCrop)  // honored when the user prefers square
+        #expect(pSquare.targetDisplayMode == .squareFillCrop)
+        // L4 to L5: both sides are overview, so both square regardless of preference.
+        guard let p45 = plan(4, 5, mode: .aspectFitInsideSquare, e) else {
+            Issue.record("nil")
+            return
+        }
+        #expect(p45.sourceDisplayMode == .squareFillCrop && p45.targetDisplayMode == .squareFillCrop)
+    }
+
+    // Per-layer opacity: source fades out, target fades in, complementary at every q.
+    @Test func layerOpacityEndpointsAndComplementarity() {
+        let e = engine()
+        guard let p = plan(4, 5, e) else {
+            Issue.record("nil")
+            return
+        }
+        #expect(abs(p.withProgress(0).sourceOpacity - 1) < 1e-9)
+        #expect(abs(p.withProgress(0).targetOpacity - 0) < 1e-9)
+        #expect(abs(p.withProgress(1).sourceOpacity - 0) < 1e-9)
+        #expect(abs(p.withProgress(1).targetOpacity - 1) < 1e-9)
+        for step in 0...10 {
+            let pq = p.withProgress(Double(step) / 10)
+            #expect(abs(pq.sourceOpacity + pq.targetOpacity - 1) < 1e-9)  // a true crossfade
+        }
+    }
+
+    // The composite uses a linear blend: a * (1 - t) + b * t. It has no background term.
+    @Test func compositeMixIsLinearWithNoBackgroundBleed() {
+        // The mix is independent of any background value - it has no bg argument at all.
+        for (a, b) in [(0.8, 0.2), (0.1, 0.9), (0.5, 0.5), (1.0, 0.0)] {
+            #expect(abs(overviewDissolveMix(a, b, 0) - a) < 1e-12)
+            #expect(abs(overviewDissolveMix(a, b, 1) - b) < 1e-12)
+            #expect(abs(overviewDissolveMix(a, b, 0.5) - (a + b) / 2) < 1e-12)  // exact average at mid-fade
+            // linearity: value at t equals the straight line between endpoints
+            for step in 0...10 {
+                let t = Double(step) / 10
+                #expect(abs(overviewDissolveMix(a, b, t) - (a + (b - a) * t)) < 1e-12)
+            }
+        }
+    }
+
+    // Contrast: prove the offscreen linear mix is not the single-pass premultiplied source-over result,
+    // which darkens the mid-fade toward the background via the `(1−t)²` term.
+    @Test func midFadeHasNoQSquaredDarkeningVsSinglePass() {
+        let a = 0.8
+        let b = 0.2
+        let bg = 0.05  // bright source, dark target, dark bg (overlap region)
+        let linearMid = overviewDissolveMix(a, b, 0.5)  // 0.5 - true average
+        let bleedMid = overviewDissolveSinglePassBleed(a, b, bg, 0.5)  // 0.2·.5 + 0.8·.25 + 0.05·.25 = 0.3125
+        #expect(abs(linearMid - 0.5) < 1e-12)
+        #expect(bleedMid < linearMid - 0.1)  // the single-pass result is visibly darker
+        // the single-pass bleed depends on bg (a tell-tale of background bleed); the linear mix never does
+        #expect(overviewDissolveSinglePassBleed(a, b, 0.0, 0.5) != overviewDissolveSinglePassBleed(a, b, 0.5, 0.5))
+        #expect(overviewDissolveMix(a, b, 0.5) == overviewDissolveMix(a, b, 0.5))  // bg-independent by construction
+    }
+
+    // guard: the renderer actually uses offscreen two-layer compositing with a single linear `mix`, not a
+    // sequential source-over dissolve into one framebuffer.
+    @Test func rendererUsesOffscreenLinearComposite() {
+        let r = source("MetalGridRenderer.swift")
+        #expect(r.contains("func renderLayerDissolve"))
+        #expect(r.contains("ensureLayerTextures"))  // offscreen render targets
+        #expect(r.contains("encodeLayerPass"))  // each layer rendered to its own texture
+        #expect(r.contains("mix(a.rgb, b.rgb, t)"))  // linear composite in the shader
+        #expect(r.contains("metalGridCompositeFragment"))
+        #expect(r.contains("render(to: target, viewportSize: viewportSize, groups: targetGroups())"))
+    }
+
+    // guard: toolbar/keyboard +/- must use the same whole-grid overview dissolve as pinch at L3 and L4 / L4 and L5.
+    @Test func plusMinusOverviewBoundaryUsesLayerDissolveNotSnap() {
+        let coord = source("MetalGridCoordinator.swift")
+        let host = source("MetalGridScrollHost.swift")
+        #expect(coord.contains("func tryBeginClickOverviewDissolve"))
+        #expect(coord.contains("engine.overviewLayerDissolvePlan("))
+        #expect(coord.contains("overviewClickDissolveDuration"))
+        #expect(host.contains("tryBeginClickOverviewDissolve"))
+        #expect(host.contains("coordinator.isOverviewClickDissolving"))
+        if let overview = host.range(of: "tryBeginClickOverviewDissolve"),
+            let snap = host.range(of: "settleScrollOffsetY")
+        {
+            #expect(overview.lowerBound < snap.lowerBound, "+/- overview dissolve must run before snap settle")
+        } else {
+            Issue.record("missing +/- overview dissolve or snap fallback source")
+        }
+    }
+
+    @Test func uiKitPinchUsesSharedTransitionPresentations() {
+        // The host class spans two files: the render loop and the pinch state machine.
+        let host = source("UIKitTimelineGridHost.swift") + source("UIKitTimelineGridHostPinch.swift")
+        #expect(host.contains("GridTransitionController"))
+        #expect(host.contains("PinchLiveZoomDriver"))
+        #expect(host.contains("gridTransition.beginPinch("))
+        #expect(host.contains("renderer.renderLayerDissolve("))
+        #expect(host.contains("engine.overviewLayerDissolvePlan("))
+        #expect(host.contains("MetalGridFrameComposer.buildTransitionGroups("))
+        #expect(host.contains("commitPinchChain(toLevel:"))
+        #expect(host.contains("commitOverviewDissolve()"))
+    }
+
+    // Guard: the overview layer dissolve must not reuse the relocation lattice / transition controller.
+    @Test func dissolveModelDoesNotUseRelocationMachinery() {
+        // Scan code only - the file's prose deliberately names these to explain what it does not use.
+        let code = source("OverviewLayerDissolve.swift")
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .filter { !$0.trimmingCharacters(in: .whitespaces).hasPrefix("//") }
+            .joined(separator: "\n")
+        #expect(!code.isEmpty)
+        for forbidden in [
+            "GridTransitionComponentBuilder", "GridTransitionController", "GridTransitionPlan",
+            "GridTransitionRendererInput", "beginPinch", "beginClick",
+        ] {
+            #expect(!code.contains(forbidden), "overview layer dissolve must not reference \(forbidden)")
+        }
+    }
+
+    private func dissolveAtBottom(_ s: Int, _ t: Int, _ e: SquareTileGridEngine) -> OverviewLayerDissolvePlan? {
+        let sourceMaxY = max(0, e.contentSize(level: s, width: viewport.width).height - viewport.height)
+        return e.overviewLayerDissolvePlan(
+            from: s, to: t, viewportSize: viewport, targetViewportSize: viewport,
+            sourceScrollY: sourceMaxY, sourceColumnPhase: nil, preferredNormalMode: .aspectFitInsideSquare,
+            anchorContentPoint: CGPoint(x: viewport.width / 2, y: sourceMaxY + viewport.height / 2),
+            anchorViewportPoint: CGPoint(x: viewport.width / 2, y: viewport.height / 2), overscan: 200)
+    }
+    private func targetMaxYFor(_ t: Int, phase: Int?, _ e: SquareTileGridEngine) -> CGFloat {
+        max(0, e.contentSize(level: t, width: viewport.width, columnPhase: phase).height - viewport.height)
+    }
+
+    // A bottom-pinned source forces the target to its bottom-filled scroll.
+    @Test func bottomPinnedSourceTargetsTargetBottom() {
+        let e = engine(6000)
+        guard let p = dissolveAtBottom(3, 4, e) else {
+            Issue.record("nil")
+            return
+        }
+        let tMax = targetMaxYFor(4, phase: p.targetColumnPhase, e)
+        #expect(tMax > 0)  // target has scroll room
+        #expect(abs(p.targetScrollY - tMax) < 1e-6)  // bottom-filled, not raw anchored
+    }
+
+    // The stored target plan uses the clamped scroll that commit will use.
+    @Test func targetPlanBuiltFromCommitScroll() {
+        let e = engine(6000)
+        guard let p = dissolveAtBottom(3, 4, e) else {
+            Issue.record("nil")
+            return
+        }
+        let rebuilt = e.framePlan(
+            level: 4, viewportSize: viewport, scrollOffset: CGPoint(x: 0, y: p.targetScrollY),
+            overscan: 200, columnPhase: p.targetColumnPhase)
+        #expect(rebuilt == p.target)  // target layer == settled plan at p.targetScrollY
+    }
+
+    // Raw anchored target scroll is clamped into [0, targetMaxY].
+    @Test func rawTargetScrollIsClampedIntoBounds() {
+        let e = engine(6000)
+        // anchor + source near the top, so raw anchored target scroll ≤ 0, so clamps to 0.
+        guard
+            let top = e.overviewLayerDissolvePlan(
+                from: 3, to: 4, viewportSize: viewport, targetViewportSize: viewport,
+                sourceScrollY: 0, sourceColumnPhase: nil, preferredNormalMode: .aspectFitInsideSquare,
+                anchorContentPoint: CGPoint(x: viewport.width / 2, y: 10),
+                anchorViewportPoint: CGPoint(x: viewport.width / 2, y: 10), overscan: 200)
+        else {
+            Issue.record("nil")
+            return
+        }
+        #expect(top.targetScrollY >= 0 && top.targetScrollY <= targetMaxYFor(4, phase: top.targetColumnPhase, e) + 1e-6)
+        #expect(top.targetScrollY < 1.0)  // top anchor, so ~0
+        // invariant across mid scroll positions: always within bounds.
+        let sMax = max(0, e.contentSize(level: 3, width: viewport.width).height - viewport.height)
+        for frac in [0.25, 0.5, 0.75] {
+            let sY = sMax * CGFloat(frac)
+            guard
+                let p = e.overviewLayerDissolvePlan(
+                    from: 3, to: 4, viewportSize: viewport, targetViewportSize: viewport,
+                    sourceScrollY: sY, sourceColumnPhase: nil, preferredNormalMode: .aspectFitInsideSquare,
+                    anchorContentPoint: CGPoint(x: viewport.width / 2, y: sY + viewport.height / 2),
+                    anchorViewportPoint: CGPoint(x: viewport.width / 2, y: viewport.height / 2), overscan: 200)
+            else { continue }
+            #expect(p.targetScrollY >= 0 && p.targetScrollY <= targetMaxYFor(4, phase: p.targetColumnPhase, e) + 1e-6)
+        }
+    }
+
+    // A non-bottom-pinned mid-library anchor settles in mid-content.
+    @Test func nonBottomPinnedDoesNotSnapToBottom() {
+        let e = engine(6000)
+        let sMax = max(0, e.contentSize(level: 3, width: viewport.width).height - viewport.height)
+        let sY = sMax * 0.5
+        guard
+            let p = e.overviewLayerDissolvePlan(
+                from: 3, to: 4, viewportSize: viewport, targetViewportSize: viewport,
+                sourceScrollY: sY, sourceColumnPhase: nil, preferredNormalMode: .aspectFitInsideSquare,
+                anchorContentPoint: CGPoint(x: viewport.width / 2, y: sY + viewport.height / 2),
+                anchorViewportPoint: CGPoint(x: viewport.width / 2, y: viewport.height / 2), overscan: 200)
+        else {
+            Issue.record("nil")
+            return
+        }
+        let tMax = targetMaxYFor(4, phase: p.targetColumnPhase, e)
+        #expect(tMax > viewport.height)
+        #expect(p.targetScrollY < tMax - viewport.height)  // clearly not the bottom
+    }
+
+    // Target content shorter than the viewport settles at targetScrollY == 0.
+    // (size-based: L4 now shows ~15 columns at this width, so a smaller count is needed for a short overview.)
+    @Test func targetShorterThanViewportSettlesAtZero() {
+        let e = engine(100)
+        #expect(e.contentSize(level: 4, width: viewport.width).height < viewport.height)  // precondition
+        guard let p = dissolveAtBottom(3, 4, e) else {
+            Issue.record("nil")
+            return
+        }
+        #expect(p.targetScrollY == 0)
+    }
+
+    /// Build a dissolve for an explicit source scroll + cursor (viewport y), and return the plan alongside the
+    /// independently-recomputed cursor-anchored clamped scroll / target phase / targetMaxY for exact comparison.
+    private func dissolveAnchored(
+        _ s: Int, _ t: Int, sourceScrollY: CGFloat, anchorViewportY: CGFloat,
+        _ e: SquareTileGridEngine
+    )
+        -> (plan: OverviewLayerDissolvePlan, rawClamped: CGFloat, tphase: Int?, tMax: CGFloat)?
+    {
+        let anchorVP = CGPoint(x: viewport.width / 2, y: anchorViewportY)
+        let anchorContent = CGPoint(x: viewport.width / 2, y: sourceScrollY + anchorViewportY)
+        guard
+            let plan = e.overviewLayerDissolvePlan(
+                from: s, to: t, viewportSize: viewport, targetViewportSize: viewport, sourceScrollY: sourceScrollY,
+                sourceColumnPhase: nil, preferredNormalMode: .aspectFitInsideSquare,
+                anchorContentPoint: anchorContent, anchorViewportPoint: anchorVP, overscan: 200),
+            let a = e.anchorItem(nearContentPoint: anchorContent, level: s, width: viewport.width, columnPhase: nil)
+        else { return nil }
+        let desiredCol = e.cursorColumn(viewportX: anchorVP.x, level: t, width: viewport.width)
+        let tphase = e.columnPhase(forItem: a.flatIndex, targetColumn: desiredCol, level: t, width: viewport.width)
+        let rawY = e.anchoredScrollOffset(
+            flatIndex: a.flatIndex, localFraction: a.localFraction,
+            viewportPoint: anchorVP, level: t, width: viewport.width, columnPhase: tphase
+        ).y
+        let tMax = max(0, e.contentSize(level: t, width: viewport.width, columnPhase: tphase).height - viewport.height)
+        return (plan, min(max(0, rawY), tMax), tphase, tMax)
+    }
+
+    // Pinching in from a bottom-pinned overview uses the cursor anchor.
+    @Test func overviewPinchInUsesCursorAnchorNotBottomPin() {
+        let e = engine(6000)
+        let sMax = max(0, e.contentSize(level: 4, width: viewport.width).height - viewport.height)  // L4 bottom
+        guard let r = dissolveAnchored(4, 3, sourceScrollY: sMax, anchorViewportY: 60, e) else {
+            Issue.record("nil")
+            return
+        }
+        #expect(abs(r.plan.targetScrollY - r.rawClamped) < 1e-6)  // cursor-anchored value
+        #expect(r.plan.targetColumnPhase == r.tphase)  // phase from the cursor anchor item
+        #expect(abs(r.plan.targetScrollY - r.tMax) > viewport.height)  // the cursor anchor is not the bottom origin
+    }
+
+    // Zooming out from a bottom-pinned source remains bottom-filled.
+    @Test func overviewPinchOutFromBottomStillBottomFills() {
+        let e = engine(6000)
+        guard let p = dissolveAtBottom(3, 4, e) else {
+            Issue.record("nil")
+            return
+        }  // s=3 to t=4 = zoom out
+        #expect(abs(p.targetScrollY - targetMaxYFor(4, phase: p.targetColumnPhase, e)) < 1e-6)
+    }
+
+    // The pinch target layer uses the level, phase, and scroll that commit will adopt.
+    @Test func overviewPinchInCommitMatchesDissolveEndpoint() {
+        let e = engine(6000)
+        let sMax = max(0, e.contentSize(level: 4, width: viewport.width).height - viewport.height)
+        guard let r = dissolveAnchored(4, 3, sourceScrollY: sMax, anchorViewportY: 60, e) else {
+            Issue.record("nil")
+            return
+        }
+        let p = r.plan
+        #expect(p.targetLevel == 3 && p.sourceLevel == 4)
+        let rebuilt = e.framePlan(
+            level: 3, viewportSize: viewport, scrollOffset: CGPoint(x: 0, y: p.targetScrollY),
+            overscan: 200, columnPhase: p.targetColumnPhase)
+        #expect(rebuilt == p.target)
+    }
+
+    // Pinching in clamps only when the cursor-anchored scroll exceeds bounds.
+    @Test func overviewPinchInClampsOnlyWhenAnchorExceedsBounds() {
+        let e = engine(6000)
+        // (a) in-bounds mid anchor, so stays strictly interior (no clamp at either bound), == raw.
+        let sMaxL4 = max(0, e.contentSize(level: 4, width: viewport.width).height - viewport.height)
+        guard let mid = dissolveAnchored(4, 3, sourceScrollY: sMaxL4 * 0.5, anchorViewportY: viewport.height / 2, e)
+        else {
+            Issue.record("nil mid")
+            return
+        }
+        #expect(mid.plan.targetScrollY > 1 && mid.plan.targetScrollY < mid.tMax - 1)  // interior, so unclamped
+        #expect(abs(mid.plan.targetScrollY - mid.rawClamped) < 1e-6)
+
+        // (b) anchor the last item with the cursor near the top, so raw target scroll > targetMaxY, so clamp (L5 to L4).
+        guard let lastRect = e.slotRect(flatIndex: 5999, level: 5, width: viewport.width) else {
+            Issue.record("no rect")
+            return
+        }
+        let sMaxL5 = max(0, e.contentSize(level: 5, width: viewport.width).height - viewport.height)
+        guard
+            let p = e.overviewLayerDissolvePlan(
+                from: 5, to: 4, viewportSize: viewport, targetViewportSize: viewport, sourceScrollY: sMaxL5 * 0.5,
+                sourceColumnPhase: nil, preferredNormalMode: .aspectFitInsideSquare,
+                anchorContentPoint: CGPoint(x: lastRect.midX, y: lastRect.midY),
+                anchorViewportPoint: CGPoint(x: lastRect.midX, y: 30), overscan: 200)
+        else {
+            Issue.record("nil last")
+            return
+        }
+        let tMax = max(
+            0, e.contentSize(level: 4, width: viewport.width, columnPhase: p.targetColumnPhase).height - viewport.height
+        )
+        #expect(abs(p.targetScrollY - tMax) < 1e-6)  // clamped to the bound because the anchor exceeded it
+    }
+
+    // A mid-library pinch-in still anchors to the cursor.
+    @Test func nonBottomPinchInStaysAnchored() {
+        let e = engine(6000)
+        let sMaxL4 = max(0, e.contentSize(level: 4, width: viewport.width).height - viewport.height)
+        guard let r = dissolveAnchored(4, 3, sourceScrollY: sMaxL4 * 0.4, anchorViewportY: viewport.height / 2, e)
+        else {
+            Issue.record("nil")
+            return
+        }
+        #expect(abs(r.plan.targetScrollY - r.rawClamped) < 1e-6)
+    }
+}

@@ -1,0 +1,119 @@
+import DesignSystemCore
+import PhotosCore
+import SwiftUI
+import TimelineCore
+import UIKit
+
+/// iOS hosts the shared loading cover and supplies only UIKit's native material surface.
+struct MobileLibraryLoadingView: View {
+    let isPresented: Bool
+    let accessibilityLabel: String
+    let activityMessage: String
+    let activityState: LibraryActivityBannerState
+
+    init(
+        isPresented: Bool,
+        accessibilityLabel: String = String(localized: "loading.library_title"),
+        activityMessage: String,
+        activityState: LibraryActivityBannerState
+    ) {
+        self.isPresented = isPresented
+        self.accessibilityLabel = accessibilityLabel
+        self.activityMessage = activityMessage
+        self.activityState = activityState
+    }
+
+    var body: some View {
+        LibraryLoadingCover(
+            isPresented: isPresented,
+            accessibilityLabel: accessibilityLabel,
+            activityMessage: activityMessage,
+            activityState: activityState
+        ) { isActive in
+            MobileFrostedBackdrop(isActive: isActive)
+        }
+    }
+}
+
+/// UIKit-only platform adapter. The effect itself animates between material and nil at alpha 1, avoiding
+/// the offscreen-composition and visual artifacts caused by fading a `UIVisualEffectView` or its parent.
+struct MobileFrostedBackdrop: UIViewRepresentable {
+    let isActive: Bool
+
+    func makeUIView(context: Context) -> MobileFrostedBackdropView {
+        MobileFrostedBackdropView(isActive: isActive)
+    }
+
+    func updateUIView(_ view: MobileFrostedBackdropView, context: Context) {
+        view.setActive(isActive, animated: !context.environment.accessibilityReduceMotion)
+    }
+}
+
+final class MobileFrostedBackdropView: UIVisualEffectView {
+    private var active: Bool
+
+    init(isActive: Bool) {
+        active = isActive
+        super.init(effect: isActive ? UIBlurEffect(style: .systemUltraThinMaterial) : nil)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { nil }
+
+    func setActive(_ isActive: Bool, animated: Bool) {
+        guard active != isActive else { return }
+        active = isActive
+        let changes: () -> Void = { [weak self] in
+            guard let self else { return }
+            self.effect = isActive ? UIBlurEffect(style: .systemUltraThinMaterial) : nil
+        }
+        guard animated else {
+            changes()
+            return
+        }
+        UIView.animate(
+            withDuration: LibraryLoadingCoverMetrics.fadeDuration,
+            delay: 0,
+            options: [.allowUserInteraction, .beginFromCurrentState, .curveEaseInOut],
+            animations: changes
+        )
+    }
+}
+
+/// Shown only when the library truly holds no photos - the one case where a blank grid is acceptable.
+struct MobileEmptyLibraryView: View {
+    var body: some View {
+        let copy = PhotoFilter.all.emptyStateCopy
+        ContentUnavailableView {
+            Label {
+                Text(copy.title)
+            } icon: {
+                MemoriesBrandMark(height: 40)
+                    .accessibilityLabel(ProductBrand.displayName)
+            }
+        } description: {
+            Text(copy.description)
+        }
+    }
+}
+
+/// Shown when the first load fails; offers a retry when the failure is retryable.
+struct MobileLibraryErrorView: View {
+    let message: String
+    let retryable: Bool
+    let onRetry: () -> Void
+
+    var body: some View {
+        ContentUnavailableView {
+            Label("error.library_load_failed", systemImage: "exclamationmark.icloud")
+        } description: {
+            Text(message)
+        } actions: {
+            if retryable {
+                Button(String(localized: "action.try_again"), action: onRetry)
+                    .buttonStyle(.borderedProminent)
+                    .tint(ProtonColor.primary)
+            }
+        }
+    }
+}
