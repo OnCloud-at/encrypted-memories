@@ -24,6 +24,8 @@
 	<string>$(ENCRYPTED_MEMORIES_BUILD_COMMIT)</string>
 	<key>LSApplicationCategoryType</key>
 	<string>public.app-category.photography</string>
+	<key>ITSAppUsesNonExemptEncryption</key>
+	<false/>
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>Encrypted Memories backs up the photos and videos in your library to Proton Drive, end-to-end encrypted. Access is requested only when you turn backup on.</string>
 	<key>BGTaskSchedulerPermittedIdentifiers</key>

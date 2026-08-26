@@ -172,6 +172,17 @@ final class ProjectHygieneTests: XCTestCase {
             "The private marketing UI test target must not be present in the public project"
         )
 
+        let macTarget = targetBlock(named: "EncryptedMemories", in: project)
+        XCTAssertTrue(macTarget.contains("INFOPLIST_KEY_ITSAppUsesNonExemptEncryption: NO"))
+
+        let mobileInfoData = try Data(
+            contentsOf: repoRoot.appendingPathComponent("iOSApp/Info.plist")
+        )
+        let mobileInfo = try XCTUnwrap(
+            PropertyListSerialization.propertyList(from: mobileInfoData, format: nil) as? [String: Any]
+        )
+        XCTAssertEqual(mobileInfo["ITSAppUsesNonExemptEncryption"] as? Bool, false)
+
         let rebuild = try String(
             contentsOf: repoRoot.appendingPathComponent("scripts/rebuild.sh"),
             encoding: .utf8
@@ -200,6 +211,12 @@ final class ProjectHygieneTests: XCTestCase {
             postClone.contains(
                 "cmp EncryptedMemories.xcworkspace/xcshareddata/swiftpm/Package.resolved XcodeCloud/Package.resolved"
             ))
+
+        let buildPaths = try String(
+            contentsOf: repoRoot.appendingPathComponent("scripts/build-paths.sh"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(buildPaths.contains("local sdk_lock=\"$canonical_lock\""))
 
         for path in [
             ".github/workflows/apple-release.yml",

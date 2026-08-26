@@ -100,6 +100,7 @@ targets:
         INFOPLIST_KEY_NSPrincipalClass: NSApplication
         INFOPLIST_KEY_NSHumanReadableCopyright: "© 2026 Encrypted Memories contributors"
         INFOPLIST_KEY_NSPhotoLibraryUsageDescription: "Encrypted Memories backs up the photos and videos in your Photos library to Proton Drive, end-to-end encrypted."
+        INFOPLIST_KEY_ITSAppUsesNonExemptEncryption: NO
         CODE_SIGN_ENTITLEMENTS: App/EncryptedMemories.entitlements
         CODE_SIGN_STYLE: Automatic
         ENABLE_HARDENED_RUNTIME: YES
