@@ -207,8 +207,53 @@ final class ProjectHygieneTests: XCTestCase {
         XCTAssertTrue(internalWorkflow.contains("environment: testflight-internal"))
         XCTAssertTrue(internalWorkflow.contains("api_platform: IOS"))
         XCTAssertTrue(internalWorkflow.contains("api_platform: MAC_OS"))
-        XCTAssertTrue(internalWorkflow.contains("archive_and_upload.sh"))
+        XCTAssertTrue(internalWorkflow.contains("Apple-Actions/import-codesign-certs@"))
+        XCTAssertTrue(internalWorkflow.contains("Import certificates with pinned community action"))
+        XCTAssertTrue(internalWorkflow.contains("keychain: encrypted_memories_signing"))
+        XCTAssertTrue(internalWorkflow.contains("p12-filepath: ${{ runner.temp }}/apple-signing-certificates.p12"))
+        XCTAssertFalse(internalWorkflow.contains("p12-file-base64:"))
+        XCTAssertTrue(internalWorkflow.contains("security find-identity -v encrypted_memories_signing.keychain"))
+        XCTAssertTrue(internalWorkflow.contains("fastlane sigh"))
+        XCTAssertTrue(internalWorkflow.contains("--force"))
+        XCTAssertTrue(internalWorkflow.contains("FASTLANE_VERSION: \"2.237.0\""))
+        XCTAssertTrue(internalWorkflow.contains("xcrun xcodebuild archive"))
+        XCTAssertTrue(internalWorkflow.contains("xcrun xcodebuild -exportArchive"))
+        XCTAssertTrue(internalWorkflow.contains("xcrun altool --upload-package"))
+        XCTAssertTrue(internalWorkflow.contains("validate_apple_distribution.sh"))
+        XCTAssertTrue(internalWorkflow.contains("ENCRYPTED_MEMORIES_PROVISIONING_PROFILE_SPECIFIER"))
+        XCTAssertTrue(internalWorkflow.contains("installerSigningCertificate"))
+        XCTAssertTrue(internalWorkflow.contains("steps.signing-identities.outputs.installer_sha1"))
+        XCTAssertTrue(
+            internalWorkflow.contains(
+                "DeveloperCertificates.$profile_certificate_count"
+            )
+        )
+        XCTAssertTrue(internalWorkflow.contains("profile_certificate_sha1"))
+        XCTAssertTrue(internalWorkflow.contains("Print :Entitlements:$PROFILE_APP_IDENTIFIER_KEY"))
+        XCTAssertTrue(internalWorkflow.contains("rm -f \"$RUNNER_TEMP/apple-signing-certificates.p12\""))
+        XCTAssertFalse(internalWorkflow.contains("3rd Party Mac Developer Installer\""))
+        XCTAssertFalse(internalWorkflow.contains("xcbeautify"))
+        XCTAssertTrue(internalWorkflow.contains("secrets.APP_STORE_CONNECT_PRIVATE_KEY_BASE64"))
+        XCTAssertFalse(internalWorkflow.contains("secrets.APP_STORE_CONNECT_PRIVATE_KEY }}"))
+        XCTAssertFalse(internalWorkflow.contains("-allowProvisioningUpdates"))
         XCTAssertTrue(internalWorkflow.contains("distribute-internal"))
+
+        let project = try String(
+            contentsOf: repoRoot.appendingPathComponent("project.yml"),
+            encoding: .utf8
+        )
+        XCTAssertEqual(
+            project.components(
+                separatedBy: "CODE_SIGN_STYLE: $(ENCRYPTED_MEMORIES_CODE_SIGN_STYLE)"
+            ).count - 1,
+            2
+        )
+        XCTAssertEqual(
+            project.components(
+                separatedBy: "PROVISIONING_PROFILE_SPECIFIER: $(ENCRYPTED_MEMORIES_PROVISIONING_PROFILE_SPECIFIER)"
+            ).count - 1,
+            2
+        )
 
         let externalWorkflow = try String(
             contentsOf: repoRoot.appendingPathComponent(".github/workflows/testflight-external.yml"),
@@ -232,19 +277,23 @@ final class ProjectHygieneTests: XCTestCase {
         XCTAssertTrue(publishWorkflow.contains("environment: app-store-production"))
         XCTAssertTrue(publishWorkflow.contains("release-app-store"))
 
-        let archiveScript = try String(
-            contentsOf: repoRoot.appendingPathComponent(".github/scripts/archive_and_upload.sh"),
+        let validationScript = try String(
+            contentsOf: repoRoot.appendingPathComponent(".github/scripts/validate_apple_distribution.sh"),
             encoding: .utf8
         )
-        XCTAssertTrue(archiveScript.contains("xcodebuild archive"))
-        XCTAssertTrue(archiveScript.contains("xcodebuild -exportArchive"))
-        XCTAssertTrue(archiveScript.contains("-disableAutomaticPackageResolution"))
-        XCTAssertTrue(archiveScript.contains("<string>app-store-connect</string>"))
-        XCTAssertTrue(archiveScript.contains("<string>export</string>"))
-        XCTAssertTrue(archiveScript.contains("xcrun altool --upload-package"))
-        XCTAssertTrue(archiveScript.contains("pkgutil --check-signature"))
-        XCTAssertTrue(archiveScript.contains("scheme=\"EncryptedMemoriesMobile\""))
-        XCTAssertTrue(archiveScript.contains("scheme=\"EncryptedMemories\""))
+        XCTAssertTrue(validationScript.contains("pkgutil --check-signature"))
+        XCTAssertTrue(validationScript.contains("Authority=Apple Distribution:"))
+        XCTAssertTrue(validationScript.contains("expected_profile_name"))
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: repoRoot.appendingPathComponent(".github/scripts/archive_and_upload.sh").path
+            )
+        )
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: repoRoot.appendingPathComponent(".github/scripts/install_apple_signing.sh").path
+            )
+        )
 
         let connectScript = try String(
             contentsOf: repoRoot.appendingPathComponent(".github/scripts/app_store_connect.rb"),

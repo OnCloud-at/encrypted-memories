@@ -18,6 +18,10 @@ settings:
     ENABLE_HARDENED_RUNTIME: YES
     # App integration uses SDK types without Sendable annotations.
     SWIFT_STRICT_CONCURRENCY: minimal
+    # Release automation overrides these target-scoped values without signing package targets.
+    ENCRYPTED_MEMORIES_CODE_SIGN_STYLE: Automatic
+    ENCRYPTED_MEMORIES_CODE_SIGN_IDENTITY: Apple Development
+    ENCRYPTED_MEMORIES_PROVISIONING_PROFILE_SPECIFIER: ""
 
 packages:
   ProtonDriveSDK:
@@ -101,13 +105,17 @@ targets:
         INFOPLIST_KEY_NSPhotoLibraryUsageDescription: "Encrypted Memories backs up the photos and videos in your Photos library to Proton Drive, end-to-end encrypted."
         INFOPLIST_KEY_ITSAppUsesNonExemptEncryption: NO
         CODE_SIGN_ENTITLEMENTS: App/EncryptedMemories.entitlements
-        CODE_SIGN_STYLE: Automatic
         ENABLE_HARDENED_RUNTIME: YES
         OTHER_CODE_SIGN_FLAGS: "--options runtime"
         # The vendored SDK stores its bootstrapper objects in this local Resources path.
         LIBRARY_SEARCH_PATHS:
           - $(inherited)
           - $(SRCROOT)/Vendor/sdk-swift/Resources
+      configs:
+        Release:
+          CODE_SIGN_STYLE: $(ENCRYPTED_MEMORIES_CODE_SIGN_STYLE)
+          CODE_SIGN_IDENTITY: $(ENCRYPTED_MEMORIES_CODE_SIGN_IDENTITY)
+          PROVISIONING_PROFILE_SPECIFIER: $(ENCRYPTED_MEMORIES_PROVISIONING_PROFILE_SPECIFIER)
 
   EncryptedMemoriesMobile:
     type: application
@@ -190,7 +198,6 @@ targets:
         SUPPORTS_MACCATALYST: NO
         SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD: NO
         SUPPORTS_XR_DESIGNED_FOR_IPHONE_IPAD: NO
-        CODE_SIGN_STYLE: Automatic
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         # Link one platform-specific SDK bootstrapper at the final iOS app target.
         LIBRARY_SEARCH_PATHS:
@@ -205,6 +212,11 @@ targets:
         OTHER_LDFLAGS[sdk=iphoneos*]:
           - $(inherited)
           - -llibbootstrapperdll.ios-arm64.o
+      configs:
+        Release:
+          CODE_SIGN_STYLE: $(ENCRYPTED_MEMORIES_CODE_SIGN_STYLE)
+          CODE_SIGN_IDENTITY: $(ENCRYPTED_MEMORIES_CODE_SIGN_IDENTITY)
+          PROVISIONING_PROFILE_SPECIFIER: $(ENCRYPTED_MEMORIES_PROVISIONING_PROFILE_SPECIFIER)
 
   EncryptedMemoriesMobileTests:
     type: bundle.unit-test
