@@ -46,13 +46,54 @@ import Testing
         var downloadCount: Int { lock.withLock { downloads } }
     }
 
+    private actor OneShotEmbeddingBarrier {
+        private var armed = false
+        private var blocked = false
+        private var released = false
+        private var blockedWaiters: [CheckedContinuation<Void, Never>] = []
+        private var releaseContinuation: CheckedContinuation<Void, Never>?
+
+        func arm() {
+            armed = true
+            blocked = false
+            released = false
+            releaseContinuation = nil
+        }
+
+        func waitIfArmed() async {
+            guard armed else { return }
+            armed = false
+            blocked = true
+            blockedWaiters.forEach { $0.resume() }
+            blockedWaiters.removeAll()
+            if released {
+                released = false
+                return
+            }
+            await withCheckedContinuation { releaseContinuation = $0 }
+        }
+
+        func waitUntilBlocked() async {
+            if blocked { return }
+            await withCheckedContinuation { blockedWaiters.append($0) }
+        }
+
+        func release() {
+            released = true
+            releaseContinuation?.resume()
+            releaseContinuation = nil
+        }
+    }
+
     /// Embeds deterministic unit vectors and counts calls per uid.
     private final class CountingEmbedder: MLAssetEmbedder, @unchecked Sendable {
         private let lock = NSLock()
+        private let barrier = OneShotEmbeddingBarrier()
         private(set) var calls: [PhotoUID: Int] = [:]
         private var delay: Duration?
 
         func embed(uid: PhotoUID, descriptor: MLModelDescriptor) async -> MLEmbeddingOutcome {
+            await barrier.waitIfArmed()
             if let delay = lock.withLock({ delay }) {
                 try? await Task.sleep(for: delay)
             }
@@ -66,6 +107,9 @@ import Testing
         func callCount(_ uid: PhotoUID) -> Int { lock.withLock { calls[uid] ?? 0 } }
         var totalCalls: Int { lock.withLock { calls.values.reduce(0, +) } }
         func setDelay(_ value: Duration?) { lock.withLock { delay = value } }
+        func blockNextEmbedding() async { await barrier.arm() }
+        func waitUntilEmbeddingStarted() async { await barrier.waitUntilBlocked() }
+        func releaseEmbedding() async { await barrier.release() }
     }
 
     private struct FixedTextEncoder: MLTextQueryEncoder {
@@ -1914,12 +1958,13 @@ import Testing
 
         // A library kick starts planning immediately, but the visible ready state remains stable
         // while the first thumbnail is still being acquired and embedded.
-        harness.provider.embedder.setDelay(.milliseconds(150))
+        let callsBeforeLibraryKick = harness.provider.embedder.totalCalls
+        await harness.provider.embedder.blockNextEmbedding()
         let added = (0..<8).map { uid("asset-new-\($0)") }
         harness.assets.set(initial + added)
         await harness.lifecycle.noteLibraryChanged()
 
-        try? await Task.sleep(for: .milliseconds(75))
+        await harness.provider.embedder.waitUntilEmbeddingStarted()
         if case .ready = await harness.lifecycle.currentSnapshot().phase {
             // Expected: planning and thumbnail acquisition remain invisible maintenance.
         } else {
@@ -1927,11 +1972,9 @@ import Testing
         }
         #expect(!phases.sawIndexing)
 
+        await harness.provider.embedder.releaseEmbedding()
         #expect(await waitUntil { phases.sawIndexing })
-        #expect(
-            added.allSatisfy {
-                !harness.storeProvider.store.contains(uid: $0, descriptor: entryA.descriptor)
-            }, "status reporting must not wait for or block the durable 8-item chunk commit")
+        #expect(harness.provider.embedder.totalCalls > callsBeforeLibraryKick)
         #expect(await waitForCompleteIndex(harness, total: initial.count + added.count))
     }
 

@@ -99,9 +99,31 @@ jobs:
             echo "- Commit: $GITHUB_SHA"
           } >> "$GITHUB_STEP_SUMMARY"
 
+  in-app-purchase-preflight:
+    name: Validate StoreKit sandbox metadata
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: testflight-internal
+    steps:
+      - name: Check out release contract
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Validate App Store Connect products
+        env:
+          APP_STORE_CONNECT_APP_ID: ${{ vars.APP_STORE_CONNECT_APP_ID }}
+          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          APP_STORE_CONNECT_PRIVATE_KEY_BASE64: ${{ secrets.APP_STORE_CONNECT_PRIVATE_KEY_BASE64 }}
+        run: |
+          set -euo pipefail
+          ruby .github/scripts/app_store_connect.rb validate-sandbox-in-app-purchases
+
   upload:
     name: Upload ${{ matrix.platform }}
-    needs: prepare
+    needs: [prepare, in-app-purchase-preflight]
     runs-on: macos-26
     timeout-minutes: 60
     environment: testflight-internal

@@ -34,7 +34,6 @@ packages:
     exactVersion: 37.3.0
 
 fileGroups:
-  - StoreKit
   - TestFlight
 
 targets:
@@ -242,7 +241,6 @@ schemes:
         EncryptedMemories: all
     run:
       config: Debug
-      storeKitConfiguration: StoreKit/EncryptedMemories.storekit
 
   EncryptedMemoriesMobile:
     build:
@@ -250,7 +248,6 @@ schemes:
         EncryptedMemoriesMobile: all
     run:
       config: Debug
-      storeKitConfiguration: StoreKit/EncryptedMemories.storekit
 
   EncryptedMemoriesMobileTests:
     build:

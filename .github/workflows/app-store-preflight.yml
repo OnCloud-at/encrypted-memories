@@ -1,0 +1,59 @@
+name: Apple App Store preflight
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: Check the four consumable tips in App Store Connect
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: apple-distribution
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    name: Validate App Store Connect metadata
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: app-store-production
+    steps:
+      - name: Validate request
+        env:
+          CONFIRMED: ${{ inputs.confirm }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REF" == "refs/heads/main" ]] || {
+            echo "Select main when starting this workflow." >&2
+            exit 1
+          }
+          [[ "$CONFIRMED" == "true" ]] || {
+            echo "Confirm the App Store Connect preflight." >&2
+            exit 1
+          }
+
+      - name: Check out release contract
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Validate release client
+        run: |
+          set -euo pipefail
+          ruby -c .github/scripts/app_store_connect.rb
+          ruby .github/scripts/test_app_store_connect.rb
+
+      - name: Validate consumable tips
+        env:
+          APP_STORE_CONNECT_APP_ID: ${{ vars.APP_STORE_CONNECT_APP_ID }}
+          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          APP_STORE_CONNECT_PRIVATE_KEY_BASE64: ${{ secrets.APP_STORE_CONNECT_PRIVATE_KEY_BASE64 }}
+        run: |
+          set -euo pipefail
+          ruby .github/scripts/app_store_connect.rb validate-in-app-purchases

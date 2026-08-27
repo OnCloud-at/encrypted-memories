@@ -13,14 +13,9 @@ on:
         required: true
         type: string
       submit_for_review:
-        description: Submit after attaching both builds
+        description: Submit after attaching both builds, only after Apple approved the first consumable tips
         required: true
         default: false
-        type: boolean
-      first_release_with_in_app_purchases:
-        description: Keep enabled until Apple approves the first app and tip products
-        required: true
-        default: true
         type: boolean
       confirm:
         description: Type RELEASE to change the production App Store version
@@ -44,8 +39,6 @@ jobs:
       - name: Validate request
         env:
           CONFIRMATION: ${{ inputs.confirm }}
-          SUBMIT_FOR_REVIEW: ${{ inputs.submit_for_review }}
-          FIRST_RELEASE_WITH_IAP: ${{ inputs.first_release_with_in_app_purchases }}
         run: |
           set -euo pipefail
           [[ "$GITHUB_REF" == "refs/heads/main" ]] || {
@@ -56,11 +49,6 @@ jobs:
             echo "Type RELEASE to confirm this production change." >&2
             exit 1
           }
-          if [[ "$SUBMIT_FOR_REVIEW" == "true" && "$FIRST_RELEASE_WITH_IAP" == "true" ]]; then
-            echo "Apple requires the first in-app purchases to be submitted with the app in App Store Connect." >&2
-            echo "Run without review submission, attach the tip products in App Store Connect, then submit there." >&2
-            exit 1
-          fi
 
       - name: Check out workflow code
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0

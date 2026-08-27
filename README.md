@@ -164,10 +164,11 @@ canonical root and detect ad-hoc Proton build trees under `/private/tmp`.
 
 ## Apple Releases
 
-GitHub Actions owns Apple distribution through four manual workflows:
+GitHub Actions owns Apple distribution through five manual workflows:
 
 - `Apple TestFlight internal` builds, signs, uploads, and assigns the iOS and native macOS apps.
 - `Apple TestFlight external` promotes an existing processed build to external testing.
+- `Apple App Store preflight` checks all four consumable tips and their review metadata without rebuilding.
 - `Apple App Store submission` attaches existing builds and can submit each platform for review.
 - `Apple App Store publish` releases both approved platforms when manual release is selected.
 
@@ -186,8 +187,29 @@ secrets. The internal workflow also needs one Base64-encoded PKCS#12 archive and
 must contain the Apple Distribution and Mac Installer Distribution identities.
 
 Use the `testflight-internal`, `testflight-external`, and `app-store-production` environments. Restrict each
-environment to `main`. Require an approval for external testing and production. The first app release with
-in-app purchases must still be submitted in App Store Connect after the tip products are attached.
+environment to `main`. Require an approval for external testing and production.
+
+The internal TestFlight workflow validates the four consumable tips before it starts a macOS runner. This sandbox
+preflight checks the App Store Connect bundle ID, exact product IDs, product type, current metadata version, active
+prices, availability in Austria and the United States, and English and German metadata against
+`.github/app-store-connect/in-app-purchases.json`. Apple does not expose Paid Apps Agreement, banking, or tax status
+through this API. Those three items must be `Active` in App Store Connect.
+
+The external TestFlight workflow uses the same sandbox preflight. The App Store preflight adds the review-only checks
+for review notes and completely processed screenshots. For the first submission, add the iOS version and all four
+tips to one iOS submission in App Store Connect. Submit the macOS version separately. Apple does not support the first
+in-app purchase submission through the review-submission API. The submission workflow refuses automatic review
+submission until App Store Connect reports every tip as approved.
+
+External TestFlight and App Review also require a working reviewer account because the photo library is available only
+after Proton sign-in. Store the reviewer username, password, contact information, and review notes only in App Store
+Connect. The App Store submission workflow confirms that these fields exist without printing their values. Keep the
+account active, give it enough sample data to exercise the submitted features, and document any verification steps in
+the review notes.
+
+Debug, TestFlight, and App Store builds all load products from App Store Connect. The repository does not contain
+a local StoreKit product catalog. TestFlight runs purchases in Apple's sandbox automatically, so use the processed
+TestFlight build to verify the same product data and purchase sheet that App Review receives.
 
 Keep the iPhone and iPad app unavailable on Apple Silicon Mac in App Store Connect. The native macOS archive
 uses the `EncryptedMemories` scheme. The TestFlight workflows also disable mobile builds on Mac for their groups.
