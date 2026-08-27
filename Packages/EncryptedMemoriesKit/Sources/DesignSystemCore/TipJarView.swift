@@ -1,4 +1,5 @@
 import Foundation
+import OSLog
 import PhotosCore
 import StoreKit
 import SwiftUI
@@ -59,11 +60,21 @@ public struct TipJarView: View {
         do {
             let loaded = try await Product.products(for: productIdentifiers)
             let productsByID = Dictionary(uniqueKeysWithValues: loaded.map { ($0.id, $0) })
+            let missingProductIdentifiers = productIdentifiers.filter { productsByID[$0] == nil }
+            guard missingProductIdentifiers.isEmpty else {
+                Self.logger.error(
+                    "StoreKit did not return configured products: \(missingProductIdentifiers.joined(separator: ", "), privacy: .public)"
+                )
+                products = []
+                productLoadState = .unavailable
+                return
+            }
             products = productIdentifiers.compactMap { productsByID[$0] }
-            productLoadState = products.isEmpty ? .unavailable : .loaded
+            productLoadState = .loaded
         } catch is CancellationError {
             return
         } catch {
+            Self.logger.error("StoreKit product request failed: \(String(describing: error), privacy: .public)")
             products = []
             productLoadState = .unavailable
         }
@@ -77,6 +88,7 @@ public struct TipJarView: View {
     }
 
     private static let fallbackBundleIdentifier = "at.oncloud.encryptedmemories"
+    private static let logger = Logger(subsystem: fallbackBundleIdentifier, category: "StoreKit")
 
     private enum ProductLoadState {
         case loading

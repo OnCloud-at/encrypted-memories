@@ -2,6 +2,7 @@
 # frozen_string_literal: true
 
 require "base64"
+require "date"
 require "json"
 require "net/http"
 require "openssl"
@@ -10,6 +11,16 @@ require "uri"
 
 module AppStoreConnect
   API_ROOT = "https://api.appstoreconnect.apple.com"
+  IN_APP_PURCHASE_CONTRACT_PATH = File.expand_path(
+    "../app-store-connect/in-app-purchases.json",
+    __dir__
+  ).freeze
+  IN_APP_PURCHASE_ACTIVE_VERSION_STATES = %w[
+    PREPARE_FOR_SUBMISSION READY_FOR_REVIEW WAITING_FOR_REVIEW IN_REVIEW ACCEPTED APPROVED
+  ].freeze
+  IN_APP_PURCHASE_SANDBOX_PRODUCT_STATES = %w[
+    READY_TO_SUBMIT WAITING_FOR_REVIEW IN_REVIEW PENDING_BINARY_APPROVAL APPROVED
+  ].freeze
   PLATFORMS = %w[IOS MAC_OS].freeze
   REVIEWED_BUILD_STATES = %w[WAITING_FOR_REVIEW IN_REVIEW APPROVED].freeze
   SUBMITTED_VERSION_STATES = %w[
@@ -261,6 +272,7 @@ module AppStoreConnect
       app_id:,
       output_path: ENV["GITHUB_OUTPUT"],
       summary_path: ENV["GITHUB_STEP_SUMMARY"],
+      in_app_purchase_contract_path: IN_APP_PURCHASE_CONTRACT_PATH,
       sleeper: ->(seconds) { sleep(seconds) },
       release_reconciliation_attempts: 30,
       release_reconciliation_delay: 10
@@ -269,6 +281,7 @@ module AppStoreConnect
       @app_id = app_id
       @output_path = output_path
       @summary_path = summary_path
+      @in_app_purchase_contract_path = in_app_purchase_contract_path
       @sleeper = sleeper
       @release_reconciliation_attempts = release_reconciliation_attempts
       @release_reconciliation_delay = release_reconciliation_delay
@@ -323,6 +336,7 @@ module AppStoreConnect
 
     def distribute_external(version:, build_number:, group_name:, localization_paths:)
       builds = require_valid_builds(version: version, build_number: build_number)
+      validate_in_app_purchase_sandbox
       validate_beta_app_localizations
       validate_beta_review_details
       unless beta_groups.any? { |group| group.dig("attributes", "isInternalGroup") == true }
@@ -341,10 +355,12 @@ module AppStoreConnect
 
     def prepare_app_store(version:, build_number:, submit: false)
       builds = require_valid_builds(version: version, build_number: build_number)
+      validate_in_app_purchases(require_approved_products: submit)
       versions = PLATFORMS.to_h do |platform|
         app_store_version = require_app_store_version(platform: platform, version: version)
         [platform, app_store_version]
       end
+      validate_app_store_review_details(versions)
       states = versions.transform_values { |item| version_state(item) }
       invalid = states.reject do |_platform, state|
         SUBMITTED_VERSION_STATES.include?(state) || %w[PREPARE_FOR_SUBMISSION READY_FOR_REVIEW].include?(state)
@@ -388,6 +404,25 @@ module AppStoreConnect
       append_summary("Submitted both #{version} (#{build_number}) app versions to App Review.")
     end
 
+    def validate_in_app_purchase_sandbox
+      validate_in_app_purchase_contract(require_review_metadata: false)
+      append_summary("All four consumable tips have sandbox-ready App Store Connect metadata.")
+      true
+    rescue Errno::ENOENT, JSON::ParserError, KeyError => error
+      raise Error, "Invalid in-app purchase contract: #{error.message}"
+    end
+
+    def validate_in_app_purchases(require_approved_products: false)
+      validate_in_app_purchase_contract(
+        require_review_metadata: true,
+        require_approved_products: require_approved_products
+      )
+      append_summary("All four consumable tips match the App Store Connect review contract.")
+      true
+    rescue Errno::ENOENT, JSON::ParserError, KeyError => error
+      raise Error, "Invalid in-app purchase contract: #{error.message}"
+    end
+
     def release_app_store(version:, permit_requests: true)
       versions = PLATFORMS.to_h do |platform|
         [platform, require_app_store_version(platform: platform, version: version)]
@@ -397,9 +432,9 @@ module AppStoreConnect
       end
       unless non_manual.empty?
         types = non_manual.map do |platform, item|
-          "#{platform}=#{item.dig("attributes", "releaseType") || "UNKNOWN"}"
+          "#{platform}=#{item.dig('attributes', 'releaseType') || 'UNKNOWN'}"
         end
-        raise Error, "App versions must use manual release: #{types.join(", ")}"
+        raise Error, "App versions must use manual release: #{types.join(', ')}"
       end
 
       releasable = versions.select do |_platform, app_store_version|
@@ -415,7 +450,7 @@ module AppStoreConnect
       end
       unless complete.empty?
         states = complete.map { |platform, item| "#{platform}=#{version_state(item)}" }
-        raise Error, "App versions are not ready for manual release: #{states.join(", ")}"
+        raise Error, "App versions are not ready for manual release: #{states.join(', ')}"
       end
 
       if !permit_requests && !releasable.empty?
@@ -448,6 +483,227 @@ module AppStoreConnect
     end
 
     private
+
+    def validate_in_app_purchase_contract(require_review_metadata:, require_approved_products: false)
+      contract = JSON.parse(File.read(@in_app_purchase_contract_path, encoding: "UTF-8"))
+      expected_products = contract.fetch("products")
+      expected_review_note = normalized_text(contract.fetch("reviewNote"))
+      required_territories = contract.fetch("requiredTerritories")
+      errors = []
+      validate_in_app_purchase_bundle_identifier(contract.fetch("bundleIdentifier"), errors)
+      products = @client.collection(
+        "/v1/apps/#{@app_id}/inAppPurchasesV2",
+        query: {
+          "fields[inAppPurchases]" => "name,productId,inAppPurchaseType,state,reviewNote",
+          "limit" => "200"
+        }
+      )
+      products_by_id = products.group_by { |product| product.dig("attributes", "productId") }
+
+      expected_products.each do |expected|
+        product_id = expected.fetch("productId")
+        matches = products_by_id.fetch(product_id, [])
+        if matches.empty?
+          errors << "#{product_id} is missing"
+          next
+        end
+        if matches.length > 1
+          errors << "#{product_id} exists more than once"
+          next
+        end
+
+        product = matches.first
+        attributes = product.fetch("attributes")
+        errors << "#{product_id} has reference name #{attributes['name'].inspect}" unless
+          attributes["name"] == expected.fetch("referenceName")
+        errors << "#{product_id} has type #{attributes['inAppPurchaseType'].inspect}" unless
+          attributes["inAppPurchaseType"] == expected.fetch("type")
+        product_state = attributes["state"]
+        if require_approved_products && product_state != "APPROVED"
+          errors << "#{product_id} has product state #{product_state.inspect}; " \
+                    "automatic submission requires APPROVED products"
+        elsif !IN_APP_PURCHASE_SANDBOX_PRODUCT_STATES.include?(product_state)
+          errors << "#{product_id} has product state #{product_state.inspect}"
+        end
+        if require_review_metadata
+          errors << "#{product_id} has an unexpected review note" unless
+            normalized_text(attributes["reviewNote"]) == expected_review_note
+        end
+
+        validate_in_app_purchase_metadata(
+          product,
+          expected,
+          errors,
+          required_territories: required_territories,
+          require_review_metadata: require_review_metadata
+        )
+      end
+
+      raise Error, "In-app purchase preflight failed: #{errors.join('; ')}" unless errors.empty?
+    end
+
+    def validate_in_app_purchase_bundle_identifier(expected_identifier, errors)
+      app = @client.get(
+        "/v1/apps/#{@app_id}",
+        query: { "fields[apps]" => "bundleId" }
+      )
+      actual_identifier = app.dig("data", "attributes", "bundleId")
+      return if actual_identifier == expected_identifier
+
+      errors << "app has bundle identifier #{actual_identifier.inspect}; expected #{expected_identifier.inspect}"
+    end
+
+    def validate_in_app_purchase_metadata(
+      product,
+      expected,
+      errors,
+      required_territories:,
+      require_review_metadata:
+    )
+      product_id = expected.fetch("productId")
+      version = current_in_app_purchase_version(product, product_id, errors)
+      validate_in_app_purchase_localizations(
+        version,
+        expected.fetch("localizations"),
+        product_id,
+        errors
+      ) if version
+
+      validate_in_app_purchase_price(product, product_id, errors)
+      validate_in_app_purchase_availability(product, product_id, required_territories, errors)
+      validate_in_app_purchase_review_screenshot(product, product_id, errors) if require_review_metadata
+    end
+
+    def current_in_app_purchase_version(product, product_id, errors)
+      versions = @client.collection(
+        "/v2/inAppPurchases/#{product.fetch('id')}/versions",
+        query: {
+          "fields[inAppPurchaseVersions]" => "version,state",
+          "limit" => "200"
+        }
+      )
+      if versions.empty?
+        errors << "#{product_id} has no metadata version"
+        return nil
+      end
+
+      latest = versions.max_by do |version|
+        Integer(version.dig("attributes", "version"), exception: false) || -1
+      end
+      state = latest.dig("attributes", "state")
+      unless IN_APP_PURCHASE_ACTIVE_VERSION_STATES.include?(state)
+        errors << "#{product_id} latest metadata version has state #{state.inspect}"
+        return nil
+      end
+      latest
+    end
+
+    def validate_in_app_purchase_localizations(version, expected_localizations, product_id, errors)
+      localization_resources = @client.collection(
+        "/v1/inAppPurchaseVersions/#{version.fetch('id')}/localizations",
+        query: {
+          "fields[inAppPurchaseLocalizations]" => "name,locale,description",
+          "limit" => "200"
+        }
+      )
+      localizations = localization_resources.to_h do |item|
+        [item.dig("attributes", "locale"), item.fetch("attributes")]
+      end
+
+      expected_localizations.each do |locale, expected_localization|
+        actual = localizations[locale]
+        unless actual
+          errors << "#{product_id} has no #{locale} localization"
+          next
+        end
+        %w[name description].each do |field|
+          next if actual[field] == expected_localization.fetch(field)
+
+          errors << "#{product_id} #{locale} #{field} is #{actual[field].inspect}"
+        end
+      end
+    end
+
+    def validate_in_app_purchase_price(product, product_id, errors)
+      schedule = @client.get(
+        "/v2/inAppPurchases/#{product.fetch('id')}/iapPriceSchedule",
+        query: { "fields[inAppPurchasePriceSchedules]" => "manualPrices" }
+      )
+      prices = @client.collection(
+        "/v1/inAppPurchasePriceSchedules/#{schedule.fetch('data').fetch('id')}/manualPrices",
+        query: {
+          "fields[inAppPurchasePrices]" => "startDate,endDate,manual",
+          "limit" => "200"
+        }
+      )
+      today = Date.today
+      active_price = prices.any? do |price|
+        attributes = price.fetch("attributes", {})
+        active_on?(today, start_date: attributes["startDate"], end_date: attributes["endDate"])
+      end
+      errors << "#{product_id} has no price active on #{today.iso8601}" unless active_price
+    rescue KeyError, ArgumentError => error
+      errors << "#{product_id} has an invalid price schedule: #{error.message}"
+    rescue TransportError => error
+      errors << "#{product_id} price schedule could not be read: #{error.message}"
+    end
+
+    def validate_in_app_purchase_availability(product, product_id, required_territories, errors)
+      availability = @client.get(
+        "/v2/inAppPurchases/#{product.fetch('id')}/inAppPurchaseAvailability",
+        query: { "fields[inAppPurchaseAvailabilities]" => "availableTerritories" }
+      )
+      territories = @client.collection(
+        "/v1/inAppPurchaseAvailabilities/#{availability.fetch('data').fetch('id')}/availableTerritories",
+        query: { "limit" => "200" }
+      ).map { |territory| territory.fetch("id") }
+      missing = required_territories - territories
+      errors << "#{product_id} is unavailable in required territories: #{missing.join(', ')}" unless missing.empty?
+    rescue KeyError => error
+      errors << "#{product_id} has invalid availability metadata: #{error.message}"
+    rescue TransportError => error
+      errors << "#{product_id} availability could not be read: #{error.message}"
+    end
+
+    def validate_in_app_purchase_review_screenshot(product, product_id, errors)
+      response = @client.get(
+        "/v2/inAppPurchases/#{product.fetch('id')}",
+        query: {
+          "include" => "appStoreReviewScreenshot",
+          "fields[inAppPurchaseAppStoreReviewScreenshots]" => "fileName,assetDeliveryState"
+        }
+      )
+      screenshot = response.dig("data", "relationships", "appStoreReviewScreenshot", "data")
+      unless screenshot
+        errors << "#{product_id} has no App Review screenshot"
+        return
+      end
+
+      screenshot_resource = response.fetch("included", []).find do |item|
+        item["type"] == "inAppPurchaseAppStoreReviewScreenshots" && item["id"] == screenshot["id"]
+      end
+      unless screenshot_resource
+        errors << "#{product_id} review screenshot metadata is missing"
+        return
+      end
+
+      screenshot_attributes = screenshot_resource.fetch("attributes", {})
+      delivery_state = screenshot_attributes.dig("assetDeliveryState", "state")
+      errors << "#{product_id} review screenshot has delivery state #{delivery_state.inspect}" unless
+        delivery_state == "COMPLETE"
+      errors << "#{product_id} review screenshot has no file name" if
+        screenshot_attributes["fileName"].to_s.strip.empty?
+    end
+
+    def active_on?(date, start_date:, end_date:)
+      starts_on = start_date.nil? ? nil : Date.iso8601(start_date)
+      ends_on = end_date.nil? ? nil : Date.iso8601(end_date)
+      (starts_on.nil? || starts_on <= date) && (ends_on.nil? || ends_on >= date)
+    end
+
+    def normalized_text(value)
+      value.to_s.split.join(" ")
+    end
 
     def monotonic_time
       Process.clock_gettime(Process::CLOCK_MONOTONIC)
@@ -582,29 +838,58 @@ module AppStoreConnect
     def validate_beta_review_details
       details = @client.collection(
         "/v1/betaAppReviewDetails",
-        query: { "filter[app]" => @app_id, "limit" => "10" }
+        query: {
+          "filter[app]" => @app_id,
+          "fields[betaAppReviewDetails]" =>
+            "contactFirstName,contactLastName,contactPhone,contactEmail,demoAccountName," \
+            "demoAccountPassword,demoAccountRequired,notes",
+          "limit" => "10"
+        }
       )
       raise Error, "TestFlight beta review contact information is missing" if details.empty?
       raise Error, "Apple returned multiple beta review detail records" if details.length > 1
 
-      attributes = details.first.fetch("attributes", {})
+      validate_review_contact_and_demo_account(
+        details.first.fetch("attributes", {}),
+        context: "TestFlight beta review"
+      )
+    end
+
+    def validate_app_store_review_details(versions)
+      versions.each do |platform, app_store_version|
+        response = @client.get(
+          "/v1/appStoreVersions/#{app_store_version.fetch('id')}/appStoreReviewDetail",
+          query: {
+            "fields[appStoreReviewDetails]" =>
+              "contactFirstName,contactLastName,contactPhone,contactEmail,demoAccountName," \
+              "demoAccountPassword,demoAccountRequired,notes"
+          }
+        )
+        attributes = response.dig("data", "attributes")
+        raise Error, "#{platform} App Store review details are missing" unless attributes
+
+        validate_review_contact_and_demo_account(attributes, context: "#{platform} App Store review")
+      end
+    end
+
+    def validate_review_contact_and_demo_account(attributes, context:)
       required = %w[contactFirstName contactLastName contactPhone contactEmail]
       missing = required.select { |name| attributes[name].to_s.strip.empty? }
       unless missing.empty?
-        raise Error, "TestFlight beta review fields are missing: #{missing.join(", ")}"
+        raise Error, "#{context} fields are missing: #{missing.join(', ')}"
       end
       phone = attributes.fetch("contactPhone").strip
       unless phone.match?(/\A\+[1-9][0-9]{7,14}\z/)
-        raise Error, "TestFlight beta review contact phone must use international E.164 format"
+        raise Error, "#{context} contact phone must use international E.164 format"
       end
-
-      return unless attributes["demoAccountRequired"] == true
+      raise Error, "#{context} must require a demo account" unless attributes["demoAccountRequired"] == true
 
       account_fields = %w[demoAccountName demoAccountPassword]
-      missing_account_fields = account_fields.select { |name| attributes[name].to_s.empty? }
+      missing_account_fields = account_fields.select { |name| attributes[name].to_s.strip.empty? }
       unless missing_account_fields.empty?
-        raise Error, "TestFlight demo account fields are missing: #{missing_account_fields.join(", ")}"
+        raise Error, "#{context} demo account fields are missing: #{missing_account_fields.join(', ')}"
       end
+      raise Error, "#{context} notes are missing" if attributes["notes"].to_s.strip.empty?
     end
 
     def upsert_build_localizations(build_id, localization_paths)
@@ -763,10 +1048,14 @@ module AppStoreConnect
       command = argv.shift
       options = parse_options(argv)
       manager = manager_from_environment
-      version = required_option(options, :version)
 
       case command
+      when "validate-sandbox-in-app-purchases"
+        manager.validate_in_app_purchase_sandbox
+      when "validate-in-app-purchases"
+        manager.validate_in_app_purchases
       when "inspect-build"
+        version = required_option(options, :version)
         build_number = required_option(options, :build_number)
         manager.inspect_build(
           platform: required_option(options, :platform),
@@ -774,6 +1063,7 @@ module AppStoreConnect
           build_number: build_number
         )
       when "wait-builds"
+        version = required_option(options, :version)
         build_number = required_option(options, :build_number)
         manager.wait_for_builds(
           version: version,
@@ -781,6 +1071,7 @@ module AppStoreConnect
           timeout_seconds: options.fetch(:timeout, 2_700)
         )
       when "distribute-internal"
+        version = required_option(options, :version)
         build_number = required_option(options, :build_number)
         manager.distribute_internal(
           version: version,
@@ -788,6 +1079,7 @@ module AppStoreConnect
           group_name: options[:group]
         )
       when "distribute-external"
+        version = required_option(options, :version)
         build_number = required_option(options, :build_number)
         manager.distribute_external(
           version: version,
@@ -796,6 +1088,7 @@ module AppStoreConnect
           localization_paths: required_option(options, :localizations)
         )
       when "prepare-app-store"
+        version = required_option(options, :version)
         build_number = required_option(options, :build_number)
         manager.prepare_app_store(
           version: version,
@@ -803,8 +1096,10 @@ module AppStoreConnect
           submit: options.fetch(:submit, false)
         )
       when "release-app-store"
+        version = required_option(options, :version)
         manager.release_app_store(version: version)
       when "verify-release-state"
+        version = required_option(options, :version)
         manager.release_app_store(version: version, permit_requests: false)
       else
         raise Error, "Unknown command #{command.inspect}"

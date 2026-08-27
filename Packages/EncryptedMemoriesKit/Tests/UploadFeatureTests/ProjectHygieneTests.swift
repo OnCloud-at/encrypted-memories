@@ -126,33 +126,26 @@ final class ProjectHygieneTests: XCTestCase {
         XCTAssertTrue(tipJar.contains("Product.products(for: productIdentifiers)"))
         XCTAssertTrue(tipJar.contains("StoreView(products: products)"))
         XCTAssertFalse(tipJar.contains("StoreView(ids: productIdentifiers)"))
-
-        let storeKitConfiguration = try Data(
-            contentsOf: repoRoot.appendingPathComponent("StoreKit/EncryptedMemories.storekit")
-        )
-        let configuration = try XCTUnwrap(
-            JSONSerialization.jsonObject(with: storeKitConfiguration) as? [String: Any]
-        )
-        let products = try XCTUnwrap(configuration["products"] as? [[String: Any]])
-        XCTAssertEqual(
-            products.compactMap { $0["productID"] as? String },
-            [
-                "at.oncloud.encryptedmemories.tip.small",
-                "at.oncloud.encryptedmemories.tip.medium",
-                "at.oncloud.encryptedmemories.tip.large",
-                "at.oncloud.encryptedmemories.tip.extra_large",
-            ]
-        )
-        XCTAssertTrue(products.allSatisfy { $0["type"] as? String == "Consumable" })
+        XCTAssertTrue(tipJar.contains("guard missingProductIdentifiers.isEmpty else"))
+        XCTAssertFalse(tipJar.contains("products.isEmpty ? .unavailable : .loaded"))
 
         let project = try String(
             contentsOf: repoRoot.appendingPathComponent("project.yml"),
             encoding: .utf8
         )
-        XCTAssertEqual(
-            project.components(separatedBy: "storeKitConfiguration: StoreKit/EncryptedMemories.storekit").count - 1,
-            2,
-            "both native debug schemes must use the same local StoreKit test products"
+        XCTAssertFalse(
+            project.contains("storeKitConfiguration:"),
+            "native runs must use App Store Connect data so sandbox testing matches App Review"
+        )
+        XCTAssertFalse(
+            project.contains("  - StoreKit\n"),
+            "a clean checkout must not reference a deleted local StoreKit directory"
+        )
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: repoRoot.appendingPathComponent("StoreKit/EncryptedMemories.storekit").path
+            ),
+            "the repository must not provide local products that can mask App Store Connect configuration errors"
         )
     }
 
@@ -236,6 +229,9 @@ final class ProjectHygieneTests: XCTestCase {
         XCTAssertTrue(internalWorkflow.contains("secrets.APP_STORE_CONNECT_PRIVATE_KEY_BASE64"))
         XCTAssertFalse(internalWorkflow.contains("secrets.APP_STORE_CONNECT_PRIVATE_KEY }}"))
         XCTAssertFalse(internalWorkflow.contains("-allowProvisioningUpdates"))
+        XCTAssertTrue(internalWorkflow.contains("Validate StoreKit sandbox metadata"))
+        XCTAssertTrue(internalWorkflow.contains("validate-sandbox-in-app-purchases"))
+        XCTAssertTrue(internalWorkflow.contains("needs: [prepare, in-app-purchase-preflight]"))
         XCTAssertTrue(internalWorkflow.contains("distribute-internal"))
 
         let project = try String(
@@ -267,8 +263,15 @@ final class ProjectHygieneTests: XCTestCase {
             encoding: .utf8
         )
         XCTAssertTrue(releaseWorkflow.contains("environment: app-store-production"))
-        XCTAssertTrue(releaseWorkflow.contains("first_release_with_in_app_purchases"))
+        XCTAssertFalse(releaseWorkflow.contains("first_release_with_in_app_purchases"))
         XCTAssertTrue(releaseWorkflow.contains("prepare-app-store"))
+
+        let preflightWorkflow = try String(
+            contentsOf: repoRoot.appendingPathComponent(".github/workflows/app-store-preflight.yml"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(preflightWorkflow.contains("environment: app-store-production"))
+        XCTAssertTrue(preflightWorkflow.contains("validate-in-app-purchases"))
 
         let publishWorkflow = try String(
             contentsOf: repoRoot.appendingPathComponent(".github/workflows/app-store-publish.yml"),
@@ -301,9 +304,47 @@ final class ProjectHygieneTests: XCTestCase {
         )
         XCTAssertTrue(connectScript.contains("/v1/betaAppReviewSubmissions"))
         XCTAssertTrue(connectScript.contains("/v1/reviewSubmissions"))
+        XCTAssertTrue(connectScript.contains("/v1/apps/#{@app_id}/inAppPurchasesV2"))
+        XCTAssertTrue(connectScript.contains("/v2/inAppPurchases/#{product.fetch('id')}/versions"))
+        XCTAssertTrue(connectScript.contains("/v1/inAppPurchaseVersions/#{version.fetch('id')}/localizations"))
+        XCTAssertTrue(
+            connectScript.contains(
+                "\"fields[inAppPurchases]\" => \"name,productId,inAppPurchaseType,state,reviewNote\""
+            )
+        )
+        XCTAssertTrue(
+            connectScript.contains(
+                "\"fields[inAppPurchaseLocalizations]\" => \"name,locale,description\""
+            )
+        )
+        XCTAssertFalse(connectScript.contains("name,locale,description,state"))
+        XCTAssertFalse(connectScript.contains("\"include\" => \"inAppPurchaseLocalizations\""))
         XCTAssertTrue(connectScript.contains("/v1/appStoreVersionReleaseRequests"))
+        XCTAssertTrue(connectScript.contains("automatic submission requires APPROVED products"))
         XCTAssertTrue(connectScript.contains("iosBuildsAvailableForAppleSiliconMac: false"))
         XCTAssertFalse(FileManager.default.fileExists(atPath: repoRoot.appendingPathComponent("ci_scripts").path))
+
+        let inAppPurchaseContract = try Data(
+            contentsOf: repoRoot.appendingPathComponent(".github/app-store-connect/in-app-purchases.json")
+        )
+        let inAppPurchaseDocument = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: inAppPurchaseContract) as? [String: Any]
+        )
+        XCTAssertEqual(inAppPurchaseDocument["bundleIdentifier"] as? String, "at.oncloud.encryptedmemories")
+        XCTAssertEqual(inAppPurchaseDocument["requiredTerritories"] as? [String], ["AUT", "USA"])
+        let products = try XCTUnwrap(inAppPurchaseDocument["products"] as? [[String: Any]])
+        let productIDs = products.compactMap { $0["productId"] as? String }
+        XCTAssertEqual(
+            productIDs,
+            [
+                "at.oncloud.encryptedmemories.tip.small",
+                "at.oncloud.encryptedmemories.tip.medium",
+                "at.oncloud.encryptedmemories.tip.large",
+                "at.oncloud.encryptedmemories.tip.extra_large",
+            ]
+        )
+        XCTAssertEqual(Set(productIDs).count, productIDs.count)
+        XCTAssertTrue(products.allSatisfy { $0["type"] as? String == "CONSUMABLE" })
 
         for locale in ["en-US", "de-DE"] {
             XCTAssertTrue(
@@ -317,6 +358,44 @@ final class ProjectHygieneTests: XCTestCase {
             contentsOf: repoRoot.appendingPathComponent("BuildSupport/Package.resolved")
         )
         XCTAssertNoThrow(try JSONSerialization.jsonObject(with: resolved))
+    }
+
+    func testPullRequestArchitectureProofUsesIsolatedPlatformShards() throws {
+        let workflow = try String(
+            contentsOf: repoRoot.appendingPathComponent(".github/workflows/pull-request.yml"),
+            encoding: .utf8
+        )
+        let shards = try sourceBlock(
+            from: "  architecture-builds:\n",
+            to: "  architecture:\n",
+            in: workflow
+        )
+        XCTAssertTrue(shards.contains("name: Shared architecture (${{ matrix.platform }})"))
+        XCTAssertTrue(shards.contains("fail-fast: false"))
+        XCTAssertTrue(shards.contains("max-parallel: 2"))
+        XCTAssertTrue(shards.contains("mode: build-ios"))
+        XCTAssertTrue(shards.contains("mode: build-macos"))
+        XCTAssertTrue(shards.contains("verify-universal-core.sh \"${{ matrix.mode }}\""))
+
+        let aggregator = try sourceBlock(
+            from: "  architecture:\n",
+            to: "  macos-app-shell:\n",
+            in: workflow
+        )
+        XCTAssertTrue(aggregator.contains("name: Shared architecture\n"))
+        XCTAssertTrue(aggregator.contains("needs: [package-tests, architecture-builds]"))
+        XCTAssertTrue(aggregator.contains("if: ${{ always() }}"))
+        XCTAssertTrue(aggregator.contains("PACKAGE_TESTS_RESULT"))
+        XCTAssertTrue(aggregator.contains("ARCHITECTURE_BUILDS_RESULT"))
+
+        let verifier = try String(
+            contentsOf: repoRoot.appendingPathComponent("scripts/verify-universal-core.sh"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(verifier.contains("fast|full|build-ios|build-macos"))
+        XCTAssertTrue(verifier.contains("RUN_ARCHITECTURE_TESTS=false"))
+        XCTAssertTrue(verifier.contains("BUILD_IOS=false"))
+        XCTAssertTrue(verifier.contains("BUILD_MACOS=false"))
     }
 
     func testWorkspaceReferencesTheGeneratedProject() throws {
