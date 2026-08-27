@@ -5,7 +5,6 @@ DerivedData/
 *.xcresult
 *.dSYM/
 *.app/
-*.ipa
 *.log
 *.abi.json
 *.swiftdoc
@@ -53,10 +52,14 @@ Archiv.zip
 !/Tools/MLModels/README.md
 !/Tools/MLModels/SigLIP2/README.md
 
-# Private release operations stay outside the public repository.
-/APPLE_RELEASE_SETUP.rst
-/fastlane/
-/scripts/archive-app-store.sh
+# Apple release credentials and exported archives never enter the repository.
+*.p8
+*.p12
+*.cer
+*.mobileprovision
+*.provisionprofile
+*.ipa
+*.xcarchive/
 
 # Local development and private review output
 .claude/
@@ -72,7 +75,7 @@ Packages/*/.build/
 Packages/*/.swiftpm/xcode/xcuserdata/
 *.resolved
 !/Packages/EncryptedMemoriesKit/Package.resolved
-!/XcodeCloud/Package.resolved
+!/BuildSupport/Package.resolved
 
 # Local marketing production material. Only site/ is published through GitHub Pages.
 /Marketing/

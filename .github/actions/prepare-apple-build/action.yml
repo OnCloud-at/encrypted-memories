@@ -33,7 +33,7 @@ runs:
         set -euo pipefail
         source scripts/build-paths.sh
         [[ -f Packages/EncryptedMemoriesKit/Package.resolved ]]
-        [[ -f XcodeCloud/Package.resolved ]]
+        [[ -f BuildSupport/Package.resolved ]]
         swift package \
           --package-path Packages/EncryptedMemoriesKit \
           --scratch-path "$ENCRYPTED_MEMORIES_SPM_SCRATCH" \
@@ -44,7 +44,7 @@ runs:
         encryptedmemories_pin_generated_project_packages "$GITHUB_WORKSPACE"
         cmp \
           EncryptedMemories.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved \
-          XcodeCloud/Package.resolved
+          BuildSupport/Package.resolved
         cmp \
           EncryptedMemories.xcworkspace/xcshareddata/swiftpm/Package.resolved \
-          XcodeCloud/Package.resolved
+          BuildSupport/Package.resolved

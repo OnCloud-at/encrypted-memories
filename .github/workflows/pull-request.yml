@@ -58,6 +58,31 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: bash scripts/check-public-tree.sh "$BASE_SHA" "$HEAD_SHA"
 
+      - name: Test Apple release automation
+        run: |
+          set -euo pipefail
+          ruby -c .github/scripts/app_store_connect.rb
+          ruby .github/scripts/test_app_store_connect.rb
+          bash -n \
+            .github/scripts/install_apple_signing.sh \
+            .github/scripts/archive_and_upload.sh \
+            .github/scripts/cleanup_apple_signing.sh
+          ruby -ryaml -e 'Dir[".github/workflows/*.yml"].sort.each { |path| YAML.parse_file(path) }'
+
+      - name: Lint GitHub Actions workflows
+        env:
+          ACTIONLINT_VERSION: 1.7.12
+          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/actionlint.tar.gz"
+          curl --fail --location --silent --show-error \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz" \
+            --output "$archive"
+          echo "$ACTIONLINT_SHA256  $archive" | sha256sum --check
+          tar -xzf "$archive" -C "$RUNNER_TEMP" actionlint
+          "$RUNNER_TEMP/actionlint" -color
+
   code-quality:
     name: Swift style
     runs-on: macos-26

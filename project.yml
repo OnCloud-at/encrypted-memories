@@ -32,7 +32,6 @@ packages:
 fileGroups:
   - StoreKit
   - TestFlight
-  - XcodeCloud
 
 targets:
   EncryptedMemories:
@@ -191,6 +190,7 @@ targets:
         SUPPORTS_MACCATALYST: NO
         SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD: NO
         SUPPORTS_XR_DESIGNED_FOR_IPHONE_IPAD: NO
+        CODE_SIGN_STYLE: Automatic
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         # Link one platform-specific SDK bootstrapper at the final iOS app target.
         LIBRARY_SEARCH_PATHS:
