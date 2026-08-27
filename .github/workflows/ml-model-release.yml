@@ -135,11 +135,13 @@ jobs:
           [[ "$commit" == "$(git rev-parse HEAD)" ]] || { echo "Checkout does not match the release tag" >&2; exit 1; }
           [[ "$asset_digest" == sha256:* ]] || { echo "GitHub did not provide a SHA-256 asset digest" >&2; exit 1; }
 
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          echo "commit=$commit" >> "$GITHUB_OUTPUT"
-          echo "released_at=$released_at" >> "$GITHUB_OUTPUT"
-          echo "asset_id=$asset_id" >> "$GITHUB_OUTPUT"
-          echo "asset_sha256=${asset_digest#sha256:}" >> "$GITHUB_OUTPUT"
+          {
+            echo "tag=$tag"
+            echo "commit=$commit"
+            echo "released_at=$released_at"
+            echo "asset_id=$asset_id"
+            echo "asset_sha256=${asset_digest#sha256:}"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Download and validate candidate archive
         env:

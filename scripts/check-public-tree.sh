@@ -21,6 +21,7 @@ check_path() {
 
   case "$path" in
     *.aac | *.aiff | *.flac | *.m4a | *.mp3 | *.wav | *.mp4 | *.mov | *.m4v | \
+      *.p8 | *.p12 | *.cer | *.mobileprovision | *.provisionprofile | *.ipa | *.xcarchive/* | \
       Marketing/Audio/* | Marketing/Captures/* | Marketing/Review/* | \
       EncryptedMemories.xcodeproj/* | */__pycache__/* | *.pyc | *.pyo | *.pyd | fastlane/* | \
       scripts/archive-app-store.sh | THIRD_PARTY_NOTICES | APPLE_RELEASE_SETUP.rst)

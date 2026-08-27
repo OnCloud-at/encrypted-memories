@@ -40,7 +40,9 @@ final class MobileSessionModel: ObservableObject {
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            self?.bootstrapSessionIfNeeded()
+            Task { @MainActor [weak self] in
+                self?.bootstrapSessionIfNeeded()
+            }
         }
         self.startupCleanupTask = Task { @MainActor [weak self] in
             let succeeded = await ProtonAuthLocalDataPurge.performStartupOffMain(

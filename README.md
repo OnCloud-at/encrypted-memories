@@ -29,7 +29,7 @@ Encrypted Memories is free and open source. Every feature remains available with
 
 **[Sponsor Encrypted Memories through GitHub Sponsors](https://github.com/sponsors/traktuner)**
 
-GitHub Sponsors supports one-time and monthly contributions. App Store releases also offer optional, repeatable StoreKit tips. Sponsorship does not purchase features, priority support, or influence over the project.
+GitHub Sponsors supports one-time and monthly contributions. App Store releases also offer optional, repeatable tips. Sponsorship does not purchase features, priority support, or influence over the project.
 
 Financial support helps cover Apple membership, test devices, infrastructure, and release work.
 
@@ -162,6 +162,36 @@ All scripts share package downloads below `ENCRYPTED_MEMORIES_BUILD_ROOT`; do no
 DerivedData or SwiftPM scratch directories. Use `./scripts/report-build-storage.sh` to inspect the
 canonical root and detect ad-hoc Proton build trees under `/private/tmp`.
 
+## Apple Releases
+
+GitHub Actions owns Apple distribution through four manual workflows:
+
+- `Apple TestFlight internal` builds, signs, uploads, and assigns the iOS and native macOS apps.
+- `Apple TestFlight external` promotes an existing processed build to external testing.
+- `Apple App Store submission` attaches existing builds and can submit each platform for review.
+- `Apple App Store publish` releases both approved platforms when manual release is selected.
+
+The publish workflow creates a permanent `refs/release-locks/app-store-<version>` ref before it contacts Apple.
+If the response is lost, later runs verify Apple's version state and stop before another release request. Keep the
+lock as the release audit trail and complete an unresolved release directly in App Store Connect.
+
+The workflows accept releases only from `main`. Configure these repository variables:
+
+- `APP_STORE_CONNECT_APP_ID`
+- `APPLE_DEVELOPER_TEAM_ID`
+- `APPLE_BUILD_NUMBER_BASE`
+
+Configure the App Store Connect issuer, key ID, and Base64-encoded private key as protected environment
+secrets. The internal workflow also needs one Base64-encoded PKCS#12 archive and its password. The archive
+must contain the Apple Distribution and Mac Installer Distribution identities.
+
+Use the `testflight-internal`, `testflight-external`, and `app-store-production` environments. Restrict each
+environment to `main`. Require an approval for external testing and production. The first app release with
+in-app purchases must still be submitted in App Store Connect after the tip products are attached.
+
+Keep the iPhone and iPad app unavailable on Apple Silicon Mac in App Store Connect. The native macOS archive
+uses the `EncryptedMemories` scheme. The TestFlight workflows also disable mobile builds on Mac for their groups.
+
 ## Tests
 
 Run the complete Swift package suite:
@@ -205,7 +235,8 @@ The test targets cover module and import boundaries, encrypted persistence, medi
 - `Tools` contains development utilities.
 - `Vendor/sdk-swift` contains the local Proton Drive SDK checkout.
 - `project.yml` is the source of truth for generated Xcode project settings.
-- `scripts` contains build, verification, SDK, and release helpers.
+- `scripts` contains local build, verification, and SDK helpers.
+- `.github` contains the reviewed build and release automation.
 
 ## License
 
