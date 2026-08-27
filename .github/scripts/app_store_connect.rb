@@ -18,8 +18,11 @@ module AppStoreConnect
   IN_APP_PURCHASE_ACTIVE_VERSION_STATES = %w[
     PREPARE_FOR_SUBMISSION READY_FOR_REVIEW WAITING_FOR_REVIEW IN_REVIEW ACCEPTED APPROVED
   ].freeze
-  IN_APP_PURCHASE_SANDBOX_PRODUCT_STATES = %w[
+  IN_APP_PURCHASE_REVIEW_PRODUCT_STATES = %w[
     READY_TO_SUBMIT WAITING_FOR_REVIEW IN_REVIEW PENDING_BINARY_APPROVAL APPROVED
+  ].freeze
+  IN_APP_PURCHASE_SANDBOX_PRODUCT_STATES = %w[
+    MISSING_METADATA READY_TO_SUBMIT WAITING_FOR_REVIEW IN_REVIEW PENDING_BINARY_APPROVAL APPROVED
   ].freeze
   PLATFORMS = %w[IOS MAC_OS].freeze
   REVIEWED_BUILD_STATES = %w[WAITING_FOR_REVIEW IN_REVIEW APPROVED].freeze
@@ -489,6 +492,11 @@ module AppStoreConnect
       expected_products = contract.fetch("products")
       expected_review_note = normalized_text(contract.fetch("reviewNote"))
       required_territories = contract.fetch("requiredTerritories")
+      allowed_product_states = if require_review_metadata
+                                 IN_APP_PURCHASE_REVIEW_PRODUCT_STATES
+                               else
+                                 IN_APP_PURCHASE_SANDBOX_PRODUCT_STATES
+                               end
       errors = []
       validate_in_app_purchase_bundle_identifier(contract.fetch("bundleIdentifier"), errors)
       products = @client.collection(
@@ -522,7 +530,7 @@ module AppStoreConnect
         if require_approved_products && product_state != "APPROVED"
           errors << "#{product_id} has product state #{product_state.inspect}; " \
                     "automatic submission requires APPROVED products"
-        elsif !IN_APP_PURCHASE_SANDBOX_PRODUCT_STATES.include?(product_state)
+        elsif !allowed_product_states.include?(product_state)
           errors << "#{product_id} has product state #{product_state.inspect}"
         end
         if require_review_metadata
