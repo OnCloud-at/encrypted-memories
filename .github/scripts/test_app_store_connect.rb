@@ -25,7 +25,8 @@ class FakeAppStoreConnectClient
     in_app_purchase_review_note: :contract,
     in_app_purchase_screenshot_state: "COMPLETE",
     in_app_purchase_prices: [{ "startDate" => nil, "endDate" => nil }],
-    in_app_purchase_available_territories: %w[AUT USA]
+    in_app_purchase_available_territories: %w[AUT USA],
+    bundle_id_capabilities: ["IN_APP_PURCHASE"]
   )
     @version_state = version_state
     @release_type = release_type
@@ -43,6 +44,7 @@ class FakeAppStoreConnectClient
     @in_app_purchase_screenshot_state = in_app_purchase_screenshot_state
     @in_app_purchase_prices = in_app_purchase_prices
     @in_app_purchase_available_territories = in_app_purchase_available_territories
+    @bundle_id_capabilities = bundle_id_capabilities
     @calls = []
   end
 
@@ -84,6 +86,23 @@ class FakeAppStoreConnectClient
       }]
     when "/v1/apps/6805117080/inAppPurchasesV2"
       in_app_purchases
+    when "/v1/bundleIds"
+      [{
+        "type" => "bundleIds",
+        "id" => "bundle-id-encrypted-memories",
+        "attributes" => {
+          "identifier" => @app_bundle_identifier,
+          "platform" => "UNIVERSAL"
+        }
+      }]
+    when "/v1/bundleIds/bundle-id-encrypted-memories/bundleIdCapabilities"
+      @bundle_id_capabilities.map.with_index do |capability_type, index|
+        {
+          "type" => "bundleIdCapabilities",
+          "id" => "capability-#{index}",
+          "attributes" => { "capabilityType" => capability_type }
+        }
+      end
     when %r{\A/v2/inAppPurchases/(iap-\d+)/versions\z}
       in_app_purchase_versions(Regexp.last_match(1))
     when %r{\A/v1/inAppPurchaseVersions/(iap-\d+)-version-\d+/localizations\z}
@@ -386,8 +405,17 @@ class AppStoreConnectTest < Minitest::Test
     localization_requests = @client.calls.count do |method, path, _query|
       method == :collection && path.match?(%r{\A/v1/inAppPurchaseVersions/[^/]+/localizations\z})
     end
-    assert_equal 4, version_requests
-    assert_equal 4, localization_requests
+    expected_count = JSON.parse(
+      File.read(AppStoreConnect::IN_APP_PURCHASE_CONTRACT_PATH, encoding: "UTF-8")
+    ).fetch("products").length
+    assert_equal expected_count, version_requests
+    assert_equal expected_count, localization_requests
+
+    capability_request = @client.calls.find do |method, path, _query|
+      method == :collection && path.end_with?("/bundleIdCapabilities")
+    end
+    refute_nil capability_request
+    assert_equal "capabilityType", capability_request.last.fetch("fields[bundleIdCapabilities]")
   end
 
   def test_sandbox_preflight_does_not_require_review_submission_metadata
@@ -469,6 +497,23 @@ class AppStoreConnectTest < Minitest::Test
     assert_match(/app has bundle identifier "at.oncloud.wrong"/, error.message)
   end
 
+  def test_sandbox_preflight_rejects_a_bundle_id_without_in_app_purchase
+    client = FakeAppStoreConnectClient.new(bundle_id_capabilities: [])
+    manager = AppStoreConnect::ReleaseManager.new(
+      client: client,
+      app_id: "6805117080",
+      output_path: nil,
+      summary_path: nil
+    )
+
+    error = assert_raises(AppStoreConnect::Error) { manager.validate_in_app_purchase_sandbox }
+
+    assert_match(/does not enable In-App Purchase/, error.message)
+    refute client.calls.any? { |method, path, _query|
+      method == :collection && path == "/v1/apps/6805117080/inAppPurchasesV2"
+    }
+  end
+
   def test_in_app_purchase_preflight_rejects_missing_review_metadata
     client = FakeAppStoreConnectClient.new(
       in_app_purchase_versions: [{ "version" => 1, "state" => "REJECTED" }],
@@ -521,7 +566,10 @@ class AppStoreConnectTest < Minitest::Test
     localization_paths = client.calls.filter_map do |method, path, _query|
       path if method == :collection && path.include?("/localizations")
     end
-    assert_equal 4, localization_paths.length
+    expected_count = JSON.parse(
+      File.read(AppStoreConnect::IN_APP_PURCHASE_CONTRACT_PATH, encoding: "UTF-8")
+    ).fetch("products").length
+    assert_equal expected_count, localization_paths.length
     assert localization_paths.all? { |path| path.include?("-version-2/") }
   end
 

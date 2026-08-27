@@ -168,7 +168,7 @@ GitHub Actions owns Apple distribution through five manual workflows:
 
 - `Apple TestFlight internal` builds, signs, uploads, and assigns the iOS and native macOS apps.
 - `Apple TestFlight external` promotes an existing processed build to external testing.
-- `Apple App Store preflight` checks all four consumable tips and their review metadata without rebuilding.
+- `Apple App Store preflight` checks the configured in-app purchases and their review metadata without rebuilding.
 - `Apple App Store submission` attaches existing builds and can submit each platform for review.
 - `Apple App Store publish` releases both approved platforms when manual release is selected.
 
@@ -189,9 +189,10 @@ must contain the Apple Distribution and Mac Installer Distribution identities.
 Use the `testflight-internal`, `testflight-external`, and `app-store-production` environments. Restrict each
 environment to `main`. Require an approval for external testing and production.
 
-The internal TestFlight workflow validates the four consumable tips before it starts a macOS runner. This sandbox
-preflight checks the App Store Connect bundle ID, exact product IDs, product type, current metadata version, active
-prices, availability in Austria and the United States, and English and German metadata against
+The internal TestFlight workflow validates the configured in-app purchases before it starts a macOS runner. This
+sandbox preflight checks the App Store Connect bundle ID, its `IN_APP_PURCHASE` capability, exact product IDs,
+product type, current metadata version, active prices, availability in Austria and the United States, and metadata
+against
 `.github/app-store-connect/in-app-purchases.json`. Apple does not expose Paid Apps Agreement, banking, or tax status
 through this API. Those three items must be `Active` in App Store Connect.
 

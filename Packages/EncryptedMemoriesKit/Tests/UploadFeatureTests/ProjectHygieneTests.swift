@@ -142,6 +142,14 @@ final class ProjectHygieneTests: XCTestCase {
             "a clean checkout must not reference a deleted local StoreKit directory"
         )
         XCTAssertFalse(
+            project.contains("com.apple.InAppPurchase"),
+            "XcodeGen 2.46 serializes nested capability attributes incorrectly"
+        )
+        XCTAssertFalse(
+            project.contains("com.apple.developer.in-app-purchase"),
+            "In-App Purchase does not define an application entitlement"
+        )
+        XCTAssertFalse(
             FileManager.default.fileExists(
                 atPath: repoRoot.appendingPathComponent("StoreKit/EncryptedMemories.storekit").path
             ),
@@ -305,6 +313,9 @@ final class ProjectHygieneTests: XCTestCase {
         XCTAssertTrue(connectScript.contains("/v1/betaAppReviewSubmissions"))
         XCTAssertTrue(connectScript.contains("/v1/reviewSubmissions"))
         XCTAssertTrue(connectScript.contains("/v1/apps/#{@app_id}/inAppPurchasesV2"))
+        XCTAssertTrue(connectScript.contains("/v1/bundleIds"))
+        XCTAssertTrue(connectScript.contains("/bundleIdCapabilities"))
+        XCTAssertTrue(connectScript.contains("IN_APP_PURCHASE"))
         XCTAssertTrue(connectScript.contains("/v2/inAppPurchases/#{product.fetch('id')}/versions"))
         XCTAssertTrue(connectScript.contains("/v1/inAppPurchaseVersions/#{version.fetch('id')}/localizations"))
         XCTAssertTrue(
@@ -321,6 +332,7 @@ final class ProjectHygieneTests: XCTestCase {
         XCTAssertFalse(connectScript.contains("\"include\" => \"inAppPurchaseLocalizations\""))
         XCTAssertTrue(connectScript.contains("/v1/appStoreVersionReleaseRequests"))
         XCTAssertTrue(connectScript.contains("automatic submission requires APPROVED products"))
+        XCTAssertFalse(connectScript.contains("All four consumable tips"))
         XCTAssertTrue(connectScript.contains("iosBuildsAvailableForAppleSiliconMac: false"))
         XCTAssertFalse(FileManager.default.fileExists(atPath: repoRoot.appendingPathComponent("ci_scripts").path))
 
