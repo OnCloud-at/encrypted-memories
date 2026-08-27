@@ -392,7 +392,7 @@ class AppStoreConnectTest < Minitest::Test
 
   def test_sandbox_preflight_does_not_require_review_submission_metadata
     client = FakeAppStoreConnectClient.new(
-      in_app_purchase_state: "READY_TO_SUBMIT",
+      in_app_purchase_state: "MISSING_METADATA",
       in_app_purchase_review_note: "not ready for review",
       in_app_purchase_screenshot_state: nil
     )
@@ -407,6 +407,20 @@ class AppStoreConnectTest < Minitest::Test
     refute client.calls.any? { |method, path, _query|
       method == :get && path.match?(%r{\A/v2/inAppPurchases/[^/]+\z})
     }
+  end
+
+  def test_review_preflight_rejects_a_missing_metadata_product_state
+    client = FakeAppStoreConnectClient.new(in_app_purchase_state: "MISSING_METADATA")
+    manager = AppStoreConnect::ReleaseManager.new(
+      client: client,
+      app_id: "6805117080",
+      output_path: nil,
+      summary_path: nil
+    )
+
+    error = assert_raises(AppStoreConnect::Error) { manager.validate_in_app_purchases }
+
+    assert_match(/product state "MISSING_METADATA"/, error.message)
   end
 
   def test_sandbox_preflight_rejects_a_product_that_needs_developer_action
