@@ -416,6 +416,7 @@ class AppStoreConnectTest < Minitest::Test
     end
     refute_nil capability_request
     assert_equal "capabilityType", capability_request.last.fetch("fields[bundleIdCapabilities]")
+    refute capability_request.last.key?("limit")
   end
 
   def test_sandbox_preflight_does_not_require_review_submission_metadata
