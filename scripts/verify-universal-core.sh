@@ -13,12 +13,35 @@ MODE="${CORE_GATE_MODE:-${1:-full}}"
 encryptedmemories_acquire_build_lock "verify-universal-core-$MODE"
 
 case "$MODE" in
-  fast|full) ;;
+  fast|full|build-ios|build-macos) ;;
   *)
-    echo "usage: $(basename "$0") [fast|full]" >&2
+    echo "usage: $(basename "$0") [fast|full|build-ios|build-macos]" >&2
     echo "  fast: CoreArchitectureGateTests only" >&2
     echo "  full: architecture tests + iOS/macOS package build proof" >&2
+    echo "  build-ios: iOS package build proof without tests" >&2
+    echo "  build-macos: macOS package build proof without tests" >&2
     exit 64
+    ;;
+esac
+
+RUN_ARCHITECTURE_TESTS=false
+BUILD_IOS=false
+BUILD_MACOS=false
+
+case "$MODE" in
+  fast)
+    RUN_ARCHITECTURE_TESTS=true
+    ;;
+  full)
+    RUN_ARCHITECTURE_TESTS=true
+    BUILD_IOS=true
+    BUILD_MACOS=true
+    ;;
+  build-ios)
+    BUILD_IOS=true
+    ;;
+  build-macos)
+    BUILD_MACOS=true
     ;;
 esac
 
@@ -64,10 +87,13 @@ MACOS_PLATFORM_ADAPTER_TARGETS=(
   MLSearchAppleAdapter
 )
 
-PLATFORMS=(
-  "iOS:generic/platform=iOS"
-  "macOS:generic/platform=macOS"
-)
+PLATFORMS=()
+if [[ "$BUILD_IOS" == "true" ]]; then
+  PLATFORMS+=("iOS:generic/platform=iOS")
+fi
+if [[ "$BUILD_MACOS" == "true" ]]; then
+  PLATFORMS+=("macOS:generic/platform=macOS")
+fi
 
 echo "[core-gate] package: $PACKAGE"
 echo "[core-gate] developer dir: $DEVELOPER_DIR"
@@ -75,12 +101,14 @@ echo "[core-gate] mode: $MODE"
 echo "[core-gate] derived data base: $DERIVED_DATA_BASE"
 
 echo "[core-gate] spm scratch: $SPM_SCRATCH"
-echo "[core-gate] running CoreArchitectureGateTests"
-xcrun swift test \
-  --package-path "$PACKAGE" \
-  --scratch-path "$SPM_SCRATCH" \
-  --cache-path "$ENCRYPTED_MEMORIES_SWIFTPM_CACHE" \
-  --filter CoreArchitectureGateTests
+if [[ "$RUN_ARCHITECTURE_TESTS" == "true" ]]; then
+  echo "[core-gate] running CoreArchitectureGateTests"
+  xcrun swift test \
+    --package-path "$PACKAGE" \
+    --scratch-path "$SPM_SCRATCH" \
+    --cache-path "$ENCRYPTED_MEMORIES_SWIFTPM_CACHE" \
+    --filter CoreArchitectureGateTests
+fi
 
 if [[ "$MODE" == "fast" ]]; then
   echo "[core-gate] fast architecture gate passed"
@@ -141,14 +169,18 @@ for target in "${RENDERING_CORE_TARGETS[@]}"; do
   done
 done
 
-for target in "${MACOS_PLATFORM_ADAPTER_TARGETS[@]}"; do
-  build_scheme "$target" "macOS" "generic/platform=macOS" ""
-done
+if [[ "$BUILD_MACOS" == "true" ]]; then
+  for target in "${MACOS_PLATFORM_ADAPTER_TARGETS[@]}"; do
+    build_scheme "$target" "macOS" "generic/platform=macOS" ""
+  done
+fi
 
-for target in "${IOS_PLATFORM_ADAPTER_TARGETS[@]}"; do
-  build_scheme "$target" "iOS" "generic/platform=iOS" ""
-done
+if [[ "$BUILD_IOS" == "true" ]]; then
+  for target in "${IOS_PLATFORM_ADAPTER_TARGETS[@]}"; do
+    build_scheme "$target" "iOS" "generic/platform=iOS" ""
+  done
+fi
 
 popd >/dev/null
 
-echo "[core-gate] universal Core + shared UI + Metal Core + platform texture adapter proof gate passed"
+echo "[core-gate] $MODE universal Core + shared UI + Metal Core + platform adapter proof passed"

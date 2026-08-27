@@ -319,6 +319,44 @@ final class ProjectHygieneTests: XCTestCase {
         XCTAssertNoThrow(try JSONSerialization.jsonObject(with: resolved))
     }
 
+    func testPullRequestArchitectureProofUsesIsolatedPlatformShards() throws {
+        let workflow = try String(
+            contentsOf: repoRoot.appendingPathComponent(".github/workflows/pull-request.yml"),
+            encoding: .utf8
+        )
+        let shards = try sourceBlock(
+            from: "  architecture-builds:\n",
+            to: "  architecture:\n",
+            in: workflow
+        )
+        XCTAssertTrue(shards.contains("name: Shared architecture (${{ matrix.platform }})"))
+        XCTAssertTrue(shards.contains("fail-fast: false"))
+        XCTAssertTrue(shards.contains("max-parallel: 2"))
+        XCTAssertTrue(shards.contains("mode: build-ios"))
+        XCTAssertTrue(shards.contains("mode: build-macos"))
+        XCTAssertTrue(shards.contains("verify-universal-core.sh \"${{ matrix.mode }}\""))
+
+        let aggregator = try sourceBlock(
+            from: "  architecture:\n",
+            to: "  macos-app-shell:\n",
+            in: workflow
+        )
+        XCTAssertTrue(aggregator.contains("name: Shared architecture\n"))
+        XCTAssertTrue(aggregator.contains("needs: [package-tests, architecture-builds]"))
+        XCTAssertTrue(aggregator.contains("if: ${{ always() }}"))
+        XCTAssertTrue(aggregator.contains("PACKAGE_TESTS_RESULT"))
+        XCTAssertTrue(aggregator.contains("ARCHITECTURE_BUILDS_RESULT"))
+
+        let verifier = try String(
+            contentsOf: repoRoot.appendingPathComponent("scripts/verify-universal-core.sh"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(verifier.contains("fast|full|build-ios|build-macos"))
+        XCTAssertTrue(verifier.contains("RUN_ARCHITECTURE_TESTS=false"))
+        XCTAssertTrue(verifier.contains("BUILD_IOS=false"))
+        XCTAssertTrue(verifier.contains("BUILD_MACOS=false"))
+    }
+
     func testWorkspaceReferencesTheGeneratedProject() throws {
         let workspace = try String(
             contentsOf: repoRoot.appendingPathComponent(
