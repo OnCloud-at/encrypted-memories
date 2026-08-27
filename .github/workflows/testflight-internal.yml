@@ -51,10 +51,7 @@ jobs:
           set -euo pipefail
           ruby -c .github/scripts/app_store_connect.rb
           ruby .github/scripts/test_app_store_connect.rb
-          bash -n \
-            .github/scripts/install_apple_signing.sh \
-            .github/scripts/archive_and_upload.sh \
-            .github/scripts/cleanup_apple_signing.sh
+          bash -n .github/scripts/validate_apple_distribution.sh
 
       - name: Resolve version and build number
         id: release
@@ -106,7 +103,7 @@ jobs:
     name: Upload ${{ matrix.platform }}
     needs: prepare
     runs-on: macos-26
-    timeout-minutes: 120
+    timeout-minutes: 60
     environment: testflight-internal
     strategy:
       fail-fast: false
@@ -115,16 +112,28 @@ jobs:
           - platform: iOS
             api_platform: IOS
             script_platform: ios
+            scheme: EncryptedMemoriesMobile
+            sdk: iphoneos
+            destination: generic/platform=iOS
+            profile_platform: ios
+            profile_name: Encrypted Memories iOS App Store
+            profile_app_identifier_key: application-identifier
+            profile_expected_platform: iOS
           - platform: macOS
             api_platform: MAC_OS
             script_platform: macos
+            scheme: EncryptedMemories
+            sdk: macosx
+            destination: generic/platform=macOS
+            profile_platform: macos
+            profile_name: Encrypted Memories macOS App Store
+            profile_app_identifier_key: com.apple.application-identifier
+            profile_expected_platform: OSX
     steps:
       - name: Check out source
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           persist-credentials: false
-
-      - uses: ./.github/actions/prepare-apple-build
 
       - name: Check for an existing upload
         id: build
@@ -150,28 +159,349 @@ jobs:
               ;;
           esac
 
-      - name: Install signing credentials
+      - name: Decode Apple distribution certificate archive
         if: steps.build.outputs.exists != 'true'
         env:
-          APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
-          APP_STORE_CONNECT_PRIVATE_KEY_BASE64: ${{ secrets.APP_STORE_CONNECT_PRIVATE_KEY_BASE64 }}
           APPLE_SIGNING_CERTIFICATES_P12_BASE64: ${{ secrets.APPLE_SIGNING_CERTIFICATES_P12_BASE64 }}
-          APPLE_SIGNING_CERTIFICATES_PASSWORD: ${{ secrets.APPLE_SIGNING_CERTIFICATES_PASSWORD }}
-        run: bash .github/scripts/install_apple_signing.sh
+        run: |
+          set -euo pipefail
+          certificate_archive="$RUNNER_TEMP/apple-signing-certificates.p12"
+          ruby -rbase64 -e '
+            File.binwrite(
+              ARGV.fetch(0),
+              Base64.strict_decode64(ENV.fetch("APPLE_SIGNING_CERTIFICATES_P12_BASE64"))
+            )
+          ' "$certificate_archive"
+          chmod 600 "$certificate_archive"
 
-      - name: Archive and upload
+      - name: Import certificates with pinned community action
+        if: steps.build.outputs.exists != 'true'
+        uses: Apple-Actions/import-codesign-certs@5142e029c445c10ffc7149d172e540235a065466 # v7.0.0
+        with:
+          keychain: encrypted_memories_signing
+          p12-filepath: ${{ runner.temp }}/apple-signing-certificates.p12
+          p12-password: ${{ secrets.APPLE_SIGNING_CERTIFICATES_PASSWORD }}
+
+      - name: Resolve imported signing identities
+        id: signing-identities
+        if: steps.build.outputs.exists != 'true'
+        env:
+          APPLE_DEVELOPER_TEAM_ID: ${{ vars.APPLE_DEVELOPER_TEAM_ID }}
+          SCRIPT_PLATFORM: ${{ matrix.script_platform }}
+        run: |
+          set -euo pipefail
+          identities_path="$RUNNER_TEMP/signing-identities.txt"
+          security find-identity -v encrypted_memories_signing.keychain > "$identities_path"
+          ruby - "$identities_path" <<'RUBY'
+          path = ARGV.fetch(0)
+          team_id = ENV.fetch("APPLE_DEVELOPER_TEAM_ID")
+          platform = ENV.fetch("SCRIPT_PLATFORM")
+          identities = []
+
+          File.foreach(path) do |line|
+            match = line.match(/^\s*\d+\)\s+([0-9A-F]{40})\s+"([^"]+)"\s*$/)
+            identities << [match[1], match[2]] if match
+          end
+          identities.uniq!
+
+          team_suffix = "(#{team_id})"
+          distribution = identities.filter_map do |fingerprint, name|
+            fingerprint if name.start_with?("Apple Distribution:") && name.end_with?(team_suffix)
+          end.uniq
+          installer = identities.filter_map do |fingerprint, name|
+            legacy = name.start_with?("3rd Party Mac Developer Installer:")
+            current = name.start_with?("Mac Installer Distribution:")
+            fingerprint if (legacy || current) && name.end_with?(team_suffix)
+          end.uniq
+
+          abort "Expected one Apple Distribution identity, found #{distribution.length}." unless distribution.one?
+          if platform == "macos" && !installer.one?
+            abort "Expected one Mac App Store installer identity, found #{installer.length}."
+          end
+
+          File.open(ENV.fetch("GITHUB_OUTPUT"), "a") do |output|
+            output.puts("distribution_sha1=#{distribution.first}")
+            output.puts("installer_sha1=#{installer.first}") if platform == "macos"
+          end
+          RUBY
+          rm -f "$identities_path"
+          echo "Validated the imported distribution identities."
+
+      - name: Create or install App Store provisioning profile
+        id: profile
         if: steps.build.outputs.exists != 'true'
         env:
           APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
           APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          APP_STORE_CONNECT_PRIVATE_KEY_BASE64: ${{ secrets.APP_STORE_CONNECT_PRIVATE_KEY_BASE64 }}
+          APPLE_DEVELOPER_TEAM_ID: ${{ vars.APPLE_DEVELOPER_TEAM_ID }}
+          DISTRIBUTION_SHA1: ${{ steps.signing-identities.outputs.distribution_sha1 }}
+          PROFILE_APP_IDENTIFIER_KEY: ${{ matrix.profile_app_identifier_key }}
+          PROFILE_EXPECTED_PLATFORM: ${{ matrix.profile_expected_platform }}
+          PROFILE_NAME: ${{ matrix.profile_name }}
+          PROFILE_PLATFORM: ${{ matrix.profile_platform }}
+          FASTLANE_DISABLE_COLORS: "1"
+          FASTLANE_HIDE_TIMESTAMP: "1"
+          FASTLANE_SKIP_UPDATE_CHECK: "1"
+          FASTLANE_VERSION: "2.237.0"
+          SIGH_IGNORE_PROFILES_WITH_DIFFERENT_NAME: "true"
+        run: |
+          set -euo pipefail
+          api_key_path="$RUNNER_TEMP/app-store-connect-api-key.json"
+          profile_output="$RUNNER_TEMP/provisioning-profile"
+          mkdir -p "$profile_output"
+          ruby -rbase64 -rjson -ropenssl -e '
+            key = Base64.strict_decode64(ENV.fetch("APP_STORE_CONNECT_PRIVATE_KEY_BASE64"))
+            OpenSSL::PKey.read(key)
+            File.write(
+              ARGV.fetch(0),
+              JSON.generate(
+                key_id: ENV.fetch("APP_STORE_CONNECT_KEY_ID"),
+                issuer_id: ENV.fetch("APP_STORE_CONNECT_ISSUER_ID"),
+                key: key,
+                in_house: false
+              )
+            )
+          ' "$api_key_path"
+          chmod 600 "$api_key_path"
+
+          actual_fastlane_version="$(
+            fastlane --version 2>&1 \
+              | awk '/^fastlane [0-9]+\./ { print $2 }' \
+              | tail -1
+          )"
+          [[ "$actual_fastlane_version" == "$FASTLANE_VERSION" ]] || {
+            echo "Expected fastlane $FASTLANE_VERSION, found ${actual_fastlane_version:-unknown}." >&2
+            exit 69
+          }
+          fastlane sigh \
+            --api_key_path "$api_key_path" \
+            --app_identifier at.oncloud.encryptedmemories \
+            --force \
+            --team_id "$APPLE_DEVELOPER_TEAM_ID" \
+            --platform "$PROFILE_PLATFORM" \
+            --provisioning_name "$PROFILE_NAME" \
+            --output_path "$profile_output"
+
+          shopt -s nullglob
+          profiles=("$profile_output"/*)
+          [[ "${#profiles[@]}" -eq 1 ]] || {
+            echo "Expected one provisioning profile, found ${#profiles[@]}." >&2
+            exit 65
+          }
+          profile_plist="$RUNNER_TEMP/provisioning-profile.plist"
+          security cms -D -i "${profiles[0]}" > "$profile_plist"
+          plutil -lint "$profile_plist"
+
+          actual_name="$(plutil -extract Name raw -o - "$profile_plist")"
+          actual_team="$(plutil -extract TeamIdentifier.0 raw -o - "$profile_plist")"
+          actual_app_identifier="$(
+            /usr/libexec/PlistBuddy \
+              -c "Print :Entitlements:$PROFILE_APP_IDENTIFIER_KEY" \
+              "$profile_plist"
+          )"
+          expiration="$(plutil -extract ExpirationDate raw -o - "$profile_plist")"
+          xcode_managed="$(plutil -extract IsXcodeManaged raw -o - "$profile_plist" 2>/dev/null || true)"
+          platforms="$(plutil -extract Platform json -o - "$profile_plist")"
+
+          [[ "$actual_name" == "$PROFILE_NAME" ]]
+          [[ "$actual_team" == "$APPLE_DEVELOPER_TEAM_ID" ]]
+          [[ "$actual_app_identifier" == "$APPLE_DEVELOPER_TEAM_ID.at.oncloud.encryptedmemories" ]]
+          [[ "$xcode_managed" != "true" ]] || {
+            echo "The provisioning profile is Xcode managed and cannot be used for manual signing." >&2
+            exit 65
+          }
+          jq -e --arg platform "$PROFILE_EXPECTED_PLATFORM" \
+            'index($platform) != null' <<< "$platforms" >/dev/null
+          ruby -rtime -e \
+            'exit(Time.parse(ARGV.fetch(0)) > Time.now + 86_400 ? 0 : 1)' \
+            "$expiration"
+
+          profile_certificate="$RUNNER_TEMP/provisioning-profile-certificate.der"
+          profile_certificate_count=0
+          profile_certificate_matches=0
+          while profile_certificate_data="$(
+            plutil -extract "DeveloperCertificates.$profile_certificate_count" \
+              raw -o - "$profile_plist" 2>/dev/null
+          )"; do
+            printf '%s' "$profile_certificate_data" \
+              | base64 --decode > "$profile_certificate"
+            profile_certificate_sha1="$(
+              openssl x509 -inform DER -in "$profile_certificate" -noout -fingerprint -sha1 \
+                | awk -F= '{ print $2 }' \
+                | tr -d ':'
+            )"
+            if [[ "$profile_certificate_sha1" == "$DISTRIBUTION_SHA1" ]]; then
+              profile_certificate_matches="$((profile_certificate_matches + 1))"
+            fi
+            profile_certificate_count="$((profile_certificate_count + 1))"
+          done
+          [[ "$profile_certificate_count" -gt 0 ]] || {
+            echo "The provisioning profile does not contain a distribution certificate." >&2
+            exit 65
+          }
+          [[ "$profile_certificate_matches" -eq 1 ]] || {
+            echo "The provisioning profile does not contain the imported distribution certificate." >&2
+            exit 65
+          }
+
+          echo "name=$actual_name" >> "$GITHUB_OUTPUT"
+          echo "Installed $actual_name, valid until $expiration."
+
+      - uses: ./.github/actions/prepare-apple-build
+        id: apple-build
+        if: steps.build.outputs.exists != 'true'
+
+      - name: Create manual export options
+        id: export-options
+        if: steps.build.outputs.exists != 'true'
+        env:
+          APPLE_DEVELOPER_TEAM_ID: ${{ vars.APPLE_DEVELOPER_TEAM_ID }}
+          DISTRIBUTION_SHA1: ${{ steps.signing-identities.outputs.distribution_sha1 }}
+          INSTALLER_SHA1: ${{ steps.signing-identities.outputs.installer_sha1 }}
+          PROFILE_NAME: ${{ steps.profile.outputs.name }}
+        run: |
+          set -euo pipefail
+          options="$RUNNER_TEMP/ExportOptions-${{ matrix.script_platform }}.plist"
+          plutil -create xml1 "$options"
+          plutil -insert destination -string export "$options"
+          plutil -insert manageAppVersionAndBuildNumber -bool false "$options"
+          plutil -insert method -string app-store-connect "$options"
+          plutil -insert provisioningProfiles -xml \
+            "<dict><key>at.oncloud.encryptedmemories</key><string>$PROFILE_NAME</string></dict>" \
+            "$options"
+          plutil -insert signingCertificate -string "$DISTRIBUTION_SHA1" "$options"
+          plutil -insert signingStyle -string manual "$options"
+          plutil -insert stripSwiftSymbols -bool true "$options"
+          plutil -insert teamID -string "$APPLE_DEVELOPER_TEAM_ID" "$options"
+          plutil -insert uploadSymbols -bool true "$options"
+          if [[ "${{ matrix.script_platform }}" == "macos" ]]; then
+            plutil -insert installerSigningCertificate \
+              -string "$INSTALLER_SHA1" \
+              "$options"
+          fi
+          plutil -lint "$options"
+          echo "path=$options" >> "$GITHUB_OUTPUT"
+
+      - name: Archive with Xcode
+        id: archive
+        if: steps.build.outputs.exists != 'true'
+        env:
           APPLE_DEVELOPER_TEAM_ID: ${{ vars.APPLE_DEVELOPER_TEAM_ID }}
           APPLE_RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
           APPLE_BUILD_NUMBER: ${{ needs.prepare.outputs.build_number }}
-        run: bash .github/scripts/archive_and_upload.sh "${{ matrix.script_platform }}"
+          DISTRIBUTION_SHA1: ${{ steps.signing-identities.outputs.distribution_sha1 }}
+          PROFILE_NAME: ${{ steps.profile.outputs.name }}
+          SOURCE_PACKAGES_PATH: ${{ steps.apple-build.outputs.source-packages-path }}
+          PACKAGE_CACHE_PATH: ${{ steps.apple-build.outputs.package-cache-path }}
+        run: |
+          set -euo pipefail
+          archive_path="$RUNNER_TEMP/EncryptedMemories-${{ matrix.script_platform }}.xcarchive"
+          derived_data="$RUNNER_TEMP/DerivedData-${{ matrix.script_platform }}.noindex"
+          result_bundle="$RUNNER_TEMP/EncryptedMemories-${{ matrix.script_platform }}.xcresult"
+          log_path="$RUNNER_TEMP/EncryptedMemories-${{ matrix.script_platform }}.log"
+          xcrun xcodebuild archive \
+            -project EncryptedMemories.xcodeproj \
+            -scheme "${{ matrix.scheme }}" \
+            -configuration Release \
+            -sdk "${{ matrix.sdk }}" \
+            -destination "${{ matrix.destination }}" \
+            -archivePath "$archive_path" \
+            -derivedDataPath "$derived_data" \
+            -resultBundlePath "$result_bundle" \
+            -clonedSourcePackagesDirPath "$SOURCE_PACKAGES_PATH" \
+            -packageCachePath "$PACKAGE_CACHE_PATH" \
+            -onlyUsePackageVersionsFromResolvedFile \
+            -disableAutomaticPackageResolution \
+            -skipPackagePluginValidation \
+            -skipMacroValidation \
+            DEVELOPMENT_TEAM="$APPLE_DEVELOPER_TEAM_ID" \
+            MARKETING_VERSION="$APPLE_RELEASE_VERSION" \
+            CURRENT_PROJECT_VERSION="$APPLE_BUILD_NUMBER" \
+            ENCRYPTED_MEMORIES_BUILD_COMMIT="$GITHUB_SHA" \
+            ENCRYPTED_MEMORIES_CODE_SIGN_STYLE=Manual \
+            ENCRYPTED_MEMORIES_CODE_SIGN_IDENTITY="$DISTRIBUTION_SHA1" \
+            ENCRYPTED_MEMORIES_PROVISIONING_PROFILE_SPECIFIER="$PROFILE_NAME" \
+            COMPILER_INDEX_STORE_ENABLE=NO \
+            2>&1 | tee "$log_path"
+          echo "path=$archive_path" >> "$GITHUB_OUTPUT"
+          echo "log-path=$log_path" >> "$GITHUB_OUTPUT"
 
-      - name: Remove signing credentials
+      - name: Export App Store package with Xcode
+        id: export
+        if: steps.build.outputs.exists != 'true'
+        env:
+          ARCHIVE_PATH: ${{ steps.archive.outputs.path }}
+          EXPORT_OPTIONS_PATH: ${{ steps.export-options.outputs.path }}
+          ARCHIVE_LOG_PATH: ${{ steps.archive.outputs.log-path }}
+        run: |
+          set -euo pipefail
+          export_path="$RUNNER_TEMP/export-${{ matrix.script_platform }}"
+          xcrun xcodebuild -exportArchive \
+            -archivePath "$ARCHIVE_PATH" \
+            -exportPath "$export_path" \
+            -exportOptionsPlist "$EXPORT_OPTIONS_PATH" \
+            2>&1 | tee -a "$ARCHIVE_LOG_PATH"
+          echo "path=$export_path" >> "$GITHUB_OUTPUT"
+
+      - name: Validate signed archive and export
+        id: artifact
+        if: steps.build.outputs.exists != 'true'
+        env:
+          APPLE_DEVELOPER_TEAM_ID: ${{ vars.APPLE_DEVELOPER_TEAM_ID }}
+        run: |
+          bash .github/scripts/validate_apple_distribution.sh \
+            "${{ matrix.script_platform }}" \
+            "${{ steps.archive.outputs.path }}" \
+            "${{ steps.export.outputs.path }}" \
+            "${{ needs.prepare.outputs.version }}" \
+            "${{ needs.prepare.outputs.build_number }}" \
+            "${{ steps.profile.outputs.name }}"
+
+      - name: Upload package to App Store Connect
+        if: steps.build.outputs.exists != 'true'
+        env:
+          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          APP_STORE_CONNECT_PRIVATE_KEY_BASE64: ${{ secrets.APP_STORE_CONNECT_PRIVATE_KEY_BASE64 }}
+          ARTIFACT_PATH: ${{ steps.artifact.outputs.path }}
+        run: |
+          set -euo pipefail
+          private_key_directory="$RUNNER_TEMP/app-store-connect-private-keys"
+          private_key="$private_key_directory/AuthKey_${APP_STORE_CONNECT_KEY_ID}.p8"
+          mkdir -p "$private_key_directory"
+          ruby -rbase64 -e '
+            File.binwrite(
+              ARGV.fetch(0),
+              Base64.strict_decode64(ENV.fetch("APP_STORE_CONNECT_PRIVATE_KEY_BASE64"))
+            )
+          ' "$private_key"
+          chmod 600 "$private_key"
+          openssl pkey -in "$private_key" -noout
+          xcrun altool --upload-package "$ARTIFACT_PATH" \
+            --api-key "$APP_STORE_CONNECT_KEY_ID" \
+            --api-issuer "$APP_STORE_CONNECT_ISSUER_ID" \
+            --p8-file-path "$private_key" \
+            --show-progress \
+            --output-format json
+
+      - name: Remove temporary release credentials
         if: always()
-        run: bash .github/scripts/cleanup_apple_signing.sh
+        run: |
+          rm -f "$RUNNER_TEMP/apple-signing-certificates.p12"
+          rm -f "$RUNNER_TEMP/app-store-connect-api-key.json"
+          rm -rf "$RUNNER_TEMP/app-store-connect-private-keys"
+
+      - name: Retain build diagnostics
+        if: failure() || cancelled()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: testflight-${{ matrix.script_platform }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/EncryptedMemories-${{ matrix.script_platform }}.log
+            ${{ runner.temp }}/EncryptedMemories-${{ matrix.script_platform }}.xcresult
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Report build storage
         if: always()

@@ -7,6 +7,14 @@ inputs:
     required: false
     default: "0.24.0"
 
+outputs:
+  source-packages-path:
+    description: Shared Xcode package checkout path.
+    value: ${{ steps.build-paths.outputs.source-packages-path }}
+  package-cache-path:
+    description: Shared Xcode package cache path.
+    value: ${{ steps.build-paths.outputs.package-cache-path }}
+
 runs:
   using: composite
   steps:
@@ -54,6 +62,17 @@ runs:
           ~/Developer/xcode/EncryptedMemories/SourcePackages.noindex
           ~/Developer/xcode/EncryptedMemories/XcodePackageCache.noindex
         key: ${{ steps.dependency-cache-key.outputs.key }}
+
+    - name: Export shared Xcode build paths
+      id: build-paths
+      shell: bash
+      run: |
+        set -euo pipefail
+        source scripts/build-paths.sh
+        {
+          echo "source-packages-path=$ENCRYPTED_MEMORIES_XCODE_SOURCE_PACKAGES"
+          echo "package-cache-path=$ENCRYPTED_MEMORIES_XCODE_PACKAGE_CACHE"
+        } >> "$GITHUB_OUTPUT"
 
     - name: Resolve and pin package graph
       shell: bash
