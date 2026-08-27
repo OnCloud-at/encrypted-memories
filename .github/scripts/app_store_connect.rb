@@ -408,19 +408,23 @@ module AppStoreConnect
     end
 
     def validate_in_app_purchase_sandbox
-      validate_in_app_purchase_contract(require_review_metadata: false)
-      append_summary("All four consumable tips have sandbox-ready App Store Connect metadata.")
+      product_count = validate_in_app_purchase_contract(require_review_metadata: false)
+      append_summary(
+        "#{product_count} configured in-app purchases have sandbox-ready App Store Connect metadata."
+      )
       true
     rescue Errno::ENOENT, JSON::ParserError, KeyError => error
       raise Error, "Invalid in-app purchase contract: #{error.message}"
     end
 
     def validate_in_app_purchases(require_approved_products: false)
-      validate_in_app_purchase_contract(
+      product_count = validate_in_app_purchase_contract(
         require_review_metadata: true,
         require_approved_products: require_approved_products
       )
-      append_summary("All four consumable tips match the App Store Connect review contract.")
+      append_summary(
+        "#{product_count} configured in-app purchases match the App Store Connect review contract."
+      )
       true
     rescue Errno::ENOENT, JSON::ParserError, KeyError => error
       raise Error, "Invalid in-app purchase contract: #{error.message}"
@@ -499,6 +503,9 @@ module AppStoreConnect
                                end
       errors = []
       validate_in_app_purchase_bundle_identifier(contract.fetch("bundleIdentifier"), errors)
+      capability_valid = validate_in_app_purchase_capability(contract.fetch("bundleIdentifier"), errors)
+      raise Error, "In-app purchase preflight failed: #{errors.join('; ')}" unless capability_valid
+
       products = @client.collection(
         "/v1/apps/#{@app_id}/inAppPurchasesV2",
         query: {
@@ -548,6 +555,8 @@ module AppStoreConnect
       end
 
       raise Error, "In-app purchase preflight failed: #{errors.join('; ')}" unless errors.empty?
+
+      expected_products.length
     end
 
     def validate_in_app_purchase_bundle_identifier(expected_identifier, errors)
@@ -559,6 +568,54 @@ module AppStoreConnect
       return if actual_identifier == expected_identifier
 
       errors << "app has bundle identifier #{actual_identifier.inspect}; expected #{expected_identifier.inspect}"
+    end
+
+    def validate_in_app_purchase_capability(expected_identifier, errors)
+      bundle_ids = @client.collection(
+        "/v1/bundleIds",
+        query: {
+          "filter[identifier]" => expected_identifier,
+          "fields[bundleIds]" => "identifier,platform",
+          "limit" => "200"
+        }
+      ).select do |bundle_id|
+        bundle_id.dig("attributes", "identifier") == expected_identifier
+      end
+
+      if bundle_ids.empty?
+        errors << "registered bundle ID #{expected_identifier.inspect} is missing"
+        return false
+      end
+      if bundle_ids.length > 1
+        errors << "registered bundle ID #{expected_identifier.inspect} is ambiguous"
+        return false
+      end
+
+      bundle_id_resource_id = bundle_ids.first["id"].to_s
+      if bundle_id_resource_id.empty?
+        errors << "registered bundle ID #{expected_identifier.inspect} has no resource ID"
+        return false
+      end
+
+      capabilities = @client.collection(
+        "/v1/bundleIds/#{bundle_id_resource_id}/bundleIdCapabilities",
+        query: {
+          "fields[bundleIdCapabilities]" => "capabilityType",
+          "limit" => "200"
+        }
+      )
+      if capabilities.any? do |capability|
+        capability.dig("attributes", "capabilityType") == "IN_APP_PURCHASE"
+      end
+        puts "Registered bundle ID #{expected_identifier} enables In-App Purchase."
+        return true
+      end
+
+      errors << "registered bundle ID #{expected_identifier.inspect} does not enable In-App Purchase"
+      false
+    rescue TransportError => error
+      errors << "registered bundle ID capabilities could not be read: #{error.message}"
+      false
     end
 
     def validate_in_app_purchase_metadata(
