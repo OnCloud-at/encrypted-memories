@@ -600,8 +600,7 @@ module AppStoreConnect
       capabilities = @client.collection(
         "/v1/bundleIds/#{bundle_id_resource_id}/bundleIdCapabilities",
         query: {
-          "fields[bundleIdCapabilities]" => "capabilityType",
-          "limit" => "200"
+          "fields[bundleIdCapabilities]" => "capabilityType"
         }
       )
       if capabilities.any? do |capability|
