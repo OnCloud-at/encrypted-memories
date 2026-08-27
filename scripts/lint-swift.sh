@@ -36,12 +36,14 @@ case "${1:-}" in
 esac
 
 declare -a source_files=()
-for file in "${files[@]}"; do
-  case "$file" in
-    Vendor/*|EncryptedMemories.xcodeproj/*) continue ;;
-  esac
-  [[ -f "$file" ]] && source_files+=("$file")
-done
+if (( ${#files[@]} > 0 )); then
+  for file in "${files[@]}"; do
+    case "$file" in
+      Vendor/*|EncryptedMemories.xcodeproj/*) continue ;;
+    esac
+    [[ -f "$file" ]] && source_files+=("$file")
+  done
+fi
 
 if [[ ${#source_files[@]} -eq 0 ]]; then
   echo "No changed Swift files require linting."
