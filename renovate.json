@@ -1,0 +1,134 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    "helpers:pinGitHubActionDigests"
+  ],
+  "enabledManagers": [
+    "github-actions",
+    "swift",
+    "custom.regex",
+    "renovate-config"
+  ],
+  "automerge": false,
+  "dependencyDashboard": true,
+  "minimumReleaseAge": "3 days",
+  "prConcurrentLimit": 5,
+  "prHourlyLimit": 2,
+  "schedule": [
+    "after 22:00 on sunday"
+  ],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Monitor every SwiftPM pin in committed Package.resolved files",
+      "managerFilePatterns": [
+        "/(^|/)Package\\.resolved$/"
+      ],
+      "matchStrings": [
+        "\\\"location\\\"\\s*:\\s*\\\"(?<depName>https?://[^\\\"]+)\\\"[\\s\\S]*?\\\"revision\\\"\\s*:\\s*\\\"(?<currentDigest>[0-9a-f]{40})\\\"[\\s\\S]*?\\\"version\\\"\\s*:\\s*\\\"(?<currentValue>[^\\\"]+)\\\""
+      ],
+      "datasourceTemplate": "git-tags",
+      "versioningTemplate": "swift"
+    },
+    {
+      "customType": "regex",
+      "description": "Monitor the pinned XcodeGen release",
+      "managerFilePatterns": [
+        "/(^|/)scripts/install-xcodegen\\.sh$/"
+      ],
+      "matchStrings": [
+        "XCODEGEN_VERSION=\\\"(?<currentValue>[^\\\"\\n]+)\\\""
+      ],
+      "depNameTemplate": "yonaskolb/XcodeGen",
+      "datasourceTemplate": "github-releases",
+      "versioningTemplate": "semver"
+    },
+    {
+      "customType": "regex",
+      "description": "Monitor the pinned rclone release",
+      "managerFilePatterns": [
+        "/(^|/)scripts/install-rclone\\.sh$/"
+      ],
+      "matchStrings": [
+        "RCLONE_VERSION=\\\"(?<currentValue>[^\\\"\\n]+)\\\""
+      ],
+      "depNameTemplate": "rclone/rclone",
+      "datasourceTemplate": "github-releases",
+      "versioningTemplate": "semver-coerced"
+    },
+    {
+      "customType": "regex",
+      "description": "Monitor the pinned SwiftLint release in the composite action",
+      "managerFilePatterns": [
+        "/(^|/)\\.github/actions/install-swiftlint/action\\.yml$/"
+      ],
+      "matchStrings": [
+        "SWIFTLINT_VERSION:\\s*\\\"(?<currentValue>[^\\\"\\n]+)\\\""
+      ],
+      "depNameTemplate": "realm/SwiftLint",
+      "datasourceTemplate": "github-releases",
+      "versioningTemplate": "semver"
+    },
+    {
+      "customType": "regex",
+      "description": "Monitor the SwiftLint version assertion",
+      "managerFilePatterns": [
+        "/(^|/)scripts/lint-swift\\.sh$/"
+      ],
+      "matchStrings": [
+        "\\[\\[ \\\"\\$actual_swiftlint_version\\\" == \\\"(?<currentValue>[^\\\"]+)\\\" \\]\\]"
+      ],
+      "depNameTemplate": "realm/SwiftLint",
+      "datasourceTemplate": "github-releases",
+      "versioningTemplate": "semver"
+    }
+  ],
+  "packageRules": [
+    {
+      "description": "Keep routine GitHub Action updates together",
+      "matchManagers": [
+        "github-actions"
+      ],
+      "matchUpdateTypes": [
+        "digest",
+        "patch",
+        "minor"
+      ],
+      "groupName": "GitHub Actions"
+    },
+    {
+      "description": "Keep SwiftPM manifest and resolved-graph updates together",
+      "matchManagers": [
+        "swift",
+        "custom.regex"
+      ],
+      "matchFileNames": [
+        "/(^|/)Package\\.swift$/",
+        "/(^|/)Package\\.resolved$/"
+      ],
+      "matchUpdateTypes": [
+        "digest",
+        "patch",
+        "minor"
+      ],
+      "groupName": "SwiftPM dependencies"
+    },
+    {
+      "description": "Release-binary updates require manual checksum refresh",
+      "matchPackageNames": [
+        "yonaskolb/XcodeGen",
+        "rclone/rclone",
+        "realm/SwiftLint"
+      ],
+      "labels": [
+        "dependencies",
+        "checksum-review"
+      ],
+      "prBodyNotes": [
+        "This update changes a release-binary version. Update and verify every corresponding SHA-256 constant before merging."
+      ],
+      "automerge": false
+    }
+  ]
+}
