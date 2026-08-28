@@ -40,6 +40,36 @@ struct TipJarCelebrationTests {
         #expect(coordinator.activeCelebration == nil)
     }
 
+    @Test("Only a matching configured tip can trigger celebration")
+    func onlyMatchingConfiguredTipCanTriggerCelebration() {
+        let allowedProductIdentifiers = [
+            "at.oncloud.encryptedmemories.tip.medium",
+            "at.oncloud.encryptedmemories.tip.large",
+        ]
+
+        #expect(
+            TipJarPurchaseEligibility.accepts(
+                productIdentifier: allowedProductIdentifiers[0],
+                transactionProductIdentifier: allowedProductIdentifiers[0],
+                allowedProductIdentifiers: allowedProductIdentifiers
+            )
+        )
+        #expect(
+            !TipJarPurchaseEligibility.accepts(
+                productIdentifier: "at.oncloud.encryptedmemories.tip.unknown",
+                transactionProductIdentifier: "at.oncloud.encryptedmemories.tip.unknown",
+                allowedProductIdentifiers: allowedProductIdentifiers
+            )
+        )
+        #expect(
+            !TipJarPurchaseEligibility.accepts(
+                productIdentifier: allowedProductIdentifiers[0],
+                transactionProductIdentifier: allowedProductIdentifiers[1],
+                allowedProductIdentifiers: allowedProductIdentifiers
+            )
+        )
+    }
+
     @Test("StoreKit view completion starts the celebration")
     func storeKitViewCompletionStartsCelebration() throws {
         var sourceURL = URL(fileURLWithPath: #filePath)

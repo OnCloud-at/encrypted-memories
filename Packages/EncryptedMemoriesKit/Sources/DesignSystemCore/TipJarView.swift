@@ -108,7 +108,11 @@ public struct TipJarView: View {
             case .success(let purchaseResult) = result,
             case .success(let verificationResult) = purchaseResult,
             case .verified(let transaction) = verificationResult,
-            transaction.productID == product.id
+            TipJarPurchaseEligibility.accepts(
+                productIdentifier: product.id,
+                transactionProductIdentifier: transaction.productID,
+                allowedProductIdentifiers: productIdentifiers
+            )
         else { return }
 
         TipJarCelebrationCoordinator.shared.celebrate()
@@ -129,6 +133,17 @@ enum TipJarProductAvailability {
     static func orderedAvailableIdentifiers(expected: [String], returned: [String]) -> [String] {
         let returnedIdentifiers = Set(returned)
         return expected.filter(returnedIdentifiers.contains)
+    }
+}
+
+enum TipJarPurchaseEligibility {
+    static func accepts(
+        productIdentifier: String,
+        transactionProductIdentifier: String,
+        allowedProductIdentifiers: [String]
+    ) -> Bool {
+        allowedProductIdentifiers.contains(productIdentifier)
+            && transactionProductIdentifier == productIdentifier
     }
 }
 
