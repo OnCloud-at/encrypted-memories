@@ -287,8 +287,11 @@ final class LibraryResourceCoordinatorTests: XCTestCase {
 
     func testRecoveryHysteresisRequiresStableDelay() async throws {
         let state = LibraryRuntimeState(initial: LibraryRuntimeSnapshot(thermalLevel: .critical))
+        let recoveryGate = RecoveryDelayGate()
         let coordinator = LibraryResourceCoordinator(
-            runtimeState: state, recoveryDelay: .milliseconds(30)
+            runtimeState: state,
+            recoveryDelay: .milliseconds(30),
+            recoverySleep: { await recoveryGate.wait(for: $0) }
         )
         await coordinator.startObserving()
         let request = LibraryWorkRequest(workload: .mlIndexing, intent: .automatic)
@@ -296,12 +299,16 @@ final class LibraryResourceCoordinatorTests: XCTestCase {
         XCTAssertFalse(initiallyAdmitted)
 
         state.update { $0.thermalLevel = .nominal }
-        try await Task.sleep(for: .milliseconds(5))
+        let requestedDelay = await recoveryGate.waitUntilEntered()
+        XCTAssertEqual(requestedDelay, .milliseconds(30))
         let admittedDuringRecovery = await coordinator.budget(for: request).isAdmitted
         XCTAssertFalse(admittedDuringRecovery)
-        try await Task.sleep(for: .milliseconds(40))
-        let admittedAfterRecovery = await coordinator.budget(for: request).isAdmitted
-        XCTAssertTrue(admittedAfterRecovery)
+
+        await recoveryGate.open()
+        let recovered = await waitUntilAsync {
+            await coordinator.budget(for: request).isAdmitted
+        }
+        XCTAssertTrue(recovered)
     }
 
     func testGenerationChangeRejectsAQueuedOldSessionPermit() async throws {
@@ -342,6 +349,31 @@ private actor AsyncGate {
 
     func waitUntilEntered() async {
         while !entered { await Task.yield() }
+    }
+
+    func open() {
+        isOpen = true
+        for waiter in waiters { waiter.resume() }
+        waiters.removeAll()
+    }
+}
+
+private actor RecoveryDelayGate {
+    private var requestedDelay: Duration?
+    private var isOpen = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func wait(for delay: Duration) async {
+        requestedDelay = delay
+        guard !isOpen else { return }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+
+    func waitUntilEntered() async -> Duration {
+        while true {
+            if let requestedDelay { return requestedDelay }
+            await Task.yield()
+        }
     }
 
     func open() {
@@ -399,4 +431,16 @@ private func waitUntil(
         try? await Task.sleep(for: .milliseconds(5))
     }
     return predicate()
+}
+
+private func waitUntilAsync(
+    timeout: Duration = .seconds(2),
+    _ predicate: @escaping @Sendable () async -> Bool
+) async -> Bool {
+    let deadline = ContinuousClock.now + timeout
+    while ContinuousClock.now < deadline {
+        if await predicate() { return true }
+        try? await Task.sleep(for: .milliseconds(5))
+    }
+    return await predicate()
 }
