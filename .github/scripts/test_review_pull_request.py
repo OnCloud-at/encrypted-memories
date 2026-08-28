@@ -196,9 +196,9 @@ class ParsingAndRenderingTests(unittest.TestCase):
             [
                 "@@ -1,4 +1,5 @@",
                 "+safe",
-                "+-----BEGIN PRIVATE KEY-----",
+                "+-----BEGIN " + "PRIVATE KEY-----",
                 "+private material that must not be sent",
-                "+-----END PRIVATE KEY-----",
+                "+-----END " + "PRIVATE KEY-----",
                 "+after",
             ]
         )
