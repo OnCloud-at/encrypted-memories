@@ -4,8 +4,8 @@
   "reviewNote": "These are optional one-time consumable tips. They do not unlock features, content, subscriptions, or services. Every app feature remains free and open source. The four products are functionally identical and differ only in price. Consumable tips may be purchased repeatedly by design. On iPhone or iPad, open Library, tap Proton Account and Settings in the top-left corner, then select Support Encrypted Memories. On macOS, open Settings from the sidebar, then select Support. Select the submitted tip and complete the sandbox purchase.",
   "products": [
     {
-      "productId": "at.oncloud.encryptedmemories.tip.small",
-      "referenceName": "Small Tip",
+      "productId": "at.oncloud.encryptedmemories.tip.s",
+      "referenceName": "Small Tip v2",
       "type": "CONSUMABLE",
       "localizations": {
         "en-US": {

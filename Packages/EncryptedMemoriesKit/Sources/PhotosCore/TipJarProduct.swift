@@ -4,7 +4,7 @@ import Foundation
 ///
 /// The universal app uses one product namespace on iOS, iPadOS, and macOS.
 public enum TipJarProduct: String, CaseIterable, Sendable {
-    case small
+    case small = "s"
     case medium
     case large
     case extraLarge = "extra_large"

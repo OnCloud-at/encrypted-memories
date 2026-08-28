@@ -11,7 +11,7 @@ struct TipJarProductTests {
 
         #expect(
             identifiers == [
-                "at.oncloud.encryptedmemories.tip.small",
+                "at.oncloud.encryptedmemories.tip.s",
                 "at.oncloud.encryptedmemories.tip.medium",
                 "at.oncloud.encryptedmemories.tip.large",
                 "at.oncloud.encryptedmemories.tip.extra_large",
@@ -19,6 +19,6 @@ struct TipJarProductTests {
         #expect(Set(identifiers).count == TipJarProduct.allCases.count)
         #expect(TipJarProduct.contains(identifiers[0], bundleIdentifier: bundleIdentifier))
         #expect(
-            !TipJarProduct.contains("at.oncloud.encryptedmemories.other.tip.small", bundleIdentifier: bundleIdentifier))
+            !TipJarProduct.contains("at.oncloud.encryptedmemories.other.tip.s", bundleIdentifier: bundleIdentifier))
     }
 }
