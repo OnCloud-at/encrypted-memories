@@ -350,7 +350,7 @@ final class ProjectHygieneTests: XCTestCase {
         XCTAssertEqual(
             productIDs,
             [
-                "at.oncloud.encryptedmemories.tip.small",
+                "at.oncloud.encryptedmemories.tip.s",
                 "at.oncloud.encryptedmemories.tip.medium",
                 "at.oncloud.encryptedmemories.tip.large",
                 "at.oncloud.encryptedmemories.tip.extra_large",
