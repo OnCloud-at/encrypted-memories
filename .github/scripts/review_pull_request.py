@@ -751,8 +751,7 @@ def main() -> int:
         expected_snapshot=event_snapshot,
     ):
         return 0
-    effort_suffix = f"/{reasoning_effort}" if reasoning_effort else ""
-    print(f"Automated pull request review completed with {model}{effort_suffix}.")
+    print("Automated pull request review completed.")
     return 0
 
 
