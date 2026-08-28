@@ -215,6 +215,7 @@ private struct MobileRootView: View {
                 MobileLoginView()
             case .signedIn:
                 MobileMainTabView()
+                    .id(libraryModel.scopePresentationRevision)
             }
         }
         .overlay {

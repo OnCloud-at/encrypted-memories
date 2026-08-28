@@ -14,7 +14,7 @@ import Testing
             policy: .init(interval: .milliseconds(5), failureInterval: .milliseconds(5))
         ) {
             await counter.increment()
-            return true
+            return .refreshed
         }
 
         try await Task.sleep(for: .milliseconds(18))
@@ -37,7 +37,7 @@ import Testing
             interval: .milliseconds(5), failureInterval: .milliseconds(5))
         await monitor.start(provider: provider, policy: policy) {
             await counter.increment()
-            return true
+            return .refreshed
         }
         try await Task.sleep(for: .milliseconds(12))
         await monitor.stop()
@@ -45,7 +45,7 @@ import Testing
         await provider.set("b")
         await monitor.restart(provider: provider, policy: policy) {
             await counter.increment()
-            return true
+            return .refreshed
         }
         let deadline = ContinuousClock.now + .seconds(2)
         while await counter.value == 0, ContinuousClock.now < deadline {
@@ -64,7 +64,7 @@ import Testing
             policy: .init(interval: .milliseconds(5), failureInterval: .milliseconds(5))
         ) {
             await attempts.increment()
-            return await attempts.value > 1
+            return await attempts.value > 1 ? .refreshed : .retry
         }
 
         try await Task.sleep(for: .milliseconds(12))
@@ -89,7 +89,7 @@ import Testing
             initialToken: "cached"
         ) {
             await counter.increment()
-            return true
+            return .refreshed
         }
 
         // The second probe proves that the first changed token was accepted and committed.
@@ -107,7 +107,7 @@ import Testing
             interval: .zero, failureInterval: .zero)
         await monitor.start(provider: provider, policy: policy, initialToken: "a") {
             await counter.increment()
-            return true
+            return .refreshed
         }
         await provider.set("b")
         let countAfterMutation = await provider.probeCount
@@ -119,7 +119,7 @@ import Testing
         let countBeforeRestart = await provider.probeCount
         await monitor.start(provider: provider, policy: policy, initialToken: "a") {
             await counter.increment()
-            return true
+            return .refreshed
         }
         await provider.waitUntilProbeCount(countBeforeRestart + 1)
         #expect(await counter.value == 1)
@@ -136,7 +136,7 @@ import Testing
             policy: .init(interval: .zero, failureInterval: .zero)
         ) {
             Issue.record("A cancelled probe must not publish a library change")
-            return true
+            return .refreshed
         }
 
         await provider.waitUntilEntered()
@@ -162,7 +162,7 @@ import Testing
             policy: .init(interval: .zero, failureInterval: .zero)
         ) {
             Issue.record("A cancelled probe must not publish a library change")
-            return true
+            return .refreshed
         }
 
         await retiringProvider.waitUntilEntered()
@@ -175,12 +175,65 @@ import Testing
             provider: replacementProvider,
             policy: .init(interval: .zero, failureInterval: .zero)
         ) {
-            true
+            .refreshed
         }
         await retiringProvider.release()
         await stopTask.value
 
         #expect(await replacementProvider.observesProbeCount(1))
+        await monitor.stop()
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func terminalScopeFailureRetiresTaskBeforeHostRecoveryRestartsMonitor() async {
+        let provider = TerminalTokenProvider()
+        let replacement = TokenProvider("replacement")
+        let terminalCallbacks = Counter()
+        let monitor = LibraryChangeMonitor()
+        await monitor.start(
+            provider: provider,
+            policy: .init(interval: .zero, failureInterval: .zero),
+            onTerminal: { _ in
+                await terminalCallbacks.increment()
+                await monitor.restart(
+                    provider: replacement,
+                    policy: .init(interval: .zero, failureInterval: .zero)
+                ) {
+                    .refreshed
+                }
+            },
+            onChange: {
+                Issue.record("A terminal scope failure must not publish a library change")
+                return .refreshed
+            }
+        )
+
+        await provider.waitUntilProbed()
+        await replacement.waitUntilProbeCount(1)
+
+        #expect(await provider.probeCount == 1)
+        #expect(await terminalCallbacks.value == 1)
+        await monitor.stop()
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func terminalRefreshOutcomeRetiresTaskBeforeCallingHostRecovery() async {
+        let provider = TokenProvider("new")
+        let terminalCallbacks = Counter()
+        let monitor = LibraryChangeMonitor()
+        await monitor.start(
+            provider: provider,
+            policy: .init(interval: .zero, failureInterval: .zero),
+            initialToken: "old",
+            onTerminal: { _ in await terminalCallbacks.increment() },
+            onChange: { .terminal }
+        )
+
+        await provider.waitUntilProbeCount(1)
+        while await terminalCallbacks.value == 0 { await Task.yield() }
+
+        #expect(await provider.probeCount == 1)
+        #expect(await terminalCallbacks.value == 1)
         await monitor.stop()
     }
 }
@@ -243,6 +296,25 @@ private actor BlockingTokenProvider: LibraryChangeTokenProvider {
     func waitUntilEntered() async { await entered.wait() }
     func waitUntilCancellationObserved() async { await cancellationObserved.wait() }
     func release() async { await releaseSignal.signal() }
+}
+
+private struct ExpectedTerminalLibraryChangeError: LibraryChangeTerminalError {}
+
+private actor TerminalTokenProvider: LibraryChangeTokenProvider {
+    private(set) var probeCount = 0
+    private var waiter: CheckedContinuation<Void, Never>?
+
+    func libraryChangeToken() async throws -> String {
+        probeCount += 1
+        waiter?.resume()
+        waiter = nil
+        throw ExpectedTerminalLibraryChangeError()
+    }
+
+    func waitUntilProbed() async {
+        guard probeCount == 0 else { return }
+        await withCheckedContinuation { waiter = $0 }
+    }
 }
 
 private actor CompletionProbe {

@@ -42,6 +42,15 @@ import Testing
             ) == .refreshRequired(monitorBaseline: "event-4"))
     }
 
+    @Test func terminalProbePreservesRecoveryMeaning() async {
+        #expect(
+            await TimelineCacheValidationPolicy.validate(
+                snapshot: snapshot(token: "event-4"),
+                repository: TerminalCacheValidationRepository()
+            ) == .terminalFailure
+        )
+    }
+
     private func snapshot(token: String?) -> CachedTimelineSnapshot {
         CachedTimelineSnapshot(sections: [], validationToken: token)
     }
@@ -68,3 +77,13 @@ private actor CacheValidationRepository: PhotosRepository, LibraryChangeTokenPro
 }
 
 private struct ProbeFailure: Error {}
+
+private struct TerminalCacheValidationRepository: PhotosRepository, LibraryChangeTokenProvider {
+    func loadTimeline() async throws -> [TimelineSection] { [] }
+
+    func libraryChangeToken() async throws -> String {
+        throw TerminalCacheValidationError()
+    }
+}
+
+private struct TerminalCacheValidationError: LibraryChangeTerminalError {}

@@ -3,6 +3,7 @@ import Foundation
 /// Stable failure classes used by platform shells to distinguish expected server convergence from real errors.
 public enum TimelineRefreshFailureReason: Sendable, Equatable {
     case pendingInventoryVisibility
+    case scopeAccessLost
     case superseded
     case cancelled
     case other
@@ -36,7 +37,7 @@ public struct TimelineRefreshConvergencePolicy: Sendable, Equatable {
             return .retry(after: schedule.delays[nextAttempt])
         case .superseded, .cancelled:
             return .cancelled
-        case .other:
+        case .scopeAccessLost, .other:
             return .failed
         }
     }

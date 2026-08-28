@@ -40,6 +40,9 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     /// enumerate the same 20k-item library concurrently.
     private var timelineLoadTask: (generation: UInt64, task: Task<TimelineLoadSnapshot, any Error>)?
     private var timelineLoadGeneration: UInt64 = 0
+    /// Three-pass quiet-window proof for a full Photos listing after event history becomes unusable. This state
+    /// is intentionally memory-only; a relaunch restarts proof instead of trusting a partially observed window.
+    private var continuityRecovery = TimelineContinuityRecoveryCoordinator()
     /// Primary uploads returned by the SDK but not yet observed in an authoritative photos listing.
     private var pendingUploadedNodeIDs = Set<String>()
     /// Low-priority, resumable reconciliation of lossy timeline tags with authoritative link MIME types.
@@ -230,17 +233,37 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
             // Keep the previous rows + token intact while network work is in flight. The final SQLite save
             // atomically replaces both only after the enumeration is complete and stable; cancellation, process
             // death or a transient endpoint failure therefore cannot poison the next warm launch.
-            let startEventToken = try await volumeEventToken(
-                volumeID: root.volumeID,
-                priority: .userInitiated
-            )
-            try checkTimelineLoad(generation: generation)
-            DebugLog.log("timeline: photos root \(root.volumeID.prefix(8))…/\(root.nodeID.prefix(8))… - enumerating")
-            let mediaTypeEvidence = timelineStore?.mediaTypeEvidence(volumeID: root.volumeID) ?? [:]
             let cachedValidationToken = timelineStore?.validationToken()
             let cachedEventToken = TimelineInventoryValidationTokenPolicy.remoteEventToken(
                 from: cachedValidationToken
             )
+            let historyEventProbe = try await volumeEventProbe(
+                volumeID: root.volumeID,
+                cursor: cachedEventToken,
+                priority: .userInitiated
+            )
+            if historyEventProbe.scopeAccessLost { throw DriveEventScopeAccessLostError() }
+            var continuityRecoveryRequired = historyEventProbe.requiresAuthoritativeRefresh
+            let startEventProbe: SDKEventCursorResult
+            if continuityRecoveryRequired {
+                // A continuity event is not a committable cursor. Seed a fresh current cursor, then prove a
+                // complete server listing against it over the bounded quiet window below.
+                startEventProbe = try await volumeEventProbe(
+                    volumeID: root.volumeID,
+                    cursor: nil,
+                    priority: .userInitiated
+                )
+                guard !startEventProbe.requiresAuthoritativeRefresh else {
+                    continuityRecovery.reset()
+                    throw TimelineContinuityRecoveryPendingError()
+                }
+            } else {
+                startEventProbe = historyEventProbe
+            }
+            let startEventToken = try eventCursor(from: startEventProbe)
+            try checkTimelineLoad(generation: generation)
+            DebugLog.log("timeline: photos root \(root.volumeID.prefix(8))…/\(root.nodeID.prefix(8))… - enumerating")
+            let mediaTypeEvidence = timelineStore?.mediaTypeEvidence(volumeID: root.volumeID) ?? [:]
             let currentValidationToken = TimelineInventoryValidationTokenPolicy.persistedToken(
                 remoteEventToken: startEventToken
             )
@@ -249,25 +272,48 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                     volumeID: root.volumeID
                 ) ?? []
             var enrichmentComplete = true
-            let source = TimelineInventorySourcePolicy.decide(
-                cachedEventToken: cachedValidationToken,
-                currentEventToken: currentValidationToken,
-                hasPendingLocalUploads: !pendingUploadedNodeIDs.isEmpty,
-                hasUnmaterializedLocalEvidence: !unmaterializedEvidenceNodeIDs.isEmpty
-            )
+            let source =
+                continuityRecoveryRequired
+                ? TimelineInventorySource.authoritativePhotosList
+                : TimelineInventorySourcePolicy.decide(
+                    cachedEventToken: cachedValidationToken,
+                    currentEventToken: currentValidationToken,
+                    hasPendingLocalUploads: !pendingUploadedNodeIDs.isEmpty,
+                    hasUnmaterializedLocalEvidence: !unmaterializedEvidenceNodeIDs.isEmpty
+                )
             let sections: [TimelineSection]
             let reconciliationItems: [PhotoItem]
             let burstMemberIDs: [String: [String]]
             let burstEntries: [PhotosListEntry]?
+            var authoritativeInventoryFingerprint: String?
 
             switch source {
             case .authoritativePhotosList:
-                let expectedRemoteNodeIDs = try await remotelyChangedActivePhotoNodeIDs(
-                    since: cachedEventToken,
-                    currentEventToken: startEventToken,
-                    volumeID: root.volumeID
-                )
-                let entries = try await driveSession.fetchPhotosList(volumeID: root.volumeID)
+                let expectedRemoteNodeIDs: Set<String>?
+                if continuityRecoveryRequired {
+                    expectedRemoteNodeIDs = nil
+                } else {
+                    expectedRemoteNodeIDs = try await remotelyChangedActivePhotoNodeIDs(
+                        since: cachedEventToken,
+                        currentEventToken: startEventToken,
+                        volumeID: root.volumeID
+                    )
+                    if expectedRemoteNodeIDs == nil {
+                        continuityRecoveryRequired = true
+                    }
+                }
+                let entries: [PhotosListEntry]
+                if continuityRecoveryRequired {
+                    entries = try await continuityRecovery.fetchInventory(
+                        cursor: startEventToken,
+                        now: .now
+                    ) { [driveSession] in
+                        try await driveSession.fetchPhotosList(volumeID: root.volumeID)
+                    }
+                } else {
+                    entries = try await driveSession.fetchPhotosList(volumeID: root.volumeID)
+                }
+                authoritativeInventoryFingerprint = TimelineContinuityInventoryFingerprint.make(entries: entries)
                 let representedNodeIDs = Set(entries.map(\.linkID)).union(
                     entries.flatMap { $0.relatedPhotos.map(\.linkID) }
                 )
@@ -364,24 +410,66 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
             guard pendingUploadedNodeIDs.isEmpty else {
                 throw TimelineInventoryVisibilityError.pendingUploadsNotVisible(pendingUploadedNodeIDs.count)
             }
-            let endEventToken = try await volumeEventToken(
-                volumeID: root.volumeID,
-                priority: .userInitiated
-            )
+            var continuityRecoveryQualified = false
+            let endEventToken: String
+            if continuityRecoveryRequired {
+                guard let authoritativeInventoryFingerprint else {
+                    continuityRecovery.reset()
+                    throw TimelineContinuityRecoveryPendingError()
+                }
+                let qualification = try await continuityRecovery.qualify(
+                    startCursor: startEventToken,
+                    inventoryFingerprint: authoritativeInventoryFingerprint,
+                    now: .now
+                ) { [self] in
+                    let probe = try await volumeEventProbe(
+                        volumeID: root.volumeID,
+                        cursor: startEventToken,
+                        priority: .userInitiated
+                    )
+                    return TimelineContinuityPostInventoryProbe(
+                        cursor: try eventCursor(from: probe),
+                        requiresAuthoritativeRefresh: probe.requiresAuthoritativeRefresh
+                    )
+                }
+                endEventToken = qualification.endCursor
+                continuityRecoveryQualified = qualification.recoveryQualified
+            } else {
+                let endEventProbe = try await volumeEventProbe(
+                    volumeID: root.volumeID,
+                    cursor: startEventToken,
+                    priority: .userInitiated
+                )
+                endEventToken = try eventCursor(from: endEventProbe)
+                // A new continuity loss during enumeration starts a fresh proof window on the next load. Do not
+                // return a successful memory-only snapshot because the monitor would consume its probed token.
+                guard !endEventProbe.requiresAuthoritativeRefresh else {
+                    continuityRecovery.reset()
+                    throw TimelineContinuityRecoveryPendingError()
+                }
+                continuityRecovery.reset()
+            }
             try checkTimelineLoad(generation: generation)
             let commit = TimelineLoadCommitPolicy.decide(
                 startEventToken: startEventToken,
                 endEventToken: endEventToken,
                 enrichmentComplete: enrichmentComplete
             )
+            if continuityRecoveryQualified, commit.persistedValidationToken == nil {
+                throw TimelineContinuityRecoveryPendingError()
+            }
             if let persistedToken = commit.persistedValidationToken {
                 try checkTimelineLoad(generation: generation)
-                let cacheSaved = writeTimelineCache(
-                    sections,
-                    validationToken: TimelineInventoryValidationTokenPolicy.persistedToken(
-                        remoteEventToken: persistedToken
+                let cacheSaved = try continuityRecovery.persist(
+                    recoveryQualified: continuityRecoveryQualified
+                ) {
+                    writeTimelineCache(
+                        sections,
+                        validationToken: TimelineInventoryValidationTokenPolicy.persistedToken(
+                            remoteEventToken: persistedToken
+                        )
                     )
-                )
+                }
                 if source == .authoritativePhotosList, cacheSaved,
                     timelineStore?.pruneUnmaterializedMediaTypeEvidence(volumeID: root.volumeID) == false
                 {
@@ -402,7 +490,13 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                 sections: sections,
                 validationToken: monitorToken(remoteToken: commit.monitorBaseline)
             )
+        } catch is TimelineContinuityRecoveryPendingError {
+            DebugLog.log("timeline: continuity recovery is still converging")
+            throw TimelineContinuityRecoveryPendingError()
         } catch {
+            // A transport error, cancellation, or other invalid observation breaks the quiet window. A future
+            // recovery attempt must collect all three qualified full inventories again.
+            continuityRecovery.reset()
             DebugLog.log("timeline: FAILED - \(error)")
             throw error
         }
@@ -441,12 +535,34 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         return timelineStore?.validationToken()
     }
 
-    /// One lightweight event-token request. A changed token tells the shared foreground monitor to
-    /// perform an authoritative timeline refresh; unchanged polls never enumerate the library.
+    /// One bounded SDK event probe. A changed cursor tells the shared foreground monitor to perform
+    /// an authoritative timeline refresh; unchanged polls never enumerate or decrypt the library.
     func libraryChangeToken() async throws -> String {
         try await withOpenSession { bridge in
             let root = try await bridge.resolvePhotosRoot()
-            let remote = try await bridge.volumeEventToken(volumeID: root.volumeID, priority: .background)
+            let cursor = TimelineInventoryValidationTokenPolicy.remoteEventToken(
+                from: bridge.timelineStore?.validationToken()
+            )
+            let probe = try await bridge.volumeEventProbe(
+                volumeID: root.volumeID,
+                cursor: cursor,
+                priority: .background
+            )
+            if probe.scopeAccessLost { throw DriveEventScopeAccessLostError() }
+            let remote: String
+            if probe.requiresAuthoritativeRefresh {
+                let seed = try await bridge.volumeEventProbe(
+                    volumeID: root.volumeID,
+                    cursor: nil,
+                    priority: .background
+                )
+                guard !seed.requiresAuthoritativeRefresh else {
+                    throw TimelineContinuityRecoveryPendingError()
+                }
+                remote = try bridge.eventCursor(from: seed)
+            } else {
+                remote = try bridge.eventCursor(from: probe)
+            }
             return bridge.monitorToken(remoteToken: remote)
         }
     }
@@ -460,7 +576,19 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     func launchValidationToken(for snapshot: CachedTimelineSnapshot) async throws -> String {
         try await withOpenSession { bridge in
             if let volumeID = snapshot.sections.lazy.flatMap(\.items).first?.uid.volumeID {
-                let remoteToken = try await bridge.volumeEventToken(volumeID: volumeID, priority: .userInitiated)
+                let cursor = TimelineInventoryValidationTokenPolicy.remoteEventToken(
+                    from: snapshot.validationToken
+                )
+                let probe = try await bridge.volumeEventProbe(
+                    volumeID: volumeID,
+                    cursor: cursor,
+                    priority: .userInitiated
+                )
+                if probe.scopeAccessLost { throw DriveEventScopeAccessLostError() }
+                guard !probe.requiresAuthoritativeRefresh else {
+                    throw TimelineContinuityRecoveryPendingError()
+                }
+                let remoteToken = try bridge.eventCursor(from: probe)
                 return TimelineInventoryValidationTokenPolicy.persistedToken(remoteEventToken: remoteToken)
             }
             return try await bridge.launchValidationTokenImpl()
@@ -469,17 +597,47 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
 
     private func launchValidationTokenImpl() async throws -> String {
         let root = try await resolvePhotosRoot()
-        let remoteToken = try await volumeEventToken(volumeID: root.volumeID, priority: .userInitiated)
+        let cursor = TimelineInventoryValidationTokenPolicy.remoteEventToken(
+            from: timelineStore?.validationToken()
+        )
+        let probe = try await volumeEventProbe(
+            volumeID: root.volumeID,
+            cursor: cursor,
+            priority: .userInitiated
+        )
+        if probe.scopeAccessLost { throw DriveEventScopeAccessLostError() }
+        guard !probe.requiresAuthoritativeRefresh else {
+            throw TimelineContinuityRecoveryPendingError()
+        }
+        let remoteToken = try eventCursor(from: probe)
         return TimelineInventoryValidationTokenPolicy.persistedToken(remoteEventToken: remoteToken)
     }
 
-    private func volumeEventToken(
+    private func volumeEventProbe(
         volumeID: String,
+        cursor: String?,
         priority: ProtonRequestPriority
-    ) async throws -> String {
+    ) async throws -> SDKEventCursorResult {
+        let accumulator = SDKEventCursorAccumulator(cursor: cursor)
         return try await ProtonRequestContext.$priority.withValue(priority) {
-            try await driveSession.latestVolumeEventID(volumeID: volumeID)
+            try await SDKCancellableOperation.run { [photosClient] cancellationToken in
+                try await photosClient.enumerateEvents(
+                    treeEventScopeId: volumeID,
+                    cursor: cursor,
+                    cancellationToken: cancellationToken,
+                    onDriveEventEnumerated: { result in accumulator.receive(result) }
+                )
+                return try accumulator.result()
+            } cancel: { [photosClient] cancellationToken in
+                try? await photosClient.cancelEnumerateEvents(cancellationToken: cancellationToken)
+            }
         }
+    }
+
+    private func eventCursor(from probe: SDKEventCursorResult) throws -> String {
+        if probe.scopeAccessLost { throw DriveEventScopeAccessLostError() }
+        guard let cursor = probe.cursor else { throw SDKEventCursorError.missingCursor }
+        return cursor
     }
 
     private func monitorToken(remoteToken: String) -> String {
@@ -928,7 +1086,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         SDKAlbumCatalogBackend(client: photosClient, admission: shutdownGate)
     }
 
-    /// Sets an album's cover to an already-uploaded photo (direct REST; SDK 0.24.0 has no album-write API).
+    /// Sets an album's cover to an already-uploaded photo (direct REST; SDK 0.25.0 has no album-write API).
     /// The photo's `nodeID` is its Drive link id.
     func setAlbumCover(albumID: String, photoUID: PhotoUID) async throws {
         try await withOpenSession { bridge in
@@ -1548,7 +1706,7 @@ extension DriveSDKBridge: PhotoUploading {
             if error is CancellationError || Self.isSDKCancellation(error) {
                 throw CancellationError()
             }
-            throw Self.uploadError(from: error)
+            throw Self.uploadError(from: error, filename: request.name)
         }
     }
 
@@ -1573,36 +1731,62 @@ extension DriveSDKBridge: PhotoUploading {
     /// Preserve the SDK's typed failure domain at the Core boundary. URL/socket failures retry as
     /// network problems; HTTP 408/429/5xx retry as temporary service failures; other API responses
     /// retain Proton's concrete message and follow the ordinary finite item retry policy.
-    private nonisolated static func uploadError(from error: Error) -> UploadCore.UploadError {
+    nonisolated static func uploadError(from error: Error, filename: String) -> any Error {
         let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
         let nsError = error as NSError
         if nsError.domain == NSURLErrorDomain {
-            return .transport(code: nsError.code, message: message)
+            return UploadCore.UploadError.transport(code: nsError.code, message: message)
         }
         guard let sdkError = error as? ProtonDriveSDKError else {
-            return .backend(message)
+            return UploadCore.UploadError.backend(message)
+        }
+        if let fileSystemError = sdkError.underlyingFileSystemErrorCode,
+            let mapped = uploadFileSystemError(fileSystemError, filename: filename)
+        {
+            return mapped
         }
         if sdkError.underlyingSocketNetworkError != nil {
-            return .transport(code: NSURLErrorNetworkConnectionLost, message: message)
+            return UploadCore.UploadError.transport(code: NSURLErrorNetworkConnectionLost, message: message)
         }
         if let transport = sdkError.underlyingHTTPNetworkError {
             if let code = transport.httpCode, code == 408 || code == 429 || (500...599).contains(code) {
-                return .retryableBackend(code: code, message: message)
+                return UploadCore.UploadError.retryableBackend(code: code, message: message)
             }
             switch transport.errorType {
             case .userAuthenticationError, .configurationLimitExceeded:
-                return .backend(message)
+                return UploadCore.UploadError.backend(message)
             default:
-                return .transport(code: NSURLErrorNetworkConnectionLost, message: message)
+                return UploadCore.UploadError.transport(
+                    code: NSURLErrorNetworkConnectionLost,
+                    message: message
+                )
             }
         }
         if let api = sdkError.underlyingAPINetworkError,
             let code = api.httpCode,
             code == 408 || code == 429 || (500...599).contains(code)
         {
-            return .retryableBackend(code: code, message: message)
+            return UploadCore.UploadError.retryableBackend(code: code, message: message)
         }
-        return .backend(message)
+        return UploadCore.UploadError.backend(message)
+    }
+
+    /// Maps SDK 0.25's normalized local-file failures into the existing queue domains. In
+    /// particular, low disk space reuses the backup runner's durable resource-pressure policy.
+    nonisolated static func uploadFileSystemError(
+        _ code: ProtonDriveSDKError.FileSystemErrorCode,
+        filename: String
+    ) -> (any Error)? {
+        switch code {
+        case .notFound:
+            UploadCore.UploadError.fileMissing(filename)
+        case .permissionDenied:
+            UploadCore.UploadError.permissionDenied(filename)
+        case .outOfSpace:
+            BackupTempFileStore.BackupTempFileError.diskBudgetExceeded
+        case .unknown:
+            nil
+        }
     }
 
     private nonisolated static func isSDKCancellation(_ error: Error) -> Bool {
@@ -1628,6 +1812,14 @@ enum DriveBridgeError: LocalizedError {
         switch self {
         case .noPhotosShare: String(localized: "error.no_photos_library")
         }
+    }
+}
+
+/// The SDK reported that this event scope is no longer accessible. Retrying the same scope cannot
+/// recover, so the shared monitor stops until account lifecycle creates a new backend instance.
+private struct DriveEventScopeAccessLostError: LocalizedError, LibraryChangeTerminalError {
+    var errorDescription: String? {
+        String(localized: "error.no_photos_library")
     }
 }
 

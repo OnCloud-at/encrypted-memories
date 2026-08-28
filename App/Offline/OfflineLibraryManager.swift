@@ -185,6 +185,7 @@ final class OfflineLibraryManager {
     func stopForAccountTeardown() async {
         let activeLocationCrawlStarter = locationCrawlStartTask
         let activeLocationConfiguration = locationConfigurationTask
+        let activeFeed = feed
         locationCrawlGeneration &+= 1
         locationConfigurationGeneration &+= 1
         activeLocationCrawlStarter?.cancel()
@@ -204,6 +205,7 @@ final class OfflineLibraryManager {
         await activeLocationConfiguration?.value
         await activeLocationCrawlStarter?.value
         await activeThumbnailUpdateTask?.value
+        await activeFeed?.stopPrefetch()
         await locationCrawl.cancel()
         // A non-cooperative metadata probe can return after the eager UI clear above but before the
         // joined Core cancellation completes. Clear once more at the retirement barrier.

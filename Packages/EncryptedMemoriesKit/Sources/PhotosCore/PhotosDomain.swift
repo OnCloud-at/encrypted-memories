@@ -183,6 +183,10 @@ public protocol LibraryChangeTokenProvider: Sendable {
     func launchValidationToken(for snapshot: CachedTimelineSnapshot) async throws -> String
 }
 
+/// Marker for a change-token failure that cannot recover by polling the same remote scope again.
+/// The shared monitor stops until normal account or backend lifecycle code installs a new provider.
+public protocol LibraryChangeTerminalError: Error, Sendable {}
+
 public extension LibraryChangeTokenProvider {
     func launchValidationToken() async throws -> String {
         try await libraryChangeToken()

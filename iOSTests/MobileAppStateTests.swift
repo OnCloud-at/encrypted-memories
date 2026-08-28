@@ -1,6 +1,7 @@
 import Foundation
 import PhotoViewerCore
 import PhotosCore
+import ProtonAuth
 import SwiftUI
 import Testing
 import UIKit
@@ -96,6 +97,16 @@ private actor MobileRetryCompletionLatch {
 
     func markCompleted() { completed = true }
     func isCompleted() -> Bool { completed }
+}
+
+@MainActor
+private final class MobileScopeRecoveryTestState {
+    var events: [String] = []
+    var oldIdentityIsCurrent = true
+
+    func record(_ event: String) {
+        events.append(event)
+    }
 }
 
 private enum MobileRetryTestTimeout: Error {
@@ -545,6 +556,185 @@ private func waitUntil(
         #expect(!lease.isCurrent(loadToken: 8, sessionUID: "account-a"))
         #expect(!lease.isCurrent(loadToken: 7, sessionUID: "account-b"))
         #expect(!lease.isCurrent(loadToken: 7, sessionUID: nil))
+    }
+
+    @Test func scopeRecoveryIdentityRejectsDifferentSessionLoadOrRequest() {
+        let failedSession = ProtonSession(
+            uid: "account-a",
+            accessToken: "access-a",
+            refreshToken: "refresh-a",
+            keyPassword: "key-a"
+        )
+        let identity = MobileScopeRecoveryIdentity(
+            failedSession: failedSession,
+            failedLoadGeneration: 7,
+            requestID: 1
+        )
+
+        #expect(identity.matches(session: failedSession, loadGeneration: 8, activeIdentity: identity))
+        #expect(!identity.matches(session: failedSession, loadGeneration: 7, activeIdentity: identity))
+        #expect(!identity.matches(session: failedSession, loadGeneration: 9, activeIdentity: identity))
+        #expect(
+            !identity.matches(
+                session: ProtonSession(
+                    uid: "account-a",
+                    accessToken: "replacement-access",
+                    refreshToken: "replacement-refresh",
+                    keyPassword: "key-a"
+                ),
+                loadGeneration: 8,
+                activeIdentity: identity
+            )
+        )
+        #expect(
+            !identity.matches(
+                session: failedSession,
+                loadGeneration: 8,
+                activeIdentity: MobileScopeRecoveryIdentity(
+                    failedSession: failedSession,
+                    failedLoadGeneration: 7,
+                    requestID: 2
+                )
+            )
+        )
+    }
+
+    @Test func terminalRecoveryTracksTaskAndOrdersClearRetirePurgeRebuild() async {
+        let coordinator = MobileScopeRecoveryCoordinator()
+        let state = MobileScopeRecoveryTestState()
+        let session = ProtonSession(
+            uid: "account-a",
+            accessToken: "access-a",
+            refreshToken: "refresh-a",
+            keyPassword: "key-a"
+        )
+        let identity = MobileScopeRecoveryIdentity(
+            failedSession: session,
+            failedLoadGeneration: 10,
+            requestID: 1
+        )
+        let driver = MobileScopeRecoveryDriver(
+            isCurrent: { coordinator.isCurrent(identity) },
+            joinRetry: { state.record("join-retry") },
+            retireOwners: { state.record("retire") },
+            purgeLostScope: { state.record("purge") },
+            rebuild: { state.record("rebuild") }
+        )
+
+        let scheduled = coordinator.schedule(
+            identity: identity,
+            prepare: { state.record("clear-projection") },
+            operation: { await driver.run() }
+        )
+
+        #expect(scheduled)
+        #expect(coordinator.isActive)
+        #expect(coordinator.isCurrent(identity))
+        #expect(state.events == ["clear-projection"])
+        #expect(await coordinator.joinIfActive())
+        #expect(state.events == ["clear-projection", "join-retry", "retire", "purge", "rebuild"])
+        #expect(!coordinator.isActive)
+    }
+
+    @Test func retryJoinsPendingScopeRecoveryInsteadOfStartingAnotherRetirement() async throws {
+        let coordinator = MobileScopeRecoveryCoordinator()
+        let latch = MobileRetryLifecycleLatch()
+        let state = MobileScopeRecoveryTestState()
+        let identity = MobileScopeRecoveryIdentity(
+            failedSession: ProtonSession(
+                uid: "account-a",
+                accessToken: "access-a",
+                refreshToken: "refresh-a",
+                keyPassword: "key-a"
+            ),
+            failedLoadGeneration: 4,
+            requestID: 1
+        )
+        #expect(
+            coordinator.schedule(
+                identity: identity,
+                prepare: { state.record("clear-projection") },
+                operation: { await latch.block("scope-recovery") }
+            )
+        )
+        try await waitUntil { await latch.hasEntered("scope-recovery") }
+
+        let retry = Task { @MainActor in
+            if await coordinator.joinIfActive() { return }
+            state.record("transient-retry")
+        }
+        await Task.yield()
+        #expect(!state.events.contains("transient-retry"))
+
+        await latch.release("scope-recovery")
+        await retry.value
+        #expect(!state.events.contains("transient-retry"))
+    }
+
+    @Test func canceledOldRecoveryCannotPurgeOrClearReplacementRecovery() async throws {
+        let coordinator = MobileScopeRecoveryCoordinator()
+        let latch = MobileRetryLifecycleLatch()
+        let state = MobileScopeRecoveryTestState()
+        let session = ProtonSession(
+            uid: "account-a",
+            accessToken: "access-a",
+            refreshToken: "refresh-a",
+            keyPassword: "key-a"
+        )
+        let oldIdentity = MobileScopeRecoveryIdentity(
+            failedSession: session,
+            failedLoadGeneration: 2,
+            requestID: 1
+        )
+        let oldDriver = MobileScopeRecoveryDriver(
+            isCurrent: { state.oldIdentityIsCurrent && coordinator.isCurrent(oldIdentity) },
+            joinRetry: {
+                state.record("old-join")
+                await latch.block("old-join")
+            },
+            retireOwners: { state.record("old-retire") },
+            purgeLostScope: { state.record("old-purge") },
+            rebuild: { state.record("old-rebuild") }
+        )
+        #expect(
+            coordinator.schedule(
+                identity: oldIdentity,
+                prepare: { state.record("old-clear") },
+                operation: { await oldDriver.run() }
+            )
+        )
+        try await waitUntil { await latch.hasEntered("old-join") }
+
+        let oldTask = coordinator.cancel()
+        state.oldIdentityIsCurrent = false
+        let newIdentity = MobileScopeRecoveryIdentity(
+            failedSession: session,
+            failedLoadGeneration: 3,
+            requestID: 2
+        )
+        #expect(
+            coordinator.schedule(
+                identity: newIdentity,
+                prepare: { state.record("new-clear") },
+                operation: {
+                    state.record("new-running")
+                    await latch.block("new-running")
+                }
+            )
+        )
+        try await waitUntil { await latch.hasEntered("new-running") }
+        await latch.release("old-join")
+        await oldTask?.value
+
+        #expect(!state.events.contains("old-retire"))
+        #expect(!state.events.contains("old-purge"))
+        #expect(!state.events.contains("old-rebuild"))
+        #expect(coordinator.isCurrent(newIdentity))
+        #expect(coordinator.isActive)
+
+        await latch.release("new-running")
+        #expect(await coordinator.joinIfActive())
+        #expect(!coordinator.isActive)
     }
 
     @Test func favoriteFilterWaitsForAuthoritativeMembership() {

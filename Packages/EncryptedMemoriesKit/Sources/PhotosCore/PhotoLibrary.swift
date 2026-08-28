@@ -129,7 +129,7 @@ public struct FavoriteMutationError: LocalizedError, Sendable, Equatable {
     }
 }
 
-/// Read + write of the favorites tag. Reads retain the Photos tag listing because SDK 0.24.0 does
+/// Read + write of the favorites tag. Reads retain the Photos tag listing because SDK 0.25.0 does
 /// not expose complete timeline tags; writes use one SDK `updatePhotos` batch and validate every
 /// per-node result.
 public protocol FavoritesProvider: Sendable {
@@ -152,7 +152,7 @@ public protocol TrashProvider: Sendable {
 
 /// Optional backend capability: load a filtered/album timeline. Album catalog reads live in
 /// AlbumCore's SDK-backed repository; tag/album contents retain the direct Photos endpoints because
-/// SDK 0.24.0 omits Tags and RelatedPhotos needed for Live Photos and bursts.
+/// SDK 0.25.0 omits Tags and RelatedPhotos needed for Live Photos and bursts.
 public protocol PhotoLibraryProvider: Sendable {
     func timeline(filter: PhotoFilter) async throws -> [TimelineSection]
 }

@@ -5,50 +5,71 @@
 /// which is important after a local upload: the already-running server snapshot may have started before the
 /// upload became visible. The drain never polls a completed task, so it cannot monopolize a cooperative executor.
 public actor LibraryRefreshCoalescer {
-    public typealias Operation = @Sendable () async -> Bool
+    public typealias Operation = @Sendable () async -> LibraryChangeRefreshOutcome
 
     private var requestedGeneration: UInt64 = 0
     private var drainIdentity: UInt64 = 0
-    private var drainTask: Task<Bool, Never>?
+    private var drainTask: Task<LibraryChangeRefreshOutcome, Never>?
+    private var admissionBarrierIdentity: UInt64 = 0
+    private var admissionBarrierTask: Task<Void, Never>?
 
     public init() {}
 
-    public func request(_ operation: @escaping Operation) async -> Bool {
+    public func request(_ operation: @escaping Operation) async -> LibraryChangeRefreshOutcome {
+        await waitForAdmissionBarrier()
         let task = enqueue(operation)
         return await task.value
     }
 
-    /// Cancels the current drain and allows the next request to start a new session immediately. An old
-    /// operation that ignores cancellation cannot clear a newer drain because every drain has an identity.
-    public func cancel() {
+    /// Cancels and joins the current drain. Requests wait at the admission barrier until every earlier drain has
+    /// returned, including a non-cooperative operation that ignores cancellation.
+    public func cancel() async {
+        let previousBarrier = admissionBarrierTask
+        let retiringTask = drainTask
+        admissionBarrierIdentity &+= 1
+        let barrierIdentity = admissionBarrierIdentity
         drainIdentity &+= 1
         requestedGeneration &+= 1
-        drainTask?.cancel()
+        retiringTask?.cancel()
         drainTask = nil
+
+        let barrierTask = Task {
+            _ = await previousBarrier?.value
+            _ = await retiringTask?.value
+        }
+        admissionBarrierTask = barrierTask
+        await barrierTask.value
+        if barrierIdentity == admissionBarrierIdentity {
+            admissionBarrierTask = nil
+        }
     }
 
     /// Enqueues a refresh and returns the active drain task.
     ///
     /// Callers normally use `request(_:)`.
-    func enqueue(_ operation: @escaping Operation) -> Task<Bool, Never> {
+    private func enqueue(_ operation: @escaping Operation) -> Task<LibraryChangeRefreshOutcome, Never> {
         requestedGeneration &+= 1
         if let drainTask { return drainTask }
 
         drainIdentity &+= 1
         let identity = drainIdentity
-        let task = Task { [weak self] in
-            guard let self else { return false }
+        let task = Task<LibraryChangeRefreshOutcome, Never> { [weak self] in
+            guard let self else { return LibraryChangeRefreshOutcome.retry }
             return await self.drain(identity: identity, operation: operation)
         }
         drainTask = task
         return task
     }
 
-    private func drain(identity: UInt64, operation: @escaping Operation) async -> Bool {
-        var succeeded = false
+    private func drain(
+        identity: UInt64,
+        operation: @escaping Operation
+    ) async -> LibraryChangeRefreshOutcome {
+        var outcome = LibraryChangeRefreshOutcome.retry
         while !Task.isCancelled {
             let servicedGeneration = requestedGeneration
-            succeeded = await operation()
+            outcome = await operation()
+            guard outcome != .terminal else { break }
             guard !Task.isCancelled, servicedGeneration != requestedGeneration else { break }
             await Task.yield()
         }
@@ -56,6 +77,20 @@ public actor LibraryRefreshCoalescer {
         if identity == drainIdentity {
             drainTask = nil
         }
-        return succeeded
+        return outcome
     }
+
+    private func waitForAdmissionBarrier() async {
+        while let barrierTask = admissionBarrierTask {
+            let barrierIdentity = admissionBarrierIdentity
+            await barrierTask.value
+            if barrierIdentity == admissionBarrierIdentity { return }
+        }
+    }
+
+    #if DEBUG
+        func testingState() -> (requestedGeneration: UInt64, cancellationBarrierActive: Bool) {
+            (requestedGeneration, admissionBarrierTask != nil)
+        }
+    #endif
 }

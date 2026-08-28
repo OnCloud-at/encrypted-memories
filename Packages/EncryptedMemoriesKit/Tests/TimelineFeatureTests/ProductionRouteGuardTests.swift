@@ -453,6 +453,131 @@ struct ProductionRouteGuardTests {
         #expect(capabilities.contains("var exactPhotoDuplicatesViaSDK = true"))
     }
 
+    @Test func libraryInvalidationUsesBoundedSDKEventsWithoutWeakeningDedupeEvidence() throws {
+        let bridge = try String(
+            contentsOf: Self.repoRoot.appendingPathComponent(
+                "Packages/EncryptedMemoriesKit/Sources/ProtonDriveBackend/DriveSDKBridge.swift"
+            ), encoding: .utf8)
+        let probe = try Self.body(
+            of: bridge,
+            from: "private func volumeEventProbe(",
+            to: "    private func eventCursor(")
+        #expect(probe.contains("photosClient.enumerateEvents("))
+        #expect(probe.contains("treeEventScopeId: volumeID"))
+        #expect(probe.contains("cursor: cursor"))
+        #expect(probe.contains("SDKCancellableOperation.run"))
+        #expect(probe.contains("photosClient.cancelEnumerateEvents(cancellationToken: cancellationToken)"))
+        #expect(!bridge.contains("driveSession.latestVolumeEventID"))
+        #expect(bridge.contains("historyEventProbe.requiresAuthoritativeRefresh"))
+        #expect(bridge.contains("cursor: nil"))
+        #expect(bridge.contains("continuityRecovery.fetchInventory("))
+        #expect(bridge.contains("continuityRecovery.qualify("))
+        #expect(bridge.contains("continuityRecovery.persist("))
+        #expect(bridge.contains("throw TimelineContinuityRecoveryPendingError()"))
+        #expect(bridge.contains("DriveEventScopeAccessLostError"))
+
+        let continuityPolicy = try String(
+            contentsOf: Self.repoRoot.appendingPathComponent(
+                "Packages/EncryptedMemoriesKit/Sources/ProtonDriveBackend/TimelineLoadCommitPolicy.swift"
+            ), encoding: .utf8)
+        #expect(continuityPolicy.contains("let probe = try await postInventoryProbe()"))
+        #expect(continuityPolicy.contains("let cacheSaved = save()"))
+        #expect(continuityPolicy.contains("TimelineContinuityPersistencePolicy.permitsMonitorAdvance"))
+
+        let dedupe = try String(
+            contentsOf: Self.repoRoot.appendingPathComponent(
+                "Packages/EncryptedMemoriesKit/Sources/ProtonDriveBackend/Upload/ProtonUploadDedupeService.swift"
+            ), encoding: .utf8)
+        #expect(dedupe.contains("session.latestVolumeEventID(volumeID: material.context.volumeID)"))
+        #expect(dedupe.contains("session.fetchVolumeEvents("))
+        #expect(dedupe.contains("event.contextShareID"))
+        #expect(dedupe.contains("event.linkType"))
+        #expect(dedupe.contains("event.linkState"))
+    }
+
+    @Test func terminalDriveScopeLossPurgesStaleDataBeforeAuthenticatedRebuild() throws {
+        let monitor = try String(
+            contentsOf: Self.repoRoot.appendingPathComponent(
+                "Packages/EncryptedMemoriesKit/Sources/TimelineCore/LibraryChangeMonitor.swift"
+            ), encoding: .utf8)
+        let terminalBody = try Self.body(
+            of: monitor,
+            from: "private func handleTerminal(",
+            to: "    private func retireCurrentTask()")
+        #expect(terminalBody.contains("task = nil"))
+        #expect(terminalBody.contains("lastToken = nil"))
+        #expect(terminalBody.contains("await onTerminal(error)"))
+        #expect(monitor.contains("case .terminal:"))
+        #expect(monitor.contains("LibraryChangeRefreshTerminalError()"))
+
+        let macModel = try String(
+            contentsOf: Self.repoRoot.appendingPathComponent("App/AppModel.swift"),
+            encoding: .utf8)
+        let macRecovery = try Self.body(
+            of: macModel,
+            from: "func recoverBackendAfterScopeAccessLoss() async {",
+            to: "    /// Stop Smart Search")
+        #expect(macRecovery.contains("AccountTeardownCoordinator"))
+        #expect(macRecovery.contains("purgeCachesForAccountTeardown"))
+        #expect(macRecovery.contains("ProtonDriveBackendFactory.purgeLocalAccountData"))
+        #expect(macRecovery.contains("self.prepareBackend(session)"))
+        #expect(!macRecovery.contains("authController.signOut"))
+        #expect(!macRecovery.contains("ProtonAuthLocalDataPurge"))
+
+        let mainView = try String(
+            contentsOf: Self.repoRoot.appendingPathComponent("App/Views/MainView.swift"),
+            encoding: .utf8)
+        #expect(mainView.contains("await model.recoverBackendAfterScopeAccessLoss()"))
+        #expect(mainView.contains("timelineModel.initialLoadFailureReason == .scopeAccessLost"))
+        #expect(mainView.contains("result.failureReason == .scopeAccessLost { return .terminal }"))
+
+        let mobile = try String(
+            contentsOf: Self.repoRoot.appendingPathComponent("iOSApp/MobileLibraryModel.swift"),
+            encoding: .utf8)
+        let mobileRecovery = try Self.body(
+            of: mobile,
+            from: "private func scheduleScopeRecovery(",
+            to: "    /// Lifecycle-only platform seam")
+        #expect(mobileRecovery.contains("self.snapshot = TimelineSnapshot()"))
+        #expect(mobileRecovery.contains("await self?.retireForRetry(advanceLoadToken: false)"))
+        #expect(mobileRecovery.contains("ProtonDriveBackendFactory.purgeLocalAccountData"))
+        #expect(mobileRecovery.contains("preserveVisibleSnapshot: false"))
+        #expect(mobileRecovery.contains("failedSession: ProtonSession"))
+        #expect(mobileRecovery.contains("failedLoadGeneration: Int"))
+        #expect(mobileRecovery.contains("scopeRecoveryCoordinator.schedule("))
+        #expect(mobileRecovery.contains("self.loadToken &+= 1"))
+        #expect(mobile.contains("self.scheduleScopeRecovery("))
+        #expect(mobile.contains("await self?.recoverAfterScopeAccessLoss("))
+        #expect(mobile.contains("catch let error as any LibraryChangeTerminalError"))
+        #expect(mobile.contains("catch is any LibraryChangeTerminalError"))
+        #expect(mobile.contains("try requireCurrentMutation(refreshLease)"))
+        #expect(mobileRecovery.components(separatedBy: "scopePresentationRevision &+= 1").count - 1 == 1)
+        let scopeRevision = try #require(mobileRecovery.range(of: "scopePresentationRevision &+= 1"))
+        let snapshotClear = try #require(mobileRecovery.range(of: "self.snapshot = TimelineSnapshot()"))
+        #expect(scopeRevision.lowerBound < snapshotClear.lowerBound)
+
+        let recoveryDriver = try Self.body(
+            of: mobile,
+            from: "func run() async {",
+            to: "}\n\n/// Owns signed-in iOS/iPadOS library state")
+        let ownerRetirement = try #require(recoveryDriver.range(of: "await retireOwners()"))
+        let accountPurge = try #require(recoveryDriver.range(of: "await purgeLostScope()"))
+        let rebuild = try #require(recoveryDriver.range(of: "rebuild()"))
+        #expect(ownerRetirement.lowerBound < accountPurge.lowerBound)
+        #expect(accountPurge.lowerBound < rebuild.lowerBound)
+        #expect(recoveryDriver.components(separatedBy: "guard !Task.isCancelled, isCurrent()").count - 1 == 4)
+        let mobileRetry = try Self.body(
+            of: mobile,
+            from: "func retry() async {",
+            to: "    /// Schedules a Drive-scope recovery")
+        #expect(!mobileRetry.contains("scopePresentationRevision"))
+
+        let mobileRoot = try String(
+            contentsOf: Self.repoRoot.appendingPathComponent("iOSApp/EncryptedMemoriesMobileApp.swift"),
+            encoding: .utf8)
+        #expect(mobileRoot.contains(".id(libraryModel.scopePresentationRevision)"))
+    }
+
     @Test func iOSLongPressRoutesIntoTheExistingSelectionState() throws {
         let host = try String(
             contentsOf: Self.repoRoot.appendingPathComponent(
@@ -2095,7 +2220,7 @@ struct ProductionRouteGuardTests {
             encoding: .utf8
         )
         #expect(
-            sdkManifest.contains("releases/download/0.24.0/CProtonDriveSDK.xcframework.zip"),
+            sdkManifest.contains("releases/download/0.25.0/CProtonDriveSDK.xcframework.zip"),
             "the vendored SDK release changed; re-evaluate the parked P3 contract before updating this pin"
         )
 

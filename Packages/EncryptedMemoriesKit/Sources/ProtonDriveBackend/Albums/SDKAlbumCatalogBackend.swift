@@ -42,7 +42,7 @@ enum SDKAlbumCatalogError: LocalizedError {
     }
 }
 
-/// SDK 0.24.0 catalog/sharing/membership adapter. Enumerations publish only after their native
+/// SDK 0.25.0 catalog/sharing/membership adapter. Enumerations publish only after their native
 /// callback stream completes, and node hydration uses a bounded task group so a large catalog
 /// cannot create one unbounded task per album.
 struct SDKAlbumCatalogBackend: AlbumCatalogBackend {

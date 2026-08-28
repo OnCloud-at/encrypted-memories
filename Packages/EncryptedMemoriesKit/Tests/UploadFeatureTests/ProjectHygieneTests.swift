@@ -1118,10 +1118,9 @@ final class ProjectHygieneTests: XCTestCase {
         let mainView = try String(
             contentsOf: repoRoot.appendingPathComponent("App/Views/MainView.swift"), encoding: .utf8)
         XCTAssertTrue(mainView.contains(".task(id: model.albumCatalogRevision) { await loadAlbums() }"))
+        XCTAssertTrue(mainView.contains("@MainActor private func performRemoteLibraryRefresh()"))
         XCTAssertTrue(
-            mainView.contains(
-                "let result = await timelineModel.refreshLibrary()\n        OfflineLibraryManager.shared.liveAssetCount = timelineModel.allItems.count\n        await loadAlbums()"
-            ),
+            mainView.contains("await loadAlbums()"),
             "the shared remote-library poll must refresh the macOS album catalog too")
 
         let mobileModel = try String(
@@ -1129,7 +1128,7 @@ final class ProjectHygieneTests: XCTestCase {
         XCTAssertTrue(mobileModel.contains("private(set) var albumCatalogRevision"))
         XCTAssertTrue(mobileModel.contains("albumSync.setRemoteAlbumsChangedHandler"))
         XCTAssertTrue(
-            mobileModel.contains("albumCatalogRevision &+= 1\n            return true"),
+            mobileModel.contains("albumCatalogRevision &+= 1\n            return .refreshed"),
             "the shared remote-library poll must invalidate the iOS/iPadOS album catalog too")
 
         let mobileAlbums = try String(

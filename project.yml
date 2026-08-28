@@ -30,7 +30,7 @@ packages:
     path: Packages/EncryptedMemoriesKit
   ProtonCore:
     url: https://github.com/ProtonMail/protoncore_ios.git
-    # Proton Drive SDK 0.24.0 requires the exact ProtonCore version 37.3.0.
+    # Proton Drive SDK 0.25.0 requires the exact ProtonCore version 37.3.0.
     exactVersion: 37.3.0
 
 fileGroups:

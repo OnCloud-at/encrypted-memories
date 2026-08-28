@@ -1,5 +1,5 @@
 diff --git a/Package.swift b/Package.swift
-index 24a48b56104dd6cd1641e29c5aadf6654a8e81db..125bdb785acc0c0f125d9d5d52d97524561adca6 100644
+index a119f72..f70ebb5 100644
 --- a/Package.swift
 +++ b/Package.swift
 @@ -3,0 +4 @@
@@ -40,7 +40,7 @@ index 24a48b56104dd6cd1641e29c5aadf6654a8e81db..125bdb785acc0c0f125d9d5d52d97524
 +            path: "Tests"
 +        ),
 diff --git a/Sources/CancellationTokenSource.swift b/Sources/CancellationTokenSource.swift
-index f8ba40ec41344e6a3ef2557d0f6dbbe42659b535..220a08a60dee9cecaf5bd61f451e80e59c684420 100644
+index f8ba40e..220a08a 100644
 --- a/Sources/CancellationTokenSource.swift
 +++ b/Sources/CancellationTokenSource.swift
 @@ -0,0 +1,17 @@
@@ -113,27 +113,19 @@ index f8ba40ec41344e6a3ef2557d0f6dbbe42659b535..220a08a60dee9cecaf5bd61f451e80e5
 +    nonisolated func freeAndWait() async {
 +        await freeTask().value
 +    }
-diff --git a/Sources/Client/ProtonDriveClient/ProtonDriveClient.swift b/Sources/Client/ProtonDriveClient/ProtonDriveClient.swift
-index acb5b5e4d0cd095e27895c9089f107374c41d3dc..1fde9e8b7c6928acf92c8b1dacfc41466c609699 100644
---- a/Sources/Client/ProtonDriveClient/ProtonDriveClient.swift
-+++ b/Sources/Client/ProtonDriveClient/ProtonDriveClient.swift
-@@ -352,0 +353 @@ extension ProtonDriveClient {
-+        try operation.claimStart()
-@@ -384,0 +386 @@ extension ProtonDriveClient {
-+        try operation.claimStart()
 diff --git a/Sources/Client/EncryptedMemoriesClient/EncryptedMemoriesClient.swift b/Sources/Client/EncryptedMemoriesClient/EncryptedMemoriesClient.swift
-index 0fe0d0f467370f2646e49d5854ad57611798b892..0baf6948db56b2b20a8649f0242c3891ef9fa0d1 100644
+index 1680d0c..6f3fe32 100644
 --- a/Sources/Client/EncryptedMemoriesClient/EncryptedMemoriesClient.swift
 +++ b/Sources/Client/EncryptedMemoriesClient/EncryptedMemoriesClient.swift
-@@ -50,0 +51,2 @@ public actor EncryptedMemoriesClient: Sendable, ProtonSDKClient {
+@@ -52,0 +53,2 @@ public actor EncryptedMemoriesClient: Sendable, ProtonSDKClient {
 +    private var shutdownTask: Task<Void, Never>?
 +    private var didShutDown = false
-@@ -132 +134,3 @@ public actor EncryptedMemoriesClient: Sendable, ProtonSDKClient {
+@@ -134 +136,3 @@ public actor EncryptedMemoriesClient: Sendable, ProtonSDKClient {
 -        Self.freeEncryptedMemoriesClient(Int64(clientHandle), logger)
 +        let handle = Int64(clientHandle)
 +        let logger = logger
 +        Task { await Self.freeEncryptedMemoriesClient(handle, logger) }
-@@ -135,4 +139,18 @@ public actor EncryptedMemoriesClient: Sendable, ProtonSDKClient {
+@@ -137,4 +141,18 @@ public actor EncryptedMemoriesClient: Sendable, ProtonSDKClient {
 -    private static func freeEncryptedMemoriesClient(_ clientHandle: Int64, _ logger: Logger?) {
 -        Task {
 -            let freeRequest = Proton_Drive_Sdk_DrivePhotosClientFreeRequest.with {
@@ -156,7 +148,7 @@ index 0fe0d0f467370f2646e49d5854ad57611798b892..0baf6948db56b2b20a8649f0242c3891
 +        let task: Task<Void, Never> = Task {
 +            for source in tokenSources {
 +                try? await source.cancel()
-@@ -140,8 +158,2 @@ public actor EncryptedMemoriesClient: Sendable, ProtonSDKClient {
+@@ -142,8 +160,2 @@ public actor EncryptedMemoriesClient: Sendable, ProtonSDKClient {
 -            do {
 -                try await SDKRequestHandler.send(freeRequest, logger: logger) as Void
 -            } catch {
@@ -167,7 +159,7 @@ index 0fe0d0f467370f2646e49d5854ad57611798b892..0baf6948db56b2b20a8649f0242c3891
 -                )
 +            for source in tokenSources {
 +                await source.freeAndWait()
-@@ -148,0 +161,19 @@ public actor EncryptedMemoriesClient: Sendable, ProtonSDKClient {
+@@ -150,0 +163,19 @@ public actor EncryptedMemoriesClient: Sendable, ProtonSDKClient {
 +            await Self.freeEncryptedMemoriesClient(handle, logger)
 +        }
 +        shutdownTask = task
@@ -187,18 +179,26 @@ index 0fe0d0f467370f2646e49d5854ad57611798b892..0baf6948db56b2b20a8649f0242c3891
 +                "Proton_Drive_Sdk_DrivePhotosClientFreeRequest failed: \(error)",
 +                category: "EncryptedMemoriesClient.freeEncryptedMemoriesClient"
 +            )
-@@ -410,0 +442 @@ extension EncryptedMemoriesClient {
+@@ -412,0 +444 @@ extension EncryptedMemoriesClient {
 +        overrideExistingDraft: Bool = false,
-@@ -426,0 +459 @@ extension EncryptedMemoriesClient {
+@@ -428,0 +461 @@ extension EncryptedMemoriesClient {
 +            overrideExistingDraft: overrideExistingDraft,
-@@ -441,0 +475 @@ extension EncryptedMemoriesClient {
+@@ -443,0 +477 @@ extension EncryptedMemoriesClient {
 +        try operation.claimStart()
-@@ -461,0 +496 @@ extension EncryptedMemoriesClient {
+@@ -463,0 +498 @@ extension EncryptedMemoriesClient {
 +        overrideExistingDraft: Bool = false,
-@@ -484,0 +520 @@ extension EncryptedMemoriesClient {
+@@ -486,0 +522 @@ extension EncryptedMemoriesClient {
 +            overrideExistingDraft: overrideExistingDraft,
+diff --git a/Sources/Client/ProtonDriveClient/ProtonDriveClient.swift b/Sources/Client/ProtonDriveClient/ProtonDriveClient.swift
+index 9b0c0ec..c2db90b 100644
+--- a/Sources/Client/ProtonDriveClient/ProtonDriveClient.swift
++++ b/Sources/Client/ProtonDriveClient/ProtonDriveClient.swift
+@@ -354,0 +355 @@ extension ProtonDriveClient {
++        try operation.claimStart()
+@@ -386,0 +388 @@ extension ProtonDriveClient {
++        try operation.claimStart()
 diff --git a/Sources/FileOperations/Downloads/DownloadThumbnailsManager.swift b/Sources/FileOperations/Downloads/DownloadThumbnailsManager.swift
-index 367242fba53cef3a962b2647a90c0620c2a9affb..f6b161f3d21cc4930f922bdfbfb6d92a1a36aacc 100644
+index 367242f..f6b161f 100644
 --- a/Sources/FileOperations/Downloads/DownloadThumbnailsManager.swift
 +++ b/Sources/FileOperations/Downloads/DownloadThumbnailsManager.swift
 @@ -5,0 +6,9 @@ actor DownloadThumbnailsManager {
@@ -315,7 +315,7 @@ index 367242fba53cef3a962b2647a90c0620c2a9affb..f6b161f3d21cc4930f922bdfbfb6d92a
 +        activeDownloads[cancellationToken] = activeDownload
 +        return activeDownload
 diff --git a/Sources/FileOperations/Downloads/cThumbnailEnumerationCallback.swift b/Sources/FileOperations/Downloads/cThumbnailEnumerationCallback.swift
-index 5f1da986c32017d23ffdcd92efd6bc863885e8e7..54a66abdef4778d18ea7d48398f193a69ff13e3c 100644
+index 5f1da98..54a66ab 100644
 --- a/Sources/FileOperations/Downloads/cThumbnailEnumerationCallback.swift
 +++ b/Sources/FileOperations/Downloads/cThumbnailEnumerationCallback.swift
 @@ -16 +16,4 @@ let cThumbnailEnumerationCallback: CCallback = { statePointer, byteArray in
@@ -335,7 +335,7 @@ index 5f1da986c32017d23ffdcd92efd6bc863885e8e7..54a66abdef4778d18ea7d48398f193a6
 -    let weakWrapper: WeakReference<ThumbnailEnumerationCallbackWrapper> = stateTypedPointer.takeUnretainedValue().state
 +    let weakWrapper: WeakReference<ThumbnailEnumerationCallbackWrapper> = box.state
 diff --git a/Sources/FileOperations/Uploads/PhotoUploadsManager.swift b/Sources/FileOperations/Uploads/PhotoUploadsManager.swift
-index 81cd6ad5a9bb65d63e6505b8c27c8817667b0ef3..7b3f27dd48c73259890c585d51da20002cd84c2d 100644
+index 81cd6ad..7b3f27d 100644
 --- a/Sources/FileOperations/Uploads/PhotoUploadsManager.swift
 +++ b/Sources/FileOperations/Uploads/PhotoUploadsManager.swift
 @@ -9 +9 @@ actor PhotoUploadsManager {
@@ -500,7 +500,7 @@ index 81cd6ad5a9bb65d63e6505b8c27c8817667b0ef3..7b3f27dd48c73259890c585d51da2000
 +            $0.overrideExistingDraftByOtherClient = overrideExistingDraft
 diff --git a/Sources/FileOperations/Uploads/UploadLifecycleSupport.swift b/Sources/FileOperations/Uploads/UploadLifecycleSupport.swift
 new file mode 100644
-index 0000000000000000000000000000000000000000..825b19a45c672b1d5726d3c9e6690ee3c612c603
+index 0000000..825b19a
 --- /dev/null
 +++ b/Sources/FileOperations/Uploads/UploadLifecycleSupport.swift
 @@ -0,0 +1,300 @@
@@ -805,7 +805,7 @@ index 0000000000000000000000000000000000000000..825b19a45c672b1d5726d3c9e6690ee3
 +    }
 +}
 diff --git a/Sources/FileOperations/Uploads/UploadOperation.swift b/Sources/FileOperations/Uploads/UploadOperation.swift
-index 0816fcd8b47acefe0e0fe936bc59a37de5feb8e3..cb2198ceb84c7ac3143d501c3a72af5cdc391505 100644
+index 0816fcd..cb2198c 100644
 --- a/Sources/FileOperations/Uploads/UploadOperation.swift
 +++ b/Sources/FileOperations/Uploads/UploadOperation.swift
 @@ -18,0 +19 @@ public final class UploadOperation: Sendable {
@@ -894,7 +894,7 @@ index 0816fcd8b47acefe0e0fe936bc59a37de5feb8e3..cb2198ceb84c7ac3143d501c3a72af5c
 -    private static func freeUploadController(_ uploadControllerHandle: Int64, logger: Logger?) async {
 +    static func freeUploadController(_ uploadControllerHandle: Int64, logger: Logger?) async {
 diff --git a/Sources/FileOperations/Uploads/UploadsManager.swift b/Sources/FileOperations/Uploads/UploadsManager.swift
-index e9fb93945d6c52118a8a0fb8dea68c66f74ed9b3..320a2a8bb7e168c6cd4e4384a623501fc1d73135 100644
+index e9fb939..320a2a8 100644
 --- a/Sources/FileOperations/Uploads/UploadsManager.swift
 +++ b/Sources/FileOperations/Uploads/UploadsManager.swift
 @@ -9 +9 @@ actor UploadsManager {
@@ -1119,7 +1119,7 @@ index e9fb93945d6c52118a8a0fb8dea68c66f74ed9b3..320a2a8bb7e168c6cd4e4384a623501f
 @@ -232,0 +315 @@ extension UploadsManager {
 +        return operation
 diff --git a/Sources/Plumbing/BoxedContinuation.swift b/Sources/Plumbing/BoxedContinuation.swift
-index c660a66a0abc5e16336cd1b91cb8140374b9d091..b7e239328cb123478d767336f2f5b35e9882d58b 100644
+index c660a66..b7e2393 100644
 --- a/Sources/Plumbing/BoxedContinuation.swift
 +++ b/Sources/Plumbing/BoxedContinuation.swift
 @@ -0,0 +1,2 @@
@@ -1159,7 +1159,7 @@ index c660a66a0abc5e16336cd1b91cb8140374b9d091..b7e239328cb123478d767336f2f5b35e
 +        completionBlock = nil
 +        return block
 diff --git a/Sources/Plumbing/SDKRequestHandler.swift b/Sources/Plumbing/SDKRequestHandler.swift
-index 155e460d9d07b8f88bf45334c34c69472f66f284..4a5eaa55b31e9c0ad7d86fea3e6a8e029f68e983 100644
+index 155e460..4a5eaa5 100644
 --- a/Sources/Plumbing/SDKRequestHandler.swift
 +++ b/Sources/Plumbing/SDKRequestHandler.swift
 @@ -7,0 +8,31 @@ enum SDKRequestHandler {
@@ -1271,7 +1271,7 @@ index 155e460d9d07b8f88bf45334c34c69472f66f284..4a5eaa55b31e9c0ad7d86fea3e6a8e02
 +
 diff --git a/Tests/CallbackHandleRegistryTests.swift b/Tests/CallbackHandleRegistryTests.swift
 new file mode 100644
-index 0000000000000000000000000000000000000000..835952e33499e470f9cd577c70bf6d7108f60dfd
+index 0000000..835952e
 --- /dev/null
 +++ b/Tests/CallbackHandleRegistryTests.swift
 @@ -0,0 +1,92 @@
@@ -1369,7 +1369,7 @@ index 0000000000000000000000000000000000000000..835952e33499e470f9cd577c70bf6d71
 +}
 diff --git a/Tests/PhotoRequestPackagingTests.swift b/Tests/PhotoRequestPackagingTests.swift
 new file mode 100644
-index 0000000000000000000000000000000000000000..d6b7a8042559c16fd7d0095ff85210d02f49491e
+index 0000000..d6b7a80
 --- /dev/null
 +++ b/Tests/PhotoRequestPackagingTests.swift
 @@ -0,0 +1,56 @@
@@ -1431,7 +1431,7 @@ index 0000000000000000000000000000000000000000..d6b7a8042559c16fd7d0095ff85210d0
 +}
 diff --git a/Tests/ThumbnailEnumerationCallbackTests.swift b/Tests/ThumbnailEnumerationCallbackTests.swift
 new file mode 100644
-index 0000000000000000000000000000000000000000..d39e91dcc38e02c75a7f7f39125f26213ef37e39
+index 0000000..d39e91d
 --- /dev/null
 +++ b/Tests/ThumbnailEnumerationCallbackTests.swift
 @@ -0,0 +1,50 @@
@@ -1487,7 +1487,7 @@ index 0000000000000000000000000000000000000000..d39e91dcc38e02c75a7f7f39125f2621
 +}
 diff --git a/Tests/UploadLifecycleSupportTests.swift b/Tests/UploadLifecycleSupportTests.swift
 new file mode 100644
-index 0000000000000000000000000000000000000000..2085db2a319b96acae822e5e178669a0e397f524
+index 0000000..2085db2
 --- /dev/null
 +++ b/Tests/UploadLifecycleSupportTests.swift
 @@ -0,0 +1,250 @@

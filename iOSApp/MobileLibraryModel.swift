@@ -50,6 +50,97 @@ struct MobileLibraryMutationLease: Equatable, Sendable {
     }
 }
 
+struct MobileScopeRecoveryIdentity: Equatable, Sendable {
+    let failedSession: ProtonSession
+    let failedLoadGeneration: Int
+    let requestID: UInt64
+
+    func matches(
+        session: ProtonSession?,
+        loadGeneration: Int,
+        activeIdentity: MobileScopeRecoveryIdentity?
+    ) -> Bool {
+        session == failedSession
+            && loadGeneration == failedLoadGeneration &+ 1
+            && activeIdentity == self
+    }
+}
+
+/// Owns the single terminal-recovery task. Scheduling is synchronous on the main actor, so retry, sign-out, and
+/// session replacement can observe and join the task before any recovery suspension occurs.
+@MainActor
+final class MobileScopeRecoveryCoordinator {
+    private(set) var activeIdentity: MobileScopeRecoveryIdentity?
+    private(set) var task: Task<Void, Never>?
+
+    var isActive: Bool { task != nil }
+
+    @discardableResult
+    func schedule(
+        identity: MobileScopeRecoveryIdentity,
+        prepare: @MainActor @Sendable () -> Void,
+        operation: @MainActor @Sendable @escaping () async -> Void
+    ) -> Bool {
+        guard task == nil, activeIdentity == nil else { return false }
+        activeIdentity = identity
+        prepare()
+        let scheduled = Task { @MainActor [weak self] in
+            await operation()
+            self?.finish(identity: identity)
+        }
+        task = scheduled
+        return true
+    }
+
+    func isCurrent(_ identity: MobileScopeRecoveryIdentity) -> Bool {
+        activeIdentity == identity
+    }
+
+    @discardableResult
+    func joinIfActive() async -> Bool {
+        guard let task else { return false }
+        await task.value
+        return true
+    }
+
+    /// Invalidates the identity before cancellation. A late completion from this task cannot clear a newer task.
+    func cancel() -> Task<Void, Never>? {
+        let activeTask = task
+        activeIdentity = nil
+        task = nil
+        activeTask?.cancel()
+        return activeTask
+    }
+
+    private func finish(identity: MobileScopeRecoveryIdentity) {
+        guard activeIdentity == identity else { return }
+        activeIdentity = nil
+        task = nil
+    }
+}
+
+/// Runs the ordered asynchronous half of terminal scope recovery. The identity gate is checked after every
+/// suspension, so an old session cannot purge or rebuild a replacement session.
+@MainActor
+struct MobileScopeRecoveryDriver {
+    let isCurrent: @MainActor @Sendable () -> Bool
+    let joinRetry: @MainActor @Sendable () async -> Void
+    let retireOwners: @MainActor @Sendable () async -> Void
+    let purgeLostScope: @MainActor @Sendable () async -> Void
+    let rebuild: @MainActor @Sendable () -> Void
+
+    func run() async {
+        guard !Task.isCancelled, isCurrent() else { return }
+        await joinRetry()
+        guard !Task.isCancelled, isCurrent() else { return }
+        await retireOwners()
+        guard !Task.isCancelled, isCurrent() else { return }
+        await purgeLostScope()
+        guard !Task.isCancelled, isCurrent() else { return }
+        rebuild()
+    }
+}
+
 enum MobileFavoriteFilterAvailability: Equatable, Sendable {
     case loading
     case available
@@ -93,6 +184,10 @@ final class MobileLibraryModel {
     /// Indicates that explicit sign-out is closing account owners and deleting account data.
     /// Transient session replacement does not set this flag.
     private(set) var isSigningOut = false
+    /// Invalidates every presentation that can retain providers or rows from a lost Drive scope. Recovery keeps
+    /// this state active until the replacement backend exists.
+    private(set) var isRecoveringScope = false
+    private(set) var scopePresentationRevision: UInt64 = 0
     private let thumbnailUpdateCoordinator = LibraryThumbnailUpdateCoordinator()
 
     /// The shared backend, exposed so the Albums / Map / Viewer tabs can reuse it without re-building anything.
@@ -165,13 +260,18 @@ final class MobileLibraryModel {
     @ObservationIgnored private var smartSearchShutdownTask: Task<Void, Never>?
     /// Coalesces repeated retry taps into one ordered transient retirement and one replacement load.
     @ObservationIgnored private var retryTask: Task<Void, Never>?
+    /// Coalesces terminal Drive scope recovery. This path keeps authentication but purges all lost-scope data.
+    @ObservationIgnored private let scopeRecoveryCoordinator = MobileScopeRecoveryCoordinator()
+    @ObservationIgnored private var nextScopeRecoveryID: UInt64 = 0
 
     func configure(session: ProtonSession?, store: SessionKeychainStore) {
-        self.store = store
         guard let session else {
+            self.store = store
             teardown()
             return
         }
+        guard !scopeRecoveryCoordinator.isActive, !isRecoveringScope else { return }
+        self.store = store
         // Reuse the configured account on relaunch or route changes without restarting the crawl.
         guard configuredUID != session.uid || backend == nil else { return }
         self.session = session
@@ -388,6 +488,7 @@ final class MobileLibraryModel {
     /// Retires account owners before starting a replacement load after failure.
     func retry() async {
         guard let session, let store else { return }
+        if await scopeRecoveryCoordinator.joinIfActive() { return }
         if let retryTask {
             await retryTask.value
             return
@@ -402,6 +503,119 @@ final class MobileLibraryModel {
         }
         retryTask = task
         await task.value
+    }
+
+    /// Schedules a Drive-scope recovery for the exact session and load that observed the terminal result. The
+    /// synchronous preparation fences old publishers and removes inaccessible content before the task can run.
+    private func scheduleScopeRecovery(
+        failedSession: ProtonSession,
+        failedStore: SessionKeychainStore,
+        failedLoadGeneration: Int
+    ) {
+        guard !scopeRecoveryCoordinator.isActive,
+            session == failedSession,
+            loadToken == failedLoadGeneration
+        else { return }
+
+        nextScopeRecoveryID &+= 1
+        let identity = MobileScopeRecoveryIdentity(
+            failedSession: failedSession,
+            failedLoadGeneration: failedLoadGeneration,
+            requestID: nextScopeRecoveryID
+        )
+        let activeRetry = retryTask
+        let activeThumbnailCache = thumbnailCache
+        let activeOriginalsCache = originalsCache
+        let locationStore = locationStore
+        let locationIndex = locationIndex
+        let policy = ProtonDriveBackendPolicy.standard(
+            libraryDatabasePolicy: ProtonDriveBackendPolicy.mobileLibraryDatabasePolicy,
+            videoCacheBudgetBytes: 128 * 1024 * 1024
+        )
+
+        let driver = MobileScopeRecoveryDriver(
+            isCurrent: { [weak self] in
+                self?.scopeRecoveryIsCurrent(identity) == true
+            },
+            joinRetry: {
+                await activeRetry?.value
+            },
+            retireOwners: { [weak self] in
+                await self?.retireForRetry(advanceLoadToken: false)
+            },
+            purgeLostScope: { [weak self] in
+                guard let self else { return }
+                self.cacheContext = nil
+                self.thumbnailCache = nil
+                self.originalsCache = nil
+                await Task.detached(priority: .utility) {
+                    activeThumbnailCache?.clearForSignOut()
+                    activeOriginalsCache?.clearForSignOut()
+                    locationStore.clear()
+                    ProtonDriveBackendFactory.purgeLocalAccountData(uid: failedSession.uid, policy: policy)
+                }.value
+            },
+            rebuild: { [weak self] in
+                guard let self else { return }
+                self.configuredUID = nil
+                self.start(session: failedSession, store: failedStore, preserveVisibleSnapshot: false)
+            }
+        )
+
+        let scheduled = scopeRecoveryCoordinator.schedule(
+            identity: identity,
+            prepare: { [weak self] in
+                guard let self else { return }
+                // Never leave inaccessible rows or provider-backed presentations visible during teardown.
+                self.isRecoveringScope = true
+                self.scopePresentationRevision &+= 1
+                self.loadToken &+= 1
+                activeRetry?.cancel()
+                self.prefetchStartTask?.cancel()
+                self.favoriteLoadTask?.cancel()
+                self.snapshot = TimelineSnapshot()
+                self.sections = []
+                self.favoriteUIDs = []
+                self.favoriteMutationsInFlight = []
+                self.favoriteLoadOverrides.removeAll(keepingCapacity: false)
+                self.favoriteLoadSettled = false
+                self.favoriteFilterAvailability = .loading
+                self.pendingTimelineRemovals.removeAll(keepingCapacity: false)
+                self.timelineMutationGeneration &+= 1
+                self.timelineRevision &+= 1
+                self.initialLibraryLoadSettled = false
+                self.loadState = .preparingInventory
+                locationIndex.replaceAll([])
+                locationIndex.updateScanProgress(PhotoLocationScanProgress())
+            },
+            operation: {
+                await driver.run()
+            }
+        )
+        precondition(scheduled, "Scope recovery changed during synchronous scheduling")
+    }
+
+    /// Removes a Drive scope only after every owner has stopped. Authentication remains valid, and a clean
+    /// facade resolves or recreates the Photos volume after SDK, timeline, media, and location data is purged.
+    private func recoverAfterScopeAccessLoss(
+        expectedSession: ProtonSession? = nil,
+        expectedLoadGeneration: Int? = nil
+    ) async {
+        guard let currentSession = session, let store else { return }
+        scheduleScopeRecovery(
+            failedSession: expectedSession ?? currentSession,
+            failedStore: store,
+            failedLoadGeneration: expectedLoadGeneration ?? loadToken
+        )
+        _ = await scopeRecoveryCoordinator.joinIfActive()
+    }
+
+    private func scopeRecoveryIsCurrent(_ identity: MobileScopeRecoveryIdentity) -> Bool {
+        identity.matches(
+            session: session,
+            loadGeneration: loadToken,
+            activeIdentity: scopeRecoveryCoordinator.activeIdentity
+        )
     }
 
     /// Lifecycle-only platform seam. Detection cadence and failure backoff remain shared TimelineCore policy.
@@ -651,7 +865,7 @@ final class MobileLibraryModel {
 
     /// Retires transient retry owners without deleting account data. Every replacement load waits for this
     /// barrier, so a retry never opens a second owner graph while the previous graph still owns SQLite handles.
-    private func retireForRetry() async {
+    private func retireForRetry(advanceLoadToken: Bool = true) async {
         let previousTeardown = teardownTask
         let activeFacade = facade
         let activeLoadTask = loadTask
@@ -667,7 +881,7 @@ final class MobileLibraryModel {
         let activeLocationCrawlStarter = locationCrawlStartTask
         let smartSearchShutdown = stopSmartSearch()
 
-        loadToken &+= 1
+        if advanceLoadToken { loadToken &+= 1 }
         activeLoadTask?.cancel()
         loadTask = nil
         transitionTask?.cancel()
@@ -754,10 +968,12 @@ final class MobileLibraryModel {
         let activeLocationCrawlStarter = locationCrawlStartTask
         let activeLocationIndex = locationIndex
         let activeRetry = retryTask
+        let activeScopeRecovery = scopeRecoveryCoordinator.cancel()
 
         loadToken &+= 1  // supersede any in-flight snapshot sort
         activeRetry?.cancel()
         retryTask = nil
+        isRecoveringScope = false
         activeLoadTask?.cancel()
         loadTask = nil
         transitionTask?.cancel()
@@ -804,6 +1020,7 @@ final class MobileLibraryModel {
             AccountTeardownOwner(id: "mobile.platform-tasks", stage: .platformTasks) {
                 await previousTeardown?.value
                 await activeRetry?.value
+                await activeScopeRecovery?.value
                 await activeTransitionTask?.value
                 await activeLoadTask?.value
                 await activePrefetchStartTask?.value
@@ -995,6 +1212,9 @@ final class MobileLibraryModel {
                 self.albumSync = albumSync
                 self.backend = backend
                 self.thumbnailFeed = feed
+                if self.isRecoveringScope {
+                    self.isRecoveringScope = false
+                }
                 self.favoriteLoadTask = Task { [weak self, backend] in
                     let loaded: Set<PhotoUID>?
                     do {
@@ -1045,6 +1265,9 @@ final class MobileLibraryModel {
                         loadGeneration == self.loadToken,
                         self.session == session
                     else { return }
+                    if case .terminalFailure = cacheValidation {
+                        throw TimelineCacheValidationTerminalError()
+                    }
                     if case .validated(let token) = cacheValidation {
                         apply(.authoritativeInventoryResolved(count: items.count, requiresNewFrame: false))
                         initialLibraryLoadSettled = true
@@ -1080,8 +1303,22 @@ final class MobileLibraryModel {
                 )
             } catch is CancellationError {
                 // A newer session/configuration replaced this task.
+            } catch let error as any LibraryChangeTerminalError {
+                guard loadGeneration == self.loadToken, self.session == session else { return }
+                DebugLog.log("timeline: terminal scope failure during initial load - \(error)")
+                // The recovery task must not join the load task that schedules it. Remove this completed owner
+                // first, then synchronously register recovery before this main-actor turn ends.
+                self.loadTask = nil
+                self.scheduleScopeRecovery(
+                    failedSession: session,
+                    failedStore: store,
+                    failedLoadGeneration: loadGeneration
+                )
             } catch {
                 guard loadGeneration == self.loadToken, self.session == session else { return }
+                if self.isRecoveringScope {
+                    self.isRecoveringScope = false
+                }
                 apply(.failed(message: Self.message(for: error), retryable: true))
                 initialLibraryLoadSettled = true
                 if hadCachedInventory {
@@ -1171,40 +1408,67 @@ final class MobileLibraryModel {
     ) {
         guard applicationIsActive,
             initialLibraryLoadSettled,
-            let provider = backend as? any LibraryChangeTokenProvider
+            let provider = backend as? any LibraryChangeTokenProvider,
+            let recoverySession = session,
+            let refreshLease = currentMutationLease()
         else { return }
         Task { [weak self] in
-            await self?.libraryChangeMonitor.restart(
+            guard let self,
+                !self.isRecoveringScope,
+                refreshLease.isCurrent(loadToken: self.loadToken, sessionUID: self.session?.uid)
+            else { return }
+            await self.libraryChangeMonitor.restart(
                 provider: provider,
                 resetBaseline: resetBaseline,
-                initialToken: initialToken
-            ) { [weak self] in
-                guard let self else { return false }
-                return await self.libraryRefreshCoalescer.request { [weak self] in
-                    await self?.performLibraryRefresh() ?? false
+                initialToken: initialToken,
+                onTerminal: { [weak self] _ in
+                    await self?.recoverAfterScopeAccessLoss(
+                        expectedSession: recoverySession,
+                        expectedLoadGeneration: refreshLease.loadToken
+                    )
+                },
+                onChange: { [weak self] in
+                    guard let self else { return .retry }
+                    return await self.libraryRefreshCoalescer.request { [weak self] in
+                        await self?.performLibraryRefresh(lease: refreshLease) ?? .retry
+                    }
                 }
-            }
+            )
         }
     }
 
     private func requestLibraryRefresh() {
+        guard let recoverySession = session, let refreshLease = currentMutationLease() else { return }
         let coalescer = libraryRefreshCoalescer
         Task { [weak self] in
-            _ = await coalescer.request { [weak self] in
-                await self?.performLibraryRefresh() ?? false
+            let outcome = await coalescer.request { [weak self] in
+                await self?.performLibraryRefresh(lease: refreshLease) ?? .retry
+            }
+            if outcome == .terminal {
+                await self?.recoverAfterScopeAccessLoss(
+                    expectedSession: recoverySession,
+                    expectedLoadGeneration: refreshLease.loadToken
+                )
             }
         }
     }
 
-    private func performLibraryRefresh() async -> Bool {
-        guard let backend else { return false }
+    private func performLibraryRefresh(
+        lease refreshLease: MobileLibraryMutationLease
+    ) async -> LibraryChangeRefreshOutcome {
+        guard !isRecoveringScope,
+            refreshLease.isCurrent(loadToken: loadToken, sessionUID: session?.uid),
+            let backend
+        else { return .retry }
         isRefreshingLibrary = true
         defer { isRefreshingLibrary = false }
         do {
             let refreshed = try await backend.loadTimeline()
             try Task.checkCancellation()
+            try requireCurrentMutation(refreshLease)
             let previousUIDs = items.map(\.uid)
             let changed = await applyItems(refreshed, cached: false)
+            try requireCurrentMutation(refreshLease)
             if let thumbnailFeed {
                 if changed {
                     scheduleThumbnailPrefetch(using: thumbnailFeed)
@@ -1214,12 +1478,14 @@ final class MobileLibraryModel {
             // The same opaque server event token covers album mutations. Reuse this central foreground
             // refresh instead of adding a second poller; Collections reloads through its existing revision key.
             albumCatalogRevision &+= 1
-            return true
+            return .refreshed
         } catch is CancellationError {
-            return false
+            return .retry
+        } catch is any LibraryChangeTerminalError {
+            return .terminal
         } catch {
             DebugLog.log("timeline: foreground refresh failed - \(error)")
-            return false
+            return .retry
         }
     }
 
