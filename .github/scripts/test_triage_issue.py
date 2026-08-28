@@ -352,17 +352,86 @@ class LLMResponseTests(unittest.TestCase):
             triage_issue.enforced_priority(issue, "NONE")
 
     def test_comment_neutralizes_mentions(self) -> None:
-        comment = triage_issue.duplicate_comment(
+        comment = triage_issue.triage_comment(
+            {
+                "reason": "Ask @maintainers <now> at https://evil.example/test.",
+                "priority_reason": "Blocked.",
+            },
+            "P1",
             {"number": 17, "html_url": "https://github.com/example/repo/issues/17"},
-            "Ask @maintainers <now> at https://evil.example/test.",
         )
 
         self.assertIn("＠maintainers (now)", comment)
         self.assertNotIn("@maintainers", comment)
         self.assertNotIn("evil.example", comment)
 
+    def test_comment_explains_when_rerun_preserves_existing_duplicate_label(self) -> None:
+        comment = triage_issue.triage_comment(
+            {
+                "reason": "The rerun did not reach the duplicate threshold.",
+                "priority_reason": "Limited impact.",
+            },
+            "P2",
+            None,
+            duplicate_label_preserved=True,
+        )
+
+        self.assertIn("rerun did not reconfirm", comment)
+        self.assertIn("label was preserved", comment)
+        self.assertNotIn("no strong duplicate was found", comment)
+
 
 class MainFlowTests(unittest.TestCase):
+    def test_upsert_comment_ignores_marker_from_another_author(self) -> None:
+        with (
+            patch.object(
+                triage_issue,
+                "github_paginated_list",
+                return_value=[
+                    {
+                        "id": 17,
+                        "body": triage_issue.COMMENT_MARKER,
+                        "user": {"login": "contributor"},
+                    }
+                ],
+            ),
+            patch.object(triage_issue, "github_request") as github_request,
+        ):
+            triage_issue.upsert_comment(
+                "example/repo",
+                23,
+                "new body",
+                token="token",
+                api_url="https://api.github.test",
+            )
+
+        self.assertEqual(github_request.call_args.args[:2], ("POST", "/repos/example/repo/issues/23/comments"))
+
+    def test_upsert_comment_updates_legacy_bot_comment(self) -> None:
+        with (
+            patch.object(
+                triage_issue,
+                "github_paginated_list",
+                return_value=[
+                    {
+                        "id": 17,
+                        "body": triage_issue.LEGACY_COMMENT_MARKER,
+                        "user": {"login": "github-actions[bot]"},
+                    }
+                ],
+            ),
+            patch.object(triage_issue, "github_request") as github_request,
+        ):
+            triage_issue.upsert_comment(
+                "example/repo",
+                23,
+                "new body",
+                token="token",
+                api_url="https://api.github.test",
+            )
+
+        self.assertEqual(github_request.call_args.args[:2], ("PATCH", "/repos/example/repo/issues/comments/17"))
+
     def test_existing_priority_is_detected_without_changing_it(self) -> None:
         with patch.object(
             triage_issue,
@@ -443,6 +512,7 @@ class MainFlowTests(unittest.TestCase):
             patch.object(triage_issue, "request_json", return_value=raw),
             patch.object(triage_issue, "ensure_label") as ensure_label,
             patch.object(triage_issue, "add_labels") as add_labels,
+            patch.object(triage_issue, "current_issue_labels", return_value={"bug"}),
             patch.object(triage_issue, "current_priority_label", return_value=None),
             patch.object(triage_issue, "upsert_comment") as upsert_comment,
         ):
@@ -496,7 +566,9 @@ class MainFlowTests(unittest.TestCase):
             patch.object(triage_issue, "request_json", return_value=raw),
             patch.object(triage_issue, "ensure_label") as ensure_label,
             patch.object(triage_issue, "add_labels") as add_labels,
+            patch.object(triage_issue, "current_issue_labels", return_value={"enhancement"}),
             patch.object(triage_issue, "current_priority_label") as current_priority_label,
+            patch.object(triage_issue, "upsert_comment") as upsert_comment,
         ):
             result = triage_issue.main()
 
@@ -504,6 +576,67 @@ class MainFlowTests(unittest.TestCase):
         ensure_label.assert_called_once()
         current_priority_label.assert_not_called()
         self.assertEqual(add_labels.call_args.args[2], ["triage:checked"])
+        upsert_comment.assert_called_once()
+        self.assertIn("no strong duplicate", upsert_comment.call_args.args[2])
+
+    def test_duplicate_label_is_preserved_when_rerun_finds_no_strong_duplicate(self) -> None:
+        issue = {
+            "number": 24,
+            "title": "[Bug]: Backup stalls",
+            "body": acknowledged_body("Use case"),
+            "labels": [{"name": "bug"}],
+        }
+        decision = {
+            "is_duplicate": False,
+            "confidence": 0.2,
+            "duplicate_issue_number": 0,
+            "reason": "The rerun did not reconfirm the previous match.",
+            "priority": "P1",
+            "priority_reason": "The core workflow is blocked.",
+        }
+        raw = "data: " + json.dumps(
+            {"choices": [{"delta": {"content": json.dumps(decision)}}]}
+        )
+        environment = {
+            "GH_TOKEN": "github-test-token",
+            "LLM_API_KEY": "llm-test-token",
+            "LLM_API_URL": "https://api.example.test/v1/chat/completions",
+            "LLM_MODEL": "custom-model",
+            "GITHUB_REPOSITORY": "example/repo",
+            "GITHUB_EVENT_PATH": "/tmp/test-event.json",
+            "GITHUB_API_URL": "https://api.github.test",
+        }
+
+        with (
+            patch.dict("os.environ", environment, clear=True),
+            patch.object(triage_issue, "load_event", return_value=issue),
+            patch.object(triage_issue, "fetch_issues", return_value=[]),
+            patch.object(triage_issue, "select_candidates", return_value=[]),
+            patch.object(triage_issue, "request_json", return_value=raw),
+            patch.object(triage_issue, "ensure_label") as ensure_label,
+            patch.object(triage_issue, "add_labels") as add_labels,
+            patch.object(
+                triage_issue,
+                "current_issue_labels",
+                return_value={"bug", triage_issue.POSSIBLE_DUPLICATE_LABEL},
+            ),
+            patch.object(triage_issue, "upsert_comment") as upsert_comment,
+        ):
+            result = triage_issue.main()
+
+        self.assertEqual(result, 0)
+        self.assertEqual(ensure_label.call_count, 2)
+        add_labels.assert_called_once_with(
+            "example/repo",
+            24,
+            ["triage:checked", "priority:P1"],
+            token="github-test-token",
+            api_url="https://api.github.test",
+        )
+        comment = upsert_comment.call_args.args[2]
+        self.assertIn("rerun did not reconfirm", comment)
+        self.assertIn("label was preserved", comment)
+        self.assertNotIn("no strong duplicate was found", comment)
 
     def test_missing_acknowledgement_skips_external_triage_without_labels(self) -> None:
         issue = {

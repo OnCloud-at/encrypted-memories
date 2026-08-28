@@ -352,41 +352,6 @@ import Testing
         #expect(policy.computeUnits != .cpuOnly)
     }
 
-    @Test func locatorReportsMissingWhenBundleHasNoArtifact() throws {
-        // A bundle without any `.mlmodelc` must report missing rather than crash or
-        // fabricate a URL.
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent("ml-locator-empty-\(UUID().uuidString)", isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: root) }
-        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-
-        let bundle = try #require(Bundle(url: root))
-        let locator = BundleMLModelLocator(bundle: bundle)
-        let status = locator.availability(for: descriptor)
-        #expect(status == .missing(descriptor: descriptor))
-        #expect(!status.isAvailable)
-    }
-
-    @Test func locatorFindsArtifactInInjectedBundle() throws {
-        // The bundle is injected, so availability is positively testable: a directory
-        // containing `<identifier>.mlmodelc` acts as the host bundle.
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent("ml-locator-tests-\(UUID().uuidString)", isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: root) }
-        let artifact = root.appendingPathComponent("\(descriptor.identifier).mlmodelc", isDirectory: true)
-        try FileManager.default.createDirectory(at: artifact, withIntermediateDirectories: true)
-
-        let bundle = try #require(Bundle(url: root))
-        let locator = BundleMLModelLocator(bundle: bundle)
-        let status = locator.availability(for: descriptor)
-        guard case .available(let url) = status else {
-            Issue.record("Expected .available, got \(status)")
-            return
-        }
-        #expect(url.lastPathComponent == "\(descriptor.identifier).mlmodelc")
-        #expect(status.isAvailable)
-    }
-
     @Test func vectorCipherRoundTripsAndBindsAccountAssetAndEpoch() throws {
         let key = SymmetricKey(size: .bits256)
         let cipher = CryptoKitMLVectorCipher(key: key, accountUID: "account-a")

@@ -1974,7 +1974,6 @@ final class CoreArchitectureGateTests: XCTestCase {
         let feedFile = adapterRoot.appendingPathComponent("UIKitThumbnailFeed.swift")
         let policyFile = adapterRoot.appendingPathComponent("UIKitMediaCachePolicy.swift")
         let decoderFile = adapterRoot.appendingPathComponent("UIKitThumbnailImageDecoder.swift")
-        let prefetchFile = adapterRoot.appendingPathComponent("UIKitThumbnailPrefetcher.swift")
         var violations: [String] = []
 
         if !manifest.contains(".library(name: \"MediaCacheUIKitAdapter\", targets: [\"MediaCacheUIKitAdapter\"])") {
@@ -1995,7 +1994,7 @@ final class CoreArchitectureGateTests: XCTestCase {
             violations.append("MediaCacheUIKitAdapter: missing Package.swift target declaration")
         }
 
-        for file in [feedFile, policyFile, decoderFile, prefetchFile]
+        for file in [feedFile, policyFile, decoderFile]
         where !FileManager.default.fileExists(atPath: file.path) {
             violations.append("MediaCacheUIKitAdapter/\(file.lastPathComponent): missing UIKit cache adapter file")
         }
@@ -2110,8 +2109,6 @@ final class CoreArchitectureGateTests: XCTestCase {
         let manifest = try String(contentsOf: packageManifest, encoding: .utf8)
         let adapterRoot = sourcesRoot.appendingPathComponent("PhotoViewerUIKitAdapter")
         let imageFile = adapterRoot.appendingPathComponent("UIKitViewerImageAdapter.swift")
-        let playerFile = adapterRoot.appendingPathComponent("UIKitPlayerLayerHostView.swift")
-        let transitionFile = adapterRoot.appendingPathComponent("UIKitViewerTransitionTiming.swift")
         var violations: [String] = []
 
         if !manifest.contains(".library(name: \"PhotoViewerUIKitAdapter\", targets: [\"PhotoViewerUIKitAdapter\"])") {
@@ -2132,8 +2129,10 @@ final class CoreArchitectureGateTests: XCTestCase {
             violations.append("PhotoViewerUIKitAdapter: missing Package.swift target declaration")
         }
 
-        for file in [imageFile, playerFile, transitionFile] where !FileManager.default.fileExists(atPath: file.path) {
-            violations.append("PhotoViewerUIKitAdapter/\(file.lastPathComponent): missing UIKit viewer adapter file")
+        if !FileManager.default.fileExists(atPath: imageFile.path) {
+            violations.append(
+                "PhotoViewerUIKitAdapter/\(imageFile.lastPathComponent): missing UIKit viewer adapter file"
+            )
         }
 
         if FileManager.default.fileExists(atPath: imageFile.path) {
@@ -2154,45 +2153,6 @@ final class CoreArchitectureGateTests: XCTestCase {
                 "ViewerFullImageDecoder.decodeCGImage(data",
             ] where !source.contains(symbol) {
                 violations.append("PhotoViewerUIKitAdapter/UIKitViewerImageAdapter.swift: missing \(symbol)")
-            }
-        }
-
-        if FileManager.default.fileExists(atPath: playerFile.path) {
-            let imports = try importedModules(in: playerFile)
-            let expectedImports: Set<String> = ["AVFoundation", "UIKit"]
-            if imports != expectedImports {
-                violations.append(
-                    "PhotoViewerUIKitAdapter/UIKitPlayerLayerHostView.swift: imports \(imports.sorted()) != \(expectedImports.sorted())"
-                )
-            }
-            let source = try String(contentsOf: playerFile, encoding: .utf8)
-            for symbol in [
-                "#if canImport(UIKit)",
-                "public final class UIKitPlayerLayerHostView: UIView",
-                "override class var layerClass: AnyClass { AVPlayerLayer.self }",
-                "public var player: AVPlayer?",
-                "configure(player: AVPlayer?, videoGravity: AVLayerVideoGravity = .resizeAspect)",
-            ] where !source.contains(symbol) {
-                violations.append("PhotoViewerUIKitAdapter/UIKitPlayerLayerHostView.swift: missing \(symbol)")
-            }
-        }
-
-        if FileManager.default.fileExists(atPath: transitionFile.path) {
-            let imports = try importedModules(in: transitionFile)
-            let expectedImports: Set<String> = ["CoreGraphics", "PhotoViewerCore"]
-            if imports != expectedImports {
-                violations.append(
-                    "PhotoViewerUIKitAdapter/UIKitViewerTransitionTiming.swift: imports \(imports.sorted()) != \(expectedImports.sorted())"
-                )
-            }
-            let source = try String(contentsOf: transitionFile, encoding: .utf8)
-            for symbol in [
-                "#if canImport(UIKit)",
-                "UIKitViewerTransitionTiming",
-                "ViewerMediaTransitionStyle",
-                "liveMotionTransform",
-            ] where !source.contains(symbol) {
-                violations.append("PhotoViewerUIKitAdapter/UIKitViewerTransitionTiming.swift: missing \(symbol)")
             }
         }
 

@@ -258,12 +258,10 @@ struct ThumbnailHealthTests {
         let cache = ThumbnailCache(
             namespace: Self.uniqueNamespace("prefetch"), rootDirectory: timelineFeatureTestCacheRoot("thumb-health"))
         let feed = await Self.makeFeed(cache: cache, loader: loader, concurrency: 1, batch: 1)
-        let prefetcher = ThumbnailPrefetcher(feed: feed)
-
-        await prefetcher.start(uids: [uid])
+        await feed.startPrefetch([uid])
         try await Task.sleep(for: .milliseconds(350))
 
-        let status = await prefetcher.status()
+        let status = await feed.prefetchStatus()
         #expect(status.diskFileCount >= 1)
         #expect(status.diskThumbnailCoverageFraction >= 1)
     }
