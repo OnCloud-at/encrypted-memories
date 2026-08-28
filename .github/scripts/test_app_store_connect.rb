@@ -24,6 +24,7 @@ class FakeAppStoreConnectClient
     in_app_purchase_versions: nil,
     in_app_purchase_review_note: :contract,
     in_app_purchase_screenshot_state: "COMPLETE",
+    in_app_purchase_description: "Editable App Store description.",
     in_app_purchase_prices: [{ "startDate" => nil, "endDate" => nil }],
     in_app_purchase_available_territories: %w[AUT USA],
     bundle_id_capabilities: ["IN_APP_PURCHASE"]
@@ -42,6 +43,7 @@ class FakeAppStoreConnectClient
     @in_app_purchase_versions = in_app_purchase_versions || [{ "version" => 1, "state" => "PREPARE_FOR_SUBMISSION" }]
     @in_app_purchase_review_note = in_app_purchase_review_note
     @in_app_purchase_screenshot_state = in_app_purchase_screenshot_state
+    @in_app_purchase_description = in_app_purchase_description
     @in_app_purchase_prices = in_app_purchase_prices
     @in_app_purchase_available_territories = in_app_purchase_available_territories
     @bundle_id_capabilities = bundle_id_capabilities
@@ -256,7 +258,7 @@ class FakeAppStoreConnectClient
         "attributes" => {
           "locale" => locale,
           "name" => values.fetch("name"),
-          "description" => values.fetch("description")
+          "description" => @in_app_purchase_description
         }
       }
     end
@@ -410,6 +412,13 @@ class AppStoreConnectTest < Minitest::Test
     ).fetch("products").length
     assert_equal expected_count, version_requests
     assert_equal expected_count, localization_requests
+
+    localization_queries = @client.calls.filter_map do |method, path, query|
+      query if method == :collection && path.match?(%r{\A/v1/inAppPurchaseVersions/[^/]+/localizations\z})
+    end
+    assert localization_queries.all? { |query|
+      query.fetch("fields[inAppPurchaseLocalizations]") == "name,locale"
+    }
 
     capability_request = @client.calls.find do |method, path, _query|
       method == :collection && path.end_with?("/bundleIdCapabilities")
