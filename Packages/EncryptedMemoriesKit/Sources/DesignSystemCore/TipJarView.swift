@@ -42,6 +42,9 @@ public struct TipJarView: View {
             }
             .productViewStyle(.compact)
             .storeButton(.hidden, for: .restorePurchases, .cancellation)
+            .onInAppPurchaseCompletion { product, result in
+                await handlePurchaseCompletion(product: product, result: result)
+            }
         case .unavailable:
             VStack(alignment: .leading, spacing: 8) {
                 Text(L10n.string("settings.tip_jar_unavailable"))
@@ -96,6 +99,26 @@ public struct TipJarView: View {
         return "heart"
     }
 
+    @MainActor
+    private func handlePurchaseCompletion(
+        product: Product,
+        result: Result<Product.PurchaseResult, any Error>
+    ) async {
+        guard productIdentifiers.contains(product.id),
+            case .success(let purchaseResult) = result,
+            case .success(let verificationResult) = purchaseResult,
+            case .verified(let transaction) = verificationResult,
+            TipJarPurchaseEligibility.accepts(
+                productIdentifier: product.id,
+                transactionProductIdentifier: transaction.productID,
+                allowedProductIdentifiers: productIdentifiers
+            )
+        else { return }
+
+        TipJarCelebrationCoordinator.shared.celebrate()
+        await transaction.finish()
+    }
+
     private static let fallbackBundleIdentifier = "at.oncloud.encryptedmemories"
     private static let logger = Logger(subsystem: fallbackBundleIdentifier, category: "StoreKit")
 
@@ -110,6 +133,17 @@ enum TipJarProductAvailability {
     static func orderedAvailableIdentifiers(expected: [String], returned: [String]) -> [String] {
         let returnedIdentifiers = Set(returned)
         return expected.filter(returnedIdentifiers.contains)
+    }
+}
+
+enum TipJarPurchaseEligibility {
+    static func accepts(
+        productIdentifier: String,
+        transactionProductIdentifier: String,
+        allowedProductIdentifiers: [String]
+    ) -> Bool {
+        allowedProductIdentifiers.contains(productIdentifier)
+            && transactionProductIdentifier == productIdentifier
     }
 }
 
@@ -138,7 +172,6 @@ public actor TipJarTransactionProcessor {
         else { return }
 
         // A tip has no digital entitlement to persist or unlock. Verification completes delivery.
-        await TipJarCelebrationCoordinator.shared.celebrate()
         await transaction.finish()
     }
 

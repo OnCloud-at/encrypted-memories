@@ -40,8 +40,38 @@ struct TipJarCelebrationTests {
         #expect(coordinator.activeCelebration == nil)
     }
 
-    @Test("Verified tip delivery starts the celebration")
-    func verifiedTipDeliveryStartsCelebration() throws {
+    @Test("Only a matching configured tip can trigger celebration")
+    func onlyMatchingConfiguredTipCanTriggerCelebration() {
+        let allowedProductIdentifiers = [
+            "at.oncloud.encryptedmemories.tip.medium",
+            "at.oncloud.encryptedmemories.tip.large",
+        ]
+
+        #expect(
+            TipJarPurchaseEligibility.accepts(
+                productIdentifier: allowedProductIdentifiers[0],
+                transactionProductIdentifier: allowedProductIdentifiers[0],
+                allowedProductIdentifiers: allowedProductIdentifiers
+            )
+        )
+        #expect(
+            !TipJarPurchaseEligibility.accepts(
+                productIdentifier: "at.oncloud.encryptedmemories.tip.unknown",
+                transactionProductIdentifier: "at.oncloud.encryptedmemories.tip.unknown",
+                allowedProductIdentifiers: allowedProductIdentifiers
+            )
+        )
+        #expect(
+            !TipJarPurchaseEligibility.accepts(
+                productIdentifier: allowedProductIdentifiers[0],
+                transactionProductIdentifier: allowedProductIdentifiers[1],
+                allowedProductIdentifiers: allowedProductIdentifiers
+            )
+        )
+    }
+
+    @Test("StoreKit view completion starts the celebration")
+    func storeKitViewCompletionStartsCelebration() throws {
         var sourceURL = URL(fileURLWithPath: #filePath)
         for _ in 0..<5 { sourceURL.deleteLastPathComponent() }
         sourceURL.appendPathComponent(
@@ -49,6 +79,16 @@ struct TipJarCelebrationTests {
         )
         let source = try String(contentsOf: sourceURL, encoding: .utf8)
 
-        #expect(source.contains("await TipJarCelebrationCoordinator.shared.celebrate()"))
+        #expect(source.contains(".onInAppPurchaseCompletion"))
+        #expect(source.contains("case .success(let purchaseResult) = result"))
+        #expect(source.contains("case .success(let verificationResult) = purchaseResult"))
+        #expect(source.contains("case .verified(let transaction) = verificationResult"))
+        #expect(source.contains("TipJarCelebrationCoordinator.shared.celebrate()"))
+
+        let transactionProcessorSource =
+            source.components(
+                separatedBy: "public actor TipJarTransactionProcessor"
+            ).last ?? ""
+        #expect(!transactionProcessorSource.contains("TipJarCelebrationCoordinator.shared.celebrate()"))
     }
 }
