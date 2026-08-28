@@ -42,6 +42,7 @@ struct EncryptedMemoriesApp: App {
             }
             .frame(minWidth: 720, minHeight: 480)
             .background(WindowConfigurator())
+            .overlay { TipJarCelebrationOverlay() }
             .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
                 model?.smartSearch?.noteConditionsChanged()
             }
@@ -95,25 +96,28 @@ struct EncryptedMemoriesApp: App {
 
         // Use the native Settings scene so macOS owns the application menu command and shortcut.
         Settings {
-            if let model {
-                SettingsView(
-                    isAccountAvailable: model.hasAuthenticatedAccount,
-                    uploadCoordinator: model.facade?.uploadCoordinator,
-                    backup: model.backupController,
-                    photoBackup: model.photoBackupController,
-                    albumSync: model.albumSyncController,
-                    smartSearch: model.smartSearch,
-                    refreshAccountInfo: {
-                        guard let facade = model.facade else { return }
-                        try? await facade.refreshAccountInfo()
-                    },
-                    signOut: { model.signOut() }
-                )
-            } else {
-                Metal3UnsupportedDeviceView(productName: ProductBrand.displayName)
-                    .frame(minWidth: 520, minHeight: 360)
-                    .background(ProtonColor.backgroundNorm)
+            Group {
+                if let model {
+                    SettingsView(
+                        isAccountAvailable: model.hasAuthenticatedAccount,
+                        uploadCoordinator: model.facade?.uploadCoordinator,
+                        backup: model.backupController,
+                        photoBackup: model.photoBackupController,
+                        albumSync: model.albumSyncController,
+                        smartSearch: model.smartSearch,
+                        refreshAccountInfo: {
+                            guard let facade = model.facade else { return }
+                            try? await facade.refreshAccountInfo()
+                        },
+                        signOut: { model.signOut() }
+                    )
+                } else {
+                    Metal3UnsupportedDeviceView(productName: ProductBrand.displayName)
+                        .frame(minWidth: 520, minHeight: 360)
+                        .background(ProtonColor.backgroundNorm)
+                }
             }
+            .overlay { TipJarCelebrationOverlay() }
         }
     }
 }

@@ -138,6 +138,7 @@ public actor TipJarTransactionProcessor {
         else { return }
 
         // A tip has no digital entitlement to persist or unlock. Verification completes delivery.
+        await TipJarCelebrationCoordinator.shared.celebrate()
         await transaction.finish()
     }
 

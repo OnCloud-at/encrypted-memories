@@ -28,6 +28,8 @@
 	<false/>
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>Encrypted Memories backs up the photos and videos in your library to Proton Drive, end-to-end encrypted. Access is requested only when you turn backup on.</string>
+	<key>NSMotionUsageDescription</key>
+	<string>Motion data lets the celebration drift with the way you hold your device.</string>
 	<key>BGTaskSchedulerPermittedIdentifiers</key>
 	<array>
 		<string>at.oncloud.encryptedmemories.photo-backup.processing</string>
