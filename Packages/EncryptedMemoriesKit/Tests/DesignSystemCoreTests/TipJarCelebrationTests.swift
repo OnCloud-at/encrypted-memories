@@ -40,8 +40,8 @@ struct TipJarCelebrationTests {
         #expect(coordinator.activeCelebration == nil)
     }
 
-    @Test("Verified tip delivery starts the celebration")
-    func verifiedTipDeliveryStartsCelebration() throws {
+    @Test("StoreKit view completion starts the celebration")
+    func storeKitViewCompletionStartsCelebration() throws {
         var sourceURL = URL(fileURLWithPath: #filePath)
         for _ in 0..<5 { sourceURL.deleteLastPathComponent() }
         sourceURL.appendPathComponent(
@@ -49,6 +49,16 @@ struct TipJarCelebrationTests {
         )
         let source = try String(contentsOf: sourceURL, encoding: .utf8)
 
-        #expect(source.contains("await TipJarCelebrationCoordinator.shared.celebrate()"))
+        #expect(source.contains(".onInAppPurchaseCompletion"))
+        #expect(source.contains("case .success(let purchaseResult) = result"))
+        #expect(source.contains("case .success(let verificationResult) = purchaseResult"))
+        #expect(source.contains("case .verified(let transaction) = verificationResult"))
+        #expect(source.contains("TipJarCelebrationCoordinator.shared.celebrate()"))
+
+        let transactionProcessorSource =
+            source.components(
+                separatedBy: "public actor TipJarTransactionProcessor"
+            ).last ?? ""
+        #expect(!transactionProcessorSource.contains("TipJarCelebrationCoordinator.shared.celebrate()"))
     }
 }
