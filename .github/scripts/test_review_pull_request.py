@@ -1,3 +1,4 @@
+import io
 import json
 import pathlib
 import sys
@@ -11,9 +12,43 @@ import review_pull_request  # noqa: E402
 import github_llm_client  # noqa: E402
 
 
-def sse(value: dict[str, object]) -> str:
-    content = json.dumps(value)
-    return f"data: {json.dumps({'choices': [{'delta': {'content': content}}]})}\n\ndata: [DONE]\n"
+def llm_content(value: dict[str, object]) -> str:
+    return json.dumps(value)
+
+
+def stream_bytes(events: list[dict[str, object]], *, done: bool = True) -> bytes:
+    chunks = [
+        b"data: " + json.dumps(event, ensure_ascii=False).encode("utf-8") + b"\n\n"
+        for event in events
+    ]
+    if done:
+        chunks.append(b"data: [DONE]\n\n")
+    return b"".join(chunks)
+
+
+class FragmentedResponse:
+    def __init__(self, chunks: list[bytes], *, terminal_error: Exception | None = None) -> None:
+        self.chunks = list(chunks)
+        self.terminal_error = terminal_error
+
+    def __enter__(self) -> "FragmentedResponse":
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        return None
+
+    def read1(self, limit: int) -> bytes:
+        if self.chunks:
+            chunk = self.chunks.pop(0)
+            if len(chunk) > limit:
+                self.chunks.insert(0, chunk[limit:])
+                return chunk[:limit]
+            return chunk
+        if self.terminal_error is not None:
+            error = self.terminal_error
+            self.terminal_error = None
+            raise error
+        return b""
 
 
 def pull_request(**overrides: object) -> dict[str, object]:
@@ -97,8 +132,14 @@ class PayloadTests(unittest.TestCase):
 
         system_prompt = payload["messages"][0]["content"]
         review_input = json.loads(payload["messages"][1]["content"])
+        self.assertEqual(review_input["task"], "github_pull_request_code_review")
+        self.assertIn("not issue triage", system_prompt)
+        self.assertIn("Do not claim to decide GitHub mergeability", system_prompt)
         self.assertIn("untrusted data", system_prompt)
         self.assertIn(injection, review_input["pull_request"]["title"])
+        self.assertEqual(review_input["pull_request"]["base"], "main")
+        self.assertEqual(review_input["pull_request"]["head_sha"], "abc123")
+        self.assertNotIn("mergeable", review_input["pull_request"])
         self.assertNotIn(injection, system_prompt)
         self.assertLessEqual(len(review_input["pull_request"]["body"]), review_pull_request.MAX_BODY_CHARS)
         self.assertLessEqual(
@@ -134,6 +175,46 @@ class PayloadTests(unittest.TestCase):
 
 
 class ParsingAndRenderingTests(unittest.TestCase):
+    def test_review_rejects_a_non_string_severity(self) -> None:
+        review = valid_review(
+            findings=[
+                {
+                    "severity": ["blocking"],
+                    "file_id": "file-001",
+                    "line": 1,
+                    "title": "Invalid severity",
+                    "detail": "The response field has the wrong JSON type.",
+                }
+            ]
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "invalid finding severity"):
+            review_pull_request.parse_review(
+                llm_content(review),
+                {"file-001": {1}},
+                {"file-001": "Sources/Backup.swift"},
+            )
+
+    def test_review_rejects_a_non_string_file_id(self) -> None:
+        review = valid_review(
+            findings=[
+                {
+                    "severity": "warning",
+                    "file_id": ["file-001"],
+                    "line": 1,
+                    "title": "Invalid file ID",
+                    "detail": "The response field has the wrong JSON type.",
+                }
+            ]
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "outside the changed files"):
+            review_pull_request.parse_review(
+                llm_content(review),
+                {"file-001": {1}},
+                {"file-001": "Sources/Backup.swift"},
+            )
+
     def test_review_rejects_a_path_outside_the_diff(self) -> None:
         review = valid_review(
             findings=[
@@ -149,12 +230,12 @@ class ParsingAndRenderingTests(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "outside the changed files"):
             review_pull_request.parse_review(
-                sse(review),
+                llm_content(review),
                 {"file-001": {1, 2, 3}},
                 {"file-001": "Sources/Backup.swift"},
             )
 
-    def test_review_rejects_a_line_outside_the_supplied_patch(self) -> None:
+    def test_review_degrades_a_line_outside_the_supplied_patch_to_file_level(self) -> None:
         review = valid_review(
             findings=[
                 {
@@ -167,12 +248,13 @@ class ParsingAndRenderingTests(unittest.TestCase):
             ]
         )
 
-        with self.assertRaisesRegex(RuntimeError, "outside the supplied patch"):
-            review_pull_request.parse_review(
-                sse(review),
-                {"file-001": {1, 2, 3}},
-                {"file-001": "Sources/Backup.swift"},
-            )
+        parsed = review_pull_request.parse_review(
+            llm_content(review),
+            {"file-001": {1, 2, 3}},
+            {"file-001": "Sources/Backup.swift"},
+        )
+
+        self.assertEqual(parsed["findings"][0]["line"], 0)
 
     def test_changed_lines_include_only_lines_present_in_the_supplied_patch(self) -> None:
         patch_text = "@@ -10,3 +20,4 @@\n context\n-removed\n+added\n final"
@@ -249,7 +331,7 @@ class ParsingAndRenderingTests(unittest.TestCase):
             ]
         )
         parsed = review_pull_request.parse_review(
-            sse(review),
+            llm_content(review),
             changed_lines,
             file_paths,
         )
@@ -303,6 +385,29 @@ class ParsingAndRenderingTests(unittest.TestCase):
         )
 
         self.assertIn("must review the omitted or truncated diff", body)
+
+    def test_github_mergeability_is_reported_separately_from_code_review(self) -> None:
+        body = review_pull_request.render_review(
+            valid_review(),
+            pull_request(mergeable=False),
+            "abc123",
+            [],
+        )
+
+        self.assertIn("Not ready to merge because GitHub reports", body)
+        self.assertIn("GitHub currently reports this pull request as not mergeable", body)
+        self.assertIn("never approves, blocks, or merges", body)
+
+    def test_pending_github_mergeability_is_not_guessed(self) -> None:
+        body = review_pull_request.render_review(
+            valid_review(),
+            pull_request(mergeable=None),
+            "abc123",
+            [],
+        )
+
+        self.assertIn("GitHub has not finished calculating mergeability", body)
+        self.assertIn("Required checks and maintainer review still decide merge", body)
 
 
 class ReviewPublicationTests(unittest.TestCase):
@@ -427,6 +532,484 @@ class GitHubRequestTests(unittest.TestCase):
 
         self.assertEqual(len(items), 101)
         self.assertIn("page=2", request.call_args_list[1].args[1])
+
+
+class LLMStreamTests(unittest.TestCase):
+    def test_large_reasoning_stream_returns_only_visible_content(self) -> None:
+        expected = llm_content(valid_review())
+        reasoning_events = [
+            {
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"reasoning_content": "x"},
+                        "finish_reason": None,
+                    }
+                ]
+            }
+            for _ in range(800)
+        ]
+        response_bytes = stream_bytes(
+            [
+                *reasoning_events,
+                {"choices": [{"index": 0, "delta": {"content": expected[:20]}, "finish_reason": None}]},
+                {"choices": [{"index": 0, "delta": {"content": expected[20:]}, "finish_reason": None}]},
+                {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+                {"choices": [], "usage": {"completion_tokens": 900}},
+            ]
+        )
+
+        self.assertGreater(len(response_bytes), 64_000)
+        self.assertEqual(
+            github_llm_client.read_llm_stream_content(io.BytesIO(response_bytes)),
+            expected,
+        )
+
+    def test_stream_accepts_data_without_a_space_and_ignores_comments(self) -> None:
+        expected = llm_content(valid_review())
+        response = io.BytesIO(
+            b": keepalive\n\n"
+            + b"data:"
+            + json.dumps(
+                {"choices": [{"index": 0, "delta": {"content": expected}, "finish_reason": None}]}
+            ).encode("utf-8")
+            + b"\n\n"
+            + stream_bytes([{"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}])
+        )
+
+        self.assertEqual(github_llm_client.read_llm_stream_content(response), expected)
+
+    def test_fragmented_utf8_and_all_sse_line_endings_are_supported(self) -> None:
+        expected = "€ok"
+        visible = json.dumps(
+            {
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"content": expected},
+                        "finish_reason": None,
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        ).encode("utf-8")
+        raw = (
+            b"data: "
+            + visible
+            + b"\r\n\r\n"
+            + b'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\r\r'
+            + b"data: [DONE]\n\n"
+        )
+        response = FragmentedResponse([raw[index : index + 1] for index in range(len(raw))])
+
+        self.assertEqual(github_llm_client.read_llm_stream_content(response), expected)
+
+    def test_multiline_data_event_is_joined_before_json_parsing(self) -> None:
+        response = io.BytesIO(
+            b'data: {"choices":\n'
+            b'data: [{"index":0,"delta":{"content":"ok"},"finish_reason":null}]}\n\n'
+            b'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n'
+            b"data: [DONE]\n\n"
+        )
+
+        self.assertEqual(github_llm_client.read_llm_stream_content(response), "ok")
+
+    def test_visible_content_limit_counts_utf8_bytes(self) -> None:
+        response = io.BytesIO(
+            stream_bytes(
+                [
+                    {"choices": [{"index": 0, "delta": {"content": "€x"}, "finish_reason": None}]},
+                    {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+                ]
+            )
+        )
+
+        with patch.object(github_llm_client, "MAX_LLM_CONTENT_BYTES", 3):
+            with self.assertRaises(github_llm_client.LLMResponseLimitError):
+                github_llm_client.read_llm_stream_content(response)
+
+    def test_exact_visible_and_wire_limits_are_accepted(self) -> None:
+        response_bytes = stream_bytes(
+            [
+                {"choices": [{"index": 0, "delta": {"content": "€"}, "finish_reason": None}]},
+                {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+            ]
+        )
+        with (
+            patch.object(github_llm_client, "MAX_LLM_CONTENT_BYTES", 3),
+            patch.object(github_llm_client, "MAX_LLM_WIRE_BYTES", len(response_bytes)),
+        ):
+            content = github_llm_client.read_llm_stream_content(io.BytesIO(response_bytes))
+
+        self.assertEqual(content, "€")
+
+    def test_incomplete_stream_is_retried_once(self) -> None:
+        expected = llm_content(valid_review())
+        incomplete = io.BytesIO(
+            stream_bytes(
+                [{"choices": [{"index": 0, "delta": {"content": "discarded"}, "finish_reason": None}]}],
+                done=False,
+            )
+        )
+        complete = io.BytesIO(
+            stream_bytes(
+                [
+                    {"choices": [{"index": 0, "delta": {"content": expected}, "finish_reason": None}]},
+                    {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+                ]
+            )
+        )
+        with (
+            patch.object(
+                github_llm_client.AUTHENTICATED_OPENER,
+                "open",
+                side_effect=[incomplete, complete],
+            ) as open_request,
+            patch.object(github_llm_client.time, "sleep"),
+        ):
+            content = github_llm_client.request_llm_content(
+                "https://api.example.test/v1/chat/completions",
+                token="token",
+                payload={"stream": True},
+            )
+
+        self.assertEqual(content, expected)
+        self.assertEqual(open_request.call_count, 2)
+
+    def test_incomplete_read_is_retried_without_reusing_partial_content(self) -> None:
+        expected = llm_content(valid_review())
+        interrupted = FragmentedResponse(
+            [
+                stream_bytes(
+                    [{"choices": [{"index": 0, "delta": {"content": "discarded"}}]}],
+                    done=False,
+                )
+            ],
+            terminal_error=github_llm_client.IncompleteRead(b"", 1),
+        )
+        complete = io.BytesIO(
+            stream_bytes(
+                [
+                    {"choices": [{"index": 0, "delta": {"content": expected}}]},
+                    {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+                ]
+            )
+        )
+        with (
+            patch.object(
+                github_llm_client.AUTHENTICATED_OPENER,
+                "open",
+                side_effect=[interrupted, complete],
+            ) as open_request,
+            patch.object(github_llm_client.time, "sleep"),
+        ):
+            content = github_llm_client.request_llm_content(
+                "https://api.example.test/v1/chat/completions",
+                token="token",
+                payload={"stream": True},
+            )
+
+        self.assertEqual(content, expected)
+        self.assertNotIn("discarded", content)
+        self.assertEqual(open_request.call_count, 2)
+
+    def test_tls_body_read_failure_is_retried(self) -> None:
+        expected = llm_content(valid_review())
+        interrupted = FragmentedResponse(
+            [],
+            terminal_error=github_llm_client.ssl.SSLError("private transport detail"),
+        )
+        complete = io.BytesIO(
+            stream_bytes(
+                [
+                    {"choices": [{"index": 0, "delta": {"content": expected}}]},
+                    {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+                ]
+            )
+        )
+        with (
+            patch.object(
+                github_llm_client.AUTHENTICATED_OPENER,
+                "open",
+                side_effect=[interrupted, complete],
+            ) as open_request,
+            patch.object(github_llm_client.time, "sleep"),
+        ):
+            content = github_llm_client.request_llm_content(
+                "https://api.example.test/v1/chat/completions",
+                token="token",
+                payload={"stream": True},
+            )
+
+        self.assertEqual(content, expected)
+        self.assertEqual(open_request.call_count, 2)
+
+    def test_non_stop_finish_reason_is_retried_once(self) -> None:
+        expected = llm_content(valid_review())
+        truncated = io.BytesIO(
+            stream_bytes(
+                [
+                    {"choices": [{"index": 0, "delta": {"content": "discarded"}}]},
+                    {"choices": [{"index": 0, "delta": {}, "finish_reason": "length"}]},
+                ]
+            )
+        )
+        complete = io.BytesIO(
+            stream_bytes(
+                [
+                    {"choices": [{"index": 0, "delta": {"content": expected}}]},
+                    {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+                ]
+            )
+        )
+        with (
+            patch.object(
+                github_llm_client.AUTHENTICATED_OPENER,
+                "open",
+                side_effect=[truncated, complete],
+            ) as open_request,
+            patch.object(github_llm_client.time, "sleep"),
+        ):
+            content = github_llm_client.request_llm_content(
+                "https://api.example.test/v1/chat/completions",
+                token="token",
+                payload={"stream": True},
+            )
+
+        self.assertEqual(content, expected)
+        self.assertNotIn("discarded", content)
+        self.assertEqual(open_request.call_count, 2)
+
+    def test_invalid_complete_result_gets_one_generic_validation_retry(self) -> None:
+        payload = {
+            "stream": True,
+            "messages": [
+                {"role": "system", "content": "Return strict JSON."},
+                {"role": "user", "content": "review input"},
+            ],
+        }
+
+        def validator(content: str) -> str:
+            if content != "valid":
+                raise RuntimeError("invalid candidate")
+            return content
+
+        with patch.object(
+            github_llm_client,
+            "request_llm_content",
+            side_effect=["discarded candidate", "valid"],
+        ) as request:
+            result = github_llm_client.request_validated_llm_result(
+                "https://api.example.test/v1/chat/completions",
+                token="token",
+                payload=payload,
+                validator=validator,
+            )
+
+        self.assertEqual(result, "valid")
+        self.assertEqual(request.call_count, 2)
+        self.assertEqual(
+            request.call_args_list[0].kwargs["deadline"],
+            request.call_args_list[1].kwargs["deadline"],
+        )
+        retry_payload = request.call_args_list[1].kwargs["payload"]
+        retry_messages = json.dumps(retry_payload["messages"])
+        self.assertIn("strict client validation", retry_messages)
+        self.assertIn("discarded candidate", retry_messages)
+        self.assertIn("untrusted data", retry_messages)
+        self.assertIn("invalid candidate", retry_messages)
+
+    def test_valid_complete_result_does_not_trigger_validation_retry(self) -> None:
+        payload = {
+            "stream": True,
+            "messages": [{"role": "system", "content": "Return strict JSON."}],
+        }
+        with patch.object(
+            github_llm_client,
+            "request_llm_content",
+            return_value="valid",
+        ) as request:
+            result = github_llm_client.request_validated_llm_result(
+                "https://api.example.test/v1/chat/completions",
+                token="token",
+                payload=payload,
+                validator=lambda content: content,
+            )
+
+        self.assertEqual(result, "valid")
+        request.assert_called_once()
+
+    def test_second_invalid_complete_result_fails_without_another_request(self) -> None:
+        payload = {
+            "stream": True,
+            "messages": [{"role": "system", "content": "Return strict JSON."}],
+        }
+
+        def reject(_: str) -> str:
+            raise RuntimeError("invalid candidate")
+
+        with patch.object(
+            github_llm_client,
+            "request_llm_content",
+            side_effect=["first", "second"],
+        ) as request:
+            with self.assertRaisesRegex(RuntimeError, "invalid candidate"):
+                github_llm_client.request_validated_llm_result(
+                    "https://api.example.test/v1/chat/completions",
+                    token="token",
+                    payload=payload,
+                    validator=reject,
+                )
+
+        self.assertEqual(request.call_count, 2)
+
+    def test_wire_limit_failure_is_not_retried(self) -> None:
+        response = io.BytesIO(
+            stream_bytes(
+                [
+                    {
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"reasoning_content": "x" * 200},
+                                "finish_reason": None,
+                            }
+                        ]
+                    }
+                ]
+            )
+        )
+        with (
+            patch.object(github_llm_client, "MAX_LLM_WIRE_BYTES", 100),
+            patch.object(
+                github_llm_client.AUTHENTICATED_OPENER,
+                "open",
+                return_value=response,
+            ) as open_request,
+        ):
+            with self.assertRaises(github_llm_client.LLMResponseLimitError):
+                github_llm_client.request_llm_content(
+                    "https://api.example.test/v1/chat/completions",
+                    token="token",
+                    payload={"stream": True},
+                )
+
+        self.assertEqual(open_request.call_count, 1)
+
+    def test_visible_content_limit_failure_is_not_retried(self) -> None:
+        response = io.BytesIO(
+            stream_bytes(
+                [
+                    {
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"content": "abcd"},
+                                "finish_reason": None,
+                            }
+                        ]
+                    }
+                ]
+            )
+        )
+        with (
+            patch.object(github_llm_client, "MAX_LLM_CONTENT_BYTES", 3),
+            patch.object(
+                github_llm_client.AUTHENTICATED_OPENER,
+                "open",
+                return_value=response,
+            ) as open_request,
+        ):
+            with self.assertRaises(github_llm_client.LLMResponseLimitError):
+                github_llm_client.request_llm_content(
+                    "https://api.example.test/v1/chat/completions",
+                    token="token",
+                    payload={"stream": True},
+                )
+
+        self.assertEqual(open_request.call_count, 1)
+
+    def test_invalid_event_and_missing_stop_are_rejected(self) -> None:
+        with self.assertRaisesRegex(github_llm_client.LLMStreamError, "invalid SSE event"):
+            github_llm_client.read_llm_stream_content(io.BytesIO(b"data: {invalid}\n\n"))
+
+        without_stop = io.BytesIO(stream_bytes([{"choices": [{"index": 0, "delta": {}}]}]))
+        with self.assertRaisesRegex(github_llm_client.LLMStreamError, "stop finish reason"):
+            github_llm_client.read_llm_stream_content(without_stop)
+
+    def test_content_after_stop_and_multiple_choices_are_rejected(self) -> None:
+        after_stop = io.BytesIO(
+            stream_bytes(
+                [
+                    {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+                    {"choices": [{"index": 0, "delta": {"content": "late"}}]},
+                ]
+            )
+        )
+        with self.assertRaisesRegex(github_llm_client.LLMStreamError, "choices after"):
+            github_llm_client.read_llm_stream_content(after_stop)
+
+        multiple = io.BytesIO(
+            stream_bytes(
+                [
+                    {
+                        "choices": [
+                            {"index": 0, "delta": {"content": "first"}},
+                            {"index": 1, "delta": {"content": "second"}},
+                        ]
+                    }
+                ]
+            )
+        )
+        with self.assertRaisesRegex(github_llm_client.LLMStreamError, "choice count"):
+            github_llm_client.read_llm_stream_content(multiple)
+
+    def test_invalid_reasoning_type_is_rejected(self) -> None:
+        response = io.BytesIO(
+            stream_bytes([{"choices": [{"index": 0, "delta": {"reasoning_content": ["bad"]}}]}])
+        )
+
+        with self.assertRaisesRegex(github_llm_client.LLMStreamError, "reasoning content"):
+            github_llm_client.read_llm_stream_content(response)
+
+    def test_escaped_lone_surrogate_is_rejected_as_invalid_visible_content(self) -> None:
+        response = io.BytesIO(
+            b'data: {"choices":[{"index":0,"delta":{"content":"\\ud800"}}]}\n\n'
+        )
+
+        with self.assertRaisesRegex(github_llm_client.LLMStreamError, "visible content"):
+            github_llm_client.read_llm_stream_content(response)
+
+    def test_stream_time_budget_is_checked_after_each_blocking_read(self) -> None:
+        response = FragmentedResponse([b": keepalive\n\n"])
+
+        with patch.object(github_llm_client.time, "monotonic", side_effect=[0.0, 2.0]):
+            with self.assertRaisesRegex(github_llm_client.LLMResponseLimitError, "time budget"):
+                github_llm_client.read_llm_stream_content(response, deadline=1.0)
+
+    def test_both_provider_error_shapes_are_retried_without_exposing_details(self) -> None:
+        uppercase_error = io.BytesIO(
+            stream_bytes([{"Code": 500, "Error": "private uppercase detail", "Details": {}}])
+        )
+        lowercase_error = io.BytesIO(stream_bytes([{"error": {"message": "private lowercase detail"}}]))
+        with (
+            patch.object(
+                github_llm_client.AUTHENTICATED_OPENER,
+                "open",
+                side_effect=[uppercase_error, lowercase_error],
+            ) as open_request,
+            patch.object(github_llm_client.time, "sleep"),
+        ):
+            with self.assertRaisesRegex(github_llm_client.LLMStreamRetryableError, "error event") as error:
+                github_llm_client.request_llm_content(
+                    "https://api.example.test/v1/chat/completions",
+                    token="token",
+                    payload={"stream": True},
+                )
+
+        self.assertNotIn("private uppercase detail", str(error.exception))
+        self.assertNotIn("private lowercase detail", str(error.exception))
+        self.assertEqual(open_request.call_count, 2)
 
 
 class MainFlowTests(unittest.TestCase):
@@ -599,7 +1182,7 @@ class MainFlowTests(unittest.TestCase):
                     side_effect=[pull_request(), pull_request(head={"sha": "new"})],
                 ),
                 patch.object(review_pull_request, "fetch_changed_files", return_value=[changed_file()]),
-                patch.object(review_pull_request, "request_json") as llm_request,
+                patch.object(review_pull_request, "request_validated_llm_result") as llm_request,
             ):
                 result = review_pull_request.main()
 
@@ -640,7 +1223,11 @@ class MainFlowTests(unittest.TestCase):
                     side_effect=[pull_request(), pull_request(), pull_request(head={"sha": "new"})],
                 ),
                 patch.object(review_pull_request, "fetch_changed_files", return_value=[changed_file()]),
-                patch.object(review_pull_request, "request_json", return_value=sse(valid_review())),
+                patch.object(
+                    review_pull_request,
+                    "request_validated_llm_result",
+                    return_value=valid_review(),
+                ),
                 patch.object(review_pull_request, "upsert_review") as upsert_review,
             ):
                 result = review_pull_request.main()
