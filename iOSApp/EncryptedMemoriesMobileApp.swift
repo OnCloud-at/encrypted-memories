@@ -56,6 +56,9 @@ private struct MobileSupportedAppRoot: View {
     /// `@State` (not `@StateObject`) because `MobileLibraryModel` is `@Observable`: SwiftUI then tracks its
     /// properties individually, so non-grid tabs don't re-render on a timeline snapshot change.
     @State private var libraryModel: MobileLibraryModel
+    @State private var confettiMotion = MobileConfettiMotion.shared
+    @State private var tipJarCelebration = TipJarCelebrationCoordinator.shared
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.scenePhase) private var scenePhase
 
     init() {
@@ -67,6 +70,9 @@ private struct MobileSupportedAppRoot: View {
         MobileRootView()
             .environmentObject(sessionModel)
             .environment(libraryModel)
+            .overlay {
+                TipJarCelebrationOverlay(horizontalBias: confettiMotion.horizontalBias)
+            }
             .task {
                 libraryModel.configure(session: sessionModel.session, store: sessionModel.sessionStore)
             }
@@ -75,6 +81,20 @@ private struct MobileSupportedAppRoot: View {
             }
             .onChange(of: sessionModel.session) { _, session in
                 libraryModel.configure(session: session, store: sessionModel.sessionStore)
+            }
+            .onChange(of: tipJarCelebration.activeCelebration?.id) { _, celebrationID in
+                if celebrationID == nil || reduceMotion {
+                    confettiMotion.stop()
+                } else {
+                    confettiMotion.start()
+                }
+            }
+            .onChange(of: reduceMotion) { _, isReduced in
+                if isReduced {
+                    confettiMotion.stop()
+                } else if tipJarCelebration.activeCelebration != nil {
+                    confettiMotion.start()
+                }
             }
             .onChange(of: scenePhase) { _, phase in
                 let opportunity: LibraryExecutionOpportunity
@@ -98,6 +118,9 @@ private struct MobileSupportedAppRoot: View {
                     Task { await libraryModel.refreshAccountInfo() }
                 }
                 libraryModel.setApplicationActive(phase == .active)
+            }
+            .onDisappear {
+                confettiMotion.stop()
             }
             .onChange(of: libraryModel.photoBackup?.uploadedLibraryMutationRevision) { _, _ in
                 libraryModel.refreshAfterLocalUpload()
