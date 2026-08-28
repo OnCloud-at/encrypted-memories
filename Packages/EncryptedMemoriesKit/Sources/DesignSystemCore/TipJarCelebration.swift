@@ -17,7 +17,7 @@ public final class TipJarCelebrationCoordinator {
 
     public private(set) var activeCelebration: TipJarCelebration?
 
-    private var nextSeed: UInt64 = 0x9E3779B97F4A7C15
+    private var nextSeed: UInt64 = 0x9E37_79B9_7F4A_7C15
 
     public init() {}
 
@@ -199,10 +199,12 @@ private struct TipJarConfettiRain: View {
             guard y >= -size.height * 0.12, y <= size.height * 1.14 else { continue }
 
             let fallProgress = min(1.2, max(0, CGFloat(fallTime) * piece.speed))
-            let sway = Foundation.sin(
-                CGFloat(fallTime) * piece.swayFrequency + piece.phase
-            ) * piece.sway * size.width
-            let x = piece.x * size.width
+            let sway =
+                Foundation.sin(
+                    CGFloat(fallTime) * piece.swayFrequency + piece.phase
+                ) * piece.sway * size.width
+            let x =
+                piece.x * size.width
                 + sway
                 + horizontalBias * piece.tiltInfluence * fallProgress * size.width
 
@@ -214,9 +216,10 @@ private struct TipJarConfettiRain: View {
 
             var context = baseContext
             context.translateBy(x: x, y: y)
-            context.rotate(by: .radians(
-                Double(piece.phase + CGFloat(fallTime) * piece.spin + horizontalBias * 0.35)
-            ))
+            context.rotate(
+                by: .radians(
+                    Double(piece.phase + CGFloat(fallTime) * piece.spin + horizontalBias * 0.35)
+                ))
 
             let width = piece.isDot ? piece.size : piece.size * piece.aspect
             let height = piece.isDot ? piece.size : piece.size
