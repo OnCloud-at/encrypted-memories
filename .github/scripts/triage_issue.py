@@ -673,8 +673,7 @@ def main() -> int:
         token=github_token,
         api_url=api_url,
     )
-    effort_suffix = f"/{reasoning_effort}" if reasoning_effort else ""
-    print(f"Automated issue triage completed with {model}{effort_suffix}.")
+    print("Automated issue triage completed.")
     return 0
 
 
