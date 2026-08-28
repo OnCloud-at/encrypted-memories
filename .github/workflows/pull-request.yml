@@ -66,6 +66,13 @@ jobs:
           bash -n .github/scripts/validate_apple_distribution.sh
           ruby -ryaml -e 'Dir[".github/workflows/*.yml"].sort.each { |path| YAML.parse_file(path) }'
 
+      - name: Test GitHub automation
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/test_remind_llm_key_expiry.py
+          python3 .github/scripts/test_triage_issue.py
+          python3 .github/scripts/test_review_pull_request.py
+
       - name: Lint GitHub Actions workflows
         env:
           ACTIONLINT_VERSION: 1.7.12

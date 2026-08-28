@@ -8,6 +8,16 @@ cd "$(dirname "$0")/.."
 ROOT="$(pwd)"
 SDK_DIR="Vendor/sdk-swift"
 REPO="https://github.com/ProtonDriveApps/sdk-swift.git"
+TAG="${1:-0.24.0}"
+PATCH_DIR="$ROOT/VendorPatches/sdk-swift/$TAG"
+PIN_FILE="$PATCH_DIR/UPSTREAM_COMMIT"
+shopt -s nullglob
+PATCHES=("$PATCH_DIR"/*.patch)
+if [[ ! -f "$PIN_FILE" || ${#PATCHES[@]} -eq 0 ]]; then
+  echo "ERROR: no reviewed Encrypted Memories patch set exists for sdk-swift $TAG." >&2
+  echo "Create and verify VendorPatches/sdk-swift/$TAG before changing the vendored checkout." >&2
+  exit 1
+fi
 
 if [ ! -d "$SDK_DIR/.git" ]; then
   echo "Cloning sdk-swift..."
@@ -15,16 +25,6 @@ if [ ! -d "$SDK_DIR/.git" ]; then
 fi
 
 git -C "$SDK_DIR" fetch --tags --quiet "$REPO"
-TAG="${1:-0.24.0}"
-PATCH_DIR="$ROOT/VendorPatches/sdk-swift/$TAG"
-PIN_FILE="$PATCH_DIR/UPSTREAM_COMMIT"
-shopt -s nullglob
-PATCHES=("$PATCH_DIR"/*.patch)
-if [[ ! -f "$PIN_FILE" || ${#PATCHES[@]} -eq 0 ]]; then
-    echo "ERROR: no reviewed Encrypted Memories patch set exists for sdk-swift $TAG." >&2
-    echo "Create and verify VendorPatches/sdk-swift/$TAG before changing the vendored checkout." >&2
-    exit 1
-fi
 
 EXPECTED_COMMIT="$(tr -d '[:space:]' < "$PIN_FILE")"
 [[ "$EXPECTED_COMMIT" =~ ^[0-9a-f]{40}$ ]] || {

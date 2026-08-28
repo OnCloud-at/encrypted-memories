@@ -12,6 +12,14 @@
 </p>
 
 <p align="center">
+  <a href="https://apps.apple.com/app/id6805117080">
+    <img src="Branding/app-store-badge.svg" alt="Download on the App Store">
+  </a>
+</p>
+
+<p align="center">
+  <a href="https://memories.oncloud.at/">Website</a>
+  ·
   <a href="https://github.com/OnCloud-at/encrypted-memories/wiki/Quick-Start">Get started</a>
   ·
   <a href="https://github.com/OnCloud-at/encrypted-memories/wiki/Device-and-Feature-Support">See supported features</a>
@@ -72,6 +80,9 @@ The reviewed Wiki source lives in [`Wiki`](Wiki). GitHub stores the visible Wiki
 - Xcode project generation from `project.yml` with XcodeGen.
 - The official open-source Proton Drive SDK 0.24.0, distributed under the MIT License and restored at `Vendor/sdk-swift`.
 
+`EncryptedMemoriesKit` is application-internal source. Its public declarations support package target
+boundaries and are not a stable third-party library API.
+
 ## Security
 
 - Sign-in uses Proton's web flow. The app does not collect the user's Proton password.
@@ -111,6 +122,8 @@ xcodegen generate
 The SDK checkout is reproducible: the bootstrap script applies the versioned fixes tracked under
 `VendorPatches/sdk-swift/0.24.0` after checking out the upstream tag. The updater fails before
 changing the checkout when the requested tag has no reviewed patch set.
+The repository retains a complete patch set only for the currently supported SDK tag. An SDK upgrade
+must add its reviewed patch and `UPSTREAM_COMMIT` pin together.
 
 ## Build
 
@@ -266,3 +279,5 @@ The test targets cover module and import boundaries, encrypted persistence, medi
 Encrypted Memories is available under the permissive [MIT License](LICENSE). You may use, copy, modify, distribute, sublicense, and sell the original project source under its terms.
 
 The software is provided without warranty or a support obligation. Dependencies and optional model artifacts retain their respective license terms.
+
+Apple and the Apple logo are trademarks of Apple Inc., registered in the U.S. and other countries and regions. App Store is a service mark of Apple Inc.

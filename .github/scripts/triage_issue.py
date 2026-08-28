@@ -7,30 +7,40 @@ import json
 import os
 import re
 import sys
-import time
 from typing import Any
-from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode, urlsplit
-from urllib.request import HTTPRedirectHandler, Request, build_opener
+
+from github_llm_client import (
+    AUTHENTICATED_OPENER,
+    MAX_LLM_REQUEST_BYTES,
+    MAX_LLM_RESPONSE_BYTES,
+    TRUNCATION_MARKER,
+    RejectAuthenticatedRedirects,
+    RequestFailure,
+    bounded_text,
+    github_paginated_list,
+    github_request,
+    redact_text,
+    request_json,
+    streamed_content,
+)
 
 
 MAX_RECENT_ISSUES = 100
 MAX_CANDIDATES = 80
 DUPLICATE_THRESHOLD = 0.90
-COMMENT_MARKER = "<!-- llm-duplicate-triage:v1 -->"
-GITHUB_API_VERSION = "2026-03-10"
+COMMENT_MARKER = "<!-- oncloud-issue-triage:v1 -->"
+LEGACY_COMMENT_MARKER = "<!-- llm-duplicate-triage:v1 -->"
+POSSIBLE_DUPLICATE_LABEL = "possible duplicate"
 MAX_ISSUE_TITLE_CHARS = 500
 MAX_ISSUE_BODY_CHARS = 12_000
 MAX_CANDIDATE_TITLE_CHARS = 300
 MAX_CANDIDATE_BODY_CHARS = 900
-MAX_LLM_REQUEST_BYTES = 128_000
-MAX_LLM_RESPONSE_BYTES = 64_000
 MAX_REASON_CHARS = 300
 DISCLOSURE_ACKNOWLEDGEMENT = (
     "I acknowledge that redacted excerpts from this public issue and selected public issues "
     "may be sent to the configured external HTTPS model endpoint for automatic triage."
 )
-TRUNCATION_MARKER = "\n[truncated]"
 PRIORITY_LABELS = {
     "P0": ("b60205", "Critical: data loss, security/privacy risk, or broad core-function outage; confirm immediately"),
     "P1": ("d93f0b", "High: major regression or blocked core workflow without a practical workaround"),
@@ -45,76 +55,6 @@ STOP_WORDS = {
     "problem", "report", "request", "that", "the", "this", "und", "von", "was", "wenn",
     "when", "with", "would", "you", "zum", "zur",
 }
-
-_PRIVATE_KEY_BLOCK_RE = re.compile(
-    r"-----BEGIN [^-\r\n]{0,80}PRIVATE KEY-----.*?-----END [^-\r\n]{0,80}PRIVATE KEY-----",
-    flags=re.IGNORECASE | re.DOTALL,
-)
-_CREDENTIAL_URL_RE = re.compile(
-    r"(?P<scheme>\b[a-z][a-z0-9+.-]*://)(?P<userinfo>[^/\s?#@]+@)(?P<host>[^/\s?#]+)",
-    flags=re.IGNORECASE,
-)
-_AUTHORIZATION_RE = re.compile(
-    r"(?i)(\b(?:proxy-)?authorization\b\s*[:=]\s*)"
-    r"(?:\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\s,;}\]]+(?:\s+[^\s,;}\]]+)?)"
-)
-_SECRET_ASSIGNMENT_RE = re.compile(
-    r"(?i)(\b(?:[a-z0-9]+[_-])*"
-    r"(?:api[_-]?(?:key|token|secret)|access[_-]?(?:key|token|secret)|"
-    r"refresh[_-]?(?:key|token|secret)|auth[_-]?(?:key|token|secret)|"
-    r"bearer[_-]?(?:key|token|secret)|session[_-]?(?:key|token|secret)|"
-    r"client[_-]?(?:key|token|secret)|private[_-]?(?:key|token|secret)|"
-    r"public[_-]?(?:key|token|secret)|signing[_-]?(?:key|token|secret)|"
-    r"key|token|secret|password|passwd|credentials?)"
-    r"(?:[_-](?:access|id|key|token|secret)){0,2}\b\s*[:=]\s*)"
-    r"(?:\"[^\"]*\"|'[^']*'|[^\s,;}\]]+(?:\s+[^\s,;}\]]+)?)"
-)
-_EMAIL_RE = re.compile(
-    r"(?i)(?<![\w.+-])[\w.!#$%&'*+/=?^_`{|}~-]+@(?:[a-z0-9-]+\.)+[a-z]{2,}(?![\w-])"
-)
-_JWT_RE = re.compile(
-    r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}(?![A-Za-z0-9_-])"
-)
-_KNOWN_TOKEN_RE = re.compile(
-    r"(?i)(?<![A-Za-z0-9_])(?:"
-    r"sk-[A-Za-z0-9]{16,}|rk-[A-Za-z0-9]{16,}|"
-    r"gh[pousr]_[A-Za-z0-9_]{16,}|github_pat_[A-Za-z0-9_]{16,}|"
-    r"xox[baprs]-[A-Za-z0-9-]{16,}|AIza[A-Za-z0-9_-]{20,}|"
-    r"AKIA[A-Z0-9]{16}|glpat-[A-Za-z0-9_-]{16,}|npm_[A-Za-z0-9_-]{16,}|"
-    r"pypi-[A-Za-z0-9_-]{16,})(?![A-Za-z0-9_])"
-)
-_LONG_TOKEN_RE = re.compile(
-    r"(?<![A-Za-z0-9])([A-Za-z0-9][A-Za-z0-9_+/=-]{31,})(?![A-Za-z0-9])"
-)
-_UUID_RE = re.compile(
-    r"(?i)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
-)
-
-
-class RequestFailure(RuntimeError):
-    def __init__(self, service: str, status: int | None, path: str) -> None:
-        self.service = service
-        self.status = status
-        self.path = path
-        detail = f"HTTP {status}" if status is not None else "network error"
-        super().__init__(f"{service} request failed with {detail}: {path}")
-
-
-class RejectAuthenticatedRedirects(HTTPRedirectHandler):
-    def redirect_request(
-        self,
-        req: Request,
-        fp: Any,
-        code: int,
-        msg: str,
-        headers: Any,
-        newurl: str,
-    ) -> None:
-        return None
-
-
-AUTHENTICATED_OPENER = build_opener(RejectAuthenticatedRedirects)
-
 
 def _normalized_text(value: str) -> str:
     return re.sub(r"\s+", " ", value).strip().casefold()
@@ -131,38 +71,7 @@ def has_disclosure_acknowledgement(issue: dict[str, Any]) -> bool:
 
 
 def _bounded_text(value: object, limit: int) -> str:
-    text = str(value or "")
-    if len(text) <= limit:
-        return text
-    if limit <= len(TRUNCATION_MARKER):
-        return TRUNCATION_MARKER[:limit]
-    return text[: limit - len(TRUNCATION_MARKER)] + TRUNCATION_MARKER
-
-
-def _looks_like_long_token(value: str) -> bool:
-    if len(value) < 32 or _UUID_RE.fullmatch(value) or re.fullmatch(r"[0-9a-fA-F]{32,}", value):
-        return False
-    classes = sum(
-        bool(re.search(pattern, value))
-        for pattern in (r"[a-z]", r"[A-Z]", r"[0-9]", r"[_+/=-]")
-    )
-    return classes >= 3 or (len(value) >= 40 and classes >= 2)
-
-
-def redact_text(value: object, limit: int) -> str:
-    text = str(value or "")
-    text = _PRIVATE_KEY_BLOCK_RE.sub("[REDACTED PRIVATE KEY]", text)
-    text = _CREDENTIAL_URL_RE.sub(r"\g<scheme>[REDACTED]@\g<host>", text)
-    text = _AUTHORIZATION_RE.sub(r"\1[REDACTED]", text)
-    text = _SECRET_ASSIGNMENT_RE.sub(r"\1[REDACTED]", text)
-    text = _EMAIL_RE.sub("[REDACTED EMAIL]", text)
-    text = _JWT_RE.sub("[REDACTED TOKEN]", text)
-    text = _KNOWN_TOKEN_RE.sub("[REDACTED TOKEN]", text)
-    text = _LONG_TOKEN_RE.sub(
-        lambda match: "[REDACTED TOKEN]" if _looks_like_long_token(match.group(1)) else match.group(1),
-        text,
-    )
-    return _bounded_text(text, limit)
+    return bounded_text(value, limit)
 
 
 def llm_configuration() -> tuple[str, str, str | None]:
@@ -177,70 +86,6 @@ def llm_configuration() -> tuple[str, str, str | None]:
     if not model:
         raise RuntimeError("LLM_MODEL must identify an OpenAI-compatible chat model")
     return api_url, model, reasoning_effort
-
-
-def request_json(
-    method: str,
-    url: str,
-    *,
-    token: str,
-    payload: dict[str, Any] | None = None,
-    service: str,
-) -> Any:
-    body = None if payload is None else json.dumps(payload).encode("utf-8")
-    if service == "LLM API" and body is not None and len(body) > MAX_LLM_REQUEST_BYTES:
-        raise RuntimeError("LLM request exceeded the configured input limit")
-    headers = {
-        "Accept": "application/vnd.github+json" if service == "GitHub" else "text/event-stream",
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-        "User-Agent": "encrypted-memories-issue-triage/1",
-    }
-    if service == "GitHub":
-        headers["X-GitHub-Api-Version"] = GITHUB_API_VERSION
-
-    for attempt in range(3):
-        try:
-            with AUTHENTICATED_OPENER.open(
-                Request(url, data=body, headers=headers, method=method),
-                timeout=60,
-            ) as response:
-                raw_bytes = response.read(MAX_LLM_RESPONSE_BYTES + 1) if service == "LLM API" else response.read()
-                if service == "LLM API" and len(raw_bytes) > MAX_LLM_RESPONSE_BYTES:
-                    raise RuntimeError("LLM API response exceeded the configured output limit")
-                raw = raw_bytes.decode("utf-8")
-                if service == "LLM API":
-                    return raw
-                return json.loads(raw) if raw else None
-        except HTTPError as error:
-            if error.code not in {429, 500, 502, 503, 504} or attempt == 2:
-                raise RequestFailure(service, error.code, urlsplit(url).path) from None
-            retry_after = error.headers.get("Retry-After", "")
-            delay = int(retry_after) if retry_after.isdigit() else 2**attempt
-            time.sleep(min(delay, 10))
-        except (URLError, TimeoutError):
-            if attempt == 2:
-                raise RequestFailure(service, None, urlsplit(url).path) from None
-            time.sleep(2**attempt)
-
-    raise AssertionError("request retry loop ended unexpectedly")
-
-
-def github_request(
-    method: str,
-    path: str,
-    *,
-    token: str,
-    api_url: str,
-    payload: dict[str, Any] | None = None,
-) -> Any:
-    return request_json(
-        method,
-        f"{api_url.rstrip('/')}{path}",
-        token=token,
-        payload=payload,
-        service="GitHub",
-    )
 
 
 def related_search_terms(issue: dict[str, Any]) -> list[str]:
@@ -421,33 +266,6 @@ def llm_payload(
     return payload
 
 
-def streamed_content(raw: str) -> str:
-    chunks: list[str] = []
-    for line in raw.splitlines():
-        if not line.startswith("data: "):
-            continue
-        data = line[6:].strip()
-        if not data or data == "[DONE]":
-            continue
-        try:
-            event = json.loads(data)
-        except json.JSONDecodeError:
-            continue
-        choices = event.get("choices") if isinstance(event, dict) else None
-        if not isinstance(choices, list):
-            continue
-        for choice in choices:
-            if not isinstance(choice, dict):
-                continue
-            delta = choice.get("delta") or {}
-            if not isinstance(delta, dict):
-                continue
-            content = delta.get("content")
-            if isinstance(content, str):
-                chunks.append(content)
-    return "".join(chunks)
-
-
 def parse_decision(raw: str, candidate_numbers: set[int]) -> dict[str, Any]:
     content = streamed_content(raw).strip()
     if not content:
@@ -563,7 +381,7 @@ def add_labels(repo: str, issue_number: int, labels: list[str], *, token: str, a
     )
 
 
-def current_priority_label(repo: str, issue_number: int, *, token: str, api_url: str) -> str | None:
+def current_issue_labels(repo: str, issue_number: int, *, token: str, api_url: str) -> set[str]:
     issue = github_request(
         "GET",
         f"/repos/{repo}/issues/{issue_number}",
@@ -572,11 +390,27 @@ def current_priority_label(repo: str, issue_number: int, *, token: str, api_url:
     )
     if not isinstance(issue, dict) or not isinstance(issue.get("labels"), list):
         raise RuntimeError("GitHub returned invalid issue labels")
-    names = {
+    return {
         str(label.get("name") or "")
         for label in issue["labels"]
-        if isinstance(label, dict)
+        if isinstance(label, dict) and isinstance(label.get("name"), str)
     }
+
+
+def current_priority_label(
+    repo: str,
+    issue_number: int,
+    *,
+    token: str,
+    api_url: str,
+    label_names: set[str] | None = None,
+) -> str | None:
+    names = label_names if label_names is not None else current_issue_labels(
+        repo,
+        issue_number,
+        token=token,
+        api_url=api_url,
+    )
     return next((f"priority:{priority}" for priority in PRIORITY_LABELS if f"priority:{priority}" in names), None)
 
 
@@ -587,30 +421,57 @@ def safe_reason(value: str) -> str:
     return value.translate(str.maketrans({"@": "＠", "<": "(", ">": ")", "[": "(", "]": ")", "`": "'"}))[:300]
 
 
-def duplicate_comment(candidate: dict[str, Any], reason: str) -> str:
-    return (
-        f"{COMMENT_MARKER}\n"
-        "### Possible duplicate\n\n"
-        f"The automated check found [#{candidate['number']}]({candidate['html_url']}) as a possible duplicate.\n\n"
-        f"Reason: {safe_reason(reason)}\n\n"
-        "This result is advisory. A maintainer must confirm it, and this workflow never closes issues automatically."
+def triage_comment(
+    decision: dict[str, Any],
+    priority: str | None,
+    candidate: dict[str, Any] | None,
+    *,
+    duplicate_label_preserved: bool = False,
+) -> str:
+    lines = [COMMENT_MARKER, "### Automated triage", ""]
+    if candidate is None:
+        if duplicate_label_preserved:
+            lines.append(
+                "- Duplicate check: this automated rerun did not reconfirm the existing `possible duplicate` "
+                "label. The label was preserved for maintainer review."
+            )
+        else:
+            lines.append("- Duplicate check: no strong duplicate was found.")
+    else:
+        lines.append(
+            f"- Possible duplicate: [#{candidate['number']}]({candidate['html_url']}). "
+            f"{safe_reason(decision['reason'])}"
+        )
+    if priority is None:
+        lines.append("- Priority: not assigned because automated priorities apply only to bug reports.")
+    else:
+        lines.append(f"- Initial priority: **{priority}**. {safe_reason(decision['priority_reason'])}")
+    lines.extend(
+        [
+            "",
+            "This review is advisory. A maintainer must confirm duplicates and priority. Automation never closes issues.",
+        ]
     )
+    return "\n".join(lines)
 
 
 def upsert_comment(repo: str, issue_number: int, body: str, *, token: str, api_url: str) -> None:
-    comments = github_request(
-        "GET",
-        f"/repos/{repo}/issues/{issue_number}/comments?per_page=100",
+    comments = github_paginated_list(
+        f"/repos/{repo}/issues/{issue_number}/comments",
         token=token,
         api_url=api_url,
     )
-    if not isinstance(comments, list):
-        raise RuntimeError("GitHub returned an invalid comment list")
     existing = next(
         (
             comment
             for comment in comments
-            if isinstance(comment, dict) and COMMENT_MARKER in str(comment.get("body") or "")
+            if isinstance(comment, dict)
+            and isinstance(comment.get("user"), dict)
+            and comment["user"].get("login") == "github-actions[bot]"
+            and any(
+                marker in str(comment.get("body") or "")
+                for marker in (COMMENT_MARKER, LEGACY_COMMENT_MARKER)
+            )
         ),
         None,
     )
@@ -684,6 +545,16 @@ def main() -> int:
     )
     decision = parse_decision(raw, {candidate["number"] for candidate in candidates})
     priority = enforced_priority(issue, decision["priority"])
+    current_labels = current_issue_labels(
+        repo,
+        issue["number"],
+        token=github_token,
+        api_url=api_url,
+    )
+    existing_duplicate_label = any(
+        label.casefold() == POSSIBLE_DUPLICATE_LABEL.casefold() for label in current_labels
+    )
+    comment_priority: str | None = None
     labels = ["triage:checked"]
     if priority is not None:
         priority_label = current_priority_label(
@@ -691,6 +562,7 @@ def main() -> int:
             issue["number"],
             token=github_token,
             api_url=api_url,
+            label_names=current_labels,
         )
         if priority_label is None:
             priority_color, priority_description = PRIORITY_LABELS[priority]
@@ -704,28 +576,35 @@ def main() -> int:
                 api_url=api_url,
             )
         labels.append(priority_label)
+        comment_priority = priority_label.removeprefix("priority:")
+    duplicate_candidate: dict[str, Any] | None = None
     if decision["is_duplicate"] and decision["confidence"] >= DUPLICATE_THRESHOLD:
         ensure_label(
             repo,
-            "possible duplicate",
+            POSSIBLE_DUPLICATE_LABEL,
             "fbca04",
             "Automated triage found a possible duplicate; maintainer confirmation required",
             token=github_token,
             api_url=api_url,
         )
-        labels.append("possible duplicate")
-        candidate = next(
+        labels.append(POSSIBLE_DUPLICATE_LABEL)
+        duplicate_candidate = next(
             item for item in candidates if item["number"] == decision["duplicate_issue_number"]
-        )
-        upsert_comment(
-            repo,
-            issue["number"],
-            duplicate_comment(candidate, decision["reason"]),
-            token=github_token,
-            api_url=api_url,
         )
 
     add_labels(repo, issue["number"], labels, token=github_token, api_url=api_url)
+    upsert_comment(
+        repo,
+        issue["number"],
+        triage_comment(
+            decision,
+            comment_priority,
+            duplicate_candidate,
+            duplicate_label_preserved=existing_duplicate_label and duplicate_candidate is None,
+        ),
+        token=github_token,
+        api_url=api_url,
+    )
     effort_suffix = f"/{reasoning_effort}" if reasoning_effort else ""
     print(f"Automated issue triage completed with {model}{effort_suffix}.")
     return 0
