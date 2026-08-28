@@ -8,7 +8,7 @@ cd "$(dirname "$0")/.."
 ROOT="$(pwd)"
 SDK_DIR="Vendor/sdk-swift"
 REPO="https://github.com/ProtonDriveApps/sdk-swift.git"
-TAG="${1:-0.24.0}"
+TAG="${1:-0.25.0}"
 PATCH_DIR="$ROOT/VendorPatches/sdk-swift/$TAG"
 PIN_FILE="$PATCH_DIR/UPSTREAM_COMMIT"
 shopt -s nullglob

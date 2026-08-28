@@ -173,7 +173,7 @@ public struct AlbumCapabilities: Sendable, Equatable {
         canReadMemberships: true
     )
 
-    /// SDK reads plus the narrow direct-HTTP write surface that SDK 0.24.0 cannot replace.
+    /// SDK reads plus the narrow direct-HTTP write surface that SDK 0.25.0 cannot replace.
     public static let sdkCatalogWithHTTPWrites = AlbumCapabilities(
         canList: true,
         canCreate: true,

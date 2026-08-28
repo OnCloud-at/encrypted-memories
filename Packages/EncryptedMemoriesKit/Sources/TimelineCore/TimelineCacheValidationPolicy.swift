@@ -7,11 +7,15 @@ public enum TimelineCacheValidation: Equatable, Sendable {
     /// The cache is unproven or stale. `monitorBaseline` seeds change monitoring so a mutation that happened
     /// before its first poll is not silently consumed as a new baseline.
     case refreshRequired(monitorBaseline: String?)
+    /// The cached scope no longer exists or is no longer accessible. Retrying through the same repository is
+    /// invalid; the host must retire and rebuild its account-scoped backend.
+    case terminalFailure
 
     public var monitorBaseline: String? {
         switch self {
         case .validated(let token): token
         case .refreshRequired(let monitorBaseline): monitorBaseline
+        case .terminalFailure: nil
         }
     }
 }
@@ -35,8 +39,14 @@ public enum TimelineCacheValidationPolicy {
                 return .refreshRequired(monitorBaseline: currentToken)
             }
             return .validated(token: currentToken)
+        } catch is any LibraryChangeTerminalError {
+            return .terminalFailure
         } catch {
             return .refreshRequired(monitorBaseline: snapshot.validationToken)
         }
     }
+}
+
+public struct TimelineCacheValidationTerminalError: LibraryChangeTerminalError {
+    public init() {}
 }

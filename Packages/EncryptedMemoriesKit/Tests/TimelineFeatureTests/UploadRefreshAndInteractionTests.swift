@@ -182,6 +182,66 @@ final class UploadRefreshAndInteractionTests: XCTestCase {
     }
 
     @MainActor
+    func testScopeLossDuringRefreshRequestsBackendRecovery() async {
+        let model = TimelineViewModel(repository: ScopeLossRepository(), feed: makeFeed())
+
+        let result = await model.refreshLibrary()
+
+        XCTAssertEqual(result.failureReason, .scopeAccessLost)
+    }
+
+    @MainActor
+    func testScopeLossAfterUploadDoesNotWarmTheRetiredThumbnailFeed() async {
+        let loader = RecordingThumbnailLoader()
+        let feed = makeFeed(loader: loader)
+        let uploadedUID = PhotoUID(volumeID: "scope-volume", nodeID: "scope-upload")
+        let model = TimelineViewModel(repository: ScopeLossRepository(), feed: feed)
+
+        let result = await model.refreshAfterUpload(uploadedUID: uploadedUID)
+        await feed.stopPrefetch()
+        let status = await feed.prefetchStatus()
+        let loaderRequestCount = await loader.requestCount
+
+        XCTAssertEqual(result.failureReason, .scopeAccessLost)
+        XCTAssertEqual(status.currentQueueLength, 0)
+        XCTAssertEqual(status.activeJobs, 0)
+        XCTAssertEqual(status.downloadStarted, 0)
+        XCTAssertEqual(loaderRequestCount, 0)
+    }
+
+    @MainActor
+    func testFilteredRefreshRoutesPreserveTypedScopeLoss() async {
+        let filters: [PhotoFilter] = [
+            .tag(.raw),
+            .album(id: "scope-album", title: "Scope Album"),
+            .trash,
+        ]
+
+        for filter in filters {
+            let model = TimelineViewModel(
+                repository: RefreshRepository(timelines: [[section([])]]),
+                feed: makeFeed(),
+                library: ScopeLossLibrary()
+            )
+            await model.load()
+            await model.select(filter)
+
+            let result = await model.refreshLibrary()
+
+            XCTAssertEqual(result.failureReason, .scopeAccessLost, "route: \(filter)")
+        }
+    }
+
+    @MainActor
+    func testScopeLossDuringInitialLoadIsExposedToHost() async {
+        let model = TimelineViewModel(repository: ScopeLossRepository(), feed: makeFeed())
+
+        await model.load()
+
+        XCTAssertEqual(model.initialLoadFailureReason, .scopeAccessLost)
+    }
+
+    @MainActor
     func testMapProjectionUsesWholeLibraryIndexAcrossRouteMutations() async {
         let a = photo("a", seconds: 1)
         let b = photo("b", seconds: 2)
@@ -308,11 +368,13 @@ final class UploadRefreshAndInteractionTests: XCTestCase {
     }
 }
 
-@MainActor private func makeFeed() -> ThumbnailFeed {
+@MainActor private func makeFeed(
+    loader: any ThumbnailBatchLoader = EmptyThumbnailLoader()
+) -> ThumbnailFeed {
     let namespace = "tests-refresh-\(UUID().uuidString)"
     let root = timelineFeatureTestCacheRoot("upload-refresh")
     return ThumbnailFeed(
-        cache: ThumbnailCache(namespace: namespace, rootDirectory: root), loader: EmptyThumbnailLoader())
+        cache: ThumbnailCache(namespace: namespace, rootDirectory: root), loader: loader)
 }
 
 private func photo(_ id: String, seconds: TimeInterval) -> PhotoItem {
@@ -382,6 +444,20 @@ private struct TerminalRefreshError: LocalizedError {
     var errorDescription: String? { "terminal refresh failure" }
 }
 
+private struct ScopeLossRepository: PhotosRepository {
+    func loadTimeline() async throws -> [TimelineSection] {
+        throw ScopeLossError()
+    }
+}
+
+private struct ScopeLossError: LibraryChangeTerminalError {}
+
+private struct ScopeLossLibrary: PhotoLibraryProvider {
+    func timeline(filter: PhotoFilter) async throws -> [TimelineSection] {
+        throw ScopeLossError()
+    }
+}
+
 private final class FakeLibrary: PhotoLibraryProvider, @unchecked Sendable {
     private let sections: [TimelineSection]
     private let delay: Duration?
@@ -399,4 +475,15 @@ private actor EmptyThumbnailLoader: ThumbnailBatchLoader {
     func loadThumbnails(
         for uids: [PhotoUID], onLoaded: @Sendable @escaping (PhotoUID, Data) -> Void
     ) async -> ThumbnailBatchLoadResult { .delivered }
+}
+
+private actor RecordingThumbnailLoader: ThumbnailBatchLoader {
+    private(set) var requestCount = 0
+
+    func loadThumbnails(
+        for uids: [PhotoUID], onLoaded: @Sendable @escaping (PhotoUID, Data) -> Void
+    ) async -> ThumbnailBatchLoadResult {
+        requestCount += uids.count
+        return .delivered
+    }
 }

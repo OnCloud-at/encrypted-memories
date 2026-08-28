@@ -5,7 +5,7 @@ inputs:
   sdk-version:
     description: Reviewed Proton Drive SDK tag.
     required: false
-    default: "0.24.0"
+    default: "0.25.0"
 
 outputs:
   source-packages-path:

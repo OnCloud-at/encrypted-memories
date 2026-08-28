@@ -92,6 +92,7 @@ final class AppModel {
     private var didBootstrap = false
     private let photoBackupScheduler = MacPhotoBackupScheduler()
     private var backendTask: Task<Void, Never>?
+    private var scopeRecoveryTask: Task<Void, Never>?
 
     init(startupPlaintextPurgeSucceeded: Bool? = nil) {
         let purgeClaim = BackupLocalDataPurge.claimSignOutPurge()
@@ -160,6 +161,9 @@ final class AppModel {
         let purgeClaim = BackupLocalDataPurge.claimSignOutPurge()
         let session = authController.currentSession
         let signedOutState = authController.signOut()
+        let activeScopeRecovery = scopeRecoveryTask
+        activeScopeRecovery?.cancel()
+        scopeRecoveryTask = nil
         let activeFacade = facade
         let folderBackup = backupController
         let photoBackup = photoBackupController
@@ -182,6 +186,7 @@ final class AppModel {
             teardownCoordinator = try AccountTeardownCoordinator(owners: [
                 AccountTeardownOwner(id: "mac.platform-build", stage: .platformTasks) {
                     await backendShutdown?.value
+                    await activeScopeRecovery?.value
                 },
                 AccountTeardownOwner(id: "shared.smart-search", stage: .smartSearch) {
                     await smartSearchShutdown?.value
@@ -240,7 +245,95 @@ final class AppModel {
     }
 
     func retryBackend() {
+        guard scopeRecoveryTask == nil else { return }
         if case .signedIn(let session) = auth { prepareBackend(session) }
+    }
+
+    /// A terminal Drive scope event invalidates every local projection for that volume. Keep authentication,
+    /// but retire all account owners before deleting the SDK, metadata, media, and location caches and rebuilding.
+    func recoverBackendAfterScopeAccessLoss() async {
+        guard scopeRecoveryTask == nil,
+            case .signedIn(let session) = auth
+        else { return }
+
+        let activeBackendTask = backendTask
+        let activeFacade = facade
+        let folderBackup = backupController
+        let photoBackup = photoBackupController
+        let albumSync = albumSyncController
+        let smartSearchShutdown = stopSmartSearch()
+        let policy = ProtonDriveBackendPolicy.standard(
+            libraryDatabasePolicy: ProtonDriveBackendPolicy.desktopLibraryDatabasePolicy
+        )
+
+        LibraryRuntimeState.shared.beginNewGeneration()
+        OfflineLibraryManager.shared.prepareForAccountTeardown()
+        activeBackendTask?.cancel()
+        backendTask = nil
+        backend = .preparing(String(localized: "loading.building_library"))
+        backupController = nil
+        photoBackupScheduler.invalidate()
+        photoBackupController = nil
+        albumSyncController = nil
+        albumCatalogRevision = 0
+        facade = nil
+        libraryReady = false
+
+        let coordinator: AccountTeardownCoordinator
+        do {
+            coordinator = try AccountTeardownCoordinator(owners: [
+                AccountTeardownOwner(id: "mac.scope-recovery.platform", stage: .platformTasks) {
+                    await activeBackendTask?.value
+                    await OfflineLibraryManager.shared.stopForAccountTeardown()
+                },
+                AccountTeardownOwner(id: "mac.scope-recovery.smart-search", stage: .smartSearch) {
+                    await smartSearchShutdown?.value
+                },
+                AccountTeardownOwner(id: "mac.scope-recovery.folder-backup", stage: .folderBackup) {
+                    await folderBackup?.shutdown()
+                },
+                AccountTeardownOwner(id: "mac.scope-recovery.photo-backup", stage: .photoBackup) {
+                    await photoBackup?.shutdown()
+                },
+                AccountTeardownOwner(id: "mac.scope-recovery.album-sync", stage: .albumSync) {
+                    await albumSync?.shutdown()
+                },
+                AccountTeardownOwner(id: "mac.scope-recovery.facade", stage: .facade) {
+                    await activeFacade?.shutdown()
+                },
+                AccountTeardownOwner(id: "mac.scope-recovery.caches", stage: .caches) {
+                    await OfflineLibraryManager.shared.purgeCachesForAccountTeardown()
+                },
+                AccountTeardownOwner(id: "mac.scope-recovery.logs", stage: .logs) {
+                    await DebugLog.flush()
+                },
+                AccountTeardownOwner(id: "mac.scope-recovery.account-data", stage: .purgeClaims) {
+                    await Task.detached(priority: .utility) {
+                        ProtonDriveBackendFactory.purgeLocalAccountData(uid: session.uid, policy: policy)
+                    }.value
+                },
+            ])
+        } catch {
+            preconditionFailure("Duplicate scope recovery owner identifier")
+        }
+
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.scopeRecoveryTask = nil }
+            let report = await coordinator.teardown()
+            guard report.succeeded else {
+                DebugLog.log("scope recovery: ordered teardown or purge failed")
+                self.backend = .failed(String(localized: "error.library_open_failed"))
+                return
+            }
+            guard !Task.isCancelled,
+                case .signedIn(let currentSession) = self.auth,
+                currentSession == session
+            else { return }
+            self.prepareBackend(session)
+        }
+        scopeRecoveryTask = task
+        await task.value
     }
 
     /// Stop Smart Search and return the ordered-shutdown task. Consecutive stops chain, so a

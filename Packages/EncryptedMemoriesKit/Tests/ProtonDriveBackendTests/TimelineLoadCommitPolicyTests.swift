@@ -113,6 +113,331 @@ import Testing
                 ))
     }
 
+    @Test func continuityRecoveryRequiresThreeMatchingPassesAcrossQuietWindow() throws {
+        let start = ContinuousClock.now
+        let first = TimelineContinuityRecoveryPolicy.decide(
+            previous: nil,
+            startCursor: "event-12",
+            endCursor: "event-12",
+            endRequiresAuthoritativeRefresh: false,
+            inventoryFingerprint: "inventory-a",
+            now: start
+        )
+        guard case .wait(let firstState) = first else {
+            Issue.record("The first full listing must remain uncommitted")
+            return
+        }
+        #expect(firstState.qualifiedPassCount == 1)
+        #expect(
+            !TimelineContinuityRecoveryPolicy.isEligibleForFullInventory(
+                previous: firstState,
+                candidateCursor: "event-12",
+                now: start.advanced(by: .seconds(11))
+            ))
+        #expect(
+            TimelineContinuityRecoveryPolicy.isEligibleForFullInventory(
+                previous: firstState,
+                candidateCursor: "event-12",
+                now: start.advanced(by: .seconds(12))
+            ))
+
+        let tooEarly = TimelineContinuityRecoveryPolicy.decide(
+            previous: firstState,
+            startCursor: "event-12",
+            endCursor: "event-12",
+            endRequiresAuthoritativeRefresh: false,
+            inventoryFingerprint: "inventory-a",
+            now: start.advanced(by: .seconds(11))
+        )
+        #expect(tooEarly == .wait(firstState))
+
+        let second = TimelineContinuityRecoveryPolicy.decide(
+            previous: firstState,
+            startCursor: "event-12",
+            endCursor: "event-12",
+            endRequiresAuthoritativeRefresh: false,
+            inventoryFingerprint: "inventory-a",
+            now: start.advanced(by: .seconds(12))
+        )
+        guard case .wait(let secondState) = second else {
+            Issue.record("The second qualified listing must remain uncommitted")
+            return
+        }
+        #expect(secondState.qualifiedPassCount == 2)
+        #expect(
+            !TimelineContinuityRecoveryPolicy.isEligibleForFullInventory(
+                previous: secondState,
+                candidateCursor: "event-12",
+                now: start.advanced(by: .seconds(29))
+            ))
+        #expect(
+            TimelineContinuityRecoveryPolicy.isEligibleForFullInventory(
+                previous: secondState,
+                candidateCursor: "event-12",
+                now: start.advanced(by: .seconds(30))
+            ))
+
+        #expect(
+            TimelineContinuityRecoveryPolicy.decide(
+                previous: secondState,
+                startCursor: "event-12",
+                endCursor: "event-12",
+                endRequiresAuthoritativeRefresh: false,
+                inventoryFingerprint: "inventory-a",
+                now: start.advanced(by: .seconds(30))
+            ) == .ready)
+    }
+
+    @Test func qualifiedContinuityRecoveryRequiresSuccessfulAtomicCacheSave() {
+        #expect(
+            !TimelineContinuityPersistencePolicy.permitsMonitorAdvance(
+                recoveryQualified: true,
+                cacheSaved: false
+            ))
+        #expect(
+            TimelineContinuityPersistencePolicy.permitsMonitorAdvance(
+                recoveryQualified: true,
+                cacheSaved: true
+            ))
+    }
+
+    @Test func continuityBridgeSeamRetainsOldSQLiteInventoryAndCursorUntilRetrySaveSucceeds() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ContinuityBridgeSeam-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let databaseURL = directory.appendingPathComponent("library-v1.sqlite")
+        let store = try #require(TimelineMetadataStore(url: databaseURL))
+        let oldItems = [timelineItem(nodeID: "old", captureTime: 1)]
+        let recoveredItems = [timelineItem(nodeID: "recovered", captureTime: 2)]
+        let oldToken = TimelineInventoryValidationTokenPolicy.persistedToken(remoteEventToken: "event-7")
+        let recoveredToken = TimelineInventoryValidationTokenPolicy.persistedToken(remoteEventToken: "event-12")
+        #expect(store.save(oldItems, validationToken: oldToken).succeeded)
+
+        let recovery = TimelineContinuityRecoveryCoordinator()
+        let start = ContinuousClock.now
+        var fullInventoryPasses = 0
+        var postInventoryProbes = 0
+        await #expect(throws: TimelineContinuityRecoveryPendingError.self) {
+            let inventory = try await recovery.fetchInventory(cursor: "event-12", now: start) {
+                fullInventoryPasses += 1
+                return recoveredItems
+            }
+            _ = try await recovery.qualify(
+                startCursor: "event-12",
+                inventoryFingerprint: "recovered-inventory",
+                now: start
+            ) {
+                postInventoryProbes += 1
+                #expect(inventory == recoveredItems)
+                return TimelineContinuityPostInventoryProbe(
+                    cursor: "event-12",
+                    requiresAuthoritativeRefresh: false
+                )
+            }
+        }
+        #expect(fullInventoryPasses == 1)
+        #expect(postInventoryProbes == 1)
+        #expect(store.load() == oldItems)
+        #expect(store.validationToken() == oldToken)
+
+        await #expect(throws: TimelineContinuityRecoveryPendingError.self) {
+            _ = try await recovery.fetchInventory(
+                cursor: "event-12",
+                now: start.advanced(by: .seconds(11))
+            ) {
+                Issue.record("an early retry invoked the complete Photos listing")
+                fullInventoryPasses += 1
+                return recoveredItems
+            }
+        }
+        #expect(fullInventoryPasses == 1, "an early retry must not run another full Photos listing")
+        #expect(postInventoryProbes == 1, "an early retry must not run a post-list event probe")
+
+        let secondInventory = try await recovery.fetchInventory(
+            cursor: "event-12",
+            now: start.advanced(by: .seconds(12))
+        ) {
+            fullInventoryPasses += 1
+            return recoveredItems
+        }
+        await #expect(throws: TimelineContinuityRecoveryPendingError.self) {
+            _ = try await recovery.qualify(
+                startCursor: "event-12",
+                inventoryFingerprint: "recovered-inventory",
+                now: start.advanced(by: .seconds(12))
+            ) {
+                postInventoryProbes += 1
+                #expect(secondInventory == recoveredItems)
+                return TimelineContinuityPostInventoryProbe(
+                    cursor: "event-12",
+                    requiresAuthoritativeRefresh: false
+                )
+            }
+        }
+        #expect(fullInventoryPasses == 2)
+        #expect(postInventoryProbes == 2)
+        #expect(store.load() == oldItems)
+        #expect(store.validationToken() == oldToken)
+
+        await #expect(throws: TimelineContinuityRecoveryPendingError.self) {
+            _ = try await recovery.fetchInventory(
+                cursor: "event-12",
+                now: start.advanced(by: .seconds(29))
+            ) {
+                Issue.record("the final full listing ran before the complete quiet window")
+                fullInventoryPasses += 1
+                return recoveredItems
+            }
+        }
+        #expect(fullInventoryPasses == 2, "the final full listing must wait for the complete quiet window")
+        #expect(postInventoryProbes == 2)
+
+        let finalInventory = try await recovery.fetchInventory(
+            cursor: "event-12",
+            now: start.advanced(by: .seconds(30))
+        ) {
+            fullInventoryPasses += 1
+            return recoveredItems
+        }
+        let firstQualification = try await recovery.qualify(
+            startCursor: "event-12",
+            inventoryFingerprint: "recovered-inventory",
+            now: start.advanced(by: .seconds(30))
+        ) {
+            postInventoryProbes += 1
+            #expect(finalInventory == recoveredItems)
+            return TimelineContinuityPostInventoryProbe(
+                cursor: "event-12",
+                requiresAuthoritativeRefresh: false
+            )
+        }
+        #expect(firstQualification.recoveryQualified)
+        #expect(fullInventoryPasses == 3)
+        #expect(postInventoryProbes == 3)
+
+        // Closing the real SQLite connection makes this production save return `succeeded == false`.
+        // The coordinator must keep the proof and the monitor must retain its old cursor.
+        store.close()
+        var monitorCursor = oldToken
+        #expect(throws: TimelineContinuityRecoveryPendingError.self) {
+            let cacheSaved = try recovery.persist(recoveryQualified: firstQualification.recoveryQualified) {
+                store.save(recoveredItems, validationToken: recoveredToken).succeeded
+            }
+            if cacheSaved { monitorCursor = recoveredToken }
+        }
+        #expect(monitorCursor == oldToken)
+        #expect(recovery.state?.qualifiedPassCount == 2)
+
+        let reopened = try #require(TimelineMetadataStore(url: databaseURL))
+        #expect(reopened.load() == oldItems)
+        #expect(reopened.validationToken() == oldToken)
+
+        let retryInventory = try await recovery.fetchInventory(
+            cursor: "event-12",
+            now: start.advanced(by: .seconds(31))
+        ) {
+            fullInventoryPasses += 1
+            return recoveredItems
+        }
+        let retryQualification = try await recovery.qualify(
+            startCursor: "event-12",
+            inventoryFingerprint: "recovered-inventory",
+            now: start.advanced(by: .seconds(31))
+        ) {
+            postInventoryProbes += 1
+            #expect(retryInventory == recoveredItems)
+            return TimelineContinuityPostInventoryProbe(
+                cursor: "event-12",
+                requiresAuthoritativeRefresh: false
+            )
+        }
+        let cacheSaved = try recovery.persist(recoveryQualified: retryQualification.recoveryQualified) {
+            reopened.save(recoveredItems, validationToken: recoveredToken).succeeded
+        }
+        if cacheSaved { monitorCursor = recoveredToken }
+
+        #expect(fullInventoryPasses == 4)
+        #expect(postInventoryProbes == 4, "the failed final save must require a fresh post-list probe")
+        #expect(recovery.state == nil)
+        #expect(monitorCursor == recoveredToken)
+        #expect(reopened.load() == recoveredItems)
+        #expect(reopened.validationToken() == recoveredToken)
+        reopened.close()
+    }
+
+    @Test func continuityRecoveryRestartsOnInventoryOrCursorMovement() {
+        let start = ContinuousClock.now
+        let previous = TimelineContinuityRecoveryState(
+            cursor: "event-12",
+            inventoryFingerprint: "inventory-a",
+            firstObservedAt: start,
+            qualifiedPassCount: 2
+        )
+
+        let changedInventory = TimelineContinuityRecoveryPolicy.decide(
+            previous: previous,
+            startCursor: "event-12",
+            endCursor: "event-12",
+            endRequiresAuthoritativeRefresh: false,
+            inventoryFingerprint: "inventory-b",
+            now: start.advanced(by: .seconds(30))
+        )
+        guard case .wait(let restarted) = changedInventory else {
+            Issue.record("A changed inventory must start a new proof window")
+            return
+        }
+        #expect(restarted.qualifiedPassCount == 1)
+        #expect(restarted.inventoryFingerprint == "inventory-b")
+
+        #expect(
+            TimelineContinuityRecoveryPolicy.decide(
+                previous: previous,
+                startCursor: "event-12",
+                endCursor: "event-13",
+                endRequiresAuthoritativeRefresh: false,
+                inventoryFingerprint: "inventory-a",
+                now: start.advanced(by: .seconds(30))
+            ) == .restartWindow)
+        #expect(
+            TimelineContinuityRecoveryPolicy.decide(
+                previous: previous,
+                startCursor: "event-12",
+                endCursor: "event-12",
+                endRequiresAuthoritativeRefresh: true,
+                inventoryFingerprint: "inventory-a",
+                now: start.advanced(by: .seconds(30))
+            ) == .restartWindow)
+    }
+
+    @Test func continuityInventoryFingerprintIsCanonicalAndCoversTimelineFields() {
+        let first = PhotosListEntry(
+            linkID: "one",
+            captureTime: 1,
+            tags: [3, 1],
+            relatedPhotos: [.init(linkID: "live")]
+        )
+        let second = PhotosListEntry(
+            linkID: "two",
+            captureTime: 2,
+            tags: [],
+            relatedPhotos: []
+        )
+        let changed = PhotosListEntry(
+            linkID: "two",
+            captureTime: 3,
+            tags: [],
+            relatedPhotos: []
+        )
+
+        #expect(
+            TimelineContinuityInventoryFingerprint.make(entries: [first, second])
+                == TimelineContinuityInventoryFingerprint.make(entries: [second, first]))
+        #expect(
+            TimelineContinuityInventoryFingerprint.make(entries: [first, second])
+                != TimelineContinuityInventoryFingerprint.make(entries: [first, changed]))
+    }
+
     @Test func remoteEventEvidenceTracksOnlyActiveFilesInThePhotosShare() throws {
         let data = Data(
             #"""
@@ -136,5 +461,13 @@ import Testing
     @Test func remoteVisibilityFailureUsesTheSharedConvergenceMarker() {
         let error: any Error = TimelineInventoryVisibilityError.remoteChangesNotVisible(1)
         #expect(error is any TimelineInventoryConvergenceError)
+    }
+
+    private func timelineItem(nodeID: String, captureTime: TimeInterval) -> PhotoItem {
+        PhotoItem(
+            uid: PhotoUID(volumeID: "photos-volume", nodeID: nodeID),
+            captureTime: Date(timeIntervalSince1970: captureTime),
+            mediaType: "image/jpeg"
+        )
     }
 }

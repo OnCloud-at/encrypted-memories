@@ -1,0 +1,459 @@
+diff --git a/Sources/Client/EncryptedMemoriesClient/EncryptedMemoriesClient.swift b/Sources/Client/EncryptedMemoriesClient/EncryptedMemoriesClient.swift
+index 6f3fe32..b8a75d0 100644
+--- a/Sources/Client/EncryptedMemoriesClient/EncryptedMemoriesClient.swift
++++ b/Sources/Client/EncryptedMemoriesClient/EncryptedMemoriesClient.swift
+@@ -50,6 +50,7 @@ public actor EncryptedMemoriesClient: Sendable, ProtonSDKClient {
+     }
+ 
+     private var activeOperations: [OperationIdentifier: CancellationTokenSource] = [:]
++    private var activeEventEnumerations: [OperationIdentifier: EventEnumerationCancellationState] = [:]
+     private var shutdownTask: Task<Void, Never>?
+     private var didShutDown = false
+ 
+@@ -152,6 +153,8 @@ public actor EncryptedMemoriesClient: Sendable, ProtonSDKClient {
+         clientHandle = 0
+         let tokenSources = Array(activeOperations.values)
+         activeOperations.removeAll(keepingCapacity: false)
++        let eventEnumerations = Array(activeEventEnumerations.values)
++        activeEventEnumerations.removeAll(keepingCapacity: false)
+         let logger = self.logger
+         let task: Task<Void, Never> = Task {
+             for source in tokenSources {
+@@ -160,6 +163,9 @@ public actor EncryptedMemoriesClient: Sendable, ProtonSDKClient {
+             for source in tokenSources {
+                 await source.freeAndWait()
+             }
++            for enumeration in eventEnumerations {
++                await enumeration.cancelAndRelease()
++            }
+             await Self.freeEncryptedMemoriesClient(handle, logger)
+         }
+         shutdownTask = task
+@@ -204,6 +210,22 @@ public actor EncryptedMemoriesClient: Sendable, ProtonSDKClient {
+         activeOperations[identifier] = nil
+         cancellationTokenSource.free()
+     }
++
++    private func releaseEventEnumeration(
++        identifier: OperationIdentifier,
++        state: EventEnumerationCancellationState,
++        cancellationRequested: Bool
++    ) async {
++        let ownsRegistration = activeEventEnumerations[identifier] === state
++        if ownsRegistration {
++            activeEventEnumerations[identifier] = nil
++        }
++        if cancellationRequested || !ownsRegistration {
++            await state.cancelAndRelease()
++        } else {
++            await state.completeAndRelease()
++        }
++    }
+ }
+ 
+ extension EncryptedMemoriesClient {
+@@ -789,10 +811,10 @@ extension EncryptedMemoriesClient {
+         cancellationToken: UUID,
+         onDriveEventEnumerated: @escaping DriveEventCallback
+     ) async throws {
+-        let cancellationTokenSource = try await createCancellationTokenSource(.enumerateEvents(cancellationToken), logger)
+-        defer {
+-            freeCancellationTokenSourceIfNeeded(identifier: .enumerateEvents(cancellationToken))
+-        }
++        let identifier = OperationIdentifier.enumerateEvents(cancellationToken)
++        let cancellationTokenSource = try await CancellationTokenSource(logger: logger)
++        let cancellationState = EventEnumerationCancellationState(tokenSource: cancellationTokenSource)
++        activeEventEnumerations[identifier] = cancellationState
+ 
+         let callbackState = DriveEventEnumerationCallbackWrapper(callback: onDriveEventEnumerated)
+         let request = Proton_Drive_Sdk_DrivePhotosClientEnumerateEventsRequest.with {
+@@ -805,16 +827,44 @@ extension EncryptedMemoriesClient {
+             $0.cancellationTokenSourceHandle = Int64(cancellationTokenSource.handle)
+         }
+ 
+-        let _: Void = try await SDKRequestHandler.send(
+-            request,
+-            state: WeakReference(value: callbackState),
+-            scope: .ownerManaged,
+-            owner: callbackState,
+-            logger: logger
+-        )
++        do {
++            let _: Void = try await SDKRequestHandler.sendCancellable(
++                request,
++                state: WeakReference(value: callbackState),
++                scope: .ownerManaged,
++                owner: callbackState,
++                requestCancellation: cancellationState.requestCancellation,
++                logger: logger
++            )
++            await releaseEventEnumeration(
++                identifier: identifier,
++                state: cancellationState,
++                cancellationRequested: false
++            )
++        } catch is CancellationError {
++            await releaseEventEnumeration(
++                identifier: identifier,
++                state: cancellationState,
++                cancellationRequested: true
++            )
++            throw CancellationError()
++        } catch {
++            await releaseEventEnumeration(
++                identifier: identifier,
++                state: cancellationState,
++                cancellationRequested: false
++            )
++            throw error
++        }
+     }
+ 
+     public func cancelEnumerateEvents(cancellationToken: UUID) async throws {
+-        try await cancelOperation(identifier: .enumerateEvents(cancellationToken))
++        let identifier = OperationIdentifier.enumerateEvents(cancellationToken)
++        guard let state = activeEventEnumerations.removeValue(forKey: identifier) else {
++            throw ProtonDriveSDKError(
++                interopError: .noCancellationTokenForIdentifier(operation: identifier.operationName)
++            )
++        }
++        await state.cancelAndRelease()
+     }
+ }
+diff --git a/Sources/Client/ProtonDriveClient/ProtonDriveClient.swift b/Sources/Client/ProtonDriveClient/ProtonDriveClient.swift
+index c2db90b..cbcd788 100644
+--- a/Sources/Client/ProtonDriveClient/ProtonDriveClient.swift
++++ b/Sources/Client/ProtonDriveClient/ProtonDriveClient.swift
+@@ -70,6 +70,7 @@ public actor ProtonDriveClient: Sendable, ProtonSDKClient {
+     }
+ 
+     private var activeOperations: [OperationIdentifier: CancellationTokenSource] = [:]
++    private var activeEventEnumerations: [OperationIdentifier: EventEnumerationCancellationState] = [:]
+ 
+     public init(
+         configuration: ProtonDriveClientConfiguration,
+@@ -175,7 +176,15 @@ public actor ProtonDriveClient: Sendable, ProtonSDKClient {
+     deinit {
+         CallbackHandleRegistry.shared.removeAll(ownedBy: sdkClientProvider)
+         guard clientHandle != 0 else { return }
+-        Self.freeProtonDriveClient(Int64(clientHandle), logger)
++        let handle = Int64(clientHandle)
++        let logger = logger
++        let eventEnumerations = Array(activeEventEnumerations.values)
++        Task {
++            for enumeration in eventEnumerations {
++                await enumeration.cancelAndRelease()
++            }
++            Self.freeProtonDriveClient(handle, logger)
++        }
+     }
+ 
+     private func cancelOperation(identifier: OperationIdentifier) async throws {
+@@ -201,6 +210,22 @@ public actor ProtonDriveClient: Sendable, ProtonSDKClient {
+         cancellationTokenSource.free()
+     }
+ 
++    private func releaseEventEnumeration(
++        identifier: OperationIdentifier,
++        state: EventEnumerationCancellationState,
++        cancellationRequested: Bool
++    ) async {
++        let ownsRegistration = activeEventEnumerations[identifier] === state
++        if ownsRegistration {
++            activeEventEnumerations[identifier] = nil
++        }
++        if cancellationRequested || !ownsRegistration {
++            await state.cancelAndRelease()
++        } else {
++            await state.completeAndRelease()
++        }
++    }
++
+     private static func freeProtonDriveClient(_ clientHandle: Int64, _ logger: Logger?) {
+         Task {
+             let freeRequest = Proton_Drive_Sdk_DriveClientFreeRequest.with {
+@@ -570,10 +595,10 @@ extension ProtonDriveClient {
+         cancellationToken: UUID,
+         onDriveEventEnumerated: @escaping DriveEventCallback
+     ) async throws {
+-        let cancellationTokenSource = try await createCancellationTokenSource(.enumerateEvents(cancellationToken), logger)
+-        defer {
+-            freeCancellationTokenSourceIfNeeded(identifier: .enumerateEvents(cancellationToken))
+-        }
++        let identifier = OperationIdentifier.enumerateEvents(cancellationToken)
++        let cancellationTokenSource = try await CancellationTokenSource(logger: logger)
++        let cancellationState = EventEnumerationCancellationState(tokenSource: cancellationTokenSource)
++        activeEventEnumerations[identifier] = cancellationState
+ 
+         let callbackState = DriveEventEnumerationCallbackWrapper(callback: onDriveEventEnumerated)
+         let request = Proton_Drive_Sdk_DriveClientEnumerateEventsRequest.with {
+@@ -586,17 +611,45 @@ extension ProtonDriveClient {
+             $0.cancellationTokenSourceHandle = Int64(cancellationTokenSource.handle)
+         }
+ 
+-        let _: Void = try await SDKRequestHandler.send(
+-            request,
+-            state: WeakReference(value: callbackState),
+-            scope: .ownerManaged,
+-            owner: callbackState,
+-            logger: logger
+-        )
++        do {
++            let _: Void = try await SDKRequestHandler.sendCancellable(
++                request,
++                state: WeakReference(value: callbackState),
++                scope: .ownerManaged,
++                owner: callbackState,
++                requestCancellation: cancellationState.requestCancellation,
++                logger: logger
++            )
++            await releaseEventEnumeration(
++                identifier: identifier,
++                state: cancellationState,
++                cancellationRequested: false
++            )
++        } catch is CancellationError {
++            await releaseEventEnumeration(
++                identifier: identifier,
++                state: cancellationState,
++                cancellationRequested: true
++            )
++            throw CancellationError()
++        } catch {
++            await releaseEventEnumeration(
++                identifier: identifier,
++                state: cancellationState,
++                cancellationRequested: false
++            )
++            throw error
++        }
+     }
+ 
+     public func cancelEnumerateEvents(cancellationToken: UUID) async throws {
+-        try await cancelOperation(identifier: .enumerateEvents(cancellationToken))
++        let identifier = OperationIdentifier.enumerateEvents(cancellationToken)
++        guard let state = activeEventEnumerations.removeValue(forKey: identifier) else {
++            throw ProtonDriveSDKError(
++                interopError: .noCancellationTokenForIdentifier(operation: identifier.operationName)
++            )
++        }
++        await state.cancelAndRelease()
+     }
+ 
+     public func rename(nodeUid: SDKNodeUid, newName: String, newMediaType: String?, cancellationToken: UUID) async throws {
+diff --git a/Sources/Client/ProtonDriveClient/cDriveEventEnumerationCallback.swift b/Sources/Client/ProtonDriveClient/cDriveEventEnumerationCallback.swift
+index e288df5..7209304 100644
+--- a/Sources/Client/ProtonDriveClient/cDriveEventEnumerationCallback.swift
++++ b/Sources/Client/ProtonDriveClient/cDriveEventEnumerationCallback.swift
+@@ -14,14 +14,11 @@ final class DriveEventEnumerationCallbackWrapper: Sendable {
+ }
+ 
+ let cDriveEventEnumerationCallback: CCallback = { statePointer, byteArray in
+-    typealias BoxType = BoxedCompletionBlock<Int, WeakReference<DriveEventEnumerationCallbackWrapper>>
+-
+-    guard let stateRawPointer = UnsafeRawPointer(bitPattern: statePointer) else {
+-        assertionFailure("cDriveEventEnumerationCallback.statePointer is nil")
+-        return
+-    }
+-    let stateTypedPointer = Unmanaged<BoxType>.fromOpaque(stateRawPointer)
+-    let weakWrapper = stateTypedPointer.takeUnretainedValue().state
++    // Event enumeration awaits `Void`, so the yield callback must use that exact box type. The
++    // registry lookup also makes a yield after task cancellation a safe no-op.
++    typealias BoxType = BoxedCompletionBlock<Void, WeakReference<DriveEventEnumerationCallbackWrapper>>
++    guard let box = CallbackHandleRegistry.shared.get(statePointer, as: BoxType.self) else { return }
++    let weakWrapper = box.state
+ 
+     let sdkDriveEvent = Proton_Drive_Sdk_DriveEvent(byteArray: byteArray)
+     do {
+diff --git a/Sources/Client/ProtonDriveClient/EventEnumerationCancellationState.swift b/Sources/Client/ProtonDriveClient/EventEnumerationCancellationState.swift
+new file mode 100644
+index 0000000..b8d0022
+--- /dev/null
++++ b/Sources/Client/ProtonDriveClient/EventEnumerationCancellationState.swift
+@@ -0,0 +1,53 @@
++import Foundation
++
++/// Exactly-once owner for one event request's Swift continuation and native cancellation token.
++///
++/// Explicit API cancellation and Swift task cancellation can race. Both enter this owner, which releases the
++/// continuation immediately, runs native cancellation at most once, and joins cancellation before token free.
++final class EventEnumerationCancellationState: @unchecked Sendable {
++    let requestCancellation = SDKRequestHandler.RequestCancellation()
++
++    private let lock = NSLock()
++    private let cancelNative: @Sendable () async -> Void
++    private let freeNative: @Sendable () async -> Void
++    private var releaseTask: Task<Void, Never>?
++
++    init(tokenSource: CancellationTokenSource) {
++        self.cancelNative = { try? await tokenSource.cancel() }
++        self.freeNative = { await tokenSource.freeAndWait() }
++    }
++
++    init(
++        cancelNative: @escaping @Sendable () async -> Void,
++        freeNative: @escaping @Sendable () async -> Void
++    ) {
++        self.cancelNative = cancelNative
++        self.freeNative = freeNative
++    }
++
++    func cancelAndRelease() async {
++        requestCancellation.cancel()
++        await release(cancelNative: true)
++    }
++
++    func completeAndRelease() async {
++        await release(cancelNative: false)
++    }
++
++    private func release(cancelNative shouldCancelNative: Bool) async {
++        let task = lock.withLock { () -> Task<Void, Never> in
++            if let releaseTask { return releaseTask }
++            let cancelNative = self.cancelNative
++            let freeNative = self.freeNative
++            let task = Task {
++                if shouldCancelNative {
++                    await cancelNative()
++                }
++                await freeNative()
++            }
++            releaseTask = task
++            return task
++        }
++        await task.value
++    }
++}
+diff --git a/Tests/DriveEventEnumerationCallbackTests.swift b/Tests/DriveEventEnumerationCallbackTests.swift
+new file mode 100644
+index 0000000..6e77d33
+--- /dev/null
++++ b/Tests/DriveEventEnumerationCallbackTests.swift
+@@ -0,0 +1,127 @@
++import CProtonDriveSDK
++import Foundation
++import SwiftProtobuf
++import Testing
++@testable import ProtonDriveSDK
++
++@Suite("Drive event enumeration callback")
++struct DriveEventEnumerationCallbackTests {
++    @Test func voidRequestBoxDeliversStreamedEvent() throws {
++        let recorder = DriveEventCallbackRecorder()
++        let wrapper = DriveEventEnumerationCallbackWrapper(callback: recorder.record)
++        let box = BoxedCompletionBlock<Void, WeakReference<DriveEventEnumerationCallbackWrapper>>(
++            nil,
++            state: WeakReference(value: wrapper)
++        )
++        let handle = CallbackHandleRegistry.shared.register(box)
++        defer { CallbackHandleRegistry.shared.remove(handle) }
++
++        let bytes = try eventBytes(id: "event-7")
++        defer { bytes.deallocate() }
++        cDriveEventEnumerationCallback(handle, bytes)
++
++        let delivered = try #require(recorder.value)
++        #expect(delivered.eventId == "event-7")
++        guard case .cursorAdvanced = delivered.kind else {
++            Issue.record("Expected a cursor-advanced event")
++            return
++        }
++    }
++
++    @Test func cancelledRequestDropsLateYieldWithoutNativeTerminalResponse() async throws {
++        let recorder = DriveEventCallbackRecorder()
++        let completion = VoidCompletionRecorder()
++        let lifecycle = LifecycleRecorder()
++        let wrapper = DriveEventEnumerationCallbackWrapper(callback: recorder.record)
++        let box = BoxedCompletionBlock<Void, WeakReference<DriveEventEnumerationCallbackWrapper>>(
++            completion.record,
++            state: WeakReference(value: wrapper)
++        )
++        let handle = CallbackHandleRegistry.shared.register(box)
++        box.registryHandleId = handle
++        let cancellation = EventEnumerationCancellationState(
++            cancelNative: { lifecycle.append("cancel") },
++            freeNative: { lifecycle.append("free") }
++        )
++        cancellation.requestCancellation.install(handle)
++
++        await cancellation.cancelAndRelease()
++        await cancellation.cancelAndRelease()
++
++        let bytes = try eventBytes(id: "late-event")
++        defer { bytes.deallocate() }
++        cDriveEventEnumerationCallback(handle, bytes)
++        sdkResponseCallbackWithRegistryHandle(handle, bytes)
++
++        #expect(completion.count == 1)
++        #expect(completion.wasCancelled)
++        #expect(recorder.value == nil)
++        #expect(!CallbackHandleRegistry.shared.contains(handle))
++        #expect(lifecycle.values == ["cancel", "free"])
++    }
++
++    @Test func cancellationBeforeCallbackHandleInstallationStillReleasesContinuation() async {
++        let completion = VoidCompletionRecorder()
++        let cancellation = EventEnumerationCancellationState(
++            cancelNative: {},
++            freeNative: {}
++        )
++        await cancellation.cancelAndRelease()
++
++        let box = BoxedCompletionBlock<Void, Void>(completion.record, state: ())
++        let handle = CallbackHandleRegistry.shared.register(box)
++        box.registryHandleId = handle
++        cancellation.requestCancellation.install(handle)
++
++        #expect(completion.count == 1)
++        #expect(completion.wasCancelled)
++        #expect(!CallbackHandleRegistry.shared.contains(handle))
++    }
++
++    private func eventBytes(id: String) throws -> ByteArray {
++        var event = Proton_Drive_Sdk_DriveEvent()
++        event.id = id
++        event.cursorAdvanced = Proton_Drive_Sdk_EventsCursorAdvancedEvent()
++        return ByteArray(data: try event.serializedData())
++    }
++}
++
++private final class DriveEventCallbackRecorder: @unchecked Sendable {
++    private let lock = NSLock()
++    private var storedValue: SDKDriveEvent?
++
++    func record(_ result: Result<SDKDriveEvent, any Error>) {
++        guard case let .success(value) = result else { return }
++        lock.withLock { storedValue = value }
++    }
++
++    var value: SDKDriveEvent? { lock.withLock { storedValue } }
++}
++
++private final class VoidCompletionRecorder: @unchecked Sendable {
++    private let lock = NSLock()
++    private var results: [Result<Void, any Error>] = []
++
++    func record(_ result: Result<Void, any Error>) {
++        lock.withLock { results.append(result) }
++    }
++
++    var count: Int { lock.withLock { results.count } }
++    var wasCancelled: Bool {
++        lock.withLock {
++            guard case let .failure(error)? = results.first else { return false }
++            return error is CancellationError
++        }
++    }
++}
++
++private final class LifecycleRecorder: @unchecked Sendable {
++    private let lock = NSLock()
++    private var storedValues: [String] = []
++
++    func append(_ value: String) {
++        lock.withLock { storedValues.append(value) }
++    }
++
++    var values: [String] { lock.withLock { storedValues } }
++}

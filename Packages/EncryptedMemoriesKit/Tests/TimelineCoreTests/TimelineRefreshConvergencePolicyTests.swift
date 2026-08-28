@@ -17,6 +17,7 @@ import Testing
     @Test func successAndTerminalFailureNeverRetry() {
         #expect(policy.decision(after: nil, attempt: 0) == .succeeded)
         #expect(policy.decision(after: .other, attempt: 0) == .failed)
+        #expect(policy.decision(after: .scopeAccessLost, attempt: 0) == .failed)
     }
 
     @Test func cancellationAndSupersededRoutesStopQuietly() {

@@ -23,6 +23,14 @@ public struct LibraryChangePollingPolicy: Sendable, Equatable {
     )
 }
 
+/// Result of the authoritative refresh requested after a change-token transition. A terminal result retires
+/// the monitor before it invokes the host callback, including when scope loss appears during the full load.
+public enum LibraryChangeRefreshOutcome: Sendable, Equatable {
+    case refreshed
+    case retry
+    case terminal
+}
+
 /// One platform-neutral monitor shared by macOS, iOS and iPadOS. Hosts only express lifecycle by
 /// starting/stopping it; token comparison, cadence, failure backoff and refresh coalescing live here.
 public actor LibraryChangeMonitor {
@@ -31,7 +39,8 @@ public actor LibraryChangeMonitor {
         let policy: LibraryChangePollingPolicy
         let resetBaseline: Bool
         let initialToken: String?
-        let onChange: @Sendable () async -> Bool
+        let onChange: @Sendable () async -> LibraryChangeRefreshOutcome
+        let onTerminal: @Sendable (any LibraryChangeTerminalError) async -> Void
     }
 
     private enum DesiredLifecycle: Sendable {
@@ -53,7 +62,8 @@ public actor LibraryChangeMonitor {
         provider: any LibraryChangeTokenProvider,
         policy: LibraryChangePollingPolicy = .foreground,
         initialToken: String? = nil,
-        onChange: @Sendable @escaping () async -> Bool
+        onTerminal: @Sendable @escaping (any LibraryChangeTerminalError) async -> Void = { _ in },
+        onChange: @Sendable @escaping () async -> LibraryChangeRefreshOutcome
     ) {
         // Repeated starts remain idempotent while a monitor is active. A start that arrives while stop,
         // restart or reset is joining the old task becomes the desired next state instead of being dropped.
@@ -64,7 +74,8 @@ public actor LibraryChangeMonitor {
                 policy: policy,
                 resetBaseline: false,
                 initialToken: initialToken,
-                onChange: onChange
+                onChange: onChange,
+                onTerminal: onTerminal
             ))
         applyDesiredLifecycleIfPossible()
     }
@@ -76,7 +87,8 @@ public actor LibraryChangeMonitor {
         if lastToken == nil, let initialToken = request.initialToken { lastToken = initialToken }
         let delayFirstProbe = lastToken != nil
         nextTaskID &+= 1
-        activeTaskID = nextTaskID
+        let taskID = nextTaskID
+        activeTaskID = taskID
         desiredLifecycle = .active
         task = Task {
             // A validated/full load just observed this revision. Polling it again immediately adds an API call
@@ -94,11 +106,21 @@ public actor LibraryChangeMonitor {
                     let token = try await request.provider.libraryChangeToken()
                     try Task.checkCancellation()
                     if let lastToken, token != lastToken {
-                        guard await request.onChange() else {
+                        switch await request.onChange() {
+                        case .refreshed:
+                            break
+                        case .retry:
                             // A successful token probe with an inventory that has not converged is not a
                             // transport failure. Keep the old token and retry at the normal foreground cadence.
                             try? await Task.sleep(for: request.policy.refreshRetryInterval)
                             continue
+                        case .terminal:
+                            await handleTerminal(
+                                taskID: taskID,
+                                error: LibraryChangeRefreshTerminalError(),
+                                onTerminal: request.onTerminal
+                            )
+                            return
                         }
                     }
                     try Task.checkCancellation()
@@ -106,6 +128,13 @@ public actor LibraryChangeMonitor {
                     try await Task.sleep(for: request.policy.interval)
                 } catch is CancellationError {
                     break
+                } catch let error as any LibraryChangeTerminalError {
+                    await handleTerminal(
+                        taskID: taskID,
+                        error: error,
+                        onTerminal: request.onTerminal
+                    )
+                    return
                 } catch {
                     try? await Task.sleep(for: request.policy.failureInterval)
                 }
@@ -123,7 +152,8 @@ public actor LibraryChangeMonitor {
         policy: LibraryChangePollingPolicy = .foreground,
         resetBaseline: Bool = false,
         initialToken: String? = nil,
-        onChange: @Sendable @escaping () async -> Bool
+        onTerminal: @Sendable @escaping (any LibraryChangeTerminalError) async -> Void = { _ in },
+        onChange: @Sendable @escaping () async -> LibraryChangeRefreshOutcome
     ) async {
         desiredLifecycle = .start(
             StartRequest(
@@ -131,7 +161,8 @@ public actor LibraryChangeMonitor {
                 policy: policy,
                 resetBaseline: resetBaseline,
                 initialToken: initialToken,
-                onChange: onChange
+                onChange: onChange,
+                onTerminal: onTerminal
             ))
         await retireCurrentTask()
     }
@@ -139,6 +170,21 @@ public actor LibraryChangeMonitor {
     public func reset() async {
         desiredLifecycle = .stopped(resetBaseline: true)
         await retireCurrentTask()
+    }
+
+    /// Retires a terminal task before notifying its host. The callback can therefore reset or restart this
+    /// monitor without joining the task that is currently invoking it. Scope loss invalidates the baseline.
+    private func handleTerminal(
+        taskID: UInt64,
+        error: any LibraryChangeTerminalError,
+        onTerminal: @Sendable (any LibraryChangeTerminalError) async -> Void
+    ) async {
+        guard activeTaskID == taskID, retiringTaskID == nil else { return }
+        task = nil
+        activeTaskID = nil
+        lastToken = nil
+        desiredLifecycle = .stopped(resetBaseline: false)
+        await onTerminal(error)
     }
 
     private func retireCurrentTask() async {
@@ -177,3 +223,5 @@ public actor LibraryChangeMonitor {
         }
     }
 }
+
+private struct LibraryChangeRefreshTerminalError: LibraryChangeTerminalError {}

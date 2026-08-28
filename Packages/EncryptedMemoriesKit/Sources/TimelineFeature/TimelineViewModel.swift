@@ -62,6 +62,9 @@ public final class TimelineViewModel {
     /// Event-token baseline captured by the shared cache-validation policy. The host seeds its foreground
     /// monitor with this only after `load()` settles, so a mutation during startup cannot be consumed silently.
     public private(set) var initialLibraryChangeToken: String?
+    /// A terminal startup failure requires account-scope recovery instead of an ordinary retry against the same
+    /// backend. The host reads this after the coalesced initial load completes.
+    public private(set) var initialLoadFailureReason: TimelineRefreshFailureReason?
     @ObservationIgnored private var initialAuthoritativeAddedUIDs: [PhotoUID] = []
     /// Flat, chronological items of the currently active route (whole library for `.all`, else the
     /// filtered tag/album/trash set) - backs selection and the upload-found lookup, not viewer paging.
@@ -290,6 +293,7 @@ public final class TimelineViewModel {
     @discardableResult
     public func refreshAfterUpload(uploadedUID: PhotoUID?) async -> TimelineRefreshResult {
         let result = await refreshCurrent(uploadedUID: uploadedUID)
+        guard result.failureReason != .scopeAccessLost else { return result }
         if let uploadedUID {
             await feed.requestPriority(uploadedUID, priority: .visibleNow)
             _ = await feed.warmDecoded([uploadedUID], limit: 1)
@@ -373,6 +377,7 @@ public final class TimelineViewModel {
 
     private func loadAll(force: Bool) async {
         if !force, case .loaded = state { return }  // load once
+        initialLoadFailureReason = nil
         var cacheValidation = TimelineCacheValidation.refreshRequired(monitorBaseline: nil)
         var authoritativeLoadSucceeded = false
         var hadInventoryBaseline = allRouteSnapshot != nil
@@ -398,6 +403,11 @@ public final class TimelineViewModel {
                         repository: repository
                     )
                     guard filter == .all else { return }
+                    if case .terminalFailure = cacheValidation {
+                        initialLoadFailureReason = .scopeAccessLost
+                        initialLibraryChangeToken = ""
+                        return
+                    }
                     if case .validated(let token) = cacheValidation {
                         applyInitialLoad(
                             .authoritativeInventoryResolved(
@@ -437,6 +447,7 @@ public final class TimelineViewModel {
             // ignore
         } catch {
             guard filter == .all else { return }
+            initialLoadFailureReason = error is any LibraryChangeTerminalError ? .scopeAccessLost : .other
             applyInitialLoad(.failed(message: error.localizedDescription, retryable: true))
             // Keep showing the cached timeline on a refresh error; surface failure only if we have
             // nothing to show.
@@ -566,6 +577,14 @@ public final class TimelineViewModel {
             )
         } catch {
             if case .loaded = state {} else { state = .failed(error.localizedDescription) }
+            let failureReason: TimelineRefreshFailureReason
+            if error is any LibraryChangeTerminalError {
+                failureReason = .scopeAccessLost
+            } else if error is any TimelineInventoryConvergenceError {
+                failureReason = .pendingInventoryVisibility
+            } else {
+                failureReason = .other
+            }
             return TimelineRefreshResult(
                 uploadedUID: uploadedUID,
                 foundItem: nil,
@@ -574,9 +593,7 @@ public final class TimelineViewModel {
                 filterDescription: Self.describe(filter),
                 elapsedMs: elapsedMilliseconds(since: start),
                 errorMessage: error.localizedDescription,
-                failureReason: error is any TimelineInventoryConvergenceError
-                    ? .pendingInventoryVisibility
-                    : .other
+                failureReason: failureReason
             )
         }
     }

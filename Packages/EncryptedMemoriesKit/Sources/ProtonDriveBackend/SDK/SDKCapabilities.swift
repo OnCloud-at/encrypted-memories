@@ -19,13 +19,15 @@ struct SDKCapabilities {
     var exactPhotoDuplicatesViaSDK = true
     var photosTrashAPIsAvailable = true
     var emptyTrashViaSDK = true
+    var eventEnumerationAvailable = true
+    var normalizedFileSystemErrorsAvailable = true
     // Generic Drive SDK trash does not update the Photos trash route used by our library UI.
     var trashViaSDK = false
 
     /// Upload capabilities, as the UI sees them (the wired SDK uploader). Single source of truth.
     var upload = UploadBackendCapabilities.sdkUploader
 
-    /// SDK 0.24.0 exposes read-only album enumeration and album-node metadata. The app's complete
+    /// SDK 0.25.0 exposes read-only album enumeration and album-node metadata. The app's complete
     /// read/write album seam remains on the narrow HTTP adapter until a separate behavior-equivalence
     /// pass adopts those reads and the SDK exposes the missing writes.
     var albumReadAPIsAvailable = true
@@ -48,6 +50,8 @@ struct SDKCapabilities {
             exactPhotoDuplicatesViaSDK=\(exactPhotoDuplicatesViaSDK)
             photosTrashAPIsAvailable=\(photosTrashAPIsAvailable)
             emptyTrashViaSDK=\(emptyTrashViaSDK)
+            eventEnumerationAvailable=\(eventEnumerationAvailable)
+            normalizedFileSystemErrorsAvailable=\(normalizedFileSystemErrorsAvailable)
             trashViaSDK=\(trashViaSDK)
             albumReadAPIsAvailable=\(albumReadAPIsAvailable)
             photoTagUpdatesAvailable=\(photoTagUpdatesAvailable)

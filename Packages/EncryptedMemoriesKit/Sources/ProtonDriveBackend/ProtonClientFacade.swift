@@ -75,7 +75,7 @@ public final class ProtonClientFacade {
         identityComposition: UploadIdentityResolverComposition,
         settlementStore: UploadManualSettlementStore?
     ) -> ProtonClientFacade {
-        // Albums: SDK 0.24.0 is the sole catalog/sharing/membership reader. Direct Photos HTTP is
+        // Albums: SDK 0.25.0 is the sole catalog/sharing/membership reader. Direct Photos HTTP is
         // retained only for writes the SDK does not expose.
         let albumWrite = bridge.makeAlbumWriteService()
         let albumCatalog = bridge.makeAlbumCatalogBackend()

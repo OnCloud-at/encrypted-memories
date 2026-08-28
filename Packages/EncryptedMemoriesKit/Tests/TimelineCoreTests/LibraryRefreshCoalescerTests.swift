@@ -7,16 +7,17 @@ import Testing
         let coalescer = LibraryRefreshCoalescer()
         let probe = BlockingRefreshProbe()
 
-        let first = await coalescer.enqueue { await probe.refresh() }
+        let first = Task { await coalescer.request { await probe.refresh() } }
         await probe.waitUntilFirstRefreshStarts()
-        let second = await coalescer.enqueue { await probe.refresh() }
-        let third = await coalescer.enqueue { await probe.refresh() }
+        let second = Task { await coalescer.request { await probe.refresh() } }
+        let third = Task { await coalescer.request { await probe.refresh() } }
+        while await coalescer.testingState().requestedGeneration < 3 { await Task.yield() }
 
         await probe.releaseFirstRefresh()
 
-        #expect(await first.value)
-        #expect(await second.value)
-        #expect(await third.value)
+        #expect(await first.value == .refreshed)
+        #expect(await second.value == .refreshed)
+        #expect(await third.value == .refreshed)
         #expect(await probe.callCount == 2)
     }
 
@@ -24,23 +25,50 @@ import Testing
         let coalescer = LibraryRefreshCoalescer()
         let counter = RefreshCounter()
 
-        #expect(await coalescer.request { await counter.refresh() })
-        #expect(await coalescer.request { await counter.refresh() })
+        #expect(await coalescer.request { await counter.refresh() } == .refreshed)
+        #expect(await coalescer.request { await counter.refresh() } == .refreshed)
         #expect(await counter.value == 2)
     }
 
-    @Test func cancellationDoesNotLetOldDrainClearNewerRequest() async {
+    @Test func terminalOutcomeStopsOverlappingRequestsWithoutASecondProbe() async {
+        let coalescer = LibraryRefreshCoalescer()
+        let probe = BlockingRefreshProbe(firstOutcome: .terminal)
+
+        let first = Task { await coalescer.request { await probe.refresh() } }
+        await probe.waitUntilFirstRefreshStarts()
+        let second = Task { await coalescer.request { await probe.refresh() } }
+        let third = Task { await coalescer.request { await probe.refresh() } }
+        while await coalescer.testingState().requestedGeneration < 3 { await Task.yield() }
+
+        await probe.releaseFirstRefresh()
+
+        #expect(await first.value == .terminal)
+        #expect(await second.value == .terminal)
+        #expect(await third.value == .terminal)
+        #expect(await probe.callCount == 1)
+    }
+
+    @Test func publicRequestWaitsUntilCancellationJoinsOldDrain() async {
         let coalescer = LibraryRefreshCoalescer()
         let blocked = BlockingRefreshProbe()
         let replacement = RefreshCounter()
+        let cancellation = CompletionProbe()
 
-        let old = await coalescer.enqueue { await blocked.refresh() }
+        let old = Task { await coalescer.request { await blocked.refresh() } }
         await blocked.waitUntilFirstRefreshStarts()
-        await coalescer.cancel()
-        let new = await coalescer.enqueue { await replacement.refresh() }
+        let cancelTask = Task {
+            await coalescer.cancel()
+            await cancellation.markComplete()
+        }
+        while !(await coalescer.testingState().cancellationBarrierActive) { await Task.yield() }
+        #expect(await cancellation.isComplete == false)
+        let new = Task { await coalescer.request { await replacement.refresh() } }
+        await Task.yield()
+        #expect(await replacement.value == 0)
         await blocked.releaseFirstRefresh()
+        await cancelTask.value
 
-        #expect(await new.value)
+        #expect(await new.value == .refreshed)
         #expect(await replacement.value == 1)
         _ = await old.value
     }
@@ -49,20 +77,25 @@ import Testing
 private actor RefreshCounter {
     private(set) var value = 0
 
-    func refresh() -> Bool {
+    func refresh() -> LibraryChangeRefreshOutcome {
         value += 1
-        return true
+        return .refreshed
     }
 }
 
 private actor BlockingRefreshProbe {
+    private let firstOutcome: LibraryChangeRefreshOutcome
     private(set) var callCount = 0
     private var startWaiters: [CheckedContinuation<Void, Never>] = []
     private var firstRefreshContinuation: CheckedContinuation<Void, Never>?
 
-    func refresh() async -> Bool {
+    init(firstOutcome: LibraryChangeRefreshOutcome = .refreshed) {
+        self.firstOutcome = firstOutcome
+    }
+
+    func refresh() async -> LibraryChangeRefreshOutcome {
         callCount += 1
-        guard callCount == 1 else { return true }
+        guard callCount == 1 else { return .refreshed }
 
         let waiters = startWaiters
         startWaiters.removeAll(keepingCapacity: false)
@@ -70,7 +103,7 @@ private actor BlockingRefreshProbe {
         await withCheckedContinuation { continuation in
             firstRefreshContinuation = continuation
         }
-        return true
+        return firstOutcome
     }
 
     func waitUntilFirstRefreshStarts() async {
@@ -83,5 +116,13 @@ private actor BlockingRefreshProbe {
     func releaseFirstRefresh() {
         firstRefreshContinuation?.resume()
         firstRefreshContinuation = nil
+    }
+}
+
+private actor CompletionProbe {
+    private(set) var isComplete = false
+
+    func markComplete() {
+        isComplete = true
     }
 }

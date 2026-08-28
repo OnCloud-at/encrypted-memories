@@ -1237,28 +1237,35 @@ struct MainView: View {
         // Coalesce with the timeline view's startup task, then seed monitoring with the token observed by the
         // shared cache validator. Starting earlier would consume a mutation during launch as a fresh baseline.
         await timelineModel.load()
+        if timelineModel.initialLoadFailureReason == .scopeAccessLost {
+            await model.recoverBackendAfterScopeAccessLoss()
+            return
+        }
         reconcileNewAssetThumbnails(timelineModel.takeInitialAuthoritativeAddedUIDs())
         guard let provider = backend as? any LibraryChangeTokenProvider else { return }
         await libraryChangeMonitor.start(
             provider: provider,
-            initialToken: timelineModel.initialLibraryChangeToken
-        ) {
-            await performRemoteLibraryRefresh()
-        }
+            initialToken: timelineModel.initialLibraryChangeToken,
+            onTerminal: { [model] _ in
+                await model.recoverBackendAfterScopeAccessLoss()
+            },
+            onChange: { await performRemoteLibraryRefresh() }
+        )
     }
 
-    @MainActor private func performRemoteLibraryRefresh() async -> Bool {
-        guard uploadRefreshTask == nil, !uploadRefreshBusy else { return false }
+    @MainActor private func performRemoteLibraryRefresh() async -> LibraryChangeRefreshOutcome {
+        guard uploadRefreshTask == nil, !uploadRefreshBusy else { return .retry }
         // The five-second token-driven comparison is routine synchronization, not user-facing progress. Keep the
         // gate for refresh serialization, but show the shared bottom banner only if the refreshed projection
         // actually schedules thumbnail or GPS work (observed by `backgroundLibraryActivityActive`).
         uploadRefreshBusy = true
+        defer { uploadRefreshBusy = false }
         let result = await timelineModel.refreshLibrary()
+        if result.failureReason == .scopeAccessLost { return .terminal }
         OfflineLibraryManager.shared.liveAssetCount = timelineModel.allItems.count
         await loadAlbums()
         reconcileNewAssetThumbnails(result.addedUIDs)
-        uploadRefreshBusy = false
-        return result.errorMessage == nil
+        return result.errorMessage == nil ? .refreshed : .retry
     }
 
     private func scheduleLibraryRefreshAfterBackupUpload() {
@@ -1283,6 +1290,7 @@ struct MainView: View {
             guard generation == uploadRefreshGeneration, !Task.isCancelled else { return }
             let result = await timelineModel.refreshLibrary()
             guard generation == uploadRefreshGeneration, !Task.isCancelled else { return }
+            if await recoverBackendAfterScopeAccessLoss(ifNeeded: result) { return }
             OfflineLibraryManager.shared.liveAssetCount = timelineModel.allItems.count
             reconcileNewAssetThumbnails(result.addedUIDs)
             logUploadRefresh(uploadedNode: "backup", attempt: attempt, result: result)
@@ -1332,6 +1340,7 @@ struct MainView: View {
             }
             let result = await timelineModel.refreshAfterUpload(uploadedUID: event.uploadedUID)
             guard generation == uploadRefreshGeneration, !Task.isCancelled else { return }
+            if await recoverBackendAfterScopeAccessLoss(ifNeeded: result) { return }
             OfflineLibraryManager.shared.liveAssetCount = timelineModel.allItems.count
             reconcileNewAssetThumbnails(result.addedUIDs)
             if event.destination.usesAlbum {
@@ -1362,6 +1371,7 @@ struct MainView: View {
         uploadRefreshSuccess = false
         uploadRefreshMessage = String(localized: "library.refreshing")
         let result = await timelineModel.refreshLibrary()
+        if await recoverBackendAfterScopeAccessLoss(ifNeeded: result) { return }
         OfflineLibraryManager.shared.liveAssetCount = timelineModel.allItems.count
         await loadAlbums()
         reconcileNewAssetThumbnails(result.addedUIDs)
@@ -1372,6 +1382,17 @@ struct MainView: View {
             result.errorMessage == nil
             ? String(localized: "library.refreshed") : String(localized: "library.refresh_failed")
         clearUploadRefreshMessage(after: .seconds(2))
+    }
+
+    @MainActor private func recoverBackendAfterScopeAccessLoss(
+        ifNeeded result: TimelineRefreshResult
+    ) async -> Bool {
+        guard result.failureReason == .scopeAccessLost else { return false }
+        uploadRefreshBusy = false
+        uploadRefreshSuccess = false
+        uploadRefreshMessage = nil
+        await model.recoverBackendAfterScopeAccessLoss()
+        return true
     }
 
     private func clearUploadRefreshMessage(after delay: Duration) {
