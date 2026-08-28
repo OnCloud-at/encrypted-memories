@@ -60,8 +60,12 @@ public struct TipJarView: View {
         do {
             let loaded = try await Product.products(for: productIdentifiers)
             let productsByID = Dictionary(uniqueKeysWithValues: loaded.map { ($0.id, $0) })
+            let availableProductIdentifiers = TipJarProductAvailability.orderedAvailableIdentifiers(
+                expected: productIdentifiers,
+                returned: Array(productsByID.keys)
+            )
             let missingProductIdentifiers = productIdentifiers.filter { productsByID[$0] == nil }
-            guard missingProductIdentifiers.isEmpty else {
+            guard !availableProductIdentifiers.isEmpty else {
                 Self.logger.error(
                     "StoreKit did not return configured products: \(missingProductIdentifiers.joined(separator: ", "), privacy: .public)"
                 )
@@ -69,7 +73,12 @@ public struct TipJarView: View {
                 productLoadState = .unavailable
                 return
             }
-            products = productIdentifiers.compactMap { productsByID[$0] }
+            if !missingProductIdentifiers.isEmpty {
+                Self.logger.warning(
+                    "StoreKit did not return some configured products: \(missingProductIdentifiers.joined(separator: ", "), privacy: .public)"
+                )
+            }
+            products = availableProductIdentifiers.compactMap { productsByID[$0] }
             productLoadState = .loaded
         } catch is CancellationError {
             return
@@ -94,6 +103,13 @@ public struct TipJarView: View {
         case loading
         case loaded
         case unavailable
+    }
+}
+
+enum TipJarProductAvailability {
+    static func orderedAvailableIdentifiers(expected: [String], returned: [String]) -> [String] {
+        let returnedIdentifiers = Set(returned)
+        return expected.filter(returnedIdentifiers.contains)
     }
 }
 

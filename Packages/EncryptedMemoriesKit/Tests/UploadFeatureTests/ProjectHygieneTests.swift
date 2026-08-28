@@ -126,8 +126,9 @@ final class ProjectHygieneTests: XCTestCase {
         XCTAssertTrue(tipJar.contains("Product.products(for: productIdentifiers)"))
         XCTAssertTrue(tipJar.contains("StoreView(products: products)"))
         XCTAssertFalse(tipJar.contains("StoreView(ids: productIdentifiers)"))
-        XCTAssertTrue(tipJar.contains("guard missingProductIdentifiers.isEmpty else"))
-        XCTAssertFalse(tipJar.contains("products.isEmpty ? .unavailable : .loaded"))
+        XCTAssertTrue(tipJar.contains("guard !availableProductIdentifiers.isEmpty else"))
+        XCTAssertTrue(tipJar.contains("TipJarProductAvailability.orderedAvailableIdentifiers"))
+        XCTAssertTrue(tipJar.contains("if !missingProductIdentifiers.isEmpty"))
 
         let project = try String(
             contentsOf: repoRoot.appendingPathComponent("project.yml"),

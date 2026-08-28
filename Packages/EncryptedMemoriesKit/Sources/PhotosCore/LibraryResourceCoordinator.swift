@@ -450,6 +450,7 @@ public actor LibraryResourceCoordinator {
     private let runtimeState: LibraryRuntimeState
     private let policy: LibraryResourcePolicy
     private let recoveryDelay: Duration
+    private let recoverySleep: @Sendable (Duration) async throws -> Void
     private let monotonicNow: @Sendable () -> UInt64
     private let preemptionSignal = LibraryWorkPreemptionSignal()
     private var waiters: [Waiter] = []
@@ -474,6 +475,26 @@ public actor LibraryResourceCoordinator {
         self.runtimeState = runtimeState
         self.policy = policy
         self.recoveryDelay = recoveryDelay
+        recoverySleep = { try await Task.sleep(for: $0) }
+        self.monotonicNow = monotonicNow
+        let snapshot = runtimeState.snapshot()
+        observedSnapshot = snapshot
+        effectiveSnapshot = snapshot
+    }
+
+    init(
+        runtimeState: LibraryRuntimeState,
+        policy: LibraryResourcePolicy = LibraryResourcePolicy(),
+        recoveryDelay: Duration,
+        monotonicNow: @escaping @Sendable () -> UInt64 = {
+            DispatchTime.now().uptimeNanoseconds
+        },
+        recoverySleep: @escaping @Sendable (Duration) async throws -> Void
+    ) {
+        self.runtimeState = runtimeState
+        self.policy = policy
+        self.recoveryDelay = recoveryDelay
+        self.recoverySleep = recoverySleep
         self.monotonicNow = monotonicNow
         let snapshot = runtimeState.snapshot()
         observedSnapshot = snapshot
@@ -645,8 +666,8 @@ public actor LibraryResourceCoordinator {
 
         recoveryIsPending = true
         emitStateTransition(snapshot)
-        recoveryTask = Task { [weak self, recoveryDelay] in
-            try? await Task.sleep(for: recoveryDelay)
+        recoveryTask = Task { [weak self, recoveryDelay, recoverySleep] in
+            try? await recoverySleep(recoveryDelay)
             guard !Task.isCancelled else { return }
             await self?.finishRecovery(expected: snapshot)
         }
