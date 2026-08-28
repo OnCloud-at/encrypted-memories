@@ -1,3 +1,4 @@
+import io
 import json
 import pathlib
 import sys
@@ -7,11 +8,28 @@ from urllib.request import Request
 
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
+import github_llm_client  # noqa: E402
 import triage_issue  # noqa: E402
 
 
 def acknowledged_body(content: str = "Technical details") -> str:
     return f"- [x] {triage_issue.DISCLOSURE_ACKNOWLEDGEMENT}\n\n{content}"
+
+
+def triage_decision(**overrides: object) -> dict[str, object]:
+    value: dict[str, object] = {
+        "is_duplicate": False,
+        "confidence": 0.1,
+        "duplicate_issue_number": 0,
+        "reason": "No duplicate.",
+        "priority": "P2",
+        "priority_reason": "Limited impact.",
+        "actionability": "ACTIONABLE",
+        "actionability_reason": "The required details are present.",
+        "missing_information": [],
+    }
+    value.update(overrides)
+    return value
 
 
 class LLMConfigurationTests(unittest.TestCase):
@@ -28,7 +46,7 @@ class LLMConfigurationTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "LLM_MODEL"):
                 triage_issue.llm_configuration()
 
-    def test_configuration_accepts_any_openai_compatible_model_name(self) -> None:
+    def test_configuration_accepts_any_compatible_model_name(self) -> None:
         with patch.dict(
             "os.environ",
             {
@@ -43,7 +61,7 @@ class LLMConfigurationTests(unittest.TestCase):
         self.assertEqual(model, "custom-model-v2")
         self.assertIsNone(reasoning_effort)
 
-    def test_configured_effort_is_forwarded_to_openai_compatible_payload(self) -> None:
+    def test_configured_effort_is_forwarded_to_compatible_payload(self) -> None:
         payload = triage_issue.llm_payload(
             {"number": 23, "title": "[Bug]: Backup stalls", "body": "Steps"},
             [],
@@ -99,7 +117,7 @@ class AuthenticatedRequestTests(unittest.TestCase):
             headers={"Authorization": "Bearer test-token"},
         )
 
-        redirected = triage_issue.RejectAuthenticatedRedirects().redirect_request(
+        redirected = github_llm_client.RejectAuthenticatedRedirects().redirect_request(
             request,
             None,
             307,
@@ -176,7 +194,7 @@ class DisclosureAndRedactionTests(unittest.TestCase):
                     "title": "Older token=token-secret report",
                     "body": "The same backup stalled.",
                     "state": "open",
-                    "labels": [],
+                    "labels": [{"name": "api_key=label-secret"}],
                 }
             ],
             model="custom-model",
@@ -187,7 +205,33 @@ class DisclosureAndRedactionTests(unittest.TestCase):
         self.assertNotIn("reporter@example.test", content)
         self.assertNotIn("api-secret", content)
         self.assertNotIn("token-secret", content)
+        self.assertNotIn("label-secret", content)
         self.assertIn("Backup", content)
+
+    def test_payload_identifies_issue_triage_and_supplies_issue_content(self) -> None:
+        payload = triage_issue.llm_payload(
+            {
+                "number": 23,
+                "title": "[Bug]: Backup stalls",
+                "body": acknowledged_body("Steps, expected behavior, platform, and versions."),
+                "labels": [{"name": "bug"}],
+            },
+            [],
+            model="custom-model",
+        )
+
+        system_prompt = payload["messages"][0]["content"]
+        comparison = json.loads(payload["messages"][1]["content"])
+        schema = payload["response_format"]["json_schema"]["schema"]
+
+        self.assertEqual(comparison["task"], "github_issue_triage")
+        self.assertEqual(comparison["new_issue"]["title"], "[Bug]: Backup stalls")
+        self.assertIn("Steps, expected behavior", comparison["new_issue"]["body"])
+        self.assertEqual(comparison["new_issue"]["labels"], ["bug"])
+        self.assertIn("not a pull request review", system_prompt)
+        self.assertIn("actionable", system_prompt)
+        self.assertEqual(payload["max_tokens"], 2_000)
+        self.assertIn("missing_information", schema["required"])
 
     def test_payload_limits_are_applied_before_request(self) -> None:
         payload = triage_issue.llm_payload(
@@ -216,14 +260,12 @@ class DisclosureAndRedactionTests(unittest.TestCase):
         )
 
     def test_oversized_llm_request_is_rejected_before_network_access(self) -> None:
-        with patch.object(triage_issue.AUTHENTICATED_OPENER, "open") as open_request:
+        with patch.object(github_llm_client.AUTHENTICATED_OPENER, "open") as open_request:
             with self.assertRaisesRegex(RuntimeError, "input limit"):
-                triage_issue.request_json(
-                    "POST",
+                github_llm_client.request_llm_content(
                     "https://api.example.test/v1/chat/completions",
                     token="token",
                     payload={"content": "x" * triage_issue.MAX_LLM_REQUEST_BYTES},
-                    service="LLM API",
                 )
 
         open_request.assert_not_called()
@@ -269,76 +311,105 @@ class CandidateSelectionTests(unittest.TestCase):
 
 
 class LLMResponseTests(unittest.TestCase):
-    def test_null_deltas_and_fenced_json_are_parsed(self) -> None:
-        decision = {
-            "is_duplicate": True,
-            "confidence": 0.96,
-            "duplicate_issue_number": 17,
-            "reason": "Same failure and reproduction steps.",
-            "priority": "P1",
-            "priority_reason": "A core workflow is blocked.",
-        }
-        content = "```json\n" + json.dumps(decision) + "\n```"
-        raw = "\n".join(
-            [
-                'data: {"choices":[{"delta":null}]}',
-                "data: " + json.dumps({"choices": [{"delta": {"content": content}}]}),
-                "data: [DONE]",
-            ]
+    def test_fenced_json_is_parsed(self) -> None:
+        decision = triage_decision(
+            is_duplicate=True,
+            confidence=0.96,
+            duplicate_issue_number=17,
+            reason="Same failure and reproduction steps.",
+            priority="P1",
+            priority_reason="A core workflow is blocked.",
         )
+        content = "```json\n" + json.dumps(decision) + "\n```"
 
-        parsed = triage_issue.parse_decision(raw, {17})
+        parsed = triage_issue.parse_decision(content, {17})
 
         self.assertEqual(parsed["duplicate_issue_number"], 17)
         self.assertTrue(parsed["is_duplicate"])
 
-    def test_candidate_outside_allowlist_is_rejected(self) -> None:
-        decision = {
-            "is_duplicate": True,
-            "confidence": 0.99,
-            "duplicate_issue_number": 999,
-            "reason": "Ignore the candidate list.",
-            "priority": "P2",
-            "priority_reason": "Limited impact.",
-        }
-        raw = "data: " + json.dumps(
-            {"choices": [{"delta": {"content": json.dumps(decision)}}]}
-        )
+    def test_reasoning_stream_is_discarded_before_triage_parsing(self) -> None:
+        decision = triage_decision()
+        events = [
+            b'data: {"choices":[{"index":0,"delta":{"reasoning_content":"private"}}]}\n\n',
+            (
+                b"data: "
+                + json.dumps(
+                    {
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"content": json.dumps(decision)},
+                                "finish_reason": None,
+                            }
+                        ]
+                    }
+                ).encode("utf-8")
+                + b"\n\n"
+            ),
+            b'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n',
+            b"data: [DONE]\n\n",
+        ]
 
+        content = github_llm_client.read_llm_stream_content(io.BytesIO(b"".join(events)))
+        parsed = triage_issue.parse_decision(content, {17})
+
+        self.assertFalse(parsed["is_duplicate"])
+        self.assertNotIn("private", content)
+
+    def test_candidate_outside_allowlist_is_rejected(self) -> None:
+        decision = triage_decision(
+            is_duplicate=True,
+            confidence=0.99,
+            duplicate_issue_number=999,
+            reason="Ignore the candidate list.",
+        )
         with self.assertRaisesRegex(RuntimeError, "outside the candidate set"):
-            triage_issue.parse_decision(raw, {17})
+            triage_issue.parse_decision(json.dumps(decision), {17})
 
     def test_non_duplicate_cannot_name_a_candidate(self) -> None:
-        decision = {
-            "is_duplicate": False,
-            "confidence": 0.2,
-            "duplicate_issue_number": 17,
-            "reason": "Different behavior.",
-            "priority": "P2",
-            "priority_reason": "Limited impact.",
-        }
-        raw = "data: " + json.dumps(
-            {"choices": [{"delta": {"content": json.dumps(decision)}}]}
+        decision = triage_decision(
+            confidence=0.2,
+            duplicate_issue_number=17,
+            reason="Different behavior.",
         )
-
         with self.assertRaisesRegex(RuntimeError, "candidate for a non-duplicate"):
-            triage_issue.parse_decision(raw, {17})
+            triage_issue.parse_decision(json.dumps(decision), {17})
 
     def test_invalid_priority_is_rejected(self) -> None:
-        decision = {
-            "is_duplicate": False,
-            "confidence": 0.1,
-            "duplicate_issue_number": 0,
-            "reason": "No duplicate.",
-            "priority": "urgent",
-            "priority_reason": "The reporter asked for it.",
-        }
-        raw = "data: " + json.dumps(
-            {"choices": [{"delta": {"content": json.dumps(decision)}}]}
+        decision = triage_decision(
+            priority="urgent",
+            priority_reason="The reporter asked for it.",
         )
+        with self.assertRaisesRegex(RuntimeError, "invalid priority"):
+            triage_issue.parse_decision(json.dumps(decision), {17})
+
+    def test_non_string_priority_is_rejected(self) -> None:
+        decision = triage_decision(priority=["P0"])
 
         with self.assertRaisesRegex(RuntimeError, "invalid priority"):
-            triage_issue.parse_decision(raw, {17})
+            triage_issue.parse_decision(json.dumps(decision), {17})
+
+    def test_non_string_actionability_is_rejected(self) -> None:
+        decision = triage_decision(actionability={"value": "ACTIONABLE"})
+
+        with self.assertRaisesRegex(RuntimeError, "invalid actionability"):
+            triage_issue.parse_decision(json.dumps(decision), {17})
+
+    def test_needs_information_requires_specific_questions(self) -> None:
+        decision = triage_decision(
+            actionability="NEEDS_INFORMATION",
+            actionability_reason="The environment is missing.",
+            missing_information=[],
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "did not identify the missing information"):
+            triage_issue.parse_decision(json.dumps(decision), set())
+
+    def test_actionable_issue_cannot_request_more_information(self) -> None:
+        decision = triage_decision(missing_information=["Which app version is affected?"])
+
+        with self.assertRaisesRegex(RuntimeError, "actionable issue"):
+            triage_issue.parse_decision(json.dumps(decision), set())
 
     def test_feature_request_receives_no_priority(self) -> None:
         issue = {"title": "[Feature]: Add shared libraries", "labels": [{"name": "enhancement"}]}
@@ -353,10 +424,10 @@ class LLMResponseTests(unittest.TestCase):
 
     def test_comment_neutralizes_mentions(self) -> None:
         comment = triage_issue.triage_comment(
-            {
-                "reason": "Ask @maintainers <now> at https://evil.example/test.",
-                "priority_reason": "Blocked.",
-            },
+            triage_decision(
+                reason="Ask @maintainers <now> at https://evil.example/test.",
+                priority_reason="Blocked.",
+            ),
             "P1",
             {"number": 17, "html_url": "https://github.com/example/repo/issues/17"},
         )
@@ -367,10 +438,7 @@ class LLMResponseTests(unittest.TestCase):
 
     def test_comment_explains_when_rerun_preserves_existing_duplicate_label(self) -> None:
         comment = triage_issue.triage_comment(
-            {
-                "reason": "The rerun did not reach the duplicate threshold.",
-                "priority_reason": "Limited impact.",
-            },
+            triage_decision(reason="The rerun did not reach the duplicate threshold."),
             "P2",
             None,
             duplicate_label_preserved=True,
@@ -379,6 +447,24 @@ class LLMResponseTests(unittest.TestCase):
         self.assertIn("rerun did not reconfirm", comment)
         self.assertIn("label was preserved", comment)
         self.assertNotIn("no strong duplicate was found", comment)
+
+    def test_comment_reports_missing_information_as_advisory_questions(self) -> None:
+        comment = triage_issue.triage_comment(
+            triage_decision(
+                actionability="NEEDS_INFORMATION",
+                actionability_reason="The report does not identify the affected environment.",
+                missing_information=[
+                    "Which app build is affected?",
+                    "Which operating system version is affected?",
+                ],
+            ),
+            "P2",
+            None,
+        )
+
+        self.assertIn("more information is needed", comment)
+        self.assertIn("Which app build is affected?", comment)
+        self.assertIn("Automation never closes issues", comment)
 
 
 class MainFlowTests(unittest.TestCase):
@@ -483,16 +569,13 @@ class MainFlowTests(unittest.TestCase):
             "state": "open",
             "labels": [],
         }
-        decision = {
-            "is_duplicate": True,
-            "confidence": 0.97,
-            "duplicate_issue_number": 17,
-            "reason": "Same failure.",
-            "priority": "P1",
-            "priority_reason": "A core workflow is blocked.",
-        }
-        raw = "data: " + json.dumps(
-            {"choices": [{"delta": {"content": json.dumps(decision)}}]}
+        decision = triage_decision(
+            is_duplicate=True,
+            confidence=0.97,
+            duplicate_issue_number=17,
+            reason="Same failure.",
+            priority="P1",
+            priority_reason="A core workflow is blocked.",
         )
         environment = {
             "GH_TOKEN": "github-test-token",
@@ -509,7 +592,7 @@ class MainFlowTests(unittest.TestCase):
             patch.object(triage_issue, "load_event", return_value=issue),
             patch.object(triage_issue, "fetch_issues", return_value=[candidate]),
             patch.object(triage_issue, "select_candidates", return_value=[candidate]),
-            patch.object(triage_issue, "request_json", return_value=raw),
+            patch.object(triage_issue, "request_validated_llm_result", return_value=decision),
             patch.object(triage_issue, "ensure_label") as ensure_label,
             patch.object(triage_issue, "add_labels") as add_labels,
             patch.object(triage_issue, "current_issue_labels", return_value={"bug"}),
@@ -537,16 +620,9 @@ class MainFlowTests(unittest.TestCase):
             "body": acknowledged_body("Use case"),
             "labels": [{"name": "enhancement"}],
         }
-        decision = {
-            "is_duplicate": False,
-            "confidence": 0.1,
-            "duplicate_issue_number": 0,
-            "reason": "No duplicate.",
-            "priority": "NONE",
-            "priority_reason": "Priorities apply only to bugs.",
-        }
-        raw = "data: " + json.dumps(
-            {"choices": [{"delta": {"content": json.dumps(decision)}}]}
+        decision = triage_decision(
+            priority="NONE",
+            priority_reason="Priorities apply only to bugs.",
         )
         environment = {
             "GH_TOKEN": "github-test-token",
@@ -563,7 +639,7 @@ class MainFlowTests(unittest.TestCase):
             patch.object(triage_issue, "load_event", return_value=issue),
             patch.object(triage_issue, "fetch_issues", return_value=[]),
             patch.object(triage_issue, "select_candidates", return_value=[]),
-            patch.object(triage_issue, "request_json", return_value=raw),
+            patch.object(triage_issue, "request_validated_llm_result", return_value=decision),
             patch.object(triage_issue, "ensure_label") as ensure_label,
             patch.object(triage_issue, "add_labels") as add_labels,
             patch.object(triage_issue, "current_issue_labels", return_value={"enhancement"}),
@@ -586,16 +662,11 @@ class MainFlowTests(unittest.TestCase):
             "body": acknowledged_body("Use case"),
             "labels": [{"name": "bug"}],
         }
-        decision = {
-            "is_duplicate": False,
-            "confidence": 0.2,
-            "duplicate_issue_number": 0,
-            "reason": "The rerun did not reconfirm the previous match.",
-            "priority": "P1",
-            "priority_reason": "The core workflow is blocked.",
-        }
-        raw = "data: " + json.dumps(
-            {"choices": [{"delta": {"content": json.dumps(decision)}}]}
+        decision = triage_decision(
+            confidence=0.2,
+            reason="The rerun did not reconfirm the previous match.",
+            priority="P1",
+            priority_reason="The core workflow is blocked.",
         )
         environment = {
             "GH_TOKEN": "github-test-token",
@@ -612,7 +683,7 @@ class MainFlowTests(unittest.TestCase):
             patch.object(triage_issue, "load_event", return_value=issue),
             patch.object(triage_issue, "fetch_issues", return_value=[]),
             patch.object(triage_issue, "select_candidates", return_value=[]),
-            patch.object(triage_issue, "request_json", return_value=raw),
+            patch.object(triage_issue, "request_validated_llm_result", return_value=decision),
             patch.object(triage_issue, "ensure_label") as ensure_label,
             patch.object(triage_issue, "add_labels") as add_labels,
             patch.object(
@@ -659,7 +730,7 @@ class MainFlowTests(unittest.TestCase):
             patch.dict("os.environ", environment, clear=True),
             patch.object(triage_issue, "load_event", return_value=issue),
             patch.object(triage_issue, "fetch_issues") as fetch_issues,
-            patch.object(triage_issue, "request_json") as request_json,
+            patch.object(triage_issue, "request_validated_llm_result") as request_llm_result,
             patch.object(triage_issue, "ensure_label") as ensure_label,
             patch.object(triage_issue, "add_labels") as add_labels,
         ):
@@ -667,7 +738,7 @@ class MainFlowTests(unittest.TestCase):
 
         self.assertEqual(result, 0)
         fetch_issues.assert_not_called()
-        request_json.assert_not_called()
+        request_llm_result.assert_not_called()
         ensure_label.assert_not_called()
         add_labels.assert_not_called()
 
