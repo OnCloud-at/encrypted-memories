@@ -666,7 +666,7 @@ module AppStoreConnect
       localization_resources = @client.collection(
         "/v1/inAppPurchaseVersions/#{version.fetch('id')}/localizations",
         query: {
-          "fields[inAppPurchaseLocalizations]" => "name,locale,description",
+          "fields[inAppPurchaseLocalizations]" => "name,locale",
           "limit" => "200"
         }
       )
@@ -680,11 +680,9 @@ module AppStoreConnect
           errors << "#{product_id} has no #{locale} localization"
           next
         end
-        %w[name description].each do |field|
-          next if actual[field] == expected_localization.fetch(field)
+        next if actual["name"] == expected_localization.fetch("name")
 
-          errors << "#{product_id} #{locale} #{field} is #{actual[field].inspect}"
-        end
+        errors << "#{product_id} #{locale} name is #{actual['name'].inspect}"
       end
     end
 

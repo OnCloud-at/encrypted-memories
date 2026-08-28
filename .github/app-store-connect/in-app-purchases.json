@@ -9,12 +9,10 @@
       "type": "CONSUMABLE",
       "localizations": {
         "en-US": {
-          "name": "Small Tip",
-          "description": "Small Tip"
+          "name": "Small Tip"
         },
         "de-DE": {
-          "name": "Kleine Spende",
-          "description": "Kleine Spende"
+          "name": "Kleine Spende"
         }
       }
     },
@@ -24,12 +22,10 @@
       "type": "CONSUMABLE",
       "localizations": {
         "en-US": {
-          "name": "Medium Tip",
-          "description": "Medium Tip"
+          "name": "Medium Tip"
         },
         "de-DE": {
-          "name": "Mittelgroße Spende",
-          "description": "Mittelgroße Spende"
+          "name": "Mittelgroße Spende"
         }
       }
     },
@@ -39,12 +35,10 @@
       "type": "CONSUMABLE",
       "localizations": {
         "en-US": {
-          "name": "Large Tip",
-          "description": "Large Tip"
+          "name": "Large Tip"
         },
         "de-DE": {
-          "name": "Große Spende",
-          "description": "Große Spende"
+          "name": "Große Spende"
         }
       }
     },
@@ -54,12 +48,10 @@
       "type": "CONSUMABLE",
       "localizations": {
         "en-US": {
-          "name": "Generous Tip",
-          "description": "Generous Tip"
+          "name": "Generous Tip"
         },
         "de-DE": {
-          "name": "Großzügige Spende",
-          "description": "Großzügige Spende"
+          "name": "Großzügige Spende"
         }
       }
     }

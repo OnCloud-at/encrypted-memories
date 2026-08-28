@@ -326,10 +326,10 @@ final class ProjectHygieneTests: XCTestCase {
         )
         XCTAssertTrue(
             connectScript.contains(
-                "\"fields[inAppPurchaseLocalizations]\" => \"name,locale,description\""
+                "\"fields[inAppPurchaseLocalizations]\" => \"name,locale\""
             )
         )
-        XCTAssertFalse(connectScript.contains("name,locale,description,state"))
+        XCTAssertFalse(connectScript.contains("name,locale,description"))
         XCTAssertFalse(connectScript.contains("\"include\" => \"inAppPurchaseLocalizations\""))
         XCTAssertTrue(connectScript.contains("/v1/appStoreVersionReleaseRequests"))
         XCTAssertTrue(connectScript.contains("automatic submission requires APPROVED products"))
