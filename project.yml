@@ -135,6 +135,8 @@ targets:
       - package: EncryptedMemoriesKit
         product: DesignSystemCore
       - package: EncryptedMemoriesKit
+        product: DesignSystemUIKitAdapter
+      - package: EncryptedMemoriesKit
         product: GridCore
       - package: EncryptedMemoriesKit
         product: TimelineCore

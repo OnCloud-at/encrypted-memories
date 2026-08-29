@@ -186,6 +186,7 @@ final class CoreArchitectureGateTests: XCTestCase {
         "DesignSystem",
         "DesignSystemAppKitAdapter",
         "DesignSystemCore",
+        "DesignSystemUIKitAdapter",
         "MapFeature",
         "MapUIKitAdapter",
         "MediaCache",
@@ -514,14 +515,17 @@ final class CoreArchitectureGateTests: XCTestCase {
         )
     }
 
-    func testDesignSystemKeepsSharedAndAppKitBoundariesSeparate() throws {
+    func testDesignSystemKeepsSharedAndPlatformBoundariesSeparate() throws {
         let manifest = try String(contentsOf: packageManifest, encoding: .utf8)
         let coreRoot = sourcesRoot.appendingPathComponent("DesignSystemCore")
         let appKitRoot = sourcesRoot.appendingPathComponent("DesignSystemAppKitAdapter")
+        let uiKitRoot = sourcesRoot.appendingPathComponent("DesignSystemUIKitAdapter")
         let compatRoot = sourcesRoot.appendingPathComponent("DesignSystem")
         var violations: [String] = []
 
-        for product in ["DesignSystemCore", "DesignSystemAppKitAdapter", "DesignSystem"] {
+        for product in [
+            "DesignSystemCore", "DesignSystemUIKitAdapter", "DesignSystemAppKitAdapter", "DesignSystem",
+        ] {
             if !manifest.contains(".library(name: \"\(product)\", targets: [\"\(product)\"])") {
                 violations.append("\(product): missing matching product")
             }
@@ -534,6 +538,13 @@ final class CoreArchitectureGateTests: XCTestCase {
         }
         if !FileManager.default.fileExists(atPath: appKitRoot.appendingPathComponent("LoadingVeil.swift").path) {
             violations.append("DesignSystemAppKitAdapter/LoadingVeil.swift: missing AppKit launch-veil adapter")
+        }
+        if !FileManager.default.fileExists(
+            atPath: uiKitRoot.appendingPathComponent("TipJarCelebrationWindowOverlay.swift").path
+        ) {
+            violations.append(
+                "DesignSystemUIKitAdapter/TipJarCelebrationWindowOverlay.swift: missing UIKit foreground-window adapter"
+            )
         }
         // The branding assets live with the shared loading mark (DesignSystemCore) - the mark is one
         // SwiftUI implementation used verbatim by the macOS launch veil and the iOS loading screen.
@@ -576,6 +587,22 @@ final class CoreArchitectureGateTests: XCTestCase {
             }
         }
 
+        let uiKitAdapterFile = uiKitRoot.appendingPathComponent("TipJarCelebrationWindowOverlay.swift")
+        if FileManager.default.fileExists(atPath: uiKitAdapterFile.path) {
+            let adapterSource = try String(contentsOf: uiKitAdapterFile, encoding: .utf8)
+            for required in [
+                "import UIKit",
+                "UIViewRepresentable",
+                "UIWindowScene",
+                "TipJarCelebrationPassthroughWindow",
+                "import DesignSystemCore",
+            ] where !adapterSource.contains(required) {
+                violations.append(
+                    "DesignSystemUIKitAdapter/TipJarCelebrationWindowOverlay.swift: missing \(required)"
+                )
+            }
+        }
+
         let exportsFile = compatRoot.appendingPathComponent("DesignSystemExports.swift")
         if FileManager.default.fileExists(atPath: exportsFile.path) {
             let exports = try String(contentsOf: exportsFile, encoding: .utf8)
@@ -590,12 +617,12 @@ final class CoreArchitectureGateTests: XCTestCase {
         XCTAssertTrue(
             violations.isEmpty,
             """
-            DesignSystem shared/AppKit split regressed:
+            DesignSystem shared/platform split regressed:
             \(violations.joined(separator: "\n"))
 
-            Cross-platform SwiftUI tokens/components belong in DesignSystemCore. Behind-window AppKit
-            material and branding resources belong in DesignSystemAppKitAdapter. The legacy DesignSystem
-            target is only a compatibility facade for macOS import sites.
+            Cross-platform SwiftUI tokens/components belong in DesignSystemCore. Native UIKit/AppKit window
+            surfaces belong in their platform adapters. The legacy DesignSystem target is only a compatibility
+            facade for macOS import sites.
             """
         )
     }

@@ -1,4 +1,5 @@
 import DesignSystemCore
+import DesignSystemUIKitAdapter
 import Foundation
 import LibraryRuntimeAppleAdapter
 import MLSearchCore
@@ -70,8 +71,8 @@ private struct MobileSupportedAppRoot: View {
         MobileRootView()
             .environmentObject(sessionModel)
             .environment(libraryModel)
-            .overlay {
-                TipJarCelebrationOverlay(horizontalBias: confettiMotion.horizontalBias)
+            .background {
+                TipJarCelebrationWindowOverlay(horizontalBias: confettiMotion.horizontalBias)
             }
             .task {
                 libraryModel.configure(session: sessionModel.session, store: sessionModel.sessionStore)
