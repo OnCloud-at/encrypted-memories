@@ -14,6 +14,7 @@ struct TipJarCelebrationTests {
 
         #expect(celebration?.id == celebrationID)
         #expect(celebration?.pieces.count == TipJarCelebrationMetrics.pieceCount)
+        #expect(TipJarCelebrationMetrics.pieceCount >= 300)
         #expect(
             celebration?.pieces.allSatisfy {
                 $0.size >= TipJarCelebrationMetrics.minimumPieceSize

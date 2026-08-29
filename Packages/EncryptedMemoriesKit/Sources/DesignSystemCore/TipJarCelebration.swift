@@ -41,7 +41,7 @@ public final class TipJarCelebrationCoordinator {
 
 enum TipJarCelebrationMetrics {
     static let duration: TimeInterval = 4.2
-    static let pieceCount = 180
+    static let pieceCount = 320
     static let minimumPieceSize: CGFloat = 2.0
     static let maximumPieceSize: CGFloat = 4.2
 }

@@ -89,6 +89,9 @@ let package = Package(
         .target(
             name: "DesignSystemAppKitAdapter", dependencies: ["DesignSystemCore"],
             swiftSettings: disableDynamicActorIsolation),
+        .testTarget(
+            name: "DesignSystemAppKitAdapterTests", dependencies: ["DesignSystemAppKitAdapter"],
+            swiftSettings: disableDynamicActorIsolation),
         .target(
             name: "DesignSystem", dependencies: ["DesignSystemCore", "DesignSystemAppKitAdapter"],
             swiftSettings: disableDynamicActorIsolation),

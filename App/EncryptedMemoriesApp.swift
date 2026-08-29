@@ -42,7 +42,7 @@ struct EncryptedMemoriesApp: App {
             }
             .frame(minWidth: 720, minHeight: 480)
             .background(WindowConfigurator())
-            .overlay { TipJarCelebrationOverlay() }
+            .background { TipJarCelebrationWindowOverlay() }
             .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
                 model?.smartSearch?.noteConditionsChanged()
             }
@@ -117,7 +117,7 @@ struct EncryptedMemoriesApp: App {
                         .background(ProtonColor.backgroundNorm)
                 }
             }
-            .overlay { TipJarCelebrationOverlay() }
+            .background { TipJarCelebrationWindowOverlay() }
         }
     }
 }
