@@ -23,6 +23,7 @@ let package = Package(
         .library(name: "LibraryRuntimeAppleAdapter", targets: ["LibraryRuntimeAppleAdapter"]),
         .library(name: "AppleSecurityCore", targets: ["AppleSecurityCore"]),
         .library(name: "DesignSystemCore", targets: ["DesignSystemCore"]),
+        .library(name: "DesignSystemUIKitAdapter", targets: ["DesignSystemUIKitAdapter"]),
         .library(name: "DesignSystemAppKitAdapter", targets: ["DesignSystemAppKitAdapter"]),
         .library(name: "DesignSystem", targets: ["DesignSystem"]),
         .library(name: "ProtonAuth", targets: ["ProtonAuth"]),
@@ -87,7 +88,13 @@ let package = Package(
             name: "DesignSystemCoreTests", dependencies: ["DesignSystemCore"],
             swiftSettings: disableDynamicActorIsolation),
         .target(
+            name: "DesignSystemUIKitAdapter", dependencies: ["DesignSystemCore"],
+            swiftSettings: disableDynamicActorIsolation),
+        .target(
             name: "DesignSystemAppKitAdapter", dependencies: ["DesignSystemCore"],
+            swiftSettings: disableDynamicActorIsolation),
+        .testTarget(
+            name: "DesignSystemAppKitAdapterTests", dependencies: ["DesignSystemAppKitAdapter"],
             swiftSettings: disableDynamicActorIsolation),
         .target(
             name: "DesignSystem", dependencies: ["DesignSystemCore", "DesignSystemAppKitAdapter"],
