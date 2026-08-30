@@ -23,6 +23,17 @@ final class MobileSessionModel: ObservableObject {
     private var startupPurgeSucceeded: Bool
     private var startupCleanupTask: Task<Void, Never>?
     private var protectedDataObserver: NSObjectProtocol?
+    private let webAuthenticationSession = ManagedWebAuthenticationSession()
+    private let webAuthenticationPresentationContext = ManagedWebAuthenticationPresentationContext {
+        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+        let windows = scenes.flatMap(\.windows)
+        guard let window = windows.first(where: \.isKeyWindow)
+            ?? windows.first(where: { !$0.isHidden })
+        else {
+            preconditionFailure("Web authentication requires an attached application window")
+        }
+        return window
+    }
 
     init(startupPlaintextPurgeSucceeded: Bool? = nil) {
         let purgeClaim = BackupLocalDataPurge.claimSignOutPurge()
@@ -70,8 +81,10 @@ final class MobileSessionModel: ObservableObject {
             return
         }
         authController.signIn(
-            openURL: { url in
-                Task { @MainActor in UIApplication.shared.open(url) }
+            openURL: { [weak self] url in
+                Task { @MainActor [weak self] in
+                    self?.startWebAuthenticationSession(url: url)
+                }
             },
             onStateChange: { [weak self] state in
                 self?.apply(state)
@@ -96,7 +109,22 @@ final class MobileSessionModel: ObservableObject {
         isSigningOut = false
     }
 
+    private func startWebAuthenticationSession(url: URL) {
+        webAuthenticationSession.start(
+            url: url,
+            presentationContextProvider: webAuthenticationPresentationContext
+        ) { [weak self] in
+            guard let self, self.isSigningIn else { return }
+            self.apply(self.authController.cancelSignIn())
+        }
+    }
+
     private func apply(_ state: ProtonAuthState) {
+        if case .authenticating = state {
+            // Keep the managed browser alive while the shared fork flow polls Proton.
+        } else {
+            webAuthenticationSession.cancel()
+        }
         switch state {
         case .checking:
             session = nil

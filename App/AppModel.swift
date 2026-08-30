@@ -90,6 +90,16 @@ final class AppModel {
     private var startupPurgeBlocked: Bool
     private var startupCleanupTask: Task<Void, Never>?
     private var didBootstrap = false
+    private let webAuthenticationSession = ManagedWebAuthenticationSession()
+    private let webAuthenticationPresentationContext = ManagedWebAuthenticationPresentationContext {
+        guard let window = NSApp.keyWindow
+            ?? NSApp.mainWindow
+            ?? NSApp.windows.first(where: { $0.isVisible })
+        else {
+            preconditionFailure("Web authentication requires a visible application window")
+        }
+        return window
+    }
     private let photoBackupScheduler = MacPhotoBackupScheduler()
     private var backendTask: Task<Void, Never>?
     private var scopeRecoveryTask: Task<Void, Never>?
@@ -138,7 +148,11 @@ final class AppModel {
             return
         }
         authController.signIn(
-            openURL: { url in Task { @MainActor in NSWorkspace.shared.open(url) } },
+            openURL: { [weak self] url in
+                Task { @MainActor [weak self] in
+                    self?.startWebAuthenticationSession(url: url)
+                }
+            },
             onStateChange: { [weak self] state in
                 self?.apply(state, prepareBackendOnSignedIn: true)
             }
@@ -147,7 +161,18 @@ final class AppModel {
 
     func cancelSignIn() {
         guard !signOutBarrier.isRunning else { return }
+        webAuthenticationSession.cancel()
         apply(authController.cancelSignIn(), prepareBackendOnSignedIn: false)
+    }
+
+    private func startWebAuthenticationSession(url: URL) {
+        webAuthenticationSession.start(
+            url: url,
+            presentationContextProvider: webAuthenticationPresentationContext
+        ) { [weak self] in
+            guard let self, case .authenticating = self.auth else { return }
+            self.apply(self.authController.cancelSignIn(), prepareBackendOnSignedIn: false)
+        }
     }
 
     func signOut() {
@@ -464,6 +489,11 @@ final class AppModel {
     }
 
     private func apply(_ state: ProtonAuthState, prepareBackendOnSignedIn: Bool) {
+        if case .authenticating = state {
+            // Keep the managed browser alive while the shared fork flow polls Proton.
+        } else {
+            webAuthenticationSession.cancel()
+        }
         switch state {
         case .checking:
             auth = .checking

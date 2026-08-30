@@ -1476,10 +1476,13 @@
                     !textureCache.isResident(uid) && !(feed?.isKnownUnfetchable(uid) ?? false)
                 }
             )
-            // The first fully populated on-screen frame tells the shell to lift the loading UI onto the grid.
+            // The first visible thumbnail tells the shell to lift the loading UI onto the grid. Remaining
+            // thumbnails continue loading behind the presented grid.
             // One-shot per content set; deferred to the next runloop tick so it never mutates observed shell
             // state during a SwiftUI update pass (renderNow can run inside updateUIView and layoutSubviews).
-            if reportFirstContent, !firstContentReported, !ids.visible.isEmpty, missingVisible.isEmpty {
+            if reportFirstContent, !firstContentReported, !ids.visible.isEmpty,
+                ids.visible.contains(where: { textureCache.isResident($0) })
+            {
                 firstContentReported = true
                 let generation = contentGeneration
                 DispatchQueue.main.async { [weak self] in
