@@ -92,9 +92,10 @@ final class AppModel {
     private var didBootstrap = false
     private let webAuthenticationSession = ManagedWebAuthenticationSession()
     private let webAuthenticationPresentationContext = ManagedWebAuthenticationPresentationContext {
-        guard let window = NSApp.keyWindow
-            ?? NSApp.mainWindow
-            ?? NSApp.windows.first(where: { $0.isVisible })
+        guard
+            let window = NSApp.keyWindow
+                ?? NSApp.mainWindow
+                ?? NSApp.windows.first(where: { $0.isVisible })
         else {
             preconditionFailure("Web authentication requires a visible application window")
         }

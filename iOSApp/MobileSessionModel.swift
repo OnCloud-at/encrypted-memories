@@ -27,8 +27,9 @@ final class MobileSessionModel: ObservableObject {
     private let webAuthenticationPresentationContext = ManagedWebAuthenticationPresentationContext {
         let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
         let windows = scenes.flatMap(\.windows)
-        guard let window = windows.first(where: \.isKeyWindow)
-            ?? windows.first(where: { !$0.isHidden })
+        guard
+            let window = windows.first(where: \.isKeyWindow)
+                ?? windows.first(where: { !$0.isHidden })
         else {
             preconditionFailure("Web authentication requires an attached application window")
         }
