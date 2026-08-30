@@ -63,7 +63,7 @@ macOS, iOS, and iPadOS use the same shared feature cores and provide the same pr
 
 The [Encrypted Memories Wiki](https://github.com/OnCloud-at/encrypted-memories/wiki) contains the Quick Start, one guide for each app area, troubleshooting, and the current device and feature support matrix.
 
-GitHub Issues are for reproducible bugs and concrete feature proposals. Do not open an issue for a how-to question; use the Wiki first.
+GitHub Issues is the official support channel for questions, reproducible bugs, and concrete feature proposals. Check the Wiki and existing issues before opening a support request.
 
 The reviewed Wiki source lives in [`Wiki`](Wiki). GitHub stores the visible Wiki in the separate Git endpoint attached to this repository. Maintainers can preview a Wiki sync or publish it with:
 

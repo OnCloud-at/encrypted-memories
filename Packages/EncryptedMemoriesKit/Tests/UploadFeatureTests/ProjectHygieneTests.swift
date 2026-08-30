@@ -527,7 +527,7 @@ final class ProjectHygieneTests: XCTestCase {
         XCTAssertTrue(manifest.contains("platforms: [.macOS(\"26.0\"), .iOS(\"26.0\")]"))
     }
 
-    func testUserWikiStaysBuiltInAndIssuesRejectQuestions() throws {
+    func testUserWikiStaysBuiltInAndIssuesAcceptSupportRequests() throws {
         let wikiRoot = repoRoot.appendingPathComponent("Wiki")
         for page in [
             "Home.md",
@@ -577,6 +577,7 @@ final class ProjectHygieneTests: XCTestCase {
         )
         XCTAssertTrue(chooser.contains("blank_issues_enabled: false"))
         XCTAssertTrue(chooser.contains("https://github.com/OnCloud-at/encrypted-memories/wiki"))
+        XCTAssertTrue(chooser.contains("select Support request above"))
 
         for template in ["bug_report.yml", "feature_request.yml"] {
             let source = try String(
@@ -585,6 +586,15 @@ final class ProjectHygieneTests: XCTestCase {
             )
             XCTAssertTrue(source.contains("not a usage question"))
         }
+
+        let supportTemplate = try String(
+            contentsOf: repoRoot.appendingPathComponent(".github/ISSUE_TEMPLATE/support_request.yml"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(supportTemplate.contains("name: Support request"))
+        XCTAssertTrue(supportTemplate.contains("official support channel"))
+        XCTAssertTrue(supportTemplate.contains("Ask a question or request help"))
+        XCTAssertTrue(supportTemplate.contains("- question"))
     }
 
     func testAppleAppsShareMetal3HardwareGateAndFallback() throws {
@@ -1578,6 +1588,30 @@ final class ProjectHygieneTests: XCTestCase {
             mobileShell.contains("ProtonForkAuthenticator(config: .externalDriveEncryptedMemories)"),
             "iOS app must inject the documented Proton API client identity explicitly"
         )
+    }
+
+    func testPlatformAppsUseManagedWebAuthenticationSession() throws {
+        let sharedSession = try String(
+            contentsOf: repoRoot.appendingPathComponent(
+                "Packages/EncryptedMemoriesKit/Sources/ProtonAuth/ManagedWebAuthenticationSession.swift"
+            ),
+            encoding: .utf8
+        )
+        let macModel = try String(
+            contentsOf: repoRoot.appendingPathComponent("App/AppModel.swift"),
+            encoding: .utf8
+        )
+        let mobileModel = try String(
+            contentsOf: repoRoot.appendingPathComponent("iOSApp/MobileSessionModel.swift"),
+            encoding: .utf8
+        )
+
+        XCTAssertTrue(sharedSession.contains("ASWebAuthenticationSession"))
+        XCTAssertTrue(sharedSession.contains("presentationContextProvider"))
+        XCTAssertTrue(macModel.contains("ManagedWebAuthenticationSession()"))
+        XCTAssertTrue(mobileModel.contains("ManagedWebAuthenticationSession()"))
+        XCTAssertFalse(macModel.contains("NSWorkspace.shared.open(url)"))
+        XCTAssertFalse(mobileModel.contains("UIApplication.shared.open(url)"))
     }
 
     func testMacAppEntitlementsStaySandboxedAndMinimal() throws {

@@ -2135,7 +2135,7 @@ extension MetalGridCoordinator {
         // visible videos; the shared resolver debounces until the viewport is stable, so this never competes
         // with thumbnail fill during fast scrolling.
         dataSource.resolveOverlays(for: visibleUIDs.filter { cache.isResident($0) })
-        // Record the first visible frame and the first fully resident frame for diagnostics.
+        // Record the first visible frame and the first resident thumbnail for diagnostics.
         if !firstContentTraced, !visibleUIDs.isEmpty {
             firstContentTraced = true
             firstGridFrameAt = CACurrentMediaTime()
@@ -2147,10 +2147,10 @@ extension MetalGridCoordinator {
                     "resident": "\(visibleUIDs.count - missing)", "level": "\(level)", "phase": "coldStart",
                 ])
         }
-        // Notify the shell after the first fully populated frame for this data source. A later data-source revision
-        // resets `contentReadyReported` and starts a new readiness cycle.
+        // Notify the shell after the first visible thumbnail for this data source. Remaining thumbnails continue
+        // loading behind the presented grid. A later revision resets `contentReadyReported` for the next cycle.
         if !contentReadyReported, !visibleUIDs.isEmpty,
-            visibleUIDs.allSatisfy({ cache.isResident($0) || !dataSource.canRetryThumbnail(for: $0) })
+            visibleUIDs.contains(where: { cache.isResident($0) })
         {
             contentReadyReported = true
             if !firstContentReadyLogged {

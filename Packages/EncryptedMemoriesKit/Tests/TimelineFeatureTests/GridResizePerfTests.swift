@@ -33,6 +33,14 @@ import Testing
         (try? String(contentsOf: repoRoot().appendingPathComponent("App/\(path)"), encoding: .utf8)) ?? ""
     }
 
+    @Test func launchReadinessUsesFirstVisibleResidentThumbnailAcrossAppleGridHosts() {
+        #expect(src("MetalGridCoordinator.swift").contains("visibleUIDs.contains(where: { cache.isResident($0) })"))
+        #expect(
+            src("UIKitTimelineGridHost.swift").contains(
+                "ids.visible.contains(where: { textureCache.isResident($0) })"
+            ))
+    }
+
     // Pure-height resize leaves width-derived metrics and contentSize unchanged.
     @Test func pureHeightResizeDoesNotRecomputeWidthMetrics() {
         let e = engine()

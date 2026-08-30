@@ -48,7 +48,7 @@ public final class GridProxy<ItemID: Hashable & Sendable> {
     /// Query live content-mode state for the shell control.
     public var contentModeState: (() -> (mode: TileContentDisplayMode, toggleAvailable: Bool))?
 
-    /// Grid-to-shell event fired once the first on-screen frame is fully populated.
+    /// Grid-to-shell event fired once the first visible thumbnail is resident.
     ///
     /// Readiness is latched so a fast grid cannot lose the event before the shell finishes installing its
     /// handler. Replacing the handler after delivery does not replay an already-consumed launch event.
@@ -56,7 +56,7 @@ public final class GridProxy<ItemID: Hashable & Sendable> {
         didSet { deliverFirstContentReadyIfPossible() }
     }
 
-    /// Fired whenever a newly installed content generation has produced a fully populated visible frame.
+    /// Fired whenever a newly installed content generation has produced its first visible resident thumbnail.
     /// Unlike `onFirstContentReady`, this repeats after data-source changes. Reports that arrive before the
     /// shell installs its handler are coalesced and replayed once, so the latest rendered generation is never
     /// lost during SwiftUI/AppKit mounting.
@@ -64,7 +64,7 @@ public final class GridProxy<ItemID: Hashable & Sendable> {
         didSet { deliverContentReadyIfPossible() }
     }
 
-    /// Reports the first fully populated on-screen frame. Duplicate reports are intentionally ignored.
+    /// Reports the first visible resident thumbnail. Duplicate reports are intentionally ignored.
     public func reportFirstContentReady() {
         guard !firstContentReadyReported else { return }
         firstContentReadyReported = true

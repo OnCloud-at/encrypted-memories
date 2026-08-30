@@ -1,0 +1,64 @@
+name: Support request
+description: Ask a question or request help with Encrypted Memories.
+title: "[Support]: "
+labels:
+  - question
+body:
+  - type: markdown
+    attributes:
+      value: |
+        GitHub Issues is the official support channel for Encrypted Memories. You can write in English or German.
+
+        Check the [Encrypted Memories Wiki](https://github.com/OnCloud-at/encrypted-memories/wiki) and [search existing issues](https://github.com/OnCloud-at/encrypted-memories/issues?q=is%3Aissue) first. Never include Proton credentials, private photos, personal data, or other sensitive information in this public issue.
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I checked the documentation and existing issues.
+          required: true
+        - label: I removed credentials, personal data, private photos, and other sensitive information.
+          required: true
+
+  - type: textarea
+    id: question
+    attributes:
+      label: How can we help?
+      description: Describe your question, the result you need, and what currently prevents it.
+      placeholder: I need help with…
+    validations:
+      required: true
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - macOS
+        - iPhone
+        - iPad
+        - More than one platform
+        - Not platform-specific
+    validations:
+      required: true
+
+  - type: input
+    id: app_version
+    attributes:
+      label: App version and build
+      description: Enter the version shown in Encrypted Memories settings, if applicable.
+      placeholder: 1.0.0 (726)
+
+  - type: input
+    id: os_version
+    attributes:
+      label: Operating system version
+      description: Enter the macOS, iOS, or iPadOS version, if applicable.
+      placeholder: macOS 26.0 or iOS 26.0
+
+  - type: textarea
+    id: attempted
+    attributes:
+      label: What have you tried?
+      description: Optional. Add the relevant steps or documentation you already tried.
