@@ -90,8 +90,8 @@ struct ProductionRouteGuardTests {
         let appModel = try String(
             contentsOf: Self.repoRoot.appendingPathComponent("App/AppModel.swift"), encoding: .utf8)
         #expect(
-            appModel.contains("ProtonDriveBackendFactory.purgeLocalAccountData"),
-            "sign-out must clear encrypted account cache blobs through the shared backend factory")
+            appModel.contains("await ProtonAuthLocalDataPurge.performOffMain("),
+            "sign-out must await the complete shared file and Keychain purge")
     }
 
     @Test func bothAppleAppsCloseAccountStoresBeforePurgingOrRelogin() throws {
@@ -190,6 +190,7 @@ struct ProductionRouteGuardTests {
             albumSync.contains("isShuttingDown = true"),
             "queued album callbacks must not restart work during logout")
         #expect(albumSync.contains("mappingStore?.close()"))
+        #expect(albumSync.contains("await remoteLinkLookup?.shutdown()"))
 
         let mac = try String(contentsOf: Self.repoRoot.appendingPathComponent("App/AppModel.swift"), encoding: .utf8)
         #expect(
@@ -204,6 +205,8 @@ struct ProductionRouteGuardTests {
         #expect(mac.contains("await photoBackup?.shutdown()"))
         #expect(mac.contains("await albumSync?.shutdown()"))
         #expect(mac.contains("await DebugLog.flush()"))
+        #expect(mac.contains("case signOutFailed"))
+        #expect(mac.contains("func retrySignOutCleanup()"))
         #expect(
             mac.range(of: "await activeFacade?.shutdown()")!.lowerBound
                 < mac.range(of: "ProtonAuthLocalDataPurge.performOffMain(", options: .backwards)!.lowerBound)
@@ -219,6 +222,12 @@ struct ProductionRouteGuardTests {
         #expect(
             mobile.contains("isSigningOut = purgeClaim != nil"),
             "generic session teardown must not be presented as logout cleanup")
+        #expect(mobile.contains("guard purgeClaim != nil else { return }"))
+        #expect(mobile.contains("if report.succeeded"))
+        #expect(
+            mobile.contains("self.signOutCleanupFailed = true"),
+            "iOS must replace the spinner with a retry state when the purge fails")
+        #expect(mobile.contains("func retrySignOutCleanup()"))
         #expect(mobile.contains("await activeFacade?.shutdown()"))
         #expect(mobile.contains("if let purgeClaim"), "generic session teardown must never imply logout")
         #expect(mobile.contains("await ProtonAuthLocalDataPurge.performOffMain("))
@@ -274,7 +283,8 @@ struct ProductionRouteGuardTests {
         let mobileApp = try String(
             contentsOf: Self.repoRoot.appendingPathComponent("iOSApp/EncryptedMemoriesMobileApp.swift"), encoding: .utf8
         )
-        #expect(mobileApp.contains("isPresented: sessionModel.isSigningOut || libraryModel.isSigningOut"))
+        #expect(mobileApp.contains("MobileSignOutCleanupPresentation.resolve("))
+        #expect(mobileApp.contains("MobileSignOutFailureView(onRetry: libraryModel.retrySignOutCleanup)"))
         #expect(mobileApp.contains("activityMessage: L10n.string(\"auth.signing_out\")"))
 
         let mobileSession = try String(
@@ -403,22 +413,19 @@ struct ProductionRouteGuardTests {
             "the login action must stay disabled while the existing session is being recovered")
     }
 
-    @Test func sdkUnifiedCacheIsAccountBoundAndEncrypted() throws {
+    @Test func nativeSDKCacheRemainsInMemoryForSafeSameProcessSignOut() throws {
         let bridge = try String(
             contentsOf: Self.repoRoot.appendingPathComponent(
                 "Packages/EncryptedMemoriesKit/Sources/ProtonDriveBackend/DriveSDKBridge.swift"), encoding: .utf8)
         let config = try Self.body(
             of: bridge, from: "let config = ProtonDriveClientConfiguration(",
             to: "self.photosClient = try await EncryptedMemoriesClient(")
-        #expect(config.contains("cachePath:"), "the SDK uses one unified cache path")
         #expect(
-            config.contains("SDKCacheProtection.fileName(accountUID: session.uid)"),
-            "the unified cache file must be account-scoped")
+            !config.contains("cachePath:"),
+            "SDK 0.25.0 does not dispose its SQLite repository, so sign-out must not persist that cache")
         #expect(
-            config.contains("cacheEncryptionKey: SDKCacheProtection.encryptionKey("),
-            "the unified cache must never be persisted without its 32-byte encryption key")
-        #expect(!config.contains("entityCachePath:"))
-        #expect(!config.contains("secretCachePath:"))
+            !config.contains("cacheEncryptionKey:"),
+            "an absent cache path selects the SDK's supported in-memory cache")
     }
 
     @Test func photosTrashUsesPhotosV2EndpointNotGenericDriveTrash() throws {

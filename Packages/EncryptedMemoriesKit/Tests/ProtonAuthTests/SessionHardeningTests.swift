@@ -168,6 +168,30 @@ struct SessionHardeningTests {
         }
     }
 
+    @Test func platformSignOutFailureKeepsTheDurablePurgeRecoverable() throws {
+        var repoRoot = URL(fileURLWithPath: #filePath)
+        for _ in 0..<5 {
+            repoRoot.deleteLastPathComponent()
+        }
+
+        let mac = try String(
+            contentsOf: repoRoot.appendingPathComponent("App/AppModel.swift"),
+            encoding: .utf8
+        )
+        let mobile = try String(
+            contentsOf: repoRoot.appendingPathComponent("iOSApp/MobileLibraryModel.swift"),
+            encoding: .utf8
+        )
+
+        for source in [mac, mobile] {
+            #expect(source.contains("pendingSignOutPurgeClaim"))
+            #expect(source.contains("func retrySignOutCleanup()"))
+            #expect(source.contains("ProtonAuthLocalDataPurge.performOffMain(claim: claim)"))
+        }
+        #expect(!mac.contains("NSApp.terminate(nil)"))
+        #expect(mobile.contains("!BackupLocalDataPurge.isPurgePending()"))
+    }
+
     private func startupInitializer(in source: String, path: String) throws -> String {
         let start = try #require(source.range(of: "init(startupPlaintextPurgeSucceeded:"))
         let endMarker =

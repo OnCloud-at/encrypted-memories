@@ -184,6 +184,9 @@ final class MobileLibraryModel {
     /// Indicates that explicit sign-out is closing account owners and deleting account data.
     /// Transient session replacement does not set this flag.
     private(set) var isSigningOut = false
+    /// Indicates that explicit sign-out closed every account owner but could not finish the local-data purge.
+    /// The durable purge marker remains armed, so retry or the next process launch must finish cleanup.
+    private(set) var signOutCleanupFailed = false
     /// Invalidates every presentation that can retain providers or rows from a lost Drive scope. Recovery keeps
     /// this state active until the replacement backend exists.
     private(set) var isRecoveringScope = false
@@ -236,6 +239,9 @@ final class MobileLibraryModel {
     /// Serializes account replacement: a newly authenticated session never opens SQLite stores
     /// until the previous facade has closed every handle and completed an explicit sign-out purge.
     private var teardownTask: Task<Void, Never>?
+    /// Retains the already-claimed idempotent purge after a failure so the user can retry without reopening
+    /// account owners. Process termination drops this value, but the durable marker recreates it at launch.
+    @ObservationIgnored private var pendingSignOutPurgeClaim: BackupLocalDataPurge.Claim?
     private var transitionTask: Task<Void, Never>?
     private var prefetchStartTask: Task<Void, Never>?
     /// Lifecycle callbacks may arrive while the backend is still validating its cache. They record foreground
@@ -281,7 +287,12 @@ final class MobileLibraryModel {
             transitionTask?.cancel()
             transitionTask = Task { @MainActor [weak self] in
                 await teardownTask.value
-                guard let self, !Task.isCancelled, self.session == session else { return }
+                guard let self,
+                    !Task.isCancelled,
+                    self.session == session,
+                    !self.isSigningOut,
+                    !BackupLocalDataPurge.isPurgePending()
+                else { return }
                 self.teardownTask = nil
                 self.transitionTask = nil
                 self.start(session: session, store: store)
@@ -958,6 +969,8 @@ final class MobileLibraryModel {
         let activeFavoriteLoadTask = favoriteLoadTask
         let purgeClaim = BackupLocalDataPurge.claimSignOutPurge()
         isSigningOut = purgeClaim != nil
+        pendingSignOutPurgeClaim = purgeClaim
+        signOutCleanupFailed = false
         let activePhotoBackup = photoBackup
         let activeAlbumSync = albumSync
         let activeThumbnailFeed = thumbnailFeed
@@ -1075,9 +1088,29 @@ final class MobileLibraryModel {
             preconditionFailure("Duplicate account teardown owner identifier")
         }
         teardownTask = Task { @MainActor in
-            _ = await teardownCoordinator.teardown()
-            if purgeClaim != nil {
+            let report = await teardownCoordinator.teardown()
+            guard purgeClaim != nil else { return }
+            if report.succeeded {
+                self.pendingSignOutPurgeClaim = nil
                 self.isSigningOut = false
+            } else {
+                self.signOutCleanupFailed = true
+            }
+        }
+    }
+
+    /// Retries only the idempotent purge. The first teardown already joined every account-scoped owner.
+    /// A failed retry keeps the durable marker and returns to the finite error presentation.
+    func retrySignOutCleanup() {
+        guard signOutCleanupFailed, let claim = pendingSignOutPurgeClaim else { return }
+        signOutCleanupFailed = false
+        teardownTask = Task { @MainActor in
+            let succeeded = await ProtonAuthLocalDataPurge.performOffMain(claim: claim)
+            if succeeded {
+                self.pendingSignOutPurgeClaim = nil
+                self.isSigningOut = false
+            } else {
+                self.signOutCleanupFailed = true
             }
         }
     }
@@ -1089,6 +1122,8 @@ final class MobileLibraryModel {
     ) {
         LibraryRuntimeState.shared.beginNewGeneration()
         isSigningOut = false
+        signOutCleanupFailed = false
+        pendingSignOutPurgeClaim = nil
         loadToken &+= 1  // this load supersedes any older in-flight snapshot sort
         let loadGeneration = loadToken
         loadTask?.cancel()

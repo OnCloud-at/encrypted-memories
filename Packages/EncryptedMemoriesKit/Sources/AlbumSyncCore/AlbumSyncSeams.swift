@@ -72,12 +72,17 @@ public protocol AlbumSyncRemoteAlbumOps: Sendable {
 /// Maps local asset identifiers to their remote counterparts via the upload identity manifest.
 public protocol AlbumSyncRemoteLinkLookup: Sendable {
     func remoteLinks(for localIdentifiers: [String]) async -> [String: AlbumSyncRemoteLink]
+    func shutdown() async
+}
+
+public extension AlbumSyncRemoteLinkLookup {
+    func shutdown() async {}
 }
 
 /// `AlbumSyncRemoteLinkLookup` over the shared `upload-manifest-v1.sqlite` (read-only role; the
 /// dedupe pipeline owns writes). Opening a second WAL connection is safe and keeps this module
 /// free of any backend dependency.
-public struct UploadManifestRemoteLinkLookup: AlbumSyncRemoteLinkLookup {
+public final class UploadManifestRemoteLinkLookup: AlbumSyncRemoteLinkLookup, @unchecked Sendable {
     private let store: UploadIdentityManifestStore
 
     public init?(manifestURL: URL, policy: LibraryDatabasePolicy) {
@@ -112,5 +117,9 @@ public struct UploadManifestRemoteLinkLookup: AlbumSyncRemoteLinkLookup {
             }
         }
         return result
+    }
+
+    public func shutdown() async {
+        store.close()
     }
 }

@@ -645,11 +645,17 @@ private struct AlbumPhotosResponse: Decodable {
 struct AccountData {
     let userKeys: [Key]
     let addresses: [Address]
+    let accountInfo: DriveAccountInfoSnapshot
 }
 
 struct DriveStorageQuota: Equatable, Sendable {
     let usedBytes: Int64
     let maxBytes: Int64
+}
+
+struct DriveAccountInfoSnapshot: Equatable, Sendable {
+    let quota: DriveStorageQuota?
+    let primaryEmail: String?
 }
 
 extension DriveSession {
@@ -664,37 +670,52 @@ extension DriveSession {
         AccountDataCache.save(
             users: uData, addresses: aData, uid: current.uid, keyPassword: current.keyPassword,
             in: accountCacheDirectory)
-        return try Self.decodeAccountData(users: uData, addresses: aData)
+        let account = try Self.decodeAccountData(users: uData, addresses: aData)
+        await publishAccountInfo(account.accountInfo)
+        return account
     }
 
     /// The encrypted-on-disk account data from a previous online launch, or nil if absent/undecryptable. Lets
     /// `DriveSDKBridge.init` rebuild the (pure) Drive crypto + SDK account client when the network is unavailable.
-    func cachedAccountData() -> AccountData? {
+    func cachedAccountData() async -> AccountData? {
         guard
             let blob = AccountDataCache.load(
                 uid: current.uid, keyPassword: current.keyPassword, in: accountCacheDirectory)
         else { return nil }
-        return try? Self.decodeAccountData(users: blob.users, addresses: blob.addresses)
+        guard let account = try? Self.decodeAccountData(users: blob.users, addresses: blob.addresses) else {
+            return nil
+        }
+        await publishAccountInfo(account.accountInfo)
+        return account
     }
 
     private static func decodeAccountData(users: Data, addresses: Data) throws -> AccountData {
         let u = try JSONDecoder().decode(UsersResponse.self, from: users)
         let a = try JSONDecoder().decode(AddressesResponse.self, from: addresses)
-        // Both live and cached paths decode here. Newer Proton accounts can have a Drive allocation that is
-        // different from the account-wide storage allocation; older responses fall back field-by-field.
-        if let quota = driveStorageQuota(from: u.user), quota.maxBytes > 0 {
-            Task { @MainActor in
+        // The primary address is the lowest-ordered one (Proton lists the account's main address first).
+        let primaryEmail = a.addresses.min(by: { ($0.order ?? 0) < ($1.order ?? 0) })?.email
+        return AccountData(
+            userKeys: u.user.keys.map(makeKey),
+            addresses: a.addresses.map(makeAddress),
+            accountInfo: DriveAccountInfoSnapshot(
+                quota: driveStorageQuota(from: u.user),
+                primaryEmail: primaryEmail
+            )
+        )
+    }
+
+    private func publishAccountInfo(_ snapshot: DriveAccountInfoSnapshot) async {
+        let accountUID = current.uid
+        await MainActor.run {
+            if let quota = snapshot.quota, quota.maxBytes > 0 {
                 AccountInfo.shared.updateDriveStorage(
                     usedBytes: quota.usedBytes,
-                    maxBytes: quota.maxBytes
+                    maxBytes: quota.maxBytes,
+                    accountUID: accountUID
                 )
             }
+            AccountInfo.shared.update(primaryEmail: snapshot.primaryEmail, accountUID: accountUID)
         }
-        // The primary address is the lowest-ordered one (Proton lists the account's main address first).
-        if let primaryEmail = a.addresses.min(by: { ($0.order ?? 0) < ($1.order ?? 0) })?.email {
-            Task { @MainActor in AccountInfo.shared.update(primaryEmail: primaryEmail) }
-        }
-        return AccountData(userKeys: u.user.keys.map(makeKey), addresses: a.addresses.map(makeAddress))
     }
 
     static func decodeDriveStorageQuota(users: Data) throws -> DriveStorageQuota? {
