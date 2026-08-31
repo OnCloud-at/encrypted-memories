@@ -1075,8 +1075,8 @@ final class MobileLibraryModel {
             preconditionFailure("Duplicate account teardown owner identifier")
         }
         teardownTask = Task { @MainActor in
-            _ = await teardownCoordinator.teardown()
-            if purgeClaim != nil {
+            let report = await teardownCoordinator.teardown()
+            if purgeClaim != nil, report.succeeded {
                 self.isSigningOut = false
             }
         }

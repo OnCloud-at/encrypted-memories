@@ -73,6 +73,9 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         policy: ProtonDriveBackendPolicy,
         deviceIdentityStore: DeviceIdentityKeychainStore = DeviceIdentityKeychainStore()
     ) async throws {
+        await MainActor.run {
+            AccountInfo.shared.beginSession(accountUID: session.uid)
+        }
         let driveSession = DriveSession(
             session: session,
             store: store,
@@ -92,7 +95,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
             DebugLog.log(
                 "bridge: account ok - \(account.addresses.count) addresses, \(account.userKeys.count) user keys")
         } catch {
-            guard let cached = driveSession.cachedAccountData() else { throw error }
+            guard let cached = await driveSession.cachedAccountData() else { throw error }
             account = cached
             DebugLog.log("bridge: OFFLINE - using cached account data (\(cached.addresses.count) addresses)")
         }
@@ -119,8 +122,10 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         )
         self.uploadManifestURL = libraryDirectory.appendingPathComponent(UploadIdentityManifestStore.databaseFileName)
         self.uploadManifestPolicy = policy.libraryDatabasePolicy
-        // The SDK cache contains both entity and secret material. Persist it only under a
-        // stable account-bound 32-byte key; a missing key would make the SDK write plaintext.
+        // Keep the optional native SDK cache in memory. SDK 0.25.0 only frees the managed client handle;
+        // it does not deterministically dispose its SQLite repository. A persistent native cache can therefore
+        // still own WAL files after shutdown and makes the required same-process sign-out purge unsafe.
+        // The app-owned encrypted account cache and timeline store provide offline and warm-launch persistence.
         let uploadClientUID = UploadClientIdentity.make(
             accountUID: session.uid,
             deviceIdentifier: deviceIdentityStore.loadOrCreate()
@@ -133,14 +138,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
             httpTransferBufferSize: uploadBufferSize,
             boundStreamsCreator: {
                 try UploadTransportBufferPolicy.makeBoundStreams(bufferSize: uploadBufferSize)
-            },
-            cachePath: caches.appendingPathComponent(
-                SDKCacheProtection.fileName(accountUID: session.uid)
-            ).path,
-            cacheEncryptionKey: SDKCacheProtection.encryptionKey(
-                accountUID: session.uid,
-                keyPassword: session.keyPassword
-            )
+            }
         )
         self.photosClient = try await EncryptedMemoriesClient(
             configuration: config,

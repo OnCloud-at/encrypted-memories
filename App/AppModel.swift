@@ -185,7 +185,6 @@ final class AppModel {
             persistentDomainName: Bundle.main.bundleIdentifier
         )
         let purgeClaim = BackupLocalDataPurge.claimSignOutPurge()
-        let session = authController.currentSession
         let signedOutState = authController.signOut()
         let activeScopeRecovery = scopeRecoveryTask
         activeScopeRecovery?.cancel()
@@ -237,17 +236,6 @@ final class AppModel {
                 },
                 AccountTeardownOwner(id: "shared.debug-log", stage: .logs) {
                     await DebugLog.flush()
-                },
-                AccountTeardownOwner(id: "mac.account-directory", stage: .purgeClaims) {
-                    guard let session else { return }
-                    let uid = session.uid
-                    await Task.detached(priority: .utility) {
-                        ProtonDriveBackendFactory.purgeLocalAccountData(
-                            uid: uid,
-                            policy: .standard(
-                                libraryDatabasePolicy: ProtonDriveBackendPolicy.desktopLibraryDatabasePolicy)
-                        )
-                    }.value
                 },
                 AccountTeardownOwner(id: "shared.local-data-claim", stage: .purgeClaims) {
                     guard let purgeClaim else { throw TeardownFailure.purgeClaimUnavailable }

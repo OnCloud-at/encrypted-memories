@@ -4,13 +4,12 @@ import PhotosCore
 
 public struct ThumbnailCacheConfiguration: Sendable, Equatable {
     public let dataMemoryBudgetBytes: Int
-    /// Optional encrypted-disk byte budget. `nil` selects the shared derivative default for thumbnails and
-    /// previews, while other derivatives remain unbounded unless a policy supplies a value.
+    /// Optional encrypted-disk byte budget. `nil` keeps whole-library thumbnails unbounded, applies the
+    /// shared preview default, and leaves other derivatives unbounded unless a policy supplies a value.
     public let diskByteBudgetBytes: Int64?
 
-    /// Shared Core defaults. Platform adapters may change the RAM budget, but disk bounds stay identical across
-    /// macOS and iOS so one cache policy cannot grow without limit on a single platform.
-    public static let defaultThumbnailDiskBudgetBytes: Int64 = 1_073_741_824
+    /// Shared Core preview default. The thumbnail feed promises complete persisted coverage, so an automatic
+    /// thumbnail cap would evict older blobs while its coverage checkpoint still reports them as present.
     public static let defaultPreviewDiskBudgetBytes: Int64 = 2_147_483_648
 
     public init(
@@ -516,9 +515,8 @@ public actor ThumbnailCache {
         }
     }
 
-    private static func defaultDiskByteBudget(for derivative: String) -> Int64? {
+    static func defaultDiskByteBudget(for derivative: String) -> Int64? {
         switch derivative {
-        case "thumbnail": return ThumbnailCacheConfiguration.defaultThumbnailDiskBudgetBytes
         case "preview": return ThumbnailCacheConfiguration.defaultPreviewDiskBudgetBytes
         default: return nil
         }

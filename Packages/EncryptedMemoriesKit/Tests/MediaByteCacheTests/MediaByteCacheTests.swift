@@ -148,8 +148,11 @@ struct MediaByteCacheTests {
         #expect(ThumbnailCacheConfiguration(dataMemoryBudgetBytes: 0).dataMemoryBudgetBytes == 1)
         #expect(ThumbnailCacheConfiguration(dataMemoryBudgetBytes: 42).dataMemoryBudgetBytes == 42)
         #expect(ThumbnailCacheConfiguration(diskByteBudgetBytes: -1).diskByteBudgetBytes == 0)
-        #expect(ThumbnailCacheConfiguration.defaultThumbnailDiskBudgetBytes == 1_073_741_824)
+        #expect(ThumbnailCache.defaultDiskByteBudget(for: "thumbnail") == nil)
         #expect(ThumbnailCacheConfiguration.defaultPreviewDiskBudgetBytes == 2_147_483_648)
+        #expect(
+            ThumbnailCache.defaultDiskByteBudget(for: "preview")
+                == ThumbnailCacheConfiguration.defaultPreviewDiskBudgetBytes)
     }
 
     @Test func automaticThumbnailDiskCapKeepsNewestDataWithinBound() async throws {

@@ -51,6 +51,7 @@ import UploadCore
         #expect(links["asset-1"]?.uid.nodeID == "l-main")
         #expect(links["asset-1"]?.sha1Hex == "abc123")
         #expect(links["asset-1"]?.isTrashed == false)
+        await lookup.shutdown()
     }
 
     @Test func mapsDuplicateOutcomesAndSkipsUnfinishedRows() async throws {
@@ -69,5 +70,7 @@ import UploadCore
         #expect(links["pending"] == nil)
         #expect(links["unknown"] == nil)
         #expect(links.count == 3)
+        await lookup.shutdown()
+        #expect(await lookup.remoteLinks(for: ["uploaded"]).isEmpty)
     }
 }

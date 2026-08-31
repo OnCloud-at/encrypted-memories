@@ -101,6 +101,7 @@ public final class AlbumSyncController {
 
     private let runner: AlbumSyncRunner?
     private let backupExecutor: PhotoAlbumBackupExecutor?
+    private let remoteLinkLookup: (any AlbumSyncRemoteLinkLookup)?
     private let localSource = PhotoKitAlbumSource()
     private let mappingStore: AlbumSyncMappingStore?
     private let changeMonitor: PhotoLibraryChangeMonitor
@@ -140,6 +141,7 @@ public final class AlbumSyncController {
             manifestURL: directory.appendingPathComponent(UploadIdentityManifestStore.databaseFileName),
             policy: configuration.databasePolicy
         )
+        remoteLinkLookup = lookup
 
         if let mappingStore, let lookup, let identityResolver {
             let executor = PhotoAlbumBackupExecutor(
@@ -328,6 +330,7 @@ public final class AlbumSyncController {
         await runner?.stop()
         await backupExecutor?.stop()
         await activeSync?.value
+        await remoteLinkLookup?.shutdown()
         mappingStore?.close()
         onRemoteAlbumsChanged = nil
     }
