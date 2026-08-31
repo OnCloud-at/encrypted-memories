@@ -211,7 +211,8 @@ final class LocalizationTests: XCTestCase {
             "sign_out.confirmation_message", "brand.independence_notice",
             "login.account_requirement", "settings.tip_jar_title",
             "settings.bug_report_action", "settings.bug_report_privacy",
-            "settings.bug_report_github", "device.requires_metal3 %@",
+            "settings.bug_report_download", "settings.bug_report_support",
+            "device.requires_metal3 %@",
             "device.unsupported_reassurance", "device.unsupported_title",
         ]
         for key in reps {

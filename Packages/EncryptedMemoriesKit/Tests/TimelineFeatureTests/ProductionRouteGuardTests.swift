@@ -331,11 +331,23 @@ struct ProductionRouteGuardTests {
         )
         #expect(settings.contains(".sheet(isPresented: $showsBugReport) { MobileBugReportSheet() }"))
         #expect(settings.contains("MobileMediaExporter.exportSupportReport(data)"))
-        #expect(settings.contains("github.com/OnCloud-at/encrypted-memories/issues/new"))
-        #expect(settings.contains("completionURL: Self.issueURL"))
+        #expect(settings.contains("github.com/OnCloud-at/encrypted-memories/issues"))
+        #expect(settings.contains("MobileSharePayload(urls: [url])"))
+        #expect(settings.contains("openURL(Self.issueURL)"))
+        #expect(!settings.contains("completionURL: Self.issueURL"))
         #expect(!settings.contains("BugReportSubmissionService"))
         #expect(!settings.contains("MobileActivityView"))
         #expect(!settings.contains("MobileSupportExport"))
+
+        let macSettings = try String(
+            contentsOf: Self.repoRoot.appendingPathComponent("App/Views/SettingsView.swift"),
+            encoding: .utf8
+        )
+        #expect(macSettings.contains("github.com/OnCloud-at/encrypted-memories/issues"))
+        #expect(macSettings.contains("Task { await exportSupportReport() }"))
+        #expect(macSettings.contains("NSWorkspace.shared.open(Self.issueURL)"))
+        #expect(macSettings.contains("try data.write(to: url)"))
+        #expect(!macSettings.contains("try data.write(to: url, options: .atomic)"))
 
         let timeline = try String(
             contentsOf: Self.repoRoot.appendingPathComponent("iOSApp/MobileTimelineScreen.swift"),
