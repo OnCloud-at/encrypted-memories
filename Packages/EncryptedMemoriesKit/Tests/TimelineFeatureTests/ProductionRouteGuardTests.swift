@@ -333,7 +333,8 @@ struct ProductionRouteGuardTests {
         #expect(settings.contains("MobileMediaExporter.exportSupportReport(data)"))
         #expect(settings.contains("github.com/OnCloud-at/encrypted-memories/issues"))
         #expect(settings.contains("MobileSharePayload(urls: [url])"))
-        #expect(settings.contains("openURL(Self.issueURL)"))
+        #expect(settings.contains("openURL(Self.issueURL) { accepted in"))
+        #expect(settings.contains("if !accepted"))
         #expect(!settings.contains("completionURL: Self.issueURL"))
         #expect(!settings.contains("BugReportSubmissionService"))
         #expect(!settings.contains("MobileActivityView"))
@@ -345,9 +346,10 @@ struct ProductionRouteGuardTests {
         )
         #expect(macSettings.contains("github.com/OnCloud-at/encrypted-memories/issues"))
         #expect(macSettings.contains("Task { await exportSupportReport() }"))
-        #expect(macSettings.contains("NSWorkspace.shared.open(Self.issueURL)"))
-        #expect(macSettings.contains("try data.write(to: url)"))
-        #expect(!macSettings.contains("try data.write(to: url, options: .atomic)"))
+        #expect(macSettings.contains("if !NSWorkspace.shared.open(Self.issueURL)"))
+        #expect(macSettings.contains("for: .itemReplacementDirectory"))
+        #expect(macSettings.contains("try data.write(to: stagedFile, options: .atomic)"))
+        #expect(macSettings.contains("replaceItemAt(destination, withItemAt: stagedFile)"))
 
         let timeline = try String(
             contentsOf: Self.repoRoot.appendingPathComponent("iOSApp/MobileTimelineScreen.swift"),

@@ -335,7 +335,11 @@ private struct MobileBugReportSheet: View {
                     }
                     .disabled(isPreparingReport)
                     Button {
-                        openURL(Self.issueURL)
+                        openURL(Self.issueURL) { accepted in
+                            if !accepted {
+                                errorMessage = L10n.string("settings.bug_report_support_failed")
+                            }
+                        }
                     } label: {
                         Label(
                             L10n.string("settings.bug_report_support"),

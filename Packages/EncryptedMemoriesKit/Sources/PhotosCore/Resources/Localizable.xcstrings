@@ -4583,6 +4583,13 @@
         "de": { "stringUnit": { "state": "translated", "value": "Support" } }
       }
     },
+    "settings.bug_report_support_failed": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Support couldn’t be opened." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Support konnte nicht geöffnet werden." } }
+      }
+    },
     "settings.bug_report_title": {
       "extractionState": "manual",
       "localizations": {

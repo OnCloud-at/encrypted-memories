@@ -1211,7 +1211,9 @@ private struct MacBugReportSheet: View {
                 }
                 .disabled(isPreparingReport)
                 Button(L10n.string("settings.bug_report_support")) {
-                    NSWorkspace.shared.open(Self.issueURL)
+                    if !NSWorkspace.shared.open(Self.issueURL) {
+                        errorMessage = L10n.string("settings.bug_report_support_failed")
+                    }
                 }
                 .buttonStyle(.borderedProminent)
             }
@@ -1235,9 +1237,28 @@ private struct MacBugReportSheet: View {
             defer {
                 if hasScopedAccess { url.stopAccessingSecurityScopedResource() }
             }
-            try data.write(to: url)
+            try Self.writeSupportReport(data, to: url)
         } catch {
             errorMessage = L10n.string("settings.bug_report_export_failed")
+        }
+    }
+
+    private static func writeSupportReport(_ data: Data, to destination: URL) throws {
+        let fileManager = FileManager.default
+        let stagingDirectory = try fileManager.url(
+            for: .itemReplacementDirectory,
+            in: .userDomainMask,
+            appropriateFor: destination,
+            create: true
+        )
+        defer { try? fileManager.removeItem(at: stagingDirectory) }
+
+        let stagedFile = stagingDirectory.appendingPathComponent(destination.lastPathComponent)
+        try data.write(to: stagedFile, options: .atomic)
+        if fileManager.fileExists(atPath: destination.path) {
+            _ = try fileManager.replaceItemAt(destination, withItemAt: stagedFile)
+        } else {
+            try fileManager.moveItem(at: stagedFile, to: destination)
         }
     }
 }
