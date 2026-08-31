@@ -1180,7 +1180,7 @@ private struct MacBugReportSheet: View {
     @State private var errorMessage: String?
 
     private static let issueURL = URL(
-        string: "https://github.com/OnCloud-at/encrypted-memories/issues/new"
+        string: "https://github.com/OnCloud-at/encrypted-memories/issues"
     )!
 
     var body: some View {
@@ -1201,15 +1201,20 @@ private struct MacBugReportSheet: View {
                 Button(L10n.string("action.done"), role: .cancel) { dismiss() }
                 Spacer()
                 Button {
-                    Task { await openGitHubIssue() }
+                    Task { await exportSupportReport() }
                 } label: {
                     if isPreparingReport {
                         ProgressView().controlSize(.small)
                     } else {
-                        Text(L10n.string("settings.bug_report_github"))
+                        Text(L10n.string("settings.bug_report_download"))
                     }
                 }
                 .disabled(isPreparingReport)
+                Button(L10n.string("settings.bug_report_support")) {
+                    if !NSWorkspace.shared.open(Self.issueURL) {
+                        errorMessage = L10n.string("settings.bug_report_support_failed")
+                    }
+                }
                 .buttonStyle(.borderedProminent)
             }
         }
@@ -1217,7 +1222,7 @@ private struct MacBugReportSheet: View {
         .frame(width: 460)
     }
 
-    @MainActor private func openGitHubIssue() async {
+    @MainActor private func exportSupportReport() async {
         guard !isPreparingReport else { return }
         isPreparingReport = true
         errorMessage = nil
@@ -1228,10 +1233,32 @@ private struct MacBugReportSheet: View {
             panel.nameFieldStringValue = "Encrypted-Memories-Support.json"
             panel.canCreateDirectories = true
             guard panel.runModal() == .OK, let url = panel.url else { return }
-            try data.write(to: url, options: .atomic)
-            NSWorkspace.shared.open(Self.issueURL)
+            let hasScopedAccess = url.startAccessingSecurityScopedResource()
+            defer {
+                if hasScopedAccess { url.stopAccessingSecurityScopedResource() }
+            }
+            try Self.writeSupportReport(data, to: url)
         } catch {
             errorMessage = L10n.string("settings.bug_report_export_failed")
+        }
+    }
+
+    private static func writeSupportReport(_ data: Data, to destination: URL) throws {
+        let fileManager = FileManager.default
+        let stagingDirectory = try fileManager.url(
+            for: .itemReplacementDirectory,
+            in: .userDomainMask,
+            appropriateFor: destination,
+            create: true
+        )
+        defer { try? fileManager.removeItem(at: stagingDirectory) }
+
+        let stagedFile = stagingDirectory.appendingPathComponent(destination.lastPathComponent)
+        try data.write(to: stagedFile, options: .atomic)
+        if fileManager.fileExists(atPath: destination.path) {
+            _ = try fileManager.replaceItemAt(destination, withItemAt: stagedFile)
+        } else {
+            try fileManager.moveItem(at: stagedFile, to: destination)
         }
     }
 }

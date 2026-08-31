@@ -331,11 +331,25 @@ struct ProductionRouteGuardTests {
         )
         #expect(settings.contains(".sheet(isPresented: $showsBugReport) { MobileBugReportSheet() }"))
         #expect(settings.contains("MobileMediaExporter.exportSupportReport(data)"))
-        #expect(settings.contains("github.com/OnCloud-at/encrypted-memories/issues/new"))
-        #expect(settings.contains("completionURL: Self.issueURL"))
+        #expect(settings.contains("github.com/OnCloud-at/encrypted-memories/issues"))
+        #expect(settings.contains("MobileSharePayload(urls: [url])"))
+        #expect(settings.contains("openURL(Self.issueURL) { accepted in"))
+        #expect(settings.contains("if !accepted"))
+        #expect(!settings.contains("completionURL: Self.issueURL"))
         #expect(!settings.contains("BugReportSubmissionService"))
         #expect(!settings.contains("MobileActivityView"))
         #expect(!settings.contains("MobileSupportExport"))
+
+        let macSettings = try String(
+            contentsOf: Self.repoRoot.appendingPathComponent("App/Views/SettingsView.swift"),
+            encoding: .utf8
+        )
+        #expect(macSettings.contains("github.com/OnCloud-at/encrypted-memories/issues"))
+        #expect(macSettings.contains("Task { await exportSupportReport() }"))
+        #expect(macSettings.contains("if !NSWorkspace.shared.open(Self.issueURL)"))
+        #expect(macSettings.contains("for: .itemReplacementDirectory"))
+        #expect(macSettings.contains("try data.write(to: stagedFile, options: .atomic)"))
+        #expect(macSettings.contains("replaceItemAt(destination, withItemAt: stagedFile)"))
 
         let timeline = try String(
             contentsOf: Self.repoRoot.appendingPathComponent("iOSApp/MobileTimelineScreen.swift"),

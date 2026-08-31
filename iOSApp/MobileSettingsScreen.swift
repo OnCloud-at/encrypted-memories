@@ -307,12 +307,13 @@ struct MobileSettingsScreen: View {
 
 private struct MobileBugReportSheet: View {
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.openURL) private var openURL
     @State private var supportExport: MobileSharePayload?
     @State private var isPreparingReport = false
     @State private var errorMessage: String?
 
     private static let issueURL = URL(
-        string: "https://github.com/OnCloud-at/encrypted-memories/issues/new"
+        string: "https://github.com/OnCloud-at/encrypted-memories/issues"
     )!
 
     var body: some View {
@@ -321,18 +322,30 @@ private struct MobileBugReportSheet: View {
                 Section {
                     Text(L10n.string("settings.bug_report_instructions"))
                     Button {
-                        Task { await openGitHubIssue() }
+                        Task { await exportSupportReport() }
                     } label: {
                         HStack {
                             Label(
-                                L10n.string("settings.bug_report_github"),
-                                systemImage: "arrow.up.right.square"
+                                L10n.string("settings.bug_report_download"),
+                                systemImage: "square.and.arrow.down"
                             )
                             Spacer()
                             if isPreparingReport { ProgressView().controlSize(.small) }
                         }
                     }
                     .disabled(isPreparingReport)
+                    Button {
+                        openURL(Self.issueURL) { accepted in
+                            if !accepted {
+                                errorMessage = L10n.string("settings.bug_report_support_failed")
+                            }
+                        }
+                    } label: {
+                        Label(
+                            L10n.string("settings.bug_report_support"),
+                            systemImage: "arrow.up.right.square"
+                        )
+                    }
                 } footer: {
                     Text(L10n.string("settings.bug_report_privacy"))
                 }
@@ -350,7 +363,7 @@ private struct MobileBugReportSheet: View {
         }
     }
 
-    @MainActor private func openGitHubIssue() async {
+    @MainActor private func exportSupportReport() async {
         guard !isPreparingReport else { return }
         isPreparingReport = true
         errorMessage = nil
@@ -361,7 +374,7 @@ private struct MobileBugReportSheet: View {
                 errorMessage = L10n.string("settings.bug_report_export_failed")
                 return
             }
-            supportExport = MobileSharePayload(urls: [url], completionURL: Self.issueURL)
+            supportExport = MobileSharePayload(urls: [url])
         } catch {
             errorMessage = L10n.string("settings.bug_report_export_failed")
         }

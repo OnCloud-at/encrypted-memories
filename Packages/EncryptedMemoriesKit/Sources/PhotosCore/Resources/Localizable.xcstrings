@@ -4551,8 +4551,15 @@
     "settings.bug_report_instructions": {
       "extractionState": "manual",
       "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "The app first creates a support report and asks you to save or share it. The new GitHub issue opens afterwards. Describe the problem there and attach the saved file." } },
-        "de": { "stringUnit": { "state": "translated", "value": "Die App erstellt zuerst einen Supportbericht und lässt dich ihn sichern oder teilen. Danach öffnet sich das neue GitHub-Issue. Beschreibe dort den Fehler und hänge die gespeicherte Datei an." } }
+        "en": { "stringUnit": { "state": "translated", "value": "Download the support file, then open Support. Describe the problem in GitHub Issues and attach the file." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Lade die Supportdatei herunter und öffne danach Support. Beschreibe den Fehler in GitHub Issues und hänge die Datei an." } }
+      }
+    },
+    "settings.bug_report_download": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Download support file" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Supportdatei herunterladen" } }
       }
     },
     "settings.bug_report_export_failed": {
@@ -4569,11 +4576,18 @@
         "de": { "stringUnit": { "state": "translated", "value": "Die Datei enthält App- und Leistungszustände, aber keine Dateinamen, Foto-IDs, Suchtexte, Pfade oder Fotoinhalte. Prüfe sie, bevor du sie an ein öffentliches Issue anhängst." } }
       }
     },
-    "settings.bug_report_github": {
+    "settings.bug_report_support": {
       "extractionState": "manual",
       "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "Open GitHub issue" } },
-        "de": { "stringUnit": { "state": "translated", "value": "GitHub-Issue öffnen" } }
+        "en": { "stringUnit": { "state": "translated", "value": "Support" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Support" } }
+      }
+    },
+    "settings.bug_report_support_failed": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Support couldn’t be opened." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Support konnte nicht geöffnet werden." } }
       }
     },
     "settings.bug_report_title": {
