@@ -341,6 +341,8 @@ private extension AppModel {
             .authentication
         case .signingOut:
             .signingOut
+        case .signOutFailed:
+            nil
         default:
             isPreparing ? .libraryPreparation : nil
         }
@@ -469,6 +471,8 @@ struct RootView: View {
             ProtonLoadingView()
         case .signingOut:
             ProtonLoadingView(caption: L10n.string("auth.signing_out"))
+        case .signOutFailed:
+            SignOutFailureView(retry: model.retrySignOutCleanup)
         case .signedOut, .authenticating:
             Color.clear
         case .signedIn:
@@ -489,6 +493,31 @@ struct RootView: View {
         case .preparing, .idle:
             ProtonLoadingView(caption: String(localized: "loading.building_library"))
         }
+    }
+}
+
+private struct SignOutFailureView: View {
+    let retry: () -> Void
+
+    var body: some View {
+        ZStack {
+            ProtonColor.backgroundNorm.ignoresSafeArea()
+            ContentUnavailableView {
+                Label {
+                    Text(L10n.string("sign_out.cleanup_failed_title"))
+                } icon: {
+                    Image(systemName: "exclamationmark.shield")
+                }
+            } description: {
+                Text(L10n.string("sign_out.cleanup_failed_message"))
+            } actions: {
+                Button(L10n.string("sign_out.try_again"), action: retry)
+                    .buttonStyle(.borderedProminent)
+                    .tint(ProtonColor.primary)
+            }
+            .padding()
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }
 

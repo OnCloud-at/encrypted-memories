@@ -212,6 +212,17 @@ enum MobileRootPresentation: Equatable {
     }
 }
 
+enum MobileSignOutCleanupPresentation: Equatable {
+    case hidden
+    case working
+    case failed
+
+    static func resolve(isSigningOut: Bool, cleanupFailed: Bool) -> Self {
+        if cleanupFailed { return .failed }
+        return isSigningOut ? .working : .hidden
+    }
+}
+
 private struct MobileRootView: View {
     @EnvironmentObject private var sessionModel: MobileSessionModel
     @Environment(MobileLibraryModel.self) private var libraryModel
@@ -243,12 +254,22 @@ private struct MobileRootView: View {
             }
         }
         .overlay {
-            MobileLibraryLoadingView(
-                isPresented: sessionModel.isSigningOut || libraryModel.isSigningOut,
-                accessibilityLabel: L10n.string("auth.signing_out"),
-                activityMessage: L10n.string("auth.signing_out"),
-                activityState: .working
-            )
+            switch MobileSignOutCleanupPresentation.resolve(
+                isSigningOut: sessionModel.isSigningOut || libraryModel.isSigningOut,
+                cleanupFailed: libraryModel.signOutCleanupFailed
+            ) {
+            case .hidden:
+                EmptyView()
+            case .working:
+                MobileLibraryLoadingView(
+                    isPresented: true,
+                    accessibilityLabel: L10n.string("auth.signing_out"),
+                    activityMessage: L10n.string("auth.signing_out"),
+                    activityState: .working
+                )
+            case .failed:
+                MobileSignOutFailureView(onRetry: libraryModel.retrySignOutCleanup)
+            }
         }
     }
 }

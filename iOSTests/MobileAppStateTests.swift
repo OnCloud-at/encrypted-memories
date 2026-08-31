@@ -159,6 +159,29 @@ private func waitUntil(
             ) == .signedIn)
     }
 
+    @Test func failedSignOutCleanupReplacesTheWorkingCoverUntilRetry() {
+        #expect(
+            MobileSignOutCleanupPresentation.resolve(
+                isSigningOut: false,
+                cleanupFailed: false
+            ) == .hidden)
+        #expect(
+            MobileSignOutCleanupPresentation.resolve(
+                isSigningOut: true,
+                cleanupFailed: false
+            ) == .working)
+        #expect(
+            MobileSignOutCleanupPresentation.resolve(
+                isSigningOut: true,
+                cleanupFailed: true
+            ) == .failed)
+        #expect(
+            MobileSignOutCleanupPresentation.resolve(
+                isSigningOut: false,
+                cleanupFailed: true
+            ) == .failed)
+    }
+
     private func makeViewerImage(size: CGSize, color: UIColor = .white) -> UIImage {
         let format = UIGraphicsImageRendererFormat()
         format.scale = 1

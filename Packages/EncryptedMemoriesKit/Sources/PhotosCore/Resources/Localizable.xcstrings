@@ -3834,6 +3834,58 @@
         }
       }
     },
+    "sign_out.cleanup_failed_message": {
+      "extractionState": "manual",
+      "comment": "Shared recovery guidance after a local-data purge fails during sign-out.",
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Die lokalen Daten konnten nicht vollständig gelöscht werden. Versuche es erneut oder schließe die App vollständig und öffne sie wieder. Beim nächsten Start wird die Bereinigung abgeschlossen, bevor eine Anmeldung möglich ist."
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "The local data could not be deleted completely. Try again, or fully close and reopen the app. Cleanup will finish at the next launch before sign-in is available."
+          }
+        }
+      }
+    },
+    "sign_out.cleanup_failed_title": {
+      "extractionState": "manual",
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Abmelden nicht abgeschlossen"
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Sign-out not completed"
+          }
+        }
+      }
+    },
+    "sign_out.try_again": {
+      "extractionState": "manual",
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Erneut versuchen"
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Try again"
+          }
+        }
+      }
+    },
     "library.title": {
       "extractionState": "manual",
       "comment": "Window title for the whole library (the .all filter).",

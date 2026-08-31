@@ -35,6 +35,47 @@ struct MobileLibraryLoadingView: View {
     }
 }
 
+/// Replaces the sign-out spinner after a real purge failure. The account remains unavailable until retry or
+/// the next cold start completes the durable purge request.
+struct MobileSignOutFailureView: View {
+    let onRetry: () -> Void
+
+    var body: some View {
+        ZStack {
+            LibraryLoadingCover(
+                isPresented: true,
+                accessibilityLabel: L10n.string("sign_out.cleanup_failed_title"),
+                showsLoadingContent: false
+            ) { isActive in
+                MobileFrostedBackdrop(isActive: isActive)
+            }
+
+            Color.clear
+                .contentShape(Rectangle())
+                .ignoresSafeArea()
+
+            ContentUnavailableView {
+                Label {
+                    Text(L10n.string("sign_out.cleanup_failed_title"))
+                } icon: {
+                    Image(systemName: "exclamationmark.shield")
+                }
+            } description: {
+                Text(L10n.string("sign_out.cleanup_failed_message"))
+            } actions: {
+                Button(L10n.string("sign_out.try_again"), action: onRetry)
+                    .buttonStyle(.borderedProminent)
+                    .tint(ProtonColor.primary)
+            }
+            .padding()
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .ignoresSafeArea()
+        .contentShape(Rectangle())
+        .allowsHitTesting(true)
+    }
+}
+
 /// UIKit-only platform adapter. The effect itself animates between material and nil at alpha 1, avoiding
 /// the offscreen-composition and visual artifacts caused by fading a `UIVisualEffectView` or its parent.
 struct MobileFrostedBackdrop: UIViewRepresentable {

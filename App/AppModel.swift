@@ -23,6 +23,7 @@ final class AppModel {
     enum AuthState: Equatable {
         case checking
         case signingOut
+        case signOutFailed
         case signedOut(error: String?)
         case authenticating(status: String)
         case signedIn(ProtonSession)
@@ -53,6 +54,9 @@ final class AppModel {
     /// The most recent ordered Smart Search shutdown; sign-out awaits it before purging.
     @ObservationIgnored private var smartSearchShutdownTask: Task<Void, Never>?
     @ObservationIgnored private let signOutBarrier = AccountSignOutBarrier()
+    /// Retains the idempotent purge after a failure. The durable marker independently recreates this claim
+    /// after process termination, before session bootstrap opens any account-owned store.
+    @ObservationIgnored private var pendingSignOutPurgeClaim: BackupLocalDataPurge.Claim?
     /// Indicates that the first signed-in library load reached a terminal state. The launch veil lifts only
     /// after the grid is ready, and this flag resets for sign-out and each new backend build.
     private(set) var libraryReady = false
@@ -63,7 +67,7 @@ final class AppModel {
         switch auth {
         case .checking:
             return true
-        case .signingOut, .signedOut, .authenticating:
+        case .signingOut, .signOutFailed, .signedOut, .authenticating:
             return false
         case .signedIn:
             switch backend {
@@ -185,6 +189,7 @@ final class AppModel {
             persistentDomainName: Bundle.main.bundleIdentifier
         )
         let purgeClaim = BackupLocalDataPurge.claimSignOutPurge()
+        pendingSignOutPurgeClaim = purgeClaim
         let signedOutState = authController.signOut()
         let activeScopeRecovery = scopeRecoveryTask
         activeScopeRecovery?.cancel()
@@ -244,16 +249,35 @@ final class AppModel {
                 },
             ])
         } catch {
-            apply(signedOutState, prepareBackendOnSignedIn: false)
-            NSApp.terminate(nil)
-            return
+            preconditionFailure("Duplicate account teardown owner identifier")
         }
 
         signOutBarrier.begin { [self] in
             let report = await teardownCoordinator.teardown()
-            apply(signedOutState, prepareBackendOnSignedIn: false)
-            if !report.succeeded {
-                NSApp.terminate(nil)
+            if report.succeeded {
+                pendingSignOutPurgeClaim = nil
+                apply(signedOutState, prepareBackendOnSignedIn: false)
+            } else {
+                auth = .signOutFailed
+            }
+        }
+    }
+
+    /// Retries only the purge after every account owner has already shut down. Failure keeps the marker armed.
+    func retrySignOutCleanup() {
+        guard case .signOutFailed = auth,
+            let claim = pendingSignOutPurgeClaim,
+            !signOutBarrier.isRunning
+        else { return }
+
+        auth = .signingOut
+        signOutBarrier.begin { [self] in
+            let succeeded = await ProtonAuthLocalDataPurge.performOffMain(claim: claim)
+            if succeeded {
+                pendingSignOutPurgeClaim = nil
+                apply(.signedOut(error: nil), prepareBackendOnSignedIn: false)
+            } else {
+                auth = .signOutFailed
             }
         }
     }

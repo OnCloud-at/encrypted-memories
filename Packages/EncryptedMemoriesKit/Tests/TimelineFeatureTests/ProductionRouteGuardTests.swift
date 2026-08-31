@@ -205,6 +205,8 @@ struct ProductionRouteGuardTests {
         #expect(mac.contains("await photoBackup?.shutdown()"))
         #expect(mac.contains("await albumSync?.shutdown()"))
         #expect(mac.contains("await DebugLog.flush()"))
+        #expect(mac.contains("case signOutFailed"))
+        #expect(mac.contains("func retrySignOutCleanup()"))
         #expect(
             mac.range(of: "await activeFacade?.shutdown()")!.lowerBound
                 < mac.range(of: "ProtonAuthLocalDataPurge.performOffMain(", options: .backwards)!.lowerBound)
@@ -220,9 +222,12 @@ struct ProductionRouteGuardTests {
         #expect(
             mobile.contains("isSigningOut = purgeClaim != nil"),
             "generic session teardown must not be presented as logout cleanup")
+        #expect(mobile.contains("guard purgeClaim != nil else { return }"))
+        #expect(mobile.contains("if report.succeeded"))
         #expect(
-            mobile.contains("if purgeClaim != nil, report.succeeded"),
-            "iOS must not reveal login before the complete sign-out purge succeeds")
+            mobile.contains("self.signOutCleanupFailed = true"),
+            "iOS must replace the spinner with a retry state when the purge fails")
+        #expect(mobile.contains("func retrySignOutCleanup()"))
         #expect(mobile.contains("await activeFacade?.shutdown()"))
         #expect(mobile.contains("if let purgeClaim"), "generic session teardown must never imply logout")
         #expect(mobile.contains("await ProtonAuthLocalDataPurge.performOffMain("))
@@ -278,7 +283,8 @@ struct ProductionRouteGuardTests {
         let mobileApp = try String(
             contentsOf: Self.repoRoot.appendingPathComponent("iOSApp/EncryptedMemoriesMobileApp.swift"), encoding: .utf8
         )
-        #expect(mobileApp.contains("isPresented: sessionModel.isSigningOut || libraryModel.isSigningOut"))
+        #expect(mobileApp.contains("MobileSignOutCleanupPresentation.resolve("))
+        #expect(mobileApp.contains("MobileSignOutFailureView(onRetry: libraryModel.retrySignOutCleanup)"))
         #expect(mobileApp.contains("activityMessage: L10n.string(\"auth.signing_out\")"))
 
         let mobileSession = try String(
