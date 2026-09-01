@@ -271,6 +271,7 @@ struct MainView: View {
                 searchDebounceTask?.cancel()
                 searchDebounceTask = nil
                 cancelVeilTasks()
+                Task { await backupUploadRefreshCoordinator.cancel() }
             }
             .onChange(of: columnVisibility) { _, newValue in
                 // The NATIVE split-view toggle drives columnVisibility - mirror it back into our open-state +
