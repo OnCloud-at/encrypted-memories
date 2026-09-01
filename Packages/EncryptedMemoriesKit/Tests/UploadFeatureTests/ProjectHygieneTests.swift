@@ -193,7 +193,7 @@ final class ProjectHygieneTests: XCTestCase {
         XCTAssertEqual(rebuild.components(separatedBy: "IOS_BUNDLE_ID=").count - 1, 1)
     }
 
-    func testAppleDistributionUsesOneGitHubReleaseWorkflow() throws {
+    func testAppleDistributionBuildsOnceAndPromotesExistingBuilds() throws {
         let buildPaths = try String(
             contentsOf: repoRoot.appendingPathComponent("scripts/build-paths.sh"),
             encoding: .utf8
@@ -252,6 +252,19 @@ final class ProjectHygieneTests: XCTestCase {
         XCTAssertTrue(internalWorkflow.contains("--submit"))
         XCTAssertFalse(internalWorkflow.contains("distribute-external"))
 
+        let externalWorkflow = try String(
+            contentsOf: repoRoot.appendingPathComponent(".github/workflows/testflight-external.yml"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(externalWorkflow.contains("workflow_dispatch:"))
+        XCTAssertTrue(externalWorkflow.contains("group: apple-distribution"))
+        XCTAssertTrue(externalWorkflow.contains("environment: testflight-external"))
+        XCTAssertTrue(externalWorkflow.contains("distribute-external"))
+        XCTAssertTrue(externalWorkflow.contains("wait-builds"))
+        XCTAssertFalse(externalWorkflow.contains("xcrun xcodebuild"))
+        XCTAssertFalse(externalWorkflow.contains("xcrun altool"))
+        XCTAssertFalse(externalWorkflow.contains("Apple-Actions/import-codesign-certs@"))
+
         let prepareAppleBuild = try String(
             contentsOf: repoRoot.appendingPathComponent(".github/actions/prepare-apple-build/action.yml"),
             encoding: .utf8
@@ -277,7 +290,6 @@ final class ProjectHygieneTests: XCTestCase {
         )
 
         for retiredWorkflow in [
-            "testflight-external.yml",
             "app-store-preflight.yml",
             "app-store-release.yml",
             "app-store-publish.yml",

@@ -29,7 +29,13 @@ class FakeAppStoreConnectClient
     in_app_purchase_available_territories: %w[AUT USA],
     bundle_id_capabilities: ["IN_APP_PURCHASE"],
     app_store_versions_exist: true,
-    app_store_localizations: nil
+    app_store_localizations: nil,
+    app_store_versions: nil,
+    review_submissions: [],
+    cancel_error_status: nil,
+    cancel_transition_reads: 0,
+    rename_error_status: nil,
+    rename_mutates_before_error: false
   )
     @version_state = version_state
     @release_type = release_type
@@ -51,6 +57,18 @@ class FakeAppStoreConnectClient
     @bundle_id_capabilities = bundle_id_capabilities
     @app_store_versions_exist = app_store_versions_exist
     @created_app_store_versions = {}
+    @configured_app_store_versions = app_store_versions&.transform_values do |versions|
+      versions.map { |version| Marshal.load(Marshal.dump(version)) }
+    end
+    @known_app_store_versions = {}
+    @review_submissions = review_submissions.map { |submission| Marshal.load(Marshal.dump(submission)) }
+    @cancel_error_status = cancel_error_status
+    @cancel_error_consumed = false
+    @cancel_transition_reads = cancel_transition_reads
+    @pending_cancellations = {}
+    @rename_error_status = rename_error_status
+    @rename_error_consumed = false
+    @rename_mutates_before_error = rename_mutates_before_error
     @app_store_localizations = app_store_localizations
     @calls = []
   end
@@ -85,17 +103,10 @@ class FakeAppStoreConnectClient
       []
     when "/v1/apps/6805117080/appStoreVersions"
       platform = query.fetch("filter[platform]")
-      created = @created_app_store_versions[platform]
-      return [created] if created
-      return [] unless @app_store_versions_exist
-
-      state = @version_state.respond_to?(:fetch) ? @version_state.fetch(platform) : @version_state
-      [{
-        "type" => "appStoreVersions",
-        "id" => "version-#{platform}",
-        "attributes" => { "appVersionState" => state, "releaseType" => @release_type }
-      }]
-    when %r{\A/v1/appStoreVersions/(version-(?:IOS|MAC_OS))/appStoreVersionLocalizations\z}
+      versions = configured_or_default_app_store_versions(platform, query["filter[versionString]"])
+      requested_version = query["filter[versionString]"]
+      requested_version ? versions.select { |item| item.dig("attributes", "versionString") == requested_version } : versions
+    when %r{\A/v1/appStoreVersions/(version-(?:IOS|MAC_OS)(?:-[^/]+)?)/appStoreVersionLocalizations\z}
       version_id = Regexp.last_match(1)
       @app_store_localizations || %w[de-DE en-US].map do |locale|
         {
@@ -131,8 +142,13 @@ class FakeAppStoreConnectClient
       in_app_purchase_prices(Regexp.last_match(1))
     when %r{\A/v1/inAppPurchaseAvailabilities/availability-(iap-\d+)/availableTerritories\z}
       @in_app_purchase_available_territories.map { |id| { "type" => "territories", "id" => id } }
-    when "/v1/reviewSubmissions"
-      []
+    when "/v1/apps/6805117080/reviewSubmissions"
+      platform = query.fetch("filter[platform]")
+      states = query["filter[state]"]&.split(",")
+      @review_submissions.select do |submission|
+        submission.dig("attributes", "platform") == platform &&
+          (states.nil? || states.include?(submission.dig("attributes", "state")))
+      end
     when %r{\A/v1/reviewSubmissions/.+/items\z}
       @review_items
     else
@@ -195,6 +211,17 @@ class FakeAppStoreConnectClient
       platform = path.include?("MAC_OS") ? "MAC_OS" : "IOS"
       return { "data" => { "type" => "builds", "id" => "build-#{platform}" } }
     end
+    if (match = %r{\A/v1/appStoreVersions/([^/]+)\z}.match(path))
+      version = @known_app_store_versions.fetch(match[1])
+      finish_pending_cancellation(version)
+      return { "data" => version }
+    end
+    if (match = %r{\A/v1/reviewSubmissions/(.+)\z}.match(path))
+      submission = @review_submissions.find { |item| item.fetch("id") == match[1] }
+      raise "Unexpected review submission #{path}" unless submission
+
+      return { "data" => submission }
+    end
 
     {
       "data" => {
@@ -214,21 +241,26 @@ class FakeAppStoreConnectClient
         "type" => "appStoreVersions",
         "id" => "version-#{platform}",
         "attributes" => {
+          "platform" => platform,
+          "versionString" => body.dig(:data, :attributes, :versionString),
           "appVersionState" => "PREPARE_FOR_SUBMISSION",
           "releaseType" => body.dig(:data, :attributes, :releaseType)
         }
       }
       @created_app_store_versions[platform] = version
+      configured = @configured_app_store_versions&.fetch(platform, nil)
+      configured << version if configured
+      @known_app_store_versions[version.fetch("id")] = version
       return { "data" => version }
     end
     if path == "/v1/reviewSubmissions"
       platform = body.dig(:data, :attributes, :platform)
-      return {
-        "data" => {
-          "id" => "review-submission-#{platform}",
-          "attributes" => { "platform" => platform, "state" => "READY_FOR_REVIEW" }
-        }
+      submission = {
+        "id" => "review-submission-#{platform}",
+        "attributes" => { "platform" => platform, "state" => "READY_FOR_REVIEW" }
       }
+      @review_submissions << submission
+      return { "data" => submission }
     end
 
     { "data" => { "id" => "created" } }
@@ -236,10 +268,95 @@ class FakeAppStoreConnectClient
 
   def patch(path, body:)
     @calls << [:patch, path, body]
+    if body.dig(:data, :attributes, :canceled) == true &&
+       (match = %r{\A/v1/reviewSubmissions/(.+)\z}.match(path))
+      submission = @review_submissions.find { |item| item.fetch("id") == match[1] }
+      raise "Unexpected review submission #{path}" unless submission
+
+      version_id = submission.dig("relationships", "appStoreVersionForReview", "data", "id")
+      if @cancel_transition_reads.positive?
+        submission["attributes"]["state"] = "CANCELING"
+        @pending_cancellations[version_id] = @cancel_transition_reads
+      else
+        submission["attributes"]["state"] = "COMPLETE"
+        @known_app_store_versions.fetch(version_id)["attributes"]["appVersionState"] = "DEVELOPER_REJECTED"
+      end
+      if @cancel_error_status && !@cancel_error_consumed
+        @cancel_error_consumed = true
+        raise AppStoreConnect::APIError.new(
+          "Simulated App Store Connect cancellation race",
+          status: @cancel_error_status,
+          codes: ["STATE_ERROR"]
+        )
+      end
+    end
+    if (match = %r{\A/v1/appStoreVersions/([^/]+)\z}.match(path))
+      version = @known_app_store_versions.fetch(match[1])
+      attributes = body.fetch(:data).fetch(:attributes, {})
+      if attributes.key?(:versionString) && @rename_error_status && !@rename_error_consumed
+        @rename_error_consumed = true
+        if @rename_mutates_before_error
+          attributes.each { |name, value| version.fetch("attributes")[name.to_s] = value }
+        end
+        raise AppStoreConnect::APIError.new(
+          "Simulated App Store Connect version update race",
+          status: @rename_error_status,
+          codes: ["STATE_ERROR"]
+        )
+      end
+      attributes.each do |name, value|
+        version.fetch("attributes")[name.to_s] = value
+      end
+      return { "data" => version }
+    end
     { "data" => { "id" => "updated" } }
   end
 
   private
+
+  def finish_pending_cancellation(version)
+    remaining_reads = @pending_cancellations[version.fetch("id")]
+    return unless remaining_reads
+
+    if remaining_reads.positive?
+      @pending_cancellations[version.fetch("id")] = remaining_reads - 1
+      return
+    end
+
+    version["attributes"]["appVersionState"] = "DEVELOPER_REJECTED"
+    submission = @review_submissions.find do |item|
+      item.dig("relationships", "appStoreVersionForReview", "data", "id") == version.fetch("id")
+    end
+    submission["attributes"]["state"] = "COMPLETE" if submission
+    @pending_cancellations.delete(version.fetch("id"))
+  end
+
+  def configured_or_default_app_store_versions(platform, requested_version)
+    if @configured_app_store_versions
+      versions = @configured_app_store_versions.fetch(platform, [])
+      versions.each { |version| @known_app_store_versions[version.fetch("id")] = version }
+      return versions
+    end
+
+    created = @created_app_store_versions[platform]
+    return [created] if created
+    return [] unless @app_store_versions_exist
+
+    version_string = requested_version || "1.0.0"
+    state = @version_state.respond_to?(:fetch) ? @version_state.fetch(platform) : @version_state
+    version = {
+      "type" => "appStoreVersions",
+      "id" => "version-#{platform}",
+      "attributes" => {
+        "platform" => platform,
+        "versionString" => version_string,
+        "appVersionState" => state,
+        "releaseType" => @release_type
+      }
+    }
+    @known_app_store_versions[version.fetch("id")] = version
+    [version]
+  end
 
   def in_app_purchase_contract
     @in_app_purchase_contract ||= JSON.parse(
@@ -400,6 +517,29 @@ class AppStoreConnectTest < Minitest::Test
     assert_equal "APP_STORE_ELIGIBLE", filters.fetch("filter[buildAudienceType]")
   end
 
+  def test_cli_parses_platform_scoped_localizations
+    options = AppStoreConnect::CLI.parse_options([
+      "--localization", "IOS:en-US=/tmp/ios.txt",
+      "--localization", "MAC_OS:en-US=/tmp/macos.txt"
+    ])
+
+    assert_equal(
+      {
+        "IOS" => { "en-US" => "/tmp/ios.txt" },
+        "MAC_OS" => { "en-US" => "/tmp/macos.txt" }
+      },
+      options.fetch(:localizations)
+    )
+  end
+
+  def test_cli_rejects_an_unscoped_localization
+    error = assert_raises(OptionParser::InvalidArgument) do
+      AppStoreConnect::CLI.parse_options(["--localization", "en-US=/tmp/notes.txt"])
+    end
+
+    assert_match(/PLATFORM:LOCALE=PATH/, error.message)
+  end
+
   def test_beta_group_create_uses_only_attributes_allowed_by_the_create_contract
     payload = AppStoreConnect.beta_group_payload(
       app_id: "6805117080",
@@ -413,7 +553,7 @@ class AppStoreConnectTest < Minitest::Test
     refute attributes.key?(:iosBuildsAvailableForAppleVision)
   end
 
-  def test_client_does_not_blindly_retry_mutating_posts_after_server_errors
+  def test_client_retries_rate_limits_but_not_ambiguous_post_server_errors
     client = AppStoreConnect::Client.new(
       issuer_id: "issuer",
       key_id: "key",
@@ -425,8 +565,27 @@ class AppStoreConnectTest < Minitest::Test
 
     assert_equal false, client.send(:retryable?, :post, unavailable)
     assert_equal true, client.send(:retryable?, :get, unavailable)
-    assert_equal false, client.send(:retryable?, :post, rate_limited)
+    assert_equal true, client.send(:retryable?, :post, rate_limited)
     assert_equal true, client.send(:retryable?, :patch, rate_limited)
+  end
+
+  def test_client_preserves_structured_api_error_status_and_codes
+    client = AppStoreConnect::Client.new(
+      issuer_id: "issuer",
+      key_id: "key",
+      private_key: OpenSSL::PKey::EC.generate("prime256v1").to_pem
+    )
+    response = Struct.new(:code, :body).new(
+      "409",
+      JSON.generate(errors: [{ code: "STATE_ERROR", title: "Conflict", detail: "The state changed." }])
+    )
+
+    error = client.send(:api_error, response)
+
+    assert_instance_of AppStoreConnect::APIError, error
+    assert_equal 409, error.status
+    assert_equal ["STATE_ERROR"], error.codes
+    assert_match(/The state changed/, error.message)
   end
 
   def test_in_app_purchase_preflight_accepts_complete_first_release_products
@@ -653,27 +812,38 @@ class AppStoreConnectTest < Minitest::Test
     assert_equal false, compatibility_call.last.dig(:data, :attributes, :iosBuildsAvailableForAppleSiliconMac)
   end
 
-  def test_internal_distribution_sets_release_notes_on_both_builds
-    file = Tempfile.new("internal-what-to-test")
-    file.write("Test the shared library.")
-    file.close
+  def test_internal_distribution_sets_platform_specific_release_notes
+    ios = Tempfile.new("internal-ios-what-to-test")
+    macos = Tempfile.new("internal-macos-what-to-test")
+    ios.write("Test the mobile viewer.")
+    macos.write("Test the desktop viewer.")
+    ios.close
+    macos.close
 
     @manager.distribute_internal(
       version: "1.0.0",
       build_number: "714",
       group_name: "Internal Testers",
-      localization_paths: { "en-US" => file.path }
+      localization_paths: {
+        "IOS" => { "en-US" => ios.path },
+        "MAC_OS" => { "en-US" => macos.path }
+      }
     )
 
     localization_posts = @client.calls.select do |method, path, _body|
       method == :post && path == "/v1/betaBuildLocalizations"
     end
-    assert_equal 2, localization_posts.length
-    assert localization_posts.all? do |_method, _path, body|
-      body.dig(:data, :attributes, :whatsNew) == "Test the shared library."
+    notes_by_build = localization_posts.to_h do |_method, _path, body|
+      [
+        body.dig(:data, :relationships, :build, :data, :id),
+        body.dig(:data, :attributes, :whatsNew)
+      ]
     end
+    assert_equal "Test the mobile viewer.", notes_by_build.fetch("build-IOS")
+    assert_equal "Test the desktop viewer.", notes_by_build.fetch("build-MAC_OS")
   ensure
-    file&.unlink
+    ios&.unlink
+    macos&.unlink
   end
 
   def test_external_distribution_sets_test_text_and_submits_both_builds
@@ -685,7 +855,7 @@ class AppStoreConnectTest < Minitest::Test
       version: "1.0.0",
       build_number: "714",
       group_name: "External Testers",
-      localization_paths: { "en-US" => file.path }
+      localization_paths: AppStoreConnect::PLATFORMS.to_h { |platform| [platform, { "en-US" => file.path }] }
     )
 
     localization_posts = @client.calls.count do |method, path, _body|
@@ -716,7 +886,7 @@ class AppStoreConnectTest < Minitest::Test
       version: "1.0.0",
       build_number: "714",
       group_name: "External Testers",
-      localization_paths: { "en-US" => __FILE__ }
+      localization_paths: AppStoreConnect::PLATFORMS.to_h { |platform| [platform, { "en-US" => __FILE__ }] }
     )
 
     review_posts = client.calls.count do |method, path, _body|
@@ -742,7 +912,7 @@ class AppStoreConnectTest < Minitest::Test
         version: "1.0.0",
         build_number: "714",
         group_name: "External Testers",
-        localization_paths: { "en-US" => __FILE__ }
+        localization_paths: AppStoreConnect::PLATFORMS.to_h { |platform| [platform, { "en-US" => __FILE__ }] }
       )
     end
     assert_match(/internal TestFlight group/, error.message)
@@ -762,7 +932,7 @@ class AppStoreConnectTest < Minitest::Test
         version: "1.0.0",
         build_number: "714",
         group_name: "External Testers",
-        localization_paths: { "en-US" => __FILE__ }
+        localization_paths: AppStoreConnect::PLATFORMS.to_h { |platform| [platform, { "en-US" => __FILE__ }] }
       )
     end
     assert_match(/E.164/, error.message)
@@ -782,7 +952,7 @@ class AppStoreConnectTest < Minitest::Test
         version: "1.0.0",
         build_number: "714",
         group_name: "External Testers",
-        localization_paths: { "en-US" => __FILE__ }
+        localization_paths: AppStoreConnect::PLATFORMS.to_h { |platform| [platform, { "en-US" => __FILE__ }] }
       )
     end
     assert_match(/must require a demo account/, error.message)
@@ -830,7 +1000,9 @@ class AppStoreConnectTest < Minitest::Test
       version: "1.1.0",
       build_number: "714",
       submit: true,
-      localization_paths: { "de-DE" => german.path, "en-US" => english.path },
+      localization_paths: AppStoreConnect::PLATFORMS.to_h do |platform|
+        [platform, { "de-DE" => german.path, "en-US" => english.path }]
+      end,
       create_versions: true,
       automatic_release: true
     )
@@ -1009,6 +1181,588 @@ class AppStoreConnectTest < Minitest::Test
     assert_equal ["/v1/appStoreVersions/version-MAC_OS/relationships/build"], attachment_paths
   end
 
+  def test_new_stable_release_validates_then_cancels_and_renames_older_versions
+    versions = AppStoreConnect::PLATFORMS.to_h do |platform|
+      [platform, [app_store_version(platform: platform, version: "1.0.1", state: "WAITING_FOR_REVIEW")]]
+    end
+    submissions = AppStoreConnect::PLATFORMS.map do |platform|
+      review_submission(
+        platform: platform,
+        version_id: "version-#{platform}-1.0.1",
+        state: "WAITING_FOR_REVIEW"
+      )
+    end
+    client = FakeAppStoreConnectClient.new(
+      app_store_versions: versions,
+      review_submissions: submissions
+    )
+    manager = AppStoreConnect::ReleaseManager.new(
+      client: client,
+      app_id: "6805117080",
+      output_path: nil,
+      summary_path: nil,
+      sleeper: ->(_seconds) {},
+      monotonic_clock: -> { 0 }
+    )
+
+    manager.prepare_app_store(
+      version: "1.0.2",
+      build_number: "714",
+      submit: true,
+      create_versions: true,
+      automatic_release: true
+    )
+
+    cancellation_calls = client.calls.select do |method, path, body|
+      method == :patch && path.start_with?("/v1/reviewSubmissions/old-review-") &&
+        body.dig(:data, :attributes, :canceled) == true
+    end
+    assert_equal 2, cancellation_calls.length
+    assert_equal(
+      %w[old-review-IOS old-review-MAC_OS],
+      cancellation_calls.map { |_method, path, _body| path.split("/").last }
+    )
+
+    rename_calls = client.calls.select do |method, path, body|
+      method == :patch && path.match?(%r{\A/v1/appStoreVersions/version-(?:IOS|MAC_OS)-1\.0\.1\z}) &&
+        body.dig(:data, :attributes, :versionString) == "1.0.2"
+    end
+    assert_equal 2, rename_calls.length
+    refute client.calls.any? { |method, path, _body| method == :post && path == "/v1/appStoreVersions" }
+    assert_operator(
+      cancellation_calls.map { |call| client.calls.index(call) }.max,
+      :<,
+      rename_calls.map { |call| client.calls.index(call) }.min
+    )
+  end
+
+  def test_new_stable_release_cancels_only_the_platform_with_an_older_version
+    versions = {
+      "IOS" => [app_store_version(platform: "IOS", version: "1.0.1", state: "IN_REVIEW")],
+      "MAC_OS" => [app_store_version(platform: "MAC_OS", version: "1.0.2", state: "WAITING_FOR_REVIEW")]
+    }
+    submissions = [
+      review_submission(platform: "IOS", version_id: "version-IOS-1.0.1", state: "IN_REVIEW"),
+      review_submission(
+        platform: "MAC_OS",
+        version_id: "version-MAC_OS-1.0.2",
+        state: "WAITING_FOR_REVIEW"
+      )
+    ]
+    client = FakeAppStoreConnectClient.new(
+      app_store_versions: versions,
+      review_submissions: submissions
+    )
+    manager = AppStoreConnect::ReleaseManager.new(
+      client: client,
+      app_id: "6805117080",
+      output_path: nil,
+      summary_path: nil,
+      sleeper: ->(_seconds) {},
+      monotonic_clock: -> { 0 }
+    )
+
+    manager.prepare_app_store(
+      version: "1.0.2",
+      build_number: "714",
+      submit: true,
+      create_versions: true,
+      automatic_release: true
+    )
+
+    cancellation_paths = client.calls.filter_map do |method, path, body|
+      path if method == :patch && body.dig(:data, :attributes, :canceled) == true
+    end
+    assert_equal ["/v1/reviewSubmissions/old-review-IOS"], cancellation_paths
+  end
+
+  def test_missing_platform_version_is_created_and_validated_before_any_cancellation
+    versions = {
+      "IOS" => [app_store_version(platform: "IOS", version: "1.0.1", state: "WAITING_FOR_REVIEW")],
+      "MAC_OS" => []
+    }
+    submissions = [
+      review_submission(
+        platform: "IOS",
+        version_id: "version-IOS-1.0.1",
+        state: "WAITING_FOR_REVIEW"
+      )
+    ]
+    client = FakeAppStoreConnectClient.new(
+      app_store_versions: versions,
+      review_submissions: submissions
+    )
+    manager = release_manager(client)
+
+    manager.prepare_app_store(
+      version: "1.0.2",
+      build_number: "714",
+      submit: true,
+      create_versions: true,
+      automatic_release: true
+    )
+
+    creation_index = client.calls.index do |method, path, body|
+      method == :post && path == "/v1/appStoreVersions" &&
+        body.dig(:data, :attributes, :platform) == "MAC_OS"
+    end
+    cancellation_index = client.calls.index do |method, _path, body|
+      method == :patch && body.dig(:data, :attributes, :canceled) == true
+    end
+    macos_review_preflight_index = client.calls.index do |method, path, _query|
+      method == :get && path == "/v1/appStoreVersions/version-MAC_OS/appStoreReviewDetail"
+    end
+    refute_nil creation_index
+    refute_nil macos_review_preflight_index
+    refute_nil cancellation_index
+    assert_operator creation_index, :<, macos_review_preflight_index
+    assert_operator macos_review_preflight_index, :<, cancellation_index
+  end
+
+  def test_cancellation_conflict_reconciles_the_authoritative_apple_state
+    versions = {
+      "IOS" => [app_store_version(platform: "IOS", version: "1.0.1", state: "WAITING_FOR_REVIEW")],
+      "MAC_OS" => [app_store_version(platform: "MAC_OS", version: "1.0.2", state: "WAITING_FOR_REVIEW")]
+    }
+    submissions = [
+      review_submission(
+        platform: "IOS",
+        version_id: "version-IOS-1.0.1",
+        state: "WAITING_FOR_REVIEW"
+      ),
+      review_submission(
+        platform: "MAC_OS",
+        version_id: "version-MAC_OS-1.0.2",
+        state: "WAITING_FOR_REVIEW"
+      )
+    ]
+    client = FakeAppStoreConnectClient.new(
+      app_store_versions: versions,
+      review_submissions: submissions,
+      cancel_error_status: 409
+    )
+    manager = AppStoreConnect::ReleaseManager.new(
+      client: client,
+      app_id: "6805117080",
+      output_path: nil,
+      summary_path: nil,
+      sleeper: ->(_seconds) {},
+      monotonic_clock: -> { 0 }
+    )
+
+    manager.prepare_app_store(
+      version: "1.0.2",
+      build_number: "714",
+      submit: true,
+      create_versions: true,
+      automatic_release: true
+    )
+
+    assert client.calls.any? { |method, path, body|
+      method == :patch && path == "/v1/appStoreVersions/version-IOS-1.0.1" &&
+        body.dig(:data, :attributes, :versionString) == "1.0.2"
+    }
+    refute client.calls.any? { |method, path, _body| method == :post && path == "/v1/appStoreVersions" }
+  end
+
+  def test_version_update_conflict_reconciles_an_already_changed_version
+    versions = AppStoreConnect::PLATFORMS.to_h do |platform|
+      [platform, [app_store_version(platform: platform, version: "1.0.1", state: "WAITING_FOR_REVIEW")]]
+    end
+    submissions = AppStoreConnect::PLATFORMS.map do |platform|
+      review_submission(
+        platform: platform,
+        version_id: "version-#{platform}-1.0.1",
+        state: "WAITING_FOR_REVIEW"
+      )
+    end
+    client = FakeAppStoreConnectClient.new(
+      app_store_versions: versions,
+      review_submissions: submissions,
+      rename_error_status: 409,
+      rename_mutates_before_error: true
+    )
+    manager = release_manager(client)
+
+    manager.prepare_app_store(
+      version: "1.0.2",
+      build_number: "714",
+      submit: true,
+      create_versions: true,
+      automatic_release: true
+    )
+
+    submitted = client.calls.count do |method, path, body|
+      method == :patch && path.start_with?("/v1/reviewSubmissions/review-submission-") &&
+        body.dig(:data, :attributes, :submitted) == true
+    end
+    assert_equal 2, submitted
+  end
+
+  def test_refused_version_change_stops_safely_and_rerun_recovers_rejected_versions
+    versions = AppStoreConnect::PLATFORMS.to_h do |platform|
+      [platform, [app_store_version(platform: platform, version: "1.0.1", state: "WAITING_FOR_REVIEW")]]
+    end
+    submissions = AppStoreConnect::PLATFORMS.map do |platform|
+      review_submission(
+        platform: platform,
+        version_id: "version-#{platform}-1.0.1",
+        state: "WAITING_FOR_REVIEW"
+      )
+    end
+    client = FakeAppStoreConnectClient.new(
+      app_store_versions: versions,
+      review_submissions: submissions,
+      rename_error_status: 422
+    )
+    manager = release_manager(client)
+
+    error = assert_raises(AppStoreConnect::Error) do
+      manager.prepare_app_store(
+        version: "1.0.2",
+        build_number: "714",
+        submit: true,
+        create_versions: true,
+        automatic_release: true
+      )
+    end
+
+    assert_match(/Apple returned HTTP 422/, error.message)
+    assert_match(/still reports version 1\.0\.1 in DEVELOPER_REJECTED/, error.message)
+    assert_match(/did not delete or create a version/, error.message)
+    refute client.calls.any? { |method, path, _body| method == :post && path == "/v1/appStoreVersions" }
+
+    manager.prepare_app_store(
+      version: "1.0.2",
+      build_number: "714",
+      submit: true,
+      create_versions: true,
+      automatic_release: true
+    )
+
+    cancellation_count = client.calls.count do |method, _path, body|
+      method == :patch && body.dig(:data, :attributes, :canceled) == true
+    end
+    assert_equal 2, cancellation_count
+  end
+
+  def test_replacement_waits_for_apple_to_confirm_the_canceled_version
+    versions = {
+      "IOS" => [app_store_version(platform: "IOS", version: "1.0.1", state: "WAITING_FOR_REVIEW")],
+      "MAC_OS" => [app_store_version(platform: "MAC_OS", version: "1.0.2", state: "WAITING_FOR_REVIEW")]
+    }
+    submissions = [
+      review_submission(
+        platform: "IOS",
+        version_id: "version-IOS-1.0.1",
+        state: "WAITING_FOR_REVIEW"
+      ),
+      review_submission(
+        platform: "MAC_OS",
+        version_id: "version-MAC_OS-1.0.2",
+        state: "WAITING_FOR_REVIEW"
+      )
+    ]
+    client = FakeAppStoreConnectClient.new(
+      app_store_versions: versions,
+      review_submissions: submissions,
+      cancel_transition_reads: 1
+    )
+    sleeps = []
+    manager = AppStoreConnect::ReleaseManager.new(
+      client: client,
+      app_id: "6805117080",
+      output_path: nil,
+      summary_path: nil,
+      sleeper: ->(seconds) { sleeps << seconds },
+      monotonic_clock: -> { 0 }
+    )
+
+    manager.prepare_app_store(
+      version: "1.0.2",
+      build_number: "714",
+      submit: true,
+      create_versions: true,
+      automatic_release: true
+    )
+
+    rename_index = client.calls.index do |method, path, body|
+      method == :patch && path == "/v1/appStoreVersions/version-IOS-1.0.1" &&
+        body.dig(:data, :attributes, :versionString) == "1.0.2"
+    end
+    refute_nil rename_index
+    confirmation_reads = client.calls.each_index.select do |index|
+      method, path, = client.calls[index]
+      index < rename_index && method == :get && path == "/v1/appStoreVersions/version-IOS-1.0.1"
+    end
+    assert_equal [10, 10], sleeps
+    assert_operator confirmation_reads.length, :>=, 3
+    assert_equal rename_index - 1, confirmation_reads.last
+  end
+
+  def test_rerun_does_not_repeat_a_cancellation_that_apple_is_completing
+    %w[COMPLETING COMPLETE].each do |initial_submission_state|
+      versions = {
+        "IOS" => [app_store_version(platform: "IOS", version: "1.0.1", state: "WAITING_FOR_REVIEW")],
+        "MAC_OS" => [app_store_version(platform: "MAC_OS", version: "1.0.2", state: "WAITING_FOR_REVIEW")]
+      }
+      submissions = [
+        review_submission(
+          platform: "IOS",
+          version_id: "version-IOS-1.0.1",
+          state: initial_submission_state
+        ),
+        review_submission(
+          platform: "MAC_OS",
+          version_id: "version-MAC_OS-1.0.2",
+          state: "WAITING_FOR_REVIEW"
+        )
+      ]
+      client = FakeAppStoreConnectClient.new(
+        app_store_versions: versions,
+        review_submissions: submissions
+      )
+      original_get = client.method(:get)
+      version_reads = 0
+      client.define_singleton_method(:get) do |path, query: {}|
+        response = original_get.call(path, query: query)
+        if path == "/v1/reviewSubmissions/old-review-IOS"
+          response.fetch("data").fetch("attributes")["state"] = "COMPLETE"
+        elsif path == "/v1/appStoreVersions/version-IOS-1.0.1"
+          version_reads += 1
+          if version_reads >= 3
+            response.fetch("data").fetch("attributes")["appVersionState"] = "DEVELOPER_REJECTED"
+          end
+        end
+        response
+      end
+      sleeps = []
+      manager = AppStoreConnect::ReleaseManager.new(
+        client: client,
+        app_id: "6805117080",
+        output_path: nil,
+        summary_path: nil,
+        sleeper: ->(seconds) { sleeps << seconds },
+        monotonic_clock: -> { 0 }
+      )
+
+      manager.prepare_app_store(
+        version: "1.0.2",
+        build_number: "714",
+        submit: true,
+        create_versions: true,
+        automatic_release: true
+      )
+
+      refute cancellation_requested?(client), initial_submission_state
+      assert_equal [10, 10], sleeps, initial_submission_state
+    end
+  end
+
+  def test_invalid_target_state_prevents_every_cancellation
+    versions = {
+      "IOS" => [app_store_version(platform: "IOS", version: "1.0.1", state: "WAITING_FOR_REVIEW")],
+      "MAC_OS" => [app_store_version(platform: "MAC_OS", version: "1.0.2", state: "REJECTED")]
+    }
+    submissions = [
+      review_submission(
+        platform: "IOS",
+        version_id: "version-IOS-1.0.1",
+        state: "WAITING_FOR_REVIEW"
+      )
+    ]
+    client = FakeAppStoreConnectClient.new(
+      app_store_versions: versions,
+      review_submissions: submissions
+    )
+    manager = release_manager(client)
+
+    error = assert_raises(AppStoreConnect::Error) do
+      manager.prepare_app_store(
+        version: "1.0.2",
+        build_number: "714",
+        submit: true,
+        create_versions: true,
+        automatic_release: true
+      )
+    end
+
+    assert_match(/MAC_OS App Store version cannot use this release workflow from REJECTED/, error.message)
+    refute cancellation_requested?(client)
+  end
+
+  def test_missing_review_metadata_prevents_every_cancellation
+    versions = AppStoreConnect::PLATFORMS.to_h do |platform|
+      [platform, [app_store_version(platform: platform, version: "1.0.1", state: "WAITING_FOR_REVIEW")]]
+    end
+    submissions = AppStoreConnect::PLATFORMS.map do |platform|
+      review_submission(
+        platform: platform,
+        version_id: "version-#{platform}-1.0.1",
+        state: "WAITING_FOR_REVIEW"
+      )
+    end
+    client = FakeAppStoreConnectClient.new(
+      app_store_versions: versions,
+      review_submissions: submissions,
+      review_notes: ""
+    )
+    manager = release_manager(client)
+
+    error = assert_raises(AppStoreConnect::Error) do
+      manager.prepare_app_store(
+        version: "1.0.2",
+        build_number: "714",
+        submit: true,
+        create_versions: true,
+        automatic_release: true
+      )
+    end
+
+    assert_match(/App Store review notes are missing/, error.message)
+    refute cancellation_requested?(client)
+  end
+
+  def test_missing_release_notes_file_prevents_every_cancellation
+    versions = AppStoreConnect::PLATFORMS.to_h do |platform|
+      [platform, [app_store_version(platform: platform, version: "1.0.1", state: "WAITING_FOR_REVIEW")]]
+    end
+    submissions = AppStoreConnect::PLATFORMS.map do |platform|
+      review_submission(
+        platform: platform,
+        version_id: "version-#{platform}-1.0.1",
+        state: "WAITING_FOR_REVIEW"
+      )
+    end
+    client = FakeAppStoreConnectClient.new(
+      app_store_versions: versions,
+      review_submissions: submissions
+    )
+    manager = release_manager(client)
+
+    error = assert_raises(AppStoreConnect::Error) do
+      manager.prepare_app_store(
+        version: "1.0.2",
+        build_number: "714",
+        submit: true,
+        localization_paths: { "IOS" => { "en-US" => "/missing/release-notes.txt" } },
+        create_versions: true,
+        automatic_release: true
+      )
+    end
+
+    assert_match(/IOS App Store release notes are missing for en-US/, error.message)
+    refute cancellation_requested?(client)
+  end
+
+  def test_rerun_renames_versions_that_were_already_developer_rejected
+    versions = AppStoreConnect::PLATFORMS.to_h do |platform|
+      [platform, [app_store_version(platform: platform, version: "1.0.1", state: "DEVELOPER_REJECTED")]]
+    end
+    client = FakeAppStoreConnectClient.new(app_store_versions: versions)
+    manager = release_manager(client)
+
+    manager.prepare_app_store(
+      version: "1.0.2",
+      build_number: "714",
+      submit: true,
+      create_versions: true,
+      automatic_release: true
+    )
+
+    rename_calls = client.calls.select do |method, path, body|
+      method == :patch && path.match?(%r{\A/v1/appStoreVersions/version-(?:IOS|MAC_OS)-1\.0\.1\z}) &&
+        body.dig(:data, :attributes, :versionString) == "1.0.2"
+    end
+    assert_equal 2, rename_calls.length
+    refute cancellation_requested?(client)
+    refute client.calls.any? { |method, path, _body| method == :post && path == "/v1/appStoreVersions" }
+  end
+
+  def test_pending_release_can_be_canceled_through_its_completed_review_submission
+    versions = AppStoreConnect::PLATFORMS.to_h do |platform|
+      [platform, [app_store_version(
+        platform: platform,
+        version: "1.0.1",
+        state: "PENDING_DEVELOPER_RELEASE"
+      )]]
+    end
+    submissions = AppStoreConnect::PLATFORMS.map do |platform|
+      review_submission(
+        platform: platform,
+        version_id: "version-#{platform}-1.0.1",
+        state: "COMPLETE"
+      )
+    end
+    client = FakeAppStoreConnectClient.new(
+      app_store_versions: versions,
+      review_submissions: submissions
+    )
+    manager = AppStoreConnect::ReleaseManager.new(
+      client: client,
+      app_id: "6805117080",
+      output_path: nil,
+      summary_path: nil,
+      sleeper: ->(_seconds) {},
+      monotonic_clock: -> { 0 }
+    )
+
+    manager.prepare_app_store(
+      version: "1.0.2",
+      build_number: "714",
+      submit: true,
+      create_versions: true,
+      automatic_release: true
+    )
+
+    cancellation_count = client.calls.count do |method, _path, body|
+      method == :patch && body.dig(:data, :attributes, :canceled) == true
+    end
+    assert_equal 2, cancellation_count
+  end
+
+  def test_release_refuses_to_replace_a_newer_reviewed_version
+    versions = {
+      "IOS" => [app_store_version(platform: "IOS", version: "1.0.1", state: "WAITING_FOR_REVIEW")],
+      "MAC_OS" => [app_store_version(platform: "MAC_OS", version: "1.0.3", state: "WAITING_FOR_REVIEW")]
+    }
+    submissions = versions.map do |platform, platform_versions|
+      existing_version = platform_versions.fetch(0).dig("attributes", "versionString")
+      review_submission(
+        platform: platform,
+        version_id: "version-#{platform}-#{existing_version}",
+        state: "WAITING_FOR_REVIEW"
+      )
+    end
+    client = FakeAppStoreConnectClient.new(
+      app_store_versions: versions,
+      review_submissions: submissions
+    )
+    manager = AppStoreConnect::ReleaseManager.new(
+      client: client,
+      app_id: "6805117080",
+      output_path: nil,
+      summary_path: nil
+    )
+
+    error = assert_raises(AppStoreConnect::Error) do
+      manager.prepare_app_store(
+        version: "1.0.2",
+        build_number: "714",
+        submit: true,
+        create_versions: true,
+        automatic_release: true
+      )
+    end
+
+    assert_match(/1\.0\.3 cannot be superseded by 1\.0\.2/, error.message)
+    refute client.calls.any? { |method, path, _body| method == :post && path == "/v1/appStoreVersions" }
+    cancellation_requested = client.calls.any? do |method, _path, body|
+      method == :patch && body.dig(:data, :attributes, :canceled) == true
+    end
+    refute cancellation_requested
+  end
+
   def test_open_review_submission_rejects_another_app_version
     client = FakeAppStoreConnectClient.new(review_items: [{
       "id" => "existing-item",
@@ -1017,7 +1771,9 @@ class AppStoreConnectTest < Minitest::Test
       }
     }])
     def client.collection(path, query: {})
-      return [{ "id" => "open", "attributes" => { "state" => "READY_FOR_REVIEW" } }] if path == "/v1/reviewSubmissions"
+      if path == "/v1/apps/6805117080/reviewSubmissions" && query["filter[state]"] == "READY_FOR_REVIEW"
+        return [{ "id" => "open", "attributes" => { "state" => "READY_FOR_REVIEW" } }]
+      end
 
       super
     end
@@ -1032,6 +1788,51 @@ class AppStoreConnectTest < Minitest::Test
       manager.prepare_app_store(version: "1.0.0", build_number: "714", submit: true)
     end
     assert_match(/already contains another app version/, error.message)
+  end
+
+  private
+
+  def release_manager(client)
+    AppStoreConnect::ReleaseManager.new(
+      client: client,
+      app_id: "6805117080",
+      output_path: nil,
+      summary_path: nil,
+      sleeper: ->(_seconds) {},
+      monotonic_clock: -> { 0 }
+    )
+  end
+
+  def cancellation_requested?(client)
+    client.calls.any? do |method, _path, body|
+      method == :patch && body.dig(:data, :attributes, :canceled) == true
+    end
+  end
+
+  def app_store_version(platform:, version:, state:)
+    {
+      "type" => "appStoreVersions",
+      "id" => "version-#{platform}-#{version}",
+      "attributes" => {
+        "platform" => platform,
+        "versionString" => version,
+        "appVersionState" => state,
+        "releaseType" => "AFTER_APPROVAL"
+      }
+    }
+  end
+
+  def review_submission(platform:, version_id:, state:)
+    {
+      "type" => "reviewSubmissions",
+      "id" => "old-review-#{platform}",
+      "attributes" => { "platform" => platform, "state" => state },
+      "relationships" => {
+        "appStoreVersionForReview" => {
+          "data" => { "type" => "appStoreVersions", "id" => version_id }
+        }
+      }
+    }
   end
 
 end

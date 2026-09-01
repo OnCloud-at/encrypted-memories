@@ -32,13 +32,32 @@ jobs:
       prerelease: ${{ steps.release.outputs.prerelease }}
       channel: ${{ steps.release.outputs.channel }}
       commit_sha: ${{ steps.revision.outputs.commit_sha }}
-      notes_de_base64: ${{ steps.release.outputs.notes_de_base64 }}
-      notes_en_base64: ${{ steps.release.outputs.notes_en_base64 }}
+      automation_sha: ${{ steps.automation.outputs.commit_sha }}
+      notes_ios_de_base64: ${{ steps.release.outputs.notes_ios_de_base64 }}
+      notes_ios_en_base64: ${{ steps.release.outputs.notes_ios_en_base64 }}
+      notes_macos_de_base64: ${{ steps.release.outputs.notes_macos_de_base64 }}
+      notes_macos_en_base64: ${{ steps.release.outputs.notes_macos_en_base64 }}
     steps:
-      - name: Check out workflow code
+      - name: Validate workflow source
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == "workflow_dispatch" && "$GITHUB_REF" != "refs/heads/main" ]]; then
+            echo "Run a manual Apple release retry from main." >&2
+            exit 1
+          fi
+
+      - name: Check out trusted automation
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
+          ref: main
+          fetch-depth: 0
           persist-credentials: false
+
+      - name: Record trusted automation revision
+        id: automation
+        run: echo "commit_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Validate scripts
         run: |
@@ -71,11 +90,21 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           ref: ${{ steps.release.outputs.tag }}
+          fetch-depth: 0
           persist-credentials: false
 
-      - name: Record release commit
+      - name: Verify and record release commit
         id: revision
-        run: echo "commit_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+        env:
+          AUTOMATION_SHA: ${{ steps.automation.outputs.commit_sha }}
+        run: |
+          set -euo pipefail
+          release_sha="$(git rev-parse HEAD)"
+          git merge-base --is-ancestor "$release_sha" "$AUTOMATION_SHA" || {
+            echo "The release tag must point to a commit on main." >&2
+            exit 1
+          }
+          echo "commit_sha=$release_sha" >> "$GITHUB_OUTPUT"
 
   in-app-purchase-preflight:
     name: Validate StoreKit sandbox metadata
@@ -84,9 +113,10 @@ jobs:
     timeout-minutes: 10
     environment: testflight-internal
     steps:
-      - name: Check out release contract
+      - name: Check out trusted release automation
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
+          ref: ${{ needs.prepare.outputs.automation_sha }}
           persist-credentials: false
 
       - name: Validate App Store Connect products
@@ -133,8 +163,19 @@ jobs:
       - name: Check out source
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
-          ref: ${{ needs.prepare.outputs.tag }}
+          ref: ${{ needs.prepare.outputs.commit_sha }}
           persist-credentials: false
+
+      - name: Verify checked-out release revision
+        env:
+          EXPECTED_RELEASE_SHA: ${{ needs.prepare.outputs.commit_sha }}
+        run: |
+          set -euo pipefail
+          actual_release_sha="$(git rev-parse HEAD)"
+          [[ "$actual_release_sha" == "$EXPECTED_RELEASE_SHA" ]] || {
+            echo "The checked-out source does not match the validated release commit." >&2
+            exit 1
+          }
 
       - name: Check for an existing upload
         id: build
@@ -516,22 +557,28 @@ jobs:
     timeout-minutes: 60
     environment: testflight-internal
     steps:
-      - name: Check out workflow code
+      - name: Check out trusted release automation
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
-          ref: ${{ needs.prepare.outputs.tag }}
+          ref: ${{ needs.prepare.outputs.automation_sha }}
           persist-credentials: false
 
       - name: Restore localized Apple notes
         env:
-          NOTES_DE_BASE64: ${{ needs.prepare.outputs.notes_de_base64 }}
-          NOTES_EN_BASE64: ${{ needs.prepare.outputs.notes_en_base64 }}
+          NOTES_IOS_DE_BASE64: ${{ needs.prepare.outputs.notes_ios_de_base64 }}
+          NOTES_IOS_EN_BASE64: ${{ needs.prepare.outputs.notes_ios_en_base64 }}
+          NOTES_MACOS_DE_BASE64: ${{ needs.prepare.outputs.notes_macos_de_base64 }}
+          NOTES_MACOS_EN_BASE64: ${{ needs.prepare.outputs.notes_macos_en_base64 }}
         run: |
           mkdir -p "$RUNNER_TEMP/apple-release-notes"
-          ruby -rbase64 -e 'File.write(ARGV.fetch(0), Base64.strict_decode64(ENV.fetch("NOTES_DE_BASE64")))' \
-            "$RUNNER_TEMP/apple-release-notes/de-DE.txt"
-          ruby -rbase64 -e 'File.write(ARGV.fetch(0), Base64.strict_decode64(ENV.fetch("NOTES_EN_BASE64")))' \
-            "$RUNNER_TEMP/apple-release-notes/en-US.txt"
+          ruby -rbase64 -e 'File.write(ARGV.fetch(0), Base64.strict_decode64(ENV.fetch(ARGV.fetch(1))))' \
+            "$RUNNER_TEMP/apple-release-notes/ios.de-DE.txt" NOTES_IOS_DE_BASE64
+          ruby -rbase64 -e 'File.write(ARGV.fetch(0), Base64.strict_decode64(ENV.fetch(ARGV.fetch(1))))' \
+            "$RUNNER_TEMP/apple-release-notes/ios.en-US.txt" NOTES_IOS_EN_BASE64
+          ruby -rbase64 -e 'File.write(ARGV.fetch(0), Base64.strict_decode64(ENV.fetch(ARGV.fetch(1))))' \
+            "$RUNNER_TEMP/apple-release-notes/macos.de-DE.txt" NOTES_MACOS_DE_BASE64
+          ruby -rbase64 -e 'File.write(ARGV.fetch(0), Base64.strict_decode64(ENV.fetch(ARGV.fetch(1))))' \
+            "$RUNNER_TEMP/apple-release-notes/macos.en-US.txt" NOTES_MACOS_EN_BASE64
 
       - name: Wait for Apple and distribute the builds
         env:
@@ -548,33 +595,41 @@ jobs:
           ruby .github/scripts/app_store_connect.rb distribute-internal \
             --version "${{ needs.prepare.outputs.version }}" \
             --build-number "${{ needs.prepare.outputs.build_number }}" \
-            --localization "de-DE=$RUNNER_TEMP/apple-release-notes/de-DE.txt" \
-            --localization "en-US=$RUNNER_TEMP/apple-release-notes/en-US.txt"
+            --localization "IOS:de-DE=$RUNNER_TEMP/apple-release-notes/ios.de-DE.txt" \
+            --localization "IOS:en-US=$RUNNER_TEMP/apple-release-notes/ios.en-US.txt" \
+            --localization "MAC_OS:de-DE=$RUNNER_TEMP/apple-release-notes/macos.de-DE.txt" \
+            --localization "MAC_OS:en-US=$RUNNER_TEMP/apple-release-notes/macos.en-US.txt"
 
   submit-app-store:
     name: Submit iOS and macOS to App Review
     needs: [prepare, upload]
     if: needs.prepare.outputs.prerelease == 'false'
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 90
     environment: app-store-production
     steps:
-      - name: Check out workflow code
+      - name: Check out trusted release automation
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
-          ref: ${{ needs.prepare.outputs.tag }}
+          ref: ${{ needs.prepare.outputs.automation_sha }}
           persist-credentials: false
 
       - name: Restore localized Apple notes
         env:
-          NOTES_DE_BASE64: ${{ needs.prepare.outputs.notes_de_base64 }}
-          NOTES_EN_BASE64: ${{ needs.prepare.outputs.notes_en_base64 }}
+          NOTES_IOS_DE_BASE64: ${{ needs.prepare.outputs.notes_ios_de_base64 }}
+          NOTES_IOS_EN_BASE64: ${{ needs.prepare.outputs.notes_ios_en_base64 }}
+          NOTES_MACOS_DE_BASE64: ${{ needs.prepare.outputs.notes_macos_de_base64 }}
+          NOTES_MACOS_EN_BASE64: ${{ needs.prepare.outputs.notes_macos_en_base64 }}
         run: |
           mkdir -p "$RUNNER_TEMP/apple-release-notes"
-          ruby -rbase64 -e 'File.write(ARGV.fetch(0), Base64.strict_decode64(ENV.fetch("NOTES_DE_BASE64")))' \
-            "$RUNNER_TEMP/apple-release-notes/de-DE.txt"
-          ruby -rbase64 -e 'File.write(ARGV.fetch(0), Base64.strict_decode64(ENV.fetch("NOTES_EN_BASE64")))' \
-            "$RUNNER_TEMP/apple-release-notes/en-US.txt"
+          ruby -rbase64 -e 'File.write(ARGV.fetch(0), Base64.strict_decode64(ENV.fetch(ARGV.fetch(1))))' \
+            "$RUNNER_TEMP/apple-release-notes/ios.de-DE.txt" NOTES_IOS_DE_BASE64
+          ruby -rbase64 -e 'File.write(ARGV.fetch(0), Base64.strict_decode64(ENV.fetch(ARGV.fetch(1))))' \
+            "$RUNNER_TEMP/apple-release-notes/ios.en-US.txt" NOTES_IOS_EN_BASE64
+          ruby -rbase64 -e 'File.write(ARGV.fetch(0), Base64.strict_decode64(ENV.fetch(ARGV.fetch(1))))' \
+            "$RUNNER_TEMP/apple-release-notes/macos.de-DE.txt" NOTES_MACOS_DE_BASE64
+          ruby -rbase64 -e 'File.write(ARGV.fetch(0), Base64.strict_decode64(ENV.fetch(ARGV.fetch(1))))' \
+            "$RUNNER_TEMP/apple-release-notes/macos.en-US.txt" NOTES_MACOS_EN_BASE64
 
       - name: Wait for Apple and submit both platforms
         env:
@@ -590,8 +645,10 @@ jobs:
           ruby .github/scripts/app_store_connect.rb prepare-app-store \
             --version "${{ needs.prepare.outputs.version }}" \
             --build-number "${{ needs.prepare.outputs.build_number }}" \
-            --localization "de-DE=$RUNNER_TEMP/apple-release-notes/de-DE.txt" \
-            --localization "en-US=$RUNNER_TEMP/apple-release-notes/en-US.txt" \
+            --localization "IOS:de-DE=$RUNNER_TEMP/apple-release-notes/ios.de-DE.txt" \
+            --localization "IOS:en-US=$RUNNER_TEMP/apple-release-notes/ios.en-US.txt" \
+            --localization "MAC_OS:de-DE=$RUNNER_TEMP/apple-release-notes/macos.de-DE.txt" \
+            --localization "MAC_OS:en-US=$RUNNER_TEMP/apple-release-notes/macos.en-US.txt" \
             --create-versions \
             --automatic-release \
             --submit

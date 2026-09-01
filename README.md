@@ -179,26 +179,68 @@ canonical root and detect ad-hoc Proton build trees under `/private/tmp`.
 
 ## Apple Releases
 
-One GitHub Actions workflow owns Apple distribution. Publish a GitHub Release only after its tagged commit passed the pull request checks.
+Reviewed GitHub Actions workflows own Apple distribution.
+PR authors never set app versions, build numbers, release tags, or release notes.
+A maintainer publishes a GitHub Release after its tagged commit passes the pull request checks.
 
 - A prerelease tag such as `v1.2.0-beta.1` or `v1.2.0-rc.1` builds iOS and macOS. It publishes both builds only to internal TestFlight.
 - A stable tag such as `v1.2.0` builds both apps. It creates the platform versions when necessary, updates both localizations, submits each platform to App Review, and selects automatic release after approval.
 - A manual workflow run can retry an existing published release tag. It reuses the GitHub Release ID as the Apple build number and does not create duplicate builds.
 - GitHub prereleases do not replace the latest stable GitHub Release.
 - The workflow never attaches a signed macOS app to the GitHub Release. The supported macOS distribution channel is the Mac App Store.
-- External TestFlight is intentionally outside the normal release flow.
 
-Use this exact release-body structure. Write the Apple notes yourself:
+### Release notes
+
+Write owner-written Apple release notes under `## English`. This is the only required section. This section alone is valid:
 
 ```markdown
-## Deutsch
-Kurze, benutzerbezogene Änderungen auf Deutsch.
-
 ## English
 Short user-facing changes in English.
 ```
 
-Other GitHub sections are allowed. Automation extracts only `Deutsch` and `English`. Contributor names, pull request lists, and generated changelogs never reach Apple.
+A platform-specific release body looks like this:
+
+```markdown
+## English
+### All Platforms
+Shared user-facing changes.
+
+### iOS and iPadOS
+Mobile-specific changes.
+
+### macOS
+Mac-specific changes.
+```
+
+The optional platform subsections are `### All Platforms`, `### iOS and iPadOS`, and `### macOS`.
+Without platform subsections, English applies to both platforms. With platform subsections, each platform receives the shared `All Platforms` text plus its specific text.
+
+`## Deutsch` is optional and uses the same structure. When German is absent, English is used for `de-DE`.
+
+Other GitHub sections are allowed. Automation sends only extracted owner text from the Apple sections to Apple.
+Contributor names, pull request lists, and generated changelog text never reach Apple.
+
+Before stable replacement, automation waits for both new platform builds.
+It validates both platform plans before it changes either review submission.
+It removes lower active review versions independently per platform.
+It removes a version only when Apple reports an Apple-removable state.
+It waits for `DEVELOPER_REJECTED` after each removal.
+It then changes the same App Store version record to the release version and starts a new review submission.
+If Apple rejects that update, the workflow stops without deleting that record or creating a fallback for that platform.
+A rerun continues from Apple's authoritative state.
+It refuses equal or newer active versions and unsafe states.
+
+### External TestFlight
+
+The manual `External TestFlight` workflow runs from `main` with one published release tag.
+It reuses the release's existing iOS and macOS builds. It never rebuilds or uploads them.
+Stable and prerelease release tags can be promoted externally.
+
+Owner action: `Actions` → `External TestFlight` → `Run workflow` from `main` → enter the published release tag.
+GitHub then pauses at the configured `testflight-external` approval gate. Approve that deployment to continue.
+
+The workflow uses the `testflight-external` environment.
+The optional repository variable `TESTFLIGHT_EXTERNAL_GROUP_NAME` overrides the default `External Testers` group.
 
 Configure these repository variables:
 
@@ -207,7 +249,13 @@ Configure these repository variables:
 
 Configure the App Store Connect issuer, key ID, and Base64-encoded private key as environment secrets. The `testflight-internal` environment also needs one Base64-encoded PKCS#12 archive and its password. The archive must contain the Apple Distribution and Mac Installer Distribution identities.
 
-Use the `testflight-internal` and `app-store-production` environments. Allow release tags in both environments. Do not require a production approval when stable GitHub Releases must enter review without another click.
+Use custom deployment branch and tag policies on every Apple environment. These server-side policies are the security boundary for environment secrets.
+
+- `testflight-internal`: allow the `main` branch and `v*` tags.
+- `testflight-external`: allow only the `main` branch.
+- `app-store-production`: allow the `main` branch and `v*` tags.
+
+Do not loosen these policies. Do not require a production approval when stable GitHub Releases must enter review without another click.
 
 The workflow validates the configured in-app purchases before it starts a macOS runner. The sandbox preflight checks the App Store Connect bundle ID, its `IN_APP_PURCHASE` capability, exact product IDs, product type, current metadata version, active prices, availability in Austria and the United States, and metadata against `.github/app-store-connect/in-app-purchases.json`. Apple does not expose Paid Apps Agreement, banking, or tax status through this API. Those three items must be `Active` in App Store Connect.
 

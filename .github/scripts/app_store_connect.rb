@@ -27,11 +27,32 @@ module AppStoreConnect
   PLATFORMS = %w[IOS MAC_OS].freeze
   REVIEWED_BUILD_STATES = %w[WAITING_FOR_REVIEW IN_REVIEW APPROVED].freeze
   SUBMITTED_VERSION_STATES = %w[
-    WAITING_FOR_REVIEW IN_REVIEW PENDING_DEVELOPER_RELEASE PENDING_APPLE_RELEASE
+    WAITING_FOR_EXPORT_COMPLIANCE WAITING_FOR_REVIEW IN_REVIEW
+    PENDING_DEVELOPER_RELEASE PENDING_APPLE_RELEASE
     PROCESSING_FOR_DISTRIBUTION READY_FOR_DISTRIBUTION READY_FOR_SALE
   ].freeze
+  SUPERSEDED_VERSION_STATES = %w[
+    WAITING_FOR_EXPORT_COMPLIANCE WAITING_FOR_REVIEW IN_REVIEW
+    PENDING_DEVELOPER_RELEASE PENDING_APPLE_RELEASE
+  ].freeze
+  EDITABLE_VERSION_STATES = %w[PREPARE_FOR_SUBMISSION READY_FOR_REVIEW DEVELOPER_REJECTED].freeze
+  CANCELABLE_REVIEW_SUBMISSION_STATES = %w[WAITING_FOR_REVIEW IN_REVIEW COMPLETE].freeze
+  TRANSITIONAL_REVIEW_SUBMISSION_STATES = %w[CANCELING COMPLETING].freeze
+  PRE_ACCEPTANCE_VERSION_STATES = %w[
+    WAITING_FOR_EXPORT_COMPLIANCE WAITING_FOR_REVIEW IN_REVIEW
+  ].freeze
+  APP_VERSION_PATTERN = /\A[0-9]+\.[0-9]+\.[0-9]+\z/
 
   class Error < StandardError; end
+  class APIError < Error
+    attr_reader :status, :codes
+
+    def initialize(message, status:, codes: [])
+      super(message)
+      @status = status
+      @codes = codes.freeze
+    end
+  end
   class TransportError < Error; end
 
   module_function
@@ -132,6 +153,16 @@ module AppStoreConnect
     }
   end
 
+  def app_store_version_number_payload(version_id:, version:)
+    {
+      data: {
+        type: "appStoreVersions",
+        id: version_id,
+        attributes: { versionString: version }
+      }
+    }
+  end
+
   def app_store_localization_payload(version_id:, locale:, whats_new:)
     {
       data: {
@@ -182,6 +213,16 @@ module AppStoreConnect
         type: "reviewSubmissions",
         id: submission_id,
         attributes: { submitted: true }
+      }
+    }
+  end
+
+  def cancel_review_payload(submission_id)
+    {
+      data: {
+        type: "reviewSubmissions",
+        id: submission_id,
+        attributes: { canceled: true }
       }
     }
   end
@@ -266,7 +307,7 @@ module AppStoreConnect
           next
         end
 
-        raise Error, error_message(response)
+        raise api_error(response)
       end
     rescue JSON::ParserError
       raise Error, "App Store Connect returned invalid JSON"
@@ -289,20 +330,28 @@ module AppStoreConnect
     end
 
     def retryable?(method, response)
+      return true if response.code.to_i == 429
       return false if method == :post
 
-      response.code.to_i == 429 || response.code.to_i >= 500
+      response.code.to_i >= 500
     end
 
-    def error_message(response)
+    def api_error(response)
       errors = JSON.parse(response.body.to_s).fetch("errors", [])
       details = errors.filter_map do |error|
         [error["code"], error["title"], error["detail"]].compact.join(": ")
       end
       detail = details.empty? ? "No error detail was returned" : details.join("; ")
-      "App Store Connect returned HTTP #{response.code}: #{detail}"
+      APIError.new(
+        "App Store Connect returned HTTP #{response.code}: #{detail}",
+        status: response.code.to_i,
+        codes: errors.filter_map { |error| error["code"] }
+      )
     rescue JSON::ParserError
-      "App Store Connect returned HTTP #{response.code} with an unreadable error response"
+      APIError.new(
+        "App Store Connect returned HTTP #{response.code} with an unreadable error response",
+        status: response.code.to_i
+      )
     end
   end
 
@@ -312,13 +361,17 @@ module AppStoreConnect
       app_id:,
       output_path: ENV["GITHUB_OUTPUT"],
       summary_path: ENV["GITHUB_STEP_SUMMARY"],
-      in_app_purchase_contract_path: IN_APP_PURCHASE_CONTRACT_PATH
+      in_app_purchase_contract_path: IN_APP_PURCHASE_CONTRACT_PATH,
+      sleeper: ->(seconds) { sleep(seconds) },
+      monotonic_clock: -> { Process.clock_gettime(Process::CLOCK_MONOTONIC) }
     )
       @client = client
       @app_id = app_id
       @output_path = output_path
       @summary_path = summary_path
       @in_app_purchase_contract_path = in_app_purchase_contract_path
+      @sleeper = sleeper
+      @monotonic_clock = monotonic_clock
     end
 
     def inspect_build(platform:, version:, build_number:)
@@ -364,8 +417,8 @@ module AppStoreConnect
       builds = require_valid_builds(version: version, build_number: build_number)
       group = find_or_create_group(name: group_name, internal: true)
       disable_mobile_builds_on_other_platforms(group)
-      builds.each_value do |build|
-        upsert_build_localizations(build.fetch("id"), localization_paths)
+      builds.each do |platform, build|
+        upsert_build_localizations(build.fetch("id"), localization_paths.fetch(platform, {}))
       end
       add_builds_to_group(group.fetch("id"), builds.values.map { |build| build.fetch("id") })
       append_summary("Distributed #{version} (#{build_number}) to internal group #{group.dig("attributes", "name")}.")
@@ -382,8 +435,8 @@ module AppStoreConnect
       group = find_or_create_group(name: group_name, internal: false)
       disable_mobile_builds_on_other_platforms(group)
 
-      builds.each_value do |build|
-        upsert_build_localizations(build.fetch("id"), localization_paths)
+      builds.each do |platform, build|
+        upsert_build_localizations(build.fetch("id"), localization_paths.fetch(platform, {}))
       end
       add_builds_to_group(group.fetch("id"), builds.values.map { |build| build.fetch("id") })
       builds.each_value { |build| submit_beta_review(build) }
@@ -400,17 +453,27 @@ module AppStoreConnect
     )
       builds = require_valid_builds(version: version, build_number: build_number)
       validate_in_app_purchases(require_approved_products: submit)
-      versions = PLATFORMS.to_h do |platform|
-        app_store_version = if create_versions
-                              find_or_create_app_store_version(platform: platform, version: version)
-                            else
-                              require_app_store_version(platform: platform, version: version)
-                            end
-        [platform, app_store_version]
-      end
+      versions = if submit
+                   resolve_app_store_versions_for_submission(
+                     version: version,
+                     builds: builds,
+                     localization_paths: localization_paths,
+                     create_versions: create_versions,
+                     automatic_release: automatic_release
+                   )
+                 else
+                   PLATFORMS.to_h do |platform|
+                     app_store_version = if create_versions
+                                           find_or_create_app_store_version(platform: platform, version: version)
+                                         else
+                                           require_app_store_version(platform: platform, version: version)
+                                         end
+                     [platform, app_store_version]
+                   end
+                 end
       states = versions.transform_values { |item| version_state(item) }
       invalid = states.reject do |_platform, state|
-        SUBMITTED_VERSION_STATES.include?(state) || %w[PREPARE_FOR_SUBMISSION READY_FOR_REVIEW].include?(state)
+        SUBMITTED_VERSION_STATES.include?(state) || EDITABLE_VERSION_STATES.include?(state)
       end
       unless invalid.empty?
         raise Error, "App versions cannot use this release workflow from states: #{invalid.map { |key, value| "#{key}=#{value}" }.join(", ")}"
@@ -418,7 +481,10 @@ module AppStoreConnect
 
       versions.each do |platform, app_store_version|
         ensure_automatic_release(app_store_version, platform: platform, state: states.fetch(platform)) if automatic_release
-        upsert_app_store_localizations(app_store_version.fetch("id"), localization_paths)
+        upsert_app_store_localizations(
+          app_store_version.fetch("id"),
+          localization_paths.fetch(platform, {})
+        )
       end
       validate_app_store_review_details(versions)
 
@@ -1024,6 +1090,365 @@ module AppStoreConnect
       )
     end
 
+    def resolve_app_store_versions_for_submission(
+      version:,
+      builds:,
+      localization_paths:,
+      create_versions:,
+      automatic_release:
+    )
+      target_components = app_version_components(version)
+      plans = PLATFORMS.to_h do |platform|
+        [platform, app_store_version_plan(
+          platform: platform,
+          target_version: version,
+          target_components: target_components,
+          create_versions: create_versions
+        )]
+      end
+
+      validate_localization_paths(localization_paths)
+      materialize_missing_app_store_versions(plans, version: version)
+      preflight_app_store_version_plans(
+        plans,
+        builds: builds,
+        automatic_release: automatic_release
+      )
+
+      # Apple has no atomic cross-platform replacement operation. Validate both plans before canceling either one.
+      plans.each_value do |plan|
+        plan.fetch(:cancellations).each do |cancellation|
+          cancel_superseded_app_version(cancellation, target_version: version)
+        end
+      end
+
+      plans.to_h do |platform, plan|
+        app_store_version = if plan[:target]
+                              read_app_store_version(plan.fetch(:target).fetch("id"))
+                            elsif plan[:replacement]
+                              rename_rejected_app_store_version(
+                                plan.fetch(:replacement),
+                                platform: platform,
+                                target_version: version
+                              )
+                            else
+                              find_or_create_app_store_version(platform: platform, version: version)
+                            end
+        [platform, app_store_version]
+      end
+    end
+
+    def app_store_version_plan(platform:, target_version:, target_components:, create_versions:)
+      versions = @client.collection(
+        "/v1/apps/#{@app_id}/appStoreVersions",
+        query: {
+          "filter[platform]" => platform,
+          "fields[appStoreVersions]" => "platform,versionString,appVersionState,releaseType",
+          "limit" => "200"
+        }
+      )
+      targets = versions.select do |item|
+        item.dig("attributes", "versionString") == target_version
+      end
+      if targets.length > 1
+        raise Error, "Apple returned multiple #{platform} App Store versions for #{target_version}"
+      end
+      target = targets.first
+
+      active_candidates = versions.select do |item|
+        SUPERSEDED_VERSION_STATES.include?(version_state(item)) && item != target
+      end
+      active_candidates.each do |app_store_version|
+        existing_version = app_store_version.dig("attributes", "versionString").to_s
+        existing_components = app_version_components(existing_version)
+        if (existing_components <=> target_components) >= 0
+          raise Error,
+                "#{platform} App Store version #{existing_version} cannot be superseded by #{target_version}"
+        end
+      end
+      if active_candidates.length > 1
+        versions_text = active_candidates.map { |item| item.dig("attributes", "versionString") }.join(", ")
+        raise Error, "Apple returned multiple active #{platform} versions to supersede: #{versions_text}"
+      end
+
+      if target.nil? && !create_versions
+        raise Error, "Missing #{platform} App Store version #{target_version}"
+      end
+
+      replacement = nil
+      if target.nil?
+        replacement = active_candidates.first
+        unless replacement
+          recoverable = versions.select do |item|
+            next false unless version_state(item) == "DEVELOPER_REJECTED"
+
+            existing_version = item.dig("attributes", "versionString").to_s
+            (app_version_components(existing_version) <=> target_components).negative?
+          end
+          if recoverable.length > 1
+            versions_text = recoverable.map { |item| item.dig("attributes", "versionString") }.join(", ")
+            raise Error, "Apple returned multiple rejected #{platform} versions to rename: #{versions_text}"
+          end
+          replacement = recoverable.first
+        end
+      end
+
+      {
+        platform: platform,
+        target: target,
+        replacement: replacement,
+        cancellations: cancellation_plans(platform: platform, candidates: active_candidates)
+      }
+    end
+
+    def materialize_missing_app_store_versions(plans, version:)
+      plans.each do |platform, plan|
+        next if plan[:target] || plan[:replacement]
+
+        plan[:target] = find_or_create_app_store_version(platform: platform, version: version)
+      end
+    end
+
+    def cancellation_plans(platform:, candidates:)
+      return [] if candidates.empty?
+
+      submissions = review_submissions(
+        platform: platform,
+        states: CANCELABLE_REVIEW_SUBMISSION_STATES + TRANSITIONAL_REVIEW_SUBMISSION_STATES
+      )
+      candidates.map do |app_store_version|
+        existing_version = app_store_version.dig("attributes", "versionString").to_s
+        matching = submissions.select do |submission|
+          review_submission_version_id(submission) == app_store_version.fetch("id")
+        end
+        if matching.empty?
+          raise Error,
+                "Missing #{platform} review submission for App Store version #{existing_version}"
+        end
+        if matching.length > 1
+          raise Error,
+                "Apple returned multiple #{platform} review submissions for App Store version #{existing_version}"
+        end
+
+        submission = matching.fetch(0)
+        submission_state = submission.dig("attributes", "state")
+        allowed_states = CANCELABLE_REVIEW_SUBMISSION_STATES + TRANSITIONAL_REVIEW_SUBMISSION_STATES
+        unless allowed_states.include?(submission_state)
+          raise Error,
+                "#{platform} review submission for #{existing_version} cannot be canceled from #{submission_state}"
+        end
+
+        {
+          platform: platform,
+          version: app_store_version,
+          version_string: existing_version,
+          submission: submission
+        }
+      end
+    end
+
+    def validate_localization_paths(localization_paths)
+      localization_paths.each do |platform, paths|
+        paths.each do |locale, path|
+          text = File.read(path, encoding: "UTF-8").strip
+          raise Error, "#{platform} App Store release notes are empty for #{locale}" if text.empty?
+        rescue Errno::ENOENT
+          raise Error, "#{platform} App Store release notes are missing for #{locale}: #{path}"
+        end
+      end
+    end
+
+    def preflight_app_store_version_plans(plans, builds:, automatic_release:)
+      review_sources = {}
+      plans.each do |platform, plan|
+        target = plan[:target]
+        source = target || plan[:replacement]
+        review_sources[platform] = source if source
+        next unless target
+
+        state = version_state(target)
+        unless SUBMITTED_VERSION_STATES.include?(state) || EDITABLE_VERSION_STATES.include?(state)
+          raise Error, "#{platform} App Store version cannot use this release workflow from #{state}"
+        end
+        next unless SUBMITTED_VERSION_STATES.include?(state)
+
+        release_type = target.dig("attributes", "releaseType")
+        if automatic_release && release_type != "AFTER_APPROVAL"
+          raise Error, "#{platform} is already submitted with release type #{release_type || 'UNKNOWN'}"
+        end
+        require_attached_build(target.fetch("id"), builds.fetch(platform).fetch("id"))
+      end
+
+      validate_app_store_review_details(review_sources) unless review_sources.empty?
+    end
+
+    def rename_rejected_app_store_version(app_store_version, platform:, target_version:)
+      version_id = app_store_version.fetch("id")
+      current = read_app_store_version(version_id)
+      state = version_state(current)
+      unless state == "DEVELOPER_REJECTED"
+        raise Error,
+              "#{platform} App Store version #{current.dig('attributes', 'versionString')} changed to #{state} " \
+              "before it could be renamed to #{target_version}"
+      end
+
+      previous_version = current.dig("attributes", "versionString")
+      updated = nil
+      begin
+        @client.patch(
+          "/v1/appStoreVersions/#{version_id}",
+          body: AppStoreConnect.app_store_version_number_payload(
+            version_id: version_id,
+            version: target_version
+          )
+        )
+      rescue APIError => error
+        raise unless [409, 422].include?(error.status)
+
+        authoritative = read_app_store_version(version_id)
+        if authoritative.dig("attributes", "versionString") == target_version
+          updated = authoritative
+        else
+          authoritative_version = authoritative.dig("attributes", "versionString") || "UNKNOWN"
+          authoritative_state = version_state(authoritative)
+          raise Error,
+                "#{platform} App Store version #{previous_version} could not be changed to #{target_version}; " \
+                "Apple returned HTTP #{error.status}. Apple still reports version #{authoritative_version} in " \
+                "#{authoritative_state}; the workflow did not delete or create a version."
+        end
+      end
+      updated ||= read_app_store_version(version_id)
+      unless updated.dig("attributes", "versionString") == target_version
+        raise Error, "#{platform} App Store version did not change to #{target_version}"
+      end
+
+      append_summary("Changed #{platform} App Store version #{previous_version} to #{target_version}.")
+      updated
+    end
+
+    def cancel_superseded_app_version(plan, target_version:, timeout_seconds: 900, poll_seconds: 10)
+      submission_id = plan.fetch(:submission).fetch("id")
+      version_id = plan.fetch(:version).fetch("id")
+      deadline = @monotonic_clock.call + timeout_seconds
+      cancel_requested = TRANSITIONAL_REVIEW_SUBMISSION_STATES.include?(
+        plan.dig(:submission, "attributes", "state")
+      )
+
+      loop do
+        app_store_version = read_app_store_version(version_id)
+        state = version_state(app_store_version)
+        if state == "DEVELOPER_REJECTED"
+          append_summary(
+            "Removed #{plan.fetch(:platform)} #{plan.fetch(:version_string)} from App Review before " \
+            "submitting #{target_version}."
+          )
+          return
+        end
+        unless SUPERSEDED_VERSION_STATES.include?(state)
+          raise Error,
+                "#{plan.fetch(:platform)} App Store version #{plan.fetch(:version_string)} changed to #{state} " \
+                "while it was being superseded"
+        end
+
+        submission = read_review_submission(submission_id)
+        submission_state = submission.dig("attributes", "state")
+        # A cancellation can reach COMPLETE before the app version reaches DEVELOPER_REJECTED.
+        # On a fresh workflow process, the pre-acceptance app state distinguishes that race from
+        # a completed review that still needs cancellation before release.
+        if submission_state == "COMPLETE" && PRE_ACCEPTANCE_VERSION_STATES.include?(state)
+          cancel_requested = true
+        end
+        if CANCELABLE_REVIEW_SUBMISSION_STATES.include?(submission_state) && !cancel_requested
+          begin
+            @client.patch(
+              "/v1/reviewSubmissions/#{submission_id}",
+              body: AppStoreConnect.cancel_review_payload(submission_id)
+            )
+            cancel_requested = true
+          rescue APIError => error
+            raise unless [404, 409, 422].include?(error.status)
+
+            refreshed_version = read_app_store_version(version_id)
+            if version_state(refreshed_version) == "DEVELOPER_REJECTED"
+              cancel_requested = true
+              next
+            end
+
+            refreshed_submission = read_review_submission(submission_id)
+            refreshed_submission_state = refreshed_submission.dig("attributes", "state")
+            if TRANSITIONAL_REVIEW_SUBMISSION_STATES.include?(refreshed_submission_state) ||
+               refreshed_submission_state == "COMPLETE" && SUPERSEDED_VERSION_STATES.include?(
+                 version_state(refreshed_version)
+               )
+              cancel_requested = true
+            else
+              raise error
+            end
+          end
+        elsif !TRANSITIONAL_REVIEW_SUBMISSION_STATES.include?(submission_state) &&
+              !(CANCELABLE_REVIEW_SUBMISSION_STATES.include?(submission_state) && cancel_requested)
+          raise Error,
+                "#{plan.fetch(:platform)} review submission for #{plan.fetch(:version_string)} changed to " \
+                "#{submission_state} while cancellation was pending"
+        end
+
+        if @monotonic_clock.call >= deadline
+          raise Error,
+                "Timed out while canceling #{plan.fetch(:platform)} App Store version " \
+                "#{plan.fetch(:version_string)} (version=#{state}, submission=#{submission_state})"
+        end
+        @sleeper.call(poll_seconds)
+      end
+    end
+
+    def app_version_components(version)
+      unless APP_VERSION_PATTERN.match?(version)
+        raise Error, "App Store version #{version.inspect} must use MAJOR.MINOR.PATCH"
+      end
+
+      version.split(".").map { |component| Integer(component, 10) }
+    end
+
+    def review_submissions(platform:, states: nil)
+      query = {
+        "filter[platform]" => platform,
+        "fields[reviewSubmissions]" => "platform,state,appStoreVersionForReview",
+        "include" => "appStoreVersionForReview",
+        "limit" => "200"
+      }
+      query["filter[state]"] = states.join(",") if states
+      @client.collection("/v1/apps/#{@app_id}/reviewSubmissions", query: query)
+    end
+
+    def review_submission_version_id(submission)
+      version_id = submission.dig("relationships", "appStoreVersionForReview", "data", "id")
+      return version_id if version_id
+
+      response = @client.get(
+        "/v1/reviewSubmissions/#{submission.fetch('id')}",
+        query: {
+          "fields[reviewSubmissions]" => "platform,state,appStoreVersionForReview",
+          "include" => "appStoreVersionForReview"
+        }
+      )
+      response.dig("data", "relationships", "appStoreVersionForReview", "data", "id") ||
+        raise(Error, "Review submission #{submission.fetch('id')} has no App Store version")
+    end
+
+    def read_app_store_version(version_id)
+      @client.get(
+        "/v1/appStoreVersions/#{version_id}",
+        query: { "fields[appStoreVersions]" => "platform,versionString,appVersionState,releaseType" }
+      ).fetch("data")
+    end
+
+    def read_review_submission(submission_id)
+      @client.get(
+        "/v1/reviewSubmissions/#{submission_id}",
+        query: { "fields[reviewSubmissions]" => "platform,state" }
+      ).fetch("data")
+    end
+
     def find_app_store_version(platform:, version:)
       versions = @client.collection(
         "/v1/apps/#{@app_id}/appStoreVersions",
@@ -1073,14 +1498,7 @@ module AppStoreConnect
     end
 
     def find_or_create_review_submission(platform:)
-      submissions = @client.collection(
-        "/v1/reviewSubmissions",
-        query: {
-          "filter[app]" => @app_id,
-          "filter[platform]" => platform,
-          "limit" => "200"
-        }
-      )
+      submissions = review_submissions(platform: platform, states: ["READY_FOR_REVIEW"])
       ready = submissions.select { |item| item.dig("attributes", "state") == "READY_FOR_REVIEW" }
       raise Error, "Apple returned multiple open #{platform} review submissions" if ready.length > 1
       return ready.first if ready.one?
@@ -1227,11 +1645,16 @@ module AppStoreConnect
         parser.on("--submit") { options[:submit] = true }
         parser.on("--create-versions") { options[:create_versions] = true }
         parser.on("--automatic-release") { options[:automatic_release] = true }
-        parser.on("--localization LOCALE=PATH") do |value|
-          locale, path = value.split("=", 2)
-          raise OptionParser::InvalidArgument, value unless locale && path
+        parser.on("--localization PLATFORM:LOCALE=PATH") do |value|
+          key, path = value.split("=", 2)
+          platform, locale = key.to_s.split(":", 2)
+          unless PLATFORMS.include?(platform) && locale && !locale.empty? && path && !path.empty?
+            raise OptionParser::InvalidArgument,
+                  "#{value} (expected PLATFORM:LOCALE=PATH)"
+          end
 
-          options[:localizations][locale] = path
+          options[:localizations][platform] ||= {}
+          options[:localizations][platform][locale] = path
         end
       end.parse!(argv)
       options
