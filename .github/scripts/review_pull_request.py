@@ -448,6 +448,8 @@ def llm_payload(
                     "Do not report hypothetical risks phrased only as potential, possible, might, or could. Trace an "
                     "exact reachable failure path in the supplied code before assigning a finding. If required context "
                     "is omitted or truncated, record the coverage limitation only; do not infer a defect from it. "
+                    "For Swift actors, identify the actual suspension point before claiming a race. Actor-isolated "
+                    "synchronous statements cannot interleave when no await occurs between them. "
                     "Do not claim to "
                     "decide GitHub mergeability, status checks, approvals, or branch-protection requirements; trusted "
                     "GitHub state handles those separately. Use blocking only for a concrete code problem that should "
