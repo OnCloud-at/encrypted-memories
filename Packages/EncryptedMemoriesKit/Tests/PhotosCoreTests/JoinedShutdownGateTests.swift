@@ -18,6 +18,10 @@ private actor ShutdownGateLatch {
         waiters.removeAll(keepingCapacity: false)
         pending.forEach { $0.resume() }
     }
+
+    nonisolated func signalFromCancellationHandler() {
+        Task { await self.signal() }
+    }
 }
 
 private actor ShutdownGateProbe {
@@ -69,6 +73,7 @@ struct JoinedShutdownGateTests {
     @Test func closeCancelsAndJoinsAdmittedWorkBeforeTeardown() async throws {
         let gate = JoinedShutdownGate()
         let operationEntered = ShutdownGateLatch()
+        let cancellationObserved = ShutdownGateLatch()
         let releaseOperation = ShutdownGateLatch()
         let admissionClosed = ShutdownGateLatch()
         let teardownProbe = ShutdownGateProbe()
@@ -76,9 +81,13 @@ struct JoinedShutdownGateTests {
 
         let operation = Task {
             try await gate.withAdmission {
-                await operationEntered.signal()
-                await releaseOperation.wait()
-                return Task.isCancelled
+                await withTaskCancellationHandler {
+                    await operationEntered.signal()
+                    await releaseOperation.wait()
+                    return Task.isCancelled
+                } onCancel: {
+                    cancellationObserved.signalFromCancellationHandler()
+                }
             }
         }
         await operationEntered.wait()
@@ -104,6 +113,7 @@ struct JoinedShutdownGateTests {
         #expect(await teardownProbe.snapshot().starts == 0)
         #expect(await shutdownReturned.snapshot().completions == 0)
 
+        await cancellationObserved.wait()
         await releaseOperation.signal()
         let operationWasCancelled = try await operation.value
         #expect(operationWasCancelled)
