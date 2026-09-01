@@ -57,6 +57,10 @@ enum MobileVideoPlaybackIntent {
         status == .waitingToPlayAtSpecifiedRate
     }
 
+    static func showsLoadingIndicator(intendsToPlay: Bool, isActivelyPlaying: Bool) -> Bool {
+        intendsToPlay && !isActivelyPlaying
+    }
+
     static func reachedEnd(current: Double, duration: Double) -> Bool {
         duration > 0 && current >= duration - 0.05
     }

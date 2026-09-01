@@ -1519,7 +1519,8 @@ private struct MobileNativeVideoPlayer: UIViewControllerRepresentable {
             let velocity = pan.velocity(in: view)
             // Match the photo page: only a vertical pan belongs to dismiss. Returning false here leaves a
             // horizontal drag to the enclosing UIPageViewController's existing previous/next interaction.
-            return abs(velocity.y) > abs(velocity.x)
+            return ViewerDragDismissPolicy.prefersDismissalAxis(
+                velocity: CGSize(width: velocity.x, height: velocity.y))
         }
 
         /// AVKit owns video zoom and pan. Its public `videoBounds` reports the displayed media rect, so custom
@@ -1586,6 +1587,7 @@ private struct MobileVideoPlaybackControls: View {
     let currentTime: Double
     let duration: Double
     let isPlaying: Bool
+    let isLoading: Bool
     let onTogglePlayback: () -> Void
     let onSeekTo: (Double) -> Void
 
@@ -1623,6 +1625,14 @@ private struct MobileVideoPlaybackControls: View {
                 .accessibilityLabel(Text("viewer.video_position_a11y"))
                 .accessibilityValue(Text(Self.positionDescription(displayedTime, duration: duration)))
                 .tint(Color.primary)
+                ProgressView()
+                    .controlSize(.small)
+                    .tint(.primary)
+                    .frame(width: 24, height: layoutProfile.controlSide)
+                    .opacity(isLoading ? 1 : 0)
+                    .allowsHitTesting(false)
+                    .accessibilityLabel(Text("viewer.video_loading_a11y"))
+                    .accessibilityHidden(!isLoading)
             }
             .padding(.horizontal, 16)
             .frame(height: layoutProfile.controlSide)
@@ -1717,6 +1727,10 @@ private struct MobileVideoPage: View {
                         currentTime: playbackTime,
                         duration: playbackDuration,
                         isPlaying: playbackIsPlaying || playbackIsBuffering,
+                        isLoading: MobileVideoPlaybackIntent.showsLoadingIndicator(
+                            intendsToPlay: playbackIntendsToPlay,
+                            isActivelyPlaying: playbackIsPlaying
+                        ),
                         onTogglePlayback: togglePlayback,
                         onSeekTo: seek(to:)
                     )
@@ -2278,7 +2292,8 @@ struct MobileZoomableImage: UIViewRepresentable {
             let isZoomedIn = scrollView.zoomScale > scrollView.minimumZoomScale + 0.01
             guard !isZoomedIn else { return false }
             let v = (gestureRecognizer as? UIPanGestureRecognizer)?.velocity(in: scrollView) ?? .zero
-            return abs(v.y) > abs(v.x)
+            return ViewerDragDismissPolicy.prefersDismissalAxis(
+                velocity: CGSize(width: v.x, height: v.y))
         }
 
         @objc func handleDismissPan(_ gesture: UIPanGestureRecognizer) {

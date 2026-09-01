@@ -931,8 +931,8 @@ struct ProductionRouteGuardTests {
             player.contains("shouldRecognizeSimultaneouslyWith"),
             "AVKit controls and viewer gestures must remain simultaneous")
         #expect(
-            player.contains("return abs(velocity.y) > abs(velocity.x)"),
-            "horizontal drags must stay with the existing page controller")
+            player.contains("ViewerDragDismissPolicy.prefersDismissalAxis"),
+            "video dismissal must use the shared, slightly diagonal axis policy")
         #expect(
             player.contains("controller.videoBounds"),
             "custom video dismiss gestures must observe AVKit's public displayed media bounds")
@@ -961,6 +961,11 @@ struct ProductionRouteGuardTests {
             of: source,
             from: "private struct MobileNativeVideoPlayer: UIViewControllerRepresentable",
             to: "private struct MobileVideoPlaybackControls: View"
+        )
+        let videoControls = try Self.body(
+            of: source,
+            from: "private struct MobileVideoPlaybackControls: View",
+            to: "private struct MobileVideoPage: View"
         )
 
         #expect(viewerHeader.contains("viewerBackButton"))
@@ -993,6 +998,18 @@ struct ProductionRouteGuardTests {
         #expect(
             source.contains("playbackIsBuffering"),
             "the video controls must distinguish buffering from paused playback")
+        #expect(videoControls.contains("let isLoading: Bool"))
+        #expect(
+            videoControls.contains("ProgressView()"),
+            "the scrubber must show native indeterminate progress while playback waits")
+        #expect(
+            videoControls.contains(".frame(width: 24, height: layoutProfile.controlSide)"),
+            "the trailing progress slot must remain fixed so buffering does not move the scrubber")
+        #expect(videoControls.contains(".opacity(isLoading ? 1 : 0)"))
+        #expect(videoControls.contains(".accessibilityLabel(Text(\"viewer.video_loading_a11y\"))"))
+        #expect(
+            source.contains("MobileVideoPlaybackIntent.showsLoadingIndicator"),
+            "loading must follow retained play intent until AVPlayer reports active playback")
         #expect(
             source.contains("MobileVideoPlaybackIntent.reachedEnd(current: playbackTime, duration: playbackDuration)"),
             "reaching the end must reset play intent so the next tap restarts instead of pausing again")

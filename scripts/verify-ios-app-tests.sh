@@ -26,6 +26,7 @@ xcrun xcodebuild \
   -scheme EncryptedMemoriesMobileTests \
   -clonedSourcePackagesDirPath "$ENCRYPTED_MEMORIES_XCODE_SOURCE_PACKAGES" \
   -packageCachePath "$ENCRYPTED_MEMORIES_XCODE_PACKAGE_CACHE" \
+  -packageAuthorizationProvider netrc \
   -onlyUsePackageVersionsFromResolvedFile
 
 echo "[ios-tests] destination: $DESTINATION"

@@ -17,6 +17,20 @@ final class ViewerDragDismissPolicyTests: XCTestCase {
             ViewerDragDismissPolicy.engages(translation: CGSize(width: CGFloat.nan, height: 80), isZoomedIn: false))
     }
 
+    func testSlightlyDiagonalDownwardSwipePrefersDismissWithoutStealingHorizontalPaging() {
+        XCTAssertEqual(ViewerDragDismissPolicy.engageDistance, 8)
+        XCTAssertEqual(ViewerDragDismissPolicy.verticalDominance, 0.9)
+        XCTAssertTrue(
+            ViewerDragDismissPolicy.engages(
+                translation: CGSize(width: 40, height: 38), isZoomedIn: false))
+        XCTAssertTrue(ViewerDragDismissPolicy.prefersDismissalAxis(velocity: CGSize(width: 400, height: 380)))
+        XCTAssertFalse(ViewerDragDismissPolicy.prefersDismissalAxis(velocity: CGSize(width: 600, height: 200)))
+        XCTAssertFalse(ViewerDragDismissPolicy.prefersDismissalAxis(velocity: .zero))
+        XCTAssertFalse(
+            ViewerDragDismissPolicy.prefersDismissalAxis(
+                velocity: CGSize(width: CGFloat.nan, height: 400)))
+    }
+
     func testProgressAndScaleAndOpacityTrackTheDragWithinBounds() {
         XCTAssertEqual(ViewerDragDismissPolicy.progress(translationY: 0, viewportHeight: 800), 0)
         XCTAssertEqual(ViewerDragDismissPolicy.progress(translationY: 400, viewportHeight: 800), 0.5, accuracy: 0.0001)
@@ -37,6 +51,8 @@ final class ViewerDragDismissPolicyTests: XCTestCase {
 
     func testReleaseDismissesPastDistanceOrOnFastFlick() {
         let h: CGFloat = 800
+        XCTAssertEqual(ViewerDragDismissPolicy.dismissDistanceFraction, 0.16)
+        XCTAssertEqual(ViewerDragDismissPolicy.dismissVelocity, 750)
         // Far enough downward to dismiss.
         XCTAssertTrue(ViewerDragDismissPolicy.shouldDismiss(translationY: h * 0.25, velocityY: 0, viewportHeight: h))
         // Short but flicked fast to dismiss.

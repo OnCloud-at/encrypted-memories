@@ -341,6 +341,9 @@ private func waitUntil(
         #expect(!MobileVideoPlaybackIntent.isActivelyPlaying(.waitingToPlayAtSpecifiedRate))
         #expect(MobileVideoPlaybackIntent.isBuffering(.waitingToPlayAtSpecifiedRate))
         #expect(!MobileVideoPlaybackIntent.isBuffering(.paused))
+        #expect(MobileVideoPlaybackIntent.showsLoadingIndicator(intendsToPlay: true, isActivelyPlaying: false))
+        #expect(!MobileVideoPlaybackIntent.showsLoadingIndicator(intendsToPlay: true, isActivelyPlaying: true))
+        #expect(!MobileVideoPlaybackIntent.showsLoadingIndicator(intendsToPlay: false, isActivelyPlaying: false))
         #expect(MobileVideoPlaybackIntent.reachedEnd(current: 37, duration: 37))
         #expect(!MobileVideoPlaybackIntent.reachedEnd(current: 36.5, duration: 37))
     }

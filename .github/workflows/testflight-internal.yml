@@ -1,26 +1,14 @@
-name: Apple TestFlight internal
+name: Apple release
 
 on:
+  release:
+    types: [published]
   workflow_dispatch:
     inputs:
-      version:
-        description: Marketing version already configured in App Store Connect
+      release_tag:
+        description: Existing published GitHub release tag to retry
         required: true
-        default: "1.0.0"
         type: string
-      build_number:
-        description: Optional build number. Leave empty for the repository counter.
-        required: false
-        type: string
-      group_name:
-        description: Internal TestFlight group. Leave empty if exactly one exists.
-        required: false
-        type: string
-      confirm:
-        description: Build, sign, and upload iOS and macOS from main
-        required: true
-        default: false
-        type: boolean
 
 permissions:
   contents: read
@@ -34,12 +22,18 @@ env:
 
 jobs:
   prepare:
-    name: Validate release request
+    name: Validate GitHub release
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:
+      tag: ${{ steps.release.outputs.tag }}
       version: ${{ steps.release.outputs.version }}
       build_number: ${{ steps.release.outputs.build_number }}
+      prerelease: ${{ steps.release.outputs.prerelease }}
+      channel: ${{ steps.release.outputs.channel }}
+      commit_sha: ${{ steps.revision.outputs.commit_sha }}
+      notes_de_base64: ${{ steps.release.outputs.notes_de_base64 }}
+      notes_en_base64: ${{ steps.release.outputs.notes_en_base64 }}
     steps:
       - name: Check out workflow code
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -51,53 +45,37 @@ jobs:
           set -euo pipefail
           ruby -c .github/scripts/app_store_connect.rb
           ruby .github/scripts/test_app_store_connect.rb
+          ruby -c .github/scripts/release_contract.rb
+          ruby .github/scripts/test_release_contract.rb
           bash -n .github/scripts/validate_apple_distribution.sh
 
-      - name: Resolve version and build number
+      - name: Resolve published release
         id: release
         env:
-          CONFIRMED: ${{ inputs.confirm }}
-          REQUESTED_VERSION: ${{ inputs.version }}
-          REQUESTED_BUILD_NUMBER: ${{ inputs.build_number }}
-          BUILD_NUMBER_BASE: ${{ vars.APPLE_BUILD_NUMBER_BASE }}
+          GH_TOKEN: ${{ github.token }}
+          EVENT_TAG: ${{ github.event.release.tag_name }}
+          REQUESTED_TAG: ${{ inputs.release_tag }}
         run: |
           set -euo pipefail
-          [[ "$GITHUB_REF" == "refs/heads/main" ]] || {
-            echo "Select main when starting this workflow." >&2
+          tag="${EVENT_TAG:-$REQUESTED_TAG}"
+          [[ -n "$tag" ]] || {
+            echo "A published GitHub release tag is required." >&2
             exit 1
           }
-          [[ "$CONFIRMED" == "true" ]] || {
-            echo "Confirm the TestFlight upload before starting the workflow." >&2
-            exit 1
-          }
-          [[ "$REQUESTED_VERSION" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] || {
-            echo "Version must contain two or three numeric components." >&2
-            exit 1
-          }
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" > "$RUNNER_TEMP/release.json"
+          ruby .github/scripts/release_contract.rb \
+            "$RUNNER_TEMP/release.json" \
+            "$RUNNER_TEMP/apple-release-notes"
 
-          build_number="$REQUESTED_BUILD_NUMBER"
-          if [[ -z "$build_number" ]]; then
-            base="${BUILD_NUMBER_BASE:-713}"
-            [[ "$base" =~ ^[0-9]+$ ]] || {
-              echo "APPLE_BUILD_NUMBER_BASE must be an integer." >&2
-              exit 1
-            }
-            build_number="$((base + GITHUB_RUN_NUMBER))"
-          fi
-          [[ "$build_number" =~ ^[1-9][0-9]{0,17}$ ]] || {
-            echo "Build number must contain from 1 through 18 digits." >&2
-            exit 1
-          }
+      - name: Check out the exact release tag
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ steps.release.outputs.tag }}
+          persist-credentials: false
 
-          echo "version=$REQUESTED_VERSION" >> "$GITHUB_OUTPUT"
-          echo "build_number=$build_number" >> "$GITHUB_OUTPUT"
-          {
-            echo "## Internal TestFlight release"
-            echo
-            echo "- Version: $REQUESTED_VERSION"
-            echo "- Build: $build_number"
-            echo "- Commit: $GITHUB_SHA"
-          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Record release commit
+        id: revision
+        run: echo "commit_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
   in-app-purchase-preflight:
     name: Validate StoreKit sandbox metadata
@@ -155,6 +133,7 @@ jobs:
       - name: Check out source
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
+          ref: ${{ needs.prepare.outputs.tag }}
           persist-credentials: false
 
       - name: Check for an existing upload
@@ -440,7 +419,7 @@ jobs:
             DEVELOPMENT_TEAM="$APPLE_DEVELOPER_TEAM_ID" \
             MARKETING_VERSION="$APPLE_RELEASE_VERSION" \
             CURRENT_PROJECT_VERSION="$APPLE_BUILD_NUMBER" \
-            ENCRYPTED_MEMORIES_BUILD_COMMIT="$GITHUB_SHA" \
+            ENCRYPTED_MEMORIES_BUILD_COMMIT="${{ needs.prepare.outputs.commit_sha }}" \
             ENCRYPTED_MEMORIES_CODE_SIGN_STYLE=Manual \
             ENCRYPTED_MEMORIES_CODE_SIGN_IDENTITY="$DISTRIBUTION_SHA1" \
             ENCRYPTED_MEMORIES_PROVISIONING_PROFILE_SPECIFIER="$PROFILE_NAME" \
@@ -532,6 +511,7 @@ jobs:
   distribute:
     name: Add to internal TestFlight
     needs: [prepare, upload]
+    if: needs.prepare.outputs.prerelease == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     environment: testflight-internal
@@ -539,7 +519,19 @@ jobs:
       - name: Check out workflow code
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
+          ref: ${{ needs.prepare.outputs.tag }}
           persist-credentials: false
+
+      - name: Restore localized Apple notes
+        env:
+          NOTES_DE_BASE64: ${{ needs.prepare.outputs.notes_de_base64 }}
+          NOTES_EN_BASE64: ${{ needs.prepare.outputs.notes_en_base64 }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/apple-release-notes"
+          ruby -rbase64 -e 'File.write(ARGV.fetch(0), Base64.strict_decode64(ENV.fetch("NOTES_DE_BASE64")))' \
+            "$RUNNER_TEMP/apple-release-notes/de-DE.txt"
+          ruby -rbase64 -e 'File.write(ARGV.fetch(0), Base64.strict_decode64(ENV.fetch("NOTES_EN_BASE64")))' \
+            "$RUNNER_TEMP/apple-release-notes/en-US.txt"
 
       - name: Wait for Apple and distribute the builds
         env:
@@ -547,16 +539,59 @@ jobs:
           APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
           APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
           APP_STORE_CONNECT_PRIVATE_KEY_BASE64: ${{ secrets.APP_STORE_CONNECT_PRIVATE_KEY_BASE64 }}
-          GROUP_NAME: ${{ inputs.group_name }}
         run: |
           set -euo pipefail
           ruby .github/scripts/app_store_connect.rb wait-builds \
             --version "${{ needs.prepare.outputs.version }}" \
             --build-number "${{ needs.prepare.outputs.build_number }}"
 
-          group=()
-          [[ -z "$GROUP_NAME" ]] || group=(--group "$GROUP_NAME")
           ruby .github/scripts/app_store_connect.rb distribute-internal \
             --version "${{ needs.prepare.outputs.version }}" \
             --build-number "${{ needs.prepare.outputs.build_number }}" \
-            "${group[@]}"
+            --localization "de-DE=$RUNNER_TEMP/apple-release-notes/de-DE.txt" \
+            --localization "en-US=$RUNNER_TEMP/apple-release-notes/en-US.txt"
+
+  submit-app-store:
+    name: Submit iOS and macOS to App Review
+    needs: [prepare, upload]
+    if: needs.prepare.outputs.prerelease == 'false'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    environment: app-store-production
+    steps:
+      - name: Check out workflow code
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+          persist-credentials: false
+
+      - name: Restore localized Apple notes
+        env:
+          NOTES_DE_BASE64: ${{ needs.prepare.outputs.notes_de_base64 }}
+          NOTES_EN_BASE64: ${{ needs.prepare.outputs.notes_en_base64 }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/apple-release-notes"
+          ruby -rbase64 -e 'File.write(ARGV.fetch(0), Base64.strict_decode64(ENV.fetch("NOTES_DE_BASE64")))' \
+            "$RUNNER_TEMP/apple-release-notes/de-DE.txt"
+          ruby -rbase64 -e 'File.write(ARGV.fetch(0), Base64.strict_decode64(ENV.fetch("NOTES_EN_BASE64")))' \
+            "$RUNNER_TEMP/apple-release-notes/en-US.txt"
+
+      - name: Wait for Apple and submit both platforms
+        env:
+          APP_STORE_CONNECT_APP_ID: ${{ vars.APP_STORE_CONNECT_APP_ID }}
+          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          APP_STORE_CONNECT_PRIVATE_KEY_BASE64: ${{ secrets.APP_STORE_CONNECT_PRIVATE_KEY_BASE64 }}
+        run: |
+          set -euo pipefail
+          ruby .github/scripts/app_store_connect.rb wait-builds \
+            --version "${{ needs.prepare.outputs.version }}" \
+            --build-number "${{ needs.prepare.outputs.build_number }}"
+          ruby .github/scripts/app_store_connect.rb prepare-app-store \
+            --version "${{ needs.prepare.outputs.version }}" \
+            --build-number "${{ needs.prepare.outputs.build_number }}" \
+            --localization "de-DE=$RUNNER_TEMP/apple-release-notes/de-DE.txt" \
+            --localization "en-US=$RUNNER_TEMP/apple-release-notes/en-US.txt" \
+            --create-versions \
+            --automatic-release \
+            --submit

@@ -21,6 +21,7 @@ xcodebuild -resolvePackageDependencies \
   -scheme EncryptedMemoriesMobile \
   -clonedSourcePackagesDirPath "$ENCRYPTED_MEMORIES_XCODE_SOURCE_PACKAGES" \
   -packageCachePath "$ENCRYPTED_MEMORIES_XCODE_PACKAGE_CACHE" \
+  -packageAuthorizationProvider netrc \
   -onlyUsePackageVersionsFromResolvedFile
 
 xcodebuild build \

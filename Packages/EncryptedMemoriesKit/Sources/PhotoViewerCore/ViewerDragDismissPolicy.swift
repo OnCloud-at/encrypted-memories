@@ -9,17 +9,17 @@ import CoreGraphics
 public enum ViewerDragDismissPolicy {
     /// A drag must travel at least this far (points) before it can take the media, so a tap with a little jitter
     /// never grabs it.
-    public static let engageDistance: CGFloat = 12
+    public static let engageDistance: CGFloat = 8
 
-    /// Vertical dominance required to engage: |dy| must exceed |dx| × this. A horizontal-ish drag stays with the
-    /// pager's swipe, so paging is never stolen.
-    public static let verticalDominance: CGFloat = 1.2
+    /// Vertical dominance required to engage. A value slightly below one accepts a naturally diagonal downward
+    /// swipe while a clearly horizontal drag stays with the pager.
+    public static let verticalDominance: CGFloat = 0.9
 
     /// Release dismisses when the drag travelled at least this fraction of the viewport height…
-    public static let dismissDistanceFraction: CGFloat = 0.20
+    public static let dismissDistanceFraction: CGFloat = 0.16
 
     /// …OR the downward release velocity (points/second) is at least this - a quick flick closes early.
-    public static let dismissVelocity: CGFloat = 900
+    public static let dismissVelocity: CGFloat = 750
 
     /// The media never shrinks below this while attached to the finger (so it stays clearly the same photo).
     public static let minimumDisplayScale: CGFloat = 0.6
@@ -40,6 +40,15 @@ public enum ViewerDragDismissPolicy {
         let dy = abs(translation.height)
         guard dx.isFinite, dy.isFinite else { return false }
         return dy >= engageDistance && dy >= dx * verticalDominance
+    }
+
+    /// Chooses the dismiss recognizer early enough that a slightly diagonal downward swipe does not become a page
+    /// swipe. Distance and release checks still protect against taps and accidental closure.
+    public static func prefersDismissalAxis(velocity: CGSize) -> Bool {
+        let dx = abs(velocity.width)
+        let dy = abs(velocity.height)
+        guard dx.isFinite, dy.isFinite, dy > 0 else { return false }
+        return dy >= dx * verticalDominance
     }
 
     /// Normalized drag progress 0…1 from the vertical travel over the viewport height.

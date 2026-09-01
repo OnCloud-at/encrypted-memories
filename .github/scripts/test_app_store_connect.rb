@@ -27,7 +27,9 @@ class FakeAppStoreConnectClient
     in_app_purchase_description: "Editable App Store description.",
     in_app_purchase_prices: [{ "startDate" => nil, "endDate" => nil }],
     in_app_purchase_available_territories: %w[AUT USA],
-    bundle_id_capabilities: ["IN_APP_PURCHASE"]
+    bundle_id_capabilities: ["IN_APP_PURCHASE"],
+    app_store_versions_exist: true,
+    app_store_localizations: nil
   )
     @version_state = version_state
     @release_type = release_type
@@ -47,6 +49,9 @@ class FakeAppStoreConnectClient
     @in_app_purchase_prices = in_app_purchase_prices
     @in_app_purchase_available_territories = in_app_purchase_available_territories
     @bundle_id_capabilities = bundle_id_capabilities
+    @app_store_versions_exist = app_store_versions_exist
+    @created_app_store_versions = {}
+    @app_store_localizations = app_store_localizations
     @calls = []
   end
 
@@ -80,12 +85,25 @@ class FakeAppStoreConnectClient
       []
     when "/v1/apps/6805117080/appStoreVersions"
       platform = query.fetch("filter[platform]")
+      created = @created_app_store_versions[platform]
+      return [created] if created
+      return [] unless @app_store_versions_exist
+
       state = @version_state.respond_to?(:fetch) ? @version_state.fetch(platform) : @version_state
       [{
         "type" => "appStoreVersions",
         "id" => "version-#{platform}",
         "attributes" => { "appVersionState" => state, "releaseType" => @release_type }
       }]
+    when %r{\A/v1/appStoreVersions/(version-(?:IOS|MAC_OS))/appStoreVersionLocalizations\z}
+      version_id = Regexp.last_match(1)
+      @app_store_localizations || %w[de-DE en-US].map do |locale|
+        {
+          "type" => "appStoreVersionLocalizations",
+          "id" => "#{version_id}-#{locale}",
+          "attributes" => { "locale" => locale, "whatsNew" => "Old notes" }
+        }
+      end
     when "/v1/apps/6805117080/inAppPurchasesV2"
       in_app_purchases
     when "/v1/bundleIds"
@@ -190,6 +208,19 @@ class FakeAppStoreConnectClient
 
   def post(path, body:)
     @calls << [:post, path, body]
+    if path == "/v1/appStoreVersions"
+      platform = body.dig(:data, :attributes, :platform)
+      version = {
+        "type" => "appStoreVersions",
+        "id" => "version-#{platform}",
+        "attributes" => {
+          "appVersionState" => "PREPARE_FOR_SUBMISSION",
+          "releaseType" => body.dig(:data, :attributes, :releaseType)
+        }
+      }
+      @created_app_store_versions[platform] = version
+      return { "data" => version }
+    end
     if path == "/v1/reviewSubmissions"
       platform = body.dig(:data, :attributes, :platform)
       return {
@@ -622,6 +653,29 @@ class AppStoreConnectTest < Minitest::Test
     assert_equal false, compatibility_call.last.dig(:data, :attributes, :iosBuildsAvailableForAppleSiliconMac)
   end
 
+  def test_internal_distribution_sets_release_notes_on_both_builds
+    file = Tempfile.new("internal-what-to-test")
+    file.write("Test the shared library.")
+    file.close
+
+    @manager.distribute_internal(
+      version: "1.0.0",
+      build_number: "714",
+      group_name: "Internal Testers",
+      localization_paths: { "en-US" => file.path }
+    )
+
+    localization_posts = @client.calls.select do |method, path, _body|
+      method == :post && path == "/v1/betaBuildLocalizations"
+    end
+    assert_equal 2, localization_posts.length
+    assert localization_posts.all? do |_method, _path, body|
+      body.dig(:data, :attributes, :whatsNew) == "Test the shared library."
+    end
+  ensure
+    file&.unlink
+  end
+
   def test_external_distribution_sets_test_text_and_submits_both_builds
     file = Tempfile.new("what-to-test")
     file.write("Test sign-in and backup.")
@@ -757,6 +811,108 @@ class AppStoreConnectTest < Minitest::Test
     assert submit_calls.all? { |_method, _path, body| body.dig(:data, :attributes, :submitted) == true }
   end
 
+  def test_stable_release_creates_versions_sets_notes_and_automatic_release
+    client = FakeAppStoreConnectClient.new(app_store_versions_exist: false)
+    manager = AppStoreConnect::ReleaseManager.new(
+      client: client,
+      app_id: "6805117080",
+      output_path: nil,
+      summary_path: nil
+    )
+    german = Tempfile.new("de-DE")
+    english = Tempfile.new("en-US")
+    german.write("Verbesserte Videowiedergabe.")
+    english.write("Improved video playback.")
+    german.close
+    english.close
+
+    manager.prepare_app_store(
+      version: "1.1.0",
+      build_number: "714",
+      submit: true,
+      localization_paths: { "de-DE" => german.path, "en-US" => english.path },
+      create_versions: true,
+      automatic_release: true
+    )
+
+    version_posts = client.calls.select do |method, path, _body|
+      method == :post && path == "/v1/appStoreVersions"
+    end
+    assert_equal %w[IOS MAC_OS], version_posts.map { |_method, _path, body| body.dig(:data, :attributes, :platform) }
+    assert version_posts.all? do |_method, _path, body|
+      body.dig(:data, :attributes, :releaseType) == "AFTER_APPROVAL"
+    end
+
+    attachment_calls = client.calls.select do |method, path, _body|
+      method == :patch && path.match?(%r{\A/v1/appStoreVersions/.+/relationships/build\z})
+    end
+    assert_equal(
+      [
+        ["/v1/appStoreVersions/version-IOS/relationships/build", "build-IOS"],
+        ["/v1/appStoreVersions/version-MAC_OS/relationships/build", "build-MAC_OS"]
+      ],
+      attachment_calls.map { |_method, path, body| [path, body.dig(:data, :id)] }
+    )
+
+    first_review_item_index = client.calls.index do |method, path, _body|
+      method == :post && path == "/v1/reviewSubmissionItems"
+    end
+    refute_nil first_review_item_index
+    assert attachment_calls.all? { |call| client.calls.index(call) < first_review_item_index }
+
+    localization_patches = client.calls.select do |method, path, _body|
+      method == :patch && path.start_with?("/v1/appStoreVersionLocalizations/")
+    end
+    assert_equal 4, localization_patches.length
+    refute(client.calls.any? do |method, path, _body|
+      method == :post && path == "/v1/appStoreVersionReleaseRequests"
+    end)
+  ensure
+    german&.unlink
+    english&.unlink
+  end
+
+  def test_stable_release_updates_manual_release_before_submission
+    manager = AppStoreConnect::ReleaseManager.new(
+      client: @client,
+      app_id: "6805117080",
+      output_path: nil,
+      summary_path: nil
+    )
+
+    manager.prepare_app_store(
+      version: "1.0.0",
+      build_number: "714",
+      automatic_release: true
+    )
+
+    release_type_patches = @client.calls.select do |method, path, body|
+      method == :patch && path.match?(%r{\A/v1/appStoreVersions/version-(IOS|MAC_OS)\z}) &&
+        body.dig(:data, :attributes, :releaseType) == "AFTER_APPROVAL"
+    end
+    assert_equal 2, release_type_patches.length
+  end
+
+  def test_stable_release_does_not_change_release_type_after_submission
+    client = FakeAppStoreConnectClient.new(version_state: "WAITING_FOR_REVIEW")
+    manager = AppStoreConnect::ReleaseManager.new(
+      client: client,
+      app_id: "6805117080",
+      output_path: nil,
+      summary_path: nil
+    )
+
+    error = assert_raises(AppStoreConnect::Error) do
+      manager.prepare_app_store(
+        version: "1.0.0",
+        build_number: "714",
+        automatic_release: true
+      )
+    end
+
+    assert_match(/already submitted with release type MANUAL/, error.message)
+  end
+
   def test_app_store_submission_requires_demo_credentials_for_each_platform
     client = FakeAppStoreConnectClient.new(review_demo_account_password: "")
     manager = AppStoreConnect::ReleaseManager.new(
@@ -878,118 +1034,4 @@ class AppStoreConnectTest < Minitest::Test
     assert_match(/already contains another app version/, error.message)
   end
 
-  def test_manual_release_requests_each_approved_platform
-    client = FakeAppStoreConnectClient.new(version_state: "PENDING_DEVELOPER_RELEASE")
-    manager = AppStoreConnect::ReleaseManager.new(
-      client: client,
-      app_id: "6805117080",
-      output_path: nil,
-      summary_path: nil
-    )
-
-    manager.release_app_store(version: "1.0.0")
-
-    version_ids = client.calls.filter_map do |method, path, body|
-      if method == :post && path == "/v1/appStoreVersionReleaseRequests"
-        body.dig(:data, :relationships, :appStoreVersion, :data, :id)
-      end
-    end
-    assert_equal %w[version-IOS version-MAC_OS], version_ids
-  end
-
-  def test_manual_release_accepts_pending_apple_release_as_idempotent
-    client = FakeAppStoreConnectClient.new(
-      version_state: { "IOS" => "PENDING_APPLE_RELEASE", "MAC_OS" => "PENDING_DEVELOPER_RELEASE" }
-    )
-    manager = AppStoreConnect::ReleaseManager.new(
-      client: client,
-      app_id: "6805117080",
-      output_path: nil,
-      summary_path: nil
-    )
-
-    manager.release_app_store(version: "1.0.0")
-
-    version_ids = client.calls.filter_map do |method, path, body|
-      if method == :post && path == "/v1/appStoreVersionReleaseRequests"
-        body.dig(:data, :relationships, :appStoreVersion, :data, :id)
-      end
-    end
-    assert_equal ["version-MAC_OS"], version_ids
-  end
-
-  def test_manual_release_rejects_automatic_release_type
-    client = FakeAppStoreConnectClient.new(
-      version_state: "PENDING_DEVELOPER_RELEASE",
-      release_type: "AFTER_APPROVAL"
-    )
-    manager = AppStoreConnect::ReleaseManager.new(
-      client: client,
-      app_id: "6805117080",
-      output_path: nil,
-      summary_path: nil
-    )
-
-    error = assert_raises(AppStoreConnect::Error) do
-      manager.release_app_store(version: "1.0.0")
-    end
-    assert_match(/must use manual release/, error.message)
-  end
-
-  def test_manual_release_reconciles_an_uncertain_post_response
-    client = FakeAppStoreConnectClient.new(
-      version_state: { "IOS" => "PENDING_DEVELOPER_RELEASE", "MAC_OS" => "READY_FOR_DISTRIBUTION" }
-    )
-    posted = false
-    client.define_singleton_method(:post) do |path, body:|
-      unless posted || path != "/v1/appStoreVersionReleaseRequests"
-        posted = true
-        @calls << [:post, path, body]
-        @version_state = { "IOS" => "PENDING_APPLE_RELEASE", "MAC_OS" => "READY_FOR_DISTRIBUTION" }
-        raise AppStoreConnect::TransportError, "App Store Connect transport failed: EOFError"
-      end
-      super(path, body: body)
-    end
-    manager = AppStoreConnect::ReleaseManager.new(
-      client: client,
-      app_id: "6805117080",
-      output_path: nil,
-      summary_path: nil
-    )
-
-    manager.release_app_store(version: "1.0.0")
-
-    assert posted
-  end
-
-  def test_release_lock_rejects_a_still_pending_release
-    client = FakeAppStoreConnectClient.new(version_state: "PENDING_DEVELOPER_RELEASE")
-    manager = AppStoreConnect::ReleaseManager.new(
-      client: client,
-      app_id: "6805117080",
-      output_path: nil,
-      summary_path: nil
-    )
-
-    error = assert_raises(AppStoreConnect::Error) do
-      manager.release_app_store(version: "1.0.0", permit_requests: false)
-    end
-
-    assert_match(/release lock exists/, error.message)
-    refute client.calls.any? { |method, path, _body| method == :post && path.include?("ReleaseRequests") }
-  end
-
-  def test_release_lock_accepts_a_confirmed_release_without_posting
-    client = FakeAppStoreConnectClient.new(version_state: "PROCESSING_FOR_DISTRIBUTION")
-    manager = AppStoreConnect::ReleaseManager.new(
-      client: client,
-      app_id: "6805117080",
-      output_path: nil,
-      summary_path: nil
-    )
-
-    manager.release_app_store(version: "1.0.0", permit_requests: false)
-
-    refute client.calls.any? { |method, path, _body| method == :post && path.include?("ReleaseRequests") }
-  end
 end

@@ -106,13 +106,50 @@ module AppStoreConnect
     { data: { type: "builds", id: build_id } }
   end
 
-  def release_request_payload(version_id)
+  def app_store_version_payload(app_id:, platform:, version:)
     {
       data: {
-        type: "appStoreVersionReleaseRequests",
+        type: "appStoreVersions",
+        attributes: {
+          platform: platform,
+          versionString: version,
+          releaseType: "AFTER_APPROVAL"
+        },
+        relationships: {
+          app: { data: { type: "apps", id: app_id } }
+        }
+      }
+    }
+  end
+
+  def automatic_release_payload(version_id)
+    {
+      data: {
+        type: "appStoreVersions",
+        id: version_id,
+        attributes: { releaseType: "AFTER_APPROVAL" }
+      }
+    }
+  end
+
+  def app_store_localization_payload(version_id:, locale:, whats_new:)
+    {
+      data: {
+        type: "appStoreVersionLocalizations",
+        attributes: { locale: locale, whatsNew: whats_new },
         relationships: {
           appStoreVersion: { data: { type: "appStoreVersions", id: version_id } }
         }
+      }
+    }
+  end
+
+  def app_store_localization_update_payload(localization_id:, whats_new:)
+    {
+      data: {
+        type: "appStoreVersionLocalizations",
+        id: localization_id,
+        attributes: { whatsNew: whats_new }
       }
     }
   end
@@ -275,19 +312,13 @@ module AppStoreConnect
       app_id:,
       output_path: ENV["GITHUB_OUTPUT"],
       summary_path: ENV["GITHUB_STEP_SUMMARY"],
-      in_app_purchase_contract_path: IN_APP_PURCHASE_CONTRACT_PATH,
-      sleeper: ->(seconds) { sleep(seconds) },
-      release_reconciliation_attempts: 30,
-      release_reconciliation_delay: 10
+      in_app_purchase_contract_path: IN_APP_PURCHASE_CONTRACT_PATH
     )
       @client = client
       @app_id = app_id
       @output_path = output_path
       @summary_path = summary_path
       @in_app_purchase_contract_path = in_app_purchase_contract_path
-      @sleeper = sleeper
-      @release_reconciliation_attempts = release_reconciliation_attempts
-      @release_reconciliation_delay = release_reconciliation_delay
     end
 
     def inspect_build(platform:, version:, build_number:)
@@ -329,10 +360,13 @@ module AppStoreConnect
       end
     end
 
-    def distribute_internal(version:, build_number:, group_name: nil)
+    def distribute_internal(version:, build_number:, group_name: nil, localization_paths: {})
       builds = require_valid_builds(version: version, build_number: build_number)
       group = find_or_create_group(name: group_name, internal: true)
       disable_mobile_builds_on_other_platforms(group)
+      builds.each_value do |build|
+        upsert_build_localizations(build.fetch("id"), localization_paths)
+      end
       add_builds_to_group(group.fetch("id"), builds.values.map { |build| build.fetch("id") })
       append_summary("Distributed #{version} (#{build_number}) to internal group #{group.dig("attributes", "name")}.")
     end
@@ -356,14 +390,24 @@ module AppStoreConnect
       append_summary("Submitted #{version} (#{build_number}) for external TestFlight testing in #{group_name}.")
     end
 
-    def prepare_app_store(version:, build_number:, submit: false)
+    def prepare_app_store(
+      version:,
+      build_number:,
+      submit: false,
+      localization_paths: {},
+      create_versions: false,
+      automatic_release: false
+    )
       builds = require_valid_builds(version: version, build_number: build_number)
       validate_in_app_purchases(require_approved_products: submit)
       versions = PLATFORMS.to_h do |platform|
-        app_store_version = require_app_store_version(platform: platform, version: version)
+        app_store_version = if create_versions
+                              find_or_create_app_store_version(platform: platform, version: version)
+                            else
+                              require_app_store_version(platform: platform, version: version)
+                            end
         [platform, app_store_version]
       end
-      validate_app_store_review_details(versions)
       states = versions.transform_values { |item| version_state(item) }
       invalid = states.reject do |_platform, state|
         SUBMITTED_VERSION_STATES.include?(state) || %w[PREPARE_FOR_SUBMISSION READY_FOR_REVIEW].include?(state)
@@ -371,6 +415,12 @@ module AppStoreConnect
       unless invalid.empty?
         raise Error, "App versions cannot use this release workflow from states: #{invalid.map { |key, value| "#{key}=#{value}" }.join(", ")}"
       end
+
+      versions.each do |platform, app_store_version|
+        ensure_automatic_release(app_store_version, platform: platform, state: states.fetch(platform)) if automatic_release
+        upsert_app_store_localizations(app_store_version.fetch("id"), localization_paths)
+      end
+      validate_app_store_review_details(versions)
 
       versions.each do |platform, app_store_version|
         build_id = builds.fetch(platform).fetch("id")
@@ -428,65 +478,6 @@ module AppStoreConnect
       true
     rescue Errno::ENOENT, JSON::ParserError, KeyError => error
       raise Error, "Invalid in-app purchase contract: #{error.message}"
-    end
-
-    def release_app_store(version:, permit_requests: true)
-      versions = PLATFORMS.to_h do |platform|
-        [platform, require_app_store_version(platform: platform, version: version)]
-      end
-      non_manual = versions.reject do |_platform, app_store_version|
-        app_store_version.dig("attributes", "releaseType") == "MANUAL"
-      end
-      unless non_manual.empty?
-        types = non_manual.map do |platform, item|
-          "#{platform}=#{item.dig('attributes', 'releaseType') || 'UNKNOWN'}"
-        end
-        raise Error, "App versions must use manual release: #{types.join(', ')}"
-      end
-
-      releasable = versions.select do |_platform, app_store_version|
-        version_state(app_store_version) == "PENDING_DEVELOPER_RELEASE"
-      end
-      complete = versions.reject do |_platform, app_store_version|
-        %w[
-          PENDING_DEVELOPER_RELEASE PENDING_APPLE_RELEASE PROCESSING_FOR_DISTRIBUTION
-          READY_FOR_DISTRIBUTION READY_FOR_SALE
-        ].include?(
-          version_state(app_store_version)
-        )
-      end
-      unless complete.empty?
-        states = complete.map { |platform, item| "#{platform}=#{version_state(item)}" }
-        raise Error, "App versions are not ready for manual release: #{states.join(', ')}"
-      end
-
-      if !permit_requests && !releasable.empty?
-        platforms = releasable.keys.join(" and ")
-        raise Error,
-              "A release lock exists while Apple still reports #{platforms} as pending developer release. " \
-              "Verify App Store Connect before removing the GitHub release lock ref."
-      end
-
-      releasable.each do |platform, app_store_version|
-        begin
-          @client.post(
-            "/v1/appStoreVersionReleaseRequests",
-            body: AppStoreConnect.release_request_payload(app_store_version.fetch("id"))
-          )
-        rescue TransportError => error
-          if release_request_accepted?(platform: platform, version: version)
-            puts "Reconciled #{platform} after an uncertain release-request response."
-            next
-          end
-          raise error
-        end
-      end
-      if releasable.empty?
-        append_summary("Both #{version} platforms are already released or processing.")
-      else
-        platforms = releasable.keys.join(" and ")
-        append_summary("Requested the App Store release for #{platforms} #{version}.")
-      end
     end
 
     private
@@ -771,22 +762,6 @@ module AppStoreConnect
       Process.clock_gettime(Process::CLOCK_MONOTONIC)
     end
 
-    def release_request_accepted?(platform:, version:)
-      @release_reconciliation_attempts.times do |attempt|
-        begin
-          refreshed = require_app_store_version(platform: platform, version: version)
-          return true if %w[
-            PENDING_APPLE_RELEASE PROCESSING_FOR_DISTRIBUTION READY_FOR_DISTRIBUTION READY_FOR_SALE
-          ].include?(version_state(refreshed))
-        rescue TransportError
-          # Continue polling because the release status remains uncertain.
-        end
-
-        @sleeper.call(@release_reconciliation_delay) if attempt + 1 < @release_reconciliation_attempts
-      end
-      false
-    end
-
     def find_build(platform:, version:, build_number:)
       raise Error, "Unsupported platform #{platform}" unless PLATFORMS.include?(platform)
 
@@ -991,6 +966,45 @@ module AppStoreConnect
       end
     end
 
+    def upsert_app_store_localizations(version_id, localization_paths)
+      return if localization_paths.empty?
+
+      existing = @client.collection(
+        "/v1/appStoreVersions/#{version_id}/appStoreVersionLocalizations",
+        query: {
+          "fields[appStoreVersionLocalizations]" => "locale,whatsNew",
+          "limit" => "50"
+        }
+      ).to_h { |item| [item.dig("attributes", "locale"), item] }
+
+      localization_paths.each do |locale, path|
+        text = File.read(path, encoding: "UTF-8").strip
+        raise Error, "App Store release notes are empty for #{locale}" if text.empty?
+
+        item = existing[locale]
+        if item
+          next if item.dig("attributes", "whatsNew") == text
+
+          @client.patch(
+            "/v1/appStoreVersionLocalizations/#{item.fetch('id')}",
+            body: AppStoreConnect.app_store_localization_update_payload(
+              localization_id: item.fetch("id"),
+              whats_new: text
+            )
+          )
+        else
+          @client.post(
+            "/v1/appStoreVersionLocalizations",
+            body: AppStoreConnect.app_store_localization_payload(
+              version_id: version_id,
+              locale: locale,
+              whats_new: text
+            )
+          )
+        end
+      end
+    end
+
     def submit_beta_review(build)
       response = @client.get(
         "/v1/builds/#{build.fetch("id")}",
@@ -1010,7 +1024,7 @@ module AppStoreConnect
       )
     end
 
-    def require_app_store_version(platform:, version:)
+    def find_app_store_version(platform:, version:)
       versions = @client.collection(
         "/v1/apps/#{@app_id}/appStoreVersions",
         query: {
@@ -1019,10 +1033,43 @@ module AppStoreConnect
           "limit" => "10"
         }
       )
-      raise Error, "Missing #{platform} App Store version #{version}" if versions.empty?
       raise Error, "Apple returned multiple #{platform} App Store versions for #{version}" if versions.length > 1
 
       versions.first
+    end
+
+    def require_app_store_version(platform:, version:)
+      find_app_store_version(platform: platform, version: version) ||
+        raise(Error, "Missing #{platform} App Store version #{version}")
+    end
+
+    def find_or_create_app_store_version(platform:, version:)
+      existing = find_app_store_version(platform: platform, version: version)
+      return existing if existing
+
+      response = @client.post(
+        "/v1/appStoreVersions",
+        body: AppStoreConnect.app_store_version_payload(
+          app_id: @app_id,
+          platform: platform,
+          version: version
+        )
+      )
+      response.fetch("data")
+    end
+
+    def ensure_automatic_release(app_store_version, platform:, state:)
+      release_type = app_store_version.dig("attributes", "releaseType")
+      return if release_type == "AFTER_APPROVAL"
+      if SUBMITTED_VERSION_STATES.include?(state)
+        raise Error, "#{platform} is already submitted with release type #{release_type || 'UNKNOWN'}"
+      end
+
+      @client.patch(
+        "/v1/appStoreVersions/#{app_store_version.fetch('id')}",
+        body: AppStoreConnect.automatic_release_payload(app_store_version.fetch("id"))
+      )
+      app_store_version["attributes"]["releaseType"] = "AFTER_APPROVAL"
     end
 
     def find_or_create_review_submission(platform:)
@@ -1138,7 +1185,8 @@ module AppStoreConnect
         manager.distribute_internal(
           version: version,
           build_number: build_number,
-          group_name: options[:group]
+          group_name: options[:group],
+          localization_paths: options[:localizations]
         )
       when "distribute-external"
         version = required_option(options, :version)
@@ -1155,14 +1203,11 @@ module AppStoreConnect
         manager.prepare_app_store(
           version: version,
           build_number: build_number,
-          submit: options.fetch(:submit, false)
+          submit: options.fetch(:submit, false),
+          localization_paths: options[:localizations],
+          create_versions: options.fetch(:create_versions, false),
+          automatic_release: options.fetch(:automatic_release, false)
         )
-      when "release-app-store"
-        version = required_option(options, :version)
-        manager.release_app_store(version: version)
-      when "verify-release-state"
-        version = required_option(options, :version)
-        manager.release_app_store(version: version, permit_requests: false)
       else
         raise Error, "Unknown command #{command.inspect}"
       end
@@ -1180,6 +1225,8 @@ module AppStoreConnect
         parser.on("--group NAME") { |value| options[:group] = value }
         parser.on("--timeout SECONDS", Integer) { |value| options[:timeout] = value }
         parser.on("--submit") { options[:submit] = true }
+        parser.on("--create-versions") { options[:create_versions] = true }
+        parser.on("--automatic-release") { options[:automatic_release] = true }
         parser.on("--localization LOCALE=PATH") do |value|
           locale, path = value.split("=", 2)
           raise OptionParser::InvalidArgument, value unless locale && path
