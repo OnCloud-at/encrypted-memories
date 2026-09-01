@@ -138,6 +138,8 @@ class PayloadTests(unittest.TestCase):
         self.assertIn("untrusted data", system_prompt)
         self.assertIn("single-expression", system_prompt)
         self.assertIn("repository-wide reference evidence", system_prompt)
+        self.assertIn("Do not report hypothetical risks", system_prompt)
+        self.assertIn("record the coverage limitation only", system_prompt)
         self.assertEqual(payload["max_tokens"], 8_000)
         self.assertIn(injection, review_input["pull_request"]["title"])
         self.assertEqual(review_input["pull_request"]["base"], "main")
