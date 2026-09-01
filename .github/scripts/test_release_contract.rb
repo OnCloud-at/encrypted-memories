@@ -22,10 +22,10 @@ class GitHubReleaseContractTest < Minitest::Test
       Notes for GitHub readers stay outside the Apple sections.
 
       ## Deutsch
-      Neue gemeinsame Mediathek.
+      Schnelleres Laden von Fotos.
 
       ## English
-      New shared library.
+      Faster photo loading.
 
       ## Contributors
       Thanks to an external contributor.
@@ -38,8 +38,8 @@ class GitHubReleaseContractTest < Minitest::Test
     assert_equal "1.2.0", release.version
     assert_equal "241000123", release.build_number
     assert_equal "app-store", release.channel
-    assert_equal "Neue gemeinsame Mediathek.", release.notes.fetch("de-DE")
-    assert_equal "New shared library.", release.notes.fetch("en-US")
+    assert_equal "Schnelleres Laden von Fotos.", release.notes.fetch("de-DE")
+    assert_equal "Faster photo loading.", release.notes.fetch("en-US")
     refute_includes release.notes.values.join, "contributor"
   end
 
@@ -80,7 +80,7 @@ class GitHubReleaseContractTest < Minitest::Test
     body = valid_body + "\n## Fixed\nOne\n## Fixed\nTwo\n"
     release = GitHubReleaseContract.parse(payload(body: body.gsub("\n", "\r\n")))
 
-    assert_equal "Neue gemeinsame Mediathek.", release.notes.fetch("de-DE")
+    assert_equal "Schnelleres Laden von Fotos.", release.notes.fetch("de-DE")
   end
 
   def test_release_rejects_draft_or_unpublished_payload
@@ -99,10 +99,11 @@ class GitHubReleaseContractTest < Minitest::Test
 
       GitHubReleaseContract.write(release, directory: notes, output_path: output, summary_path: nil)
 
-      assert_equal "Neue gemeinsame Mediathek.\n", File.read(File.join(notes, "de-DE.txt"))
-      assert_equal "New shared library.\n", File.read(File.join(notes, "en-US.txt"))
-      assert_includes File.read(output), "channel=app-store\n"
-      assert_includes File.read(output), "notes_de_base64=TmV1ZSBnZW1laW5zYW1lIE1lZGlhdGhlay4=\n"
+      assert_equal "Schnelleres Laden von Fotos.\n", File.read(File.join(notes, "de-DE.txt"))
+      assert_equal "Faster photo loading.\n", File.read(File.join(notes, "en-US.txt"))
+      output_values = File.readlines(output, chomp: true).to_h { |line| line.split("=", 2) }
+      assert_equal "app-store", output_values.fetch("channel")
+      assert_equal "Schnelleres Laden von Fotos.", Base64.strict_decode64(output_values.fetch("notes_de_base64"))
     end
   end
 end

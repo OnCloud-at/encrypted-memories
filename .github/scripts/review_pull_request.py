@@ -25,9 +25,9 @@ from github_llm_client import (
 
 
 MAX_FILES = 80
-MAX_PATCH_CHARS = 8_000
-MAX_TOTAL_PATCH_CHARS = 64_000
-MAX_PATCH_LINES = 1_000
+MAX_PATCH_CHARS = 24_000
+MAX_TOTAL_PATCH_CHARS = 96_000
+MAX_PATCH_LINES = 3_000
 MAX_TITLE_CHARS = 500
 MAX_BODY_CHARS = 8_000
 MAX_SUMMARY_CHARS = 2_000
@@ -305,9 +305,10 @@ def _redact_patch_lines(
 def compact_files(
     files: list[dict[str, Any]],
     declared_file_count: int,
-) -> tuple[list[dict[str, Any]], list[str]]:
+) -> tuple[list[dict[str, Any]], list[str], dict[str, set[int]]]:
     compact: list[dict[str, Any]] = []
     gaps: list[str] = []
+    changed_lines: dict[str, set[int]] = {}
     total_patch_chars = 0
     total_patch_lines = 0
 
@@ -335,6 +336,11 @@ def compact_files(
             gaps.append(f"The patch for `{safe_markdown(path, 500)}` was truncated.")
         total_patch_chars += len(bounded_patch)
         total_patch_lines += len(redacted_lines)
+        changed_lines[parsed.file_id] = {
+            int(line["new_line"])
+            for line in redacted_lines
+            if isinstance(line.get("new_line"), int)
+        }
         compact.append(
             {
                 "file_id": parsed.file_id,
@@ -343,13 +349,16 @@ def compact_files(
                 "additions": parsed.additions,
                 "deletions": parsed.deletions,
                 "changes": parsed.changes,
-                "lines": redacted_lines,
+                # A compact patch string leaves enough request budget for complete workflow files.
+                # New-line identities stay local in `changed_lines` for deterministic citation validation.
+                "patch": bounded_patch,
+                "patch_complete": not patch_truncated,
             }
         )
         if total_patch_chars >= MAX_TOTAL_PATCH_CHARS and len(compact) < min(len(files), MAX_FILES):
             gaps.append("The total diff limit was reached before every textual patch could be included.")
 
-    return compact, list(dict.fromkeys(gaps))
+    return compact, list(dict.fromkeys(gaps)), changed_lines
 
 
 def llm_payload(
@@ -362,15 +371,7 @@ def llm_payload(
     declared_file_count = pull_request.get("changed_files")
     if isinstance(declared_file_count, bool) or not isinstance(declared_file_count, int):
         declared_file_count = len(files)
-    compact, coverage_gaps = compact_files(files, declared_file_count)
-    changed_lines = {
-        str(item["file_id"]): {
-            int(line["new_line"])
-            for line in item.get("lines", [])
-            if isinstance(line, dict) and isinstance(line.get("new_line"), int)
-        }
-        for item in compact
-    }
+    compact, coverage_gaps, changed_lines = compact_files(files, declared_file_count)
     file_paths = {str(item["file_id"]): str(item["path"]) for item in compact}
     review_input = {
         "task": "github_pull_request_code_review",
@@ -396,7 +397,7 @@ def llm_payload(
                     "properties": {
                         "severity": {"type": "string", "enum": sorted(ALLOWED_SEVERITIES)},
                         "file_id": {"type": "string", "maxLength": 32},
-                        "line": {"type": "integer", "minimum": 0},
+                        "line": {"type": "integer", "minimum": 1},
                         "title": {"type": "string", "maxLength": MAX_FINDING_TITLE_CHARS},
                         "detail": {"type": "string", "maxLength": MAX_FINDING_DETAIL_CHARS},
                     },
@@ -458,8 +459,9 @@ def llm_payload(
                     "GitHub state handles those separately. Use blocking only for a concrete code problem that should "
                     "prevent merge. Use warning for a likely defect that needs maintainer judgment. Use suggestion for "
                     "a bounded improvement. Reference only a supplied "
-                    "file_id and exact new-file line from the line records. Use line 0 when the exact new-file line "
-                    "is unavailable. Keep the complete visible response below 12,000 UTF-8 bytes. Before responding, "
+                    "file_id and exact new-file line from a supplied patch hunk. If no supplied new-file line proves "
+                    "the issue, do not return a finding; record missing context only as a testing gap. Keep the "
+                    "complete visible response below 12,000 UTF-8 bytes. Before responding, "
                     "internally verify the complete response against the schema, size limits, supplied file IDs, and "
                     "changed-line constraints. Return only the requested JSON object."
                 ),
@@ -563,10 +565,10 @@ def parse_review(
         path = file_paths.get(file_id) if file_paths is not None else ""
         if file_paths is not None and path is None:
             raise RuntimeError("LLM API referenced a file ID without a supplied path")
-        if isinstance(line, bool) or not isinstance(line, int) or not 0 <= line <= 10_000_000:
+        if isinstance(line, bool) or not isinstance(line, int) or not 1 <= line <= 10_000_000:
             raise RuntimeError("LLM API returned an invalid finding line")
-        if line and line not in changed_lines[file_id]:
-            line = 0
+        if line not in changed_lines[file_id]:
+            raise RuntimeError("LLM API referenced a line outside the supplied patch")
         if not isinstance(title, str) or len(title) > MAX_FINDING_TITLE_CHARS:
             raise RuntimeError("LLM API returned an invalid finding title")
         if not isinstance(detail, str) or len(detail) > MAX_FINDING_DETAIL_CHARS:

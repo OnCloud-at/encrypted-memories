@@ -21,8 +21,8 @@ module GitHubReleaseContract
 
   def parse(payload)
     release_id = Integer(payload.fetch("id"), exception: false)
-    unless release_id&.positive? && release_id.to_s.length <= 18
-      raise Error, "GitHub release ID must be a positive integer with at most 18 digits"
+    unless release_id&.positive?
+      raise Error, "GitHub release ID must be a positive integer"
     end
     raise Error, "GitHub release must be published" if payload["draft"] == true || payload["published_at"].to_s.empty?
 
