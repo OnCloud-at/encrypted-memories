@@ -821,8 +821,8 @@ class AppStoreConnectTest < Minitest::Test
     )
     german = Tempfile.new("de-DE")
     english = Tempfile.new("en-US")
-    german.write("Gemeinsame Mediathek.")
-    english.write("Shared library.")
+    german.write("Verbesserte Videowiedergabe.")
+    english.write("Improved video playback.")
     german.close
     english.close
 
@@ -842,6 +842,23 @@ class AppStoreConnectTest < Minitest::Test
     assert version_posts.all? do |_method, _path, body|
       body.dig(:data, :attributes, :releaseType) == "AFTER_APPROVAL"
     end
+
+    attachment_calls = client.calls.select do |method, path, _body|
+      method == :patch && path.match?(%r{\A/v1/appStoreVersions/.+/relationships/build\z})
+    end
+    assert_equal(
+      [
+        ["/v1/appStoreVersions/version-IOS/relationships/build", "build-IOS"],
+        ["/v1/appStoreVersions/version-MAC_OS/relationships/build", "build-MAC_OS"]
+      ],
+      attachment_calls.map { |_method, path, body| [path, body.dig(:data, :id)] }
+    )
+
+    first_review_item_index = client.calls.index do |method, path, _body|
+      method == :post && path == "/v1/reviewSubmissionItems"
+    end
+    refute_nil first_review_item_index
+    assert attachment_calls.all? { |call| client.calls.index(call) < first_review_item_index }
 
     localization_patches = client.calls.select do |method, path, _body|
       method == :patch && path.start_with?("/v1/appStoreVersionLocalizations/")
