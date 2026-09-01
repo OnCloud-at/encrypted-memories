@@ -32,6 +32,75 @@ import Testing
         #expect(await recorder.callCount == 2)
         await coordinator.cancel()
     }
+
+    @Test func supersededCancelledResultRunsLatestRequestAndSkipsStaleObserver() async {
+        let firstRelease = AsyncGate()
+        let recorder = CoordinatorRaceRecorder()
+        let coordinator = TimelineUploadRefreshCoordinator(policy: .init(schedule: .init(delays: [.zero])))
+
+        await coordinator.request(
+            refresh: { _ in
+                await recorder.markFirstStarted()
+                await firstRelease.wait()
+                return .cancelled
+            },
+            observer: { _ in await recorder.recordOldObservation() }
+        )
+        await recorder.waitForFirstStart()
+        await coordinator.request(
+            refresh: { _ in
+                await recorder.markSecondStarted()
+                return nil
+            },
+            observer: { _ in await recorder.recordNewObservation() }
+        )
+        await firstRelease.open()
+        await recorder.waitForNewObservation()
+
+        #expect(await recorder.secondStarts == 1)
+        #expect(await recorder.oldObservations == 0)
+        #expect(await recorder.newObservations == 1)
+        await coordinator.cancel()
+    }
+
+    @Test func cancelledWorkerCannotClearReplacementWorker() async {
+        let firstRelease = AsyncGate()
+        let secondRelease = AsyncGate()
+        let recorder = CoordinatorRaceRecorder()
+        let coordinator = TimelineUploadRefreshCoordinator(policy: .init(schedule: .init(delays: [.zero])))
+
+        await coordinator.request(refresh: { _ in
+            await recorder.markFirstStarted()
+            while !Task.isCancelled { await Task.yield() }
+            await recorder.markFirstCancelled()
+            await firstRelease.wait()
+            return .cancelled
+        })
+        await recorder.waitForFirstStart()
+        let cancellation = Task { await coordinator.cancel() }
+        await recorder.waitForFirstCancellation()
+
+        await coordinator.request(refresh: { _ in
+            await recorder.markSecondStarted()
+            await secondRelease.wait()
+            return nil
+        })
+        await recorder.waitForSecondStart()
+        await firstRelease.open()
+        await cancellation.value
+
+        await coordinator.request(refresh: { _ in
+            await recorder.markThirdStarted()
+            return nil
+        })
+        try? await Task.sleep(for: .milliseconds(20))
+        #expect(await recorder.thirdStarts == 0)
+
+        await secondRelease.open()
+        await recorder.waitForThirdStart()
+        #expect(await recorder.thirdStarts == 1)
+        await coordinator.cancel()
+    }
 }
 
 private actor RefreshAttemptRecorder {
@@ -58,5 +127,58 @@ private actor RefreshAttemptRecorder {
 
     func waitForAttempts(_ count: Int) async {
         while attempts.count < count { await Task.yield() }
+    }
+}
+
+private actor AsyncGate {
+    private var isOpen = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func wait() async {
+        guard !isOpen else { return }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+
+    func open() {
+        isOpen = true
+        let pending = waiters
+        waiters.removeAll()
+        for waiter in pending { waiter.resume() }
+    }
+}
+
+private actor CoordinatorRaceRecorder {
+    private(set) var firstStarts = 0
+    private(set) var firstCancellations = 0
+    private(set) var secondStarts = 0
+    private(set) var thirdStarts = 0
+    private(set) var oldObservations = 0
+    private(set) var newObservations = 0
+
+    func markFirstStarted() { firstStarts += 1 }
+    func markFirstCancelled() { firstCancellations += 1 }
+    func markSecondStarted() { secondStarts += 1 }
+    func markThirdStarted() { thirdStarts += 1 }
+    func recordOldObservation() { oldObservations += 1 }
+    func recordNewObservation() { newObservations += 1 }
+
+    func waitForFirstStart() async {
+        while firstStarts == 0 { await Task.yield() }
+    }
+
+    func waitForFirstCancellation() async {
+        while firstCancellations == 0 { await Task.yield() }
+    }
+
+    func waitForSecondStart() async {
+        while secondStarts == 0 { await Task.yield() }
+    }
+
+    func waitForThirdStart() async {
+        while thirdStarts == 0 { await Task.yield() }
+    }
+
+    func waitForNewObservation() async {
+        while newObservations == 0 { await Task.yield() }
     }
 }

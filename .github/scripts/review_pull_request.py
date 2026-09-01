@@ -7,11 +7,13 @@ import json
 import os
 import re
 import sys
+import time
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlsplit
 
 from github_llm_client import (
+    LLMStreamRetryableError,
     MAX_LLM_REQUEST_BYTES,
     RequestFailure,
     bounded_text,
@@ -34,6 +36,7 @@ MAX_FINDING_DETAIL_CHARS = 1_200
 MAX_TESTING_GAP_CHARS = 500
 MAX_FINDINGS = 8
 MAX_TESTING_GAPS = 4
+REVIEW_PROVIDER_ATTEMPTS = 3
 REVIEW_MARKER_PREFIX = "<!-- oncloud-pr-review:v1 head:"
 ALLOWED_SEVERITIES = {"blocking", "warning", "suggestion"}
 _HUNK_HEADER_RE = re.compile(
@@ -414,7 +417,9 @@ def llm_payload(
         "model": model,
         "stream": True,
         "temperature": 0,
-        "max_tokens": 4_000,
+        # High-reasoning reviews have exceeded 4,000 total reasoning and visible tokens in production.
+        # The client still enforces its independent visible-content and wire limits.
+        "max_tokens": 8_000,
         "response_format": {
             "type": "json_schema",
             "json_schema": {
@@ -436,7 +441,11 @@ def llm_payload(
                     "assertions and exercise the relevant behavior. For security-sensitive changes, trace only the "
                     "modified trust boundaries, input validation, authentication, authorization, sensitive-data flow, "
                     "cryptography, configuration, and error handling. Report only concrete regressions. Do not report "
-                    "style preferences or speculative concerns. Do not claim to "
+                    "style preferences or speculative concerns. Before reporting a compile defect, verify the language "
+                    "semantics shown by the supplied source. Swift permits an implicit return from a single-expression "
+                    "function, so absence of an explicit return is not by itself a defect. Do not claim a symbol is "
+                    "unused from a partial patch; require repository-wide reference evidence supplied in the input. "
+                    "Do not claim to "
                     "decide GitHub mergeability, status checks, approvals, or branch-protection requirements; trusted "
                     "GitHub state handles those separately. Use blocking only for a concrete code problem that should "
                     "prevent merge. Use warning for a likely defect that needs maintainer judgment. Use suggestion for "
@@ -458,6 +467,37 @@ def llm_payload(
     if len(json.dumps(payload, ensure_ascii=False).encode("utf-8")) > MAX_LLM_REQUEST_BYTES:
         raise RuntimeError("LLM request exceeded the configured input limit")
     return payload, changed_lines, coverage_gaps, file_paths
+
+
+def request_review_with_retries(
+    llm_api_url: str,
+    *,
+    token: str,
+    payload: dict[str, Any],
+    changed_lines: dict[str, set[int]],
+    file_paths: dict[str, str],
+) -> dict[str, Any]:
+    """Retry only bounded provider/stream failures; deterministic validation failures still fail once."""
+
+    for attempt in range(REVIEW_PROVIDER_ATTEMPTS):
+        try:
+            return request_validated_llm_result(
+                llm_api_url,
+                token=token,
+                payload=payload,
+                validator=lambda content: parse_review(content, changed_lines, file_paths),
+            )
+        except LLMStreamRetryableError as error:
+            if attempt == REVIEW_PROVIDER_ATTEMPTS - 1:
+                raise
+            delay = 2**attempt
+            print(
+                f"::warning::{error}; retrying the complete review request "
+                f"({attempt + 2}/{REVIEW_PROVIDER_ATTEMPTS}).",
+                file=sys.stderr,
+            )
+            time.sleep(delay)
+    raise AssertionError("Review provider retry loop ended unexpectedly")
 
 
 def changed_new_lines(patch: str) -> set[int]:
@@ -730,11 +770,12 @@ def main() -> int:
         model=model,
         reasoning_effort=reasoning_effort,
     )
-    review = request_validated_llm_result(
+    review = request_review_with_retries(
         llm_api_url,
         token=llm_token,
         payload=payload,
-        validator=lambda content: parse_review(content, changed_lines, file_paths),
+        changed_lines=changed_lines,
+        file_paths=file_paths,
     )
     pull_request_before_publish = fetch_pull_request(repo, number, token=github_token, api_url=api_url)
     if not same_pull_request_snapshot(event_snapshot, pull_request_before_publish):

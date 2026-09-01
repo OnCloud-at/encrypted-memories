@@ -136,6 +136,9 @@ class PayloadTests(unittest.TestCase):
         self.assertIn("not issue triage", system_prompt)
         self.assertIn("Do not claim to decide GitHub mergeability", system_prompt)
         self.assertIn("untrusted data", system_prompt)
+        self.assertIn("single-expression", system_prompt)
+        self.assertIn("repository-wide reference evidence", system_prompt)
+        self.assertEqual(payload["max_tokens"], 8_000)
         self.assertIn(injection, review_input["pull_request"]["title"])
         self.assertEqual(review_input["pull_request"]["base"], "main")
         self.assertEqual(review_input["pull_request"]["head_sha"], "abc123")
@@ -172,6 +175,79 @@ class PayloadTests(unittest.TestCase):
         )
 
         self.assertEqual(payload["reasoning_effort"], "high")
+
+
+class ReviewProviderRetryTests(unittest.TestCase):
+    def test_transient_provider_failure_retries_the_complete_review(self) -> None:
+        expected = valid_review(summary="recovered")
+        with (
+            patch.object(
+                review_pull_request,
+                "request_validated_llm_result",
+                side_effect=[
+                    github_llm_client.LLMStreamRetryableError("transient stream failure"),
+                    expected,
+                ],
+            ) as request,
+            patch.object(review_pull_request.time, "sleep") as sleep,
+        ):
+            result = review_pull_request.request_review_with_retries(
+                "https://api.example.test/v1/chat/completions",
+                token="token",
+                payload={"stream": True},
+                changed_lines={"file-001": {1}},
+                file_paths={"file-001": "Sources/Backup.swift"},
+            )
+
+        self.assertEqual(result, expected)
+        self.assertEqual(request.call_count, 2)
+        sleep.assert_called_once_with(1)
+
+    def test_three_transient_provider_failures_exhaust_the_bounded_retry(self) -> None:
+        failure = github_llm_client.LLMStreamRetryableError("transient stream failure")
+        with (
+            patch.object(
+                review_pull_request,
+                "request_validated_llm_result",
+                side_effect=[failure, failure, failure],
+            ) as request,
+            patch.object(review_pull_request.time, "sleep") as sleep,
+        ):
+            with self.assertRaisesRegex(
+                github_llm_client.LLMStreamRetryableError,
+                "transient stream failure",
+            ):
+                review_pull_request.request_review_with_retries(
+                    "https://api.example.test/v1/chat/completions",
+                    token="token",
+                    payload={"stream": True},
+                    changed_lines={"file-001": {1}},
+                    file_paths={"file-001": "Sources/Backup.swift"},
+                )
+
+        self.assertEqual(request.call_count, 3)
+        self.assertEqual([call.args for call in sleep.call_args_list], [(1,), (2,)])
+
+    def test_deterministic_validation_failure_is_not_retried(self) -> None:
+        with (
+            patch.object(
+                review_pull_request,
+                "request_validated_llm_result",
+                side_effect=RuntimeError("invalid review schema"),
+            ) as request,
+            patch.object(review_pull_request.time, "sleep") as sleep,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "invalid review schema"):
+                review_pull_request.request_review_with_retries(
+                    "https://api.example.test/v1/chat/completions",
+                    token="token",
+                    payload={"stream": True},
+                    changed_lines={"file-001": {1}},
+                    file_paths={"file-001": "Sources/Backup.swift"},
+                )
+
+        request.assert_called_once()
+        sleep.assert_not_called()
 
 
 class ParsingAndRenderingTests(unittest.TestCase):
@@ -984,7 +1060,7 @@ class LLMStreamTests(unittest.TestCase):
         response = FragmentedResponse([b": keepalive\n\n"])
 
         with patch.object(github_llm_client.time, "monotonic", side_effect=[0.0, 2.0]):
-            with self.assertRaisesRegex(github_llm_client.LLMResponseLimitError, "time budget"):
+            with self.assertRaisesRegex(github_llm_client.LLMTimeBudgetError, "time budget"):
                 github_llm_client.read_llm_stream_content(response, deadline=1.0)
 
     def test_both_provider_error_shapes_are_retried_without_exposing_details(self) -> None:

@@ -442,7 +442,7 @@ public actor ThumbnailFeedCore {
     public nonisolated func setOnCacheArrivalWake(
         _ callback: @escaping @Sendable () -> Void
     ) -> ThumbnailFeedWakeRegistration {
-        cacheArrivalWake.add(callback)
+        return cacheArrivalWake.add(callback)
     }
 
     /// A generous "a live viewport is (or was very recently) waiting on content" gate for the arrival wake: wide

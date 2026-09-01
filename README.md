@@ -50,7 +50,7 @@ Financial support helps cover Apple membership, test devices, infrastructure, an
 - Photo Library backup on macOS, iOS, and iPadOS with persistent queues, streamed hashing, duplicate detection, crash recovery, album synchronization, and OS-scheduled background catch-up.
 - MapKit browsing with encrypted location metadata and adaptive clustering.
 - Encrypted thumbnail, preview, original, and offline caches.
-- Optional on-device Smart Search using Core ML. Model artifacts and the local search index stay on the device, and photos and search queries are not sent to a search service.
+- Optional on-device Smart Search using Core ML. Model artifacts and the local search index stay on the device, and photos and search queries are not sent to a search service. Initial indexing can temporarily make the device warmer. Its duration varies with the number of photos and the device's performance, so large libraries can take longer to finish.
 - Shared network request governance for foreground interactions and background work.
 
 ## Platform Status
