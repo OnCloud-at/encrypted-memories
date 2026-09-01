@@ -396,6 +396,7 @@ public actor MLIndexRunner {
             var committedResults: [MLPipelineStageResult] = []
             committedResults.reserveCapacity(work.count)
             var stopReason: MLDerivedPipelineStopReason?
+            var deferredWorkSeen = false
 
             var planOffset = 0
             while planOffset < plans.count {
@@ -444,6 +445,9 @@ public actor MLIndexRunner {
                             stopReason = .cancelled
                         case .suspended:
                             stopReason = .policySuspended
+                        case .deferred:
+                            deferredWorkSeen = true
+                            committedResults.append(result)
                         default:
                             committedResults.append(result)
                         }
@@ -462,6 +466,9 @@ public actor MLIndexRunner {
             }
             if let stopReason {
                 return MLDerivedPipelinePassOutcome(reason: stopReason, progress: progress)
+            }
+            if deferredWorkSeen {
+                return MLDerivedPipelinePassOutcome(reason: .retryPending, progress: progress)
             }
             if let remaining = remainingAnalysisPlans {
                 remainingAnalysisPlans = remaining - plans.count

@@ -122,6 +122,7 @@ struct MainView: View {
     @State private var favorites: Set<PhotoUID> = []
     @State private var uploadRefreshTask: Task<Void, Never>?
     @State private var uploadRefreshGeneration: UInt64 = 0
+    @State private var backupUploadRefreshCoordinator = TimelineUploadRefreshCoordinator()
     @State private var uploadRefreshMessage: String?
     @State private var uploadRefreshBusy = false
     /// Whether the current banner message represents success (drives the icon/colour). Tracked
@@ -270,6 +271,7 @@ struct MainView: View {
                 searchDebounceTask?.cancel()
                 searchDebounceTask = nil
                 cancelVeilTasks()
+                Task { await backupUploadRefreshCoordinator.cancel() }
             }
             .onChange(of: columnVisibility) { _, newValue in
                 // The NATIVE split-view toggle drives columnVisibility - mirror it back into our open-state +
@@ -1269,61 +1271,49 @@ struct MainView: View {
     }
 
     private func scheduleLibraryRefreshAfterBackupUpload() {
-        uploadRefreshGeneration &+= 1
-        let generation = uploadRefreshGeneration
-        uploadRefreshTask?.cancel()
-        uploadRefreshTask = Task { @MainActor in
-            await runBackupUploadRefresh(generation: generation)
-            guard generation == uploadRefreshGeneration else { return }
-            uploadRefreshTask = nil
-        }
-    }
-
-    @MainActor private func runBackupUploadRefresh(generation: UInt64) async {
         uploadRefreshBusy = true
         uploadRefreshSuccess = false
         uploadRefreshMessage = String(localized: "library.refreshing")
-        let policy = TimelineRefreshConvergencePolicy()
-        var attempt = 0
-
-        while true {
-            guard generation == uploadRefreshGeneration, !Task.isCancelled else { return }
-            let result = await timelineModel.refreshLibrary()
-            guard generation == uploadRefreshGeneration, !Task.isCancelled else { return }
-            if await recoverBackendAfterScopeAccessLoss(ifNeeded: result) { return }
-            OfflineLibraryManager.shared.liveAssetCount = timelineModel.allItems.count
-            reconcileNewAssetThumbnails(result.addedUIDs)
-            logUploadRefresh(uploadedNode: "backup", attempt: attempt, result: result)
-
-            switch policy.decision(after: result.failureReason, attempt: attempt) {
-            case .succeeded:
-                uploadRefreshBusy = false
-                uploadRefreshSuccess = true
-                uploadRefreshMessage = String(localized: "library.refreshed")
-                clearUploadRefreshMessage(after: .seconds(2))
-                return
-            case .retry(let delay):
-                uploadRefreshMessage = String(localized: "upload.waiting_for_refresh")
-                do {
-                    try await Task.sleep(for: delay)
-                } catch {
-                    return
+        Task {
+            await backupUploadRefreshCoordinator.request(
+                refresh: { attempt in
+                    await performBackupUploadRefreshAttempt(attempt: attempt)
+                },
+                observer: { state in
+                    await applyBackupUploadRefresh(state)
                 }
-                attempt += 1
-            case .notYetVisible:
-                uploadRefreshBusy = false
-                uploadRefreshMessage = String(localized: "upload.not_yet_indexed")
-                return
-            case .failed:
-                uploadRefreshBusy = false
-                uploadRefreshMessage = String(localized: "library.refresh_failed")
-                clearUploadRefreshMessage(after: .seconds(2))
-                return
-            case .cancelled:
-                uploadRefreshBusy = false
-                uploadRefreshMessage = nil
-                return
-            }
+            )
+        }
+    }
+
+    @MainActor private func performBackupUploadRefreshAttempt(attempt: Int) async -> TimelineRefreshFailureReason? {
+        let result = await timelineModel.refreshLibrary()
+        if await recoverBackendAfterScopeAccessLoss(ifNeeded: result) { return .cancelled }
+        OfflineLibraryManager.shared.liveAssetCount = timelineModel.allItems.count
+        reconcileNewAssetThumbnails(result.addedUIDs)
+        logUploadRefresh(uploadedNode: "backup", attempt: attempt, result: result)
+        return result.failureReason
+    }
+
+    @MainActor private func applyBackupUploadRefresh(_ state: TimelineUploadRefreshAttempt) {
+        switch state.decision {
+        case .succeeded:
+            uploadRefreshBusy = false
+            uploadRefreshSuccess = true
+            uploadRefreshMessage = String(localized: "library.refreshed")
+            clearUploadRefreshMessage(after: .seconds(2))
+        case .retry:
+            uploadRefreshMessage = String(localized: "upload.waiting_for_refresh")
+        case .notYetVisible:
+            uploadRefreshBusy = false
+            uploadRefreshMessage = String(localized: "upload.not_yet_indexed")
+        case .failed:
+            uploadRefreshBusy = false
+            uploadRefreshMessage = String(localized: "library.refresh_failed")
+            clearUploadRefreshMessage(after: .seconds(2))
+        case .cancelled:
+            uploadRefreshBusy = false
+            uploadRefreshMessage = nil
         }
     }
 

@@ -413,6 +413,44 @@ import Testing
         #expect(store.progress(for: key).total == 1)
     }
 
+    @Test func versionFourRetryLimitRowsReopenWithoutDiscardingCompletedWork() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("SQLiteMLDerivedPipelineStoreTests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let url = root.appendingPathComponent(SQLiteMLDerivedPipelineStore.databaseFileName)
+        let cipher = TestDerivedCipher(key: 0x72)
+        let artifact = try makeArtifact(stage: "ocr", revision: "revision3")
+        let key = try makeKey(account: "account", artifacts: [artifact])
+        let first = try MLPipelineAssetRevision(
+            uid: PhotoUID(volumeID: "volume", nodeID: "first"), sourceRevision: "source-v1")
+        let second = try MLPipelineAssetRevision(
+            uid: PhotoUID(volumeID: "volume", nodeID: "second"), sourceRevision: "source-v1")
+
+        var store: SQLiteMLDerivedPipelineStore? = try openStore(url: url, cipher: cipher)
+        #expect(store?.enqueue([first, second], for: key) == true)
+        let work = try #require(store?.nextWorkBatch(for: key, limit: 2, now: .now))
+        #expect(
+            store?.commit(
+                [
+                    .init(workItem: work[0], outcome: .completedEmpty),
+                    .init(workItem: work[1], outcome: .permanentInputFailure(reason: .retryLimitReached)),
+                ], for: key, now: .now) == true)
+        store?.close()
+        store = nil
+
+        var raw: OpaquePointer?
+        #expect(sqlite3_open(url.path, &raw) == SQLITE_OK)
+        #expect(sqlite3_exec(raw, "PRAGMA user_version=4;", nil, nil, nil) == SQLITE_OK)
+        sqlite3_close(raw)
+
+        store = try openStore(url: url, cipher: cipher)
+        let progress = try #require(store?.progress(for: key))
+        #expect(progress.completed == 1)
+        #expect(progress.pending == 1)
+        #expect(progress.permanentFailure == 0)
+        #expect(store?.nextWorkBatch(for: key, limit: 2, now: .now).first?.attempts == 0)
+    }
+
     @Test func emptyResultsCompleteAndTerminalFailuresAreGroupedByAsset() async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("SQLiteMLDerivedPipelineStoreTests-\(UUID().uuidString)")

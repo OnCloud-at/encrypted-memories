@@ -80,6 +80,10 @@ public enum MLPipelineFailureReason: String, Codable, CaseIterable, Equatable, H
     case retryLimitReached
 }
 
+public enum MLPipelineDeferralReason: String, Codable, Equatable, Hashable, Sendable {
+    case sourceNotResident
+}
+
 public enum MLPipelineSuspensionReason: String, Codable, Equatable, Hashable, Sendable {
     case resourcePolicy
     case thermal
@@ -107,10 +111,19 @@ public enum MLPipelineStageOutcome: Equatable, Sendable {
     /// a skip or failure, and prevents the same empty request from being repeated forever.
     case completedEmpty
     case skipped(MLPipelineSkipReason)
+    /// The input is valid but not locally resident yet. Deferrals never consume the failure retry budget.
+    case deferred(reason: MLPipelineDeferralReason, retryAfter: Date?)
     case retryableFailure(reason: MLPipelineFailureReason, retryAfter: Date?)
     case permanentInputFailure(reason: MLPipelineFailureReason)
     case cancelled
     case suspended(MLPipelineSuspensionReason)
+}
+
+extension MLPipelineStageOutcome {
+    var consumesAttempt: Bool {
+        if case .deferred = self { return false }
+        return true
+    }
 }
 
 public struct MLPipelineStageResult: Equatable, Sendable {
@@ -387,6 +400,9 @@ public final class InMemoryMLDerivedPipelineStore: MLDerivedPipelineStore, @unch
                 case .skipped(let reason):
                     record.state = .skipped(reason)
                     record.output = nil
+                case .deferred(_, let retryAfter):
+                    record.state = .retry(retryAfter ?? now)
+                    record.output = nil
                 case .retryableFailure(_, let retryAfter):
                     record.state = .retry(retryAfter ?? now)
                     record.output = nil
@@ -396,7 +412,7 @@ public final class InMemoryMLDerivedPipelineStore: MLDerivedPipelineStore, @unch
                 case .cancelled, .suspended:
                     continue
                 }
-                record.attempts += 1
+                if result.outcome.consumesAttempt { record.attempts += 1 }
                 records[recordKey] = record
                 changed = true
             }

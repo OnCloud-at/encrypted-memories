@@ -98,6 +98,10 @@ class LLMResponseLimitError(LLMStreamError):
     """The LLM stream exceeded a deterministic local resource limit."""
 
 
+class LLMTimeBudgetError(LLMStreamRetryableError):
+    """The provider did not complete one bounded request before its deadline."""
+
+
 class RejectAuthenticatedRedirects(HTTPRedirectHandler):
     def redirect_request(
         self,
@@ -296,10 +300,10 @@ def read_llm_stream_content(response: Any, *, deadline: float | None = None) -> 
 
     while not saw_done:
         if time.monotonic() >= deadline:
-            raise LLMResponseLimitError("LLM API stream exceeded the configured time budget")
+            raise LLMTimeBudgetError("LLM API stream exceeded the configured time budget")
         raw_chunk = read_chunk(MAX_LLM_READ_BYTES)
         if time.monotonic() >= deadline:
-            raise LLMResponseLimitError("LLM API stream exceeded the configured time budget")
+            raise LLMTimeBudgetError("LLM API stream exceeded the configured time budget")
         if not raw_chunk:
             drain_lines(at_eof=True)
             consume_event()
@@ -341,13 +345,13 @@ def request_llm_content(
     def sleep_before_retry(delay: float) -> None:
         remaining = deadline - time.monotonic()
         if remaining <= delay:
-            raise LLMResponseLimitError("LLM API request exceeded the configured time budget")
+            raise LLMTimeBudgetError("LLM API request exceeded the configured time budget")
         time.sleep(delay)
 
     for attempt in range(LLM_API_ATTEMPTS):
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            raise LLMResponseLimitError("LLM API request exceeded the configured time budget")
+            raise LLMTimeBudgetError("LLM API request exceeded the configured time budget")
         try:
             with AUTHENTICATED_OPENER.open(
                 Request(url, data=body, headers=headers, method="POST"),
