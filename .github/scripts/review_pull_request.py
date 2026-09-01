@@ -37,7 +37,7 @@ MAX_TESTING_GAP_CHARS = 500
 MAX_FINDINGS = 8
 MAX_TESTING_GAPS = 4
 REVIEW_PROVIDER_ATTEMPTS = 3
-REVIEW_MARKER_PREFIX = "<!-- oncloud-pr-review:v1 head:"
+REVIEW_COMMENT_MARKER = "<!-- oncloud-pr-review:v2 -->"
 ALLOWED_SEVERITIES = {"blocking", "warning", "suggestion"}
 _HUNK_HEADER_RE = re.compile(
     r"^@@ -(?P<old_start>\d+)(?:,(?P<old_count>\d+))? "
@@ -625,10 +625,6 @@ def assessment(review: dict[str, Any], coverage_gaps: list[str], pull_request: d
     return "No blocking problem was found in the reviewed diff. Required checks and maintainer review still decide merge."
 
 
-def review_marker(head_sha: str) -> str:
-    return f"{REVIEW_MARKER_PREFIX}{head_sha} -->"
-
-
 def render_review(
     review: dict[str, Any],
     pull_request: dict[str, Any],
@@ -636,7 +632,7 @@ def render_review(
     coverage_gaps: list[str],
 ) -> str:
     lines = [
-        review_marker(head_sha),
+        REVIEW_COMMENT_MARKER,
         "## Automated pull request review",
         "",
         f"**Assessment:** {assessment(review, coverage_gaps, pull_request)}",
@@ -687,18 +683,17 @@ def render_review(
     return "\n".join(lines)
 
 
-def upsert_review(
+def upsert_review_comment(
     repo: str,
     number: int,
-    head_sha: str,
     body: str,
     *,
     token: str,
     api_url: str,
     expected_snapshot: PullRequestSnapshot | None = None,
 ) -> bool:
-    reviews = github_paginated_list(
-        f"/repos/{repo}/pulls/{number}/reviews",
+    comments = github_paginated_list(
+        f"/repos/{repo}/issues/{number}/comments",
         token=token,
         api_url=api_url,
     )
@@ -707,27 +702,26 @@ def upsert_review(
     if expected_snapshot is not None:
         current = fetch_pull_request(repo, number, token=token, api_url=api_url)
         if not same_pull_request_snapshot(expected_snapshot, current):
-            print("::notice::The pull request changed while reviews were fetched; the review was not published.")
+            print("::notice::The pull request changed while comments were fetched; the review was not published.")
             return False
-    marker = review_marker(head_sha)
     existing = next(
         (
-            review
-            for review in reviews
-            if isinstance(review, dict)
-            and isinstance(review.get("user"), dict)
-            and review["user"].get("login") == "github-actions[bot]"
-            and marker in str(review.get("body") or "")
+            comment
+            for comment in comments
+            if isinstance(comment, dict)
+            and isinstance(comment.get("user"), dict)
+            and comment["user"].get("login") == "github-actions[bot]"
+            and REVIEW_COMMENT_MARKER in str(comment.get("body") or "")
         ),
         None,
     )
     if existing is not None:
-        review_id = existing.get("id")
-        if not isinstance(review_id, int):
-            raise RuntimeError("GitHub returned an invalid pull request review identifier")
+        comment_id = existing.get("id")
+        if not isinstance(comment_id, int):
+            raise RuntimeError("GitHub returned an invalid pull request comment identifier")
         github_request(
-            "PUT",
-            f"/repos/{repo}/pulls/{number}/reviews/{review_id}",
+            "PATCH",
+            f"/repos/{repo}/issues/comments/{comment_id}",
             token=token,
             api_url=api_url,
             payload={"body": body},
@@ -735,10 +729,10 @@ def upsert_review(
         return True
     github_request(
         "POST",
-        f"/repos/{repo}/pulls/{number}/reviews",
+        f"/repos/{repo}/issues/{number}/comments",
         token=token,
         api_url=api_url,
-        payload={"commit_id": head_sha, "body": body, "event": "COMMENT"},
+        payload={"body": body},
     )
     return True
 
@@ -790,10 +784,9 @@ def main() -> int:
         print("::notice::The pull request snapshot changed; this stale review result was not published.")
         return 0
     body = render_review(review, pull_request_before_publish, head_sha, coverage_gaps)
-    if not upsert_review(
+    if not upsert_review_comment(
         repo,
         number,
-        head_sha,
         body,
         token=github_token,
         api_url=api_url,

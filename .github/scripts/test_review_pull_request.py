@@ -435,6 +435,8 @@ class ParsingAndRenderingTests(unittest.TestCase):
 
         body = review_pull_request.render_review(review, pull_request(), "abc123", [])
 
+        self.assertTrue(body.startswith(review_pull_request.REVIEW_COMMENT_MARKER))
+        self.assertIn("**Reviewed commit:** `abc123`", body)
         self.assertIn("＠maintainers (now)", body)
         self.assertIn("＠owner", body)
         self.assertNotIn("<script>", body)
@@ -492,8 +494,7 @@ class ParsingAndRenderingTests(unittest.TestCase):
 
 
 class ReviewPublicationTests(unittest.TestCase):
-    def test_existing_review_for_same_commit_is_updated(self) -> None:
-        marker = review_pull_request.review_marker("abc123")
+    def test_existing_sticky_review_comment_is_updated_for_a_new_commit(self) -> None:
         with (
             patch.object(
                 review_pull_request,
@@ -501,47 +502,54 @@ class ReviewPublicationTests(unittest.TestCase):
                 return_value=[
                     {
                         "id": 77,
-                        "body": marker,
+                        "body": review_pull_request.REVIEW_COMMENT_MARKER,
                         "user": {"login": "github-actions[bot]"},
+                    }
+                ],
+            ) as list_comments,
+            patch.object(review_pull_request, "github_request") as request,
+        ):
+            review_pull_request.upsert_review_comment(
+                "example/repo", 42, "new body", token="token", api_url="https://api.github.test"
+            )
+
+        list_comments.assert_called_once_with(
+            "/repos/example/repo/issues/42/comments",
+            token="token",
+            api_url="https://api.github.test",
+        )
+        self.assertEqual(request.call_args.args[:2], ("PATCH", "/repos/example/repo/issues/comments/77"))
+        self.assertEqual(request.call_args.kwargs["payload"], {"body": "new body"})
+
+    def test_first_run_creates_sticky_review_comment(self) -> None:
+        with (
+            patch.object(review_pull_request, "github_paginated_list", return_value=[]),
+            patch.object(review_pull_request, "github_request") as request,
+        ):
+            review_pull_request.upsert_review_comment(
+                "example/repo", 42, "new body", token="token", api_url="https://api.github.test"
+            )
+
+        self.assertEqual(request.call_args.args[:2], ("POST", "/repos/example/repo/issues/42/comments"))
+        self.assertEqual(request.call_args.kwargs["payload"], {"body": "new body"})
+
+    def test_marker_from_another_author_cannot_capture_the_comment(self) -> None:
+        with (
+            patch.object(
+                review_pull_request,
+                "github_paginated_list",
+                return_value=[
+                    {
+                        "id": 77,
+                        "body": review_pull_request.REVIEW_COMMENT_MARKER,
+                        "user": {"login": "contributor"},
                     }
                 ],
             ),
             patch.object(review_pull_request, "github_request") as request,
         ):
-            review_pull_request.upsert_review(
-                "example/repo", 42, "abc123", "new body", token="token", api_url="https://api.github.test"
-            )
-
-        self.assertEqual(request.call_args.args[:2], ("PUT", "/repos/example/repo/pulls/42/reviews/77"))
-        self.assertEqual(request.call_args.kwargs["payload"], {"body": "new body"})
-
-    def test_new_commit_creates_comment_review(self) -> None:
-        with (
-            patch.object(review_pull_request, "github_paginated_list", return_value=[]),
-            patch.object(review_pull_request, "github_request") as request,
-        ):
-            review_pull_request.upsert_review(
-                "example/repo", 42, "abc123", "new body", token="token", api_url="https://api.github.test"
-            )
-
-        self.assertEqual(request.call_args.args[:2], ("POST", "/repos/example/repo/pulls/42/reviews"))
-        self.assertEqual(
-            request.call_args.kwargs["payload"],
-            {"commit_id": "abc123", "body": "new body", "event": "COMMENT"},
-        )
-
-    def test_marker_from_another_author_cannot_capture_the_review(self) -> None:
-        marker = review_pull_request.review_marker("abc123")
-        with (
-            patch.object(
-                review_pull_request,
-                "github_paginated_list",
-                return_value=[{"id": 77, "body": marker, "user": {"login": "contributor"}}],
-            ),
-            patch.object(review_pull_request, "github_request") as request,
-        ):
-            review_pull_request.upsert_review(
-                "example/repo", 42, "abc123", "new body", token="token", api_url="https://api.github.test"
+            review_pull_request.upsert_review_comment(
+                "example/repo", 42, "new body", token="token", api_url="https://api.github.test"
             )
 
         self.assertEqual(request.call_args.args[0], "POST")
@@ -564,10 +572,9 @@ class ReviewPublicationTests(unittest.TestCase):
             ),
             patch.object(review_pull_request, "github_request") as request,
         ):
-            published = review_pull_request.upsert_review(
+            published = review_pull_request.upsert_review_comment(
                 "example/repo",
                 42,
-                "abc123",
                 "review body",
                 token="token",
                 api_url="https://api.github.test",
@@ -1309,7 +1316,7 @@ class MainFlowTests(unittest.TestCase):
                     "request_validated_llm_result",
                     return_value=valid_review(),
                 ),
-                patch.object(review_pull_request, "upsert_review") as upsert_review,
+                patch.object(review_pull_request, "upsert_review_comment") as upsert_review,
             ):
                 result = review_pull_request.main()
 

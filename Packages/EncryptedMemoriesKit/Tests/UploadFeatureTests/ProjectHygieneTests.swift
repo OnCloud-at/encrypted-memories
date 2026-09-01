@@ -389,6 +389,11 @@ final class ProjectHygieneTests: XCTestCase {
             contentsOf: repoRoot.appendingPathComponent(".github/workflows/pull-request.yml"),
             encoding: .utf8
         )
+        XCTAssertEqual(
+            workflow.components(separatedBy: "needs: [repository-hygiene, code-quality]").count - 1,
+            5,
+            "Every expensive PR job must wait for both fast checks"
+        )
         let shards = try sourceBlock(
             from: "  architecture-builds:\n",
             to: "  architecture:\n",
