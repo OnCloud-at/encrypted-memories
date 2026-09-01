@@ -21,9 +21,6 @@ class GitHubReleaseContractTest < Minitest::Test
     <<~MARKDOWN
       Notes for GitHub readers stay outside the Apple sections.
 
-      ## Deutsch
-      Schnelleres Laden von Fotos.
-
       ## English
       Faster photo loading.
 
@@ -38,9 +35,10 @@ class GitHubReleaseContractTest < Minitest::Test
     assert_equal "1.2.0", release.version
     assert_equal "241000123", release.build_number
     assert_equal "app-store", release.channel
-    assert_equal "Schnelleres Laden von Fotos.", release.notes.fetch("de-DE")
-    assert_equal "Faster photo loading.", release.notes.fetch("en-US")
-    refute_includes release.notes.values.join, "contributor"
+    assert_equal "Faster photo loading.", release.notes.dig("IOS", "en-US")
+    assert_equal "Faster photo loading.", release.notes.dig("MAC_OS", "en-US")
+    assert_equal "Faster photo loading.", release.notes.dig("IOS", "de-DE")
+    refute_includes release.notes.values.flat_map(&:values).join, "contributor"
   end
 
   def test_beta_and_release_candidate_route_to_internal_testflight
@@ -60,17 +58,17 @@ class GitHubReleaseContractTest < Minitest::Test
     assert_match(/prerelease flag/, error.message)
   end
 
-  def test_release_requires_both_apple_note_sections
+  def test_release_requires_english_apple_notes
     error = assert_raises(GitHubReleaseContract::Error) do
-      GitHubReleaseContract.parse(payload(body: "## English\nOnly English."))
+      GitHubReleaseContract.parse(payload(body: "## Deutsch\nNur Deutsch."))
     end
 
-    assert_match(/Deutsch/, error.message)
+    assert_match(/English/, error.message)
   end
 
   def test_release_rejects_duplicate_apple_note_sections
     error = assert_raises(GitHubReleaseContract::Error) do
-      GitHubReleaseContract.parse(payload(body: "## Deutsch\nA\n## Deutsch\nB\n## English\nC"))
+      GitHubReleaseContract.parse(payload(body: "## English\nA\n## English\nB"))
     end
 
     assert_match(/duplicate sections/, error.message)
@@ -80,7 +78,106 @@ class GitHubReleaseContractTest < Minitest::Test
     body = valid_body + "\n## Fixed\nOne\n## Fixed\nTwo\n"
     release = GitHubReleaseContract.parse(payload(body: body.gsub("\n", "\r\n")))
 
-    assert_equal "Schnelleres Laden von Fotos.", release.notes.fetch("de-DE")
+    assert_equal "Faster photo loading.", release.notes.dig("IOS", "en-US")
+  end
+
+  def test_platform_sections_combine_shared_and_platform_specific_notes
+    body = <<~MARKDOWN
+      ## English
+      ### All Platforms
+      Improved reliability.
+
+      ### iOS and iPadOS
+      Improved swipe-to-dismiss.
+
+      ### macOS
+      Fixed window restoration.
+    MARKDOWN
+
+    release = GitHubReleaseContract.parse(payload(body: body))
+
+    assert_equal "Improved reliability.\n\nImproved swipe-to-dismiss.", release.notes.dig("IOS", "en-US")
+    assert_equal "Improved reliability.\n\nFixed window restoration.", release.notes.dig("MAC_OS", "en-US")
+    assert_equal release.notes.dig("IOS", "en-US"), release.notes.dig("IOS", "de-DE")
+    assert_equal release.notes.dig("MAC_OS", "en-US"), release.notes.dig("MAC_OS", "de-DE")
+  end
+
+  def test_optional_german_section_can_have_independent_platform_notes
+    body = <<~MARKDOWN
+      ## English
+      Shared English notes.
+
+      ## Deutsch
+      ### All Platforms
+      Gemeinsame deutsche Hinweise.
+
+      ### iOS and iPadOS
+      Verbesserte Gesten.
+
+      ### macOS
+      Verbesserte Fensterwiederherstellung.
+    MARKDOWN
+
+    release = GitHubReleaseContract.parse(payload(body: body))
+
+    assert_equal "Shared English notes.", release.notes.dig("IOS", "en-US")
+    assert_equal "Gemeinsame deutsche Hinweise.\n\nVerbesserte Gesten.", release.notes.dig("IOS", "de-DE")
+    assert_equal(
+      "Gemeinsame deutsche Hinweise.\n\nVerbesserte Fensterwiederherstellung.",
+      release.notes.dig("MAC_OS", "de-DE")
+    )
+  end
+
+  def test_platform_sections_require_notes_for_each_platform
+    error = assert_raises(GitHubReleaseContract::Error) do
+      GitHubReleaseContract.parse(payload(body: "## English\n### iOS and iPadOS\nOnly mobile."))
+    end
+
+    assert_match(/no release notes for macOS/, error.message)
+  end
+
+  def test_platform_sections_reject_ambiguous_preamble_and_unknown_headings
+    preamble_error = assert_raises(GitHubReleaseContract::Error) do
+      GitHubReleaseContract.parse(
+        payload(body: "## English\nShared.\n### iOS and iPadOS\nMobile.\n### macOS\nDesktop.")
+      )
+    end
+    unknown_error = assert_raises(GitHubReleaseContract::Error) do
+      GitHubReleaseContract.parse(payload(body: "## English\n### iOS\nMobile.\n### macOS\nDesktop."))
+    end
+
+    assert_match(/All Platforms/, preamble_error.message)
+    assert_match(/unsupported platform sections: iOS/, unknown_error.message)
+  end
+
+  def test_platform_sections_reject_duplicates
+    error = assert_raises(GitHubReleaseContract::Error) do
+      GitHubReleaseContract.parse(
+        payload(body: "## English\n### All Platforms\nA\n### All Platforms\nB")
+      )
+    end
+
+    assert_match(/duplicate platform sections/, error.message)
+  end
+
+  def test_platform_sections_enforce_the_apple_limit_after_composition
+    body = <<~MARKDOWN
+      ## English
+      ### All Platforms
+      #{"a" * 3_000}
+
+      ### iOS and iPadOS
+      #{"b" * 1_001}
+
+      ### macOS
+      Short desktop note.
+    MARKDOWN
+
+    error = assert_raises(GitHubReleaseContract::Error) do
+      GitHubReleaseContract.parse(payload(body: body))
+    end
+
+    assert_match(/English for iOS and iPadOS exceeds 4000 characters/, error.message)
   end
 
   def test_release_rejects_draft_or_unpublished_payload
@@ -99,11 +196,53 @@ class GitHubReleaseContractTest < Minitest::Test
 
       GitHubReleaseContract.write(release, directory: notes, output_path: output, summary_path: nil)
 
-      assert_equal "Schnelleres Laden von Fotos.\n", File.read(File.join(notes, "de-DE.txt"))
-      assert_equal "Faster photo loading.\n", File.read(File.join(notes, "en-US.txt"))
+      assert_equal "Faster photo loading.\n", File.read(File.join(notes, "ios.de-DE.txt"))
+      assert_equal "Faster photo loading.\n", File.read(File.join(notes, "ios.en-US.txt"))
+      assert_equal "Faster photo loading.\n", File.read(File.join(notes, "macos.de-DE.txt"))
+      assert_equal "Faster photo loading.\n", File.read(File.join(notes, "macos.en-US.txt"))
       output_values = File.readlines(output, chomp: true).to_h { |line| line.split("=", 2) }
       assert_equal "app-store", output_values.fetch("channel")
-      assert_equal "Schnelleres Laden von Fotos.", Base64.strict_decode64(output_values.fetch("notes_de_base64"))
+      assert_equal(
+        "Faster photo loading.",
+        Base64.strict_decode64(output_values.fetch("notes_ios_de_base64"))
+      )
+      assert_equal(
+        "Faster photo loading.",
+        Base64.strict_decode64(output_values.fetch("notes_macos_en_base64"))
+      )
     end
+  end
+
+  def test_external_testflight_workflow_promotes_a_published_release_without_uploading
+    workflow_path = File.expand_path("../workflows/testflight-external.yml", __dir__)
+    workflow = File.read(workflow_path, encoding: "UTF-8")
+
+    assert_match(/^  workflow_dispatch:$/m, workflow)
+    refute_match(/^  release:$/m, workflow)
+    assert_includes workflow, "group: apple-distribution"
+    assert_includes workflow, '[[ "$GITHUB_REF" == "refs/heads/main" ]]'
+    assert_includes workflow, "ref: main"
+    assert_includes workflow, "fetch-depth: 0"
+    assert_includes workflow, "git merge-base --is-ancestor"
+    assert_includes workflow, "release_contract.rb"
+    assert_includes workflow, "wait-builds"
+    assert_includes workflow, "distribute-external"
+    assert_includes workflow, "IOS:en-US="
+    assert_includes workflow, "MAC_OS:en-US="
+    refute_match(/xcodebuild|altool|upload-artifact/, workflow)
+  end
+
+  def test_apple_release_workflow_uses_trusted_automation_for_secret_bearing_jobs
+    workflow_path = File.expand_path("../workflows/testflight-internal.yml", __dir__)
+    workflow = File.read(workflow_path, encoding: "UTF-8")
+
+    assert_includes workflow, '"$EVENT_NAME" == "workflow_dispatch"'
+    assert_includes workflow, '"$GITHUB_REF" != "refs/heads/main"'
+    assert_includes workflow, "automation_sha:"
+    assert_operator workflow.scan("ref: ${{ needs.prepare.outputs.automation_sha }}").length, :>=, 3
+    assert_includes workflow, "ref: ${{ needs.prepare.outputs.commit_sha }}"
+    assert_includes workflow, '[[ "$actual_release_sha" == "$EXPECTED_RELEASE_SHA" ]]'
+    assert_includes workflow, "git merge-base --is-ancestor"
+    assert_includes workflow, "The release tag must point to a commit on main."
   end
 end

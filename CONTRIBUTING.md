@@ -7,7 +7,7 @@ Thank you for helping improve Encrypted Memories. Keep each pull request focused
 - Search existing issues and pull requests.
 - Open an issue before a large feature or architecture change.
 - Never include credentials, private user data, signing files, or local build output.
-- Do not change app versions, build numbers, tags, or release notes. Maintainers own releases.
+- PR authors never set app versions, build numbers, release tags, or release notes. Maintainers own releases.
 
 ## Architecture rules
 
@@ -55,9 +55,30 @@ Use the shared build root documented in the README. Do not create build caches i
 
 ## Release ownership
 
-A pull request must not set a version or build number. After tested changes reach `main`, a maintainer publishes a GitHub Release.
+A pull request must not set an app version, build number, release tag, or release notes.
+After tested changes reach `main`, a maintainer publishes a GitHub Release.
 
 - `v1.2.0-beta.1` and `v1.2.0-rc.1` publish only to internal TestFlight.
 - `v1.2.0` submits iOS and macOS to App Review and selects automatic release after approval.
 
-The release body must contain owner-written `## Deutsch` and `## English` sections. Automation sends only those sections to Apple. It never sends contributor lists or generated pull request text.
+Write owner-written notes under `## English`. This is the only required release-notes section.
+Without platform subsections, English applies to both platforms.
+Optional `### All Platforms`, `### iOS and iPadOS`, and `### macOS` subsections let each platform receive shared text plus its specific text.
+
+`## Deutsch` is optional and uses the same structure. English is used for `de-DE` when German is absent.
+
+Automation sends only extracted owner text to Apple. It never sends contributor names, pull request lists, or generated changelog text.
+Contributors have no release-note work.
+
+Before stable replacement, automation waits for both new builds.
+It validates both platform plans before it changes either review submission.
+It removes lower active review versions independently per platform only in Apple-removable states.
+It waits for `DEVELOPER_REJECTED`, updates the same version record, and starts a new review submission.
+It does not delete that record or create a fallback for that platform when Apple rejects the update.
+It refuses equal or newer active versions or unsafe states.
+
+The manual `External TestFlight` workflow runs from `main` with one published release tag.
+It reuses existing builds and never rebuilds or uploads.
+It uses the `testflight-external` environment.
+`TESTFLIGHT_EXTERNAL_GROUP_NAME` optionally overrides `External Testers`.
+Stable and prerelease release tags can be promoted externally.

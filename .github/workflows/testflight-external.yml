@@ -1,0 +1,94 @@
+name: External TestFlight
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Published GitHub release tag whose existing builds should be promoted
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: apple-distribution
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    name: Promote existing iOS and macOS builds
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    environment: testflight-external
+    steps:
+      - name: Validate workflow source
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REF" == "refs/heads/main" ]] || {
+            echo "Run this workflow from main." >&2
+            exit 1
+          }
+
+      - name: Check out trusted automation
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate release automation
+        run: |
+          set -euo pipefail
+          ruby -c .github/scripts/app_store_connect.rb
+          ruby .github/scripts/test_app_store_connect.rb
+          ruby -c .github/scripts/release_contract.rb
+          ruby .github/scripts/test_release_contract.rb
+
+      - name: Resolve published release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" \
+            > "$RUNNER_TEMP/release.json"
+          ruby .github/scripts/release_contract.rb \
+            "$RUNNER_TEMP/release.json" \
+            "$RUNNER_TEMP/apple-release-notes"
+          release_sha="$(git rev-parse --verify "refs/tags/$RELEASE_TAG^{commit}")"
+          git merge-base --is-ancestor "$release_sha" HEAD || {
+            echo "The release tag must point to a commit on main." >&2
+            exit 1
+          }
+
+      - name: Promote existing builds to external TestFlight
+        env:
+          APP_STORE_CONNECT_APP_ID: ${{ vars.APP_STORE_CONNECT_APP_ID }}
+          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          APP_STORE_CONNECT_PRIVATE_KEY_BASE64: ${{ secrets.APP_STORE_CONNECT_PRIVATE_KEY_BASE64 }}
+          BETA_GROUP_NAME: ${{ vars.TESTFLIGHT_EXTERNAL_GROUP_NAME }}
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+          RELEASE_BUILD_NUMBER: ${{ steps.release.outputs.build_number }}
+        run: |
+          set -euo pipefail
+          beta_group_name="${BETA_GROUP_NAME:-External Testers}"
+          [[ "$beta_group_name" =~ ^[^[:cntrl:]]{1,100}$ ]] || {
+            echo "The external TestFlight group name must contain 1 to 100 printable characters." >&2
+            exit 1
+          }
+
+          ruby .github/scripts/app_store_connect.rb wait-builds \
+            --version "$RELEASE_VERSION" \
+            --build-number "$RELEASE_BUILD_NUMBER"
+
+          ruby .github/scripts/app_store_connect.rb distribute-external \
+            --version "$RELEASE_VERSION" \
+            --build-number "$RELEASE_BUILD_NUMBER" \
+            --group "$beta_group_name" \
+            --localization "IOS:de-DE=$RUNNER_TEMP/apple-release-notes/ios.de-DE.txt" \
+            --localization "IOS:en-US=$RUNNER_TEMP/apple-release-notes/ios.en-US.txt" \
+            --localization "MAC_OS:de-DE=$RUNNER_TEMP/apple-release-notes/macos.de-DE.txt" \
+            --localization "MAC_OS:en-US=$RUNNER_TEMP/apple-release-notes/macos.en-US.txt"
