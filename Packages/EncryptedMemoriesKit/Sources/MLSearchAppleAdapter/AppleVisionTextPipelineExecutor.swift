@@ -101,7 +101,7 @@ public final class AppleVisionPipelineExecutor: MLDerivedPipelineExecutor, Senda
             return plan.workItems.map { .init(workItem: $0, outcome: outcome) }
         case .transientFailure:
             return plan.workItems.map {
-                .init(workItem: $0, outcome: .retryableFailure(reason: .analysisFailed, retryAfter: nil))
+                .init(workItem: $0, outcome: .deferred(reason: .sourceNotResident, retryAfter: nil))
             }
         case .image(let source):
             let outputs = await analyze(source, contexts)

@@ -1138,7 +1138,8 @@ final class ProjectHygieneTests: XCTestCase {
         XCTAssertTrue(mobileModel.contains("private(set) var albumCatalogRevision"))
         XCTAssertTrue(mobileModel.contains("albumSync.setRemoteAlbumsChangedHandler"))
         XCTAssertTrue(
-            mobileModel.contains("albumCatalogRevision &+= 1\n            return .refreshed"),
+            mobileModel.contains(
+                "albumCatalogRevision &+= 1\n            return .init(outcome: .refreshed, failureReason: nil)"),
             "the shared remote-library poll must invalidate the iOS/iPadOS album catalog too")
 
         let mobileAlbums = try String(

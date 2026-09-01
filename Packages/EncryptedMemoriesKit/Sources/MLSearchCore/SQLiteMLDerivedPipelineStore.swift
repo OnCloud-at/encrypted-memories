@@ -10,11 +10,9 @@ import SQLite3
 public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchecked Sendable {
     public static let databaseFileName = "ml-derived-index-v1.sqlite"
 
-    // v4 adds transactionally maintained progress counters. The derived store is entirely
-    // rebuildable, so a schema mismatch deliberately resets it instead of paying a large
-    // migration cost on every device. This prevents a progress update from scanning the complete
-    // asset × artifact work matrix after every bounded ML quantum.
-    private static let schemaVersion: Int32 = 4
+    // v5 reopens v4 retry-limit rows once because v4 could terminalize a valid cache miss.
+    // Other schema mismatches still reset this entirely rebuildable store.
+    private static let schemaVersion: Int32 = 5
     private static let pending = Int32(0)
     private static let completed = Int32(1)
     private static let skipped = Int32(2)
@@ -349,7 +347,7 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
                     "SELECT asset_id FROM ml_derived_assets WHERE account_id=? AND volume_id=? AND node_id=? AND source_revision=?;",
                     &selectAsset),
                 prepare(
-                    "UPDATE ml_derived_work SET state=?, attempts=attempts+1, retry_at=?, terminal_reason=?, payload=?, updated_at=? WHERE asset_id=? AND artifact_id=?;",
+                    "UPDATE ml_derived_work SET state=?, attempts=attempts+?, retry_at=?, terminal_reason=?, payload=?, updated_at=? WHERE asset_id=? AND artifact_id=?;",
                     &updateWork),
                 prepare("DELETE FROM ml_derived_tokens WHERE asset_id=? AND artifact_id=?;", &deleteTokens),
                 prepare(
@@ -405,6 +403,12 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
                     terminalReason = reason.rawValue
                     ciphertext = nil
                     tokens = []
+                case .deferred(let reason, let date):
+                    state = Self.retry
+                    retryAt = date ?? now
+                    terminalReason = reason.rawValue
+                    ciphertext = nil
+                    tokens = []
                 case .retryableFailure(let reason, let date):
                     state = Self.retry
                     retryAt = date ?? now
@@ -423,20 +427,21 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
 
                 reset(updateWork)
                 sqlite3_bind_int(updateWork, 1, state)
+                sqlite3_bind_int(updateWork, 2, result.outcome.consumesAttempt ? 1 : 0)
                 if let retryAt {
-                    sqlite3_bind_double(updateWork, 2, retryAt.timeIntervalSince1970)
-                } else {
-                    sqlite3_bind_null(updateWork, 2)
-                }
-                if let terminalReason {
-                    bindText(updateWork, 3, terminalReason)
+                    sqlite3_bind_double(updateWork, 3, retryAt.timeIntervalSince1970)
                 } else {
                     sqlite3_bind_null(updateWork, 3)
                 }
-                if let ciphertext { bindBlob(updateWork, 4, ciphertext) } else { sqlite3_bind_null(updateWork, 4) }
-                sqlite3_bind_double(updateWork, 5, now.timeIntervalSince1970)
-                sqlite3_bind_int64(updateWork, 6, assetID)
-                sqlite3_bind_int64(updateWork, 7, artifactID)
+                if let terminalReason {
+                    bindText(updateWork, 4, terminalReason)
+                } else {
+                    sqlite3_bind_null(updateWork, 4)
+                }
+                if let ciphertext { bindBlob(updateWork, 5, ciphertext) } else { sqlite3_bind_null(updateWork, 5) }
+                sqlite3_bind_double(updateWork, 6, now.timeIntervalSince1970)
+                sqlite3_bind_int64(updateWork, 7, assetID)
+                sqlite3_bind_int64(updateWork, 8, artifactID)
                 guard sqlite3_step(updateWork) == SQLITE_DONE else { return rollback() }
                 guard sqlite3_changes(db) > 0 else { continue }
 
@@ -934,6 +939,18 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
         let version = sqlite3_column_int(stmt, 0)
         if version == 0 {
             return sqlite3_exec(handle, "PRAGMA user_version=\(schemaVersion);", nil, nil, nil) == SQLITE_OK
+        }
+        if version == 4 {
+            let migration = """
+                BEGIN IMMEDIATE;
+                UPDATE ml_derived_work
+                   SET state=0, attempts=0, retry_at=NULL, terminal_reason=NULL, payload=NULL
+                 WHERE state=3 AND terminal_reason='retryLimitReached';
+                UPDATE ml_derived_generation SET generation=generation+1 WHERE changes() > 0;
+                PRAGMA user_version=5;
+                COMMIT;
+                """
+            return sqlite3_exec(handle, migration, nil, nil, nil) == SQLITE_OK
         }
         return version == schemaVersion
     }

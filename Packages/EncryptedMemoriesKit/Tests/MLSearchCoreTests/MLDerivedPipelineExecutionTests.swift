@@ -185,6 +185,32 @@ import Testing
         #expect(second.progress.isComplete)
     }
 
+    @Test func sourceResidencyDeferralNeverConsumesRetryBudget() async throws {
+        let store = InMemoryMLDerivedPipelineStore()
+        let artifact = try artifact(pipeline: .nativeSearch, stage: "ocr", revision: "revision3")
+        let key = try executionKey(pipeline: .nativeSearch, artifacts: [artifact])
+        #expect(store.enqueue([try asset("waiting")], for: key))
+        let executor = RecordingExecutor { plan in
+            plan.workItems.map {
+                .init(workItem: $0, outcome: .deferred(reason: .sourceNotResident, retryAfter: nil))
+            }
+        }
+        let configuration = MLIndexRunner.Configuration(chunkSize: 1, retryDelay: 0, maxRetryAttempts: 1)
+
+        for second in 0..<3 {
+            let outcome = await MLIndexRunner.runDerivedPass(
+                key: key,
+                store: store,
+                executor: executor,
+                configuration: configuration,
+                now: { Date(timeIntervalSince1970: Double(second)) }
+            )
+            #expect(outcome.progress.retryPending == 1)
+            #expect(outcome.progress.permanentFailure == 0)
+        }
+        #expect(store.nextWorkBatch(for: key, limit: 1, now: .distantFuture).first?.attempts == 0)
+    }
+
     @Test func searchRequiresEveryNormalizedTokenAndKeepsAccountsIsolated() async throws {
         let store = InMemoryMLDerivedPipelineStore()
         let artifact = try artifact(pipeline: .nativeSearch, stage: "ocr", revision: "revision3")

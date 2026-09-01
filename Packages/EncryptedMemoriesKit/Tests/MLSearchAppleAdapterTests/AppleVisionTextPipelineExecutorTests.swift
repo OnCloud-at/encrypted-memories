@@ -62,7 +62,7 @@ import Testing
             ) == .run)
     }
 
-    @Test func unavailableCachedImageKeepsAllStagesRetryable() async throws {
+    @Test func unavailableCachedImageDefersAllStagesWithoutConsumingFailureBudget() async throws {
         let executor = AppleVisionPipelineExecutor(
             imageSource: CountingVisionImageSource(outcome: .transientFailure),
             analyze: { _, _ in
@@ -73,7 +73,7 @@ import Testing
         let results = await executor.execute(try makePlan(kinds: [.textRecognition, .barcodeDetection]))
         #expect(
             results.allSatisfy {
-                if case .retryableFailure = $0.outcome { true } else { false }
+                $0.outcome == .deferred(reason: .sourceNotResident, retryAfter: nil)
             })
     }
 

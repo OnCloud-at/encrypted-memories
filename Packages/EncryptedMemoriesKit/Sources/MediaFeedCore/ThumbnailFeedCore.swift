@@ -381,6 +381,7 @@ public actor ThumbnailFeedCore {
     /// crawl worker stores network arrivals to disk only, so without this signal a host that has gone idle (or
     /// whose visible warm set is unchanged) never learns the bytes arrived. Each platform host owns one token.
     private nonisolated let imagesAvailableWake = ImagesAvailableWakeBox()
+    private nonisolated let cacheArrivalWake = ImagesAvailableWakeBox()
     #if DEBUG
         /// Deterministic test-only gate for a disk probe. It is absent from release builds.
         private nonisolated let testingHooks = ThumbnailFeedCoreTestingHooks()
@@ -433,6 +434,15 @@ public actor ThumbnailFeedCore {
         _ callback: @escaping @Sendable () -> Void
     ) -> ThumbnailFeedWakeRegistration {
         imagesAvailableWake.add(callback)
+    }
+
+    /// Fires when downloaded thumbnail bytes become durable in the encrypted cache. Unlike the grid wake,
+    /// this remains active during a background crawl so cache-backed consumers can resume immediately.
+    @discardableResult
+    public nonisolated func setOnCacheArrivalWake(
+        _ callback: @escaping @Sendable () -> Void
+    ) -> ThumbnailFeedWakeRegistration {
+        cacheArrivalWake.add(callback)
     }
 
     /// A generous "a live viewport is (or was very recently) waiting on content" gate for the arrival wake: wide
@@ -1053,6 +1063,7 @@ public actor ThumbnailFeedCore {
             return nil
         }
         diskPresence.set(uid, present: true)
+        cacheArrivalWake.call()
         guard let image else {
             diagnostics.increment("thumb.diskDecodeFailed")
             recordError("decode failed for \(Self.key(uid))")
@@ -1446,8 +1457,11 @@ public actor ThumbnailFeedCore {
             }
             // Arrival wake: bytes just landed on disk. If a viewport is recently live, tell the host to
             // re-warm missing visible cells from disk and redraw.
-            if completed > 0, hostArrivalWakeIsLive(now: clock()) {
-                imagesAvailableWake.call()
+            if completed > 0 {
+                cacheArrivalWake.call()
+                if hostArrivalWakeIsLive(now: clock()) {
+                    imagesAvailableWake.call()
+                }
             }
             emitPrefetchSummary()
         }

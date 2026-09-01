@@ -19,6 +19,9 @@ public final class AppleSmartSearchWorkGate: @unchecked Sendable {
     private let governor = LibraryWorkloadGovernorPolicy()
     private let refreshLock = NSLock()
     private var demandRefreshScheduled = false
+    private let indexingWakeLock = NSLock()
+    private var indexingWake: (@Sendable () -> Void)?
+    private var cacheArrivalWakeRegistration: ThumbnailFeedWakeRegistration?
 
     public init(
         feed: ThumbnailFeedCore,
@@ -31,6 +34,11 @@ public final class AppleSmartSearchWorkGate: @unchecked Sendable {
         self.runtimeState = runtimeState
         self.hostPermitsIndexing = hostPermitsIndexing
         self.scheduleDemandRefresh = Self.defaultDemandRefreshScheduler
+        self.cacheArrivalWakeRegistration = feed.setOnCacheArrivalWake { [weak self] in
+            guard let self else { return }
+            let wake = self.indexingWakeLock.withLock { self.indexingWake }
+            wake?()
+        }
     }
 
     init(
@@ -43,6 +51,10 @@ public final class AppleSmartSearchWorkGate: @unchecked Sendable {
         self.runtimeState = runtimeState
         self.hostPermitsIndexing = hostPermitsIndexing
         self.scheduleDemandRefresh = scheduleDemandRefresh
+    }
+
+    public func setIndexingWake(_ callback: @escaping @Sendable () -> Void) {
+        indexingWakeLock.withLock { indexingWake = callback }
     }
 
     public func permitsIndexing() -> Bool {

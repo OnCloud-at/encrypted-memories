@@ -66,6 +66,11 @@ struct MobileScopeRecoveryIdentity: Equatable, Sendable {
     }
 }
 
+private struct MobileLibraryRefreshResult: Sendable {
+    let outcome: LibraryChangeRefreshOutcome
+    let failureReason: TimelineRefreshFailureReason?
+}
+
 /// Owns the single terminal-recovery task. Scheduling is synchronous on the main actor, so retry, sign-out, and
 /// session replacement can observe and join the task before any recovery suspension occurs.
 @MainActor
@@ -256,6 +261,7 @@ final class MobileLibraryModel {
     private var loadToken = 0
     private let libraryChangeMonitor = LibraryChangeMonitor()
     private let libraryRefreshCoalescer = LibraryRefreshCoalescer()
+    private let uploadRefreshCoordinator = TimelineUploadRefreshCoordinator()
     private var applicationIsActive = true
     private(set) var isRefreshingLibrary = false
     @ObservationIgnored private var smartSearchMemoryRegistration: MemoryPressureRegistration?
@@ -641,7 +647,23 @@ final class MobileLibraryModel {
 
     /// Local upload completion is authoritative enough to refresh immediately; repeated signals coalesce.
     func refreshAfterLocalUpload() {
-        requestLibraryRefresh()
+        guard let recoverySession = session, let refreshLease = currentMutationLease() else { return }
+        Task { [weak self] in
+            guard let self else { return }
+            await self.uploadRefreshCoordinator.request(
+                refresh: { [weak self] _ in
+                    guard let self else { return .cancelled }
+                    return await self.performLibraryRefresh(lease: refreshLease).failureReason
+                },
+                observer: { [weak self] attempt in
+                    guard attempt.failureReason == .scopeAccessLost else { return }
+                    await self?.recoverAfterScopeAccessLoss(
+                        expectedSession: recoverySession,
+                        expectedLoadGeneration: refreshLease.loadToken
+                    )
+                }
+            )
+        }
     }
 
     /// Best-effort settings metadata refresh. A failed foreground refresh keeps the last encrypted-cache value
@@ -887,6 +909,7 @@ final class MobileLibraryModel {
         let activeAlbumSync = albumSync
         let activeThumbnailFeed = thumbnailFeed
         let activeRefreshCoalescer = libraryRefreshCoalescer
+        let activeUploadRefreshCoordinator = uploadRefreshCoordinator
         let activeChangeMonitor = libraryChangeMonitor
         let activeLocationCrawl = locationCrawl
         let activeLocationCrawlStarter = locationCrawlStartTask
@@ -933,6 +956,7 @@ final class MobileLibraryModel {
                     await activeFavoriteLoadTask?.value
                     await activeThumbnailUpdateTask?.value
                     await activeRefreshCoalescer.cancel()
+                    await activeUploadRefreshCoordinator.cancel()
                     await activeChangeMonitor.reset()
                     await activeThumbnailFeed?.stopPrefetch()
                 },
@@ -976,6 +1000,7 @@ final class MobileLibraryModel {
         let activeThumbnailFeed = thumbnailFeed
         let activeOriginalsCache = originalsCache
         let activeRefreshCoalescer = libraryRefreshCoalescer
+        let activeUploadRefreshCoordinator = uploadRefreshCoordinator
         let activeChangeMonitor = libraryChangeMonitor
         let activeLocationCrawl = locationCrawl
         let activeLocationCrawlStarter = locationCrawlStartTask
@@ -1040,6 +1065,7 @@ final class MobileLibraryModel {
                 await activeFavoriteLoadTask?.value
                 await activeThumbnailUpdateTask?.value
                 await activeRefreshCoalescer.cancel()
+                await activeUploadRefreshCoordinator.cancel()
                 await activeChangeMonitor.reset()
                 await activeThumbnailFeed?.stopPrefetch()
             },
@@ -1465,7 +1491,7 @@ final class MobileLibraryModel {
                 onChange: { [weak self] in
                     guard let self else { return .retry }
                     return await self.libraryRefreshCoalescer.request { [weak self] in
-                        await self?.performLibraryRefresh(lease: refreshLease) ?? .retry
+                        await self?.performLibraryRefresh(lease: refreshLease).outcome ?? .retry
                     }
                 }
             )
@@ -1477,7 +1503,7 @@ final class MobileLibraryModel {
         let coalescer = libraryRefreshCoalescer
         Task { [weak self] in
             let outcome = await coalescer.request { [weak self] in
-                await self?.performLibraryRefresh(lease: refreshLease) ?? .retry
+                await self?.performLibraryRefresh(lease: refreshLease).outcome ?? .retry
             }
             if outcome == .terminal {
                 await self?.recoverAfterScopeAccessLoss(
@@ -1490,11 +1516,11 @@ final class MobileLibraryModel {
 
     private func performLibraryRefresh(
         lease refreshLease: MobileLibraryMutationLease
-    ) async -> LibraryChangeRefreshOutcome {
+    ) async -> MobileLibraryRefreshResult {
         guard !isRecoveringScope,
             refreshLease.isCurrent(loadToken: loadToken, sessionUID: session?.uid),
             let backend
-        else { return .retry }
+        else { return .init(outcome: .retry, failureReason: .cancelled) }
         isRefreshingLibrary = true
         defer { isRefreshingLibrary = false }
         do {
@@ -1513,14 +1539,16 @@ final class MobileLibraryModel {
             // The same opaque server event token covers album mutations. Reuse this central foreground
             // refresh instead of adding a second poller; Collections reloads through its existing revision key.
             albumCatalogRevision &+= 1
-            return .refreshed
+            return .init(outcome: .refreshed, failureReason: nil)
         } catch is CancellationError {
-            return .retry
+            return .init(outcome: .retry, failureReason: .cancelled)
         } catch is any LibraryChangeTerminalError {
-            return .terminal
+            return .init(outcome: .terminal, failureReason: .scopeAccessLost)
+        } catch is any TimelineInventoryConvergenceError {
+            return .init(outcome: .retry, failureReason: .pendingInventoryVisibility)
         } catch {
             DebugLog.log("timeline: foreground refresh failed - \(error)")
-            return .retry
+            return .init(outcome: .retry, failureReason: .other)
         }
     }
 

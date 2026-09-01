@@ -844,6 +844,23 @@ struct ThumbnailFeedCoreTests {
         registration.end()
     }
 
+    @Test func backgroundCrawlDeliveryWakesCacheConsumersWithoutViewportDemand() async throws {
+        let uid = Self.uid("cache-wake-idle")
+        let cache = Self.cache("cache-wake-idle")
+        let loader = RecordingLoader(payloads: [uid: Self.pngData(width: 8, height: 8)])
+        let feed = ThumbnailFeedCore(
+            cache: cache, loader: loader,
+            configuration: Self.configuration(downloadConcurrencyLimit: 1, batchSize: 1)
+        )
+        let wakes = Counter()
+        let registration = feed.setOnCacheArrivalWake { wakes.increment() }
+
+        await feed.startPrefetch([uid])
+        try await Self.waitUntil { wakes.value() > 0 }
+        #expect(cache.hasUsableDiskData(uid))
+        registration.end()
+    }
+
     @Test func visiblePressureExcludesSequentialBacklogButTracksLiveDemand() async throws {
         // The Map's GPS crawl yields on `hasVisibleThumbnailPressure`. A pending whole-library sequential
         // A sequential fill must not count as pressure. The GPS crawl checks `hasPendingThumbnailWork`,

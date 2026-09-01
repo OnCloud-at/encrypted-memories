@@ -143,6 +143,9 @@ public enum AppleSmartSearchBootstrap {
                 featureAvailability: featureAvailability(),
                 indexingCapacityProfile: indexingCapacityProfile
             ))
+        workGate.setIndexingWake { [weak lifecycle] in
+            Task { await lifecycle?.noteConditionsChanged() }
+        }
         return lifecycle
     }
 }
