@@ -39,6 +39,7 @@ xcodebuild -resolvePackageDependencies \
     -project "$PROJECT" -scheme "$MAC_SCHEME" \
     -clonedSourcePackagesDirPath "$ENCRYPTED_MEMORIES_XCODE_SOURCE_PACKAGES" \
     -packageCachePath "$ENCRYPTED_MEMORIES_XCODE_PACKAGE_CACHE" \
+    -packageAuthorizationProvider netrc \
     -onlyUsePackageVersionsFromResolvedFile
 
 SIGNING_IDENTITY_HASH="${ENCRYPTED_MEMORIES_CODE_SIGN_IDENTITY:-}"

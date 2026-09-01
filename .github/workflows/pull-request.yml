@@ -63,6 +63,8 @@ jobs:
           set -euo pipefail
           ruby -c .github/scripts/app_store_connect.rb
           ruby .github/scripts/test_app_store_connect.rb
+          ruby -c .github/scripts/release_contract.rb
+          ruby .github/scripts/test_release_contract.rb
           bash -n .github/scripts/validate_apple_distribution.sh
           ruby -ryaml -e 'Dir[".github/workflows/*.yml"].sort.each { |path| YAML.parse_file(path) }'
 

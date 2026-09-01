@@ -23,6 +23,8 @@
   <a href="https://github.com/OnCloud-at/encrypted-memories/wiki/Quick-Start">Get started</a>
   ·
   <a href="https://github.com/OnCloud-at/encrypted-memories/wiki/Device-and-Feature-Support">See supported features</a>
+  ·
+  <a href="CONTRIBUTING.md">Contribute</a>
 </p>
 
 Encrypted Memories is an independent photo client for Proton Drive. It requires an existing Proton account and does not create accounts.
@@ -177,43 +179,39 @@ canonical root and detect ad-hoc Proton build trees under `/private/tmp`.
 
 ## Apple Releases
 
-GitHub Actions owns Apple distribution through five manual workflows:
+One GitHub Actions workflow owns Apple distribution. Publish a GitHub Release only after its tagged commit passed the pull request checks.
 
-- `Apple TestFlight internal` builds, signs, uploads, and assigns the iOS and native macOS apps.
-- `Apple TestFlight external` promotes an existing processed build to external testing.
-- `Apple App Store preflight` checks the configured in-app purchases and their review metadata without rebuilding.
-- `Apple App Store submission` attaches existing builds and can submit each platform for review.
-- `Apple App Store publish` releases both approved platforms when manual release is selected.
+- A prerelease tag such as `v1.2.0-beta.1` or `v1.2.0-rc.1` builds iOS and macOS. It publishes both builds only to internal TestFlight.
+- A stable tag such as `v1.2.0` builds both apps. It creates the platform versions when necessary, updates both localizations, submits each platform to App Review, and selects automatic release after approval.
+- A manual workflow run can retry an existing published release tag. It reuses the GitHub Release ID as the Apple build number and does not create duplicate builds.
+- GitHub prereleases do not replace the latest stable GitHub Release.
+- The workflow never attaches a signed macOS app to the GitHub Release. The supported macOS distribution channel is the Mac App Store.
+- External TestFlight is intentionally outside the normal release flow.
 
-The publish workflow creates a permanent `refs/release-locks/app-store-<version>` ref before it contacts Apple.
-If the response is lost, later runs verify Apple's version state and stop before another release request. Keep the
-lock as the release audit trail and complete an unresolved release directly in App Store Connect.
+Use this exact release-body structure. Write the Apple notes yourself:
 
-The workflows accept releases only from `main`. Configure these repository variables:
+```markdown
+## Deutsch
+Kurze, benutzerbezogene Änderungen auf Deutsch.
+
+## English
+Short user-facing changes in English.
+```
+
+Other GitHub sections are allowed. Automation extracts only `Deutsch` and `English`. Contributor names, pull request lists, and generated changelogs never reach Apple.
+
+Configure these repository variables:
 
 - `APP_STORE_CONNECT_APP_ID`
 - `APPLE_DEVELOPER_TEAM_ID`
-- `APPLE_BUILD_NUMBER_BASE`
 
-Configure the App Store Connect issuer, key ID, and Base64-encoded private key as protected environment
-secrets. The internal workflow also needs one Base64-encoded PKCS#12 archive and its password. The archive
-must contain the Apple Distribution and Mac Installer Distribution identities.
+Configure the App Store Connect issuer, key ID, and Base64-encoded private key as environment secrets. The `testflight-internal` environment also needs one Base64-encoded PKCS#12 archive and its password. The archive must contain the Apple Distribution and Mac Installer Distribution identities.
 
-Use the `testflight-internal`, `testflight-external`, and `app-store-production` environments. Restrict each
-environment to `main`. Require an approval for external testing and production.
+Use the `testflight-internal` and `app-store-production` environments. Allow release tags in both environments. Do not require a production approval when stable GitHub Releases must enter review without another click.
 
-The internal TestFlight workflow validates the configured in-app purchases before it starts a macOS runner. This
-sandbox preflight checks the App Store Connect bundle ID, its `IN_APP_PURCHASE` capability, exact product IDs,
-product type, current metadata version, active prices, availability in Austria and the United States, and metadata
-against
-`.github/app-store-connect/in-app-purchases.json`. Apple does not expose Paid Apps Agreement, banking, or tax status
-through this API. Those three items must be `Active` in App Store Connect.
+The workflow validates the configured in-app purchases before it starts a macOS runner. The sandbox preflight checks the App Store Connect bundle ID, its `IN_APP_PURCHASE` capability, exact product IDs, product type, current metadata version, active prices, availability in Austria and the United States, and metadata against `.github/app-store-connect/in-app-purchases.json`. Apple does not expose Paid Apps Agreement, banking, or tax status through this API. Those three items must be `Active` in App Store Connect.
 
-The external TestFlight workflow uses the same sandbox preflight. The App Store preflight adds the review-only checks
-for review notes and completely processed screenshots. For the first submission, add the iOS version and all four
-tips to one iOS submission in App Store Connect. Submit the macOS version separately. Apple does not support the first
-in-app purchase submission through the review-submission API. The submission workflow refuses automatic review
-submission until App Store Connect reports every tip as approved.
+The stable path adds the review-only checks for review notes and processed screenshots. It refuses automatic review submission until App Store Connect reports every tip as approved. For the first tip submission, add the iOS version and all four tips to one iOS submission in App Store Connect. Submit the macOS version separately. Apple does not support the first in-app purchase submission through the review-submission API.
 
 External TestFlight and App Review also require a working reviewer account because the photo library is available only
 after Proton sign-in. Store the reviewer username, password, contact information, and review notes only in App Store

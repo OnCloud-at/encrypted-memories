@@ -143,6 +143,7 @@ xcrun xcodebuild \
   -scheme PhotosCore \
   -clonedSourcePackagesDirPath "$ENCRYPTED_MEMORIES_XCODE_SOURCE_PACKAGES" \
   -packageCachePath "$ENCRYPTED_MEMORIES_XCODE_PACKAGE_CACHE" \
+  -packageAuthorizationProvider netrc \
   -onlyUsePackageVersionsFromResolvedFile
 
 for target in "${CORE_TARGETS[@]}"; do

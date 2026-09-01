@@ -193,7 +193,7 @@ final class ProjectHygieneTests: XCTestCase {
         XCTAssertEqual(rebuild.components(separatedBy: "IOS_BUNDLE_ID=").count - 1, 1)
     }
 
-    func testAppleDistributionUsesReviewedGitHubPromotionWorkflows() throws {
+    func testAppleDistributionUsesOneGitHubReleaseWorkflow() throws {
         let buildPaths = try String(
             contentsOf: repoRoot.appendingPathComponent("scripts/build-paths.sh"),
             encoding: .utf8
@@ -206,7 +206,11 @@ final class ProjectHygieneTests: XCTestCase {
             encoding: .utf8
         )
         XCTAssertTrue(internalWorkflow.contains("workflow_dispatch:"))
+        XCTAssertTrue(internalWorkflow.contains("release:"))
+        XCTAssertTrue(internalWorkflow.contains("types: [published]"))
+        XCTAssertTrue(internalWorkflow.contains("group: apple-distribution"))
         XCTAssertTrue(internalWorkflow.contains("environment: testflight-internal"))
+        XCTAssertTrue(internalWorkflow.contains("environment: app-store-production"))
         XCTAssertTrue(internalWorkflow.contains("api_platform: IOS"))
         XCTAssertTrue(internalWorkflow.contains("api_platform: MAC_OS"))
         XCTAssertTrue(internalWorkflow.contains("Apple-Actions/import-codesign-certs@"))
@@ -242,6 +246,18 @@ final class ProjectHygieneTests: XCTestCase {
         XCTAssertTrue(internalWorkflow.contains("validate-sandbox-in-app-purchases"))
         XCTAssertTrue(internalWorkflow.contains("needs: [prepare, in-app-purchase-preflight]"))
         XCTAssertTrue(internalWorkflow.contains("distribute-internal"))
+        XCTAssertTrue(internalWorkflow.contains("prepare-app-store"))
+        XCTAssertTrue(internalWorkflow.contains("--create-versions"))
+        XCTAssertTrue(internalWorkflow.contains("--automatic-release"))
+        XCTAssertTrue(internalWorkflow.contains("--submit"))
+        XCTAssertFalse(internalWorkflow.contains("distribute-external"))
+
+        let prepareAppleBuild = try String(
+            contentsOf: repoRoot.appendingPathComponent(".github/actions/prepare-apple-build/action.yml"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(prepareAppleBuild.contains("-resolvePackageDependencies"))
+        XCTAssertTrue(prepareAppleBuild.contains("-packageAuthorizationProvider netrc"))
 
         let project = try String(
             contentsOf: repoRoot.appendingPathComponent("project.yml"),
@@ -260,34 +276,28 @@ final class ProjectHygieneTests: XCTestCase {
             2
         )
 
-        let externalWorkflow = try String(
-            contentsOf: repoRoot.appendingPathComponent(".github/workflows/testflight-external.yml"),
-            encoding: .utf8
-        )
-        XCTAssertTrue(externalWorkflow.contains("environment: testflight-external"))
-        XCTAssertTrue(externalWorkflow.contains("distribute-external"))
+        for retiredWorkflow in [
+            "testflight-external.yml",
+            "app-store-preflight.yml",
+            "app-store-release.yml",
+            "app-store-publish.yml",
+        ] {
+            XCTAssertFalse(
+                FileManager.default.fileExists(
+                    atPath: repoRoot.appendingPathComponent(".github/workflows/\(retiredWorkflow)").path
+                )
+            )
+        }
 
-        let releaseWorkflow = try String(
-            contentsOf: repoRoot.appendingPathComponent(".github/workflows/app-store-release.yml"),
+        let releaseContract = try String(
+            contentsOf: repoRoot.appendingPathComponent(".github/scripts/release_contract.rb"),
             encoding: .utf8
         )
-        XCTAssertTrue(releaseWorkflow.contains("environment: app-store-production"))
-        XCTAssertFalse(releaseWorkflow.contains("first_release_with_in_app_purchases"))
-        XCTAssertTrue(releaseWorkflow.contains("prepare-app-store"))
-
-        let preflightWorkflow = try String(
-            contentsOf: repoRoot.appendingPathComponent(".github/workflows/app-store-preflight.yml"),
-            encoding: .utf8
-        )
-        XCTAssertTrue(preflightWorkflow.contains("environment: app-store-production"))
-        XCTAssertTrue(preflightWorkflow.contains("validate-in-app-purchases"))
-
-        let publishWorkflow = try String(
-            contentsOf: repoRoot.appendingPathComponent(".github/workflows/app-store-publish.yml"),
-            encoding: .utf8
-        )
-        XCTAssertTrue(publishWorkflow.contains("environment: app-store-production"))
-        XCTAssertTrue(publishWorkflow.contains("release-app-store"))
+        XCTAssertTrue(releaseContract.contains("TAG_PATTERN"))
+        XCTAssertTrue(releaseContract.contains("beta|rc"))
+        XCTAssertTrue(releaseContract.contains("payload.fetch(\"id\")"))
+        XCTAssertTrue(releaseContract.contains("\"de-DE\" => \"Deutsch\""))
+        XCTAssertTrue(releaseContract.contains("\"en-US\" => \"English\""))
 
         let validationScript = try String(
             contentsOf: repoRoot.appendingPathComponent(".github/scripts/validate_apple_distribution.sh"),
@@ -331,7 +341,8 @@ final class ProjectHygieneTests: XCTestCase {
         )
         XCTAssertFalse(connectScript.contains("name,locale,description"))
         XCTAssertFalse(connectScript.contains("\"include\" => \"inAppPurchaseLocalizations\""))
-        XCTAssertTrue(connectScript.contains("/v1/appStoreVersionReleaseRequests"))
+        XCTAssertTrue(connectScript.contains("releaseType: \"AFTER_APPROVAL\""))
+        XCTAssertFalse(connectScript.contains("/v1/appStoreVersionReleaseRequests"))
         XCTAssertTrue(connectScript.contains("automatic submission requires APPROVED products"))
         XCTAssertFalse(connectScript.contains("All four consumable tips"))
         XCTAssertTrue(connectScript.contains("iosBuildsAvailableForAppleSiliconMac: false"))

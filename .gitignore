@@ -47,6 +47,8 @@ Archiv.zip
 *.md
 !/README.md
 !/SECURITY.md
+!/CONTRIBUTING.md
+!/.github/pull_request_template.md
 !/Wiki/
 !/Wiki/**/*.md
 !/Tools/MLModels/README.md
