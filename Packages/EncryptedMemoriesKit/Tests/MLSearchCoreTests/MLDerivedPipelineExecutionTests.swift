@@ -36,11 +36,11 @@ import Testing
 
         #expect(nativeOutcome.reason == .drained)
         #expect(nativeOutcome.progress.completed == 2)
-        #expect(store.progress(for: peopleKey).completed == 0)
+        #expect(try store.progress(for: peopleKey).completed == 0)
 
         store.purge(artifact: nativeArtifact, accountIdentifier: nativeKey.accountIdentifier)
-        #expect(store.progress(for: nativeKey).total == 0)
-        #expect(store.progress(for: peopleKey).total == 2)
+        #expect(try store.progress(for: nativeKey).total == 0)
+        #expect(try store.progress(for: peopleKey).total == 2)
     }
 
     @Test func suspensionBeforeCommitLeavesWorkPending() async throws {
@@ -105,7 +105,7 @@ import Testing
                 [
                     try MLPipelineAssetRevision(uid: uid("1"), sourceRevision: "source-v2")
                 ], for: key))
-        let progress = store.progress(for: key)
+        let progress = try store.progress(for: key)
         #expect(progress.completed == 1)
         #expect(progress.pending == 1)
     }
@@ -208,7 +208,7 @@ import Testing
             #expect(outcome.progress.retryPending == 1)
             #expect(outcome.progress.permanentFailure == 0)
         }
-        #expect(store.nextWorkBatch(for: key, limit: 1, now: .distantFuture).first?.attempts == 0)
+        #expect(try store.nextWorkBatch(for: key, limit: 1, now: .distantFuture).first?.attempts == 0)
     }
 
     @Test func searchRequiresEveryNormalizedTokenAndKeepsAccountsIsolated() async throws {

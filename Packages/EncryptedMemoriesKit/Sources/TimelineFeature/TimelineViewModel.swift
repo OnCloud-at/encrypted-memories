@@ -73,6 +73,12 @@ public final class TimelineViewModel {
     /// interpreted as asset deletion by consumers such as Smart Search.
     public private(set) var wholeLibraryUIDs: [PhotoUID] = []
     public private(set) var wholeLibraryRevision: UInt64 = 0
+    /// Monotonic revision for canonical item content. Unlike `wholeLibraryRevision`, this also advances
+    /// when metadata changes without changing identity or order.
+    public private(set) var wholeLibraryContentRevision: UInt64 = 0
+    /// Completeness of the whole-library inventory published to source-aware derived-data consumers.
+    public private(set) var wholeLibraryInventoryAuthority: SourceInventoryAuthority = .hydrating
+    public private(set) var wholeLibraryInventoryAuthorityRevision: UInt64 = 0
     /// Revision of the identity/order that actually drives Metal grid presentation. Metadata enrichment can
     /// update `contentRevision` without rebuilding an unchanged whole-library grid.
     public var gridSourceRevision: UInt64 {
@@ -129,12 +135,20 @@ public final class TimelineViewModel {
     @ObservationIgnored private var hiddenFromTrash = Set<PhotoUID>()
 
     private func updateAllRouteSnapshot(_ projection: TimelineContentProjection) {
+        let contentChanged = wholeLibrarySnapshot != projection.snapshot
         allRouteSnapshot = projection.sections
         wholeLibrarySnapshot = projection.snapshot
+        if contentChanged { wholeLibraryContentRevision &+= 1 }
         let uids = projection.uids
         guard uids != wholeLibraryUIDs else { return }
         wholeLibraryUIDs = uids
         wholeLibraryRevision &+= 1
+    }
+
+    private func updateWholeLibraryAuthority(_ authority: SourceInventoryAuthority) {
+        guard wholeLibraryInventoryAuthority != authority else { return }
+        wholeLibraryInventoryAuthority = authority
+        wholeLibraryInventoryAuthorityRevision &+= 1
     }
 
     /// Whether `sections` flattens to exactly `items` (same `PhotoItem`s, same order) without allocating the
@@ -395,6 +409,7 @@ public final class TimelineViewModel {
             if let cached {
                 hadInventoryBaseline = true
                 let projection = await normalizeOffMain(cached.sections, for: .all)
+                updateWholeLibraryAuthority(.cached)
                 applyInitialLoad(.inventoryResolved(count: projection.snapshot.count, cached: true))
                 await applyAllContent(projection)
                 if !force {
@@ -409,6 +424,7 @@ public final class TimelineViewModel {
                         return
                     }
                     if case .validated(let token) = cacheValidation {
+                        updateWholeLibraryAuthority(.authoritative)
                         applyInitialLoad(
                             .authoritativeInventoryResolved(
                                 count: projection.snapshot.count,
@@ -433,6 +449,7 @@ public final class TimelineViewModel {
                 ? LibraryInventoryDelta.addedUIDs(previous: wholeLibraryUIDs, current: projection.uids)
                 : []
             let requiresNewFrame = projection.uids != wholeLibraryUIDs
+            updateWholeLibraryAuthority(.authoritative)
             applyInitialLoad(
                 .authoritativeInventoryResolved(
                     count: projection.snapshot.count,
@@ -525,7 +542,10 @@ public final class TimelineViewModel {
             // reassign state/allItems, refresh the route cache, or restart the crawl - the grid stays put
             // (scroll + selection preserved). The found-item lookup still runs against the current list.
             if Self.timelineContentUnchanged(sections, vs: allItems) {
-                if f == .all { updateAllRouteSnapshot(projection) }
+                if f == .all {
+                    updateWholeLibraryAuthority(.authoritative)
+                    updateAllRouteSnapshot(projection)
+                }
                 noteRefresh("unchangedSkip")
                 let foundItem = uploadedUID.flatMap { uid in allItems.first { $0.uid == uid } }
                 return TimelineRefreshResult(
@@ -546,6 +566,7 @@ public final class TimelineViewModel {
             allItems = items
             state = items.isEmpty ? .empty : .loaded(sections)
             if f == .all {
+                updateWholeLibraryAuthority(.authoritative)
                 updateAllRouteSnapshot(projection)
             } else {
                 filterCache.insert(sections, for: f, activeRoute: filter)

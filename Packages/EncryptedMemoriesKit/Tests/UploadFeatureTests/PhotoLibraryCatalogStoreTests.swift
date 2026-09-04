@@ -221,7 +221,7 @@ final class PhotoLibraryCatalogStoreTests: XCTestCase {
         )
     }
 
-    func testFutureSchemaResetsToEmpty() throws {
+    func testFutureSchemaFailsClosedWithoutDeletingCatalog() throws {
         let url = tempDir.appendingPathComponent(PhotoLibraryCatalogManifestStore.databaseFileName)
         do {
             let store = try XCTUnwrap(PhotoLibraryCatalogManifestStore(url: url))
@@ -235,8 +235,41 @@ final class PhotoLibraryCatalogStoreTests: XCTestCase {
         )
         sqlite3_close(handle)
 
-        let reopened = try XCTUnwrap(PhotoLibraryCatalogManifestStore(url: url))
-        XCTAssertEqual(reopened.count(), 0)
+        XCTAssertNil(PhotoLibraryCatalogManifestStore(url: url))
+        XCTAssertEqual(sqliteCount(url: url, table: "photo_catalog"), 1)
+    }
+
+    func testMarkerlessCatalogShapeFailsClosedWithoutRepairingIt() throws {
+        let url = tempDir.appendingPathComponent(PhotoLibraryCatalogManifestStore.databaseFileName)
+        var handle: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(url.path, &handle), SQLITE_OK)
+        XCTAssertEqual(
+            sqlite3_exec(
+                handle,
+                "CREATE TABLE photo_catalog(local_id TEXT); INSERT INTO photo_catalog VALUES('kept');",
+                nil,
+                nil,
+                nil
+            ),
+            SQLITE_OK
+        )
+        sqlite3_close(handle)
+
+        XCTAssertNil(PhotoLibraryCatalogManifestStore(url: url))
+        XCTAssertEqual(sqliteCount(url: url, table: "photo_catalog"), 1)
+        XCTAssertEqual(sqliteCount(url: url, table: "photo_catalog_info"), -1)
+    }
+
+    private func sqliteCount(url: URL, table: String) -> Int {
+        var handle: OpaquePointer?
+        guard sqlite3_open(url.path, &handle) == SQLITE_OK else { return -1 }
+        defer { sqlite3_close(handle) }
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(handle, "SELECT COUNT(*) FROM \(table);", -1, &statement, nil) == SQLITE_OK else {
+            return -1
+        }
+        defer { sqlite3_finalize(statement) }
+        return sqlite3_step(statement) == SQLITE_ROW ? Int(sqlite3_column_int64(statement, 0)) : -1
     }
 
     func testCompletedFullScanMarkerPersistsAcrossReopen() throws {

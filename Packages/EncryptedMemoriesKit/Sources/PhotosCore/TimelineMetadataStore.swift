@@ -170,7 +170,7 @@ public struct TimelineSaveResult: Sendable, Equatable {
 ///   refresh upserts only rows whose content actually differs and anti-joins the enumerated key
 ///   set to sweep vanished rows - never a full-table rewrite.
 /// - `schema_info` versions each feature's tables explicitly; an unknown newer version fails
-///   closed by resetting the (re-derivable) database rather than guessing.
+///   closed without modifying or deleting the last usable timeline.
 ///
 /// Not `Sendable` by design: single-owner, held inside one actor (the app's SDK bridge).
 public final class TimelineMetadataStore {
@@ -178,7 +178,7 @@ public final class TimelineMetadataStore {
     private let policy: LibraryDatabasePolicy
     private let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)  // SQLITE_TRANSIENT
 
-    /// Feature schema versions this build understands. Any mismatch resets this re-derivable store.
+    /// Feature schema versions this build understands. Any mismatch preserves the store and rejects opening it.
     private static let supportedFeatureVersions: [String: Int] = [
         "timeline": 1,
         "photo_tags": 1,
@@ -229,26 +229,12 @@ public final class TimelineMetadataStore {
     // MARK: Open / schema
 
     private static func openVerified(url: URL, policy: LibraryDatabasePolicy) -> OpaquePointer? {
-        if let handle = openOnce(url: url, policy: policy) { return handle }
-        // Incompatible (from-the-future or corrupt) store: it is re-derivable server metadata, so
-        // fail closed by resetting the files and building schema v1 fresh.
-        destroyDatabaseFiles(at: url)
-        return openOnce(url: url, policy: policy)
+        // Preserve the last usable timeline on every open or schema failure. A remote refresh may
+        // rebuild a new versioned store, but a transient filesystem error must never delete offline state.
+        openOnce(url: url, policy: policy)
     }
 
     private static func openOnce(url: URL, policy: LibraryDatabasePolicy) -> OpaquePointer? {
-        var handle: OpaquePointer?
-        guard sqlite3_open(url.path, &handle) == SQLITE_OK else {
-            sqlite3_close(handle)
-            return nil
-        }
-        sqlite3_exec(handle, "PRAGMA journal_mode=WAL;", nil, nil, nil)
-        sqlite3_exec(handle, "PRAGMA synchronous=NORMAL;", nil, nil, nil)
-        sqlite3_exec(handle, "PRAGMA busy_timeout=\(policy.busyTimeoutMs);", nil, nil, nil)
-        sqlite3_exec(handle, "PRAGMA cache_size=-\(max(0, policy.cacheSizeKiB));", nil, nil, nil)
-        sqlite3_exec(handle, "PRAGMA mmap_size=\(max(0, policy.mmapBytes));", nil, nil, nil)
-        sqlite3_exec(handle, "PRAGMA journal_size_limit=\(policy.journalSizeLimitBytes);", nil, nil, nil)
-
         let schema = """
             CREATE TABLE IF NOT EXISTS schema_info(feature TEXT PRIMARY KEY, version INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS photos(
@@ -285,36 +271,71 @@ public final class TimelineMetadataStore {
             );
             CREATE TABLE IF NOT EXISTS store_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
             """
-        guard sqlite3_exec(handle, schema, nil, nil, nil) == SQLITE_OK,
-            verifyAndStampFeatureVersions(handle)
-        else {
+
+        let compatibility = SQLiteStoreSchemaGate.compatibility(
+            at: url,
+            schemaSQL: schema,
+            busyTimeoutMs: policy.busyTimeoutMs,
+            versionIsCurrent: verifyFeatureVersions
+        )
+        guard compatibility == .empty || compatibility == .current else { return nil }
+        var handle: OpaquePointer?
+        let flags =
+            SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX
+            | (compatibility == .empty ? SQLITE_OPEN_CREATE : 0)
+        guard sqlite3_open_v2(url.path, &handle, flags, nil) == SQLITE_OK else {
+            sqlite3_close(handle)
+            return nil
+        }
+        sqlite3_busy_timeout(handle, Int32(clamping: policy.busyTimeoutMs))
+        switch compatibility {
+        case .empty:
+            SQLiteStoreSchemaGate.configureConnection(handle, policy: policy)
+            guard
+                SQLiteStoreSchemaGate.initializeCurrentSchema(
+                    handle,
+                    schemaSQL: schema,
+                    stamp: { stampFeatureVersions(handle) }
+                )
+            else {
+                sqlite3_close(handle)
+                return nil
+            }
+        case .current:
+            guard verifyFeatureVersions(handle),
+                SQLiteStoreSchemaGate.matchesCurrentSchema(handle, schemaSQL: schema)
+            else {
+                sqlite3_close(handle)
+                return nil
+            }
+            SQLiteStoreSchemaGate.configureConnection(handle, policy: policy)
+        case .incompatible, .unavailable:
             sqlite3_close(handle)
             return nil
         }
         return handle
     }
 
-    /// True when every present feature row exactly matches this build. A fresh database has no rows
-    /// and is stamped below; any mismatch or unknown feature requires a reset.
-    private static func verifyAndStampFeatureVersions(_ handle: OpaquePointer?) -> Bool {
+    /// Existing feature rows must exactly match this build. Missing or unknown markers fail closed.
+    private static func verifyFeatureVersions(_ handle: OpaquePointer?) -> Bool {
         var onDisk: [String: Int] = [:]
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(handle, "SELECT feature, version FROM schema_info;", -1, &stmt, nil) == SQLITE_OK
         else {
             return false
         }
-        while sqlite3_step(stmt) == SQLITE_ROW {
+        var result = sqlite3_step(stmt)
+        while result == SQLITE_ROW {
             if let feature = sqlite3_column_text(stmt, 0) {
                 onDisk[String(cString: feature)] = Int(sqlite3_column_int(stmt, 1))
             }
+            result = sqlite3_step(stmt)
         }
         sqlite3_finalize(stmt)
+        return result == SQLITE_DONE && onDisk == supportedFeatureVersions
+    }
 
-        guard Set(onDisk.keys).isSubset(of: Set(supportedFeatureVersions.keys)) else { return false }
-        for (feature, supported) in supportedFeatureVersions {
-            if let version = onDisk[feature], version != supported { return false }
-        }
-
+    private static func stampFeatureVersions(_ handle: OpaquePointer?) -> Bool {
         var upsert: OpaquePointer?
         guard
             sqlite3_prepare_v2(
@@ -331,12 +352,6 @@ public final class TimelineMetadataStore {
             guard sqlite3_step(upsert) == SQLITE_DONE else { return false }
         }
         return true
-    }
-
-    private static func destroyDatabaseFiles(at url: URL) {
-        for suffix in ["", "-wal", "-shm"] {
-            try? FileManager.default.removeItem(at: URL(fileURLWithPath: url.path + suffix))
-        }
     }
 
     // MARK: Load

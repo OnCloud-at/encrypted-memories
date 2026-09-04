@@ -72,6 +72,22 @@ public enum ProtonDriveBackendFactory {
         policy: ProtonDriveBackendPolicy
     ) async throws -> ProtonClientFacade {
         let bridge = try await DriveSDKBridge(session: session, store: store, policy: policy)
+        let accountDataDirectory = bridge.uploadManifestURL.deletingLastPathComponent()
+        let sourceInventoryStore = LibrarySourceInventoryStore(
+            directory: accountDataDirectory,
+            accountUID: session.uid,
+            encryptionKey: LibrarySourceInventoryKeyDerivation.key(
+                accountUID: session.uid,
+                keyPassword: session.keyPassword
+            ),
+            policy: policy.libraryDatabasePolicy
+        )
+        let librarySources = LibrarySourceCoordinator(
+            remote: bridge.makeAlbumCatalogBackend(),
+            thumbnailLoader: bridge,
+            inventoryStore: sourceInventoryStore
+        )
+        await librarySources.prepare()
         SDKCapabilities.current.log()
         // Opening account-scoped SQLite stores is synchronous. Prepare them on a utility executor before the
         // facade's MainActor composition so account activation does not block the UI executor on disk I/O.
@@ -88,6 +104,7 @@ public enum ProtonDriveBackendFactory {
         return await MainActor.run {
             ProtonClientFacade.make(
                 bridge: bridge,
+                librarySources: librarySources,
                 identityComposition: preparedStores.0,
                 settlementStore: preparedStores.1
             )

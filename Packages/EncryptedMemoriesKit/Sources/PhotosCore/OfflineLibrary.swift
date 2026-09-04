@@ -109,9 +109,9 @@ public struct OfflineCacheStatus: Sendable, Equatable {
         self.lastError = lastError
     }
 
-    /// Disk thumbnail coverage as a 0…1 fraction (1 when there are no assets yet).
+    /// Disk thumbnail coverage as a 0…1 fraction. An empty or hydrating library reports zero.
     public var thumbnailCoverage: Double {
-        guard totalAssets > 0 else { return 1 }
+        guard totalAssets > 0 else { return 0 }
         return min(1, Double(thumbnailsOnDisk) / Double(totalAssets))
     }
 

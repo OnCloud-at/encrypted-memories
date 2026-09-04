@@ -49,8 +49,8 @@ import Testing
         #expect(!persisted.contains(Data("receipt".utf8)))
 
         store = try openStore(url: url, cipher: cipher)
-        #expect(store?.progress(for: key).completed == 1)
-        #expect(store?.nextWorkBatch(for: key, limit: 8, now: .now).isEmpty == true)
+        #expect(try store?.progress(for: key).completed == 1)
+        #expect(try store?.nextWorkBatch(for: key, limit: 8, now: .now).isEmpty == true)
         #expect(store?.search(normalizedTokens: ["secret"], in: key, limit: 10).map(\.uid) == [uid])
     }
 
@@ -83,7 +83,7 @@ import Testing
 
         let changed = try MLPipelineAssetRevision(uid: uid, sourceRevision: "source-v2")
         #expect(store.enqueue([changed], for: key))
-        #expect(store.progress(for: key).pending == 1)
+        #expect(try store.progress(for: key).pending == 1)
         #expect(store.output(for: uid, artifact: artifact, accountIdentifier: "account") == nil)
         #expect(store.search(normalizedTokens: ["old"], in: key, limit: 10).isEmpty)
     }
@@ -127,7 +127,7 @@ import Testing
             store.output(for: asset.uid, artifact: currentBarcode, accountIdentifier: "account")?.payload
                 == Data("barcode".utf8)
         )
-        let progress = store.progress(for: currentKey)
+        let progress = try store.progress(for: currentKey)
         #expect(progress.total == 2)
         #expect(progress.completed == 1)
         #expect(progress.pending == 1)
@@ -153,11 +153,11 @@ import Testing
         #expect(store.enqueue([asset], for: secondKey))
 
         store.purge(artifact: ocr, accountIdentifier: "first")
-        #expect(store.progress(for: firstKey).total == 1)
-        #expect(store.progress(for: secondKey).total == 1)
+        #expect(try store.progress(for: firstKey).total == 1)
+        #expect(try store.progress(for: secondKey).total == 1)
         store.purge(pipelineID: .nativeSearch, accountIdentifier: "second")
-        #expect(store.progress(for: secondKey).total == 0)
-        #expect(store.progress(for: firstKey).total == 1)
+        #expect(try store.progress(for: secondKey).total == 0)
+        #expect(try store.progress(for: firstKey).total == 1)
     }
 
     @Test func reconcileRemovesOnlyMissingAssetsAndTheirTokenPostings() async throws {
@@ -194,7 +194,7 @@ import Testing
         #expect(store.search(normalizedTokens: ["shared"], in: key, limit: 10).count == 2)
 
         #expect(store.reconcile(liveUIDs: [retained.uid], for: key))
-        #expect(store.progress(for: key).total == 1)
+        #expect(try store.progress(for: key).total == 1)
         #expect(store.search(normalizedTokens: ["shared"], in: key, limit: 10).map(\.uid) == [retained.uid])
         #expect(store.output(for: deleted.uid, artifact: artifact, accountIdentifier: "account") == nil)
     }
@@ -257,10 +257,10 @@ import Testing
             cipher: TestDerivedCipher(key: 0x63)
         )
         #expect(store?.enqueue(assets, for: key) == true)
-        #expect(store?.progress(for: try makeKey(account: "account", artifacts: [ocr])).total == 10_000)
-        #expect(store?.progress(for: try makeKey(account: "account", artifacts: [document])).total == 10_000)
-        #expect(store?.progress(for: try makeKey(account: "account", artifacts: [barcode])).total == 10_000)
-        #expect(store?.progress(for: key).total == 30_000)
+        #expect(try store?.progress(for: makeKey(account: "account", artifacts: [ocr])).total == 10_000)
+        #expect(try store?.progress(for: makeKey(account: "account", artifacts: [document])).total == 10_000)
+        #expect(try store?.progress(for: makeKey(account: "account", artifacts: [barcode])).total == 10_000)
+        #expect(try store?.progress(for: key).total == 30_000)
         store?.close()
         store = nil
 
@@ -268,6 +268,49 @@ import Testing
             .compactMap { try? FileManager.default.attributesOfItem(atPath: $0.path)[.size] as? NSNumber }
             .reduce(Int64(0)) { $0 + $1.int64Value }
         #expect(persistedBytes < 12 * 1_024 * 1_024)
+    }
+
+    @Test func denseWorkSelectionIsAccountScopedAndKeepsDeterministicAssetGroups() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("SQLiteMLDerivedPipelineStoreTests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try openStore(
+            url: root.appendingPathComponent(SQLiteMLDerivedPipelineStore.databaseFileName),
+            cipher: TestDerivedCipher(key: 0x75)
+        )
+        let artifacts: Set<MLDerivedArtifactIdentity> = [
+            try makeArtifact(stage: "ocr", revision: "revision3"),
+            try makeArtifact(stage: "document", revision: "revision1"),
+            try makeArtifact(stage: "barcode", revision: "revision4"),
+        ]
+        let firstKey = try makeKey(account: "first-account", artifacts: artifacts)
+        let secondKey = try makeKey(account: "second-account", artifacts: artifacts)
+        let firstAssets = try (0..<512).map { index in
+            try MLPipelineAssetRevision(
+                uid: PhotoUID(volumeID: "first-volume", nodeID: String(format: "node-%04d", index)),
+                sourceRevision: "first-revision-\(index)"
+            )
+        }
+        let secondAssets = try (0..<512).map { index in
+            try MLPipelineAssetRevision(
+                uid: PhotoUID(volumeID: "second-volume", nodeID: String(format: "node-%04d", index)),
+                sourceRevision: "second-revision-\(index)"
+            )
+        }
+
+        // Give the other account the lower global asset IDs. Account-keyed indexes must still
+        // return the requested account without scanning or mixing those earlier rows.
+        #expect(store.enqueue(secondAssets, for: secondKey))
+        #expect(store.enqueue(firstAssets, for: firstKey))
+
+        let batch = try store.nextWorkBatch(for: firstKey, limit: 9, now: .now)
+        #expect(batch.count == 9)
+        #expect(batch.allSatisfy { $0.asset.uid.volumeID == "first-volume" })
+        #expect(
+            batch.map(\.asset.uid.nodeID) == Array(repeating: "node-0000", count: 3)
+                + Array(repeating: "node-0001", count: 3)
+                + Array(repeating: "node-0002", count: 3))
+        #expect(Set(batch.prefix(3).map(\.artifact)) == artifacts)
     }
 
     @Test func configuredSizeLimitTruncatesTheSingleCanonicalWAL() throws {
@@ -302,7 +345,7 @@ import Testing
             (try? FileManager.default.attributesOfItem(atPath: walURL.path)[.size] as? NSNumber)?
             .int64Value ?? 0
         #expect(walBytes == 0)
-        #expect(store.progress(for: key).total == assets.count)
+        #expect(try store.progress(for: key).total == assets.count)
     }
 
     @Test func materializedProgressTracksEveryStateTransitionWithoutRescanningWork() throws {
@@ -321,9 +364,9 @@ import Testing
             sourceRevision: "source-v1"
         )
         #expect(store.enqueue([asset], for: key))
-        #expect(store.progress(for: key).pending == 2)
+        #expect(try store.progress(for: key).pending == 2)
 
-        let work = store.nextWorkBatch(for: key, limit: 2, now: .now)
+        let work = try store.nextWorkBatch(for: key, limit: 2, now: .now)
         #expect(work.count == 2)
         let first = try #require(work.first { $0.artifact == ocr })
         let second = try #require(work.first { $0.artifact == barcode })
@@ -335,7 +378,7 @@ import Testing
                         workItem: second,
                         outcome: .retryableFailure(reason: .analysisFailed, retryAfter: .distantFuture)),
                 ], for: key, now: .now))
-        var progress = store.progress(for: key)
+        var progress = try store.progress(for: key)
         #expect(progress.completed == 1)
         #expect(progress.retryPending == 1)
 
@@ -344,7 +387,7 @@ import Testing
                 [
                     .init(workItem: second, outcome: .permanentInputFailure(reason: .sourceCorrupt))
                 ], for: key, now: .now))
-        progress = store.progress(for: key)
+        progress = try store.progress(for: key)
         #expect(progress.total == 2)
         #expect(progress.completed == 1)
         #expect(progress.retryPending == 0)
@@ -352,7 +395,7 @@ import Testing
         #expect(progress.unavailableAssets == 1)
     }
 
-    @Test func nextWorkBatchMergesPendingAndDueRetriesInDurableOrder() throws {
+    @Test func nextWorkBatchMergesPendingAndDueRetriesIntoDeterministicAssetGroups() throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("SQLiteMLDerivedPipelineStoreTests-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: root) }
@@ -371,7 +414,7 @@ import Testing
         )
         #expect(store.enqueue([firstAsset, secondAsset], for: key))
 
-        let initial = store.nextWorkBatch(for: key, limit: 4, now: .now)
+        let initial = try store.nextWorkBatch(for: key, limit: 4, now: .now)
         let retry = try #require(initial.first { $0.asset.uid == firstAsset.uid })
         #expect(
             store.commit(
@@ -380,13 +423,55 @@ import Testing
                         workItem: retry, outcome: .retryableFailure(reason: .analysisFailed, retryAfter: .distantPast))
                 ], for: key, now: .now))
 
-        let work = store.nextWorkBatch(for: key, limit: 4, now: .now)
+        let work = try store.nextWorkBatch(for: key, limit: 4, now: .now)
         #expect(work.count == 4)
         #expect(work[0].asset.uid == firstAsset.uid)
         #expect(work[0].artifact == retry.artifact)
         #expect(work[1].asset.uid == firstAsset.uid)
         #expect(work[2].asset.uid == secondAsset.uid)
         #expect(work[3].asset.uid == secondAsset.uid)
+    }
+
+    @Test func retrySelectionIsBoundedByDueTimeBeforeAssetGrouping() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("SQLiteMLDerivedPipelineStoreTests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try openStore(
+            url: root.appendingPathComponent(SQLiteMLDerivedPipelineStore.databaseFileName),
+            cipher: TestDerivedCipher(key: 0x76)
+        )
+        let artifact = try makeArtifact(stage: "ocr", revision: "revision3")
+        let key = try makeKey(account: "account", artifacts: [artifact])
+        let assets = try (0..<3).map { index in
+            try MLPipelineAssetRevision(
+                uid: PhotoUID(volumeID: "volume", nodeID: "node-\(index)"),
+                sourceRevision: "source-v1"
+            )
+        }
+        #expect(store.enqueue(assets, for: key))
+        let initial = try store.nextWorkBatch(for: key, limit: 3, now: .now)
+        #expect(initial.count == 3)
+        let base = Date(timeIntervalSince1970: 10_000)
+        let retryDates = [
+            base.addingTimeInterval(-10),
+            base.addingTimeInterval(-20),
+            base.addingTimeInterval(-30),
+        ]
+        #expect(
+            store.commit(
+                zip(initial, retryDates).map { work, retryAt in
+                    MLPipelineStageResult(
+                        workItem: work,
+                        outcome: .retryableFailure(reason: .analysisFailed, retryAfter: retryAt)
+                    )
+                },
+                for: key,
+                now: base
+            )
+        )
+
+        let next = try store.nextWorkBatch(for: key, limit: 1, now: base)
+        #expect(next.map(\.asset.uid) == [assets[2].uid])
     }
 
     @Test func obsoleteDerivedSchemaIsRebuiltWithoutTouchingOtherMLState() throws {
@@ -410,10 +495,80 @@ import Testing
             sourceRevision: "source-v1"
         )
         #expect(store.enqueue([asset], for: key))
-        #expect(store.progress(for: key).total == 1)
+        #expect(try store.progress(for: key).total == 1)
     }
 
-    @Test func versionFourRetryLimitRowsReopenWithoutDiscardingCompletedWork() throws {
+    @Test func currentMarkerWithWrongShapeResetsTheDerivedPipeline() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("SQLiteMLDerivedPipelineStoreTests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let url = root.appendingPathComponent(SQLiteMLDerivedPipelineStore.databaseFileName)
+        var raw: OpaquePointer?
+        #expect(sqlite3_open(url.path, &raw) == SQLITE_OK)
+        #expect(
+            sqlite3_exec(
+                raw,
+                "CREATE TABLE legacy_work(value TEXT); PRAGMA user_version=7;",
+                nil,
+                nil,
+                nil
+            ) == SQLITE_OK
+        )
+        sqlite3_close(raw)
+
+        let store = try openStore(url: url, cipher: TestDerivedCipher(key: 0x65))
+        let artifact = try makeArtifact(stage: "ocr", revision: "revision3")
+        let key = try makeKey(account: "account", artifacts: [artifact])
+        #expect(try store.progress(for: key).total == 0)
+        store.close()
+
+        raw = nil
+        #expect(sqlite3_open_v2(url.path, &raw, SQLITE_OPEN_READONLY, nil) == SQLITE_OK)
+        var statement: OpaquePointer?
+        #expect(
+            sqlite3_prepare_v2(
+                raw,
+                "SELECT COUNT(*) FROM sqlite_schema WHERE name='legacy_work';",
+                -1,
+                &statement,
+                nil
+            ) == SQLITE_OK
+        )
+        #expect(sqlite3_step(statement) == SQLITE_ROW)
+        #expect(sqlite3_column_int(statement, 0) == 0)
+        sqlite3_finalize(statement)
+        sqlite3_close(raw)
+    }
+
+    @Test func markerlessExactSchemaResetsInsteadOfAdoptingDerivedWork() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("SQLiteMLDerivedPipelineStoreTests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let url = root.appendingPathComponent(SQLiteMLDerivedPipelineStore.databaseFileName)
+        let cipher = TestDerivedCipher(key: 0x66)
+        let artifact = try makeArtifact(stage: "ocr", revision: "revision3")
+        let key = try makeKey(account: "account", artifacts: [artifact])
+        let asset = try MLPipelineAssetRevision(
+            uid: PhotoUID(volumeID: "volume", nodeID: "cached"),
+            sourceRevision: "source-v1"
+        )
+        let first = try openStore(url: url, cipher: cipher)
+        #expect(first.enqueue([asset], for: key))
+        #expect(try first.progress(for: key).total == 1)
+        first.close()
+
+        var raw: OpaquePointer?
+        #expect(sqlite3_open(url.path, &raw) == SQLITE_OK)
+        #expect(sqlite3_exec(raw, "PRAGMA user_version=0;", nil, nil, nil) == SQLITE_OK)
+        sqlite3_close(raw)
+
+        let rebuilt = try openStore(url: url, cipher: cipher)
+        #expect(try rebuilt.progress(for: key).total == 0)
+        rebuilt.close()
+    }
+
+    @Test func previousSchemaResetsInsteadOfMigratingRows() throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("SQLiteMLDerivedPipelineStoreTests-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: root) }
@@ -428,7 +583,8 @@ import Testing
 
         var store: SQLiteMLDerivedPipelineStore? = try openStore(url: url, cipher: cipher)
         #expect(store?.enqueue([first, second], for: key) == true)
-        let work = try #require(store?.nextWorkBatch(for: key, limit: 2, now: .now))
+        let openedStore = try #require(store)
+        let work = try openedStore.nextWorkBatch(for: key, limit: 2, now: .now)
         #expect(
             store?.commit(
                 [
@@ -440,15 +596,17 @@ import Testing
 
         var raw: OpaquePointer?
         #expect(sqlite3_open(url.path, &raw) == SQLITE_OK)
-        #expect(sqlite3_exec(raw, "PRAGMA user_version=4;", nil, nil, nil) == SQLITE_OK)
+        #expect(sqlite3_exec(raw, "PRAGMA user_version=6;", nil, nil, nil) == SQLITE_OK)
         sqlite3_close(raw)
 
         store = try openStore(url: url, cipher: cipher)
-        let progress = try #require(store?.progress(for: key))
-        #expect(progress.completed == 1)
-        #expect(progress.pending == 1)
+        let reopenedStore = try #require(store)
+        let progress = try reopenedStore.progress(for: key)
+        #expect(progress.completed == 0)
+        #expect(progress.pending == 0)
         #expect(progress.permanentFailure == 0)
-        #expect(store?.nextWorkBatch(for: key, limit: 2, now: .now).first?.attempts == 0)
+        #expect(progress.total == 0)
+        #expect(try store?.nextWorkBatch(for: key, limit: 2, now: .now).isEmpty == true)
     }
 
     @Test func emptyResultsCompleteAndTerminalFailuresAreGroupedByAsset() async throws {
@@ -491,6 +649,38 @@ import Testing
         #expect(outcome.progress.unavailableAssets == 1)
         #expect(outcome.progress.unavailableAssetReasons == [.sourceCorrupt: 1])
         #expect(store.output(for: emptyAsset.uid, artifact: first, accountIdentifier: "account") == nil)
+    }
+
+    @Test func closedStoreReportsStorageFailureInsteadOfAnEmptyDrainedQueue() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("SQLiteMLDerivedPipelineStoreTests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try openStore(
+            url: root.appendingPathComponent(SQLiteMLDerivedPipelineStore.databaseFileName),
+            cipher: TestDerivedCipher(key: 0x77)
+        )
+        let artifact = try makeArtifact(stage: "ocr", revision: "revision3")
+        let key = try makeKey(account: "account", artifacts: [artifact])
+        let asset = try MLPipelineAssetRevision(
+            uid: PhotoUID(volumeID: "volume", nodeID: "pending"),
+            sourceRevision: "source-v1"
+        )
+        #expect(store.enqueue([asset], for: key))
+        store.close()
+
+        #expect(throws: MLDerivedPipelineStoreError.storageUnavailable) {
+            _ = try store.progress(for: key)
+        }
+        #expect(throws: MLDerivedPipelineStoreError.storageUnavailable) {
+            _ = try store.nextWorkBatch(for: key, limit: 1, now: .now)
+        }
+
+        let outcome = await MLIndexRunner.runDerivedPass(
+            key: key,
+            store: store,
+            executor: SQLiteRecordingExecutor { _ in [] }
+        )
+        #expect(outcome.reason == .storageFailure)
     }
 
     private func makeArtifact(stage: String, revision: String) throws -> MLDerivedArtifactIdentity {

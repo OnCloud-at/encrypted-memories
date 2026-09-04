@@ -6,7 +6,7 @@ import ProtonDriveSDK
 /// Narrow testable surface over the SDK actor. Keeping the protocol here avoids leaking SDK types
 /// into AlbumCore while allowing catalog/cancellation/partial-result behavior to be tested without
 /// constructing a signed-in Proton client.
-protocol SDKPhotoCatalogClient: Sendable {
+protocol SDKPhotoCatalogClient: AnyObject, Sendable {
     func enumerateAlbumNodeUids(
         cancellationToken: UUID,
         onNodeUidEnumerated: @escaping NodeUidCallback
@@ -17,6 +17,12 @@ protocol SDKPhotoCatalogClient: Sendable {
         onNodeUidEnumerated: @escaping NodeUidCallback
     ) async throws
     func cancelEnumerateSharedWithMeNodeUids(cancellationToken: UUID) async throws
+    func enumerateAlbum(
+        albumUid: SDKNodeUid,
+        cancellationToken: UUID,
+        onAlbumItemEnumerated: @escaping AlbumItemCallback
+    ) async throws
+    func cancelEnumerateAlbum(cancellationToken: UUID) async throws
     func getNode(nodeUid: SDKNodeUid, cancellationToken: UUID) async throws -> DriveNode?
     func cancelGetNode(cancellationToken: UUID) async throws
     func leaveSharedNode(nodeUid: SDKNodeUid, cancellationToken: UUID) async throws
@@ -28,7 +34,9 @@ extension EncryptedMemoriesClient: SDKPhotoCatalogClient {}
 enum SDKAlbumCatalogError: LocalizedError {
     case missingNode(AlbumNodeIdentifier)
     case unexpectedOwnedNode(AlbumNodeIdentifier)
+    case unexpectedSharedNode(AlbumNodeIdentifier)
     case unexpectedPhotoNode(AlbumNodeIdentifier)
+    case invalidCaptureTime(AlbumNodeIdentifier)
 
     var errorDescription: String? {
         switch self {
@@ -36,9 +44,209 @@ enum SDKAlbumCatalogError: LocalizedError {
             "SDK returned no node for \(node.volumeID)~\(node.nodeID)"
         case .unexpectedOwnedNode(let node):
             "SDK album catalog returned a non-album node for \(node.volumeID)~\(node.nodeID)"
+        case .unexpectedSharedNode(let node):
+            "SDK shared photo catalog returned an unsupported node for \(node.volumeID)~\(node.nodeID)"
         case .unexpectedPhotoNode(let node):
             "SDK membership lookup returned a non-photo node for \(node.volumeID)~\(node.nodeID)"
+        case .invalidCaptureTime(let node):
+            "SDK album content returned an invalid capture time for \(node.volumeID)~\(node.nodeID)"
         }
+    }
+}
+
+/// One account-scoped, short-lived snapshot shared by album UI and derived-data source discovery.
+/// Concurrent callers join one SDK enumeration instead of repeating every bounded `getNode` request.
+actor SDKSharedAlbumSnapshotCache {
+    private struct CachedSnapshot {
+        let nodes: [AlbumNode]
+        let expiresAt: ContinuousClock.Instant
+    }
+
+    private struct Flight {
+        let id: UUID
+        let generation: UInt64
+        var task: Task<Void, Never>?
+        var waiters: [UUID: CheckedContinuation<[AlbumNode], any Error>]
+    }
+
+    private struct ScopeState {
+        var generation: UInt64 = 0
+        var cached: CachedSnapshot?
+        var flight: Flight?
+    }
+
+    private struct OrphanedFlight {
+        let scope: ObjectIdentifier
+        let task: Task<Void, Never>
+    }
+
+    private let lifetime: Duration
+    private var scopes: [ObjectIdentifier: ScopeState] = [:]
+    private var orphanedFlights: [UUID: OrphanedFlight] = [:]
+
+    init(lifetime: Duration = .seconds(5)) {
+        self.lifetime = lifetime
+    }
+
+    func value(
+        client: any SDKPhotoCatalogClient,
+        loader: @escaping @Sendable () async throws -> [AlbumNode]
+    ) async throws -> [AlbumNode] {
+        try Task.checkCancellation()
+        let scope = ObjectIdentifier(client)
+        let now = ContinuousClock.now
+        if let cached = scopes[scope]?.cached, now < cached.expiresAt {
+            try Task.checkCancellation()
+            return cached.nodes
+        }
+        let waiterID = UUID()
+        let nodes = try await withTaskCancellationHandler {
+            try await wait(
+                scope: scope,
+                waiterID: waiterID,
+                loader: loader
+            )
+        } onCancel: {
+            Task { await self.cancelWaiter(scope: scope, waiterID: waiterID) }
+        }
+        try Task.checkCancellation()
+        return nodes
+    }
+
+    /// Fences one account immediately. Canceled native work remains tracked for the shutdown join,
+    /// so a successful leave never waits on a non-cooperative SDK cancellation callback.
+    func invalidate(client: any SDKPhotoCatalogClient) {
+        fence(scopes: [ObjectIdentifier(client)])
+    }
+
+    func invalidateAll() async {
+        let allScopes = Set(scopes.keys).union(orphanedFlights.values.map(\.scope))
+        fence(scopes: Array(allScopes))
+        let tasks = orphanedFlights.values.map(\.task)
+        for task in tasks { await task.value }
+    }
+
+    private func wait(
+        scope: ObjectIdentifier,
+        waiterID: UUID,
+        loader: @escaping @Sendable () async throws -> [AlbumNode]
+    ) async throws -> [AlbumNode] {
+        try await withCheckedThrowingContinuation { continuation in
+            var state = scopes[scope] ?? ScopeState()
+            let now = ContinuousClock.now
+            if let cached = state.cached, now < cached.expiresAt {
+                continuation.resume(returning: cached.nodes)
+                return
+            }
+            state.cached = nil
+            if var flight = state.flight {
+                flight.waiters[waiterID] = continuation
+                state.flight = flight
+                scopes[scope] = state
+            } else {
+                let flightID = UUID()
+                let generation = state.generation
+                state.flight = Flight(
+                    id: flightID,
+                    generation: generation,
+                    task: nil,
+                    waiters: [waiterID: continuation]
+                )
+                scopes[scope] = state
+                let task = Task { [weak self] in
+                    let result: Result<[AlbumNode], any Error>
+                    do {
+                        result = .success(try await loader())
+                    } catch {
+                        result = .failure(error)
+                    }
+                    await self?.complete(
+                        scope: scope,
+                        flightID: flightID,
+                        generation: generation,
+                        result: result
+                    )
+                }
+                if var installed = scopes[scope], var flight = installed.flight,
+                    flight.id == flightID
+                {
+                    flight.task = task
+                    installed.flight = flight
+                    scopes[scope] = installed
+                } else {
+                    task.cancel()
+                }
+            }
+            if Task.isCancelled {
+                cancelWaiter(scope: scope, waiterID: waiterID)
+            }
+        }
+    }
+
+    private func cancelWaiter(scope: ObjectIdentifier, waiterID: UUID) {
+        guard var state = scopes[scope], var flight = state.flight,
+            let continuation = flight.waiters.removeValue(forKey: waiterID)
+        else { return }
+        if flight.waiters.isEmpty {
+            state.flight = nil
+            if let task = flight.task {
+                orphanedFlights[flight.id] = OrphanedFlight(scope: scope, task: task)
+                task.cancel()
+            }
+        } else {
+            state.flight = flight
+        }
+        scopes[scope] = state
+        continuation.resume(throwing: CancellationError())
+    }
+
+    private func complete(
+        scope: ObjectIdentifier,
+        flightID: UUID,
+        generation: UInt64,
+        result: Result<[AlbumNode], any Error>
+    ) {
+        orphanedFlights.removeValue(forKey: flightID)
+        guard var state = scopes[scope], state.generation == generation,
+            let flight = state.flight, flight.id == flightID
+        else { return }
+        state.flight = nil
+        if case .success(let nodes) = result {
+            state.cached = CachedSnapshot(
+                nodes: nodes,
+                expiresAt: ContinuousClock.now + lifetime
+            )
+        }
+        scopes[scope] = state
+        for continuation in flight.waiters.values {
+            switch result {
+            case .success(let nodes): continuation.resume(returning: nodes)
+            case .failure(let error): continuation.resume(throwing: error)
+            }
+        }
+    }
+
+    private func fence(scopes requestedScopes: [ObjectIdentifier]) {
+        let requested = Set(requestedScopes)
+        var waiters: [CheckedContinuation<[AlbumNode], any Error>] = []
+        for scope in requested {
+            guard var state = scopes[scope] else { continue }
+            state.generation &+= 1
+            state.cached = nil
+            if let flight = state.flight {
+                if let task = flight.task {
+                    orphanedFlights[flight.id] = OrphanedFlight(scope: scope, task: task)
+                    task.cancel()
+                }
+                waiters.append(contentsOf: flight.waiters.values)
+                state.flight = nil
+            }
+            scopes[scope] = state
+        }
+        for flight in orphanedFlights.values where requested.contains(flight.scope) {
+            flight.task.cancel()
+        }
+        waiters.forEach { $0.resume(throwing: CancellationError()) }
     }
 }
 
@@ -49,15 +257,18 @@ struct SDKAlbumCatalogBackend: AlbumCatalogBackend {
     private let client: any SDKPhotoCatalogClient
     private let maximumConcurrentNodeLoads: Int
     private let admission: JoinedShutdownGate?
+    private let sharedAlbumSnapshotCache: SDKSharedAlbumSnapshotCache
 
     init(
         client: any SDKPhotoCatalogClient,
         maximumConcurrentNodeLoads: Int = 4,
-        admission: JoinedShutdownGate? = nil
+        admission: JoinedShutdownGate? = nil,
+        sharedAlbumSnapshotCache: SDKSharedAlbumSnapshotCache = SDKSharedAlbumSnapshotCache()
     ) {
         self.client = client
         self.maximumConcurrentNodeLoads = max(1, maximumConcurrentNodeLoads)
         self.admission = admission
+        self.sharedAlbumSnapshotCache = sharedAlbumSnapshotCache
     }
 
     func listAlbums() async throws -> [AlbumSummary] {
@@ -89,13 +300,50 @@ struct SDKAlbumCatalogBackend: AlbumCatalogBackend {
     }
 
     private func performListSharedWithMeAlbums() async throws -> [SharedAlbumSummary] {
-        let uids = try await enumerateSharedWithMeUIDs()
-        let nodes = try await loadNodes(uids)
-        let albums = nodes.compactMap { _, node -> SharedAlbumSummary? in
-            guard case .album(let album)? = node, album.trashTime == nil else { return nil }
-            return Self.sharedSummary(album)
-        }
+        let albums = try await sharedAlbumNodes().map(Self.sharedSummary)
         return albums.sorted(by: Self.sharedAlbumOrder)
+    }
+
+    /// Complete, volume-qualified locators for every currently accessible additional album source.
+    /// Photo nodes can also appear in Shared with me and are deliberately ignored here.
+    func librarySourceLocators() async throws -> [AlbumNodeIdentifier] {
+        try await withAdmission {
+            try await self.sharedAlbumNodes()
+                .map { Self.identifier($0.uid) }
+                .sorted(by: Self.identifierOrder)
+        }
+    }
+
+    /// Complete membership enumeration for one source. `AlbumItem` proves only identity and capture time;
+    /// richer fields stay unknown so no consumer can mistake a partial SDK contract for full metadata.
+    func librarySourceItems(for album: AlbumNodeIdentifier) async throws -> [LibrarySourceItem] {
+        try await withAdmission {
+            let collector = SDKEnumerationCollector<AlbumItem>()
+            let sdkUID = SDKNodeUid(volumeID: album.volumeID, nodeID: album.nodeID)
+            let items = try await SDKCancellableOperation.run { token in
+                try await client.enumerateAlbum(
+                    albumUid: sdkUID,
+                    cancellationToken: token,
+                    onAlbumItemEnumerated: { result in collector.receive(result) }
+                )
+                return try collector.collected()
+            } cancel: { token in
+                try? await client.cancelEnumerateAlbum(cancellationToken: token)
+            }
+            return try items.map { item in
+                guard item.captureTime.isFinite else {
+                    throw SDKAlbumCatalogError.invalidCaptureTime(Self.identifier(item.nodeUid))
+                }
+                return LibrarySourceItem(
+                    item: PhotoItem(
+                        uid: Self.photoUID(item.nodeUid),
+                        captureTime: Date(timeIntervalSince1970: item.captureTime),
+                        mediaType: ""
+                    ),
+                    knownFields: [.captureTime]
+                )
+            }
+        }
     }
 
     func leaveSharedAlbum(_ album: AlbumNodeIdentifier) async throws {
@@ -111,6 +359,7 @@ struct SDKAlbumCatalogBackend: AlbumCatalogBackend {
         } cancel: { token in
             try? await client.cancelLeaveSharedNode(cancellationToken: token)
         }
+        await sharedAlbumSnapshotCache.invalidate(client: client)
     }
 
     func albumMemberships(
@@ -172,6 +421,30 @@ struct SDKAlbumCatalogBackend: AlbumCatalogBackend {
             return try collector.collected()
         } cancel: { token in
             try? await client.cancelEnumerateSharedWithMeNodeUids(cancellationToken: token)
+        }
+    }
+
+    private func sharedAlbumNodes() async throws -> [AlbumNode] {
+        try await sharedAlbumSnapshotCache.value(client: client) {
+            try await loadSharedAlbumNodes()
+        }
+    }
+
+    private func loadSharedAlbumNodes() async throws -> [AlbumNode] {
+        let uids = try await enumerateSharedWithMeUIDs()
+        let nodes = try await loadNodes(uids)
+        return try nodes.compactMap { uid, node in
+            guard let node else {
+                throw SDKAlbumCatalogError.missingNode(Self.identifier(uid))
+            }
+            switch node {
+            case .album(let album):
+                return album.trashTime == nil ? album : nil
+            case .photo:
+                return nil
+            case .folder, .file:
+                throw SDKAlbumCatalogError.unexpectedSharedNode(Self.identifier(uid))
+            }
         }
     }
 
@@ -262,6 +535,13 @@ struct SDKAlbumCatalogBackend: AlbumCatalogBackend {
         if nameOrder != .orderedSame { return nameOrder == .orderedAscending }
         if lhs.node.volumeID != rhs.node.volumeID { return lhs.node.volumeID < rhs.node.volumeID }
         return lhs.node.nodeID < rhs.node.nodeID
+    }
+
+    private static func identifierOrder(_ lhs: AlbumNodeIdentifier, _ rhs: AlbumNodeIdentifier) -> Bool {
+        if lhs.volumeID != rhs.volumeID {
+            return lhs.volumeID.utf8.lexicographicallyPrecedes(rhs.volumeID.utf8)
+        }
+        return lhs.nodeID.utf8.lexicographicallyPrecedes(rhs.nodeID.utf8)
     }
 
     private static func identifier(_ uid: SDKNodeUid) -> AlbumNodeIdentifier {

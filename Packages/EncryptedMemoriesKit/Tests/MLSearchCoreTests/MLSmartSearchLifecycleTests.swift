@@ -292,6 +292,14 @@ import Testing
         init(_ uids: [PhotoUID]) { inventory = .authoritative(uids) }
         var current: MLAssetInventorySnapshot { lock.withLock { inventory } }
         func set(_ new: [PhotoUID]) { lock.withLock { inventory = .authoritative(new) } }
+        func setHydrating(_ visible: [PhotoUID]) {
+            lock.withLock {
+                inventory = MLAssetInventorySnapshot(
+                    uids: visible,
+                    isAuthoritative: false
+                )
+            }
+        }
         func beginHydration() { lock.withLock { inventory = .hydrating } }
     }
 
@@ -326,6 +334,61 @@ import Testing
             shouldContinue: @escaping @Sendable () -> Bool,
             observer: MLDerivedPipelineObserver
         ) async -> MLDerivedPipelinePassOutcome {
+            await performIndex(
+                assets: assets,
+                allowsDestructiveReconciliation: true,
+                shouldContinue: shouldContinue,
+                observer: observer
+            )
+        }
+
+        func indexQuantum(
+            assets: [MLPipelineAssetRevision],
+            libraryGeneration: UInt64,
+            allowsDestructiveReconciliation: Bool,
+            maximumAssets: Int,
+            maximumConcurrentAssets: Int,
+            shouldContinue: @escaping @Sendable () -> Bool,
+            observer: MLDerivedPipelineObserver
+        ) async -> MLDerivedPipelinePassOutcome {
+            await performIndex(
+                assets: assets,
+                allowsDestructiveReconciliation: allowsDestructiveReconciliation,
+                shouldContinue: shouldContinue,
+                observer: observer
+            )
+        }
+
+        func indexQuantum(
+            assets: [MLPipelineAssetRevision],
+            libraryGeneration: UInt64,
+            allowsDestructiveReconciliation: Bool,
+            destructiveReconciliationIsAuthorized: @escaping @Sendable () async -> Bool,
+            maximumAssets: Int,
+            maximumConcurrentAssets: Int,
+            shouldContinue: @escaping @Sendable () -> Bool,
+            observer: MLDerivedPipelineObserver
+        ) async -> MLDerivedPipelinePassOutcome {
+            let authorized: Bool
+            if allowsDestructiveReconciliation {
+                authorized = await destructiveReconciliationIsAuthorized()
+            } else {
+                authorized = false
+            }
+            return await performIndex(
+                assets: assets,
+                allowsDestructiveReconciliation: authorized,
+                shouldContinue: shouldContinue,
+                observer: observer
+            )
+        }
+
+        private func performIndex(
+            assets: [MLPipelineAssetRevision],
+            allowsDestructiveReconciliation: Bool,
+            shouldContinue: @escaping @Sendable () -> Bool,
+            observer: MLDerivedPipelineObserver
+        ) async -> MLDerivedPipelinePassOutcome {
             lock.withLock { indexes += 1 }
             guard shouldContinue() else {
                 return MLDerivedPipelinePassOutcome(
@@ -340,12 +403,20 @@ import Testing
                     )
                 )
             }
-            lock.withLock { indexedAssets = assets }
+            let visibleCount = lock.withLock {
+                if allowsDestructiveReconciliation {
+                    indexedAssets = assets
+                } else {
+                    var seen = Set(indexedAssets.map(\.uid))
+                    indexedAssets.append(contentsOf: assets.filter { seen.insert($0.uid).inserted })
+                }
+                return indexedAssets.count
+            }
             let outcome = MLDerivedPipelinePassOutcome(
                 reason: .drained,
                 progress: MLDerivedPipelineProgress(
-                    total: assets.count,
-                    completed: assets.count,
+                    total: visibleCount,
+                    completed: visibleCount,
                     skipped: 0,
                     permanentFailure: 0,
                     retryPending: 0,
@@ -782,7 +853,7 @@ import Testing
         let (entryA, urlA) = downloadableEntry(id: "model-a", payload: payloadA)
         let (entryB, urlB) = downloadableEntry(id: "model-b", payload: payloadB)
         let assets = [uid("a"), uid("b"), uid("c")]
-        let nativeOnly = uid("native-result")
+        let nativeOnly = assets[0]
         let nativeSearch = RecordingNativeSearch(results: [nativeOnly])
         let harness = try makeHarness(
             catalog: MLModelCatalog(entries: [entryA, entryB]),
@@ -834,7 +905,7 @@ import Testing
         #expect(await waitUntil { nativeSearch.indexCount == 2 && nativeSearch.indexedUIDs.count == 2 })
     }
 
-    @Test func completedNativeBackendWaitsForAuthoritativeColdStartInventory() async throws {
+    @Test func completedNativeBackendIndexesHydratingScopeWithoutReconcilingStoredRows() async throws {
         let existing = uid("existing")
         let nativeSearch = RecordingNativeSearch(results: [], initiallyIndexed: [existing])
         let harness = try makeHarness(
@@ -850,21 +921,21 @@ import Testing
         await harness.lifecycle.start()
         try await Task.sleep(for: .milliseconds(100))
 
-        #expect(nativeSearch.indexCount == 0)
+        #expect(nativeSearch.indexCount == 1)
         #expect(nativeSearch.indexedUIDs == [existing])
 
         harness.assets.set([existing])
         await harness.lifecycle.noteLibraryChanged()
         #expect(
             await waitUntil {
-                nativeSearch.indexCount == 1 && nativeSearch.indexedUIDs == [existing]
+                nativeSearch.indexCount == 2 && nativeSearch.indexedUIDs == [existing]
             })
     }
 
     @Test func semanticDownloadFailureDoesNotDisableCompletedNativeSearch() async throws {
         let payload = Data("model".utf8)
         let (entry, url) = downloadableEntry(id: "model", payload: payload)
-        let nativeOnly = uid("native-result")
+        let nativeOnly = uid("asset")
         let nativeSearch = RecordingNativeSearch(results: [nativeOnly])
         let harness = try makeHarness(
             catalog: MLModelCatalog(entries: [entry]),
@@ -909,7 +980,7 @@ import Testing
                 isVisualSearchEnabled: true,
                 selectedModelID: entry.id
             ))
-        let nativeOnly = uid("native-result")
+        let nativeOnly = uid("asset")
         let nativeSearch = RecordingNativeSearch(results: [nativeOnly])
         let harness = try makeHarness(
             catalog: MLModelCatalog(entries: [entry]),
@@ -1032,8 +1103,8 @@ import Testing
     @Test func nativeIndexAndScopedSearchShareTheUniversalLifecycle() async throws {
         let payload = Data("model-a-bytes".utf8)
         let (entryA, urlA) = downloadableEntry(id: "model-a", payload: payload)
-        let assets = [uid("a"), uid("b")]
         let nativeOnly = uid("native-only")
+        let assets = [uid("a"), uid("b"), nativeOnly]
         let nativeSearch = RecordingNativeSearch(results: [nativeOnly])
         let harness = try makeHarness(
             catalog: MLModelCatalog(entries: [entryA]),
@@ -1080,7 +1151,9 @@ import Testing
                 await indexQuantum(
                     assets: assets,
                     libraryGeneration: 0,
+                    allowsDestructiveReconciliation: true,
                     maximumAssets: assets.count,
+                    maximumConcurrentAssets: 1,
                     shouldContinue: shouldContinue,
                     observer: observer
                 )
@@ -1088,7 +1161,9 @@ import Testing
             func indexQuantum(
                 assets: [MLPipelineAssetRevision],
                 libraryGeneration: UInt64,
+                allowsDestructiveReconciliation: Bool,
                 maximumAssets: Int,
+                maximumConcurrentAssets: Int,
                 shouldContinue: @escaping @Sendable () -> Bool,
                 observer: MLDerivedPipelineObserver
             ) async -> MLDerivedPipelinePassOutcome {
@@ -1197,6 +1272,7 @@ import Testing
                 await indexQuantum(
                     assets: assets,
                     libraryGeneration: 0,
+                    allowsDestructiveReconciliation: true,
                     maximumAssets: assets.count,
                     maximumConcurrentAssets: 1,
                     shouldContinue: shouldContinue,
@@ -1206,6 +1282,7 @@ import Testing
             func indexQuantum(
                 assets: [MLPipelineAssetRevision],
                 libraryGeneration: UInt64,
+                allowsDestructiveReconciliation: Bool,
                 maximumAssets: Int,
                 maximumConcurrentAssets: Int,
                 shouldContinue: @escaping @Sendable () -> Bool,
@@ -1296,6 +1373,7 @@ import Testing
                 await indexQuantum(
                     assets: assets,
                     libraryGeneration: 0,
+                    allowsDestructiveReconciliation: true,
                     maximumAssets: assets.count,
                     maximumConcurrentAssets: 1,
                     shouldContinue: shouldContinue,
@@ -1305,6 +1383,7 @@ import Testing
             func indexQuantum(
                 assets: [MLPipelineAssetRevision],
                 libraryGeneration: UInt64,
+                allowsDestructiveReconciliation: Bool,
                 maximumAssets: Int,
                 maximumConcurrentAssets: Int,
                 shouldContinue: @escaping @Sendable () -> Bool,
@@ -1919,6 +1998,86 @@ import Testing
         #expect(harness.provider.embedder.callCount(initial[1]) == 1)
     }
 
+    @Test func hydratingInventoryNeverAuthorizesSemanticDeletion() async throws {
+        let payload = Data("model-a-bytes".utf8)
+        let (entry, url) = downloadableEntry(id: "model-a", payload: payload)
+        let initial = (0..<4).map { uid("asset-\($0)") }
+        let harness = try makeHarness(
+            catalog: MLModelCatalog(entries: [entry]),
+            payloads: [url: payload],
+            assets: initial,
+            retryDelay: .milliseconds(20)
+        )
+        defer { try? FileManager.default.removeItem(at: harness.layout.rootDirectory) }
+
+        await harness.lifecycle.start()
+        await harness.lifecycle.setEnabled(true)
+        await harness.lifecycle.select(entry.id)
+        #expect(await waitForCompleteIndex(harness, total: initial.count))
+
+        harness.assets.beginHydration()
+        await harness.lifecycle.noteLibraryChanged()
+        #expect(
+            await waitUntil {
+                if case .waiting = await harness.lifecycle.currentSnapshot().indexingState {
+                    return true
+                }
+                return false
+            })
+        #expect(harness.storeProvider.store.count(for: entry.descriptor) == initial.count)
+
+        let retained = Array(initial.dropFirst())
+        harness.assets.set(retained)
+        await harness.lifecycle.noteLibraryChanged()
+        #expect(
+            await waitUntil {
+                !harness.storeProvider.store.contains(uid: initial[0], descriptor: entry.descriptor)
+            })
+        #expect(harness.storeProvider.store.count(for: entry.descriptor) == retained.count)
+    }
+
+    @Test func authoritativeInventoryRemovesVectorsAddedDuringHydration() async throws {
+        let payload = Data("model-a-bytes".utf8)
+        let (entry, url) = downloadableEntry(id: "model-a", payload: payload)
+        let retained = uid("retained")
+        let transient = uid("transient")
+        let harness = try makeHarness(
+            catalog: MLModelCatalog(entries: [entry]),
+            payloads: [url: payload],
+            assets: [retained],
+            retryDelay: .milliseconds(20)
+        )
+        defer { try? FileManager.default.removeItem(at: harness.layout.rootDirectory) }
+
+        await harness.lifecycle.start()
+        await harness.lifecycle.setEnabled(true)
+        await harness.lifecycle.select(entry.id)
+        #expect(await waitForCompleteIndex(harness, total: 1))
+
+        harness.assets.setHydrating([retained, transient])
+        await harness.lifecycle.noteLibraryChanged()
+        #expect(
+            await waitUntil {
+                harness.storeProvider.store.contains(
+                    uid: transient,
+                    descriptor: entry.descriptor
+                )
+            }
+        )
+
+        harness.assets.set([retained])
+        await harness.lifecycle.noteLibraryChanged()
+        #expect(
+            await waitUntil {
+                !harness.storeProvider.store.contains(
+                    uid: transient,
+                    descriptor: entry.descriptor
+                )
+            }
+        )
+        #expect(harness.storeProvider.store.count(for: entry.descriptor) == 1)
+    }
+
     @Test func readyStatusStaysStableUntilRealEmbeddingStarts() async throws {
         let payload = Data("model-a-bytes".utf8)
         let (entryA, urlA) = downloadableEntry(id: "model-a", payload: payload)
@@ -2010,7 +2169,7 @@ import Testing
         let payload = Data("model-a-bytes".utf8)
         let (entry, url) = downloadableEntry(id: "model-a", payload: payload)
         let assets = [uid("a"), uid("b")]
-        let nativeResult = uid("native-result")
+        let nativeResult = assets[0]
         let nativeSearch = RecordingNativeSearch(results: [nativeResult])
         let harness = try makeHarness(
             catalog: MLModelCatalog(entries: [entry]),

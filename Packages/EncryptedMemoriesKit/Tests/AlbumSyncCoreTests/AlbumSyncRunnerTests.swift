@@ -1,5 +1,6 @@
 import Foundation
 import PhotosCore
+import SQLite3
 import Testing
 import UploadCore
 
@@ -504,6 +505,29 @@ private final class ProgressBox: @unchecked Sendable {
         #expect(try Data(contentsOf: url) == original)
     }
 
+    @Test func markerlessMappingShapeFailsClosedWithoutRepairingIt() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("album-sync-markerless-\(UUID().uuidString).sqlite")
+        defer { try? FileManager.default.removeItem(at: url) }
+        var db: OpaquePointer?
+        #expect(sqlite3_open(url.path, &db) == SQLITE_OK)
+        #expect(
+            sqlite3_exec(
+                db,
+                "CREATE TABLE album_sync_mapping(local_album_id TEXT); "
+                    + "INSERT INTO album_sync_mapping VALUES('kept');",
+                nil,
+                nil,
+                nil
+            ) == SQLITE_OK
+        )
+        sqlite3_close(db)
+
+        #expect(AlbumSyncMappingStore(url: url) == nil)
+        #expect(sqliteCount(url: url, table: "album_sync_mapping") == 1)
+        #expect(sqliteCount(url: url, table: "mapping_info") == -1)
+    }
+
     @Test func selectionRoundTripKeepsMappingOnDeselect() throws {
         let store = makeStore()
         store.addSelection(
@@ -550,5 +574,17 @@ private final class ProgressBox: @unchecked Sendable {
 
         store.removeMapping(localAlbumID: "L1")
         #expect(store.mapping(localAlbumID: "L1") == nil)
+    }
+
+    private func sqliteCount(url: URL, table: String) -> Int {
+        var db: OpaquePointer?
+        guard sqlite3_open(url.path, &db) == SQLITE_OK else { return -1 }
+        defer { sqlite3_close(db) }
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM \(table);", -1, &statement, nil) == SQLITE_OK else {
+            return -1
+        }
+        defer { sqlite3_finalize(statement) }
+        return sqlite3_step(statement) == SQLITE_ROW ? Int(sqlite3_column_int64(statement, 0)) : -1
     }
 }

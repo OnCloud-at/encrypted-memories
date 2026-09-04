@@ -4,15 +4,14 @@ import SQLite3
 
 /// Account-scoped derived pipeline queue and encrypted output store.
 ///
-/// Assets and artifact descriptors are interned once. The hot work and token indexes contain only
-/// integer foreign keys, which avoids repeating long account, namespace and PhotoUID strings for
-/// every pipeline stage while preserving independent artifact retry and purge semantics.
+/// Accounts, assets and artifact descriptors are interned once. The hot work and token indexes
+/// contain only integer foreign keys, which avoids repeating long account, namespace and PhotoUID
+/// strings for every pipeline stage while preserving independent artifact retry and purge semantics.
 public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchecked Sendable {
     public static let databaseFileName = "ml-derived-index-v1.sqlite"
 
-    // v5 reopens v4 retry-limit rows once because v4 could terminalize a valid cache miss.
-    // Other schema mismatches still reset this entirely rebuildable store.
-    private static let schemaVersion: Int32 = 5
+    // Derived state never migrates. Version 7 adds account-keyed bounded work selection.
+    private static let schemaVersion: Int32 = 7
     private static let pending = Int32(0)
     private static let completed = Int32(1)
     private static let skipped = Int32(2)
@@ -67,14 +66,17 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
     public func enqueue(_ assets: [MLPipelineAssetRevision], for key: MLPipelineExecutionKey) -> Bool {
         return lock.withLock {
             defer { checkpointWALLocked() }
-            guard begin(), let artifactIDs = artifactIDsLocked(for: key, create: true) else {
+            guard begin(),
+                let accountKey = accountKeyLocked(identifier: key.accountIdentifier, create: true),
+                let artifactIDs = artifactIDsLocked(for: key, create: true)
+            else {
                 return rollback()
             }
-            guard let removedObsoleteArtifacts = removeObsoleteWorkLocked(for: key) else {
+            guard let removedObsoleteArtifacts = removeObsoleteWorkLocked(for: key, accountKey: accountKey) else {
                 return rollback()
             }
             if assets.isEmpty {
-                guard !removedObsoleteArtifacts || bumpGenerationLocked(for: key) else {
+                guard !removedObsoleteArtifacts || bumpGenerationLocked(for: key, accountKey: accountKey) else {
                     return rollback()
                 }
                 return commitTransaction(
@@ -90,18 +92,20 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
             var insertWork: OpaquePointer?
             guard
                 prepare(
-                    "SELECT asset_id, source_revision FROM ml_derived_assets WHERE account_id=? AND volume_id=? AND node_id=?;",
+                    "SELECT asset_id, source_revision FROM ml_derived_assets WHERE account_key=? AND volume_id=? AND node_id=?;",
                     &selectAsset),
                 prepare(
-                    "INSERT INTO ml_derived_assets(account_id, volume_id, node_id, source_revision) VALUES(?,?,?,?);",
+                    "INSERT INTO ml_derived_assets(account_key, volume_id, node_id, source_revision) VALUES(?,?,?,?);",
                     &insertAsset),
-                prepare("UPDATE ml_derived_assets SET source_revision=? WHERE asset_id=?;", &updateAsset),
                 prepare(
-                    "UPDATE ml_derived_work SET state=0, attempts=0, retry_at=NULL, terminal_reason=NULL, payload=NULL, updated_at=? WHERE asset_id=?;",
+                    "UPDATE ml_derived_assets SET source_revision=? WHERE account_key=? AND asset_id=?;",
+                    &updateAsset),
+                prepare(
+                    "UPDATE ml_derived_work SET state=0, attempts=0, retry_at=NULL, terminal_reason=NULL, payload=NULL, updated_at=? WHERE account_key=? AND asset_id=?;",
                     &invalidateWork),
                 prepare("DELETE FROM ml_derived_tokens WHERE asset_id=?;", &deleteTokens),
                 prepare(
-                    "INSERT OR IGNORE INTO ml_derived_work(asset_id, artifact_id, state, attempts, retry_at, terminal_reason, payload, updated_at) VALUES(?,?,0,0,NULL,NULL,NULL,?);",
+                    "INSERT OR IGNORE INTO ml_derived_work(account_key, asset_id, artifact_id, state, attempts, retry_at, terminal_reason, payload, updated_at) VALUES(?,?,?,0,0,NULL,NULL,NULL,?);",
                     &insertWork)
             else {
                 finalize([selectAsset, insertAsset, updateAsset, invalidateWork, deleteTokens, insertWork])
@@ -117,7 +121,7 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
 
             for asset in assets where seenUIDs.insert(asset.uid).inserted {
                 reset(selectAsset)
-                bindText(selectAsset, 1, key.accountIdentifier)
+                sqlite3_bind_int64(selectAsset, 1, accountKey)
                 bindText(selectAsset, 2, asset.uid.volumeID)
                 bindText(selectAsset, 3, asset.uid.nodeID)
 
@@ -132,19 +136,21 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
 
                         reset(invalidateWork)
                         sqlite3_bind_double(invalidateWork, 1, now)
-                        sqlite3_bind_int64(invalidateWork, 2, assetID)
+                        sqlite3_bind_int64(invalidateWork, 2, accountKey)
+                        sqlite3_bind_int64(invalidateWork, 3, assetID)
                         guard sqlite3_step(invalidateWork) == SQLITE_DONE else { return rollback() }
 
                         reset(updateAsset)
                         bindText(updateAsset, 1, asset.sourceRevision)
-                        sqlite3_bind_int64(updateAsset, 2, assetID)
+                        sqlite3_bind_int64(updateAsset, 2, accountKey)
+                        sqlite3_bind_int64(updateAsset, 3, assetID)
                         guard sqlite3_step(updateAsset) == SQLITE_DONE else { return rollback() }
                         changed = true
                         invalidatedExistingPipelines = true
                     }
                 } else {
                     reset(insertAsset)
-                    bindText(insertAsset, 1, key.accountIdentifier)
+                    sqlite3_bind_int64(insertAsset, 1, accountKey)
                     bindText(insertAsset, 2, asset.uid.volumeID)
                     bindText(insertAsset, 3, asset.uid.nodeID)
                     bindText(insertAsset, 4, asset.sourceRevision)
@@ -155,9 +161,10 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
 
                 for artifactID in artifactIDs.values {
                     reset(insertWork)
-                    sqlite3_bind_int64(insertWork, 1, assetID)
-                    sqlite3_bind_int64(insertWork, 2, artifactID)
-                    sqlite3_bind_double(insertWork, 3, now)
+                    sqlite3_bind_int64(insertWork, 1, accountKey)
+                    sqlite3_bind_int64(insertWork, 2, assetID)
+                    sqlite3_bind_int64(insertWork, 3, artifactID)
+                    sqlite3_bind_double(insertWork, 4, now)
                     guard sqlite3_step(insertWork) == SQLITE_DONE else { return rollback() }
                     changed = changed || sqlite3_changes(db) > 0
                 }
@@ -166,8 +173,8 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
             if changed {
                 let bumped =
                     invalidatedExistingPipelines
-                    ? bumpAllGenerationsLocked(accountIdentifier: key.accountIdentifier)
-                    : bumpGenerationLocked(for: key)
+                    ? bumpAllGenerationsLocked(accountKey: accountKey)
+                    : bumpGenerationLocked(for: key, accountKey: accountKey)
                 guard bumped else { return rollback() }
             }
             return commitTransaction(
@@ -180,33 +187,33 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
         for key: MLPipelineExecutionKey,
         limit: Int,
         now: Date
-    ) -> [MLDerivedPipelineWorkItem] {
+    ) throws -> [MLDerivedPipelineWorkItem] {
         guard limit > 0 else { return [] }
-        return lock.withLock {
-            guard let artifactIDs = artifactIDsLocked(for: key, create: false), !artifactIDs.isEmpty else { return [] }
+        return try lock.withLock {
+            guard db != nil else { throw MLDerivedPipelineStoreError.storageUnavailable }
+            guard let accountKey = try existingAccountKeyLocked(identifier: key.accountIdentifier) else {
+                return []
+            }
+            let artifactIDs = try existingArtifactIDsLocked(for: key)
+            guard !artifactIDs.isEmpty else { return [] }
             let artifactsByID = Dictionary(
                 uniqueKeysWithValues: key.artifacts.compactMap { artifact in
                     artifactIDs[artifact.stableNamespace].map { ($0, artifact) }
                 })
-            let ids = artifactsByID.keys.sorted()
-            // The old combined `state=0 OR retry` query made SQLite start from every account
-            // asset and sort the dense work matrix. Query pending and retryable work through their
-            // respective partial indexes, then merge the two bounded ordered streams. This keeps
-            // retry fairness identical while making the common all-pending path proportional to
-            // one quantum instead of the complete library.
-            let pending = queuedWorkLocked(
+            // Query pending and retryable work through artifact-leading partial indexes, then merge
+            // the two bounded ordered streams. Sparse work must not probe every account asset for
+            // every artifact before it can apply the limit.
+            let pending = try queuedWorkLocked(
                 state: Self.pending,
-                accountIdentifier: key.accountIdentifier,
+                accountKey: accountKey,
                 artifactsByID: artifactsByID,
-                artifactIDs: ids,
                 limit: limit,
                 now: now
             )
-            let retryable = queuedWorkLocked(
+            let retryable = try queuedWorkLocked(
                 state: Self.retry,
-                accountIdentifier: key.accountIdentifier,
+                accountKey: accountKey,
                 artifactsByID: artifactsByID,
-                artifactIDs: ids,
                 limit: limit,
                 now: now
             )
@@ -216,76 +223,87 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
 
     private func queuedWorkLocked(
         state: Int32,
-        accountIdentifier: String,
+        accountKey: Int64,
         artifactsByID: [Int64: MLDerivedArtifactIdentity],
-        artifactIDs: [Int64],
         limit: Int,
         now: Date
-    ) -> [QueuedWork] {
-        let predicate: String
+    ) throws -> [QueuedWork] {
+        let sql: String
         let index: String
         switch state {
         case Self.pending:
-            predicate = "w.state=0"
             index = "ml_derived_pending_work"
+            sql = """
+                SELECT w.asset_id, w.artifact_id, a.volume_id, a.node_id, a.source_revision, w.attempts
+                FROM ml_derived_work w INDEXED BY \(index)
+                JOIN ml_derived_assets a ON a.asset_id=w.asset_id
+                WHERE w.account_key=? AND w.artifact_id=? AND w.state=0
+                ORDER BY w.asset_id
+                LIMIT ?;
+                """
         case Self.retry:
-            predicate = "w.state=4 AND w.retry_at<=?"
             index = "ml_derived_retry_work"
+            sql = """
+                SELECT w.asset_id, w.artifact_id, a.volume_id, a.node_id, a.source_revision, w.attempts
+                FROM ml_derived_work w INDEXED BY \(index)
+                JOIN ml_derived_assets a ON a.asset_id=w.asset_id
+                WHERE w.account_key=? AND w.artifact_id=? AND w.state=4 AND w.retry_at<=?
+                ORDER BY w.retry_at, w.asset_id
+                LIMIT ?;
+                """
         default:
             return []
         }
         var stmt: OpaquePointer?
-        guard
-            prepare(
-                """
-                SELECT w.asset_id, w.artifact_id, a.volume_id, a.node_id, a.source_revision, w.attempts
-                FROM ml_derived_work w INDEXED BY \(index)
-                JOIN ml_derived_assets a ON a.asset_id=w.asset_id
-                WHERE \(predicate)
-                  AND w.artifact_id IN (\(Self.placeholders(artifactIDs.count)))
-                  AND w.asset_id IN (
-                    SELECT asset_id FROM ml_derived_assets WHERE account_id=?
-                  )
-                ORDER BY w.asset_id, w.artifact_id
-                LIMIT ?;
-                """,
-                &stmt
-            )
-        else { return [] }
+        guard prepare(sql, &stmt) else {
+            throw MLDerivedPipelineStoreError.storageUnavailable
+        }
         defer { sqlite3_finalize(stmt) }
-        var bindIndex: Int32 = 1
-        if state == Self.retry {
-            sqlite3_bind_double(stmt, bindIndex, now.timeIntervalSince1970)
-            bindIndex += 1
-        }
-        for id in artifactIDs {
-            sqlite3_bind_int64(stmt, bindIndex, id)
-            bindIndex += 1
-        }
-        bindText(stmt, bindIndex, accountIdentifier)
-        bindIndex += 1
-        sqlite3_bind_int64(stmt, bindIndex, Int64(limit))
 
         var work: [QueuedWork] = []
-        work.reserveCapacity(limit)
-        while sqlite3_step(stmt) == SQLITE_ROW {
-            let artifactID = sqlite3_column_int64(stmt, 1)
-            guard let artifact = artifactsByID[artifactID],
-                let asset = try? MLPipelineAssetRevision(
-                    uid: PhotoUID(volumeID: columnText(stmt, 2), nodeID: columnText(stmt, 3)),
-                    sourceRevision: columnText(stmt, 4)
-                )
-            else { continue }
-            work.append(
-                QueuedWork(
-                    assetID: sqlite3_column_int64(stmt, 0),
-                    artifactID: artifactID,
-                    item: MLDerivedPipelineWorkItem(
-                        asset: asset,
-                        artifact: artifact,
-                        attempts: Int(sqlite3_column_int64(stmt, 5))
+        for artifactID in artifactsByID.keys.sorted() {
+            reset(stmt)
+            sqlite3_bind_int64(stmt, 1, accountKey)
+            sqlite3_bind_int64(stmt, 2, artifactID)
+            var limitIndex: Int32 = 3
+            if state == Self.retry {
+                sqlite3_bind_double(stmt, 3, now.timeIntervalSince1970)
+                limitIndex = 4
+            }
+            sqlite3_bind_int64(stmt, limitIndex, Int64(limit))
+
+            while true {
+                let result = sqlite3_step(stmt)
+                guard result == SQLITE_ROW else {
+                    if result != SQLITE_DONE {
+                        throw MLDerivedPipelineStoreError.storageUnavailable
+                    }
+                    break
+                }
+                guard let artifact = artifactsByID[artifactID],
+                    let asset = try? MLPipelineAssetRevision(
+                        uid: PhotoUID(volumeID: columnText(stmt, 2), nodeID: columnText(stmt, 3)),
+                        sourceRevision: columnText(stmt, 4)
                     )
-                ))
+                else { throw MLDerivedPipelineStoreError.corruptData }
+                work.append(
+                    QueuedWork(
+                        assetID: sqlite3_column_int64(stmt, 0),
+                        artifactID: artifactID,
+                        item: MLDerivedPipelineWorkItem(
+                            asset: asset,
+                            artifact: artifact,
+                            attempts: Int(sqlite3_column_int64(stmt, 5))
+                        )
+                    ))
+            }
+        }
+        // Each artifact query applies `limit` before collection. Sorting therefore touches at most
+        // `artifact count × limit`, independent of library size. Retry candidates are selected by
+        // due time first, then merged into the same deterministic asset/artifact order as pending work.
+        work.sort {
+            $0.assetID < $1.assetID
+                || ($0.assetID == $1.assetID && $0.artifactID < $1.artifactID)
         }
         return work
     }
@@ -335,7 +353,10 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
         guard !results.isEmpty else { return true }
         return lock.withLock {
             defer { checkpointWALLocked() }
-            guard begin(), let artifactIDs = artifactIDsLocked(for: key, create: false) else {
+            guard begin(),
+                let accountKey = accountKeyLocked(identifier: key.accountIdentifier, create: false),
+                let artifactIDs = artifactIDsLocked(for: key, create: false)
+            else {
                 return rollback()
             }
             var selectAsset: OpaquePointer?
@@ -344,10 +365,10 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
             var insertToken: OpaquePointer?
             guard
                 prepare(
-                    "SELECT asset_id FROM ml_derived_assets WHERE account_id=? AND volume_id=? AND node_id=? AND source_revision=?;",
+                    "SELECT asset_id FROM ml_derived_assets WHERE account_key=? AND volume_id=? AND node_id=? AND source_revision=?;",
                     &selectAsset),
                 prepare(
-                    "UPDATE ml_derived_work SET state=?, attempts=attempts+?, retry_at=?, terminal_reason=?, payload=?, updated_at=? WHERE asset_id=? AND artifact_id=?;",
+                    "UPDATE ml_derived_work SET state=?, attempts=attempts+?, retry_at=?, terminal_reason=?, payload=?, updated_at=? WHERE account_key=? AND asset_id=? AND artifact_id=?;",
                     &updateWork),
                 prepare("DELETE FROM ml_derived_tokens WHERE asset_id=? AND artifact_id=?;", &deleteTokens),
                 prepare(
@@ -365,7 +386,7 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
                 let item = result.workItem
                 guard let artifactID = artifactIDs[item.artifact.stableNamespace] else { continue }
                 reset(selectAsset)
-                bindText(selectAsset, 1, key.accountIdentifier)
+                sqlite3_bind_int64(selectAsset, 1, accountKey)
                 bindText(selectAsset, 2, item.asset.uid.volumeID)
                 bindText(selectAsset, 3, item.asset.uid.nodeID)
                 bindText(selectAsset, 4, item.asset.sourceRevision)
@@ -440,8 +461,9 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
                 }
                 if let ciphertext { bindBlob(updateWork, 5, ciphertext) } else { sqlite3_bind_null(updateWork, 5) }
                 sqlite3_bind_double(updateWork, 6, now.timeIntervalSince1970)
-                sqlite3_bind_int64(updateWork, 7, assetID)
-                sqlite3_bind_int64(updateWork, 8, artifactID)
+                sqlite3_bind_int64(updateWork, 7, accountKey)
+                sqlite3_bind_int64(updateWork, 8, assetID)
+                sqlite3_bind_int64(updateWork, 9, artifactID)
                 guard sqlite3_step(updateWork) == SQLITE_DONE else { return rollback() }
                 guard sqlite3_changes(db) > 0 else { continue }
 
@@ -468,15 +490,22 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
                 changed = true
                 changedRows += 1
             }
-            guard !changed || bumpGenerationLocked(for: key) else { return rollback() }
+            guard !changed || bumpGenerationLocked(for: key, accountKey: accountKey) else { return rollback() }
             return commitTransaction(rowWrites: changedRows)
         }
     }
 
-    public func progress(for key: MLPipelineExecutionKey) -> MLDerivedPipelineProgress {
-        lock.withLock {
-            guard let artifactIDs = artifactIDsLocked(for: key, create: false), !artifactIDs.isEmpty else {
-                return emptyProgress(for: key)
+    public func progress(for key: MLPipelineExecutionKey) throws -> MLDerivedPipelineProgress {
+        try lock.withLock {
+            guard db != nil else { throw MLDerivedPipelineStoreError.storageUnavailable }
+            guard let accountKey = try existingAccountKeyLocked(identifier: key.accountIdentifier) else {
+                return emptyProgress(generation: 0)
+            }
+            let artifactIDs = try existingArtifactIDsLocked(for: key)
+            guard !artifactIDs.isEmpty else {
+                return emptyProgress(
+                    generation: try generationLocked(for: key, accountKey: accountKey)
+                )
             }
             let ids = artifactIDs.values.sorted()
             var stmt: OpaquePointer?
@@ -489,15 +518,15 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
                       COALESCE(SUM(permanent_failure), 0),
                       COALESCE(SUM(retry_pending), 0)
                     FROM ml_derived_progress
-                    WHERE account_id=? AND pipeline_id=? AND schema_version=?
+                    WHERE account_key=? AND pipeline_id=? AND schema_version=?
                       AND artifact_id IN (\(Self.placeholders(ids.count)));
                     """,
                     &stmt
                 )
-            else { return emptyProgress(for: key) }
+            else { throw MLDerivedPipelineStoreError.storageUnavailable }
             defer { sqlite3_finalize(stmt) }
             var index: Int32 = 1
-            bindText(stmt, index, key.accountIdentifier)
+            sqlite3_bind_int64(stmt, index, accountKey)
             index += 1
             bindText(stmt, index, key.pipelineID.rawValue)
             index += 1
@@ -507,7 +536,9 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
                 sqlite3_bind_int64(stmt, index, id)
                 index += 1
             }
-            guard sqlite3_step(stmt) == SQLITE_ROW else { return emptyProgress(for: key) }
+            guard sqlite3_step(stmt) == SQLITE_ROW else {
+                throw MLDerivedPipelineStoreError.storageUnavailable
+            }
             let permanentFailure = Int(sqlite3_column_int64(stmt, 3))
             return MLDerivedPipelineProgress(
                 total: Int(sqlite3_column_int64(stmt, 0)),
@@ -519,18 +550,22 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
                 // diagnostics precise without making the normal zero-failure path scan work.
                 unavailableAssets: permanentFailure == 0
                     ? 0
-                    : unavailableAssetCountLocked(accountIdentifier: key.accountIdentifier, artifactIDs: ids),
+                    : try unavailableAssetCountLocked(accountKey: accountKey, artifactIDs: ids),
                 unavailableAssetReasons: permanentFailure == 0
                     ? [:]
-                    : unavailableAssetReasonsLocked(accountIdentifier: key.accountIdentifier, artifactIDs: ids),
-                generation: generationLocked(for: key)
+                    : try unavailableAssetReasonsLocked(accountKey: accountKey, artifactIDs: ids),
+                generation: try generationLocked(for: key, accountKey: accountKey)
             )
         }
     }
 
     public func unavailableAssetUIDs(for key: MLPipelineExecutionKey) -> Set<PhotoUID> {
         lock.withLock {
-            guard let artifactIDs = artifactIDsLocked(for: key, create: false), !artifactIDs.isEmpty else {
+            guard
+                let accountKey = accountKeyLocked(identifier: key.accountIdentifier, create: false),
+                let artifactIDs = artifactIDsLocked(for: key, create: false),
+                !artifactIDs.isEmpty
+            else {
                 return []
             }
             let ids = artifactIDs.values.sorted()
@@ -541,7 +576,7 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
                     SELECT DISTINCT a.volume_id, a.node_id
                     FROM ml_derived_work w
                     JOIN ml_derived_assets a ON a.asset_id=w.asset_id
-                    WHERE a.account_id=? AND w.state=3
+                    WHERE w.account_key=? AND w.state=3
                       AND w.artifact_id IN (\(Self.placeholders(ids.count)));
                     """,
                     &stmt
@@ -549,7 +584,7 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
             else { return [] }
             defer { sqlite3_finalize(stmt) }
             var index: Int32 = 1
-            bindText(stmt, index, key.accountIdentifier)
+            sqlite3_bind_int64(stmt, index, accountKey)
             index += 1
             for id in ids {
                 sqlite3_bind_int64(stmt, index, id)
@@ -571,6 +606,9 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
         accountIdentifier: String
     ) -> MLDerivedPipelineOutput? {
         lock.withLock {
+            guard let accountKey = accountKeyLocked(identifier: accountIdentifier, create: false) else {
+                return nil
+            }
             var stmt: OpaquePointer?
             guard
                 prepare(
@@ -579,14 +617,14 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
                     FROM ml_derived_work w
                     JOIN ml_derived_assets a ON a.asset_id=w.asset_id
                     JOIN ml_derived_artifacts f ON f.artifact_id=w.artifact_id
-                    WHERE a.account_id=? AND a.volume_id=? AND a.node_id=?
+                    WHERE a.account_key=? AND a.volume_id=? AND a.node_id=?
                       AND f.artifact_namespace=? AND w.state=1;
                     """,
                     &stmt
                 )
             else { return nil }
             defer { sqlite3_finalize(stmt) }
-            bindText(stmt, 1, accountIdentifier)
+            sqlite3_bind_int64(stmt, 1, accountKey)
             bindText(stmt, 2, uid.volumeID)
             bindText(stmt, 3, uid.nodeID)
             bindText(stmt, 4, artifact.stableNamespace)
@@ -609,7 +647,11 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
         let tokens = Array(Set(normalizedTokens.filter { !$0.isEmpty })).sorted()
         guard !tokens.isEmpty, limit > 0 else { return [] }
         return lock.withLock {
-            guard let artifactIDs = artifactIDsLocked(for: key, create: false), !artifactIDs.isEmpty else { return [] }
+            guard
+                let accountKey = accountKeyLocked(identifier: key.accountIdentifier, create: false),
+                let artifactIDs = artifactIDsLocked(for: key, create: false),
+                !artifactIDs.isEmpty
+            else { return [] }
             let artifacts = key.artifacts.sorted { $0.stableNamespace < $1.stableNamespace }
             let digestGroups: [[(artifactID: Int64, digest: Data)]]
             do {
@@ -640,7 +682,7 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
                     """
                     SELECT a.volume_id, a.node_id
                     FROM ml_derived_assets a
-                    WHERE a.account_id=? AND \(conditions)
+                    WHERE a.account_key=? AND \(conditions)
                     ORDER BY a.asset_id
                     LIMIT ?;
                     """,
@@ -649,7 +691,7 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
             else { return [] }
             defer { sqlite3_finalize(stmt) }
             var index: Int32 = 1
-            bindText(stmt, index, key.accountIdentifier)
+            sqlite3_bind_int64(stmt, index, accountKey)
             index += 1
             for group in digestGroups {
                 for pair in group {
@@ -678,7 +720,11 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
     public func reconcile(liveUIDs: Set<PhotoUID>, for key: MLPipelineExecutionKey) -> Bool {
         lock.withLock {
             defer { checkpointWALLocked() }
-            guard let artifactIDs = artifactIDsLocked(for: key, create: false), !artifactIDs.isEmpty else {
+            guard
+                let accountKey = accountKeyLocked(identifier: key.accountIdentifier, create: false),
+                let artifactIDs = artifactIDsLocked(for: key, create: false),
+                !artifactIDs.isEmpty
+            else {
                 return true
             }
             let ids = artifactIDs.values.sorted()
@@ -689,24 +735,27 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
                     SELECT DISTINCT a.asset_id, a.volume_id, a.node_id
                     FROM ml_derived_assets a
                     JOIN ml_derived_work w ON w.asset_id=a.asset_id
-                    WHERE a.account_id=? AND w.artifact_id IN (\(Self.placeholders(ids.count)));
+                    WHERE w.account_key=? AND w.artifact_id IN (\(Self.placeholders(ids.count)));
                     """,
                     &select
                 )
             else { return false }
             var index: Int32 = 1
-            bindText(select, index, key.accountIdentifier)
+            sqlite3_bind_int64(select, index, accountKey)
             index += 1
             for id in ids {
                 sqlite3_bind_int64(select, index, id)
                 index += 1
             }
             var staleAssetIDs: [Int64] = []
-            while sqlite3_step(select) == SQLITE_ROW {
+            var result = sqlite3_step(select)
+            while result == SQLITE_ROW {
                 let uid = PhotoUID(volumeID: columnText(select, 1), nodeID: columnText(select, 2))
                 if !liveUIDs.contains(uid) { staleAssetIDs.append(sqlite3_column_int64(select, 0)) }
+                result = sqlite3_step(select)
             }
             sqlite3_finalize(select)
+            guard result == SQLITE_DONE else { return false }
             guard !staleAssetIDs.isEmpty else { return true }
             guard begin() else { return false }
 
@@ -714,11 +763,11 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
             var deleteOrphan: OpaquePointer?
             guard
                 prepare(
-                    "DELETE FROM ml_derived_work WHERE asset_id=? AND artifact_id IN (\(Self.placeholders(ids.count)));",
+                    "DELETE FROM ml_derived_work WHERE account_key=? AND asset_id=? AND artifact_id IN (\(Self.placeholders(ids.count)));",
                     &deleteWork
                 ),
                 prepare(
-                    "DELETE FROM ml_derived_assets WHERE asset_id=? AND NOT EXISTS(SELECT 1 FROM ml_derived_work WHERE asset_id=?);",
+                    "DELETE FROM ml_derived_assets WHERE account_key=? AND asset_id=? AND NOT EXISTS(SELECT 1 FROM ml_derived_work WHERE asset_id=?);",
                     &deleteOrphan
                 )
             else {
@@ -728,8 +777,9 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
             defer { finalize([deleteWork, deleteOrphan]) }
             for assetID in staleAssetIDs {
                 reset(deleteWork)
-                sqlite3_bind_int64(deleteWork, 1, assetID)
-                var binding: Int32 = 2
+                sqlite3_bind_int64(deleteWork, 1, accountKey)
+                sqlite3_bind_int64(deleteWork, 2, assetID)
+                var binding: Int32 = 3
                 for id in ids {
                     sqlite3_bind_int64(deleteWork, binding, id)
                     binding += 1
@@ -737,11 +787,12 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
                 guard sqlite3_step(deleteWork) == SQLITE_DONE else { return rollback() }
 
                 reset(deleteOrphan)
-                sqlite3_bind_int64(deleteOrphan, 1, assetID)
+                sqlite3_bind_int64(deleteOrphan, 1, accountKey)
                 sqlite3_bind_int64(deleteOrphan, 2, assetID)
+                sqlite3_bind_int64(deleteOrphan, 3, assetID)
                 guard sqlite3_step(deleteOrphan) == SQLITE_DONE else { return rollback() }
             }
-            guard bumpGenerationLocked(for: key) else { return rollback() }
+            guard bumpGenerationLocked(for: key, accountKey: accountKey) else { return rollback() }
             return commitTransaction(
                 rowWrites: Self.saturatedProduct(staleAssetIDs.count, ids.count)
             )
@@ -751,11 +802,14 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
     public func purge(artifact: MLDerivedArtifactIdentity, accountIdentifier: String) {
         lock.withLock {
             defer { checkpointWALLocked() }
-            guard let artifactID = artifactIDLocked(namespace: artifact.stableNamespace) else { return }
+            guard
+                let accountKey = accountKeyLocked(identifier: accountIdentifier, create: false),
+                let artifactID = artifactIDLocked(namespace: artifact.stableNamespace)
+            else { return }
             guard begin(),
-                deleteWorkLocked(accountIdentifier: accountIdentifier, artifactIDs: [artifactID]),
-                deleteOrphanAssetsLocked(accountIdentifier: accountIdentifier),
-                bumpGenerationsLocked(accountIdentifier: accountIdentifier, pipelineID: artifact.pipelineID.rawValue)
+                deleteWorkLocked(accountKey: accountKey, artifactIDs: [artifactID]),
+                deleteOrphanAssetsLocked(accountKey: accountKey),
+                bumpGenerationsLocked(accountKey: accountKey, pipelineID: artifact.pipelineID.rawValue)
             else {
                 _ = rollback()
                 return
@@ -768,11 +822,14 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
         lock.withLock {
             defer { checkpointWALLocked() }
             let artifactIDs = artifactIDsLocked(pipelineID: pipelineID.rawValue)
-            guard !artifactIDs.isEmpty else { return }
+            guard
+                !artifactIDs.isEmpty,
+                let accountKey = accountKeyLocked(identifier: accountIdentifier, create: false)
+            else { return }
             guard begin(),
-                deleteWorkLocked(accountIdentifier: accountIdentifier, artifactIDs: artifactIDs),
-                deleteOrphanAssetsLocked(accountIdentifier: accountIdentifier),
-                bumpGenerationsLocked(accountIdentifier: accountIdentifier, pipelineID: pipelineID.rawValue)
+                deleteWorkLocked(accountKey: accountKey, artifactIDs: artifactIDs),
+                deleteOrphanAssetsLocked(accountKey: accountKey),
+                bumpGenerationsLocked(accountKey: accountKey, pipelineID: pipelineID.rawValue)
             else {
                 _ = rollback()
                 return
@@ -781,35 +838,42 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
         }
     }
 
-    private static func openVerified(url: URL, policy: LibraryDatabasePolicy) -> OpaquePointer? {
-        if let handle = openOnce(url: url, policy: policy) { return handle }
-        for suffix in ["", "-wal", "-shm"] {
-            try? FileManager.default.removeItem(at: URL(fileURLWithPath: url.path + suffix))
-        }
-        return openOnce(url: url, policy: policy)
+    private enum OpenResult {
+        case opened(OpaquePointer)
+        case incompatible
+        case failed
     }
 
-    private static func openOnce(url: URL, policy: LibraryDatabasePolicy) -> OpaquePointer? {
-        var handle: OpaquePointer?
-        guard sqlite3_open(url.path, &handle) == SQLITE_OK else {
-            sqlite3_close(handle)
+    private static func openVerified(url: URL, policy: LibraryDatabasePolicy) -> OpaquePointer? {
+        switch openOnce(url: url, policy: policy) {
+        case .opened(let handle):
+            return handle
+        case .failed:
+            return nil
+        case .incompatible:
+            guard destroyDatabaseFiles(at: url) else { return nil }
+            if case .opened(let handle) = openOnce(url: url, policy: policy) {
+                return handle
+            }
             return nil
         }
-        sqlite3_exec(handle, "PRAGMA foreign_keys=ON;", nil, nil, nil)
-        sqlite3_exec(handle, "PRAGMA journal_mode=WAL;", nil, nil, nil)
-        sqlite3_exec(handle, "PRAGMA synchronous=NORMAL;", nil, nil, nil)
-        sqlite3_exec(handle, "PRAGMA busy_timeout=\(policy.busyTimeoutMs);", nil, nil, nil)
-        sqlite3_exec(handle, "PRAGMA cache_size=-\(max(0, policy.cacheSizeKiB));", nil, nil, nil)
-        sqlite3_exec(handle, "PRAGMA mmap_size=\(max(0, policy.mmapBytes));", nil, nil, nil)
-        sqlite3_exec(handle, "PRAGMA journal_size_limit=\(policy.journalSizeLimitBytes);", nil, nil, nil)
+    }
+
+    private static func openOnce(url: URL, policy: LibraryDatabasePolicy) -> OpenResult {
         let schema = """
+            CREATE TABLE IF NOT EXISTS ml_derived_accounts(
+              account_key        INTEGER PRIMARY KEY,
+              account_identifier TEXT NOT NULL UNIQUE
+            );
             CREATE TABLE IF NOT EXISTS ml_derived_assets(
               asset_id         INTEGER PRIMARY KEY,
-              account_id       TEXT NOT NULL,
+              account_key      INTEGER NOT NULL,
               volume_id        TEXT NOT NULL,
               node_id          TEXT NOT NULL,
               source_revision  TEXT NOT NULL,
-              UNIQUE(account_id, volume_id, node_id)
+              UNIQUE(account_key, volume_id, node_id),
+              UNIQUE(account_key, asset_id),
+              FOREIGN KEY(account_key) REFERENCES ml_derived_accounts(account_key) ON DELETE CASCADE
             );
             CREATE TABLE IF NOT EXISTS ml_derived_artifacts(
               artifact_id          INTEGER PRIMARY KEY,
@@ -818,6 +882,7 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
               artifact_namespace  TEXT NOT NULL UNIQUE
             );
             CREATE TABLE IF NOT EXISTS ml_derived_work(
+              account_key  INTEGER NOT NULL,
               asset_id     INTEGER NOT NULL,
               artifact_id  INTEGER NOT NULL,
               state        INTEGER NOT NULL,
@@ -827,17 +892,16 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
               payload      BLOB,
               updated_at   REAL NOT NULL,
               PRIMARY KEY(asset_id, artifact_id),
-              FOREIGN KEY(asset_id) REFERENCES ml_derived_assets(asset_id) ON DELETE CASCADE,
+              FOREIGN KEY(account_key, asset_id)
+                REFERENCES ml_derived_assets(account_key, asset_id) ON DELETE CASCADE,
               FOREIGN KEY(artifact_id) REFERENCES ml_derived_artifacts(artifact_id) ON DELETE CASCADE
             ) WITHOUT ROWID;
-            CREATE INDEX IF NOT EXISTS ml_derived_next_work
-              ON ml_derived_work(artifact_id, state, retry_at, asset_id);
             CREATE INDEX IF NOT EXISTS ml_derived_pending_work
-              ON ml_derived_work(asset_id, artifact_id) WHERE state=0;
+              ON ml_derived_work(account_key, artifact_id, asset_id) WHERE state=0;
             CREATE INDEX IF NOT EXISTS ml_derived_retry_work
-              ON ml_derived_work(retry_at, asset_id, artifact_id) WHERE state=4;
+              ON ml_derived_work(account_key, artifact_id, retry_at, asset_id) WHERE state=4;
             CREATE INDEX IF NOT EXISTS ml_derived_permanent_failure_work
-              ON ml_derived_work(asset_id, artifact_id) WHERE state=3;
+              ON ml_derived_work(account_key, asset_id, artifact_id) WHERE state=3;
             CREATE TABLE IF NOT EXISTS ml_derived_tokens(
               asset_id      INTEGER NOT NULL,
               artifact_id   INTEGER NOT NULL,
@@ -849,14 +913,15 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
             CREATE INDEX IF NOT EXISTS ml_derived_token_lookup
               ON ml_derived_tokens(artifact_id, token_digest, asset_id);
             CREATE TABLE IF NOT EXISTS ml_derived_generation(
-              account_id      TEXT NOT NULL,
+              account_key     INTEGER NOT NULL,
               pipeline_id     TEXT NOT NULL,
               schema_version  INTEGER NOT NULL,
               generation      INTEGER NOT NULL,
-              PRIMARY KEY(account_id, pipeline_id, schema_version)
+              PRIMARY KEY(account_key, pipeline_id, schema_version),
+              FOREIGN KEY(account_key) REFERENCES ml_derived_accounts(account_key) ON DELETE CASCADE
             ) WITHOUT ROWID;
             CREATE TABLE IF NOT EXISTS ml_derived_progress(
-              account_id        TEXT NOT NULL,
+              account_key       INTEGER NOT NULL,
               pipeline_id       TEXT NOT NULL,
               schema_version    INTEGER NOT NULL,
               artifact_id       INTEGER NOT NULL,
@@ -865,21 +930,21 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
               skipped           INTEGER NOT NULL DEFAULT 0,
               permanent_failure INTEGER NOT NULL DEFAULT 0,
               retry_pending     INTEGER NOT NULL DEFAULT 0,
-              PRIMARY KEY(account_id, pipeline_id, schema_version, artifact_id),
+              PRIMARY KEY(account_key, pipeline_id, schema_version, artifact_id),
+              FOREIGN KEY(account_key) REFERENCES ml_derived_accounts(account_key) ON DELETE CASCADE,
               FOREIGN KEY(artifact_id) REFERENCES ml_derived_artifacts(artifact_id) ON DELETE CASCADE
             ) WITHOUT ROWID;
             CREATE TRIGGER IF NOT EXISTS ml_derived_work_progress_insert
             AFTER INSERT ON ml_derived_work BEGIN
               INSERT INTO ml_derived_progress(
-                account_id, pipeline_id, schema_version, artifact_id,
+                account_key, pipeline_id, schema_version, artifact_id,
                 total, completed, skipped, permanent_failure, retry_pending
               )
-              SELECT a.account_id, f.pipeline_id, f.schema_version, NEW.artifact_id,
+              SELECT NEW.account_key, f.pipeline_id, f.schema_version, NEW.artifact_id,
                 1, NEW.state=1, NEW.state=2, NEW.state=3, NEW.state=4
-              FROM ml_derived_assets a
-              JOIN ml_derived_artifacts f ON f.artifact_id=NEW.artifact_id
-              WHERE a.asset_id=NEW.asset_id
-              ON CONFLICT(account_id, pipeline_id, schema_version, artifact_id) DO UPDATE SET
+              FROM ml_derived_artifacts f
+              WHERE f.artifact_id=NEW.artifact_id
+              ON CONFLICT(account_key, pipeline_id, schema_version, artifact_id) DO UPDATE SET
                 total=total+1,
                 completed=completed+(NEW.state=1),
                 skipped=skipped+(NEW.state=2),
@@ -894,7 +959,7 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
                 permanent_failure=permanent_failure-(OLD.state=3)+(NEW.state=3),
                 retry_pending=retry_pending-(OLD.state=4)+(NEW.state=4)
               WHERE artifact_id=NEW.artifact_id
-                AND account_id=(SELECT account_id FROM ml_derived_assets WHERE asset_id=NEW.asset_id)
+                AND account_key=NEW.account_key
                 AND pipeline_id=(SELECT pipeline_id FROM ml_derived_artifacts WHERE artifact_id=NEW.artifact_id)
                 AND schema_version=(SELECT schema_version FROM ml_derived_artifacts WHERE artifact_id=NEW.artifact_id);
             END;
@@ -907,17 +972,60 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
                 permanent_failure=permanent_failure-(OLD.state=3),
                 retry_pending=retry_pending-(OLD.state=4)
               WHERE artifact_id=OLD.artifact_id
-                AND account_id=(SELECT account_id FROM ml_derived_assets WHERE asset_id=OLD.asset_id)
+                AND account_key=OLD.account_key
                 AND pipeline_id=(SELECT pipeline_id FROM ml_derived_artifacts WHERE artifact_id=OLD.artifact_id)
                 AND schema_version=(SELECT schema_version FROM ml_derived_artifacts WHERE artifact_id=OLD.artifact_id);
               DELETE FROM ml_derived_progress WHERE total=0;
             END;
             """
-        guard sqlite3_exec(handle, schema, nil, nil, nil) == SQLITE_OK,
-            verifyAndStampVersion(handle)
+
+        let compatibility = SQLiteStoreSchemaGate.compatibility(
+            at: url,
+            schemaSQL: schema,
+            busyTimeoutMs: policy.busyTimeoutMs,
+            versionIsCurrent: verifyVersion
+        )
+        guard compatibility != .incompatible else { return .incompatible }
+        guard compatibility != .unavailable else { return .failed }
+        var handle: OpaquePointer?
+        let flags =
+            SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX
+            | (compatibility == .empty ? SQLITE_OPEN_CREATE : 0)
+        guard sqlite3_open_v2(url.path, &handle, flags, nil) == SQLITE_OK,
+            let handle
         else {
             sqlite3_close(handle)
-            return nil
+            return .failed
+        }
+        sqlite3_busy_timeout(handle, Int32(clamping: policy.busyTimeoutMs))
+        sqlite3_exec(handle, "PRAGMA foreign_keys=ON;", nil, nil, nil)
+        switch compatibility {
+        case .empty:
+            SQLiteStoreSchemaGate.configureConnection(handle, policy: policy)
+            guard
+                SQLiteStoreSchemaGate.initializeCurrentSchema(
+                    handle,
+                    schemaSQL: schema,
+                    stamp: { stampVersion(handle) }
+                )
+            else {
+                sqlite3_close(handle)
+                return .failed
+            }
+        case .current:
+            guard verifyVersion(handle),
+                SQLiteStoreSchemaGate.matchesCurrentSchema(handle, schemaSQL: schema)
+            else {
+                sqlite3_close(handle)
+                return .incompatible
+            }
+            SQLiteStoreSchemaGate.configureConnection(handle, policy: policy)
+        case .incompatible:
+            sqlite3_close(handle)
+            return .incompatible
+        case .unavailable:
+            sqlite3_close(handle)
+            return .failed
         }
         // A previous process may have exited with a large committed WAL. This is the one canonical
         // derived index, so fold it into the main database before starting another indexing pass.
@@ -928,31 +1036,33 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
             nil,
             nil
         )
-        return handle
+        return .opened(handle)
     }
 
-    private static func verifyAndStampVersion(_ handle: OpaquePointer?) -> Bool {
+    private static func verifyVersion(_ handle: OpaquePointer?) -> Bool {
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(handle, "PRAGMA user_version;", -1, &stmt, nil) == SQLITE_OK else { return false }
         defer { sqlite3_finalize(stmt) }
         guard sqlite3_step(stmt) == SQLITE_ROW else { return false }
-        let version = sqlite3_column_int(stmt, 0)
-        if version == 0 {
-            return sqlite3_exec(handle, "PRAGMA user_version=\(schemaVersion);", nil, nil, nil) == SQLITE_OK
+        return sqlite3_column_int(stmt, 0) == schemaVersion
+    }
+
+    private static func stampVersion(_ handle: OpaquePointer?) -> Bool {
+        sqlite3_exec(handle, "PRAGMA user_version=\(schemaVersion);", nil, nil, nil) == SQLITE_OK
+    }
+
+    private static func destroyDatabaseFiles(at url: URL) -> Bool {
+        guard !url.hasDirectoryPath else { return false }
+        for suffix in ["", "-wal", "-shm"] {
+            let target = URL(fileURLWithPath: url.path + suffix)
+            guard FileManager.default.fileExists(atPath: target.path) else { continue }
+            do {
+                try FileManager.default.removeItem(at: target)
+            } catch {
+                return false
+            }
         }
-        if version == 4 {
-            let migration = """
-                BEGIN IMMEDIATE;
-                UPDATE ml_derived_work
-                   SET state=0, attempts=0, retry_at=NULL, terminal_reason=NULL, payload=NULL
-                 WHERE state=3 AND terminal_reason='retryLimitReached';
-                UPDATE ml_derived_generation SET generation=generation+1 WHERE changes() > 0;
-                PRAGMA user_version=5;
-                COMMIT;
-                """
-            return sqlite3_exec(handle, migration, nil, nil, nil) == SQLITE_OK
-        }
-        return version == schemaVersion
+        return true
     }
 
     private func artifactIDsLocked(
@@ -999,6 +1109,89 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
         return result
     }
 
+    /// Read-only lookup which distinguishes a genuinely absent row from an unavailable SQLite
+    /// connection. Work schedulers must never translate the latter into an empty, drained queue.
+    private func existingArtifactIDsLocked(
+        for key: MLPipelineExecutionKey
+    ) throws -> [String: Int64] {
+        var select: OpaquePointer?
+        guard
+            prepare(
+                "SELECT artifact_id, pipeline_id, schema_version FROM ml_derived_artifacts WHERE artifact_namespace=?;",
+                &select
+            )
+        else { throw MLDerivedPipelineStoreError.storageUnavailable }
+        defer { sqlite3_finalize(select) }
+
+        var result: [String: Int64] = [:]
+        result.reserveCapacity(key.artifacts.count)
+        for artifact in key.artifacts {
+            reset(select)
+            bindText(select, 1, artifact.stableNamespace)
+            switch sqlite3_step(select) {
+            case SQLITE_ROW:
+                guard columnText(select, 1) == key.pipelineID.rawValue,
+                    sqlite3_column_int64(select, 2) == Int64(key.schemaVersion)
+                else { throw MLDerivedPipelineStoreError.corruptData }
+                result[artifact.stableNamespace] = sqlite3_column_int64(select, 0)
+            case SQLITE_DONE:
+                continue
+            default:
+                throw MLDerivedPipelineStoreError.storageUnavailable
+            }
+        }
+        return result
+    }
+
+    private func accountKeyLocked(identifier: String, create: Bool) -> Int64? {
+        var insert: OpaquePointer?
+        if create,
+            !prepare(
+                "INSERT OR IGNORE INTO ml_derived_accounts(account_identifier) VALUES(?);",
+                &insert
+            )
+        {
+            return nil
+        }
+        defer { sqlite3_finalize(insert) }
+        if create {
+            bindText(insert, 1, identifier)
+            guard sqlite3_step(insert) == SQLITE_DONE else { return nil }
+        }
+
+        var select: OpaquePointer?
+        guard
+            prepare(
+                "SELECT account_key FROM ml_derived_accounts WHERE account_identifier=?;",
+                &select
+            )
+        else { return nil }
+        defer { sqlite3_finalize(select) }
+        bindText(select, 1, identifier)
+        guard sqlite3_step(select) == SQLITE_ROW else { return nil }
+        return sqlite3_column_int64(select, 0)
+    }
+
+    private func existingAccountKeyLocked(identifier: String) throws -> Int64? {
+        var select: OpaquePointer?
+        guard
+            prepare(
+                "SELECT account_key FROM ml_derived_accounts WHERE account_identifier=?;",
+                &select
+            )
+        else { throw MLDerivedPipelineStoreError.storageUnavailable }
+        defer { sqlite3_finalize(select) }
+        bindText(select, 1, identifier)
+        switch sqlite3_step(select) {
+        case SQLITE_ROW:
+            return sqlite3_column_int64(select, 0)
+        case SQLITE_DONE:
+            return nil
+        default:
+            throw MLDerivedPipelineStoreError.storageUnavailable
+        }
+    }
+
     private func artifactIDLocked(namespace: String) -> Int64? {
         var stmt: OpaquePointer?
         guard prepare("SELECT artifact_id FROM ml_derived_artifacts WHERE artifact_namespace=?;", &stmt) else {
@@ -1022,7 +1215,10 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
     /// Removes account-local work from older request revisions or stages no longer present in the
     /// active execution key. Artifact descriptors remain interned while any account still uses
     /// them; only encrypted work, postings, and now-orphaned assets are reclaimed here.
-    private func removeObsoleteWorkLocked(for key: MLPipelineExecutionKey) -> Bool? {
+    private func removeObsoleteWorkLocked(
+        for key: MLPipelineExecutionKey,
+        accountKey: Int64
+    ) -> Bool? {
         let namespaces = key.artifacts.map(\.stableNamespace).sorted()
         guard !namespaces.isEmpty else { return false }
         var stmt: OpaquePointer?
@@ -1030,9 +1226,7 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
             prepare(
                 """
                 DELETE FROM ml_derived_work
-                WHERE asset_id IN (
-                  SELECT asset_id FROM ml_derived_assets WHERE account_id=?
-                )
+                WHERE account_key=?
                   AND artifact_id IN (
                     SELECT artifact_id
                     FROM ml_derived_artifacts
@@ -1045,7 +1239,7 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
         else { return nil }
         defer { sqlite3_finalize(stmt) }
         var index: Int32 = 1
-        bindText(stmt, index, key.accountIdentifier)
+        sqlite3_bind_int64(stmt, index, accountKey)
         index += 1
         bindText(stmt, index, key.pipelineID.rawValue)
         index += 1
@@ -1055,18 +1249,18 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
         }
         guard sqlite3_step(stmt) == SQLITE_DONE else { return nil }
         let changed = sqlite3_changes(db) > 0
-        guard !changed || deleteOrphanAssetsLocked(accountIdentifier: key.accountIdentifier) else {
+        guard !changed || deleteOrphanAssetsLocked(accountKey: accountKey) else {
             return nil
         }
         return changed
     }
 
-    private func deleteWorkLocked(accountIdentifier: String, artifactIDs: [Int64]) -> Bool {
+    private func deleteWorkLocked(accountKey: Int64, artifactIDs: [Int64]) -> Bool {
         guard !artifactIDs.isEmpty else { return true }
         var stmt: OpaquePointer?
         guard
             prepare(
-                "DELETE FROM ml_derived_work WHERE artifact_id IN (\(Self.placeholders(artifactIDs.count))) AND asset_id IN (SELECT asset_id FROM ml_derived_assets WHERE account_id=?);",
+                "DELETE FROM ml_derived_work WHERE artifact_id IN (\(Self.placeholders(artifactIDs.count))) AND account_key=?;",
                 &stmt
             )
         else { return false }
@@ -1076,27 +1270,27 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
             sqlite3_bind_int64(stmt, index, id)
             index += 1
         }
-        bindText(stmt, index, accountIdentifier)
+        sqlite3_bind_int64(stmt, index, accountKey)
         return sqlite3_step(stmt) == SQLITE_DONE
     }
 
-    private func deleteOrphanAssetsLocked(accountIdentifier: String) -> Bool {
+    private func deleteOrphanAssetsLocked(accountKey: Int64) -> Bool {
         var stmt: OpaquePointer?
         guard
             prepare(
-                "DELETE FROM ml_derived_assets WHERE account_id=? AND NOT EXISTS(SELECT 1 FROM ml_derived_work WHERE asset_id=ml_derived_assets.asset_id);",
+                "DELETE FROM ml_derived_assets WHERE account_key=? AND NOT EXISTS(SELECT 1 FROM ml_derived_work WHERE asset_id=ml_derived_assets.asset_id);",
                 &stmt
             )
         else { return false }
         defer { sqlite3_finalize(stmt) }
-        bindText(stmt, 1, accountIdentifier)
+        sqlite3_bind_int64(stmt, 1, accountKey)
         return sqlite3_step(stmt) == SQLITE_DONE
     }
 
     private func unavailableAssetReasonsLocked(
-        accountIdentifier: String,
+        accountKey: Int64,
         artifactIDs: [Int64]
-    ) -> [MLPipelineFailureReason: Int] {
+    ) throws -> [MLPipelineFailureReason: Int] {
         guard !artifactIDs.isEmpty else { return [:] }
         var stmt: OpaquePointer?
         guard
@@ -1106,8 +1300,7 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
                 FROM (
                   SELECT w.asset_id, MIN(w.terminal_reason) AS reason
                   FROM ml_derived_work w
-                  JOIN ml_derived_assets a ON a.asset_id=w.asset_id
-                  WHERE a.account_id=? AND w.state=3
+                  WHERE w.account_key=? AND w.state=3
                     AND w.artifact_id IN (\(Self.placeholders(artifactIDs.count)))
                     AND w.terminal_reason IS NOT NULL
                   GROUP BY w.asset_id
@@ -1116,10 +1309,10 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
                 """,
                 &stmt
             )
-        else { return [:] }
+        else { throw MLDerivedPipelineStoreError.storageUnavailable }
         defer { sqlite3_finalize(stmt) }
         var index: Int32 = 1
-        bindText(stmt, index, accountIdentifier)
+        sqlite3_bind_int64(stmt, index, accountKey)
         index += 1
         for id in artifactIDs {
             sqlite3_bind_int64(stmt, index, id)
@@ -1127,17 +1320,25 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
         }
 
         var reasons: [MLPipelineFailureReason: Int] = [:]
-        while sqlite3_step(stmt) == SQLITE_ROW {
-            guard let reason = MLPipelineFailureReason(rawValue: columnText(stmt, 0)) else { continue }
-            reasons[reason] = Int(sqlite3_column_int64(stmt, 1))
+        while true {
+            switch sqlite3_step(stmt) {
+            case SQLITE_ROW:
+                guard let reason = MLPipelineFailureReason(rawValue: columnText(stmt, 0)) else {
+                    throw MLDerivedPipelineStoreError.corruptData
+                }
+                reasons[reason] = Int(sqlite3_column_int64(stmt, 1))
+            case SQLITE_DONE:
+                return reasons
+            default:
+                throw MLDerivedPipelineStoreError.storageUnavailable
+            }
         }
-        return reasons
     }
 
     private func unavailableAssetCountLocked(
-        accountIdentifier: String,
+        accountKey: Int64,
         artifactIDs: [Int64]
-    ) -> Int {
+    ) throws -> Int {
         guard !artifactIDs.isEmpty else { return 0 }
         var stmt: OpaquePointer?
         guard
@@ -1145,97 +1346,107 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
                 """
                 SELECT COUNT(DISTINCT w.asset_id)
                 FROM ml_derived_work w
-                JOIN ml_derived_assets a ON a.asset_id=w.asset_id
-                WHERE a.account_id=? AND w.state=3
+                WHERE w.account_key=? AND w.state=3
                   AND w.artifact_id IN (\(Self.placeholders(artifactIDs.count)));
                 """,
                 &stmt
             )
-        else { return 0 }
+        else { throw MLDerivedPipelineStoreError.storageUnavailable }
         defer { sqlite3_finalize(stmt) }
         var index: Int32 = 1
-        bindText(stmt, index, accountIdentifier)
+        sqlite3_bind_int64(stmt, index, accountKey)
         index += 1
         for id in artifactIDs {
             sqlite3_bind_int64(stmt, index, id)
             index += 1
         }
-        guard sqlite3_step(stmt) == SQLITE_ROW else { return 0 }
+        guard sqlite3_step(stmt) == SQLITE_ROW else {
+            throw MLDerivedPipelineStoreError.storageUnavailable
+        }
         return Int(sqlite3_column_int64(stmt, 0))
     }
 
-    private func emptyProgress(for key: MLPipelineExecutionKey) -> MLDerivedPipelineProgress {
-        MLDerivedPipelineProgress(
+    private func emptyProgress(generation: UInt64) -> MLDerivedPipelineProgress {
+        return MLDerivedPipelineProgress(
             total: 0,
             completed: 0,
             skipped: 0,
             permanentFailure: 0,
             retryPending: 0,
-            generation: generationLocked(for: key)
+            generation: generation
         )
     }
 
-    private func bumpGenerationLocked(for key: MLPipelineExecutionKey) -> Bool {
+    private func bumpGenerationLocked(for key: MLPipelineExecutionKey, accountKey: Int64) -> Bool {
         var stmt: OpaquePointer?
         guard
             prepare(
                 """
-                INSERT INTO ml_derived_generation(account_id, pipeline_id, schema_version, generation)
+                INSERT INTO ml_derived_generation(account_key, pipeline_id, schema_version, generation)
                 VALUES(?,?,?,1)
-                ON CONFLICT(account_id, pipeline_id, schema_version)
+                ON CONFLICT(account_key, pipeline_id, schema_version)
                 DO UPDATE SET generation=generation+1;
                 """,
                 &stmt
             )
         else { return false }
         defer { sqlite3_finalize(stmt) }
-        bindText(stmt, 1, key.accountIdentifier)
+        sqlite3_bind_int64(stmt, 1, accountKey)
         bindText(stmt, 2, key.pipelineID.rawValue)
         sqlite3_bind_int64(stmt, 3, Int64(key.schemaVersion))
         return sqlite3_step(stmt) == SQLITE_DONE
     }
 
-    private func bumpAllGenerationsLocked(accountIdentifier: String) -> Bool {
+    private func bumpAllGenerationsLocked(accountKey: Int64) -> Bool {
         var stmt: OpaquePointer?
         guard
             prepare(
-                "UPDATE ml_derived_generation SET generation=generation+1 WHERE account_id=?;",
+                "UPDATE ml_derived_generation SET generation=generation+1 WHERE account_key=?;",
                 &stmt
             )
         else { return false }
         defer { sqlite3_finalize(stmt) }
-        bindText(stmt, 1, accountIdentifier)
+        sqlite3_bind_int64(stmt, 1, accountKey)
         return sqlite3_step(stmt) == SQLITE_DONE
     }
 
-    private func bumpGenerationsLocked(accountIdentifier: String, pipelineID: String) -> Bool {
+    private func bumpGenerationsLocked(accountKey: Int64, pipelineID: String) -> Bool {
         var stmt: OpaquePointer?
         guard
             prepare(
-                "UPDATE ml_derived_generation SET generation=generation+1 WHERE account_id=? AND pipeline_id=?;",
+                "UPDATE ml_derived_generation SET generation=generation+1 WHERE account_key=? AND pipeline_id=?;",
                 &stmt
             )
         else { return false }
         defer { sqlite3_finalize(stmt) }
-        bindText(stmt, 1, accountIdentifier)
+        sqlite3_bind_int64(stmt, 1, accountKey)
         bindText(stmt, 2, pipelineID)
         return sqlite3_step(stmt) == SQLITE_DONE
     }
 
-    private func generationLocked(for key: MLPipelineExecutionKey) -> UInt64 {
+    private func generationLocked(
+        for key: MLPipelineExecutionKey,
+        accountKey: Int64
+    ) throws -> UInt64 {
         var stmt: OpaquePointer?
         guard
             prepare(
-                "SELECT generation FROM ml_derived_generation WHERE account_id=? AND pipeline_id=? AND schema_version=?;",
+                "SELECT generation FROM ml_derived_generation WHERE account_key=? AND pipeline_id=? AND schema_version=?;",
                 &stmt
             )
-        else { return 0 }
+        else { throw MLDerivedPipelineStoreError.storageUnavailable }
         defer { sqlite3_finalize(stmt) }
-        bindText(stmt, 1, key.accountIdentifier)
+        sqlite3_bind_int64(stmt, 1, accountKey)
         bindText(stmt, 2, key.pipelineID.rawValue)
         sqlite3_bind_int64(stmt, 3, Int64(key.schemaVersion))
-        guard sqlite3_step(stmt) == SQLITE_ROW else { return 0 }
-        return UInt64(max(0, sqlite3_column_int64(stmt, 0)))
+        switch sqlite3_step(stmt) {
+        case SQLITE_ROW:
+            return UInt64(max(0, sqlite3_column_int64(stmt, 0)))
+        case SQLITE_DONE:
+            return 0
+        default:
+            throw MLDerivedPipelineStoreError.storageUnavailable
+        }
     }
 
     private func begin() -> Bool {

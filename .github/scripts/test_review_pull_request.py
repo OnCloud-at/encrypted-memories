@@ -206,15 +206,21 @@ class ReviewProviderRetryTests(unittest.TestCase):
 
         self.assertEqual(result, expected)
         self.assertEqual(request.call_count, 2)
+        self.assertTrue(
+            all(
+                call.kwargs["total_seconds"] == review_pull_request.REVIEW_LLM_TOTAL_SECONDS
+                for call in request.call_args_list
+            )
+        )
         sleep.assert_called_once_with(1)
 
-    def test_three_transient_provider_failures_exhaust_the_bounded_retry(self) -> None:
+    def test_two_transient_provider_failures_exhaust_the_bounded_retry(self) -> None:
         failure = github_llm_client.LLMStreamRetryableError("transient stream failure")
         with (
             patch.object(
                 review_pull_request,
                 "request_validated_llm_result",
-                side_effect=[failure, failure, failure],
+                side_effect=[failure, failure],
             ) as request,
             patch.object(review_pull_request.time, "sleep") as sleep,
         ):
@@ -230,8 +236,8 @@ class ReviewProviderRetryTests(unittest.TestCase):
                     file_paths={"file-001": "Sources/Backup.swift"},
                 )
 
-        self.assertEqual(request.call_count, 3)
-        self.assertEqual([call.args for call in sleep.call_args_list], [(1,), (2,)])
+        self.assertEqual(request.call_count, 2)
+        sleep.assert_called_once_with(1)
 
     def test_deterministic_validation_failure_is_not_retried(self) -> None:
         with (
@@ -922,6 +928,18 @@ class LLMStreamTests(unittest.TestCase):
 
         self.assertEqual(result, "valid")
         request.assert_called_once()
+
+    def test_validation_budget_must_be_finite_and_positive(self) -> None:
+        for total_seconds in (0.0, -1.0, float("nan"), float("inf")):
+            with self.subTest(total_seconds=total_seconds):
+                with self.assertRaisesRegex(ValueError, "finite and positive"):
+                    github_llm_client.request_validated_llm_result(
+                        "https://api.example.test/v1/chat/completions",
+                        token="token",
+                        payload={"stream": True},
+                        validator=lambda content: content,
+                        total_seconds=total_seconds,
+                    )
 
     def test_second_invalid_complete_result_fails_without_another_request(self) -> None:
         payload = {

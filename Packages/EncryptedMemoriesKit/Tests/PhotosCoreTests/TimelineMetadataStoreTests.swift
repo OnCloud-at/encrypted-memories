@@ -141,19 +141,87 @@ final class TimelineMetadataStoreTests: XCTestCase {
         store.close()
     }
 
-    func testNewerOnDiskSchemaVersionFailsClosedByResetting() throws {
+    func testNewerOnDiskSchemaVersionFailsClosedWithoutDeletingTimeline() throws {
         let dir = try makeTempDir()
         let (store, url) = try makeStore(in: dir)
         store.save([makeItem(node: "n1", t: 100)])
         store.close()
 
         // Simulate a store written by a future build: version above what this build supports.
-        rawExec(url, "UPDATE schema_info SET version = 99 WHERE feature = 'timeline';")
+        rawExec(
+            url,
+            """
+            UPDATE schema_info SET version = 99 WHERE feature = 'timeline';
+            DROP INDEX idx_photos_timeline;
+            """)
 
-        let reopened = try XCTUnwrap(TimelineMetadataStore(url: url))
-        XCTAssertEqual(reopened.schemaInfoVersions()["timeline"], 1, "incompatible store must reset to v1")
-        XCTAssertEqual(reopened.count(), 0, "reset store starts empty (re-derivable data)")
-        reopened.close()
+        XCTAssertNil(TimelineMetadataStore(url: url))
+        XCTAssertEqual(rawRows(url, "SELECT node FROM photos;").map { $0[0] }, ["n1"])
+        XCTAssertEqual(rawRows(url, "SELECT version FROM schema_info WHERE feature='timeline';")[0][0], "99")
+        XCTAssertTrue(
+            rawRows(url, "SELECT name FROM sqlite_schema WHERE name='idx_photos_timeline';").isEmpty,
+            "an incompatible file must not receive missing schema objects"
+        )
+    }
+
+    func testMarkerlessWrongShapeFailsClosedWithoutStampingOrRepairing() throws {
+        let dir = try makeTempDir()
+        let url = dir.appendingPathComponent("markerless.sqlite")
+        rawExec(
+            url,
+            """
+            CREATE TABLE photos(vol TEXT NOT NULL, node TEXT NOT NULL, PRIMARY KEY(vol, node));
+            INSERT INTO photos(vol, node) VALUES('legacy-volume', 'legacy-node');
+            """)
+        let objectsBefore = rawRows(
+            url,
+            "SELECT type, name, tbl_name FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name;"
+        )
+
+        XCTAssertNil(TimelineMetadataStore(url: url))
+
+        XCTAssertEqual(
+            rawRows(
+                url,
+                "SELECT type, name, tbl_name FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name;"
+            ),
+            objectsBefore
+        )
+        XCTAssertEqual(rawRows(url, "SELECT vol, node FROM photos;"), [["legacy-volume", "legacy-node"]])
+        XCTAssertTrue(rawRows(url, "SELECT name FROM sqlite_schema WHERE name='schema_info';").isEmpty)
+    }
+
+    func testCurrentMarkerWithDamagedShapeFailsClosedWithoutRepairingIt() throws {
+        let dir = try makeTempDir()
+        let (store, url) = try makeStore(in: dir)
+        store.save([makeItem(node: "kept", t: 1)])
+        store.close()
+        rawExec(url, "DROP INDEX idx_photos_timeline;")
+
+        XCTAssertNil(TimelineMetadataStore(url: url))
+        XCTAssertEqual(rawRows(url, "SELECT node FROM photos;"), [["kept"]])
+        XCTAssertTrue(rawRows(url, "SELECT name FROM sqlite_schema WHERE name='idx_photos_timeline';").isEmpty)
+    }
+
+    func testCurrentMarkerWithSemanticallyDifferentIndexFailsClosedWithoutRewritingIt() throws {
+        let dir = try makeTempDir()
+        let (store, url) = try makeStore(in: dir)
+        store.save([makeItem(node: "kept", t: 1)])
+        store.close()
+        rawExec(
+            url,
+            """
+            DROP INDEX idx_photos_timeline;
+            CREATE INDEX idx_photos_timeline ON photos(t DESC, vol, node);
+            """)
+
+        XCTAssertNil(TimelineMetadataStore(url: url))
+        XCTAssertEqual(rawRows(url, "SELECT node FROM photos;"), [["kept"]])
+        XCTAssertTrue(
+            rawRows(url, "SELECT sql FROM sqlite_schema WHERE name='idx_photos_timeline';")[0][0]
+                .contains("t DESC"),
+            "an incompatible operational schema must remain byte-for-byte under owner control"
+        )
     }
 
     func testEqualCaptureTimeRowsLoadInTimelineOrderAcrossCycles() throws {

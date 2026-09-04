@@ -30,6 +30,145 @@ import Testing
         #expect(universe.snapshot() == .hydrating)
     }
 
+    @Test func assetUniversePreservesSourceScopeOrderAndAuthority() {
+        let source = LibrarySource(
+            id: SourceID("source"),
+            capabilities: [.readThumbnail]
+        )
+        let graph = LibrarySourceGraph()
+        let sourceSetLease = graph.beginSourceSetRefresh()
+        _ = graph.commitSourceSet([source], using: sourceSetLease)
+        let initialRefresh = graph.beginRefresh(source.id)!
+        _ = graph.commit(
+            [
+                .complete(
+                    PhotoItem(
+                        uid: uid("b"),
+                        captureTime: Date(timeIntervalSince1970: 1),
+                        mediaType: "image/jpeg"
+                    )
+                ),
+                .complete(
+                    PhotoItem(
+                        uid: uid("a"),
+                        captureTime: Date(timeIntervalSince1970: 2),
+                        mediaType: "image/jpeg"
+                    )
+                ),
+            ],
+            validationToken: nil,
+            using: initialRefresh
+        )
+        let replacementRefresh = graph.beginRefresh(source.id)!
+        let scope = graph.analysisDerivedDataScope()
+        let universe = MLAssetUniverse(analysisScope: scope)
+
+        #expect(universe.snapshot() == MLAssetInventorySnapshot(analysisScope: scope))
+
+        let authoritative = graph.commit(
+            [
+                .complete(
+                    PhotoItem(
+                        uid: uid("a"),
+                        captureTime: Date(timeIntervalSince1970: 2),
+                        mediaType: "image/jpeg"
+                    )
+                )
+            ],
+            validationToken: nil,
+            using: replacementRefresh
+        )!.analysisScope
+        #expect(universe.publish(authoritative))
+        #expect(universe.snapshot() == MLAssetInventorySnapshot(analysisScope: authoritative))
+
+        #expect(!universe.publish(scope))
+        #expect(universe.snapshot() == MLAssetInventorySnapshot(analysisScope: authoritative))
+
+        let otherGraph = LibrarySourceGraph()
+        let otherSetLease = otherGraph.beginSourceSetRefresh()
+        _ = otherGraph.commitSourceSet([source], using: otherSetLease)
+        let otherRefresh = otherGraph.beginRefresh(source.id)!
+        let otherEpoch = otherGraph.commit(
+            [
+                .complete(
+                    PhotoItem(
+                        uid: uid("other"),
+                        captureTime: Date(timeIntervalSince1970: 3),
+                        mediaType: "image/jpeg"
+                    )
+                )
+            ],
+            validationToken: nil,
+            using: otherRefresh
+        )!.analysisScope
+        #expect(!universe.publish(otherEpoch))
+        #expect(!universe.publishAuthoritative([uid("legacy")]))
+
+        universe.invalidateSourceSession()
+        #expect(universe.snapshot() == .hydrating)
+        #expect(!universe.publish(authoritative))
+        #expect(!universe.publishAuthoritative([uid("late-legacy")]))
+        universe.resetSourceSession(to: otherEpoch.epoch)
+        #expect(universe.publish(otherEpoch))
+        #expect(universe.snapshot() == MLAssetInventorySnapshot(analysisScope: otherEpoch))
+    }
+
+    @Test func nonAuthoritativeScopeImmediatelyHidesExplicitlyRemovedSource() {
+        let sourceA = LibrarySource(
+            id: SourceID("source-a"),
+            capabilities: [.readThumbnail]
+        )
+        let sourceB = LibrarySource(
+            id: SourceID("source-b"),
+            capabilities: [.readThumbnail]
+        )
+        let uidA = uid("a")
+        let uidB = uid("b")
+        let graph = LibrarySourceGraph()
+        let sourceSetLease = graph.beginSourceSetRefresh()
+        _ = graph.commitSourceSet([sourceA, sourceB], using: sourceSetLease)
+        let refreshA = graph.beginRefresh(sourceA.id)!
+        _ = graph.commit(
+            [
+                .complete(
+                    PhotoItem(
+                        uid: uidA,
+                        captureTime: Date(timeIntervalSince1970: 1),
+                        mediaType: "image/jpeg"
+                    )
+                )
+            ],
+            validationToken: nil,
+            using: refreshA
+        )
+        let refreshB = graph.beginRefresh(sourceB.id)!
+        _ = graph.commit(
+            [
+                .complete(
+                    PhotoItem(
+                        uid: uidB,
+                        captureTime: Date(timeIntervalSince1970: 2),
+                        mediaType: "image/jpeg"
+                    )
+                )
+            ],
+            validationToken: nil,
+            using: refreshB
+        )
+        let initialScope = graph.analysisDerivedDataScope()
+        let universe = MLAssetUniverse(analysisScope: initialScope)
+
+        #expect(initialScope.isAuthoritative)
+        #expect(initialScope.uids == [uidA, uidB])
+
+        _ = graph.beginRefresh(sourceA.id)
+        let removalScope = graph.removeSource(sourceB.id)!.analysisScope
+        #expect(!removalScope.isAuthoritative)
+        #expect(removalScope.uids == [uidA])
+        #expect(universe.publish(removalScope))
+        #expect(universe.snapshot() == MLAssetInventorySnapshot(analysisScope: removalScope))
+    }
+
     @Test func alreadyIndexedAssetsAreNotPlannedAgain() {
         let store = InMemoryMLIndexStore()
         let assets = (0..<5).map { uid("a\($0)") }
@@ -112,6 +251,39 @@ import Testing
         #expect(plan.toIndex.map(\.nodeID).sorted() == ["a0", "a2"])
         #expect(plan.skippedPermanentFailure.count == 1)
         #expect(plan.skippedPermanentFailure.contains(uid("a1")))
+    }
+
+    @Test func incrementalReconciliationRemovesOnlyThePreviousAuthoritativeDelta() {
+        let store = InMemoryMLIndexStore()
+        store.upsert([
+            record("retained", descriptorV1, [1, 0, 0, 0]),
+            record("removed", descriptorV1, [0, 1, 0, 0]),
+            record("outside-baseline", descriptorV1, [0, 0, 1, 0]),
+        ])
+        store.recordFailures([
+            MLIndexFailureRecord(
+                uid: uid("failed-removed"),
+                descriptor: descriptorV1,
+                kind: .permanent,
+                attempts: 1
+            )
+        ])
+        let generation = store.generation(for: descriptorV1)
+
+        #expect(
+            store.reconcileTrackedUIDs(
+                currentAuthoritativeUIDs: [uid("retained")],
+                previousAuthoritativeUIDs: [
+                    uid("retained"), uid("removed"), uid("removed"), uid("failed-removed"),
+                ],
+                descriptor: descriptorV1
+            ))
+
+        #expect(store.contains(uid: uid("retained"), descriptor: descriptorV1))
+        #expect(!store.contains(uid: uid("removed"), descriptor: descriptorV1))
+        #expect(store.contains(uid: uid("outside-baseline"), descriptor: descriptorV1))
+        #expect(store.failureRecords(for: descriptorV1, from: [uid("failed-removed")]).isEmpty)
+        #expect(store.generation(for: descriptorV1) == generation + 1)
     }
 
     @Test func failedAssetExcludedFromBatchUpsert() {
@@ -314,7 +486,7 @@ import Testing
         #expect(!store.contains(uid: uid("a0"), descriptor: descriptorV1))
         #expect(store.contains(uid: uid("a1"), descriptor: descriptorV1))
         #expect(store.count(for: descriptorV1) == 1)
-        store.removeAll(for: descriptorV1)
+        #expect(store.removeAll(for: descriptorV1))
         #expect(store.count(for: descriptorV1) == 0)
     }
 

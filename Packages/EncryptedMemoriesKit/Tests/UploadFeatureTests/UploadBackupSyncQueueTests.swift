@@ -770,6 +770,27 @@ final class UploadBackupSyncQueueTests: XCTestCase {
         XCTAssertGreaterThan(sqlite3_column_bytes(stmt, 1), 0)
     }
 
+    func testSQLiteQueueRejectsMarkerlessWrongShapeWithoutRepairingIt() throws {
+        let url = tempDir.appendingPathComponent(UploadBackupSyncQueueManifestStore.databaseFileName)
+        var handle: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(url.path, &handle), SQLITE_OK)
+        XCTAssertEqual(
+            sqlite3_exec(
+                handle,
+                "CREATE TABLE backup_sync_queue(source_id TEXT); INSERT INTO backup_sync_queue VALUES('kept');",
+                nil,
+                nil,
+                nil
+            ),
+            SQLITE_OK
+        )
+        sqlite3_close(handle)
+
+        XCTAssertNil(UploadBackupSyncQueueManifestStore(url: url))
+        XCTAssertEqual(sqliteCount(url: url, table: "backup_sync_queue"), 1)
+        XCTAssertEqual(sqliteCount(url: url, table: "backup_sync_queue_info"), -1)
+    }
+
     func testSQLiteQueueOpenFailureDoesNotReplaceDatabaseWithAnEmptyQueue() throws {
         let url = tempDir.appendingPathComponent(UploadBackupSyncQueueManifestStore.databaseFileName)
         let original = Data("not-a-sqlite-database".utf8)
@@ -777,6 +798,18 @@ final class UploadBackupSyncQueueTests: XCTestCase {
 
         XCTAssertNil(UploadBackupSyncQueueManifestStore(url: url))
         XCTAssertEqual(try Data(contentsOf: url), original)
+    }
+
+    private func sqliteCount(url: URL, table: String) -> Int {
+        var handle: OpaquePointer?
+        guard sqlite3_open(url.path, &handle) == SQLITE_OK else { return -1 }
+        defer { sqlite3_close(handle) }
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(handle, "SELECT COUNT(*) FROM \(table);", -1, &statement, nil) == SQLITE_OK else {
+            return -1
+        }
+        defer { sqlite3_finalize(statement) }
+        return sqlite3_step(statement) == SQLITE_ROW ? Int(sqlite3_column_int64(statement, 0)) : -1
     }
 
     func testClosedSQLiteQueueFailsClosedInsteadOfLookingEmpty() throws {

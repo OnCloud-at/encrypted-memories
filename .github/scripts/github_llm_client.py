@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import ssl
 import time
@@ -436,10 +437,13 @@ def request_validated_llm_result(
     token: str,
     payload: dict[str, Any],
     validator: Callable[[str], ValidatedResult],
+    total_seconds: float = MAX_LLM_TOTAL_SECONDS,
 ) -> ValidatedResult:
     """Request, validate, and once regenerate an invalid complete model result."""
 
-    deadline = time.monotonic() + MAX_LLM_TOTAL_SECONDS
+    if not math.isfinite(total_seconds) or total_seconds <= 0:
+        raise ValueError("LLM time budget must be finite and positive")
+    deadline = time.monotonic() + total_seconds
     attempt_payload = payload
     for attempt in range(LLM_VALIDATION_ATTEMPTS):
         content = request_llm_content(

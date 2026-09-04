@@ -152,6 +152,47 @@ import Testing
         #expect(await runtime.progress().total == 2)
     }
 
+    @Test func completedPassRevalidatesAuthorityBeforeRemovingStoredAssets() async throws {
+        let configuration = try MLNativeSearchConfiguration(
+            accountIdentifier: "account",
+            capabilitySnapshot: capabilitySnapshot(kinds: [.textRecognition])
+        )
+        let runtime = MLNativeSearchRuntime(
+            configuration: configuration,
+            store: InMemoryMLDerivedPipelineStore(),
+            executor: NativeTextTestExecutor()
+        )
+        let retained = try MLPipelineAssetRevision(uid: uid("retained"), sourceRevision: "retained")
+        let removed = try MLPipelineAssetRevision(uid: uid("removed"), sourceRevision: "removed")
+        _ = await runtime.index(assets: [retained, removed], shouldContinue: { true })
+
+        let fenced = await runtime.indexQuantum(
+            assets: [retained],
+            libraryGeneration: 2,
+            allowsDestructiveReconciliation: true,
+            destructiveReconciliationIsAuthorized: { false },
+            maximumAssets: 8,
+            maximumConcurrentAssets: 1,
+            shouldContinue: { true },
+            observer: MLDerivedPipelineObserver()
+        )
+        #expect(fenced.reason == .drained)
+        #expect(Set(await runtime.search("grusse", scope: .text, limit: 10)) == [retained.uid, removed.uid])
+
+        let authoritative = await runtime.indexQuantum(
+            assets: [retained],
+            libraryGeneration: 3,
+            allowsDestructiveReconciliation: true,
+            destructiveReconciliationIsAuthorized: { true },
+            maximumAssets: 8,
+            maximumConcurrentAssets: 1,
+            shouldContinue: { true },
+            observer: MLDerivedPipelineObserver()
+        )
+        #expect(authoritative.reason == .drained)
+        #expect(await runtime.search("grusse", scope: .text, limit: 10) == [retained.uid])
+    }
+
     @Test func nativeRuntimeClampsConcurrencyPerQuantumWithoutCreatingUnboundedWork() async throws {
         let configuration = try MLNativeSearchConfiguration(
             accountIdentifier: "account",

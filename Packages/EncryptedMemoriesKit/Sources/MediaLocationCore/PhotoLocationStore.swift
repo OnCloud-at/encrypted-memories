@@ -28,9 +28,9 @@ struct PhotoLocationDelta: Sendable, Equatable, Codable {
 
 /// Encrypted-at-rest persistence for the whole-library GPS index.
 ///
-/// Version 1 was one AES-GCM coordinate blob. Version 2 keeps an encrypted base snapshot and encrypted
-/// append-only delta frames. A manifest switches generations only after the new base and journal are complete,
-/// so a crash cannot expose a partial compaction. The old v1 blob remains readable and migrates on the next write.
+/// The store keeps an encrypted base snapshot and encrypted append-only delta frames. A manifest switches
+/// generations only after the new base and journal are complete, so a crash cannot expose a partial compaction.
+/// Obsolete derived-store formats are discarded and rebuilt from the authoritative remote library.
 ///
 /// GPS is sensitive PII. Coordinates, negative-cache UIDs, manifests, and journal frames remain encrypted.
 /// Platform-agnostic (Foundation + CryptoKit) and shared across Apple platforms.
@@ -57,7 +57,6 @@ public final class PhotoLocationStore: @unchecked Sendable {
         let generation: String
     }
 
-    private static let legacyVersion = 1
     private static let version = 2
     private static let manifestName = "locations.v2.manifest.enc"
     private static let legacyName = "locations.v1.enc"
@@ -108,6 +107,7 @@ public final class PhotoLocationStore: @unchecked Sendable {
             validatedJournalGeneration = nil
             self.accountUID = accountUID
             self.key = key
+            try? FileManager.default.removeItem(at: legacyURL)
             return SessionLease(generation: sessionGeneration)
         }
     }
@@ -231,9 +231,8 @@ public final class PhotoLocationStore: @unchecked Sendable {
                 )
             }
 
-            // First v2 append. Fold the delta into the migrated v1 snapshot so the journal starts bounded.
-            let migrated = loadSnapshotLocked(key: key, accountUID: accountUID)
-            let merged = applying(delta, to: migrated)
+            // First append creates the current derived-store generation directly.
+            let merged = applying(delta, to: PhotoLocationSnapshot())
             guard let plain = try? JSONEncoder().encode(merged) else { return false }
             return replaceSnapshotLocked(
                 plain: plain,
@@ -392,11 +391,7 @@ public final class PhotoLocationStore: @unchecked Sendable {
             return normalized(snapshot)
         }
 
-        guard let blob = try? Data(contentsOf: legacyURL),
-            let plain = openLegacy(blob, key: key, accountUID: accountUID),
-            let coordinates = try? JSONDecoder().decode([PhotoCoordinate].self, from: plain)
-        else { return PhotoLocationSnapshot() }
-        return normalized(PhotoLocationSnapshot(coordinates: coordinates))
+        return PhotoLocationSnapshot()
     }
 
     private func loadManifestLocked(key: SymmetricKey, accountUID: String) -> Manifest? {
@@ -514,15 +509,6 @@ public final class PhotoLocationStore: @unchecked Sendable {
             box,
             using: key,
             authenticating: aad(accountUID: accountUID, purpose: purpose)
-        )
-    }
-
-    private func openLegacy(_ blob: Data, key: SymmetricKey, accountUID: String) -> Data? {
-        guard let box = try? AES.GCM.SealedBox(combined: blob) else { return nil }
-        return try? AES.GCM.open(
-            box,
-            using: key,
-            authenticating: Data("encryptedmemories.locations.v\(Self.legacyVersion)|acct=\(accountUID)".utf8)
         )
     }
 

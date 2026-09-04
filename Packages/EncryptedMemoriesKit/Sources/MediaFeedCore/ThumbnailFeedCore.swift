@@ -254,6 +254,10 @@ public actor ThumbnailFeedCore {
     private nonisolated let onDecoded: @Sendable (PhotoUID, DecodedThumbnail) -> Void
     private nonisolated let decoded: DecodedThumbnailCache
     private nonisolated let diskPresence = DiskPresenceCache()
+    private nonisolated let selectedAuthorization =
+        DerivedDataResourceAuthorization<SelectedDerivedDataScopeKind>()
+    private nonisolated let analysisAuthorization =
+        DerivedDataResourceAuthorization<AnalysisDerivedDataScopeKind>()
     private nonisolated let configuration: ThumbnailFeedCoreConfiguration
     private nonisolated let coverageStore: (any ThumbnailCoverageCheckpointStore)?
     private nonisolated let diagnostics: PhotoDiagnostics
@@ -290,6 +294,8 @@ public actor ThumbnailFeedCore {
     /// the newest generation. This prevents cancelled per-viewport task groups from accumulating blockers.
     private var visibleDiskDemand = LatestVisibleDecodeDemand()
     private var visibleDiskWorkerCount = 0
+    private var visibleDiskWorkerTasks: [UUID: Task<Void, Never>] = [:]
+    private var retiredVisibleDiskWorkerTasks: [Task<Void, Never>] = []
     /// Reserved crawl/priority candidates whose encrypted presence is being checked off actor. Coverage cannot
     /// be declared settled until these reservations return, even if their source queues are already empty.
     private var diskProbeBatchesInFlight = 0
@@ -297,6 +303,25 @@ public actor ThumbnailFeedCore {
     private var lastErrors: [String] = []
     private var prefetchEnabled = true
     private var prefetchPaused = false
+    private var sourceEpoch: LibrarySourceEpoch?
+    private var lastSelectedScope: SelectedDerivedDataScope?
+    private var lastAnalysisScope: AnalysisDerivedDataScope?
+    private var lastRetentionScope: ThumbnailRetentionDerivedDataScope?
+    private var sourceReconciliationInFlight = false
+    private var highestSourceReconciliationRevision: UInt64?
+    private struct SourceReconciliationRequest {
+        let selectedScope: SelectedDerivedDataScope
+        let analysisScope: AnalysisDerivedDataScope
+        let retentionScope: ThumbnailRetentionDerivedDataScope
+    }
+    private struct SourceReconciliationWaiter {
+        let revision: UInt64
+        let continuation: CheckedContinuation<MediaCacheReconciliationResult, Never>
+    }
+    /// Reentrant callers publish only the newest accepted revision while the current worker join drains.
+    /// Authorization is applied before queuing, so an older crawl cannot serve a newly excluded resource.
+    private var pendingSourceReconciliation: SourceReconciliationRequest?
+    private var sourceReconciliationWaiters: [SourceReconciliationWaiter] = []
     private let coverageCheckpointKey = "thumbnail-coverage-v1"
     private var checkpointPresent: Set<PhotoUID> = []
     /// Persisted coverage is an advisory write-suppression hint only. It never skips the first authenticated
@@ -312,6 +337,8 @@ public actor ThumbnailFeedCore {
     private static let checkpointFlushThreshold = 128
     /// Invalidates asynchronous checkpoint bootstraps and worker groups across timeline/account changes.
     private var prefetchGeneration: UInt64 = 0
+    /// Main-projection identities used by diagnostics. The crawl may also contain analysis-only identities.
+    private var prefetchReportingUIDs: Set<PhotoUID>?
     private var prefetchCompleted = 0
     private var prefetchFailed = 0
     private var prefetchFailedTimeout = 0
@@ -467,6 +494,7 @@ public actor ThumbnailFeedCore {
     }
 
     public func cachedDecoded(for uid: PhotoUID) async -> DecodedThumbnail? {
+        guard selectedAuthorization.isAllowed(uid) else { return nil }
         guard ownerLeaseIsCurrent() else {
             decoded.removeAll()
             return nil
@@ -484,7 +512,9 @@ public actor ThumbnailFeedCore {
             guard let data = cache.diskData(for: uid) else { return (false, nil) }
             return (true, ThumbnailImageDecoder.downsample(data, maxPixelSize: maxPixels))
         }
-        guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(generation) else {
+        guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(generation),
+            selectedAuthorization.isAllowed(uid)
+        else {
             decoded.removeAll()
             return nil
         }
@@ -515,18 +545,63 @@ public actor ThumbnailFeedCore {
         return image
     }
 
+    /// Source-aware direct decode for an explicitly visible analysis-only surface, such as an additional
+    /// collection cover. It never publishes into the main grid's decoded LRU.
+    public func analysisDecoded(for uid: PhotoUID) async -> DecodedThumbnail? {
+        guard ownerLeaseIsCurrent(), analysisAuthorization.isAllowed(uid) else { return nil }
+        if case .decoded(let cached) = await backgroundThumbnailDecodeResult(for: uid) {
+            return cached
+        }
+        guard !unfetchable.contains(uid) else { return nil }
+
+        let cache = self.cache
+        let generation = cache.captureWriterGeneration()
+        let buffer = ByteBox()
+        let result: ThumbnailBatchLoadResult
+        if let priorityLoader = loader as? any PriorityThumbnailBatchLoader {
+            result = await priorityLoader.loadThumbnails(for: [uid], priority: .visibleNow) { loadedUID, data in
+                if loadedUID == uid { buffer.set(data) }
+            }
+        } else {
+            result = await loader.loadThumbnails(for: [uid]) { loadedUID, data in
+                if loadedUID == uid { buffer.set(data) }
+            }
+        }
+        guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(generation),
+            analysisAuthorization.isAllowed(uid)
+        else { return nil }
+        guard let data = buffer.value else {
+            if result.itemErrors[uid] != nil { unfetchable.insert(uid) }
+            return nil
+        }
+        let maxPixels = configuration.targetPixels
+        let decoded: DecodedThumbnail? = await decodeExecutor.perform(priority: .visibleNow) {
+            guard cache.storeToDisk(data, for: uid, ifCurrent: generation) == .stored else { return nil }
+            return ThumbnailImageDecoder.downsample(data, maxPixelSize: maxPixels)
+        }
+        guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(generation),
+            analysisAuthorization.isAllowed(uid)
+        else { return nil }
+        return decoded
+    }
+
     /// Detailed cache-only result for background consumers that must distinguish a thumbnail
     /// that may still arrive from bytes that are present but cannot be decoded.
     public nonisolated func backgroundThumbnailDecodeResult(for uid: PhotoUID) async -> BackgroundThumbnailDecodeResult
     {
+        guard analysisAuthorization.isAllowed(uid) else { return .missing }
         let cache = self.cache
         let generation = cache.captureWriterGeneration()
-        guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(generation) else {
+        guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(generation),
+            analysisAuthorization.isAllowed(uid)
+        else {
             decoded.removeAll()
             return .missing
         }
         if let image = decoded.image(for: uid) {
-            guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(generation) else {
+            guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(generation),
+                analysisAuthorization.isAllowed(uid)
+            else {
                 decoded.removeAll()
                 return .missing
             }
@@ -538,39 +613,53 @@ public actor ThumbnailFeedCore {
             guard let data = cache.diskData(for: uid) else { return (false, nil) }
             return (true, ThumbnailImageDecoder.downsample(data, maxPixelSize: maxPixels))
         }.value
-        guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(generation) else {
+        guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(generation),
+            analysisAuthorization.isAllowed(uid)
+        else {
             decoded.removeAll()
             return .missing
         }
         guard result.dataPresent else {
-            guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(generation) else {
+            guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(generation),
+                analysisAuthorization.isAllowed(uid)
+            else {
                 decoded.removeAll()
                 return .missing
             }
             diskPresence.set(uid, present: false)
-            guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(generation) else {
+            guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(generation),
+                analysisAuthorization.isAllowed(uid)
+            else {
                 decoded.removeAll()
                 return .missing
             }
             return .missing
         }
-        guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(generation) else {
+        guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(generation),
+            analysisAuthorization.isAllowed(uid)
+        else {
             decoded.removeAll()
             return .missing
         }
         diskPresence.set(uid, present: true)
-        guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(generation) else {
+        guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(generation),
+            analysisAuthorization.isAllowed(uid)
+        else {
             decoded.removeAll()
             return .missing
         }
         guard let image = result.image else {
-            guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(generation) else {
+            guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(generation),
+                analysisAuthorization.isAllowed(uid)
+            else {
                 decoded.removeAll()
                 return .missing
             }
             return .undecodable
         }
-        guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(generation) else {
+        guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(generation),
+            analysisAuthorization.isAllowed(uid)
+        else {
             decoded.removeAll()
             return .missing
         }
@@ -578,7 +667,7 @@ public actor ThumbnailFeedCore {
     }
 
     public nonisolated func memoryDecoded(for uid: PhotoUID) -> DecodedThumbnail? {
-        guard ownerLeaseIsCurrent() else {
+        guard ownerLeaseIsCurrent(), selectedAuthorization.isAllowed(uid) else {
             decoded.removeAll()
             return nil
         }
@@ -590,7 +679,7 @@ public actor ThumbnailFeedCore {
     /// ordinary missing-tile path) or already adequate, so a settled render loop that keys retry work on
     /// this can never spin on a source-limited image.
     public nonisolated func decodedNeedsSharperSource(_ uid: PhotoUID, forPixels pixels: Int) -> Bool {
-        guard ownerLeaseIsCurrent() else { return false }
+        guard ownerLeaseIsCurrent(), selectedAuthorization.isAllowed(uid) else { return false }
         return decoded.needsSharperDecode(for: uid, requestedPixels: pixels)
     }
 
@@ -606,13 +695,13 @@ public actor ThumbnailFeedCore {
     }
 
     public nonisolated func isKnownUnfetchable(_ uid: PhotoUID) -> Bool {
-        unfetchable.contains(uid)
+        analysisAuthorization.isAllowed(uid) && unfetchable.contains(uid)
     }
 
     public func cacheState(
         for request: ThumbnailRequest, gpuTextureResident: Bool = false
     ) async -> ThumbnailCacheTierState {
-        guard ownerLeaseIsCurrent() else {
+        guard ownerLeaseIsCurrent(), selectedAuthorization.isAllowed(request.uid) else {
             return ThumbnailCacheTierState(
                 knownInTimeline: true,
                 diskThumbnail: false,
@@ -647,6 +736,7 @@ public actor ThumbnailFeedCore {
     /// because a first-time cache validation performs a real file read and AES-GCM open.
     @discardableResult
     public func requestPriority(_ uid: PhotoUID, priority requestedPriority: ThumbnailPriority = .visibleNow) -> Bool {
+        guard selectedAuthorization.isAllowed(uid) else { return false }
         if requestedPriority != .idleLibraryCrawl { lastDemand.set(clock()) }
         if let index = priorityReservations.firstIndex(where: { $0.uid == uid }) {
             if requestedPriority < priorityReservations[index].priority {
@@ -737,7 +827,8 @@ public actor ThumbnailFeedCore {
         _ requests: [ThumbnailRequest]
     ) {
         lastDemand.set(clock())
-        guard visibleDiskDemandInbox.submit(requests: requests) else { return }
+        let authorized = requests.filter { selectedAuthorization.isAllowed($0.uid) }
+        guard visibleDiskDemandInbox.submit(requests: authorized) else { return }
         Task { await drainVisibleDiskDemandInbox() }
     }
 
@@ -753,6 +844,7 @@ public actor ThumbnailFeedCore {
     ) {
         var seen = Set<PhotoUID>()
         let jobs = requests.compactMap { request -> LatestVisibleDecodeDemand.Job? in
+            guard selectedAuthorization.isAllowed(request.uid) else { return nil }
             guard seen.insert(request.uid).inserted else { return nil }
             let pixels = visibleDecodePixels(for: request)
             guard !decoded.hasAdequateEntry(for: request.uid, requestedPixels: Int(pixels)) else { return nil }
@@ -778,13 +870,21 @@ public actor ThumbnailFeedCore {
         let desired = min(configuration.maxConcurrentDecodes, visibleDiskDemand.pendingCount)
         while visibleDiskWorkerCount < desired {
             visibleDiskWorkerCount += 1
-            Task { [weak self] in
-                await self?.runVisibleDiskWorker()
+            let workerID = UUID()
+            let task = Task { [weak self] in
+                guard let self else { return }
+                await self.runVisibleDiskWorker(id: workerID)
             }
+            visibleDiskWorkerTasks[workerID] = task
         }
     }
 
-    private func runVisibleDiskWorker() async {
+    private func runVisibleDiskWorker(id: UUID) async {
+        defer {
+            visibleDiskWorkerTasks.removeValue(forKey: id)
+            visibleDiskWorkerCount = max(0, visibleDiskWorkerCount - 1)
+            startVisibleDiskWorkersIfNeeded()
+        }
         while let job = visibleDiskDemand.takeNext() {
             guard await decodePermits.acquire(priority: .visibleNow) else {
                 // `false` means this worker was cancelled before it acquired a lane. The asset was not read,
@@ -809,16 +909,23 @@ public actor ThumbnailFeedCore {
                 visibleDiskDemand.complete(job)
                 continue
             }
+            guard selectedAuthorization.isAllowed(job.uid) else {
+                decoded.remove(job.uid)
+                visibleDiskDemand.complete(job)
+                continue
+            }
             publishVisibleDiskTile(tile, generation: generation)
             visibleDiskDemand.complete(job)
         }
-        visibleDiskWorkerCount = max(0, visibleDiskWorkerCount - 1)
-        startVisibleDiskWorkersIfNeeded()
     }
 
     private func publishVisibleDiskTile(_ tile: DecodedTile, generation: CacheWriterGeneration.Token) {
         guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(generation) else {
             decoded.removeAll()
+            return
+        }
+        guard selectedAuthorization.isAllowed(tile.uid) else {
+            decoded.remove(tile.uid)
             return
         }
         recordSlowDecodeStages(tile)
@@ -853,7 +960,11 @@ public actor ThumbnailFeedCore {
         priority requestedPriority: ThumbnailPriority,
         limit: Int
     ) async -> WarmDecodedResult {
-        let targets = Array(requests.prefix(max(0, limit)))
+        let targets = Array(
+            requests.lazy
+                .filter { self.selectedAuthorization.isAllowed($0.uid) }
+                .prefix(max(0, limit))
+        )
         lastDemand.set(clock())
         var alreadyDecoded = 0
         var decodedFromDisk = 0
@@ -921,13 +1032,16 @@ public actor ThumbnailFeedCore {
                 }
                 for _ in 0..<lanes { addNext() }
                 for await tile in group {
-                    if Task.isCancelled || !ownerLeaseIsCurrent() || !cache.isCurrentWriterGeneration(decodeGeneration)
+                    if Task.isCancelled || !ownerLeaseIsCurrent()
+                        || !cache.isCurrentWriterGeneration(decodeGeneration)
                     {
                         group.cancelAll()
                         continue
                     }
                     if let tile {
-                        guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(decodeGeneration) else {
+                        guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(decodeGeneration),
+                            selectedAuthorization.isAllowed(tile.uid)
+                        else {
                             group.cancelAll()
                             continue
                         }
@@ -995,7 +1109,7 @@ public actor ThumbnailFeedCore {
     }
 
     public func decoded(for uid: PhotoUID) async -> DecodedThumbnail? {
-        guard ownerLeaseIsCurrent() else {
+        guard ownerLeaseIsCurrent(), selectedAuthorization.isAllowed(uid) else {
             decoded.removeAll()
             return nil
         }
@@ -1025,6 +1139,7 @@ public actor ThumbnailFeedCore {
     }
 
     private func loadDirectDecoded(for uid: PhotoUID) async -> DecodedThumbnail? {
+        guard selectedAuthorization.isAllowed(uid) else { return nil }
         let box = ByteBox()
         let cache = self.cache
         let writerGeneration = cache.captureWriterGeneration()
@@ -1040,7 +1155,9 @@ public actor ThumbnailFeedCore {
                 if loadedUID == uid { box.set(data) }
             }
         }
-        guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(writerGeneration) else {
+        guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(writerGeneration),
+            selectedAuthorization.isAllowed(uid)
+        else {
             decoded.removeAll()
             return nil
         }
@@ -1058,7 +1175,9 @@ public actor ThumbnailFeedCore {
             guard cache.storeToDisk(data, for: uid, ifCurrent: writerGeneration) == .stored else { return nil }
             return ThumbnailImageDecoder.downsample(data, maxPixelSize: maxPixels)
         }
-        guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(writerGeneration) else {
+        guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(writerGeneration),
+            selectedAuthorization.isAllowed(uid)
+        else {
             decoded.removeAll()
             return nil
         }
@@ -1074,7 +1193,31 @@ public actor ThumbnailFeedCore {
     }
 
     public func startPrefetch(_ uids: [PhotoUID]) async {
+        if let lastSelectedScope, let lastAnalysisScope {
+            var orderedUIDs = lastSelectedScope.orderedUIDs
+            var seen = Set(orderedUIDs)
+            orderedUIDs.append(contentsOf: lastAnalysisScope.orderedUIDs.filter { seen.insert($0).inserted })
+            await startPrefetch(
+                orderedUIDs,
+                reporting: lastSelectedScope.uids,
+                requiringSourceRevision: lastAnalysisScope.revision
+            )
+        } else {
+            await startPrefetch(uids, reporting: Set(uids), requiringSourceRevision: nil)
+        }
+    }
+
+    private func startPrefetch(
+        _ uids: [PhotoUID],
+        reporting reportingUIDs: Set<PhotoUID>,
+        requiringSourceRevision requiredSourceRevision: UInt64?
+    ) async {
         guard prefetchEnabled, ownerLeaseIsCurrent() else { return }
+        if let requiredSourceRevision {
+            guard lastAnalysisScope?.revision == requiredSourceRevision else { return }
+        }
+        let uids = uids.filter { analysisAuthorization.isAllowed($0) }
+        prefetchReportingUIDs = reportingUIDs
         flushCheckpointUpdates()
         restorePriorityReservationsForRestart()
         prefetchGeneration &+= 1
@@ -1101,6 +1244,9 @@ public actor ThumbnailFeedCore {
             Set(coverageStore?.loadPresent(uids, for: coverageKey) ?? [])
         }.value
         guard generation == prefetchGeneration, prefetchEnabled else { return }
+        if let requiredSourceRevision {
+            guard lastAnalysisScope?.revision == requiredSourceRevision else { return }
+        }
         guard cache.isCurrentWriterGeneration(cacheGeneration) else { return }
 
         if diskPresenceGeneration != cacheGeneration {
@@ -1114,7 +1260,7 @@ public actor ThumbnailFeedCore {
         // probe before the crawl can skip it, so a removed or corrupt blob cannot hide behind a stale checkpoint.
         startupAuthenticationPending = !uids.isEmpty
         sequentialIndex = 0
-        diskPresence.beginTracking(uids, knownPresent: [])
+        diskPresence.beginTracking(uids, reporting: reportingUIDs, knownPresent: [])
         unfetchable.removeAll()  // a fresh crawl retries backend-refused items exactly once
         lastRepassPercent = -1.0
         coverageScanCursor = 0
@@ -1147,6 +1293,12 @@ public actor ThumbnailFeedCore {
             retiredDirectDecodeTasks.append(flight.task)
         }
         directDecodeFlights.removeAll(keepingCapacity: false)
+        visibleDiskDemand.cancelAll()
+        for task in visibleDiskWorkerTasks.values {
+            task.cancel()
+            retiredVisibleDiskWorkerTasks.append(task)
+        }
+        visibleDiskWorkerTasks.removeAll(keepingCapacity: false)
     }
 
     /// Stops and joins every worker owned by this feed instance. Account retry and sign-out use this
@@ -1173,9 +1325,17 @@ public actor ThumbnailFeedCore {
                 _ = await task.value
             }
 
+            let visibleWorkers = retiredVisibleDiskWorkerTasks
+            retiredVisibleDiskWorkerTasks.removeAll(keepingCapacity: false)
+            for task in visibleWorkers {
+                await task.value
+            }
+
             guard retiredWorkerTasks.isEmpty,
                 timedOutLoaderTasks.isEmpty,
-                retiredDirectDecodeTasks.isEmpty
+                retiredDirectDecodeTasks.isEmpty,
+                retiredVisibleDiskWorkerTasks.isEmpty,
+                visibleDiskWorkerTasks.isEmpty
             else { continue }
             break
         }
@@ -1193,6 +1353,219 @@ public actor ThumbnailFeedCore {
         checkpointHints.removeAll()
         diskPresence.invalidate()
         if shouldRestart { await startPrefetch(current) }
+    }
+
+    /// Binds this feed and its encrypted cache to one graph lifetime.
+    @discardableResult
+    public func bindDerivedDataEpoch(_ epoch: LibrarySourceEpoch) -> Bool {
+        guard sourceEpoch == nil || sourceEpoch == epoch else { return false }
+        guard cache.bindDerivedDataEpoch(epoch, sessionLease: ownerSessionLease) else { return false }
+        selectedAuthorization.requireScope()
+        analysisAuthorization.requireScope()
+        if sourceEpoch == nil { highestSourceReconciliationRevision = nil }
+        sourceEpoch = epoch
+        return true
+    }
+
+    /// Replaces every source-aware feed projection from one atomic graph change.
+    ///
+    /// The retention scope controls encrypted disk bytes. The selected scope controls visible work and decoded
+    /// grid plaintext. The analysis scope extends only the low-priority crawl and cache-only background decode.
+    /// All scopes must come from the same graph revision.
+    @discardableResult
+    public func reconcile(
+        selected selectedScope: SelectedDerivedDataScope,
+        analysis analysisScope: AnalysisDerivedDataScope,
+        retention retentionScope: ThumbnailRetentionDerivedDataScope
+    ) async -> MediaCacheReconciliationResult {
+        guard selectedScope.epoch == analysisScope.epoch,
+            selectedScope.epoch == retentionScope.epoch,
+            selectedScope.revision == analysisScope.revision,
+            selectedScope.revision == retentionScope.revision,
+            let sourceEpoch,
+            sourceEpoch == selectedScope.epoch
+        else { return self.sourceEpoch == nil ? .unbound : .staleScope }
+        if let lastSelectedScope, let lastAnalysisScope, let lastRetentionScope {
+            let isExactRetry =
+                selectedScope == lastSelectedScope
+                && analysisScope == lastAnalysisScope
+                && retentionScope == lastRetentionScope
+            guard isExactRetry || selectedScope.revision > lastSelectedScope.revision else {
+                return .staleScope
+            }
+        }
+        if let highestSourceReconciliationRevision {
+            guard selectedScope.revision >= highestSourceReconciliationRevision else { return .staleScope }
+        }
+        highestSourceReconciliationRevision = selectedScope.revision
+
+        // Authorization changes immediately even when another reconciliation owns the slow worker/cache
+        // boundary. That owner consumes only the newest queued revision, so an older continuation can never
+        // overwrite a newer feed state after one of the awaits below.
+        selectedAuthorization.apply(selectedScope)
+        analysisAuthorization.apply(analysisScope)
+        let incomingRequest = SourceReconciliationRequest(
+            selectedScope: selectedScope,
+            analysisScope: analysisScope,
+            retentionScope: retentionScope
+        )
+        guard !sourceReconciliationInFlight else {
+            if pendingSourceReconciliation.map({ $0.selectedScope.revision <= selectedScope.revision }) ?? true {
+                pendingSourceReconciliation = incomingRequest
+            }
+            return await withCheckedContinuation { continuation in
+                sourceReconciliationWaiters.append(
+                    SourceReconciliationWaiter(
+                        revision: selectedScope.revision,
+                        continuation: continuation
+                    )
+                )
+            }
+        }
+
+        sourceReconciliationInFlight = true
+        defer { sourceReconciliationInFlight = false }
+        let incomingRevision = selectedScope.revision
+        var request = incomingRequest
+
+        while true {
+            // Join the previous crawl before removing its coverage checkpoint. No retired worker can recreate
+            // old cache or checkpoint state after cleanup.
+            await stopPrefetchAndWait()
+
+            if let pending = pendingSourceReconciliation,
+                pending.selectedScope.revision >= request.selectedScope.revision
+            {
+                request = pending
+                pendingSourceReconciliation = nil
+            }
+
+            // Reconciliation can unlink many encrypted blobs after a source is removed. Keep that bounded local
+            // maintenance off this actor so visible thumbnail requests remain responsive while it completes.
+            let cache = self.cache
+            let retentionScope = request.retentionScope
+            let cacheResult = await Task.detached(priority: .utility) {
+                cache.reconcile(with: retentionScope)
+            }.value
+
+            if let pending = pendingSourceReconciliation,
+                pending.selectedScope.revision > request.selectedScope.revision
+            {
+                request = pending
+                pendingSourceReconciliation = nil
+                continue
+            }
+            if pendingSourceReconciliation?.selectedScope.revision == request.selectedScope.revision {
+                pendingSourceReconciliation = nil
+            }
+            switch cacheResult {
+            case .unbound, .staleScope:
+                resumeSourceReconciliationWaiters(
+                    processedRevision: request.selectedScope.revision,
+                    result: cacheResult
+                )
+                return incomingRevision == request.selectedScope.revision ? cacheResult : .staleScope
+            case .deferred, .reconciled, .ioFailure:
+                break
+            }
+
+            lastSelectedScope = request.selectedScope
+            lastAnalysisScope = request.analysisScope
+            lastRetentionScope = request.retentionScope
+
+            // Join first, then remove only plaintext which left the visible projection. The source and cache
+            // fences already reject a cancellation-ignoring loader, so retained tiles stay immediately usable.
+            decoded.retainOnly(request.selectedScope.uids)
+            checkpointPresent.removeAll(keepingCapacity: true)
+            checkpointHints.removeAll(keepingCapacity: true)
+            pendingCheckpointUpdates.removeAll(keepingCapacity: true)
+            unfetchable.removeAll()
+            visibleDiskDemand.cancelAll()
+            diskProbeBatchesInFlight = 0
+            sequential = []
+            sequentialIndex = 0
+            resetGenerationStatistics()
+
+            guard lastSelectedScope?.revision == request.selectedScope.revision else {
+                if let pendingSourceReconciliation {
+                    request = pendingSourceReconciliation
+                    self.pendingSourceReconciliation = nil
+                    continue
+                }
+                resumeSourceReconciliationWaiters(
+                    processedRevision: request.selectedScope.revision,
+                    result: .staleScope
+                )
+                return .staleScope
+            }
+
+            if prefetchEnabled, !request.analysisScope.orderedUIDs.isEmpty {
+                let selectedUIDs = request.selectedScope.uids
+                var orderedUIDs = request.selectedScope.orderedUIDs
+                var seen = Set(orderedUIDs)
+                orderedUIDs.append(
+                    contentsOf: request.analysisScope.orderedUIDs.filter { seen.insert($0).inserted }
+                )
+                await startPrefetch(
+                    orderedUIDs,
+                    reporting: selectedUIDs,
+                    requiringSourceRevision: request.analysisScope.revision
+                )
+            }
+
+            if let pending = pendingSourceReconciliation,
+                pending.selectedScope.revision > request.selectedScope.revision
+            {
+                request = pending
+                pendingSourceReconciliation = nil
+                continue
+            }
+            resumeSourceReconciliationWaiters(
+                processedRevision: request.selectedScope.revision,
+                result: cacheResult
+            )
+            return incomingRevision == request.selectedScope.revision ? cacheResult : .staleScope
+        }
+    }
+
+    private func resumeSourceReconciliationWaiters(
+        processedRevision: UInt64,
+        result: MediaCacheReconciliationResult
+    ) {
+        let waiters = sourceReconciliationWaiters
+        sourceReconciliationWaiters.removeAll(keepingCapacity: true)
+        for waiter in waiters {
+            waiter.continuation.resume(
+                returning: waiter.revision == processedRevision ? result : .staleScope
+            )
+        }
+    }
+
+    private func resetGenerationStatistics() {
+        prefetchCompleted = 0
+        prefetchFailed = 0
+        prefetchFailedTimeout = 0
+        prefetchFailedBatchError = 0
+        prefetchFailedItemError = 0
+        prefetchFailedUnreported = 0
+        prefetchDiskHit = 0
+        prefetchDownloadStarted = 0
+        prefetchDownloadCompleted = 0
+        prefetchDecodeStarted = 0
+        prefetchDecodeCompleted = 0
+        skippedUnfetchable = 0
+        lastErrors.removeAll(keepingCapacity: true)
+    }
+
+    private func isReportedForPrefetch(_ uid: PhotoUID) -> Bool {
+        prefetchReportingUIDs?.contains(uid) ?? true
+    }
+
+    private func reportedCount(in uids: [PhotoUID]) -> Int {
+        guard let prefetchReportingUIDs else { return uids.count }
+        return uids.reduce(into: 0) { count, uid in
+            if prefetchReportingUIDs.contains(uid) { count += 1 }
+        }
     }
 
     public func setPrefetchEnabled(_ enabled: Bool) {
@@ -1232,6 +1605,8 @@ public actor ThumbnailFeedCore {
         public let lastErrors: [String]
         public let cacheSizeBytes: Int64
         public let diskFileCount: Int
+        public let ramDecodedCount: Int
+        public let ramDecodedBytes: Int
         public let activeJobs: Int
         public let completed: Int
         public let failed: Int
@@ -1253,6 +1628,11 @@ public actor ThumbnailFeedCore {
 
     public func prefetchStatus() -> PrefetchStatus {
         let coverage = diskPresence.coverage()
+        let decodedMetrics = decoded.metrics()
+        let reportedSequentialRemaining = sequential.dropFirst(min(sequentialIndex, sequential.count)).reduce(into: 0) {
+            count, uid in
+            if isReportedForPrefetch(uid) { count += 1 }
+        }
         let pausedReason: String
         if !prefetchEnabled {
             pausedReason = "disabled"
@@ -1267,12 +1647,14 @@ public actor ThumbnailFeedCore {
             diskThumbnailCoverageFraction: coverage.percent,
             diskThumbnailTotal: coverage.total,
             diskCoverageVerified: coverageSettled,
-            currentQueueLength: priority.count + max(0, sequential.count - sequentialIndex),
+            currentQueueLength: priority.count + reportedSequentialRemaining,
             downloadsInFlight: downloadInFlight,
             decodesInFlight: decodeInFlight,
             lastErrors: lastErrors,
             cacheSizeBytes: 0,
             diskFileCount: coverage.present,
+            ramDecodedCount: decodedMetrics.entryCount,
+            ramDecodedBytes: decodedMetrics.byteCost,
             activeJobs: downloadInFlight + decodeInFlight,
             completed: prefetchCompleted,
             failed: prefetchFailed,
@@ -1285,7 +1667,7 @@ public actor ThumbnailFeedCore {
             downloadCompleted: prefetchDownloadCompleted,
             decodeStarted: prefetchDecodeStarted,
             decodeCompleted: prefetchDecodeCompleted,
-            unfetchableCount: unfetchable.count,
+            unfetchableCount: unfetchable.count(intersecting: prefetchReportingUIDs),
             skippedUnfetchable: skippedUnfetchable,
             pausedReason: pausedReason
         )
@@ -1377,7 +1759,7 @@ public actor ThumbnailFeedCore {
             if Task.isCancelled { return }
             activeDownloaders += 1
             downloadInFlight += chunk.count
-            prefetchDownloadStarted += chunk.count
+            prefetchDownloadStarted += reportedCount(in: chunk)
             diagnostics.recordNetworkRequestDuringPinch()
             guard ownerLeaseIsCurrent() else { return }
             let writerGeneration = cache.captureWriterGeneration()
@@ -1408,34 +1790,37 @@ public actor ThumbnailFeedCore {
             }
             guard generation == prefetchGeneration, ownerLeaseIsCurrent() else { return }
             let completed = snapshot.delivered.count
-            prefetchCompleted += completed
-            prefetchDownloadCompleted += completed
+            let reportedDelivered = snapshot.delivered.filter(isReportedForPrefetch)
+            prefetchCompleted += reportedDelivered.count
+            prefetchDownloadCompleted += reportedDelivered.count
             recordCheckpointPresent(Array(snapshot.delivered), writerGeneration: writerGeneration)
             let undelivered = chunk.filter { !snapshot.delivered.contains($0) }
-            prefetchFailed += undelivered.count
+            let reportedUndelivered = undelivered.filter(isReportedForPrefetch)
+            prefetchFailed += reportedUndelivered.count
             var networkSuspect = false  // batch/timeout/unreported failures point at transport, not content
             switch snapshot.resolution {
             case .timedOut:
-                prefetchFailedTimeout += undelivered.count
+                prefetchFailedTimeout += reportedUndelivered.count
                 networkSuspect = true
                 recordError(
                     "thumbnail batch timed out after \(configuration.downloadTimeoutSeconds)s (\(completed)/\(chunk.count) delivered)"
                 )
             case .finished(let result):
                 if let batchError = result.batchError {
-                    prefetchFailedBatchError += undelivered.count
+                    prefetchFailedBatchError += reportedUndelivered.count
                     networkSuspect = true
                     recordError("thumbnail batch failed (\(completed)/\(chunk.count) delivered): \(batchError)")
                 } else if !undelivered.isEmpty {
                     let refused = undelivered.filter { result.itemErrors[$0] != nil }
-                    prefetchFailedItemError += refused.count
+                    prefetchFailedItemError += refused.filter(isReportedForPrefetch).count
                     unfetchable.formUnion(refused)
                     if let first = refused.first, let reason = result.itemErrors[first] {
                         recordError(
                             "thumbnail refused for \(refused.count) item(s), e.g. \(Self.key(first)): \(reason)")
                     }
                     let unreported = undelivered.count - refused.count
-                    prefetchFailedUnreported += unreported
+                    let reportedUnreported = reportedUndelivered.filter { result.itemErrors[$0] == nil }.count
+                    prefetchFailedUnreported += reportedUnreported
                     if unreported > 0 {
                         networkSuspect = true
                         recordError("thumbnail batch missing \(unreported)/\(chunk.count) with no reported reason")
@@ -1620,7 +2005,7 @@ public actor ThumbnailFeedCore {
             let itemPriority = priorityByUID.removeValue(forKey: uid) ?? .idleLibraryCrawl
             batchPriority = min(batchPriority, itemPriority)
             if unfetchable.contains(uid) {
-                skippedUnfetchable += 1
+                if isReportedForPrefetch(uid) { skippedUnfetchable += 1 }
                 continue
             }
             // Priority work always revalidates. A durable checkpoint can outlive an evicted or corrupt cache
@@ -1662,7 +2047,7 @@ public actor ThumbnailFeedCore {
             let uid = sequential[sequentialIndex]
             sequentialIndex += 1
             if unfetchable.contains(uid) {
-                skippedUnfetchable += 1
+                if isReportedForPrefetch(uid) { skippedUnfetchable += 1 }
                 continue
             }
             if checkpointPresent.contains(uid) {
@@ -1670,7 +2055,7 @@ public actor ThumbnailFeedCore {
                     return BatchWork()
                 }
                 diskPresence.set(uid, present: true)
-                prefetchDiskHit += 1
+                if isReportedForPrefetch(uid) { prefetchDiskHit += 1 }
                 continue
             }
             guard reserved.insert(uid).inserted else { continue }
@@ -1703,7 +2088,7 @@ public actor ThumbnailFeedCore {
             diskPresence.set(probe.uid, present: probe.usable)
             if probe.usable {
                 diskHits.append(probe.uid)
-                prefetchDiskHit += 1
+                if isReportedForPrefetch(probe.uid) { prefetchDiskHit += 1 }
             } else {
                 diskMisses.append(probe.uid)
             }
@@ -1749,7 +2134,7 @@ public actor ThumbnailFeedCore {
             diskPresence.set(probe.uid, present: probe.usable)
             if probe.usable {
                 hits.append(probe.uid)
-                prefetchDiskHit += 1
+                if isReportedForPrefetch(probe.uid) { prefetchDiskHit += 1 }
             } else {
                 misses.append(probe.uid)
             }
@@ -2163,7 +2548,16 @@ public actor ThumbnailFeedCore {
     }
 
     private func storeDecoded(_ image: DecodedThumbnail, for uid: PhotoUID, decodePixelCap: Int) {
+        guard ownerLeaseIsCurrent(), selectedAuthorization.isAllowed(uid) else { return }
         decoded.set(image, for: uid, decodePixelCap: decodePixelCap)
+        guard ownerLeaseIsCurrent() else {
+            decoded.removeAll()
+            return
+        }
+        guard selectedAuthorization.isAllowed(uid) else {
+            decoded.remove(uid)
+            return
+        }
         onDecoded(uid, image)
     }
 
@@ -2286,6 +2680,12 @@ struct LatestVisibleDecodeDemand {
 
     var pendingCount: Int { pending.count }
     var activeCount: Int { active.count }
+
+    mutating func cancelAll() {
+        pending.removeAll(keepingCapacity: false)
+        active.removeAll(keepingCapacity: false)
+        desired.removeAll(keepingCapacity: false)
+    }
 
     mutating func replace(with jobs: [Job], generation newGeneration: UInt64) -> Bool {
         guard newGeneration >= generation else { return false }
@@ -2501,6 +2901,13 @@ private final class UnfetchableThumbnailBox: @unchecked Sendable {
 
     var count: Int {
         lock.withLock { ids.count }
+    }
+
+    func count(intersecting allowed: Set<PhotoUID>?) -> Int {
+        lock.withLock {
+            guard let allowed else { return ids.count }
+            return ids.intersection(allowed).count
+        }
     }
 
     func contains(_ uid: PhotoUID) -> Bool {

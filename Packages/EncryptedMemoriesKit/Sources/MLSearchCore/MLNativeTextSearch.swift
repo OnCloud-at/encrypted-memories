@@ -223,6 +223,17 @@ public protocol MLNativeSearchServing: Sendable {
     func indexQuantum(
         assets: [MLPipelineAssetRevision],
         libraryGeneration: UInt64,
+        allowsDestructiveReconciliation: Bool,
+        maximumAssets: Int,
+        maximumConcurrentAssets: Int,
+        shouldContinue: @escaping @Sendable () -> Bool,
+        observer: MLDerivedPipelineObserver
+    ) async -> MLDerivedPipelinePassOutcome
+    func indexQuantum(
+        assets: [MLPipelineAssetRevision],
+        libraryGeneration: UInt64,
+        allowsDestructiveReconciliation: Bool,
+        destructiveReconciliationIsAuthorized: @escaping @Sendable () async -> Bool,
         maximumAssets: Int,
         maximumConcurrentAssets: Int,
         shouldContinue: @escaping @Sendable () -> Bool,
@@ -241,6 +252,31 @@ public extension MLNativeSearchServing {
     func indexQuantum(
         assets: [MLPipelineAssetRevision],
         libraryGeneration: UInt64,
+        allowsDestructiveReconciliation: Bool,
+        destructiveReconciliationIsAuthorized: @escaping @Sendable () async -> Bool,
+        maximumAssets: Int,
+        maximumConcurrentAssets: Int,
+        shouldContinue: @escaping @Sendable () -> Bool,
+        observer: MLDerivedPipelineObserver
+    ) async -> MLDerivedPipelinePassOutcome {
+        // Legacy conformers cannot revalidate after their awaited work. Keep them additive until
+        // they implement this requirement and can enforce the fence at their deletion boundary.
+        _ = destructiveReconciliationIsAuthorized
+        return await indexQuantum(
+            assets: assets,
+            libraryGeneration: libraryGeneration,
+            allowsDestructiveReconciliation: false,
+            maximumAssets: maximumAssets,
+            maximumConcurrentAssets: maximumConcurrentAssets,
+            shouldContinue: shouldContinue,
+            observer: observer
+        )
+    }
+
+    func indexQuantum(
+        assets: [MLPipelineAssetRevision],
+        libraryGeneration: UInt64,
+        allowsDestructiveReconciliation: Bool,
         maximumAssets: Int,
         maximumConcurrentAssets: Int,
         shouldContinue: @escaping @Sendable () -> Bool,
@@ -275,6 +311,14 @@ public actor MLNativeSearchRuntime: MLNativeSearchServing {
     private let executor: any MLDerivedPipelineExecutor
     private let runnerConfiguration: MLIndexRunner.Configuration
     private var preparedLibraryGeneration: UInt64?
+    private var lastKnownProgress = MLDerivedPipelineProgress(
+        total: 0,
+        completed: 0,
+        skipped: 0,
+        permanentFailure: 0,
+        retryPending: 0,
+        generation: 0
+    )
 
     public init(
         configuration: MLNativeSearchConfiguration,
@@ -313,6 +357,7 @@ public actor MLNativeSearchRuntime: MLNativeSearchServing {
     public func indexQuantum(
         assets: [MLPipelineAssetRevision],
         libraryGeneration: UInt64,
+        allowsDestructiveReconciliation: Bool = true,
         maximumAssets: Int,
         maximumConcurrentAssets: Int,
         shouldContinue: @escaping @Sendable () -> Bool,
@@ -321,6 +366,30 @@ public actor MLNativeSearchRuntime: MLNativeSearchServing {
         await index(
             assets: assets,
             libraryGeneration: libraryGeneration,
+            allowsDestructiveReconciliation: allowsDestructiveReconciliation,
+            destructiveReconciliationIsAuthorized: { true },
+            maximumAssets: maximumAssets,
+            maximumConcurrentAssets: maximumConcurrentAssets,
+            shouldContinue: shouldContinue,
+            observer: observer
+        )
+    }
+
+    public func indexQuantum(
+        assets: [MLPipelineAssetRevision],
+        libraryGeneration: UInt64,
+        allowsDestructiveReconciliation: Bool,
+        destructiveReconciliationIsAuthorized: @escaping @Sendable () async -> Bool,
+        maximumAssets: Int,
+        maximumConcurrentAssets: Int,
+        shouldContinue: @escaping @Sendable () -> Bool,
+        observer: MLDerivedPipelineObserver
+    ) async -> MLDerivedPipelinePassOutcome {
+        await index(
+            assets: assets,
+            libraryGeneration: libraryGeneration,
+            allowsDestructiveReconciliation: allowsDestructiveReconciliation,
+            destructiveReconciliationIsAuthorized: destructiveReconciliationIsAuthorized,
             maximumAssets: maximumAssets,
             maximumConcurrentAssets: maximumConcurrentAssets,
             shouldContinue: shouldContinue,
@@ -331,6 +400,8 @@ public actor MLNativeSearchRuntime: MLNativeSearchServing {
     private func index(
         assets: [MLPipelineAssetRevision],
         libraryGeneration: UInt64?,
+        allowsDestructiveReconciliation: Bool = true,
+        destructiveReconciliationIsAuthorized: @escaping @Sendable () async -> Bool = { true },
         maximumAssets: Int?,
         maximumConcurrentAssets: Int? = nil,
         shouldContinue: @escaping @Sendable () -> Bool,
@@ -340,7 +411,7 @@ public actor MLNativeSearchRuntime: MLNativeSearchServing {
             guard store.enqueue(assets, for: configuration.executionKey) else {
                 return MLDerivedPipelinePassOutcome(
                     reason: .storageFailure,
-                    progress: store.progress(for: configuration.executionKey)
+                    progress: readProgressOrLast()
                 )
             }
             preparedLibraryGeneration = libraryGeneration
@@ -361,7 +432,16 @@ public actor MLNativeSearchRuntime: MLNativeSearchServing {
             shouldContinue: shouldContinue,
             observer: observer
         )
-        guard outcome.reason == .drained, outcome.progress.isComplete else { return outcome }
+        // The runner's initial-read fallback carries the storage-failure reason but no trustworthy
+        // counts. Keep the last successful snapshot until SQLite can be read again.
+        if outcome.reason != .storageFailure {
+            lastKnownProgress = outcome.progress
+        }
+        guard allowsDestructiveReconciliation,
+            outcome.reason == .drained,
+            outcome.progress.isComplete
+        else { return outcome }
+        guard await destructiveReconciliationIsAuthorized() else { return outcome }
         guard
             store.reconcile(
                 liveUIDs: Set(assets.map(\.uid)),
@@ -370,12 +450,19 @@ public actor MLNativeSearchRuntime: MLNativeSearchServing {
         else {
             return MLDerivedPipelinePassOutcome(
                 reason: .storageFailure,
-                progress: store.progress(for: configuration.executionKey)
+                progress: readProgressOrLast()
             )
         }
+        guard let progress = try? store.progress(for: configuration.executionKey) else {
+            return MLDerivedPipelinePassOutcome(
+                reason: .storageFailure,
+                progress: lastKnownProgress
+            )
+        }
+        lastKnownProgress = progress
         return MLDerivedPipelinePassOutcome(
             reason: .drained,
-            progress: store.progress(for: configuration.executionKey)
+            progress: progress
         )
     }
 
@@ -386,7 +473,7 @@ public actor MLNativeSearchRuntime: MLNativeSearchServing {
     }
 
     public func progress() -> MLDerivedPipelineProgress {
-        store.progress(for: configuration.executionKey)
+        readProgressOrLast()
     }
 
     public func unavailableAssetUIDs() -> Set<PhotoUID> {
@@ -402,6 +489,14 @@ public actor MLNativeSearchRuntime: MLNativeSearchServing {
 
     public func shutdown() {
         store.close()
+    }
+
+    private func readProgressOrLast() -> MLDerivedPipelineProgress {
+        guard let progress = try? store.progress(for: configuration.executionKey) else {
+            return lastKnownProgress
+        }
+        lastKnownProgress = progress
+        return progress
     }
 }
 

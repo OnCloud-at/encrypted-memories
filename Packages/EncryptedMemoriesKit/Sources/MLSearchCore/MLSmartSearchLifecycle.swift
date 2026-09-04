@@ -139,6 +139,14 @@ public actor MLSmartSearchLifecycle {
     private var libraryGeneration: UInt64 = 0
     private var semanticIndexedLibraryGeneration: UInt64?
     private var nativeIndexedLibraryGeneration: UInt64?
+    /// Last authoritative inventory whose semantic store reconciliation committed. The snapshot
+    /// shares its immutable UID buffer with the source universe, so retaining it does not copy the
+    /// library. A new descriptor or source epoch deliberately falls back to one durable store scan.
+    private var semanticReconciliationBaseline:
+        (
+            descriptor: MLModelDescriptor,
+            inventory: MLAssetInventorySnapshot
+        )?
     private var lastEmittedDownloadFraction: Double = -1
     private var lastCatalogRefreshAt: ContinuousClock.Instant?
     private var catalogRefreshInProgress = false
@@ -674,6 +682,10 @@ public actor MLSmartSearchLifecycle {
             throw MLSmartSearchQueryError.unavailable
         }
         let generation = sessionGeneration
+        let initialInventory = await deps.assetsProvider()
+        guard generation == sessionGeneration, !isShutDown else {
+            throw MLSmartSearchQueryError.staleEpoch
+        }
         let results = try await deps.resourceCoordinator.withHeavyPermit(
             LibraryWorkRequest(workload: .mlInference, intent: .interactive, memoryClass: .small)
         ) { _ in
@@ -682,7 +694,17 @@ public actor MLSmartSearchLifecycle {
         guard generation == sessionGeneration else {
             throw MLSmartSearchQueryError.staleEpoch
         }
-        return results
+        let currentInventory = await deps.assetsProvider()
+        guard generation == sessionGeneration, !isShutDown,
+            currentInventory.sourceEpoch == initialInventory.sourceEpoch
+        else { throw MLSmartSearchQueryError.staleEpoch }
+        let allowedUIDs = Set(currentInventory.uids)
+        return MLSearchResults(
+            descriptor: results.descriptor,
+            queryText: results.queryText,
+            results: results.results.filter { allowedUIDs.contains($0.uid) },
+            durationMs: results.durationMs
+        )
     }
 
     public func availableSearchScopes() async -> [MLSearchScope] {
@@ -705,6 +727,11 @@ public actor MLSmartSearchLifecycle {
     ) async throws -> [PhotoUID] {
         guard !isShutDown, persistent.isEnabled, limit > 0 else {
             throw MLSmartSearchQueryError.unavailable
+        }
+        let generation = sessionGeneration
+        let initialInventory = await deps.assetsProvider()
+        guard generation == sessionGeneration, !isShutDown else {
+            throw MLSmartSearchQueryError.staleEpoch
         }
         let semanticRequested = scope == .all || scope == .semantic
         let nativeRequested = scope == .all || scope == .text || scope == .documents || scope == .barcodes
@@ -734,10 +761,16 @@ public actor MLSmartSearchLifecycle {
             }
         }
         guard hasBackend else { throw MLSmartSearchQueryError.unavailable }
-        if scope == .all {
-            return MLSearchRankFusion.interleaved([semanticUIDs, nativeUIDs], limit: limit)
-        }
-        return Array((semanticRequested ? semanticUIDs : nativeUIDs).prefix(limit))
+        let currentInventory = await deps.assetsProvider()
+        guard generation == sessionGeneration, !isShutDown,
+            currentInventory.sourceEpoch == initialInventory.sourceEpoch
+        else { throw MLSmartSearchQueryError.staleEpoch }
+        let allowedUIDs = Set(currentInventory.uids)
+        let ranked =
+            scope == .all
+            ? MLSearchRankFusion.interleaved([semanticUIDs, nativeUIDs], limit: limit)
+            : Array((semanticRequested ? semanticUIDs : nativeUIDs).prefix(limit))
+        return Array(ranked.lazy.filter { allowedUIDs.contains($0) }.prefix(limit))
     }
 
     // MARK: - Activation
@@ -934,10 +967,22 @@ public actor MLSmartSearchLifecycle {
                 previousRevision != nil
                 && (previousRevision != record.revision || previousDescriptor != entry.descriptor)
             if indexInvalidated, let previousDescriptor {
-                store.removeAll(for: previousDescriptor)
+                guard store.removeAll(for: previousDescriptor) else {
+                    await newSession.shutdown()
+                    guard isCurrent(token) else { return }
+                    phase = .failed(
+                        MLSmartSearchFailure(
+                            kind: .storage,
+                            isRetryable: true,
+                            debugDescription: "index epoch cleanup failed"
+                        ))
+                    emit()
+                    return
+                }
                 lastCoverage = MLIndexCoverage(total: 0, indexed: 0, permanentlyUnindexable: 0)
                 semanticUnavailableAssetUIDs = []
                 semanticIndexedLibraryGeneration = nil
+                semanticReconciliationBaseline = nil
             }
             persistent.activatedRevision = record.revision
             persistent.activatedDescriptor = entry.descriptor
@@ -1204,6 +1249,7 @@ public actor MLSmartSearchLifecycle {
 
     private func runIndexingLoop(generation: UInt64) async {
         var scheduledLibraryGeneration: UInt64?
+        var scheduledInventory = MLAssetInventorySnapshot.hydrating
         var scheduledAssets: [PhotoUID] = []
         var scheduledNativeAssets: [MLPipelineAssetRevision] = []
 
@@ -1224,9 +1270,17 @@ public actor MLSmartSearchLifecycle {
                     || nativeIndexedLibraryGeneration != observedLibraryGeneration)
 
             if !semanticNeedsPass, !nativeNeedsPass {
+                let inventory = await deps.assetsProvider()
                 let aggregate = aggregateProgress()
-                indexingState = .ready(aggregate)
-                if session != nil { updatePhaseFromIndexLoop(.ready(lastCoverage)) }
+                indexingState =
+                    inventory.isAuthoritative
+                    ? .ready(aggregate) : .waiting(aggregate)
+                if session != nil {
+                    updatePhaseFromIndexLoop(
+                        inventory.isAuthoritative
+                            ? .ready(lastCoverage) : .waiting(lastCoverage)
+                    )
+                }
                 emit()
                 await waitForKick(timeout: nil, since: observedKickGeneration)
                 continue
@@ -1246,18 +1300,14 @@ public actor MLSmartSearchLifecycle {
 
             if scheduledLibraryGeneration != observedLibraryGeneration {
                 let inventory = await deps.assetsProvider()
-                guard inventory.isAuthoritative else {
-                    if let activeModel {
-                        refreshCoverageFromStoreCount(descriptor: activeModel.entry.descriptor)
-                        updatePhaseFromIndexLoop(.waiting(lastCoverage))
-                    }
-                    if let nativeSearch { lastNativeProgress = await nativeSearch.progress() }
-                    indexingState = .waiting(aggregateProgress())
-                    emit()
-                    await waitForKick(timeout: nil, since: observedKickGeneration)
-                    continue
-                }
+                scheduledInventory = inventory
                 scheduledAssets = inventory.uids
+                // A partial inventory may add vectors but cannot authorize deletion. Its writes are not
+                // represented by the last authoritative delta baseline, so the next complete inventory
+                // must re-establish that baseline from the store exactly once.
+                if !inventory.isAuthoritative {
+                    semanticReconciliationBaseline = nil
+                }
                 scheduledNativeAssets = scheduledAssets.compactMap { uid in
                     try? MLPipelineAssetRevision(
                         uid: uid,
@@ -1272,6 +1322,9 @@ public actor MLSmartSearchLifecycle {
             let nativeOutcome: MLDerivedPipelinePassOutcome?
             var nativeLeaseDecision: LibraryWorkContinuationDecision?
             if nativeNeedsPass, let nativeSearch {
+                let expectedInventory = scheduledInventory
+                let allowsDestructiveReconciliation = expectedInventory.isAuthoritative
+                let assetsProvider = deps.assetsProvider
                 do {
                     let assets = scheduledNativeAssets
                     let maximumAssets = min(
@@ -1300,6 +1353,11 @@ public actor MLSmartSearchLifecycle {
                         let outcome = await nativeSearch.indexQuantum(
                             assets: assets,
                             libraryGeneration: observedLibraryGeneration,
+                            allowsDestructiveReconciliation: allowsDestructiveReconciliation,
+                            destructiveReconciliationIsAuthorized: {
+                                let current = await assetsProvider()
+                                return current.isAuthoritative && current == expectedInventory
+                            },
                             maximumAssets: limit,
                             maximumConcurrentAssets: lease.budget.internalParallelism,
                             shouldContinue: {
@@ -1372,6 +1430,7 @@ public actor MLSmartSearchLifecycle {
             }
 
             var semanticOutcome: MLIndexPassOutcome?
+            var semanticReconciliationFailed = false
             var semanticQuantumLimit: Int?
             var semanticLeaseDecision: LibraryWorkContinuationDecision?
             if semanticNeedsPass,
@@ -1462,19 +1521,49 @@ public actor MLSmartSearchLifecycle {
                 lastCoverage = outcome.coverage
                 semanticUnavailableAssetUIDs = await session.permanentlyUnavailableAssetUIDs(scheduledAssets)
                 if outcome.ranToCompletion {
-                    removeDeletedAssets(current: scheduledAssets, descriptor: activeModel.entry.descriptor)
-                    semanticIndexedLibraryGeneration = observedLibraryGeneration
+                    let currentInventory = await deps.assetsProvider()
+                    if scheduledInventory.isAuthoritative,
+                        currentInventory.isAuthoritative,
+                        currentInventory == scheduledInventory
+                    {
+                        semanticReconciliationFailed = !reconcileSemanticInventory(
+                            scheduledInventory,
+                            descriptor: activeModel.entry.descriptor
+                        )
+                    }
+                    if !semanticReconciliationFailed {
+                        semanticIndexedLibraryGeneration = observedLibraryGeneration
+                    }
                 }
             }
             guard generation == sessionGeneration, !Task.isCancelled else { return }
+
+            if semanticReconciliationFailed {
+                let failure = MLSmartSearchFailure(
+                    kind: .storage,
+                    isRetryable: true,
+                    debugDescription: "semantic reconciliation store unavailable"
+                )
+                indexingState = .failed(failure)
+                emit()
+                await waitForKick(timeout: configuration.indexRetryDelay, since: observedKickGeneration)
+                continue
+            }
 
             let semanticComplete =
                 semanticOutcome.map { $0.ranToCompletion && $0.coverage.isComplete }
                 ?? !semanticNeedsPass
             let nativeComplete = nativeOutcome?.progress.isComplete ?? !nativeNeedsPass
             if semanticComplete && nativeComplete {
-                indexingState = .ready(aggregateProgress())
-                if semanticOutcome != nil { updatePhaseFromIndexLoop(.ready(lastCoverage)) }
+                indexingState =
+                    scheduledInventory.isAuthoritative
+                    ? .ready(aggregateProgress()) : .waiting(aggregateProgress())
+                if semanticOutcome != nil {
+                    updatePhaseFromIndexLoop(
+                        scheduledInventory.isAuthoritative
+                            ? .ready(lastCoverage) : .waiting(lastCoverage)
+                    )
+                }
                 emit()
                 await waitForKick(timeout: nil, since: observedKickGeneration)
             } else if deps.governor.permitsIndexing(),
@@ -1634,12 +1723,51 @@ public actor MLSmartSearchLifecycle {
         phase = newPhase
     }
 
-    /// Drop vectors for assets that no longer exist in the library.
-    private func removeDeletedAssets(current: [PhotoUID], descriptor: MLModelDescriptor) {
-        guard let store = deps.storeProvider.openStore() else { return }
-        let currentSet = Set(current)
-        let deleted = store.allTrackedUIDs(for: descriptor).filter { !currentSet.contains($0) }
-        store.remove(uids: deleted, descriptor: descriptor)
+    /// Reconcile only from a snapshot that stayed authoritative for the completed pass. The first
+    /// pass for a descriptor/source epoch scans persisted keys once; later passes delete the exact
+    /// delta from the last committed inventory.
+    private func reconcileSemanticInventory(
+        _ current: MLAssetInventorySnapshot,
+        descriptor: MLModelDescriptor
+    ) -> Bool {
+        guard current.isAuthoritative, let store = deps.storeProvider.openStore() else { return false }
+
+        let previousUIDs: [PhotoUID]?
+        if let baseline = semanticReconciliationBaseline,
+            baseline.descriptor == descriptor,
+            inventoriesShareOrderedEpoch(baseline.inventory, current)
+        {
+            previousUIDs = baseline.inventory.uids
+        } else {
+            previousUIDs = nil
+        }
+
+        guard
+            store.reconcileTrackedUIDs(
+                currentAuthoritativeUIDs: current.uids,
+                previousAuthoritativeUIDs: previousUIDs,
+                descriptor: descriptor
+            )
+        else { return false }
+        semanticReconciliationBaseline = (descriptor, current)
+        return true
+    }
+
+    private func inventoriesShareOrderedEpoch(
+        _ previous: MLAssetInventorySnapshot,
+        _ current: MLAssetInventorySnapshot
+    ) -> Bool {
+        guard previous.isAuthoritative,
+            previous.sourceEpoch == current.sourceEpoch
+        else { return false }
+        switch (previous.sourceRevision, current.sourceRevision) {
+        case (.none, .none):
+            return true
+        case (.some(let previous), .some(let current)):
+            return current >= previous
+        default:
+            return false
+        }
     }
 
     private func refreshCoverageFromStoreCount(descriptor: MLModelDescriptor) {
@@ -1714,6 +1842,7 @@ public actor MLSmartSearchLifecycle {
         lastCoverage = MLIndexCoverage(total: 0, indexed: 0, permanentlyUnindexable: 0)
         semanticUnavailableAssetUIDs = []
         semanticIndexedLibraryGeneration = nil
+        semanticReconciliationBaseline = nil
     }
 
     private func shutdownNativeSearch() async {
@@ -1748,7 +1877,18 @@ public actor MLSmartSearchLifecycle {
         }
         if let from {
             if let descriptor {
-                deps.storeProvider.openStore()?.removeAll(for: descriptor)
+                guard let store = deps.storeProvider.openStore(),
+                    store.removeAll(for: descriptor)
+                else {
+                    phase = .failed(
+                        MLSmartSearchFailure(
+                            kind: .storage,
+                            isRetryable: true,
+                            debugDescription: "model switch cleanup failed"
+                        ))
+                    emit()
+                    return false
+                }
             }
             if let previousEntry = catalog.entry(for: from) {
                 await deps.installer.uninstall(previousEntry)
@@ -1792,7 +1932,18 @@ public actor MLSmartSearchLifecycle {
 
         if let model {
             if let descriptor {
-                deps.storeProvider.openStore()?.removeAll(for: descriptor)
+                guard let store = deps.storeProvider.openStore(),
+                    store.removeAll(for: descriptor)
+                else {
+                    phase = .failed(
+                        MLSmartSearchFailure(
+                            kind: .storage,
+                            isRetryable: true,
+                            debugDescription: "visual index cleanup failed"
+                        ))
+                    emit()
+                    return false
+                }
             }
             if let entry = catalog.entry(for: model) {
                 await deps.installer.uninstall(entry)

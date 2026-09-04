@@ -20,6 +20,7 @@ let package = Package(
     platforms: [.macOS("26.0"), .iOS("26.0")],
     products: [
         .library(name: "PhotosCore", targets: ["PhotosCore"]),
+        .library(name: "LibrarySourceRuntime", targets: ["LibrarySourceRuntime"]),
         .library(name: "LibraryRuntimeAppleAdapter", targets: ["LibraryRuntimeAppleAdapter"]),
         .library(name: "AppleSecurityCore", targets: ["AppleSecurityCore"]),
         .library(name: "DesignSystemCore", targets: ["DesignSystemCore"]),
@@ -131,6 +132,19 @@ let package = Package(
                 .product(name: "ProtonCoreCryptoPatchedGoImplementation", package: "protoncore_ios"),
             ],
             swiftSettings: sdkBackendSwiftSettings
+        ),
+        .target(
+            name: "LibrarySourceRuntime",
+            dependencies: ["PhotosCore", "ProtonDriveBackend", "MediaFeedCore", "MLSearchCore"],
+            swiftSettings: disableDynamicActorIsolation
+        ),
+        .testTarget(
+            name: "LibrarySourceRuntimeTests",
+            dependencies: [
+                "LibrarySourceRuntime", "PhotosCore", "ProtonDriveBackend", "MediaByteCache", "MediaFeedCore",
+                "MLSearchCore", "AlbumCore",
+            ],
+            swiftSettings: disableDynamicActorIsolation
         ),
         .target(name: "MediaByteCache", dependencies: ["PhotosCore"], swiftSettings: disableDynamicActorIsolation),
         .testTarget(

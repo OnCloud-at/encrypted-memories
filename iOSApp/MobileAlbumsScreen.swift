@@ -202,6 +202,12 @@ private struct MobileSharedAlbumRow: View {
     @Environment(MobileLibraryModel.self) private var model
     let album: SharedAlbumSummary
     @State private var coverImage: UIImage?
+    @State private var loadedCoverUID: PhotoUID?
+
+    private struct CoverLoadKey: Equatable {
+        let uid: PhotoUID?
+        let analysisRevision: UInt64
+    }
 
     private var coverUID: PhotoUID? { album.coverPhotoUID }
 
@@ -245,12 +251,16 @@ private struct MobileSharedAlbumRow: View {
             Spacer()
         }
         .padding(.vertical, 4)
-        .task(id: coverUID) {
-            coverImage = nil
+        .task(id: CoverLoadKey(uid: coverUID, analysisRevision: model.sourceAnalysisRevision)) {
+            if loadedCoverUID != coverUID {
+                coverImage = nil
+                loadedCoverUID = coverUID
+            }
+            guard coverImage == nil else { return }
             guard let coverUID, let feed = model.thumbnailFeed else { return }
             coverImage = feed.memoryImage(for: coverUID)
             if coverImage == nil {
-                coverImage = await feed.image(for: coverUID)
+                coverImage = await feed.analysisImage(for: coverUID)
             }
         }
     }

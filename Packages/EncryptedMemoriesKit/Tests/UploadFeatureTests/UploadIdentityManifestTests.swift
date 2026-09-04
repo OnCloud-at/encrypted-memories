@@ -26,6 +26,29 @@ final class UploadIdentityManifestTests: XCTestCase {
         return url
     }
 
+    private func scalarInteger(at url: URL, sql: String) throws -> Int {
+        var handle: OpaquePointer?
+        guard sqlite3_open_v2(url.path, &handle, SQLITE_OPEN_READONLY, nil) == SQLITE_OK,
+            let handle
+        else {
+            sqlite3_close(handle)
+            throw NSError(domain: "UploadIdentityManifestTests", code: 1)
+        }
+        defer { sqlite3_close(handle) }
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(handle, sql, -1, &statement, nil) == SQLITE_OK,
+            let statement
+        else {
+            sqlite3_finalize(statement)
+            throw NSError(domain: "UploadIdentityManifestTests", code: 2)
+        }
+        defer { sqlite3_finalize(statement) }
+        guard sqlite3_step(statement) == SQLITE_ROW else {
+            throw NSError(domain: "UploadIdentityManifestTests", code: 3)
+        }
+        return Int(sqlite3_column_int64(statement, 0))
+    }
+
     func testSHA1MatchesKnownVector() throws {
         // FIPS 180 test vector: SHA1("abc") = a9993e364706816aba3e25717850c26c9cd0d89d.
         let url = try writeFile("abc.bin", Data("abc".utf8))
@@ -223,7 +246,7 @@ final class UploadIdentityManifestTests: XCTestCase {
         XCTAssertEqual(reopened.record(for: record.source), record)
     }
 
-    func testNewerSchemaFailsClosedByResetting() throws {
+    func testNewerSchemaFailsClosedAndPreservesUploadState() throws {
         let url = tempDir.appendingPathComponent(UploadIdentityManifestStore.databaseFileName)
         do {
             let store = try XCTUnwrap(UploadIdentityManifestStore(url: url))
@@ -237,11 +260,64 @@ final class UploadIdentityManifestTests: XCTestCase {
             sqlite3_exec(handle, "UPDATE manifest_info SET value=99 WHERE key='schema';", nil, nil, nil), SQLITE_OK)
         sqlite3_close(handle)
 
-        let reopened = try XCTUnwrap(UploadIdentityManifestStore(url: url))
-        XCTAssertEqual(reopened.count(), 0, "a newer on-disk schema must reset the (rehashable) manifest")
+        XCTAssertNil(UploadIdentityManifestStore(url: url))
+        XCTAssertEqual(
+            try scalarInteger(at: url, sql: "SELECT value FROM manifest_info WHERE key='schema';"),
+            99
+        )
+        XCTAssertEqual(try scalarInteger(at: url, sql: "SELECT COUNT(*) FROM upload_identity;"), 1)
     }
 
-    func testSchemaSevenMigratesWithoutDiscardingIdentityCache() throws {
+    func testCurrentMarkerWithWrongShapeFailsClosedWithoutDeletingFile() throws {
+        let url = tempDir.appendingPathComponent(UploadIdentityManifestStore.databaseFileName)
+        var handle: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(url.path, &handle), SQLITE_OK)
+        XCTAssertEqual(
+            sqlite3_exec(
+                handle,
+                "CREATE TABLE legacy_identity(value TEXT); "
+                    + "CREATE TABLE manifest_info(key TEXT PRIMARY KEY, value INTEGER NOT NULL); "
+                    + "INSERT INTO manifest_info(key, value) VALUES('schema', 8);",
+                nil,
+                nil,
+                nil
+            ),
+            SQLITE_OK
+        )
+        sqlite3_close(handle)
+
+        XCTAssertNil(UploadIdentityManifestStore(url: url))
+        XCTAssertEqual(
+            try scalarInteger(
+                at: url,
+                sql: "SELECT COUNT(*) FROM sqlite_schema WHERE name='legacy_identity';"
+            ),
+            1
+        )
+    }
+
+    func testMarkerlessExactSchemaFailsClosedWithoutDeletingIdentityRows() throws {
+        let url = tempDir.appendingPathComponent(UploadIdentityManifestStore.databaseFileName)
+        do {
+            let first = try XCTUnwrap(UploadIdentityManifestStore(url: url))
+            first.upsert(makeRecord())
+            XCTAssertEqual(first.count(), 1)
+            first.close()
+        }
+
+        var handle: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(url.path, &handle), SQLITE_OK)
+        XCTAssertEqual(
+            sqlite3_exec(handle, "DELETE FROM manifest_info WHERE key='schema';", nil, nil, nil),
+            SQLITE_OK
+        )
+        sqlite3_close(handle)
+
+        XCTAssertNil(UploadIdentityManifestStore(url: url))
+        XCTAssertEqual(try scalarInteger(at: url, sql: "SELECT COUNT(*) FROM upload_identity;"), 1)
+    }
+
+    func testSchemaSevenFailsClosedWithoutMigrationOrDataLoss() throws {
         let url = tempDir.appendingPathComponent(UploadIdentityManifestStore.databaseFileName)
         let record = makeRecord()
         do {
@@ -267,9 +343,12 @@ final class UploadIdentityManifestTests: XCTestCase {
         XCTAssertEqual(sqlite3_exec(handle, downgrade, nil, nil, nil), SQLITE_OK)
         sqlite3_close(handle)
 
-        let migrated = try XCTUnwrap(UploadIdentityManifestStore(url: url))
-        XCTAssertEqual(migrated.record(for: record.source), record)
-        XCTAssertEqual(migrated.count(), 1)
+        XCTAssertNil(UploadIdentityManifestStore(url: url))
+        XCTAssertEqual(
+            try scalarInteger(at: url, sql: "SELECT value FROM manifest_info WHERE key='schema';"),
+            7
+        )
+        XCTAssertEqual(try scalarInteger(at: url, sql: "SELECT COUNT(*) FROM upload_identity;"), 1)
     }
 
     func testRemoteContentIndexAndCheckpointSurviveReopen() throws {

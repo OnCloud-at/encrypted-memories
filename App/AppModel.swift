@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import LibrarySourceRuntime
 import MLSearchAppleAdapter
 import MLSearchCore
 import MediaByteCache
@@ -47,12 +48,18 @@ final class AppModel {
     /// Bumped after album sync creates or mutates Proton albums. Views use it only to refresh
     /// visible album lists; sync correctness lives in the shared controller.
     private(set) var albumCatalogRevision = 0
+    /// Wakes analysis-only presentation after a source inventory becomes readable.
+    private(set) var sourceAnalysisRevision: UInt64 = 0
     /// Account-scoped Smart Search controller. Lifecycle decisions stay in MLSearchCore.
     private(set) var smartSearch: MLSmartSearchController?
     @ObservationIgnored private var smartSearchMemoryRegistration: MemoryPressureRegistration?
     @ObservationIgnored private let smartSearchAssets = MLAssetUniverse()
     /// The most recent ordered Smart Search shutdown; sign-out awaits it before purging.
     @ObservationIgnored private var smartSearchShutdownTask: Task<Void, Never>?
+    @ObservationIgnored private var sourceAnalysisRuntime: LibrarySourceAnalysisRuntime?
+    @ObservationIgnored private var sourceAnalysisStartupTask: Task<Void, Never>?
+    @ObservationIgnored private var sourceAnalysisShutdownTask: Task<Void, Never>?
+    @ObservationIgnored private var sourcePrimaryInventoryGeneration: UInt64 = 0
     @ObservationIgnored private let signOutBarrier = AccountSignOutBarrier()
     /// Retains the idempotent purge after a failure. The durable marker independently recreates this claim
     /// after process termination, before session bootstrap opens any account-owned store.
@@ -204,6 +211,7 @@ final class AppModel {
         backendTask = nil
         backend = .idle
         let smartSearchShutdown = stopSmartSearch()
+        let sourceAnalysisShutdown = stopSourceAnalysis()
         backupController = nil
         photoBackupScheduler.invalidate()
         photoBackupController = nil
@@ -220,6 +228,7 @@ final class AppModel {
                 },
                 AccountTeardownOwner(id: "shared.smart-search", stage: .smartSearch) {
                     await smartSearchShutdown?.value
+                    await sourceAnalysisShutdown?.value
                 },
                 AccountTeardownOwner(id: "mac.location-crawl", stage: .locationCrawl) {
                     await OfflineLibraryManager.shared.stopForAccountTeardown()
@@ -300,6 +309,7 @@ final class AppModel {
         let photoBackup = photoBackupController
         let albumSync = albumSyncController
         let smartSearchShutdown = stopSmartSearch()
+        let sourceAnalysisShutdown = stopSourceAnalysis()
         let policy = ProtonDriveBackendPolicy.standard(
             libraryDatabasePolicy: ProtonDriveBackendPolicy.desktopLibraryDatabasePolicy
         )
@@ -326,6 +336,7 @@ final class AppModel {
                 },
                 AccountTeardownOwner(id: "mac.scope-recovery.smart-search", stage: .smartSearch) {
                     await smartSearchShutdown?.value
+                    await sourceAnalysisShutdown?.value
                 },
                 AccountTeardownOwner(id: "mac.scope-recovery.folder-backup", stage: .folderBackup) {
                     await folderBackup?.shutdown()
@@ -393,18 +404,71 @@ final class AppModel {
         return task
     }
 
+    @discardableResult
+    private func stopSourceAnalysis() -> Task<Void, Never>? {
+        smartSearchAssets.invalidateSourceSession()
+        let runtime = sourceAnalysisRuntime
+        sourceAnalysisRuntime = nil
+        let startup = sourceAnalysisStartupTask
+        sourceAnalysisStartupTask = nil
+        guard runtime != nil || startup != nil else { return sourceAnalysisShutdownTask }
+        startup?.cancel()
+        let previous = sourceAnalysisShutdownTask
+        let task = Task {
+            await previous?.value
+            await startup?.value
+            await runtime?.shutdown()
+        }
+        sourceAnalysisShutdownTask = task
+        return task
+    }
+
     /// Creates the account-scoped Smart Search lifecycle after the feed and timeline are available.
     /// Lifecycle decisions remain in the shared Core actor.
     func configureSmartSearch(
         feedCore: ThumbnailFeedCore,
-        assetUIDs: [PhotoUID]
+        primaryItems: [PhotoItem],
+        primaryAuthority: SourceInventoryAuthority
     ) {
+        guard let session = authController.currentSession, let facade else { return }
+        sourcePrimaryInventoryGeneration &+= 1
+        let primaryGeneration = sourcePrimaryInventoryGeneration
+        if sourceAnalysisRuntime == nil {
+            let runtime = LibrarySourceAnalysisRuntime(
+                coordinator: facade.librarySources,
+                feed: feedCore,
+                assets: smartSearchAssets,
+                onAssetsChanged: { [weak self] in
+                    Task { @MainActor [weak self] in
+                        guard let self else { return }
+                        self.sourceAnalysisRevision &+= 1
+                        self.smartSearch?.noteLibraryChanged()
+                    }
+                }
+            )
+            sourceAnalysisRuntime = runtime
+            let previousShutdown = sourceAnalysisShutdownTask
+            sourceAnalysisStartupTask = Task {
+                await previousShutdown?.value
+                _ = await runtime.start(
+                    primaryItems: primaryItems,
+                    authority: primaryAuthority,
+                    generation: primaryGeneration
+                )
+            }
+        } else if let sourceAnalysisRuntime {
+            Task {
+                await sourceAnalysisRuntime.replacePrimaryInventory(
+                    primaryItems,
+                    authority: primaryAuthority,
+                    generation: primaryGeneration
+                )
+            }
+        }
+
         guard AppleSmartSearchBootstrap.featureAvailability() == .available,
-            smartSearch == nil,
-            let session = authController.currentSession,
-            let facade
+            smartSearch == nil
         else { return }
-        smartSearchAssets.publishAuthoritative(assetUIDs)
         #if DEBUG
             let allowsDeveloperModels = true
         #else
@@ -437,9 +501,25 @@ final class AppModel {
         }
     }
 
-    func updateSmartSearchAssets(_ uids: [PhotoUID]) {
-        guard smartSearchAssets.publishAuthoritative(uids) else { return }
-        smartSearch?.noteLibraryChanged()
+    func updateSmartSearchAssets(
+        _ items: [PhotoItem],
+        authority: SourceInventoryAuthority
+    ) {
+        guard let sourceAnalysisRuntime else { return }
+        sourcePrimaryInventoryGeneration &+= 1
+        let primaryGeneration = sourcePrimaryInventoryGeneration
+        Task {
+            await sourceAnalysisRuntime.replacePrimaryInventory(
+                items,
+                authority: authority,
+                generation: primaryGeneration
+            )
+        }
+    }
+
+    func refreshLibrarySources() {
+        guard let sourceAnalysisRuntime else { return }
+        Task { await sourceAnalysisRuntime.refresh() }
     }
 
     private func prepareBackend(_ session: ProtonSession) {
@@ -447,6 +527,7 @@ final class AppModel {
         backendTask?.cancel()
         libraryReady = false
         stopSmartSearch()
+        stopSourceAnalysis()
         // Install the per-account encrypted-cache key derived from the restored session before the grid
         // renders or the crawl begins.
         OfflineLibraryManager.shared.configure(session: session)

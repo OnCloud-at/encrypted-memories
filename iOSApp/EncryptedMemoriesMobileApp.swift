@@ -327,6 +327,10 @@ private struct MobileMainTabView: View {
                     viewerRouter: viewerRouter
                 )
             }
+            .onChange(of: networkMonitor.didRecentlyRestoreConnection) { _, restored in
+                guard restored else { return }
+                libraryModel.refreshLibrarySources()
+            }
     }
 }
 

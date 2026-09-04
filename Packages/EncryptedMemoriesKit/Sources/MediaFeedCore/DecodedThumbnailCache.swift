@@ -4,6 +4,10 @@ import PhotosCore
 
 /// Thread-safe LRU cache keyed by photo ID and evicted by decoded byte count.
 final class DecodedThumbnailCache: @unchecked Sendable {
+    struct Metrics: Sendable, Equatable {
+        let entryCount: Int
+        let byteCost: Int
+    }
     private final class Node {
         let uid: PhotoUID
         var image: DecodedThumbnail
@@ -97,6 +101,27 @@ final class DecodedThumbnailCache: @unchecked Sendable {
         evictToBudget(keeping: nil)
     }
 
+    func remove(_ uid: PhotoUID) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let node = map.removeValue(forKey: uid) else { return }
+        unlink(node)
+        totalCost -= node.cost
+    }
+
+    /// Drops only entries which no longer belong to the visible projection.
+    /// Source refreshes preserve every still-valid decoded tile and avoid a full-grid re-decode.
+    func retainOnly(_ allowedUIDs: Set<PhotoUID>) {
+        lock.lock()
+        defer { lock.unlock() }
+        let removed = map.keys.filter { !allowedUIDs.contains($0) }
+        for uid in removed {
+            guard let node = map.removeValue(forKey: uid) else { continue }
+            unlink(node)
+            totalCost -= node.cost
+        }
+    }
+
     func removeAll() {
         lock.lock()
         defer { lock.unlock() }
@@ -104,6 +129,12 @@ final class DecodedThumbnailCache: @unchecked Sendable {
         head = nil
         tail = nil
         totalCost = 0
+    }
+
+    func metrics() -> Metrics {
+        lock.lock()
+        defer { lock.unlock() }
+        return Metrics(entryCount: map.count, byteCost: totalCost)
     }
 
     // MARK: - LRU List

@@ -56,6 +56,8 @@ targets:
       - package: EncryptedMemoriesKit
         product: ProtonDriveBackend
       - package: EncryptedMemoriesKit
+        product: LibrarySourceRuntime
+      - package: EncryptedMemoriesKit
         product: MediaCache
       - package: EncryptedMemoriesKit
         product: MediaByteCache
@@ -132,6 +134,8 @@ targets:
         product: ProtonAuth
       - package: EncryptedMemoriesKit
         product: ProtonDriveBackend
+      - package: EncryptedMemoriesKit
+        product: LibrarySourceRuntime
       - package: EncryptedMemoriesKit
         product: DesignSystemCore
       - package: EncryptedMemoriesKit

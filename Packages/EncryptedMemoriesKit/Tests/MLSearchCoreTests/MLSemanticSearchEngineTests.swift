@@ -51,6 +51,17 @@ import Testing
         }
         func allIndexedUIDs(for descriptor: MLModelDescriptor) -> [PhotoUID] { backing.allIndexedUIDs(for: descriptor) }
         func allTrackedUIDs(for descriptor: MLModelDescriptor) -> [PhotoUID] { backing.allTrackedUIDs(for: descriptor) }
+        func reconcileTrackedUIDs(
+            currentAuthoritativeUIDs: [PhotoUID],
+            previousAuthoritativeUIDs: [PhotoUID]?,
+            descriptor: MLModelDescriptor
+        ) -> Bool {
+            backing.reconcileTrackedUIDs(
+                currentAuthoritativeUIDs: currentAuthoritativeUIDs,
+                previousAuthoritativeUIDs: previousAuthoritativeUIDs,
+                descriptor: descriptor
+            )
+        }
         func allRecords(for descriptor: MLModelDescriptor) -> [MLEmbeddingRecord] {
             backing.allRecords(for: descriptor)
         }
@@ -75,7 +86,9 @@ import Testing
         func remove(uids: [PhotoUID], descriptor: MLModelDescriptor) {
             backing.remove(uids: uids, descriptor: descriptor)
         }
-        func removeAll(for descriptor: MLModelDescriptor) { backing.removeAll(for: descriptor) }
+        func removeAll(for descriptor: MLModelDescriptor) -> Bool {
+            backing.removeAll(for: descriptor)
+        }
         func count(for descriptor: MLModelDescriptor) -> Int { backing.count(for: descriptor) }
         func generation(for descriptor: MLModelDescriptor) -> UInt64 { backing.generation(for: descriptor) }
         func recordFailures(_ records: [MLIndexFailureRecord]) -> Bool { backing.recordFailures(records) }

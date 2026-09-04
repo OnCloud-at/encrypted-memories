@@ -13,8 +13,8 @@ import SQLite3
 public final class SQLiteMLIndexStore: MLIndexStore, @unchecked Sendable {
     public static let databaseFileName = "ml-search-index-v1.sqlite"
 
-    // Version 4 stores epoch counts so progress and reservations avoid full-vector scans.
-    private static let schemaVersion: Int32 = 4
+    // Derived state never migrates. Version 5 forces one clean rebuild for the source-aware inventory cut.
+    private static let schemaVersion: Int32 = 5
     private static let membershipChunkSize = 200
     /// The one precision this build writes and reads. Rows with any other precision are
     /// invisible (skipped by the epoch-read predicate), never misinterpreted.
@@ -177,82 +177,56 @@ public final class SQLiteMLIndexStore: MLIndexStore, @unchecked Sendable {
 
     public func remove(uids: [PhotoUID], descriptor: MLModelDescriptor) {
         guard !uids.isEmpty else { return }
-        lock.withLock {
-            guard sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK else { return }
-            var embeddingStmt: OpaquePointer?
-            guard
-                sqlite3_prepare_v2(
-                    db,
-                    "DELETE FROM ml_embeddings WHERE model_identifier=? AND model_version=? AND volume_id=? AND node_id=?;",
-                    -1, &embeddingStmt, nil
-                ) == SQLITE_OK
-            else {
-                sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
-                return
-            }
-            defer { sqlite3_finalize(embeddingStmt) }
-            var failureStmt: OpaquePointer?
-            guard
-                sqlite3_prepare_v2(
-                    db,
-                    "DELETE FROM ml_failures WHERE model_identifier=? AND model_version=? AND volume_id=? AND node_id=?;",
-                    -1, &failureStmt, nil
-                ) == SQLITE_OK
-            else {
-                sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
-                return
-            }
-            defer { sqlite3_finalize(failureStmt) }
-
-            var vectorsChanged = false
-            for uid in Set(uids) {
-                sqlite3_reset(embeddingStmt)
-                sqlite3_clear_bindings(embeddingStmt)
-                bindDescriptor(embeddingStmt, descriptor)
-                bindText(embeddingStmt, 3, uid.volumeID)
-                bindText(embeddingStmt, 4, uid.nodeID)
-                guard sqlite3_step(embeddingStmt) == SQLITE_DONE else {
-                    sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
-                    return
-                }
-                vectorsChanged = sqlite3_changes(db) > 0 || vectorsChanged
-
-                sqlite3_reset(failureStmt)
-                sqlite3_clear_bindings(failureStmt)
-                bindDescriptor(failureStmt, descriptor)
-                bindText(failureStmt, 3, uid.volumeID)
-                bindText(failureStmt, 4, uid.nodeID)
-                guard sqlite3_step(failureStmt) == SQLITE_DONE else {
-                    sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
-                    return
-                }
-            }
-
-            guard !vectorsChanged || bumpGenerationLocked(for: descriptor),
-                sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK
-            else {
-                sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
-                return
-            }
-        }
+        lock.withLock { _ = removeTrackedUIDsLocked(uids, descriptor: descriptor) }
     }
 
-    public func removeAll(for descriptor: MLModelDescriptor) {
+    @discardableResult
+    public func removeAll(for descriptor: MLModelDescriptor) -> Bool {
         lock.withLock {
-            var stmt: OpaquePointer?
+            guard db != nil,
+                sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK
+            else { return false }
+
+            var embeddings: OpaquePointer?
+            var failures: OpaquePointer?
             guard
                 sqlite3_prepare_v2(
                     db,
                     "DELETE FROM ml_embeddings WHERE model_identifier=? AND model_version=?;",
-                    -1, &stmt, nil
+                    -1, &embeddings, nil
+                ) == SQLITE_OK,
+                sqlite3_prepare_v2(
+                    db,
+                    "DELETE FROM ml_failures WHERE model_identifier=? AND model_version=?;",
+                    -1, &failures, nil
                 ) == SQLITE_OK
-            else { return }
-            defer { sqlite3_finalize(stmt) }
-            bindDescriptor(stmt, descriptor)
-            if sqlite3_step(stmt) == SQLITE_DONE, sqlite3_changes(db) > 0 {
-                bumpGenerationLocked(for: descriptor)
+            else {
+                sqlite3_finalize(embeddings)
+                sqlite3_finalize(failures)
+                sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
+                return false
             }
-            deleteFailuresLocked(for: descriptor)
+            defer {
+                sqlite3_finalize(embeddings)
+                sqlite3_finalize(failures)
+            }
+
+            bindDescriptor(embeddings, descriptor)
+            guard sqlite3_step(embeddings) == SQLITE_DONE else {
+                sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
+                return false
+            }
+            let removedEmbeddings = sqlite3_changes(db)
+
+            bindDescriptor(failures, descriptor)
+            guard sqlite3_step(failures) == SQLITE_DONE,
+                removedEmbeddings == 0 || bumpGenerationLocked(for: descriptor),
+                sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK
+            else {
+                sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
+                return false
+            }
+            return true
         }
     }
 
@@ -351,32 +325,27 @@ public final class SQLiteMLIndexStore: MLIndexStore, @unchecked Sendable {
     }
 
     public func allTrackedUIDs(for descriptor: MLModelDescriptor) -> [PhotoUID] {
-        lock.withLock {
-            var stmt: OpaquePointer?
-            guard
-                sqlite3_prepare_v2(
-                    db,
-                    """
-                    SELECT volume_id, node_id FROM ml_embeddings
-                    WHERE model_identifier=? AND model_version=?
-                      AND embedding_dimension=? AND embedding_precision=?
-                    UNION
-                    SELECT volume_id, node_id FROM ml_failures
-                    WHERE model_identifier=? AND model_version=?
-                    ORDER BY volume_id, node_id;
-                    """,
-                    -1, &stmt, nil
-                ) == SQLITE_OK
-            else { return [] }
-            defer { sqlite3_finalize(stmt) }
-            bindEpochRead(stmt, descriptor)
-            bindText(stmt, 5, descriptor.identifier)
-            sqlite3_bind_int64(stmt, 6, Int64(descriptor.version))
-            var uids: [PhotoUID] = []
-            while sqlite3_step(stmt) == SQLITE_ROW {
-                uids.append(PhotoUID(volumeID: columnText(stmt, 0), nodeID: columnText(stmt, 1)))
+        lock.withLock { allTrackedUIDsLocked(for: descriptor) ?? [] }
+    }
+
+    @discardableResult
+    public func reconcileTrackedUIDs(
+        currentAuthoritativeUIDs: [PhotoUID],
+        previousAuthoritativeUIDs: [PhotoUID]?,
+        descriptor: MLModelDescriptor
+    ) -> Bool {
+        let current = Set(currentAuthoritativeUIDs)
+        return lock.withLock {
+            let baseline: [PhotoUID]
+            if let previousAuthoritativeUIDs {
+                baseline = previousAuthoritativeUIDs
+            } else if let stored = allTrackedUIDsLocked(for: descriptor) {
+                baseline = stored
+            } else {
+                return false
             }
-            return uids
+            let removed = baseline.filter { !current.contains($0) }
+            return removeTrackedUIDsLocked(removed, descriptor: descriptor)
         }
     }
 
@@ -728,27 +697,28 @@ public final class SQLiteMLIndexStore: MLIndexStore, @unchecked Sendable {
 
     // MARK: - Open / schema
 
-    private static func openVerified(url: URL, policy: LibraryDatabasePolicy) -> OpaquePointer? {
-        if let handle = openOnce(url: url, policy: policy) { return handle }
-        for suffix in ["", "-wal", "-shm"] {
-            try? FileManager.default.removeItem(at: URL(fileURLWithPath: url.path + suffix))
-        }
-        return openOnce(url: url, policy: policy)
+    private enum OpenResult {
+        case opened(OpaquePointer)
+        case incompatible
+        case failed
     }
 
-    private static func openOnce(url: URL, policy: LibraryDatabasePolicy) -> OpaquePointer? {
-        var handle: OpaquePointer?
-        guard sqlite3_open(url.path, &handle) == SQLITE_OK else {
-            sqlite3_close(handle)
+    private static func openVerified(url: URL, policy: LibraryDatabasePolicy) -> OpaquePointer? {
+        switch openOnce(url: url, policy: policy) {
+        case .opened(let handle):
+            return handle
+        case .failed:
+            return nil
+        case .incompatible:
+            guard destroyDatabaseFiles(at: url) else { return nil }
+            if case .opened(let handle) = openOnce(url: url, policy: policy) {
+                return handle
+            }
             return nil
         }
-        sqlite3_exec(handle, "PRAGMA journal_mode=WAL;", nil, nil, nil)
-        sqlite3_exec(handle, "PRAGMA synchronous=NORMAL;", nil, nil, nil)
-        sqlite3_exec(handle, "PRAGMA busy_timeout=\(policy.busyTimeoutMs);", nil, nil, nil)
-        sqlite3_exec(handle, "PRAGMA cache_size=-\(max(0, policy.cacheSizeKiB));", nil, nil, nil)
-        sqlite3_exec(handle, "PRAGMA mmap_size=\(max(0, policy.mmapBytes));", nil, nil, nil)
-        sqlite3_exec(handle, "PRAGMA journal_size_limit=\(policy.journalSizeLimitBytes);", nil, nil, nil)
+    }
 
+    private static func openOnce(url: URL, policy: LibraryDatabasePolicy) -> OpenResult {
         let schema = """
             CREATE TABLE IF NOT EXISTS ml_embeddings(
               volume_id           TEXT NOT NULL,
@@ -807,28 +777,195 @@ public final class SQLiteMLIndexStore: MLIndexStore, @unchecked Sendable {
               DELETE FROM ml_embedding_count WHERE count=0;
             END;
             """
-        guard sqlite3_exec(handle, schema, nil, nil, nil) == SQLITE_OK,
-            verifyAndStampVersion(handle)
+
+        let compatibility = SQLiteStoreSchemaGate.compatibility(
+            at: url,
+            schemaSQL: schema,
+            busyTimeoutMs: policy.busyTimeoutMs,
+            versionIsCurrent: verifyVersion
+        )
+        guard compatibility != .incompatible else { return .incompatible }
+        guard compatibility != .unavailable else { return .failed }
+        var handle: OpaquePointer?
+        let flags =
+            SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX
+            | (compatibility == .empty ? SQLITE_OPEN_CREATE : 0)
+        guard sqlite3_open_v2(url.path, &handle, flags, nil) == SQLITE_OK,
+            let handle
         else {
             sqlite3_close(handle)
-            return nil
+            return .failed
         }
-        return handle
+        sqlite3_busy_timeout(handle, Int32(clamping: policy.busyTimeoutMs))
+        switch compatibility {
+        case .empty:
+            SQLiteStoreSchemaGate.configureConnection(handle, policy: policy)
+            guard
+                SQLiteStoreSchemaGate.initializeCurrentSchema(
+                    handle,
+                    schemaSQL: schema,
+                    stamp: { stampVersion(handle) }
+                )
+            else {
+                sqlite3_close(handle)
+                return .failed
+            }
+        case .current:
+            guard verifyVersion(handle),
+                SQLiteStoreSchemaGate.matchesCurrentSchema(handle, schemaSQL: schema)
+            else {
+                sqlite3_close(handle)
+                return .incompatible
+            }
+            SQLiteStoreSchemaGate.configureConnection(handle, policy: policy)
+        case .incompatible:
+            sqlite3_close(handle)
+            return .incompatible
+        case .unavailable:
+            sqlite3_close(handle)
+            return .failed
+        }
+        return .opened(handle)
     }
 
-    private static func verifyAndStampVersion(_ handle: OpaquePointer?) -> Bool {
+    private static func verifyVersion(_ handle: OpaquePointer?) -> Bool {
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(handle, "PRAGMA user_version;", -1, &stmt, nil) == SQLITE_OK else { return false }
         defer { sqlite3_finalize(stmt) }
         guard sqlite3_step(stmt) == SQLITE_ROW else { return false }
-        let version = sqlite3_column_int(stmt, 0)
-        if version == 0 {
-            return sqlite3_exec(handle, "PRAGMA user_version=\(schemaVersion);", nil, nil, nil) == SQLITE_OK
+        return sqlite3_column_int(stmt, 0) == schemaVersion
+    }
+
+    private static func stampVersion(_ handle: OpaquePointer?) -> Bool {
+        sqlite3_exec(handle, "PRAGMA user_version=\(schemaVersion);", nil, nil, nil) == SQLITE_OK
+    }
+
+    private static func destroyDatabaseFiles(at url: URL) -> Bool {
+        guard !url.hasDirectoryPath else { return false }
+        for suffix in ["", "-wal", "-shm"] {
+            let target = URL(fileURLWithPath: url.path + suffix)
+            guard FileManager.default.fileExists(atPath: target.path) else { continue }
+            do {
+                try FileManager.default.removeItem(at: target)
+            } catch {
+                return false
+            }
         }
-        return version == schemaVersion
+        return true
     }
 
     // MARK: - Helpers (lock held)
+
+    private func allTrackedUIDsLocked(for descriptor: MLModelDescriptor) -> [PhotoUID]? {
+        guard db != nil else { return nil }
+        var stmt: OpaquePointer?
+        guard
+            sqlite3_prepare_v2(
+                db,
+                """
+                SELECT volume_id, node_id FROM ml_embeddings
+                WHERE model_identifier=? AND model_version=?
+                  AND embedding_dimension=? AND embedding_precision=?
+                UNION
+                SELECT volume_id, node_id FROM ml_failures
+                WHERE model_identifier=? AND model_version=?
+                ORDER BY volume_id, node_id;
+                """,
+                -1, &stmt, nil
+            ) == SQLITE_OK
+        else { return nil }
+        defer { sqlite3_finalize(stmt) }
+        bindEpochRead(stmt, descriptor)
+        bindText(stmt, 5, descriptor.identifier)
+        sqlite3_bind_int64(stmt, 6, Int64(descriptor.version))
+
+        var uids: [PhotoUID] = []
+        while true {
+            switch sqlite3_step(stmt) {
+            case SQLITE_ROW:
+                uids.append(PhotoUID(volumeID: columnText(stmt, 0), nodeID: columnText(stmt, 1)))
+            case SQLITE_DONE:
+                return uids
+            default:
+                return nil
+            }
+        }
+    }
+
+    /// Removes tracked state in bounded SQL statements and one transaction. The caller holds `lock`.
+    private func removeTrackedUIDsLocked(
+        _ uids: [PhotoUID],
+        descriptor: MLModelDescriptor
+    ) -> Bool {
+        let uniqueUIDs = Array(Set(uids))
+        guard !uniqueUIDs.isEmpty else { return true }
+        guard db != nil, sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK else {
+            return false
+        }
+
+        guard
+            let removedEmbeddings = deleteUIDRowsLocked(
+                uniqueUIDs,
+                table: "ml_embeddings",
+                descriptor: descriptor
+            ),
+            deleteUIDRowsLocked(
+                uniqueUIDs,
+                table: "ml_failures",
+                descriptor: descriptor
+            ) != nil,
+            removedEmbeddings == 0 || bumpGenerationLocked(for: descriptor),
+            sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK
+        else {
+            sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
+            return false
+        }
+        return true
+    }
+
+    /// Deletes UID rows in bounded chunks. Only fixed internal table names are accepted.
+    private func deleteUIDRowsLocked(
+        _ uids: [PhotoUID],
+        table: String,
+        descriptor: MLModelDescriptor
+    ) -> Int? {
+        guard table == "ml_embeddings" || table == "ml_failures" else { return nil }
+        var totalChanges = 0
+        var start = 0
+        while start < uids.count {
+            let end = min(start + Self.membershipChunkSize, uids.count)
+            let chunk = uids[start..<end]
+            start = end
+            let placeholders = Array(repeating: "(?,?)", count: chunk.count).joined(separator: ",")
+            var stmt: OpaquePointer?
+            guard
+                sqlite3_prepare_v2(
+                    db,
+                    """
+                    DELETE FROM \(table)
+                    WHERE model_identifier=? AND model_version=?
+                      AND (volume_id, node_id) IN (VALUES \(placeholders));
+                    """,
+                    -1, &stmt, nil
+                ) == SQLITE_OK
+            else { return nil }
+
+            bindDescriptor(stmt, descriptor)
+            var index: Int32 = 3
+            for uid in chunk {
+                bindText(stmt, index, uid.volumeID)
+                bindText(stmt, index + 1, uid.nodeID)
+                index += 2
+            }
+            let result = sqlite3_step(stmt)
+            if result == SQLITE_DONE {
+                totalChanges += Int(sqlite3_changes(db))
+            }
+            sqlite3_finalize(stmt)
+            guard result == SQLITE_DONE else { return nil }
+        }
+        return totalChanges
+    }
 
     private func countLocked(for descriptor: MLModelDescriptor) -> Int {
         var stmt: OpaquePointer?
@@ -904,20 +1041,6 @@ public final class SQLiteMLIndexStore: MLIndexStore, @unchecked Sendable {
         defer { sqlite3_finalize(stmt) }
         bindDescriptor(stmt, descriptor)
         return sqlite3_step(stmt) == SQLITE_DONE
-    }
-
-    private func deleteFailuresLocked(for descriptor: MLModelDescriptor) {
-        var stmt: OpaquePointer?
-        guard
-            sqlite3_prepare_v2(
-                db,
-                "DELETE FROM ml_failures WHERE model_identifier=? AND model_version=?;",
-                -1, &stmt, nil
-            ) == SQLITE_OK
-        else { return }
-        defer { sqlite3_finalize(stmt) }
-        bindDescriptor(stmt, descriptor)
-        _ = sqlite3_step(stmt)
     }
 
     private func bindDescriptor(_ stmt: OpaquePointer?, _ descriptor: MLModelDescriptor) {

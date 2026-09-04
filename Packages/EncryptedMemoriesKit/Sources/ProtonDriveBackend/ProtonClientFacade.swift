@@ -18,6 +18,8 @@ struct UploadIdentityResolverComposition: Sendable {
 public final class ProtonClientFacade {
     /// Existing timeline/thumbnail/download/etc. surface (unchanged).
     public let backend: any PhotosBackend
+    /// Neutral multi-source inventory and source-fenced thumbnail route for derived-data consumers.
+    public let librarySources: LibrarySourceCoordinator
     /// Album listing and writes through the shared AlbumCore facade.
     public let albums: AlbumsRepository
     /// Upload queue/state-machine.
@@ -46,6 +48,7 @@ public final class ProtonClientFacade {
 
     private init(
         backend: any PhotosBackend,
+        librarySources: LibrarySourceCoordinator,
         albums: AlbumsRepository,
         uploads: UploadManager,
         uploadCoordinator: UploadCoordinator,
@@ -58,6 +61,7 @@ public final class ProtonClientFacade {
         shutdownHandler: @Sendable @escaping () async -> Void
     ) {
         self.backend = backend
+        self.librarySources = librarySources
         self.albums = albums
         self.uploads = uploads
         self.uploadCoordinator = uploadCoordinator
@@ -72,6 +76,7 @@ public final class ProtonClientFacade {
 
     static func make(
         bridge: DriveSDKBridge,
+        librarySources: LibrarySourceCoordinator,
         identityComposition: UploadIdentityResolverComposition,
         settlementStore: UploadManualSettlementStore?
     ) -> ProtonClientFacade {
@@ -108,7 +113,10 @@ public final class ProtonClientFacade {
         )
         let albumsRepo = AlbumsRepository(
             catalogBackend: albumCatalog,
-            writeBackend: albumWrites
+            writeBackend: albumWrites,
+            didLeaveSharedAlbum: { album in
+                await librarySources.revokeAdditionalSource(for: album)
+            }
         )
 
         // Uploads: pure manager over the SDK uploader (the bridge) + the album-attaching shim +
@@ -137,6 +145,7 @@ public final class ProtonClientFacade {
 
         return ProtonClientFacade(
             backend: bridge,
+            librarySources: librarySources,
             albums: albumsRepo,
             uploads: manager,
             uploadCoordinator: coordinator,
@@ -150,6 +159,7 @@ public final class ProtonClientFacade {
             ),
             accountInfoRefresher: { try await bridge.refreshAccountInfo() },
             shutdownHandler: {
+                await librarySources.shutdown()
                 await manager.shutdown()
                 // Bridge shutdown closes shared admission and joins backend, album, sync, upload,
                 // and identity work before any account-scoped resolver store is closed.

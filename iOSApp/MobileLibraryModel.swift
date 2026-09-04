@@ -1,6 +1,7 @@
 import AlbumCore
 import AlbumsFeature
 import Foundation
+import LibrarySourceRuntime
 import MLSearchAppleAdapter
 import MLSearchCore
 import MediaByteCache
@@ -264,12 +265,20 @@ final class MobileLibraryModel {
     private let uploadRefreshCoordinator = TimelineUploadRefreshCoordinator()
     private var applicationIsActive = true
     private(set) var isRefreshingLibrary = false
+    /// Wakes analysis-only presentation after a source inventory becomes readable.
+    private(set) var sourceAnalysisRevision: UInt64 = 0
     @ObservationIgnored private var smartSearchMemoryRegistration: MemoryPressureRegistration?
     @ObservationIgnored private let smartSearchAssets = MLAssetUniverse()
+    @ObservationIgnored private var primaryInventoryAuthority: SourceInventoryAuthority = .hydrating
     @ObservationIgnored private var pendingTimelineRemovals = Set<PhotoUID>()
     @ObservationIgnored private var timelineMutationGeneration = 0
     /// The most recent ordered Smart Search shutdown; teardown awaits it before the sign-out purge.
     @ObservationIgnored private var smartSearchShutdownTask: Task<Void, Never>?
+    @ObservationIgnored private var sourceAnalysisRuntime: LibrarySourceAnalysisRuntime?
+    @ObservationIgnored private var sourceAnalysisStartupTask: Task<Void, Never>?
+    @ObservationIgnored private var sourceAnalysisActivityTask: Task<Void, Never>?
+    @ObservationIgnored private var sourceAnalysisShutdownTask: Task<Void, Never>?
+    @ObservationIgnored private var sourcePrimaryInventoryGeneration: UInt64 = 0
     /// Coalesces repeated retry taps into one ordered transient retirement and one replacement load.
     @ObservationIgnored private var retryTask: Task<Void, Never>?
     /// Coalesces terminal Drive scope recovery. This path keeps authentication but purges all lost-scope data.
@@ -643,6 +652,15 @@ final class MobileLibraryModel {
         } else {
             Task { await libraryChangeMonitor.stop() }
         }
+        if let sourceAnalysisRuntime {
+            let previous = sourceAnalysisActivityTask
+            let task = Task {
+                await previous?.value
+                guard !Task.isCancelled else { return }
+                await sourceAnalysisRuntime.setActive(active)
+            }
+            sourceAnalysisActivityTask = task
+        }
     }
 
     /// Local upload completion is authoritative enough to refresh immediately; repeated signals coalesce.
@@ -670,6 +688,14 @@ final class MobileLibraryModel {
     /// visible instead of turning a temporary network problem into an app-level error.
     func refreshAccountInfo() async {
         try? await facade?.refreshAccountInfo()
+        await sourceAnalysisRuntime?.refresh()
+    }
+
+    /// Coalesces source discovery with any active refresh. Callers use this after connectivity or
+    /// catalog change signals and do not delay the primary timeline refresh on secondary metadata.
+    func refreshLibrarySources() {
+        guard let sourceAnalysisRuntime else { return }
+        Task { await sourceAnalysisRuntime.refresh() }
     }
 
     /// Called when the grid first draws a fully populated frame to lift the loading UI.
@@ -877,6 +903,29 @@ final class MobileLibraryModel {
         }
     }
 
+    private func configureSourceAnalysis(client: ProtonClientFacade, feed: UIKitThumbnailFeed) {
+        guard sourceAnalysisRuntime == nil else { return }
+        let runtime = LibrarySourceAnalysisRuntime(
+            coordinator: client.librarySources,
+            feed: feed.feedCore,
+            assets: smartSearchAssets,
+            initiallyActive: applicationIsActive,
+            onAssetsChanged: { [weak self] in
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    self.sourceAnalysisRevision &+= 1
+                    self.smartSearch?.noteLibraryChanged()
+                }
+            }
+        )
+        sourceAnalysisRuntime = runtime
+        let previousShutdown = sourceAnalysisShutdownTask
+        sourceAnalysisStartupTask = Task {
+            await previousShutdown?.value
+            _ = await runtime.start()
+        }
+    }
+
     /// Stops Smart Search and returns a task that completes after all prior shutdowns and the current
     /// lifecycle shutdown finish.
     @discardableResult
@@ -893,6 +942,29 @@ final class MobileLibraryModel {
             await lifecycle.shutdown()
         }
         smartSearchShutdownTask = task
+        return task
+    }
+
+    @discardableResult
+    private func stopSourceAnalysis() -> Task<Void, Never>? {
+        smartSearchAssets.invalidateSourceSession()
+        let runtime = sourceAnalysisRuntime
+        sourceAnalysisRuntime = nil
+        let startup = sourceAnalysisStartupTask
+        sourceAnalysisStartupTask = nil
+        let activity = sourceAnalysisActivityTask
+        sourceAnalysisActivityTask = nil
+        guard runtime != nil || startup != nil || activity != nil else { return sourceAnalysisShutdownTask }
+        startup?.cancel()
+        activity?.cancel()
+        let previous = sourceAnalysisShutdownTask
+        let task = Task {
+            await previous?.value
+            await activity?.value
+            await startup?.value
+            await runtime?.shutdown()
+        }
+        sourceAnalysisShutdownTask = task
         return task
     }
 
@@ -914,6 +986,7 @@ final class MobileLibraryModel {
         let activeLocationCrawl = locationCrawl
         let activeLocationCrawlStarter = locationCrawlStartTask
         let smartSearchShutdown = stopSmartSearch()
+        let sourceAnalysisShutdown = stopSourceAnalysis()
 
         if advanceLoadToken { loadToken &+= 1 }
         activeLoadTask?.cancel()
@@ -937,6 +1010,7 @@ final class MobileLibraryModel {
         locationInventoryTask = nil
         isRefreshingLibrary = false
         initialLibraryLoadSettled = false
+        primaryInventoryAuthority = .hydrating
         backend = nil
         facade = nil
         albumActions = nil
@@ -962,6 +1036,7 @@ final class MobileLibraryModel {
                 },
                 smartSearch: {
                     await smartSearchShutdown?.value
+                    await sourceAnalysisShutdown?.value
                 },
                 locationCrawl: {
                     await activeLocationCrawlStarter?.value
@@ -1027,6 +1102,7 @@ final class MobileLibraryModel {
         let activeThumbnailUpdateTask = thumbnailUpdateCoordinator.cancel()
         isRefreshingLibrary = false
         initialLibraryLoadSettled = false
+        primaryInventoryAuthority = .hydrating
         configuredUID = nil
         session = nil
         cacheContext = nil
@@ -1046,6 +1122,7 @@ final class MobileLibraryModel {
         timelineRevision &+= 1
         thumbnailFeed = nil
         let smartSearchShutdown = stopSmartSearch()
+        let sourceAnalysisShutdown = stopSourceAnalysis()
         thumbnailCache = nil
         originalsCache = nil
         loadState = .initial
@@ -1071,6 +1148,7 @@ final class MobileLibraryModel {
             },
             AccountTeardownOwner(id: "shared.smart-search", stage: .smartSearch) {
                 await smartSearchShutdown?.value
+                await sourceAnalysisShutdown?.value
             },
             AccountTeardownOwner(id: "mobile.location-crawl", stage: .locationCrawl) {
                 await activeLocationCrawlStarter?.value
@@ -1163,6 +1241,7 @@ final class MobileLibraryModel {
         thumbnailUpdateCoordinator.cancel()
         isRefreshingLibrary = false
         initialLibraryLoadSettled = false
+        primaryInventoryAuthority = .hydrating
         configuredUID = session.uid
         backend = nil
         facade = nil
@@ -1180,6 +1259,7 @@ final class MobileLibraryModel {
         }
         thumbnailFeed = nil
         stopSmartSearch()
+        stopSourceAnalysis()
         loadState = .preparingInventory
 
         let cacheContext = LocalMediaCacheContext(accountUID: session.uid, keyPassword: session.keyPassword)
@@ -1228,7 +1308,7 @@ final class MobileLibraryModel {
                 let backend = client.backend
                 let feed = UIKitThumbnailFeed(
                     cache: cache,
-                    loader: backend,
+                    loader: client.librarySources,
                     dimensions: PhotoDimensionCoalescer(store: backend),
                     targetPixels: 288
                 )
@@ -1300,6 +1380,7 @@ final class MobileLibraryModel {
                 }
                 // The live feed's RAM tiers (UIImage wrappers + decoded core) respond to pressure tiers.
                 UIKitMemoryPressureCoordinator.shared.attachFeed(feed)
+                self.configureSourceAnalysis(client: client, feed: feed)
                 self.configureSmartSearch(session: session, client: client, feed: feed)
                 // Show the persisted snapshot while Core validates its event token. A match avoids row
                 // enumeration; a mismatch falls back to the authoritative load.
@@ -1330,6 +1411,10 @@ final class MobileLibraryModel {
                         throw TimelineCacheValidationTerminalError()
                     }
                     if case .validated(let token) = cacheValidation {
+                        publishSmartSearchInventory(
+                            snapshot.items,
+                            authority: .authoritative
+                        )
                         apply(.authoritativeInventoryResolved(count: items.count, requiresNewFrame: false))
                         initialLibraryLoadSettled = true
                         startLibraryChangeMonitorIfPossible(
@@ -1412,12 +1497,17 @@ final class MobileLibraryModel {
         let requiresNewFrame =
             prepared.snapshot.items.lazy.map(\.uid).elementsEqual(snapshot.items.lazy.map(\.uid)) == false
         let changed = prepared.snapshot != snapshot
+        if authoritative {
+            primaryInventoryAuthority = .authoritative
+        } else if cached, primaryInventoryAuthority != .authoritative {
+            primaryInventoryAuthority = .cached
+        }
         if changed {
             publish(prepared, locationInventoryChanged: requiresNewFrame)
         } else {
             // An empty complete timeline is still authoritative. Publish readiness even when its
             // value equals the launch placeholder so Smart Search can distinguish it from hydration.
-            publishSmartSearchInventory(prepared.uids)
+            publishSmartSearchInventory(prepared.snapshot.items)
         }
         if authoritative {
             apply(
@@ -1448,7 +1538,7 @@ final class MobileLibraryModel {
         if locationInventoryChanged {
             locationInventoryRevision &+= 1
         }
-        publishSmartSearchInventory(projection.uids)
+        publishSmartSearchInventory(projection.snapshot.items)
         if locationCrawlStarted,
             locationCrawlInventoryRevision != locationInventoryRevision,
             locationIndex.scanProgress.phase == .completed || locationIndex.scanProgress.phase == .failed
@@ -1458,9 +1548,26 @@ final class MobileLibraryModel {
         }
     }
 
-    private func publishSmartSearchInventory(_ uids: [PhotoUID]) {
-        guard smartSearchAssets.publishAuthoritative(uids) else { return }
-        smartSearch?.noteLibraryChanged()
+    private func publishSmartSearchInventory(
+        _ items: [PhotoItem],
+        authority: SourceInventoryAuthority? = nil
+    ) {
+        if let authority,
+            primaryInventoryAuthority != .authoritative || authority == .authoritative
+        {
+            primaryInventoryAuthority = authority
+        }
+        guard let sourceAnalysisRuntime else { return }
+        let primaryInventoryAuthority = self.primaryInventoryAuthority
+        sourcePrimaryInventoryGeneration &+= 1
+        let primaryGeneration = sourcePrimaryInventoryGeneration
+        Task {
+            await sourceAnalysisRuntime.replacePrimaryInventory(
+                items,
+                authority: primaryInventoryAuthority,
+                generation: primaryGeneration
+            )
+        }
     }
 
     private func startLibraryChangeMonitorIfPossible(
@@ -1528,7 +1635,7 @@ final class MobileLibraryModel {
             try Task.checkCancellation()
             try requireCurrentMutation(refreshLease)
             let previousUIDs = items.map(\.uid)
-            let changed = await applyItems(refreshed, cached: false)
+            let changed = await applyItems(refreshed, cached: false, authoritative: true)
             try requireCurrentMutation(refreshLease)
             if let thumbnailFeed {
                 if changed {
@@ -1539,6 +1646,7 @@ final class MobileLibraryModel {
             // The same opaque server event token covers album mutations. Reuse this central foreground
             // refresh instead of adding a second poller; Collections reloads through its existing revision key.
             albumCatalogRevision &+= 1
+            refreshLibrarySources()
             return .init(outcome: .refreshed, failureReason: nil)
         } catch is CancellationError {
             return .init(outcome: .retry, failureReason: .cancelled)

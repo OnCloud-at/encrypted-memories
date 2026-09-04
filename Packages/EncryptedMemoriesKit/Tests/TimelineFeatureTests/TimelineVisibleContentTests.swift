@@ -242,6 +242,7 @@ import TimelineCore
         #expect(enrichedModel.allItems == [enriched])
         #expect(enrichedModel.contentRevision == 2)
         #expect(enrichedModel.wholeLibraryRevision == 1)
+        #expect(enrichedModel.wholeLibraryContentRevision == 2)
         #expect(
             enrichedModel.gridSourceRevision == 2,
             "same UID order must keep the already-rendered Metal grid generation")
