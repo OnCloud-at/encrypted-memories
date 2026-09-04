@@ -44,6 +44,8 @@ jobs:
           ruby .github/scripts/test_app_store_connect.rb
           ruby -c .github/scripts/release_contract.rb
           ruby .github/scripts/test_release_contract.rb
+          ruby -c .github/scripts/release_build_number.rb
+          ruby .github/scripts/test_release_build_number.rb
 
       - name: Resolve published release
         id: release
@@ -63,6 +65,15 @@ jobs:
             exit 1
           }
 
+      - name: Resolve release build number
+        id: build
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          release_sha="$(git rev-parse --verify "refs/tags/$RELEASE_TAG^{commit}")"
+          ruby .github/scripts/release_build_number.rb "$release_sha"
+
       - name: Promote existing builds to external TestFlight
         env:
           APP_STORE_CONNECT_APP_ID: ${{ vars.APP_STORE_CONNECT_APP_ID }}
@@ -71,7 +82,7 @@ jobs:
           APP_STORE_CONNECT_PRIVATE_KEY_BASE64: ${{ secrets.APP_STORE_CONNECT_PRIVATE_KEY_BASE64 }}
           BETA_GROUP_NAME: ${{ vars.TESTFLIGHT_EXTERNAL_GROUP_NAME }}
           RELEASE_VERSION: ${{ steps.release.outputs.version }}
-          RELEASE_BUILD_NUMBER: ${{ steps.release.outputs.build_number }}
+          RELEASE_BUILD_NUMBER: ${{ steps.build.outputs.build_number }}
         run: |
           set -euo pipefail
           beta_group_name="${BETA_GROUP_NAME:-External Testers}"

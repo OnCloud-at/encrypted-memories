@@ -93,6 +93,18 @@ module AppStoreConnect
     }
   end
 
+  def build_history_filters(app_id:, platform:, version: nil)
+    filters = {
+      "filter[app]" => app_id,
+      "filter[preReleaseVersion.platform]" => platform,
+      "filter[buildAudienceType]" => "APP_STORE_ELIGIBLE",
+      "fields[builds]" => "version",
+      "limit" => "200"
+    }
+    filters["filter[preReleaseVersion.version]"] = version if version
+    filters
+  end
+
   def beta_group_payload(app_id:, name:, internal:)
     {
       data: {
@@ -372,6 +384,31 @@ module AppStoreConnect
       @in_app_purchase_contract_path = in_app_purchase_contract_path
       @sleeper = sleeper
       @monotonic_clock = monotonic_clock
+    end
+
+    def validate_build_number(version:, build_number:)
+      candidate = normalized_build_number(build_number)
+      PLATFORMS.each do |platform|
+        existing = find_build(platform: platform, version: version, build_number: build_number)
+        if existing
+          state = existing.dig("attributes", "processingState") || "UNKNOWN"
+          raise Error, "Apple already rejected #{platform} build #{version} (#{build_number})" if
+            %w[FAILED INVALID].include?(state)
+
+          next
+        end
+
+        comparison_version = platform == "IOS" ? version : nil
+        highest = highest_build_number(platform: platform, version: comparison_version)
+        next unless highest
+        next if compare_build_numbers(candidate, highest).positive?
+
+        scope = platform == "IOS" ? "for version #{version}" : "across all macOS versions"
+        raise Error,
+              "#{platform} build #{build_number} must be greater than existing build #{highest} #{scope}"
+      end
+      append_summary("Validated Apple build number #{build_number} for iOS and macOS.")
+      true
     end
 
     def inspect_build(platform:, version:, build_number:)
@@ -843,6 +880,36 @@ module AppStoreConnect
       raise Error, "Apple returned more than one #{platform} build for #{version} (#{build_number})" if builds.length > 1
 
       builds.first
+    end
+
+    def highest_build_number(platform:, version: nil)
+      raise Error, "Unsupported platform #{platform}" unless PLATFORMS.include?(platform)
+
+      builds = @client.collection(
+        "/v1/builds",
+        query: AppStoreConnect.build_history_filters(
+          app_id: @app_id,
+          platform: platform,
+          version: version
+        )
+      )
+      builds.map { |build| normalized_build_number(build.dig("attributes", "version")) }
+        .max { |left, right| compare_build_numbers(left, right) }
+    end
+
+    def normalized_build_number(value)
+      text = value.to_s
+      unless /\A(?:0|[1-9][0-9]*)(?:\.(?:0|[1-9][0-9]*)){0,2}\z/.match?(text)
+        raise Error, "Unsupported Apple build number #{text.inspect}"
+      end
+
+      text
+    end
+
+    def compare_build_numbers(left, right)
+      left_components = left.split(".").map(&:to_i).fill(0, left.count(".") + 1...3)
+      right_components = right.split(".").map(&:to_i).fill(0, right.count(".") + 1...3)
+      left_components <=> right_components
     end
 
     def require_valid_builds(version:, build_number:)
@@ -1588,6 +1655,11 @@ module AppStoreConnect
           platform: required_option(options, :platform),
           version: version,
           build_number: build_number
+        )
+      when "validate-build-number"
+        manager.validate_build_number(
+          version: required_option(options, :version),
+          build_number: required_option(options, :build_number)
         )
       when "wait-builds"
         version = required_option(options, :version)

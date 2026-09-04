@@ -123,6 +123,18 @@ import Testing
     let snapshot = universe.snapshot()
     #expect(snapshot.isAuthoritative)
     #expect(snapshot.uids == [current.uid])
+    let visibleWarm = await feed.warmVisibleDecoded(
+        [ThumbnailRequest(uid: current.uid)],
+        limit: 1
+    )
+    #expect(visibleWarm.requested == 1)
+    #expect(visibleWarm.queuedNetwork == 1)
+    let delivered = ThumbnailDeliveryProbe()
+    let result = await coordinator.loadThumbnails(for: [current.uid], priority: .visibleNow) { uid, data in
+        delivered.record(uid: uid, data: data)
+    }
+    #expect(result == .delivered)
+    #expect(delivered.data(for: current.uid) == Data("thumbnail".utf8))
     await runtime.shutdown()
     await coordinator.shutdown()
 }

@@ -61,6 +61,8 @@ After tested changes reach `main`, a maintainer publishes a GitHub Release.
 - `v1.2.0-beta.1` and `v1.2.0-rc.1` publish only to internal TestFlight.
 - `v1.2.0` submits iOS and macOS to App Review and selects automatic release after approval.
 
+Automation derives one shared Apple build number from the release commit and validates it with App Store Connect before starting Xcode. Prerelease and stable tags for the same app version on the same commit reuse the exact tested iOS and macOS builds; a later main commit receives a higher build number.
+
 Write owner-written notes under `## English`. This is the only required release-notes section.
 Without platform subsections, English applies to both platforms.
 Optional `### All Platforms`, `### iOS and iPadOS`, and `### macOS` subsections let each platform receive shared text plus its specific text.

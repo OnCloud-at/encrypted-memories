@@ -2165,6 +2165,29 @@ struct ProductionRouteGuardTests {
             "iOS and iPadOS primary-inventory updates must use the same generation fence"
         )
 
+        let mobileSourceConfiguration = sourceBlock(
+            from: "private func configureSourceAnalysis(",
+            to: "/// Stops Smart Search",
+            in: mobileLibrary
+        )
+        #expect(
+            !mobileSourceConfiguration.contains("_ = await runtime.start()"),
+            "mobile must not bind an empty source scope while the first timeline inventory is already loading"
+        )
+
+        let mobileInventoryPublication = sourceBlock(
+            from: "private func applyItems(",
+            to: "private func publish(",
+            in: mobileLibrary
+        )
+        #expect(mobileInventoryPublication.contains("await synchronizePrimarySourceInventory("))
+        #expect(mobileInventoryPublication.contains("if changed {"))
+        #expect(
+            mobileInventoryPublication.range(of: "await synchronizePrimarySourceInventory(")!.lowerBound
+                < mobileInventoryPublication.range(of: "if changed {")!.lowerBound,
+            "primary membership must authorize the feed before any first grid frame is published"
+        )
+
         let macConnectivityRecovery = sourceBlock(
             from: "private func retryAfterConnectivityRestored()",
             to: "private var gridFillOrder",
