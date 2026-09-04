@@ -321,6 +321,7 @@ private actor ControlledLateLoader: ThumbnailBatchLoader {
     func requestCount() -> Int { requested.count }
     func requestedOrder() -> [PhotoUID] { requested }
     func finishedBatches() -> Int { finishedBatchCount }
+    func isWaiting() -> Bool { continuation != nil }
 }
 
 private actor PerUIDControlledLateLoader: ThumbnailBatchLoader {
@@ -1177,6 +1178,193 @@ struct ThumbnailFeedCoreTests {
         #expect(cache.image(for: Self.uid("dc-x")) == nil)
     }
 
+    @Test func feedScopeReplacementPurgesDecodedAndEncryptedTiers() async {
+        let retained = Self.uid("feed-retained-membership")
+        let orphaned = Self.uid("feed-final-orphan")
+        let cache = Self.cache("feed-source-removal")
+        cache.storeToDisk(Self.pngData(width: 8, height: 8), for: retained)
+        cache.storeToDisk(Self.pngData(width: 8, height: 8), for: orphaned)
+        let feed = ThumbnailFeedCore(
+            cache: cache,
+            loader: RecordingLoader(),
+            configuration: Self.configuration()
+        )
+        #expect(await feed.cachedDecoded(for: retained) != nil)
+        #expect(await feed.cachedDecoded(for: orphaned) != nil)
+        let source = LibrarySource(
+            id: SourceID("feed-source"),
+            capabilities: .readThumbnail
+        )
+        let graph = LibrarySourceGraph()
+        let sourceSetLease = graph.beginSourceSetRefresh()
+        _ = graph.commitSourceSet([source], using: sourceSetLease)
+        let initialRefresh = graph.beginRefresh(source.id)!
+        _ = graph.commit(
+            Self.sourceItems([retained, orphaned]),
+            validationToken: nil,
+            using: initialRefresh
+        )
+        let replacementRefresh = graph.beginRefresh(source.id)!
+        let replacement = graph.commit(
+            Self.sourceItems([retained]),
+            validationToken: nil,
+            using: replacementRefresh
+        )!
+        #expect(await feed.bindDerivedDataEpoch(graph.runtimeEpoch))
+
+        let result = await feed.reconcile(
+            selected: replacement.selectedScope,
+            analysis: replacement.analysisScope,
+            retention: replacement.thumbnailRetentionScope
+        )
+
+        #expect(result == .reconciled(removedEntries: 1))
+        #expect(feed.memoryDecoded(for: retained) != nil)
+        #expect(feed.memoryDecoded(for: orphaned) == nil)
+        #expect(await feed.cachedDecoded(for: retained) != nil)
+        #expect(cache.diskData(for: retained) != nil)
+        #expect(cache.diskData(for: orphaned) == nil)
+    }
+
+    @Test func analysisOnlyInventoryIsIndexedAndRetainedWithoutEnteringVisibleCoverage() async throws {
+        let primaryUID = Self.uid("feed-primary")
+        let analysisUID = Self.uid("feed-analysis-only")
+        let payload = Self.pngData(width: 8, height: 8)
+        let loader = RecordingLoader(payloads: [primaryUID: payload, analysisUID: payload])
+        let cache = Self.cache("feed-analysis-scope")
+        let feed = ThumbnailFeedCore(
+            cache: cache,
+            loader: loader,
+            configuration: Self.configuration(downloadConcurrencyLimit: 1, batchSize: 2)
+        )
+        let primarySource = LibrarySource(
+            id: SourceID("primary-source"),
+            capabilities: .readThumbnail
+        )
+        let analysisSource = LibrarySource(
+            id: SourceID("analysis-source"),
+            capabilities: .readThumbnail,
+            isIncluded: false
+        )
+        let graph = LibrarySourceGraph()
+        let sourceSetLease = graph.beginSourceSetRefresh()
+        _ = graph.commitSourceSet([primarySource, analysisSource], using: sourceSetLease)
+        let primaryRefresh = graph.beginRefresh(primarySource.id)!
+        _ = graph.commit(Self.sourceItems([primaryUID]), validationToken: nil, using: primaryRefresh)
+        let analysisRefresh = graph.beginRefresh(analysisSource.id)!
+        let change = graph.commit(
+            Self.sourceItems([analysisUID]),
+            validationToken: nil,
+            using: analysisRefresh
+        )!
+        #expect(await feed.bindDerivedDataEpoch(graph.runtimeEpoch))
+
+        _ = await feed.reconcile(
+            selected: change.selectedScope,
+            analysis: change.analysisScope,
+            retention: change.thumbnailRetentionScope
+        )
+        try await Self.waitUntil {
+            let status = await feed.prefetchStatus()
+            let requestCount = await loader.requestCount()
+            return status.diskCoverageVerified && requestCount >= 2
+        }
+
+        let status = await feed.prefetchStatus()
+        #expect(status.diskThumbnailTotal == 1)
+        #expect(status.diskFileCount == 1)
+        #expect(status.downloadCompleted == 1)
+        #expect(cache.diskFileCount() == 2)
+        #expect(await feed.cachedDecoded(for: analysisUID) == nil)
+        #expect(await feed.backgroundCachedDecoded(for: analysisUID) != nil)
+
+        let replacementLease = graph.beginSourceSetRefresh()
+        let replacement = graph.commitSourceSet([primarySource], using: replacementLease)!
+        _ = await feed.reconcile(
+            selected: replacement.selectedScope,
+            analysis: replacement.analysisScope,
+            retention: replacement.thumbnailRetentionScope
+        )
+        #expect(cache.diskData(for: primaryUID) != nil)
+        #expect(cache.diskData(for: analysisUID) == nil)
+        #expect(await feed.backgroundCachedDecoded(for: analysisUID) == nil)
+    }
+
+    @Test func feedScopeReplacementCoalescesNewerRevisionDuringWorkerJoin() async throws {
+        let original = Self.uid("feed-original-revision")
+        let superseded = Self.uid("feed-superseded-revision")
+        let latest = Self.uid("feed-latest-revision")
+        let loader = ControlledLateLoader(payloads: [:])
+        let feed = ThumbnailFeedCore(
+            cache: Self.cache("feed-source-reentrancy"),
+            loader: loader,
+            configuration: Self.configuration(downloadConcurrencyLimit: 1, batchSize: 1)
+        )
+        let source = LibrarySource(
+            id: SourceID("feed-reentrant-source"),
+            capabilities: .readThumbnail
+        )
+        let graph = LibrarySourceGraph()
+        let sourceSetLease = graph.beginSourceSetRefresh()
+        _ = graph.commitSourceSet([source], using: sourceSetLease)
+        let initialRefresh = graph.beginRefresh(source.id)!
+        let initial = graph.commit(
+            Self.sourceItems([original]),
+            validationToken: nil,
+            using: initialRefresh
+        )!
+        #expect(await feed.bindDerivedDataEpoch(graph.runtimeEpoch))
+        _ = await feed.reconcile(
+            selected: initial.selectedScope,
+            analysis: initial.analysisScope,
+            retention: initial.thumbnailRetentionScope
+        )
+        try await Self.waitUntil { await loader.isWaiting() }
+        #expect(await loader.isWaiting())
+
+        let supersededRefresh = graph.beginRefresh(source.id)!
+        let supersededChange = graph.commit(
+            Self.sourceItems([superseded]),
+            validationToken: nil,
+            using: supersededRefresh
+        )!
+        let joining = Task {
+            await feed.reconcile(
+                selected: supersededChange.selectedScope,
+                analysis: supersededChange.analysisScope,
+                retention: supersededChange.thumbnailRetentionScope
+            )
+        }
+        try await Task.sleep(for: .milliseconds(50))
+
+        let latestRefresh = graph.beginRefresh(source.id)!
+        let latestChange = graph.commit(
+            Self.sourceItems([latest]),
+            validationToken: nil,
+            using: latestRefresh
+        )!
+        let latestJoining = Task {
+            await feed.reconcile(
+                selected: latestChange.selectedScope,
+                analysis: latestChange.analysisScope,
+                retention: latestChange.thumbnailRetentionScope
+            )
+        }
+        try await Task.sleep(for: .milliseconds(50))
+        await loader.release()
+        let latestResult = await latestJoining.value
+        let supersededResult = await joining.value
+        try await Self.waitUntil { await loader.requestedOrder().contains(latest) }
+        let requested = await loader.requestedOrder()
+
+        #expect(latestResult != .staleScope)
+        #expect(supersededResult == .staleScope)
+        #expect(requested.contains(original))
+        #expect(requested.contains(latest))
+        #expect(!requested.contains(superseded))
+        await feed.stopPrefetchAndWait()
+    }
+
     @Test func warmReDecodesSharperWhenALargerPixelSizeIsRequested() async throws {
         // Decoded once small for a dense level, the same UID must re-decode sharper for a larger level -
         // "already decoded" is size-aware, keyed on the shared 1.25× upgrade hysteresis.
@@ -1992,6 +2180,18 @@ struct ThumbnailFeedCoreTests {
 
     private static func uid(_ id: String) -> PhotoUID {
         PhotoUID(volumeID: "vol", nodeID: "\(id)-\(UUID().uuidString)")
+    }
+
+    private static func sourceItems(_ uids: [PhotoUID]) -> [LibrarySourceItem] {
+        uids.enumerated().map { offset, uid in
+            .complete(
+                PhotoItem(
+                    uid: uid,
+                    captureTime: Date(timeIntervalSince1970: TimeInterval(offset)),
+                    mediaType: "image/jpeg"
+                )
+            )
+        }
     }
 
     private static func pngData(width: Int, height: Int) -> Data {

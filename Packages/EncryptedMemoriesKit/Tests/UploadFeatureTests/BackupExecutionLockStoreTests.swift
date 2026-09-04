@@ -281,7 +281,7 @@ final class BackupExecutionLockStoreTests: XCTestCase {
         queue.close()
     }
 
-    func testFutureSchemaResetsToEmpty() throws {
+    func testFutureSchemaFailsClosedWithoutDeletingExecutionLock() throws {
         let url = tempDir.appendingPathComponent(BackupExecutionLockManifestStore.databaseFileName)
         do {
             let store = try XCTUnwrap(BackupExecutionLockManifestStore(url: url, now: { [clock] in clock!.now }))
@@ -295,8 +295,41 @@ final class BackupExecutionLockStoreTests: XCTestCase {
             SQLITE_OK)
         sqlite3_close(handle)
 
-        let reopened = try XCTUnwrap(BackupExecutionLockManifestStore(url: url, now: { [clock] in clock!.now }))
-        XCTAssertNil(reopened.currentLock(), "a future schema resets the lock table to empty")
+        XCTAssertNil(BackupExecutionLockManifestStore(url: url, now: { [clock] in clock!.now }))
+        XCTAssertEqual(sqliteCount(url: url, table: "backup_execution_lock"), 1)
+    }
+
+    func testMarkerlessExecutionLockShapeFailsClosedWithoutRepairingIt() throws {
+        let url = tempDir.appendingPathComponent(BackupExecutionLockManifestStore.databaseFileName)
+        var handle: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(url.path, &handle), SQLITE_OK)
+        XCTAssertEqual(
+            sqlite3_exec(
+                handle,
+                "CREATE TABLE backup_execution_lock(run_id TEXT); INSERT INTO backup_execution_lock VALUES('kept');",
+                nil,
+                nil,
+                nil
+            ),
+            SQLITE_OK
+        )
+        sqlite3_close(handle)
+
+        XCTAssertNil(BackupExecutionLockManifestStore(url: url, now: { [clock] in clock!.now }))
+        XCTAssertEqual(sqliteCount(url: url, table: "backup_execution_lock"), 1)
+        XCTAssertEqual(sqliteCount(url: url, table: "backup_execution_lock_info"), -1)
+    }
+
+    private func sqliteCount(url: URL, table: String) -> Int {
+        var handle: OpaquePointer?
+        guard sqlite3_open(url.path, &handle) == SQLITE_OK else { return -1 }
+        defer { sqlite3_close(handle) }
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(handle, "SELECT COUNT(*) FROM \(table);", -1, &statement, nil) == SQLITE_OK else {
+            return -1
+        }
+        defer { sqlite3_finalize(statement) }
+        return sqlite3_step(statement) == SQLITE_ROW ? Int(sqlite3_column_int64(statement, 0)) : -1
     }
 
     private final class ClockBox: @unchecked Sendable {

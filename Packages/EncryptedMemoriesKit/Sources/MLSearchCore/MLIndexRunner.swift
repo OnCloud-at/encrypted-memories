@@ -368,19 +368,36 @@ public actor MLIndexRunner {
         now: @escaping @Sendable () -> Date = { Date() },
         observer: MLDerivedPipelineObserver = MLDerivedPipelineObserver()
     ) async -> MLDerivedPipelinePassOutcome {
-        var progress = store.progress(for: key)
+        var progress: MLDerivedPipelineProgress
+        do {
+            progress = try store.progress(for: key)
+        } catch {
+            return MLDerivedPipelinePassOutcome(
+                reason: .storageFailure,
+                progress: emptyDerivedProgress()
+            )
+        }
         observer.report(progress)
         var remainingAnalysisPlans = maximumAnalysisPlans.map { max(1, $0) }
 
         while shouldContinue(), !Task.isCancelled {
             let currentTime = now()
-            let work = store.nextWorkBatch(
-                for: key,
-                limit: configuration.chunkSize * max(1, key.artifacts.count),
-                now: currentTime
-            )
+            let work: [MLDerivedPipelineWorkItem]
+            do {
+                work = try store.nextWorkBatch(
+                    for: key,
+                    limit: configuration.chunkSize * max(1, key.artifacts.count),
+                    now: currentTime
+                )
+            } catch {
+                return MLDerivedPipelinePassOutcome(reason: .storageFailure, progress: progress)
+            }
             guard !work.isEmpty else {
-                progress = store.progress(for: key)
+                do {
+                    progress = try store.progress(for: key)
+                } catch {
+                    return MLDerivedPipelinePassOutcome(reason: .storageFailure, progress: progress)
+                }
                 return MLDerivedPipelinePassOutcome(
                     reason: progress.isComplete ? .drained : .retryPending,
                     progress: progress
@@ -458,10 +475,14 @@ public actor MLIndexRunner {
 
             if !committedResults.isEmpty {
                 guard store.commit(committedResults, for: key, now: currentTime) else {
-                    progress = store.progress(for: key)
+                    progress = (try? store.progress(for: key)) ?? progress
                     return MLDerivedPipelinePassOutcome(reason: .storageFailure, progress: progress)
                 }
-                progress = store.progress(for: key)
+                do {
+                    progress = try store.progress(for: key)
+                } catch {
+                    return MLDerivedPipelinePassOutcome(reason: .storageFailure, progress: progress)
+                }
                 observer.report(progress)
             }
             if let stopReason {
@@ -487,10 +508,28 @@ public actor MLIndexRunner {
             }
         }
 
-        progress = store.progress(for: key)
+        do {
+            progress = try store.progress(for: key)
+        } catch {
+            return MLDerivedPipelinePassOutcome(
+                reason: Task.isCancelled ? .cancelled : .storageFailure,
+                progress: progress
+            )
+        }
         return MLDerivedPipelinePassOutcome(
             reason: Task.isCancelled ? .cancelled : .policySuspended,
             progress: progress
+        )
+    }
+
+    private static func emptyDerivedProgress() -> MLDerivedPipelineProgress {
+        MLDerivedPipelineProgress(
+            total: 0,
+            completed: 0,
+            skipped: 0,
+            permanentFailure: 0,
+            retryPending: 0,
+            generation: 0
         )
     }
 

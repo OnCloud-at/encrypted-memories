@@ -101,7 +101,7 @@ private final class LocationWriteBarrier: @unchecked Sendable {
         #expect(wrongAccount.load().isEmpty)
     }
 
-    @Test func readsLegacyV1BlobAndMigratesItOnTheNextWrite() throws {
+    @Test func discardsLegacyDerivedStoreWithoutMigratingIt() throws {
         let dir = tempDir()
         defer { try? FileManager.default.removeItem(at: dir) }
         let key = SymmetricKey(size: .bits256)
@@ -113,9 +113,7 @@ private final class LocationWriteBarrier: @unchecked Sendable {
 
         let store = PhotoLocationStore(directory: dir)
         store.configure(accountUID: "acct", key: key)
-        #expect(store.load() == coordinates)
-        store.save(PhotoLocationSnapshot(coordinates: coordinates))
-        #expect(store.load() == coordinates)
+        #expect(store.load().isEmpty)
         #expect(!FileManager.default.fileExists(atPath: dir.appendingPathComponent("locations.v1.enc").path))
     }
 

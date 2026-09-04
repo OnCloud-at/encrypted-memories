@@ -9,14 +9,19 @@ final class DiskPresenceCache: @unchecked Sendable {
     private var trackedTotal = 0
     private var trackedPresent = 0
 
-    func beginTracking(_ uids: [PhotoUID], knownPresent: Set<PhotoUID> = []) {
+    func beginTracking(
+        _ uids: [PhotoUID],
+        reporting reportingUIDs: Set<PhotoUID>? = nil,
+        knownPresent: Set<PhotoUID> = []
+    ) {
         lock.withLock {
-            trackedKeys = Set(uids)
-            trackedTotal = uids.count
+            let allKeys = Set(uids)
+            trackedKeys = reportingUIDs.map { $0.intersection(allKeys) } ?? allKeys
+            trackedTotal = trackedKeys.count
             for uid in knownPresent where trackedKeys.contains(uid) {
                 values[uid] = true
             }
-            trackedPresent = uids.reduce(0) { count, uid in
+            trackedPresent = trackedKeys.reduce(0) { count, uid in
                 count + (values[uid] == true ? 1 : 0)
             }
         }

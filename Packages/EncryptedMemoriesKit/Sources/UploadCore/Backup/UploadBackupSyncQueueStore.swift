@@ -822,18 +822,6 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
         """
 
     private static func openOnce(url: URL, policy: LibraryDatabasePolicy) -> OpaquePointer? {
-        var handle: OpaquePointer?
-        guard sqlite3_open(url.path, &handle) == SQLITE_OK else {
-            sqlite3_close(handle)
-            return nil
-        }
-        sqlite3_exec(handle, "PRAGMA journal_mode=WAL;", nil, nil, nil)
-        sqlite3_exec(handle, "PRAGMA synchronous=NORMAL;", nil, nil, nil)
-        sqlite3_exec(handle, "PRAGMA busy_timeout=\(policy.busyTimeoutMs);", nil, nil, nil)
-        sqlite3_exec(handle, "PRAGMA cache_size=-\(max(0, policy.cacheSizeKiB));", nil, nil, nil)
-        sqlite3_exec(handle, "PRAGMA mmap_size=\(max(0, policy.mmapBytes));", nil, nil, nil)
-        sqlite3_exec(handle, "PRAGMA journal_size_limit=\(policy.journalSizeLimitBytes);", nil, nil, nil)
-
         let schema = """
             CREATE TABLE IF NOT EXISTS backup_sync_queue_info(key TEXT PRIMARY KEY, value INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS backup_sync_runtime_issue(key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -858,16 +846,49 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
             CREATE INDEX IF NOT EXISTS backup_sync_queue_source_idx
               ON backup_sync_queue(source_kind, source_id, resource);
             """
-        guard sqlite3_exec(handle, schema, nil, nil, nil) == SQLITE_OK,
-            verifyAndStampVersion(handle)
-        else {
+
+        let compatibility = SQLiteStoreSchemaGate.compatibility(
+            at: url,
+            schemaSQL: schema,
+            busyTimeoutMs: policy.busyTimeoutMs,
+            versionIsCurrent: verifyVersion
+        )
+        guard compatibility == .empty || compatibility == .current else { return nil }
+        var handle: OpaquePointer?
+        let flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX
+            | (compatibility == .empty ? SQLITE_OPEN_CREATE : 0)
+        guard sqlite3_open_v2(url.path, &handle, flags, nil) == SQLITE_OK else {
+            sqlite3_close(handle)
+            return nil
+        }
+        sqlite3_busy_timeout(handle, Int32(clamping: policy.busyTimeoutMs))
+        switch compatibility {
+        case .empty:
+            SQLiteStoreSchemaGate.configureConnection(handle, policy: policy)
+            guard SQLiteStoreSchemaGate.initializeCurrentSchema(
+                handle,
+                schemaSQL: schema,
+                stamp: { stampVersion(handle) }
+            ) else {
+                sqlite3_close(handle)
+                return nil
+            }
+        case .current:
+            guard verifyVersion(handle),
+                SQLiteStoreSchemaGate.matchesCurrentSchema(handle, schemaSQL: schema)
+            else {
+                sqlite3_close(handle)
+                return nil
+            }
+            SQLiteStoreSchemaGate.configureConnection(handle, policy: policy)
+        case .incompatible, .unavailable:
             sqlite3_close(handle)
             return nil
         }
         return handle
     }
 
-    private static func verifyAndStampVersion(_ handle: OpaquePointer?) -> Bool {
+    private static func verifyVersion(_ handle: OpaquePointer?) -> Bool {
         var stmt: OpaquePointer?
         guard
             sqlite3_prepare_v2(handle, "SELECT value FROM backup_sync_queue_info WHERE key='schema';", -1, &stmt, nil)
@@ -876,9 +897,13 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
             return false
         }
         var onDisk: Int?
-        if sqlite3_step(stmt) == SQLITE_ROW { onDisk = Int(sqlite3_column_int(stmt, 0)) }
+        let result = sqlite3_step(stmt)
+        if result == SQLITE_ROW { onDisk = Int(sqlite3_column_int(stmt, 0)) }
         sqlite3_finalize(stmt)
-        if let onDisk, onDisk != schemaVersion { return false }
+        return result == SQLITE_ROW && onDisk == schemaVersion
+    }
+
+    private static func stampVersion(_ handle: OpaquePointer?) -> Bool {
         return sqlite3_exec(
             handle,
             "INSERT INTO backup_sync_queue_info(key, value) VALUES('schema', \(schemaVersion)) "

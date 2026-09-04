@@ -55,6 +55,35 @@ struct MediaByteCacheTests {
         PhotoUID(volumeID: "vol-1", nodeID: id)
     }
 
+    private func sourceGraph(
+        retaining uids: [PhotoUID],
+        authoritative: Bool
+    ) -> (graph: LibrarySourceGraph, scope: ThumbnailRetentionDerivedDataScope) {
+        let source = LibrarySource(
+            id: SourceID("cache-source"),
+            capabilities: .readThumbnail
+        )
+        let graph = LibrarySourceGraph()
+        let sourceSetLease = graph.beginSourceSetRefresh()
+        _ = graph.commitSourceSet([source], using: sourceSetLease)
+        let refresh = graph.beginRefresh(source.id)!
+        _ = graph.commit(
+            uids.enumerated().map { offset, uid in
+                .complete(
+                    PhotoItem(
+                        uid: uid,
+                        captureTime: Date(timeIntervalSince1970: TimeInterval(offset)),
+                        mediaType: "image/jpeg"
+                    )
+                )
+            },
+            validationToken: nil,
+            using: refresh
+        )
+        if !authoritative { _ = graph.beginRefresh(source.id) }
+        return (graph, graph.thumbnailRetentionDerivedDataScope())
+    }
+
     @Test func encryptedBlobHasNoPlaintextAndRoundTrips() throws {
         let cache = ThumbnailCache(namespace: uniqueNamespace(), rootDirectory: uniqueRoot())
         cache.configure(accountUID: "acct-A", key: byteCacheTestKey)
@@ -190,6 +219,39 @@ struct MediaByteCacheTests {
         #expect(cache.diskData(for: keepB) != nil)
     }
 
+    @Test func byteCapDoesNotAccountForAFileThatCouldNotBeDeleted() throws {
+        let cache = ThumbnailCache(namespace: uniqueNamespace(), rootDirectory: uniqueRoot())
+        cache.configure(accountUID: "acct-A", key: byteCacheTestKey)
+        let photo = uid("failed-cap-deletion")
+        let generation = cache.captureWriterGeneration()
+        #expect(cache.storeToDisk(png(), for: photo, ifCurrent: generation) == .stored)
+
+        let blobURL = cache.diskURL(for: photo)
+        let cacheDirectory = blobURL.deletingLastPathComponent()
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o500],
+            ofItemAtPath: cacheDirectory.path
+        )
+        defer {
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o700],
+                ofItemAtPath: cacheDirectory.path
+            )
+        }
+
+        #expect(cache.enforceByteCap(0, ifCurrent: generation) == false)
+        #expect(FileManager.default.fileExists(atPath: blobURL.path))
+        #expect(cache.diskSizeBytes() > 0)
+
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o700],
+            ofItemAtPath: cacheDirectory.path
+        )
+        #expect(cache.enforceByteCap(0, ifCurrent: generation))
+        #expect(FileManager.default.fileExists(atPath: blobURL.path) == false)
+        #expect(cache.diskSizeBytes() == 0)
+    }
+
     @Test func reusedInstanceDoesNotReturnAccountADataToAccountB() async {
         let cache = ThumbnailCache(namespace: uniqueNamespace(), rootDirectory: uniqueRoot())
         let photo = uid("reused-account")
@@ -251,6 +313,119 @@ struct MediaByteCacheTests {
 
         #expect(await lateWriter.value == .stale)
         #expect(cache.has(photo) == false)
+    }
+
+    @Test func nonAuthoritativeScopeCannotDeleteEncryptedBlobs() async {
+        let cache = ThumbnailCache(namespace: uniqueNamespace(), rootDirectory: uniqueRoot())
+        cache.configure(accountUID: "acct-A", key: byteCacheTestKey)
+        let retained = uid("retained-cached")
+        let unknown = uid("unknown-cached")
+        cache.storeToDisk(png(), for: retained)
+        cache.storeToDisk(png(), for: unknown)
+        let source = sourceGraph(retaining: [retained], authoritative: false)
+        let session = cache.captureSessionLease()
+        #expect(cache.bindDerivedDataEpoch(source.graph.runtimeEpoch, sessionLease: session))
+
+        let result = cache.reconcile(with: source.scope)
+
+        #expect(result == .deferred)
+        #expect(cache.diskData(for: retained) == png())
+        #expect(cache.diskData(for: unknown) == nil)
+        #expect(FileManager.default.fileExists(atPath: cache.diskURL(for: unknown).path))
+    }
+
+    @Test func authoritativeScopePurgesOrphansAndRejectsCapturedWriter() async throws {
+        let root = uniqueRoot()
+        let cache = ThumbnailCache(namespace: uniqueNamespace(), rootDirectory: root)
+        cache.configure(accountUID: "acct-A", key: byteCacheTestKey)
+        let retained = uid("retained-authoritative")
+        let removed = uid("removed-authoritative")
+        cache.storeToDisk(png(), for: retained)
+        cache.storeToDisk(png(), for: removed)
+        let staleWriter = cache.captureWriterGeneration()
+        let checkpoint = cache.coverageCheckpointDirectory()
+        try FileManager.default.createDirectory(at: checkpoint, withIntermediateDirectories: true)
+        try Data("checkpoint".utf8).write(to: checkpoint.appendingPathComponent("state"))
+        let source = sourceGraph(retaining: [retained], authoritative: true)
+        let session = cache.captureSessionLease()
+        #expect(cache.bindDerivedDataEpoch(source.graph.runtimeEpoch, sessionLease: session))
+
+        let result = cache.reconcile(with: source.scope)
+
+        #expect(result == .reconciled(removedEntries: 1))
+        #expect(cache.diskData(for: retained) == png())
+        #expect(cache.diskData(for: removed) == nil)
+        #expect(FileManager.default.fileExists(atPath: checkpoint.path) == false)
+        #expect(cache.storeToDisk(png(), for: removed, ifCurrent: staleWriter) == .stale)
+    }
+
+    @Test func delayedOlderScopeCannotRemoveResourcesAcceptedByNewerScope() async {
+        let cache = ThumbnailCache(namespace: uniqueNamespace(), rootDirectory: uniqueRoot())
+        cache.configure(accountUID: "acct-A", key: byteCacheTestKey)
+        let retained = uid("retained")
+        let added = uid("added-later")
+        await cache.store(png(), for: retained)
+        await cache.store(png(), for: added)
+        let source = sourceGraph(retaining: [retained], authoritative: true)
+        let older = source.scope
+        let sourceID = SourceID("cache-source")
+        let refresh = source.graph.beginRefresh(sourceID)!
+        let newer = source.graph.commit(
+            [retained, added].enumerated().map { offset, uid in
+                .complete(
+                    PhotoItem(
+                        uid: uid,
+                        captureTime: Date(timeIntervalSince1970: TimeInterval(offset)),
+                        mediaType: "image/jpeg"
+                    )
+                )
+            },
+            validationToken: nil,
+            using: refresh
+        )!.thumbnailRetentionScope
+        let session = cache.captureSessionLease()
+        #expect(cache.bindDerivedDataEpoch(source.graph.runtimeEpoch, sessionLease: session))
+
+        #expect(cache.reconcile(with: newer) == .reconciled(removedEntries: 0))
+        #expect(cache.reconcile(with: older) == .staleScope)
+
+        #expect(await cache.data(for: retained) == png())
+        #expect(await cache.data(for: added) == png())
+    }
+
+    @Test func authoritativeAddOnlyScopeKeepsTheWriterGenerationAndCoverageCheckpoint() throws {
+        let cache = ThumbnailCache(namespace: uniqueNamespace(), rootDirectory: uniqueRoot())
+        cache.configure(accountUID: "acct-A", key: byteCacheTestKey)
+        let retained = uid("retained-add-only")
+        let added = uid("added-only")
+        cache.storeToDisk(png(), for: retained)
+        let source = sourceGraph(retaining: [retained], authoritative: true)
+        let session = cache.captureSessionLease()
+        #expect(cache.bindDerivedDataEpoch(source.graph.runtimeEpoch, sessionLease: session))
+        #expect(cache.reconcile(with: source.scope) == .reconciled(removedEntries: 0))
+        let existingWriter = cache.captureWriterGeneration()
+        let checkpoint = cache.coverageCheckpointDirectory()
+        try FileManager.default.createDirectory(at: checkpoint, withIntermediateDirectories: true)
+        try Data("checkpoint".utf8).write(to: checkpoint.appendingPathComponent("state"))
+
+        let refresh = source.graph.beginRefresh(SourceID("cache-source"))!
+        let addedScope = source.graph.commit(
+            [retained, added].enumerated().map { offset, uid in
+                .complete(
+                    PhotoItem(
+                        uid: uid,
+                        captureTime: Date(timeIntervalSince1970: TimeInterval(offset)),
+                        mediaType: "image/jpeg"
+                    )
+                )
+            },
+            validationToken: nil,
+            using: refresh
+        )!.thumbnailRetentionScope
+
+        #expect(cache.reconcile(with: addedScope) == .reconciled(removedEntries: 0))
+        #expect(cache.storeToDisk(png(), for: retained, ifCurrent: existingWriter) == .stored)
+        #expect(FileManager.default.fileExists(atPath: checkpoint.path))
     }
 }
 

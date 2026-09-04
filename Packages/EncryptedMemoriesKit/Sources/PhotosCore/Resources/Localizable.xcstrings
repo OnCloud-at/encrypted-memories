@@ -3569,6 +3569,42 @@
         }
       }
     },
+    "upload.persistence_unavailable": {
+      "extractionState": "manual",
+      "comment": "Upload queue title when durable local upload state cannot be opened.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Uploads unavailable"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Uploads nicht verfügbar"
+          }
+        }
+      }
+    },
+    "upload.persistence_unavailable_description": {
+      "extractionState": "manual",
+      "comment": "Upload queue description when durable local upload state cannot be opened.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Encrypted Memories could not open the protected upload state. Existing records remain unchanged."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Encrypted Memories konnte den geschützten Upload-Status nicht öffnen. Vorhandene Einträge bleiben unverändert."
+          }
+        }
+      }
+    },
     "upload.action_pause": {
       "extractionState": "manual",
       "comment": "Per-item pause action.",

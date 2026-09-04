@@ -45,6 +45,7 @@ struct EncryptedMemoriesApp: App {
             .background { TipJarCelebrationWindowOverlay() }
             .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
                 model?.smartSearch?.noteConditionsChanged()
+                model?.refreshLibrarySources()
             }
         }
         .defaultSize(width: 1080, height: 720)

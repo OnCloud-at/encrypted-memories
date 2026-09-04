@@ -95,6 +95,24 @@ final class AlbumsRepositoryTests: XCTestCase {
         XCTAssertEqual(albums.map(\.id), ["a"])
     }
 
+    func testSuccessfulSharedLeavePublishesConfirmedAccessLoss() async throws {
+        let backend = FakeAlbumBackend(capabilities: .sdkCatalogWithHTTPWrites)
+        let recorder = SharedLeaveRecorder()
+        let repo = AlbumsRepository(
+            catalogBackend: backend,
+            writeBackend: backend,
+            capabilities: backend.capabilities,
+            didLeaveSharedAlbum: { album in await recorder.record(album) }
+        )
+        let album = AlbumNodeIdentifier(volumeID: "shared-volume", nodeID: "shared-album")
+
+        try await repo.leaveSharedAlbum(album)
+
+        XCTAssertEqual(backend.leftSharedAlbums, [album])
+        let recorded = await recorder.values
+        XCTAssertEqual(recorded, [album])
+    }
+
     func testAlbumMembershipTitlesMatchLosslessVolumeAndSortForViewer() async throws {
         let photo = uid("photo")
         let backend = FakeAlbumBackend(
@@ -272,5 +290,13 @@ final class AlbumsRepositoryTests: XCTestCase {
         try await repo.setAlbumCover(albumID: "a", photoUID: uid("9"))
         XCTAssertEqual(backend.covers.count, 1)
         XCTAssertEqual(backend.covers.first?.album, "a")
+    }
+}
+
+private actor SharedLeaveRecorder {
+    private(set) var values: [AlbumNodeIdentifier] = []
+
+    func record(_ album: AlbumNodeIdentifier) {
+        values.append(album)
     }
 }

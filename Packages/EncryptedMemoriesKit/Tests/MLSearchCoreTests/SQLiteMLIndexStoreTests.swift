@@ -1,5 +1,6 @@
 import Foundation
 import PhotosCore
+import SQLite3
 import Testing
 
 @testable import MLSearchCore
@@ -55,6 +56,66 @@ struct TestMLVectorCipher: MLVectorCipher {
         let store = try #require(SQLiteMLIndexStore(url: url, cipher: TestMLVectorCipher()))
         try body(store, url)
         store.close()
+    }
+
+    @Test func currentMarkerWithWrongShapeResetsTheDerivedIndex() throws {
+        let url = makeTempURL()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        try FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        var handle: OpaquePointer?
+        #expect(sqlite3_open(url.path, &handle) == SQLITE_OK)
+        #expect(
+            sqlite3_exec(
+                handle,
+                "CREATE TABLE legacy_vectors(value TEXT); PRAGMA user_version=5;",
+                nil,
+                nil,
+                nil
+            ) == SQLITE_OK
+        )
+        sqlite3_close(handle)
+
+        let store = try #require(SQLiteMLIndexStore(url: url, cipher: TestMLVectorCipher()))
+        #expect(store.count(for: descriptorV1) == 0)
+        store.close()
+
+        handle = nil
+        #expect(sqlite3_open_v2(url.path, &handle, SQLITE_OPEN_READONLY, nil) == SQLITE_OK)
+        var statement: OpaquePointer?
+        #expect(
+            sqlite3_prepare_v2(
+                handle,
+                "SELECT COUNT(*) FROM sqlite_schema WHERE name='legacy_vectors';",
+                -1,
+                &statement,
+                nil
+            ) == SQLITE_OK
+        )
+        #expect(sqlite3_step(statement) == SQLITE_ROW)
+        #expect(sqlite3_column_int(statement, 0) == 0)
+        sqlite3_finalize(statement)
+        sqlite3_close(handle)
+    }
+
+    @Test func markerlessExactSchemaResetsInsteadOfAdoptingRows() throws {
+        let url = makeTempURL()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let first = try #require(SQLiteMLIndexStore(url: url, cipher: TestMLVectorCipher()))
+        first.upsert([record("cached", descriptorV1, [1, 0, 0, 0])])
+        #expect(first.count(for: descriptorV1) == 1)
+        first.close()
+
+        var handle: OpaquePointer?
+        #expect(sqlite3_open(url.path, &handle) == SQLITE_OK)
+        #expect(sqlite3_exec(handle, "PRAGMA user_version=0;", nil, nil, nil) == SQLITE_OK)
+        sqlite3_close(handle)
+
+        let rebuilt = try #require(SQLiteMLIndexStore(url: url, cipher: TestMLVectorCipher()))
+        #expect(rebuilt.count(for: descriptorV1) == 0)
+        rebuilt.close()
     }
 
     @Test func roundTripsOneEmbedding() throws {
@@ -186,14 +247,161 @@ struct TestMLVectorCipher: MLVectorCipher {
         }
     }
 
+    @Test func authoritativeReconciliationUsesColdStoreStateThenExactInventoryDelta() throws {
+        try withStore { store, _ in
+            let original = (0..<450).map { uid("asset-\($0)") }
+            store.upsert(
+                original.map {
+                    MLEmbeddingRecord(
+                        uid: $0,
+                        descriptor: descriptorV1,
+                        vector: [1, 0, 0, 0],
+                        timestamp: Date(timeIntervalSince1970: 1_000)
+                    )
+                }
+            )
+            let failed = uid("failed")
+            #expect(
+                store.recordFailures([
+                    MLIndexFailureRecord(
+                        uid: failed,
+                        descriptor: descriptorV1,
+                        kind: .permanent,
+                        attempts: 1
+                    )
+                ]))
+
+            let firstInventory = Array(original.prefix(225))
+            let beforeColdReconciliation = store.generation(for: descriptorV1)
+            #expect(
+                store.reconcileTrackedUIDs(
+                    currentAuthoritativeUIDs: firstInventory,
+                    previousAuthoritativeUIDs: nil,
+                    descriptor: descriptorV1
+                ))
+            #expect(Set(store.allIndexedUIDs(for: descriptorV1)) == Set(firstInventory))
+            #expect(store.failureRecords(for: descriptorV1, from: [failed]).isEmpty)
+            #expect(store.generation(for: descriptorV1) == beforeColdReconciliation + 1)
+
+            let laterAsset = uid("later")
+            store.upsert([
+                MLEmbeddingRecord(
+                    uid: laterAsset,
+                    descriptor: descriptorV1,
+                    vector: [0, 1, 0, 0],
+                    timestamp: Date(timeIntervalSince1970: 2_000)
+                )
+            ])
+            let previousInventory = firstInventory + [laterAsset]
+            let nextInventory = Array(firstInventory.dropFirst(224))
+            let beforeDeltaReconciliation = store.generation(for: descriptorV1)
+            #expect(
+                store.reconcileTrackedUIDs(
+                    currentAuthoritativeUIDs: nextInventory,
+                    previousAuthoritativeUIDs: previousInventory,
+                    descriptor: descriptorV1
+                ))
+            #expect(store.allIndexedUIDs(for: descriptorV1) == nextInventory)
+            #expect(store.generation(for: descriptorV1) == beforeDeltaReconciliation + 1)
+
+            let beforeNoOp = store.generation(for: descriptorV1)
+            #expect(
+                store.reconcileTrackedUIDs(
+                    currentAuthoritativeUIDs: nextInventory,
+                    previousAuthoritativeUIDs: nextInventory,
+                    descriptor: descriptorV1
+                ))
+            #expect(store.generation(for: descriptorV1) == beforeNoOp)
+        }
+    }
+
+    @Test func reconciliationReportsFailureAfterStoreClosure() throws {
+        let url = makeTempURL()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let store = try #require(SQLiteMLIndexStore(url: url, cipher: TestMLVectorCipher()))
+        store.upsert([record("asset", descriptorV1, [1, 0, 0, 0])])
+        store.close()
+
+        #expect(
+            !store.reconcileTrackedUIDs(
+                currentAuthoritativeUIDs: [],
+                previousAuthoritativeUIDs: [uid("asset")],
+                descriptor: descriptorV1
+            ))
+    }
+
     @Test func removeAllForDescriptorLeavesOtherEpochsIntact() throws {
         try withStore { store, _ in
             store.upsert([record("a0", descriptorV1, [1, 0, 0, 0])])
             store.upsert([record("a0", descriptorV2, [1, 0, 0, 0])])
-            store.removeAll(for: descriptorV1)
+            #expect(store.removeAll(for: descriptorV1))
             #expect(store.count(for: descriptorV1) == 0)
             #expect(store.count(for: descriptorV2) == 1)
         }
+    }
+
+    @Test func removeAllReportsFailureAfterStoreClosure() throws {
+        let url = makeTempURL()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let store = try #require(SQLiteMLIndexStore(url: url, cipher: TestMLVectorCipher()))
+        store.upsert([record("asset", descriptorV1, [1, 0, 0, 0])])
+        store.close()
+
+        #expect(!store.removeAll(for: descriptorV1))
+    }
+
+    @Test func removeAllRollsBackEmbeddingsFailuresAndGenerationTogether() throws {
+        let url = makeTempURL()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let store = try #require(SQLiteMLIndexStore(url: url, cipher: TestMLVectorCipher()))
+        defer { store.close() }
+        let embedded = uid("embedded")
+        let failed = uid("failed")
+        store.upsert([record("embedded", descriptorV1, [1, 0, 0, 0])])
+        #expect(
+            store.recordFailures([
+                MLIndexFailureRecord(
+                    uid: failed,
+                    descriptor: descriptorV1,
+                    kind: .permanent,
+                    reason: "unsupported",
+                    attempts: 1
+                )
+            ])
+        )
+        let generation = store.generation(for: descriptorV1)
+
+        var handle: OpaquePointer?
+        #expect(sqlite3_open(url.path, &handle) == SQLITE_OK)
+        #expect(
+            sqlite3_exec(
+                handle,
+                """
+                CREATE TRIGGER reject_failure_cleanup
+                BEFORE DELETE ON ml_failures
+                BEGIN
+                  SELECT RAISE(ABORT, 'injected cleanup failure');
+                END;
+                """,
+                nil,
+                nil,
+                nil
+            ) == SQLITE_OK
+        )
+        sqlite3_close(handle)
+
+        #expect(!store.removeAll(for: descriptorV1))
+        #expect(store.contains(uid: embedded, descriptor: descriptorV1))
+        #expect(store.failureRecords(for: descriptorV1, from: [failed])[failed] != nil)
+        #expect(store.generation(for: descriptorV1) == generation)
+
+        handle = nil
+        #expect(sqlite3_open(url.path, &handle) == SQLITE_OK)
+        #expect(sqlite3_exec(handle, "DROP TRIGGER reject_failure_cleanup;", nil, nil, nil) == SQLITE_OK)
+        sqlite3_close(handle)
+        #expect(store.removeAll(for: descriptorV1))
+        #expect(store.allTrackedUIDs(for: descriptorV1).isEmpty)
+        #expect(store.generation(for: descriptorV1) == generation + 1)
     }
 
     @Test func reopenedStoreSeesPersistedRecords() throws {

@@ -1,5 +1,6 @@
 import Foundation
 import PhotosCore
+import SQLite3
 import XCTest
 
 @testable import UploadCore
@@ -34,6 +35,19 @@ private final class SettlementEventLog: @unchecked Sendable {
 
     var snapshot: [String] {
         lock.withLock { events }
+    }
+}
+
+private final class SettlementStatsBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = UploadQueueStats()
+
+    func store(_ stats: UploadQueueStats) {
+        lock.withLock { value = stats }
+    }
+
+    var snapshot: UploadQueueStats {
+        lock.withLock { value }
     }
 }
 
@@ -308,6 +322,57 @@ final class ManualUploadSettlementTests: XCTestCase {
             await Task.yield()
         }
         return false
+    }
+
+    func testMarkerlessSettlementShapeFailsClosedWithoutRepairingIt() throws {
+        let url = tempDir.appendingPathComponent(UploadManualSettlementStore.databaseFileName)
+        var handle: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(url.path, &handle), SQLITE_OK)
+        XCTAssertEqual(
+            sqlite3_exec(
+                handle,
+                "CREATE TABLE manual_upload_settlement(queue_item_id TEXT); "
+                    + "INSERT INTO manual_upload_settlement VALUES('kept');",
+                nil,
+                nil,
+                nil
+            ),
+            SQLITE_OK
+        )
+        sqlite3_close(handle)
+
+        XCTAssertNil(UploadManualSettlementStore(url: url))
+        XCTAssertEqual(sqliteCount(url: url, table: "manual_upload_settlement"), 1)
+        XCTAssertEqual(sqliteCount(url: url, table: "manual_upload_settlement_info"), -1)
+    }
+
+    func testMissingRequiredSettlementPublishesUnavailableInsteadOfEmpty() async {
+        let manager = UploadManager(
+            uploader: SettlementUploader(),
+            settlementStore: nil,
+            requiresDurableSettlement: true
+        )
+        let stats = SettlementStatsBox()
+
+        await manager.setOnChange { _, snapshot in
+            stats.store(snapshot)
+        }
+
+        XCTAssertTrue(stats.snapshot.persistenceUnavailable)
+        XCTAssertEqual(stats.snapshot.total, 0)
+        await manager.shutdown()
+    }
+
+    private func sqliteCount(url: URL, table: String) -> Int {
+        var handle: OpaquePointer?
+        guard sqlite3_open(url.path, &handle) == SQLITE_OK else { return -1 }
+        defer { sqlite3_close(handle) }
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(handle, "SELECT COUNT(*) FROM \(table);", -1, &statement, nil) == SQLITE_OK else {
+            return -1
+        }
+        defer { sqlite3_finalize(statement) }
+        return sqlite3_step(statement) == SQLITE_ROW ? Int(sqlite3_column_int64(statement, 0)) : -1
     }
 
     func testLateNonCooperativeSuccessAfterCancelPersistsReceiptAndKeepsUID() async throws {

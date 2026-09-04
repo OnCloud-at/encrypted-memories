@@ -1411,6 +1411,8 @@ public actor UploadManager: UploadManaging {
         items.reserveCapacity(order.count)
         var stats = UploadQueueStats()
         stats.concurrency = maxConcurrent
+        stats.persistenceUnavailable =
+            requiresDurableSettlement && !(settlementStore?.isOperational() ?? false)
         for id in order {
             guard let item = jobs[id]?.item else { continue }
             items.append(item)

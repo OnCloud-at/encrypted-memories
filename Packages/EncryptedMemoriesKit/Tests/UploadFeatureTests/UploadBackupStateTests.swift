@@ -239,7 +239,7 @@ final class UploadBackupStateTests: XCTestCase {
         }
     }
 
-    func testSQLiteStoreResetsFutureSchema() throws {
+    func testSQLiteStoreFailsClosedForFutureSchemaWithoutChangingMarker() throws {
         let url = tempDir.appendingPathComponent(UploadBackupStateManifestStore.databaseFileName)
         do {
             let store = try XCTUnwrap(UploadBackupStateManifestStore(url: url))
@@ -260,7 +260,52 @@ final class UploadBackupStateTests: XCTestCase {
             sqlite3_exec(handle, "UPDATE backup_state_info SET value=99 WHERE key='schema';", nil, nil, nil), SQLITE_OK)
         sqlite3_close(handle)
 
-        let reopened = try XCTUnwrap(UploadBackupStateManifestStore(url: url))
-        XCTAssertEqual(reopened.count(), 0)
+        XCTAssertNil(UploadBackupStateManifestStore(url: url))
+        XCTAssertEqual(sqliteCount(url: url, table: "backup_asset_state"), 1)
+        XCTAssertEqual(sqliteInteger(url: url, sql: "SELECT value FROM backup_state_info WHERE key='schema';"), 99)
+    }
+
+    func testSQLiteStoreRejectsMarkerlessWrongShapeWithoutRepairingIt() throws {
+        let url = tempDir.appendingPathComponent(UploadBackupStateManifestStore.databaseFileName)
+        var handle: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(url.path, &handle), SQLITE_OK)
+        XCTAssertEqual(
+            sqlite3_exec(
+                handle,
+                "CREATE TABLE backup_asset_state(source_id TEXT); INSERT INTO backup_asset_state VALUES('kept');",
+                nil,
+                nil,
+                nil
+            ),
+            SQLITE_OK
+        )
+        sqlite3_close(handle)
+
+        XCTAssertNil(UploadBackupStateManifestStore(url: url))
+        XCTAssertEqual(sqliteCount(url: url, table: "backup_asset_state"), 1)
+        XCTAssertEqual(sqliteCount(url: url, table: "backup_state_info"), -1)
+    }
+
+    private func sqliteCount(url: URL, table: String) -> Int {
+        var handle: OpaquePointer?
+        guard sqlite3_open(url.path, &handle) == SQLITE_OK else { return -1 }
+        defer { sqlite3_close(handle) }
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(handle, "SELECT COUNT(*) FROM \(table);", -1, &statement, nil) == SQLITE_OK else {
+            return -1
+        }
+        defer { sqlite3_finalize(statement) }
+        return sqlite3_step(statement) == SQLITE_ROW ? Int(sqlite3_column_int64(statement, 0)) : -1
+    }
+
+    private func sqliteInteger(url: URL, sql: String) -> Int? {
+        var handle: OpaquePointer?
+        guard sqlite3_open(url.path, &handle) == SQLITE_OK else { return nil }
+        defer { sqlite3_close(handle) }
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(handle, sql, -1, &statement, nil) == SQLITE_OK else { return nil }
+        defer { sqlite3_finalize(statement) }
+        guard sqlite3_step(statement) == SQLITE_ROW else { return nil }
+        return Int(sqlite3_column_int64(statement, 0))
     }
 }

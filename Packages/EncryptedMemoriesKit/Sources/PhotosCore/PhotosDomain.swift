@@ -91,7 +91,7 @@ public struct PhotoItem: Identifiable, Hashable, Sendable, Codable {
         try container.encode(isLivePhoto, forKey: .isLivePhoto)
         try container.encodeIfPresent(relatedVideoID, forKey: .relatedVideoID)
         try container.encodeIfPresent(durationSeconds, forKey: .durationSeconds)
-        try container.encode(tags, forKey: .tags)
+        try container.encode(tags.sorted { $0.rawValue < $1.rawValue }, forKey: .tags)
         try container.encode(burstMemberIDs, forKey: .burstMemberIDs)
     }
 }

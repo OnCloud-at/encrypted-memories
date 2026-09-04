@@ -18,6 +18,7 @@ public actor AlbumsRepository: AlbumManaging {
     public nonisolated let capabilities: AlbumCapabilities
     private let catalogBackend: any AlbumCatalogBackend
     private let writeBackend: any AlbumWriteBackend
+    private let didLeaveSharedAlbum: @Sendable (AlbumNodeIdentifier) async -> Void
     private var albumCatalogCache: [AlbumSummary]?
     /// Session-local on-demand membership cache. Successful writes update it in place, so opening a
     /// picker after a mutation cannot show a stale checkmark or schedule a redundant attach.
@@ -28,11 +29,13 @@ public actor AlbumsRepository: AlbumManaging {
     public init(
         catalogBackend: any AlbumCatalogBackend,
         writeBackend: any AlbumWriteBackend,
-        capabilities: AlbumCapabilities = .sdkCatalogWithHTTPWrites
+        capabilities: AlbumCapabilities = .sdkCatalogWithHTTPWrites,
+        didLeaveSharedAlbum: @escaping @Sendable (AlbumNodeIdentifier) async -> Void = { _ in }
     ) {
         self.catalogBackend = catalogBackend
         self.writeBackend = writeBackend
         self.capabilities = capabilities
+        self.didLeaveSharedAlbum = didLeaveSharedAlbum
     }
 
     public func listAlbums() async throws -> [AlbumSummary] {
@@ -71,6 +74,7 @@ public actor AlbumsRepository: AlbumManaging {
         }
         do {
             try await catalogBackend.leaveSharedAlbum(album)
+            await didLeaveSharedAlbum(album)
         } catch {
             throw Self.normalized(error)
         }

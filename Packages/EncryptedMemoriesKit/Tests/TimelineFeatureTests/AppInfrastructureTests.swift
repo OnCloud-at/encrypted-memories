@@ -105,7 +105,7 @@ struct AppInfrastructureTests {
 
     @Test func cacheCoverageMath() {
         var status = OfflineCacheStatus()
-        #expect(status.thumbnailCoverage == 1)  // no assets yet
+        #expect(status.thumbnailCoverage == 0)  // no authoritative inventory yet
         status.totalAssets = 200
         status.thumbnailsOnDisk = 50
         #expect(abs(status.thumbnailCoverage - 0.25) < 1e-9)

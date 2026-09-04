@@ -21,6 +21,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     private let uploadClientUID: String
     private let driveSession: DriveSession
     private let requestGovernor = ProtonRequestGovernor()
+    private nonisolated let sharedAlbumSnapshotCache = SDKSharedAlbumSnapshotCache()
     private var photosRoot: SDKNodeUid?
     private var photosShareID: String?
     /// App-owned SQLite timeline metadata store (`library-v1.sqlite`, PhotosCore). The bridge is
@@ -175,6 +176,10 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     }
 
     private func performShutdown() async {
+        // Admission is closed and every published operation has settled before this teardown runs.
+        // Drain cache-owned SDK tasks now, including flights orphaned by admission cancellation.
+        await sharedAlbumSnapshotCache.invalidateAll()
+
         let timelineTask = timelineLoadTask?.task
         timelineLoadTask = nil
         timelineTask?.cancel()
@@ -1081,7 +1086,11 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     // MARK: - PhotoLibraryProvider
 
     nonisolated func makeAlbumCatalogBackend() -> SDKAlbumCatalogBackend {
-        SDKAlbumCatalogBackend(client: photosClient, admission: shutdownGate)
+        SDKAlbumCatalogBackend(
+            client: photosClient,
+            admission: shutdownGate,
+            sharedAlbumSnapshotCache: sharedAlbumSnapshotCache
+        )
     }
 
     /// Sets an album's cover to an already-uploaded photo (direct REST; SDK 0.25.0 has no album-write API).

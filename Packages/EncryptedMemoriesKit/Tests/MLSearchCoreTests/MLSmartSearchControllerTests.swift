@@ -263,6 +263,7 @@ import Testing
         root: URL,
         state: MLSmartSearchPersistentState,
         catalogProvider: any MLModelCatalogProvider = StaticMLModelCatalogProvider(.init(entries: [])),
+        assetInventory: MLAssetInventorySnapshot = .authoritative([]),
         nativeSearchFactory: @escaping @Sendable () async -> (any MLNativeSearchServing)?
     ) throws -> MLSmartSearchLifecycle {
         let layout = MLModelInstallLayout(rootDirectory: root)
@@ -277,7 +278,7 @@ import Testing
                 installer: MLModelInstaller(layout: layout, transport: UnusedTransport()),
                 storeProvider: InMemoryStoreProvider(),
                 runtimeProvider: NoopRuntimeProvider(),
-                assetsProvider: { .authoritative([]) },
+                assetsProvider: { assetInventory },
                 nativeSearchFactory: nativeSearchFactory,
                 advertisedNativeSearchBackends: [.recognizedText, .documentText],
                 governor: MLAlwaysPermitsIndexing(),
@@ -348,6 +349,7 @@ import Testing
             root: root,
             state: MLSmartSearchPersistentState(isEnabled: true),
             catalogProvider: catalogProvider,
+            assetInventory: .authoritative([expected]),
             nativeSearchFactory: { nativeSearch }
         )
         let controller = MLSmartSearchController(lifecycle: lifecycle)

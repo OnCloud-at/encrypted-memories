@@ -9,16 +9,35 @@ import PhotosCore
 public struct MLAssetInventorySnapshot: Sendable, Equatable {
     public let uids: [PhotoUID]
     public let isAuthoritative: Bool
+    public let sourceEpoch: LibrarySourceEpoch?
+    public let sourceRevision: UInt64?
 
-    public init(uids: [PhotoUID], isAuthoritative: Bool) {
+    public init(
+        uids: [PhotoUID],
+        isAuthoritative: Bool,
+        sourceEpoch: LibrarySourceEpoch? = nil,
+        sourceRevision: UInt64? = nil
+    ) {
         self.uids = uids
         self.isAuthoritative = isAuthoritative
+        self.sourceEpoch = sourceEpoch
+        self.sourceRevision = sourceRevision
     }
 
     public static let hydrating = MLAssetInventorySnapshot(uids: [], isAuthoritative: false)
 
     public static func authoritative(_ uids: [PhotoUID]) -> MLAssetInventorySnapshot {
         MLAssetInventorySnapshot(uids: uids, isAuthoritative: true)
+    }
+
+    /// Adapts the universal source scope without losing deterministic timeline order or authority.
+    public init(analysisScope scope: AnalysisDerivedDataScope) {
+        self.init(
+            uids: scope.orderedUIDs,
+            isAuthoritative: scope.isAuthoritative,
+            sourceEpoch: scope.epoch,
+            sourceRevision: scope.revision
+        )
     }
 }
 
@@ -27,6 +46,7 @@ public struct MLAssetInventorySnapshot: Sendable, Equatable {
 public final class MLAssetUniverse: @unchecked Sendable {
     private let lock = NSLock()
     private var inventory: MLAssetInventorySnapshot
+    private var acceptsSourceScopes = true
 
     public init() {
         inventory = .hydrating
@@ -36,10 +56,42 @@ public final class MLAssetUniverse: @unchecked Sendable {
         inventory = .authoritative(uids)
     }
 
+    public init(analysisScope scope: AnalysisDerivedDataScope) {
+        inventory = MLAssetInventorySnapshot(analysisScope: scope)
+    }
+
     /// Marks a new host/session hydration boundary. This never publishes an authoritative empty
     /// library and therefore cannot trigger destructive reconciliation.
     public func beginHydration() {
-        lock.withLock { inventory = .hydrating }
+        lock.withLock {
+            // A source-bound universe must be replaced for a new graph epoch. The legacy API cannot erase
+            // its epoch/revision fence and let an old scope become current again.
+            guard inventory.sourceEpoch == nil else { return }
+            inventory = .hydrating
+        }
+    }
+
+    /// Starts a replacement graph session on a long-lived host universe. The empty inventory is explicitly
+    /// non-authoritative, and old-epoch publishers cannot populate it afterwards.
+    public func resetSourceSession(to epoch: LibrarySourceEpoch) {
+        lock.withLock {
+            acceptsSourceScopes = true
+            inventory = MLAssetInventorySnapshot(
+                uids: [],
+                isAuthoritative: false,
+                sourceEpoch: epoch,
+                sourceRevision: nil
+            )
+        }
+    }
+
+    /// Closes the current graph admission before an account or backend replacement begins.
+    /// Old asynchronous publishers remain rejected until the next graph explicitly resets the session.
+    public func invalidateSourceSession() {
+        lock.withLock {
+            acceptsSourceScopes = false
+            inventory = .hydrating
+        }
     }
 
     /// Publishes one complete inventory. Repeating the same snapshot is a no-op so duplicate host
@@ -47,7 +99,29 @@ public final class MLAssetUniverse: @unchecked Sendable {
     @discardableResult
     public func publishAuthoritative(_ uids: [PhotoUID]) -> Bool {
         lock.withLock {
+            guard acceptsSourceScopes, inventory.sourceEpoch == nil else { return false }
             let next = MLAssetInventorySnapshot.authoritative(uids)
+            guard inventory != next else { return false }
+            inventory = next
+            return true
+        }
+    }
+
+    /// Publishes the exact currently accessible source inventory.
+    ///
+    /// Authority controls destructive index reconciliation. It does not extend query visibility: an
+    /// explicitly removed source disappears immediately even while a different source is refreshing.
+    @discardableResult
+    public func publish(_ scope: AnalysisDerivedDataScope) -> Bool {
+        lock.withLock {
+            guard acceptsSourceScopes else { return false }
+            if let sourceEpoch = inventory.sourceEpoch {
+                guard sourceEpoch == scope.epoch else { return false }
+                if let sourceRevision = inventory.sourceRevision {
+                    guard scope.revision > sourceRevision else { return false }
+                }
+            }
+            let next = MLAssetInventorySnapshot(analysisScope: scope)
             guard inventory != next else { return false }
             inventory = next
             return true

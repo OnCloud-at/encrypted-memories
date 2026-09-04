@@ -3071,6 +3071,35 @@ final class CoreArchitectureGateTests: XCTestCase {
         )
     }
 
+    func testRuntimeStoresNeverUseInPlaceSchemaMigrationDDL() throws {
+        let forbiddenPatterns = [
+            #"\bALTER\s+TABLE\b"#,
+            #"\bRENAME\s+COLUMN\b"#,
+            #"\bDROP\s+COLUMN\b"#,
+        ]
+        var violations: [String] = []
+
+        for file in try swiftFiles(in: sourcesRoot) {
+            let source = try String(contentsOf: file, encoding: .utf8)
+            for pattern in forbiddenPatterns
+            where source.range(
+                of: pattern,
+                options: [.regularExpression, .caseInsensitive]
+            ) != nil {
+                violations.append("\(file.path): contains forbidden migration DDL \(pattern)")
+            }
+        }
+
+        XCTAssertTrue(
+            violations.isEmpty,
+            """
+            Runtime persistence must use an exact schema or a classified reset. It must never mutate an
+            existing schema in place:
+            \(violations.joined(separator: "\n"))
+            """
+        )
+    }
+
     private func swiftFiles(in directory: URL) throws -> [URL] {
         guard
             let enumerator = FileManager.default.enumerator(

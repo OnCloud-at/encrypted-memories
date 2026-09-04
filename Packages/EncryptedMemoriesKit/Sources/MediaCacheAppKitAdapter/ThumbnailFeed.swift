@@ -197,6 +197,11 @@ public actor ThumbnailFeed {
         return image(for: decoded, uid: uid)
     }
 
+    public func analysisImage(for uid: PhotoUID) async -> NSImage? {
+        guard let decoded = await core.analysisDecoded(for: uid) else { return nil }
+        return MacThumbnailImageDecoder.image(from: decoded)
+    }
+
     public func startPrefetch(_ uids: [PhotoUID]) async {
         await core.startPrefetch(uids)
     }

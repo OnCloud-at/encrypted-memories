@@ -157,6 +157,11 @@
             return image(for: decoded, uid: uid)
         }
 
+        public func analysisImage(for uid: PhotoUID) async -> UIImage? {
+            guard let decoded = await core.analysisDecoded(for: uid) else { return nil }
+            return UIKitThumbnailImageDecoder.image(from: decoded)
+        }
+
         public func startPrefetch(_ uids: [PhotoUID]) async {
             await core.startPrefetch(uids)
         }

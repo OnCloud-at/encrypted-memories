@@ -49,6 +49,10 @@ public actor ThumbnailCache {
     private nonisolated let crypto: CryptoBox
     /// Fence for loaders and detached writers that can outlive a destructive clear or session change.
     private nonisolated let writerGeneration = CacheWriterGeneration()
+    private nonisolated let retentionScopeFence =
+        DerivedDataScopeRevisionFence<ThumbnailRetentionDerivedDataScopeKind>()
+    private nonisolated let retentionAuthorization =
+        DerivedDataResourceAuthorization<ThumbnailRetentionDerivedDataScopeKind>()
     /// Filenames proven decryptable this session (so `hasUsableDiskData` is O(1) after the first probe).
     private nonisolated let validated = ValidatedPresence()
     /// Nominal RAM-tier byte budget, retained so a memory-pressure scale can be restored to full.
@@ -128,20 +132,23 @@ public actor ThumbnailCache {
     /// Installs the per-account key derived from the unlocked session. A missing key locks the cache
     /// (reads miss and writes drop) without falling back to plaintext.
     public nonisolated func configure(accountUID: String, key: SymmetricKey?) {
-        // A cache instance can be reused across sign-in. Keep captures blocked across the complete crypto
-        // transition so an old owner cannot capture a new generation between invalidation and key install.
-        writerGeneration.invalidateAndPerform(invalidatesSession: true) {
-            memory.removeAllObjects()
-            validated.clearAll()
-            guard let key else {
-                crypto.set(cipher: nil, account: accountUID)
-                return
+        retentionScopeFence.resetForSessionTransition {
+            // A cache instance can be reused across sign-in. Keep captures blocked across the complete crypto
+            // transition so an old owner cannot capture a new generation between invalidation and key install.
+            writerGeneration.invalidateAndPerform(invalidatesSession: true) {
+                retentionAuthorization.reset()
+                memory.removeAllObjects()
+                validated.clearAll()
+                guard let key else {
+                    crypto.set(cipher: nil, account: accountUID)
+                    return
+                }
+                crypto.set(
+                    cipher: SecureBlobCipher(
+                        key: key, namespace: namespace, accountUID: accountUID, derivative: derivative),
+                    account: accountUID
+                )
             }
-            crypto.set(
-                cipher: SecureBlobCipher(
-                    key: key, namespace: namespace, accountUID: accountUID, derivative: derivative),
-                account: accountUID
-            )
         }
     }
 
@@ -149,23 +156,35 @@ public actor ThumbnailCache {
 
     /// Cache lookup from decoded memory to encrypted disk. Never triggers a network load.
     public func data(for uid: PhotoUID) -> Data? {
+        guard retentionAuthorization.isAllowed(uid) else { return nil }
+        let generation = writerGeneration.capture()
         let mk = Self.memKey(uid)
-        if let cached = memory.object(forKey: mk) { return cached as Data }
+        if let cached = memory.object(forKey: mk) {
+            return writerGeneration.performIfCurrent(generation) {
+                retentionAuthorization.isAllowed(uid) ? cached as Data : nil
+            } ?? nil
+        }
         guard let data = diskData(for: uid) else { return nil }
-        memory.setObject(data as NSData, forKey: mk, cost: data.count)
-        return data
+        return writerGeneration.performIfCurrent(generation) {
+            guard retentionAuthorization.isAllowed(uid) else { return nil }
+            memory.setObject(data as NSData, forKey: mk, cost: data.count)
+            return data
+        } ?? nil
     }
 
     /// Cheap on-disk existence check (no read/decrypt) for diagnostics and coverage only. Do not use this to
     /// gate network fetches: with encrypted blobs a corrupt/tampered/wrong-key file can exist yet be
     /// unreadable. Use `hasUsableDiskData(_:)` for any skip-the-network decision.
     public nonisolated func has(_ uid: PhotoUID) -> Bool {
+        guard retentionAuthorization.isAllowed(uid) else { return false }
         let generation = writerGeneration.capture()
         let (_, account) = crypto.snapshot()
         let present = FileManager.default.fileExists(
             atPath: directory.appendingPathComponent(filename(uid: uid, account: account)).path
         )
-        return writerGeneration.isCurrent(generation) && present
+        return writerGeneration.isCurrent(generation)
+            && retentionAuthorization.isAllowed(uid)
+            && present
     }
 
     /// True only when a decryptable blob is on disk (the safe "skip the network" predicate). On the first
@@ -186,6 +205,7 @@ public actor ThumbnailCache {
         _ uid: PhotoUID,
         trustValidatedPresence: Bool
     ) -> Bool {
+        guard retentionAuthorization.isAllowed(uid) else { return false }
         let generation = writerGeneration.capture()
         let (cipher, account) = crypto.snapshot()
         guard let cipher else { return false }  // A locked cache has no usable data.
@@ -197,6 +217,7 @@ public actor ThumbnailCache {
                 return false
             }
             return writerGeneration.isCurrent(generation)
+                && retentionAuthorization.isAllowed(uid)
         }
         guard let blob = try? Data(contentsOf: url) else { return false }
         guard cipher.open(blob, uid: uid) != nil else {
@@ -207,15 +228,19 @@ public actor ThumbnailCache {
             }
             return false
         }
-        return writerGeneration.performIfCurrent(generation) {
-            validated.insert(name, generation: generation)
-            return true
-        } ?? false
+        let authenticated =
+            writerGeneration.performIfCurrent(generation) {
+                guard retentionAuthorization.isAllowed(uid) else { return false }
+                validated.insert(name, generation: generation)
+                return true
+            } ?? false
+        return authenticated && retentionAuthorization.isAllowed(uid)
     }
 
     /// Direct disk read + decrypt (no in-memory layer). Returns plaintext bytes, or `nil` on a miss, a
     /// missing key, or an authentication failure (the corrupt blob is then deleted so it re-fetches).
     public nonisolated func diskData(for uid: PhotoUID) -> Data? {
+        guard retentionAuthorization.isAllowed(uid) else { return nil }
         let generation = writerGeneration.capture()
         let (cipher, account) = crypto.snapshot()
         guard let cipher else { return nil }  // locked
@@ -240,11 +265,12 @@ public actor ThumbnailCache {
             writerGeneration.performIfCurrent(
                 generation,
                 {
+                    guard retentionAuthorization.isAllowed(uid) else { return false }
                     validated.insert(name, generation: generation)
                     return true
                 }) == true
         else { return nil }
-        return plaintext
+        return retentionAuthorization.isAllowed(uid) ? plaintext : nil
     }
 
     /// URL of the on-disk encrypted blob (bytes are ciphertext - not directly decodable).
@@ -308,12 +334,16 @@ public actor ThumbnailCache {
         for uid: PhotoUID,
         ifCurrent generation: CacheWriterGeneration.Token
     ) -> ThumbnailCacheStoreResult {
+        guard retentionAuthorization.isAllowed(uid) else { return .stale }
         let (cipher, account) = crypto.snapshot()
         // Never persist plaintext while the cache is locked.
         guard let cipher, let sealed = try? cipher.seal(data, uid: uid) else { return .ioFailure }
         let name = filename(uid: uid, account: account)
-        let result =
+        let result: ThumbnailCacheStoreResult =
             writerGeneration.performIfCurrent(generation) {
+                guard retentionAuthorization.isAllowed(uid) else {
+                    return ThumbnailCacheStoreResult.stale
+                }
                 do {
                     try sealed.write(to: directory.appendingPathComponent(name), options: .atomic)
                     validated.insert(name, generation: generation)  // we just sealed it - it's decryptable
@@ -334,9 +364,20 @@ public actor ThumbnailCache {
     }
 
     public func store(_ data: Data, for uid: PhotoUID) {
-        // Plaintext remains process-local.
-        memory.setObject(data as NSData, forKey: Self.memKey(uid), cost: data.count)
-        storeToDisk(data, for: uid)
+        guard retentionAuthorization.isAllowed(uid) else { return }
+        let generation = writerGeneration.capture()
+        guard storeToDisk(data, for: uid, ifCurrent: generation) == .stored else {
+            memory.removeObject(forKey: Self.memKey(uid))
+            return
+        }
+        let published =
+            writerGeneration.performIfCurrent(generation) {
+                guard retentionAuthorization.isAllowed(uid) else { return false }
+                // Plaintext remains process-local and is published only after the fenced encrypted write.
+                memory.setObject(data as NSData, forKey: Self.memKey(uid), cost: data.count)
+                return true
+            } ?? false
+        if !published { memory.removeObject(forKey: Self.memKey(uid)) }
     }
 
     // MARK: - LRU size cap
@@ -354,9 +395,11 @@ public actor ThumbnailCache {
         _ uid: PhotoUID,
         ifCurrent generation: CacheWriterGeneration.Token
     ) -> Bool {
+        guard retentionAuthorization.isAllowed(uid) else { return false }
         let (_, account) = crypto.snapshot()
         let url = directory.appendingPathComponent(filename(uid: uid, account: account))
         return writerGeneration.performIfCurrent(generation) {
+            guard retentionAuthorization.isAllowed(uid) else { return false }
             try? FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: url.path)
             return true
         } ?? false
@@ -409,9 +452,13 @@ public actor ThumbnailCache {
             if total <= capBytes { break }
             let removed =
                 writerGeneration.performIfCurrent(generation) {
-                    try? FileManager.default.removeItem(at: entry.url)
-                    validated.remove(entry.url.lastPathComponent, generation: generation)
-                    return true
+                    do {
+                        try FileManager.default.removeItem(at: entry.url)
+                        validated.remove(entry.url.lastPathComponent, generation: generation)
+                        return true
+                    } catch {
+                        return false
+                    }
                 } ?? false
             guard removed else { return false }
             total -= entry.size
@@ -420,6 +467,125 @@ public actor ThumbnailCache {
     }
 
     // MARK: - Clearing
+
+    /// Binds source-aware reconciliation for the current account session.
+    @discardableResult
+    public nonisolated func bindDerivedDataEpoch(
+        _ epoch: LibrarySourceEpoch,
+        sessionLease: CacheWriterGeneration.SessionToken
+    ) -> Bool {
+        let bound = retentionScopeFence.bindIfNeeded(
+            to: epoch,
+            validating: { writerGeneration.isCurrentSession(sessionLease) }
+        )
+        if bound { retentionAuthorization.requireScope() }
+        return bound
+    }
+
+    /// Reconciles encrypted blobs only when the scope is a complete current inventory.
+    ///
+    /// Cached, refreshing, and hydrating scopes can schedule additions. They cannot authorize deletion.
+    /// A successful reconciliation also removes the coverage checkpoint because its prior completeness
+    /// claim no longer matches the disk contents.
+    @discardableResult
+    public nonisolated func reconcile(
+        with scope: ThumbnailRetentionDerivedDataScope
+    ) -> MediaCacheReconciliationResult {
+        let fenced = retentionScopeFence.perform(with: scope) { previousScope in
+            guard scope.isAuthoritative else {
+                retentionAuthorization.apply(scope)
+                return (MediaCacheReconciliationResult.deferred, true)
+            }
+            if previousScope?.isAuthoritative == true, previousScope?.uids == scope.uids {
+                retentionAuthorization.apply(scope)
+                return (MediaCacheReconciliationResult.reconciled(removedEntries: 0), true)
+            }
+
+            // A complete first scope must sweep unknown files. Later complete scopes delete only the
+            // membership delta. Add-only updates therefore stay O(1) and do not invalidate active readers.
+            let removedUIDs: Set<PhotoUID>?
+            if let previousScope, previousScope.isAuthoritative {
+                removedUIDs = previousScope.uids.subtracting(scope.uids)
+            } else {
+                removedUIDs = nil
+            }
+            if removedUIDs?.isEmpty == true {
+                retentionAuthorization.apply(scope)
+                return (MediaCacheReconciliationResult.reconciled(removedEntries: 0), true)
+            }
+
+            let account = writerGeneration.invalidateAndPerform {
+                // Finish any writer which already owns the old generation and revoke membership before
+                // reopening captures. The slow unlink pass can then run without blocking retained reads or
+                // writes; removed resources are rejected by both the new generation and authorization scope.
+                retentionAuthorization.apply(scope)
+                let (_, account) = crypto.snapshot()
+                validated.clearAll()
+                return account
+            }.result
+            var removedDiskFiles = 0
+            var failed = false
+
+            if let removedUIDs {
+                for uid in removedUIDs {
+                    let name = filename(uid: uid, account: account)
+                    memory.removeObject(forKey: Self.memKey(uid))
+                    let url = directory.appendingPathComponent(name)
+                    guard FileManager.default.fileExists(atPath: url.path) else { continue }
+                    do {
+                        try FileManager.default.removeItem(at: url)
+                        removedDiskFiles += 1
+                    } catch {
+                        failed = true
+                    }
+                }
+            } else {
+                let retainedFilenames = Set(scope.uids.map { filename(uid: $0, account: account) })
+                do {
+                    try FileManager.default.createDirectory(
+                        at: directory,
+                        withIntermediateDirectories: true
+                    )
+                    let urls = try FileManager.default.contentsOfDirectory(
+                        at: directory,
+                        includingPropertiesForKeys: nil,
+                        options: [.skipsHiddenFiles]
+                    )
+                    for url in urls
+                    where url.pathExtension == "blob"
+                        && !retainedFilenames.contains(url.lastPathComponent)
+                    {
+                        do {
+                            try FileManager.default.removeItem(at: url)
+                            removedDiskFiles += 1
+                        } catch {
+                            failed = true
+                        }
+                    }
+                } catch {
+                    failed = true
+                }
+            }
+
+            if !Self.removeDirectoryIfPresent(coverageCheckpointDir) {
+                failed = true
+            }
+            let result: MediaCacheReconciliationResult = failed
+                ? .ioFailure
+                : .reconciled(removedEntries: removedDiskFiles)
+            // Authorization changes immediately, but a failed cleanup must remain retryable with the same
+            // revision. The fence still rejects every older revision while no cleanup revision is committed.
+            return (result, result != .ioFailure)
+        }
+        switch fenced.decision {
+        case .accepted:
+            return fenced.value ?? .ioFailure
+        case .unbound:
+            return .unbound
+        case .epochMismatch, .staleRevision:
+            return .staleScope
+        }
+    }
 
     /// Erases the on-disk cache (keeps the account key - re-crawl refills). Used by "Delete Offline Cache".
     public func clear() {
@@ -436,20 +602,23 @@ public actor ThumbnailCache {
 
     /// Sign-out purge: erases blobs and replaces the session-derived key with a fresh ephemeral key.
     public nonisolated func clearForSignOut() {
-        writerGeneration.invalidateAndPerform(invalidatesSession: true) {
-            memory.removeAllObjects()
-            validated.clearAll()
-            try? FileManager.default.removeItem(at: directory)
-            try? FileManager.default.removeItem(at: coverageCheckpointDir)
-            try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-            crypto.set(
-                cipher: SecureBlobCipher(
-                    key: SymmetricKey(size: .bits256),
-                    namespace: namespace,
-                    accountUID: CryptoBox.ephemeralAccount,
-                    derivative: derivative),
-                account: CryptoBox.ephemeralAccount
-            )
+        retentionScopeFence.resetForSessionTransition {
+            writerGeneration.invalidateAndPerform(invalidatesSession: true) {
+                retentionAuthorization.reset()
+                memory.removeAllObjects()
+                validated.clearAll()
+                try? FileManager.default.removeItem(at: directory)
+                try? FileManager.default.removeItem(at: coverageCheckpointDir)
+                try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                crypto.set(
+                    cipher: SecureBlobCipher(
+                        key: SymmetricKey(size: .bits256),
+                        namespace: namespace,
+                        accountUID: CryptoBox.ephemeralAccount,
+                        derivative: derivative),
+                    account: CryptoBox.ephemeralAccount
+                )
+            }
         }
     }
 
@@ -519,6 +688,16 @@ public actor ThumbnailCache {
         switch derivative {
         case "preview": return ThumbnailCacheConfiguration.defaultPreviewDiskBudgetBytes
         default: return nil
+        }
+    }
+
+    private static func removeDirectoryIfPresent(_ url: URL) -> Bool {
+        guard FileManager.default.fileExists(atPath: url.path) else { return true }
+        do {
+            try FileManager.default.removeItem(at: url)
+            return true
+        } catch {
+            return false
         }
     }
 }

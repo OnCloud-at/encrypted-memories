@@ -148,7 +148,11 @@ struct MainView: View {
         // disk cache uses the durable per-account session-derived key and survives relaunch. A fresh
         // ThumbnailCache() here would stay on a per-process ephemeral key and re-crawl the whole library
         // every launch.
-        let feed = ThumbnailFeed(cache: OfflineLibraryManager.shared.cache, loader: backend, dimensions: dimensions)
+        let feed = ThumbnailFeed(
+            cache: OfflineLibraryManager.shared.cache,
+            loader: facade.librarySources,
+            dimensions: dimensions
+        )
         self.feed = feed
         self.temporalCoverImageLoader = TimelineTemporalCoverImageLoader(
             media: backend,
@@ -186,6 +190,7 @@ struct MainView: View {
                         sharedAlbumCatalogFailed: albumActions.sharedLoadErrorMessage != nil,
                         canLeaveSharedAlbum: albumActions.canLeaveSharedAlbum,
                         thumbnailFeed: feed,
+                        sourceAnalysisRevision: model.sourceAnalysisRevision,
                         selection: $selection,
                         onRetryAlbums: { Task { await loadAlbums() } },
                         onRetrySharedAlbums: { Task { await albumActions.refreshSharedAlbums() } },
@@ -258,21 +263,25 @@ struct MainView: View {
                 routeScrollGeneration += 1
                 Task { await timelineModel.select(newValue) }
             }
-            .onChange(of: timelineModel.wholeLibraryRevision) { _, _ in
+            .onChange(of: timelineModel.wholeLibraryContentRevision) { _, _ in
                 let items = timelineModel.wholeLibraryItemsForViewer
                 OfflineLibraryManager.shared.liveAssetCount = items.count
                 // Kick off the low-priority GPS crawl (once) so the Map's location index fills in behind the
                 // thumbnail crawl.
                 OfflineLibraryManager.shared.startLocationCrawl(items: items, metadata: backend)
                 // New/removed assets flow into the Smart Search index on its next background pass.
-                model.updateSmartSearchAssets(timelineModel.wholeLibraryUIDs)
+                model.updateSmartSearchAssets(
+                    items,
+                    authority: timelineModel.wholeLibraryInventoryAuthority
+                )
             }
-            .onDisappear {
-                searchDebounceTask?.cancel()
-                searchDebounceTask = nil
-                cancelVeilTasks()
-                Task { await backupUploadRefreshCoordinator.cancel() }
+            .onChange(of: timelineModel.wholeLibraryInventoryAuthorityRevision) { _, _ in
+                model.updateSmartSearchAssets(
+                    timelineModel.wholeLibraryItemsForViewer,
+                    authority: timelineModel.wholeLibraryInventoryAuthority
+                )
             }
+            .onDisappear(perform: handleDisappear)
             .onChange(of: columnVisibility) { _, newValue in
                 // The NATIVE split-view toggle drives columnVisibility - mirror it back into our open-state +
                 // persistence (the ⌥⌘S path goes through toggleSidebar() which sets both).
@@ -291,7 +300,6 @@ struct MainView: View {
             }
             .task { await uploadCoordinator.start() }
             .task { await startLibraryChangeMonitor() }
-            .onDisappear { Task { await libraryChangeMonitor.stop() } }
             .onReceive(NotificationCenter.default.publisher(for: .encryptedMemoriesUploadPhotos)) { notification in
                 performUploadUIAction("uploadPhotos", trigger: uploadTrigger(from: notification))
             }
@@ -541,6 +549,16 @@ struct MainView: View {
         } message: {
             Text(exportFailureMessage ?? "")
         }
+    }
+
+    private func handleDisappear() {
+        searchDebounceTask?.cancel()
+        searchDebounceTask = nil
+        cancelVeilTasks()
+        let backupRefresh = backupUploadRefreshCoordinator
+        Task { await backupRefresh.cancel() }
+        let changeMonitor = libraryChangeMonitor
+        Task { await changeMonitor.stop() }
     }
 
     private var libraryDetail: some View {
@@ -972,7 +990,8 @@ struct MainView: View {
         manager.liveAssetCount = timelineModel.wholeLibraryUIDs.count
         model.configureSmartSearch(
             feedCore: feed.feedCore,
-            assetUIDs: timelineModel.wholeLibraryUIDs
+            primaryItems: timelineModel.wholeLibraryItemsForViewer,
+            primaryAuthority: timelineModel.wholeLibraryInventoryAuthority
         )
     }
 
@@ -1100,6 +1119,7 @@ struct MainView: View {
             Task { await timelineModel.retry() }
         }
         Task { await loadAlbums() }
+        model.refreshLibrarySources()
         OfflineLibraryManager.shared.restartLocationCrawl(items: timelineModel.allItems, metadata: backend)
     }
 
@@ -1266,6 +1286,7 @@ struct MainView: View {
         if result.failureReason == .scopeAccessLost { return .terminal }
         OfflineLibraryManager.shared.liveAssetCount = timelineModel.allItems.count
         await loadAlbums()
+        model.refreshLibrarySources()
         reconcileNewAssetThumbnails(result.addedUIDs)
         return result.errorMessage == nil ? .refreshed : .retry
     }
@@ -2423,6 +2444,7 @@ private struct SidebarView: View {
     let sharedAlbumCatalogFailed: Bool
     let canLeaveSharedAlbum: Bool
     let thumbnailFeed: ThumbnailFeed
+    let sourceAnalysisRevision: UInt64
     @Binding var selection: PhotoFilter
     let onRetryAlbums: () -> Void
     let onRetrySharedAlbums: () -> Void
@@ -2486,7 +2508,11 @@ private struct SidebarView: View {
                         .disabled(true)
                 }
                 ForEach(sharedAlbums) { album in
-                    SharedAlbumSidebarRow(album: album, thumbnailFeed: thumbnailFeed)
+                    SharedAlbumSidebarRow(
+                        album: album,
+                        thumbnailFeed: thumbnailFeed,
+                        sourceAnalysisRevision: sourceAnalysisRevision
+                    )
                         .contextMenu {
                             if canLeaveSharedAlbum {
                                 Button(L10n.string("albums.leave_shared_action"), role: .destructive) {
@@ -2537,7 +2563,14 @@ private struct SidebarView: View {
 private struct SharedAlbumSidebarRow: View {
     let album: SharedAlbumSummary
     let thumbnailFeed: ThumbnailFeed
+    let sourceAnalysisRevision: UInt64
     @State private var coverImage: NSImage?
+    @State private var loadedCoverUID: PhotoUID?
+
+    private struct CoverLoadKey: Equatable {
+        let uid: PhotoUID?
+        let analysisRevision: UInt64
+    }
 
     private var coverUID: PhotoUID? { album.coverPhotoUID }
 
@@ -2578,12 +2611,16 @@ private struct SharedAlbumSidebarRow: View {
                     .lineLimit(1)
             }
         }
-        .task(id: coverUID) {
-            coverImage = nil
+        .task(id: CoverLoadKey(uid: coverUID, analysisRevision: sourceAnalysisRevision)) {
+            if loadedCoverUID != coverUID {
+                coverImage = nil
+                loadedCoverUID = coverUID
+            }
+            guard coverImage == nil else { return }
             guard let coverUID else { return }
             coverImage = thumbnailFeed.memoryImage(for: coverUID)
             if coverImage == nil {
-                coverImage = await thumbnailFeed.image(for: coverUID)
+                coverImage = await thumbnailFeed.analysisImage(for: coverUID)
             }
         }
     }

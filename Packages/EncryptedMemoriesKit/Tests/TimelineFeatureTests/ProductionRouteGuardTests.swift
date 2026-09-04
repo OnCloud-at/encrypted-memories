@@ -55,8 +55,9 @@ struct ProductionRouteGuardTests {
         let mainView = Self.repoRoot.appendingPathComponent("App/Views/MainView.swift")
         let text = try String(contentsOf: mainView, encoding: .utf8)
         // The grid feed must be built with the account-configured shared cache, never a throwaway instance.
-        #expect(text.contains("ThumbnailFeed(cache: OfflineLibraryManager.shared.cache"))
-        #expect(!text.contains("ThumbnailFeed(cache: ThumbnailCache()"))
+        #expect(text.contains("let feed = ThumbnailFeed("))
+        #expect(text.contains("cache: OfflineLibraryManager.shared.cache"))
+        #expect(!text.contains("cache: ThumbnailCache()"))
     }
 
     @Test func appAccountDataCacheIsEncryptedAndCleared() throws {
@@ -118,6 +119,16 @@ struct ProductionRouteGuardTests {
         #expect(
             bridge.contains("shutdownGate.closeAdmission()"),
             "bridge shutdown must reject stale facade operations before its first await")
+        let gateDrain = try #require(bridge.range(of: "await shutdownGate.run"))
+        let cacheDrain = try #require(
+            bridge.range(of: "await sharedAlbumSnapshotCache.invalidateAll()"))
+        let sdkShutdown = try #require(bridge.range(of: "await photosClient.shutdown()"))
+        #expect(
+            gateDrain.lowerBound < cacheDrain.lowerBound,
+            "cache-owned SDK tasks must drain only after admitted operations have joined")
+        #expect(
+            cacheDrain.lowerBound < sdkShutdown.lowerBound,
+            "cache-owned SDK tasks must join before the native client shuts down")
         #expect(bridge.contains("private nonisolated func withOpenSession"))
         #expect(
             bridge.contains("admission: shutdownGate"),
@@ -1974,8 +1985,19 @@ struct ProductionRouteGuardTests {
             !mainView.contains("albums = (try? await backend.albums()) ?? []"),
             "a transient album refresh failure must preserve the last authoritative catalog")
         #expect(
-            mainView.contains("Task { await loadAlbums() }\n        OfflineLibraryManager.shared.restartLocationCrawl"),
+            sourceBlock(
+                from: "private func retryAfterConnectivityRestored()",
+                to: "private var gridFillOrder",
+                in: mainView
+            ).contains("Task { await loadAlbums() }"),
             "connectivity recovery must retry the album catalog too")
+        #expect(
+            sourceBlock(
+                from: "private func retryAfterConnectivityRestored()",
+                to: "private var gridFillOrder",
+                in: mainView
+            ).contains("model.refreshLibrarySources()"),
+            "connectivity recovery must retry additional library-source discovery")
         #expect(mainView.contains("Label(\"sidebar.map\""), "Map must be localized on macOS")
         #expect(
             !mainView.contains("try? await facade.albums.setAlbumCover"),
@@ -2116,6 +2138,62 @@ struct ProductionRouteGuardTests {
             "popover content must not stack a second material over native popover glass")
     }
 
+    @Test func librarySourceRuntimeKeepsVersionedInventoryAndRecoveryRoutes() throws {
+        let appModel = try String(
+            contentsOf: Self.repoRoot.appendingPathComponent("App/AppModel.swift"),
+            encoding: .utf8
+        )
+        let mainView = try String(
+            contentsOf: Self.repoRoot.appendingPathComponent("App/Views/MainView.swift"),
+            encoding: .utf8
+        )
+        let mobileApp = try String(
+            contentsOf: Self.repoRoot.appendingPathComponent("iOSApp/EncryptedMemoriesMobileApp.swift"),
+            encoding: .utf8
+        )
+        let mobileLibrary = try String(
+            contentsOf: Self.repoRoot.appendingPathComponent("iOSApp/MobileLibraryModel.swift"),
+            encoding: .utf8
+        )
+
+        #expect(
+            appModel.components(separatedBy: "generation: primaryGeneration").count - 1 >= 2,
+            "macOS startup and later primary-inventory updates must share the monotonic generation fence"
+        )
+        #expect(
+            mobileLibrary.contains("generation: primaryGeneration"),
+            "iOS and iPadOS primary-inventory updates must use the same generation fence"
+        )
+
+        let macConnectivityRecovery = sourceBlock(
+            from: "private func retryAfterConnectivityRestored()",
+            to: "private var gridFillOrder",
+            in: mainView
+        )
+        #expect(macConnectivityRecovery.contains("model.refreshLibrarySources()"))
+
+        let macRemoteRefresh = sourceBlock(
+            from: "@MainActor private func performRemoteLibraryRefresh()",
+            to: "private func scheduleLibraryRefreshAfterBackupUpload()",
+            in: mainView
+        )
+        #expect(macRemoteRefresh.contains("model.refreshLibrarySources()"))
+
+        #expect(
+            mobileApp.contains("libraryModel.refreshLibrarySources()"),
+            "mobile connectivity recovery must refresh additional library sources"
+        )
+        let mobileRemoteRefresh = sourceBlock(
+            from: "private func performLibraryRefresh(",
+            to: "private func apply(_ event: LibraryLoadEvent)",
+            in: mobileLibrary
+        )
+        #expect(
+            mobileRemoteRefresh.contains("refreshLibrarySources()"),
+            "mobile remote-library changes must refresh additional library sources"
+        )
+    }
+
     @Test func liquidGlassAvailabilityStaysCentralized() {
         let roots = [
             Self.repoRoot.appendingPathComponent("App"),
@@ -2236,8 +2314,10 @@ struct ProductionRouteGuardTests {
             "favorite writes must run inside the bridge shutdown admission lease")
         #expect(bridge.contains("SDKAlbumCatalogBackend("))
         #expect(
-            bridge.contains("client: photosClient, admission: shutdownGate"),
-            "the SDK album catalog must share the account shutdown admission owner")
+            bridge.contains("client: photosClient")
+                && bridge.contains("admission: shutdownGate")
+                && bridge.contains("sharedAlbumSnapshotCache: sharedAlbumSnapshotCache"),
+            "the SDK album catalog must share account shutdown and snapshot owners")
         #expect(
             !bridge.contains("func albums()"),
             "the manual album-name decryption bridge was replaced, not layered over")
@@ -2250,6 +2330,11 @@ struct ProductionRouteGuardTests {
         )
         #expect(facade.contains("HTTPAlbumWriteBackend("))
         #expect(!facade.contains("HTTPAlbumBackend("))
+        #expect(
+            facade.contains("didLeaveSharedAlbum: { album in")
+                && facade.contains("await librarySources.revokeAdditionalSource(for: album)"),
+            "confirmed access loss must reach the shared source coordinator on every platform"
+        )
     }
 
     @Test func sdkAlbumContentMigrationStaysParkedUntilContractIsComplete() throws {
@@ -2394,7 +2479,7 @@ struct ProductionRouteGuardTests {
         let onChangeBody = try Self.body(
             of: mainText,
             from: ".onChange(of: selection)",
-            to: ".onChange(of: timelineModel.wholeLibraryRevision)"
+            to: ".onChange(of: timelineModel.wholeLibraryContentRevision)"
         )
         #expect(onChangeBody.contains("routeScrollPositions[oldValue]"))
         #expect(onChangeBody.contains("routeInitialScrollAnchor = routeScrollPositions[newValue]"))

@@ -24,6 +24,15 @@ public protocol MLIndexStore: Sendable {
     /// assets that left the library without scanning vector payloads.
     func allTrackedUIDs(for descriptor: MLModelDescriptor) -> [PhotoUID]
 
+    /// Reconciles one authoritative inventory. After the first session-local baseline, callers pass
+    /// the last successfully reconciled inventory so stores can remove only the exact delta.
+    @discardableResult
+    func reconcileTrackedUIDs(
+        currentAuthoritativeUIDs: [PhotoUID],
+        previousAuthoritativeUIDs: [PhotoUID]?,
+        descriptor: MLModelDescriptor
+    ) -> Bool
+
     /// All embeddings for a model epoch, in the store's deterministic order.
     /// Query paths should use `forEachVectorBlock` so vector memory stays bounded.
     func allRecords(for descriptor: MLModelDescriptor) -> [MLEmbeddingRecord]
@@ -50,8 +59,10 @@ public protocol MLIndexStore: Sendable {
     /// Implementations must bump the vector generation at most once for the batch.
     func remove(uids: [PhotoUID], descriptor: MLModelDescriptor)
 
-    /// Drop every record for a model epoch (used when retiring a model version).
-    func removeAll(for descriptor: MLModelDescriptor)
+    /// Atomically drops every embedding and failure record for a model epoch. Callers may retire
+    /// external model state only after this returns `true`.
+    @discardableResult
+    func removeAll(for descriptor: MLModelDescriptor) -> Bool
 
     /// Total record count for a model epoch.
     func count(for descriptor: MLModelDescriptor) -> Int
@@ -182,6 +193,35 @@ public final class InMemoryMLIndexStore: MLIndexStore, @unchecked Sendable {
         }
     }
 
+    @discardableResult
+    public func reconcileTrackedUIDs(
+        currentAuthoritativeUIDs: [PhotoUID],
+        previousAuthoritativeUIDs: [PhotoUID]?,
+        descriptor: MLModelDescriptor
+    ) -> Bool {
+        let current = Set(currentAuthoritativeUIDs)
+        return lock.withLock {
+            let candidates: Set<PhotoUID>
+            if let previousAuthoritativeUIDs {
+                candidates = Set(previousAuthoritativeUIDs)
+            } else {
+                let indexed = recordsByDescriptor[descriptor].map { Set($0.keys) } ?? []
+                let failed = failuresByDescriptor[descriptor].map { Set($0.keys) } ?? []
+                candidates = indexed.union(failed)
+            }
+            var vectorsChanged = false
+            for uid in candidates where !current.contains(uid) {
+                vectorsChanged = recordsByDescriptor[descriptor]?.removeValue(forKey: uid) != nil
+                    || vectorsChanged
+                failuresByDescriptor[descriptor]?.removeValue(forKey: uid)
+            }
+            if vectorsChanged {
+                generations[descriptor, default: 0] &+= 1
+            }
+            return true
+        }
+    }
+
     public func allRecords(for descriptor: MLModelDescriptor) -> [MLEmbeddingRecord] {
         lock.lock()
         defer { lock.unlock() }
@@ -209,12 +249,14 @@ public final class InMemoryMLIndexStore: MLIndexStore, @unchecked Sendable {
         }
     }
 
-    public func removeAll(for descriptor: MLModelDescriptor) {
+    @discardableResult
+    public func removeAll(for descriptor: MLModelDescriptor) -> Bool {
         lock.lock()
         defer { lock.unlock() }
         let changed = recordsByDescriptor.removeValue(forKey: descriptor) != nil
         failuresByDescriptor.removeValue(forKey: descriptor)
         if changed { generations[descriptor, default: 0] &+= 1 }
+        return true
     }
 
     public func count(for descriptor: MLModelDescriptor) -> Int {

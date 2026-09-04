@@ -189,6 +189,11 @@ public struct MLDerivedSearchHit: Equatable, Sendable {
     }
 }
 
+public enum MLDerivedPipelineStoreError: Error, Equatable, Sendable {
+    case storageUnavailable
+    case corruptData
+}
+
 public protocol MLDerivedPipelineStore: Sendable {
     /// Idempotently schedules current source revisions. A changed source revision reopens only the
     /// corresponding asset/artifact work row.
@@ -196,11 +201,13 @@ public protocol MLDerivedPipelineStore: Sendable {
     func enqueue(_ assets: [MLPipelineAssetRevision], for key: MLPipelineExecutionKey) -> Bool
 
     /// Returns a bounded, indexed work page. Implementations must not load encrypted payloads here.
+    /// Candidate order is a store-owned scheduling policy: a persistent store may select retries by
+    /// due time before grouping the bounded page by asset. Callers must not depend on global order.
     func nextWorkBatch(
         for key: MLPipelineExecutionKey,
         limit: Int,
         now: Date
-    ) -> [MLDerivedPipelineWorkItem]
+    ) throws -> [MLDerivedPipelineWorkItem]
 
     /// Commits output and durable outcome together. Observer progress may advance only after this
     /// returns `true`.
@@ -211,7 +218,7 @@ public protocol MLDerivedPipelineStore: Sendable {
         now: Date
     ) -> Bool
 
-    func progress(for key: MLPipelineExecutionKey) -> MLDerivedPipelineProgress
+    func progress(for key: MLPipelineExecutionKey) throws -> MLDerivedPipelineProgress
     func unavailableAssetUIDs(for key: MLPipelineExecutionKey) -> Set<PhotoUID>
     func output(
         for uid: PhotoUID,
@@ -349,7 +356,7 @@ public final class InMemoryMLDerivedPipelineStore: MLDerivedPipelineStore, @unch
         for key: MLPipelineExecutionKey,
         limit: Int,
         now: Date
-    ) -> [MLDerivedPipelineWorkItem] {
+    ) throws -> [MLDerivedPipelineWorkItem] {
         guard limit > 0 else { return [] }
         return lock.withLock {
             records.compactMap { storedKey, record -> MLDerivedPipelineWorkItem? in
@@ -421,7 +428,7 @@ public final class InMemoryMLDerivedPipelineStore: MLDerivedPipelineStore, @unch
         }
     }
 
-    public func progress(for key: MLPipelineExecutionKey) -> MLDerivedPipelineProgress {
+    public func progress(for key: MLPipelineExecutionKey) throws -> MLDerivedPipelineProgress {
         lock.withLock {
             var completed = 0
             var skipped = 0

@@ -51,6 +51,7 @@ CORE_TARGETS=(
   MediaByteCache
   MediaDecodingCore
   MediaFeedCore
+  LibrarySourceRuntime
   MediaLocationCore
   MediaCacheCore
   GridCore

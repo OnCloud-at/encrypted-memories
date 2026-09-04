@@ -219,6 +219,8 @@ public struct UploadQueueStats: Sendable, Equatable {
     public var cancelled = 0
     public var paused = 0
     public var concurrency = 0
+    /// Durable upload state could not be opened. The queue must not present this as an empty history.
+    public var persistenceUnavailable = false
 
     public init() {}
 

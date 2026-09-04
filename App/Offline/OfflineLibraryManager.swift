@@ -384,8 +384,9 @@ final class OfflineLibraryManager {
         let prefetch = await feed?.prefetchStatus()
         let metadataRows = await statsProvider?.metadataRowCount() ?? 0
         let totalAssets = max(liveAssetCount, metadataRows)
-        let onDisk = cache.diskFileCount()
-        let decode = PhotoDiagnostics.shared.decodeStats()
+        // Source-aware feeds report coverage for the primary projection only. Physical cache bytes still
+        // include authorized analysis-only derivatives and remain reflected in `cacheSizeBytes` below.
+        let onDisk = prefetch?.diskFileCount ?? cache.diskFileCount()
 
         var s = OfflineCacheStatus()
         s.offlineEnabled = offlineEnabled
@@ -393,8 +394,7 @@ final class OfflineLibraryManager {
         s.metadataRows = metadataRows
         s.thumbnailsOnDisk = onDisk
         s.thumbnailsMissing = max(0, totalAssets - onDisk)
-        // NSCache count isn't observable; bound the cumulative decode count by a fixed display ceiling.
-        s.ramDecodedEstimate = min(1500, max(0, decode.ramDecodeCompleted - decode.ramDecodeFailed))
+        s.ramDecodedEstimate = prefetch?.ramDecodedCount ?? 0
         s.prefetchQueueDepth = prefetch?.currentQueueLength ?? 0
         s.activePrefetchJobs = prefetch?.activeJobs ?? 0
         // Thumbnails always crawl, so the offline toggle never reports "disabled" here.

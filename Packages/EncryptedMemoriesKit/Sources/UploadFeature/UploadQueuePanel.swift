@@ -14,7 +14,9 @@ public struct UploadQueuePanel: View {
         VStack(spacing: 0) {
             header
             Divider()
-            if coordinator.items.isEmpty {
+            if coordinator.stats.persistenceUnavailable {
+                persistenceUnavailable
+            } else if coordinator.items.isEmpty {
                 empty
             } else {
                 List {
@@ -89,6 +91,15 @@ public struct UploadQueuePanel: View {
             Label(L10n.string("upload.no_uploads"), systemImage: "tray")
         } description: {
             Text(L10n.string("upload.empty_description"))
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var persistenceUnavailable: some View {
+        ContentUnavailableView {
+            Label(L10n.string("upload.persistence_unavailable"), systemImage: "exclamationmark.triangle")
+        } description: {
+            Text(L10n.string("upload.persistence_unavailable_description"))
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }

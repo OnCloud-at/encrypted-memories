@@ -407,23 +407,6 @@ public final class UploadManualSettlementStore: UploadManualSettlementStoreProto
     }
 
     private static func open(url: URL, policy: LibraryDatabasePolicy) -> OpaquePointer? {
-        var handle: OpaquePointer?
-        guard sqlite3_open(url.path, &handle) == SQLITE_OK, let handle else {
-            sqlite3_close(handle)
-            return nil
-        }
-        let pragmas = [
-            "PRAGMA journal_mode=WAL;",
-            "PRAGMA synchronous=NORMAL;",
-            "PRAGMA busy_timeout=\(policy.busyTimeoutMs);",
-            "PRAGMA cache_size=-\(max(0, policy.cacheSizeKiB));",
-            "PRAGMA mmap_size=\(max(0, policy.mmapBytes));",
-            "PRAGMA journal_size_limit=\(policy.journalSizeLimitBytes);",
-        ]
-        guard pragmas.allSatisfy({ sqlite3_exec(handle, $0, nil, nil, nil) == SQLITE_OK }) else {
-            sqlite3_close(handle)
-            return nil
-        }
         let schema = """
             CREATE TABLE IF NOT EXISTS manual_upload_settlement_info(
               key TEXT PRIMARY KEY,
@@ -438,9 +421,42 @@ public final class UploadManualSettlementStore: UploadManualSettlementStoreProto
             CREATE INDEX IF NOT EXISTS manual_upload_settlement_stage_idx
               ON manual_upload_settlement(stage, updated_at);
             """
-        guard sqlite3_exec(handle, schema, nil, nil, nil) == SQLITE_OK,
-            verifyVersion(handle)
-        else {
+
+        let compatibility = SQLiteStoreSchemaGate.compatibility(
+            at: url,
+            schemaSQL: schema,
+            busyTimeoutMs: policy.busyTimeoutMs,
+            versionIsCurrent: verifyVersion
+        )
+        guard compatibility == .empty || compatibility == .current else { return nil }
+        var handle: OpaquePointer?
+        let flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX
+            | (compatibility == .empty ? SQLITE_OPEN_CREATE : 0)
+        guard sqlite3_open_v2(url.path, &handle, flags, nil) == SQLITE_OK, let handle else {
+            sqlite3_close(handle)
+            return nil
+        }
+        sqlite3_busy_timeout(handle, Int32(clamping: policy.busyTimeoutMs))
+        switch compatibility {
+        case .empty:
+            SQLiteStoreSchemaGate.configureConnection(handle, policy: policy)
+            guard SQLiteStoreSchemaGate.initializeCurrentSchema(
+                handle,
+                schemaSQL: schema,
+                stamp: { stampVersion(handle) }
+            ) else {
+                sqlite3_close(handle)
+                return nil
+            }
+        case .current:
+            guard verifyVersion(handle),
+                SQLiteStoreSchemaGate.matchesCurrentSchema(handle, schemaSQL: schema)
+            else {
+                sqlite3_close(handle)
+                return nil
+            }
+            SQLiteStoreSchemaGate.configureConnection(handle, policy: policy)
+        case .incompatible, .unavailable:
             sqlite3_close(handle)
             return nil
         }
@@ -459,9 +475,13 @@ public final class UploadManualSettlementStore: UploadManualSettlementStoreProto
             ) == SQLITE_OK
         else { return false }
         var onDisk: Int?
-        if sqlite3_step(statement) == SQLITE_ROW { onDisk = Int(sqlite3_column_int(statement, 0)) }
+        let result = sqlite3_step(statement)
+        if result == SQLITE_ROW { onDisk = Int(sqlite3_column_int(statement, 0)) }
         sqlite3_finalize(statement)
-        if let onDisk, onDisk != schemaVersion { return false }
+        return result == SQLITE_ROW && onDisk == schemaVersion
+    }
+
+    private static func stampVersion(_ db: OpaquePointer?) -> Bool {
         return sqlite3_exec(
             db,
             "INSERT INTO manual_upload_settlement_info(key, value) VALUES('schema', \(schemaVersion)) "

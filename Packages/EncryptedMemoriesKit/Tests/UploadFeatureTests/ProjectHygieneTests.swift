@@ -1165,10 +1165,17 @@ final class ProjectHygieneTests: XCTestCase {
             contentsOf: repoRoot.appendingPathComponent("iOSApp/MobileLibraryModel.swift"), encoding: .utf8)
         XCTAssertTrue(mobileModel.contains("private(set) var albumCatalogRevision"))
         XCTAssertTrue(mobileModel.contains("albumSync.setRemoteAlbumsChangedHandler"))
+        let mobileRemoteRefresh = try sourceBlock(
+            from: "private func performLibraryRefresh(",
+            to: "private func apply(_ event: LibraryLoadEvent)",
+            in: mobileModel
+        )
         XCTAssertTrue(
-            mobileModel.contains(
-                "albumCatalogRevision &+= 1\n            return .init(outcome: .refreshed, failureReason: nil)"),
+            mobileRemoteRefresh.contains("albumCatalogRevision &+= 1"),
             "the shared remote-library poll must invalidate the iOS/iPadOS album catalog too")
+        XCTAssertTrue(
+            mobileRemoteRefresh.contains("refreshLibrarySources()"),
+            "the shared remote-library poll must refresh additional source inventories too")
 
         let mobileAlbums = try String(
             contentsOf: repoRoot.appendingPathComponent("iOSApp/MobileAlbumsScreen.swift"), encoding: .utf8)
