@@ -759,7 +759,8 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
         )
         guard compatibility == .empty || compatibility == .current else { return nil }
         var handle: OpaquePointer?
-        let flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX
+        let flags =
+            SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX
             | (compatibility == .empty ? SQLITE_OPEN_CREATE : 0)
         guard sqlite3_open_v2(url.path, &handle, flags, nil) == SQLITE_OK else {
             sqlite3_close(handle)
@@ -769,11 +770,13 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
         switch compatibility {
         case .empty:
             SQLiteStoreSchemaGate.configureConnection(handle, policy: policy)
-            guard SQLiteStoreSchemaGate.initializeCurrentSchema(
-                handle,
-                schemaSQL: schema,
-                stamp: { stampVersion(handle) }
-            ) else {
+            guard
+                SQLiteStoreSchemaGate.initializeCurrentSchema(
+                    handle,
+                    schemaSQL: schema,
+                    stamp: { stampVersion(handle) }
+                )
+            else {
                 sqlite3_close(handle)
                 return nil
             }

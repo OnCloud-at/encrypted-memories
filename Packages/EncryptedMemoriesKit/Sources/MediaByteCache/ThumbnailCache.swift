@@ -570,7 +570,8 @@ public actor ThumbnailCache {
             if !Self.removeDirectoryIfPresent(coverageCheckpointDir) {
                 failed = true
             }
-            let result: MediaCacheReconciliationResult = failed
+            let result: MediaCacheReconciliationResult =
+                failed
                 ? .ioFailure
                 : .reconciled(removedEntries: removedDiskFiles)
             // Authorization changes immediately, but a failed cleanup must remain retryable with the same

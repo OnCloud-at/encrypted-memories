@@ -151,10 +151,12 @@ public final class LibrarySourceInventoryStore: @unchecked Sendable {
     public func activate(for epoch: LibrarySourceEpoch) async throws -> SessionLease {
         try await perform {
             if !self.ownsFile {
-                guard LibrarySourceInventoryOwnerRegistry.shared.acquire(
-                    self.fileURL,
-                    ownerID: self.ownerID
-                ) else {
+                guard
+                    LibrarySourceInventoryOwnerRegistry.shared.acquire(
+                        self.fileURL,
+                        ownerID: self.ownerID
+                    )
+                else {
                     throw LibrarySourceInventoryStoreError.alreadyOwned
                 }
                 self.ownsFile = true
@@ -194,95 +196,100 @@ public final class LibrarySourceInventoryStore: @unchecked Sendable {
         try await perform {
             try self.validate(session)
             do {
-            guard let db = self.db else {
-                throw LibrarySourceInventoryStoreError.openFailed
-            }
-
-            var sourceStatement: OpaquePointer?
-            guard sqlite3_prepare_v2(
-                db,
-                "SELECT source_key, payload FROM source_inventory ORDER BY source_key;",
-                -1,
-                &sourceStatement,
-                nil
-            ) == SQLITE_OK else {
-                throw Self.readError(sqlite3_errcode(db))
-            }
-            defer { sqlite3_finalize(sourceStatement) }
-
-            var storedSources: [(key: Data, value: StoredSource)] = []
-            var sourceIndexByKey: [Data: Int] = [:]
-            var sourceStep = sqlite3_step(sourceStatement)
-            while sourceStep == SQLITE_ROW {
-                guard let sourceKey = Self.columnData(sourceStatement, 0),
-                    let payload = Self.columnData(sourceStatement, 1)
-                else { throw LibrarySourceInventoryStoreError.corruptData }
-                let stored: StoredSource = try self.open(
-                    payload,
-                    domain: "source",
-                    rowKey: sourceKey
-                )
-                guard self.sourceKey(for: stored.source.id) == sourceKey else {
-                    throw LibrarySourceInventoryStoreError.corruptData
+                guard let db = self.db else {
+                    throw LibrarySourceInventoryStoreError.openFailed
                 }
-                sourceIndexByKey[sourceKey] = storedSources.count
-                storedSources.append((sourceKey, stored))
-                sourceStep = sqlite3_step(sourceStatement)
-            }
-            guard sourceStep == SQLITE_DONE else { throw Self.readError(sourceStep) }
 
-            var itemsBySource = Array(repeating: [LibrarySourceItem](), count: storedSources.count)
-            var itemStatement: OpaquePointer?
-            guard sqlite3_prepare_v2(
-                db,
-                """
-                SELECT source_key, item_key, payload
-                FROM source_item
-                ORDER BY source_key, item_key;
-                """,
-                -1,
-                &itemStatement,
-                nil
-            ) == SQLITE_OK else {
-                throw Self.readError(sqlite3_errcode(db))
-            }
-            defer { sqlite3_finalize(itemStatement) }
-
-            var itemStep = sqlite3_step(itemStatement)
-            while itemStep == SQLITE_ROW {
-                guard let sourceKey = Self.columnData(itemStatement, 0),
-                    let itemKey = Self.columnData(itemStatement, 1),
-                    let payload = Self.columnData(itemStatement, 2),
-                    let sourceIndex = sourceIndexByKey[sourceKey]
-                else { throw LibrarySourceInventoryStoreError.corruptData }
-                let item: LibrarySourceItem = try self.open(
-                    payload,
-                    domain: "item",
-                    rowKey: sourceKey + itemKey
-                )
-                guard self.itemKey(for: item.uid) == itemKey else {
-                    throw LibrarySourceInventoryStoreError.corruptData
+                var sourceStatement: OpaquePointer?
+                guard
+                    sqlite3_prepare_v2(
+                        db,
+                        "SELECT source_key, payload FROM source_inventory ORDER BY source_key;",
+                        -1,
+                        &sourceStatement,
+                        nil
+                    ) == SQLITE_OK
+                else {
+                    throw Self.readError(sqlite3_errcode(db))
                 }
-                itemsBySource[sourceIndex].append(item)
-                itemStep = sqlite3_step(itemStatement)
-            }
-            guard itemStep == SQLITE_DONE else { throw Self.readError(itemStep) }
+                defer { sqlite3_finalize(sourceStatement) }
 
-            let inventories = storedSources.enumerated().map { index, stored in
-                Self.canonicalInventory(LibrarySourceInventory(
-                    source: stored.value.source,
-                    accessState: stored.value.accessState,
-                    authority: stored.value.authority,
-                    items: itemsBySource[index],
-                    validationToken: stored.value.validationToken
-                ))
-            }.sorted { lhs, rhs in
-                lhs.source.id.rawValue.utf8.lexicographicallyPrecedes(
-                    rhs.source.id.rawValue.utf8
-                )
-            }
-            try LibrarySourceInventoryValidator.validate(inventories)
-            return inventories
+                var storedSources: [(key: Data, value: StoredSource)] = []
+                var sourceIndexByKey: [Data: Int] = [:]
+                var sourceStep = sqlite3_step(sourceStatement)
+                while sourceStep == SQLITE_ROW {
+                    guard let sourceKey = Self.columnData(sourceStatement, 0),
+                        let payload = Self.columnData(sourceStatement, 1)
+                    else { throw LibrarySourceInventoryStoreError.corruptData }
+                    let stored: StoredSource = try self.open(
+                        payload,
+                        domain: "source",
+                        rowKey: sourceKey
+                    )
+                    guard self.sourceKey(for: stored.source.id) == sourceKey else {
+                        throw LibrarySourceInventoryStoreError.corruptData
+                    }
+                    sourceIndexByKey[sourceKey] = storedSources.count
+                    storedSources.append((sourceKey, stored))
+                    sourceStep = sqlite3_step(sourceStatement)
+                }
+                guard sourceStep == SQLITE_DONE else { throw Self.readError(sourceStep) }
+
+                var itemsBySource = Array(repeating: [LibrarySourceItem](), count: storedSources.count)
+                var itemStatement: OpaquePointer?
+                guard
+                    sqlite3_prepare_v2(
+                        db,
+                        """
+                        SELECT source_key, item_key, payload
+                        FROM source_item
+                        ORDER BY source_key, item_key;
+                        """,
+                        -1,
+                        &itemStatement,
+                        nil
+                    ) == SQLITE_OK
+                else {
+                    throw Self.readError(sqlite3_errcode(db))
+                }
+                defer { sqlite3_finalize(itemStatement) }
+
+                var itemStep = sqlite3_step(itemStatement)
+                while itemStep == SQLITE_ROW {
+                    guard let sourceKey = Self.columnData(itemStatement, 0),
+                        let itemKey = Self.columnData(itemStatement, 1),
+                        let payload = Self.columnData(itemStatement, 2),
+                        let sourceIndex = sourceIndexByKey[sourceKey]
+                    else { throw LibrarySourceInventoryStoreError.corruptData }
+                    let item: LibrarySourceItem = try self.open(
+                        payload,
+                        domain: "item",
+                        rowKey: sourceKey + itemKey
+                    )
+                    guard self.itemKey(for: item.uid) == itemKey else {
+                        throw LibrarySourceInventoryStoreError.corruptData
+                    }
+                    itemsBySource[sourceIndex].append(item)
+                    itemStep = sqlite3_step(itemStatement)
+                }
+                guard itemStep == SQLITE_DONE else { throw Self.readError(itemStep) }
+
+                let inventories = storedSources.enumerated().map { index, stored in
+                    Self.canonicalInventory(
+                        LibrarySourceInventory(
+                            source: stored.value.source,
+                            accessState: stored.value.accessState,
+                            authority: stored.value.authority,
+                            items: itemsBySource[index],
+                            validationToken: stored.value.validationToken
+                        ))
+                }.sorted { lhs, rhs in
+                    lhs.source.id.rawValue.utf8.lexicographicallyPrecedes(
+                        rhs.source.id.rawValue.utf8
+                    )
+                }
+                try LibrarySourceInventoryValidator.validate(inventories)
+                return inventories
             } catch LibrarySourceInventoryStoreError.corruptData {
                 try self.resetCorruptStoreLocked()
                 return []
@@ -347,7 +354,8 @@ public final class LibrarySourceInventoryStore: @unchecked Sendable {
             guard let db = self.db else {
                 throw LibrarySourceInventoryStoreError.openFailed
             }
-            let ordered = inventories
+            let ordered =
+                inventories
                 .map(Self.canonicalInventory)
                 .sorted { lhs, rhs in
                     lhs.source.id.rawValue.utf8.lexicographicallyPrecedes(
@@ -363,17 +371,19 @@ public final class LibrarySourceInventoryStore: @unchecked Sendable {
                 throw LibrarySourceInventoryStoreError.openFailed
             }
             do {
-                guard sqlite3_exec(
-                    db,
-                    """
-                    DELETE FROM incoming_source;
-                    DELETE FROM incoming_authoritative_source;
-                    DELETE FROM incoming_item;
-                    """,
-                    nil,
-                    nil,
-                    nil
-                ) == SQLITE_OK else {
+                guard
+                    sqlite3_exec(
+                        db,
+                        """
+                        DELETE FROM incoming_source;
+                        DELETE FROM incoming_authoritative_source;
+                        DELETE FROM incoming_item;
+                        """,
+                        nil,
+                        nil,
+                        nil
+                    ) == SQLITE_OK
+                else {
                     throw LibrarySourceInventoryStoreError.corruptData
                 }
                 var changedSources = 0
@@ -417,24 +427,26 @@ public final class LibrarySourceInventoryStore: @unchecked Sendable {
                 }
 
                 let beforeItems = sqlite3_total_changes(db)
-                guard sqlite3_exec(
-                    db,
-                    """
-                    DELETE FROM source_item
-                    WHERE EXISTS (
-                      SELECT 1 FROM incoming_authoritative_source a
-                      WHERE a.source_key = source_item.source_key
-                    )
-                    AND NOT EXISTS (
-                      SELECT 1 FROM incoming_item i
-                      WHERE i.source_key = source_item.source_key
-                        AND i.item_key = source_item.item_key
-                    );
-                    """,
-                    nil,
-                    nil,
-                    nil
-                ) == SQLITE_OK else {
+                guard
+                    sqlite3_exec(
+                        db,
+                        """
+                        DELETE FROM source_item
+                        WHERE EXISTS (
+                          SELECT 1 FROM incoming_authoritative_source a
+                          WHERE a.source_key = source_item.source_key
+                        )
+                        AND NOT EXISTS (
+                          SELECT 1 FROM incoming_item i
+                          WHERE i.source_key = source_item.source_key
+                            AND i.item_key = source_item.item_key
+                        );
+                        """,
+                        nil,
+                        nil,
+                        nil
+                    ) == SQLITE_OK
+                else {
                     throw LibrarySourceInventoryStoreError.corruptData
                 }
                 var removedItems = Int(sqlite3_total_changes(db) - beforeItems)
@@ -461,19 +473,21 @@ public final class LibrarySourceInventoryStore: @unchecked Sendable {
                             );
                             """
                     )
-                    guard sqlite3_exec(
-                        db,
-                        """
-                        DELETE FROM source_inventory
-                        WHERE NOT EXISTS (
-                          SELECT 1 FROM incoming_source i
-                          WHERE i.source_key = source_inventory.source_key
-                        );
-                        """,
-                        nil,
-                        nil,
-                        nil
-                    ) == SQLITE_OK else {
+                    guard
+                        sqlite3_exec(
+                            db,
+                            """
+                            DELETE FROM source_inventory
+                            WHERE NOT EXISTS (
+                              SELECT 1 FROM incoming_source i
+                              WHERE i.source_key = source_inventory.source_key
+                            );
+                            """,
+                            nil,
+                            nil,
+                            nil
+                        ) == SQLITE_OK
+                    else {
                         throw LibrarySourceInventoryStoreError.corruptData
                     }
                 }
@@ -542,13 +556,15 @@ public final class LibrarySourceInventoryStore: @unchecked Sendable {
                     )
                 }
                 var deleteItems: OpaquePointer?
-                guard sqlite3_prepare_v2(
-                    db,
-                    "DELETE FROM source_item WHERE source_key=?;",
-                    -1,
-                    &deleteItems,
-                    nil
-                ) == SQLITE_OK else {
+                guard
+                    sqlite3_prepare_v2(
+                        db,
+                        "DELETE FROM source_item WHERE source_key=?;",
+                        -1,
+                        &deleteItems,
+                        nil
+                    ) == SQLITE_OK
+                else {
                     throw LibrarySourceInventoryStoreError.corruptData
                 }
                 defer { sqlite3_finalize(deleteItems) }
@@ -647,12 +663,14 @@ public final class LibrarySourceInventoryStore: @unchecked Sendable {
         }
 
         var handle: OpaquePointer?
-        guard sqlite3_open_v2(
-            fileURL.path,
-            &handle,
-            SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_NOMUTEX,
-            nil
-        ) == SQLITE_OK, let handle else {
+        guard
+            sqlite3_open_v2(
+                fileURL.path,
+                &handle,
+                SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_NOMUTEX,
+                nil
+            ) == SQLITE_OK, let handle
+        else {
             sqlite3_close(handle)
             return .failed
         }
@@ -671,19 +689,21 @@ public final class LibrarySourceInventoryStore: @unchecked Sendable {
             guard Self.userVersion(handle) == 0,
                 SQLiteStoreSchemaGate.state(of: handle) == .empty
             else { return close(.incompatible) }
-            guard SQLiteStoreSchemaGate.initializeCurrentSchema(
-                handle,
-                schemaSQL: Self.persistentSchema,
-                stamp: {
-                    sqlite3_exec(
-                        handle,
-                        "PRAGMA user_version=\(Self.schemaVersion);",
-                        nil,
-                        nil,
-                        nil
-                    ) == SQLITE_OK
-                }
-            ) else {
+            guard
+                SQLiteStoreSchemaGate.initializeCurrentSchema(
+                    handle,
+                    schemaSQL: Self.persistentSchema,
+                    stamp: {
+                        sqlite3_exec(
+                            handle,
+                            "PRAGMA user_version=\(Self.schemaVersion);",
+                            nil,
+                            nil,
+                            nil
+                        ) == SQLITE_OK
+                    }
+                )
+            else {
                 let code = sqlite3_errcode(handle)
                 return close(
                     code == SQLITE_OK || Self.isConfirmedCorruption(code) ? .incompatible : .failed
@@ -816,7 +836,8 @@ public final class LibrarySourceInventoryStore: @unchecked Sendable {
             bindings: [sourceKey],
             transient: transient
         )
-        let sourcePayload: Data? = try existingSourceDigest == sourceDigest
+        let sourcePayload: Data? =
+            try existingSourceDigest == sourceDigest
             ? nil : seal(sourcePlaintext, domain: "source", rowKey: sourceKey)
         let items = try inventory.items.map { item -> PreparedItemRow in
             let itemKey = itemKey(for: item.uid)
@@ -852,12 +873,14 @@ public final class LibrarySourceInventoryStore: @unchecked Sendable {
             sqlite3_clear_bindings(statement) == SQLITE_OK
         else { throw LibrarySourceInventoryStoreError.corruptData }
         for (offset, binding) in bindings.enumerated() {
-            guard bind(
-                binding,
-                to: statement,
-                at: Int32(offset + 1),
-                transient: transient
-            ) else { throw LibrarySourceInventoryStoreError.corruptData }
+            guard
+                bind(
+                    binding,
+                    to: statement,
+                    at: Int32(offset + 1),
+                    transient: transient
+                )
+            else { throw LibrarySourceInventoryStoreError.corruptData }
         }
         switch sqlite3_step(statement) {
         case SQLITE_ROW:
@@ -881,12 +904,14 @@ public final class LibrarySourceInventoryStore: @unchecked Sendable {
             sqlite3_clear_bindings(statement) == SQLITE_OK
         else { throw LibrarySourceInventoryStoreError.corruptData }
         for (offset, binding) in bindings.enumerated() {
-            guard bind(
-                binding,
-                to: statement,
-                at: Int32(offset + 1),
-                transient: transient
-            ) else { throw LibrarySourceInventoryStoreError.corruptData }
+            guard
+                bind(
+                    binding,
+                    to: statement,
+                    at: Int32(offset + 1),
+                    transient: transient
+                )
+            else { throw LibrarySourceInventoryStoreError.corruptData }
         }
         let step = sqlite3_step(statement)
         guard step == SQLITE_DONE else { throw readError(step) }

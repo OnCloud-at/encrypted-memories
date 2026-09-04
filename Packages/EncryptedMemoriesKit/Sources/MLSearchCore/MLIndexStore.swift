@@ -211,7 +211,8 @@ public final class InMemoryMLIndexStore: MLIndexStore, @unchecked Sendable {
             }
             var vectorsChanged = false
             for uid in candidates where !current.contains(uid) {
-                vectorsChanged = recordsByDescriptor[descriptor]?.removeValue(forKey: uid) != nil
+                vectorsChanged =
+                    recordsByDescriptor[descriptor]?.removeValue(forKey: uid) != nil
                     || vectorsChanged
                 failuresByDescriptor[descriptor]?.removeValue(forKey: uid)
             }

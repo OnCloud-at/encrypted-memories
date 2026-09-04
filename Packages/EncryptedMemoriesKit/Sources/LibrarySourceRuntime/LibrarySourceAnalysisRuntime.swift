@@ -27,11 +27,12 @@ public actor LibrarySourceAnalysisRuntime {
     private var pendingReconciliationRetryChange: LibrarySourceChange?
     private var activeRetryOperations = 0
     private var retryDrainWaiters: [CheckedContinuation<Void, Never>] = []
-    private var pendingPrimaryInventory: (
-        items: [PhotoItem],
-        authority: SourceInventoryAuthority,
-        generation: UInt64
-    )?
+    private var pendingPrimaryInventory:
+        (
+            items: [PhotoItem],
+            authority: SourceInventoryAuthority,
+            generation: UInt64
+        )?
     private var latestPrimaryInventoryGeneration: UInt64?
     private var applyingPrimaryInventory = false
     private var primaryInventoryDrainWaiters: [CheckedContinuation<Void, Never>] = []

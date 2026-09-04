@@ -200,15 +200,17 @@ public enum SQLiteStoreSchemaGate {
 
     private static func schemaObjects(in db: OpaquePointer?) -> [SchemaObject]? {
         var statement: OpaquePointer?
-        guard sqlite3_prepare_v2(
-            db,
-            "SELECT type, name, tbl_name, sql FROM sqlite_schema "
-                + "WHERE type IN ('table','index','view','trigger') AND name NOT LIKE 'sqlite_%' "
-                + "ORDER BY type, name, tbl_name;",
-            -1,
-            &statement,
-            nil
-        ) == SQLITE_OK else { return nil }
+        guard
+            sqlite3_prepare_v2(
+                db,
+                "SELECT type, name, tbl_name, sql FROM sqlite_schema "
+                    + "WHERE type IN ('table','index','view','trigger') AND name NOT LIKE 'sqlite_%' "
+                    + "ORDER BY type, name, tbl_name;",
+                -1,
+                &statement,
+                nil
+            ) == SQLITE_OK
+        else { return nil }
         defer { sqlite3_finalize(statement) }
 
         var objects: [SchemaObject] = []
@@ -416,5 +418,4 @@ public enum SQLiteStoreSchemaGate {
         }
         return String(result)
     }
-
 }

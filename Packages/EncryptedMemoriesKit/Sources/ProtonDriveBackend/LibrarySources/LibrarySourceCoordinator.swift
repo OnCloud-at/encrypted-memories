@@ -271,10 +271,12 @@ public actor LibrarySourceCoordinator: PriorityThumbnailBatchLoader {
         }
         let baseline = graph.captureChangeBaseline()
         let sourceSetLease = graph.beginSourceSetRefresh()
-        guard graph.commitSourceSetWithoutProjection(
-            [Self.primarySource] + additionalSources,
-            using: sourceSetLease
-        ) else {
+        guard
+            graph.commitSourceSetWithoutProjection(
+                [Self.primarySource] + additionalSources,
+                using: sourceSetLease
+            )
+        else {
             if let failed = graph.failSourceSetRefresh(using: sourceSetLease) {
                 await publish(failed)
             }
@@ -356,16 +358,17 @@ public actor LibrarySourceCoordinator: PriorityThumbnailBatchLoader {
                 return revokedLocators.contains(locator)
             }
             let persistedSourceIDs = Set(inventories.map(\.source.id))
-            inventories.append(contentsOf: revokedLocators.compactMap { locator in
-                let sourceID = Self.sourceID(for: locator)
-                guard !persistedSourceIDs.contains(sourceID) else { return nil }
-                return LibrarySourceInventory(
-                    source: Self.additionalSource(id: sourceID),
-                    accessState: .accessLost,
-                    authority: .authoritative,
-                    items: []
-                )
-            })
+            inventories.append(
+                contentsOf: revokedLocators.compactMap { locator in
+                    let sourceID = Self.sourceID(for: locator)
+                    guard !persistedSourceIDs.contains(sourceID) else { return nil }
+                    return LibrarySourceInventory(
+                        source: Self.additionalSource(id: sourceID),
+                        accessState: .accessLost,
+                        authority: .authoritative,
+                        items: []
+                    )
+                })
             let persistenceSignature = graph.persistenceSignature(
                 excluding: [Self.primarySourceID],
                 additionalStateGeneration: revocationPersistenceGeneration

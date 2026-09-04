@@ -23,13 +23,14 @@ struct LibrarySourceCoordinatorTests {
         let recorder = LibrarySourceChangeRecorder()
         _ = await coordinator.attach { change in await recorder.store(change) }
         let primaryUID = PhotoUID(volumeID: "primary-volume", nodeID: "primary-photo")
-        await coordinator.replacePrimaryInventory([
-            PhotoItem(
-                uid: primaryUID,
-                captureTime: Date(timeIntervalSince1970: 1),
-                mediaType: "image/jpeg"
-            )
-        ], authority: .authoritative)
+        await coordinator.replacePrimaryInventory(
+            [
+                PhotoItem(
+                    uid: primaryUID,
+                    captureTime: Date(timeIntervalSince1970: 1),
+                    mediaType: "image/jpeg"
+                )
+            ], authority: .authoritative)
 
         await coordinator.refresh()
 

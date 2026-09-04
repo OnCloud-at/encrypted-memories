@@ -1386,7 +1386,8 @@ public actor ThumbnailFeedCore {
             sourceEpoch == selectedScope.epoch
         else { return self.sourceEpoch == nil ? .unbound : .staleScope }
         if let lastSelectedScope, let lastAnalysisScope, let lastRetentionScope {
-            let isExactRetry = selectedScope == lastSelectedScope
+            let isExactRetry =
+                selectedScope == lastSelectedScope
                 && analysisScope == lastAnalysisScope
                 && retentionScope == lastRetentionScope
             guard isExactRetry || selectedScope.revision > lastSelectedScope.revision else {

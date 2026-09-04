@@ -142,10 +142,11 @@ public actor MLSmartSearchLifecycle {
     /// Last authoritative inventory whose semantic store reconciliation committed. The snapshot
     /// shares its immutable UID buffer with the source universe, so retaining it does not copy the
     /// library. A new descriptor or source epoch deliberately falls back to one durable store scan.
-    private var semanticReconciliationBaseline: (
-        descriptor: MLModelDescriptor,
-        inventory: MLAssetInventorySnapshot
-    )?
+    private var semanticReconciliationBaseline:
+        (
+            descriptor: MLModelDescriptor,
+            inventory: MLAssetInventorySnapshot
+        )?
     private var lastEmittedDownloadFraction: Double = -1
     private var lastCatalogRefreshAt: ContinuousClock.Instant?
     private var catalogRefreshInProgress = false
@@ -1271,7 +1272,8 @@ public actor MLSmartSearchLifecycle {
             if !semanticNeedsPass, !nativeNeedsPass {
                 let inventory = await deps.assetsProvider()
                 let aggregate = aggregateProgress()
-                indexingState = inventory.isAuthoritative
+                indexingState =
+                    inventory.isAuthoritative
                     ? .ready(aggregate) : .waiting(aggregate)
                 if session != nil {
                     updatePhaseFromIndexLoop(
@@ -1553,7 +1555,8 @@ public actor MLSmartSearchLifecycle {
                 ?? !semanticNeedsPass
             let nativeComplete = nativeOutcome?.progress.isComplete ?? !nativeNeedsPass
             if semanticComplete && nativeComplete {
-                indexingState = scheduledInventory.isAuthoritative
+                indexingState =
+                    scheduledInventory.isAuthoritative
                     ? .ready(aggregateProgress()) : .waiting(aggregateProgress())
                 if semanticOutcome != nil {
                     updatePhaseFromIndexLoop(
@@ -1739,11 +1742,13 @@ public actor MLSmartSearchLifecycle {
             previousUIDs = nil
         }
 
-        guard store.reconcileTrackedUIDs(
-            currentAuthoritativeUIDs: current.uids,
-            previousAuthoritativeUIDs: previousUIDs,
-            descriptor: descriptor
-        ) else { return false }
+        guard
+            store.reconcileTrackedUIDs(
+                currentAuthoritativeUIDs: current.uids,
+                previousAuthoritativeUIDs: previousUIDs,
+                descriptor: descriptor
+            )
+        else { return false }
         semanticReconciliationBaseline = (descriptor, current)
         return true
     }

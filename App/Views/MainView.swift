@@ -2513,13 +2513,13 @@ private struct SidebarView: View {
                         thumbnailFeed: thumbnailFeed,
                         sourceAnalysisRevision: sourceAnalysisRevision
                     )
-                        .contextMenu {
-                            if canLeaveSharedAlbum {
-                                Button(L10n.string("albums.leave_shared_action"), role: .destructive) {
-                                    pendingSharedAlbumLeave = album
-                                }
+                    .contextMenu {
+                        if canLeaveSharedAlbum {
+                            Button(L10n.string("albums.leave_shared_action"), role: .destructive) {
+                                pendingSharedAlbumLeave = album
                             }
                         }
+                    }
                 }
             }
             Section {

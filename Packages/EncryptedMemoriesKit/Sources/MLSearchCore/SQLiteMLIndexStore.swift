@@ -787,7 +787,8 @@ public final class SQLiteMLIndexStore: MLIndexStore, @unchecked Sendable {
         guard compatibility != .incompatible else { return .incompatible }
         guard compatibility != .unavailable else { return .failed }
         var handle: OpaquePointer?
-        let flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX
+        let flags =
+            SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX
             | (compatibility == .empty ? SQLITE_OPEN_CREATE : 0)
         guard sqlite3_open_v2(url.path, &handle, flags, nil) == SQLITE_OK,
             let handle
@@ -799,11 +800,13 @@ public final class SQLiteMLIndexStore: MLIndexStore, @unchecked Sendable {
         switch compatibility {
         case .empty:
             SQLiteStoreSchemaGate.configureConnection(handle, policy: policy)
-            guard SQLiteStoreSchemaGate.initializeCurrentSchema(
-                handle,
-                schemaSQL: schema,
-                stamp: { stampVersion(handle) }
-            ) else {
+            guard
+                SQLiteStoreSchemaGate.initializeCurrentSchema(
+                    handle,
+                    schemaSQL: schema,
+                    stamp: { stampVersion(handle) }
+                )
+            else {
                 sqlite3_close(handle)
                 return .failed
             }

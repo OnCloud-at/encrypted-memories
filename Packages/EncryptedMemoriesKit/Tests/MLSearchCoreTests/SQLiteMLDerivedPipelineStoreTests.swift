@@ -306,9 +306,10 @@ import Testing
         let batch = try store.nextWorkBatch(for: firstKey, limit: 9, now: .now)
         #expect(batch.count == 9)
         #expect(batch.allSatisfy { $0.asset.uid.volumeID == "first-volume" })
-        #expect(batch.map(\.asset.uid.nodeID) == Array(repeating: "node-0000", count: 3)
-            + Array(repeating: "node-0001", count: 3)
-            + Array(repeating: "node-0002", count: 3))
+        #expect(
+            batch.map(\.asset.uid.nodeID) == Array(repeating: "node-0000", count: 3)
+                + Array(repeating: "node-0001", count: 3)
+                + Array(repeating: "node-0002", count: 3))
         #expect(Set(batch.prefix(3).map(\.artifact)) == artifacts)
     }
 

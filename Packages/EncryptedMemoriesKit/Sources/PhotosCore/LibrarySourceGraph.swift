@@ -233,21 +233,25 @@ enum LibrarySourceInventoryValidator {
     static func hasValidItem(_ sourceItem: LibrarySourceItem) -> Bool {
         let item = sourceItem.item
         let validDuration = item.durationSeconds.map { $0.isFinite && $0 >= 0 } ?? true
-        let validRelatedVideo = item.relatedVideoID.map {
-            !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        } ?? true
+        let validRelatedVideo =
+            item.relatedVideoID.map {
+                !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            } ?? true
         let coherentLivePhotoRelationship =
             !sourceItem.knownFields.contains(.livePhotoRelationship)
             || (item.isLivePhoto
                 ? item.relatedVideoID != nil && item.relatedVideoID != item.uid.nodeID
                 : item.relatedVideoID == nil)
-        let validBurstMembers = item.burstMemberIDs.allSatisfy {
-            !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                && $0 != item.uid.nodeID
-        } && Set(item.burstMemberIDs).count == item.burstMemberIDs.count
-        let validCaptureTime = !sourceItem.knownFields.contains(.captureTime)
+        let validBurstMembers =
+            item.burstMemberIDs.allSatisfy {
+                !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    && $0 != item.uid.nodeID
+            } && Set(item.burstMemberIDs).count == item.burstMemberIDs.count
+        let validCaptureTime =
+            !sourceItem.knownFields.contains(.captureTime)
             || item.captureTime.timeIntervalSinceReferenceDate.isFinite
-        let validMediaType = !sourceItem.knownFields.contains(.mediaType)
+        let validMediaType =
+            !sourceItem.knownFields.contains(.mediaType)
             || !item.mediaType.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         let validKnownDuration = !sourceItem.knownFields.contains(.duration) || validDuration
         let validKnownLiveRelationship =
@@ -915,10 +919,11 @@ public final class LibrarySourceGraph {
             preservingKnownFieldsFrom: record.items
         )
         let nextAuthority: SourceInventoryAuthority = canonicalItems.isEmpty ? .hydrating : .cached
-        guard record.items != canonicalItems
-            || record.authority != nextAuthority
-            || record.accessState != .temporarilyUnavailable
-            || record.validationToken != validationToken
+        guard
+            record.items != canonicalItems
+                || record.authority != nextAuthority
+                || record.accessState != .temporarilyUnavailable
+                || record.validationToken != validationToken
         else { return nil }
         if record.items != canonicalItems {
             record.accessGeneration &+= 1
@@ -1022,7 +1027,8 @@ public final class LibrarySourceGraph {
         excluding excludedSourceIDs: Set<SourceID> = [],
         additionalStateGeneration: UInt64
     ) -> LibrarySourcePersistenceSignature {
-        let entries = records.keys.sorted(by: Self.sourceIDPrecedes).compactMap { sourceID -> LibrarySourcePersistenceSignature.Entry? in
+        let entries = records.keys.sorted(by: Self.sourceIDPrecedes).compactMap {
+            sourceID -> LibrarySourcePersistenceSignature.Entry? in
             guard !excludedSourceIDs.contains(sourceID) else { return nil }
             guard let record = records[sourceID] else { return nil }
             return LibrarySourcePersistenceSignature.Entry(
@@ -1072,7 +1078,8 @@ public final class LibrarySourceGraph {
         where record.accessState != .accessLost
             && (includeExcludedSources || record.source.isIncluded)
             && record.source.capabilities.contains(capability)
-            && record.itemIndexByUID[uid] != nil {
+            && record.itemIndexByUID[uid] != nil
+        {
             if let selectedID, let selected = records[selectedID],
                 !LibrarySourceProjection.sourcePrecedes(record.source, selected.source)
             {
@@ -1108,7 +1115,7 @@ public final class LibrarySourceGraph {
         var selectedID: SourceID?
         for (sourceID, record) in records {
             guard record.accessState != .accessLost,
-                (includeExcludedSources || record.source.isIncluded),
+                includeExcludedSources || record.source.isIncluded,
                 record.source.capabilities.contains(capability),
                 let itemIndex = record.itemIndexByUID[ownerUID],
                 Self.establishes(
