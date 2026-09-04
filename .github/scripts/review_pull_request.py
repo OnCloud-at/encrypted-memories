@@ -36,7 +36,8 @@ MAX_FINDING_DETAIL_CHARS = 1_200
 MAX_TESTING_GAP_CHARS = 500
 MAX_FINDINGS = 8
 MAX_TESTING_GAPS = 4
-REVIEW_PROVIDER_ATTEMPTS = 3
+REVIEW_LLM_TOTAL_SECONDS = 360.0
+REVIEW_PROVIDER_ATTEMPTS = 2
 REVIEW_COMMENT_MARKER = "<!-- oncloud-pr-review:v2 -->"
 ALLOWED_SEVERITIES = {"blocking", "warning", "suggestion"}
 _HUNK_HEADER_RE = re.compile(
@@ -496,6 +497,7 @@ def request_review_with_retries(
                 token=token,
                 payload=payload,
                 validator=lambda content: parse_review(content, changed_lines, file_paths),
+                total_seconds=REVIEW_LLM_TOTAL_SECONDS,
             )
         except LLMStreamRetryableError as error:
             if attempt == REVIEW_PROVIDER_ATTEMPTS - 1:
