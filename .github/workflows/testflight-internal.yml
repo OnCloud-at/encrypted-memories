@@ -285,7 +285,8 @@ jobs:
           FASTLANE_DISABLE_COLORS: "1"
           FASTLANE_HIDE_TIMESTAMP: "1"
           FASTLANE_SKIP_UPDATE_CHECK: "1"
-          FASTLANE_VERSION: "2.237.0"
+          FASTLANE_MIN_VERSION: "2.237.0"
+          FASTLANE_MAX_VERSION: "3.0.0"
           SIGH_IGNORE_PROFILES_WITH_DIFFERENT_NAME: "true"
         run: |
           set -euo pipefail
@@ -312,10 +313,19 @@ jobs:
               | awk '/^fastlane [0-9]+\./ { print $2 }' \
               | tail -1
           )"
-          [[ "$actual_fastlane_version" == "$FASTLANE_VERSION" ]] || {
-            echo "Expected fastlane $FASTLANE_VERSION, found ${actual_fastlane_version:-unknown}." >&2
+          [[ -n "$actual_fastlane_version" ]] || {
+            echo "Could not determine the installed fastlane version." >&2
             exit 69
           }
+          ruby -rrubygems -e '
+            version = Gem::Version.new(ARGV.fetch(0))
+            requirement = Gem::Requirement.new(
+              ">= #{ENV.fetch("FASTLANE_MIN_VERSION")}",
+              "< #{ENV.fetch("FASTLANE_MAX_VERSION")}"
+            )
+            abort "Expected fastlane #{requirement}, found #{version}." unless requirement.satisfied_by?(version)
+          ' "$actual_fastlane_version"
+          echo "Using compatible fastlane $actual_fastlane_version."
           fastlane sigh \
             --api_key_path "$api_key_path" \
             --app_identifier at.oncloud.encryptedmemories \

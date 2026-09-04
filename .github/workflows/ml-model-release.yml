@@ -45,6 +45,7 @@ concurrency:
 jobs:
   validate:
     name: Validate model release contracts
+    if: github.event_name != 'release' || startsWith(github.event.release.tag_name, 'ml-model-')
     runs-on: macos-26
     timeout-minutes: 45
     steps:
