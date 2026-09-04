@@ -28,7 +28,7 @@ jobs:
     outputs:
       tag: ${{ steps.release.outputs.tag }}
       version: ${{ steps.release.outputs.version }}
-      build_number: ${{ steps.release.outputs.build_number }}
+      build_number: ${{ steps.revision.outputs.build_number }}
       prerelease: ${{ steps.release.outputs.prerelease }}
       channel: ${{ steps.release.outputs.channel }}
       commit_sha: ${{ steps.revision.outputs.commit_sha }}
@@ -66,6 +66,8 @@ jobs:
           ruby .github/scripts/test_app_store_connect.rb
           ruby -c .github/scripts/release_contract.rb
           ruby .github/scripts/test_release_contract.rb
+          ruby -c .github/scripts/release_build_number.rb
+          ruby .github/scripts/test_release_build_number.rb
           bash -n .github/scripts/validate_apple_distribution.sh
 
       - name: Resolve published release
@@ -86,25 +88,27 @@ jobs:
             "$RUNNER_TEMP/release.json" \
             "$RUNNER_TEMP/apple-release-notes"
 
+      - name: Verify and record release commit
+        id: revision
+        env:
+          AUTOMATION_SHA: ${{ steps.automation.outputs.commit_sha }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          release_sha="$(git rev-parse --verify "refs/tags/$RELEASE_TAG^{commit}")"
+          git merge-base --is-ancestor "$release_sha" "$AUTOMATION_SHA" || {
+            echo "The release tag must point to a commit on main." >&2
+            exit 1
+          }
+          echo "commit_sha=$release_sha" >> "$GITHUB_OUTPUT"
+          ruby .github/scripts/release_build_number.rb "$release_sha"
+
       - name: Check out the exact release tag
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           ref: ${{ steps.release.outputs.tag }}
           fetch-depth: 0
           persist-credentials: false
-
-      - name: Verify and record release commit
-        id: revision
-        env:
-          AUTOMATION_SHA: ${{ steps.automation.outputs.commit_sha }}
-        run: |
-          set -euo pipefail
-          release_sha="$(git rev-parse HEAD)"
-          git merge-base --is-ancestor "$release_sha" "$AUTOMATION_SHA" || {
-            echo "The release tag must point to a commit on main." >&2
-            exit 1
-          }
-          echo "commit_sha=$release_sha" >> "$GITHUB_OUTPUT"
 
   in-app-purchase-preflight:
     name: Validate StoreKit sandbox metadata
@@ -128,6 +132,9 @@ jobs:
         run: |
           set -euo pipefail
           ruby .github/scripts/app_store_connect.rb validate-sandbox-in-app-purchases
+          ruby .github/scripts/app_store_connect.rb validate-build-number \
+            --version "${{ needs.prepare.outputs.version }}" \
+            --build-number "${{ needs.prepare.outputs.build_number }}"
 
   upload:
     name: Upload ${{ matrix.platform }}

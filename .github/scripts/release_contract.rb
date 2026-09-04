@@ -24,7 +24,7 @@ module GitHubReleaseContract
 
   class Error < StandardError; end
 
-  Release = Data.define(:tag, :version, :build_number, :prerelease, :channel, :notes)
+  Release = Data.define(:tag, :version, :prerelease, :channel, :notes)
 
   module_function
 
@@ -51,7 +51,6 @@ module GitHubReleaseContract
     Release.new(
       tag: tag,
       version: match[:version],
-      build_number: release_id.to_s,
       prerelease: prerelease,
       channel: prerelease ? "testflight" : "app-store",
       notes: notes
@@ -140,7 +139,6 @@ module GitHubReleaseContract
       File.open(output_path, "a") do |output|
         output.puts("tag=#{release.tag}")
         output.puts("version=#{release.version}")
-        output.puts("build_number=#{release.build_number}")
         output.puts("prerelease=#{release.prerelease}")
         output.puts("channel=#{release.channel}")
         output.puts("notes_ios_de_base64=#{Base64.strict_encode64(release.notes.dig('IOS', 'de-DE'))}")
@@ -157,7 +155,6 @@ module GitHubReleaseContract
       summary.puts
       summary.puts("- Tag: #{release.tag}")
       summary.puts("- App version: #{release.version}")
-      summary.puts("- Build: #{release.build_number}")
       summary.puts("- Destination: #{release.prerelease ? 'internal TestFlight' : 'App Store review'}")
     end
   end

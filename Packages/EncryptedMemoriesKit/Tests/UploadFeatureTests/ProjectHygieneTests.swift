@@ -221,7 +221,9 @@ final class ProjectHygieneTests: XCTestCase {
         XCTAssertTrue(internalWorkflow.contains("security find-identity -v encrypted_memories_signing.keychain"))
         XCTAssertTrue(internalWorkflow.contains("fastlane sigh"))
         XCTAssertTrue(internalWorkflow.contains("--force"))
-        XCTAssertTrue(internalWorkflow.contains("FASTLANE_VERSION: \"2.237.0\""))
+        XCTAssertTrue(internalWorkflow.contains("FASTLANE_MIN_VERSION: \"2.237.0\""))
+        XCTAssertTrue(internalWorkflow.contains("FASTLANE_MAX_VERSION: \"3.0.0\""))
+        XCTAssertFalse(internalWorkflow.contains("FASTLANE_VERSION:"))
         XCTAssertTrue(internalWorkflow.contains("xcrun xcodebuild archive"))
         XCTAssertTrue(internalWorkflow.contains("xcrun xcodebuild -exportArchive"))
         XCTAssertTrue(internalWorkflow.contains("xcrun altool --upload-package"))
@@ -244,6 +246,9 @@ final class ProjectHygieneTests: XCTestCase {
         XCTAssertFalse(internalWorkflow.contains("-allowProvisioningUpdates"))
         XCTAssertTrue(internalWorkflow.contains("Validate StoreKit sandbox metadata"))
         XCTAssertTrue(internalWorkflow.contains("validate-sandbox-in-app-purchases"))
+        XCTAssertTrue(internalWorkflow.contains("validate-build-number"))
+        XCTAssertTrue(internalWorkflow.contains("steps.revision.outputs.build_number"))
+        XCTAssertFalse(internalWorkflow.contains("steps.release.outputs.build_number"))
         XCTAssertTrue(internalWorkflow.contains("needs: [prepare, in-app-purchase-preflight]"))
         XCTAssertTrue(internalWorkflow.contains("distribute-internal"))
         XCTAssertTrue(internalWorkflow.contains("prepare-app-store"))
@@ -261,6 +266,9 @@ final class ProjectHygieneTests: XCTestCase {
         XCTAssertTrue(externalWorkflow.contains("environment: testflight-external"))
         XCTAssertTrue(externalWorkflow.contains("distribute-external"))
         XCTAssertTrue(externalWorkflow.contains("wait-builds"))
+        XCTAssertTrue(externalWorkflow.contains("release_build_number.rb"))
+        XCTAssertTrue(externalWorkflow.contains("steps.build.outputs.build_number"))
+        XCTAssertFalse(externalWorkflow.contains("steps.release.outputs.build_number"))
         XCTAssertFalse(externalWorkflow.contains("xcrun xcodebuild"))
         XCTAssertFalse(externalWorkflow.contains("xcrun altool"))
         XCTAssertFalse(externalWorkflow.contains("Apple-Actions/import-codesign-certs@"))
@@ -311,6 +319,15 @@ final class ProjectHygieneTests: XCTestCase {
         XCTAssertTrue(releaseContract.contains("\"de-DE\" => \"Deutsch\""))
         XCTAssertTrue(releaseContract.contains("\"en-US\" => \"English\""))
 
+        let buildNumberContract = try String(
+            contentsOf: repoRoot.appendingPathComponent(".github/scripts/release_build_number.rb"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(buildNumberContract.contains("68c8f3f7de98ce4b3385f655d97252d40dd2378e"))
+        XCTAssertTrue(buildNumberContract.contains("BASELINE_BUILD_NUMBER = 382_818_668"))
+        XCTAssertTrue(buildNumberContract.contains("git\", \"rev-list\", \"--first-parent"))
+        XCTAssertTrue(buildNumberContract.contains("build_number=#{build_number}"))
+
         let validationScript = try String(
             contentsOf: repoRoot.appendingPathComponent(".github/scripts/validate_apple_distribution.sh"),
             encoding: .utf8
@@ -354,6 +371,8 @@ final class ProjectHygieneTests: XCTestCase {
         XCTAssertFalse(connectScript.contains("name,locale,description"))
         XCTAssertFalse(connectScript.contains("\"include\" => \"inAppPurchaseLocalizations\""))
         XCTAssertTrue(connectScript.contains("releaseType: \"AFTER_APPROVAL\""))
+        XCTAssertTrue(connectScript.contains("validate_build_number"))
+        XCTAssertTrue(connectScript.contains("build_history_filters"))
         XCTAssertFalse(connectScript.contains("/v1/appStoreVersionReleaseRequests"))
         XCTAssertTrue(connectScript.contains("automatic submission requires APPROVED products"))
         XCTAssertFalse(connectScript.contains("All four consumable tips"))

@@ -33,7 +33,6 @@ class GitHubReleaseContractTest < Minitest::Test
     release = GitHubReleaseContract.parse(payload)
 
     assert_equal "1.2.0", release.version
-    assert_equal "241000123", release.build_number
     assert_equal "app-store", release.channel
     assert_equal "Faster photo loading.", release.notes.dig("IOS", "en-US")
     assert_equal "Faster photo loading.", release.notes.dig("MAC_OS", "en-US")
@@ -202,6 +201,7 @@ class GitHubReleaseContractTest < Minitest::Test
       assert_equal "Faster photo loading.\n", File.read(File.join(notes, "macos.en-US.txt"))
       output_values = File.readlines(output, chomp: true).to_h { |line| line.split("=", 2) }
       assert_equal "app-store", output_values.fetch("channel")
+      refute output_values.key?("build_number")
       assert_equal(
         "Faster photo loading.",
         Base64.strict_decode64(output_values.fetch("notes_ios_de_base64"))
@@ -225,6 +225,9 @@ class GitHubReleaseContractTest < Minitest::Test
     assert_includes workflow, "fetch-depth: 0"
     assert_includes workflow, "git merge-base --is-ancestor"
     assert_includes workflow, "release_contract.rb"
+    assert_includes workflow, "release_build_number.rb"
+    assert_includes workflow, "steps.build.outputs.build_number"
+    refute_includes workflow, "steps.release.outputs.build_number"
     assert_includes workflow, "wait-builds"
     assert_includes workflow, "distribute-external"
     assert_includes workflow, "IOS:en-US="
@@ -243,6 +246,10 @@ class GitHubReleaseContractTest < Minitest::Test
     assert_includes workflow, "ref: ${{ needs.prepare.outputs.commit_sha }}"
     assert_includes workflow, '[[ "$actual_release_sha" == "$EXPECTED_RELEASE_SHA" ]]'
     assert_includes workflow, "git merge-base --is-ancestor"
+    assert_includes workflow, 'git rev-parse --verify "refs/tags/$RELEASE_TAG^{commit}"'
     assert_includes workflow, "The release tag must point to a commit on main."
+    assert_includes workflow, "steps.revision.outputs.build_number"
+    assert_includes workflow, "validate-build-number"
+    refute_includes workflow, "steps.release.outputs.build_number"
   end
 end

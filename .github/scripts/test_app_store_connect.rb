@@ -471,11 +471,56 @@ class FakeAppStoreConnectClient
   end
 end
 
+class BuildHistoryAppStoreConnectClient
+  attr_reader :calls
+
+  def initialize(builds)
+    @builds = builds
+    @calls = []
+  end
+
+  def collection(path, query: {})
+    raise "Unexpected collection #{path}" unless path == "/v1/builds"
+
+    @calls << [:collection, path, query]
+    @builds.select do |build|
+      build.fetch("testPlatform") == query.fetch("filter[preReleaseVersion.platform]") &&
+        (!query.key?("filter[preReleaseVersion.version]") ||
+          build.fetch("testMarketingVersion") == query.fetch("filter[preReleaseVersion.version]")) &&
+        (!query.key?("filter[version]") ||
+          build.dig("attributes", "version") == query.fetch("filter[version]"))
+    end
+  end
+end
+
 class AppStoreConnectTest < Minitest::Test
   def setup
     @client = FakeAppStoreConnectClient.new
     @manager = AppStoreConnect::ReleaseManager.new(
       client: @client,
+      app_id: "6805117080",
+      output_path: nil,
+      summary_path: nil
+    )
+  end
+
+  def build_history_record(platform, marketing_version, build_number, state: "VALID")
+    {
+      "type" => "builds",
+      "id" => "build-#{platform}-#{marketing_version}-#{build_number}",
+      "testPlatform" => platform,
+      "testMarketingVersion" => marketing_version,
+      "attributes" => {
+        "version" => build_number,
+        "processingState" => state,
+        "usesNonExemptEncryption" => false
+      }
+    }
+  end
+
+  def manager_for_build_history(builds)
+    AppStoreConnect::ReleaseManager.new(
+      client: BuildHistoryAppStoreConnectClient.new(builds),
       app_id: "6805117080",
       output_path: nil,
       summary_path: nil
@@ -515,6 +560,45 @@ class AppStoreConnectTest < Minitest::Test
     assert_equal "714", filters.fetch("filter[version]")
     assert_equal "IOS", filters.fetch("filter[preReleaseVersion.platform]")
     assert_equal "APP_STORE_ELIGIBLE", filters.fetch("filter[buildAudienceType]")
+  end
+
+  def test_build_history_lookup_can_scope_ios_to_one_marketing_version
+    filters = AppStoreConnect.build_history_filters(
+      app_id: "6805117080",
+      platform: "IOS",
+      version: "1.0.2"
+    )
+
+    assert_equal "6805117080", filters.fetch("filter[app]")
+    assert_equal "IOS", filters.fetch("filter[preReleaseVersion.platform]")
+    assert_equal "1.0.2", filters.fetch("filter[preReleaseVersion.version]")
+    assert_equal "APP_STORE_ELIGIBLE", filters.fetch("filter[buildAudienceType]")
+    assert_equal "version", filters.fetch("fields[builds]")
+  end
+
+  def test_build_number_validation_accepts_next_number_and_an_exact_retry
+    builds = [
+      build_history_record("IOS", "1.0.2", "382818668"),
+      build_history_record("MAC_OS", "1.0.2", "382818668")
+    ]
+    manager = manager_for_build_history(builds)
+
+    assert manager.validate_build_number(version: "1.0.2", build_number: "382818668")
+    assert manager.validate_build_number(version: "1.0.2", build_number: "382818669")
+  end
+
+  def test_build_number_validation_rejects_a_non_monotonic_new_build()
+    builds = [
+      build_history_record("IOS", "1.0.2", "382818668"),
+      build_history_record("MAC_OS", "1.0.2", "382818668")
+    ]
+    manager = manager_for_build_history(builds)
+
+    error = assert_raises(AppStoreConnect::Error) do
+      manager.validate_build_number(version: "1.0.3", build_number: "382818668")
+    end
+
+    assert_match(/MAC_OS build 382818668 must be greater than existing build 382818668/, error.message)
   end
 
   def test_cli_parses_platform_scoped_localizations

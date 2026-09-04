@@ -163,6 +163,10 @@ final class MobileLibraryModel {
         case purgeFailed
     }
 
+    private struct SourceAnalysisStartupError: LocalizedError {
+        var errorDescription: String? { String(localized: "error.library_load_failed") }
+    }
+
     /// Shared onboarding and loading policy. See `LibraryLoadState`.
     private(set) var loadState: LibraryLoadState = .initial
     /// Immutable timeline snapshot prepared off the main actor. Its index provides O(1) and O(k) lookups
@@ -275,7 +279,6 @@ final class MobileLibraryModel {
     /// The most recent ordered Smart Search shutdown; teardown awaits it before the sign-out purge.
     @ObservationIgnored private var smartSearchShutdownTask: Task<Void, Never>?
     @ObservationIgnored private var sourceAnalysisRuntime: LibrarySourceAnalysisRuntime?
-    @ObservationIgnored private var sourceAnalysisStartupTask: Task<Void, Never>?
     @ObservationIgnored private var sourceAnalysisActivityTask: Task<Void, Never>?
     @ObservationIgnored private var sourceAnalysisShutdownTask: Task<Void, Never>?
     @ObservationIgnored private var sourcePrimaryInventoryGeneration: UInt64 = 0
@@ -919,11 +922,27 @@ final class MobileLibraryModel {
             }
         )
         sourceAnalysisRuntime = runtime
+    }
+
+    /// Installs the source-aware byte route before the same primary inventory is exposed to the grid. Otherwise
+    /// the first visible warm pass can run against the runtime's initial empty scope and leave the loading cover
+    /// without a rendered thumbnail with which to settle.
+    private func synchronizePrimarySourceInventory(
+        _ items: [PhotoItem],
+        authority: SourceInventoryAuthority
+    ) async -> Bool {
+        guard let runtime = sourceAnalysisRuntime else { return false }
+        sourcePrimaryInventoryGeneration &+= 1
+        let primaryGeneration = sourcePrimaryInventoryGeneration
         let previousShutdown = sourceAnalysisShutdownTask
-        sourceAnalysisStartupTask = Task {
-            await previousShutdown?.value
-            _ = await runtime.start()
-        }
+
+        await previousShutdown?.value
+        guard !Task.isCancelled, sourceAnalysisRuntime === runtime else { return false }
+        return await runtime.start(
+            primaryItems: items,
+            authority: authority,
+            generation: primaryGeneration
+        )
     }
 
     /// Stops Smart Search and returns a task that completes after all prior shutdowns and the current
@@ -950,18 +969,14 @@ final class MobileLibraryModel {
         smartSearchAssets.invalidateSourceSession()
         let runtime = sourceAnalysisRuntime
         sourceAnalysisRuntime = nil
-        let startup = sourceAnalysisStartupTask
-        sourceAnalysisStartupTask = nil
         let activity = sourceAnalysisActivityTask
         sourceAnalysisActivityTask = nil
-        guard runtime != nil || startup != nil || activity != nil else { return sourceAnalysisShutdownTask }
-        startup?.cancel()
+        guard runtime != nil || activity != nil else { return sourceAnalysisShutdownTask }
         activity?.cancel()
         let previous = sourceAnalysisShutdownTask
         let task = Task {
             await previous?.value
             await activity?.value
-            await startup?.value
             await runtime?.shutdown()
         }
         sourceAnalysisShutdownTask = task
@@ -1391,7 +1406,7 @@ final class MobileLibraryModel {
                         loadGeneration == self.loadToken,
                         self.session == session
                     else { return }
-                    let appliedCachedItems = await applyItems(cached.sections, cached: true)
+                    let appliedCachedItems = try await applyItems(cached.sections, cached: true)
                     guard !Task.isCancelled,
                         loadGeneration == self.loadToken,
                         self.session == session
@@ -1431,7 +1446,7 @@ final class MobileLibraryModel {
                     self.session == session
                 else { return }
                 let previousUIDs = items.map(\.uid)
-                let changed = await applyItems(refreshed.sections, cached: false, authoritative: true)
+                let changed = try await applyItems(refreshed.sections, cached: false, authoritative: true)
                 guard !Task.isCancelled,
                     loadGeneration == self.loadToken,
                     self.session == session
@@ -1482,7 +1497,7 @@ final class MobileLibraryModel {
         _ sections: [TimelineSection],
         cached: Bool,
         authoritative: Bool = false
-    ) async -> Bool {
+    ) async throws -> Bool {
         let token = loadToken
         let mutationGeneration = timelineMutationGeneration
         let removals = pendingTimelineRemovals
@@ -1494,6 +1509,15 @@ final class MobileLibraryModel {
             token == loadToken,
             mutationGeneration == timelineMutationGeneration
         else { return false }
+        let sourceReady = await synchronizePrimarySourceInventory(
+            prepared.snapshot.items,
+            authority: authoritative ? .authoritative : .cached
+        )
+        try Task.checkCancellation()
+        guard token == loadToken,
+            mutationGeneration == timelineMutationGeneration
+        else { return false }
+        guard sourceReady else { throw SourceAnalysisStartupError() }
         let requiresNewFrame =
             prepared.snapshot.items.lazy.map(\.uid).elementsEqual(snapshot.items.lazy.map(\.uid)) == false
         let changed = prepared.snapshot != snapshot
@@ -1503,11 +1527,11 @@ final class MobileLibraryModel {
             primaryInventoryAuthority = .cached
         }
         if changed {
-            publish(prepared, locationInventoryChanged: requiresNewFrame)
-        } else {
-            // An empty complete timeline is still authoritative. Publish readiness even when its
-            // value equals the launch placeholder so Smart Search can distinguish it from hydration.
-            publishSmartSearchInventory(prepared.snapshot.items)
+            publish(
+                prepared,
+                locationInventoryChanged: requiresNewFrame,
+                publishPrimaryInventory: false
+            )
         }
         if authoritative {
             apply(
@@ -1523,7 +1547,8 @@ final class MobileLibraryModel {
 
     private func publish(
         _ projection: TimelineContentProjection,
-        locationInventoryChanged: Bool
+        locationInventoryChanged: Bool,
+        publishPrimaryInventory: Bool = true
     ) {
         if locationInventoryChanged {
             let locationItems = projection.snapshot.items
@@ -1538,7 +1563,9 @@ final class MobileLibraryModel {
         if locationInventoryChanged {
             locationInventoryRevision &+= 1
         }
-        publishSmartSearchInventory(projection.snapshot.items)
+        if publishPrimaryInventory {
+            publishSmartSearchInventory(projection.snapshot.items)
+        }
         if locationCrawlStarted,
             locationCrawlInventoryRevision != locationInventoryRevision,
             locationIndex.scanProgress.phase == .completed || locationIndex.scanProgress.phase == .failed
@@ -1635,7 +1662,7 @@ final class MobileLibraryModel {
             try Task.checkCancellation()
             try requireCurrentMutation(refreshLease)
             let previousUIDs = items.map(\.uid)
-            let changed = await applyItems(refreshed, cached: false, authoritative: true)
+            let changed = try await applyItems(refreshed, cached: false, authoritative: true)
             try requireCurrentMutation(refreshLease)
             if let thumbnailFeed {
                 if changed {
