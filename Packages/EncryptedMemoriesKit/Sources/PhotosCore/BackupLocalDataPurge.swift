@@ -18,6 +18,7 @@ public enum BackupLocalDataPurge {
         // Reuse the crash-resumable file + Keychain transaction. Clearing preferences here prevents
         // new feature owners from retaining pre-reset settings while the asynchronous purge runs.
         requestPurgeOnSignOut(defaults: defaults, persistentDomainName: persistentDomainName)
+        defaults.set(false, forKey: resetOnNextLaunchKey)
         return true
     }
 

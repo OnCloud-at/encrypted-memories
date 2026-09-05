@@ -248,6 +248,18 @@ import Testing
         #expect(state == .contentReady(count: 9))
     }
 
+    @Test func automaticAuthoritativeRefreshRecoversWithoutReset() {
+        let failed = LibraryLoadState.failed(message: "Network unavailable", retryable: true)
+        let loading = LibraryLoadPolicy.reduce(
+            failed, .authoritativeInventoryResolved(count: 9, requiresNewFrame: true)
+        )
+        #expect(loading == .loadingContent(count: 9, usingCachedInventory: false))
+        #expect(LibraryLoadPolicy.reduce(loading, .firstContentReady) == .contentReady(count: 9))
+        #expect(
+            LibraryLoadPolicy.reduce(failed, .authoritativeInventoryResolved(count: 0, requiresNewFrame: false))
+                == .empty)
+    }
+
     @Test func stateIsValueSemantic() {
         // Equatable + Sendable value type - safe to publish across the app without shared mutable state.
         let a = LibraryLoadState.loadingContent(count: 1, usingCachedInventory: false)

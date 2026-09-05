@@ -61,7 +61,7 @@ After tested changes reach `main`, a maintainer publishes a GitHub Release.
 - `v1.2.0-beta.1` and `v1.2.0-rc.1` publish only to internal TestFlight.
 - `v1.2.0` submits iOS and macOS to App Review and selects automatic release after approval.
 
-Automation derives one shared Apple build number from the release commit and validates it with App Store Connect before starting Xcode. Prerelease and stable tags for the same app version on the same commit reuse the exact tested iOS and macOS builds; a later main commit receives a higher build number.
+Automation derives one shared Apple build number from the immutable GitHub Release ID and validates it with App Store Connect before starting Xcode. Separate prerelease and stable releases get new builds even on the same source commit. Keep beta tags and their notes unchanged as release history; publish a new stable release instead of renaming a beta. Retrying the same release reuses its build number. Releases through `v1.0.2-beta.3` retain their previously uploaded, commit-derived numbers.
 
 Write owner-written notes under `## English`. This is the only required release-notes section.
 Without platform subsections, English applies to both platforms.
