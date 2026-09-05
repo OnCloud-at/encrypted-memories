@@ -101,7 +101,7 @@ jobs:
             exit 1
           }
           echo "commit_sha=$release_sha" >> "$GITHUB_OUTPUT"
-          ruby .github/scripts/release_build_number.rb "$release_sha"
+          ruby .github/scripts/release_build_number.rb "$release_sha" "$RUNNER_TEMP/release.json"
 
       - name: Check out the exact release tag
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0

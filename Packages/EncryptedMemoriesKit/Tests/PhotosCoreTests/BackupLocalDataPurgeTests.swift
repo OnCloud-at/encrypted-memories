@@ -86,6 +86,10 @@ final class BackupLocalDataPurgeTests: XCTestCase {
                 defaults: defaults, persistentDomainName: suiteName
             ))
         XCTAssertFalse(defaults.bool(forKey: BackupLocalDataPurge.resetOnNextLaunchKey))
+        XCTAssertEqual(
+            defaults.persistentDomain(forName: suiteName)?[BackupLocalDataPurge.resetOnNextLaunchKey] as? Bool,
+            false
+        )
         XCTAssertNil(defaults.object(forKey: "thumbnail.cachedBytes"))
         XCTAssertNil(defaults.object(forKey: "ml.enabled"))
         XCTAssertTrue(BackupLocalDataPurge.isPurgePending(defaults: defaults))
@@ -100,6 +104,7 @@ final class BackupLocalDataPurgeTests: XCTestCase {
         XCTAssertTrue(claim.perform(defaults: defaults).succeeded)
         XCTAssertFalse(BackupLocalDataPurge.isPurgePending(defaults: defaults))
         XCTAssertFalse(FileManager.default.fileExists(atPath: root.path))
+        XCTAssertEqual(defaults.object(forKey: BackupLocalDataPurge.resetOnNextLaunchKey) as? Bool, false)
     }
 
     func testFailedClaimKeepsPendingMarkerForNextLaunch() throws {

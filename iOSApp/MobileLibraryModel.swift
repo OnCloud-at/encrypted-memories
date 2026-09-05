@@ -1489,11 +1489,9 @@ final class MobileLibraryModel {
                     apply(.failed(message: Self.message(for: error), retryable: true))
                 }
                 initialLibraryLoadSettled = true
-                if hadCachedInventory {
-                    // The cached frame remains usable. Seed below each validation token so the first successful
-                    // foreground probe retries the authoritative load after connectivity/API recovery.
-                    startLibraryChangeMonitorIfPossible(resetBaseline: true, initialToken: "")
-                }
+                // Both cold and cached loads must recover when the server becomes reachable again, even if
+                // its revision did not change. An unknown (nil) baseline would only observe that revision.
+                startLibraryChangeMonitorIfPossible(resetBaseline: true, initialToken: "")
             }
         }
     }
@@ -1621,6 +1619,9 @@ final class MobileLibraryModel {
             let recoverySession = session,
             let refreshLease = currentMutationLease()
         else { return }
+        // A failed cold load may have settled while inactive. Preserve its retry seed on the next foreground
+        // start; otherwise that start would silently establish a baseline without ever loading the inventory.
+        let initialToken = initialToken ?? (loadState.failure?.retryable == true ? "" : nil)
         Task { [weak self] in
             guard let self,
                 !self.isRecoveringScope,

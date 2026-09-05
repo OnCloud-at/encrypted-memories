@@ -6,6 +6,41 @@ require "tmpdir"
 require_relative "release_build_number"
 
 class AppleReleaseBuildNumberTest < Minitest::Test
+  def command_for_history
+    lambda do |*arguments|
+      assert_equal ["git", "rev-list", "--first-parent", "a" * 40], arguments
+      ["#{'a' * 40}\n#{AppleReleaseBuildNumber::BASELINE_COMMIT}\n", Struct.new(:success?).new(true)]
+    end
+  end
+
+  def test_published_legacy_release_keeps_its_uploaded_number
+    build = AppleReleaseBuildNumber.for_release(
+      "a" * 40, { "id" => AppleReleaseBuildNumber::LAST_COMMIT_NUMBERED_RELEASE_ID },
+      command: command_for_history
+    )
+
+    assert_equal "382818669", build
+  end
+
+  def test_distinct_releases_of_the_same_commit_get_distinct_builds
+    first_id = AppleReleaseBuildNumber::LAST_COMMIT_NUMBERED_RELEASE_ID + 1
+    first = AppleReleaseBuildNumber.for_release("a" * 40, { "id" => first_id }, command: command_for_history)
+    second = AppleReleaseBuildNumber.for_release("a" * 40, { "id" => first_id + 1 }, command: command_for_history)
+    retry_build = AppleReleaseBuildNumber.for_release("a" * 40, { "id" => first_id }, command: command_for_history)
+
+    assert_equal first_id.to_s, first
+    assert_equal (first_id + 1).to_s, second
+    assert_equal first, retry_build
+  end
+
+  def test_invalid_release_ids_are_rejected_before_git
+    [nil, 0, -1, "383102209", 383102209.5].each do |id|
+      assert_raises(AppleReleaseBuildNumber::Error) do
+        AppleReleaseBuildNumber.for_release("a" * 40, { "id" => id }, command: ->(*) { flunk "must not run git" })
+      end
+    end
+  end
+
   def test_baseline_commit_keeps_the_first_uploaded_build_number
     build = AppleReleaseBuildNumber.from_first_parent_history([
       AppleReleaseBuildNumber::BASELINE_COMMIT

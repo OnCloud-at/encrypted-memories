@@ -45,14 +45,14 @@ import Testing
             ) == .authoritativePhotosList)
     }
 
-    @Test func firstLoadWithoutCacheKeepsSDKBootstrapPath() {
+    @Test func firstLoadWithoutCacheUsesCompleteMetadataListing() {
         #expect(
             TimelineInventorySourcePolicy.decide(
                 cachedEventToken: nil,
                 currentEventToken: "event-1",
                 hasPendingLocalUploads: false,
                 hasUnmaterializedLocalEvidence: false
-            ) == .sdkCache)
+            ) == .authoritativePhotosList)
     }
 
     @Test func inventoryTokenContractForcesOneAuthoritativeRefreshForLegacyCaches() {

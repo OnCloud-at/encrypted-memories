@@ -2217,6 +2217,28 @@ struct ProductionRouteGuardTests {
         )
     }
 
+    @Test func mobileColdFailureKeepsAutomaticInventoryRecovery() throws {
+        let mobileLibrary = try String(
+            contentsOf: Self.repoRoot.appendingPathComponent("iOSApp/MobileLibraryModel.swift"),
+            encoding: .utf8
+        )
+        let failure = sourceBlock(
+            from: "if error is SourceAnalysisStartupError {",
+            to: "/// Builds an immutable",
+            in: mobileLibrary
+        )
+        #expect(failure.contains("initialLibraryLoadSettled = true"))
+        #expect(failure.contains("startLibraryChangeMonitorIfPossible(resetBaseline: true, initialToken: \"\")"))
+        #expect(!failure.contains("if hadCachedInventory"))
+        let monitor = sourceBlock(
+            from: "private func startLibraryChangeMonitorIfPossible(",
+            to: "private func requestLibraryRefresh()",
+            in: mobileLibrary
+        )
+        #expect(monitor.contains("loadState.failure?.retryable == true ? \"\" : nil"))
+        #expect(monitor.contains("initialToken: initialToken"))
+    }
+
     @Test func liquidGlassAvailabilityStaysCentralized() {
         let roots = [
             Self.repoRoot.appendingPathComponent("App"),

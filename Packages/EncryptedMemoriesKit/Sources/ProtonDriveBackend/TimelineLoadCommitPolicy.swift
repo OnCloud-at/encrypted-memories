@@ -301,7 +301,9 @@ enum TimelineInventoryVisibilityError: LocalizedError, TimelineInventoryConverge
     }
 }
 
-/// Keeps the SDK's cached enumeration on unchanged loads, but bypasses it after a known server mutation.
+/// Uses one complete metadata listing for cold or changed inventories. SDK enumeration is retained only
+/// for unchanged inventories: SDK 0.25 otherwise resolves the photos root again for every timeline page
+/// and needs separate tag listings afterward.
 enum TimelineInventorySourcePolicy {
     static func decide(
         cachedEventToken: String?,
@@ -310,7 +312,7 @@ enum TimelineInventorySourcePolicy {
         hasUnmaterializedLocalEvidence: Bool
     ) -> TimelineInventorySource {
         if hasPendingLocalUploads || hasUnmaterializedLocalEvidence { return .authoritativePhotosList }
-        guard let cachedEventToken else { return .sdkCache }
+        guard let cachedEventToken else { return .authoritativePhotosList }
         return cachedEventToken == currentEventToken ? .sdkCache : .authoritativePhotosList
     }
 }
