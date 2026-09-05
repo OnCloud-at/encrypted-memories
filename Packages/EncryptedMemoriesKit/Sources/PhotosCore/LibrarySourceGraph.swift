@@ -902,6 +902,7 @@ public final class LibrarySourceGraph {
 
     /// Installs a locally persisted inventory without claiming current remote completeness.
     /// A cached frame can add query-visible work, but it cannot authorize destructive reconciliation.
+    /// Valid unchanged input returns the current snapshot without advancing its revision; `nil` means rejection.
     public func installCachedInventory(
         _ items: [LibrarySourceItem],
         validationToken: String? = nil,
@@ -923,7 +924,7 @@ public final class LibrarySourceGraph {
                 || record.authority != nextAuthority
                 || record.accessState != .temporarilyUnavailable
                 || record.validationToken != validationToken
-        else { return nil }
+        else { return snapshot() }
         if record.items != canonicalItems {
             record.accessGeneration &+= 1
             record.itemGeneration &+= 1

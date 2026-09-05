@@ -147,7 +147,14 @@ public actor LibrarySourceCoordinator: PriorityThumbnailBatchLoader {
     ) async -> PrimaryInventoryAdmission {
         guard prepared, !closed else { return .unavailable }
         guard authority != .hydrating else { return .deferred }
-        let sourceItems = items.map(LibrarySourceItem.complete)
+        let sourceItems = items.map { item in
+            // A Live Photo tag does not prove that the listing resolved its companion. Keep the raw tag,
+            // but do not claim a complete relationship or erase an earlier known pairing.
+            let knownFields: LibrarySourceMetadataFields =
+                item.isLivePhoto && item.relatedVideoID == nil
+                ? .complete.subtracting(.livePhotoRelationship) : .complete
+            return LibrarySourceItem(item: item, knownFields: knownFields)
+        }
         if authority == .cached {
             guard let current = graph.inventory(for: Self.primarySourceID) else { return .unavailable }
             guard current.authority != .authoritative else { return .superseded }

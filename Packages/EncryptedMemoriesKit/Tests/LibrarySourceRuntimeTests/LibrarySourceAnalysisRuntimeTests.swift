@@ -444,6 +444,75 @@ func productionBurstGroupsAdmitAndDecodeVisibleThumbnails(authority: SourceInven
     await coordinator.shutdown()
 }
 
+@Test(arguments: [SourceInventoryAuthority.cached, .authoritative])
+func livePhotoTagWithoutMotionDoesNotRejectTheFirstLibraryInventory(
+    authority: SourceInventoryAuthority
+) async throws {
+    let entries = try JSONDecoder().decode(
+        [PhotosListEntry].self,
+        from: Data(
+            #"[{"LinkID":"tagged-still","CaptureTime":1,"Tags":[3],"RelatedPhotos":[]},{"LinkID":"live","CaptureTime":2,"Tags":[3],"RelatedPhotos":[{"LinkID":"motion"}]},{"LinkID":"still","CaptureTime":3,"Tags":[],"RelatedPhotos":[]}]"#
+                .utf8
+        )
+    )
+    let projection = TimelineContentProjection(sections: DriveSDKBridge.group(entries, volumeID: "v"))
+    let items = projection.snapshot.items
+    #expect(items.count == 3)
+    #expect(items[0].tags.contains(.livePhotos))
+    #expect(items[0].isLivePhoto)
+    #expect(items[0].relatedVideoID == nil)
+    #expect(items[1].isLivePhoto)
+    #expect(items[1].relatedVideoID == "motion")
+
+    let backend = FakeLibrarySourceBackend(locators: [], itemsByAlbum: [:], thumbnail: try makeSourceRuntimePNG())
+    let coordinator = LibrarySourceCoordinator(remote: backend, thumbnailLoader: backend, inventoryStore: nil)
+    await coordinator.prepare()
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let cache = ThumbnailCache(namespace: "first-live-inventory", rootDirectory: root)
+    cache.configure(accountUID: "account", key: SymmetricKey(size: .bits256))
+    let feed = ThumbnailFeedCore(cache: cache, loader: coordinator)
+    await feed.setPrefetchEnabled(false)
+    let universe = MLAssetUniverse()
+    let runtime = LibrarySourceAnalysisRuntime(
+        coordinator: coordinator, feed: feed, assets: universe, initiallyActive: false, onAssetsChanged: {}
+    )
+    let admission = await runtime.start(primaryItems: items, authority: authority, generation: 1)
+    #expect(admission == .accepted)
+    if admission == .accepted {
+        #expect(Set(universe.snapshot().uids) == Set(items.map(\.uid)))
+        let initial = await coordinator.snapshot()
+        let taggedMetadata = initial.selectedProjection.metadata(for: items[0].uid)
+        #expect(taggedMetadata?.knownFields.contains(.livePhotoRelationship) == false)
+        #expect(taggedMetadata?.item.tags.contains(.livePhotos) == true)
+        for item in items {
+            #expect(await feed.decoded(for: item.uid) != nil)
+            #expect(cache.diskData(for: item.uid) != nil)
+        }
+
+        let resolved = PhotoItem(
+            uid: items[0].uid, captureTime: items[0].captureTime, mediaType: items[0].mediaType,
+            isLivePhoto: true, relatedVideoID: "resolved-motion", tags: items[0].tags
+        )
+        #expect(
+            await runtime.replacePrimaryInventory(
+                [resolved] + items.dropFirst(), authority: authority, generation: 2
+            ) == .accepted
+        )
+        let resolvedRevision = await coordinator.snapshot().analysisScope.revision
+        // A later incomplete listing must not invent an authoritative removal of the known companion.
+        #expect(await runtime.replacePrimaryInventory(items, authority: authority, generation: 3) == .accepted)
+        let refreshed = await coordinator.snapshot()
+        #expect(refreshed.selectedProjection.metadata(for: resolved.uid)?.item.relatedVideoID == "resolved-motion")
+        #expect(refreshed.videoRetentionScope.uids.contains(PhotoUID(volumeID: "v", nodeID: "resolved-motion")))
+        if authority == .cached {
+            #expect(refreshed.analysisScope.revision == resolvedRevision)
+        }
+    }
+    await runtime.shutdown()
+    await coordinator.shutdown()
+}
+
 @Test func rejectedPrimaryInventoryDoesNotReportReadyOrAuthorizePartialData() async throws {
     let backend = FakeLibrarySourceBackend(locators: [], itemsByAlbum: [:], thumbnail: try makeSourceRuntimePNG())
     let coordinator = LibrarySourceCoordinator(remote: backend, thumbnailLoader: backend, inventoryStore: nil)
@@ -473,6 +542,18 @@ func productionBurstGroupsAdmitAndDecodeVisibleThumbnails(authority: SourceInven
     #expect(universe.snapshot().uids == [good.uid])
     #expect(cache.diskData(for: good.uid) != nil)
     #expect(await feed.decoded(for: bad.uid) == nil)
+    for (index, companion) in ["", "bad"].enumerated() {
+        let invalidRelationship = PhotoItem(
+            uid: bad.uid, captureTime: .now, mediaType: "image/png", isLivePhoto: true, relatedVideoID: companion
+        )
+        #expect(
+            await runtime.replacePrimaryInventory(
+                [invalidRelationship], authority: .authoritative, generation: UInt64(index + 4)
+            ) == .rejected
+        )
+        #expect(universe.snapshot().uids == [good.uid])
+        #expect(cache.diskData(for: good.uid) != nil)
+    }
     await runtime.shutdown()
     await coordinator.shutdown()
 }
