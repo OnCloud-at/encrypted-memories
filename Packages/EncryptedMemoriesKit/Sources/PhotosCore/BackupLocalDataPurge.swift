@@ -6,6 +6,20 @@ import Foundation
 /// Teardown must await completion before another login. Filesystem deletion must stay off the UI executor.
 public enum BackupLocalDataPurge {
     private static let pendingKey = "backup.pendingSignOutPurge.v1"
+    /// Written by the iOS Settings bundle; consumed only at cold launch, before feature composition.
+    public static let resetOnNextLaunchKey = "app.resetOnNextLaunch"
+
+    @discardableResult
+    public static func prepareRequestedResetForLaunch(
+        defaults: UserDefaults = .standard,
+        persistentDomainName: String
+    ) -> Bool {
+        guard defaults.bool(forKey: resetOnNextLaunchKey) else { return false }
+        // Reuse the crash-resumable file + Keychain transaction. Clearing preferences here prevents
+        // new feature owners from retaining pre-reset settings while the asynchronous purge runs.
+        requestPurgeOnSignOut(defaults: defaults, persistentDomainName: persistentDomainName)
+        return true
+    }
 
     public struct Result: Sendable, Equatable {
         public let removedRoots: [URL]

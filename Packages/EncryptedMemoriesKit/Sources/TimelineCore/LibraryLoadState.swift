@@ -92,6 +92,9 @@ public enum LibraryLoadEvent: Equatable, Sendable {
     /// Loading failed. `retryable` requests a retry affordance in the shell.
     case failed(message: String, retryable: Bool)
 
+    /// Inventory exists, but its byte route cannot produce the first visible frame.
+    case contentLoadFailed(message: String)
+
     /// A new session / sign-out / manual retry restarts the lifecycle at `preparingInventory`.
     case reset
 }
@@ -101,6 +104,11 @@ public enum LibraryLoadEvent: Equatable, Sendable {
 public enum LibraryLoadPolicy {
     public static func reduce(_ state: LibraryLoadState, _ event: LibraryLoadEvent) -> LibraryLoadState {
         switch event {
+        case .contentLoadFailed(let message):
+            switch state {
+            case .contentReady, .empty: return state
+            default: return .failed(message: message, retryable: true)
+            }
         case .reset:
             return .preparingInventory
 

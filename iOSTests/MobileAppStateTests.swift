@@ -126,6 +126,45 @@ private func waitUntil(
 }
 
 @Suite @MainActor struct MobileAppStateTests {
+    @Test func unconfiguredLibraryDoesNotStartSignOutTeardown() {
+        let library = MobileLibraryModel()
+        let revision = library.timelineRevision
+        library.configure(session: nil, store: SessionKeychainStore())
+        library.configure(session: nil, store: SessionKeychainStore())
+        #expect(library.timelineRevision == revision)
+        #expect(!library.isSigningOut)
+    }
+
+    @Test func installedSettingsBundleHasOneLocalizedResetSwitch() throws {
+        let rootURL = try #require(
+            Bundle.main.url(forResource: "Root", withExtension: "plist", subdirectory: "Settings.bundle"))
+        let root = try #require(
+            PropertyListSerialization.propertyList(from: Data(contentsOf: rootURL), format: nil) as? [String: Any])
+        #expect(root["StringsTable"] as? String == "Root")
+        let specifiers = try #require(root["PreferenceSpecifiers"] as? [[String: Any]])
+        let switches = specifiers.filter { $0["Type"] as? String == "PSToggleSwitchSpecifier" }
+        #expect(switches.count == 1)
+        let toggle = try #require(switches.first)
+        #expect(toggle["Key"] as? String == BackupLocalDataPurge.resetOnNextLaunchKey)
+        #expect(toggle["DefaultValue"] as? Bool == false)
+        let visibleKeys = specifiers.flatMap { specifier in
+            ["Title", "FooterText"].compactMap { specifier[$0] as? String }
+        }
+        for locale in ["en", "de"] {
+            let stringsURL = rootURL.deletingLastPathComponent()
+                .appendingPathComponent("\(locale).lproj/Root.strings")
+            let strings = try #require(
+                PropertyListSerialization.propertyList(from: Data(contentsOf: stringsURL), format: nil)
+                    as? [String: String])
+            #expect(Set(strings.keys) == Set(visibleKeys))
+            #expect(Set(strings.values).count == strings.count)
+            for key in visibleKeys {
+                #expect(strings[key]?.isEmpty == false)
+                #expect(strings[key] != key)
+            }
+        }
+    }
+
     @Test func unresolvedSessionShowsLoadingInsteadOfLogin() {
         #expect(
             MobileRootPresentation.resolve(

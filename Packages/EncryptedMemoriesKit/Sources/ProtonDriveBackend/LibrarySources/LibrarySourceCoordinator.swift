@@ -16,6 +16,15 @@ public enum LibrarySourceRefreshOutcome: Sendable, Equatable {
     case cancelled
 }
 
+/// Admission is distinct from runtime binding: only an accepted inventory authorizes its resources.
+public enum PrimaryInventoryAdmission: Sendable, Equatable {
+    case accepted
+    case rejected
+    case deferred
+    case superseded
+    case unavailable
+}
+
 /// Account-scoped source discovery, membership refresh, persistence, and byte-route fencing.
 ///
 /// The coordinator owns one graph. Platform hosts consume immutable changes and never infer source
@@ -131,35 +140,41 @@ public actor LibrarySourceCoordinator: PriorityThumbnailBatchLoader {
 
     /// Replaces the primary inventory with explicit host authority.
     /// Cached frames become query-visible but cannot authorize destructive derived-data reconciliation.
+    @discardableResult
     public func replacePrimaryInventory(
         _ items: [PhotoItem],
         authority: SourceInventoryAuthority
-    ) async {
-        guard prepared, !closed else { return }
+    ) async -> PrimaryInventoryAdmission {
+        guard prepared, !closed else { return .unavailable }
+        guard authority != .hydrating else { return .deferred }
         let sourceItems = items.map(LibrarySourceItem.complete)
         if authority == .cached {
+            guard let current = graph.inventory(for: Self.primarySourceID) else { return .unavailable }
+            guard current.authority != .authoritative else { return .superseded }
+            if current.items == sourceItems { return .accepted }
             if let change = graph.installCachedInventory(
                 sourceItems,
                 for: Self.primarySourceID
             ) {
                 await publish(change)
+                return closed ? .unavailable : .accepted
             }
-            return
+            return .rejected
         }
-        guard authority == .authoritative else { return }
         if let current = graph.inventory(for: Self.primarySourceID),
             current.accessState == .available,
             current.authority == .authoritative,
             current.items == sourceItems
         {
-            return
+            return .accepted
         }
-        guard let lease = graph.beginRefresh(Self.primarySourceID) else { return }
+        guard let lease = graph.beginRefresh(Self.primarySourceID) else { return .unavailable }
         guard let change = graph.commit(sourceItems, validationToken: nil, using: lease) else {
             if let failed = graph.failRefresh(using: lease) { await publish(failed) }
-            return
+            return .rejected
         }
         await publish(change)
+        return closed ? .unavailable : .accepted
     }
 
     /// Applies an already-confirmed remote access loss without waiting for another catalog sweep.

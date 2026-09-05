@@ -1,6 +1,8 @@
 import AlbumCore
+import CoreGraphics
 import CryptoKit
 import Foundation
+import ImageIO
 import MLSearchCore
 import MediaByteCache
 import MediaFeedCore
@@ -116,7 +118,7 @@ import Testing
             primaryItems: [stale],
             authority: .authoritative,
             generation: 1
-        )
+        ) == .superseded
     )
     await runtime.refresh()
 
@@ -223,7 +225,7 @@ import Testing
             primaryItems: [],
             authority: .authoritative,
             generation: 1
-        )
+        ) == .accepted
     )
     await runtime.refresh()
     #expect(await backend.discoveryCalls == 0)
@@ -325,7 +327,7 @@ import Testing
             primaryItems: [],
             authority: .authoritative,
             generation: 1
-        )
+        ) == .accepted
     )
     for _ in 0..<10_000 {
         if await backend.discoveryCalls >= 2, universe.snapshot().uids == [remoteUID] { break }
@@ -400,16 +402,110 @@ import Testing
     await coordinator.shutdown()
 }
 
+@Test(arguments: [SourceInventoryAuthority.cached, .authoritative])
+func productionBurstGroupsAdmitAndDecodeVisibleThumbnails(authority: SourceInventoryAuthority) async throws {
+    let fixture = try makeSourceRuntimePNG()
+    let backend = FakeLibrarySourceBackend(locators: [], itemsByAlbum: [:], thumbnail: fixture)
+    let coordinator = LibrarySourceCoordinator(remote: backend, thumbnailLoader: backend, inventoryStore: nil)
+    await coordinator.prepare()
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let cache = ThumbnailCache(namespace: "burst-admission", rootDirectory: root)
+    cache.configure(accountUID: "account", key: SymmetricKey(size: .bits256))
+    let feed = ThumbnailFeedCore(cache: cache, loader: coordinator)
+    await feed.setPrefetchEnabled(false)
+    let universe = MLAssetUniverse()
+    let runtime = LibrarySourceAnalysisRuntime(
+        coordinator: coordinator, feed: feed, assets: universe, initiallyActive: false, onAssetsChanged: {}
+    )
+    let date = Date(timeIntervalSince1970: 100)
+    let groups = BurstGroupResolver.memberLookup(candidates: [
+        BurstGroupCandidate(id: "burst", relatedIDs: ["sibling"], captureTime: date)
+    ])
+    let item = PhotoItem(
+        uid: PhotoUID(volumeID: "volume", nodeID: "burst"), captureTime: date,
+        mediaType: "image/png", tags: [.bursts], burstMemberIDs: try #require(groups["burst"])
+    )
+    // Siblings need not have their own timeline row; the production Photos listing exposes burst anchors.
+    #expect(item.burstMemberIDs.contains(item.uid.nodeID))
+    async let firstStart = runtime.start(primaryItems: [item], authority: authority, generation: 1)
+    async let joiningStart = runtime.start(primaryItems: [item], authority: authority, generation: 1)
+    let admissions = await (firstStart, joiningStart)
+    #expect(admissions.0 == .accepted)
+    #expect(admissions.1 == .accepted)
+    #expect(universe.snapshot().uids == [item.uid])
+    #expect(await feed.decoded(for: item.uid) != nil)
+    #expect(feed.memoryDecoded(for: item.uid) != nil)
+    #expect(cache.diskData(for: item.uid) == fixture)
+    // An unchanged refresh must preserve authorization and decoded residency too.
+    #expect(await runtime.replacePrimaryInventory([item], authority: authority, generation: 2) == .accepted)
+    #expect(feed.memoryDecoded(for: item.uid) != nil)
+    await runtime.shutdown()
+    await coordinator.shutdown()
+}
+
+@Test func rejectedPrimaryInventoryDoesNotReportReadyOrAuthorizePartialData() async throws {
+    let backend = FakeLibrarySourceBackend(locators: [], itemsByAlbum: [:], thumbnail: try makeSourceRuntimePNG())
+    let coordinator = LibrarySourceCoordinator(remote: backend, thumbnailLoader: backend, inventoryStore: nil)
+    await coordinator.prepare()
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let cache = ThumbnailCache(namespace: "rejected-admission", rootDirectory: root)
+    cache.configure(accountUID: "account", key: SymmetricKey(size: .bits256))
+    let feed = ThumbnailFeedCore(cache: cache, loader: coordinator)
+    await feed.setPrefetchEnabled(false)
+    let universe = MLAssetUniverse()
+    let runtime = LibrarySourceAnalysisRuntime(
+        coordinator: coordinator, feed: feed, assets: universe, initiallyActive: false, onAssetsChanged: {}
+    )
+    let good = PhotoItem(uid: PhotoUID(volumeID: "v", nodeID: "good"), captureTime: .now, mediaType: "image/png")
+    let bad = PhotoItem(
+        uid: PhotoUID(volumeID: "v", nodeID: "bad"), captureTime: .now, mediaType: "image/png",
+        burstMemberIDs: ["bad", "bad"]
+    )
+    #expect(await runtime.start(primaryItems: [good, bad], authority: .cached, generation: 1) == .rejected)
+    #expect(universe.snapshot().uids.isEmpty)
+    #expect(await feed.decoded(for: good.uid) == nil)
+    #expect(await runtime.start(primaryItems: [good], authority: .authoritative, generation: 2) == .accepted)
+    #expect(await feed.decoded(for: good.uid) != nil)
+    #expect(await runtime.replacePrimaryInventory([bad], authority: .authoritative, generation: 3) == .rejected)
+    // Failed refresh retains the last valid inventory; it must not authorize deletion of its cached bytes.
+    #expect(universe.snapshot().uids == [good.uid])
+    #expect(cache.diskData(for: good.uid) != nil)
+    #expect(await feed.decoded(for: bad.uid) == nil)
+    await runtime.shutdown()
+    await coordinator.shutdown()
+}
+
+private func makeSourceRuntimePNG() throws -> Data {
+    let context = try #require(
+        CGContext(
+            data: nil, width: 2, height: 2, bitsPerComponent: 8, bytesPerRow: 8,
+            space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ))
+    context.setFillColor(CGColor(red: 1, green: 0, blue: 0, alpha: 1))
+    context.fill(CGRect(x: 0, y: 0, width: 2, height: 2))
+    let image = try #require(context.makeImage())
+    let data = NSMutableData()
+    let destination = try #require(CGImageDestinationCreateWithData(data, "public.png" as CFString, 1, nil))
+    CGImageDestinationAddImage(destination, image, nil)
+    #expect(CGImageDestinationFinalize(destination))
+    return data as Data
+}
+
 private actor FakeLibrarySourceBackend: LibrarySourceRemoteBackend, PriorityThumbnailBatchLoader {
     let locators: [AlbumNodeIdentifier]
     let itemsByAlbum: [String: [LibrarySourceItem]]
+    let thumbnail: Data
 
     init(
         locators: [AlbumNodeIdentifier],
-        itemsByAlbum: [String: [LibrarySourceItem]]
+        itemsByAlbum: [String: [LibrarySourceItem]],
+        thumbnail: Data = Data("thumbnail".utf8)
     ) {
         self.locators = locators
         self.itemsByAlbum = itemsByAlbum
+        self.thumbnail = thumbnail
     }
 
     func librarySourceLocators() async throws -> [AlbumNodeIdentifier] {
@@ -424,7 +520,7 @@ private actor FakeLibrarySourceBackend: LibrarySourceRemoteBackend, PriorityThum
         for uids: [PhotoUID],
         onLoaded: @Sendable @escaping (PhotoUID, Data) -> Void
     ) async -> ThumbnailBatchLoadResult {
-        for uid in uids { onLoaded(uid, Data("thumbnail".utf8)) }
+        for uid in uids { onLoaded(uid, thumbnail) }
         return .delivered
     }
 

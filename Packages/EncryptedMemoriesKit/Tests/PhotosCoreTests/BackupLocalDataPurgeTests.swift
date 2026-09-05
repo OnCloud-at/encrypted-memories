@@ -69,6 +69,39 @@ final class BackupLocalDataPurgeTests: XCTestCase {
         XCTAssertTrue(BackupLocalDataPurge.isPurgePending(defaults: defaults))
     }
 
+    func testSettingsResetClearsPreferencesAndHandsOffToOneResumablePurge() throws {
+        let root = try makeTempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        defaults.set(12345, forKey: "thumbnail.cachedBytes")
+        defaults.set(true, forKey: "ml.enabled")
+        XCTAssertFalse(
+            BackupLocalDataPurge.prepareRequestedResetForLaunch(
+                defaults: defaults, persistentDomainName: suiteName
+            ))
+        XCTAssertEqual(defaults.integer(forKey: "thumbnail.cachedBytes"), 12345)
+
+        defaults.set(true, forKey: BackupLocalDataPurge.resetOnNextLaunchKey)
+        XCTAssertTrue(
+            BackupLocalDataPurge.prepareRequestedResetForLaunch(
+                defaults: defaults, persistentDomainName: suiteName
+            ))
+        XCTAssertFalse(defaults.bool(forKey: BackupLocalDataPurge.resetOnNextLaunchKey))
+        XCTAssertNil(defaults.object(forKey: "thumbnail.cachedBytes"))
+        XCTAssertNil(defaults.object(forKey: "ml.enabled"))
+        XCTAssertTrue(BackupLocalDataPurge.isPurgePending(defaults: defaults))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: root.path), "Arming must not do UI-thread filesystem work")
+
+        // A second launch must retain the already-armed transaction rather than clear its retry marker.
+        XCTAssertFalse(
+            BackupLocalDataPurge.prepareRequestedResetForLaunch(
+                defaults: defaults, persistentDomainName: suiteName
+            ))
+        let claim = try XCTUnwrap(BackupLocalDataPurge.claimSignOutPurge(defaults: defaults, roots: [root]))
+        XCTAssertTrue(claim.perform(defaults: defaults).succeeded)
+        XCTAssertFalse(BackupLocalDataPurge.isPurgePending(defaults: defaults))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.path))
+    }
+
     func testFailedClaimKeepsPendingMarkerForNextLaunch() throws {
         let root = try makeTempRoot()
         BackupLocalDataPurge.requestPurgeOnSignOut(defaults: defaults)

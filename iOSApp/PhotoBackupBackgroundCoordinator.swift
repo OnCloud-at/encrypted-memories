@@ -29,6 +29,7 @@ final class PhotoBackupBackgroundCoordinator {
     private var processingIssue: BackupExecutionOpportunityIssue?
     private var applicationIsForegroundActive = false
     private var backupIsActivelyProcessing = false
+    private var schedulingStopped = false
 
     private init() {}
 
@@ -60,6 +61,7 @@ final class PhotoBackupBackgroundCoordinator {
     /// Connects the account-scoped shared controller to the platform runtime. No backup behavior
     /// is implemented here; the hooks only protect an already-running shared pass from suspension.
     func configure(controller: PhotoLibraryBackupController) {
+        schedulingStopped = false
         PhotoLibraryBackupSharedRef.shared.controller = controller
         publishExecutionIssue(to: controller)
         applicationIsForegroundActive = UIApplication.shared.applicationState == .active
@@ -103,6 +105,7 @@ final class PhotoBackupBackgroundCoordinator {
     }
 
     func backupResumed(controller: PhotoLibraryBackupController) {
+        schedulingStopped = false
         PhotoLibraryBackupSharedRef.shared.controller = controller
         if controller.isEnabled, !controller.isUserPaused {
             scheduleProcessingCatchUp(controller: controller)
@@ -114,6 +117,7 @@ final class PhotoBackupBackgroundCoordinator {
     }
 
     private func stopScheduling(detachController: Bool) {
+        schedulingStopped = true
         scheduler.cancel(taskRequestWithIdentifier: Self.processingTaskIdentifier)
         processingIssue = nil
         publishExecutionIssue()
@@ -143,6 +147,7 @@ final class PhotoBackupBackgroundCoordinator {
     /// same identifier; errors are logged rather than silently turning background backup into a no-op.
     @discardableResult
     func scheduleProcessingCatchUp(controller: PhotoLibraryBackupController? = nil) -> Bool {
+        guard !schedulingStopped, !BackupLocalDataPurge.isPurgePending() else { return false }
         let request = BGProcessingTaskRequest(identifier: Self.processingTaskIdentifier)
         request.requiresNetworkConnectivity = true
         request.requiresExternalPower = false

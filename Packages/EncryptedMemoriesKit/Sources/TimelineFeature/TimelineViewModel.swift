@@ -257,6 +257,13 @@ public final class TimelineViewModel {
         applyInitialLoad(.firstContentReady)
     }
 
+    /// A rejected source inventory cannot render a first thumbnail. Preserve an already displayed library.
+    public func reportInitialContentFailure() {
+        let message = L10n.string("error.load_library_title")
+        applyInitialLoad(.contentLoadFailed(message: message))
+        if initialLibraryLoadState.failure != nil { state = .failed(message) }
+    }
+
     /// Shows a caller-provided, already-resolved item set in the existing timeline grid without asking the
     /// backend for a server-side filter. Used by map cluster/member pins: the map owns which UIDs are grouped,
     /// while the grid, selection, export, trash, viewer, and thumbnail prefetch remain the normal timeline path.

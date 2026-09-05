@@ -37,13 +37,12 @@ final class MobileSessionModel: ObservableObject {
     }
 
     init(startupPlaintextPurgeSucceeded: Bool? = nil) {
-        let purgeClaim = BackupLocalDataPurge.claimSignOutPurge()
         injectDefaultCryptoImplementation()
         self.authController = ProtonAuthController(
             store: sessionStore,
             authenticator: ProtonForkAuthenticator(config: .externalDriveEncryptedMemories)
         )
-        self.startupPurgeSucceeded = true
+        self.startupPurgeSucceeded = false
         self.startupCleanupTask = nil
         isCheckingSession = true
         statusText = String(localized: "auth.checking_session")
@@ -53,18 +52,36 @@ final class MobileSessionModel: ObservableObject {
             queue: .main
         ) { [weak self] _ in
             Task { @MainActor [weak self] in
-                self?.bootstrapSessionIfNeeded()
+                guard let self else { return }
+                if !self.startupPurgeSucceeded {
+                    self.beginStartupCleanup()
+                } else {
+                    self.bootstrapSessionIfNeeded()
+                }
             }
         }
-        self.startupCleanupTask = Task { @MainActor [weak self] in
+        beginStartupCleanup(plaintextPurgeSucceeded: startupPlaintextPurgeSucceeded)
+    }
+
+    private func beginStartupCleanup(plaintextPurgeSucceeded: Bool? = nil, signInAfterCleanup: Bool = false) {
+        guard startupCleanupTask == nil else { return }
+        apply(.checking)
+        guard UIApplication.shared.isProtectedDataAvailable else { return }
+        let purgeClaim = BackupLocalDataPurge.claimSignOutPurge()
+        startupPurgeSucceeded = false
+        startupCleanupTask = Task { @MainActor [weak self] in
             let succeeded = await ProtonAuthLocalDataPurge.performStartupOffMain(
                 claim: purgeClaim,
-                plaintextPurgeSucceeded: startupPlaintextPurgeSucceeded
+                plaintextPurgeSucceeded: plaintextPurgeSucceeded
             )
             guard let self else { return }
             self.startupPurgeSucceeded = succeeded
             self.startupCleanupTask = nil
-            self.bootstrapSessionIfNeeded()
+            if succeeded, signInAfterCleanup {
+                self.signIn()
+            } else {
+                self.bootstrapSessionIfNeeded()
+            }
         }
     }
 
@@ -77,8 +94,8 @@ final class MobileSessionModel: ObservableObject {
     func signIn() {
         isSigningOut = false
         guard startupCleanupTask == nil else { return }
-        guard !BackupLocalDataPurge.isPurgePending() else {
-            errorText = String(localized: "auth.sign_in_failed")
+        guard startupPurgeSucceeded, !BackupLocalDataPurge.isPurgePending() else {
+            beginStartupCleanup(signInAfterCleanup: true)
             return
         }
         authController.signIn(
@@ -139,7 +156,7 @@ final class MobileSessionModel: ObservableObject {
             isSigningIn = false
             isCheckingSession = false
             errorText = error
-            statusText = error == nil ? Self.signInPrompt : String(localized: "auth.sign_in_failed")
+            statusText = error == nil ? Self.signInPrompt : L10n.string("auth.sign_in_failed")
         case .authenticating(let progress):
             session = nil
             isSigningIn = true
@@ -162,12 +179,12 @@ final class MobileSessionModel: ObservableObject {
     /// the existing item can be read; this must never look like an account sign-out.
     private func bootstrapSessionIfNeeded() {
         guard startupCleanupTask == nil, session == nil, !isSigningIn, !isSigningOut else { return }
-        guard startupPurgeSucceeded else {
-            apply(.signedOut(error: String(localized: "auth.sign_in_failed")))
-            return
-        }
         guard UIApplication.shared.isProtectedDataAvailable else {
             apply(.checking)
+            return
+        }
+        guard startupPurgeSucceeded else {
+            apply(.signedOut(error: L10n.string("auth.sign_in_failed")))
             return
         }
         apply(authController.bootstrap())

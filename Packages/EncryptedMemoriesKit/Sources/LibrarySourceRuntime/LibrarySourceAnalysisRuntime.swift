@@ -34,6 +34,8 @@ public actor LibrarySourceAnalysisRuntime {
             generation: UInt64
         )?
     private var latestPrimaryInventoryGeneration: UInt64?
+    private var primaryInventoryOutcome: (generation: UInt64, admission: PrimaryInventoryAdmission)?
+    private var startupTask: Task<Bool, Never>?
     private var applyingPrimaryInventory = false
     private var primaryInventoryDrainWaiters: [CheckedContinuation<Void, Never>] = []
     private var activeApplyCount = 0
@@ -78,10 +80,19 @@ public actor LibrarySourceAnalysisRuntime {
     @discardableResult
     public func start() async -> Bool {
         guard !closed else { return false }
+        if let startupTask { return await startupTask.value && !closed }
         if started {
             await drainPrimaryInventory()
-            return true
+            return !closed
         }
+        let task = Task { await self.bindConsumers() }
+        startupTask = task
+        let ready = await task.value
+        startupTask = nil
+        return ready && !closed
+    }
+
+    private func bindConsumers() async -> Bool {
         let initial = await coordinator.attach { [weak self] change in
             await self?.receive(change)
         }
@@ -131,32 +142,45 @@ public actor LibrarySourceAnalysisRuntime {
         primaryItems: [PhotoItem],
         authority: SourceInventoryAuthority,
         generation: UInt64
-    ) async -> Bool {
+    ) async -> PrimaryInventoryAdmission {
         stagePrimaryInventory(primaryItems, authority: authority, generation: generation)
-        return await start()
+        guard await start() else { return .unavailable }
+        return admission(for: generation)
     }
 
+    @discardableResult
     public func replacePrimaryInventory(
         _ items: [PhotoItem],
         authority: SourceInventoryAuthority
-    ) async {
+    ) async -> PrimaryInventoryAdmission {
         let generation = (latestPrimaryInventoryGeneration ?? 0) &+ 1
-        await replacePrimaryInventory(
+        return await replacePrimaryInventory(
             items,
             authority: authority,
             generation: generation
         )
     }
 
+    @discardableResult
     public func replacePrimaryInventory(
         _ items: [PhotoItem],
         authority: SourceInventoryAuthority,
         generation: UInt64
-    ) async {
-        guard !closed else { return }
+    ) async -> PrimaryInventoryAdmission {
+        guard !closed else { return .unavailable }
         stagePrimaryInventory(items, authority: authority, generation: generation)
-        guard started else { return }
+        if let startupTask { _ = await startupTask.value }
+        guard started else { return .deferred }
         await drainPrimaryInventory()
+        return admission(for: generation)
+    }
+
+    private func admission(for generation: UInt64) -> PrimaryInventoryAdmission {
+        guard !closed else { return .unavailable }
+        guard let primaryInventoryOutcome, primaryInventoryOutcome.generation == generation else {
+            return .superseded
+        }
+        return primaryInventoryOutcome.admission
     }
 
     private func stagePrimaryInventory(
@@ -180,15 +204,19 @@ public actor LibrarySourceAnalysisRuntime {
     }
 
     private func drainPrimaryInventory() async {
-        guard !applyingPrimaryInventory else { return }
+        guard !applyingPrimaryInventory else {
+            await waitForPrimaryInventoryDrain()
+            return
+        }
         applyingPrimaryInventory = true
         defer { finishPrimaryInventoryDrain() }
         while !closed, let pendingPrimaryInventory {
             self.pendingPrimaryInventory = nil
-            await coordinator.replacePrimaryInventory(
+            let result = await coordinator.replacePrimaryInventory(
                 pendingPrimaryInventory.items,
                 authority: pendingPrimaryInventory.authority
             )
+            primaryInventoryOutcome = (pendingPrimaryInventory.generation, result)
         }
     }
 
@@ -440,6 +468,8 @@ public actor LibrarySourceAnalysisRuntime {
         guard !closed else { return }
         closed = true
         isActive = false
+        let startup = startupTask
+        startup?.cancel()
         refreshGeneration &+= 1
         let activeRefresh = refreshTask
         let refreshRetry = refreshRetryTask
@@ -455,10 +485,12 @@ public actor LibrarySourceAnalysisRuntime {
         await reconciliationRetry?.value
         await waitForRetryDrain()
         refreshTask = nil
+        _ = await startup?.value
         await waitForPrimaryInventoryDrain()
         await waitForApplyDrain()
         await coordinator.detach()
         pendingPrimaryInventory = nil
+        primaryInventoryOutcome = nil
         pendingChange = nil
         pendingReconciliationRetryChange = nil
     }

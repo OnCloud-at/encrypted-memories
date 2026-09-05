@@ -245,7 +245,6 @@ enum LibrarySourceInventoryValidator {
         let validBurstMembers =
             item.burstMemberIDs.allSatisfy {
                 !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                    && $0 != item.uid.nodeID
             } && Set(item.burstMemberIDs).count == item.burstMemberIDs.count
         let validCaptureTime =
             !sourceItem.knownFields.contains(.captureTime)

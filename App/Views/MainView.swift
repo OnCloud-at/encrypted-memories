@@ -991,7 +991,8 @@ struct MainView: View {
         model.configureSmartSearch(
             feedCore: feed.feedCore,
             primaryItems: timelineModel.wholeLibraryItemsForViewer,
-            primaryAuthority: timelineModel.wholeLibraryInventoryAuthority
+            primaryAuthority: timelineModel.wholeLibraryInventoryAuthority,
+            onPrimaryInventoryFailure: { timelineModel.reportInitialContentFailure() }
         )
     }
 
