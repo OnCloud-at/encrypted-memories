@@ -51,7 +51,7 @@ public final class PhotoViewerModel {
             isFullResolutionStillReady: isSharp,
             didFullResolutionStillFail: originalLoadFailed,
             motionState: motion.loadState,
-            isMotionRequested: motion.isPlayRequested || motion.loadState != .idle
+            isMotionRequested: motion.isPlayRequested
         )
     }
 
@@ -495,6 +495,7 @@ public final class PhotoViewerModel {
             isSharp = false
             return
         }
+        motion.prepare(for: item, streamer: streamer) { [weak self] in self?.isDisplaying(item) ?? false }
 
         // Instant: if we already have the sharp original cached, show it - no spinner, no network.
         if let cached = Self.fullImageCache.object(forKey: Self.cacheKey(item.uid)) {

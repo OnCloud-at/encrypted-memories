@@ -83,6 +83,7 @@ final class FakeChecker: UploadDuplicateChecking, @unchecked Sendable {
     private var invalidationCount = 0
     private var contentFindCount = 0
     private var exactFindCount = 0
+    var onNameLookup: (@Sendable ([String]) -> Void)?
 
     func nameHash(forCorrectedName name: String) async throws -> String {
         lock.withLock { nameHashCalls += 1 }
@@ -95,6 +96,7 @@ final class FakeChecker: UploadDuplicateChecking, @unchecked Sendable {
 
     func findDuplicates(nameHashes: [String]) async throws -> [RemotePhotoDuplicate] {
         if let findError { throw findError }
+        onNameLookup?(nameHashes)
         return lock.withLock {
             findBatches.append(nameHashes)
             return nameHashes.flatMap { hash in remoteItemsByNameHash[hash] ?? [] }
@@ -694,6 +696,65 @@ final class UploadDedupePipelineTests: XCTestCase {
         )
         let second = try await duplicateCall.value
         XCTAssertEqual(second.decision, .skip(.knownFromManifest, remoteLinkID: "first-link"))
+    }
+
+    func testSettlingEarlierResourceRevisionPreservesTheLaterContentClaim() async throws {
+        try await assertEarlierRevisionPreservesLaterClaim(.uploaded)
+    }
+
+    func testFailingEarlierResourceRevisionPreservesTheLaterContentClaim() async throws {
+        try await assertEarlierRevisionPreservesLaterClaim(.failed)
+    }
+
+    func testReconcilingEarlierResourceRevisionPreservesTheLaterContentClaim() async throws {
+        try await assertEarlierRevisionPreservesLaterClaim(.reconciliation)
+    }
+
+    private enum EarlierRevisionSettlement { case uploaded, failed, reconciliation }
+
+    private func assertEarlierRevisionPreservesLaterClaim(_ settlement: EarlierRevisionSettlement) async throws {
+        let source = UploadSourceIdentity(kind: .photoLibraryAsset, identifier: "edited-photo")
+        let earlier = UploadResourceDescriptor(
+            source: source, fileURL: URL(fileURLWithPath: "/earlier/original.HEIC"),
+            filename: "original.HEIC", fileSize: 1_000, modificationDate: Date(timeIntervalSince1970: 100)
+        )
+        let later = UploadResourceDescriptor(
+            source: source, fileURL: URL(fileURLWithPath: "/later/edited.jpg"),
+            filename: "edited.jpg", fileSize: 2_000, modificationDate: Date(timeIntervalSince1970: 200)
+        )
+        let copy = descriptor(path: "/copy/renamed.jpg", size: 2_000)
+        hasher.contentSeeds[later.fileURL.path] = "edited-bytes"
+        hasher.contentSeeds[copy.fileURL.path] = "edited-bytes"
+        let first = try await pipeline.resolve(earlier)
+        let second = try await pipeline.resolve(later)
+        XCTAssertEqual(first.decision, .upload)
+        XCTAssertEqual(second.decision, .upload)
+        switch settlement {
+        case .uploaded:
+            try await pipeline.recordUploaded(
+                earlier, identity: first.identity, remoteVolumeID: "vol", remoteLinkID: "earlier-link"
+            )
+        case .failed:
+            await pipeline.uploadDidFail(earlier)
+        case .reconciliation:
+            await pipeline.remoteCommitNeedsReconciliation(earlier)
+        }
+
+        let queriedBeforeSettlement = expectation(description: "copy must wait for the later resource revision")
+        queriedBeforeSettlement.isInverted = true
+        checker.onNameLookup = { hashes in
+            if hashes.contains("nh(renamed.jpg)") { queriedBeforeSettlement.fulfill() }
+        }
+        let pipeline = self.pipeline!
+        let copyTask = Task { try await pipeline.resolve(copy) }
+        await fulfillment(of: [queriedBeforeSettlement], timeout: 0.2)
+
+        try await pipeline.recordUploaded(
+            later, identity: second.identity, remoteVolumeID: "vol", remoteLinkID: "later-link"
+        )
+        let result = try await copyTask.value
+        XCTAssertEqual(result.decision, .skip(.knownFromManifest, remoteLinkID: "later-link"))
+        if result.decision.uploadsBytes { await pipeline.uploadDidFail(copy) }
     }
 
     func testPrimeBatchesAtProtonSize() async throws {

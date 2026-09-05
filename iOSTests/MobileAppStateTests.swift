@@ -1,5 +1,6 @@
 import Foundation
 import PhotoViewerCore
+import PhotoViewerUIKitAdapter
 import PhotosCore
 import ProtonAuth
 import SwiftUI
@@ -111,6 +112,90 @@ private final class MobileScopeRecoveryTestState {
 
 private enum MobileRetryTestTimeout: Error {
     case elapsed
+}
+
+private actor ViewerOriginalLoadProbe: FullMediaProvider, OriginalByteStreamProvider, VideoStreamProvider {
+    let previewData: Data
+    private var work: Task<Void, Error>?
+    private var motionWork: Task<Void, Error>?
+    private(set) var started = false
+    private(set) var cancelled = false
+    private(set) var motionStarted = false
+    private(set) var motionCancelled = false
+
+    init(previewData: Data) { self.previewData = previewData }
+
+    func preview(for uid: PhotoUID) async throws -> Data { previewData }
+
+    func originalData(for uid: PhotoUID, onProgress: @escaping @Sendable (Double) -> Void) async throws -> Data {
+        throw CancellationError()
+    }
+
+    func streamOriginalBytes(
+        for uid: PhotoUID,
+        onChunk: @escaping @Sendable (Data) async throws -> Void,
+        onProgress: @escaping @Sendable (Double) -> Void
+    ) async throws {
+        let pending = Task { try await Task.sleep(for: .seconds(60)) }
+        work = pending
+        started = true
+        do {
+            try await withTaskCancellationHandler {
+                try await pending.value
+            } onCancel: {
+                pending.cancel()
+            }
+        } catch {
+            cancelled = Task.isCancelled
+            throw error
+        }
+    }
+
+    func prefetchEncrypted(for uid: PhotoUID) async throws {
+        let pending = Task { try await Task.sleep(for: .seconds(60)) }
+        motionWork = pending
+        motionStarted = true
+        do {
+            try await withTaskCancellationHandler {
+                try await pending.value
+            } onCancel: {
+                pending.cancel()
+            }
+        } catch {
+            motionCancelled = Task.isCancelled
+            throw error
+        }
+    }
+
+    func makeStreamingAsset(for uid: PhotoUID) async throws -> StreamingVideoAsset {
+        throw VideoStreamError.notAVideo
+    }
+
+    func finish() {
+        work?.cancel()
+        motionWork?.cancel()
+    }
+}
+
+@MainActor @Observable private final class ViewerPageVisibility {
+    var isCurrent = true
+    var isPresented = true
+}
+
+private struct ViewerImagePageProbe: View {
+    let visibility: ViewerPageVisibility
+    let store: UIKitViewerImageStore
+    let item: PhotoItem
+    var streamer: (any VideoStreamProvider)? = nil
+
+    var body: some View {
+        if visibility.isPresented {
+            MobileImagePage(
+                item: item, isCurrent: visibility.isCurrent, imageStore: store, streamer: streamer,
+                onToggleChrome: {}, onCloseRequested: {}
+            )
+        }
+    }
 }
 
 private func waitUntil(
@@ -266,6 +351,92 @@ private func waitUntil(
         let scrollView = try #require(findViewerScrollView(in: host.view))
         scrollView.layoutIfNeeded()
         return (window, host, scrollView)
+    }
+
+    private func makeHostedImagePage(
+        _ page: ViewerImagePageProbe
+    ) throws -> (
+        UIWindow, UIHostingController<ViewerImagePageProbe>
+    ) {
+        let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let window = UIWindow(windowScene: scene)
+        let host = UIHostingController(rootView: page)
+        window.frame = CGRect(x: 0, y: 0, width: 390, height: 844)
+        window.rootViewController = host
+        window.makeKeyAndVisible()
+        host.view.frame = window.bounds
+        host.view.layoutIfNeeded()
+        return (window, host)
+    }
+
+    @Test(.serialized, arguments: [false, true])
+    func leavingImagePageCancelsTheOriginalZoomLoad(dismiss: Bool) async throws {
+        let thumbnail = makeViewerImage(size: CGSize(width: 120, height: 80))
+        let provider = ViewerOriginalLoadProbe(previewData: try #require(thumbnail.pngData()))
+        let store = UIKitViewerImageStore(thumbnailProvider: { _ in thumbnail }, media: provider)
+        let visibility = ViewerPageVisibility()
+        let item = PhotoItem(uid: uid("zoom-cancel"), captureTime: Date(), mediaType: "image/jpeg")
+        let (window, host) = try makeHostedImagePage(.init(visibility: visibility, store: store, item: item))
+        defer {
+            window.isHidden = true
+            window.rootViewController = nil
+        }
+
+        do {
+            try await waitUntil {
+                await MainActor.run { self.findViewerScrollView(in: host.view) != nil }
+            }
+            let scrollView = try #require(findViewerScrollView(in: host.view))
+            scrollView.setZoomScale(3, animated: false)
+            scrollView.delegate?.scrollViewDidEndZooming?(scrollView, with: nil, atScale: 3)
+            try await waitUntil { await provider.started }
+
+            if dismiss {
+                visibility.isPresented = false
+            } else {
+                visibility.isCurrent = false
+            }
+            try await waitUntil { await provider.cancelled }
+        } catch {
+            await provider.finish()
+            throw error
+        }
+        await provider.finish()
+    }
+
+    @Test func livePhotoPreloadsMotionOnlyWhenItsPageBecomesCurrent() async throws {
+        let thumbnail = makeViewerImage(size: CGSize(width: 120, height: 80))
+        let provider = ViewerOriginalLoadProbe(previewData: try #require(thumbnail.pngData()))
+        let store = UIKitViewerImageStore(thumbnailProvider: { _ in thumbnail }, media: provider)
+        let visibility = ViewerPageVisibility()
+        visibility.isCurrent = false
+        let item = PhotoItem(
+            uid: uid("live-preload"), captureTime: Date(), mediaType: "image/heic",
+            isLivePhoto: true, relatedVideoID: "motion"
+        )
+        let (window, host) = try makeHostedImagePage(
+            .init(visibility: visibility, store: store, item: item, streamer: provider)
+        )
+        defer {
+            window.isHidden = true
+            window.rootViewController = nil
+        }
+        do {
+            try await waitUntil {
+                await MainActor.run { self.findViewerScrollView(in: host.view) != nil }
+            }
+            #expect(await !provider.motionStarted)
+            visibility.isCurrent = true
+            try await waitUntil { await provider.motionStarted }
+            try await waitUntil { await provider.started }
+            visibility.isCurrent = false
+            try await waitUntil { await provider.motionCancelled }
+            try await waitUntil { await provider.cancelled }
+        } catch {
+            await provider.finish()
+            throw error
+        }
+        await provider.finish()
     }
 
     private func resizeHostedViewer(

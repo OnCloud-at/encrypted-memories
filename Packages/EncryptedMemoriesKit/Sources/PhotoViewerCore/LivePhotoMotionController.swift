@@ -17,7 +17,7 @@ public enum LivePhotoMotionLoadState: Equatable, Sendable {
 /// E2EE-safe: the clip uses the encrypted resource-loader path as regular video
 /// (`makeStreamingAsset` using `protonvideo://`). Encrypted blocks are cached locally and decrypted only in
 /// RAM, so plaintext motion-video files are never written. Unlike timeline videos, the clip is fully
-/// pre-downloaded after the user requests playback, before `player` is exposed. Without a `player` (still loading), an active play intent
+/// pre-downloaded when its photo becomes current, before `player` is exposed. Without a `player` (still loading), an active play intent
 /// is retained until preparation finishes; `stop()` cancels that intent.
 ///
 /// Deliberately carries no audio-session configuration: on macOS a plain `AVPlayer` mixes with system audio and
@@ -41,6 +41,7 @@ public final class LivePhotoMotionController {
     /// weakly, so it must live as long as the player.
     private var asset: StreamingVideoAsset?
     private var prepareTask: Task<Void, Never>?
+    private var preparingMotionUID: PhotoUID?
     private var endObserver: NSObjectProtocol?
     private var preparationGeneration: UInt = 0
     /// Retains a press that began while the encrypted clip was still being prepared. Without this intent,
@@ -52,15 +53,21 @@ public final class LivePhotoMotionController {
 
     /// Preloads the paired motion clip for a Live Photo. No-op for non-Live items / when no streamer is
     /// available (per `LivePhotoMotionPolicy`). `isStillCurrent` lets the caller abort if the user paged away
-    /// mid-load, so a swiped-past item never attaches a player; any prior clip is torn down first.
+    /// mid-load. Repeated preparation of the same clip reuses its in-flight or ready player; a different clip
+    /// tears down its predecessor first.
     public func prepare(
         for item: PhotoItem, streamer: VideoStreamProvider?,
         isStillCurrent: @escaping @MainActor () -> Bool
     ) {
-        teardown()
         guard LivePhotoMotionPolicy.shouldPrepare(item: item, hasStreamer: streamer != nil),
-            let motionUID = item.relatedVideoUID, let streamer
-        else { return }
+            let motionUID = item.relatedVideoUID, let streamer, isStillCurrent()
+        else {
+            teardown()
+            return
+        }
+        guard preparingMotionUID != motionUID || (loadState != .loading && loadState != .ready) else { return }
+        teardown()
+        preparingMotionUID = motionUID
         loadState = .loading
         let generation = preparationGeneration
         prepareTask = Task { [weak self] in
@@ -116,24 +123,18 @@ public final class LivePhotoMotionController {
         startPlaybackIfRequested()
     }
 
-    /// Requests playback and starts preparation only when the user invokes Live Photo motion. This keeps the
-    /// expensive encrypted paired-clip preload out of ordinary page navigation.
+    /// Reuses the current page's preload. An early press retains playback intent; a failed preload can retry.
     public func play(
         for item: PhotoItem,
         streamer: VideoStreamProvider?,
         isStillCurrent: @escaping @MainActor () -> Bool
     ) {
         guard LivePhotoMotionPolicy.shouldPrepare(item: item, hasStreamer: streamer != nil),
-            let streamer
+            let streamer, isStillCurrent()
         else { return }
+        prepare(for: item, streamer: streamer, isStillCurrent: isStillCurrent)
         isPlayRequested = true
-        if player != nil {
-            startPlaybackIfRequested()
-        } else if loadState == .idle || loadState == .failed {
-            prepare(for: item, streamer: streamer, isStillCurrent: isStillCurrent)
-            // `prepare` tears down the previous generation, including its play intent.
-            isPlayRequested = true
-        }
+        startPlaybackIfRequested()
     }
 
     private func startPlaybackIfRequested() {
@@ -163,6 +164,7 @@ public final class LivePhotoMotionController {
         preparationGeneration &+= 1
         prepareTask?.cancel()
         prepareTask = nil
+        preparingMotionUID = nil
         removeEndObserver()
         player?.pause()
         isPlayRequested = false
