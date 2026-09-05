@@ -121,8 +121,10 @@ public enum MLPipelineStageOutcome: Equatable, Sendable {
 
 extension MLPipelineStageOutcome {
     var consumesAttempt: Bool {
-        if case .deferred = self { return false }
-        return true
+        switch self {
+        case .deferred, .suspended, .cancelled: false
+        default: true
+        }
     }
 }
 

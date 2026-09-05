@@ -64,6 +64,7 @@ After tested changes reach `main`, a maintainer publishes a GitHub Release.
 Automation derives one shared Apple build number from the immutable GitHub Release ID and validates it with App Store Connect before starting Xcode. Separate prerelease and stable releases get new builds even on the same source commit. Keep beta tags and their notes unchanged as release history; publish a new stable release instead of renaming a beta. Retrying the same release reuses its build number. Releases through `v1.0.2-beta.3` retain their previously uploaded, commit-derived numbers.
 
 Write owner-written notes under `## English`. This is the only required release-notes section.
+Keep notes short and understandable to app users. For a maintenance release, `Bug fixes and performance improvements.` is enough; technical details belong in the pull request.
 Without platform subsections, English applies to both platforms.
 Optional `### All Platforms`, `### iOS and iPadOS`, and `### macOS` subsections let each platform receive shared text plus its specific text.
 

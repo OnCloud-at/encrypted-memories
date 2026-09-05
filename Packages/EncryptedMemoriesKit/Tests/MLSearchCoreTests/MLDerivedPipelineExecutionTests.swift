@@ -44,6 +44,8 @@ import Testing
     }
 
     @Test func suspensionBeforeCommitLeavesWorkPending() async throws {
+        #expect(!MLPipelineStageOutcome.suspended(.resourcePolicy).consumesAttempt)
+        #expect(!MLPipelineStageOutcome.cancelled.consumesAttempt)
         let store = InMemoryMLDerivedPipelineStore()
         let artifact = try artifact(pipeline: .nativeSearch, stage: "ocr", revision: "revision3")
         let key = try executionKey(pipeline: .nativeSearch, artifacts: [artifact])

@@ -2898,6 +2898,20 @@ final class CoreArchitectureGateTests: XCTestCase {
         )
     }
 
+    func testMLBackgroundAdapterOwnsOnlyOSOpportunities() throws {
+        let manifest = try String(contentsOf: packageManifest, encoding: .utf8)
+        let target = try XCTUnwrap(manifestLine(forTarget: "MLSearchBackgroundAppleAdapter", in: manifest))
+        XCTAssertEqual(Set(dependencies(inTargetLine: target)), ["MLSearchCore", "PhotosCore"])
+        let allowed: Set<String> = [
+            "Foundation", "MLSearchCore", "PhotosCore", "os", "BackgroundTasks", "UIKit", "AppKit",
+        ]
+        let files = try swiftFiles(in: sourcesRoot.appendingPathComponent("MLSearchBackgroundAppleAdapter"))
+        XCTAssertFalse(files.isEmpty)
+        for file in files {
+            XCTAssertTrue(try importedModules(in: file).isSubset(of: allowed), file.lastPathComponent)
+        }
+    }
+
     func testNoTargetOutsideMLSearchAppleAdapterMayImportCoreML() throws {
         let manifest = try String(contentsOf: packageManifest, encoding: .utf8)
         var violations: [String] = []
@@ -2980,7 +2994,7 @@ final class CoreArchitectureGateTests: XCTestCase {
         )
     }
 
-    func testMLSearchAppleAdapterComputePolicyHoldsToNeuralEngineOnly() throws {
+    func testMLSearchAppleAdapterComputePolicyRemainsCentralized() throws {
         // Production sources under MLSearchAppleAdapter must not expose public .all or .cpuOnly.
         // These may only appear behind #if debug guards or in test files.
         let adapterRoot = sourcesRoot.appendingPathComponent("MLSearchAppleAdapter")
@@ -3036,8 +3050,8 @@ final class CoreArchitectureGateTests: XCTestCase {
             ML compute policy hardened incorrectly:
             \(violations.joined(separator: "\n"))
 
-            Production inference must only allow .cpuAndNeuralEngine. Debug escape hatches
-            must be internal and behind #if DEBUG guards.
+            Foreground inference uses .cpuAndNeuralEngine. The central policy alone may select
+            CPU-only for iOS background execution. Arbitrary debug overrides remain internal.
             """
         )
     }

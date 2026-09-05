@@ -3,6 +3,7 @@ import AlbumsFeature
 import Foundation
 import LibrarySourceRuntime
 import MLSearchAppleAdapter
+import MLSearchBackgroundAppleAdapter
 import MLSearchCore
 import MediaByteCache
 import MediaCacheCore
@@ -900,6 +901,7 @@ final class MobileLibraryModel {
             catalogEndpoint: catalogEndpoint
         )
         smartSearch = MLSmartSearchController(lifecycle: lifecycle)
+        AppleSmartSearchBackgroundCoordinator.shared.configure(lifecycle: lifecycle)
         // Under memory pressure the search stack drops cached vector blocks and unloads the
         // CoreML model; both rebuild on demand.
         smartSearchMemoryRegistration?.end()
@@ -953,6 +955,7 @@ final class MobileLibraryModel {
     @discardableResult
     private func stopSmartSearch() -> Task<Void, Never>? {
         let lifecycle = smartSearch?.lifecycleActor
+        if let lifecycle { AppleSmartSearchBackgroundCoordinator.shared.detach(lifecycle: lifecycle) }
         smartSearch = nil
         smartSearchAssets.beginHydration()
         smartSearchMemoryRegistration?.end()

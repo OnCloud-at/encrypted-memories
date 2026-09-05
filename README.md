@@ -197,7 +197,7 @@ Write owner-written Apple release notes under `## English`. This is the only req
 
 ```markdown
 ## English
-Short user-facing changes in English.
+Bug fixes and performance improvements.
 ```
 
 A platform-specific release body looks like this:

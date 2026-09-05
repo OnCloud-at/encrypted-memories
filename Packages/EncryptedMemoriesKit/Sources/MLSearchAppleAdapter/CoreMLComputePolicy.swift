@@ -1,14 +1,27 @@
 import CoreML
 import Foundation
 import MLSearchCore
+import PhotosCore
 
 /// Compute-unit policy for Core ML inference.
-/// Production inference uses the CPU and Neural Engine. Other choices are available only to debug tests.
+/// Foreground inference uses CPU and Neural Engine; iOS background inference uses CPU only.
 public struct CoreMLComputePolicy: Sendable, Equatable {
     public let computeUnits: MLComputeUnits
 
     /// The production policy: CPU plus Neural Engine.
     public static let `default`: CoreMLComputePolicy = .init(computeUnits: .cpuAndNeuralEngine)
+
+    static var requiresCPUOnly: Bool {
+        #if os(iOS)
+            LibraryRuntimeState.shared.snapshot().executionOpportunity >= .backgroundPermitted
+        #else
+            false
+        #endif
+    }
+
+    func resolved(requiresCPUOnly: Bool) -> Self {
+        requiresCPUOnly ? .init(computeUnits: .cpuOnly) : self
+    }
 
     /// Creates the default production policy.
     public init() {

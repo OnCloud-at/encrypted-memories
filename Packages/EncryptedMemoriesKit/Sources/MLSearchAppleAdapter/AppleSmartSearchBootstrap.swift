@@ -141,8 +141,11 @@ public enum AppleSmartSearchBootstrap {
                 governor: MLClosureIndexingGovernor({ workGate.permitsIndexing() }),
                 allowsDeveloperModels: allowsDeveloperModels,
                 featureAvailability: featureAvailability(),
-                indexingCapacityProfile: indexingCapacityProfile
-            ))
+                indexingCapacityProfile: indexingCapacityProfile,
+                releaseDerivedResources: { await imageSource.releaseMemory() }
+            ),
+            initiallyAllowsIndexingExecution: !CoreMLComputePolicy.requiresCPUOnly
+        )
         workGate.setIndexingWake { [weak lifecycle] in
             Task { await lifecycle?.noteConditionsChanged() }
         }

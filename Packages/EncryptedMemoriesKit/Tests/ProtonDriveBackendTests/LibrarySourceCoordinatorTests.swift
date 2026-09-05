@@ -75,6 +75,74 @@ struct LibrarySourceCoordinatorTests {
         await coordinator.shutdown()
     }
 
+    @Test(arguments: [false, true])
+    func thumbnailsStreamBeforeTheBatchEndsAndLateBytesRemainFenced(closeRuntime: Bool) async throws {
+        let firstUID = PhotoUID(volumeID: "remote-volume", nodeID: "first")
+        let lateUID = PhotoUID(volumeID: "remote-volume", nodeID: "late")
+        let locator = AlbumNodeIdentifier(volumeID: "remote-volume", nodeID: "album")
+        let backend = ControlledLibrarySourceBackend(blockAfterFirstThumbnail: true, repeatFirstThumbnail: true)
+        await backend.setSources([locator: [Self.item(firstUID), Self.item(lateUID)]])
+        let coordinator = LibrarySourceCoordinator(remote: backend, thumbnailLoader: backend, inventoryStore: nil)
+        await coordinator.prepare()
+        await coordinator.refresh()
+        let delivered = ThumbnailDeliveryRecorder()
+        let load = Task {
+            await coordinator.loadThumbnails(for: [firstUID, lateUID], priority: .visibleNow) { uid, data in
+                delivered.store(data, for: uid)
+            }
+        }
+        while await !backend.isThumbnailLoadWaiting() { await Task.yield() }
+        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while delivered.data(for: firstUID) == nil, ContinuousClock.now < deadline { await Task.yield() }
+        let deliveredBeforeCompletion = delivered.data(for: firstUID) != nil
+        if closeRuntime {
+            await coordinator.shutdown()
+        } else {
+            await coordinator.revokeAdditionalSource(for: locator)
+        }
+        await backend.releaseThumbnailLoad()
+        let result = await load.value
+
+        #expect(deliveredBeforeCompletion, "An available thumbnail must not wait for the remaining download")
+        #expect(delivered.data(for: lateUID) == nil)
+        #expect(result.itemErrors[lateUID] == "source authorization changed")
+        #expect(result.itemErrors[firstUID] == nil, "Already delivered items must not also be reported as failures")
+        #expect(result.itemErrors.count == 1, "Unrequested callbacks must not create item errors")
+        await coordinator.shutdown()
+    }
+
+    @Test func cancelledThumbnailStreamJoinsTheLoaderWithoutReportingAccessLoss() async throws {
+        let uid = PhotoUID(volumeID: "remote-volume", nodeID: "photo")
+        let backend = ControlledLibrarySourceBackend(blockThumbnailLoads: true)
+        await backend.setSources([
+            AlbumNodeIdentifier(volumeID: "remote-volume", nodeID: "album"): [Self.item(uid)]
+        ])
+        let coordinator = LibrarySourceCoordinator(remote: backend, thumbnailLoader: backend, inventoryStore: nil)
+        await coordinator.prepare()
+        await coordinator.refresh()
+        let delivered = ThumbnailDeliveryRecorder()
+        let completion = SynchronousCompletionProbe()
+        let load = Task {
+            let result = await coordinator.loadThumbnails(for: [uid]) { uid, data in
+                delivered.store(data, for: uid)
+            }
+            completion.markCompleted()
+            return result
+        }
+        while await !backend.isThumbnailLoadWaiting() { await Task.yield() }
+        load.cancel()
+        while await !backend.wasThumbnailLoadCancelled() { await Task.yield() }
+        // This loader deliberately does not cooperate with cancellation. The caller still owns
+        // its structured child and cannot finish while the backend has not returned.
+        #expect(!completion.isCompleted)
+        await backend.releaseThumbnailLoad()
+        let result = await load.value
+        #expect(result.batchError == "cancelled")
+        #expect(result.itemErrors.isEmpty)
+        #expect(delivered.data(for: uid) == nil)
+        await coordinator.shutdown()
+    }
+
     @Test func confirmedAccessLossImmediatelyRemovesDerivedDataMembership() async throws {
         let remoteUID = PhotoUID(volumeID: "remote-volume", nodeID: "remote-photo")
         let locator = AlbumNodeIdentifier(volumeID: "remote-volume", nodeID: "album")
@@ -393,10 +461,17 @@ private actor ControlledLibrarySourceBackend: LibrarySourceRemoteBackend, Priori
     private var blockedItemEnumeration: AlbumNodeIdentifier?
     private var itemEnumerationContinuation: CheckedContinuation<Void, Never>?
     private let blockThumbnailLoads: Bool
+    private let blockAfterFirstThumbnail: Bool
+    private let repeatFirstThumbnail: Bool
+    private let thumbnailCancellation = SynchronousCompletionProbe()
     private var thumbnailContinuation: CheckedContinuation<Void, Never>?
 
-    init(blockThumbnailLoads: Bool = false) {
+    init(
+        blockThumbnailLoads: Bool = false, blockAfterFirstThumbnail: Bool = false, repeatFirstThumbnail: Bool = false
+    ) {
         self.blockThumbnailLoads = blockThumbnailLoads
+        self.blockAfterFirstThumbnail = blockAfterFirstThumbnail
+        self.repeatFirstThumbnail = repeatFirstThumbnail
     }
 
     func setSources(_ sources: [AlbumNodeIdentifier: [LibrarySourceItem]]) {
@@ -450,12 +525,26 @@ private actor ControlledLibrarySourceBackend: LibrarySourceRemoteBackend, Priori
         onLoaded: @Sendable @escaping (PhotoUID, Data) -> Void
     ) async -> ThumbnailBatchLoadResult {
         if blockThumbnailLoads {
-            await withCheckedContinuation { continuation in
-                thumbnailContinuation = continuation
+            await withTaskCancellationHandler {
+                await withCheckedContinuation { continuation in
+                    thumbnailContinuation = continuation
+                }
+            } onCancel: { [thumbnailCancellation] in
+                thumbnailCancellation.markCompleted()
             }
         }
-        for uid in uids {
+        for (index, uid) in uids.enumerated() {
             onLoaded(uid, Data("thumbnail".utf8))
+            if blockAfterFirstThumbnail, index == 0 {
+                await withCheckedContinuation { thumbnailContinuation = $0 }
+            }
+            if repeatFirstThumbnail, index == 0 {
+                for _ in 0..<64 { onLoaded(uid, Data("duplicate".utf8)) }
+                onLoaded(PhotoUID(volumeID: "unrequested", nodeID: "unrequested"), Data("unrequested".utf8))
+            }
+        }
+        if repeatFirstThumbnail, let firstUID = uids.first {
+            return ThumbnailBatchLoadResult(itemErrors: [firstUID: "late duplicate failure"])
         }
         return .delivered
     }
@@ -470,6 +559,10 @@ private actor ControlledLibrarySourceBackend: LibrarySourceRemoteBackend, Priori
 
     func isThumbnailLoadWaiting() -> Bool {
         thumbnailContinuation != nil
+    }
+
+    func wasThumbnailLoadCancelled() -> Bool {
+        thumbnailCancellation.isCompleted
     }
 
     func releaseThumbnailLoad() {

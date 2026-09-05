@@ -585,6 +585,17 @@ public actor ThumbnailFeedCore {
         return decoded
     }
 
+    /// A derived consumer retaining decoded pixels must validate the same account, cache epoch
+    /// and analysis access as a fresh decode. It must not turn its own cache into an access bypass.
+    package nonisolated func analysisThumbnailLease(for uid: PhotoUID) -> (@Sendable () -> Bool)? {
+        let generation = cache.captureWriterGeneration()
+        let isCurrent: @Sendable () -> Bool = { [self] in
+            ownerLeaseIsCurrent() && cache.isCurrentWriterGeneration(generation)
+                && analysisAuthorization.isAllowed(uid)
+        }
+        return isCurrent() ? isCurrent : nil
+    }
+
     /// Detailed cache-only result for background consumers that must distinguish a thumbnail
     /// that may still arrive from bytes that are present but cannot be decoded.
     public nonisolated func backgroundThumbnailDecodeResult(for uid: PhotoUID) async -> BackgroundThumbnailDecodeResult

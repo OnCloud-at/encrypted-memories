@@ -217,6 +217,7 @@ public actor MLModelInstaller {
         _ entry: MLModelCatalogEntry,
         onProgress: @escaping @Sendable (MLModelTransferProgress) async -> Void
     ) async throws -> MLModelInstallRecord {
+        try Task.checkCancellation()
         guard let plan = entry.downloadPlan else { throw MLModelInstallError.notDownloadable }
         // The transfer boundary enforces the distribution and product-use license flags.
         guard entry.license.allowsRedistribution, entry.license.allowsProductUse else {
@@ -241,6 +242,7 @@ public actor MLModelInstaller {
             return installed
         }
 
+        try Task.checkCancellation()
         let layout = self.layout
         let transport = self.transport
         let now = self.now

@@ -151,6 +151,29 @@ extension DriveSessionStubSuite {
             }
         }
 
+        @Test(arguments: [
+            #"{"Code":1000}"#,
+            #"{"Code":1001,"Responses":[]}"#,
+            #"{"Code":1001,"Responses":[{"LinkID":"l1","Response":{"Code":1000}}]}"#,
+            #"{"Code":1001,"Responses":[{"LinkID":"l1","Response":{"Code":1000}},{"LinkID":"l1","Response":{"Code":1000}}]}"#,
+            #"{"Code":1001,"Responses":[{"LinkID":"l1","Response":{"Code":1000}},{"LinkID":"other","Response":{"Code":1000}}]}"#,
+            #"{"Code":1001,"Responses":[{"LinkID":"l1","Response":{}},{"LinkID":"l2","Response":{"Code":1000}}]}"#,
+            #"{"Code":1001,"Responses":[{"LinkID":"l1"},{"LinkID":"l2","Response":{"Code":1000}}]}"#,
+        ])
+        func incompleteMultistatusNeverConfirmsTrashOrRestore(_ response: String) async throws {
+            StubURLProtocol.reset()
+            StubURLProtocol.route("POST /drive/v2/volumes/vol1/trash_multiple", json: response)
+            StubURLProtocol.route("PUT /drive/v2/volumes/vol1/trash/restore_multiple", json: response)
+            let session = makeSession()
+
+            await #expect(throws: DriveBatchActionError.self) {
+                try await session.trash(volumeID: "vol1", linkIDs: ["l1", "l2"])
+            }
+            await #expect(throws: DriveBatchActionError.self) {
+                try await session.restore(volumeID: "vol1", linkIDs: ["l1", "l2"])
+            }
+        }
+
         @Test func restorePutsLinkIDsToRestoreMultiple() async throws {
             StubURLProtocol.reset()
             StubURLProtocol.route(

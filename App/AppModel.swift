@@ -2,6 +2,7 @@ import AppKit
 import Foundation
 import LibrarySourceRuntime
 import MLSearchAppleAdapter
+import MLSearchBackgroundAppleAdapter
 import MLSearchCore
 import MediaByteCache
 import MediaFeedCore
@@ -403,6 +404,7 @@ final class AppModel {
     @discardableResult
     private func stopSmartSearch() -> Task<Void, Never>? {
         let lifecycle = smartSearch?.lifecycleActor
+        if let lifecycle { AppleSmartSearchBackgroundCoordinator.shared.detach(lifecycle: lifecycle) }
         smartSearch = nil
         smartSearchAssets.beginHydration()
         smartSearchMemoryRegistration?.end()
@@ -510,6 +512,7 @@ final class AppModel {
             catalogEndpoint: catalogEndpoint
         )
         smartSearch = MLSmartSearchController(lifecycle: lifecycle)
+        AppleSmartSearchBackgroundCoordinator.shared.configure(lifecycle: lifecycle)
         // Under memory pressure the search stack drops cached vector blocks and unloads the
         // CoreML model; both rebuild on demand.
         smartSearchMemoryRegistration?.end()
@@ -598,12 +601,14 @@ final class AppModel {
                 }
                 albumSyncController = albumSync
                 await client.uploadCoordinator.start()
+                guard !Task.isCancelled, facade === client, authController.currentSession == session else { return }
                 backend = .ready(client.backend)
                 // Register account caches after construction so pressure events can manage their budgets.
                 AppMemoryPressureCoordinator.shared.install()
             } catch is CancellationError {
                 // ignore
             } catch {
+                guard !Task.isCancelled, authController.currentSession == session else { return }
                 DebugLog.log("backend prepare FAILED: \(error)")
                 backend = .failed((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
             }

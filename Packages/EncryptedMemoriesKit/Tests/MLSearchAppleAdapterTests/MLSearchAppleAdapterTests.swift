@@ -227,6 +227,75 @@ import Testing
         #expect(await loads.value == 1)
     }
 
+    @Test func cachedThumbnailSourceRevalidatesWarmAccessAndReleasesMemory() async throws {
+        let context = try #require(
+            CGContext(
+                data: nil, width: 2, height: 2, bitsPerComponent: 8, bytesPerRow: 8,
+                space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+        let image = try #require(context.makeImage())
+        let authorized = DemandState(active: true)
+        let loads = ImageSourceLoadCounter()
+        let source = CachedThumbnailMLImageSource(
+            lease: { _ -> (@Sendable () -> Bool)? in
+                guard authorized.isActive() else { return nil }
+                return { authorized.isActive() }
+            },
+            resolve: { _ in
+                await loads.increment()
+                return .image(CoreMLSourceImage(cgImage: image))
+            })
+        let photo = uid("leased")
+        guard case .image = await source.image(for: photo) else {
+            Issue.record("Authorized image must load")
+            return
+        }
+        authorized.setActive(false)
+        guard case .transientFailure = await source.image(for: photo) else {
+            Issue.record("A warm ML cache must not bypass revoked analysis access")
+            return
+        }
+        #expect(await loads.value == 1)
+        authorized.setActive(true)
+        _ = await source.image(for: photo)
+        #expect(await loads.value == 2)
+        await source.releaseMemory()
+        _ = await source.image(for: photo)
+        #expect(await loads.value == 3)
+    }
+
+    @Test func backgroundComputePolicyDoesNotChangeTheForegroundDefault() {
+        #expect(CoreMLComputePolicy.default.resolved(requiresCPUOnly: true).computeUnits == .cpuOnly)
+        #expect(CoreMLComputePolicy.default.resolved(requiresCPUOnly: false).computeUnits == .cpuAndNeuralEngine)
+    }
+
+    @Test func releasingMLImagesRejectsLateDecodeAndAllowsFreshRequests() async throws {
+        let context = try #require(
+            CGContext(
+                data: nil, width: 2, height: 2, bitsPerComponent: 8, bytesPerRow: 8,
+                space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+        let image = try #require(context.makeImage())
+        let gate = ImageSourceDecodeGate()
+        let source = CachedThumbnailMLImageSource(resolve: { _ in
+            await gate.decode()
+            return .image(CoreMLSourceImage(cgImage: image))
+        })
+        let photo = uid("decoding")
+        let first = Task { await source.image(for: photo) }
+        await gate.waitForStart()
+        await source.releaseMemory()
+        await gate.release()
+        guard case .transientFailure = await first.value else {
+            Issue.record("A decode from before memory release must be discarded")
+            return
+        }
+        #expect(await gate.calls == 1)
+        guard case .image = await source.image(for: photo) else {
+            Issue.record("The next decode in the new epoch must work")
+            return
+        }
+        #expect(await gate.calls == 2)
+    }
+
     @Test(.enabled(if: ProcessInfo.processInfo.environment["ENCRYPTED_MEMORIES_TINYCLIP_MODEL"] != nil))
     func optionalRealTinyCLIPRuntimeSmoke() async throws {
         let modelPath = try #require(ProcessInfo.processInfo.environment["ENCRYPTED_MEMORIES_TINYCLIP_MODEL"])
@@ -511,5 +580,31 @@ private actor ImageSourceLoadCounter {
 
     func increment() {
         value += 1
+    }
+}
+
+private actor ImageSourceDecodeGate {
+    private(set) var calls = 0
+    private var started: CheckedContinuation<Void, Never>?
+    private var blocked: CheckedContinuation<Void, Never>?
+    private var released = false
+
+    func decode() async {
+        calls += 1
+        started?.resume()
+        started = nil
+        guard !released else { return }
+        await withCheckedContinuation { blocked = $0 }
+    }
+
+    func waitForStart() async {
+        guard calls == 0 else { return }
+        await withCheckedContinuation { started = $0 }
+    }
+
+    func release() {
+        released = true
+        blocked?.resume()
+        blocked = nil
     }
 }

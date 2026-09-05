@@ -1282,12 +1282,34 @@ final class ProjectHygieneTests: XCTestCase {
             info["NSPhotoLibraryUsageDescription"],
             "photo backup needs a usage description on iOS")
         let identifiers = try XCTUnwrap(info["BGTaskSchedulerPermittedIdentifiers"] as? [String])
-        XCTAssertEqual(identifiers, ["at.oncloud.encryptedmemories.photo-backup.processing"])
+        XCTAssertEqual(
+            identifiers,
+            [
+                "at.oncloud.encryptedmemories.photo-backup.processing",
+                "at.oncloud.encryptedmemories.smart-search.processing",
+            ])
         let modes = try XCTUnwrap(info["UIBackgroundModes"] as? [String])
         XCTAssertTrue(modes.contains("processing"))
         XCTAssertFalse(
             modes.contains("audio") || modes.contains("location") || modes.contains("voip"),
             "no keep-alive background-mode abuse")
+
+        let searchBackground = try String(
+            contentsOf: repoRoot.appendingPathComponent(
+                "Packages/EncryptedMemoriesKit/Sources/MLSearchBackgroundAppleAdapter/AppleSmartSearchBackgroundCoordinator.swift"
+            ), encoding: .utf8)
+        XCTAssertTrue(searchBackground.contains("at.oncloud.encryptedmemories.smart-search.processing"))
+        XCTAssertTrue(searchBackground.contains("request.requiresExternalPower = true"))
+        XCTAssertTrue(searchBackground.contains("request.requiresNetworkConnectivity = false"))
+        XCTAssertTrue(searchBackground.contains("await lifecycle.performBackgroundCatchUp()"))
+        XCTAssertTrue(searchBackground.contains("task.expirationHandler = { operation.cancel() }"))
+        XCTAssertFalse(searchBackground.contains("BGContinuedProcessingTask"))
+        let mobileApp = try String(
+            contentsOf: repoRoot.appendingPathComponent("iOSApp/EncryptedMemoriesMobileApp.swift"), encoding: .utf8)
+        let registration = try XCTUnwrap(mobileApp.range(of: "AppleSmartSearchBackgroundCoordinator.shared.register()"))
+        let scene = try XCTUnwrap(mobileApp.range(of: "var body: some Scene"))
+        XCTAssertLessThan(registration.lowerBound, scene.lowerBound)
+        XCTAssertTrue(mobileApp.contains("AppleSmartSearchBackgroundCoordinator.shared.stop()"))
 
         let backgroundCoordinator =
             (try? String(

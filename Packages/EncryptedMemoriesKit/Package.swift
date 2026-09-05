@@ -61,6 +61,7 @@ let package = Package(
         .library(name: "MapFeature", targets: ["MapFeature"]),
         .library(name: "MLSearchCore", targets: ["MLSearchCore"]),
         .library(name: "MLSearchAppleAdapter", targets: ["MLSearchAppleAdapter"]),
+        .library(name: "MLSearchBackgroundAppleAdapter", targets: ["MLSearchBackgroundAppleAdapter"]),
         .library(name: "MLSearchFeature", targets: ["MLSearchFeature"]),
     ],
     dependencies: [
@@ -297,6 +298,9 @@ let package = Package(
             resources: [.process("Resources")], swiftSettings: disableDynamicActorIsolation),
         .testTarget(
             name: "MLSearchAppleAdapterTests", dependencies: ["MLSearchAppleAdapter", "MLSearchCore", "PhotosCore"],
+            swiftSettings: disableDynamicActorIsolation),
+        .target(
+            name: "MLSearchBackgroundAppleAdapter", dependencies: ["MLSearchCore", "PhotosCore"],
             swiftSettings: disableDynamicActorIsolation),
         .target(
             name: "MLSearchFeature", dependencies: ["MLSearchCore", "PhotosCore"],

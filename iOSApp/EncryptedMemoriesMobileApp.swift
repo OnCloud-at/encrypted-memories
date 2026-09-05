@@ -2,6 +2,7 @@ import DesignSystemCore
 import DesignSystemUIKitAdapter
 import Foundation
 import LibraryRuntimeAppleAdapter
+import MLSearchBackgroundAppleAdapter
 import MLSearchCore
 import MLSearchFeature
 import Metal
@@ -25,6 +26,7 @@ struct EncryptedMemoriesMobileApp: App {
         }
         if BackupLocalDataPurge.isPurgePending() {
             PhotoBackupBackgroundCoordinator.shared.backupStopped()
+            AppleSmartSearchBackgroundCoordinator.shared.stop()
         }
         let metal3Supported = MobileMetal3Runtime.isSupported()
         self.metal3Supported = metal3Supported
@@ -34,6 +36,7 @@ struct EncryptedMemoriesMobileApp: App {
         AppleLibraryRuntimeAdapter.shared.install()
         MobileMetricKitCollector.shared.install()
         PhotoBackupBackgroundCoordinator.shared.register()
+        AppleSmartSearchBackgroundCoordinator.shared.register()
     }
 
     var body: some Scene {
@@ -112,6 +115,7 @@ private struct MobileSupportedAppRoot: View {
                 @unknown default: opportunity = .foregroundInactive
                 }
                 AppleLibraryRuntimeAdapter.shared.setExecutionOpportunity(opportunity)
+                AppleSmartSearchBackgroundCoordinator.shared.applicationStateChanged(isForeground: phase != .background)
                 if phase == .background {
                     PhotoBackupBackgroundCoordinator.shared.applicationDidEnterBackground(
                         controller: EncryptedMemoriesMobileApp.currentPhotoBackup()

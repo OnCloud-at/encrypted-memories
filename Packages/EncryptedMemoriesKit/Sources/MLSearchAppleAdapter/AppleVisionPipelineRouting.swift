@@ -11,7 +11,7 @@ extension AppleVisionPipelineExecutor {
     ) -> RoutingDecision {
         guard let result else { return .run }
         switch result {
-        case .completed:
+        case .completed, .suspended:
             return .run
         case .completedEmpty, .unsupported:
             return .skip

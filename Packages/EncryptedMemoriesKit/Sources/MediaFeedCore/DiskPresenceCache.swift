@@ -16,6 +16,7 @@ final class DiskPresenceCache: @unchecked Sendable {
     ) {
         lock.withLock {
             let allKeys = Set(uids)
+            values = values.filter { allKeys.contains($0.key) }
             trackedKeys = reportingUIDs.map { $0.intersection(allKeys) } ?? allKeys
             trackedTotal = trackedKeys.count
             for uid in knownPresent where trackedKeys.contains(uid) {

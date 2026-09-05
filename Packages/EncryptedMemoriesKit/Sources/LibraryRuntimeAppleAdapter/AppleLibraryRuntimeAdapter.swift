@@ -39,6 +39,14 @@ public final class AppleLibraryRuntimeAdapter {
         guard !installed else { return }
         installed = true
 
+        #if canImport(UIKit) && !os(watchOS)
+            let applicationState = UIApplication.shared.applicationState
+            runtimeState.update {
+                $0.executionOpportunity = applicationState == .background ? .backgroundPermitted : .foregroundInactive
+                if applicationState == .active { $0.executionOpportunity = .foregroundActive }
+            }
+        #endif
+
         Task {
             await LibraryResourceCoordinator.shared.startObserving()
         }
