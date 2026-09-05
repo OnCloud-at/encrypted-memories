@@ -5,6 +5,19 @@ import Testing
 /// Covers the five library-load phases the product requires: unknown count, known count / no thumbnails,
 /// first content ready, empty library, and error - plus the transitions and edge cases between them.
 @Suite struct LibraryLoadStateTests {
+    @Test func rejectedByteRouteSettlesBeforeFirstFrameButPreservesPresentedContent() {
+        for cached in [false, true] {
+            let failed = LibraryLoadPolicy.reduce(
+                .loadingContent(count: 37_249, usingCachedInventory: cached),
+                .contentLoadFailed(message: "test-error")
+            )
+            #expect(failed == .failed(message: "test-error", retryable: true))
+            #expect(!failed.isLoading)
+        }
+        let presented = LibraryLoadState.contentReady(count: 37_249)
+        #expect(LibraryLoadPolicy.reduce(presented, .contentLoadFailed(message: "test-error")) == presented)
+    }
+
     private func reduce(_ state: LibraryLoadState, _ events: [LibraryLoadEvent]) -> LibraryLoadState {
         events.reduce(state) { LibraryLoadPolicy.reduce($0, $1) }
     }

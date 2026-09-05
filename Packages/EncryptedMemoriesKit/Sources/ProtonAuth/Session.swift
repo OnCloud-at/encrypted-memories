@@ -67,9 +67,9 @@ public enum SessionKeychainError: Error, LocalizedError, Sendable, Equatable {
     public var errorDescription: String? {
         switch self {
         case .invalidPayload:
-            "The saved Proton session is invalid."
+            L10n.string("auth.saved_session_invalid")
         case .verificationFailed:
-            "The Proton session could not be verified after saving."
+            L10n.string("auth.saved_session_verification_failed")
         }
     }
 }
@@ -109,7 +109,16 @@ public enum ProtonAuthLocalDataPurge {
         defaults: UserDefaults = .standard,
         plaintextPurgeSucceeded: Bool? = nil
     ) async -> Bool {
-        await performStartupOffMain(
+        #if os(iOS)
+            if claim != nil {
+                // Foundation's default network stores are app-sandbox local on iOS, but live
+                // outside our product cache roots. Await their reset before any session opens.
+                await withCheckedContinuation { continuation in
+                    URLSession.shared.reset { continuation.resume() }
+                }
+            }
+        #endif
+        return await performStartupOffMain(
             claim: claim,
             defaults: SendableUserDefaults(defaults),
             plaintextPurge: {
@@ -169,7 +178,10 @@ public enum ProtonAuthLocalDataPurge {
     }
 
     public static func purgeKeychain() throws {
-        let keychain = SystemAppleKeychainStore()
+        try purgeKeychain(using: SystemAppleKeychainStore())
+    }
+
+    static func purgeKeychain(using keychain: any AppleKeychainStoring) throws {
         let services = [
             SessionKeychainStore.defaultService,
             DeviceIdentityKeychainStore.defaultService,

@@ -146,7 +146,7 @@ struct MobileLibraryErrorView: View {
 
     var body: some View {
         ContentUnavailableView {
-            Label("error.library_load_failed", systemImage: "exclamationmark.icloud")
+            Label(L10n.string("error.load_library_title"), systemImage: "exclamationmark.icloud")
         } description: {
             Text(message)
         } actions: {

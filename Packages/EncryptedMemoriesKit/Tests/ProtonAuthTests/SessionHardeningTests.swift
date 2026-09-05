@@ -88,6 +88,38 @@ struct SessionHardeningTests {
         #expect(!BackupLocalDataPurge.isPurgePending(defaults: defaults))
     }
 
+    @Test func settingsResetRemovesSessionIdentityAndCachesBeforeBootstrap() async throws {
+        let suite = "settings-reset-\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        for name in ["library.sqlite", "ml.sqlite", "thumbnail.cache", "model.artifact"] {
+            try Data([1]).write(to: root.appendingPathComponent(name))
+        }
+        let keychain = MemoryAppleKeychainStore()
+        let store = SessionKeychainStore(
+            service: SessionKeychainStore.defaultService, account: "default", keychain: keychain)
+        try store.save(ProtonSession(uid: "test", accessToken: "test", refreshToken: "test", keyPassword: "test"))
+        let identity = DeviceIdentityKeychainStore(
+            service: DeviceIdentityKeychainStore.defaultService, account: "installation", keychain: keychain)
+        let oldIdentity = identity.loadOrCreate()
+        defaults.set(true, forKey: BackupLocalDataPurge.resetOnNextLaunchKey)
+        #expect(BackupLocalDataPurge.prepareRequestedResetForLaunch(defaults: defaults, persistentDomainName: suite))
+        let claim = try #require(BackupLocalDataPurge.claimSignOutPurge(defaults: defaults, roots: [root]))
+        #expect(
+            await ProtonAuthLocalDataPurge.performStartupOffMain(
+                claim: claim, defaults: SendableUserDefaults(defaults), plaintextPurge: { true },
+                purgeKeychain: { try ProtonAuthLocalDataPurge.purgeKeychain(using: keychain) }
+            ))
+        #expect(try store.load() == nil)
+        #expect(identity.loadOrCreate() != oldIdentity)
+        #expect(!FileManager.default.fileExists(atPath: root.path))
+        #expect(!BackupLocalDataPurge.isPurgePending(defaults: defaults))
+        #expect(!defaults.bool(forKey: BackupLocalDataPurge.resetOnNextLaunchKey))
+    }
+
     @Test @MainActor func awaitedPurgeLeavesTheUIExecutor() async throws {
         let suite = "auth-purge-off-main-test-\(UUID().uuidString)"
         let defaults = try #require(UserDefaults(suiteName: suite))
@@ -158,7 +190,10 @@ struct SessionHardeningTests {
             #expect(initializer.contains("ProtonAuthLocalDataPurge.performStartupOffMain("))
             #expect(!initializer.contains("TransientPlaintextPurge.purgeShareExports"))
             #expect(!initializer.contains("Task.detached"))
-            #expect(initializer.contains("self.startupCleanupTask = Task { @MainActor"))
+            #expect(initializer.contains("startupCleanupTask = Task { @MainActor"))
+            #expect(
+                initializer.contains("beginStartupCleanup(plaintextPurgeSucceeded: startupPlaintextPurgeSucceeded)"))
+            #expect(source.contains("beginStartupCleanup(signInAfterCleanup: true)"))
             #expect(source.contains("guard startupCleanupTask == nil"))
             if relativePath == "App/AppModel.swift" {
                 #expect(
@@ -166,6 +201,18 @@ struct SessionHardeningTests {
                     "the cleanup task and SwiftUI scene task must not bootstrap macOS twice")
             }
         }
+    }
+
+    @Test func mobileSignInCannotClaimCleanupWhileAccountTeardownOwnsIt() throws {
+        var repoRoot = URL(fileURLWithPath: #filePath)
+        for _ in 0..<5 { repoRoot.deleteLastPathComponent() }
+        let source = try String(
+            contentsOf: repoRoot.appendingPathComponent("iOSApp/MobileSessionModel.swift"), encoding: .utf8)
+        let start = try #require(source.range(of: "func signIn() {"))
+        let end = try #require(source.range(of: "func signOut() {", range: start.upperBound..<source.endIndex))
+        let signIn = String(source[start.upperBound..<end.lowerBound])
+        #expect(signIn.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("guard !isSigningOut else { return }"))
+        #expect(!signIn.contains("isSigningOut = false"))
     }
 
     @Test func platformSignOutFailureKeepsTheDurablePurgeRecoverable() throws {

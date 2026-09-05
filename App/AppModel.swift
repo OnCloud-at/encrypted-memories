@@ -60,6 +60,7 @@ final class AppModel {
     @ObservationIgnored private var sourceAnalysisStartupTask: Task<Void, Never>?
     @ObservationIgnored private var sourceAnalysisShutdownTask: Task<Void, Never>?
     @ObservationIgnored private var sourcePrimaryInventoryGeneration: UInt64 = 0
+    @ObservationIgnored private var onPrimaryInventoryFailure: (@MainActor () -> Void)?
     @ObservationIgnored private let signOutBarrier = AccountSignOutBarrier()
     /// Retains the idempotent purge after a failure. The durable marker independently recreates this claim
     /// after process termination, before session bootstrap opens any account-owned store.
@@ -117,7 +118,6 @@ final class AppModel {
     private var scopeRecoveryTask: Task<Void, Never>?
 
     init(startupPlaintextPurgeSucceeded: Bool? = nil) {
-        let purgeClaim = BackupLocalDataPurge.claimSignOutPurge()
         let store = SessionKeychainStore()
         self.sessionStore = store
         self.authController = ProtonAuthController(
@@ -128,15 +128,28 @@ final class AppModel {
         self.startupCleanupTask = nil
         // Wire ProtonCore's CryptoGo to the patched GopenPGP implementation before any crypto runs.
         injectDefaultCryptoImplementation()
-        self.startupCleanupTask = Task { @MainActor [weak self] in
+        beginStartupCleanup(plaintextPurgeSucceeded: startupPlaintextPurgeSucceeded)
+    }
+
+    private func beginStartupCleanup(plaintextPurgeSucceeded: Bool? = nil, signInAfterCleanup: Bool = false) {
+        guard startupCleanupTask == nil else { return }
+        let purgeClaim = BackupLocalDataPurge.claimSignOutPurge()
+        startupPurgeBlocked = true
+        auth = .checking
+        startupCleanupTask = Task { @MainActor [weak self] in
             let succeeded = await ProtonAuthLocalDataPurge.performStartupOffMain(
                 claim: purgeClaim,
-                plaintextPurgeSucceeded: startupPlaintextPurgeSucceeded
+                plaintextPurgeSucceeded: plaintextPurgeSucceeded
             )
             guard let self else { return }
             self.startupPurgeBlocked = !succeeded
             self.startupCleanupTask = nil
-            self.bootstrap()
+            if succeeded, signInAfterCleanup {
+                self.signIn()
+            } else {
+                self.didBootstrap = false
+                self.bootstrap()
+            }
         }
     }
 
@@ -146,7 +159,7 @@ final class AppModel {
         guard !didBootstrap else { return }
         didBootstrap = true
         guard !startupPurgeBlocked else {
-            auth = .signedOut(error: String(localized: "auth.sign_in_failed"))
+            auth = .signedOut(error: L10n.string("auth.sign_in_failed"))
             return
         }
         apply(authController.bootstrap(), prepareBackendOnSignedIn: true)
@@ -155,8 +168,8 @@ final class AppModel {
     func signIn() {
         guard !signOutBarrier.isRunning else { return }
         guard startupCleanupTask == nil else { return }
-        guard !BackupLocalDataPurge.isPurgePending() else {
-            auth = .signedOut(error: String(localized: "auth.sign_in_failed"))
+        guard !startupPurgeBlocked, !BackupLocalDataPurge.isPurgePending() else {
+            beginStartupCleanup(signInAfterCleanup: true)
             return
         }
         authController.signIn(
@@ -409,6 +422,7 @@ final class AppModel {
         smartSearchAssets.invalidateSourceSession()
         let runtime = sourceAnalysisRuntime
         sourceAnalysisRuntime = nil
+        onPrimaryInventoryFailure = nil
         let startup = sourceAnalysisStartupTask
         sourceAnalysisStartupTask = nil
         guard runtime != nil || startup != nil else { return sourceAnalysisShutdownTask }
@@ -428,9 +442,11 @@ final class AppModel {
     func configureSmartSearch(
         feedCore: ThumbnailFeedCore,
         primaryItems: [PhotoItem],
-        primaryAuthority: SourceInventoryAuthority
+        primaryAuthority: SourceInventoryAuthority,
+        onPrimaryInventoryFailure: @escaping @MainActor () -> Void
     ) {
         guard let session = authController.currentSession, let facade else { return }
+        self.onPrimaryInventoryFailure = onPrimaryInventoryFailure
         sourcePrimaryInventoryGeneration &+= 1
         let primaryGeneration = sourcePrimaryInventoryGeneration
         if sourceAnalysisRuntime == nil {
@@ -450,19 +466,21 @@ final class AppModel {
             let previousShutdown = sourceAnalysisShutdownTask
             sourceAnalysisStartupTask = Task {
                 await previousShutdown?.value
-                _ = await runtime.start(
+                let admission = await runtime.start(
                     primaryItems: primaryItems,
                     authority: primaryAuthority,
                     generation: primaryGeneration
                 )
+                self.handlePrimaryAdmission(admission, runtime: runtime, generation: primaryGeneration)
             }
         } else if let sourceAnalysisRuntime {
             Task {
-                await sourceAnalysisRuntime.replacePrimaryInventory(
+                let admission = await sourceAnalysisRuntime.replacePrimaryInventory(
                     primaryItems,
                     authority: primaryAuthority,
                     generation: primaryGeneration
                 )
+                self.handlePrimaryAdmission(admission, runtime: sourceAnalysisRuntime, generation: primaryGeneration)
             }
         }
 
@@ -509,12 +527,22 @@ final class AppModel {
         sourcePrimaryInventoryGeneration &+= 1
         let primaryGeneration = sourcePrimaryInventoryGeneration
         Task {
-            await sourceAnalysisRuntime.replacePrimaryInventory(
+            let admission = await sourceAnalysisRuntime.replacePrimaryInventory(
                 items,
                 authority: authority,
                 generation: primaryGeneration
             )
+            self.handlePrimaryAdmission(admission, runtime: sourceAnalysisRuntime, generation: primaryGeneration)
         }
+    }
+
+    private func handlePrimaryAdmission(
+        _ admission: PrimaryInventoryAdmission,
+        runtime: LibrarySourceAnalysisRuntime,
+        generation: UInt64
+    ) {
+        guard sourceAnalysisRuntime === runtime, sourcePrimaryInventoryGeneration == generation else { return }
+        if admission == .rejected || admission == .unavailable { onPrimaryInventoryFailure?() }
     }
 
     func refreshLibrarySources() {

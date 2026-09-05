@@ -185,7 +185,8 @@ A maintainer publishes a GitHub Release after its tagged commit passes the pull 
 
 - A prerelease tag such as `v1.2.0-beta.1` or `v1.2.0-rc.1` builds iOS and macOS. It publishes both builds only to internal TestFlight.
 - A stable tag such as `v1.2.0` builds both apps. It creates the platform versions when necessary, updates both localizations, submits each platform to App Review, and selects automatic release after approval.
-- A manual workflow run can retry an existing published release tag. It reuses the GitHub Release ID as the Apple build number and does not create duplicate builds.
+- A manual workflow run can retry an existing published release tag. It reuses the commit-derived Apple build number and does not create duplicate builds.
+- Apple build numbers continue from the first uploaded build (`382818668`), not from GitHub Release IDs. macOS requires increasing build numbers across all app versions, so this existing app cannot restart at a smaller number.
 - GitHub prereleases do not replace the latest stable GitHub Release.
 - The workflow never attaches a signed macOS app to the GitHub Release. The supported macOS distribution channel is the Mac App Store.
 

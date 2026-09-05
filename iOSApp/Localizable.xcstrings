@@ -341,23 +341,6 @@
         }
       }
     },
-    "auth.sign_in_failed": {
-      "extractionState": "manual",
-      "localizations": {
-        "de": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Anmeldung fehlgeschlagen."
-          }
-        },
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Sign-in failed."
-          }
-        }
-      }
-    },
     "auth.sign_in_prompt": {
       "extractionState": "manual",
       "localizations": {
@@ -473,23 +456,6 @@
           "stringUnit": {
             "state": "translated",
             "value": "Trash"
-          }
-        }
-      }
-    },
-    "error.library_load_failed": {
-      "extractionState": "manual",
-      "localizations": {
-        "de": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Ihre Mediathek konnte nicht geladen werden"
-          }
-        },
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Couldn't load your library"
           }
         }
       }

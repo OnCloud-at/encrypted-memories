@@ -20,6 +20,12 @@ struct EncryptedMemoriesMobileApp: App {
     private let metal3Supported: Bool
 
     init() {
+        if let domain = Bundle.main.bundleIdentifier {
+            BackupLocalDataPurge.prepareRequestedResetForLaunch(persistentDomainName: domain)
+        }
+        if BackupLocalDataPurge.isPurgePending() {
+            PhotoBackupBackgroundCoordinator.shared.backupStopped()
+        }
         let metal3Supported = MobileMetal3Runtime.isSupported()
         self.metal3Supported = metal3Supported
         MobileBuildProvenanceLog.noteCurrentBuild()

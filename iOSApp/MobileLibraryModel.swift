@@ -164,7 +164,7 @@ final class MobileLibraryModel {
     }
 
     private struct SourceAnalysisStartupError: LocalizedError {
-        var errorDescription: String? { String(localized: "error.library_load_failed") }
+        var errorDescription: String? { L10n.string("error.load_library_title") }
     }
 
     /// Shared onboarding and loading policy. See `LibraryLoadState`.
@@ -291,6 +291,9 @@ final class MobileLibraryModel {
     func configure(session: ProtonSession?, store: SessionKeychainStore) {
         guard let session else {
             self.store = store
+            // Cold-launch cleanup belongs to MobileSessionModel. An unconfigured library must
+            // not claim the same pending reset while that startup transaction is still running.
+            guard self.session != nil || configuredUID != nil else { return }
             teardown()
             return
         }
@@ -930,14 +933,14 @@ final class MobileLibraryModel {
     private func synchronizePrimarySourceInventory(
         _ items: [PhotoItem],
         authority: SourceInventoryAuthority
-    ) async -> Bool {
-        guard let runtime = sourceAnalysisRuntime else { return false }
+    ) async -> PrimaryInventoryAdmission {
+        guard let runtime = sourceAnalysisRuntime else { return .unavailable }
         sourcePrimaryInventoryGeneration &+= 1
         let primaryGeneration = sourcePrimaryInventoryGeneration
         let previousShutdown = sourceAnalysisShutdownTask
 
         await previousShutdown?.value
-        guard !Task.isCancelled, sourceAnalysisRuntime === runtime else { return false }
+        guard !Task.isCancelled, sourceAnalysisRuntime === runtime else { return .unavailable }
         return await runtime.start(
             primaryItems: items,
             authority: authority,
@@ -1480,7 +1483,11 @@ final class MobileLibraryModel {
                 if self.isRecoveringScope {
                     self.isRecoveringScope = false
                 }
-                apply(.failed(message: Self.message(for: error), retryable: true))
+                if error is SourceAnalysisStartupError {
+                    apply(.contentLoadFailed(message: Self.message(for: error)))
+                } else {
+                    apply(.failed(message: Self.message(for: error), retryable: true))
+                }
                 initialLibraryLoadSettled = true
                 if hadCachedInventory {
                     // The cached frame remains usable. Seed below each validation token so the first successful
@@ -1517,7 +1524,8 @@ final class MobileLibraryModel {
         guard token == loadToken,
             mutationGeneration == timelineMutationGeneration
         else { return false }
-        guard sourceReady else { throw SourceAnalysisStartupError() }
+        if sourceReady == .superseded { return false }
+        guard sourceReady == .accepted else { throw SourceAnalysisStartupError() }
         let requiresNewFrame =
             prepared.snapshot.items.lazy.map(\.uid).elementsEqual(snapshot.items.lazy.map(\.uid)) == false
         let changed = prepared.snapshot != snapshot
@@ -1588,12 +1596,18 @@ final class MobileLibraryModel {
         let primaryInventoryAuthority = self.primaryInventoryAuthority
         sourcePrimaryInventoryGeneration &+= 1
         let primaryGeneration = sourcePrimaryInventoryGeneration
-        Task {
-            await sourceAnalysisRuntime.replacePrimaryInventory(
+        Task { [weak self] in
+            let admission = await sourceAnalysisRuntime.replacePrimaryInventory(
                 items,
                 authority: primaryInventoryAuthority,
                 generation: primaryGeneration
             )
+            guard let self, self.sourceAnalysisRuntime === sourceAnalysisRuntime,
+                self.sourcePrimaryInventoryGeneration == primaryGeneration
+            else { return }
+            if admission == .rejected || admission == .unavailable {
+                self.apply(.contentLoadFailed(message: L10n.string("error.load_library_title")))
+            }
         }
     }
 

@@ -1,6 +1,27 @@
 {
   "sourceLanguage": "en",
   "strings": {
+    "auth.saved_session_invalid": {
+      "extractionState": "manual",
+      "localizations": {
+        "de": { "stringUnit": { "state": "translated", "value": "Die gespeicherte Proton-Sitzung ist ungültig." } },
+        "en": { "stringUnit": { "state": "translated", "value": "The saved Proton session is invalid." } }
+      }
+    },
+    "auth.saved_session_verification_failed": {
+      "extractionState": "manual",
+      "localizations": {
+        "de": { "stringUnit": { "state": "translated", "value": "Die Proton-Sitzung konnte nach dem Speichern nicht überprüft werden." } },
+        "en": { "stringUnit": { "state": "translated", "value": "The Proton session could not be verified after saving." } }
+      }
+    },
+    "auth.sign_in_failed": {
+      "extractionState": "manual",
+      "localizations": {
+        "de": { "stringUnit": { "state": "translated", "value": "Anmeldung fehlgeschlagen." } },
+        "en": { "stringUnit": { "state": "translated", "value": "Sign-in failed." } }
+      }
+    },
     "search.title": {
       "extractionState": "manual",
       "localizations": {

@@ -1,0 +1,2 @@
+"reset.title" = "Reset App on Next Launch";
+"reset.footer" = "Deletes this app’s local data, settings and saved sign-in. Your photos in Proton Drive stay unchanged. Fully close the app, then open it again to reset it and sign in again.";
