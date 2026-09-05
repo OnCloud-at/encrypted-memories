@@ -1,4 +1,7 @@
 import Foundation
+import MediaByteCache
+import MediaCache
+import PhotoViewerFeature
 import PhotosCore
 import XCTest
 
@@ -95,15 +98,86 @@ final class LivePhotoMotionTests: XCTestCase {
     }
 
     func testCompositeReadinessIsIdleUntilMotionIsRequested() {
-        XCTAssertEqual(
-            LivePhotoCompositeReadiness.resolve(
-                requiresMotion: true,
-                isFullResolutionStillReady: true,
-                motionState: .idle,
-                isMotionRequested: false
+        for state in [LivePhotoMotionLoadState.idle, .loading, .ready, .failed] {
+            XCTAssertEqual(
+                LivePhotoCompositeReadiness.resolve(
+                    requiresMotion: true,
+                    isFullResolutionStillReady: true,
+                    motionState: state,
+                    isMotionRequested: false
+                ),
+                .notApplicable,
+                "silent preloading must not cover the still image with a motion spinner"
+            )
+        }
+    }
+
+    @MainActor
+    func testRepeatedPreparationAndPressReuseTheCurrentPreload() async throws {
+        let controller = LivePhotoMotionController()
+        let streamer = MotionPrefetchProbe()
+        let live = item(isLivePhoto: true, relatedVideoID: "motion")
+        defer { controller.teardown() }
+
+        controller.prepare(for: live, streamer: streamer) { true }
+        try await waitUntil { await streamer.started == 1 }
+        XCTAssertFalse(controller.isPlaying)
+        XCTAssertFalse(controller.isPlayRequested)
+
+        controller.play(for: live, streamer: streamer) { true }
+        controller.prepare(for: live, streamer: streamer) { true }
+        XCTAssertTrue(controller.isPlayRequested, "appearance updates must preserve a press during preload")
+        let started = await streamer.started
+        XCTAssertEqual(started, 1)
+        controller.stop()
+        XCTAssertEqual(controller.loadState, .loading, "releasing a press must keep the current page preloading")
+        controller.teardown()
+        try await waitUntil { await streamer.cancelled == 1 }
+        XCTAssertEqual(controller.loadState, .idle)
+    }
+
+    @MainActor
+    func testNonCurrentItemDoesNotStartPreloading() async {
+        let controller = LivePhotoMotionController()
+        let streamer = MotionPrefetchProbe()
+        controller.prepare(for: item(isLivePhoto: true, relatedVideoID: "motion"), streamer: streamer) { false }
+        XCTAssertEqual(controller.loadState, .idle)
+        let started = await streamer.started
+        XCTAssertEqual(started, 0)
+    }
+
+    @MainActor
+    func testMacViewerOpeningPreloadsWithoutAPlaybackRequest() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("motion-preload-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let streamer = MotionPrefetchProbe()
+        let model = PhotoViewerModel(
+            items: [item(isLivePhoto: true, relatedVideoID: "motion")], index: 0,
+            feed: ThumbnailFeed(
+                cache: ThumbnailCache(namespace: "motion-preload", rootDirectory: root),
+                loader: MotionPreviewProvider()
             ),
-            .notApplicable
+            media: MotionPreviewProvider(), streamer: streamer
         )
+        defer { model.stop() }
+        model.start()
+        try await waitUntil { await streamer.started == 1 }
+        XCTAssertEqual(model.motion.loadState, .loading)
+        XCTAssertFalse(model.motion.isPlayRequested)
+        XCTAssertEqual(model.livePhotoReadiness, .notApplicable)
+        model.stop()
+        try await waitUntil { await streamer.cancelled == 1 }
+    }
+
+    @MainActor
+    private func waitUntil(_ condition: @escaping @Sendable () async -> Bool) async throws {
+        let deadline = ContinuousClock.now + .seconds(3)
+        while ContinuousClock.now < deadline {
+            if await condition() { return }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTFail("motion provider did not reach its expected lifecycle boundary")
+        throw CancellationError()
     }
 
     @MainActor
@@ -172,6 +246,35 @@ final class LivePhotoMotionTests: XCTestCase {
 
         XCTAssertEqual(controller.loadState, .failed)
     }
+}
+
+private actor MotionPrefetchProbe: VideoStreamProvider {
+    private(set) var started = 0
+    private(set) var cancelled = 0
+
+    func prefetchEncrypted(for uid: PhotoUID) async throws {
+        started += 1
+        do {
+            try await Task.sleep(for: .seconds(60))
+        } catch {
+            if Task.isCancelled { cancelled += 1 }
+            throw error
+        }
+    }
+
+    func makeStreamingAsset(for uid: PhotoUID) async throws -> StreamingVideoAsset {
+        throw VideoStreamError.notAVideo
+    }
+}
+
+private struct MotionPreviewProvider: FullMediaProvider, ThumbnailBatchLoader {
+    func preview(for uid: PhotoUID) async throws -> Data { throw VideoStreamError.notAVideo }
+    func originalData(for uid: PhotoUID, onProgress: @escaping @Sendable (Double) -> Void) async throws -> Data {
+        throw VideoStreamError.notAVideo
+    }
+    func loadThumbnails(
+        for uids: [PhotoUID], onLoaded: @Sendable @escaping (PhotoUID, Data) -> Void
+    ) async -> ThumbnailBatchLoadResult { .delivered }
 }
 
 private struct SuspendedVideoStreamProvider: VideoStreamProvider {

@@ -29,21 +29,18 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
     /// decision is outstanding. Identical bytes discovered concurrently (copied folders in one
     /// scan, duplicate files in one enqueue) wait here until the first upload settles, then
     /// re-check the manifest instead of uploading the same content in parallel.
-    private struct PendingContentUpload {
-        var owner: UploadSourceIdentity
+    private struct PendingUpload {
+        // Different revisions of one resource may resolve concurrently. Use the same fingerprint as
+        // manifest reuse so settling an older revision cannot release the newer revision's claims.
+        let owner: UploadIdentityRecord
         var waiters: [CheckedContinuation<Void, Never>]
     }
 
+    private var pendingContentUploads: [String: PendingUpload] = [:]
     /// The server draft is keyed by the encrypted/corrected name. Different photos can legally
     /// share a camera filename, but they must not upload under that name concurrently: otherwise
     /// one live upload can look exactly like a stale same-client draft to the other.
-    private struct PendingNameUpload {
-        var owner: UploadSourceIdentity
-        var waiters: [CheckedContinuation<Void, Never>]
-    }
-
-    private var pendingContentUploads: [String: PendingContentUpload] = [:]
-    private var pendingNameUploads: [String: PendingNameUpload] = [:]
+    private var pendingNameUploads: [String: PendingUpload] = [:]
 
     private static func contentKey(epoch: String, contentHash: String) -> String {
         "\(epoch)|\(contentHash)"
@@ -193,7 +190,7 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
             guard pendingContentUploads[contentKey] != nil else {
                 // Claim the content before the remote check - identical items resolving
                 // concurrently must serialize here, not race to independent `.upload` decisions.
-                pendingContentUploads[contentKey] = PendingContentUpload(owner: descriptor.source, waiters: [])
+                pendingContentUploads[contentKey] = PendingUpload(owner: record, waiters: [])
                 break
             }
             // Identical bytes are uploading right now - wait until that attempt settles
@@ -213,9 +210,9 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
         // an own draft observed below cannot belong to another live upload in this process.
         let nameKey = Self.nameKey(epoch: epoch, nameHash: nameHash)
         do {
-            try await acquirePendingNameClaim(nameKey, owner: descriptor.source)
+            try await acquirePendingNameClaim(nameKey, owner: record)
         } catch {
-            releasePendingContentClaim(contentKey, owner: descriptor.source)
+            releasePendingContentClaim(contentKey, owner: descriptor)
             throw error
         }
 
@@ -238,13 +235,13 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
                 do {
                     try persist(decision, in: &record)
                 } catch {
-                    releasePendingUploadClaims(ownedBy: descriptor.source)
+                    releasePendingUploadClaims(ownedBy: descriptor)
                     throw error
                 }
-                releasePendingUploadClaims(ownedBy: descriptor.source)
+                releasePendingUploadClaims(ownedBy: descriptor)
                 return UploadPreflightResult(identity: identity, decision: decision)
             }
-            releasePendingUploadClaims(ownedBy: descriptor.source)
+            releasePendingUploadClaims(ownedBy: descriptor)
             throw detailedLookupError
         }
 
@@ -266,23 +263,23 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
                     )
                     try persist(contentDecision, in: &record)
                     if !contentDecision.uploadsBytes {
-                        releasePendingUploadClaims(ownedBy: descriptor.source)
+                        releasePendingUploadClaims(ownedBy: descriptor)
                     }
                     return UploadPreflightResult(identity: identity, decision: contentDecision)
                 }
                 try Task.checkCancellation()
             } catch {
-                releasePendingUploadClaims(ownedBy: descriptor.source)
+                releasePendingUploadClaims(ownedBy: descriptor)
                 throw error
             }
         } else {
             do {
                 try persist(nameDecision, in: &record)
             } catch {
-                releasePendingUploadClaims(ownedBy: descriptor.source)
+                releasePendingUploadClaims(ownedBy: descriptor)
                 throw error
             }
-            releasePendingUploadClaims(ownedBy: descriptor.source)
+            releasePendingUploadClaims(ownedBy: descriptor)
             return UploadPreflightResult(identity: identity, decision: nameDecision)
         }
 
@@ -401,19 +398,19 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
 
     /// Releases the same-content claim (if `owner` still holds it) and wakes every waiter so it
     /// re-checks the manifest / re-resolves against fresh state.
-    private func releasePendingContentClaim(_ key: String, owner: UploadSourceIdentity) {
-        guard let pending = pendingContentUploads[key], pending.owner == owner else { return }
+    private func releasePendingContentClaim(_ key: String, owner: UploadResourceDescriptor) {
+        guard let pending = pendingContentUploads[key], pending.owner.isValid(for: owner) else { return }
         pendingContentUploads[key] = nil
         for waiter in pending.waiters { waiter.resume() }
     }
 
     private func acquirePendingNameClaim(
         _ key: String,
-        owner: UploadSourceIdentity
+        owner: UploadIdentityRecord
     ) async throws {
         while true {
             guard pendingNameUploads[key] != nil else {
-                pendingNameUploads[key] = PendingNameUpload(owner: owner, waiters: [])
+                pendingNameUploads[key] = PendingUpload(owner: owner, waiters: [])
                 return
             }
             await withCheckedContinuation { continuation in
@@ -548,7 +545,7 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
                 ))
         } catch {
             await invalidateCachedRemoteState()
-            releasePendingUploadClaims(ownedBy: descriptor.source)
+            releasePendingUploadClaims(ownedBy: descriptor)
             throw error
         }
         await checker.recordUploaded(contentHash: identity.contentHash, remoteLinkID: remoteLinkID)
@@ -564,7 +561,7 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
         // Settle the same-content claim after the manifest row exists, so released waiters find
         // it. Owner-scoped scan (not key computation) so a failed epoch fetch can never leak the
         // claim and hang waiters.
-        releasePendingUploadClaims(ownedBy: descriptor.source)
+        releasePendingUploadClaims(ownedBy: descriptor)
     }
 
     /// Reports that an upload attempt for a `.upload` decision ended without success (error,
@@ -573,20 +570,20 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
     /// items re-resolve against fresh state.
     public func uploadDidFail(_ descriptor: UploadResourceDescriptor) async {
         await invalidateCachedRemoteState()
-        releasePendingUploadClaims(ownedBy: descriptor.source)
+        releasePendingUploadClaims(ownedBy: descriptor)
     }
 
     public func remoteCommitNeedsReconciliation(_ descriptor: UploadResourceDescriptor) async {
         await invalidateCachedRemoteState()
-        releasePendingUploadClaims(ownedBy: descriptor.source)
+        releasePendingUploadClaims(ownedBy: descriptor)
     }
 
-    private func releasePendingUploadClaims(ownedBy owner: UploadSourceIdentity) {
-        for (key, pending) in pendingContentUploads where pending.owner == owner {
+    private func releasePendingUploadClaims(ownedBy owner: UploadResourceDescriptor) {
+        for (key, pending) in pendingContentUploads where pending.owner.isValid(for: owner) {
             pendingContentUploads[key] = nil
             for waiter in pending.waiters { waiter.resume() }
         }
-        for (key, pending) in pendingNameUploads where pending.owner == owner {
+        for (key, pending) in pendingNameUploads where pending.owner.isValid(for: owner) {
             pendingNameUploads[key] = nil
             for waiter in pending.waiters { waiter.resume() }
         }

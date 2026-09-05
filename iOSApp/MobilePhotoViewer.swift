@@ -1075,11 +1075,11 @@ private struct MobileViewerPage: View {
 /// off-main to a screen-bounded size and swapped in. Swipe-preview neighbours never fetch/decode (no fan-out),
 /// and swiping away cancels an in-flight load (the `.task(id:)` re-runs on the isCurrent flip). No full-resolution
 /// decode just because a page appeared.
-private struct MobileImagePage: View {
+struct MobileImagePage: View {
     let item: PhotoItem
     let isCurrent: Bool
     let imageStore: UIKitViewerImageStore
-    /// The shared streamer used to prepare a Live Photo's paired motion clip after a user request (nil for non-Live items).
+    /// The shared streamer used to preload the current Live Photo's encrypted motion clip.
     let streamer: (any VideoStreamProvider)?
     let onToggleChrome: () -> Void
     let onCloseRequested: () -> Void
@@ -1211,6 +1211,9 @@ private struct MobileImagePage: View {
         .task(id: MobileLivePhotoMotionTaskID(item: item, isCurrent: isCurrent)) {
             prepareOrStopMotion()
         }
+        .onChange(of: isCurrent) { _, current in
+            if !current { cancelZoomDecode() }
+        }
         .onAppear {
             if MobileViewerLog.isEnabled {
                 MobileViewerLog.logger.notice(
@@ -1219,6 +1222,7 @@ private struct MobileImagePage: View {
             }
         }
         .onDisappear {
+            cancelZoomDecode()
             if MobileViewerLog.isEnabled {
                 MobileViewerLog.logger.notice(
                     "[ViewerPerf] page disappear uid=\(MobileViewerLog.short(item.uid), privacy: .public)")
@@ -1227,13 +1231,13 @@ private struct MobileImagePage: View {
         }
     }
 
-    /// Releases motion for pages that leave the current position. The expensive preparation starts only from the
-    /// native press/hover callback above.
+    /// Preloads only the current page. The task identity excludes viewport changes, so resizing cannot restart it.
     private func prepareOrStopMotion() {
         guard item.isLivePhoto, isCurrent else {
             motion.teardown()
             return
         }
+        motion.prepare(for: item, streamer: streamer) { isCurrent }
     }
 
     private var livePhotoReadiness: LivePhotoCompositeReadiness {
@@ -1242,7 +1246,7 @@ private struct MobileImagePage: View {
             isFullResolutionStillReady: isFullResolutionStillReady,
             didFullResolutionStillFail: didFullResolutionStillFail,
             motionState: motion.loadState,
-            isMotionRequested: motion.isPlayRequested || motion.loadState != .idle
+            isMotionRequested: motion.isPlayRequested
         )
     }
 
@@ -1275,7 +1279,7 @@ private struct MobileImagePage: View {
         }
         await loadFullResolutionLivePhotoStill(maxPixelSize: cap)
         // The full original remains deferred until a settled zoom requests more pixels. Live Photos load the
-        // bounded still needed for their composite readiness; paired motion remains demand-driven.
+        // bounded still needed for their composite readiness; the paired motion preloads independently.
     }
 
     private func loadFullResolutionLivePhotoStill(maxPixelSize: Int) async {
@@ -1307,10 +1311,10 @@ private struct MobileImagePage: View {
         guard zoom > 1.01, isCurrent, viewportSize.width > 0, viewportSize.height > 0 else { return }
         let cap = ViewerImageLoadPolicy.zoomedMaxPixelSize(
             viewportPoints: viewportSize, scale: displayScale, zoom: zoom)
-        zoomDecodeTask?.cancel()
+        cancelZoomDecode()
         zoomDecodeTask = Task {
             guard let sharp = await imageStore.originalImage(for: item.uid, maxPixelSize: cap),
-                !Task.isCancelled
+                !Task.isCancelled, isCurrent
             else { return }
             _ = installIfNotLowerQuality(sharp, requestedCap: cap)
             if MobileViewerLog.isEnabled {
@@ -1319,6 +1323,11 @@ private struct MobileImagePage: View {
                 )
             }
         }
+    }
+
+    private func cancelZoomDecode() {
+        zoomDecodeTask?.cancel()
+        zoomDecodeTask = nil
     }
 
     @discardableResult

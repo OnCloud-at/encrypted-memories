@@ -1084,7 +1084,7 @@ struct ProductionRouteGuardTests {
             "the visible Live Photo status must remain discoverable to VoiceOver")
         let imagePage = try Self.body(
             of: source,
-            from: "private struct MobileImagePage: View",
+            from: "struct MobileImagePage: View",
             to: "private struct MobileNativeVideoPlayer: UIViewControllerRepresentable"
         )
         #expect(
@@ -1119,10 +1119,10 @@ struct ProductionRouteGuardTests {
             "the native image surface must retain its Live Photo press recognizer")
         #expect(
             source.contains("motion.play(for: item, streamer: streamer)"),
-            "Live Photo preparation must begin from the user press")
+            "the user press must play or join the current Live Photo preload")
         #expect(
-            !source.contains("motion.prepare(for: item, streamer: streamer)"),
-            "ordinary page appearance must not preload Live Photo motion")
+            source.contains("motion.prepare(for: item, streamer: streamer)"),
+            "the current Live Photo must preload before the user presses")
         #expect(
             source.contains("case .began:\n                motionActive = true\n                onMotionStart?()"),
             "the press threshold must still start the shared Live Photo motion controller")
@@ -1541,10 +1541,10 @@ struct ProductionRouteGuardTests {
         #expect(viewer.contains("decodeStreamedImage"), "viewer decoding must consume streamed chunks")
         #expect(
             viewer.contains("motion.play(for: item, streamer: streamer)"),
-            "Live Photo motion preparation must begin from an explicit user request")
+            "motion playback must still require an explicit user request")
         #expect(
-            !viewer.contains("motion.prepare(for: item, streamer: streamer)"),
-            "ordinary page appearance must not preload Live Photo motion")
+            viewer.contains("motion.prepare(for: item, streamer: streamer)"),
+            "the current Live Photo must preload before the user requests playback")
 
         let offline = try String(
             contentsOf: Self.repoRoot.appendingPathComponent("App/Offline/OfflineLibraryManager.swift"), encoding: .utf8
