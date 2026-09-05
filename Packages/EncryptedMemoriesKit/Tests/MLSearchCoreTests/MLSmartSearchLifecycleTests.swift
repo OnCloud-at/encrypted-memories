@@ -91,6 +91,7 @@ import Testing
         private let barrier = OneShotEmbeddingBarrier()
         private(set) var calls: [PhotoUID: Int] = [:]
         private var delay: Duration?
+        private var embeddingIndices: [PhotoUID: Int] = [:]
 
         func embed(uid: PhotoUID, descriptor: MLModelDescriptor) async -> MLEmbeddingOutcome {
             await barrier.waitIfArmed()
@@ -99,7 +100,9 @@ import Testing
             }
             lock.withLock { calls[uid, default: 0] += 1 }
             var vector = ContiguousArray<Float32>(repeating: 0, count: descriptor.embeddingDimension)
-            let index = Int(UInt(bitPattern: uid.nodeID.hashValue) % UInt(descriptor.embeddingDimension))
+            let index =
+                lock.withLock { embeddingIndices[uid] }
+                ?? Int(UInt(bitPattern: uid.nodeID.hashValue) % UInt(descriptor.embeddingDimension))
             vector[index] = 1
             return .embedded(vector)
         }
@@ -107,6 +110,7 @@ import Testing
         func callCount(_ uid: PhotoUID) -> Int { lock.withLock { calls[uid] ?? 0 } }
         var totalCalls: Int { lock.withLock { calls.values.reduce(0, +) } }
         func setDelay(_ value: Duration?) { lock.withLock { delay = value } }
+        func setEmbeddingIndex(_ index: Int, for uid: PhotoUID) { lock.withLock { embeddingIndices[uid] = index } }
         func blockNextEmbedding() async { await barrier.arm() }
         func waitUntilEmbeddingStarted() async { await barrier.waitUntilBlocked() }
         func releaseEmbedding() async { await barrier.release() }
@@ -1114,6 +1118,12 @@ import Testing
         )
         defer { try? FileManager.default.removeItem(at: harness.layout.rootDirectory) }
 
+        // Keep the native hit behind the semantic hits so this exercises rank interleaving,
+        // independently of Swift's randomized hashing.
+        harness.provider.embedder.setEmbeddingIndex(0, for: assets[0])
+        harness.provider.embedder.setEmbeddingIndex(0, for: assets[1])
+        harness.provider.embedder.setEmbeddingIndex(1, for: nativeOnly)
+
         await harness.lifecycle.start()
         await harness.lifecycle.setEnabled(true)
         await harness.lifecycle.select(entryA.id)
@@ -1125,6 +1135,7 @@ import Testing
         let semantic = try await harness.lifecycle.searchUIDs("receipt", scope: .semantic, limit: 5)
         let combined = try await harness.lifecycle.searchUIDs("receipt", scope: .all, limit: 5)
         #expect(!semantic.isEmpty)
+        #expect(semantic.first != nativeOnly)
         #expect(combined.first == semantic.first)
         #expect(combined.dropFirst().first == nativeOnly)
 

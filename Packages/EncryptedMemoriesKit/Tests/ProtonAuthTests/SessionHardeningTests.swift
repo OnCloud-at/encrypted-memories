@@ -203,6 +203,18 @@ struct SessionHardeningTests {
         }
     }
 
+    @Test func mobileSignInCannotClaimCleanupWhileAccountTeardownOwnsIt() throws {
+        var repoRoot = URL(fileURLWithPath: #filePath)
+        for _ in 0..<5 { repoRoot.deleteLastPathComponent() }
+        let source = try String(
+            contentsOf: repoRoot.appendingPathComponent("iOSApp/MobileSessionModel.swift"), encoding: .utf8)
+        let start = try #require(source.range(of: "func signIn() {"))
+        let end = try #require(source.range(of: "func signOut() {", range: start.upperBound..<source.endIndex))
+        let signIn = String(source[start.upperBound..<end.lowerBound])
+        #expect(signIn.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("guard !isSigningOut else { return }"))
+        #expect(!signIn.contains("isSigningOut = false"))
+    }
+
     @Test func platformSignOutFailureKeepsTheDurablePurgeRecoverable() throws {
         var repoRoot = URL(fileURLWithPath: #filePath)
         for _ in 0..<5 {

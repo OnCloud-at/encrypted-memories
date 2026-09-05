@@ -92,7 +92,7 @@ final class MobileSessionModel: ObservableObject {
     }
 
     func signIn() {
-        isSigningOut = false
+        guard !isSigningOut else { return }
         guard startupCleanupTask == nil else { return }
         guard startupPurgeSucceeded, !BackupLocalDataPurge.isPurgePending() else {
             beginStartupCleanup(signInAfterCleanup: true)
