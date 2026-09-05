@@ -1243,7 +1243,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     }
 
     /// Builds timeline sections from direct-listing entries (tag filters + album contents).
-    private static func group(
+    static func group(
         _ entries: [PhotosListEntry],
         volumeID: String,
         mediaTypeOverrides: [String: String] = [:],
