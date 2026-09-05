@@ -25,6 +25,21 @@ import Testing
         #expect(cov.present == 1 && cov.total == 2)
     }
 
+    @Test func replacingInventoryDropsOldPresenceButKeepsCurrentUnreportedItems() {
+        let cache = DiskPresenceCache()
+        let removed = uid("v", "removed")
+        let retained = uid("v", "retained")
+        cache.beginTracking([removed, retained])
+        cache.set(removed, present: true)
+        cache.set(retained, present: true)
+
+        cache.beginTracking([retained], reporting: [])
+        #expect(cache.coverage().total == 0)
+        cache.beginTracking([removed, retained])
+        #expect(cache.coverage().present == 1)
+        #expect(cache.coverage().total == 2)
+    }
+
     @Test func togglingPresenceDecrements() {
         let cache = DiskPresenceCache()
         cache.beginTracking([uid("v", "a")])

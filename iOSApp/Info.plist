@@ -33,6 +33,7 @@
 	<key>BGTaskSchedulerPermittedIdentifiers</key>
 	<array>
 		<string>at.oncloud.encryptedmemories.photo-backup.processing</string>
+		<string>at.oncloud.encryptedmemories.smart-search.processing</string>
 	</array>
 	<key>UIBackgroundModes</key>
 	<array>

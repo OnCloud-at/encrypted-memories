@@ -5,10 +5,46 @@ import Foundation
 import MLSearchCore
 import PhotosCore
 import Testing
+import Vision
 
 @testable import MLSearchAppleAdapter
 
 @Suite struct AppleVisionPipelineExecutorTests {
+    @Test func backgroundDevicePolicyUsesOnlySupportedCPUStages() throws {
+        let request = DetectTextRectanglesRequest()
+        let stages = request.supportedComputeStageDevices
+        let cpuAvailable =
+            !stages.isEmpty
+            && stages.values.allSatisfy { devices in
+                devices.contains { if case .cpu = $0 { true } else { false } }
+            }
+        if cpuAvailable {
+            let configured = try AppleVisionComputePolicy.prepare(request, requiresCPUOnly: true)
+            for stage in stages.keys {
+                guard case .cpu = configured.computeDevice(for: stage) else {
+                    Issue.record("Every background Vision stage must use a supported CPU")
+                    continue
+                }
+            }
+        } else {
+            #expect(throws: AppleVisionComputePolicy.UnavailableInBackground.self) {
+                try AppleVisionComputePolicy.prepare(request, requiresCPUOnly: true)
+            }
+        }
+        #expect(try AppleVisionComputePolicy.prepare(request, requiresCPUOnly: false) == request)
+    }
+
+    @Test func backgroundUnavailableStagesStayPendingInsteadOfBecomingUnsupported() async throws {
+        let executor = AppleVisionPipelineExecutor(
+            imageSource: CountingVisionImageSource(outcome: .image(try sourceImage())),
+            resultAnalyzer: { _, contexts in
+                Dictionary(uniqueKeysWithValues: contexts.keys.map { ($0, .suspended) })
+            })
+        let results = await executor.execute(try makePlan(kinds: [.textRecognition, .barcodeDetection]))
+        #expect(results.allSatisfy { $0.outcome == .suspended(.resourcePolicy) })
+        #expect(AppleVisionPipelineExecutor.routingDecision(for: .suspended) == .run)
+    }
+
     @Test func oneSourceImageFeedsIndependentTextAndBarcodeStages() async throws {
         let imageSource = CountingVisionImageSource(outcome: .image(try sourceImage()))
         let probe = VisionAnalysisProbe()

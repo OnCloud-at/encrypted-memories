@@ -1251,10 +1251,13 @@ public final class LibrarySourceGraph {
     }
 
     private func makeChange(previousRetentionUIDs: Set<PhotoUID>) -> LibrarySourceChange {
-        let selectedRecords = selectedRecords()
         let retentionRecords = retentionRecords()
-        let selectedProjection = makeProjection(records: selectedRecords)
+        let selectedRecords = retentionRecords.filter { $0.source.isIncluded }
         let retentionProjection = makeProjection(records: retentionRecords)
+        let selectedProjection =
+            selectedRecords.count == retentionRecords.count
+            ? retentionProjection : makeProjection(records: selectedRecords)
+        let retentionOrder = Self.membershipOrder(records: retentionRecords)
         let selectedScope: SelectedDerivedDataScope = makeScope(
             records: selectedRecords,
             orderedUIDs: selectedProjection.timeline.uids
@@ -1262,23 +1265,24 @@ public final class LibrarySourceGraph {
         let analysisRecords = retentionRecords.filter {
             $0.source.capabilities.contains(.readThumbnail)
         }
+        let analysisOrder =
+            analysisRecords.count == retentionRecords.count
+            ? retentionOrder : Self.membershipOrder(records: analysisRecords)
         let analysisScope: AnalysisDerivedDataScope = makeScope(
             records: analysisRecords,
-            orderedUIDs: Self.membershipOrder(records: analysisRecords),
+            orderedUIDs: analysisOrder,
             requiredCapability: .readThumbnail
         )
         let retentionScope: RetentionDerivedDataScope = makeScope(
             records: retentionRecords,
-            orderedUIDs: Self.membershipOrder(records: retentionRecords)
+            orderedUIDs: retentionOrder
         )
-        let thumbnailRecords = retentionRecords.filter {
-            $0.source.capabilities.contains(.readThumbnail)
-        }
         let thumbnailRetentionScope: ThumbnailRetentionDerivedDataScope = makeScope(
-            records: thumbnailRecords,
+            records: analysisRecords,
             orderedUIDs: Self.relationshipRetentionOrder(
-                records: thumbnailRecords,
-                relationship: .burstMember
+                records: analysisRecords,
+                relationship: .burstMember,
+                directOrder: analysisOrder
             ),
             requiredCapability: .readThumbnail
         )
@@ -1289,7 +1293,9 @@ public final class LibrarySourceGraph {
             records: videoRecords,
             orderedUIDs: Self.relationshipRetentionOrder(
                 records: videoRecords,
-                relationship: .livePhotoMotion
+                relationship: .livePhotoMotion,
+                directOrder: videoRecords.count == retentionRecords.count
+                    ? retentionOrder : Self.membershipOrder(records: videoRecords)
             ),
             requiredCapability: .readContent
         )
@@ -1408,10 +1414,11 @@ public final class LibrarySourceGraph {
     /// Conflicting complete relationships can therefore coexist without precedence deleting either target.
     private static func relationshipRetentionOrder(
         records: [Record],
-        relationship: LibrarySourceRelationship
+        relationship: LibrarySourceRelationship,
+        directOrder: [PhotoUID]? = nil
     ) -> [PhotoUID] {
         var relatedByOwner: [PhotoUID: [PhotoUID]] = [:]
-        let directOrder = membershipOrder(records: records)
+        let directOrder = directOrder ?? membershipOrder(records: records)
         relatedByOwner.reserveCapacity(directOrder.count)
         for record in records
         where record.source.capabilities.contains(
@@ -1431,12 +1438,19 @@ public final class LibrarySourceGraph {
                 }
             }
         }
-        return directOrder.flatMap { uid in
-            [uid] + relatedByOwner[uid, default: []]
+        var ordered: [PhotoUID] = []
+        ordered.reserveCapacity(directOrder.count + relatedByOwner.values.reduce(0) { $0 + $1.count })
+        for uid in directOrder {
+            ordered.append(uid)
+            if let related = relatedByOwner[uid] { ordered.append(contentsOf: related) }
         }
+        return ordered
     }
 
     private static func membershipOrder(records: [Record]) -> [PhotoUID] {
+        // Every record already owns a unique, canonically sorted inventory. The common single-source
+        // path needs neither another identity dictionary nor a sort.
+        if records.count == 1 { return records[0].items.map(\.uid) }
         var bestByUID: [PhotoUID: LibrarySourceItem] = [:]
         for record in records {
             for item in record.items where bestByUID[item.uid] == nil {

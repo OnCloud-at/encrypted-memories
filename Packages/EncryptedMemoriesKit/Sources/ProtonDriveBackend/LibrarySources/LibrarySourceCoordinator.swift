@@ -464,35 +464,57 @@ public actor LibrarySourceCoordinator: PriorityThumbnailBatchLoader {
                 denied[uid] = "source unavailable"
             }
         }
-        let authorized = uids.filter { leases[$0] != nil }
+        var requested = Set<PhotoUID>()
+        let authorized = uids.filter { leases[$0] != nil && requested.insert($0).inserted }
         guard !authorized.isEmpty else {
             return ThumbnailBatchLoadResult(itemErrors: denied)
         }
 
-        let buffer = BufferedThumbnailBatch()
-        let result: ThumbnailBatchLoadResult
-        if let priority, let priorityLoader = thumbnailLoader as? any PriorityThumbnailBatchLoader {
-            result = await priorityLoader.loadThumbnails(for: authorized, priority: priority) { uid, data in
-                buffer.store(data, for: uid)
-            }
-        } else {
-            result = await thumbnailLoader.loadThumbnails(for: authorized) { uid, data in
-                buffer.store(data, for: uid)
-            }
-        }
-
+        let (stream, continuation) = AsyncStream<(PhotoUID, Data)>.makeStream(
+            bufferingPolicy: .bufferingOldest(authorized.count)
+        )
+        async let loading = Self.streamThumbnails(
+            loader: thumbnailLoader, uids: authorized, priority: priority, continuation: continuation
+        )
         var itemErrors = denied
-        for (uid, reason) in result.itemErrors where leases[uid] != nil {
-            itemErrors[uid] = reason
-        }
-        for (uid, data) in buffer.values() {
+        var delivered = Set<PhotoUID>()
+        // Validate on this actor at delivery time, not on the SDK callback thread. One slow item must
+        // not hold already-available thumbnails behind the completion of the entire network batch.
+        for await (uid, data) in stream {
+            if Task.isCancelled { break }
             guard let lease = leases[uid], graph.isCurrent(lease), !closed else {
                 itemErrors[uid] = "source authorization changed"
                 continue
             }
+            delivered.insert(uid)
             onLoaded(uid, data)
         }
-        return ThumbnailBatchLoadResult(batchError: result.batchError, itemErrors: itemErrors)
+        let result = await loading
+        for (uid, reason) in result.itemErrors
+        where leases[uid] != nil && !delivered.contains(uid) && itemErrors[uid] == nil {
+            itemErrors[uid] = reason
+        }
+        return ThumbnailBatchLoadResult(
+            batchError: Task.isCancelled ? "cancelled" : result.batchError, itemErrors: itemErrors
+        )
+    }
+
+    private static func streamThumbnails(
+        loader: any ThumbnailBatchLoader,
+        uids: [PhotoUID],
+        priority: ThumbnailPriority?,
+        continuation: AsyncStream<(PhotoUID, Data)>.Continuation
+    ) async -> ThumbnailBatchLoadResult {
+        defer { continuation.finish() }
+        let emitter = ThumbnailStreamEmitter(uids: uids, continuation: continuation)
+        if let priority, let loader = loader as? any PriorityThumbnailBatchLoader {
+            return await loader.loadThumbnails(for: uids, priority: priority) { uid, data in
+                emitter.yield(uid, data)
+            }
+        }
+        return await loader.loadThumbnails(for: uids) { uid, data in
+            emitter.yield(uid, data)
+        }
     }
 
     /// Stops discovery before the facade closes the SDK admission gate and releases the inventory database.
@@ -587,6 +609,24 @@ private struct ConsumerChangeSignature: Equatable {
     }
 }
 
+/// Admit at most one value per requested UID before buffering; duplicate or unsolicited SDK
+/// callbacks must not consume another requested thumbnail's bounded stream slot.
+private final class ThumbnailStreamEmitter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var remaining: Set<PhotoUID>
+    private let continuation: AsyncStream<(PhotoUID, Data)>.Continuation
+
+    init(uids: [PhotoUID], continuation: AsyncStream<(PhotoUID, Data)>.Continuation) {
+        remaining = Set(uids)
+        self.continuation = continuation
+    }
+
+    func yield(_ uid: PhotoUID, _ data: Data) {
+        guard lock.withLock({ remaining.remove(uid) != nil }) else { return }
+        continuation.yield((uid, data))
+    }
+}
+
 enum LibrarySourceInventoryKeyDerivation {
     static func key(accountUID: String, keyPassword: String) -> SymmetricKey {
         HKDF<SHA256>.deriveKey(
@@ -595,18 +635,5 @@ enum LibrarySourceInventoryKeyDerivation {
             info: Data("local-source-inventory".utf8),
             outputByteCount: 32
         )
-    }
-}
-
-private final class BufferedThumbnailBatch: @unchecked Sendable {
-    private let lock = NSLock()
-    private var storage: [PhotoUID: Data] = [:]
-
-    func store(_ data: Data, for uid: PhotoUID) {
-        lock.withLock { storage[uid] = data }
-    }
-
-    func values() -> [PhotoUID: Data] {
-        lock.withLock { storage }
     }
 }

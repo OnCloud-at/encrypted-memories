@@ -926,6 +926,35 @@ final class LibrarySourceGraphTests: XCTestCase {
         XCTAssertLessThan(elapsed, .seconds(2))
     }
 
+    func testCombinedSnapshotMatchesIndependentScopesAcrossInclusionAndCapabilityChanges() throws {
+        var graph = LibrarySourceGraph()
+        let primary = item("same", time: 10, isLivePhoto: true, relatedVideoID: "motion", burstMemberIDs: ["burst"])
+        let thumbnailOnly = LibrarySource(id: SourceID("thumbnail-only"), capabilities: [.readThumbnail])
+        func checkSnapshot() {
+            let change = graph.snapshot()
+            XCTAssertEqual(change.selectedProjection.timeline.snapshot, graph.selectedProjection().timeline.snapshot)
+            XCTAssertEqual(change.retentionProjection.timeline.snapshot, graph.retentionProjection().timeline.snapshot)
+            XCTAssertEqual(change.selectedScope, graph.selectedDerivedDataScope())
+            XCTAssertEqual(change.analysisScope, graph.analysisDerivedDataScope())
+            XCTAssertEqual(change.retentionScope, graph.retentionDerivedDataScope())
+            XCTAssertEqual(change.thumbnailRetentionScope, graph.thumbnailRetentionDerivedDataScope())
+            XCTAssertEqual(change.videoRetentionScope, graph.videoRetentionDerivedDataScope())
+        }
+        checkSnapshot()
+        _ = install(firstSource, items: [primary, item("earlier", time: 1)], in: &graph)
+        checkSnapshot()
+        _ = install(thumbnailOnly, items: [item("same", time: 20), item("additional", time: 30)], in: &graph)
+        checkSnapshot()
+        _ = graph.setIncluded(false, for: thumbnailOnly.id)
+        checkSnapshot()
+        _ = graph.setIncluded(false, for: firstSource.id)
+        checkSnapshot()
+        _ = graph.removeSource(firstSource.id)
+        checkSnapshot()
+        _ = graph.removeSource(thumbnailOnly.id)
+        checkSnapshot()
+    }
+
     func testPersistenceSignatureIgnoresNoOpRefreshChurnButTracksPayloadAndOverlayChanges() throws {
         var graph = LibrarySourceGraph()
         _ = install(firstSource, items: [item("asset", time: 1)], in: &graph)

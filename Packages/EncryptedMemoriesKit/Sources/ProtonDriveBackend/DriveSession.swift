@@ -1,4 +1,5 @@
 import Foundation
+import PhotosCore
 import ProtonAuth
 import ProtonCoreDataModel
 
@@ -453,22 +454,21 @@ extension DriveSession {
         for chunk in Self.chunked(linkIDs, size: Self.batchRequestSize) {
             let data = try await send(path, method: method, body: ["LinkIDs": chunk])
             guard let decoded = try? JSONDecoder().decode(BatchLinkResponses.self, from: data),
-                let responses = decoded.responses
+                let responses = decoded.responses,
+                responses.count == chunk.count,
+                Set(responses.compactMap(\.linkID)) == Set(chunk)
             else {
-                // Unknown body shape: the HTTP layer already enforced 2xx, so count the chunk as moved,
-                // but log it - a silent contract change must stay visible in the debug log.
-                DebugLog.log(
-                    "\(action): WARNING - unrecognized multistatus body (\(data.count) bytes), assuming success")
-                succeeded += chunk.count
+                failed += chunk.count
+                firstError = firstError ?? "incomplete multistatus response"
                 continue
             }
             for item in responses {
                 if let error = item.response?.error, !error.isEmpty {
                     failed += 1
                     if firstError == nil { firstError = error }
-                } else if let code = item.response?.code, code != 1000 {
+                } else if item.response?.code != 1000 {
                     failed += 1
-                    if firstError == nil { firstError = "code \(code)" }
+                    if firstError == nil { firstError = "missing or unsuccessful item status" }
                 } else {
                     succeeded += 1
                 }
@@ -478,7 +478,7 @@ extension DriveSession {
             "\(action): vol=\(volumeID.prefix(8))… n=\(linkIDs.count) ok=\(succeeded) failed=\(failed)"
                 + (firstError.map { " firstError=\($0)" } ?? ""))
         if failed > 0 {
-            throw DriveBatchActionError(action: action, failed: failed, total: linkIDs.count, firstMessage: firstError)
+            throw DriveBatchActionError(failed: failed, total: linkIDs.count)
         }
     }
 
@@ -619,13 +619,10 @@ private struct BatchLinkResponses: Decodable {
 
 /// A batched link mutation partially or fully failed (per-item multistatus codes).
 struct DriveBatchActionError: LocalizedError {
-    let action: String
     let failed: Int
     let total: Int
-    let firstMessage: String?
     var errorDescription: String? {
-        let base = "\(action) failed for \(failed) of \(total) items"
-        return firstMessage.map { "\(base) (\($0))" } ?? base
+        L10n.string("error.batch_action_incomplete \(failed) \(total)")
     }
 }
 

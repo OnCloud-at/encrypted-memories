@@ -91,6 +91,8 @@ public actor CoreMLDualEncoder: MLAssetEmbedder, MLTextQueryEncoder {
     private let imageConstraint: MLImageConstraint
     private var activeFunction: String?
     private var activeModel: MLModel?
+    private var activeComputePolicy: CoreMLComputePolicy?
+    private var residencyGeneration: UInt64 = 0
 
     public init(
         modelURL: URL,
@@ -129,6 +131,7 @@ public actor CoreMLDualEncoder: MLAssetEmbedder, MLTextQueryEncoder {
         switch await imageSource.image(for: uid) {
         case .image(let source):
             do {
+                try Task.checkCancellation()
                 let feature = try MLFeatureValue(
                     cgImage: source.cgImage,
                     orientation: source.orientation,
@@ -137,7 +140,9 @@ public actor CoreMLDualEncoder: MLAssetEmbedder, MLTextQueryEncoder {
                 )
                 let input = try MLDictionaryFeatureProvider(dictionary: [schema.imageInput: feature])
                 let model = try await model(for: schema.imageFunction)
+                try Task.checkCancellation()
                 let output = try await model.prediction(from: input)
+                try Task.checkCancellation()
                 return .embedded(
                     try Self.embedding(
                         from: output, name: schema.embeddingOutput, dimension: descriptor.embeddingDimension))
@@ -158,6 +163,7 @@ public actor CoreMLDualEncoder: MLAssetEmbedder, MLTextQueryEncoder {
     }
 
     public func encode(text: String, descriptor: MLModelDescriptor) async throws -> ContiguousArray<Float32> {
+        try Task.checkCancellation()
         guard descriptor == self.descriptor else { throw CoreMLDualEncoderError.descriptorMismatch }
         let tokenized = try tokenizer.tokenize(text)
         guard tokenized.inputIDs.count == schema.contextLength,
@@ -174,27 +180,38 @@ public actor CoreMLDualEncoder: MLAssetEmbedder, MLTextQueryEncoder {
         }
         let provider = try MLDictionaryFeatureProvider(dictionary: features)
         let model = try await model(for: schema.textFunction)
+        try Task.checkCancellation()
         let output = try await model.prediction(from: provider)
+        try Task.checkCancellation()
         return try Self.embedding(from: output, name: schema.embeddingOutput, dimension: descriptor.embeddingDimension)
     }
 
     public func releaseModel() {
+        residencyGeneration &+= 1
         activeModel = nil
         activeFunction = nil
+        activeComputePolicy = nil
     }
 
     private func model(for function: String) async throws -> MLModel {
-        if activeFunction == function, let activeModel { return activeModel }
+        try Task.checkCancellation()
+        let policy = computePolicy.resolved(requiresCPUOnly: CoreMLComputePolicy.requiresCPUOnly)
+        if activeFunction == function, activeComputePolicy == policy, let activeModel { return activeModel }
 
         // A multi-function CLIP asset can otherwise retain both large function models. Release
         // the inactive one before loading its replacement to keep device memory bounded.
-        activeModel = nil
-        activeFunction = nil
-        let configuration = computePolicy.modelConfiguration
+        releaseModel()
+        let generation = residencyGeneration
+        let configuration = policy.modelConfiguration
         configuration.functionName = function
         let loaded = try await MLModel.load(asset: modelAsset, configuration: configuration)
+        try Task.checkCancellation()
+        guard generation == residencyGeneration,
+            policy == computePolicy.resolved(requiresCPUOnly: CoreMLComputePolicy.requiresCPUOnly)
+        else { throw CancellationError() }
         activeModel = loaded
         activeFunction = function
+        activeComputePolicy = policy
         return loaded
     }
 

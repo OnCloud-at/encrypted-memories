@@ -64,7 +64,7 @@ public actor MLSmartSearchStorageMeter {
             let enumerator = fileManager.enumerator(
                 at: layout.rootDirectory,
                 includingPropertiesForKeys: keys,
-                options: [.skipsPackageDescendants],
+                options: [],
                 errorHandler: { _, _ in true }
             )
         else { return .empty }

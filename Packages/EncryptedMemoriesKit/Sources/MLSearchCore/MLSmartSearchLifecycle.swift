@@ -8,6 +8,13 @@ public enum MLSmartSearchQueryError: Error, Equatable {
     case staleEpoch
 }
 
+/// Disposition of an OS-granted catch-up window over the existing indexing loop.
+public enum MLBackgroundProcessingResult: Sendable, Equatable {
+    case complete
+    case deferred
+    case cancelled
+}
+
 /// The single universal Smart Search lifecycle: one state machine, one implementation of
 /// enable/disable, model selection, download, verification, activation, indexing, switching
 /// and purge for every Apple platform. Platform code renders snapshots and calls intents;
@@ -81,6 +88,8 @@ public actor MLSmartSearchLifecycle {
         public var featureAvailability: AppFeatureAvailability
         /// Adapter-injected sustained-work envelope. Scheduling and ramp state remain Core-owned.
         public var indexingCapacityProfile: MLIndexingCapacityProfile
+        /// Shared adapter caches outlive individual native/semantic sessions.
+        public var releaseDerivedResources: @Sendable () async -> Void
 
         public init(
             catalog: MLModelCatalog,
@@ -97,7 +106,8 @@ public actor MLSmartSearchLifecycle {
             resourceCoordinator: LibraryResourceCoordinator = .shared,
             allowsDeveloperModels: Bool,
             featureAvailability: AppFeatureAvailability = .available,
-            indexingCapacityProfile: MLIndexingCapacityProfile = .constrained
+            indexingCapacityProfile: MLIndexingCapacityProfile = .constrained,
+            releaseDerivedResources: @escaping @Sendable () async -> Void = {}
         ) {
             self.catalog = catalog
             self.catalogProvider = catalogProvider ?? StaticMLModelCatalogProvider(catalog)
@@ -114,6 +124,7 @@ public actor MLSmartSearchLifecycle {
             self.allowsDeveloperModels = allowsDeveloperModels
             self.featureAvailability = featureAvailability
             self.indexingCapacityProfile = indexingCapacityProfile
+            self.releaseDerivedResources = releaseDerivedResources
         }
     }
 
@@ -157,6 +168,10 @@ public actor MLSmartSearchLifecycle {
     /// not overwrite switch/download phases.
     private var switchInProgress = false
     private var indexTask: Task<Void, Never>?
+    private var indexTaskID: UUID?
+    private var activationTasks: [UUID: Task<Void, Never>] = [:]
+    private var indexingExecutionIsAllowed = true
+    private var backgroundPassWaiters: [UUID: CheckedContinuation<MLBackgroundProcessingResult, Never>] = [:]
     /// Presentation events are best-effort and never awaited by the indexer. A pass identity
     /// prevents delayed UI work from changing the phase of a later catch-up pass.
     private var activeIndexPassID: UUID?
@@ -186,11 +201,16 @@ public actor MLSmartSearchLifecycle {
     /// session down can never race new lifecycle work against its account purge.
     private var isShutDown = false
 
-    public init(dependencies: Dependencies, configuration: Configuration = Configuration()) {
+    public init(
+        dependencies: Dependencies,
+        configuration: Configuration = Configuration(),
+        initiallyAllowsIndexingExecution: Bool = true
+    ) {
         self.deps = dependencies
         self.configuration = configuration
         self.storageMeter = MLSmartSearchStorageMeter(layout: dependencies.layout)
         self.catalog = dependencies.catalog
+        self.indexingExecutionIsAllowed = initiallyAllowsIndexingExecution
         self.nativeParallelismRamp = MLNativeParallelismRamp(
             ceiling: 1,
             profile: dependencies.indexingCapacityProfile
@@ -292,6 +312,7 @@ public actor MLSmartSearchLifecycle {
     }
 
     private func resumePersistentState() async {
+        guard !isShutDown, !Task.isCancelled else { return }
         switch persistent.pendingOperation {
         case .purge:
             // A purge that began before a crash completes before anything else may run.
@@ -338,8 +359,8 @@ public actor MLSmartSearchLifecycle {
         guard !isShutDown else { return }
         isShutDown = true
         activationGeneration &+= 1
+        await stopActivations()
         await stopCatalogRefreshLoop()
-        await deps.installer.cancelAllInstalls()
         await stopIndexing()
         await teardownSession()
         await shutdownNativeSearch()
@@ -546,6 +567,10 @@ public actor MLSmartSearchLifecycle {
 
         // Retire the old epoch, commit the journal, then activate the new epoch from a clean slate.
         // Keep this ordered and idempotent so it also serves crash recovery.
+        await stopActivations()
+        guard !isShutDown, persistent.isEnabled,
+            activationGeneration == selectionGeneration
+        else { return }
         await stopIndexing()
         guard !isShutDown, persistent.isEnabled,
             activationGeneration == selectionGeneration
@@ -666,8 +691,68 @@ public actor MLSmartSearchLifecycle {
         await refreshCatalogIfDue()
     }
 
+    /// Platform hosts grant execution time, not a second indexer. Closing the opportunity joins
+    /// the current quantum without disabling Smart Search or discarding its durable progress.
+    public func setIndexingExecutionAllowed(_ allowed: Bool) async {
+        guard !isShutDown else { return }
+        indexingExecutionIsAllowed = allowed
+        if !allowed {
+            await stopActivations()
+            await stopIndexing()
+        }
+        // A foreground transition may arrive while the cancelled quantum is draining.
+        if indexingExecutionIsAllowed {
+            if persistent.isEnabled, activationTasks.isEmpty,
+                phase == .preparingModel || (session == nil && nativeSearch == nil)
+                    || (persistent.isVisualSearchEnabled && persistent.selectedModelID != nil && session == nil)
+            {
+                _ = beginActivation { [self] in await prepareSelectedModel() }
+            } else {
+                startIndexingLoopIfAvailable()
+            }
+        } else if persistent.isEnabled {
+            indexingState = .waiting(aggregateProgress())
+            emit()
+        }
+    }
+
+    /// Waits for the shared loop to catch up or yield to policy/input availability. Requests
+    /// coalesce on that loop; cancellation removes only this waiter, never another owner's work.
+    public func performBackgroundCatchUp() async -> MLBackgroundProcessingResult {
+        guard !isShutDown, !Task.isCancelled else { return .cancelled }
+        guard persistent.isEnabled else { return .complete }
+        guard indexingExecutionIsAllowed, persistent.pendingOperation == nil,
+            session != nil || nativeSearch != nil || !activationTasks.isEmpty
+        else { return .deferred }
+        let id = UUID()
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                guard !Task.isCancelled else {
+                    continuation.resume(returning: .cancelled)
+                    return
+                }
+                backgroundPassWaiters[id] = continuation
+                kick()
+                startIndexingLoopIfAvailable()
+            }
+        } onCancel: {
+            Task { await self.cancelBackgroundPass(id) }
+        }
+    }
+
+    private func cancelBackgroundPass(_ id: UUID) {
+        backgroundPassWaiters.removeValue(forKey: id)?.resume(returning: .cancelled)
+    }
+
+    private func finishBackgroundPasses(_ result: MLBackgroundProcessingResult) {
+        let waiters = backgroundPassWaiters.values
+        backgroundPassWaiters.removeAll()
+        for waiter in waiters { waiter.resume(returning: result) }
+    }
+
     /// Drop cached vector blocks and release model residency under memory pressure.
     public func releaseMemory() async {
+        await deps.releaseDerivedResources()
         await session?.releaseMemory()
     }
 
@@ -775,6 +860,43 @@ public actor MLSmartSearchLifecycle {
 
     // MARK: - Activation
 
+    /// Own the complete preparation, stale-result disposal and publication, not just the
+    /// framework load. Shutdown/purge can then join without leaving a late open store/model.
+    private func beginActivation(_ operation: @escaping @Sendable () async -> Void) -> Task<Void, Never> {
+        let id = UUID()
+        let task = Task {
+            await operation()
+            activationTasks.removeValue(forKey: id)
+            guard activationTasks.isEmpty else { return }
+            kick()
+            if !Task.isCancelled { startIndexingLoopIfAvailable() }
+            if indexTask == nil {
+                finishBackgroundPasses(Task.isCancelled ? .cancelled : .deferred)
+            }
+        }
+        activationTasks[id] = task
+        return task
+    }
+
+    private func awaitActivation(_ operation: @escaping @Sendable () async -> Void) async {
+        guard !isShutDown, !Task.isCancelled else { return }
+        let task = beginActivation(operation)
+        await withTaskCancellationHandler {
+            await task.value
+        } onCancel: {
+            task.cancel()
+        }
+    }
+
+    private func stopActivations() async {
+        let tasks = Array(activationTasks.values)
+        for task in tasks { task.cancel() }
+        // Installer children are deliberately coalesced, not cancelled by a single caller.
+        // This lifecycle-wide stop owns every installation, so cancel them before joining callers.
+        await deps.installer.cancelAllInstalls()
+        for task in tasks { await task.value }
+    }
+
     /// A model may be selected/activated in this environment: developer environments see every
     /// entry; release environments require the production track AND a product-usable license.
     private func isSelectable(_ entry: MLModelCatalogEntry) -> Bool {
@@ -785,7 +907,13 @@ public actor MLSmartSearchLifecycle {
     /// Native Apple analysis is the zero-download baseline. It is activated independently from
     /// semantic model selection so OCR/barcode search can index and serve on its own.
     private func activateNativeSearch(intent: LibraryWorkIntent = .automatic) async {
-        guard persistent.isEnabled, nativeSearch == nil else { return }
+        await awaitActivation { [self] in await prepareNativeSearch(intent: intent) }
+    }
+
+    private func prepareNativeSearch(intent: LibraryWorkIntent = .automatic) async {
+        guard !isShutDown, !Task.isCancelled, persistent.isEnabled, nativeSearch == nil,
+            indexingExecutionIsAllowed || intent == .userInitiated
+        else { return }
         guard let nativeSearchFactory = deps.nativeSearchFactory else { return }
         let generation = activationGeneration
         let created: (any MLNativeSearchServing)?
@@ -800,13 +928,13 @@ public actor MLSmartSearchLifecycle {
         } catch {
             return
         }
-        guard !isShutDown, persistent.isEnabled, activationGeneration == generation else {
+        guard !isShutDown, !Task.isCancelled, persistent.isEnabled, activationGeneration == generation else {
             await created?.shutdown()
             return
         }
         let createdProgress = await created?.progress()
         let createdCeiling = await created?.maximumConcurrentAssets() ?? 1
-        guard !isShutDown, persistent.isEnabled, activationGeneration == generation else {
+        guard !isShutDown, !Task.isCancelled, persistent.isEnabled, activationGeneration == generation else {
             await created?.shutdown()
             return
         }
@@ -832,12 +960,15 @@ public actor MLSmartSearchLifecycle {
     }
 
     private func startIndexingLoopIfAvailable() {
-        guard !isShutDown, indexTask == nil, session != nil || nativeSearch != nil else { return }
+        guard !isShutDown, indexingExecutionIsAllowed, indexTask == nil, activationTasks.isEmpty,
+            persistent.pendingOperation == nil, phase != .preparingModel,
+            session != nil || nativeSearch != nil
+        else { return }
         startIndexingLoop()
     }
 
     private func isCurrent(_ token: ActivationToken) -> Bool {
-        guard !isShutDown,
+        guard !isShutDown, !Task.isCancelled,
             persistent.isEnabled,
             persistent.isVisualSearchEnabled,
             persistent.selectedModelID == token.entry.id,
@@ -850,7 +981,13 @@ public actor MLSmartSearchLifecycle {
     }
 
     private func activateSelectedModel(intent: LibraryWorkIntent = .automatic) async {
-        guard !isShutDown, persistent.isEnabled, persistent.pendingOperation == nil else {
+        await awaitActivation { [self] in await prepareSelectedModel(intent: intent) }
+    }
+
+    private func prepareSelectedModel(intent: LibraryWorkIntent = .automatic) async {
+        guard !isShutDown, !Task.isCancelled, persistent.isEnabled, persistent.pendingOperation == nil,
+            indexingExecutionIsAllowed || intent == .userInitiated
+        else {
             return
         }
 
@@ -864,7 +1001,7 @@ public actor MLSmartSearchLifecycle {
             } else {
                 nil
             }
-        await activateNativeSearch(intent: intent)
+        await prepareNativeSearch(intent: intent)
         guard !isShutDown, persistent.isEnabled else { return }
         guard let token else {
             phase = .selectingModel
@@ -1014,6 +1151,9 @@ public actor MLSmartSearchLifecycle {
                 )
             }
             guard isCurrent(token) else { return }
+            phase = .waiting(lastCoverage)
+            indexingState = .waiting(aggregateProgress())
+            emit()
             startIndexingLoop()
         } catch is CancellationError {
             return
@@ -1242,9 +1382,23 @@ public actor MLSmartSearchLifecycle {
     // MARK: - Indexing loop
 
     private func startIndexingLoop() {
+        guard !isShutDown, persistent.isEnabled, indexingExecutionIsAllowed else { return }
         indexTask?.cancel()
         let generation = sessionGeneration
-        indexTask = Task { await runIndexingLoop(generation: generation) }
+        let id = UUID()
+        indexTaskID = id
+        indexTask = Task {
+            await runIndexingLoop(generation: generation)
+            if indexTaskID == id {
+                indexTask = nil
+                indexTaskID = nil
+                activeIndexPassID = nil
+                acceptedIndexProgressSettled = 0
+                if !backgroundPassIsAwaitingActivation {
+                    finishBackgroundPasses(Task.isCancelled ? .cancelled : .deferred)
+                }
+            }
+        }
     }
 
     private func runIndexingLoop(generation: UInt64) async {
@@ -1255,6 +1409,7 @@ public actor MLSmartSearchLifecycle {
 
         while !Task.isCancelled,
             generation == sessionGeneration,
+            indexingExecutionIsAllowed,
             persistent.isEnabled,
             session != nil || nativeSearch != nil
         {
@@ -1793,6 +1948,13 @@ public actor MLSmartSearchLifecycle {
 
     private func waitForKick(timeout: Duration?, since observedGeneration: UInt64) async {
         guard kickGeneration == observedGeneration else { return }
+        if !backgroundPassIsAwaitingActivation {
+            if case .ready = indexingState {
+                finishBackgroundPasses(.complete)
+            } else {
+                finishBackgroundPasses(.deferred)
+            }
+        }
         let id = UUID()
         await withTaskCancellationHandler {
             await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
@@ -1820,14 +1982,23 @@ public actor MLSmartSearchLifecycle {
 
     // MARK: - Teardown / purge
 
+    private var backgroundPassIsAwaitingActivation: Bool {
+        !isShutDown && persistent.isEnabled && indexingExecutionIsAllowed && !activationTasks.isEmpty
+    }
+
     private func stopIndexing() async {
-        indexTask?.cancel()
+        let task = indexTask
+        let id = indexTaskID
+        task?.cancel()
         // Resume any parked loop so cancellation lands at the next boundary.
         kick()
-        _ = await indexTask?.value
+        _ = await task?.value
+        guard indexTaskID == id else { return }
         indexTask = nil
+        indexTaskID = nil
         activeIndexPassID = nil
         acceptedIndexProgressSettled = 0
+        if !backgroundPassIsAwaitingActivation { finishBackgroundPasses(.cancelled) }
     }
 
     private func teardownSession() async {
@@ -1847,6 +2018,7 @@ public actor MLSmartSearchLifecycle {
 
     private func shutdownNativeSearch() async {
         await nativeSearch?.shutdown()
+        await deps.releaseDerivedResources()
         nativeSearch = nil
         nativeParallelismRamp = MLNativeParallelismRamp(
             ceiling: 1,
@@ -1926,7 +2098,7 @@ public actor MLSmartSearchLifecycle {
         model: MLModelID?,
         descriptor: MLModelDescriptor?
     ) async -> Bool {
-        await deps.installer.cancelAllInstalls()
+        await stopActivations()
         await stopIndexing()
         await teardownSession()
 
@@ -1979,13 +2151,13 @@ public actor MLSmartSearchLifecycle {
         persistent.pendingOperation = .purge
         persistent.isEnabled = false
         guard persistState() else { return }
+        await stopActivations()
         await stopCatalogRefreshLoop()
 
         phase = .deleting
         indexingState = .idle
         emit()
 
-        await deps.installer.cancelAllInstalls()
         await stopIndexing()
         await teardownSession()
         await shutdownNativeSearch()
@@ -2062,6 +2234,7 @@ public actor MLSmartSearchLifecycle {
     /// Refreshes only the signed distribution data. Runtime contracts, dimensions and
     /// licensing remain compiled into the app and are validated by the provider.
     private func refreshCatalog() async -> Bool {
+        guard !isShutDown, !Task.isCancelled else { return false }
         phase = .loadingCatalog
         emit()
         do {
@@ -2162,7 +2335,7 @@ public actor MLSmartSearchLifecycle {
     }
 
     private func startCatalogRefreshLoopIfNeeded() {
-        guard catalogRefreshTask == nil,
+        guard !isShutDown, !Task.isCancelled, catalogRefreshTask == nil,
             configuration.catalogRefreshInterval > .zero
         else { return }
         let interval = configuration.catalogRefreshInterval

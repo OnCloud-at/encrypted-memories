@@ -92,9 +92,14 @@ import Testing
         private(set) var calls: [PhotoUID: Int] = [:]
         private var delay: Duration?
         private var embeddingIndices: [PhotoUID: Int] = [:]
+        private var cancelledEmbeddings = 0
 
         func embed(uid: PhotoUID, descriptor: MLModelDescriptor) async -> MLEmbeddingOutcome {
-            await barrier.waitIfArmed()
+            await withTaskCancellationHandler {
+                await barrier.waitIfArmed()
+            } onCancel: {
+                self.lock.withLock { self.cancelledEmbeddings += 1 }
+            }
             if let delay = lock.withLock({ delay }) {
                 try? await Task.sleep(for: delay)
             }
@@ -109,6 +114,7 @@ import Testing
 
         func callCount(_ uid: PhotoUID) -> Int { lock.withLock { calls[uid] ?? 0 } }
         var totalCalls: Int { lock.withLock { calls.values.reduce(0, +) } }
+        var cancellationCount: Int { lock.withLock { cancelledEmbeddings } }
         func setDelay(_ value: Duration?) { lock.withLock { delay = value } }
         func setEmbeddingIndex(_ index: Int, for uid: PhotoUID) { lock.withLock { embeddingIndices[uid] = index } }
         func blockNextEmbedding() async { await barrier.arm() }
@@ -134,6 +140,7 @@ import Testing
         private var makeSessionStarted = false
         private var releasedBlockedMakeSession = false
         private var blockedMakeSession: CheckedContinuation<Void, Never>?
+        private var cancelledSessionLoads = 0
         private(set) var makeSessionAttempts = 0
         private(set) var sessionsBuilt = 0
         /// When set, `makeSession` returns this instead of a real service.
@@ -161,6 +168,7 @@ import Testing
             continuation?.resume()
         }
         var sessionLoadStarted: Bool { lock.withLock { makeSessionStarted } }
+        var sessionLoadCancellations: Int { lock.withLock { cancelledSessionLoads } }
         var attemptCount: Int { lock.withLock { makeSessionAttempts } }
         var builtCount: Int { lock.withLock { sessionsBuilt } }
 
@@ -189,13 +197,17 @@ import Testing
                 return false
             }
             if shouldBlock {
-                await withCheckedContinuation { continuation in
-                    let resumeImmediately = lock.withLock {
-                        if releasedBlockedMakeSession { return true }
-                        blockedMakeSession = continuation
-                        return false
+                await withTaskCancellationHandler {
+                    await withCheckedContinuation { continuation in
+                        let resumeImmediately = lock.withLock {
+                            if releasedBlockedMakeSession { return true }
+                            blockedMakeSession = continuation
+                            return false
+                        }
+                        if resumeImmediately { continuation.resume() }
                     }
-                    if resumeImmediately { continuation.resume() }
+                } onCancel: {
+                    self.lock.withLock { self.cancelledSessionLoads += 1 }
                 }
             }
             if let sessionOverride {
@@ -1079,6 +1091,138 @@ import Testing
         #expect(!results.isEmpty)
     }
 
+    @Test func executionWindowsReuseOneIndexAndRespectPendingLibraryChanges() async throws {
+        let payload = Data("background-model".utf8)
+        let (entry, url) = downloadableEntry(id: "background-model", payload: payload)
+        let first = uid("first")
+        let second = uid("second")
+        let harness = try makeHarness(
+            catalog: MLModelCatalog(entries: [entry]), payloads: [url: payload], assets: [first])
+        defer { try? FileManager.default.removeItem(at: harness.layout.rootDirectory) }
+        await harness.lifecycle.setIndexingExecutionAllowed(false)
+        await harness.lifecycle.start()
+        await harness.lifecycle.setEnabled(true)
+        await harness.lifecycle.select(entry.id)
+
+        #expect(harness.provider.embedder.totalCalls == 0)
+        #expect(await harness.lifecycle.performBackgroundCatchUp() == .deferred)
+        #expect(await harness.lifecycle.currentSnapshot().isEnabled)
+        await harness.lifecycle.setIndexingExecutionAllowed(true)
+        async let firstWindow = harness.lifecycle.performBackgroundCatchUp()
+        async let secondWindow = harness.lifecycle.performBackgroundCatchUp()
+        let windows = await (firstWindow, secondWindow)
+        #expect(windows.0 == .complete)
+        #expect(windows.1 == .complete)
+        #expect(harness.provider.embedder.callCount(first) == 1)
+
+        harness.assets.set([first, second])
+        await harness.lifecycle.noteLibraryChanged()
+        #expect(await harness.lifecycle.performBackgroundCatchUp() == .complete)
+        #expect(harness.storeProvider.store.count(for: entry.descriptor) == 2)
+        #expect(harness.provider.embedder.callCount(first) == 1)
+        #expect(harness.provider.embedder.callCount(second) == 1)
+        await harness.lifecycle.shutdown()
+    }
+
+    @Test func backgroundCatchUpYieldsToPolicyWithoutDisablingSearch() async throws {
+        let payload = Data("background-model".utf8)
+        let (entry, url) = downloadableEntry(id: "background-model", payload: payload)
+        let harness = try makeHarness(
+            catalog: MLModelCatalog(entries: [entry]), payloads: [url: payload], assets: [uid("photo")])
+        defer { try? FileManager.default.removeItem(at: harness.layout.rootDirectory) }
+        harness.governor.set(false)
+        await harness.lifecycle.start()
+        await harness.lifecycle.setEnabled(true)
+        await harness.lifecycle.select(entry.id)
+        #expect(await harness.lifecycle.performBackgroundCatchUp() == .deferred)
+        #expect(harness.provider.embedder.totalCalls == 0)
+        #expect(await harness.lifecycle.currentSnapshot().isEnabled)
+        harness.governor.set(true)
+        #expect(await harness.lifecycle.performBackgroundCatchUp() == .complete)
+        await harness.lifecycle.shutdown()
+    }
+
+    @Test func executionReopensTheSelectedModelWhenNativeSearchAlreadyExists() async throws {
+        let payload = Data("resume-model".utf8)
+        let (entry, url) = downloadableEntry(id: "resume-model", payload: payload)
+        let photo = uid("photo")
+        let native = RecordingNativeSearch(results: [photo])
+        let harness = try makeHarness(
+            catalog: MLModelCatalog(entries: [entry]), payloads: [url: payload], assets: [photo],
+            nativeSearchFactoryOverride: { native })
+        defer { try? FileManager.default.removeItem(at: harness.layout.rootDirectory) }
+        await harness.lifecycle.start()
+        await harness.lifecycle.setEnabled(true)
+        harness.provider.failNext()
+        await harness.lifecycle.select(entry.id)
+        #expect(harness.provider.builtCount == 0)
+        await harness.lifecycle.setIndexingExecutionAllowed(false)
+        await harness.lifecycle.setIndexingExecutionAllowed(true)
+        #expect(await harness.lifecycle.performBackgroundCatchUp() == .complete)
+        #expect(harness.provider.builtCount == 1)
+        #expect(harness.provider.embedder.callCount(photo) == 1)
+        #expect(native.shutdownCount == 0)
+        await harness.lifecycle.shutdown()
+    }
+
+    @Test func cancellingOneBackgroundWaiterDoesNotCancelSharedIndexing() async throws {
+        let payload = Data("background-model".utf8)
+        let (entry, url) = downloadableEntry(id: "background-model", payload: payload)
+        let photo = uid("photo")
+        let harness = try makeHarness(
+            catalog: MLModelCatalog(entries: [entry]), payloads: [url: payload], assets: [photo])
+        defer { try? FileManager.default.removeItem(at: harness.layout.rootDirectory) }
+        await harness.provider.embedder.blockNextEmbedding()
+        await harness.lifecycle.start()
+        await harness.lifecycle.setEnabled(true)
+        await harness.lifecycle.select(entry.id)
+        await harness.provider.embedder.waitUntilEmbeddingStarted()
+        let cancelledWindow = Task { await harness.lifecycle.performBackgroundCatchUp() }
+        let survivingWindow = Task { await harness.lifecycle.performBackgroundCatchUp() }
+        cancelledWindow.cancel()
+        #expect(await cancelledWindow.value == .cancelled)
+        await harness.provider.embedder.releaseEmbedding()
+        #expect(await survivingWindow.value == .complete)
+        #expect(harness.provider.embedder.callCount(photo) == 1)
+        await harness.lifecycle.shutdown()
+    }
+
+    @Test(arguments: [false, true])
+    func closingExecutionJoinsTheQuantumAndResumesWithoutReindexingSettledAssets(
+        foregroundDuringDrain: Bool
+    ) async throws {
+        let payload = Data("background-model".utf8)
+        let (entry, url) = downloadableEntry(id: "background-model", payload: payload)
+        let first = uid("first")
+        let second = uid("second")
+        let harness = try makeHarness(
+            catalog: MLModelCatalog(entries: [entry]), payloads: [url: payload], assets: [first])
+        defer { try? FileManager.default.removeItem(at: harness.layout.rootDirectory) }
+        await harness.lifecycle.start()
+        await harness.lifecycle.setEnabled(true)
+        await harness.lifecycle.select(entry.id)
+        #expect(await harness.lifecycle.performBackgroundCatchUp() == .complete)
+        await harness.provider.embedder.blockNextEmbedding()
+        harness.assets.set([first, second])
+        await harness.lifecycle.noteLibraryChanged()
+        await harness.provider.embedder.waitUntilEmbeddingStarted()
+        let closing = Task { await harness.lifecycle.setIndexingExecutionAllowed(false) }
+        #expect(await waitUntil { harness.provider.embedder.cancellationCount > 0 })
+        #expect(harness.storeProvider.store.count(for: entry.descriptor) == 1)
+        if foregroundDuringDrain { await harness.lifecycle.setIndexingExecutionAllowed(true) }
+        await harness.provider.embedder.releaseEmbedding()
+        await closing.value
+        if !foregroundDuringDrain {
+            #expect(await harness.lifecycle.performBackgroundCatchUp() == .deferred)
+            await harness.lifecycle.setIndexingExecutionAllowed(true)
+        }
+        #expect(await harness.lifecycle.currentSnapshot().isEnabled)
+        #expect(await harness.lifecycle.performBackgroundCatchUp() == .complete)
+        #expect(harness.storeProvider.store.count(for: entry.descriptor) == 2)
+        #expect(harness.provider.embedder.callCount(first) == 1)
+        await harness.lifecycle.shutdown()
+    }
+
     @Test func searchBecomesAvailableAfterFirstDurableIndexChunk() async throws {
         let payload = Data("model-a-bytes".utf8)
         let (entryA, urlA) = downloadableEntry(id: "model-a", payload: payload)
@@ -1788,7 +1932,7 @@ import Testing
         #expect(second.storeProvider.store.count(for: entryV2.descriptor) == assets.count)
     }
 
-    @Test func activationCannotCommitAfterShutdown() async throws {
+    @Test func shutdownJoinsActivationBeforeClosingItsStore() async throws {
         let payload = Data("model-bytes".utf8)
         let (entry, url) = downloadableEntry(id: "model", payload: payload)
         let harness = try makeHarness(
@@ -1804,14 +1948,50 @@ import Testing
         let activation = Task { await harness.lifecycle.select(entry.id) }
         #expect(await waitUntil { harness.provider.sessionLoadStarted })
 
-        await harness.lifecycle.shutdown()
+        let shutdown = Task { await harness.lifecycle.shutdown() }
+        #expect(await waitUntil { harness.provider.sessionLoadCancellations == 1 })
+        #expect(harness.storeProvider.closeCount == 0)
         harness.provider.releaseBlockedSessionLoad()
+        await shutdown.value
         await activation.value
 
+        #expect(harness.storeProvider.closeCount == 1)
         #expect(try harness.stateStore.load()?.activatedRevision == nil)
         await #expect(throws: MLSmartSearchQueryError.unavailable) {
             _ = try await harness.lifecycle.search("anything", limit: 3)
         }
+    }
+
+    @Test func visualDisableJoinsActivationBeforeRemovingItsFiles() async throws {
+        let payload = Data("model-bytes".utf8)
+        let (entry, url) = downloadableEntry(id: "model", payload: payload)
+        let harness = try makeHarness(
+            catalog: MLModelCatalog(entries: [entry]),
+            payloads: [url: payload],
+            assets: [uid("asset")]
+        )
+        defer { try? FileManager.default.removeItem(at: harness.layout.rootDirectory) }
+
+        await harness.lifecycle.start()
+        await harness.lifecycle.setEnabled(true)
+        harness.provider.blockNextSessionLoad()
+        let activation = Task { await harness.lifecycle.select(entry.id) }
+        #expect(await waitUntil { harness.provider.sessionLoadStarted })
+
+        let disable = Task { await harness.lifecycle.setVisualSearchEnabled(false) }
+        #expect(await waitUntil { harness.provider.sessionLoadCancellations == 1 })
+        let modelDirectory = harness.layout.modelDirectory(for: entry.id)
+        #expect(FileManager.default.fileExists(atPath: modelDirectory.path))
+        #expect(try harness.stateStore.load()?.pendingOperation == .disableVisualSearch(model: entry.id))
+        harness.provider.releaseBlockedSessionLoad()
+        await disable.value
+        await activation.value
+
+        #expect(!FileManager.default.fileExists(atPath: modelDirectory.path))
+        #expect(try harness.stateStore.load()?.pendingOperation == nil)
+        #expect(try harness.stateStore.load()?.isVisualSearchEnabled == false)
+        #expect(try harness.stateStore.load()?.activatedRevision == nil)
+        #expect(await harness.lifecycle.currentSnapshot().isEnabled)
     }
 
     @Test func activationCannotCommitAfterNewerSelection() async throws {
@@ -1837,6 +2017,8 @@ import Testing
             await waitUntil {
                 await harness.lifecycle.currentSnapshot().selectedModelID == entryB.id
             })
+        #expect(await waitUntil { harness.provider.sessionLoadCancellations == 1 })
+        #expect(FileManager.default.fileExists(atPath: harness.layout.modelDirectory(for: entryA.id).path))
         harness.provider.releaseBlockedSessionLoad()
         await activationA.value
         await activationB.value
@@ -1845,6 +2027,7 @@ import Testing
         #expect(await harness.lifecycle.currentSnapshot().selectedModelID == entryB.id)
         #expect(harness.provider.builtCount == 2)
         #expect(try harness.stateStore.load()?.selectedModelID == entryB.id)
+        #expect(!FileManager.default.fileExists(atPath: harness.layout.modelDirectory(for: entryA.id).path))
     }
 
     @Test func modelSwitchRetiresOldEpochCompletely() async throws {

@@ -1218,6 +1218,19 @@ struct ProductionRouteGuardTests {
             "a committed restore must reconcile the source route before viewer presentation is gated")
     }
 
+    @Test func macBackendPreparationCannotPublishAfterSignOut() throws {
+        let model = try String(contentsOf: Self.repoRoot.appendingPathComponent("App/AppModel.swift"), encoding: .utf8)
+        let preparation = sourceBlock(from: "private func prepareBackend(", to: "private func apply(", in: model)
+        let completion = sourceBlock(
+            from: "await client.uploadCoordinator.start()", to: "backend = .ready", in: preparation)
+        #expect(completion.contains("!Task.isCancelled"))
+        #expect(completion.contains("facade === client"))
+        #expect(completion.contains("authController.currentSession == session"))
+        let failure = sourceBlock(from: "} catch {", to: "backend = .failed", in: preparation)
+        #expect(failure.contains("!Task.isCancelled"))
+        #expect(failure.contains("authController.currentSession == session"))
+    }
+
     @Test func trashMutationsDecodeMultistatusAndListingResolvesViaFetchMetadata() throws {
         let session = try String(
             contentsOf: Self.repoRoot.appendingPathComponent(

@@ -88,6 +88,8 @@ targets:
       - package: EncryptedMemoriesKit
         product: MLSearchAppleAdapter
       - package: EncryptedMemoriesKit
+        product: MLSearchBackgroundAppleAdapter
+      - package: EncryptedMemoriesKit
         product: MLSearchFeature
       - package: ProtonCore
         product: ProtonCoreCryptoPatchedGoImplementation
@@ -188,6 +190,8 @@ targets:
         product: MLSearchCore
       - package: EncryptedMemoriesKit
         product: MLSearchAppleAdapter
+      - package: EncryptedMemoriesKit
+        product: MLSearchBackgroundAppleAdapter
       - package: EncryptedMemoriesKit
         product: MLSearchFeature
       - package: ProtonCore

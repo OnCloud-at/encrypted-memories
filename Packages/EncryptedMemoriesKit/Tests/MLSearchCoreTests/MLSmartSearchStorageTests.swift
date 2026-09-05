@@ -31,6 +31,30 @@ import Testing
         #expect(layout.derivedIndexDatabaseFileURLs.count == 3)
     }
 
+    @Test func countsModelPackageContentsWithoutFollowingSymbolicLinks() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("MLSmartSearchStorageTests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let layout = MLModelInstallLayout(rootDirectory: root)
+        let compiledWeights = layout.modelsDirectory.appendingPathComponent("visual.mlmodelc/weights/weight.bin")
+        let packageWeights = layout.modelsDirectory.appendingPathComponent("text.mlpackage/Data/weights.bin")
+        for url in [compiledWeights, packageWeights] {
+            try FileManager.default.createDirectory(
+                at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        }
+        try bytes(17).write(to: compiledWeights)
+        try bytes(23).write(to: packageWeights)
+        try FileManager.default.createSymbolicLink(
+            at: layout.modelsDirectory.appendingPathComponent("alias.mlmodelc"),
+            withDestinationURL: compiledWeights.deletingLastPathComponent().deletingLastPathComponent()
+        )
+
+        let result = await MLSmartSearchStorageMeter(layout: layout).measure()
+
+        #expect(result.installedVisualModelsBytes == 40)
+        #expect(result.totalBytes == 40)
+    }
+
     private func bytes(_ count: Int) -> Data {
         Data(repeating: 0x5a, count: count)
     }

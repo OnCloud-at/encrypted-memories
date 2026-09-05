@@ -16,6 +16,7 @@ public final class AppleVisionPipelineExecutor: MLDerivedPipelineExecutor, Senda
         case completed(MLDerivedPipelineOutput)
         case completedEmpty
         case unsupported
+        case suspended
         case retryableFailure(MLPipelineFailureReason)
         case permanentFailure(MLPipelineFailureReason)
     }
@@ -63,6 +64,9 @@ public final class AppleVisionPipelineExecutor: MLDerivedPipelineExecutor, Senda
     }
 
     public func execute(_ plan: MLAssetAnalysisPlan) async -> [MLPipelineStageResult] {
+        guard !Task.isCancelled else {
+            return plan.workItems.map { .init(workItem: $0, outcome: .cancelled) }
+        }
         let contexts: [MLNativeAnalysisKind: MLNativeResultContext]
         do {
             contexts = try Dictionary(
@@ -104,6 +108,9 @@ public final class AppleVisionPipelineExecutor: MLDerivedPipelineExecutor, Senda
                 .init(workItem: $0, outcome: .deferred(reason: .sourceNotResident, retryAfter: nil))
             }
         case .image(let source):
+            guard !Task.isCancelled else {
+                return plan.workItems.map { .init(workItem: $0, outcome: .cancelled) }
+            }
             let outputs = await analyze(source, contexts)
             if Task.isCancelled {
                 return plan.workItems.map { .init(workItem: $0, outcome: .cancelled) }
@@ -117,6 +124,7 @@ public final class AppleVisionPipelineExecutor: MLDerivedPipelineExecutor, Senda
                     case .completed(let output): .completed(output)
                     case .completedEmpty: .completedEmpty
                     case .unsupported: .skipped(.unsupportedCapability)
+                    case .suspended: .suspended(.resourcePolicy)
                     case .retryableFailure(let reason): .retryableFailure(reason: reason, retryAfter: nil)
                     case .permanentFailure(let reason): .permanentInputFailure(reason: reason)
                     }
@@ -204,6 +212,8 @@ public final class AppleVisionPipelineExecutor: MLDerivedPipelineExecutor, Senda
                         }
                     } catch is CancellationError {
                         return [:]
+                    } catch is AppleVisionComputePolicy.UnavailableInBackground {
+                        results[.documentRecognition] = .suspended
                     } catch is MLAnalysisContractError {
                         results[.documentRecognition] = .permanentFailure(.invalidArtifactContract)
                     } catch {
@@ -228,6 +238,8 @@ public final class AppleVisionPipelineExecutor: MLDerivedPipelineExecutor, Senda
                     .map(ArtifactAnalysisResult.completed) ?? .completedEmpty
             } catch is CancellationError {
                 return [:]
+            } catch is AppleVisionComputePolicy.UnavailableInBackground {
+                results[.barcodeDetection] = .suspended
             } catch is MLAnalysisContractError {
                 results[.barcodeDetection] = .permanentFailure(.invalidArtifactContract)
             } catch {
@@ -254,6 +266,8 @@ public final class AppleVisionPipelineExecutor: MLDerivedPipelineExecutor, Senda
                         .map(ArtifactAnalysisResult.completed) ?? .completedEmpty
                 } catch is CancellationError {
                     return [:]
+                } catch is AppleVisionComputePolicy.UnavailableInBackground {
+                    results[.textRecognition] = .suspended
                 } catch is MLAnalysisContractError {
                     results[.textRecognition] = .permanentFailure(.invalidArtifactContract)
                 } catch {
@@ -288,6 +302,8 @@ public final class AppleVisionPipelineExecutor: MLDerivedPipelineExecutor, Senda
         textRequest.recognitionLanguages = preferredLanguages(from: textRequest.supportedRecognitionLanguages)
         var barcodeRequest = DetectBarcodesRequest(barcodeRevision)
         barcodeRequest.symbologies = barcodeRequest.supportedSymbologies
+        if needsText { textRequest = try AppleVisionComputePolicy.prepare(textRequest) }
+        if needsBarcode { barcodeRequest = try AppleVisionComputePolicy.prepare(barcodeRequest) }
 
         let textObservations: [RecognizedTextObservation]
         let barcodeObservations: [BarcodeObservation]
@@ -387,7 +403,9 @@ public final class AppleVisionPipelineExecutor: MLDerivedPipelineExecutor, Senda
         barcodeOptions.symbologies = includeBarcodes ? request.supportedBarcodeSymbologies : []
         request.barcodeDetectionOptions = barcodeOptions
 
-        guard let document = try await handler.perform(request).first?.document else { return nil }
+        guard let document = try await handler.perform(AppleVisionComputePolicy.prepare(request)).first?.document else {
+            return nil
+        }
         let languages = textOptions.recognitionLanguages.map(\.minimalIdentifier)
         let text = document.text.lines.compactMap(textObservation)
         let barcodes = includeBarcodes ? documentBarcodes(in: document) : []
@@ -624,6 +642,7 @@ private extension AppleVisionPipelineExecutor {
         let handler = ImageRequestHandler(source.cgImage, orientation: source.orientation)
         var results: [MLNativeAnalysisKind: ArtifactAnalysisResult] = [:]
         for kind in routingKinds {
+            guard !Task.isCancelled else { return results }
             guard let context = contexts[kind] else { continue }
             results[kind] = await analyze(kind: kind, context: context, handler: handler)
         }
@@ -642,6 +661,7 @@ private extension AppleVisionPipelineExecutor {
         ]
 
         for kind in MLNativeAnalysisKind.allCases {
+            guard !Task.isCancelled else { return results }
             guard !faceKinds.contains(kind), let context = contexts[kind] else { continue }
             results[kind] = await analyze(kind: kind, context: context, handler: handler)
         }
@@ -677,7 +697,8 @@ private extension AppleVisionPipelineExecutor {
         }
 
         do {
-            let faces = try await handler.perform(DetectFaceRectanglesRequest(revision))
+            let faces = try await handler.perform(
+                AppleVisionComputePolicy.prepare(DetectFaceRectanglesRequest(revision)))
             var results: [MLNativeAnalysisKind: ArtifactAnalysisResult] = [:]
             results[.faceDetection] =
                 try faceRegionsOutput(faces, context: detectionContext)
@@ -708,6 +729,8 @@ private extension AppleVisionPipelineExecutor {
                 uniqueKeysWithValues: contexts.keys.map {
                     ($0, .retryableFailure(.analysisFailed))
                 })
+        } catch is AppleVisionComputePolicy.UnavailableInBackground {
+            return Dictionary(uniqueKeysWithValues: contexts.keys.map { ($0, .suspended) })
         } catch is MLAnalysisContractError {
             return Dictionary(
                 uniqueKeysWithValues: contexts.keys.map {
@@ -735,11 +758,13 @@ private extension AppleVisionPipelineExecutor {
         do {
             var request = DetectFaceLandmarksRequest(revision)
             request.inputFaceObservations = faces
-            let observations = try await handler.perform(request)
+            let observations = try await handler.perform(AppleVisionComputePolicy.prepare(request))
             return try faceLandmarksOutput(observations, context: context)
                 .map(ArtifactAnalysisResult.completed) ?? .completedEmpty
         } catch is CancellationError {
             return .retryableFailure(.analysisFailed)
+        } catch is AppleVisionComputePolicy.UnavailableInBackground {
+            return .suspended
         } catch is MLAnalysisContractError {
             return .permanentFailure(.invalidArtifactContract)
         } catch {
@@ -761,11 +786,13 @@ private extension AppleVisionPipelineExecutor {
         do {
             var request = DetectFaceCaptureQualityRequest(revision)
             request.inputFaceObservations = faces
-            let observations = try await handler.perform(request)
+            let observations = try await handler.perform(AppleVisionComputePolicy.prepare(request))
             return try faceQualityOutput(observations, context: context)
                 .map(ArtifactAnalysisResult.completed) ?? .completedEmpty
         } catch is CancellationError {
             return .retryableFailure(.analysisFailed)
+        } catch is AppleVisionComputePolicy.UnavailableInBackground {
+            return .suspended
         } catch is MLAnalysisContractError {
             return .permanentFailure(.invalidArtifactContract)
         } catch {
@@ -988,11 +1015,13 @@ private extension AppleVisionPipelineExecutor {
             return .unsupported
         }
         do {
-            let observation = try await handler.perform(request(revision))
+            let observation = try await handler.perform(AppleVisionComputePolicy.prepare(request(revision)))
             guard let output = try transform(observation, context) else { return .completedEmpty }
             return .completed(output)
         } catch is CancellationError {
             return .retryableFailure(.analysisFailed)
+        } catch is AppleVisionComputePolicy.UnavailableInBackground {
+            return .suspended
         } catch is MLAnalysisContractError {
             return .permanentFailure(.invalidArtifactContract)
         } catch {
