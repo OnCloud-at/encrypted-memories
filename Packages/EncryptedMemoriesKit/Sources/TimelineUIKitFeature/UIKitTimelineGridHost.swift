@@ -1103,25 +1103,14 @@
         }
 
         private func tick() {
-            guard framePump.shouldTick else {
+            guard framePump.beginTick() else {
                 displayLink.stop()
                 perf.noteLoopStopped()
                 return
             }
             advancePinchSettleIfNeeded()
             let outcome = renderNow()
-            let keepTicking: Bool
-            switch outcome {
-            case .skippedNoSurface:
-                // Nothing drawable yet (zero bounds / no cache) - the event that changes that (layout,
-                // configure) re-requests a render, so don't spin.
-                keepTicking = framePump.completeTick(presented: true, hasPendingWork: false)
-            case .noDrawable:
-                // Transient drawable starvation - retry next tick so content can never strand off-screen.
-                keepTicking = framePump.completeTick(presented: false, hasPendingWork: false)
-            case .drawn(let hasPendingWork):
-                keepTicking = framePump.completeTick(presented: true, hasPendingWork: hasPendingWork)
-            }
+            let keepTicking = framePump.completeTick(outcome)
             var drawableFailed = false
             if case .noDrawable = outcome { drawableFailed = true }
             perf.noteTick(drawableFailed: drawableFailed)
@@ -1131,14 +1120,8 @@
             }
         }
 
-        private enum RenderOutcome {
-            case skippedNoSurface
-            case noDrawable
-            case drawn(hasPendingWork: Bool)
-        }
-
         @discardableResult
-        private func renderNow() -> RenderOutcome {
+        private func renderNow() -> GridRenderOutcome {
             guard isMetal3Capable,
                 bounds.width > 0,
                 bounds.height > 0,
@@ -1254,7 +1237,7 @@
             renderer: MetalGridRenderer,
             textureCache: MetalGridTextureCache<PhotoUID>,
             viewportSize: CGSize
-        ) -> RenderOutcome {
+        ) -> GridRenderOutcome {
             let now = CACurrentMediaTime()
             let draws = gridTransition.currentDraws()
             guard !draws.isEmpty else { return .drawn(hasPendingWork: false) }
@@ -1288,7 +1271,7 @@
             slotSidePoints: CGFloat,
             textureCache: MetalGridTextureCache<PhotoUID>,
             now: Double = CACurrentMediaTime()
-        ) -> RenderOutcome {
+        ) -> GridRenderOutcome {
             let feed = thumbnailFeed
             let missing = newestFirst(
                 uids.filter { uid in
@@ -1313,7 +1296,7 @@
             textureCache: MetalGridTextureCache<PhotoUID>,
             plan: OverviewLayerDissolvePlan,
             viewportSize: CGSize
-        ) -> RenderOutcome {
+        ) -> GridRenderOutcome {
             let now = CACurrentMediaTime()
             let sourceSlots = renderSlots(from: plan.source.visibleSlots)
             let targetSlots = renderSlots(from: plan.target.visibleSlots)
@@ -1423,7 +1406,7 @@
             allowUpgrade: Bool,
             reportFirstContent: Bool,
             forcePendingWork: Bool
-        ) -> RenderOutcome {
+        ) -> GridRenderOutcome {
             let now = CACurrentMediaTime()
             let uploadPixels = GridTextureUploadSizing.uploadPixels(
                 slotSidePoints: slotSidePoints,

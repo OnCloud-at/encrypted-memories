@@ -15,33 +15,3 @@ extension MetalGridDrawableTarget {
         )
     }
 }
-
-extension MetalGridRenderer {
-    @MainActor
-    func render(in view: MTKView, viewportSize: CGSize, groups: [MetalGridRenderGroup]) {
-        guard let target = MetalGridDrawableTarget(view: view) else { return }
-        render(to: target, viewportSize: viewportSize, groups: groups)
-    }
-
-    @MainActor
-    func renderLayerDissolve(
-        in view: MTKView,
-        viewportSize: CGSize,
-        redrawSource: Bool,
-        redrawTarget: Bool,
-        sourceGroups: () -> [MetalGridRenderGroup],
-        targetGroups: () -> [MetalGridRenderGroup],
-        t: Float
-    ) {
-        guard let target = MetalGridDrawableTarget(view: view) else { return }
-        renderLayerDissolve(
-            to: target,
-            viewportSize: viewportSize,
-            redrawSource: redrawSource,
-            redrawTarget: redrawTarget,
-            sourceGroups: sourceGroups,
-            targetGroups: targetGroups,
-            t: t
-        )
-    }
-}

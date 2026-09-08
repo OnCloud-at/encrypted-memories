@@ -1,16 +1,27 @@
+/// Platform hosts distinguish a missing surface from transient drawable starvation.
+public enum GridRenderOutcome: Equatable, Sendable {
+    case skippedNoSurface
+    case noDrawable
+    case drawn(hasPendingWork: Bool)
+}
+
 /// Coalesces render invalidations into at most one render per display tick.
-/// The tick remains active while presentation or visible-content work is pending.
-/// Hosts provide the display link and call `completeTick` after each render attempt.
+/// Hosts call `beginTick` before rendering and `completeTick` with its outcome.
 public struct GridFramePump: Equatable, Sendable {
     /// A fresh pump wants a first frame - content configured before the first tick must draw.
     private var dirty = true
     /// Whether the host surface is the active one. A fresh pump is active (the common single-surface case).
     private var active = true
+    private var invalidationVersion: UInt64 = 0
+    private var tickVersion: UInt64?
 
     public init() {}
 
     /// Note that the on-screen state changed (scroll, new items, layout, arrived thumbnails).
-    public mutating func invalidate() { dirty = true }
+    public mutating func invalidate() {
+        dirty = true
+        invalidationVersion &+= 1
+    }
 
     /// Whether the host surface is currently active (its tab/window is foreground).
     public var isActive: Bool { active }
@@ -23,18 +34,39 @@ public struct GridFramePump: Equatable, Sendable {
     public mutating func setActive(_ active: Bool) -> Bool {
         guard active != self.active else { return false }
         self.active = active
-        if active { dirty = true }
+        if active { invalidate() }
         return true
     }
 
     /// Whether the next display tick should render: only when active AND something is dirty.
     public var shouldTick: Bool { active && dirty }
 
+    /// Capture invalidations before rendering so a callback during the draw cannot lose the next frame.
+    public mutating func beginTick() -> Bool {
+        guard shouldTick else { return false }
+        tickVersion = invalidationVersion
+        return true
+    }
+
+    @discardableResult
+    public mutating func completeTick(_ outcome: GridRenderOutcome) -> Bool {
+        switch outcome {
+        case .skippedNoSurface:
+            return completeTick(presented: true, hasPendingWork: false)
+        case .noDrawable:
+            return completeTick(presented: false, hasPendingWork: false)
+        case .drawn(let hasPendingWork):
+            return completeTick(presented: true, hasPendingWork: hasPendingWork)
+        }
+    }
+
     /// Report the outcome of a tick's render. Returns whether the tick loop must keep running - never while
     /// inactive, so a host that deactivates mid-flight stops its loop on the next `completeTick`.
     @discardableResult
     public mutating func completeTick(presented: Bool, hasPendingWork: Bool) -> Bool {
-        dirty = !presented || hasPendingWork
+        let invalidatedDuringTick = tickVersion.map { $0 != invalidationVersion } ?? false
+        tickVersion = nil
+        dirty = invalidatedDuringTick || !presented || hasPendingWork
         return active && dirty
     }
 }
