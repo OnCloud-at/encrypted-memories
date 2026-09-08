@@ -68,6 +68,21 @@ package struct MetalGridDrawableTarget {
         CGSize(width: drawable.texture.width, height: drawable.texture.height)
     }
 
+    /// Adds a bounded, callback-only observation of the actual Core Animation presentation. Callers must keep
+    /// the handler nonblocking; Metal can invoke it away from the main actor.
+    package func addPresentedHandler(_ handler: @escaping @Sendable (CFTimeInterval?) -> Void) {
+        #if targetEnvironment(simulator)
+            // The simulator MTLDrawable protocol omits addPresentedHandler/presentedTime. Leave presentation
+            // unavailable there; deterministic tests exercise the accumulator directly instead of fabricating it.
+            _ = handler
+        #else
+            drawable.addPresentedHandler { drawable in
+                let presentedTime = drawable.presentedTime
+                handler(presentedTime > 0 ? presentedTime : nil)
+            }
+        #endif
+    }
+
     package init(
         drawable: CAMetalDrawable,
         renderPassDescriptor: MTLRenderPassDescriptor,

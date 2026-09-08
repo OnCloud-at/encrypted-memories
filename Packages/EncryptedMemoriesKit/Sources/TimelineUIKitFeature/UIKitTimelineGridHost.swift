@@ -226,7 +226,8 @@
         let scrollView = UIScrollView()
         private let contentView = UIView()
         private let profileAdapter = UIKitTimelineGridProfileAdapter()
-        private let displayLink = UIKitTimelineDisplayLinkDriver()
+        private let displayLink: UIKitTimelineDisplayLinkDriver
+        private let renderFrameOverride: (() -> GridRenderOutcome)?
         private weak var contentReplacementSnapshot: UIView?
         private var contentReplacementUsesSurfaceFade = false
 
@@ -324,9 +325,9 @@
         /// The finger's last position in viewport space, so an auto-scroll tick (finger stationary, content moving)
         /// re-resolves the item under it against the new content offset - no skipped rows.
         private var dragLastViewportPoint: CGPoint = .zero
-        /// Dedicated driver for the edge auto-scroll ramp, separate from the render `displayLink` (whose driver
-        /// stops itself on re-start), so auto-scrolling the selection never stops the render loop.
-        private let autoScrollLink = UIKitTimelineDisplayLinkDriver()
+        /// Whether the edge auto-scroll ramp is active. It advances from the grid's existing display link so one
+        /// attached surface never installs a second frame timer.
+        private var autoScrollActive = false
         private var autoScrollLastTimestamp: CFTimeInterval = 0
         /// The edge band thickness and max ramp speed for drag-select auto-scroll (points, points/second).
         private static let autoScrollEdgeInset: CGFloat = 96
@@ -395,6 +396,9 @@
         /// next scroll event.
         var framePump = GridFramePump()
         private var perf = RenderPerfWindow()
+        private let presentationTiming = PresentationTimingAccumulator()
+        private var activeDisplayFrame: UIKitTimelineDisplayFrame?
+        private var applicationIsBackgrounded = false
 
         public private(set) var isMetal3Capable = false
 
@@ -419,24 +423,46 @@
         public var onDragSelectionChanged: ((Set<PhotoUID>) -> Void)?
 
         public override init(frame: CGRect = .zero) {
+            displayLink = UIKitTimelineDisplayLinkDriver()
+            renderFrameOverride = nil
             super.init(frame: frame)
             configureSubviews()
             configureMetal()
         }
 
+        init(
+            frame: CGRect = .zero,
+            displayLink: UIKitTimelineDisplayLinkDriver,
+            renderFrame: @escaping () -> GridRenderOutcome
+        ) {
+            self.displayLink = displayLink
+            renderFrameOverride = renderFrame
+            super.init(frame: frame)
+            configureSubviews()
+            configureMetal()
+            isMetal3Capable = true
+        }
+
         public required init?(coder: NSCoder) {
+            displayLink = UIKitTimelineDisplayLinkDriver()
+            renderFrameOverride = nil
             super.init(coder: coder)
             configureSubviews()
             configureMetal()
         }
 
         deinit {
-            imagesAvailableWakeRegistration?.end()
-            let pressureRegistration = texturePressureRegistration
+            let finalDisplayLink = displayLink
+            let finalImagesAvailableWakeRegistration = imagesAvailableWakeRegistration
+            let finalTexturePressureRegistration = texturePressureRegistration
+            let finalWarmTask = warmTask
+            NotificationCenter.default.removeObserver(self)
+            finalImagesAvailableWakeRegistration?.end()
             Task { @MainActor in
-                pressureRegistration?.end()
+                finalDisplayLink.stop()
+                finalTexturePressureRegistration?.end()
             }
-            warmTask?.cancel()
+            finalWarmTask?.cancel()
         }
 
         public func configure(
@@ -634,9 +660,10 @@
             if window == nil {
                 suspendRenderLoop()
             } else if framePump.isActive {
+                applicationIsBackgrounded = UIApplication.shared.applicationState == .background
                 // Re-attached while the tab is active, resume. If the tab is inactive, stay
                 // suspended; `setActive(true)` resumes later (window is present by then).
-                resumeRenderLoop()
+                if !applicationIsBackgrounded { resumeRenderLoop() }
             }
             invalidateAccessibilityElements()
         }
@@ -664,8 +691,9 @@
         /// Stop the render loop and drop all in-flight warm work - used both when the view leaves its window and
         /// when the tab deactivates. Visible cache/textures stay resident, so returning redraws immediately.
         private func suspendRenderLoop() {
-            displayLink.stop()
-            perf.noteLoopStopped()
+            displayLink.pause()
+            perf.noteLoopPaused(reason: "suspended")
+            presentationTiming.resetCadence()
             cancelDragSelectIfActive()  // never leave an edge auto-scroll driver running off-screen / off-tab
             warmTask?.cancel()
             aheadWarmTask?.cancel()
@@ -691,6 +719,18 @@
             backgroundColor = .black
             isAccessibilityElement = false
             shouldGroupAccessibilityChildren = true
+            NotificationCenter.default.addObserver(
+                self,
+                selector: #selector(applicationDidEnterBackground),
+                name: UIApplication.didEnterBackgroundNotification,
+                object: nil
+            )
+            NotificationCenter.default.addObserver(
+                self,
+                selector: #selector(applicationDidBecomeActive),
+                name: UIApplication.didBecomeActiveNotification,
+                object: nil
+            )
 
             metalView.translatesAutoresizingMaskIntoConstraints = true
             metalView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
@@ -731,6 +771,17 @@
             // dependency, the simultaneous tap recognizer also fires when that same finger lifts; by then
             // selection mode is active, so the release tap immediately toggles the anchor back off.
             tap.require(toFail: dragSelect)
+        }
+
+        @objc func applicationDidEnterBackground() {
+            applicationIsBackgrounded = true
+            suspendRenderLoop()
+        }
+
+        @objc func applicationDidBecomeActive() {
+            applicationIsBackgrounded = false
+            guard window != nil, framePump.isActive else { return }
+            resumeRenderLoop()
         }
 
         private func configureMetal() {
@@ -1094,34 +1145,79 @@
             // Start the loop only when the surface can actually draw: in a window AND active (the pump gates
             // `shouldTick` on active). A hidden/inactive grid stays marked dirty, so returning re-arms it, but
             // never spins the display link while menus/other tabs are on screen.
-            guard window != nil, framePump.shouldTick else { return }
+            guard let window, !applicationIsBackgrounded, framePump.shouldTick else { return }
+            let maximumFramesPerSecond = window.screen.maximumFramesPerSecond
             if !displayLink.isRunning {
-                displayLink.start { [weak self] _ in
-                    self?.tick()
+                displayLink.start(maximumFramesPerSecond: maximumFramesPerSecond) { [weak self] frame in
+                    self?.tick(frame)
                 }
+            } else {
+                displayLink.configure(maximumFramesPerSecond: maximumFramesPerSecond)
             }
         }
 
-        private func tick() {
+        private func tick(_ frame: UIKitTimelineDisplayFrame) {
+            perf.notePresentation(presentationTiming.drain())
             guard framePump.beginTick() else {
-                displayLink.stop()
-                perf.noteLoopStopped()
+                // An input phase can remain active while a finger is stationary. A clean pump has no
+                // work even then; the next scroll/thumbnail invalidation resumes this same installed link.
+                perf.noteLoopPaused(reason: "idle")
+                presentationTiming.resetCadence()
+                displayLink.pause()
                 return
+            }
+            activeDisplayFrame = frame
+            if autoScrollActive {
+                let targetInterval = frame.targetTimestamp - frame.timestamp
+                autoScrollTick(
+                    frame.timestamp,
+                    initialInterval: targetInterval > 0 ? targetInterval : frame.duration
+                )
             }
             advancePinchSettleIfNeeded()
             let outcome = renderNow()
+            activeDisplayFrame = nil
             let keepTicking = framePump.completeTick(outcome)
             var drawableFailed = false
             if case .noDrawable = outcome { drawableFailed = true }
-            perf.noteTick(drawableFailed: drawableFailed)
-            if !keepTicking {
-                perf.flush(reason: "idle")
-                displayLink.stop()
+            var drew = false
+            if case .drawn = outcome { drew = true }
+            let completedAt = CACurrentMediaTime()
+            perf.noteTick(
+                frame: frame,
+                phase: currentScrollPhase,
+                drew: drew,
+                drawableFailed: drawableFailed,
+                completedAt: completedAt
+            )
+            if !keepTicking, !renderLoopHasActiveMotion {
+                perf.noteLoopPaused(reason: "idle")
+                presentationTiming.resetCadence()
+                displayLink.pause()
             }
+        }
+
+        private var currentScrollPhase: UIKitGridScrollPhase {
+            if scrollView.isTracking { return .tracking }
+            if scrollView.isDecelerating { return .decelerating }
+            if scrollView.isDragging || scrollInputActive || selectionInputActive || autoScrollActive {
+                return .dragging
+            }
+            if pinchStartLevel != nil || zoomTransaction != nil || commitBridgeTransaction != nil
+                || gridTransition.isActive || overviewDissolve != nil || pinchSettling
+            {
+                return .animating
+            }
+            return .idle
+        }
+
+        private var renderLoopHasActiveMotion: Bool {
+            currentScrollPhase != .idle
         }
 
         @discardableResult
         private func renderNow() -> GridRenderOutcome {
+            if let renderFrameOverride { return renderFrameOverride() }
             guard isMetal3Capable,
                 bounds.width > 0,
                 bounds.height > 0,
@@ -1129,11 +1225,6 @@
                 let textureCache,
                 let texturePolicy
             else { return .skippedNoSurface }
-            guard let target = MetalGridDrawableTarget(layer: metalView.metalLayer, clearColor: Self.gridClearColor)
-            else {
-                return .noDrawable
-            }
-
             let viewportSize = bounds.size
             let overscan = texturePolicy.budget.overscanFraction * viewportSize.height
             let profile = currentProfile()
@@ -1142,7 +1233,6 @@
 
             if let dissolve = overviewDissolve {
                 return renderOverviewDissolve(
-                    target: target,
                     renderer: renderer,
                     textureCache: textureCache,
                     plan: dissolve,
@@ -1152,7 +1242,6 @@
 
             if gridTransition.isActive {
                 return renderTransitionFrame(
-                    target: target,
                     renderer: renderer,
                     textureCache: textureCache,
                     viewportSize: viewportSize
@@ -1174,7 +1263,6 @@
                     )
                     let metrics = engine.resolvedMetrics(level: commitBridgeLevel, width: bounds.width)
                     return renderSlotFrame(
-                        target: target,
                         renderer: renderer,
                         textureCache: textureCache,
                         slots: slots,
@@ -1193,7 +1281,6 @@
                 let frame = tx.frame(
                     continuousLevel: zoomTransactionLevel, viewportSize: viewportSize, overscan: overscan)
                 return renderSlotFrame(
-                    target: target,
                     renderer: renderer,
                     textureCache: textureCache,
                     slots: frame.visibleSlots,
@@ -1214,7 +1301,6 @@
             )
 
             let outcome = renderSlotFrame(
-                target: target,
                 renderer: renderer,
                 textureCache: textureCache,
                 slots: renderSlots(from: plan.visibleSlots),
@@ -1233,11 +1319,11 @@
         }
 
         private func renderTransitionFrame(
-            target: MetalGridDrawableTarget,
             renderer: MetalGridRenderer,
             textureCache: MetalGridTextureCache<PhotoUID>,
             viewportSize: CGSize
         ) -> GridRenderOutcome {
+            let cpuPreparationStarted = CACurrentMediaTime()
             let now = CACurrentMediaTime()
             let draws = gridTransition.currentDraws()
             guard !draws.isEmpty else { return .drawn(hasPendingWork: false) }
@@ -1259,9 +1345,12 @@
                 now: now
             ).groups
             textureCache.evictToBudget()
-            renderer.render(to: target, viewportSize: viewportSize, groups: groups)
+            guard let acquisition = acquireDrawableTarget() else { return .noDrawable }
+            let cpuPreparationMs = (acquisition.startedAt - cpuPreparationStarted) * 1000
+            renderer.render(to: acquisition.target, viewportSize: viewportSize, groups: groups)
             return finishTransitionDraw(
-                uids: uids, slotSidePoints: slotSide, textureCache: textureCache, now: now)
+                uids: uids, slotSidePoints: slotSide, textureCache: textureCache, renderer: renderer,
+                cpuPreparationMs: cpuPreparationMs, drawableWaitMs: acquisition.waitMs, now: now)
         }
 
         /// Shared tail of every transition/dissolve frame: warm the still-missing tiles at the transition's
@@ -1270,6 +1359,9 @@
             uids: [PhotoUID],
             slotSidePoints: CGFloat,
             textureCache: MetalGridTextureCache<PhotoUID>,
+            renderer: MetalGridRenderer,
+            cpuPreparationMs: Double,
+            drawableWaitMs: Double,
             now: Double = CACurrentMediaTime()
         ) -> GridRenderOutcome {
             let feed = thumbnailFeed
@@ -1285,18 +1377,20 @@
             perf.noteDraw(
                 visible: uids.count, missing: missing.count,
                 ramHitGpuMiss: ramReadyMissing, saturated: textureCache.residencySaturatedThisFrame,
-                cache: textureCache)
+                cache: textureCache, cpuPreparationMs: cpuPreparationMs,
+                drawableWaitMs: drawableWaitMs, frameBoundaryWaitMs: renderer.lastFrameBoundaryWaitMs,
+                rendererEncodeMs: renderer.lastEncodeMs, gpuMs: renderer.lastCompletedGpuMs)
             let activeReveal = textureCache.hasActiveThumbnailReveal(in: uids, now: now)
             return .drawn(hasPendingWork: pinchSettling || warmInFlight || ramReadyMissing > 0 || activeReveal)
         }
 
         private func renderOverviewDissolve(
-            target: MetalGridDrawableTarget,
             renderer: MetalGridRenderer,
             textureCache: MetalGridTextureCache<PhotoUID>,
             plan: OverviewLayerDissolvePlan,
             viewportSize: CGSize
         ) -> GridRenderOutcome {
+            let cpuPreparationStarted = CACurrentMediaTime()
             let now = CACurrentMediaTime()
             let sourceSlots = renderSlots(from: plan.source.visibleSlots)
             let targetSlots = renderSlots(from: plan.target.visibleSlots)
@@ -1315,37 +1409,38 @@
             let targetResidentAfter = residentSlotCount(targetSlots, textureCache: textureCache)
             let activeReveal = textureCache.hasActiveThumbnailReveal(in: uids, now: now)
             textureCache.evictToBudget()
+            let sourceGroups = MetalGridFrameComposer.buildGroups(
+                slots: MetalGridFrameComposer.viewportDrawSlots(sourceSlots, viewportSize: viewportSize),
+                flatUIDs: itemUIDs,
+                cache: textureCache,
+                displayMode: plan.sourceDisplayMode,
+                cornerRadius: GridVisualConstants.thumbnailCornerRadius,
+                decorations: productionDecorations(),
+                now: now
+            ).groups
+            let targetGroups = MetalGridFrameComposer.buildGroups(
+                slots: MetalGridFrameComposer.viewportDrawSlots(targetSlots, viewportSize: viewportSize),
+                flatUIDs: itemUIDs,
+                cache: textureCache,
+                displayMode: plan.targetDisplayMode,
+                cornerRadius: GridVisualConstants.thumbnailCornerRadius,
+                decorations: productionDecorations(),
+                now: now
+            ).groups
+            guard let acquisition = acquireDrawableTarget() else { return .noDrawable }
+            let cpuPreparationMs = (acquisition.startedAt - cpuPreparationStarted) * 1000
             renderer.renderLayerDissolve(
-                to: target,
+                to: acquisition.target,
                 viewportSize: viewportSize,
                 redrawSource: sourceResidentAfter != sourceResidentBefore || activeReveal,
                 redrawTarget: targetResidentAfter != targetResidentBefore || activeReveal,
-                sourceGroups: {
-                    MetalGridFrameComposer.buildGroups(
-                        slots: MetalGridFrameComposer.viewportDrawSlots(sourceSlots, viewportSize: viewportSize),
-                        flatUIDs: itemUIDs,
-                        cache: textureCache,
-                        displayMode: plan.sourceDisplayMode,
-                        cornerRadius: GridVisualConstants.thumbnailCornerRadius,
-                        decorations: productionDecorations(),
-                        now: now
-                    ).groups
-                },
-                targetGroups: {
-                    MetalGridFrameComposer.buildGroups(
-                        slots: MetalGridFrameComposer.viewportDrawSlots(targetSlots, viewportSize: viewportSize),
-                        flatUIDs: itemUIDs,
-                        cache: textureCache,
-                        displayMode: plan.targetDisplayMode,
-                        cornerRadius: GridVisualConstants.thumbnailCornerRadius,
-                        decorations: productionDecorations(),
-                        now: now
-                    ).groups
-                },
+                sourceGroups: { sourceGroups },
+                targetGroups: { targetGroups },
                 t: Float(plan.targetOpacity)
             )
             return finishTransitionDraw(
-                uids: uids, slotSidePoints: slotSide, textureCache: textureCache, now: now)
+                uids: uids, slotSidePoints: slotSide, textureCache: textureCache, renderer: renderer,
+                cpuPreparationMs: cpuPreparationMs, drawableWaitMs: acquisition.waitMs, now: now)
         }
 
         private func streamTransitionTextures(
@@ -1397,7 +1492,6 @@
         }
 
         private func renderSlotFrame(
-            target: MetalGridDrawableTarget,
             renderer: MetalGridRenderer,
             textureCache: MetalGridTextureCache<PhotoUID>,
             slots: [GridRenderSlot],
@@ -1407,6 +1501,7 @@
             reportFirstContent: Bool,
             forcePendingWork: Bool
         ) -> GridRenderOutcome {
+            let cpuPreparationStarted = CACurrentMediaTime()
             let now = CACurrentMediaTime()
             let uploadPixels = GridTextureUploadSizing.uploadPixels(
                 slotSidePoints: slotSidePoints,
@@ -1452,7 +1547,9 @@
                 now: now
             ).groups
             textureCache.evictToBudget()
-            renderer.render(to: target, viewportSize: viewportSize, groups: groups)
+            guard let acquisition = acquireDrawableTarget() else { return .noDrawable }
+            let cpuPreparationMs = (acquisition.startedAt - cpuPreparationStarted) * 1000
+            renderer.render(to: acquisition.target, viewportSize: viewportSize, groups: groups)
 
             let missingVisible = newestFirst(
                 ids.visible.filter { uid in
@@ -1501,8 +1598,35 @@
             perf.noteDraw(
                 visible: ids.visible.count, missing: missingVisible.count,
                 ramHitGpuMiss: ramReadyMissing, saturated: textureCache.residencySaturatedThisFrame,
-                cache: textureCache)
+                cache: textureCache, cpuPreparationMs: cpuPreparationMs,
+                drawableWaitMs: acquisition.waitMs, frameBoundaryWaitMs: renderer.lastFrameBoundaryWaitMs,
+                rendererEncodeMs: renderer.lastEncodeMs, gpuMs: renderer.lastCompletedGpuMs)
             return .drawn(hasPendingWork: hasPendingWork)
+        }
+
+        private func acquireDrawableTarget() -> (
+            target: MetalGridDrawableTarget,
+            startedAt: CFTimeInterval,
+            waitMs: Double
+        )? {
+            let startedAt = CACurrentMediaTime()
+            guard let target = MetalGridDrawableTarget(layer: metalView.metalLayer, clearColor: Self.gridClearColor)
+            else {
+                perf.noteDrawableWait((CACurrentMediaTime() - startedAt) * 1000)
+                return nil
+            }
+            let waitMs = (CACurrentMediaTime() - startedAt) * 1000
+            if let frame = activeDisplayFrame {
+                let targetInterval = frame.targetTimestamp - frame.timestamp
+                target.addPresentedHandler { [presentationTiming] presentedTime in
+                    presentationTiming.note(
+                        presentedTime: presentedTime,
+                        targetTimestamp: frame.targetTimestamp,
+                        targetInterval: targetInterval
+                    )
+                }
+            }
+            return (target, startedAt, waitMs)
         }
 
         /// The resolved grid geometry for the current viewport + active level, or nil when there is nothing to lay
@@ -1677,26 +1801,27 @@
             }
         }
 
-        private func updateAutoScroll(viewportY: CGFloat) {
+        func updateAutoScroll(viewportY: CGFloat) {
             let inBand = GridEdgeAutoScrollPolicy.isInEdgeBand(
                 touchY: viewportY, viewportHeight: bounds.height, edgeInset: Self.autoScrollEdgeInset)
             if inBand {
-                if !autoScrollLink.isRunning {
+                if !autoScrollActive {
+                    autoScrollActive = true
                     autoScrollLastTimestamp = 0
-                    autoScrollLink.start { [weak self] timestamp in self?.autoScrollTick(timestamp) }
+                    requestRender()
                 }
             } else {
                 stopAutoScroll()
             }
         }
 
-        private func autoScrollTick(_ timestamp: CFTimeInterval) {
+        private func autoScrollTick(_ timestamp: CFTimeInterval, initialInterval: CFTimeInterval) {
             guard dragActive else {
                 stopAutoScroll()
                 return
             }
             let dt: CFTimeInterval =
-                autoScrollLastTimestamp == 0 ? 1.0 / 60.0 : max(0, timestamp - autoScrollLastTimestamp)
+                autoScrollLastTimestamp == 0 ? max(0, initialInterval) : max(0, timestamp - autoScrollLastTimestamp)
             autoScrollLastTimestamp = timestamp
             let velocity = GridEdgeAutoScrollPolicy.velocity(
                 touchY: dragLastViewportPoint.y, viewportHeight: bounds.height,
@@ -1710,7 +1835,7 @@
             // Already pinned to the top/bottom edge - the clamp produced no movement, so there is nothing left to
             // reveal or select. Stop the ramp so neither the auto-scroll link nor the render loop spins at full
             // frame rate doing no-op work at the boundary (a finger held in the band with the grid already at its
-            // limit). A later finger move re-enters updateAutoScroll and restarts the link if progress is again
+            // limit). A later finger move re-enters updateAutoScroll and restarts the ramp if progress is again
             // possible; the finger's current position was already applied by the triggering `updateDragSelect`.
             guard newY != currentY else {
                 stopAutoScroll()
@@ -1730,7 +1855,7 @@
         }
 
         private func stopAutoScroll() {
-            if autoScrollLink.isRunning { autoScrollLink.stop() }
+            autoScrollActive = false
             autoScrollLastTimestamp = 0
         }
 

@@ -289,6 +289,8 @@ public actor ThumbnailFeedCore {
     /// one unstructured actor task per display tick. Exactly one actor drain is scheduled at a time; skipped
     /// intermediate generations were never visible long enough to deserve disk work.
     private nonisolated let visibleDiskDemandInbox = LatestVisibleDecodeDemandInbox()
+    /// Stable network intent survives source maintenance independently of the moving disk viewport.
+    private var visiblePriorityDemand: [PhotoUID]?
     /// One long-lived latest-demand queue serves moving viewports. Replacing the viewport drops only pending
     /// stale work; already-running synchronous reads finish in their existing lanes and workers then pull from
     /// the newest generation. This prevents cancelled per-viewport task groups from accumulating blockers.
@@ -443,8 +445,8 @@ public actor ThumbnailFeedCore {
         cache.isCurrentSessionLease(ownerSessionLease)
     }
 
-    /// Subscribe to the "images available" arrival wake (see `onImagesAvailable`). The callback fires on the feed
-    /// actor whenever a thumbnail becomes available while a viewport is recently live; the host hops to its own
+    /// Subscribe to the "images available" wake (see `onImagesAvailable`). The callback fires after source
+    /// admission or when a thumbnail becomes available while a viewport is recently live; the host hops to its own
     /// actor and redraws / re-warms. Registration is synchronous with respect to the nonisolated wake box, so a
     /// first visible viewport cannot miss a tiny cached arrival while an actor task is still queued.
     @discardableResult
@@ -491,6 +493,9 @@ public actor ThumbnailFeedCore {
         let clamped = min(1, max(0, scale))
         decoded.setCostLimit(max(1, Int(Double(configuration.decodedMemoryBudgetBytes) * clamped)))
         if purge { decoded.removeAll() }
+        // Eviction is not completed viewport work. Permit the next host demand to retry, without
+        // immediately refilling memory while the governor is asking consumers to release it.
+        visibleDiskDemandInbox.invalidate()
     }
 
     public func cachedDecoded(for uid: PhotoUID) async -> DecodedThumbnail? {
@@ -780,6 +785,12 @@ public actor ThumbnailFeedCore {
     @discardableResult
     public func replaceVisiblePriorityDemand(_ orderedUIDs: [PhotoUID]) -> Int {
         lastDemand.set(clock())
+        visiblePriorityDemand = orderedUIDs
+        guard !sourceReconciliationInFlight else { return 0 }
+        return applyVisiblePriorityDemand(orderedUIDs)
+    }
+
+    private func applyVisiblePriorityDemand(_ orderedUIDs: [PhotoUID]) -> Int {
         removeQueuedPriorities([.visibleNow, .nearViewportScrollAhead])
 
         var seen = Set<PhotoUID>()
@@ -838,9 +849,15 @@ public actor ThumbnailFeedCore {
         _ requests: [ThumbnailRequest]
     ) {
         lastDemand.set(clock())
-        let authorized = requests.filter { selectedAuthorization.isAllowed($0.uid) }
-        guard visibleDiskDemandInbox.submit(requests: authorized) else { return }
+        // Keep raw viewport intent. Authorization is an execution fence, not an acknowledgement that
+        // these tiles were loaded: the first viewport can arrive before its source scope is admitted.
+        guard visibleDiskDemandInbox.submit(requests: requests) else { return }
         Task { await drainVisibleDiskDemandInbox() }
+    }
+
+    private func replayVisibleDiskDecodeDemand() {
+        guard ownerLeaseIsCurrent(), visibleDiskDemandInbox.replay() else { return }
+        Task { drainVisibleDiskDemandInbox() }
     }
 
     private func drainVisibleDiskDemandInbox() {
@@ -853,6 +870,7 @@ public actor ThumbnailFeedCore {
         _ requests: [ThumbnailRequest],
         generation: UInt64
     ) {
+        guard !sourceReconciliationInFlight, ownerLeaseIsCurrent() else { return }
         var seen = Set<PhotoUID>()
         let jobs = requests.compactMap { request -> LatestVisibleDecodeDemand.Job? in
             guard selectedAuthorization.isAllowed(request.uid) else { return nil }
@@ -878,6 +896,7 @@ public actor ThumbnailFeedCore {
     }
 
     private func startVisibleDiskWorkersIfNeeded() {
+        guard !sourceReconciliationInFlight else { return }
         let desired = min(configuration.maxConcurrentDecodes, visibleDiskDemand.pendingCount)
         while visibleDiskWorkerCount < desired {
             visibleDiskWorkerCount += 1
@@ -897,6 +916,7 @@ public actor ThumbnailFeedCore {
             startVisibleDiskWorkersIfNeeded()
         }
         while let job = visibleDiskDemand.takeNext() {
+            let demandGeneration = visibleDiskDemand.generation
             guard await decodePermits.acquire(priority: .visibleNow) else {
                 // `false` means this worker was cancelled before it acquired a lane. The asset was not read,
                 // so it must remain pending if it still belongs to the latest viewport generation.
@@ -926,7 +946,13 @@ public actor ThumbnailFeedCore {
                 continue
             }
             publishVisibleDiskTile(tile, generation: generation)
-            visibleDiskDemand.complete(job)
+            if tile.decoded == nil, demandGeneration != visibleDiskDemand.generation {
+                // A disk arrival can replay the viewport while this read is still returning its earlier
+                // miss. Preserve that retry without ever running two decodes for the same UID at once.
+                visibleDiskDemand.returnToPending(job)
+            } else {
+                visibleDiskDemand.complete(job)
+            }
         }
     }
 
@@ -1283,6 +1309,14 @@ public actor ThumbnailFeedCore {
     }
 
     public func stopPrefetch() {
+        stopPrefetch(preservingVisibleDemand: false)
+    }
+
+    private func stopPrefetch(preservingVisibleDemand: Bool) {
+        if !preservingVisibleDemand {
+            visibleDiskDemandInbox.cancel()
+            visiblePriorityDemand = nil
+        }
         flushCheckpointUpdates()
         prefetchGeneration &+= 1
         let activeWorker = workerTask
@@ -1315,7 +1349,11 @@ public actor ThumbnailFeedCore {
     /// Stops and joins every worker owned by this feed instance. Account retry and sign-out use this
     /// boundary before releasing the backend; destructive cache clear remains generation-fenced and non-blocking.
     public func stopPrefetchAndWait() async {
-        stopPrefetch()
+        await stopPrefetchAndWait(preservingVisibleDemand: false)
+    }
+
+    private func stopPrefetchAndWait(preservingVisibleDemand: Bool) async {
+        stopPrefetch(preservingVisibleDemand: preservingVisibleDemand)
         while true {
             let retiredWorkers = retiredWorkerTasks
             retiredWorkerTasks.removeAll(keepingCapacity: false)
@@ -1435,14 +1473,26 @@ public actor ThumbnailFeedCore {
         }
 
         sourceReconciliationInFlight = true
-        defer { sourceReconciliationInFlight = false }
+        var resumeVisibleDemand = false
+        defer {
+            sourceReconciliationInFlight = false
+            if resumeVisibleDemand, ownerLeaseIsCurrent() {
+                replayVisibleDiskDecodeDemand()
+                if let visiblePriorityDemand {
+                    _ = applyVisiblePriorityDemand(visiblePriorityDemand)
+                }
+                // Both native hosts already re-warm on this Core wake. In particular, UIKit's awaited
+                // warm pass may have completed while authorization was still empty or workers were joined.
+                imagesAvailableWake.call()
+            }
+        }
         let incomingRevision = selectedScope.revision
         var request = incomingRequest
 
         while true {
             // Join the previous crawl before removing its coverage checkpoint. No retired worker can recreate
             // old cache or checkpoint state after cleanup.
-            await stopPrefetchAndWait()
+            await stopPrefetchAndWait(preservingVisibleDemand: true)
 
             if let pending = pendingSourceReconciliation,
                 pending.selectedScope.revision >= request.selectedScope.revision
@@ -1535,6 +1585,7 @@ public actor ThumbnailFeedCore {
                 processedRevision: request.selectedScope.revision,
                 result: cacheResult
             )
+            resumeVisibleDemand = true
             return incomingRevision == request.selectedScope.revision ? cacheResult : .staleScope
         }
     }
@@ -1855,6 +1906,7 @@ public actor ThumbnailFeedCore {
             // re-warm missing visible cells from disk and redraw.
             if completed > 0 {
                 cacheArrivalWake.call()
+                replayVisibleDiskDecodeDemand()
                 if hostArrivalWakeIsLive(now: clock()) {
                     imagesAvailableWake.call()
                 }
@@ -2576,6 +2628,7 @@ public actor ThumbnailFeedCore {
     /// completion, rather than after the surrounding task group drains: the native host coalesces redraw requests
     /// onto its display link, so the first ready visible tile can be uploaded while slower encrypted reads run.
     private func notifyHostOfAvailableImageIfVisible() {
+        visibleDiskDemandInbox.invalidate()
         guard hostArrivalWakeIsLive(now: clock()) else { return }
         imagesAvailableWake.call()
     }
@@ -2748,6 +2801,8 @@ final class LatestVisibleDecodeDemandInbox: @unchecked Sendable {
 
     private let lock = NSLock()
     private var latest: Submission?
+    private var retainedRequests: [ThumbnailRequest]?
+    private var needsResubmission = false
     private var drainScheduled = false
     private var nextGeneration: UInt64 = 0
 
@@ -2755,12 +2810,41 @@ final class LatestVisibleDecodeDemandInbox: @unchecked Sendable {
     /// generation so replacing a platform data source cannot reset ordering while this feed remains alive.
     func submit(requests: [ThumbnailRequest]) -> Bool {
         lock.withLock {
-            nextGeneration &+= 1
-            latest = Submission(requests: requests, generation: nextGeneration)
-            guard !drainScheduled else { return false }
-            drainScheduled = true
-            return true
+            guard needsResubmission || requests != retainedRequests else { return false }
+            retainedRequests = requests
+            return enqueue(requests)
         }
+    }
+
+    /// A scope admission or disk arrival can make an unchanged viewport actionable. Re-submit the latest
+    /// intent under the same lock so recovery cannot overwrite a newer viewport with an older snapshot.
+    func replay() -> Bool {
+        lock.withLock {
+            guard let retainedRequests, !retainedRequests.isEmpty else { return false }
+            return enqueue(retainedRequests)
+        }
+    }
+
+    /// Terminal owner shutdown clears intent; source reconciliation only pauses execution and retains it.
+    func cancel() {
+        lock.withLock {
+            retainedRequests = nil
+            latest = nil
+            needsResubmission = false
+        }
+    }
+
+    func invalidate() {
+        lock.withLock { needsResubmission = true }
+    }
+
+    private func enqueue(_ requests: [ThumbnailRequest]) -> Bool {
+        needsResubmission = false
+        nextGeneration &+= 1
+        latest = Submission(requests: requests, generation: nextGeneration)
+        guard !drainScheduled else { return false }
+        drainScheduled = true
+        return true
     }
 
     /// Returns the newest pending value. When empty, atomically releases drain ownership so a racing producer

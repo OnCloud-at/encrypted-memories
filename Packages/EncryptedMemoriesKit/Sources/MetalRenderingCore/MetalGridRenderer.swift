@@ -24,6 +24,8 @@ package final class MetalGridRenderer {
 
     package private(set) var lastEncodeMs: Double = 0
     package private(set) var lastGpuMs: Double = 0
+    package private(set) var lastCompletedGpuMs: Double?
+    package private(set) var lastFrameBoundaryWaitMs: Double = 0
     package private(set) var lastDrawCalls = 0
     package private(set) var lastInstanceCount = 0
     package private(set) var lastTextureBinds = 0
@@ -102,7 +104,9 @@ package final class MetalGridRenderer {
     @MainActor
     package func render(to target: MetalGridDrawableTarget, viewportSize: CGSize, groups: [MetalGridRenderGroup]) {
         drainCompletedGpuTimings()
+        lastFrameBoundaryWaitMs = 0
         let start = CFAbsoluteTimeGetCurrent()
+        defer { lastEncodeMs = (CFAbsoluteTimeGetCurrent() - start) * 1000 }
         guard let commandBuffer = commandQueue.makeCommandBuffer() else { return }
         let pass = target.renderPassDescriptor
         pass.colorAttachments[0].loadAction = .clear
@@ -113,7 +117,9 @@ package final class MetalGridRenderer {
         }
         // Claim a pool slot only once we're committed to drawing (the guards above can early-return without
         // a matching signal). The completion handler releases it when the GPU is done with this frame.
+        let boundaryWaitStarted = CFAbsoluteTimeGetCurrent()
         frameBoundary.wait()
+        lastFrameBoundaryWaitMs = (CFAbsoluteTimeGetCurrent() - boundaryWaitStarted) * 1000
         frameCounter &+= 1
         let slot = frameCounter % Self.maxInFlight
         commandBuffer.addCompletedHandler { [frameBoundary] _ in frameBoundary.signal() }
@@ -122,7 +128,6 @@ package final class MetalGridRenderer {
         encoder.endEncoding()
         pendingGpuCommandBuffers.append(commandBuffer)
         present(commandBuffer, to: target)
-        lastEncodeMs = (CFAbsoluteTimeGetCurrent() - start) * 1000
         lastDrawCalls = drawCalls
         lastInstanceCount = instances
         lastTextureBinds = textureBinds
@@ -287,7 +292,9 @@ package final class MetalGridRenderer {
         targetGroups: () -> [MetalGridRenderGroup], t: Float
     ) {
         drainCompletedGpuTimings()
+        lastFrameBoundaryWaitMs = 0
         let start = CFAbsoluteTimeGetCurrent()
+        defer { lastEncodeMs = (CFAbsoluteTimeGetCurrent() - start) * 1000 }
         guard let composite = compositePipeline,
             let cmd = commandQueue.makeCommandBuffer()
         else {
@@ -329,7 +336,6 @@ package final class MetalGridRenderer {
         enc.endEncoding()
         pendingGpuCommandBuffers.append(cmd)
         present(cmd, to: target)
-        lastEncodeMs = (CFAbsoluteTimeGetCurrent() - start) * 1000
         lastDrawCalls = sourceStats.0 + targetStats.0 + 1
         lastInstanceCount = sourceStats.1 + targetStats.1
         lastTextureBinds = sourceStats.2 + targetStats.2 + 2
@@ -337,12 +343,16 @@ package final class MetalGridRenderer {
 
     @MainActor
     private func drainCompletedGpuTimings() {
+        lastCompletedGpuMs = nil
         guard !pendingGpuCommandBuffers.isEmpty else { return }
         var stillPending: [MTLCommandBuffer] = []
         stillPending.reserveCapacity(pendingGpuCommandBuffers.count)
         for commandBuffer in pendingGpuCommandBuffers {
             if commandBuffer.status == .completed {
-                lastGpuMs = Self.gpuDurationMs(commandBuffer)
+                if let duration = Self.gpuDurationMs(commandBuffer) {
+                    lastGpuMs = duration
+                    lastCompletedGpuMs = duration
+                }
             } else {
                 stillPending.append(commandBuffer)
             }
@@ -350,10 +360,10 @@ package final class MetalGridRenderer {
         pendingGpuCommandBuffers = stillPending
     }
 
-    private static func gpuDurationMs(_ commandBuffer: MTLCommandBuffer) -> Double {
+    private static func gpuDurationMs(_ commandBuffer: MTLCommandBuffer) -> Double? {
         let start = commandBuffer.gpuStartTime
         let end = commandBuffer.gpuEndTime
-        guard start > 0, end >= start else { return 0 }
+        guard start > 0, end >= start else { return nil }
         return (end - start) * 1000
     }
 
