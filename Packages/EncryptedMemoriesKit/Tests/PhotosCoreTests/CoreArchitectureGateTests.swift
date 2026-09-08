@@ -2566,7 +2566,9 @@ final class CoreArchitectureGateTests: XCTestCase {
                 "#if canImport(UIKit)",
                 "public final class UIKitTimelineDisplayLinkDriver",
                 "CADisplayLink",
-                "preferredFramesPerSecond",
+                "preferredFrameRateRange",
+                "targetTimestamp",
+                "displayLink.isPaused = true",
                 "add(to: .main, forMode: .common)",
                 "stop()",
             ] where !source.contains(symbol) {

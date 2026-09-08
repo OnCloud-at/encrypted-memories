@@ -9,10 +9,18 @@
     /// `GridFramePlan.visibleSlots`, in engine order, through stable UID-keyed `UIAccessibilityElement` instances.
     @MainActor
     final class UIKitTimelineGridAccessibilityProvider {
-        weak var container: UIView?
+        weak var container: UIView? {
+            didSet {
+                guard oldValue !== container else { return }
+                oldValue?.accessibilityElements = nil
+                elementsByUID.removeAll(keepingCapacity: true)
+                elements = []
+            }
+        }
         private var elementsByUID: [PhotoUID: UIKitTimelineGridAccessibilityElement] = [:]
         private(set) var elements: [UIKitTimelineGridAccessibilityElement] = []
         private var invalidationScheduled = false
+        private(set) var membershipUpdateCount = 0
 
         var onOpen: ((PhotoItem) -> Void)?
         var onToggleSelection: ((PhotoItem) -> Void)?
@@ -56,6 +64,7 @@
                 visibleSlots: plan.visibleSlots,
                 selectedUIDs: host.selectedUIDs,
                 selectionMode: host.selectionMode,
+                localizationIdentifier: Self.currentLocalizationIdentifier,
                 frameForSlot: { [weak host] slot in
                     guard let host else { return .zero }
                     return Self.frameInContainer(for: slot, viewport: host.metalView, container: host)
@@ -70,6 +79,7 @@
             visibleSlots: [GridSlot],
             selectedUIDs: Set<PhotoUID>,
             selectionMode: Bool,
+            localizationIdentifier: String = UIKitTimelineGridAccessibilityProvider.currentLocalizationIdentifier,
             frameForSlot: (GridSlot) -> CGRect
         ) {
             guard let container else {
@@ -77,32 +87,51 @@
                 return
             }
 
-            var nextElements: [UIKitTimelineGridAccessibilityElement] = []
-            var nextByUID: [PhotoUID: UIKitTimelineGridAccessibilityElement] = [:]
-            nextElements.reserveCapacity(visibleSlots.count)
+            let validSlots = visibleSlots.filter { items.indices.contains($0.index) }
+            let nextUIDs = validSlots.map { items[$0.index].uid }
+            if nextUIDs != elements.map(\.uid) {
+                var nextElements: [UIKitTimelineGridAccessibilityElement] = []
+                var nextByUID: [PhotoUID: UIKitTimelineGridAccessibilityElement] = [:]
+                nextElements.reserveCapacity(validSlots.count)
+                for uid in nextUIDs {
+                    let element =
+                        elementsByUID[uid]
+                        ?? UIKitTimelineGridAccessibilityElement(
+                            container: container,
+                            uid: uid,
+                            activate: { [weak self] item, selectionMode in
+                                guard let self else { return false }
+                                if selectionMode {
+                                    self.onToggleSelection?(item)
+                                } else {
+                                    self.onOpen?(item)
+                                }
+                                return true
+                            })
+                    nextElements.append(element)
+                    nextByUID[uid] = element
+                }
+                elementsByUID = nextByUID
+                membershipUpdateCount += 1
+                replaceElements(nextElements)
+            }
 
-            for slot in visibleSlots {
-                guard items.indices.contains(slot.index) else { continue }
+            for (slot, element) in zip(validSlots, elements) {
                 let item = items[slot.index]
-                let element =
-                    elementsByUID[item.uid]
-                    ?? UIKitTimelineGridAccessibilityElement(container: container, uid: item.uid)
-                element.update(
+                element.updateFrame(frameForSlot(slot))
+                element.updateSemanticsIfNeeded(
                     item: item,
                     selected: selectedUIDs.contains(item.uid),
                     selectionMode: selectionMode,
                     position: slot.index + 1,
                     total: items.count,
-                    frame: frameForSlot(slot),
-                    onOpen: { [weak self] item in self?.onOpen?(item) },
-                    onToggleSelection: { [weak self] item in self?.onToggleSelection?(item) }
+                    localizationIdentifier: localizationIdentifier
                 )
-                nextElements.append(element)
-                nextByUID[item.uid] = element
             }
+        }
 
-            elementsByUID = nextByUID
-            replaceElements(nextElements)
+        static var currentLocalizationIdentifier: String {
+            "\(Locale.current.identifier)|\(Bundle.main.preferredLocalizations.joined(separator: ","))"
         }
 
         private func replaceElements(_ next: [UIKitTimelineGridAccessibilityElement]) {
@@ -115,7 +144,21 @@
     @MainActor
     final class UIKitTimelineGridAccessibilityElement: UIAccessibilityElement {
         let uid: PhotoUID
-        private var activateAction: (() -> Bool)?
+        private let activateAction: (PhotoItem, Bool) -> Bool
+        private var activeItem: PhotoItem?
+        private var selectionMode = false
+        private var semanticState: SemanticState?
+        private(set) var semanticUpdateCount = 0
+
+        private struct SemanticState: Equatable {
+            let captureTime: Date
+            let isVideo: Bool
+            let selected: Bool
+            let selectionMode: Bool
+            let position: Int
+            let total: Int
+            let localizationIdentifier: String
+        }
         private static let labelFormatter: DateFormatter = {
             let formatter = DateFormatter()
             formatter.dateStyle = .medium
@@ -123,22 +166,43 @@
             return formatter
         }()
 
-        init(container: UIView, uid: PhotoUID) {
+        init(
+            container: UIView,
+            uid: PhotoUID,
+            activate: @escaping (PhotoItem, Bool) -> Bool
+        ) {
             self.uid = uid
+            activateAction = activate
             super.init(accessibilityContainer: container)
         }
 
-        func update(
+        func updateFrame(_ frame: CGRect) {
+            accessibilityFrameInContainerSpace = frame
+        }
+
+        func updateSemanticsIfNeeded(
             item: PhotoItem,
             selected: Bool,
             selectionMode: Bool,
             position: Int,
             total: Int,
-            frame: CGRect,
-            onOpen: @escaping (PhotoItem) -> Void,
-            onToggleSelection: @escaping (PhotoItem) -> Void
+            localizationIdentifier: String
         ) {
-            accessibilityFrameInContainerSpace = frame
+            activeItem = item
+            self.selectionMode = selectionMode
+            let next = SemanticState(
+                captureTime: item.captureTime,
+                isVideo: item.isVideo,
+                selected: selected,
+                selectionMode: selectionMode,
+                position: position,
+                total: total,
+                localizationIdentifier: localizationIdentifier
+            )
+            guard semanticState != next else { return }
+            semanticState = next
+            semanticUpdateCount += 1
+            Self.labelFormatter.locale = .current
             let kind = L10n.string(item.isVideo ? "a11y.video" : "a11y.photo")
             accessibilityLabel = "\(kind), \(Self.labelFormatter.string(from: item.captureTime))"
             accessibilityValue = L10n.string("a11y.grid.position \(position) \(total)")
@@ -146,18 +210,11 @@
             var traits: UIAccessibilityTraits = [.image, .button]
             if selected { traits.insert(.selected) }
             accessibilityTraits = traits
-            activateAction = {
-                if selectionMode {
-                    onToggleSelection(item)
-                } else {
-                    onOpen(item)
-                }
-                return true
-            }
         }
 
         override func accessibilityActivate() -> Bool {
-            activateAction?() ?? false
+            guard let activeItem else { return false }
+            return activateAction(activeItem, selectionMode)
         }
     }
 #endif
