@@ -34,6 +34,9 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
     private var firstContentTraced = false
     private var firstGridFrameAt: CFTimeInterval = 0
 
+    var onRequestRedraw: (() -> Void)?
+    private(set) var lastRenderOutcome: GridRenderOutcome = .skippedNoSurface
+
     weak var clipView: NSClipView?
     weak var metalView: MTKView?
 
@@ -366,7 +369,7 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
         selectionMode = on
         requestRedraw()
     }
-    func requestRedraw() { metalView?.needsDisplay = true }
+    func requestRedraw() { onRequestRedraw?() }
 
     private func rebuildIndex() {
         var map: [PhotoUID: Int] = [:]
@@ -1158,7 +1161,7 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
     }
 
     /// Presents the sidebar resize snapshot at the current source-to-target interpolation.
-    private func drawSidebarResize(in view: MTKView, viewportSize: CGSize, now: CFTimeInterval) {
+    private func drawSidebarResize(to target: MetalGridDrawableTarget, viewportSize: CGSize, now: CFTimeInterval) {
         // Fixed gaps cannot be represented by one uniformly scaled quad, so keep this on bounded per-cell groups.
         let scaled = sidebarPresentationSlots(viewportSize: viewportSize, progress: presentationSidebarProgress)
         let flatUIDs = dataSource.flatUIDs
@@ -1189,7 +1192,7 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
             viewportSize: viewportSize,
             displayMode: presentationSnapshotDisplayMode
         )
-        renderer.render(in: view, viewportSize: viewportSize, groups: groups)
+        renderer.render(to: target, viewportSize: viewportSize, groups: groups)
         let activeReveal = cache.hasActiveThumbnailReveal(in: admission.visible, now: now)
         hasPendingVisibleThumbnails =
             activeReveal
@@ -1198,7 +1201,7 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
     }
 
     /// Presents the window-resize snapshot geometry while keeping thumbnail streaming live.
-    private func drawPresentationResize(in view: MTKView, viewportSize: CGSize, now: CFTimeInterval) {
+    private func drawPresentationResize(to target: MetalGridDrawableTarget, viewportSize: CGSize, now: CFTimeInterval) {
         let scaled = resizePresentationSlots(viewportSize: viewportSize)
         let flatUIDs = dataSource.flatUIDs
         let (visibleUIDs, overscanUIDs) = MetalGridFrameComposer.classifyVisibility(
@@ -1213,7 +1216,7 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
             now: now
         )
         let realCount = renderRealSlots(
-            in: view,
+            to: target,
             slots: Self.viewportDrawSlots(scaled, viewportSize: viewportSize),
             flatUIDs: flatUIDs,
             viewportSize: viewportSize,
@@ -1375,7 +1378,7 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
     /// Render the settle: each settled (target) slot eased from its scaled (source) position by `easeOut(progress)`.
     /// A target item with no source match (newly revealed at an edge) appears at its settled rect. Textures stream
     /// + decorations draw via the canonical real-slot path.
-    private func drawResizeSettle(in view: MTKView, viewportSize: CGSize, now: CFTimeInterval) {
+    private func drawResizeSettle(to target: MetalGridDrawableTarget, viewportSize: CGSize, now: CFTimeInterval) {
         let q = Self.easeOutCubic(min(1, max(0, resizeSettleProgress)))
         var srcByIndex: [Int: CGRect] = [:]
         srcByIndex.reserveCapacity(resizeSettleSource.count)
@@ -1401,7 +1404,7 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
             }
         }
         streamTextures(visibleUIDs: visibleUIDs, overscanUIDs: overscanUIDs, now: now)
-        _ = renderRealSlots(in: view, slots: slots, flatUIDs: flatUIDs, viewportSize: viewportSize)
+        _ = renderRealSlots(to: target, slots: slots, flatUIDs: flatUIDs, viewportSize: viewportSize)
         let activeReveal = cache.hasActiveThumbnailReveal(in: visibleUIDs, now: now)
         hasPendingVisibleThumbnails =
             activeReveal
@@ -1445,9 +1448,15 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
     }
 
     func draw(in view: MTKView) {
+        lastRenderOutcome = .skippedNoSurface
         guard let clip = clipView else { return }
         let viewportSize = view.bounds.size
         guard viewportSize.width > 1, viewportSize.height > 1 else { return }
+        guard let target = MetalGridDrawableTarget(view: view) else {
+            lastRenderOutcome = .noDrawable
+            return
+        }
+        defer { lastRenderOutcome = .drawn(hasPendingWork: hasPendingVisibleThumbnails) }
         // Refresh the display backing scale from the live drawable (invariant to window size - the ratio is the
         // Retina factor). Set before any early-returning branch so every path that reaches `streamTextures`
         // sizes uploads against the current display.
@@ -1457,18 +1466,18 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
         let now = CACurrentMediaTime()
         // During a live resize, present the gesture-start snapshot without re-resolving its grid.
         if presentationResizeActive {
-            drawPresentationResize(in: view, viewportSize: viewportSize, now: now)
+            drawPresentationResize(to: target, viewportSize: viewportSize, now: now)
             return
         }
         // Sidebar open/close: interpolate captured slots to the once-resolved destination while leaving the full
         // Metal surface behind the glass. Separate from live window resize; driven by the host's timed tick.
         if presentationSidebarActive {
-            drawSidebarResize(in: view, viewportSize: viewportSize, now: now)
+            drawSidebarResize(to: target, viewportSize: viewportSize, now: now)
             return
         }
         // A release settle is used only when the release layout changed its column count.
         if resizeSettleActive {
-            drawResizeSettle(in: view, viewportSize: viewportSize, now: now)
+            drawResizeSettle(to: target, viewportSize: viewportSize, now: now)
             return
         }
         // Overview boundaries use an offscreen two-layer dissolve.
@@ -1478,12 +1487,12 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
                 if q >= 1 {
                     finishClickOverviewDissolve()
                 } else if let updated = overviewDissolve {
-                    drawOverviewDissolve(in: view, plan: updated, viewportSize: viewportSize, now: now)
-                    view.setNeedsDisplay(view.bounds)
+                    drawOverviewDissolve(to: target, plan: updated, viewportSize: viewportSize, now: now)
+                    requestRedraw()
                     return
                 }
             } else {
-                drawOverviewDissolve(in: view, plan: plan, viewportSize: viewportSize, now: now)
+                drawOverviewDissolve(to: target, plan: plan, viewportSize: viewportSize, now: now)
                 return
             }
         }
@@ -1492,26 +1501,26 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
             // Live pinch progress comes from the host's scrub driver. Render the current progress and let the
             // host decide when to request the next frame.
             if gridTransition.activeKind == .pinch {
-                drawTransition(in: view, viewportSize: viewportSize, now: now)
+                drawTransition(to: target, viewportSize: viewportSize, now: now)
                 return
             }
             // Click: q is the host-clock trapezoidal profile advanced per display tick.
             let dt = transitionPrevNow == 0 ? 1.0 / 60.0 : max(0, now - transitionPrevNow)
             transitionPrevNow = now
             if gridTransition.advanceClick(bySeconds: dt) {
-                drawTransition(in: view, viewportSize: viewportSize, now: now)
-                view.setNeedsDisplay(view.bounds)  // keep ticking while the transition runs
+                drawTransition(to: target, viewportSize: viewportSize, now: now)
+                requestRedraw()  // keep ticking while the transition runs
                 return
             }
             // Continue with settled rendering when the controller finishes this tick.
         }
         // Commit bridge (post-release geometry settle) takes precedence over the settled render.
         if isCommitBridging {
-            drawCommitBridge(in: view, viewportSize: viewportSize, now: now)
+            drawCommitBridge(to: target, viewportSize: viewportSize, now: now)
             return
         }
         // Settled rendering draws the engine's frame plan.
-        drawEngineFrame(in: view, clip: clip, viewportSize: viewportSize, now: now)
+        drawEngineFrame(to: target, clip: clip, viewportSize: viewportSize, now: now)
     }
 
     // MARK: - Single-lattice transition render
@@ -1557,7 +1566,7 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
         committedPhase = tgtPhase  // commit settled target state (post-transition frame is the target)
         level = lv
         transitionPrevNow = 0
-        metalView?.setNeedsDisplay(metalView?.bounds ?? .zero)
+        requestRedraw()
         return tgtScroll.y
     }
 
@@ -1779,7 +1788,7 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
     /// Render the active dissolve: build each layer's settled groups (source keeps its mode; target square),
     /// stream both layers' textures, and hand them to the offscreen compositor as `mix(source, target, ease(q))`.
     private func drawOverviewDissolve(
-        in view: MTKView, plan: OverviewLayerDissolvePlan, viewportSize: CGSize, now: CFTimeInterval
+        to target: MetalGridDrawableTarget, plan: OverviewLayerDissolvePlan, viewportSize: CGSize, now: CFTimeInterval
     ) {
         let flatUIDs = dataSource.flatUIDs
         let srcSlots = renderTranslate(
@@ -1806,7 +1815,7 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
         evictTexturesToBudget()
         PhotoPerformanceSignposts.grid.interval("dissolve.layerPass") {
             renderer.renderLayerDissolve(
-                in: view, viewportSize: viewportSize,
+                to: target, viewportSize: viewportSize,
                 redrawSource: srcResidentAfter != srcResidentBefore || activeReveal,
                 redrawTarget: tgtResidentAfter != tgtResidentBefore || activeReveal,
                 sourceGroups: {
@@ -1840,7 +1849,7 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
                 columnPhase: plan.targetColumnPhase), now: now)
     }
 
-    private func drawTransition(in view: MTKView, viewportSize: CGSize, now: CFTimeInterval) {
+    private func drawTransition(to target: MetalGridDrawableTarget, viewportSize: CGSize, now: CFTimeInterval) {
         let draws = gridTransition.currentDraws()
         let flatUIDs = dataSource.flatUIDs
         // stream textures for the union of source+target occupants currently drawn
@@ -1848,7 +1857,7 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
         for d in draws where d.index < flatUIDs.count { uids.append(flatUIDs[d.index]) }
         streamTextures(visibleUIDs: uids, overscanUIDs: [], now: now)
         let realCount = renderTransitionDraws(
-            in: view, draws: draws, flatUIDs: flatUIDs, viewportSize: viewportSize, now: now)
+            to: target, draws: draws, flatUIDs: flatUIDs, viewportSize: viewportSize, now: now)
         publishLightDiagnostics(
             phase: "transition", visibleCount: uids.count, overscanCount: 0,
             realCount: realCount, cellCount: draws.count,
@@ -1861,7 +1870,7 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
     /// followed by the target at local progress. All draws use the renderer's uniform clear surface.
     @discardableResult
     private func renderTransitionDraws(
-        in view: MTKView, draws: [GridTransitionDraw], flatUIDs: [PhotoUID],
+        to target: MetalGridDrawableTarget, draws: [GridTransitionDraw], flatUIDs: [PhotoUID],
         viewportSize: CGSize, now: TimeInterval
     ) -> Int {
         let output = MetalGridFrameComposer.buildTransitionGroups(
@@ -1877,7 +1886,7 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
             now: now
         )
         evictTexturesToBudget()
-        renderer.render(in: view, viewportSize: viewportSize, groups: output.groups)
+        renderer.render(to: target, viewportSize: viewportSize, groups: output.groups)
         return output.realCount
     }
 
@@ -1885,7 +1894,7 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
     /// and the cursor-aligned phased settled plan (the multi-column phase mismatch is removed structurally by
     /// `committedPhase`, so nothing flies across columns). At p=0 this equals the live transaction's final
     /// frame; at p=1 it equals the settled (phased) `GridFramePlan`. No crossfade, no photo replacement.
-    private func drawCommitBridge(in view: MTKView, viewportSize: CGSize, now: CFTimeInterval) {
+    private func drawCommitBridge(to target: MetalGridDrawableTarget, viewportSize: CGSize, now: CFTimeInterval) {
         guard let tx = bridgeTransaction else { return }
         let overscan = budget.overscanFraction * viewportSize.height
         let scrollOffset = CGPoint(x: 0, y: bridgeScrollY)
@@ -1903,7 +1912,7 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
             slots: slots, flatUIDs: flatUIDs, viewportSize: viewportSize)
         streamTextures(visibleUIDs: visibleUIDs, overscanUIDs: overscanUIDs, now: now)
         let realCount = renderRealSlots(
-            in: view, slots: Self.viewportDrawSlots(slots, viewportSize: viewportSize),
+            to: target, slots: Self.viewportDrawSlots(slots, viewportSize: viewportSize),
             flatUIDs: flatUIDs, viewportSize: viewportSize, now: now)
         let activeReveal = cache.hasActiveThumbnailReveal(in: visibleUIDs, now: now)
         hasPendingVisibleThumbnails =
@@ -1919,7 +1928,9 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
     // MARK: - Engine render
 
     /// Resolves a `GridFramePlan` and draws its square slots. The engine owns settled and live geometry.
-    private func drawEngineFrame(in view: MTKView, clip: NSClipView, viewportSize: CGSize, now: CFTimeInterval) {
+    private func drawEngineFrame(
+        to target: MetalGridDrawableTarget, clip: NSClipView, viewportSize: CGSize, now: CFTimeInterval
+    ) {
         let overscan = budget.overscanFraction * viewportSize.height
         // Render in viewport space. Both paths produce `GridRenderSlot` (viewport-space); the engine's
         // content-space `GridSlot.slotRect` is mapped to a viewport rect here, never reused with a live rect.
@@ -1976,7 +1987,7 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
             visibleUIDs: visibleUIDs, overscanUIDs: overscanUIDs,
             allowUpgrade: zoomTransaction == nil, now: now)
         let realCount = renderRealSlots(
-            in: view, slots: Self.viewportDrawSlots(slots, viewportSize: viewportSize),
+            to: target, slots: Self.viewportDrawSlots(slots, viewportSize: viewportSize),
             flatUIDs: flatUIDs, viewportSize: viewportSize, now: now)
         // Keep ticking while visible placeholders or quality upgrades can still complete.
         // Residency saturation waits for a later viewport change.
@@ -2000,7 +2011,7 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
 
     @discardableResult
     private func renderRealSlots(
-        in view: MTKView,
+        to target: MetalGridDrawableTarget,
         slots: [GridRenderSlot],
         flatUIDs: [PhotoUID],
         viewportSize: CGSize,
@@ -2013,8 +2024,8 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
                 displayMode: effectiveDisplayMode, contentTransition: transition, now: now)
         }
         evictTexturesToBudget()
-        renderer.render(in: view, viewportSize: viewportSize, groups: groups)
-        if transition != nil { view.setNeedsDisplay(view.bounds) }
+        renderer.render(to: target, viewportSize: viewportSize, groups: groups)
+        if transition != nil { requestRedraw() }
         return realCount
     }
 

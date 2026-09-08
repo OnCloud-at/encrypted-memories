@@ -80,8 +80,7 @@ final class MetalGridScrollHost: NSView {
     nonisolated static let normalLevelLeadingGap: CGFloat = 16
 
     private var streamingTick: CADisplayLink?
-    private var displayLinkWakeUntil: CFTimeInterval = 0
-    private let displayLinkIdleGrace: CFTimeInterval = 0.25
+    private(set) var framePump = GridFramePump()
     /// The grid is laid out oldest at top-left and newest at bottom-right. It opens and re-pins at the
     /// newest edge until the user scrolls away.
     private var stickToBottom = true
@@ -184,15 +183,13 @@ final class MetalGridScrollHost: NSView {
     }
 
     private func setUp() {
-        // Metal view (back): on-demand rendering. It redraws only when `needsDisplay` is set - on scroll
-        // (the clip-bounds observer below) and while thumbnails are still streaming (the display-link
-        // tick) - and is fully idle otherwise, so it never burns the main thread competing with the app.
+        // The shared frame pump owns invalidation and drawable retries; AppKit supplies the display tick.
         metalView.frame = bounds
         metalView.autoresizingMask = [.width, .height]
         metalView.colorPixelFormat = .bgra8Unorm
         metalView.framebufferOnly = true
         metalView.isPaused = true
-        metalView.enableSetNeedsDisplay = true
+        metalView.enableSetNeedsDisplay = false
         // Uncovered pixels clear to the grid background (the inter-cell gap + letterbox colour), so a transient
         // coverage gap during a zoom transition is never a black flash.
         metalView.clearColor = MetalGridPalette.clearColor
@@ -223,6 +220,7 @@ final class MetalGridScrollHost: NSView {
 
         coordinator.clipView = scrollView.contentView
         coordinator.metalView = metalView
+        coordinator.onRequestRedraw = { [weak self] in self?.requestFrame() }
         coordinator.normalLevelLeadingGap = Self.normalLevelLeadingGap
         coordinator.onContentSizeChange = { [weak self] size in
             // Freeze content size during width and sidebar scaling.
@@ -863,25 +861,25 @@ final class MetalGridScrollHost: NSView {
     private func ensureDisplayLink() {
         guard window != nil, streamingTick == nil else { return }
         let dl = displayLink(target: self, selector: #selector(step))
+        dl.isPaused = true
         dl.add(to: .main, forMode: .common)
         streamingTick = dl
     }
 
-    private func requestFrame(keepDisplayLinkAlive: Bool = true) {
-        metalView.needsDisplay = true
-        if keepDisplayLinkAlive { wakeDisplayLink() }
+    private func requestFrame() {
+        framePump.invalidate()
+        wakeDisplayLink()
     }
 
-    private func wakeDisplayLink(duration: CFTimeInterval? = nil) {
-        guard window != nil else { return }
-        let grace = duration ?? displayLinkIdleGrace
-        displayLinkWakeUntil = max(displayLinkWakeUntil, CACurrentMediaTime() + grace)
+    private func wakeDisplayLink() {
+        guard window != nil, framePump.isActive else { return }
         ensureDisplayLink()
         streamingTick?.isPaused = false
     }
 
-    private func displayLinkHasActiveWork(now: CFTimeInterval) -> Bool {
-        coordinator.isCommitBridging
+    private func displayLinkHasActiveWork() -> Bool {
+        framePump.shouldTick
+            || coordinator.isCommitBridging
             || coordinator.isSidebarResizing
             || coordinator.isResizeSettling
             || coordinator.isScrollRebasing
@@ -892,11 +890,10 @@ final class MetalGridScrollHost: NSView {
             || (pinchMode == .lattice && pinchDriver.isSelfAdvancing)
             || (pinchMode == .overviewDissolve && pinchSettling)
             || (pinchMode == .reflow && pinchSettling)
-            || now < displayLinkWakeUntil
     }
 
-    private func updateDisplayLinkIdleState(now: CFTimeInterval = CACurrentMediaTime()) {
-        streamingTick?.isPaused = !displayLinkHasActiveWork(now: now)
+    private func updateDisplayLinkIdleState() {
+        streamingTick?.isPaused = !framePump.isActive || !displayLinkHasActiveWork()
     }
 
     func updateGridProfileResolver(_ resolver: TimelineGridProfileResolver?) {
@@ -987,14 +984,14 @@ final class MetalGridScrollHost: NSView {
         return true
     }
 
-    // The display link only TRIGGERS redraws while thumbnails are streaming in; when the visible set is
-    // fully loaded and not scrolling, no draws happen at all. It's invalidated when the view leaves its
-    // window (CADisplayLink retains its target, so this also breaks that retain before dealloc).
+    // Visibility activates the shared pump; attaching to an initially hidden window alone cannot draw.
+    // Invalidate the link on detachment to release its retained target.
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         // A manual window resize detaches the bottom-pin (so the camera rebase runs even on a fresh-open grid).
         NotificationCenter.default.removeObserver(self, name: NSWindow.willStartLiveResizeNotification, object: nil)
         NotificationCenter.default.removeObserver(self, name: NSWindow.didEndLiveResizeNotification, object: nil)
+        NotificationCenter.default.removeObserver(self, name: NSWindow.didChangeOcclusionStateNotification, object: nil)
         if let window {
             NotificationCenter.default.addObserver(
                 self, selector: #selector(windowWillLiveResize),
@@ -1002,7 +999,11 @@ final class MetalGridScrollHost: NSView {
             NotificationCenter.default.addObserver(
                 self, selector: #selector(windowDidEndLiveResize),
                 name: NSWindow.didEndLiveResizeNotification, object: window)
+            NotificationCenter.default.addObserver(
+                self, selector: #selector(windowVisibilityChanged),
+                name: NSWindow.didChangeOcclusionStateNotification, object: window)
         }
+        framePump.setActive(window?.occlusionState.contains(.visible) == true)
         if window != nil {
             ensureDisplayLink()
             requestFrame()
@@ -1014,11 +1015,20 @@ final class MetalGridScrollHost: NSView {
             updateFeedInteractionState()
             streamingTick?.invalidate()
             streamingTick = nil
-            displayLinkWakeUntil = 0
         }
     }
 
-    @objc private func step() {
+    @objc private func windowVisibilityChanged() {
+        framePump.setActive(window?.occlusionState.contains(.visible) == true)
+        if framePump.isActive { requestFrame() }
+        updateDisplayLinkIdleState()
+    }
+
+    @objc func step() {
+        guard framePump.isActive else {
+            updateDisplayLinkIdleState()
+            return
+        }
         if coordinator.isCommitBridging { advanceCommitBridge() }
         if coordinator.isSidebarResizing { advanceSidebarResize() }
         if coordinator.isResizeSettling { advanceResizeSettle() }
@@ -1032,6 +1042,10 @@ final class MetalGridScrollHost: NSView {
         if coordinator.isScrollRebasing { requestFrame() }  // edge/corner rebase slide
         if coordinator.hasPendingVisibleThumbnails { requestFrame() }
         _ = applyResolvedGridProfileIfNeeded(oldFrame: lastViewportScreenFrame, newFrame: viewportScreenFrame())
+        if framePump.beginTick() {
+            metalView.draw()
+            framePump.completeTick(coordinator.lastRenderOutcome)
+        }
         updateDisplayLinkIdleState()
     }
 

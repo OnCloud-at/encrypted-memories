@@ -275,7 +275,7 @@ private final class PresentationTestDataSource: MetalGridDataSource {
         #expect(
             !drawBody.contains("engine.framePlan") && !slotBody.contains("engine.framePlan"),
             "drawPresentationResize must NOT re-resolve the layout per tick (that reflows)")
-        #expect(coord.contains("if presentationResizeActive {") && coord.contains("drawPresentationResize(in: view"))
+        #expect(coord.contains("if presentationResizeActive {") && coord.contains("drawPresentationResize(to: target"))
     }
 
     // Shared snapshot capture builds settled slots once with generous overscan above (so a scale-out
@@ -478,7 +478,7 @@ private final class PresentationTestDataSource: MetalGridDataSource {
                 && coord.contains("delta > 1.5"),
             "begin must arm only when the release layout changed columns and source differs from target")
         #expect(
-            coord.contains("if resizeSettleActive {") && coord.contains("drawResizeSettle(in: view"),
+            coord.contains("if resizeSettleActive {") && coord.contains("drawResizeSettle(to: target"),
             "draw() must render the settle morph")
         let host = src("MetalGridScrollHost.swift")
         #expect(
@@ -596,7 +596,7 @@ private final class PresentationTestDataSource: MetalGridDataSource {
             coord.contains("func beginSidebarResize(") && coord.contains("presentationScaledRectRightAnchored"),
             "unmatched overscan slots retain the right-edge fallback mapping")
         #expect(
-            coord.contains("if presentationSidebarActive {") && coord.contains("drawSidebarResize(in: view"),
+            coord.contains("if presentationSidebarActive {") && coord.contains("drawSidebarResize(to: target"),
             "draw() renders the sidebar transition")
         #expect(
             coord.contains("sidebarObstructionInset = presentationSidebarToEventInset"),

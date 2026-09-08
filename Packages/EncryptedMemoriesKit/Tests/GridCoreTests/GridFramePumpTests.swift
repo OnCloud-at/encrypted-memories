@@ -5,6 +5,40 @@ import XCTest
 /// Locks the coalesced render-loop semantics: one render per tick, retry on a failed present, keep
 /// ticking while streaming work is pending, stop when idle.
 final class GridFramePumpTests: XCTestCase {
+    func testColdStartDrawableFailuresRetryWithoutAnotherInvalidation() {
+        var pump = GridFramePump()
+        for _ in 0..<3 {
+            XCTAssertTrue(pump.beginTick())
+            XCTAssertTrue(pump.completeTick(.noDrawable))
+        }
+        XCTAssertTrue(pump.beginTick())
+        XCTAssertFalse(pump.completeTick(.drawn(hasPendingWork: false)))
+        XCTAssertFalse(pump.beginTick())
+    }
+
+    func testInvalidationDuringRenderSurvivesSuccessfulFrame() {
+        var pump = GridFramePump()
+        XCTAssertTrue(pump.beginTick())
+        pump.invalidate()
+        XCTAssertTrue(pump.completeTick(.drawn(hasPendingWork: false)))
+        XCTAssertTrue(pump.beginTick())
+        XCTAssertFalse(pump.completeTick(.drawn(hasPendingWork: false)))
+    }
+
+    func testMissingSurfaceWaitsForLayoutAndInactiveSurfaceRetainsRetry() {
+        var pump = GridFramePump()
+        XCTAssertTrue(pump.beginTick())
+        XCTAssertFalse(pump.completeTick(.skippedNoSurface))
+        pump.invalidate()
+        XCTAssertTrue(pump.beginTick())
+        pump.setActive(false)
+        XCTAssertFalse(pump.completeTick(.noDrawable))
+        XCTAssertFalse(pump.beginTick())
+        pump.setActive(true)
+        XCTAssertTrue(pump.beginTick())
+        XCTAssertFalse(pump.completeTick(.drawn(hasPendingWork: false)))
+    }
+
     func testFreshPumpWantsAFirstFrame() {
         XCTAssertTrue(GridFramePump().shouldTick)
     }

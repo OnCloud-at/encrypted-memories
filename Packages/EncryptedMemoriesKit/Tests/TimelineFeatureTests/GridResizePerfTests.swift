@@ -163,7 +163,8 @@ import Testing
         let renderingCore = src("MetalGridRenderPrimitives.swift")
         let adapter = src("MetalGridRenderer+MTKView.swift")
         #expect(renderingCore.contains("struct MetalGridDrawableTarget"))
-        #expect(adapter.contains("guard let target = MetalGridDrawableTarget(view: view) else { return }"))
+        #expect(!adapter.contains("extension MetalGridRenderer"))
+        #expect(src("MetalGridCoordinator.swift").contains("guard let target = MetalGridDrawableTarget(view: view)"))
         #expect(adapter.contains("init?(view: MTKView)"))
         #expect(r.containsCodeFragmentIgnoringWhitespace("func render(to target: MetalGridDrawableTarget"))
         #expect(r.containsCodeFragmentIgnoringWhitespace("func renderLayerDissolve(to target: MetalGridDrawableTarget"))
@@ -214,9 +215,9 @@ import Testing
     // pauses again once the viewport is idle and the visible thumbnails are resident.
     @Test func displayLinkIdlesAndWakesForThumbnailArrival() {
         let host = src("MetalGridScrollHost.swift")
-        #expect(host.contains("private var displayLinkWakeUntil"))
-        #expect(host.contains("private func requestFrame(keepDisplayLinkAlive: Bool = true)"))
-        #expect(host.contains("streamingTick?.isPaused = !displayLinkHasActiveWork(now: now)"))
+        #expect(host.contains("framePump = GridFramePump()"))
+        #expect(host.contains("framePump.completeTick(coordinator.lastRenderOutcome)"))
+        #expect(host.contains("streamingTick?.isPaused = !framePump.isActive || !displayLinkHasActiveWork()"))
         #expect(host.contains("coordinator.hasPendingVisibleThumbnails"))
         #expect(host.contains("source.onImagesAvailable = { [weak self]"))
         #expect(
