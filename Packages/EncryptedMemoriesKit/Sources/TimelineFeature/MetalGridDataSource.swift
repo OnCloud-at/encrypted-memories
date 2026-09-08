@@ -63,8 +63,6 @@ final class RealMetalGridDataSource: MetalGridDataSource {
     private let feed: ThumbnailFeed
     private let metadataProvider: (any PhotoMetadataProvider)?
     private let overlayResolver: TimelineThumbnailOverlayResolver
-    private var lastSubmittedVisibleDiskDemand: [ThumbnailRequest] = []
-    private var visibleDiskDemandNeedsResubmission = false
     private var prefetchTask: Task<Void, Never>?
     private var imagesAvailableWakeRegistration: ThumbnailFeedWakeRegistration?
     /// Coalesces network reprioritization for stable viewports while keeping local decoding immediate.
@@ -86,7 +84,6 @@ final class RealMetalGridDataSource: MetalGridDataSource {
         self.overlayResolver.onChange = { [weak self] in self?.onImagesAvailable?() }
         self.imagesAvailableWakeRegistration = self.feed.feedCore.setOnImagesAvailableWake { [weak self] in
             Task { @MainActor [weak self] in
-                self?.visibleDiskDemandNeedsResubmission = true
                 self?.onImagesAvailable?()
             }
         }
@@ -151,11 +148,7 @@ final class RealMetalGridDataSource: MetalGridDataSource {
             }
             return true
         }
-        if visibleDiskDemandNeedsResubmission || incoming != lastSubmittedVisibleDiskDemand {
-            visibleDiskDemandNeedsResubmission = false
-            lastSubmittedVisibleDiskDemand = incoming
-            feed.submitVisibleDiskDecodeDemand(incoming)
-        }
+        feed.submitVisibleDiskDecodeDemand(incoming)
         PhotoDiagnostics.shared.emitDebug(
             "ThumbSchedule",
             [

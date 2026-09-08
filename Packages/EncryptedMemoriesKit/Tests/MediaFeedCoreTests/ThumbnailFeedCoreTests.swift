@@ -166,6 +166,29 @@ private let feedCacheTestKey = SymmetricKey(size: .bits256)
     #expect(inbox.takeLatestOrFinish() == .init(requests: replacement, generation: 2))
 }
 
+@Test func latestVisibleDecodeDemandInboxRetainsOnlyLatestIntentForReplay() {
+    let inbox = LatestVisibleDecodeDemandInbox()
+    let first = [ThumbnailRequest(uid: PhotoUID(volumeID: "vol", nodeID: "first"))]
+    let latest = [ThumbnailRequest(uid: PhotoUID(volumeID: "vol", nodeID: "latest"))]
+    #expect(inbox.submit(requests: first))
+    _ = inbox.takeLatestOrFinish()
+    #expect(inbox.takeLatestOrFinish() == nil)
+    #expect(!inbox.submit(requests: first), "unchanged display ticks must not schedule more actor tasks")
+    #expect(inbox.replay(), "a dependency change must retry even a drained viewport")
+    #expect(!inbox.submit(requests: latest))
+    #expect(inbox.takeLatestOrFinish()?.requests == latest, "recovery must not restore an older viewport")
+    #expect(inbox.takeLatestOrFinish() == nil)
+    #expect(inbox.submit(requests: []))
+    _ = inbox.takeLatestOrFinish()
+    #expect(inbox.takeLatestOrFinish() == nil)
+    #expect(!inbox.replay(), "leaving the viewport removes recovery work")
+    #expect(inbox.submit(requests: first))
+    inbox.cancel()
+    #expect(inbox.takeLatestOrFinish() == nil)
+    #expect(!inbox.replay(), "shutdown must discard both queued and retained intent")
+    #expect(inbox.submit(requests: first), "a fresh owner request can reuse the feed")
+}
+
 @Test func decodePermitPoolPrioritizesVisibleWaiters() async throws {
     let pool = DecodePermitPool(permits: 1)
     #expect(await pool.acquire(priority: .idleLibraryCrawl))
@@ -1178,6 +1201,131 @@ struct ThumbnailFeedCoreTests {
         #expect(cache.image(for: Self.uid("dc-x")) == nil)
     }
 
+    @Test func visibleDiskDemandBeforeAuthorizationRecoversWithoutAnotherViewport() async throws {
+        let old = Self.uid("old-viewport")
+        let visible = Self.uid("initial-viewport")
+        let cache = Self.cache("visible-before-authorization")
+        let payload = Self.pngData(width: 8, height: 8)
+        cache.storeToDisk(payload, for: old)
+        cache.storeToDisk(payload, for: visible)
+        let loader = RecordingLoader()
+        let feed = ThumbnailFeedCore(cache: cache, loader: loader, configuration: Self.configuration())
+        await feed.setPrefetchEnabled(false)
+        let graph = LibrarySourceGraph()
+        let change = Self.visibleScope(in: graph, uids: [old, visible])
+        #expect(await feed.bindDerivedDataEpoch(graph.runtimeEpoch))
+
+        feed.submitVisibleDiskDecodeDemand([ThumbnailRequest(uid: old)])
+        feed.submitVisibleDiskDecodeDemand([ThumbnailRequest(uid: visible)])
+        try await Task.sleep(for: .milliseconds(100))
+        #expect(feed.memoryDecoded(for: visible) == nil, "pending authorization must remain fail-closed")
+        _ = await feed.reconcile(
+            selected: change.selectedScope, analysis: change.analysisScope,
+            retention: change.thumbnailRetentionScope)
+        try await Self.waitUntil { feed.memoryDecoded(for: visible) != nil }
+        #expect(feed.memoryDecoded(for: visible) != nil, "no second submit or scroll is allowed for recovery")
+        #expect(feed.memoryDecoded(for: old) == nil, "only the newest viewport is replayed")
+        #expect(await loader.requestCount() == 0, "this must be viewport disk decoding, not a crawl")
+        await feed.stopPrefetchAndWait()
+    }
+
+    @Test func unchangedVisibleDemandRetriesAfterMemoryPressure() async throws {
+        let uid = Self.uid("visible-after-memory-pressure")
+        let cache = Self.cache("visible-after-memory-pressure")
+        cache.storeToDisk(Self.pngData(width: 8, height: 8), for: uid)
+        let feed = ThumbnailFeedCore(cache: cache, loader: RecordingLoader(), configuration: Self.configuration())
+        let requests = [ThumbnailRequest(uid: uid)]
+        feed.submitVisibleDiskDecodeDemand(requests)
+        try await Self.waitUntil { feed.memoryDecoded(for: uid) != nil }
+        #expect(feed.memoryDecoded(for: uid) != nil)
+        // The host has not yet submitted a smaller missing set when pressure removes these decoded tiles.
+        feed.applyDecodedMemoryPressure(scale: 1, purge: true)
+        #expect(feed.memoryDecoded(for: uid) == nil)
+        feed.submitVisibleDiskDecodeDemand(requests)
+        try await Self.waitUntil { feed.memoryDecoded(for: uid) != nil }
+        #expect(feed.memoryDecoded(for: uid) != nil, "equal viewport demand must recover after eviction")
+        await feed.stopPrefetchAndWait()
+    }
+
+    @Test func stoppedVisibleDemandIsNotReplayedBySourceAdmission() async throws {
+        let uid = Self.uid("stopped-viewport")
+        let cache = Self.cache("stopped-before-authorization")
+        cache.storeToDisk(Self.pngData(width: 8, height: 8), for: uid)
+        let loader = RecordingLoader()
+        let feed = ThumbnailFeedCore(cache: cache, loader: loader, configuration: Self.configuration())
+        await feed.setPrefetchEnabled(false)
+        let graph = LibrarySourceGraph()
+        let change = Self.visibleScope(in: graph, uids: [uid])
+        #expect(await feed.bindDerivedDataEpoch(graph.runtimeEpoch))
+        feed.submitVisibleDiskDecodeDemand([ThumbnailRequest(uid: uid)])
+        _ = await feed.replaceVisiblePriorityDemand([uid])
+        await feed.stopPrefetchAndWait()
+        _ = await feed.reconcile(
+            selected: change.selectedScope, analysis: change.analysisScope,
+            retention: change.thumbnailRetentionScope)
+        try await Task.sleep(for: .milliseconds(150))
+        #expect(feed.memoryDecoded(for: uid) == nil)
+        #expect(await loader.requestCount() == 0)
+        await feed.stopPrefetchAndWait()
+    }
+
+    @Test func visibleNetworkDemandBeforeAuthorizationRecoversAndDecodesArrival() async throws {
+        let uid = Self.uid("visible-network-before-scope")
+        let cache = Self.cache("visible-network-before-scope")
+        let loader = RecordingLoader(payloads: [uid: Self.pngData(width: 8, height: 8)])
+        let feed = ThumbnailFeedCore(cache: cache, loader: loader, configuration: Self.configuration())
+        // Pause only speculative crawling. Disabling prefetch also fences network disk probes, so it
+        // cannot exercise the supported visible-network path.
+        await feed.pausePrefetch()
+        let graph = LibrarySourceGraph()
+        let change = Self.visibleScope(in: graph, uids: [uid])
+        #expect(await feed.bindDerivedDataEpoch(graph.runtimeEpoch))
+        feed.submitVisibleDiskDecodeDemand([ThumbnailRequest(uid: uid)])
+        #expect(await feed.replaceVisiblePriorityDemand([uid]) == 0)
+        #expect(await loader.requestCount() == 0)
+        _ = await feed.reconcile(
+            selected: change.selectedScope, analysis: change.analysisScope,
+            retention: change.thumbnailRetentionScope)
+        try await Self.waitUntil { feed.memoryDecoded(for: uid) != nil }
+        #expect(feed.memoryDecoded(for: uid) != nil, "a disk miss must recover without a second stable viewport")
+        let requestCount = await loader.requestCount()
+        #expect(requestCount == 1)
+        await feed.stopPrefetchAndWait()
+    }
+
+    @Test func sourceAdmissionWakesAwaitedVisibleWarmPath() async throws {
+        let uid = Self.uid("awaited-visible-before-scope")
+        let cache = Self.cache("awaited-visible-before-scope")
+        cache.storeToDisk(Self.pngData(width: 8, height: 8), for: uid)
+        let loader = RecordingLoader()
+        let feed = ThumbnailFeedCore(cache: cache, loader: loader, configuration: Self.configuration())
+        await feed.setPrefetchEnabled(false)
+        let graph = LibrarySourceGraph()
+        let change = Self.visibleScope(in: graph, uids: [uid])
+        #expect(await feed.bindDerivedDataEpoch(graph.runtimeEpoch))
+        let requests = [ThumbnailRequest(uid: uid)]
+        let blocked = await feed.warmVisibleDecoded(requests, limit: 1)
+        #expect(blocked.requested == 0)
+        let wakes = Counter()
+        let registration = feed.setOnImagesAvailableWake { wakes.increment() }
+        defer { registration.end() }
+        _ = await feed.reconcile(
+            selected: change.selectedScope, analysis: change.analysisScope,
+            retention: change.thumbnailRetentionScope)
+        #expect(wakes.value() == 1, "UIKit's existing arrival hook must schedule a new awaited warm pass")
+        let admitted = await feed.warmVisibleDecoded(requests, limit: 1)
+        #expect(admitted.decodedFromDisk == 1)
+        #expect(feed.memoryDecoded(for: uid) != nil)
+        #expect(await loader.requestCount() == 0)
+        await feed.stopPrefetchAndWait()
+    }
+
+    private static func visibleScope(in graph: LibrarySourceGraph, uids: [PhotoUID]) -> LibrarySourceChange {
+        let source = LibrarySource(id: SourceID("visible-demand-test"), capabilities: .readThumbnail)
+        _ = graph.commitSourceSet([source], using: graph.beginSourceSetRefresh())
+        return graph.commit(Self.sourceItems(uids), validationToken: nil, using: graph.beginRefresh(source.id)!)!
+    }
+
     @Test func feedScopeReplacementPurgesDecodedAndEncryptedTiers() async {
         let retained = Self.uid("feed-retained-membership")
         let orphaned = Self.uid("feed-final-orphan")
@@ -1191,6 +1339,11 @@ struct ThumbnailFeedCoreTests {
         )
         #expect(await feed.cachedDecoded(for: retained) != nil)
         #expect(await feed.cachedDecoded(for: orphaned) != nil)
+        // Retained viewport intent must not re-authorize an asset when its final membership is revoked.
+        feed.submitVisibleDiskDecodeDemand([
+            ThumbnailRequest(uid: retained), ThumbnailRequest(uid: orphaned),
+        ])
+        _ = await feed.replaceVisiblePriorityDemand([retained, orphaned])
         let source = LibrarySource(
             id: SourceID("feed-source"),
             capabilities: .readThumbnail
@@ -1224,6 +1377,7 @@ struct ThumbnailFeedCoreTests {
         #expect(await feed.cachedDecoded(for: retained) != nil)
         #expect(cache.diskData(for: retained) != nil)
         #expect(cache.diskData(for: orphaned) == nil)
+        await feed.stopPrefetchAndWait()
     }
 
     @Test func analysisOnlyInventoryIsIndexedAndRetainedWithoutEnteringVisibleCoverage() async throws {
