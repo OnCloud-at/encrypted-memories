@@ -175,11 +175,27 @@ public actor MLIndexRunner {
         {
             quantumPlan = cached
         } else {
-            let plan = MLIndexPlanner.plan(
-                allAssets: allAssets,
-                descriptor: descriptor,
-                store: store
-            )
+            let plan: MLIndexPlan
+            do {
+                plan = try MLIndexPlanner.plan(
+                    allAssets: allAssets,
+                    descriptor: descriptor,
+                    store: store
+                )
+            } catch {
+                let progress = MLIndexProgress(
+                    phase: .failed(message: "storage unavailable"),
+                    descriptor: descriptor,
+                    totalAssets: Set(allAssets).count
+                )
+                observer.reportProgressUpdated(progress)
+                return MLIndexPassOutcome(
+                    report: MLIndexBatchReport(),
+                    ranToCompletion: false,
+                    newPermanentFailures: [],
+                    progress: progress
+                )
+            }
             quantumPlan = SemanticQuantumPlan(
                 libraryGeneration: libraryGeneration ?? 0,
                 descriptor: descriptor,
@@ -304,16 +320,6 @@ public actor MLIndexRunner {
             // Durable commit before the next chunk: this is the resume point.
             let stored = store.upsert(records)
             let failuresPersisted = store.recordFailures(failureRecords)
-            if failuresPersisted {
-                newPermanent.formUnion(chunkPermanentUIDs)
-            } else {
-                completed = false
-                retryUIDs.append(contentsOf: chunkPermanentUIDs)
-            }
-            retryUIDs.append(contentsOf: chunkTransientUIDs)
-            if stored.transientFailure > 0 {
-                retryUIDs.append(contentsOf: records.map(\.uid))
-            }
             let chunkReport = MLIndexBatchReport(
                 total: processedCount,
                 indexed: stored.indexed,
@@ -326,6 +332,24 @@ public actor MLIndexRunner {
             aggregate = aggregate.merge(chunkReport)
             progress.apply(chunkReport)
             observer.reportProgressUpdated(progress)
+
+            // Store-layer transient failures invalidate the cached bounded plan. They are
+            // distinct from an embedder transient miss, which remains eligible for ordinary
+            // retry scheduling below.
+            guard stored.transientFailure == 0, failuresPersisted else {
+                completed = false
+                semanticQuantumPlan = nil
+                progress.phase = .failed(message: "storage unavailable")
+                observer.reportProgressUpdated(progress)
+                return MLIndexPassOutcome(
+                    report: aggregate,
+                    ranToCompletion: false,
+                    newPermanentFailures: newPermanent,
+                    progress: progress
+                )
+            }
+            newPermanent.formUnion(chunkPermanentUIDs)
+            retryUIDs.append(contentsOf: chunkTransientUIDs)
 
             if stopAfterCommit { break }
         }

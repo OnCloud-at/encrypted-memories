@@ -45,10 +45,10 @@ public enum MLIndexPlanner {
         allAssets: [PhotoUID],
         descriptor: MLModelDescriptor,
         store: MLIndexStore
-    ) -> MLIndexPlan {
+    ) throws -> MLIndexPlan {
         // Single O(n) pass: build the indexed set once, then partition.
-        let indexedSet = store.indexedUIDs(for: descriptor, from: allAssets)
-        let storedFailures = store.failureRecords(for: descriptor, from: allAssets)
+        let indexedSet = try store.indexedUIDs(for: descriptor, from: allAssets)
+        let storedFailures = try store.failureRecords(for: descriptor, from: allAssets)
 
         let permanentCount = storedFailures.values.reduce(into: 0) { count, failure in
             if failure.kind == .permanent { count += 1 }

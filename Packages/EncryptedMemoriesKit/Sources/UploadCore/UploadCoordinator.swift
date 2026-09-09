@@ -16,6 +16,55 @@ public struct UploadAlbumDestination: Identifiable, Sendable, Equatable {
 
 typealias FolderEnqueueOperation = @Sendable (URL, UploadDestination) async throws -> [UploadQueueItemID]
 
+/// `items` and `stats` travel together so the consumer never mixes queue state from two moments.
+struct UploadSnapshotEnvelope: Sendable {
+    let sequence: UInt64
+    let items: [UploadItem]
+    let stats: UploadQueueStats
+}
+
+/// Bounded single-slot mailbox for the latest snapshot. `deliver` succeeds only while the owning
+/// coordinator generation is alive; after `finish()` every late delivery returns `false` and is
+/// dropped, so a stale callback can neither overwrite newer state nor leak unbounded tasks.
+final class UploadCallbackMailbox<Element: Sendable>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: AsyncStream<Element>.Continuation?
+    private let sequence: ((Element) -> UInt64)?
+    private var latestSequence: UInt64 = 0
+
+    init(
+        continuation: AsyncStream<Element>.Continuation,
+        sequence: ((Element) -> UInt64)? = nil
+    ) {
+        self.continuation = continuation
+        self.sequence = sequence
+    }
+
+    /// Enqueues the value if the mailbox is still attached. Returns `false` for retired mailboxes.
+    @discardableResult
+    func deliver(_ value: Element) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let continuation else { return false }
+        if let sequence {
+            let valueSequence = sequence(value)
+            guard valueSequence > latestSequence else { return false }
+            latestSequence = valueSequence
+        }
+        continuation.yield(value)
+        return true
+    }
+
+    /// Detaches the mailbox so late deliveries are dropped and the stream terminates.
+    func finish() {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let continuation else { return }
+        self.continuation = nil
+        continuation.finish()
+    }
+}
+
 /// Main-actor, observable façade the UI binds to. Mirrors the `UploadManager` actor's snapshots onto
 /// the main thread and exposes the user-facing actions (choose destination, pause/resume/cancel/retry).
 @MainActor
@@ -46,6 +95,14 @@ public final class UploadCoordinator {
     private var folderEnqueueTail: Task<Void, Never>?
     private var nextFolderOperationID: UInt64 = 0
     private var latestFolderErrorOperationID: UInt64 = 0
+
+    /// Streaming state belongs to this coordinator. Repeated starts share the same subscription;
+    /// account replacement creates a new coordinator and manager.
+    @ObservationIgnored private var snapshotMailbox: UploadCallbackMailbox<UploadSnapshotEnvelope>?
+    @ObservationIgnored private var completionMailbox: UploadCallbackMailbox<UploadCompletedEvent>?
+    @ObservationIgnored private var snapshotConsumerTask: Task<Void, Never>?
+    @ObservationIgnored private var completionConsumerTask: Task<Void, Never>?
+    @ObservationIgnored private var appliedSnapshotSequence: UInt64 = 0
 
     private enum PendingSelection {
         case files([URL])
@@ -87,20 +144,61 @@ public final class UploadCoordinator {
         self.folderEnqueueOperation = folderEnqueueOperation
     }
 
-    /// Begin streaming snapshots from the manager. Call once after construction.
+    deinit {
+        snapshotMailbox?.finish()
+        completionMailbox?.finish()
+        snapshotConsumerTask?.cancel()
+        completionConsumerTask?.cancel()
+    }
+
+    /// Begins one subscription. Admission is synchronous on MainActor, so concurrent calls cannot
+    /// install a retired callback after a newer start or create a gap in terminal event delivery.
     public func start() async {
-        await manager.setOnChange { [weak self] items, stats in
-            Task { @MainActor in
-                self?.items = items
-                self?.stats = stats
+        guard snapshotMailbox == nil else { return }
+        let (snapshotStream, snapshotContinuation) = AsyncStream.makeStream(
+            of: UploadSnapshotEnvelope.self,
+            bufferingPolicy: .bufferingNewest(1)
+        )
+        let (completionStream, completionContinuation) = AsyncStream.makeStream(of: UploadCompletedEvent.self)
+        let snapshotMailbox = UploadCallbackMailbox(
+            continuation: snapshotContinuation,
+            sequence: { $0.sequence }
+        )
+        let completionMailbox = UploadCallbackMailbox(continuation: completionContinuation)
+        self.snapshotMailbox = snapshotMailbox
+        self.completionMailbox = completionMailbox
+        snapshotConsumerTask = Task { @MainActor [weak self] in
+            for await envelope in snapshotStream {
+                self?.applySnapshot(envelope)
             }
         }
-        await manager.setOnCompleted { [weak self] event in
-            Task { @MainActor in
-                self?.latestCompletedUpload = event
-                self?.completedUploadRevision += 1
+        completionConsumerTask = Task { @MainActor [weak self] in
+            for await event in completionStream {
+                self?.applyCompletedUpload(event)
             }
         }
+        await manager.setCoordinatorCallbacks(
+            onChange: { [weak snapshotMailbox] sequence, items, stats in
+                snapshotMailbox?.deliver(UploadSnapshotEnvelope(sequence: sequence, items: items, stats: stats))
+            },
+            onCompleted: { [weak completionMailbox] event in
+                completionMailbox?.deliver(event)
+            }
+        )
+    }
+
+    /// Applies a snapshot envelope unless a newer sequence was already applied.
+    func applySnapshot(_ envelope: UploadSnapshotEnvelope) {
+        guard envelope.sequence > appliedSnapshotSequence else { return }
+        appliedSnapshotSequence = envelope.sequence
+        items = envelope.items
+        stats = envelope.stats
+    }
+
+    /// Applies a durable completion event. Deliberately unfenced: completions must stay lossless.
+    func applyCompletedUpload(_ event: UploadCompletedEvent) {
+        latestCompletedUpload = event
+        completedUploadRevision += 1
     }
 
     // MARK: - Destination flow

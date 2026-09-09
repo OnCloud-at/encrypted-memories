@@ -130,12 +130,12 @@ public actor MLSearchService {
         )
     }
 
-    public func coverage(for assets: [PhotoUID]) async -> MLIndexCoverage {
-        await searchEngine.coverage(for: descriptor, allAssets: assets)
+    public func coverage(for assets: [PhotoUID]) async throws -> MLIndexCoverage {
+        try await searchEngine.coverage(for: descriptor, allAssets: assets)
     }
 
-    public func permanentlyUnavailableAssetUIDs(_ assets: [PhotoUID]) async -> Set<PhotoUID> {
-        await searchEngine.permanentlyUnavailableAssetUIDs(for: descriptor, allAssets: assets)
+    public func permanentlyUnavailableAssetUIDs(_ assets: [PhotoUID]) async throws -> Set<PhotoUID> {
+        try await searchEngine.permanentlyUnavailableAssetUIDs(for: descriptor, allAssets: assets)
     }
 
     public func releaseMemory() async {

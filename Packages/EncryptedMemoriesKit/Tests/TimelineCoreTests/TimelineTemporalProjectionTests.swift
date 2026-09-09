@@ -156,6 +156,40 @@ import Testing
             ) == 1_334)
     }
 
+    @Test(arguments: [Calendar.Identifier.gregorian, .japanese, .hebrew, .chinese])
+    func bucketIntervalsKeepCalendarAndEraSemantics(_ identifier: Calendar.Identifier) {
+        var calendar = Calendar(identifier: identifier)
+        calendar.timeZone = TimeZone(identifier: "Europe/Vienna")!
+        let anchors = [date(2019, 4, 30, 12), date(2019, 5, 1, 12), date(2026, 3, 29, 12), date(2026, 10, 25, 12)]
+        let photos = anchors.enumerated().flatMap { group, anchor in
+            (0..<20).map { offset in
+                item("calendar-\(group)-\(offset)", date: anchor.addingTimeInterval(Double(offset) * 60))
+            }
+        }
+        let projection = TimelineTemporalProjection(
+            mode: .years, sections: [section("calendar", photos.reversed())], calendar: calendar
+        )
+        #expect(projection.itemCount == photos.count)
+        for year in projection.yearGroups {
+            let firstYearItem = projection.item(for: year.itemUIDs[0])!
+            #expect(year.dateInterval == calendar.dateInterval(of: .year, for: firstYearItem.captureTime))
+            for month in year.monthGroups {
+                let firstMonthItem = projection.item(for: month.itemUIDs[0])!
+                #expect(month.dateInterval == calendar.dateInterval(of: .month, for: firstMonthItem.captureTime))
+                for day in month.dayGroups {
+                    let firstDayItem = projection.item(for: day.itemUIDs[0])!
+                    #expect(day.dateInterval == calendar.dateInterval(of: .day, for: firstDayItem.captureTime))
+                    #expect(day.events.allSatisfy { $0.dateInterval == day.dateInterval })
+                }
+            }
+        }
+        if identifier == .gregorian {
+            let days = projection.yearGroups.flatMap(\.monthGroups).flatMap(\.dayGroups)
+            #expect(days.contains { $0.dateInterval.duration == 23 * 60 * 60 })
+            #expect(days.contains { $0.dateInterval.duration == 25 * 60 * 60 })
+        }
+    }
+
     @Test func cancellationIsObservedBeforeDetachedBuild() async {
         let task = Task { () throws -> TimelineTemporalProjection in
             try Task.checkCancellation()

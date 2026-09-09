@@ -49,6 +49,9 @@ enum ProtonAlbumWriteError: LocalizedError {
     case missingAlbumHashKey
     /// The create-album response did not contain the new album's link id.
     case malformedCreateResponse
+    /// The add-multiple response body could not be decoded (absent, malformed, or no `Responses`
+    /// array). The per-item remote outcome is unknown, so the batch must not report success.
+    case malformedAddResponse
 
     var errorDescription: String? {
         switch self {
@@ -56,6 +59,7 @@ enum ProtonAlbumWriteError: LocalizedError {
         case .missingRootHashKey: "The photo library's hash key is unavailable."
         case .missingAlbumHashKey: "The album's hash key is unavailable."
         case .malformedCreateResponse: "The server response for the new album was incomplete."
+        case .malformedAddResponse: "The server response for the album update was incomplete."
         }
     }
 }
@@ -64,6 +68,13 @@ private enum AlbumPayloadPreparationError: Error {
     case linkMetadataUnavailable
     case relatedMetadataUnavailable
     case contentHashUnavailable
+}
+
+/// Result of strictly evaluating a main link's response rows: either a settled outcome, or a
+/// request to retry the group because the server reported part of the related set missing.
+private enum MainResponseEvaluation {
+    case outcome(AlbumAttachItemOutcome)
+    case retryMissing([String])
 }
 
 // MARK: - Service
@@ -77,7 +88,8 @@ actor ProtonAlbumWriteService {
     private nonisolated let admission: JoinedShutdownGate?
     private let contextProvider: @Sendable () async throws -> PhotosShareContext
 
-    /// Proton's documented add-multiple ceiling ("never lower than 10").
+    /// Proton's normal add-multiple batch target. A single related-photo group can exceed this
+    /// target and remains atomic rather than being split.
     static let addBatchSize = 10
     /// The web client's chunk size for `links/fetch_metadata`.
     private static let metadataBatchSize = 150
@@ -262,21 +274,17 @@ actor ProtonAlbumWriteService {
                 albumLinkID: albumID,
                 albumData: batch.flatMap(\.payloads).map(\.dictionary)
             )
-            let byLinkID = Dictionary(responses.map { ($0.linkID ?? "", $0) }, uniquingKeysWith: { a, _ in a })
             for group in batch {
-                if let missing = byLinkID[group.mainLinkID]?.response?.details?.missing,
-                    !missing.isEmpty
-                {
+                switch Self.evaluateMainResponse(responses, mainLinkID: group.mainLinkID) {
+                case .outcome(let outcome):
+                    result.outcomes[group.mainLinkID] = outcome
+                case .retryMissing(let missing):
                     result.outcomes[group.mainLinkID] = try await retryGroupOnce(
                         group,
                         missingLinkIDs: missing,
                         albumID: albumID,
                         root: material,
                         album: album
-                    )
-                } else {
-                    result.outcomes[group.mainLinkID] = Self.outcome(
-                        from: byLinkID[group.mainLinkID]?.response
                     )
                 }
             }
@@ -504,8 +512,14 @@ actor ProtonAlbumWriteService {
             albumLinkID: albumID,
             albumData: retry.payloads.map(\.dictionary)
         )
-        let response = responses.first { $0.linkID == group.mainLinkID }?.response
-        return Self.outcome(from: response)
+        // The Missing retry is attempted exactly once. A second Missing verdict is an
+        // unconfirmed mutation and must surface as failure, not as attached.
+        switch Self.evaluateMainResponse(responses, mainLinkID: group.mainLinkID) {
+        case .outcome(let outcome):
+            return outcome
+        case .retryMissing:
+            return .failed(code: 2000, message: "related photo set remained incomplete")
+        }
     }
 
     private static func batches(_ groups: [PreparedPhotoGroup]) -> [[PreparedPhotoGroup]] {
@@ -526,11 +540,49 @@ actor ProtonAlbumWriteService {
         return result
     }
 
-    private static func outcome(from status: AlbumAddItemResponse.Status?) -> AlbumAttachItemOutcome {
-        guard let status else { return .attached }
-        if status.code == 2500 { return .alreadyMember }
-        if status.code == nil || status.code == 1000, status.error?.isEmpty != false { return .attached }
-        return .failed(code: status.code, message: status.error ?? "code \(status.code ?? -1)")
+    /// Strict evaluation of the main link's echoed response row. Success requires exactly one
+    /// unambiguous row for the main link carrying a recognized code (1000 attached, 2500 already a
+    /// member). Anything else - absent, duplicate, contradictory, or code-less - is an unconfirmed
+    /// mutation and must surface as failure, never as attached.
+    private static func evaluateMainResponse(
+        _ responses: [AlbumAddItemResponse],
+        mainLinkID: String
+    ) -> MainResponseEvaluation {
+        let mainRows = responses.filter { $0.linkID == mainLinkID }
+        guard mainRows.count == 1, let status = mainRows.first?.response else {
+            let absent = mainRows.isEmpty
+            return .outcome(
+                .failed(
+                    code: nil,
+                    message:
+                        absent
+                        ? "album response missing for the requested item"
+                        : "album response was ambiguous for the requested item"
+                ))
+        }
+        if status.code == 2000, let missing = status.details?.missing, !missing.isEmpty {
+            return .retryMissing(missing)
+        }
+        // The existing album contract treats 2500 as idempotent membership, including the
+        // server's explanatory Error text. Tightening that known status would regress retries.
+        if status.code == 2500 { return .outcome(.alreadyMember) }
+        if status.code == 1000 {
+            guard status.error?.isEmpty != false else {
+                return .outcome(.failed(code: 1000, message: "unconfirmed album response"))
+            }
+            return .outcome(.attached)
+        }
+        if status.code == 2000 {
+            return .outcome(
+                .failed(
+                    code: 2000, message: status.error.flatMap { $0.isEmpty ? nil : $0 } ?? "unconfirmed album response")
+            )
+        }
+        return .outcome(
+            .failed(
+                code: status.code,
+                message: "unconfirmed album response"
+            ))
     }
 
     /// The link identifiers of the album's primary photos.
@@ -846,8 +898,9 @@ extension DriveSession {
     }
 
     /// `POST /drive/photos/volumes/{volumeID}/albums/{albumLinkID}/add-multiple` returns multistatus
-    /// batch (HTTP 200 with per-item codes). Callers pass at most
-    /// `ProtonAlbumWriteService.addBatchSize` entries and must inspect the per-item responses.
+    /// batch (HTTP 200 with per-item codes). Callers target
+    /// `ProtonAlbumWriteService.addBatchSize` entries, while a larger related-photo group remains
+    /// atomic, and must inspect the per-item responses.
     func addToAlbum(
         volumeID: String, albumLinkID: String, albumData: [[String: Any]]
     ) async throws -> [AlbumAddItemResponse] {
@@ -857,7 +910,18 @@ extension DriveSession {
             method: "POST",
             body: ["AlbumData": albumData]
         )
-        return (try? JSONDecoder().decode(AlbumAddResponse.self, from: data))?.responses ?? []
+        let decoded: AlbumAddResponse
+        do {
+            decoded = try JSONDecoder().decode(AlbumAddResponse.self, from: data)
+        } catch {
+            // A body that cannot be decoded, or lacks the `Responses` multistatus array, leaves the
+            // per-item outcomes unknown. Never silently downgrade that to a benign empty batch.
+            throw ProtonAlbumWriteError.malformedAddResponse
+        }
+        guard let responses = decoded.responses else {
+            throw ProtonAlbumWriteError.malformedAddResponse
+        }
+        return responses
     }
 
     /// `POST /drive/photos/volumes/{volumeID}/albums/{albumLinkID}/remove-multiple` removes only

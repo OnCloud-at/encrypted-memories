@@ -3,7 +3,11 @@ import PhotosCore
 import ProtonCoreCryptoGoInterface
 import UniformTypeIdentifiers
 
-enum StreamingError: Error { case noRevision, noXAttr }
+enum StreamingError: Error {
+    case noRevision
+    case noXAttr
+    case revisionPaginationNoProgress
+}
 
 /// One block's fetch info + its position in the *cleartext* file (from XAttr block sizes), so the
 /// resource loader can map a requested byte range to the blocks it needs.
@@ -270,20 +274,67 @@ actor PhotoVideoStreamSource {
 
     /// Pages through the revision's blocks (FromBlockIndex is 1-based) until all are collected.
     private func fetchRevisionBlocks(linkID: String, revID: String) async throws -> ([BlockInfo], String?) {
+        let pageSize = 500
+        return try await Self.collectRevisionBlocks(pageSize: pageSize) { from in
+            let path =
+                "/drive/shares/\(self.shareID)/files/\(linkID)/revisions/\(revID)?FromBlockIndex=\(from)&PageSize=\(pageSize)"
+            let revision = try await self.session.getJSON(path, as: RevisionResponse.self).revision
+            return (blocks: revision.blocks, xAttr: revision.xAttr)
+        }
+    }
+
+    /// Collects the same pages used by production revision fetching. Keeping the page fetch as a
+    /// narrow seam lets tests exercise the loop, terminal-page handling, and cancellation without
+    /// constructing the streamer's crypto key chain.
+    nonisolated static func collectRevisionBlocks(
+        pageSize: Int,
+        fetchPage: (Int) async throws -> (blocks: [BlockInfo], xAttr: String?)
+    ) async throws -> ([BlockInfo], String?) {
         var all: [BlockInfo] = []
         var xattr: String?
         var from = 1
-        let pageSize = 500
         while true {
-            let path =
-                "/drive/shares/\(shareID)/files/\(linkID)/revisions/\(revID)?FromBlockIndex=\(from)&PageSize=\(pageSize)"
-            let revision = try await session.getJSON(path, as: RevisionResponse.self).revision
-            if xattr == nil { xattr = revision.xAttr }
-            all.append(contentsOf: revision.blocks)
-            guard revision.blocks.count == pageSize, let last = revision.blocks.map(\.index).max() else { break }
-            from = last + 1
+            try Task.checkCancellation()
+            let page = try await fetchPage(from)
+            try Task.checkCancellation()
+            if xattr == nil { xattr = page.xAttr }
+            let next = try nextRevisionPageStart(
+                previousStart: from,
+                blocks: page.blocks,
+                pageSize: pageSize
+            )
+            all.append(contentsOf: page.blocks)
+            guard let next else { break }
+            from = next
         }
         return (all, xattr)
+    }
+
+    /// Every page must contain exactly the contiguous range requested by the 1-based server
+    /// cursor. Reordered wire entries are allowed; gaps, duplicates, overlap, cursor skips,
+    /// oversized pages, and cursor overflow are unconfirmed pagination.
+    nonisolated static func nextRevisionPageStart(
+        previousStart: Int,
+        blocks: [BlockInfo],
+        pageSize: Int
+    ) throws -> Int? {
+        guard previousStart > 0, pageSize > 0, blocks.count <= pageSize else {
+            throw StreamingError.revisionPaginationNoProgress
+        }
+        guard !blocks.isEmpty else { return nil }
+
+        let lastResult = previousStart.addingReportingOverflow(blocks.count - 1)
+        guard !lastResult.overflow else { throw StreamingError.revisionPaginationNoProgress }
+        for (offset, index) in blocks.map(\.index).sorted().enumerated() {
+            let expected = previousStart + offset
+            guard index == expected else { throw StreamingError.revisionPaginationNoProgress }
+        }
+
+        guard blocks.count == pageSize else { return nil }
+        guard lastResult.partialValue < Int.max else {
+            throw StreamingError.revisionPaginationNoProgress
+        }
+        return lastResult.partialValue + 1
     }
 }
 

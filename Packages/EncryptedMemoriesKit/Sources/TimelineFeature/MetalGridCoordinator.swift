@@ -2116,26 +2116,28 @@ extension MetalGridCoordinator {
             signposts: composeSignposts
         )
         let pendingVisibleQualityUpgrade = result.pendingVisibleQualityUpgrade
-        let visibleResident = visibleUIDs.reduce(into: 0) { count, uid in
-            if cache.isResident(uid) { count += 1 }
-        }
-        let retryableMissing = visibleUIDs.reduce(into: 0) { count, uid in
-            if !cache.isResident(uid), dataSource.canRetryThumbnail(for: uid) { count += 1 }
-        }
         PhotoDiagnostics.shared.emitDebug(
             "ThumbViewport",
-            [
-                "level": "\(level)",
-                "visible": "\(visibleUIDs.count)",
-                "resident": "\(visibleResident)",
-                "missing": "\(visibleUIDs.count - visibleResident)",
-                "retryableMissing": "\(retryableMissing)",
-                "overscan": "\(overscanUIDs.count)",
-                "warm": "\(result.warm.count)",
-                "uploads": "\(cache.uploadsThisFrame)",
-                "deferredUploads": "\(cache.deferredUploadsThisFrame)",
-                "pendingUpgrade": "\(pendingVisibleQualityUpgrade)",
-            ], throttleSeconds: 0.25, throttleKey: "frame")
+            fields: {
+                let visibleResident = visibleUIDs.reduce(into: 0) { count, uid in
+                    if cache.isResident(uid) { count += 1 }
+                }
+                let retryableMissing = visibleUIDs.reduce(into: 0) { count, uid in
+                    if !cache.isResident(uid), dataSource.canRetryThumbnail(for: uid) { count += 1 }
+                }
+                return [
+                    "level": "\(level)",
+                    "visible": "\(visibleUIDs.count)",
+                    "resident": "\(visibleResident)",
+                    "missing": "\(visibleUIDs.count - visibleResident)",
+                    "retryableMissing": "\(retryableMissing)",
+                    "overscan": "\(overscanUIDs.count)",
+                    "warm": "\(result.warm.count)",
+                    "uploads": "\(cache.uploadsThisFrame)",
+                    "deferredUploads": "\(cache.deferredUploadsThisFrame)",
+                    "pendingUpgrade": "\(pendingVisibleQualityUpgrade)",
+                ]
+            }, throttleSeconds: 0.25, throttleKey: "frame")
         if !result.warm.isEmpty {
             let requests = result.warm.map {
                 ThumbnailRequest(uid: $0, pixelSize: uploadPixels, cropMode: effectiveDisplayMode.rawValue)

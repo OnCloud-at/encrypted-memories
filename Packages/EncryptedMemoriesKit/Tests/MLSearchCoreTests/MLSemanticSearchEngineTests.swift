@@ -43,10 +43,10 @@ import Testing
 
         var blockLoads: Int { lock.withLock { loads } }
         func upsert(_ records: [MLEmbeddingRecord]) -> MLIndexBatchReport { backing.upsert(records) }
-        func contains(uid: PhotoUID, descriptor: MLModelDescriptor) -> Bool {
+        func contains(uid: PhotoUID, descriptor: MLModelDescriptor) throws -> Bool {
             backing.contains(uid: uid, descriptor: descriptor)
         }
-        func indexedUIDs(for descriptor: MLModelDescriptor, from uids: [PhotoUID]) -> Set<PhotoUID> {
+        func indexedUIDs(for descriptor: MLModelDescriptor, from uids: [PhotoUID]) throws -> Set<PhotoUID> {
             backing.indexedUIDs(for: descriptor, from: uids)
         }
         func allIndexedUIDs(for descriptor: MLModelDescriptor) -> [PhotoUID] { backing.allIndexedUIDs(for: descriptor) }
@@ -94,7 +94,7 @@ import Testing
         func recordFailures(_ records: [MLIndexFailureRecord]) -> Bool { backing.recordFailures(records) }
         func failureRecords(
             for descriptor: MLModelDescriptor, from uids: [PhotoUID]
-        ) -> [PhotoUID: MLIndexFailureRecord] { backing.failureRecords(for: descriptor, from: uids) }
+        ) throws -> [PhotoUID: MLIndexFailureRecord] { backing.failureRecords(for: descriptor, from: uids) }
     }
 
     @Test func normalizesQueryAndRanksSharedIndex() async throws {
@@ -244,7 +244,7 @@ import Testing
         #expect(try await engine.search(MLSearchQuery(descriptor: descriptor, queryText: "x")).count == 1)
     }
 
-    @Test func coverageDistinguishesSearchablePermanentAndPending() async {
+    @Test func coverageDistinguishesSearchablePermanentAndPending() async throws {
         let store = InMemoryMLIndexStore()
         let indexed = uid("indexed")
         let permanent = uid("permanent")
@@ -265,14 +265,14 @@ import Testing
             scorer: ReferenceDotProductScorer()
         )
 
-        let coverage = await engine.coverage(for: descriptor, allAssets: [indexed, permanent, pending])
+        let coverage = try await engine.coverage(for: descriptor, allAssets: [indexed, permanent, pending])
         #expect(coverage.indexed == 1)
         #expect(coverage.permanentlyUnindexable == 1)
         #expect(coverage.pending == 1)
         #expect(!coverage.isComplete)
     }
 
-    @Test func coverageCountsDuplicateHostUIDsOnce() async {
+    @Test func coverageCountsDuplicateHostUIDsOnce() async throws {
         let store = InMemoryMLIndexStore()
         let indexed = uid("indexed")
         store.upsert([MLEmbeddingRecord(uid: indexed, descriptor: descriptor, vector: [1, 0, 0])])
@@ -282,7 +282,7 @@ import Testing
             scorer: ReferenceDotProductScorer()
         )
 
-        let coverage = await engine.coverage(
+        let coverage = try await engine.coverage(
             for: descriptor,
             allAssets: [indexed, indexed, uid("pending"), uid("pending")]
         )
@@ -338,7 +338,7 @@ import Testing
         let indexed = await service.index(assets)
         #expect(indexed.report.indexed == 2)
         #expect(releases.value == 1)
-        #expect(await service.coverage(for: assets).isComplete)
+        #expect(try await service.coverage(for: assets).isComplete)
         let results = try await service.search("trees", limit: 1)
         #expect(results.descriptor == descriptor)
         #expect(results.results.map(\.uid.nodeID) == ["tree"])

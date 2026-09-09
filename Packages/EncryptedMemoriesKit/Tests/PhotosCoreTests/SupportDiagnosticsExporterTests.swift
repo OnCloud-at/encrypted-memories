@@ -3,6 +3,40 @@ import XCTest
 @testable import PhotosCore
 
 final class SupportDiagnosticsExporterTests: XCTestCase {
+    func testDisabledDebugLoggingDoesNotBuildFields() {
+        let diagnostics = PhotoDiagnostics(debugConsoleLogsEnabled: false)
+        var evaluations = 0
+        diagnostics.emitDebug(
+            "AuditProbe",
+            fields: {
+                evaluations += 1
+                return ["count": "1"]
+            }, throttleSeconds: 60, throttleKey: "frame")
+        XCTAssertEqual(evaluations, 0)
+    }
+
+    func testExplicitDebugThrottleBuildsFieldsOnlyForAdmittedEvents() {
+        let diagnostics = PhotoDiagnostics(debugConsoleLogsEnabled: true)
+        var evaluations = 0
+        for _ in 0..<100 {
+            diagnostics.emitDebug(
+                "AuditProbe",
+                fields: {
+                    evaluations += 1
+                    return ["count": "1"]
+                }, throttleSeconds: 60, throttleKey: "frame")
+        }
+        XCTAssertEqual(evaluations, 1)
+        XCTAssertTrue(diagnostics.supportSnapshot().events.isEmpty)
+        diagnostics.emitDebug(
+            "AuditProbe",
+            fields: {
+                evaluations += 1
+                return ["count": "2"]
+            }, throttleSeconds: 60, throttleKey: "another-frame")
+        XCTAssertEqual(evaluations, 2)
+    }
+
     func testDiagnosticsThrottleRetainsOnlyItsFixedKeyBudget() {
         var throttle = BoundedDiagnosticsThrottle(capacity: 3)
         let start = Date(timeIntervalSince1970: 1_000)

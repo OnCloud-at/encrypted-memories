@@ -49,8 +49,12 @@ final class AlbumActionRouteTests: XCTestCase {
         XCTAssertTrue(collections.contains("Button(L10n.string(\"action.retry\"))"))
         XCTAssertTrue(collections.contains("networkMonitor.didRecentlyRestoreConnection"))
         XCTAssertTrue(collections.contains("guard restored, phase.isFailure"))
+        XCTAssertTrue(collections.contains("snapshotReconciler.beginLoad()"))
         XCTAssertTrue(
-            collections.contains("generation == loadGeneration"),
-            "late responses must not overwrite a newer retry result")
+            collections.contains("snapshotReconciler.publishLoaded(prepared, token: token)"),
+            "successful loads must pass the shared generation and snapshot-revision guard")
+        XCTAssertTrue(
+            collections.contains("snapshotReconciler.isCurrent(token)"),
+            "late load failures must not overwrite a newer retry result")
     }
 }

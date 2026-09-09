@@ -134,7 +134,8 @@ struct TestMLVectorCipher: MLVectorCipher {
             }
             #expect(loaded.timestamp == Date(timeIntervalSince1970: 1_000))
             #expect(loaded.captureTime == capture)
-            #expect(store.contains(uid: uid("a0"), descriptor: descriptorV1))
+            let readResult1 = try store.contains(uid: uid("a0"), descriptor: descriptorV1)
+            #expect(readResult1)
         }
     }
 
@@ -171,7 +172,8 @@ struct TestMLVectorCipher: MLVectorCipher {
             #expect(
                 report.total == report.indexed + report.skippedAlreadyIndexed + report.permanentFailure
                     + report.transientFailure)
-            #expect(!store.contains(uid: uid("a1"), descriptor: descriptorV1))
+            let readResult2 = try store.contains(uid: uid("a1"), descriptor: descriptorV1) == false
+            #expect(readResult2)
         }
     }
 
@@ -184,10 +186,86 @@ struct TestMLVectorCipher: MLVectorCipher {
             var probes = (0..<450).map { uid("a\($0)") }
             probes.append(contentsOf: (0..<450).map { uid("missing\($0)") })
             probes.append(uid("v2only"))
-            let members = store.indexedUIDs(for: descriptorV1, from: probes)
+            let members = try store.indexedUIDs(for: descriptorV1, from: probes)
             #expect(members.count == 450)
             #expect(!members.contains(uid("v2only")))
             #expect(!members.contains(uid("missing0")))
+        }
+    }
+
+    @Test func closedStoreThrowsForPlanningMembershipReads() throws {
+        let root = makeTempURL()
+        defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
+        let store = try #require(SQLiteMLIndexStore(url: root, cipher: TestMLVectorCipher()))
+        store.close()
+
+        #expect(throws: MLIndexStoreReadError.storageUnavailable) {
+            _ = try store.contains(uid: uid("missing"), descriptor: descriptorV1)
+        }
+        #expect(throws: MLIndexStoreReadError.storageUnavailable) {
+            _ = try store.indexedUIDs(for: descriptorV1, from: [uid("missing")])
+        }
+        #expect(throws: MLIndexStoreReadError.storageUnavailable) {
+            _ = try store.failureRecords(for: descriptorV1, from: [uid("missing")])
+        }
+        #expect(throws: MLIndexStoreReadError.storageUnavailable) {
+            _ = try store.coverage(for: descriptorV1, allAssets: [uid("missing")])
+        }
+    }
+
+    @Test func failedFailureRecordSQLReadDoesNotReturnAPartialSet() throws {
+        let url = makeTempURL()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let store = try #require(SQLiteMLIndexStore(url: url, cipher: TestMLVectorCipher()))
+        defer { store.close() }
+        store.upsert([record("a0", descriptorV1, [1, 0, 0, 0])])
+
+        var handle: OpaquePointer?
+        #expect(sqlite3_open(url.path, &handle) == SQLITE_OK)
+        #expect(sqlite3_exec(handle, "DROP TABLE ml_failures;", nil, nil, nil) == SQLITE_OK)
+        sqlite3_close(handle)
+
+        #expect(throws: MLIndexStoreReadError.storageUnavailable) {
+            _ = try store.failureRecords(for: descriptorV1, from: [uid("a0"), uid("missing")])
+        }
+    }
+
+    @Test func unknownPersistedFailureKindIsStorageUnavailable() throws {
+        let url = makeTempURL()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let store = try #require(SQLiteMLIndexStore(url: url, cipher: TestMLVectorCipher()))
+        defer { store.close() }
+
+        var handle: OpaquePointer?
+        #expect(sqlite3_open(url.path, &handle) == SQLITE_OK)
+        #expect(
+            sqlite3_exec(
+                handle,
+                """
+                INSERT INTO ml_failures(
+                  volume_id, node_id, model_identifier, model_version,
+                  kind, reason, attempts, updated_at
+                ) VALUES
+                  ('vol1', 'permanent', 'fixture-model', 1, 'permanent', 'keep', 1, 1.0),
+                  ('vol1', 'unknown', 'fixture-model', 1, 'future-kind', 'reject', 1, 2.0);
+                """,
+                nil,
+                nil,
+                nil
+            ) == SQLITE_OK
+        )
+        sqlite3_close(handle)
+
+        do {
+            _ = try store.failureRecords(
+                for: descriptorV1,
+                from: [uid("permanent"), uid("unknown")]
+            )
+            Issue.record("unknown persisted failure kinds must not be skipped")
+        } catch let error as MLIndexStoreReadError {
+            #expect(error == .storageUnavailable)
+        } catch {
+            Issue.record("unexpected failure-record read error: \(error)")
         }
     }
 
@@ -195,7 +273,8 @@ struct TestMLVectorCipher: MLVectorCipher {
         try withStore { store, _ in
             store.upsert([record("a0", descriptorV1, [1, 0, 0, 0])])
             #expect(store.count(for: descriptorV2) == 0)
-            #expect(!store.contains(uid: uid("a0"), descriptor: descriptorV2))
+            let readResult3 = try store.contains(uid: uid("a0"), descriptor: descriptorV2) == false
+            #expect(readResult3)
 
             store.upsert([record("a0", descriptorV2, [2, 0, 0, 0])])
             #expect(store.count(for: descriptorV1) == 1)
@@ -212,8 +291,10 @@ struct TestMLVectorCipher: MLVectorCipher {
                 record("a1", descriptorV1, [0, 1, 0, 0]),
             ])
             store.remove(uid: uid("a0"), descriptor: descriptorV1)
-            #expect(!store.contains(uid: uid("a0"), descriptor: descriptorV1))
-            #expect(store.contains(uid: uid("a1"), descriptor: descriptorV1))
+            let readResult4 = try store.contains(uid: uid("a0"), descriptor: descriptorV1) == false
+            #expect(readResult4)
+            let readResult5 = try store.contains(uid: uid("a1"), descriptor: descriptorV1)
+            #expect(readResult5)
             #expect(store.count(for: descriptorV1) == 1)
         }
     }
@@ -243,7 +324,8 @@ struct TestMLVectorCipher: MLVectorCipher {
 
             #expect(store.generation(for: descriptorV1) == generation + 1)
             #expect(store.allIndexedUIDs(for: descriptorV1) == [uid("keep")])
-            #expect(store.failureRecords(for: descriptorV1, from: [failed]).isEmpty)
+            let readResult6 = try store.failureRecords(for: descriptorV1, from: [failed]).isEmpty
+            #expect(readResult6)
         }
     }
 
@@ -280,7 +362,8 @@ struct TestMLVectorCipher: MLVectorCipher {
                     descriptor: descriptorV1
                 ))
             #expect(Set(store.allIndexedUIDs(for: descriptorV1)) == Set(firstInventory))
-            #expect(store.failureRecords(for: descriptorV1, from: [failed]).isEmpty)
+            let readResult7 = try store.failureRecords(for: descriptorV1, from: [failed]).isEmpty
+            #expect(readResult7)
             #expect(store.generation(for: descriptorV1) == beforeColdReconciliation + 1)
 
             let laterAsset = uid("later")
@@ -391,8 +474,10 @@ struct TestMLVectorCipher: MLVectorCipher {
         sqlite3_close(handle)
 
         #expect(!store.removeAll(for: descriptorV1))
-        #expect(store.contains(uid: embedded, descriptor: descriptorV1))
-        #expect(store.failureRecords(for: descriptorV1, from: [failed])[failed] != nil)
+        let readResult8 = try store.contains(uid: embedded, descriptor: descriptorV1)
+        #expect(readResult8)
+        let readResult9 = try store.failureRecords(for: descriptorV1, from: [failed])[failed] != nil
+        #expect(readResult9)
         #expect(store.generation(for: descriptorV1) == generation)
 
         handle = nil
@@ -418,7 +503,7 @@ struct TestMLVectorCipher: MLVectorCipher {
         let reopened = try #require(SQLiteMLIndexStore(url: url, cipher: TestMLVectorCipher()))
         defer { reopened.close() }
         #expect(reopened.count(for: descriptorV1) == 2)
-        #expect(reopened.contains(uid: uid("a0"), descriptor: descriptorV1))
+        #expect(try reopened.contains(uid: uid("a0"), descriptor: descriptorV1))
         #expect(reopened.allRecords(for: descriptorV1).map(\.uid.nodeID) == ["a0", "a1"])
         // Idempotent replay after restart: no duplicates.
         let replay = reopened.upsert([record("a0", descriptorV1, [1, 2, 3, 4])])
@@ -500,9 +585,9 @@ struct TestMLVectorCipher: MLVectorCipher {
 
         let reopened = try #require(SQLiteMLIndexStore(url: url, cipher: cipher))
         defer { reopened.close() }
-        #expect(reopened.failureRecords(for: descriptorV1, from: [failedUID])[failedUID]?.attempts == 2)
+        #expect(try reopened.failureRecords(for: descriptorV1, from: [failedUID])[failedUID]?.attempts == 2)
         reopened.upsert([record("failed", descriptorV1, [1, 0, 0, 0])])
-        #expect(reopened.failureRecords(for: descriptorV1, from: [failedUID]).isEmpty)
+        #expect(try reopened.failureRecords(for: descriptorV1, from: [failedUID]).isEmpty)
     }
 
     @Test(.timeLimit(.minutes(1))) func smokeTwentyThousandUpsertAndLoad() throws {
@@ -539,7 +624,8 @@ struct TestMLVectorCipher: MLVectorCipher {
 
             // Membership over the whole set stays chunked and index-only.
             let probes = (0..<20_000).map { PhotoUID(volumeID: "vol1", nodeID: String(format: "n%06d", $0)) }
-            #expect(store.indexedUIDs(for: descriptor, from: probes).count == 20_000)
+            let readResult10 = try store.indexedUIDs(for: descriptor, from: probes).count == 20_000
+            #expect(readResult10)
         }
     }
 }

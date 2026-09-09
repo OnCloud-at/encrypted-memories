@@ -42,7 +42,10 @@ final class CoreArchitectureGateTests: XCTestCase {
         CoreTargetRule(
             name: "PhotosCore",
             // PhotosCore uses CryptoKit for timeline digests, OSLog for instrumentation, and SQLite3 for its app-owned metadata store.
-            allowedImports: ["AVFoundation", "CoreGraphics", "CryptoKit", "Foundation", "OSLog", "SQLite3"],
+            // Observation drives the shared immutable snapshot owner; it adds no platform UI dependency.
+            allowedImports: [
+                "AVFoundation", "CoreGraphics", "CryptoKit", "Foundation", "Observation", "OSLog", "SQLite3",
+            ],
             expectedDependencies: [],
             extraForbiddenTokens: []
         ),

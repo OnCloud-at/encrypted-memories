@@ -1,6 +1,10 @@
 import Foundation
 import PhotosCore
 
+public enum MLIndexStoreReadError: Error, Equatable, Sendable {
+    case storageUnavailable
+}
+
 /// Batched persistence boundary for ML embeddings and failure state. Keys are
 /// `(PhotoUID, MLModelDescriptor)`, writes are first-write-wins, and reads are deterministic.
 public protocol MLIndexStore: Sendable {
@@ -11,11 +15,11 @@ public protocol MLIndexStore: Sendable {
     func upsert(_ records: [MLEmbeddingRecord]) -> MLIndexBatchReport
 
     /// `true` iff a record exists for `(uid, descriptor)`.
-    func contains(uid: PhotoUID, descriptor: MLModelDescriptor) -> Bool
+    func contains(uid: PhotoUID, descriptor: MLModelDescriptor) throws -> Bool
 
     /// Bulk membership check for a model epoch. Returns the subset of `uids` already indexed.
     /// Must not load vectors or scan other epochs.
-    func indexedUIDs(for descriptor: MLModelDescriptor, from uids: [PhotoUID]) -> Set<PhotoUID>
+    func indexedUIDs(for descriptor: MLModelDescriptor, from uids: [PhotoUID]) throws -> Set<PhotoUID>
 
     /// All UIDs indexed under a model epoch (used for coverage / eviction heuristics).
     func allIndexedUIDs(for descriptor: MLModelDescriptor) -> [PhotoUID]
@@ -73,7 +77,9 @@ public protocol MLIndexStore: Sendable {
     /// Persist retry/permanent failure state independently from embeddings.
     @discardableResult
     func recordFailures(_ records: [MLIndexFailureRecord]) -> Bool
-    func failureRecords(for descriptor: MLModelDescriptor, from uids: [PhotoUID]) -> [PhotoUID: MLIndexFailureRecord]
+    func failureRecords(
+        for descriptor: MLModelDescriptor, from uids: [PhotoUID]
+    ) throws -> [PhotoUID: MLIndexFailureRecord]
 }
 
 extension MLIndexStore {
@@ -104,10 +110,10 @@ extension MLIndexStore {
         if !block.isEmpty { body(block) }
     }
 
-    public func coverage(for descriptor: MLModelDescriptor, allAssets: [PhotoUID]) -> MLIndexCoverage {
+    public func coverage(for descriptor: MLModelDescriptor, allAssets: [PhotoUID]) throws -> MLIndexCoverage {
         let uniqueAssets = Array(Set(allAssets))
-        let indexed = indexedUIDs(for: descriptor, from: uniqueAssets)
-        let failures = failureRecords(for: descriptor, from: uniqueAssets)
+        let indexed = try indexedUIDs(for: descriptor, from: uniqueAssets)
+        let failures = try failureRecords(for: descriptor, from: uniqueAssets)
         let permanent = failures.values.reduce(into: 0) { count, failure in
             if failure.kind == .permanent, !indexed.contains(failure.uid) { count += 1 }
         }

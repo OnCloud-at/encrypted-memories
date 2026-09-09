@@ -208,6 +208,25 @@ final class UploadManagerTests: XCTestCase {
         )
     }
 
+    func testClearFinishedUsesMembershipSetAndKeepsActiveOrder() async throws {
+        let (_, urls) = try jpegs(["first", "active", "queued"])
+        let uploader = MockUploader(workDuration: .milliseconds(100), deliverProgress: false)
+        let manager = UploadManager(uploader: uploader, maxConcurrent: 1)
+        _ = await manager.enqueueFiles(urls, destination: .library)
+
+        let beforeClear = await waitUntil(manager) { items in
+            items.count == 3 && items[0].state.isTerminal && items[1].state.isActive
+        }
+        XCTAssertEqual(beforeClear.map(\.displayName), ["first.jpg", "active.jpg", "queued.jpg"])
+
+        await manager.clearFinished()
+        let retained = await manager.snapshot()
+        XCTAssertEqual(retained.map(\.displayName), ["active.jpg", "queued.jpg"])
+        XCTAssertEqual(retained.first?.state.isActive, true)
+
+        _ = await waitForAllTerminal(manager)
+    }
+
     func testStateMachineRetryToCompleted() async throws {
         let (_, urls) = try jpegs(["x"])
         let uploader = MockUploader(deliverProgress: false, transientFailures: ["x.jpg": 1])

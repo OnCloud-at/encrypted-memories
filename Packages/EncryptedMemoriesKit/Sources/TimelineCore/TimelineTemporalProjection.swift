@@ -328,9 +328,6 @@ public struct TimelineTemporalProjection: Equatable, Sendable {
             let yearKey = YearKey(era: parts.era, year: parts.year)
             let monthKey = MonthKey(era: parts.era, year: parts.year, month: parts.month)
             let dayKey = DayKey(era: parts.era, year: parts.year, month: parts.month, day: parts.day)
-            let yearInterval = interval(.year, for: item.captureTime, calendar: calendar)
-            let monthInterval = interval(.month, for: item.captureTime, calendar: calendar)
-            let dayInterval = interval(.day, for: item.captureTime, calendar: calendar)
             let dayTitle = Self.dayTitle(for: dayKey)
             let placeLabel = cleanedLabel(enrichment.placeLabel(for: item.uid))
             let eventLabel = cleanedLabel(enrichment.eventLabel(for: item.uid))
@@ -349,7 +346,7 @@ public struct TimelineTemporalProjection: Equatable, Sendable {
                 yearOrder.append(yearKey)
                 yearBuilders[yearKey] = MutableYear(
                     key: yearKey,
-                    interval: yearInterval,
+                    interval: interval(.year, for: item.captureTime, calendar: calendar),
                     item: item,
                     placeLabel: placeLabel
                 )
@@ -363,7 +360,7 @@ public struct TimelineTemporalProjection: Equatable, Sendable {
                 monthOrder.append(monthKey)
                 monthBuilders[monthKey] = MutableMonth(
                     key: monthKey,
-                    interval: monthInterval,
+                    interval: interval(.month, for: item.captureTime, calendar: calendar),
                     item: item,
                     placeLabel: placeLabel
                 )
@@ -377,7 +374,7 @@ public struct TimelineTemporalProjection: Equatable, Sendable {
                 dayOrder.append(dayKey)
                 dayBuilders[dayKey] = MutableDay(
                     key: dayKey,
-                    interval: dayInterval,
+                    interval: interval(.day, for: item.captureTime, calendar: calendar),
                     title: dayTitle,
                     item: item,
                     eventKey: eventKey,

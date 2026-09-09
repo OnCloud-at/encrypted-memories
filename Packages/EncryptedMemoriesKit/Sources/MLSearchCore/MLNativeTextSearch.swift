@@ -241,7 +241,7 @@ public protocol MLNativeSearchServing: Sendable {
     ) async -> MLDerivedPipelinePassOutcome
     func search(_ text: String, scope: MLSearchScope, limit: Int) async -> [PhotoUID]
     func progress() async -> MLDerivedPipelineProgress
-    func unavailableAssetUIDs() async -> Set<PhotoUID>
+    func unavailableAssetUIDs() async throws -> Set<PhotoUID>
     func purge() async
     func shutdown() async
 }
@@ -476,8 +476,8 @@ public actor MLNativeSearchRuntime: MLNativeSearchServing {
         readProgressOrLast()
     }
 
-    public func unavailableAssetUIDs() -> Set<PhotoUID> {
-        store.unavailableAssetUIDs(for: configuration.executionKey)
+    public func unavailableAssetUIDs() throws -> Set<PhotoUID> {
+        try store.unavailableAssetUIDs(for: configuration.executionKey)
     }
 
     public func purge() {

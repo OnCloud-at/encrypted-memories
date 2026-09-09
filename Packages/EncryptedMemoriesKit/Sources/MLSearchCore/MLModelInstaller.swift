@@ -158,6 +158,15 @@ public actor MLModelInstaller {
     private let transport: any MLModelArtifactTransport
     private let now: @Sendable () -> Date
     private var inFlight: [InstallDestinationKey: InFlightInstall] = [:]
+    private var modelFenceOwners: [MLModelID: Int] = [:]
+    private var allInstallFenceOwners = 0
+
+    #if DEBUG
+        private var installWaiterCount = 0
+        private var installWaiters: [(minimum: Int, continuation: CheckedContinuation<Void, Never>)] = []
+        private var fenceWaiters:
+            [(minimum: Int, modelID: MLModelID?, continuation: CheckedContinuation<Void, Never>)] = []
+    #endif
 
     public init(
         layout: MLModelInstallLayout,
@@ -229,43 +238,60 @@ public actor MLModelInstaller {
             artifacts: plan.items.map(\.artifact).sorted { $0.relativePath < $1.relativePath }
         )
         let destinationKey = InstallDestinationKey(modelID: entry.id, revision: plan.revision)
-        if let existing = inFlight[destinationKey] {
-            let record = try await existing.task.value
-            if existing.requestKey == requestKey {
-                return record
-            }
-            if inFlight[destinationKey]?.token == existing.token {
-                inFlight[destinationKey] = nil
-            }
-        }
-        if let installed = installedRecord(for: entry, revision: plan.revision) {
-            return installed
+        guard !isFenced(entry.id) else {
+            throw MLModelInstallError.cancelled
         }
 
-        try Task.checkCancellation()
-        let layout = self.layout
-        let transport = self.transport
-        let now = self.now
-        let install = InFlightInstall(
-            requestKey: requestKey,
-            task: Task {
-                try await Self.performInstall(
-                    entry: entry,
-                    plan: plan,
-                    layout: layout,
-                    transport: transport,
-                    now: now,
-                    onProgress: onProgress
-                )
-            })
-        inFlight[destinationKey] = install
-        // Clear only our entry: a cancel + fresh install may have replaced it while we awaited.
-        defer {
-            if inFlight[destinationKey]?.token == install.token {
-                inFlight[destinationKey] = nil
+        while true {
+            guard !isFenced(entry.id) else {
+                throw MLModelInstallError.cancelled
             }
+            if let existing = inFlight[destinationKey] {
+                #if DEBUG
+                    beginInstallWaiter()
+                    defer { endInstallWaiter() }
+                #endif
+                let record = try await existing.task.value
+                guard !isFenced(entry.id) else {
+                    throw MLModelInstallError.cancelled
+                }
+                if existing.requestKey == requestKey {
+                    return record
+                }
+                if inFlight[destinationKey]?.token == existing.token {
+                    inFlight[destinationKey] = nil
+                }
+                continue
+            }
+            if let installed = installedRecord(for: entry, revision: plan.revision) {
+                return installed
+            }
+
+            try Task.checkCancellation()
+            let layout = self.layout
+            let transport = self.transport
+            let now = self.now
+            let install = InFlightInstall(
+                requestKey: requestKey,
+                task: Task {
+                    try await Self.performInstall(
+                        entry: entry,
+                        plan: plan,
+                        layout: layout,
+                        transport: transport,
+                        now: now,
+                        onProgress: onProgress
+                    )
+                })
+            inFlight[destinationKey] = install
+            // Clear only our entry: a cancel + fresh install may have replaced it while we awaited.
+            defer {
+                if inFlight[destinationKey]?.token == install.token {
+                    inFlight[destinationKey] = nil
+                }
+            }
+            return try await install.task.value
         }
-        return try await install.task.value
     }
 
     /// Install `entry` by copying a developer-provided local artifact directory. Checksums are
@@ -324,7 +350,9 @@ public actor MLModelInstaller {
     /// Awaits any in-flight install of the same entry first, so a racing installer task can
     /// never recreate files after the removal.
     public func uninstall(_ entry: MLModelCatalogEntry) async {
-        await cancelInstall(of: entry.id)
+        acquireModelFence(for: entry.id)
+        defer { releaseModelFence(for: entry.id) }
+        await cancelRegisteredInstalls(for: entry.id)
         try? FileManager.default.removeItem(at: layout.modelDirectory(for: entry.id))
         try? FileManager.default.removeItem(at: layout.runtimeCacheModelDirectory(for: entry.id))
         for staging in layout.stagingDirectories(for: entry.id) {
@@ -362,7 +390,16 @@ public actor MLModelInstaller {
     /// still-running install task would otherwise recreate `tmp/` after the delete. Partial
     /// downloads stay in `tmp/` for a later resume/restart; they are never loadable.
     public func cancelInstall(of id: MLModelID) async {
-        let installs = inFlight.filter { $0.key.modelID == id }
+        acquireModelFence(for: id)
+        defer { releaseModelFence(for: id) }
+        await cancelRegisteredInstalls(for: id)
+    }
+
+    private func cancelRegisteredInstalls(for id: MLModelID? = nil) async {
+        let installs = inFlight.filter { key, _ in
+            guard let id else { return true }
+            return key.modelID == id
+        }
         for install in installs.values { install.task.cancel() }
         for install in installs.values { _ = try? await install.task.value }
         let cancelledTokens = Set(installs.values.map(\.token))
@@ -371,12 +408,96 @@ public actor MLModelInstaller {
 
     /// Cancel and await every in-flight install (session shutdown / purge).
     public func cancelAllInstalls() async {
-        let installs = Array(inFlight.values)
-        for install in installs { install.task.cancel() }
-        for install in installs { _ = try? await install.task.value }
-        let cancelledTokens = Set(installs.map(\.token))
-        inFlight = inFlight.filter { !cancelledTokens.contains($0.value.token) }
+        allInstallFenceOwners += 1
+        #if DEBUG
+            resumeSatisfiedFenceWaiters()
+        #endif
+        defer { allInstallFenceOwners -= 1 }
+        await cancelRegisteredInstalls()
     }
+
+    private func isFenced(_ id: MLModelID) -> Bool {
+        allInstallFenceOwners > 0 || (modelFenceOwners[id] ?? 0) > 0
+    }
+
+    private func acquireModelFence(for id: MLModelID) {
+        modelFenceOwners[id, default: 0] += 1
+        #if DEBUG
+            resumeSatisfiedFenceWaiters()
+        #endif
+    }
+
+    private func releaseModelFence(for id: MLModelID) {
+        guard let owners = modelFenceOwners[id], owners > 0 else {
+            preconditionFailure("released an unowned model-install fence")
+        }
+        if owners == 1 {
+            modelFenceOwners[id] = nil
+        } else {
+            modelFenceOwners[id] = owners - 1
+        }
+        #if DEBUG
+            resumeSatisfiedFenceWaiters()
+        #endif
+    }
+
+    #if DEBUG
+        /// Test-only synchronization for admission tests. This observes actor state instead of
+        /// using scheduler turns as a proxy for a caller reaching an awaited predecessor.
+        internal func waitForInstallWaiters(_ minimum: Int) async {
+            guard installWaiterCount < minimum else { return }
+            await withCheckedContinuation { continuation in
+                installWaiters.append((minimum: minimum, continuation: continuation))
+            }
+        }
+
+        /// Test-only synchronization for overlapping cancellation/uninstall owners.
+        internal func waitForFenceOwners(modelID: MLModelID? = nil, minimum: Int) async {
+            guard fenceOwnerCount(for: modelID) < minimum else { return }
+            await withCheckedContinuation { continuation in
+                fenceWaiters.append((minimum: minimum, modelID: modelID, continuation: continuation))
+            }
+        }
+
+        private func beginInstallWaiter() {
+            installWaiterCount += 1
+            resumeSatisfiedFenceWaiters()
+        }
+
+        private func endInstallWaiter() {
+            installWaiterCount -= 1
+        }
+
+        private func fenceOwnerCount(for modelID: MLModelID?) -> Int {
+            if let modelID {
+                return allInstallFenceOwners + (modelFenceOwners[modelID] ?? 0)
+            }
+            return allInstallFenceOwners
+        }
+
+        private func resumeSatisfiedFenceWaiters() {
+            var remainingInstallWaiters: [(minimum: Int, continuation: CheckedContinuation<Void, Never>)] = []
+            for waiter in installWaiters {
+                if installWaiterCount >= waiter.minimum {
+                    waiter.continuation.resume()
+                } else {
+                    remainingInstallWaiters.append(waiter)
+                }
+            }
+            installWaiters = remainingInstallWaiters
+
+            var remaining: [(minimum: Int, modelID: MLModelID?, continuation: CheckedContinuation<Void, Never>)] = []
+            for waiter in fenceWaiters {
+                let satisfied = fenceOwnerCount(for: waiter.modelID) >= waiter.minimum
+                if satisfied {
+                    waiter.continuation.resume()
+                } else {
+                    remaining.append(waiter)
+                }
+            }
+            fenceWaiters = remaining
+        }
+    #endif
 
     // MARK: - Install pipeline (static: no actor hops during I/O)
 

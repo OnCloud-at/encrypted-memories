@@ -3,10 +3,10 @@ import Foundation
 /// Couples one SDK operation to its matching native cancellation call with the same token.
 enum SDKCancellableOperation {
     static func run<Value: Sendable>(
+        token: UUID = UUID(),
         operation: @Sendable @escaping (UUID) async throws -> Value,
         cancel: @Sendable @escaping (UUID) async -> Void
     ) async throws -> Value {
-        let token = UUID()
         let cancellation = SDKCancellationJoin(token: token, cancel: cancel)
         let result: Result<Value, any Error>
         do {

@@ -1560,17 +1560,6 @@ public actor MLSmartSearchLifecycle {
                         leaseDecision: nativeLeaseDecision
                     )
                 )
-                lastNativeProgress = nativeOutcome.progress
-                // The detailed UID set is only needed to suppress assets with terminal input
-                // failures. On the overwhelmingly common zero-failure path, avoid a second
-                // derived-store scan after every short indexing quantum.
-                nativeUnavailableAssetUIDs =
-                    nativeOutcome.progress.permanentFailure == 0
-                    ? []
-                    : await nativeSearch?.unavailableAssetUIDs() ?? []
-                if nativeOutcome.reason == .drained, nativeOutcome.progress.isComplete {
-                    nativeIndexedLibraryGeneration = observedLibraryGeneration
-                }
                 if nativeOutcome.reason == .storageFailure {
                     let failure = MLSmartSearchFailure(
                         kind: .storage,
@@ -1581,6 +1570,33 @@ public actor MLSmartSearchLifecycle {
                     emit()
                     await waitForKick(timeout: configuration.indexRetryDelay, since: observedKickGeneration)
                     continue
+                }
+                // The detailed UID set is only needed to suppress assets with terminal input
+                // failures. On the overwhelmingly common zero-failure path, avoid a second
+                // derived-store scan after every short indexing quantum.
+                if nativeOutcome.progress.permanentFailure == 0 {
+                    nativeUnavailableAssetUIDs = []
+                } else {
+                    do {
+                        let unavailableAssetUIDs = try await nativeSearch?.unavailableAssetUIDs() ?? []
+                        guard generation == sessionGeneration, !Task.isCancelled else { return }
+                        nativeUnavailableAssetUIDs = unavailableAssetUIDs
+                    } catch {
+                        guard generation == sessionGeneration, !Task.isCancelled else { return }
+                        let failure = MLSmartSearchFailure(
+                            kind: .storage,
+                            isRetryable: true,
+                            debugDescription: "native analysis suppression state unavailable"
+                        )
+                        indexingState = .failed(failure)
+                        emit()
+                        await waitForKick(timeout: configuration.indexRetryDelay, since: observedKickGeneration)
+                        continue
+                    }
+                }
+                lastNativeProgress = nativeOutcome.progress
+                if nativeOutcome.reason == .drained, nativeOutcome.progress.isComplete {
+                    nativeIndexedLibraryGeneration = observedLibraryGeneration
                 }
             }
 
@@ -1673,10 +1689,37 @@ public actor MLSmartSearchLifecycle {
                 if activeIndexPassID == passID { activeIndexPassID = nil }
                 acceptedIndexProgressSettled = 0
                 guard generation == sessionGeneration, !Task.isCancelled else { return }
+                if case .failed = outcome.progress.phase {
+                    let failure = MLSmartSearchFailure(
+                        kind: .storage,
+                        isRetryable: true,
+                        debugDescription: "semantic index store unavailable"
+                    )
+                    indexingState = .failed(failure)
+                    emit()
+                    await waitForKick(timeout: configuration.indexRetryDelay, since: observedKickGeneration)
+                    continue
+                }
+                do {
+                    let unavailableAssetUIDs = try await session.permanentlyUnavailableAssetUIDs(scheduledAssets)
+                    guard generation == sessionGeneration, !Task.isCancelled else { return }
+                    semanticUnavailableAssetUIDs = unavailableAssetUIDs
+                } catch {
+                    guard generation == sessionGeneration, !Task.isCancelled else { return }
+                    let failure = MLSmartSearchFailure(
+                        kind: .storage,
+                        isRetryable: true,
+                        debugDescription: "semantic suppression state unavailable"
+                    )
+                    indexingState = .failed(failure)
+                    emit()
+                    await waitForKick(timeout: configuration.indexRetryDelay, since: observedKickGeneration)
+                    continue
+                }
                 lastCoverage = outcome.coverage
-                semanticUnavailableAssetUIDs = await session.permanentlyUnavailableAssetUIDs(scheduledAssets)
                 if outcome.ranToCompletion {
                     let currentInventory = await deps.assetsProvider()
+                    guard generation == sessionGeneration, !Task.isCancelled else { return }
                     if scheduledInventory.isAuthoritative,
                         currentInventory.isAuthoritative,
                         currentInventory == scheduledInventory

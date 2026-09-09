@@ -99,7 +99,7 @@ public final class AppleVisionPipelineExecutor: MLDerivedPipelineExecutor, Senda
         switch await imageSource.image(for: plan.asset.uid) {
         case .permanentFailure(let reason):
             let outcome: MLPipelineStageOutcome =
-                reason == "thumbnail unavailable from backend"
+                reason == CachedThumbnailMLImageSourceFailureReason.unavailable.rawValue
                 ? .skipped(.sourceUnavailable)
                 : .permanentInputFailure(reason: .sourceCorrupt)
             return plan.workItems.map { .init(workItem: $0, outcome: outcome) }

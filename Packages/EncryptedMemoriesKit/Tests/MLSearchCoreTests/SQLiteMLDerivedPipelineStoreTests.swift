@@ -674,6 +674,9 @@ import Testing
         #expect(throws: MLDerivedPipelineStoreError.storageUnavailable) {
             _ = try store.nextWorkBatch(for: key, limit: 1, now: .now)
         }
+        #expect(throws: MLDerivedPipelineStoreError.storageUnavailable) {
+            _ = try store.unavailableAssetUIDs(for: key)
+        }
 
         let outcome = await MLIndexRunner.runDerivedPass(
             key: key,
@@ -681,6 +684,20 @@ import Testing
             executor: SQLiteRecordingExecutor { _ in [] }
         )
         #expect(outcome.reason == .storageFailure)
+    }
+
+    @Test func unavailableAssetsAreEmptyForAValidMissingAccount() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("SQLiteMLDerivedPipelineStoreTests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try openStore(
+            url: root.appendingPathComponent(SQLiteMLDerivedPipelineStore.databaseFileName),
+            cipher: TestDerivedCipher(key: 0x78)
+        )
+        let artifact = try makeArtifact(stage: "ocr", revision: "revision3")
+        let key = try makeKey(account: "missing-account", artifacts: [artifact])
+
+        #expect(try store.unavailableAssetUIDs(for: key).isEmpty)
     }
 
     private func makeArtifact(stage: String, revision: String) throws -> MLDerivedArtifactIdentity {

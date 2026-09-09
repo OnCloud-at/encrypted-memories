@@ -68,6 +68,78 @@ import Testing
         #expect(embedder.totalCalls == 10)
     }
 
+    @Test func planningStorageFailureDoesNotEmbedOrClaimCompletion() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("MLIndexRunnerTests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let url = root.appendingPathComponent(SQLiteMLIndexStore.databaseFileName)
+        let store = try #require(SQLiteMLIndexStore(url: url, cipher: TestMLVectorCipher()))
+        store.close()
+        let embedder = ScriptedEmbedder()
+        let runner = MLIndexRunner(store: store, embedder: embedder)
+
+        let outcome = await runner.runPass(
+            allAssets: [uid("a0"), uid("a1")],
+            descriptor: descriptor
+        )
+
+        #expect(!outcome.ranToCompletion)
+        #expect(outcome.progress.phase == .failed(message: "storage unavailable"))
+        #expect(outcome.progress.totalAssets == 2)
+        #expect(!outcome.progress.isComplete)
+        #expect(embedder.totalCalls == 0)
+    }
+
+    @Test func closedStoreBetweenSemanticQuantaFailsAndReplansBeforeRetry() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("MLIndexRunnerTests-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let url = root.appendingPathComponent(SQLiteMLIndexStore.databaseFileName)
+        let store = try #require(SQLiteMLIndexStore(url: url, cipher: TestMLVectorCipher()))
+        defer { store.close() }
+        let embedder = ScriptedEmbedder()
+        let runner = MLIndexRunner(
+            store: store,
+            embedder: embedder,
+            configuration: .init(chunkSize: 1)
+        )
+        let assets = [uid("a0"), uid("a1")]
+
+        let first = await runner.runPass(
+            allAssets: assets,
+            descriptor: descriptor,
+            maximumAssets: 1,
+            libraryGeneration: 1
+        )
+        #expect(!first.ranToCompletion)
+        #expect(first.report.indexed == 1)
+
+        store.close()
+        let callsBeforeFailedWrite = embedder.totalCalls
+        let failed = await runner.runPass(
+            allAssets: assets,
+            descriptor: descriptor,
+            maximumAssets: 1,
+            libraryGeneration: 1
+        )
+        #expect(!failed.ranToCompletion)
+        #expect(failed.progress.phase == .failed(message: "storage unavailable"))
+        #expect(embedder.totalCalls == callsBeforeFailedWrite + 1)
+
+        // The bounded work above may have run before the closed-store write was discovered.
+        // Once discovered, the cached plan is discarded: a still-closed store fails in planning
+        // and does not continue embedding the same quantum on the next retry.
+        let retry = await runner.runPass(
+            allAssets: assets,
+            descriptor: descriptor,
+            maximumAssets: 1,
+            libraryGeneration: 1
+        )
+        #expect(!retry.ranToCompletion)
+        #expect(retry.progress.phase == .failed(message: "storage unavailable"))
+        #expect(embedder.totalCalls == callsBeforeFailedWrite + 1)
+    }
+
     @Test func gateStopPersistsPartialChunkAndResumes() async {
         let store = InMemoryMLIndexStore()
         let gate = LockedGate(remainingAssets: 4)

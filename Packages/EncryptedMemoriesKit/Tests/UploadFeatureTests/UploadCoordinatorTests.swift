@@ -62,6 +62,107 @@ private actor FolderEnqueueProbe {
 }
 
 final class UploadCoordinatorTests: XCTestCase {
+    func testSnapshotMailboxIsBoundedAndRejectsLateDelivery() async {
+        let (stream, continuation) = AsyncStream.makeStream(
+            of: Int.self,
+            bufferingPolicy: .bufferingNewest(1)
+        )
+        let mailbox = UploadCallbackMailbox(continuation: continuation)
+
+        for value in 0..<10_000 {
+            XCTAssertTrue(mailbox.deliver(value))
+        }
+        mailbox.finish()
+        XCTAssertFalse(mailbox.deliver(10_000))
+
+        var values: [Int] = []
+        for await value in stream { values.append(value) }
+        XCTAssertEqual(values, [9_999], "pending snapshots must stay bounded to one newest value")
+    }
+
+    func testSnapshotMailboxDropsOutOfOrderOldValueBeforeConsumerRuns() async {
+        let (stream, continuation) = AsyncStream.makeStream(
+            of: UInt64.self,
+            bufferingPolicy: .bufferingNewest(1)
+        )
+        let mailbox = UploadCallbackMailbox(
+            continuation: continuation,
+            sequence: { $0 }
+        )
+
+        XCTAssertTrue(mailbox.deliver(10))
+        XCTAssertTrue(mailbox.deliver(12))
+        XCTAssertFalse(mailbox.deliver(11))
+        mailbox.finish()
+
+        var values: [UInt64] = []
+        for await value in stream { values.append(value) }
+        XCTAssertEqual(values, [12])
+    }
+
+    @MainActor
+    func testOlderDeferredSnapshotCannotOverwriteNewerTerminalPair() {
+        let manager = UploadManager(uploader: MockUploader(deliverProgress: false))
+        let coordinator = UploadCoordinator(
+            manager: manager,
+            uploadCapabilities: .sdkUploader,
+            canCreateAlbum: false,
+            canAddToAlbum: false,
+            canSetAlbumCover: false
+        )
+        let url = URL(fileURLWithPath: "/terminal.jpg")
+        let id = UUID()
+        let queued = UploadItem(
+            id: id, ordinal: 0, fileURL: url, displayName: "terminal.jpg",
+            mediaType: "image/jpeg", byteCount: 1, state: .queued
+        )
+        var terminal = queued
+        terminal.state = .completed
+        var terminalStats = UploadQueueStats()
+        terminalStats.completed = 1
+
+        coordinator.applySnapshot(.init(sequence: 10, items: [queued], stats: .init()))
+        coordinator.applySnapshot(.init(sequence: 11, items: [terminal], stats: terminalStats))
+        coordinator.applySnapshot(.init(sequence: 10, items: [queued], stats: .init()))
+
+        XCTAssertEqual(coordinator.items, [terminal])
+        XCTAssertEqual(coordinator.stats, terminalStats)
+    }
+
+    @MainActor
+    func testCompletedEventsRemainLosslessAcrossSeveralTerminalUploadsAndConcurrentStarts() async throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("upload-coordinator-" + UUID().uuidString)
+        let urls = try makeTempFiles(["a.jpg", "b.jpg", "c.jpg"], in: dir)
+        let manager = UploadManager(
+            uploader: MockUploader(workDuration: .milliseconds(1), deliverProgress: false),
+            maxConcurrent: 1
+        )
+        let coordinator = UploadCoordinator(
+            manager: manager,
+            uploadCapabilities: .sdkUploader,
+            canCreateAlbum: false,
+            canAddToAlbum: false,
+            canSetAlbumCover: false
+        )
+
+        await withTaskGroup(of: Void.self) { group in
+            for _ in 0..<10 { group.addTask { await coordinator.start() } }
+        }
+        _ = await manager.enqueueFiles(urls, destination: .library)
+        let deadline = ContinuousClock.now + .seconds(5)
+        while coordinator.completedUploadRevision < 3, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+
+        XCTAssertEqual(coordinator.completedUploadRevision, 3)
+        XCTAssertEqual(coordinator.latestCompletedUpload?.displayName, "c.jpg")
+
+        await coordinator.start()
+        XCTAssertEqual(coordinator.completedUploadRevision, 3)
+        try? FileManager.default.removeItem(at: dir)
+    }
+
     @MainActor
     func testFolderConfirmationsAreSerialized() async {
         let probe = FolderEnqueueProbe()

@@ -61,9 +61,6 @@
                 onDecoded: { uid, decoded in
                     // Same DB-backed dimension pipeline as the macOS feed - batched, off this path.
                     dimensions?.record(uid, width: decoded.pixelWidth, height: decoded.pixelHeight)
-                    // A (re)decode may have replaced the CGImage with a sharper one; drop the stale UIImage
-                    // wrapper so viewer/map consumers rebuild from the current decoded tier on next read.
-                    wrappers.remove(forKey: Self.key(uid))
                 }
             )
         }
@@ -82,17 +79,14 @@
         }
 
         public func cachedImage(for uid: PhotoUID) async -> UIImage? {
-            guard let decoded = await core.cachedDecoded(for: uid) else { return nil }
-            return image(for: decoded, uid: uid)
+            let ticket = imageWrappers.captureTicket()
+            guard await core.cachedDecoded(for: uid) != nil else { return nil }
+            return currentImage(for: uid, ticket: ticket)
         }
 
         public nonisolated func memoryImage(for uid: PhotoUID) -> UIImage? {
-            let key = Self.key(uid)
-            if let image = imageWrappers.image(forKey: key) { return image }
-            guard let decoded = core.memoryDecoded(for: uid) else { return nil }
-            let image = UIKitThumbnailImageDecoder.image(from: decoded)
-            imageWrappers.set(image, forKey: key, cost: decoded.decodedCostBytes)
-            return image
+            let ticket = imageWrappers.captureTicket()
+            return currentImage(for: uid, ticket: ticket)
         }
 
         public nonisolated func memoryCGImage(for uid: PhotoUID) -> CGImage? {
@@ -153,8 +147,9 @@
         }
 
         public func image(for uid: PhotoUID) async -> UIImage? {
-            guard let decoded = await core.decoded(for: uid) else { return nil }
-            return image(for: decoded, uid: uid)
+            let ticket = imageWrappers.captureTicket()
+            guard await core.decoded(for: uid) != nil else { return nil }
+            return currentImage(for: uid, ticket: ticket)
         }
 
         public func analysisImage(for uid: PhotoUID) async -> UIImage? {
@@ -167,10 +162,12 @@
         }
 
         public func stopPrefetch() async {
+            imageWrappers.invalidateAll()
             await core.stopPrefetchAndWait()
         }
 
         public func clearCacheAndRestartPrefetch() async {
+            imageWrappers.invalidateAll()
             await core.clearCacheAndRestartPrefetch()
         }
 
@@ -194,12 +191,24 @@
             await core.prefetchStatus()
         }
 
-        private func image(for decoded: DecodedThumbnail, uid: PhotoUID) -> UIImage {
+        private nonisolated func currentImage(
+            for uid: PhotoUID,
+            ticket: WrapperImageCache<UIImage>.InsertionTicket
+        ) -> UIImage? {
+            guard let decoded = core.memoryDecoded(for: uid) else { return nil }
             let key = Self.key(uid)
-            if let image = imageWrappers.image(forKey: key) { return image }
-            let image = UIKitThumbnailImageDecoder.image(from: decoded)
-            imageWrappers.set(image, forKey: key, cost: decoded.decodedCostBytes)
-            return image
+            return imageWrappers.resolvePairedImage(
+                forKey: key,
+                cost: decoded.decodedCostBytes,
+                source: decoded.image,
+                ticket: ticket,
+                sourceIsCurrent: { [core] in
+                    core.memoryDecoded(for: uid)?.image === decoded.image
+                },
+                build: {
+                    UIKitThumbnailImageDecoder.image(from: decoded)
+                }
+            )
         }
 
         private static func key(_ uid: PhotoUID) -> NSString {

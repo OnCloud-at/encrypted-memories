@@ -316,7 +316,9 @@ private struct MobileFilterGridScreen: View {
     let filter: PhotoFilter
 
     @Environment(MobileViewerRouter.self) private var viewerRouter
-    @State private var snapshot = TimelineSnapshot()
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var snapshotReconciler = TimelineSnapshotReconciler()
+    private var snapshot: TimelineSnapshot { snapshotReconciler.snapshot }
     @State private var phase: Phase = .loading
     @State private var selection = MobileGridSelectionController()
     @State private var confirmEmptyTrash = false
@@ -330,7 +332,6 @@ private struct MobileFilterGridScreen: View {
     @State private var showAlbumPhotoActions = false
     @State private var isRemovingFromAlbum = false
     @State private var networkMonitor = NetworkMonitor.shared
-    @State private var loadGeneration = 0
 
     private enum Phase: Equatable {
         case loading, loaded
@@ -343,7 +344,10 @@ private struct MobileFilterGridScreen: View {
 
     var body: some View {
         alertContent
-            .task(id: filter) { await load() }
+            .task(id: filter) {
+                snapshotReconciler.reset()
+                await load()
+            }
             .onChange(of: viewerRouter.completedMutation) { _, mutation in
                 guard let mutation, snapshot.index(of: mutation.uid) != nil else { return }
                 reconcileCompletedViewerMutation(mutation)
@@ -353,6 +357,7 @@ private struct MobileFilterGridScreen: View {
                 Task { await load() }
             }
             .onDisappear {
+                snapshotReconciler.invalidatePendingWork()
                 showAlbumPicker = false
                 showAlbumPhotoActions = false
                 selection.finish()
@@ -628,8 +633,7 @@ private struct MobileFilterGridScreen: View {
 
     private func load() async {
         guard let backend = model.backend, filter.hasTimeline else { return }
-        loadGeneration &+= 1
-        let generation = loadGeneration
+        let token = snapshotReconciler.beginLoad()
         phase = .loading
         do {
             let sections = try await backend.timeline(filter: filter)
@@ -637,11 +641,10 @@ private struct MobileFilterGridScreen: View {
             let prepared = await Task.detached(priority: .userInitiated) {
                 TimelineSnapshot(sections: sections)
             }.value
-            guard !Task.isCancelled, generation == loadGeneration else { return }
-            snapshot = prepared
+            guard !Task.isCancelled, snapshotReconciler.publishLoaded(prepared, token: token) else { return }
             phase = .loaded
         } catch {
-            guard !Task.isCancelled, generation == loadGeneration else { return }
+            guard !Task.isCancelled, snapshotReconciler.isCurrent(token) else { return }
             phase = .failed((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
         }
     }
@@ -656,14 +659,15 @@ private struct MobileFilterGridScreen: View {
     }
 
     private func reconcileCompletedViewerMutation(_ mutation: MobileViewerMutation) {
-        let current = snapshot
+        let epoch = snapshotReconciler.epoch
         Task {
-            let updated = await Task.detached(priority: .userInitiated) {
-                current.removingItems(withUIDs: [mutation.uid])
-            }.value
-            guard viewerRouter.completedMutation?.id == mutation.id else { return }
-            withAnimation(.easeInOut(duration: 0.2)) {
-                snapshot = updated
+            if await snapshotReconciler.remove(
+                [mutation.uid], within: epoch,
+                withPublication: { update in
+                    withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.2)) { update() }
+                })
+            {
+                phase = .loaded
             }
         }
     }
@@ -676,13 +680,12 @@ private struct MobileFilterGridScreen: View {
     }
 
     private func performTrash() {
+        let epoch = snapshotReconciler.epoch
         selection.performTrash { uids in
             try await model.trashItems(uids)
-            let current = snapshot
-            let updated = await Task.detached(priority: .userInitiated) {
-                current.removingItems(withUIDs: uids)
-            }.value
-            snapshot = updated
+            if await snapshotReconciler.remove(uids, within: epoch) {
+                phase = .loaded
+            }
         }
     }
 
@@ -690,14 +693,13 @@ private struct MobileFilterGridScreen: View {
         guard let albumID, !selection.selected.isEmpty, !isRemovingFromAlbum else { return }
         let uids = snapshot.orderedUIDs(including: selection.selected)
         isRemovingFromAlbum = true
+        let epoch = snapshotReconciler.epoch
         Task {
             defer { isRemovingFromAlbum = false }
             do {
                 try await model.removeItems(uids, fromAlbum: albumID)
-                let current = snapshot
-                snapshot = await Task.detached(priority: .userInitiated) {
-                    current.removingItems(withUIDs: Set(uids))
-                }.value
+                guard await snapshotReconciler.remove(Set(uids), within: epoch) else { return }
+                phase = .loaded
                 selection.finish()
             } catch {
                 actionErrorTitle = L10n.string("albums.remove_photos_failed_title")
@@ -710,15 +712,14 @@ private struct MobileFilterGridScreen: View {
         let selectedItems = snapshot.items(withUIDs: selection.selected)
         guard !selectedItems.isEmpty, !isRestoring else { return }
         isRestoring = true
+        let epoch = snapshotReconciler.epoch
         Task {
             defer { isRestoring = false }
             do {
                 try await model.restoreItems(selectedItems)
-                let current = snapshot
                 let uids = Set(selectedItems.map(\.uid))
-                snapshot = await Task.detached(priority: .userInitiated) {
-                    current.removingItems(withUIDs: uids)
-                }.value
+                guard await snapshotReconciler.remove(uids, within: epoch) else { return }
+                phase = .loaded
                 selection.finish()
             } catch {
                 actionErrorTitle = String(localized: "trash.restore_failed_title")
@@ -743,10 +744,12 @@ private struct MobileFilterGridScreen: View {
     @MainActor private func emptyTrash() async {
         guard filter == .trash, !snapshot.isEmpty, !isEmptyingTrash else { return }
         isEmptyingTrash = true
+        let epoch = snapshotReconciler.epoch
         defer { isEmptyingTrash = false }
         do {
             try await model.emptyTrash()
-            snapshot = TimelineSnapshot()
+            guard epoch == snapshotReconciler.epoch else { return }
+            snapshotReconciler.reset()
             phase = .loaded
         } catch {
             actionErrorTitle = L10n.string("trash.empty_failed_title")

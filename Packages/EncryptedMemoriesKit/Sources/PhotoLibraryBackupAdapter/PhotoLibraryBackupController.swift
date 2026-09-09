@@ -809,6 +809,14 @@ public final class PhotoLibraryBackupController {
             return true
         }
 
+        @discardableResult
+        internal func startPreparedInstantWorkForTesting(
+            prepare: @escaping @Sendable () async -> Void,
+            consume: @escaping @Sendable () async -> Void
+        ) -> Bool {
+            startPreparedInstantWork(prepare: prepare, consume: { _ in await consume() })
+        }
+
         internal var isRetiringInstantWorkForTesting: Bool { isRetiringInstantWork }
 
         internal func retireInstantWorkForTesting() async {
@@ -962,28 +970,50 @@ public final class PhotoLibraryBackupController {
         guard !isShuttingDown, !isRetiringInstantWork,
             let engine, let runner, let catalogStore
         else { return }
-        let prepared = monitor.prepareChanges()
-        // requiresFullRescan means the token is untrusted (expired); the running pass's own full scan
-        // covers it; do not spin a targeted enqueue from an unreliable id list.
-        guard !prepared.changes.requiresFullRescan else { return }
-        let targeted = Array(Set(prepared.changes.changedIdentifiers + prepared.changes.deletedIdentifiers))
-        guard !targeted.isEmpty else { return }
-        // Off the main actor: the catalog sync enumerates PhotoKit and writes SQLite. Tracked so the
-        // exit paths can cancel it if the pass ends before this completes.
+        startPreparedInstantWork(
+            prepare: { await Self.prepareChangesOffMainActor(monitor) },
+            consume: { prepared in
+                // An expired token is covered by the current pass's full scan. This path never
+                // commits a token; the active pass remains its sole owner.
+                guard !prepared.changes.requiresFullRescan else { return }
+                let targeted = Array(Set(prepared.changes.changedIdentifiers + prepared.changes.deletedIdentifiers))
+                guard !targeted.isEmpty else { return }
+                let sync = PhotoLibraryCatalogSync(
+                    store: catalogStore,
+                    onRemoved: { identifiers in
+                        _ = await runner.removePhotoLibraryAssets(identifiers)
+                    }
+                )
+                _ = try? await sync.run(engine: engine, identifiers: targeted)
+            }
+        )
+    }
+
+    /// Registers preparation and the resulting writer as one lifetime. Retirement must join a
+    /// non-cooperative PhotoKit read before it can release the run or close account stores.
+    @discardableResult
+    private func startPreparedInstantWork<Value: Sendable>(
+        prepare: @escaping @Sendable () async -> Value,
+        consume: @escaping @Sendable (Value) async -> Void
+    ) -> Bool {
+        guard !isShuttingDown, !isRetiringInstantWork, isSyncing, let runID = activeRunID else { return false }
         let completion = InstantWorkCompletion()
-        let task = Task.detached(priority: .utility) {
-            let sync = PhotoLibraryCatalogSync(
-                store: catalogStore,
-                onRemoved: { identifiers in
-                    _ = await runner.removePhotoLibraryAssets(identifiers)
+        let task = Task.detached(priority: .utility) { [weak self] in
+            if !Task.isCancelled, await self?.acceptsInstantWork(runID: runID) == true {
+                let value = await prepare()
+                if !Task.isCancelled, await self?.acceptsInstantWork(runID: runID) == true {
+                    await consume(value)
                 }
-            )
-            _ = try? await sync.run(engine: engine, identifiers: targeted)
+            }
             await completion.markCompleted()
-            // The durable rows are now runnable; the concurrent reconcile loop claims them on its next
-            // drain cycle (within its ~250 ms inter-drain sleep); no explicit wake needed.
         }
+        // No actor suspension occurs between creating the task and recording its join handle.
         instantWorkItems.append(InstantWorkItem(task: task, completion: completion))
+        return true
+    }
+
+    private func acceptsInstantWork(runID: String) -> Bool {
+        !isShuttingDown && !isRetiringInstantWork && isSyncing && activeRunID == runID
     }
 
     // MARK: - Status projection

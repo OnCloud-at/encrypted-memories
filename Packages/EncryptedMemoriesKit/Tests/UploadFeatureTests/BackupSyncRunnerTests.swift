@@ -264,6 +264,13 @@ final class BackupEventLog: @unchecked Sendable {
     func firstIndex(of event: String) -> Int? { events.firstIndex(of: event) }
 }
 
+private final class UploadProgressRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var values: [UploadProgress] = []
+    func append(_ value: UploadProgress) { lock.withLock { values.append(value) } }
+    var snapshots: [UploadProgress] { lock.withLock { values } }
+}
+
 final class BackupProgressRecorder: @unchecked Sendable {
     private let lock = NSLock()
     private var values: [BackupSyncProgress] = []
@@ -1167,6 +1174,11 @@ final class BackupSyncRunnerTests: XCTestCase {
         let pending = try XCTUnwrap(queueStore.entry(for: entry.source, revision: entry.revision))
         XCTAssertEqual(pending.state, .needsRemoteReconciliation)
         XCTAssertNotNil(pending.remoteCommitReconciliation)
+        XCTAssertEqual(pending.remoteCommitReconciliation?.descriptor?.source, entry.source)
+        XCTAssertEqual(pending.remoteCommitReconciliation?.descriptor?.filename, entry.originalFilename)
+        XCTAssertEqual(pending.remoteCommitReconciliation?.descriptor?.fileSize, entry.byteCount)
+        XCTAssertEqual(pending.remoteCommitReconciliation?.queueBinding?.source, entry.source)
+        XCTAssertEqual(pending.remoteCommitReconciliation?.queueBinding?.revision, entry.revision)
         XCTAssertEqual(uploader.requests.count, 1, "the server commit happened exactly once")
 
         clock.advance(by: 2)
@@ -2054,6 +2066,38 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertEqual(final.backedUp, 1)
         XCTAssertEqual(final.activeExecutionItemEquivalents, 0)
         XCTAssertEqual(afterLateCallbacks.activeExecutionItemEquivalents, 0)
+    }
+
+    func testUploadProgressGateKeepsPhaseEdgesAndTerminalHighWaterMark() {
+        let forwarded = UploadProgressRecorder()
+        let gate = BackupUploadCallbackGate { forwarded.append($0) }
+
+        gate.publish(.init(phase: .preparing))
+        gate.publish(.init(phase: .preparing))
+        gate.publish(.init(phase: .hashing))
+        gate.publish(.init(phase: .hashing))
+        gate.publish(.init(phase: .uploading, fraction: 0.001))
+        gate.publish(.init(phase: .uploading, fraction: 0.009))
+        gate.publish(.init(phase: .uploading, fraction: 0.01))
+        gate.publish(.init(phase: .uploading, fraction: 0.50))
+        gate.publish(.init(phase: .uploading, fraction: 0.40))
+        gate.publish(.init(phase: .uploading, fraction: 1.0))
+        // A phase callback after bytes must not reset the upload high-water mark.
+        gate.publish(.init(phase: .preparing))
+        gate.publish(.init(phase: .uploading, fraction: 0.10))
+
+        XCTAssertEqual(
+            forwarded.snapshots,
+            [
+                .init(phase: .preparing),
+                .init(phase: .hashing),
+                .init(phase: .uploading, fraction: 0.001),
+                .init(phase: .uploading, fraction: 0.01),
+                .init(phase: .uploading, fraction: 0.50),
+                .init(phase: .uploading, fraction: 1.0),
+                .init(phase: .preparing),
+            ]
+        )
     }
 
     func testCompositeResolverRoutesAndRejectsUnknownKinds() async throws {

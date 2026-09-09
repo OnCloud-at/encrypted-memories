@@ -610,7 +610,12 @@ public actor BackupSyncRunner {
                     let reconciliation = UploadRemoteCommitReconciliation(
                         source: resolved.descriptor.source,
                         identity: identity,
-                        receipt: receipt
+                        receipt: receipt,
+                        descriptor: UploadResourceDescriptorSnapshot(resolved.descriptor),
+                        queueBinding: UploadRemoteCommitQueueBinding(
+                            source: entry.source,
+                            revision: entry.revision
+                        )
                     )
                     guard
                         queue.markNeedsRemoteReconciliation(
@@ -1129,7 +1134,12 @@ public actor BackupSyncRunner {
                         let reconciliation = UploadRemoteCommitReconciliation(
                             source: secondary.descriptor.source,
                             identity: identity,
-                            receipt: receipt
+                            receipt: receipt,
+                            descriptor: UploadResourceDescriptorSnapshot(secondary.descriptor),
+                            queueBinding: UploadRemoteCommitQueueBinding(
+                                source: entry.source,
+                                revision: entry.revision
+                            )
                         )
                         guard
                             queue.markNeedsRemoteReconciliation(
@@ -1727,8 +1737,9 @@ public actor BackupSyncRunner {
 
         let uploadTask = Task {
             do {
-                let uid = try await uploader.upload(request) { progress in
-                    activity.markProgress()
+                // Coalesce byte callbacks before the actor hop; markProgress stays unconditional
+                // so the watchdog still treats every raw callback as transfer liveness.
+                let progressGate = BackupUploadCallbackGate { progress in
                     Task {
                         await runner.updateActiveTransfer(
                             key: progressKey,
@@ -1736,6 +1747,10 @@ public actor BackupSyncRunner {
                             progress: progress
                         )
                     }
+                }
+                let uid = try await uploader.upload(request) { progress in
+                    activity.markProgress()
+                    progressGate.publish(progress)
                 }
                 race.resolve(.success(uid))
             } catch {
@@ -1977,6 +1992,42 @@ private final class BackupPreparationCallbackGate: @unchecked Sendable {
             return true
         }
         if shouldPublish { handler(Double(bucket) / 100) }
+    }
+}
+
+/// Upload backends can call the byte-progress handler for every streamed block, and each forwarded
+/// callback spawns a task that hops onto the runner actor. Bucketing uploading phase progress before
+/// that hop bounds the spawned-task count to at most 100 per transfer. Only the actor hop is gated;
+/// watchdog liveness (`markProgress`) keeps seeing every raw callback, and the original progress
+/// value is forwarded unchanged so terminal progress and phase transitions stay accurate.
+final class BackupUploadCallbackGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var lastBucket = -1
+    private var lastPhase: UploadProgress.Phase?
+    private let handler: @Sendable (UploadProgress) -> Void
+
+    init(handler: @escaping @Sendable (UploadProgress) -> Void) {
+        self.handler = handler
+    }
+
+    func publish(_ progress: UploadProgress) {
+        let shouldPublish = lock.withLock {
+            if progress.phase != .uploading {
+                guard progress.phase != lastPhase else { return false }
+                lastPhase = progress.phase
+                return true
+            }
+
+            // Keep phase transitions and the terminal 1.0 callback visible, while the byte
+            // fraction remains a monotonic high-water mark across any phase restart.
+            lastPhase = .uploading
+            let clamped = min(1, max(0, progress.fraction))
+            let bucket = Int((clamped * 100).rounded(.down))
+            guard bucket > lastBucket else { return false }
+            lastBucket = bucket
+            return true
+        }
+        if shouldPublish { handler(progress) }
     }
 }
 

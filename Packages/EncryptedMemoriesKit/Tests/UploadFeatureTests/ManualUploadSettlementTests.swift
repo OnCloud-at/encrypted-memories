@@ -436,7 +436,28 @@ final class ManualUploadSettlementTests: XCTestCase {
             settlementStore: replayStore,
             maxConcurrent: 1
         )
+        let coordinator = await MainActor.run {
+            UploadCoordinator(
+                manager: replayManager,
+                uploadCapabilities: uploader.capabilities,
+                canCreateAlbum: false,
+                canAddToAlbum: false,
+                canSetAlbumCover: false
+            )
+        }
+        await coordinator.start()
         let replayed = await waitUntil(replayManager) { $0.first?.state == .completed }
+        let deadline = ContinuousClock.now + .seconds(5)
+        while await coordinator.completedUploadRevision == 0, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        await coordinator.start()
+        await replayManager.retry(id)
+        let completedRevision = await coordinator.completedUploadRevision
+        let completion = await coordinator.latestCompletedUpload
+        XCTAssertEqual(completedRevision, 1, "recovered upload must refresh the library exactly once")
+        XCTAssertEqual(completion?.id, id)
+        XCTAssertEqual(completion?.uploadedUID, testUID("photo.jpg"))
         XCTAssertEqual(replayed.first?.id, id)
         XCTAssertEqual(replayed.first?.uploadedUID, testUID("photo.jpg"))
         XCTAssertEqual(replayStore.record(for: id)?.stage, .terminal)

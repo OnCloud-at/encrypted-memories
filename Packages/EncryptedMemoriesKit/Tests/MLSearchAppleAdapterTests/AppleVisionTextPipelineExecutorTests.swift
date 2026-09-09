@@ -113,6 +113,32 @@ import Vision
             })
     }
 
+    @Test func cachedThumbnailFailureContractPreservesUnavailableAndCorruptCategories() async throws {
+        let unavailableExecutor = AppleVisionPipelineExecutor(
+            imageSource: CountingVisionImageSource(
+                outcome: .permanentFailure(
+                    reason: CachedThumbnailMLImageSourceFailureReason.unavailable.rawValue)),
+            analyze: { _, _ in
+                Issue.record("Vision must not run without an available source")
+                return [:]
+            }
+        )
+        let unavailable = await unavailableExecutor.execute(
+            try makePlan(kinds: [.textRecognition, .barcodeDetection]))
+        #expect(unavailable.allSatisfy { $0.outcome == .skipped(.sourceUnavailable) })
+
+        let corruptExecutor = AppleVisionPipelineExecutor(
+            imageSource: CountingVisionImageSource(outcome: .permanentFailure(reason: "other source error")),
+            analyze: { _, _ in
+                Issue.record("Vision must not run for a corrupt source")
+                return [:]
+            }
+        )
+        let corrupt = await corruptExecutor.execute(
+            try makePlan(kinds: [.textRecognition, .barcodeDetection]))
+        #expect(corrupt.allSatisfy { $0.outcome == .permanentInputFailure(reason: .sourceCorrupt) })
+    }
+
     @Test func structuredDocumentProducesIndependentSearchArtifactsWithoutFlatteningLayout() throws {
         let bounds = try MLNormalizedRect(x: 0.1, y: 0.2, width: 0.6, height: 0.3)
         let snapshot = AppleVisionPipelineExecutor.StructuredDocumentSnapshot(
