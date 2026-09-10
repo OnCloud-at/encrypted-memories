@@ -46,7 +46,7 @@ jobs:
   validate:
     name: Validate model release contracts
     if: github.event_name != 'release' || startsWith(github.event.release.tag_name, 'ml-model-')
-    runs-on: macos-26
+    runs-on: xcode-27
     timeout-minutes: 45
     steps:
       - name: Check out source
@@ -85,7 +85,7 @@ jobs:
     name: Publish signed catalog pair
     if: github.event_name != 'pull_request'
     needs: validate
-    runs-on: macos-26
+    runs-on: xcode-27
     timeout-minutes: 60
     environment: ml-model-production
     permissions:

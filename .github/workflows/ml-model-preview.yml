@@ -26,7 +26,7 @@ concurrency:
 jobs:
   publish-preview:
     name: Publish signed preview catalog pair
-    runs-on: macos-26
+    runs-on: xcode-27
     timeout-minutes: 60
     environment: ml-model-preview
     steps:

@@ -25,7 +25,7 @@ concurrency:
 
 jobs:
   rollback:
-    runs-on: macos-26
+    runs-on: xcode-27
     timeout-minutes: 45
     environment: ml-model-production
     steps:

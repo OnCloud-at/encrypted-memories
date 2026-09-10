@@ -108,7 +108,10 @@ import Testing
 
         #expect(presentation.statusText == L10n.string("mlsearch.status_indexing"))
         #expect(presentation.progressFraction == 0.4)
-        #expect(presentation.detailText == L10n.string("mlsearch.work_progress_percent 40"))
+        // Mirror the production call: the key is looked up through
+        // String.LocalizationValue interpolation so the catalog entry with
+        // its "%lld" placeholder is resolved instead of the literal key.
+        #expect(presentation.detailText == L10n.string("mlsearch.work_progress_percent \(40)"))
         #expect(presentation.indexedCount == 120)
         #expect(presentation.totalCount == 300)
     }

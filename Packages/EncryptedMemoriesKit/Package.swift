@@ -144,6 +144,10 @@ let package = Package(
             dependencies: [
                 "LibrarySourceRuntime", "PhotosCore", "ProtonDriveBackend", "MediaByteCache", "MediaFeedCore",
                 "MLSearchCore", "AlbumCore",
+                .product(name: "ProtonCoreCryptoGoInterface", package: "protoncore_ios"),
+                // libproton_drive_sdk.a's CExports references the Go pgp_* symbols; without the
+                // patched Go implementation the Xcode 27 linker fails to resolve them in this bundle.
+                .product(name: "ProtonCoreCryptoPatchedGoImplementation", package: "protoncore_ios"),
             ],
             swiftSettings: disableDynamicActorIsolation
         ),
