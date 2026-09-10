@@ -537,23 +537,37 @@ jobs:
           ' "$private_key"
           chmod 600 "$private_key"
           openssl pkey -in "$private_key" -noout
-          # Transient runner-side network failures can abort altool before the
-          # upload starts. Apple ignores duplicate uploads of the same build,
-          # so retrying with backoff is safe.
+          # Retry every altool failure, not only failures before the upload
+          # starts. Most failures are transient runner-side network errors.
+          # If Apple already ingested this build and the connection dropped
+          # afterwards, the retry fails with ITMS-90189 "Redundant Binary
+          # Upload"; treat that as success instead of failing the workflow.
           max_attempts=3
           attempt=1
           delay_seconds=30
-          until xcrun altool --upload-package "$ARTIFACT_PATH" \
-            --api-key "$APP_STORE_CONNECT_KEY_ID" \
-            --api-issuer "$APP_STORE_CONNECT_ISSUER_ID" \
-            --p8-file-path "$private_key" \
-            --show-progress \
-            --output-format json; do
+          while [[ "$attempt" -le "$max_attempts" ]]; do
+            upload_log="$RUNNER_TEMP/altool-upload-${{ matrix.script_platform }}-attempt-${attempt}.log"
+            set +e
+            xcrun altool --upload-package "$ARTIFACT_PATH" \
+              --api-key "$APP_STORE_CONNECT_KEY_ID" \
+              --api-issuer "$APP_STORE_CONNECT_ISSUER_ID" \
+              --p8-file-path "$private_key" \
+              --show-progress \
+              --output-format json 2>&1 | tee "$upload_log"
+            altool_status="${PIPESTATUS[0]}"
+            set -e
+            if [[ "$altool_status" -eq 0 ]]; then
+              break
+            fi
+            if grep -qiE 'ITMS-90189|Redundant Binary Upload' "$upload_log"; then
+              echo "::notice::App Store Connect already holds this build (ITMS-90189); treating the upload as complete."
+              break
+            fi
             if [[ "$attempt" -ge "$max_attempts" ]]; then
-              echo "altool upload failed after $attempt attempts." >&2
+              echo "altool upload failed after $attempt attempts; see $upload_log." >&2
               exit 1
             fi
-            echo "::warning::altool upload attempt $attempt failed; retrying in ${delay_seconds}s."
+            echo "::warning::altool upload attempt $attempt failed (exit $altool_status); retrying in ${delay_seconds}s."
             sleep "$delay_seconds"
             attempt=$((attempt + 1))
             delay_seconds=$((delay_seconds * 3))
@@ -574,6 +588,7 @@ jobs:
           path: |
             ${{ runner.temp }}/EncryptedMemories-${{ matrix.script_platform }}.log
             ${{ runner.temp }}/EncryptedMemories-${{ matrix.script_platform }}.xcresult
+            ${{ runner.temp }}/altool-upload-${{ matrix.script_platform }}-attempt-*.log
           if-no-files-found: warn
           retention-days: 14
 
