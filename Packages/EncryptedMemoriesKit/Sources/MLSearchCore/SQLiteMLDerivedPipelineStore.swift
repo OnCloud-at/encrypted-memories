@@ -559,15 +559,14 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
         }
     }
 
-    public func unavailableAssetUIDs(for key: MLPipelineExecutionKey) -> Set<PhotoUID> {
-        lock.withLock {
-            guard
-                let accountKey = accountKeyLocked(identifier: key.accountIdentifier, create: false),
-                let artifactIDs = artifactIDsLocked(for: key, create: false),
-                !artifactIDs.isEmpty
-            else {
+    public func unavailableAssetUIDs(for key: MLPipelineExecutionKey) throws -> Set<PhotoUID> {
+        try lock.withLock {
+            guard db != nil else { throw MLDerivedPipelineStoreError.storageUnavailable }
+            guard let accountKey = try existingAccountKeyLocked(identifier: key.accountIdentifier) else {
                 return []
             }
+            let artifactIDs = try existingArtifactIDsLocked(for: key)
+            guard !artifactIDs.isEmpty else { return [] }
             let ids = artifactIDs.values.sorted()
             var stmt: OpaquePointer?
             guard
@@ -581,7 +580,7 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
                     """,
                     &stmt
                 )
-            else { return [] }
+            else { throw MLDerivedPipelineStoreError.storageUnavailable }
             defer { sqlite3_finalize(stmt) }
             var index: Int32 = 1
             sqlite3_bind_int64(stmt, index, accountKey)
@@ -591,10 +590,18 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
                 index += 1
             }
             var result: Set<PhotoUID> = []
-            while sqlite3_step(stmt) == SQLITE_ROW {
-                let volumeID = columnText(stmt, 0)
-                let nodeID = columnText(stmt, 1)
-                result.insert(PhotoUID(volumeID: volumeID, nodeID: nodeID))
+            var done = false
+            while !done {
+                switch sqlite3_step(stmt) {
+                case SQLITE_ROW:
+                    let volumeID = columnText(stmt, 0)
+                    let nodeID = columnText(stmt, 1)
+                    result.insert(PhotoUID(volumeID: volumeID, nodeID: nodeID))
+                case SQLITE_DONE:
+                    done = true
+                default:
+                    throw MLDerivedPipelineStoreError.storageUnavailable
+                }
             }
             return result
         }

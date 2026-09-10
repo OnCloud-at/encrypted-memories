@@ -232,8 +232,9 @@ public final class SQLiteMLIndexStore: MLIndexStore, @unchecked Sendable {
 
     // MARK: - Membership / coverage
 
-    public func contains(uid: PhotoUID, descriptor: MLModelDescriptor) -> Bool {
-        lock.withLock {
+    public func contains(uid: PhotoUID, descriptor: MLModelDescriptor) throws -> Bool {
+        try lock.withLock {
+            guard db != nil else { throw MLIndexStoreReadError.storageUnavailable }
             var stmt: OpaquePointer?
             guard
                 sqlite3_prepare_v2(
@@ -246,19 +247,24 @@ public final class SQLiteMLIndexStore: MLIndexStore, @unchecked Sendable {
                     """,
                     -1, &stmt, nil
                 ) == SQLITE_OK
-            else { return false }
+            else { throw MLIndexStoreReadError.storageUnavailable }
             defer { sqlite3_finalize(stmt) }
             bindEpochRead(stmt, descriptor)
             bindText(stmt, 5, uid.volumeID)
             bindText(stmt, 6, uid.nodeID)
-            return sqlite3_step(stmt) == SQLITE_ROW
+            switch sqlite3_step(stmt) {
+            case SQLITE_ROW: return true
+            case SQLITE_DONE: return false
+            default: throw MLIndexStoreReadError.storageUnavailable
+            }
         }
     }
 
-    public func indexedUIDs(for descriptor: MLModelDescriptor, from uids: [PhotoUID]) -> Set<PhotoUID> {
+    public func indexedUIDs(for descriptor: MLModelDescriptor, from uids: [PhotoUID]) throws -> Set<PhotoUID> {
         guard !uids.isEmpty else { return [] }
         var found: Set<PhotoUID> = []
-        lock.withLock {
+        try lock.withLock {
+            guard db != nil else { throw MLIndexStoreReadError.storageUnavailable }
             // Chunked row-value IN so a 100k+ membership check never builds one giant
             // statement and never loads vectors (index-only lookup).
             var start = 0
@@ -280,7 +286,7 @@ public final class SQLiteMLIndexStore: MLIndexStore, @unchecked Sendable {
                         """,
                         -1, &stmt, nil
                     ) == SQLITE_OK
-                else { continue }
+                else { throw MLIndexStoreReadError.storageUnavailable }
                 defer {
                     if let stmt { sqlite3_finalize(stmt) }
                 }
@@ -291,8 +297,16 @@ public final class SQLiteMLIndexStore: MLIndexStore, @unchecked Sendable {
                     bindText(stmt, index + 1, uid.nodeID)
                     index += 2
                 }
-                while sqlite3_step(stmt) == SQLITE_ROW {
-                    found.insert(PhotoUID(volumeID: columnText(stmt, 0), nodeID: columnText(stmt, 1)))
+                var done = false
+                while !done {
+                    switch sqlite3_step(stmt) {
+                    case SQLITE_ROW:
+                        found.insert(PhotoUID(volumeID: columnText(stmt, 0), nodeID: columnText(stmt, 1)))
+                    case SQLITE_DONE:
+                        done = true
+                    default:
+                        throw MLIndexStoreReadError.storageUnavailable
+                    }
                 }
             }
         }
@@ -430,9 +444,10 @@ public final class SQLiteMLIndexStore: MLIndexStore, @unchecked Sendable {
     public func failureRecords(
         for descriptor: MLModelDescriptor,
         from uids: [PhotoUID]
-    ) -> [PhotoUID: MLIndexFailureRecord] {
+    ) throws -> [PhotoUID: MLIndexFailureRecord] {
         guard !uids.isEmpty else { return [:] }
-        return lock.withLock {
+        return try lock.withLock {
+            guard db != nil else { throw MLIndexStoreReadError.storageUnavailable }
             var found: [PhotoUID: MLIndexFailureRecord] = [:]
             var start = 0
             while start < uids.count {
@@ -452,7 +467,10 @@ public final class SQLiteMLIndexStore: MLIndexStore, @unchecked Sendable {
                         """,
                         -1, &stmt, nil
                     ) == SQLITE_OK
-                else { continue }
+                else { throw MLIndexStoreReadError.storageUnavailable }
+                defer {
+                    if let stmt { sqlite3_finalize(stmt) }
+                }
                 bindDescriptor(stmt, descriptor)
                 var index: Int32 = 3
                 for uid in chunk {
@@ -460,20 +478,29 @@ public final class SQLiteMLIndexStore: MLIndexStore, @unchecked Sendable {
                     bindText(stmt, index + 1, uid.nodeID)
                     index += 2
                 }
-                while sqlite3_step(stmt) == SQLITE_ROW {
-                    let uid = PhotoUID(volumeID: columnText(stmt, 0), nodeID: columnText(stmt, 1))
-                    guard let kind = MLIndexFailureKind(rawValue: columnText(stmt, 2)) else { continue }
-                    let reason = sqlite3_column_type(stmt, 3) == SQLITE_NULL ? nil : columnText(stmt, 3)
-                    found[uid] = MLIndexFailureRecord(
-                        uid: uid,
-                        descriptor: descriptor,
-                        kind: kind,
-                        reason: reason,
-                        attempts: Int(sqlite3_column_int64(stmt, 4)),
-                        updatedAt: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 5))
-                    )
+                var done = false
+                while !done {
+                    switch sqlite3_step(stmt) {
+                    case SQLITE_ROW:
+                        let uid = PhotoUID(volumeID: columnText(stmt, 0), nodeID: columnText(stmt, 1))
+                        guard let kind = MLIndexFailureKind(rawValue: columnText(stmt, 2)) else {
+                            throw MLIndexStoreReadError.storageUnavailable
+                        }
+                        let reason = sqlite3_column_type(stmt, 3) == SQLITE_NULL ? nil : columnText(stmt, 3)
+                        found[uid] = MLIndexFailureRecord(
+                            uid: uid,
+                            descriptor: descriptor,
+                            kind: kind,
+                            reason: reason,
+                            attempts: Int(sqlite3_column_int64(stmt, 4)),
+                            updatedAt: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 5))
+                        )
+                    case SQLITE_DONE:
+                        done = true
+                    default:
+                        throw MLIndexStoreReadError.storageUnavailable
+                    }
                 }
-                sqlite3_finalize(stmt)
             }
             return found
         }

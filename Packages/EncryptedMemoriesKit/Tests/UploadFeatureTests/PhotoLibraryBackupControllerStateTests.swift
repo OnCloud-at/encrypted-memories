@@ -131,6 +131,50 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
         await fixture.controller.shutdown()
     }
 
+    func testRetirementJoinsChangePreparationAndRejectsItsLateWriter() async throws {
+        let fixture = try makeControllerFixture(prefix: "photo-backup-preparation-retirement")
+        defer { fixture.cleanup() }
+        let preparation = NonCooperativeWriterLatch()
+        let consumed = CompletionLatch()
+        let orchestration = Task { while !Task.isCancelled { await Task.yield() } }
+        XCTAssertTrue(fixture.controller.installSyncRunForTesting(runID: "prepared-run", task: orchestration))
+        XCTAssertTrue(
+            fixture.controller.startPreparedInstantWorkForTesting(
+                prepare: {
+                    XCTAssertFalse(Thread.isMainThread)
+                    await preparation.markStarted()
+                    await preparation.waitUntilReleased()
+                },
+                consume: { await consumed.markCompleted() }
+            ))
+        await preparation.waitUntilBlocked()
+        // Reaching this actor while preparation is blocked also proves UI work remains runnable.
+        await fixture.controller.retireInstantWorkForTesting()
+        XCTAssertTrue(fixture.controller.isRetiringInstantWorkForTesting)
+        await preparation.release()
+        await fixture.controller.waitForInstantWorkRetirementForTesting()
+        let didConsume = await consumed.isCompleted()
+        XCTAssertFalse(didConsume, "a preparation from a retired pass must never enqueue work")
+        await fixture.controller.shutdown()
+        await orchestration.value
+    }
+
+    func testPreparedChangesAreConsumedForTheActiveRun() async throws {
+        let fixture = try makeControllerFixture(prefix: "photo-backup-preparation-current")
+        defer { fixture.cleanup() }
+        let consumed = CompletionLatch()
+        let orchestration = Task { while !Task.isCancelled { await Task.yield() } }
+        XCTAssertTrue(fixture.controller.installSyncRunForTesting(runID: "current-run", task: orchestration))
+        XCTAssertTrue(
+            fixture.controller.startPreparedInstantWorkForTesting(
+                prepare: { XCTAssertFalse(Thread.isMainThread) },
+                consume: { await consumed.markCompleted() }
+            ))
+        await consumed.waitUntilCompleted()
+        await fixture.controller.shutdown()
+        await orchestration.value
+    }
+
     func testExpirationTracksEveryConcurrentWriterAndRetiresUntilBothReturn() async throws {
         let suite = "photo-backup-controller-retirement-\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))

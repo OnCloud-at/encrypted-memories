@@ -192,7 +192,7 @@ import Testing
         }
 
         let rejected = CachedThumbnailMLImageSource(resolve: { _ in
-            .permanentFailure(reason: "thumbnail unavailable from backend")
+            .permanentFailure(reason: CachedThumbnailMLImageSourceFailureReason.unavailable.rawValue)
         })
         guard case .permanentFailure = await rejected.image(for: uid("rejected")) else {
             Issue.record("An explicitly unavailable source must settle permanently")

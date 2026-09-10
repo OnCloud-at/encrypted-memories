@@ -127,6 +127,64 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
         }
     }
 
+    public func entriesWithRemoteCommitReconciliation(limit: Int) throws -> [UploadBackupSyncQueueEntry] {
+        try lock.withLock {
+            guard db != nil, !operationFailed else {
+                throw UploadRemoteCommitRecoveryError.storeUnavailable
+            }
+            var stmt: OpaquePointer?
+            guard
+                requireOperational(
+                    sqlite3_prepare_v2(
+                        db,
+                        """
+                        SELECT source_kind, source_id, resource, revision_us, original_filename, byte_count,
+                               state, attempts, last_error, updated_at, remote_commit_reconciliation
+                        FROM backup_sync_queue
+                        WHERE remote_commit_reconciliation IS NOT NULL
+                        ORDER BY updated_at ASC
+                        LIMIT ?;
+                        """,
+                        -1, &stmt, nil
+                    ) == SQLITE_OK)
+            else { throw UploadRemoteCommitRecoveryError.storeUnavailable }
+            defer { sqlite3_finalize(stmt) }
+            sqlite3_bind_int(stmt, 1, Int32(clamping: max(1, limit)))
+
+            var entries: [UploadBackupSyncQueueEntry] = []
+            var result = sqlite3_step(stmt)
+            while result == SQLITE_ROW {
+                guard let source = sourceFromColumns(stmt, kindColumn: 0, idColumn: 1, resourceColumn: 2) else {
+                    operationFailed = true
+                    throw UploadRemoteCommitRecoveryError.storeUnavailable
+                }
+                let revision = UploadBackupRevision(rawValue: sqlite3_column_int64(stmt, 3))
+                guard let reconciliation = strictReconciliation(stmt, column: 10) else {
+                    operationFailed = true
+                    throw UploadRemoteCommitRecoveryError.malformedReceipt(source, revision)
+                }
+                entries.append(
+                    UploadBackupSyncQueueEntry(
+                        source: source,
+                        revision: revision,
+                        originalFilename: columnText(stmt, 4) ?? "",
+                        byteCount: sqlite3_column_type(stmt, 5) == SQLITE_NULL
+                            ? nil : sqlite3_column_int64(stmt, 5),
+                        state: UploadBackupSyncQueueState(rawValue: columnText(stmt, 6) ?? "") ?? .failed,
+                        attempts: Int(sqlite3_column_int(stmt, 7)),
+                        lastError: columnText(stmt, 8),
+                        remoteCommitReconciliation: reconciliation,
+                        updatedAt: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 9))
+                    ))
+                result = sqlite3_step(stmt)
+            }
+            guard requireOperational(result == SQLITE_DONE) else {
+                throw UploadRemoteCommitRecoveryError.storeUnavailable
+            }
+            return entries
+        }
+    }
+
     public func nextRunnable(limit: Int) -> [UploadBackupSyncQueueEntry] {
         let clampedLimit = max(1, limit)
         return lock.withLock {
@@ -156,7 +214,8 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
                     return []
                 }
                 let revision = UploadBackupRevision(rawValue: sqlite3_column_int64(stmt, 3))
-                entries.append(row(stmt, source: source, revision: revision, offset: 4))
+                guard let entry = row(stmt, source: source, revision: revision, offset: 4) else { return [] }
+                entries.append(entry)
                 stepResult = sqlite3_step(stmt)
             }
             guard requireOperational(stepResult == SQLITE_DONE) else { return [] }
@@ -251,7 +310,12 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
                     return []
                 }
                 let revision = UploadBackupRevision(rawValue: sqlite3_column_int64(selectStmt, 3))
-                selected.append(row(selectStmt, source: source, revision: revision, offset: 4))
+                guard let entry = row(selectStmt, source: source, revision: revision, offset: 4) else {
+                    sqlite3_finalize(selectStmt)
+                    sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
+                    return []
+                }
+                selected.append(entry)
                 selectResult = sqlite3_step(selectStmt)
             }
             sqlite3_finalize(selectStmt)
@@ -348,7 +412,8 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
                     return []
                 }
                 let revision = UploadBackupRevision(rawValue: sqlite3_column_int64(stmt, 3))
-                entries.append(row(stmt, source: source, revision: revision, offset: 4))
+                guard let entry = row(stmt, source: source, revision: revision, offset: 4) else { return [] }
+                entries.append(entry)
                 stepResult = sqlite3_step(stmt)
             }
             guard requireOperational(stepResult == SQLITE_DONE) else { return [] }
@@ -946,8 +1011,15 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
         source: UploadSourceIdentity,
         revision: UploadBackupRevision,
         offset: Int32 = 0
-    ) -> UploadBackupSyncQueueEntry {
-        UploadBackupSyncQueueEntry(
+    ) -> UploadBackupSyncQueueEntry? {
+        let reconciliationColumn = offset + 6
+        let hasReconciliation = sqlite3_column_type(stmt, reconciliationColumn) != SQLITE_NULL
+        let decodedReconciliation = reconciliation(stmt, column: reconciliationColumn)
+        guard !hasReconciliation || decodedReconciliation != nil else {
+            operationFailed = true
+            return nil
+        }
+        return UploadBackupSyncQueueEntry(
             source: source,
             revision: revision,
             originalFilename: columnText(stmt, offset) ?? "",
@@ -956,7 +1028,7 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
             state: UploadBackupSyncQueueState(rawValue: columnText(stmt, offset + 2) ?? "") ?? .failed,
             attempts: Int(sqlite3_column_int(stmt, offset + 3)),
             lastError: columnText(stmt, offset + 4),
-            remoteCommitReconciliation: reconciliation(stmt, column: offset + 6),
+            remoteCommitReconciliation: decodedReconciliation,
             updatedAt: Date(timeIntervalSince1970: sqlite3_column_double(stmt, offset + 5))
         )
     }
@@ -1031,6 +1103,19 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
     }
 
     private func reconciliation(
+        _ stmt: OpaquePointer?,
+        column: Int32
+    ) -> UploadRemoteCommitReconciliation? {
+        guard sqlite3_column_type(stmt, column) != SQLITE_NULL,
+            let bytes = sqlite3_column_blob(stmt, column)
+        else {
+            return nil
+        }
+        let data = Data(bytes: bytes, count: Int(sqlite3_column_bytes(stmt, column)))
+        return try? JSONDecoder().decode(UploadRemoteCommitReconciliation.self, from: data)
+    }
+
+    private func strictReconciliation(
         _ stmt: OpaquePointer?,
         column: Int32
     ) -> UploadRemoteCommitReconciliation? {

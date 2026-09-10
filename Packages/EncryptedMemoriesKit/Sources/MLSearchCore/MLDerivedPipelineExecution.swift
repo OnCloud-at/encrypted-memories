@@ -221,7 +221,7 @@ public protocol MLDerivedPipelineStore: Sendable {
     ) -> Bool
 
     func progress(for key: MLPipelineExecutionKey) throws -> MLDerivedPipelineProgress
-    func unavailableAssetUIDs(for key: MLPipelineExecutionKey) -> Set<PhotoUID>
+    func unavailableAssetUIDs(for key: MLPipelineExecutionKey) throws -> Set<PhotoUID>
     func output(
         for uid: PhotoUID,
         artifact: MLDerivedArtifactIdentity,

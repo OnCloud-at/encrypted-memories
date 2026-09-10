@@ -3,6 +3,10 @@ import MLSearchCore
 import MediaFeedCore
 import PhotosCore
 
+enum CachedThumbnailMLImageSourceFailureReason: String, Sendable {
+    case unavailable = "thumbnail unavailable from backend"
+}
+
 /// Shared Apple-platform image source for semantic indexing.
 ///
 /// It reuses the universal encrypted thumbnail cache and never starts a download. Missing
@@ -23,7 +27,8 @@ public struct CachedThumbnailMLImageSource: CoreMLImageSource {
                     return .permanentFailure(reason: "cached thumbnail cannot be decoded")
                 case .missing:
                     if feed.isKnownUnfetchable(uid) {
-                        return .permanentFailure(reason: "thumbnail unavailable from backend")
+                        return .permanentFailure(
+                            reason: CachedThumbnailMLImageSourceFailureReason.unavailable.rawValue)
                     }
                     return .transientFailure
                 }

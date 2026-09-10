@@ -185,6 +185,12 @@ package final class MetalGridTextureCache<ID: Hashable & Sendable> {
         return effectiveMaxTexturePixels * 4 >= currentLongest * 5
     }
 
+    /// Duration accounting must not depend on user or network adjustments to wall-clock time.
+    private static func elapsedMilliseconds(since start: ContinuousClock.Instant) -> Double {
+        let elapsed = start.duration(to: .now).components
+        return Double(elapsed.seconds) * 1_000 + Double(elapsed.attoseconds) / 1_000_000_000_000_000
+    }
+
     private var uploadTimeBudgetExhausted: Bool {
         uploadsThisFrame > 0 && uploadMsThisFrame >= budget.maxUploadMillisecondsPerFrame
     }
@@ -237,12 +243,12 @@ package final class MetalGridTextureCache<ID: Hashable & Sendable> {
                 budgetDeferred += 1
                 continue
             }
-            let start = CFAbsoluteTimeGetCurrent()
+            let start = ContinuousClock.now
             guard let texture = makeTexture(from: image, width: size.width, height: size.height) else {
                 lru.abandonUpload(id)
                 continue
             }
-            uploadMsThisFrame += (CFAbsoluteTimeGetCurrent() - start) * 1000
+            uploadMsThisFrame += Self.elapsedMilliseconds(since: start)
             textures[id] = texture
             if let revealStartedAt, revealIDs.contains(id) {
                 thumbnailRevealStartedAt[id] = revealStartedAt
@@ -284,9 +290,9 @@ package final class MetalGridTextureCache<ID: Hashable & Sendable> {
             }
             // Replacement keeps the residency count stable and can evict offscreen texture bytes.
             guard lru.canReplaceResident(id, oldCost: oldBytes, newCost: newBytes) else { continue }
-            let start = CFAbsoluteTimeGetCurrent()
+            let start = ContinuousClock.now
             guard let texture = makeTexture(from: image, width: size.width, height: size.height) else { continue }
-            uploadMsThisFrame += (CFAbsoluteTimeGetCurrent() - start) * 1000
+            uploadMsThisFrame += Self.elapsedMilliseconds(since: start)
             textures[id] = texture
             uploadBytesThisFrame += newBytes
             uploadsThisFrame += 1
@@ -310,7 +316,7 @@ package final class MetalGridTextureCache<ID: Hashable & Sendable> {
     /// memory pressure (`residencyPressureScale < 1`) the ceiling is scaled down; the visible pinned set
     /// is never evicted, so the grid stays drawable. At full scale this is the original budget eviction.
     package func evictToBudget() {
-        let start = CFAbsoluteTimeGetCurrent()
+        let start = ContinuousClock.now
         let evicted: [ID]
         if residencyPressureScale >= 1 {
             evicted = lru.evictToBudget()
@@ -324,7 +330,7 @@ package final class MetalGridTextureCache<ID: Hashable & Sendable> {
             thumbnailRevealStartedAt.removeValue(forKey: id)
         }
         evictionsThisFrame = evicted.count
-        evictMsThisFrame += (CFAbsoluteTimeGetCurrent() - start) * 1000
+        evictMsThisFrame += Self.elapsedMilliseconds(since: start)
     }
 
     /// Governor-driven memory-pressure response: set the resident ceiling scale (`1.0` = full budget,

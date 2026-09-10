@@ -86,6 +86,10 @@ public actor UploadManager: UploadManaging {
     private var onChange: (@Sendable ([UploadItem], UploadQueueStats) -> Void)?
     /// Completion hook for refresh integration. Fired once per successful library-node creation.
     private var onCompleted: (@Sendable (UploadCompletedEvent) -> Void)?
+    /// Sequenced variant used by `UploadCoordinator`. The sequence is assigned at the manager's
+    /// source event, before an escaping callback can be deferred or delivered out of order.
+    private var onSequencedChange: (@Sendable (UInt64, [UploadItem], UploadQueueStats) -> Void)?
+    private var nextChangeSequence: UInt64 = 0
 
     public init(
         uploader: any PhotoUploading,
@@ -108,6 +112,22 @@ public actor UploadManager: UploadManaging {
     public func setOnChange(_ handler: @Sendable @escaping ([UploadItem], UploadQueueStats) -> Void) {
         guard !isShuttingDown else { return }
         onChange = handler
+        onSequencedChange = nil
+        startDurableSettlementReplaySynchronouslyIfNeeded()
+        notify()
+    }
+
+    /// Installs the ordered snapshot hook used by the main-actor coordinator. The manager actor
+    /// assigns event sequence numbers at the source, before an escaping callback can be delayed.
+    func setCoordinatorCallbacks(
+        onChange handler: @Sendable @escaping (UInt64, [UploadItem], UploadQueueStats) -> Void,
+        onCompleted completion: @Sendable @escaping (UploadCompletedEvent) -> Void
+    ) {
+        guard !isShuttingDown else { return }
+        onChange = nil
+        onSequencedChange = handler
+        // Register terminal delivery before replay can publish its first recovered completion.
+        onCompleted = completion
         startDurableSettlementReplaySynchronouslyIfNeeded()
         notify()
     }
@@ -489,6 +509,11 @@ public actor UploadManager: UploadManaging {
             recordSettlementFailure(current, message: "Durable upload descriptor is invalid.")
             return
         }
+
+        // A replayed receipt proves the bytes reached the library even when local metadata
+        // settlement still fails. Preserve the same once-per-manager completion contract as
+        // a live upload so the platform refreshes its library after a relaunch.
+        emitCompletedUpload(current.queueItemID)
 
         var record = current
         if record.stage == .manifestPending && !manifestAlreadyRecorded {
@@ -1214,6 +1239,7 @@ public actor UploadManager: UploadManaging {
         jobs.removeAll()
         order.removeAll()
         onChange = nil
+        onSequencedChange = nil
         onCompleted = nil
         didShutDown = true
     }
@@ -1369,7 +1395,8 @@ public actor UploadManager: UploadManaging {
                 || activeIDs.contains($0)
                 || hasPendingSettlement($0)
         }
-        for id in order where !keep.contains(id) {
+        let keepIDs = Set(keep)
+        for id in order where !keepIDs.contains(id) {
             if durableSettlement(for: id)?.stage == .terminal {
                 _ = settlementStore?.remove(queueItemID: id)
             }
@@ -1431,7 +1458,9 @@ public actor UploadManager: UploadManaging {
             case .paused: stats.paused += 1
             }
         }
+        nextChangeSequence &+= 1
         onChange?(items, stats)
+        onSequencedChange?(nextChangeSequence, items, stats)
     }
 
     private func message(_ error: Error) -> String {

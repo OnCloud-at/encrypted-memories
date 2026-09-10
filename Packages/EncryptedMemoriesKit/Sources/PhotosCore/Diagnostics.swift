@@ -383,11 +383,16 @@ public final class PhotoDiagnostics: @unchecked Sendable {
     private var decodeQueueDepth = 0
     private let debugConsoleLogsAreEnabled: Bool
 
-    public init() {
+    public convenience init() {
         let environment = ProcessInfo.processInfo.environment
-        debugConsoleLogsAreEnabled =
-            environment[Self.debugConsoleLogsEnvironmentKey] == "1"
-            || UserDefaults.standard.bool(forKey: Self.debugConsoleLogsUserDefaultsKey)
+        self.init(
+            debugConsoleLogsEnabled: environment[Self.debugConsoleLogsEnvironmentKey] == "1"
+                || UserDefaults.standard.bool(forKey: Self.debugConsoleLogsUserDefaultsKey)
+        )
+    }
+
+    init(debugConsoleLogsEnabled: Bool) {
+        debugConsoleLogsAreEnabled = debugConsoleLogsEnabled
     }
 
     public func setActivePinch(_ active: Bool) {
@@ -590,21 +595,36 @@ public final class PhotoDiagnostics: @unchecked Sendable {
         _ event: String, _ fields: [String: String], throttleSeconds: TimeInterval = 0,
         throttleKey: String? = nil
     ) {
+        emitDebug(event, fields: { fields }, throttleSeconds: throttleSeconds, throttleKey: throttleKey)
+    }
+
+    /// Builds a diagnostic payload only after logging is enabled and an explicit throttle key is
+    /// admitted. Without a key, fields still define throttle identity as in the eager overload.
+    /// The closure must obey the same fixed-scalar privacy contract as `emitDebug` above.
+    public func emitDebug(
+        _ event: String, fields: () -> [String: String], throttleSeconds: TimeInterval = 0,
+        throttleKey: String? = nil
+    ) {
         guard debugConsoleLogsEnabled() else { return }
         let now = Date()
+        var evaluatedFields: [String: String]?
         if throttleSeconds > 0 {
-            let key =
-                "debug:" + event + ":"
-                + (throttleKey
-                    ?? fields.sorted { $0.key < $1.key }
-                    .map { "\($0.key)=\($0.value)" }
-                    .joined(separator: "|"))
+            let identity: String
+            if let throttleKey {
+                identity = throttleKey
+            } else {
+                let value = fields()
+                evaluatedFields = value
+                identity = value.sorted { $0.key < $1.key }
+                    .map { "\($0.key)=\($0.value)" }.joined(separator: "|")
+            }
+            let key = "debug:" + event + ":" + identity
             let shouldLog = lock.withLock {
                 eventThrottle.shouldEmit(key: key, now: now, interval: throttleSeconds)
             }
             guard shouldLog else { return }
         }
-        let payload = fields.sorted { $0.key < $1.key }
+        let payload = (evaluatedFields ?? fields()).sorted { $0.key < $1.key }
             .map { "\($0.key)=\($0.value)" }
             .joined(separator: " ")
         #if DEBUG

@@ -22,8 +22,9 @@ struct SDKCancellableOperationTests {
 
     @Test func taskCancellationUsesTheOperationsExactToken() async throws {
         let probe = CancellationProbe()
+        let nativeToken = UUID()
         let task = Task {
-            try await SDKCancellableOperation.run { token in
+            try await SDKCancellableOperation.run(token: nativeToken) { token in
                 await probe.waitForCancellation(of: token)
                 throw CancellationError()
             } cancel: { token in
@@ -39,17 +40,21 @@ struct SDKCancellableOperationTests {
         await #expect(throws: CancellationError.self) {
             try await task.value
         }
-        #expect(await probe.cancellationToken == probe.operationToken)
+        #expect(await probe.operationToken == nativeToken)
+        #expect(await probe.cancellationToken == nativeToken)
         #expect(await probe.cancellationCount == 1)
     }
 
-    @Test func cancellationRPCIsJoinedAfterNonCooperativeOperationReturns() async {
+    @Test(arguments: [false, true])
+    func cancellationRPCIsJoinedAfterNonCooperativeOperationReturns(operationFails: Bool) async {
+        struct OperationFailure: Error {}
         let probe = JoinedCancellationProbe()
         let returned = CancellationReturnProbe()
         let task = Task {
             do {
                 _ = try await SDKCancellableOperation.run { token in
                     await probe.runOperation(token)
+                    if operationFails { throw OperationFailure() }
                     return 42
                 } cancel: { token in
                     await probe.runCancellation(token)

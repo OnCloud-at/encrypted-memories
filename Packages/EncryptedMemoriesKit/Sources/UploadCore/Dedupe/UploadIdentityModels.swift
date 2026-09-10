@@ -668,7 +668,9 @@ public struct DedupeUnavailableIdentityResolver: UploadIdentityResolving {
     public func prime(_ descriptors: [UploadResourceDescriptor]) async {}
     public func recordUploaded(
         _ descriptor: UploadResourceDescriptor, identity: UploadIdentity, remoteVolumeID: String, remoteLinkID: String
-    ) async throws {}
+    ) async throws {
+        throw UploadError.backend(message)
+    }
     public func invalidateCachedRemoteState() async {}
     public func uploadDidFail(_ descriptor: UploadResourceDescriptor) async {}
 }

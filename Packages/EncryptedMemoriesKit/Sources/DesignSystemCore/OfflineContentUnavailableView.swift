@@ -1,3 +1,4 @@
+import PhotosCore
 import SwiftUI
 
 public struct OfflineContentUnavailableView: View {
@@ -5,9 +6,9 @@ public struct OfflineContentUnavailableView: View {
 
     public var body: some View {
         ContentUnavailableView {
-            Label("offline.content_title", systemImage: "bolt.slash")
+            Label(L10n.string("offline.content_title"), systemImage: "bolt.slash")
         } description: {
-            Text("offline.content_message")
+            Text(L10n.string("offline.content_message"))
         }
     }
 }

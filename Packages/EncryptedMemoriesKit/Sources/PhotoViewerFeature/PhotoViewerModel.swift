@@ -663,6 +663,8 @@ public final class PhotoViewerModel {
         isLoadingOriginal = true
         originalLoadFailed = false
         if expecting == .video { video.setDownloading(0) }
+        let progressAdmission = ViewerProgressAdmission()
+        defer { progressAdmission.close() }
         let ref = WeakViewerRef(self)
         let originalWriterGeneration = originalsCache?.captureWriterGeneration()
         do {
@@ -684,8 +686,10 @@ public final class PhotoViewerModel {
                     uid: item.uid,
                     maxPixelSize: maxPixelSize,
                     onProgress: { p in
+                        guard let sample = progressAdmission.admit(p) else { return }
                         Task { @MainActor in
-                            ref.model?.updateDownloadProgress(p, for: item, generation: generation)
+                            guard progressAdmission.isCurrent(sample) else { return }
+                            ref.model?.updateDownloadProgress(sample.fraction, for: item, generation: generation)
                         }
                     }
                 )
@@ -693,8 +697,10 @@ public final class PhotoViewerModel {
                 data = nil
             } else {
                 let original = try await media.originalData(for: item.uid) { p in
+                    guard let sample = progressAdmission.admit(p) else { return }
                     Task { @MainActor in
-                        ref.model?.updateDownloadProgress(p, for: item, generation: generation)
+                        guard progressAdmission.isCurrent(sample) else { return }
+                        ref.model?.updateDownloadProgress(sample.fraction, for: item, generation: generation)
                     }
                 }
                 data = original

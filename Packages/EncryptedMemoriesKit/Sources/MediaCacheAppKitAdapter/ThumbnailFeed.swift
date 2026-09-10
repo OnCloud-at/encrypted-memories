@@ -66,6 +66,8 @@ public actor ThumbnailFeed {
             crawlBackoffSeconds: 5,
             downloadTimeoutSeconds: 20
         )
+        let wrappers = WrapperImageCache<NSImage>(countLimit: 512, costLimitBytes: Self.wrapperRAMBudgetBytes())
+        self.imageWrappers = wrappers
         self.core = ThumbnailFeedCore(
             cache: cache,
             loader: loader,
@@ -82,7 +84,6 @@ public actor ThumbnailFeed {
                 dimensions?.record(uid, width: decoded.pixelWidth, height: decoded.pixelHeight)
             }
         )
-        imageWrappers = WrapperImageCache(countLimit: 512, costLimitBytes: Self.wrapperRAMBudgetBytes())
     }
 
     static func decodedRAMBudgetBytes() -> Int {
@@ -113,17 +114,14 @@ public actor ThumbnailFeed {
     }
 
     public func cachedImage(for uid: PhotoUID) async -> NSImage? {
-        guard let decoded = await core.cachedDecoded(for: uid) else { return nil }
-        return image(for: decoded, uid: uid)
+        let ticket = imageWrappers.captureTicket()
+        guard await core.cachedDecoded(for: uid) != nil else { return nil }
+        return currentImage(for: uid, ticket: ticket)
     }
 
     public nonisolated func memoryImage(for uid: PhotoUID) -> NSImage? {
-        let key = Self.key(uid)
-        if let image = imageWrappers.image(forKey: key) { return image }
-        guard let decoded = core.memoryDecoded(for: uid) else { return nil }
-        let image = MacThumbnailImageDecoder.image(from: decoded)
-        imageWrappers.set(image, forKey: key, cost: decoded.decodedCostBytes)
-        return image
+        let ticket = imageWrappers.captureTicket()
+        return currentImage(for: uid, ticket: ticket)
     }
 
     public nonisolated func memoryCGImage(for uid: PhotoUID) -> CGImage? {
@@ -193,8 +191,9 @@ public actor ThumbnailFeed {
     }
 
     public func image(for uid: PhotoUID) async -> NSImage? {
-        guard let decoded = await core.decoded(for: uid) else { return nil }
-        return image(for: decoded, uid: uid)
+        let ticket = imageWrappers.captureTicket()
+        guard await core.decoded(for: uid) != nil else { return nil }
+        return currentImage(for: uid, ticket: ticket)
     }
 
     public func analysisImage(for uid: PhotoUID) async -> NSImage? {
@@ -207,10 +206,12 @@ public actor ThumbnailFeed {
     }
 
     public func stopPrefetch() async {
+        imageWrappers.invalidateAll()
         await core.stopPrefetchAndWait()
     }
 
     public func clearCacheAndRestartPrefetch() async {
+        imageWrappers.invalidateAll()
         await core.clearCacheAndRestartPrefetch()
     }
 
@@ -234,12 +235,24 @@ public actor ThumbnailFeed {
         await core.prefetchStatus()
     }
 
-    private func image(for decoded: DecodedThumbnail, uid: PhotoUID) -> NSImage {
+    private nonisolated func currentImage(
+        for uid: PhotoUID,
+        ticket: WrapperImageCache<NSImage>.InsertionTicket
+    ) -> NSImage? {
+        guard let decoded = core.memoryDecoded(for: uid) else { return nil }
         let key = Self.key(uid)
-        if let image = imageWrappers.image(forKey: key) { return image }
-        let image = MacThumbnailImageDecoder.image(from: decoded)
-        imageWrappers.set(image, forKey: key, cost: decoded.decodedCostBytes)
-        return image
+        return imageWrappers.resolvePairedImage(
+            forKey: key,
+            cost: decoded.decodedCostBytes,
+            source: decoded.image,
+            ticket: ticket,
+            sourceIsCurrent: { [core] in
+                core.memoryDecoded(for: uid)?.image === decoded.image
+            },
+            build: {
+                MacThumbnailImageDecoder.image(from: decoded)
+            }
+        )
     }
 
     private static func key(_ uid: PhotoUID) -> NSString {

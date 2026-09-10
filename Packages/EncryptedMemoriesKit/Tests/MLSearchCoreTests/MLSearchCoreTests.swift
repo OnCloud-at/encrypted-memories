@@ -169,7 +169,7 @@ import Testing
         #expect(universe.snapshot() == MLAssetInventorySnapshot(analysisScope: removalScope))
     }
 
-    @Test func alreadyIndexedAssetsAreNotPlannedAgain() {
+    @Test func alreadyIndexedAssetsAreNotPlannedAgain() throws {
         let store = InMemoryMLIndexStore()
         let assets = (0..<5).map { uid("a\($0)") }
         // Pre-index the first two.
@@ -178,7 +178,7 @@ import Testing
             record("a1", descriptorV1, [0, 1, 0, 0]),
         ])
 
-        let plan = MLIndexPlanner.plan(allAssets: assets, descriptor: descriptorV1, store: store)
+        let plan = try MLIndexPlanner.plan(allAssets: assets, descriptor: descriptorV1, store: store)
 
         #expect(plan.toIndex.map(\.nodeID).sorted() == ["a2", "a3", "a4"])
         #expect(plan.skippedAlreadyIndexed.count == 2)
@@ -187,21 +187,21 @@ import Testing
         #expect(!plan.isComplete)
     }
 
-    @Test func rePlanningAfterFullIndexIsComplete() {
+    @Test func rePlanningAfterFullIndexIsComplete() throws {
         let store = InMemoryMLIndexStore()
         let assets = [uid("a0"), uid("a1")]
         store.upsert([
             record("a0", descriptorV1, [1, 0, 0, 0]),
             record("a1", descriptorV1, [0, 1, 0, 0]),
         ])
-        let plan = MLIndexPlanner.plan(allAssets: assets, descriptor: descriptorV1, store: store)
+        let plan = try MLIndexPlanner.plan(allAssets: assets, descriptor: descriptorV1, store: store)
         #expect(plan.toIndex.isEmpty)
         #expect(plan.isComplete)
     }
 
-    @Test func plannerDeduplicatesHostAssetListWithoutChangingOrder() {
+    @Test func plannerDeduplicatesHostAssetListWithoutChangingOrder() throws {
         let store = InMemoryMLIndexStore()
-        let plan = MLIndexPlanner.plan(
+        let plan = try MLIndexPlanner.plan(
             allAssets: [uid("a0"), uid("a1"), uid("a0"), uid("a2"), uid("a1")],
             descriptor: descriptorV1,
             store: store
@@ -211,7 +211,7 @@ import Testing
         #expect(plan.totalAssets == 3)
     }
 
-    @Test func modelVersionChangeCreatesNewEpoch() {
+    @Test func modelVersionChangeCreatesNewEpoch() throws {
         let store = InMemoryMLIndexStore()
         let assets = [uid("a0"), uid("a1")]
         // Fully indexed under v1.
@@ -220,7 +220,7 @@ import Testing
             record("a1", descriptorV1, [0, 1, 0, 0]),
         ])
         // Under v2, everything must re-index despite v1 being complete.
-        let planV2 = MLIndexPlanner.plan(allAssets: assets, descriptor: descriptorV2, store: store)
+        let planV2 = try MLIndexPlanner.plan(allAssets: assets, descriptor: descriptorV2, store: store)
         #expect(planV2.toIndex.count == 2)
         #expect(planV2.skippedAlreadyIndexed.isEmpty)
         // v1 epoch is untouched by v2 planning.
@@ -237,13 +237,13 @@ import Testing
         #expect(store.contains(uid: uid("a0"), descriptor: descriptorV1))
     }
 
-    @Test func permanentFailureDoesNotBlockOthers() {
+    @Test func permanentFailureDoesNotBlockOthers() throws {
         let store = InMemoryMLIndexStore()
         let assets = [uid("a0"), uid("a1"), uid("a2")]
         store.recordFailures([
             MLIndexFailureRecord(uid: uid("a1"), descriptor: descriptorV1, kind: .permanent, attempts: 1)
         ])
-        let plan = MLIndexPlanner.plan(
+        let plan = try MLIndexPlanner.plan(
             allAssets: assets,
             descriptor: descriptorV1,
             store: store
@@ -286,36 +286,36 @@ import Testing
         #expect(store.generation(for: descriptorV1) == generation + 1)
     }
 
-    @Test func failedAssetExcludedFromBatchUpsert() {
+    @Test func failedAssetExcludedFromBatchUpsert() throws {
         let store = InMemoryMLIndexStore()
         let assets = [uid("a0"), uid("a1"), uid("a2")]
         store.recordFailures([
             MLIndexFailureRecord(uid: uid("a1"), descriptor: descriptorV1, kind: .permanent, attempts: 1)
         ])
-        let plan = MLIndexPlanner.plan(allAssets: assets, descriptor: descriptorV1, store: store)
+        let plan = try MLIndexPlanner.plan(allAssets: assets, descriptor: descriptorV1, store: store)
         // Simulate embedding only the planned-to-index assets.
         let records = plan.toIndex.map { record($0.nodeID, descriptorV1, [1, 0, 0, 0]) }
         let report = store.upsert(records)
         #expect(report.indexed == 2)
         #expect(store.count(for: descriptorV1) == 2)
         // Re-plan: only the failed one stays excluded, the rest converge.
-        let replan = MLIndexPlanner.plan(allAssets: assets, descriptor: descriptorV1, store: store)
+        let replan = try MLIndexPlanner.plan(allAssets: assets, descriptor: descriptorV1, store: store)
         #expect(replan.toIndex.isEmpty)
         #expect(replan.skippedAlreadyIndexed.count == 2)
         #expect(replan.skippedPermanentFailure.count == 1)
     }
 
-    @Test func transientFailureIsRetriedOnNextPass() {
+    @Test func transientFailureIsRetriedOnNextPass() throws {
         let store = InMemoryMLIndexStore()
         let assets = [uid("a0"), uid("a1")]
         // First pass: index a0, transient-fail a1 (not stored).
         store.upsert([record("a0", descriptorV1, [1, 0, 0, 0])])
-        let planAfter = MLIndexPlanner.plan(allAssets: assets, descriptor: descriptorV1, store: store)
+        let planAfter = try MLIndexPlanner.plan(allAssets: assets, descriptor: descriptorV1, store: store)
         // a1 wasn't stored, so it should re-enter toIndex on the next planning pass.
         #expect(planAfter.toIndex.map(\.nodeID) == ["a1"])
         // Second pass: now succeed with a1.
         store.upsert([record("a1", descriptorV1, [0, 1, 0, 0])])
-        let planFinal = MLIndexPlanner.plan(allAssets: assets, descriptor: descriptorV1, store: store)
+        let planFinal = try MLIndexPlanner.plan(allAssets: assets, descriptor: descriptorV1, store: store)
         #expect(planFinal.toIndex.isEmpty)
         #expect(planFinal.isComplete)
     }

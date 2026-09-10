@@ -83,6 +83,80 @@ import Testing
             releaseContinuation?.resume()
             releaseContinuation = nil
         }
+
+        func releaseAndArmNext() {
+            let pending = releaseContinuation
+            arm()
+            pending?.resume()
+        }
+    }
+
+    private final class BlockingSuppressionRead: @unchecked Sendable {
+        private let lock = NSLock()
+        private let result: Set<PhotoUID>
+        private var readContinuation: CheckedContinuation<Set<PhotoUID>, Error>?
+        private var started = false
+        private var cancelled = false
+        private var startedWaiters: [CheckedContinuation<Void, Never>] = []
+        private var cancellationWaiters: [CheckedContinuation<Void, Never>] = []
+
+        init(result: Set<PhotoUID>) {
+            self.result = result
+        }
+
+        func read() async throws -> Set<PhotoUID> {
+            try await withTaskCancellationHandler {
+                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Set<PhotoUID>, Error>) in
+                    let resumeCancelled = lock.withLock {
+                        started = true
+                        startedWaiters.forEach { $0.resume() }
+                        startedWaiters.removeAll()
+                        guard !cancelled else { return true }
+                        readContinuation = continuation
+                        return false
+                    }
+                    if resumeCancelled {
+                        continuation.resume(throwing: CancellationError())
+                    }
+                }
+            } onCancel: {
+                self.cancel()
+            }
+        }
+
+        func waitUntilStarted() async {
+            await withCheckedContinuation { continuation in
+                let alreadyStarted = lock.withLock {
+                    if started { return true }
+                    startedWaiters.append(continuation)
+                    return false
+                }
+                if alreadyStarted { continuation.resume() }
+            }
+        }
+
+        func waitUntilCancelled() async {
+            await withCheckedContinuation { continuation in
+                let alreadyCancelled = lock.withLock {
+                    if cancelled { return true }
+                    cancellationWaiters.append(continuation)
+                    return false
+                }
+                if alreadyCancelled { continuation.resume() }
+            }
+        }
+
+        private func cancel() {
+            let continuation = lock.withLock {
+                cancelled = true
+                cancellationWaiters.forEach { $0.resume() }
+                cancellationWaiters.removeAll()
+                let continuation = readContinuation
+                readContinuation = nil
+                return continuation
+            }
+            continuation?.resume(throwing: CancellationError())
+        }
     }
 
     /// Embeds deterministic unit vectors and counts calls per uid.
@@ -120,6 +194,7 @@ import Testing
         func blockNextEmbedding() async { await barrier.arm() }
         func waitUntilEmbeddingStarted() async { await barrier.waitUntilBlocked() }
         func releaseEmbedding() async { await barrier.release() }
+        func releaseEmbeddingAndBlockNext() async { await barrier.releaseAndArmNext() }
     }
 
     private struct FixedTextEncoder: MLTextQueryEncoder {
@@ -289,6 +364,59 @@ import Testing
         var shutdownCount: Int { lock.withLock { shutdowns } }
     }
 
+    private final class FixedSemanticSession: MLSmartSearchSession, @unchecked Sendable {
+        let descriptor: MLModelDescriptor
+        private let permanentlyUnavailable: Set<PhotoUID>
+        private let suppressionRead: BlockingSuppressionRead?
+
+        init(
+            descriptor: MLModelDescriptor,
+            permanentlyUnavailable: Set<PhotoUID> = [],
+            suppressionRead: BlockingSuppressionRead? = nil
+        ) {
+            self.descriptor = descriptor
+            self.permanentlyUnavailable = permanentlyUnavailable
+            self.suppressionRead = suppressionRead
+        }
+
+        func index(_ assets: [PhotoUID], observer: MLIndexPassObserver) async -> MLIndexPassOutcome {
+            let permanentFailure = permanentlyUnavailable.intersection(Set(assets)).count
+            let progress = MLIndexProgress(
+                phase: .completed,
+                descriptor: descriptor,
+                totalAssets: assets.count,
+                indexed: assets.count - permanentFailure,
+                permanentFailure: permanentFailure
+            )
+            let outcome = MLIndexPassOutcome(
+                report: MLIndexBatchReport(
+                    total: assets.count,
+                    indexed: assets.count - permanentFailure,
+                    permanentFailure: permanentFailure
+                ),
+                ranToCompletion: true,
+                newPermanentFailures: permanentlyUnavailable.intersection(Set(assets)),
+                progress: progress
+            )
+            observer.reportProgressUpdated(progress)
+            return outcome
+        }
+
+        func permanentlyUnavailableAssetUIDs(_ assets: [PhotoUID]) async throws -> Set<PhotoUID> {
+            if let suppressionRead {
+                return try await suppressionRead.read()
+            }
+            return permanentlyUnavailable.intersection(Set(assets))
+        }
+
+        func search(_ text: String, limit: Int) async throws -> MLSearchResults {
+            MLSearchResults(descriptor: descriptor, queryText: text, results: [])
+        }
+
+        func releaseMemory() async {}
+        func shutdown() async {}
+    }
+
     private final class SessionRecorder: @unchecked Sendable {
         private let lock = NSLock()
         private var storage: [TrackingSession] = []
@@ -329,12 +457,21 @@ import Testing
     private final class RecordingNativeSearch: MLNativeSearchServing, @unchecked Sendable {
         private let lock = NSLock()
         private let results: [PhotoUID]
+        private let permanentlyUnavailable: Set<PhotoUID>
+        private let suppressionRead: BlockingSuppressionRead?
         private var indexedAssets: [MLPipelineAssetRevision] = []
         private var indexes = 0
         private var shutdowns = 0
 
-        init(results: [PhotoUID], initiallyIndexed: [PhotoUID] = []) {
+        init(
+            results: [PhotoUID],
+            initiallyIndexed: [PhotoUID] = [],
+            permanentlyUnavailable: Set<PhotoUID> = [],
+            suppressionRead: BlockingSuppressionRead? = nil
+        ) {
             self.results = results
+            self.permanentlyUnavailable = permanentlyUnavailable
+            self.suppressionRead = suppressionRead
             indexedAssets = initiallyIndexed.compactMap {
                 try? MLPipelineAssetRevision(
                     uid: $0,
@@ -428,14 +565,16 @@ import Testing
                 }
                 return indexedAssets.count
             }
+            let permanentFailure = permanentlyUnavailable.intersection(Set(assets.map(\.uid))).count
             let outcome = MLDerivedPipelinePassOutcome(
                 reason: .drained,
                 progress: MLDerivedPipelineProgress(
                     total: visibleCount,
-                    completed: visibleCount,
+                    completed: max(0, visibleCount - permanentFailure),
                     skipped: 0,
-                    permanentFailure: 0,
+                    permanentFailure: permanentFailure,
                     retryPending: 0,
+                    unavailableAssets: permanentFailure,
                     generation: 1
                 )
             )
@@ -457,6 +596,13 @@ import Testing
                 retryPending: 0,
                 generation: count > 0 ? 1 : 0
             )
+        }
+
+        func unavailableAssetUIDs() async throws -> Set<PhotoUID> {
+            if let suppressionRead {
+                return try await suppressionRead.read()
+            }
+            return permanentlyUnavailable
         }
 
         func purge() async {}
@@ -2063,6 +2209,99 @@ import Testing
         #expect(results.descriptor == entryB.descriptor)
     }
 
+    @Test func cancelledNativeSuppressionReadCannotPublishRetiredStorageFailure() async throws {
+        let asset = uid("native-suppressed")
+        let suppressionRead = BlockingSuppressionRead(result: [asset])
+        let native = RecordingNativeSearch(
+            results: [],
+            permanentlyUnavailable: [asset],
+            suppressionRead: suppressionRead
+        )
+        let harness = try makeHarness(
+            catalog: MLModelCatalog(entries: []),
+            payloads: [:],
+            assets: [asset],
+            nativeSearch: native
+        )
+        defer { try? FileManager.default.removeItem(at: harness.layout.rootDirectory) }
+
+        let stream = await harness.lifecycle.snapshots()
+        let observations = Task {
+            var snapshots: [MLSmartSearchSnapshot] = []
+            for await snapshot in stream { snapshots.append(snapshot) }
+            return snapshots
+        }
+        await harness.lifecycle.start()
+        await harness.lifecycle.setEnabled(true)
+        await suppressionRead.waitUntilStarted()
+
+        let stopping = Task { await harness.lifecycle.setIndexingExecutionAllowed(false) }
+        await suppressionRead.waitUntilCancelled()
+        await stopping.value
+
+        if case .failed(let failure) = await harness.lifecycle.currentSnapshot().indexingState {
+            #expect(failure.debugDescription != "native analysis suppression state unavailable")
+        }
+        await harness.lifecycle.shutdown()
+        let snapshots = await observations.value
+        #expect(
+            !snapshots.contains { snapshot in
+                guard case .failed(let failure) = snapshot.indexingState else { return false }
+                return failure.debugDescription == "native analysis suppression state unavailable"
+            }, "Even a briefly published retired storage failure violates the session boundary")
+    }
+
+    @Test func replacedSemanticSessionCannotPublishRetiredSuppressionFailure() async throws {
+        let asset = uid("semantic-suppressed")
+        let suppressionRead = BlockingSuppressionRead(result: [asset])
+        let payload = Data("semantic-suppression-model".utf8)
+        let (entryA, urlA) = downloadableEntry(id: "suppression-a", payload: payload)
+        let (entryB, urlB) = downloadableEntry(id: "suppression-b", payload: payload)
+        let harness = try makeHarness(
+            catalog: MLModelCatalog(entries: [entryA, entryB]),
+            payloads: [urlA: payload, urlB: payload],
+            assets: [asset]
+        )
+        defer { try? FileManager.default.removeItem(at: harness.layout.rootDirectory) }
+        harness.provider.sessionOverride = { model in
+            if model.entry.id == entryA.id {
+                return FixedSemanticSession(
+                    descriptor: model.entry.descriptor,
+                    permanentlyUnavailable: [asset],
+                    suppressionRead: suppressionRead
+                )
+            }
+            return FixedSemanticSession(descriptor: model.entry.descriptor)
+        }
+
+        let stream = await harness.lifecycle.snapshots()
+        let observations = Task {
+            var snapshots: [MLSmartSearchSnapshot] = []
+            for await snapshot in stream { snapshots.append(snapshot) }
+            return snapshots
+        }
+        await harness.lifecycle.start()
+        await harness.lifecycle.setEnabled(true)
+        await harness.lifecycle.select(entryA.id)
+        await suppressionRead.waitUntilStarted()
+
+        let switching = Task { await harness.lifecycle.select(entryB.id) }
+        await suppressionRead.waitUntilCancelled()
+        await switching.value
+
+        #expect(await harness.lifecycle.currentSnapshot().selectedModelID == entryB.id)
+        if case .failed(let failure) = await harness.lifecycle.currentSnapshot().indexingState {
+            #expect(failure.debugDescription != "semantic suppression state unavailable")
+        }
+        await harness.lifecycle.shutdown()
+        let snapshots = await observations.value
+        #expect(
+            !snapshots.contains { snapshot in
+                guard case .failed(let failure) = snapshot.indexingState else { return false }
+                return failure.debugDescription == "semantic suppression state unavailable"
+            }, "Even a briefly published retired storage failure violates the session boundary")
+    }
+
     @Test func staleQueryFromPreviousEpochIsDiscarded() async throws {
         /// Session whose search blocks until released.
         final class BlockingSession: MLSmartSearchSession, @unchecked Sendable {
@@ -2325,9 +2564,19 @@ import Testing
         }
         #expect(!phases.sawIndexing)
 
-        await harness.provider.embedder.releaseEmbedding()
+        // Visibility events are best-effort. Keep the pass alive at the next embedding so
+        // its first produced-embedding event cannot be retired before the observer consumes it.
+        // Re-arming and releasing must be one barrier operation; separate calls would race.
+        await harness.provider.embedder.releaseEmbeddingAndBlockNext()
+        await harness.provider.embedder.waitUntilEmbeddingStarted()
         #expect(await waitUntil { phases.sawIndexing })
         #expect(harness.provider.embedder.totalCalls > callsBeforeLibraryKick)
+        if case .indexing = await harness.lifecycle.currentSnapshot().phase {
+            // Real work is now visible while the next embedding remains blocked.
+        } else {
+            Issue.record("ongoing indexing did not publish its produced embedding")
+        }
+        await harness.provider.embedder.releaseEmbedding()
         #expect(await waitForCompleteIndex(harness, total: initial.count + added.count))
     }
 

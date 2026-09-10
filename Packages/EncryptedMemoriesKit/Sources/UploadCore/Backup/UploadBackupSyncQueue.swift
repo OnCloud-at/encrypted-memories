@@ -53,19 +53,67 @@ public enum UploadBackupSyncQueueState: String, Sendable, Codable, CaseIterable 
     }
 }
 
+/// Exact queue row that owned a new remote commit. Keeping this inside the existing receipt JSON
+/// binds descriptor evidence without changing the queue schema.
+public struct UploadRemoteCommitQueueBinding: Sendable, Equatable, Codable {
+    public let source: UploadSourceIdentity
+    public let revision: UploadBackupRevision
+
+    public init(source: UploadSourceIdentity, revision: UploadBackupRevision) {
+        self.source = source
+        self.revision = revision
+    }
+}
+
 public struct UploadRemoteCommitReconciliation: Sendable, Equatable, Codable {
     public let source: UploadSourceIdentity
     public let identity: UploadIdentity
     public let receipt: UploadRemoteCommitReceipt
+    /// Exact metadata captured before the irreversible upload result. Older persisted receipts do
+    /// not have this field and fall back to source rematerialization during settlement recovery.
+    public let descriptor: UploadResourceDescriptorSnapshot?
+    /// Present for descriptor-bearing receipts written by current runners. Older descriptor-less
+    /// receipts decode with no binding and retain their resolver-backed recovery contract.
+    public let queueBinding: UploadRemoteCommitQueueBinding?
 
     public init(
         source: UploadSourceIdentity,
         identity: UploadIdentity,
-        receipt: UploadRemoteCommitReceipt
+        receipt: UploadRemoteCommitReceipt,
+        descriptor: UploadResourceDescriptorSnapshot? = nil,
+        queueBinding: UploadRemoteCommitQueueBinding? = nil
     ) {
         self.source = source
         self.identity = identity
         self.receipt = receipt
+        self.descriptor = descriptor
+        self.queueBinding = queueBinding
+    }
+}
+
+public enum UploadRemoteCommitRecoveryError: LocalizedError, Sendable, Equatable {
+    case storeUnavailable
+    case malformedReceipt(UploadSourceIdentity, UploadBackupRevision)
+    case invalidReceipt(UploadSourceIdentity, UploadBackupRevision)
+    case descriptorUnavailable(UploadSourceIdentity, UploadBackupRevision)
+    case descriptorMismatch(UploadSourceIdentity, UploadBackupRevision)
+    case receiptRemovalFailed(UploadSourceIdentity, UploadBackupRevision)
+
+    public var errorDescription: String? {
+        switch self {
+        case .storeUnavailable:
+            "Remote commit reconciliation store is unavailable."
+        case .malformedReceipt(let source, _):
+            "Remote commit reconciliation is malformed for \(source.identifier)."
+        case .invalidReceipt(let source, _):
+            "Remote commit receipt is invalid for \(source.identifier)."
+        case .descriptorUnavailable(let source, _):
+            "Committed resource metadata is unavailable for \(source.identifier)."
+        case .descriptorMismatch(let source, _):
+            "Committed resource metadata no longer matches \(source.identifier)."
+        case .receiptRemovalFailed(let source, _):
+            "Settled remote commit receipt could not be removed for \(source.identifier)."
+        }
     }
 }
 
@@ -212,6 +260,9 @@ public protocol UploadBackupSyncQueueStore: Sendable {
     @discardableResult
     func upsertBatch(_ entries: [UploadBackupSyncQueueEntry]) -> Bool
     func entry(for source: UploadSourceIdentity, revision: UploadBackupRevision) -> UploadBackupSyncQueueEntry?
+    /// Bounded, strict scan of every row carrying durable remote-commit evidence, independent of
+    /// queue state. A malformed non-null payload is an error, never ordinary no-receipt work.
+    func entriesWithRemoteCommitReconciliation(limit: Int) throws -> [UploadBackupSyncQueueEntry]
     func nextRunnable(limit: Int) -> [UploadBackupSyncQueueEntry]
     /// Earliest persisted eligibility time for any runnable row. Retry delays survive process death,
     /// so a restarted runner can wait for due work instead of declaring the queue drained.
@@ -281,6 +332,26 @@ public extension UploadBackupSyncQueueStore {
 
     func earliestRunnableEntry() -> UploadBackupSyncQueueEntry? {
         nextRunnable(limit: Int.max).min { $0.updatedAt < $1.updatedAt }
+    }
+
+    func entriesWithRemoteCommitReconciliation(limit: Int) throws -> [UploadBackupSyncQueueEntry] {
+        guard isOperational() else { throw UploadRemoteCommitRecoveryError.storeUnavailable }
+        let limit = max(1, limit)
+        var result: [UploadBackupSyncQueueEntry] = []
+        result.reserveCapacity(limit)
+        for state in UploadBackupSyncQueueState.allCases {
+            // Generic test stores cannot express a receipt predicate. Inspect their complete state
+            // slice so ordinary rows ahead of a receipt cannot make a complete scan look empty;
+            // the production SQLite store overrides this with a bounded WHERE/limit query.
+            for entry in entries(in: state, updatedBefore: .distantFuture, limit: .max) {
+                if entry.remoteCommitReconciliation != nil {
+                    result.append(entry)
+                    if result.count == limit { return result }
+                }
+            }
+        }
+        guard isOperational() else { throw UploadRemoteCommitRecoveryError.storeUnavailable }
+        return result
     }
 
     func earliestEntry(in state: UploadBackupSyncQueueState) -> UploadBackupSyncQueueEntry? {

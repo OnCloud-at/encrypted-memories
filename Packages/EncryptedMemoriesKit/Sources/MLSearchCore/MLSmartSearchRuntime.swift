@@ -159,7 +159,7 @@ public protocol MLSmartSearchSession: Sendable {
         shouldContinue: @escaping @Sendable () -> Bool,
         observer: MLIndexPassObserver
     ) async -> MLIndexPassOutcome
-    func permanentlyUnavailableAssetUIDs(_ assets: [PhotoUID]) async -> Set<PhotoUID>
+    func permanentlyUnavailableAssetUIDs(_ assets: [PhotoUID]) async throws -> Set<PhotoUID>
     func search(_ text: String, limit: Int) async throws -> MLSearchResults
     func releaseMemory() async
     func shutdown() async

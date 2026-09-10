@@ -197,6 +197,8 @@ final class UploadBackupSyncQueueTests: XCTestCase {
         let pending = try XCTUnwrap(reopened.entry(for: entry.source, revision: entry.revision))
         XCTAssertEqual(pending.state, .needsRemoteReconciliation)
         XCTAssertEqual(pending.remoteCommitReconciliation, reconciliation)
+        XCTAssertNil(pending.remoteCommitReconciliation?.descriptor, "legacy receipts decode without a descriptor")
+        XCTAssertNil(pending.remoteCommitReconciliation?.queueBinding, "legacy receipts decode without a queue binding")
         let claimed = try XCTUnwrap(
             reopened.claimRunnable(
                 limit: 1,

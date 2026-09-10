@@ -454,6 +454,133 @@ extension DriveSessionStubSuite {
             #expect(result.firstFailureMessage == "boom")
         }
 
+        @Test func attachFailsClosedForUnknownMainOutcomesWithoutAffectingValidGroups() async throws {
+            StubURLProtocol.reset()
+            let fixture = try AlbumCryptoFixture()
+            fixture.routeShareAndRoot()
+            StubURLProtocol.route(
+                "POST /drive/photos/volumes/vol1/albums",
+                json: #"{"Code":1000,"Album":{"Link":{"LinkID":"album1"}}}"#
+            )
+            let ids = ["valid", "nil-response", "missing", "duplicate", "unknown"]
+            fixture.routePhotoMetadata(ids.map { fixture.photoMetadata(id: $0, xAttr: fixture.photoXAttrMessage) })
+            StubURLProtocol.route(
+                "POST /drive/photos/volumes/vol1/albums/album1/add-multiple",
+                json: #"""
+                    {"Code":1001,"Responses":[
+                      {"LinkID":"valid","Response":{"Code":1000,"Details":{"Missing":["not-a-retry"]}}},
+                      {"LinkID":"nil-response"},
+                      {"LinkID":"duplicate","Response":{"Code":1000}},
+                      {"LinkID":"duplicate","Response":{"Code":2500}},
+                      {"LinkID":"unknown","Response":{"Code":4321,"Error":"server id 77"}}
+                    ]}
+                    """#
+            )
+
+            let service = fixture.makeService()
+            _ = try await service.createAlbum(name: "Strict")
+            let result = try await service.attach(
+                ids.map { AlbumAttachRequestItem(uid: PhotoUID(volumeID: "vol1", nodeID: $0), sha1Hex: nil) },
+                albumID: "album1"
+            )
+
+            #expect(result.attachedCount == 1)
+            #expect(result.failedCount == 4)
+            let unknown = try #require(result.outcomes["unknown"])
+            if case .failed(_, let message) = unknown {
+                #expect(message == "unconfirmed album response")
+            } else {
+                Issue.record("unknown main status was not reported as a failure")
+            }
+        }
+
+        @Test func attachDoesNotRetrySuccessfulCodesWithMissingDetails() async throws {
+            StubURLProtocol.reset()
+            let fixture = try AlbumCryptoFixture()
+            fixture.routeShareAndRoot()
+            StubURLProtocol.route(
+                "POST /drive/photos/volumes/vol1/albums",
+                json: #"{"Code":1000,"Album":{"Link":{"LinkID":"album1"}}}"#
+            )
+            let ids = ["attached-with-missing", "already-member-with-missing"]
+            fixture.routePhotoMetadata(
+                ids.map {
+                    fixture.photoMetadata(id: $0, xAttr: fixture.photoXAttrMessage)
+                })
+            StubURLProtocol.route(
+                "POST /drive/photos/volumes/vol1/albums/album1/add-multiple",
+                json: #"""
+                    {"Code":1001,"Responses":[
+                    {"LinkID":"attached-with-missing","Response":{"Code":1000,"Details":{"Missing":["late"]}}},
+                    {"LinkID":"already-member-with-missing","Response":{"Code":2500,"Error":"Already in this album","Details":{"Missing":["late"]}}}
+                    ]}
+                    """#
+            )
+
+            let service = fixture.makeService()
+            _ = try await service.createAlbum(name: "Successful statuses")
+            let result = try await service.attach(
+                ids.map { AlbumAttachRequestItem(uid: PhotoUID(volumeID: "vol1", nodeID: $0)) },
+                albumID: "album1"
+            )
+
+            #expect(result.attachedCount == 1)
+            #expect(result.alreadyMemberCount == 1)
+            #expect(result.failedCount == 0)
+            #expect(StubURLProtocol.requests().filter { $0.path.contains("/add-multiple") }.count == 1)
+        }
+
+        @Test func attachFailsWhenMissingRetryStillHasUnknownOutcome() async throws {
+            StubURLProtocol.reset()
+            let fixture = try AlbumCryptoFixture()
+            fixture.routeShareAndRoot()
+            StubURLProtocol.route(
+                "POST /drive/photos/volumes/vol1/albums",
+                json: #"{"Code":1000,"Album":{"Link":{"LinkID":"album1"}}}"#
+            )
+            StubURLProtocol.routeSequence(
+                "POST /drive/photos/volumes/vol1/links",
+                responses: [
+                    (
+                        200,
+                        jsonObject([
+                            "Links": [fixture.photoMetadata(id: "main", xAttr: fixture.photoXAttrMessage)]
+                        ])
+                    ),
+                    (
+                        200,
+                        jsonObject([
+                            "Links": [fixture.photoMetadata(id: "late", xAttr: fixture.photoXAttrMessage)]
+                        ])
+                    ),
+                ]
+            )
+            StubURLProtocol.routeSequence(
+                "POST /drive/photos/volumes/vol1/albums/album1/add-multiple",
+                responses: [
+                    (
+                        200,
+                        #"{"Code":1001,"Responses":[{"LinkID":"main","Response":{"Code":2000,"Details":{"Missing":["late"]}}}]}"#
+                    ),
+                    (
+                        200,
+                        #"{"Code":1001,"Responses":[{"LinkID":"main","Response":{"Code":2000,"Details":{"Missing":["late"]}}}]}"#
+                    ),
+                ]
+            )
+
+            let service = fixture.makeService()
+            _ = try await service.createAlbum(name: "Retry failure")
+            let result = try await service.attach(
+                [AlbumAttachRequestItem(uid: PhotoUID(volumeID: "vol1", nodeID: "main"), sha1Hex: nil)],
+                albumID: "album1"
+            )
+
+            #expect(result.attachedCount == 0)
+            #expect(result.failedCount == 1)
+            #expect(StubURLProtocol.requests().filter { $0.path.contains("/add-multiple") }.count == 2)
+        }
+
         @Test func attachPreparesLargeSelectionInInputOrder() async throws {
             StubURLProtocol.reset()
             let fixture = try AlbumCryptoFixture()

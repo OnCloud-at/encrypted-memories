@@ -531,8 +531,7 @@ public actor ThumbnailFeedCore {
                 recordError("decode failed for \(Self.key(uid))")
                 return nil
             }
-            storeDecoded(image, for: uid, decodePixelCap: Int(configuration.targetPixels))
-            return image
+            return storeDecoded(image, for: uid, decodePixelCap: Int(configuration.targetPixels))
         }
         diskPresence.set(uid, present: false)
         diagnostics.increment("thumb.diskCacheMiss")
@@ -1225,8 +1224,7 @@ public actor ThumbnailFeedCore {
             recordError("decode failed for \(Self.key(uid))")
             return nil
         }
-        storeDecoded(image, for: uid, decodePixelCap: Int(configuration.targetPixels))
-        return image
+        return storeDecoded(image, for: uid, decodePixelCap: Int(configuration.targetPixels))
     }
 
     public func startPrefetch(_ uids: [PhotoUID]) async {
@@ -2610,18 +2608,24 @@ public actor ThumbnailFeedCore {
             ])
     }
 
-    private func storeDecoded(_ image: DecodedThumbnail, for uid: PhotoUID, decodePixelCap: Int) {
-        guard ownerLeaseIsCurrent(), selectedAuthorization.isAllowed(uid) else { return }
-        decoded.set(image, for: uid, decodePixelCap: decodePixelCap)
+    @discardableResult
+    private func storeDecoded(
+        _ image: DecodedThumbnail,
+        for uid: PhotoUID,
+        decodePixelCap: Int
+    ) -> DecodedThumbnail? {
+        guard ownerLeaseIsCurrent(), selectedAuthorization.isAllowed(uid) else { return nil }
+        let becameCurrent = decoded.set(image, for: uid, decodePixelCap: decodePixelCap)
         guard ownerLeaseIsCurrent() else {
             decoded.removeAll()
-            return
+            return nil
         }
         guard selectedAuthorization.isAllowed(uid) else {
             decoded.remove(uid)
-            return
+            return nil
         }
-        onDecoded(uid, image)
+        if becameCurrent { onDecoded(uid, image) }
+        return decoded.image(for: uid)
     }
 
     /// A completed disk decode is immediately useful to the Metal grid. This wake intentionally happens at each

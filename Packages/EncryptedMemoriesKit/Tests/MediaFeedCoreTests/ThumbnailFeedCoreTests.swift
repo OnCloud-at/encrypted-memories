@@ -1591,15 +1591,15 @@ struct ThumbnailFeedCoreTests {
         #expect(!feed.decodedNeedsSharperSource(uid, forPixels: 18))  // A value within hysteresis is adequate.
     }
 
-    @Test func decodedCacheUpgradeReplacesCostAndKeepsLargerOnRace() {
+    @Test func decodedCacheRejectsLateLowerResolutionAndReportsTheCurrentSource() {
         let cache = DecodedThumbnailCache(costLimit: 10_000_000)
         let a = Self.uid("dc-upgrade")
-        cache.set(Self.decodedThumb(10, 10), for: a, decodePixelCap: 16)  // 400 bytes
-        cache.set(Self.decodedThumb(20, 20), for: a, decodePixelCap: 320)  // upgrade replaces cost in place
+        #expect(cache.set(Self.decodedThumb(10, 10), for: a, decodePixelCap: 16))  // 400 bytes
+        #expect(cache.set(Self.decodedThumb(20, 20), for: a, decodePixelCap: 320))
         #expect(cache.snapshotForTesting().count == 1)
         #expect(cache.snapshotForTesting().cost == 1600)
-        // A smaller concurrent decode landing last must not undo the sharp entry (cross-grid warm race).
-        cache.set(Self.decodedThumb(10, 10), for: a, decodePixelCap: 16)
+        // The false result prevents onDecoded consumers from treating this rejected source as current.
+        #expect(!cache.set(Self.decodedThumb(10, 10), for: a, decodePixelCap: 16))
         #expect(cache.snapshotForTesting().cost == 1600)
         #expect(cache.image(for: a)?.pixelWidth == 20)
     }

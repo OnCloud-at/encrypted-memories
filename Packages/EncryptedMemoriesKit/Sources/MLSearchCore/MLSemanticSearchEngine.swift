@@ -86,18 +86,18 @@ public actor MLSemanticSearchEngine {
         )
     }
 
-    public func coverage(for descriptor: MLModelDescriptor, allAssets: [PhotoUID]) -> MLIndexCoverage {
-        store.coverage(for: descriptor, allAssets: allAssets)
+    public func coverage(for descriptor: MLModelDescriptor, allAssets: [PhotoUID]) throws -> MLIndexCoverage {
+        try store.coverage(for: descriptor, allAssets: allAssets)
     }
 
     public func permanentlyUnavailableAssetUIDs(
         for descriptor: MLModelDescriptor,
         allAssets: [PhotoUID]
-    ) -> Set<PhotoUID> {
+    ) throws -> Set<PhotoUID> {
         let assets = Array(Set(allAssets))
-        let indexed = store.indexedUIDs(for: descriptor, from: assets)
+        let indexed = try store.indexedUIDs(for: descriptor, from: assets)
         return Set(
-            store.failureRecords(for: descriptor, from: assets).values.compactMap { failure in
+            try store.failureRecords(for: descriptor, from: assets).values.compactMap { failure in
                 failure.kind == .permanent && !indexed.contains(failure.uid) ? failure.uid : nil
             })
     }

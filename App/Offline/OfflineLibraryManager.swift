@@ -74,8 +74,26 @@ final class OfflineLibraryManager {
 
     private var feed: ThumbnailFeed?
     private var statsProvider: (any LibraryStatsProvider)?
+    private let statsCoordinator = OfflineLibraryStatsCoordinator()
+    private var statsSession: OfflineLibraryStatsCoordinator.Session?
+    private var statsTeardownSession: OfflineLibraryStatsCoordinator.Session?
+    private var accountTeardownInProgress = false
     /// Live count of photos currently loaded into the timeline (pushed by `MainView`).
-    var liveAssetCount = 0
+    var liveAssetCount = 0 {
+        didSet {
+            if liveAssetCount != oldValue { markStatusDirty() }
+        }
+    }
+
+    private struct StatusReadContext: Sendable {
+        let feed: ThumbnailFeed?
+        let statsProvider: (any LibraryStatsProvider)?
+        let cache: ThumbnailCache
+        let previewCache: ThumbnailCache
+        let originalsCache: ThumbnailCache
+        let offlineEnabled: Bool
+        let liveAssetCount: Int
+    }
 
     private init() {
         let defaults = UserDefaults.standard
@@ -92,6 +110,7 @@ final class OfflineLibraryManager {
     func attach(feed: ThumbnailFeed, stats: any LibraryStatsProvider) {
         self.feed = feed
         self.statsProvider = stats
+        markStatusDirty()
         Task {
             await feed.setPrefetchEnabled(OfflineLibraryPolicy.shouldCrawlThumbnails(offlineEnabled: offlineEnabled))
         }
@@ -99,6 +118,12 @@ final class OfflineLibraryManager {
 
     /// Clears account-derived values from observable Settings state before asynchronous teardown begins.
     func prepareForAccountTeardown() {
+        accountTeardownInProgress = true
+        if let statsSession {
+            statsCoordinator.invalidate(statsSession)
+            statsTeardownSession = statsSession
+            self.statsSession = nil
+        }
         liveAssetCount = 0
         isLibraryActivityActive = false
         status = OfflineCacheStatus()
@@ -127,9 +152,16 @@ final class OfflineLibraryManager {
     /// Keychain prompt for a separate cache key item.
     func configure(session: ProtonSession) {
         let context = LocalMediaCacheContext(accountUID: session.uid, keyPassword: session.keyPassword)
+        let previousAccountUID = configuredAccountUID
+        accountTeardownInProgress = false
+        status = OfflineCacheStatus()
+        // Configuration remains the original security transition even for the same account:
+        // refresh credentials and invalidate old cache writer/retention generations.
+        // Statistics read immutable cache directories and revalidate this session before
+        // publication; account teardown still joins readers before closing provider stores.
+        statsSession = statsCoordinator.beginSession()
         context.configure(cache, previewCache, originalsCache)
         let previousCrawlStarted = locationCrawlStarted
-        let previousAccountUID = configuredAccountUID
         let accountChanged = previousAccountUID != nil && previousAccountUID != context.accountUID
         locationCrawlGeneration &+= 1
         locationConfigurationGeneration &+= 1
@@ -183,6 +215,7 @@ final class OfflineLibraryManager {
     /// Stops account-bound location and activity work before any facade or cache owner is closed.
     /// Kept separate from cache deletion so the shared account teardown stages stay explicit.
     func stopForAccountTeardown() async {
+        let retiringStatsSession = statsTeardownSession
         let activeLocationCrawlStarter = locationCrawlStartTask
         let activeLocationConfiguration = locationConfigurationTask
         let activeFeed = feed
@@ -205,6 +238,10 @@ final class OfflineLibraryManager {
         await activeLocationConfiguration?.value
         await activeLocationCrawlStarter?.value
         await activeThumbnailUpdateTask?.value
+        if let retiringStatsSession {
+            await statsCoordinator.stopAndJoin(retiringStatsSession)
+            if statsTeardownSession == retiringStatsSession { statsTeardownSession = nil }
+        }
         await activeFeed?.stopPrefetch()
         await locationCrawl.cancel()
         // A non-cooperative metadata probe can return after the eager UI clear above but before the
@@ -341,6 +378,7 @@ final class OfflineLibraryManager {
         guard enabled != offlineEnabled else { return }
         offlineEnabled = enabled
         UserDefaults.standard.set(enabled, forKey: AppSettingsKey.offlineLibraryEnabled)
+        markStatusDirty()
     }
 
     /// Persists the originals-cache cap and enforces it immediately - lowering it (or switching from unbounded to
@@ -353,6 +391,7 @@ final class OfflineLibraryManager {
         let oc = originalsCache
         Task {
             await Task.detached { oc.enforceByteCap(cap) }.value  // file I/O off the main actor
+            markStatusDirty()
             await refreshStatus()
         }
     }
@@ -361,6 +400,7 @@ final class OfflineLibraryManager {
     /// and the account key remain available to the grid.
     func purgeOriginalsCache() async {
         await originalsCache.clear()
+        markStatusDirty()
         await refreshStatus()
     }
 
@@ -375,36 +415,84 @@ final class OfflineLibraryManager {
         await previewCache.clear()
         await originalsCache.clear()
         await VideoByteRangeCache.shared.clearAllAsync()  // also drop streamed video blocks
+        markStatusDirty()
         await refreshStatus()
     }
 
     /// Recomputes `status` from the cache actors, the feed, and the diagnostics counters.
     @discardableResult
     func refreshStatus() async -> OfflineCacheStatus {
-        let prefetch = await feed?.prefetchStatus()
-        let metadataRows = await statsProvider?.metadataRowCount() ?? 0
-        let totalAssets = max(liveAssetCount, metadataRows)
-        // Source-aware feeds report coverage for the primary projection only. Physical cache bytes still
-        // include authorized analysis-only derivatives and remain reflected in `cacheSizeBytes` below.
-        let onDisk = prefetch?.diskFileCount ?? cache.diskFileCount()
+        guard !accountTeardownInProgress,
+            let session = statsSession,
+            var requiredDemand = statsCoordinator.requestRefresh(in: session)
+        else { return status }
 
-        var s = OfflineCacheStatus()
-        s.offlineEnabled = offlineEnabled
-        s.totalAssets = totalAssets
-        s.metadataRows = metadataRows
-        s.thumbnailsOnDisk = onDisk
-        s.thumbnailsMissing = max(0, totalAssets - onDisk)
-        s.ramDecodedEstimate = prefetch?.ramDecodedCount ?? 0
-        s.prefetchQueueDepth = prefetch?.currentQueueLength ?? 0
-        s.activePrefetchJobs = prefetch?.activeJobs ?? 0
-        // Thumbnails always crawl, so the offline toggle never reports "disabled" here.
-        s.prefetchPausedReason = prefetch?.pausedReason ?? "none"
-        s.failedThumbnailCount = prefetch?.failed ?? 0
-        s.cacheSizeBytes = cache.diskSizeBytes()
-        s.previewCacheSizeBytes = previewCache.diskSizeBytes()
-        s.originalsCacheSizeBytes = originalsCache.diskSizeBytes()
-        s.lastError = prefetch?.lastErrors.last
-        status = s
-        return s
+        while true {
+            let measurement = await statsCoordinator.refresh(
+                in: session,
+                satisfying: requiredDemand
+            ) { [weak self] in
+                guard let initial = await self?.statusReadContext(for: session) else { return nil }
+                let prefetch = await initial.feed?.prefetchStatus()
+                let metadataRows = await initial.statsProvider?.metadataRowCount() ?? 0
+                // Revalidate the account owner after the asynchronous providers and before synchronous disk walks.
+                guard let current = await self?.statusReadContext(for: session) else { return nil }
+
+                let thumbnailFileCount = current.cache.diskFileCount()
+                let thumbnailSizeBytes = current.cache.diskSizeBytes()
+                let previewSizeBytes = current.previewCache.diskSizeBytes()
+                let originalsSizeBytes = current.originalsCache.diskSizeBytes()
+                let totalAssets = max(current.liveAssetCount, metadataRows)
+                var snapshot = OfflineCacheStatus()
+                snapshot.offlineEnabled = current.offlineEnabled
+                snapshot.totalAssets = totalAssets
+                snapshot.metadataRows = metadataRows
+                // Source-aware feeds report coverage for the primary projection only. Physical cache bytes still
+                // include authorized analysis-only derivatives and remain reflected in `cacheSizeBytes` below.
+                snapshot.thumbnailsOnDisk = prefetch?.diskFileCount ?? thumbnailFileCount
+                snapshot.thumbnailsMissing = max(0, totalAssets - snapshot.thumbnailsOnDisk)
+                snapshot.ramDecodedEstimate = prefetch?.ramDecodedCount ?? 0
+                snapshot.prefetchQueueDepth = prefetch?.currentQueueLength ?? 0
+                snapshot.activePrefetchJobs = prefetch?.activeJobs ?? 0
+                // Thumbnails always crawl, so the offline toggle never reports "disabled" here.
+                snapshot.prefetchPausedReason = prefetch?.pausedReason ?? "none"
+                snapshot.failedThumbnailCount = prefetch?.failed ?? 0
+                snapshot.cacheSizeBytes = thumbnailSizeBytes
+                snapshot.previewCacheSizeBytes = previewSizeBytes
+                snapshot.originalsCacheSizeBytes = originalsSizeBytes
+                snapshot.lastError = prefetch?.lastErrors.last
+                return snapshot
+            }
+            guard let measurement,
+                statsSession == session,
+                !accountTeardownInProgress
+            else { return status }
+            if statsCoordinator.isCurrent(measurement.demand, in: session) {
+                status = measurement.status
+                return measurement.status
+            }
+            guard let currentDemand = statsCoordinator.currentDemand(in: session) else { return status }
+            requiredDemand = currentDemand
+        }
+    }
+
+    private func markStatusDirty() {
+        guard let statsSession else { return }
+        statsCoordinator.markDirty(in: statsSession)
+    }
+
+    private func statusReadContext(
+        for session: OfflineLibraryStatsCoordinator.Session
+    ) -> StatusReadContext? {
+        guard statsSession == session, !accountTeardownInProgress else { return nil }
+        return StatusReadContext(
+            feed: feed,
+            statsProvider: statsProvider,
+            cache: cache,
+            previewCache: previewCache,
+            originalsCache: originalsCache,
+            offlineEnabled: offlineEnabled,
+            liveAssetCount: liveAssetCount
+        )
     }
 }

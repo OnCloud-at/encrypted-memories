@@ -57,11 +57,11 @@ import Testing
         var blockLoadCount: Int { lock.withLock { blockLoads } }
 
         func upsert(_ records: [MLEmbeddingRecord]) -> MLIndexBatchReport { backing.upsert(records) }
-        func contains(uid: PhotoUID, descriptor: MLModelDescriptor) -> Bool {
-            backing.contains(uid: uid, descriptor: descriptor)
+        func contains(uid: PhotoUID, descriptor: MLModelDescriptor) throws -> Bool {
+            try backing.contains(uid: uid, descriptor: descriptor)
         }
-        func indexedUIDs(for descriptor: MLModelDescriptor, from uids: [PhotoUID]) -> Set<PhotoUID> {
-            backing.indexedUIDs(for: descriptor, from: uids)
+        func indexedUIDs(for descriptor: MLModelDescriptor, from uids: [PhotoUID]) throws -> Set<PhotoUID> {
+            try backing.indexedUIDs(for: descriptor, from: uids)
         }
         func allIndexedUIDs(for descriptor: MLModelDescriptor) -> [PhotoUID] { backing.allIndexedUIDs(for: descriptor) }
         func allTrackedUIDs(for descriptor: MLModelDescriptor) -> [PhotoUID] { backing.allTrackedUIDs(for: descriptor) }
@@ -105,7 +105,7 @@ import Testing
         func recordFailures(_ records: [MLIndexFailureRecord]) -> Bool { backing.recordFailures(records) }
         func failureRecords(
             for descriptor: MLModelDescriptor, from uids: [PhotoUID]
-        ) -> [PhotoUID: MLIndexFailureRecord] { backing.failureRecords(for: descriptor, from: uids) }
+        ) throws -> [PhotoUID: MLIndexFailureRecord] { try backing.failureRecords(for: descriptor, from: uids) }
     }
 
     private struct FixedTextEncoder: MLTextQueryEncoder {
@@ -312,7 +312,7 @@ import Testing
         #expect(store.allRecords(for: descriptor).count == 3)
 
         // The read purges the invalid derived row. Normal membership now schedules it again.
-        #expect(!store.contains(uid: uid("a1"), descriptor: descriptor))
+        #expect(try store.contains(uid: uid("a1"), descriptor: descriptor) == false)
         #expect(store.count(for: descriptor) == 3)
         store.upsert([
             MLEmbeddingRecord(uid: uid("a1"), descriptor: descriptor, vector: vector(seed: 1, dimension: dimension))
@@ -358,7 +358,7 @@ import Testing
         sqlite3_finalize(write)
 
         #expect(store.vectorBlock(for: descriptor).count == 1)
-        #expect(!store.contains(uid: uid("a1"), descriptor: descriptor))
+        #expect(try store.contains(uid: uid("a1"), descriptor: descriptor) == false)
         #expect(store.generation(for: descriptor) > generationBefore)
 
         #expect(

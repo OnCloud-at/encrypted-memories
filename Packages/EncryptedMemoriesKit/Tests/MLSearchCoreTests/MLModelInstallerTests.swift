@@ -45,6 +45,72 @@ import Testing
         }
     }
 
+    private actor DownloadGate {
+        private var started = 0
+        private var active = 0
+        private var firstRelease: CheckedContinuation<Void, Never>?
+        private var firstStart: CheckedContinuation<Void, Never>?
+        private(set) var maxActive = 0
+
+        func begin() async {
+            started += 1
+            active += 1
+            maxActive = max(maxActive, active)
+            if started == 1 {
+                firstStart?.resume()
+                firstStart = nil
+                await withCheckedContinuation { firstRelease = $0 }
+            }
+        }
+
+        func waitForFirstStart() async {
+            if started > 0 { return }
+            await withCheckedContinuation { firstStart = $0 }
+        }
+
+        func releaseFirst() {
+            firstRelease?.resume()
+            firstRelease = nil
+        }
+
+        func finish() {
+            active -= 1
+        }
+    }
+
+    private final class GatedTransport: MLModelArtifactTransport, @unchecked Sendable {
+        let gate = DownloadGate()
+        private let payloads: [URL: Data]
+        private let lock = NSLock()
+        private var downloadCounts: [URL: Int] = [:]
+
+        init(payloads: [URL: Data]) { self.payloads = payloads }
+
+        func download(
+            from url: URL,
+            to destination: URL,
+            expectedByteCount: Int64,
+            progress: @escaping @Sendable (Int64, Int64?) async -> Void
+        ) async throws {
+            await gate.begin()
+            lock.withLock { downloadCounts[url, default: 0] += 1 }
+            do {
+                try Task.checkCancellation()
+                guard let payload = payloads[url] else { throw URLError(.fileDoesNotExist) }
+                try payload.write(to: destination)
+                await progress(Int64(payload.count), expectedByteCount)
+            } catch {
+                await gate.finish()
+                throw error
+            }
+            await gate.finish()
+        }
+
+        func downloadCount(_ url: URL) -> Int {
+            lock.withLock { downloadCounts[url, default: 0] }
+        }
+    }
+
     private func makeRoot() throws -> URL {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("ml-installer-tests-\(UUID().uuidString)", isDirectory: true)
@@ -336,6 +402,170 @@ import Testing
         async let second = installer.install(testEntry) { _ in }
         _ = try await (first, second)
         #expect(transport.downloadCount(url) == 1)
+    }
+
+    @Test func threeDifferentRequestsForOneDestinationNeverOverlap() async throws {
+        let root = try makeRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let layout = MLModelInstallLayout(rootDirectory: root)
+        let payload = Data("shared-destination".utf8)
+        let urls = ["a", "b", "c"].map { URL(string: "https://example.test/\($0).bin")! }
+        let transport = GatedTransport(payloads: Dictionary(uniqueKeysWithValues: urls.map { ($0, payload) }))
+        let installer = MLModelInstaller(layout: layout, transport: transport)
+        let entries = urls.enumerated().map { index, url in
+            entry(
+                id: "model-three-way",
+                plan: plan(revision: "shared-revision", files: [("weights-\(index).bin", payload, url)])
+            )
+        }
+
+        let first = Task { try await installer.install(entries[0]) { _ in } }
+        await transport.gate.waitForFirstStart()
+        let second = Task { try await installer.install(entries[1]) { _ in } }
+        let third = Task { try await installer.install(entries[2]) { _ in } }
+        await installer.waitForInstallWaiters(2)
+        await transport.gate.releaseFirst()
+
+        let firstRecord = try await first.value
+        let secondRecord = try await second.value
+        let thirdRecord = try await third.value
+        #expect(await transport.gate.maxActive == 1)
+        #expect(transport.downloadCount(urls[0]) == 1)
+        #expect(transport.downloadCount(urls[1]) == 1)
+        #expect(transport.downloadCount(urls[2]) == 1)
+        #expect(firstRecord.artifacts.map(\.relativePath) == ["Model.mlmodelc/weights-0.bin"])
+        #expect(secondRecord.artifacts.map(\.relativePath) == ["Model.mlmodelc/weights-1.bin"])
+        #expect(thirdRecord.artifacts.map(\.relativePath) == ["Model.mlmodelc/weights-2.bin"])
+    }
+
+    @Test func overlappingCancelInstallAndUninstallKeepModelFencedUntilBothRelease() async throws {
+        let root = try makeRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let layout = MLModelInstallLayout(rootDirectory: root)
+        let payload = Data("overlap-model-fence".utf8)
+        let url = URL(string: "https://example.test/overlap-model.bin")!
+        let testEntry = entry(id: "model-overlap", plan: plan(files: [("weights.bin", payload, url)]))
+        let transport = GatedTransport(payloads: [url: payload])
+        let installer = MLModelInstaller(layout: layout, transport: transport)
+
+        let first = Task { try await installer.install(testEntry) { _ in } }
+        await transport.gate.waitForFirstStart()
+        let cancellation = Task { await installer.cancelInstall(of: testEntry.id) }
+        let removal = Task { await installer.uninstall(testEntry) }
+        await installer.waitForFenceOwners(modelID: testEntry.id, minimum: 2)
+
+        await #expect(throws: MLModelInstallError.cancelled) {
+            _ = try await installer.install(testEntry) { _ in }
+        }
+        await transport.gate.releaseFirst()
+        await cancellation.value
+        await removal.value
+
+        await #expect(throws: MLModelInstallError.cancelled) { _ = try await first.value }
+        #expect(transport.downloadCount(url) == 1)
+        #expect(!FileManager.default.fileExists(atPath: layout.modelDirectory(for: testEntry.id).path))
+        #expect(
+            !FileManager.default.fileExists(atPath: layout.runtimeCacheModelDirectory(for: testEntry.id).path))
+        #expect(layout.stagingDirectories(for: testEntry.id).isEmpty)
+    }
+
+    @Test func concurrentCancelAllOwnersKeepEveryModelFencedUntilBothRelease() async throws {
+        let root = try makeRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let layout = MLModelInstallLayout(rootDirectory: root)
+        let payload = Data("overlap-all-fence".utf8)
+        let url = URL(string: "https://example.test/overlap-all.bin")!
+        let testEntry = entry(id: "model-overlap-all", plan: plan(files: [("weights.bin", payload, url)]))
+        let transport = GatedTransport(payloads: [url: payload])
+        let installer = MLModelInstaller(layout: layout, transport: transport)
+
+        let first = Task { try await installer.install(testEntry) { _ in } }
+        await transport.gate.waitForFirstStart()
+        let firstCancellation = Task { await installer.cancelAllInstalls() }
+        let secondCancellation = Task { await installer.cancelAllInstalls() }
+        await installer.waitForFenceOwners(minimum: 2)
+
+        await #expect(throws: MLModelInstallError.cancelled) {
+            _ = try await installer.install(testEntry) { _ in }
+        }
+        await transport.gate.releaseFirst()
+        await firstCancellation.value
+        await secondCancellation.value
+
+        await #expect(throws: MLModelInstallError.cancelled) { _ = try await first.value }
+        #expect(transport.downloadCount(url) == 1)
+        #expect(!FileManager.default.fileExists(atPath: layout.modelDirectory(for: testEntry.id).path))
+        // Cancellation preserves resumable partials; only uninstall removes staging.
+        #expect(layout.stagingDirectories(for: testEntry.id).count == 1)
+    }
+
+    @Test func cancelAllFencesWaitingSuccessor() async throws {
+        let root = try makeRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let layout = MLModelInstallLayout(rootDirectory: root)
+        let payload = Data("cancelled".utf8)
+        let urls = [
+            URL(string: "https://example.test/cancel-a.bin")!,
+            URL(string: "https://example.test/cancel-b.bin")!,
+        ]
+        let transport = GatedTransport(payloads: Dictionary(uniqueKeysWithValues: urls.map { ($0, payload) }))
+        let installer = MLModelInstaller(layout: layout, transport: transport)
+        let entries = urls.enumerated().map { index, url in
+            entry(
+                id: "model-cancel",
+                plan: plan(revision: "cancel-revision", files: [("weights-\(index).bin", payload, url)]))
+        }
+
+        let first = Task { try await installer.install(entries[0]) { _ in } }
+        await transport.gate.waitForFirstStart()
+        let successor = Task { try await installer.install(entries[1]) { _ in } }
+        await installer.waitForInstallWaiters(1)
+        let cancellation = Task { await installer.cancelAllInstalls() }
+        await installer.waitForFenceOwners(minimum: 1)
+        await transport.gate.releaseFirst()
+        await cancellation.value
+
+        await #expect(throws: MLModelInstallError.cancelled) { _ = try await first.value }
+        await #expect(throws: MLModelInstallError.cancelled) { _ = try await successor.value }
+        #expect(transport.downloadCount(urls[0]) == 1)
+        #expect(transport.downloadCount(urls[1]) == 0)
+        #expect(installer.installedRecord(for: entries[0], revision: "cancel-revision") == nil)
+    }
+
+    @Test func uninstallFencesWaitingSuccessorAndRemovesStaging() async throws {
+        let root = try makeRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let layout = MLModelInstallLayout(rootDirectory: root)
+        let payload = Data("uninstalled".utf8)
+        let urls = [
+            URL(string: "https://example.test/uninstall-a.bin")!,
+            URL(string: "https://example.test/uninstall-b.bin")!,
+        ]
+        let transport = GatedTransport(payloads: Dictionary(uniqueKeysWithValues: urls.map { ($0, payload) }))
+        let installer = MLModelInstaller(layout: layout, transport: transport)
+        let entries = urls.enumerated().map { index, url in
+            entry(
+                id: "model-uninstall",
+                plan: plan(revision: "uninstall-revision", files: [("weights-\(index).bin", payload, url)]))
+        }
+
+        let first = Task { try await installer.install(entries[0]) { _ in } }
+        await transport.gate.waitForFirstStart()
+        let successor = Task { try await installer.install(entries[1]) { _ in } }
+        await installer.waitForInstallWaiters(1)
+        let removal = Task { await installer.uninstall(entries[0]) }
+        await installer.waitForFenceOwners(modelID: entries[0].id, minimum: 1)
+        await transport.gate.releaseFirst()
+        await removal.value
+
+        await #expect(throws: MLModelInstallError.cancelled) { _ = try await first.value }
+        await #expect(throws: MLModelInstallError.cancelled) { _ = try await successor.value }
+        #expect(transport.downloadCount(urls[1]) == 0)
+        #expect(installer.installedRecord(for: entries[0], revision: "uninstall-revision") == nil)
+        #expect(!FileManager.default.fileExists(atPath: layout.modelDirectory(for: entries[0].id).path))
+        #expect(
+            !FileManager.default.fileExists(atPath: layout.runtimeCacheModelDirectory(for: entries[0].id).path))
+        #expect(layout.stagingDirectories(for: entries[0].id).isEmpty)
     }
 
     @Test func localDeveloperInstallHashesAndInstallsContent() async throws {

@@ -989,15 +989,17 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                     progressCallback: { onProgress($0.fractionCompleted) }
                 )
             }
-            let verificationIssue = try await withTaskCancellationHandler {
+            // Keep the export's partial file and open-session lease alive until native cancel
+            // has settled, even when the download's terminal callback arrives first.
+            let verificationIssue = try await SDKCancellableOperation.run(token: token) { _ in
                 try await operation.awaitDownloadWithResilience(
                     operationalResilience: BasicOperationalResilience.default,
                     onRetriableErrorReceived: { error in
                         DebugLog.log("original file transfer retry: \(error.localizedDescription)")
                     }
                 )
-            } onCancel: {
-                Task { try? await operation.cancel() }
+            } cancel: { _ in
+                try? await operation.cancel()
             }
             try Task.checkCancellation()
             if fileManager.fileExists(atPath: destination.path) {

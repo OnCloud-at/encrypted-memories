@@ -55,6 +55,8 @@ struct SettingsView: View {
                         .tabItem { Label("settings.diagnostics_tab", systemImage: "internaldrive") }
                 }
             }
+            // Native grouped tabs survive account changes without retaining stale Settings toolbar items.
+            .tabViewStyle(.grouped)
             Divider()
             AppBuildInfoLabel()
                 .frame(maxWidth: .infinity)
@@ -78,7 +80,7 @@ struct SettingsView: View {
 private struct BackupSettingsTab: View {
     @AppStorage(AppSettingsKey.folderBackupFullDiskAccessIntroduced)
     private var didIntroduceFullDiskAccess = false
-    @State var backup: FolderBackupController
+    let backup: FolderBackupController
     let photoBackup: PhotoLibraryBackupController?
     let albumSync: AlbumSyncController?
     let uploadCoordinator: UploadCoordinator?
@@ -475,7 +477,7 @@ private struct LibrarySettingsTab: View {
 
 /// Renders Photos-library backup consent, permission, and status state.
 private struct PhotoLibraryBackupSection: View {
-    @State var controller: PhotoLibraryBackupController
+    let controller: PhotoLibraryBackupController
     @State private var rowModel = BackupStatusRowModel()
     @State private var showFailedList = false
 
@@ -777,7 +779,7 @@ private struct MacFailedBackupSheet: View {
 /// Renders selected local-album mappings from the shared sync controller.
 /// Removing a row keeps the Proton album and its mapping.
 private struct AlbumSyncSection: View {
-    @State var controller: AlbumSyncController
+    let controller: AlbumSyncController
     @State private var showPicker = false
 
     var body: some View {
@@ -928,7 +930,7 @@ private struct AlbumSyncSection: View {
 /// The album picker. Confirmation replaces the full selection.
 /// Opening the sheet is the explicit user action that may trigger the photo-access prompt.
 private struct AlbumPickerSheet: View {
-    @State var controller: AlbumSyncController
+    let controller: AlbumSyncController
     @Environment(\.dismiss) private var dismiss
 
     @State private var draft: Set<String> = []
