@@ -148,6 +148,32 @@ final class OfflineLibraryStatsCoordinatorTests: XCTestCase {
         await coordinator.stopAndJoin(session)
     }
 
+    func testDelayedCallerReusesCompletedDemandButNewRequestAndMutationReadAgain() async throws {
+        let coordinator = OfflineLibraryStatsCoordinator()
+        let session = coordinator.beginSession()
+        let demand = try XCTUnwrap(coordinator.requestRefresh(in: session))
+        let source = StatusSource(Self.status(1))
+        let initial = await coordinator.refresh(in: session, satisfying: demand) { source.read() }
+        let delayed = await coordinator.refresh(in: session, satisfying: demand) { source.read() }
+        XCTAssertEqual(initial, delayed)
+        XCTAssertEqual(source.readCount, 1)
+
+        source.set(Self.status(2))
+        let newDemand = try XCTUnwrap(coordinator.requestRefresh(in: session))
+        let fresh = await coordinator.refresh(in: session, satisfying: newDemand) { source.read() }
+        XCTAssertEqual(fresh?.status, Self.status(2))
+        XCTAssertEqual(source.readCount, 2)
+
+        source.set(Self.status(3))
+        let mutation = try XCTUnwrap(coordinator.markDirty(in: session))
+        let afterMutation = await coordinator.refresh(in: session, satisfying: demand) { source.read() }
+        let delayedMutation = await coordinator.refresh(in: session, satisfying: mutation) { source.read() }
+        XCTAssertEqual(afterMutation, delayedMutation)
+        XCTAssertEqual(afterMutation?.status, Self.status(3))
+        XCTAssertEqual(source.readCount, 3)
+        await coordinator.stopAndJoin(session)
+    }
+
     func testStoppingNewSessionJoinsInheritedOlderReader() async throws {
         let coordinator = OfflineLibraryStatsCoordinator()
         let oldSession = coordinator.beginSession()

@@ -30,6 +30,7 @@ public final class OfflineLibraryStatsCoordinator: @unchecked Sendable {
         let id: UInt64
         var demandRevision: UInt64
         var completedRevision: UInt64
+        var completedStatus: OfflineCacheStatus?
     }
 
     private struct Work {
@@ -53,7 +54,7 @@ public final class OfflineLibraryStatsCoordinator: @unchecked Sendable {
         lock.withLock {
             nextSessionID &+= 1
             let session = Session(id: nextSessionID)
-            currentSession = SessionState(id: session.id, demandRevision: 1, completedRevision: 0)
+            currentSession = SessionState(id: session.id, demandRevision: 1, completedRevision: 0, completedStatus: nil)
             return session
         }
     }
@@ -107,7 +108,8 @@ public final class OfflineLibraryStatsCoordinator: @unchecked Sendable {
     }
 
     /// Returns a measurement satisfying both the requested and any newer coalesced demand. A mutation that
-    /// overlaps a read produces exactly one follow-up read at the latest revision.
+    /// overlaps a read produces exactly one follow-up read at the latest revision. Delayed waiters
+    /// reuse its completed value; an explicit new refresh or mutation still advances demand.
     public func refresh(
         in session: Session,
         satisfying requestedDemand: Demand,
@@ -116,9 +118,20 @@ public final class OfflineLibraryStatsCoordinator: @unchecked Sendable {
         guard requestedDemand.sessionID == session.id else { return nil }
 
         while true {
-            let work = lock.withLock { () -> Work? in
-                guard let state = currentSession, state.id == session.id else { return nil }
-                if let active { return active }
+            let (work, completed) = lock.withLock { () -> (Work?, Measurement?) in
+                guard let state = currentSession, state.id == session.id else { return (nil, nil) }
+                if state.completedRevision >= max(requestedDemand.revision, state.demandRevision),
+                    let status = state.completedStatus
+                {
+                    return (
+                        nil,
+                        Measurement(
+                            status: status,
+                            demand: Demand(sessionID: session.id, revision: state.completedRevision)
+                        )
+                    )
+                }
+                if let active { return (active, nil) }
                 nextWorkID &+= 1
                 let newWork = Work(
                     id: nextWorkID,
@@ -127,16 +140,21 @@ public final class OfflineLibraryStatsCoordinator: @unchecked Sendable {
                     task: Task.detached(priority: .utility) { await read() }
                 )
                 active = newWork
-                return newWork
+                return (newWork, nil)
             }
+            if let completed { return completed }
             guard let work else { return nil }
 
             let value = await work.task.value
             let stateAfterRead = lock.withLock { () -> SessionState? in
                 if active?.id == work.id { active = nil }
                 guard var state = currentSession, state.id == session.id else { return nil }
-                if work.sessionID == session.id, value != nil {
-                    state.completedRevision = max(state.completedRevision, work.demandRevision)
+                if work.sessionID == session.id,
+                    work.demandRevision >= state.completedRevision,
+                    let value
+                {
+                    state.completedRevision = work.demandRevision
+                    state.completedStatus = value
                     currentSession = state
                 }
                 return state
