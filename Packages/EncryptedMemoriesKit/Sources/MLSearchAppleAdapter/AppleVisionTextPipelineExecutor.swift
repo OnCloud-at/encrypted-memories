@@ -1168,7 +1168,10 @@ private extension AppleVisionPipelineExecutor {
         _ observations: [FaceObservation],
         context: MLNativeResultContext
     ) throws -> MLDerivedPipelineOutput? {
-        let scores = observations.compactMap(\.captureQuality?.score).filter(\.isFinite)
+        // Read captureQuality via a closure, not a key path. A key path on this
+        // settable Vision property also binds the setter symbol, which the
+        // SDK 27 Vision.tbd exports but macOS 26.6 hosts do not implement.
+        let scores = observations.compactMap { $0.captureQuality?.score }.filter(\.isFinite)
         guard !scores.isEmpty else { return nil }
         return try encodedOutput(
             MLQualityArtifact(
