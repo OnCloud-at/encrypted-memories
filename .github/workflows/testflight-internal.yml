@@ -537,12 +537,27 @@ jobs:
           ' "$private_key"
           chmod 600 "$private_key"
           openssl pkey -in "$private_key" -noout
-          xcrun altool --upload-package "$ARTIFACT_PATH" \
+          # Transient runner-side network failures can abort altool before the
+          # upload starts. Apple ignores duplicate uploads of the same build,
+          # so retrying with backoff is safe.
+          max_attempts=3
+          attempt=1
+          delay_seconds=30
+          until xcrun altool --upload-package "$ARTIFACT_PATH" \
             --api-key "$APP_STORE_CONNECT_KEY_ID" \
             --api-issuer "$APP_STORE_CONNECT_ISSUER_ID" \
             --p8-file-path "$private_key" \
             --show-progress \
-            --output-format json
+            --output-format json; do
+            if [[ "$attempt" -ge "$max_attempts" ]]; then
+              echo "altool upload failed after $attempt attempts." >&2
+              exit 1
+            fi
+            echo "::warning::altool upload attempt $attempt failed; retrying in ${delay_seconds}s."
+            sleep "$delay_seconds"
+            attempt=$((attempt + 1))
+            delay_seconds=$((delay_seconds * 3))
+          done
 
       - name: Remove temporary release credentials
         if: always()
