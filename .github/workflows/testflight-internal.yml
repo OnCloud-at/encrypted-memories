@@ -18,7 +18,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+  DEVELOPER_DIR: /Applications/Xcode.app/Contents/Developer
 
 jobs:
   prepare:
@@ -139,7 +139,7 @@ jobs:
   upload:
     name: Upload ${{ matrix.platform }}
     needs: [prepare, in-app-purchase-preflight]
-    runs-on: macos-26
+    runs-on: xcode-27
     timeout-minutes: 60
     environment: testflight-internal
     strategy:
