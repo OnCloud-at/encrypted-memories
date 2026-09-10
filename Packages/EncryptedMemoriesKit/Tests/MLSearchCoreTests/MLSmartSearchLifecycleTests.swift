@@ -83,6 +83,12 @@ import Testing
             releaseContinuation?.resume()
             releaseContinuation = nil
         }
+
+        func releaseAndArmNext() {
+            let pending = releaseContinuation
+            arm()
+            pending?.resume()
+        }
     }
 
     private final class BlockingSuppressionRead: @unchecked Sendable {
@@ -188,6 +194,7 @@ import Testing
         func blockNextEmbedding() async { await barrier.arm() }
         func waitUntilEmbeddingStarted() async { await barrier.waitUntilBlocked() }
         func releaseEmbedding() async { await barrier.release() }
+        func releaseEmbeddingAndBlockNext() async { await barrier.releaseAndArmNext() }
     }
 
     private struct FixedTextEncoder: MLTextQueryEncoder {
@@ -2557,9 +2564,19 @@ import Testing
         }
         #expect(!phases.sawIndexing)
 
-        await harness.provider.embedder.releaseEmbedding()
+        // Visibility events are best-effort. Keep the pass alive at the next embedding so
+        // its first produced-embedding event cannot be retired before the observer consumes it.
+        // Re-arming and releasing must be one barrier operation; separate calls would race.
+        await harness.provider.embedder.releaseEmbeddingAndBlockNext()
+        await harness.provider.embedder.waitUntilEmbeddingStarted()
         #expect(await waitUntil { phases.sawIndexing })
         #expect(harness.provider.embedder.totalCalls > callsBeforeLibraryKick)
+        if case .indexing = await harness.lifecycle.currentSnapshot().phase {
+            // Real work is now visible while the next embedding remains blocked.
+        } else {
+            Issue.record("ongoing indexing did not publish its produced embedding")
+        }
+        await harness.provider.embedder.releaseEmbedding()
         #expect(await waitForCompleteIndex(harness, total: initial.count + added.count))
     }
 
