@@ -62,6 +62,10 @@ struct MetalProductionGridView: NSViewRepresentable {
     var favoriteUIDs: Set<PhotoUID> = []
     var media: FullMediaProvider?  // Reserved for drag-to-Finder support.
     var metadataProvider: PhotoMetadataProvider?  // Reserved for richer on-demand metadata.
+    /// Drag-out (drag-to-Finder): resolves + stages decrypted originals for the dragged set.
+    var dragOutProvider: (any OriginalFileProvider)? = nil
+    /// Reports a failed drag-out session (mapped to the shell's shared failure alert).
+    var onDragOutFailed: ((DragOutFailureKind) -> Void)? = nil
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
@@ -92,6 +96,7 @@ struct MetalProductionGridView: NSViewRepresentable {
         coord.allItems = allItems
         coord.onOpen = onOpen
         coord.onSelectionChange = onSelectionChange
+        coord.onDragOutFailed = onDragOutFailed
         coord.dataRevision = dataRevision
         // A freshly created host opens at its route's initial viewport. At launch (generation 0) the host's
         // default `stickToBottom` already opens at newest, so leave the generation untouched. When the host is
@@ -132,6 +137,32 @@ struct MetalProductionGridView: NSViewRepresentable {
         host.onMarqueeEnded = { [weak coord] in
             coord?.interaction?.handleMarqueeEnded()
         }
+        // Drag-out: a threshold-crossing press on a tile starts a native NSFilePromiseProvider
+        // dragging session; background presses fall through and the marquee behaves unchanged.
+        if let dragOutProvider {
+            let dragOut = MetalGridDragOutController(
+                spacer: host.documentSpacer,
+                coordinator: host.coordinator,
+                fileProvider: dragOutProvider,
+                itemForUID: { [weak coord] uid in
+                    guard let coord else { return nil }
+                    return coord.allItems.first(where: { $0.uid == uid })
+                },
+                liftItems: { [weak coord] pressed in
+                    guard let coord else { return [pressed] }
+                    let selected = coord.selection?.selected ?? []
+                    if selected.contains(pressed.uid), selected.count > 1 {
+                        return coord.allItems.filter { selected.contains($0.uid) }
+                    }
+                    return [pressed]
+                },
+                onFailed: { [weak coord] kind in coord?.onDragOutFailed?(kind) }
+            )
+            coord.dragOut = dragOut
+            host.onDragOutThreshold = { [weak dragOut] event, contentPoint in
+                dragOut?.beginDrag(contentPoint: contentPoint, event: event) ?? false
+            }
+        }
 
         let header = MetalGridHeaderRenderer(coordinator: host.coordinator)
         header.overlay.frame = host.bounds
@@ -167,6 +198,7 @@ struct MetalProductionGridView: NSViewRepresentable {
         coord.allItems = allItems
         coord.onOpen = onOpen
         coord.onSelectionChange = onSelectionChange
+        coord.onDragOutFailed = onDragOutFailed
         coord.interaction?.selectionMode = selectionMode
         coord.a11y?.items = allItems
         coord.a11y?.selected = host.coordinator.selectedUIDs
@@ -254,7 +286,10 @@ struct MetalProductionGridView: NSViewRepresentable {
         var allItems: [PhotoItem] = []
         var onOpen: ((PhotoItem, [PhotoItem]) -> Void)?
         var onSelectionChange: ((Set<PhotoUID>) -> Void)?
+        var onDragOutFailed: ((DragOutFailureKind) -> Void)?
         var dataRevision = 0
         var appliedRouteScrollGeneration = 0
+        /// Owns the native drag-out session; created once in `makeNSView` when a provider exists.
+        var dragOut: MetalGridDragOutController?
     }
 }

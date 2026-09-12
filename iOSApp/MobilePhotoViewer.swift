@@ -61,8 +61,10 @@ struct MobilePhotoViewer: View {
         startIndex: Int,
         context: ViewerCollectionContext,
         libraryModel: MobileLibraryModel,
-        viewerRouter: MobileViewerRouter
+        viewerRouter: MobileViewerRouter,
+        showsInfoInitially: Bool = false
     ) {
+        _showInfo = State(initialValue: showsInfoInitially)
         self.items = items
         self.startIndex = startIndex
         self.context = context

@@ -31,10 +31,19 @@ final class MetalGridDocumentSpacer: NSView {
     var onMarqueeChanged: ((CGRect) -> Void)?
     var onMarqueeEnded: (() -> Void)?
 
+    /// DRAG-OUT ARBITRATION. Called once, when a press first crosses the marquee threshold, with
+    /// the original mouse-down event. Return true when a native drag-out session claimed the
+    /// gesture (the press was on a photo tile); the spacer then suppresses BOTH the marquee and
+    /// the trailing click for this gesture. Return false and the marquee proceeds EXACTLY as
+    /// before - drag-out must not change background-press behavior.
+    var onDragThresholdArbiter: ((NSEvent, CGPoint) -> Bool)?
+
     private var mouseDownPoint: CGPoint?
     private var mouseDownClickCount = 0
     private var mouseDownModifiers: GridClickModifiers = []
     private var isMarqueeing = false
+    /// True while a native drag-out session owns the current gesture (marquee + click suppressed).
+    private var isDragSession = false
     private static let marqueeThreshold: CGFloat = 4  // px of drag before a press becomes a marquee (jitter-tolerant)
 
     override var isFlipped: Bool { true }
@@ -47,28 +56,40 @@ final class MetalGridDocumentSpacer: NSView {
         mouseDownClickCount = event.clickCount
         mouseDownModifiers = MetalGridInteractionController.modifiers(from: event)
         isMarqueeing = false
+        isDragSession = false
     }
     override func mouseDragged(with event: NSEvent) {
         guard let start = mouseDownPoint else { return }
         let p = convert(event.locationInWindow, from: nil)
-        if !isMarqueeing {
+        if !isMarqueeing, !isDragSession {
             guard hypot(p.x - start.x, p.y - start.y) >= Self.marqueeThreshold else { return }
+            // Threshold crossed: let the drag-out arbiter claim a TILE press first. When it starts
+            // a native dragging session (it needs the ORIGINAL event, so AppKit can track the
+            // mouse) this gesture becomes a drag-out: no marquee, no trailing click.
+            if onDragThresholdArbiter?(event, start) == true {
+                isDragSession = true
+                return
+            }
             isMarqueeing = true
             onMarqueeBegan?(mouseDownModifiers)
         }
+        guard !isDragSession else { return }
         onMarqueeChanged?(
             CGRect(
                 x: min(start.x, p.x), y: min(start.y, p.y),
                 width: abs(p.x - start.x), height: abs(p.y - start.y)))
     }
     override func mouseUp(with event: NSEvent) {
-        if isMarqueeing {
+        if isDragSession {
+            // The drag-out session consumed the gesture; AppKit delivered its own mouse-up flow.
+        } else if isMarqueeing {
             onMarqueeEnded?()
         } else if let start = mouseDownPoint {
             onClick?(start, mouseDownClickCount, mouseDownModifiers)  // No drag means this was a click.
         }
         mouseDownPoint = nil
         isMarqueeing = false
+        isDragSession = false
     }
     override func magnify(with event: NSEvent) {
         onMagnify?(event)

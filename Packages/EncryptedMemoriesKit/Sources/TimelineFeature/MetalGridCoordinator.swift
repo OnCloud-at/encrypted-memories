@@ -401,6 +401,32 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
         return (slot.index, uid)
     }
 
+    /// Drag-out owns only the visible photo interior; its edge remains available for marquee.
+    func hitTestDragOut(contentPoint: CGPoint) -> (flatIndex: Int, uid: PhotoUID)? {
+        guard let hit = hitTestCell(contentPoint: contentPoint),
+            let slot = cellRect(flatIndex: hit.flatIndex)
+        else { return nil }
+        let image = thumbnailImage(for: hit.uid)
+        let pixels = image.map { CGSize(width: $0.width, height: $0.height) } ?? slot.size
+        let visible = TileContentFitter.fit(
+            slotRect: slot, mediaPixelSize: pixels, displayMode: effectiveDisplayMode
+        ).contentRect
+        return GridDragIntentPolicy.startsDragOut(at: contentPoint, visiblePhotoRect: visible) ? hit : nil
+    }
+
+    /// The content-space rectangle of the cell at a flat index (for drag ghosts). Nil when the
+    /// engine has no layout for that index yet.
+    func cellRect(flatIndex: Int) -> CGRect? {
+        let width = layoutWidth
+        guard width > 1 else { return nil }
+        return engine.slotRect(flatIndex: flatIndex, level: level, width: width, columnPhase: currentPhase())
+    }
+
+    /// The decoded thumbnail for a uid (drag ghost imagery). Nil while the tile is not yet cached.
+    func thumbnailImage(for uid: PhotoUID) -> CGImage? {
+        dataSource.image(for: uid)
+    }
+
     /// The UIDs whose cells intersect a content-space rect - the marquee (drag-rectangle) selection set.
     func uids(intersecting contentRect: CGRect) -> Set<PhotoUID> {
         let width = layoutWidth

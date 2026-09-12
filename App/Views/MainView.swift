@@ -118,6 +118,8 @@ struct MainView: View {
     /// failed request never needs to reconstruct optimistic state or risks showing a false success.
     @State private var trashActionFailureMessage: String?
     @State private var albumMembershipFailureMessage: String?
+    /// A failed drag-out (drag-to-Finder) staging session, surfaced through the shared alert surface.
+    @State private var dragOutFailureMessage: String?
     // Favorites (read from server so iOS favorites show up; toggle writes back).
     @State private var favorites: Set<PhotoUID> = []
     @State private var uploadRefreshTask: Task<Void, Never>?
@@ -362,6 +364,8 @@ struct MainView: View {
                     metadataProvider: backend,
                     favoriteUIDs: favorites,
                     isOffline: !networkMonitor.isOnline,
+                    dragOutProvider: backend,
+                    onDragOutFailed: { dragOutFailureMessage = $0.localizedMessage },
                     onSelectionChange: { selectedUIDs = $0 }
                 ) { item, items in
                     openPhoto(item, items, proxy: mapClusterGridProxy)
@@ -485,6 +489,17 @@ struct MainView: View {
             Text(trashActionFailureMessage ?? "")
         }
         .alert(
+            L10n.string("dragout.error.title"),
+            isPresented: Binding(
+                get: { dragOutFailureMessage != nil },
+                set: { if !$0 { dragOutFailureMessage = nil } }
+            )
+        ) {
+            Button(L10n.string("action.ok"), role: .cancel) { dragOutFailureMessage = nil }
+        } message: {
+            Text(dragOutFailureMessage ?? "")
+        }
+        .alert(
             L10n.string("albums.remove_photos_failed_title"),
             isPresented: Binding(
                 get: { albumMembershipFailureMessage != nil },
@@ -594,6 +609,8 @@ struct MainView: View {
                     metadataProvider: backend,
                     favoriteUIDs: favorites,
                     isOffline: !networkMonitor.isOnline,
+                    dragOutProvider: backend,
+                    onDragOutFailed: { dragOutFailureMessage = $0.localizedMessage },
                     onSelectionChange: { selectedUIDs = $0 },
                     onOpen: { item, items in openPhoto(item, items, proxy: nil) }
                 )

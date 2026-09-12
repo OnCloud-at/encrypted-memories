@@ -25,6 +25,9 @@ final class MetalGridScrollHost: NSView {
     private let metalView: MetalGridView
     private let scrollView = MetalGridBlockingScrollView()
     private let spacer = MetalGridDocumentSpacer()
+    /// The event-handling document spacer - the view that owns a native drag-out session
+    /// (`beginDraggingSession` must be invoked on the view receiving the mouse events).
+    var documentSpacer: NSView { spacer }
     private weak var wiredImageAvailabilitySource: MetalGridDataSource?
 
     var onHUD: ((MetalGridHUD) -> Void)? {
@@ -36,6 +39,10 @@ final class MetalGridScrollHost: NSView {
     var onMarqueeBegan: ((GridClickModifiers) -> Void)?
     var onMarqueeChanged: ((CGRect) -> Void)?
     var onMarqueeEnded: (() -> Void)?
+    /// DRAG-OUT: fired when a press crosses the marquee threshold. Receives the raw AppKit event
+    /// and the press point converted to layout coordinates; returns true when a native drag-out
+    /// session claimed the gesture (the spacer then suppresses marquee + click).
+    var onDragOutThreshold: ((NSEvent, CGPoint) -> Bool)?
     /// The translucent selection rectangle drawn over the grid during a marquee drag (a passive overlay on the
     /// scroll document, so it scrolls with the content it's selecting).
     private let marqueeView = MetalGridMarqueeView()
@@ -256,6 +263,13 @@ final class MetalGridScrollHost: NSView {
             self.updateFeedInteractionState()
             self.marqueeView.isHidden = true
             self.onMarqueeEnded?()
+        }
+        spacer.onDragThresholdArbiter = { [weak self] event, spacerPoint in
+            guard let self, let onDragOut = self.onDragOutThreshold else { return false }
+            // Same render-to-layout conversion as `onClick` (sidebar + gap offset).
+            let contentPoint = CGPoint(
+                x: spacerPoint.x - self.coordinator.leadingObstructionInset, y: spacerPoint.y)
+            return onDragOut(event, contentPoint)
         }
         spacer.onMagnify = { [weak self] event in self?.handleMagnify(event) }
         // Swallow scroll whenever a pinch could leak into one. Wired on both the document spacer and the
