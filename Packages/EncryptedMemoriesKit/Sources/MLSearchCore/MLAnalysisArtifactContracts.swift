@@ -789,6 +789,17 @@ public struct MLDerivedArtifactIdentity: Codable, Equatable, Hashable, Sendable 
         ].map(Self.lengthPrefixed).joined(separator: "|")
     }
 
+    /// Prefix shared by every revision of one pipeline stage. Persistent stores use this to
+    /// retire superseded revisions without treating a temporarily unavailable optional stage as
+    /// removed.
+    var stableStageNamespacePrefix: String {
+        [
+            "ml-artifact-v1",
+            pipelineID.rawValue,
+            stageID.rawValue,
+        ].map(Self.lengthPrefixed).joined(separator: "|") + "|"
+    }
+
     public func belongsToSameStage(as other: MLDerivedArtifactIdentity) -> Bool {
         pipelineID == other.pipelineID && stageID == other.stageID
     }

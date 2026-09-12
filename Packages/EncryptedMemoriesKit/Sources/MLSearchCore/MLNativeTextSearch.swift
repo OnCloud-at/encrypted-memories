@@ -86,7 +86,9 @@ public struct MLNativeSearchConfiguration: Sendable, Equatable {
                     kind: kind,
                     requestRevision: revision
                 ),
-                preprocessingRevision: Self.preprocessingRevision,
+                preprocessingRevision: Self.preprocessingRevision(
+                    capability: capability
+                ),
                 output: stage.output,
                 schemaEpoch: stage.schemaEpoch
             )
@@ -104,6 +106,29 @@ public struct MLNativeSearchConfiguration: Sendable, Equatable {
     }
 
     public var availableBackends: Set<MLSearchBackend> { Set(backendsByArtifact.values) }
+
+    /// Vision can expand the effective languages, identifiers, animals or symbologies of an
+    /// existing request revision. Those options affect executor output and therefore belong to the
+    /// derived artifact identity even when the framework's request revision itself is unchanged.
+    private static func preprocessingRevision(
+        capability: MLNativeAnalysisCapability
+    ) -> String {
+        let components = [
+            "vision-runtime-configuration-v1",
+            capability.implementationIdentifier,
+            stableList(capability.supportedLanguages),
+            stableList(capability.supportedIdentifiers),
+            stableList(capability.supportedAnimals),
+            stableList(capability.supportedSymbologies),
+        ]
+        return ([preprocessingRevision] + components)
+            .map { "\($0.utf8.count):\($0)" }
+            .joined(separator: "|")
+    }
+
+    private static func stableList(_ values: [String]) -> String {
+        Array(Set(values)).sorted().map { "\($0.utf8.count):\($0)" }.joined(separator: "|")
+    }
 
     public func key(for scope: MLSearchScope) -> MLPipelineExecutionKey? {
         let selectedBackends: Set<MLSearchBackend>

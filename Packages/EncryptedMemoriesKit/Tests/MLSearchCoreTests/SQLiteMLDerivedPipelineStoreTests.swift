@@ -133,6 +133,45 @@ import Testing
         #expect(progress.pending == 1)
     }
 
+    @Test func temporarilyUnavailableStageKeepsCompletedWorkForReuse() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("SQLiteMLDerivedPipelineStoreTests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try openStore(
+            url: root.appendingPathComponent(SQLiteMLDerivedPipelineStore.databaseFileName),
+            cipher: TestDerivedCipher(key: 0x35)
+        )
+        let ocr = try makeArtifact(stage: "ocr", revision: "revision3")
+        let barcode = try makeArtifact(stage: "barcode", revision: "revision4")
+        let completeKey = try makeKey(account: "account", artifacts: [ocr, barcode])
+        let asset = try MLPipelineAssetRevision(
+            uid: PhotoUID(volumeID: "volume", nodeID: "1"),
+            sourceRevision: "source-v1"
+        )
+        #expect(store.enqueue([asset], for: completeKey))
+        let executor = SQLiteRecordingExecutor { plan in
+            plan.workItems.map {
+                .init(
+                    workItem: $0,
+                    outcome: .completed(
+                        .init(
+                            payload: Data($0.artifact.stageID.rawValue.utf8),
+                            normalizedSearchTokens: [$0.artifact.stageID.rawValue]
+                        ))
+                )
+            }
+        }
+        _ = await MLIndexRunner.runDerivedPass(key: completeKey, store: store, executor: executor)
+
+        let temporarilyReducedKey = try makeKey(account: "account", artifacts: [ocr])
+        #expect(store.enqueue([asset], for: temporarilyReducedKey))
+        #expect(store.output(for: asset.uid, artifact: barcode, accountIdentifier: "account") != nil)
+
+        #expect(store.enqueue([asset], for: completeKey))
+        #expect(try store.nextWorkBatch(for: completeKey, limit: 8, now: .now).isEmpty)
+        #expect(try store.progress(for: completeKey).completed == 2)
+    }
+
     @Test func accountAndArtifactPurgeStayIsolated() async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("SQLiteMLDerivedPipelineStoreTests-\(UUID().uuidString)")

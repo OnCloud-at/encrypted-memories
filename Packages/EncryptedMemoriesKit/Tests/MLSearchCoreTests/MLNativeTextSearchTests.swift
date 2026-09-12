@@ -87,6 +87,59 @@ import Testing
                 ))
     }
 
+    @Test func runtimeVocabularyChangesOnlyTheAffectedArtifactIdentity() throws {
+        func snapshot(languages: [String], symbologies: [String]) -> MLNativeAnalysisCapabilitySnapshot {
+            MLNativeAnalysisCapabilitySnapshot(
+                providerIdentifier: "apple.vision",
+                sdkIdentifier: "test",
+                capabilities: [
+                    MLNativeAnalysisCapability(
+                        kind: .textRecognition,
+                        implementationIdentifier: "RecognizeTextRequest",
+                        availability: .available,
+                        selectedRevision: "revision3",
+                        supportedRevisions: ["revision3"],
+                        supportedLanguages: languages
+                    ),
+                    MLNativeAnalysisCapability(
+                        kind: .barcodeDetection,
+                        implementationIdentifier: "DetectBarcodesRequest",
+                        availability: .available,
+                        selectedRevision: "revision4",
+                        supportedRevisions: ["revision4"],
+                        supportedSymbologies: symbologies
+                    ),
+                ]
+            )
+        }
+        func artifact(
+            _ kind: MLNativeAnalysisKind,
+            in configuration: MLNativeSearchConfiguration
+        ) -> MLDerivedArtifactIdentity? {
+            configuration.executionKey.artifacts.first { artifact in
+                guard case .native(_, let candidate, _) = artifact.producer else { return false }
+                return candidate == kind
+            }
+        }
+
+        let baseline = try MLNativeSearchConfiguration(
+            accountIdentifier: "account",
+            capabilitySnapshot: snapshot(languages: ["en-US", "de-DE"], symbologies: ["qr"])
+        )
+        let reordered = try MLNativeSearchConfiguration(
+            accountIdentifier: "account",
+            capabilitySnapshot: snapshot(languages: ["de-DE", "en-US"], symbologies: ["qr"])
+        )
+        let expanded = try MLNativeSearchConfiguration(
+            accountIdentifier: "account",
+            capabilitySnapshot: snapshot(languages: ["de-DE", "en-US", "fr-FR"], symbologies: ["qr"])
+        )
+
+        #expect(artifact(.textRecognition, in: baseline) == artifact(.textRecognition, in: reordered))
+        #expect(artifact(.textRecognition, in: baseline) != artifact(.textRecognition, in: expanded))
+        #expect(artifact(.barcodeDetection, in: baseline) == artifact(.barcodeDetection, in: expanded))
+    }
+
     @Test func nativeRuntimeIndexesAndSearchesWithoutMixingScopes() async throws {
         let configuration = try MLNativeSearchConfiguration(
             accountIdentifier: "account",

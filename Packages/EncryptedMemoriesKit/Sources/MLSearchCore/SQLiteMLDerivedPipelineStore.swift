@@ -1219,15 +1219,20 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
         return ids
     }
 
-    /// Removes account-local work from older request revisions or stages no longer present in the
-    /// active execution key. Artifact descriptors remain interned while any account still uses
-    /// them; only encrypted work, postings, and now-orphaned assets are reclaimed here.
+    /// Removes account-local work from older revisions of stages present in the active execution
+    /// key. Stages absent from the key may be temporarily unavailable and remain untouched.
+    /// Artifact descriptors remain interned while any account still uses them; only encrypted
+    /// work, postings, and now-orphaned assets are reclaimed here.
     private func removeObsoleteWorkLocked(
         for key: MLPipelineExecutionKey,
         accountKey: Int64
     ) -> Bool? {
         let namespaces = key.artifacts.map(\.stableNamespace).sorted()
-        guard !namespaces.isEmpty else { return false }
+        let stagePrefixes = Set(key.artifacts.map(\.stableStageNamespacePrefix)).sorted()
+        guard !namespaces.isEmpty, !stagePrefixes.isEmpty else { return false }
+        let matchingStage = stagePrefixes.map { _ in
+            "substr(artifact_namespace, 1, length(?))=?"
+        }.joined(separator: " OR ")
         var stmt: OpaquePointer?
         guard
             prepare(
@@ -1239,6 +1244,7 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
                     FROM ml_derived_artifacts
                     WHERE pipeline_id=?
                       AND artifact_namespace NOT IN (\(Self.placeholders(namespaces.count)))
+                      AND (\(matchingStage))
                   );
                 """,
                 &stmt
@@ -1252,6 +1258,12 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
         index += 1
         for namespace in namespaces {
             bindText(stmt, index, namespace)
+            index += 1
+        }
+        for prefix in stagePrefixes {
+            bindText(stmt, index, prefix)
+            index += 1
+            bindText(stmt, index, prefix)
             index += 1
         }
         guard sqlite3_step(stmt) == SQLITE_DONE else { return nil }
