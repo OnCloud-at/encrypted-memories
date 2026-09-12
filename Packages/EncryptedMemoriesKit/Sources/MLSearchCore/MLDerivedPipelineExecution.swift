@@ -314,10 +314,19 @@ public final class InMemoryMLDerivedPipelineStore: MLDerivedPipelineStore, @unch
     @discardableResult
     public func enqueue(_ assets: [MLPipelineAssetRevision], for key: MLPipelineExecutionKey) -> Bool {
         lock.withLock {
-            let obsoleteKeys = records.compactMap { storedKey, record in
+            let existingArtifacts = Set(records.compactMap { storedKey, record in
                 storedKey.accountIdentifier == key.accountIdentifier
                     && record.artifact.pipelineID == key.pipelineID
-                    && !key.artifacts.contains(record.artifact)
+                    ? record.artifact
+                    : nil
+            })
+            let staleArtifacts = MLDerivedArtifactInvalidationPolicy.staleArtifacts(
+                existing: existingArtifacts,
+                current: key.artifacts
+            )
+            let obsoleteKeys = records.compactMap { storedKey, record in
+                storedKey.accountIdentifier == key.accountIdentifier
+                    && staleArtifacts.contains(record.artifact)
                     ? storedKey
                     : nil
             }
