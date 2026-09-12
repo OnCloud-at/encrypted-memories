@@ -1831,6 +1831,9 @@ struct ProductionRouteGuardTests {
         #expect(
             frost.contains("effect.effect = isActive ? UIBlurEffect"),
             "UIKit frost must animate its effect instead of alpha-fading a visual-effect hierarchy")
+        #expect(
+            frost.contains("if #available(iOS 27.0, *)") && frost.contains("EmptyView()"),
+            "iOS 27 must rely on native navigation edge treatment instead of stacking the iOS 26 frost bridge")
         #expect(mainView.contains(".smartSearchToolbar("), "search must use the shared native toolbar policy")
         #expect(
             mainView.contains("snapshot.isSearchAvailable == true"),
@@ -1904,6 +1907,17 @@ struct ProductionRouteGuardTests {
         #expect(
             !mobileApp.contains(".smartSearchToolbar("),
             "a toolbar-search wrapper on TabView renders ordinary top search chrome")
+        #expect(
+            mobileApp.contains(".mobileTabBarBackgroundPolicy()"),
+            "the mobile tab shell must preserve iOS 26 legibility without forcing iOS 27's full-width material")
+        let mobileRootChrome = try String(
+            contentsOf: Self.repoRoot.appendingPathComponent("iOSApp/MobileRootChrome.swift"), encoding: .utf8)
+        #expect(mobileRootChrome.contains("if #available(iOS 27.0, *)"))
+        #expect(mobileRootChrome.contains("toolbarBackgroundVisibility(.automatic, for: .tabBar)"))
+        #expect(mobileRootChrome.contains("toolbarBackgroundVisibility(.visible, for: .tabBar)"))
+        #expect(
+            !mobileApp.contains(".toolbarBackground(.visible, for: .tabBar)"),
+            "an unconditional visible tab-bar background becomes a second glass sheet on iOS 27")
         #expect(
             !mobileApp.contains("--search-tab-diagnostic") && !mobileApp.contains("Search-tab baseline"),
             "temporary search diagnostics must not remain reachable in production")

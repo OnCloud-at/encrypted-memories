@@ -394,8 +394,7 @@ private struct MobileAdaptiveTabShell: View {
         .tabViewSearchActivation(.searchTabSelection)
         .tabViewStyle(.tabBarOnly)
         .tint(ProtonColor.primary)
-        // Keep the native Liquid-Glass tab bar visible while the photo grid extends underneath it.
-        .toolbarBackground(.visible, for: .tabBar)
+        .mobileTabBarBackgroundPolicy()
         .onChange(of: selection) { _, tab in
             MobileTabActivityLog.note(tab: tab)
         }

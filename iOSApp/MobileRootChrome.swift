@@ -9,6 +9,17 @@ extension View {
     func mobileNavigationTitle(_ title: String, isVisible: Bool = true) -> some View {
         modifier(MobileNavigationTitleModifier(title: title, isVisible: isVisible))
     }
+
+    /// iOS 26 needs an always-visible background to keep the floating tab bar legible over the Metal grid.
+    /// iOS 27 renders that preference as an additional full-width material behind the native glass controls,
+    /// so restore the system's automatic background policy there.
+    @ViewBuilder func mobileTabBarBackgroundPolicy() -> some View {
+        if #available(iOS 27.0, *) {
+            toolbarBackgroundVisibility(.automatic, for: .tabBar)
+        } else {
+            toolbarBackgroundVisibility(.visible, for: .tabBar)
+        }
+    }
 }
 
 private struct MobileNavigationTitleModifier: ViewModifier {

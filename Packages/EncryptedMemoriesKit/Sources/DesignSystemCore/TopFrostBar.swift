@@ -24,7 +24,21 @@ public struct TopFrostBar: View {
         self.intensity = intensity
     }
 
-    public var body: some View {
+    @ViewBuilder public var body: some View {
+        #if canImport(UIKit)
+            if #available(iOS 27.0, *) {
+                // iOS 27 applies its own edge treatment around native navigation chrome. Keeping this
+                // UIKit material as well produces a second full-width glass band behind the floating controls.
+                EmptyView()
+            } else {
+                frost
+            }
+        #else
+            frost
+        #endif
+    }
+
+    private var frost: some View {
         FrostBlur(
             intensity: intensity,
             isActive: !loadingCoverPresented,
