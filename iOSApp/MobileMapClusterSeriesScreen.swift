@@ -23,6 +23,7 @@ struct MobileMapClusterSeriesScreen: View {
     @State private var pageIndex = 0
     @State private var clusterItems: [PhotoItem] = []
     @State private var placeName: String?
+    @State private var contextMenu = MobileGridContextMenuController()
     @State private var showAlbumPicker = false
 
     private var selectionBusy: Bool { selection.isBusy }
@@ -35,6 +36,7 @@ struct MobileMapClusterSeriesScreen: View {
 
     var body: some View {
         content
+            .mobileGridContextMenu(contextMenu, model: model)
             .mobileNavigationTitle(placeName ?? L10n.string("map.cluster_title"))
             .toolbar { toolbarContent }
             .toolbar(selection.isSelecting ? .hidden : .automatic, for: .tabBar)
@@ -153,9 +155,13 @@ struct MobileMapClusterSeriesScreen: View {
                     selectedUIDs: selection.selected,
                     isActive: true,
                     onOpenPhoto: open,
-                    onBeginSelection: selection.begin,
                     onToggleSelection: selection.toggle,
-                    onDragSelectionChanged: selection.applyDragSelection
+                    dragOutProvider: model.backend,
+                    onDragOutFailed: { selection.actionError = MobileSelectionError(message: $0.localizedMessage) },
+                    contextMenuActions: { contextMenu.actions(for: $0, model: model) },
+                    onContextMenuAction: { action, items in
+                        contextMenu.perform(action, items: items, model: model, router: viewerRouter)
+                    }
                 )
                 .ignoresSafeArea(edges: .bottom)
             } else {

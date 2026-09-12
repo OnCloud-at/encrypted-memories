@@ -28,6 +28,8 @@ public struct TimelineView: View {
     private let metadataProvider: PhotoMetadataProvider?
     private let favoriteUIDs: Set<PhotoUID>
     private let isOffline: Bool
+    private let dragOutProvider: (any OriginalFileProvider)?
+    private let onDragOutFailed: ((DragOutFailureKind) -> Void)?
     private let gridProfile: GridLevelProfile
     private let gridProfileResolver: TimelineGridProfileResolver?
     private let gridFillOrder: GridFillOrder
@@ -54,6 +56,8 @@ public struct TimelineView: View {
         metadataProvider: PhotoMetadataProvider? = nil,
         favoriteUIDs: Set<PhotoUID> = [],
         isOffline: Bool = false,
+        dragOutProvider: (any OriginalFileProvider)? = nil,
+        onDragOutFailed: ((DragOutFailureKind) -> Void)? = nil,
         onSelectionChange: @escaping (Set<PhotoUID>) -> Void = { _ in },
         onOpen: @escaping (PhotoItem, [PhotoItem]) -> Void = { _, _ in }
     ) {
@@ -75,6 +79,8 @@ public struct TimelineView: View {
         self.metadataProvider = metadataProvider
         self.favoriteUIDs = favoriteUIDs
         self.isOffline = isOffline
+        self.dragOutProvider = dragOutProvider
+        self.onDragOutFailed = onDragOutFailed
         self.onSelectionChange = onSelectionChange
         self.onOpen = onOpen
         _searchProjection = State(initialValue: nil)
@@ -134,7 +140,9 @@ public struct TimelineView: View {
                             onSelectionChange: onSelectionChange,
                             favoriteUIDs: favoriteUIDs,
                             media: media,
-                            metadataProvider: metadataProvider
+                            metadataProvider: metadataProvider,
+                            dragOutProvider: dragOutProvider,
+                            onDragOutFailed: onDragOutFailed
                         )
                         .ignoresSafeArea(edges: .bottom)
 

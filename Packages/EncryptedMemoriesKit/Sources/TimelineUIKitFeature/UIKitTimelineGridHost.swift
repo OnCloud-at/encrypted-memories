@@ -55,9 +55,11 @@
         private let prefersReducedMotion: Bool
         private let onFirstContentReady: (() -> Void)?
         private let onOpenPhoto: ((PhotoItem) -> Void)?
-        private let onBeginSelection: ((PhotoItem) -> Void)?
         private let onToggleSelection: ((PhotoItem) -> Void)?
-        private let onDragSelectionChanged: ((Set<PhotoUID>) -> Void)?
+        private let dragOutProvider: (any OriginalFileProvider)?
+        private let onDragOutFailed: ((DragOutFailureKind) -> Void)?
+        private let contextMenuActions: (([PhotoItem]) -> [PhotoContextMenuAction])?
+        private let onContextMenuAction: ((PhotoContextMenuAction, [PhotoItem]) -> Void)?
 
         public init(
             items: [PhotoItem],
@@ -81,9 +83,11 @@
             prefersReducedMotion: Bool = false,
             onFirstContentReady: (() -> Void)? = nil,
             onOpenPhoto: ((PhotoItem) -> Void)? = nil,
-            onBeginSelection: ((PhotoItem) -> Void)? = nil,
             onToggleSelection: ((PhotoItem) -> Void)? = nil,
-            onDragSelectionChanged: ((Set<PhotoUID>) -> Void)? = nil
+            dragOutProvider: (any OriginalFileProvider)? = nil,
+            onDragOutFailed: ((DragOutFailureKind) -> Void)? = nil,
+            contextMenuActions: (([PhotoItem]) -> [PhotoContextMenuAction])? = nil,
+            onContextMenuAction: ((PhotoContextMenuAction, [PhotoItem]) -> Void)? = nil
         ) {
             self.items = items
             self.contentRevision = contentRevision
@@ -106,9 +110,11 @@
             self.prefersReducedMotion = prefersReducedMotion
             self.onFirstContentReady = onFirstContentReady
             self.onOpenPhoto = onOpenPhoto
-            self.onBeginSelection = onBeginSelection
             self.onToggleSelection = onToggleSelection
-            self.onDragSelectionChanged = onDragSelectionChanged
+            self.dragOutProvider = dragOutProvider
+            self.onDragOutFailed = onDragOutFailed
+            self.contextMenuActions = contextMenuActions
+            self.onContextMenuAction = onContextMenuAction
         }
 
         /// Remembers the last applied scroll-to-latest signal, so the representable acts only on a real change
@@ -144,9 +150,11 @@
             let view = UIKitTimelineGridHostView()
             view.onFirstContentReady = onFirstContentReady
             view.onOpenPhoto = onOpenPhoto
-            view.onBeginSelection = onBeginSelection
             view.onToggleSelection = onToggleSelection
-            view.onDragSelectionChanged = onDragSelectionChanged
+            view.dragOutProvider = dragOutProvider
+            view.onDragOutFailed = onDragOutFailed
+            view.contextMenuActions = contextMenuActions
+            view.onContextMenuAction = onContextMenuAction
             view.configure(
                 items: items, contentRevision: contentRevision,
                 thumbnailFeed: thumbnailFeed, metadataProvider: metadataProvider,
@@ -163,9 +171,11 @@
         public func updateUIView(_ uiView: UIKitTimelineGridHostView, context: Context) {
             uiView.onFirstContentReady = onFirstContentReady
             uiView.onOpenPhoto = onOpenPhoto
-            uiView.onBeginSelection = onBeginSelection
             uiView.onToggleSelection = onToggleSelection
-            uiView.onDragSelectionChanged = onDragSelectionChanged
+            uiView.dragOutProvider = dragOutProvider
+            uiView.onDragOutFailed = onDragOutFailed
+            uiView.contextMenuActions = contextMenuActions
+            uiView.onContextMenuAction = onContextMenuAction
             let shouldDissolveContent = contentTransitionSignal != context.coordinator.lastContentTransitionSignal
             if shouldDissolveContent {
                 context.coordinator.lastContentTransitionSignal = contentTransitionSignal
@@ -224,7 +234,7 @@
 
         let metalView = UIKitTimelineMetalHostView()
         let scrollView = UIScrollView()
-        private let contentView = UIView()
+        let contentView = UIView()
         private let profileAdapter = UIKitTimelineGridProfileAdapter()
         private let displayLink: UIKitTimelineDisplayLinkDriver
         private let renderFrameOverride: (() -> GridRenderOutcome)?
@@ -298,40 +308,11 @@
         }()
         private var metadataProvider: (any PhotoMetadataProvider)?
 
-        // MARK: - Drag selection (selection-mode finger drag)
-        /// True once a long-press-and-drag selection is under way.
-        private var dragActive = false
         /// Gesture-only workload signal for shared background scheduling. These flags change only at
         /// UIKit interaction boundaries; a mounted or repeatedly warming grid remains idle.
         var scrollInputActive = false
         var pinchInputActive = false
-        var selectionInputActive = false
         private var reportedFeedInteractionActive = false
-        /// The item index the drag started on (the range's fixed end).
-        private var dragAnchorIndex: Int?
-        /// Whether the drag adds to or removes from the selection. Decided from the anchor cell's
-        /// membership at drag start, the iOS Photos convention.
-        private var dragSelecting = true
-        /// The selection the drag started from. Every move recomputes the swept range against this base, so pulling
-        /// the finger back reverts the cells it left.
-        private var dragBaseSelection: Set<PhotoUID> = []
-        /// The live, in-progress selection. While non-nil it drives the selection decorations instead of
-        /// `selectedUIDs`, so a drag redraws by re-rendering the Metal grid - never by pushing state through SwiftUI
-        /// every frame (which would rebuild the hosting screen's body per move).
-        private var dragLiveSelection: Set<PhotoUID>?
-        /// The last item index resolved under the finger; kept when the finger is momentarily in an inter-row gap so
-        /// the swept range never collapses mid-drag.
-        private var dragCurrentIndex: Int?
-        /// The finger's last position in viewport space, so an auto-scroll tick (finger stationary, content moving)
-        /// re-resolves the item under it against the new content offset - no skipped rows.
-        private var dragLastViewportPoint: CGPoint = .zero
-        /// Whether the edge auto-scroll ramp is active. It advances from the grid's existing display link so one
-        /// attached surface never installs a second frame timer.
-        private var autoScrollActive = false
-        private var autoScrollLastTimestamp: CFTimeInterval = 0
-        /// The edge band thickness and max ramp speed for drag-select auto-scroll (points, points/second).
-        private static let autoScrollEdgeInset: CGFloat = 96
-        private static let autoScrollMaxSpeed: CGFloat = 1400
         var warmTask: Task<Void, Never>?
         var lastWarmIDs: [PhotoUID] = []
         /// Scroll-direction-biased prefetch (shared `GridScrollAheadPolicy`): the user's last vertical travel
@@ -409,18 +390,30 @@
         /// Called on the main actor when the user taps a photo cell, with the tapped item. The shell presents the viewer.
         public var onOpenPhoto: ((PhotoItem) -> Void)?
 
-        /// Called when a long press starts over a photo outside selection mode. The shell enters its existing selection
-        /// presentation and selects this exact item; Core rendering and subsequent range selection stay unchanged.
-        public var onBeginSelection: ((PhotoItem) -> Void)?
-
         /// Called on the main actor when the user taps a cell while in selection mode, with the tapped item. The shell
         /// toggles that item's membership in the selection set.
         public var onToggleSelection: ((PhotoItem) -> Void)?
 
-        /// Called on the main actor when a finger-drag selection commits (the gesture ends), with the resulting UID
-        /// set. The shell writes it to its selection state once per drag - never per frame - so a drag never triggers
-        /// a per-frame SwiftUI rebuild.
-        public var onDragSelectionChanged: ((Set<PhotoUID>) -> Void)?
+        /// The original-file backend that powers native drag-out. Setting it installs the drag interaction;
+        /// setting nil removes drag-out support without affecting tap or zoom.
+        public var dragOutProvider: (any OriginalFileProvider)? {
+            didSet {
+                installDragOutInteractionIfNeeded()
+            }
+        }
+
+        /// Called on the main actor with (lifted item count, staged fraction in 0...1) while originals are being
+        /// staged for an active drag-out session. The shell may use it for progress surfacing.
+        public var dragOutProgressReporter: ((Int, Double) -> Void)?
+
+        /// Called on the main actor when a drag-out cannot be delivered, with the coarse failure cause.
+        public var onDragOutFailed: ((DragOutFailureKind) -> Void)?
+        var contextMenuActions: (([PhotoItem]) -> [PhotoContextMenuAction])?
+        var onContextMenuAction: ((PhotoContextMenuAction, [PhotoItem]) -> Void)?
+
+        /// Retained drag-out machinery; owned by the host but implemented entirely in
+        /// UIKitTimelineGridHostDrag.swift to keep this file focused on hosting duties.
+        var dragOutController: UIKitTimelineGridDragOutController?
 
         public override init(frame: CGRect = .zero) {
             displayLink = UIKitTimelineDisplayLinkDriver()
@@ -694,14 +687,12 @@
             displayLink.pause()
             perf.noteLoopPaused(reason: "suspended")
             presentationTiming.resetCadence()
-            cancelDragSelectIfActive()  // never leave an edge auto-scroll driver running off-screen / off-tab
             warmTask?.cancel()
             aheadWarmTask?.cancel()
             aheadWarmInFlight = false
             cancelLiveZoomState()
             scrollInputActive = false
             pinchInputActive = false
-            selectionInputActive = false
             updateFeedInteractionState()
             warmGeneration &+= 1  // retire the cancelled pass so its late completion can't touch a newer one
             warmInFlight = false  // never leave the warm gate latched shut after a suspend cancels the pass
@@ -758,19 +749,6 @@
             let pinch = UIPinchGestureRecognizer(target: self, action: #selector(handlePinch(_:)))
             pinch.delegate = self
             scrollView.addGestureRecognizer(pinch)
-
-            // Selection-mode finger drag: hold a photo, then drag across cells to select a contiguous range, with
-            // edge auto-scroll. It only begins in selection mode (`gestureRecognizerShouldBegin`), so normal scroll,
-            // tap-to-open, and pinch are untouched otherwise; once it begins it disables scroll for the drag so the
-            // one finger selects instead of scrolling.
-            let dragSelect = UILongPressGestureRecognizer(target: self, action: #selector(handleDragSelect(_:)))
-            dragSelect.minimumPressDuration = 0.35
-            dragSelect.delegate = self
-            scrollView.addGestureRecognizer(dragSelect)
-            // A recognized long press enters selection and selects its anchor. Without this native failure
-            // dependency, the simultaneous tap recognizer also fires when that same finger lifts; by then
-            // selection mode is active, so the release tap immediately toggles the anchor back off.
-            tap.require(toFail: dragSelect)
         }
 
         @objc func applicationDidEnterBackground() {
@@ -1167,13 +1145,6 @@
                 return
             }
             activeDisplayFrame = frame
-            if autoScrollActive {
-                let targetInterval = frame.targetTimestamp - frame.timestamp
-                autoScrollTick(
-                    frame.timestamp,
-                    initialInterval: targetInterval > 0 ? targetInterval : frame.duration
-                )
-            }
             advancePinchSettleIfNeeded()
             let outcome = renderNow()
             activeDisplayFrame = nil
@@ -1200,7 +1171,7 @@
         private var currentScrollPhase: UIKitGridScrollPhase {
             if scrollView.isTracking { return .tracking }
             if scrollView.isDecelerating { return .decelerating }
-            if scrollView.isDragging || scrollInputActive || selectionInputActive || autoScrollActive {
+            if scrollView.isDragging || scrollInputActive {
                 return .dragging
             }
             if pinchStartLevel != nil || zoomTransaction != nil || commitBridgeTransaction != nil
@@ -1685,44 +1656,11 @@
             }
         }
 
-        // MARK: - Drag selection
-
-        /// Outside selection mode, a long press begins only over a real item and enters selection with that item.
-        /// Once selection is active, the same recognizer retains its range-drag behavior. This doubles as the
-        /// `UIGestureRecognizerDelegate` hook for the recognizers on the scroll view (their delegate is `self`), so
-        /// it must live in the class body with `override` (it also satisfies `UIView`'s method of the same name).
-        public override func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
-            if gestureRecognizer is UILongPressGestureRecognizer {
-                if selectionMode { return true }
-                return onBeginSelection != nil && item(at: gestureRecognizer.location(in: contentView)) != nil
-            }
-            return super.gestureRecognizerShouldBegin(gestureRecognizer)
-        }
-
-        @objc private func handleDragSelect(_ gesture: UILongPressGestureRecognizer) {
-            switch gesture.state {
-            case .began:
-                let contentPoint = gesture.location(in: contentView)
-                if selectionMode {
-                    beginDragSelect(contentPoint: contentPoint, viewportPoint: gesture.location(in: self))
-                } else if let item = item(at: contentPoint) {
-                    beginSelection(with: item)
-                }
-            case .changed:
-                updateDragSelect(
-                    contentPoint: gesture.location(in: contentView), viewportPoint: gesture.location(in: self))
-            case .ended, .cancelled, .failed:
-                endDragSelect()
-            default:
-                break
-            }
-        }
-
-        private func item(at contentPoint: CGPoint) -> PhotoItem? {
-            guard let ctx = currentGridContext(),
-                let slot = ctx.engine.hitTest(
+        func item(at contentPoint: CGPoint) -> PhotoItem? {
+            guard let context = currentGridContext(),
+                let slot = context.engine.hitTest(
                     contentPoint: contentPoint,
-                    level: ctx.level,
+                    level: context.level,
                     width: bounds.width,
                     columnPhase: committedPhase
                 ),
@@ -1731,172 +1669,6 @@
             return items[slot.index]
         }
 
-        /// Mirrors the pressed item into the renderer immediately, then commits the same transition to the shell's
-        /// authoritative selection controller. Waiting for the next SwiftUI representable update made the toolbar
-        /// enter selection mode one frame before the checkmark appeared (and could look like the item was not
-        /// selected at all on a busy frame). The next `configure` call reconciles this adapter mirror with Core state.
-        private func beginSelection(with item: PhotoItem) {
-            selectionMode = true
-            selectedUIDs.insert(item.uid)
-            requestRender()
-            onBeginSelection?(item)
-        }
-
-        private func beginDragSelect(contentPoint: CGPoint, viewportPoint: CGPoint) {
-            guard selectionMode, let ctx = currentGridContext(),
-                let slot = ctx.engine.hitTest(
-                    contentPoint: contentPoint, level: ctx.level, width: bounds.width, columnPhase: committedPhase),
-                slot.index >= 0, slot.index < itemUIDs.count
-            else { return }
-            dragActive = true
-            selectionInputActive = true
-            updateFeedInteractionState()
-            dragAnchorIndex = slot.index
-            dragCurrentIndex = slot.index
-            dragBaseSelection = selectedUIDs
-            // An unselected anchor becomes selected; an already-selected anchor becomes deselected.
-            dragSelecting = !selectedUIDs.contains(itemUIDs[slot.index])
-            dragLastViewportPoint = viewportPoint
-            // The one finger now selects instead of scrolling; edge auto-scroll is driven manually. A programmatic
-            // contentOffset write still works while scrolling is disabled.
-            scrollView.isScrollEnabled = false
-            applyDragSelection()
-        }
-
-        private func updateDragSelect(contentPoint: CGPoint, viewportPoint: CGPoint) {
-            guard dragActive else { return }
-            dragLastViewportPoint = viewportPoint
-            resolveDragIndex(contentPoint: contentPoint)
-            applyDragSelection()
-            updateAutoScroll(viewportY: viewportPoint.y)
-        }
-
-        /// Resolve the item index under a content-space point, clamping to the first/last item when the point is
-        /// above/below all content and holding the previous index for an inter-row gap, so the swept range never
-        /// develops holes as the finger moves or the grid auto-scrolls.
-        private func resolveDragIndex(contentPoint: CGPoint) {
-            guard let ctx = currentGridContext() else { return }
-            if let slot = ctx.engine.hitTest(
-                contentPoint: contentPoint, level: ctx.level, width: bounds.width, columnPhase: committedPhase),
-                slot.index >= 0, slot.index < itemUIDs.count
-            {
-                dragCurrentIndex = slot.index
-            } else if contentPoint.y <= 0 {
-                dragCurrentIndex = 0
-            } else if contentPoint.y >= scrollView.contentSize.height {
-                dragCurrentIndex = max(0, itemUIDs.count - 1)
-            }
-            // else: finger in a gap / a short final row's trailing empty cells - keep the last resolved index.
-        }
-
-        private func applyDragSelection() {
-            guard let anchor = dragAnchorIndex, let current = dragCurrentIndex else { return }
-            let next = GridDragRangeSelection.selection(
-                base: dragBaseSelection, orderedIDs: itemUIDs,
-                anchorIndex: anchor, currentIndex: current, selecting: dragSelecting
-            )
-            if dragLiveSelection != next {
-                dragLiveSelection = next
-                requestRender()
-            }
-        }
-
-        func updateAutoScroll(viewportY: CGFloat) {
-            let inBand = GridEdgeAutoScrollPolicy.isInEdgeBand(
-                touchY: viewportY, viewportHeight: bounds.height, edgeInset: Self.autoScrollEdgeInset)
-            if inBand {
-                if !autoScrollActive {
-                    autoScrollActive = true
-                    autoScrollLastTimestamp = 0
-                    requestRender()
-                }
-            } else {
-                stopAutoScroll()
-            }
-        }
-
-        private func autoScrollTick(_ timestamp: CFTimeInterval, initialInterval: CFTimeInterval) {
-            guard dragActive else {
-                stopAutoScroll()
-                return
-            }
-            let dt: CFTimeInterval =
-                autoScrollLastTimestamp == 0 ? max(0, initialInterval) : max(0, timestamp - autoScrollLastTimestamp)
-            autoScrollLastTimestamp = timestamp
-            let velocity = GridEdgeAutoScrollPolicy.velocity(
-                touchY: dragLastViewportPoint.y, viewportHeight: bounds.height,
-                edgeInset: Self.autoScrollEdgeInset, maxSpeed: Self.autoScrollMaxSpeed)
-            guard velocity != 0 else {
-                stopAutoScroll()
-                return
-            }
-            let currentY = scrollView.contentOffset.y
-            let newY = min(max(currentY + velocity * CGFloat(dt), 0), maxContentOffsetY)
-            // Already pinned to the top/bottom edge - the clamp produced no movement, so there is nothing left to
-            // reveal or select. Stop the ramp so neither the auto-scroll link nor the render loop spins at full
-            // frame rate doing no-op work at the boundary (a finger held in the band with the grid already at its
-            // limit). A later finger move re-enters updateAutoScroll and restarts the ramp if progress is again
-            // possible; the finger's current position was already applied by the triggering `updateDragSelect`.
-            guard newY != currentY else {
-                stopAutoScroll()
-                return
-            }
-            isApplyingProgrammaticScroll = true
-            scrollView.setContentOffset(CGPoint(x: 0, y: newY), animated: false)
-            isApplyingProgrammaticScroll = false
-            // Re-resolve the item under the (stationary) finger against the NEW content offset, so the swept range
-            // extends into the newly revealed rows with no skipped holes even while the finger doesn't move.
-            let contentPoint = CGPoint(
-                x: dragLastViewportPoint.x + scrollView.contentOffset.x,
-                y: dragLastViewportPoint.y + scrollView.contentOffset.y)
-            resolveDragIndex(contentPoint: contentPoint)
-            applyDragSelection()
-            requestRender()
-        }
-
-        private func stopAutoScroll() {
-            autoScrollActive = false
-            autoScrollLastTimestamp = 0
-        }
-
-        private func endDragSelect() {
-            stopAutoScroll()
-            scrollView.isScrollEnabled = true
-            guard dragActive else { return }
-            dragActive = false
-            selectionInputActive = false
-            updateFeedInteractionState()
-            let committed = dragLiveSelection ?? selectedUIDs
-            // Mirror the committed set into the host so decorations stay correct for the frame(s) before SwiftUI's
-            // re-configure lands with the same set (no flash), then drop the live overlay and commit once to SwiftUI.
-            selectedUIDs = committed
-            dragLiveSelection = nil
-            dragAnchorIndex = nil
-            dragCurrentIndex = nil
-            requestRender()
-            onDragSelectionChanged?(committed)
-        }
-
-        /// Abandon an in-progress drag without committing - used when the surface suspends (tab switch / off-window)
-        /// mid-drag, where the long-press recognizer may not deliver a `.cancelled`. Restores scrolling and reverts
-        /// the live overlay to the base selection.
-        private func cancelDragSelectIfActive() {
-            stopAutoScroll()
-            guard dragActive else { return }
-            dragActive = false
-            selectionInputActive = false
-            updateFeedInteractionState()
-            dragLiveSelection = nil
-            dragAnchorIndex = nil
-            dragCurrentIndex = nil
-            scrollView.isScrollEnabled = true
-            requestRender()
-        }
-
-        /// The shared grid decorations for the current frame - always built, mirroring the macOS coordinator, so a
-        /// duration/RAW labels show during normal browsing and the checkmark badge shows in selection mode. The
-        /// Proton primary (0x6D4AFF) is injected as neutral SIMD/glyph data at this adapter edge, keeping the
-        /// composer platform-neutral.
         private func productionDecorations() -> MetalGridDecorations<PhotoUID> {
             let accent = SIMD4<Float>(Float(0x6D) / 255, Float(0x4A) / 255, Float(0xFF) / 255, 1)
             return MetalGridDecorations(
@@ -1905,9 +1677,8 @@
                     red: Double(accent.x), green: Double(accent.y), blue: Double(accent.z), alpha: 1),
                 selectionMode: selectionMode,
                 // Outlines belong to selection mode only; normal browsing carries an empty set so a bare grid draws
-                // just thumbnails + media overlays. While a finger-drag is live its in-progress set is drawn instead of
-                // the committed selection, so the drag paints without a per-frame SwiftUI round-trip.
-                selected: selectionMode ? (dragLiveSelection ?? selectedUIDs) : [],
+                // just thumbnails + media overlays.
+                selected: selectionMode ? selectedUIDs : [],
                 favorites: [],
                 overlay: { [thumbnailOverlayResolver] uid in thumbnailOverlayResolver.overlay(for: uid) }
             )
@@ -1978,7 +1749,7 @@
         }
 
         func updateFeedInteractionState() {
-            let active = scrollInputActive || pinchInputActive || selectionInputActive
+            let active = scrollInputActive || pinchInputActive
             guard active != reportedFeedInteractionActive else { return }
             reportedFeedInteractionActive = active
             thumbnailFeed?.setUserInteractionActive(active)

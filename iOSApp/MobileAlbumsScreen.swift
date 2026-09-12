@@ -321,6 +321,7 @@ private struct MobileFilterGridScreen: View {
     private var snapshot: TimelineSnapshot { snapshotReconciler.snapshot }
     @State private var phase: Phase = .loading
     @State private var selection = MobileGridSelectionController()
+    @State private var contextMenu = MobileGridContextMenuController()
     @State private var confirmEmptyTrash = false
     @State private var confirmDeleteAlbum = false
     @State private var isDeletingAlbum = false
@@ -344,6 +345,7 @@ private struct MobileFilterGridScreen: View {
 
     var body: some View {
         alertContent
+            .mobileGridContextMenu(contextMenu, model: model, onRemoved: removeContextItems)
             .task(id: filter) {
                 snapshotReconciler.reset()
                 await load()
@@ -405,25 +407,31 @@ private struct MobileFilterGridScreen: View {
                     selectionMode: selection.isSelecting,
                     selectedUIDs: selection.selected,
                     onOpenPhoto: open,
-                    onBeginSelection: beginSelectionHandler,
                     onToggleSelection: toggleSelectionHandler,
-                    onDragSelectionChanged: dragSelectionHandler
+                    dragOutProvider: model.backend,
+                    onDragOutFailed: {
+                        actionErrorTitle = L10n.string("dragout.error.title")
+                        actionError = $0.localizedMessage
+                    },
+                    contextMenuActions: {
+                        contextMenu.actions(
+                            for: $0, model: model,
+                            context: ViewerCollectionContext(filter: filter), albumID: albumID)
+                    },
+                    onContextMenuAction: { action, items in
+                        contextMenu.perform(
+                            action, items: items, model: model, router: viewerRouter,
+                            context: ViewerCollectionContext(filter: filter), albumID: albumID,
+                            onRemoved: removeContextItems)
+                    }
                 )
                 .ignoresSafeArea(edges: .bottom)
             }
         }
     }
 
-    private var beginSelectionHandler: ((PhotoItem) -> Void)? {
-        return { selection.begin(with: $0) }
-    }
-
     private var toggleSelectionHandler: ((PhotoItem) -> Void)? {
         return { selection.toggle($0) }
-    }
-
-    private var dragSelectionHandler: ((Set<PhotoUID>) -> Void)? {
-        return { selection.applyDragSelection($0) }
     }
 
     private var selectionDialogContent: some View {
@@ -656,6 +664,15 @@ private struct MobileFilterGridScreen: View {
             items: snapshot.items,
             context: ViewerCollectionContext(filter: filter)
         )
+    }
+
+    private func removeContextItems(_ uids: Set<PhotoUID>) {
+        // Context actions carry explicit items; they never enter or overwrite selection mode.
+        selection.selected.subtract(uids)
+        let epoch = snapshotReconciler.epoch
+        Task {
+            _ = await snapshotReconciler.remove(uids, within: epoch)
+        }
     }
 
     private func reconcileCompletedViewerMutation(_ mutation: MobileViewerMutation) {

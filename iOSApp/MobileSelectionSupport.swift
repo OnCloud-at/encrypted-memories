@@ -3,9 +3,8 @@ import PhotosCore
 import SwiftUI
 import UIKit
 
-/// Shared iOS/iPadOS selection state machine for the main timeline, collection grids, and map results.
-/// Platform screens only provide their item source and the existing backend action; mode transitions, long-press
-/// entry, bounded original export and honest error/partial-result state stay identical everywhere.
+/// One iOS/iPadOS selection state machine shared by the main timeline, collection grids and map results.
+/// Platform screens only provide their item source and the existing backend action; Select-button mode transitions, bounded original export and honest error/partial-result state stay identical everywhere.
 @MainActor
 @Observable
 final class MobileGridSelectionController {
@@ -37,18 +36,6 @@ final class MobileGridSelectionController {
         }
     }
 
-    func begin(with item: PhotoItem) {
-        begin(with: item, reduceMotion: UIAccessibility.isReduceMotionEnabled)
-    }
-
-    func begin(with item: PhotoItem, reduceMotion: Bool) {
-        guard !isBusy else { return }
-        withAnimation(reduceMotion ? nil : .smooth(duration: 0.22)) {
-            isSelecting = true
-            selected.insert(item.uid)
-        }
-    }
-
     func toggle(_ item: PhotoItem) {
         guard !isBusy else { return }
         if selected.contains(item.uid) {
@@ -56,11 +43,6 @@ final class MobileGridSelectionController {
         } else {
             selected.insert(item.uid)
         }
-    }
-
-    func applyDragSelection(_ uids: Set<PhotoUID>) {
-        guard !isBusy else { return }
-        selected = uids
     }
 
     func finish() {

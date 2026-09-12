@@ -263,19 +263,6 @@ struct UIKitTimelinePerformanceTests {
         #expect(driver.installationCount == 1)
     }
 
-    @Test func edgeAutoScrollUsesTheGridDisplayLink() throws {
-        let setup = makeTestHost(outcomes: [.drawn(hasPendingWork: false)])
-        let link = try #require(setup.factory.links.first)
-
-        setup.host.updateAutoScroll(viewportY: 0)
-        #expect(setup.factory.links.count == 1)
-        link.fire(timestamp: CACurrentMediaTime(), interval: 1.0 / 120.0)
-
-        #expect(setup.factory.links.count == 1)
-        #expect(setup.driver.installationCount == 1)
-        _ = setup.window
-    }
-
     @Test func cadenceTracks60And120HzMissesAndExcludesIdle() {
         var tracker = DisplayCadenceTracker()
         let sixty = 1.0 / 60.0

@@ -489,7 +489,8 @@ private func waitUntil(
         let selection = MobileGridSelectionController()
 
         selection.toggleMode()
-        selection.applyDragSelection([uid("one"), uid("two")])
+        selection.toggle(PhotoItem(uid: uid("one"), captureTime: Date(), mediaType: "image/jpeg"))
+        selection.toggle(PhotoItem(uid: uid("two"), captureTime: Date(), mediaType: "image/jpeg"))
         #expect(selection.isSelecting)
         #expect(selection.selected.count == 2)
 
@@ -498,10 +499,10 @@ private func waitUntil(
         #expect(selection.selected.isEmpty)
     }
 
-    @Test func finishClearsDragSelectionAndSelectionMode() {
+    @Test func finishClearsSelectionAndSelectionMode() {
         let selection = MobileGridSelectionController()
         selection.toggleMode()
-        selection.applyDragSelection([uid("one")])
+        selection.toggle(PhotoItem(uid: uid("one"), captureTime: Date(), mediaType: "image/jpeg"))
 
         selection.finish()
 

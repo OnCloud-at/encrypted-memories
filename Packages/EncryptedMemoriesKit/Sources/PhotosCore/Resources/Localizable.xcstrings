@@ -1,6 +1,69 @@
 {
   "sourceLanguage": "en",
   "strings": {
+    "contextmenu.share": {
+      "localizations": {
+        "de": { "stringUnit": { "state": "translated", "value": "Teilen" } },
+        "en": { "stringUnit": { "state": "translated", "value": "Share" } }
+      }
+    },
+    "contextmenu.copy": {
+      "localizations": {
+        "de": { "stringUnit": { "state": "translated", "value": "Kopieren" } },
+        "en": { "stringUnit": { "state": "translated", "value": "Copy" } }
+      }
+    },
+    "contextmenu.favorite": {
+      "localizations": {
+        "de": { "stringUnit": { "state": "translated", "value": "Als Favorit markieren" } },
+        "en": { "stringUnit": { "state": "translated", "value": "Favorite" } }
+      }
+    },
+    "contextmenu.unfavorite": {
+      "localizations": {
+        "de": { "stringUnit": { "state": "translated", "value": "Aus Favoriten entfernen" } },
+        "en": { "stringUnit": { "state": "translated", "value": "Remove from Favorites" } }
+      }
+    },
+    "contextmenu.information": {
+      "localizations": {
+        "de": { "stringUnit": { "state": "translated", "value": "Informationen" } },
+        "en": { "stringUnit": { "state": "translated", "value": "Info" } }
+      }
+    },
+    "contextmenu.trash": {
+      "localizations": {
+        "de": { "stringUnit": { "state": "translated", "value": "In den Papierkorb" } },
+        "en": { "stringUnit": { "state": "translated", "value": "Move to Trash" } }
+      }
+    },
+    "contextmenu.restore": {
+      "localizations": {
+        "de": { "stringUnit": { "state": "translated", "value": "Wiederherstellen" } },
+        "en": { "stringUnit": { "state": "translated", "value": "Restore" } }
+      }
+    },
+    "dragout.error.title": {
+      "extractionState": "manual",
+      "localizations": {
+        "de": { "stringUnit": { "state": "translated", "value": "Drag-out nicht möglich" } },
+        "en": { "stringUnit": { "state": "translated", "value": "Couldn’t Drag Out" } }
+      }
+    },
+    "dragout.error.insufficient_space": {
+      "extractionState": "manual",
+      "localizations": {
+        "de": { "stringUnit": { "state": "translated", "value": "Es ist nicht genug freier Speicherplatz vorhanden, um dieses Element vorzubereiten." } },
+        "en": { "stringUnit": { "state": "translated", "value": "There is not enough free space to prepare this item." } }
+      }
+    },
+    "dragout.error.write_failed": {
+      "extractionState": "manual",
+      "localizations": {
+        "de": { "stringUnit": { "state": "translated", "value": "Das Element konnte nicht vorbereitet werden." } },
+        "en": { "stringUnit": { "state": "translated", "value": "The item could not be prepared." } }
+      }
+    },
     "auth.saved_session_invalid": {
       "extractionState": "manual",
       "localizations": {

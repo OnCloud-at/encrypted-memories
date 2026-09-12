@@ -69,6 +69,7 @@ struct MobileTimelineScreen: View {
     @State private var refinementTopPlacementSignal = 0
     @State private var refinementTopPlacementPending = false
     @State private var searchSessionActive = false
+    @State private var contextMenu = MobileGridContextMenuController()
     @State private var showAlbumPicker = false
     @State private var showSettings = false
     /// The native toolbar keeps its slots mounted from frame one, but its content appears only after the
@@ -139,6 +140,7 @@ struct MobileTimelineScreen: View {
     var body: some View {
         NavigationStack {
             content
+                .mobileGridContextMenu(contextMenu, model: model)
                 .mobileNavigationTitle(
                     surface.title,
                     isVisible: launchChromeVisible
@@ -516,9 +518,13 @@ struct MobileTimelineScreen: View {
                     prefersReducedMotion: reduceMotion,
                     onFirstContentReady: { withAnimation(.spring(duration: 0.55)) { model.markFirstContentReady() } },
                     onOpenPhoto: open,
-                    onBeginSelection: selection.begin,
                     onToggleSelection: selection.toggle,
-                    onDragSelectionChanged: selection.applyDragSelection
+                    dragOutProvider: model.backend,
+                    onDragOutFailed: { selection.actionError = MobileSelectionError(message: $0.localizedMessage) },
+                    contextMenuActions: { contextMenu.actions(for: $0, model: model) },
+                    onContextMenuAction: { action, items in
+                        contextMenu.perform(action, items: items, model: model, router: viewerRouter)
+                    }
                 )
                 // Extend the scroll surface below the floating navigation and tab bars. The UIKit grid keeps
                 // its safe-area content inset, so only the newest edge exposes protected space below the final
@@ -763,6 +769,7 @@ struct MobileViewerPresentation: Identifiable {
     let index: Int
     let items: [PhotoItem]
     let context: ViewerCollectionContext
+    var showsInfoInitially = false
 }
 
 /// A successful viewer mutation removes the current item from the collection that opened it. Filtered grids
