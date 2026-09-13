@@ -1288,6 +1288,10 @@ module AppStoreConnect
         matching = submissions.select do |submission|
           review_submission_version_id(submission) == app_store_version.fetch("id")
         end
+        # Apple retains completed review attempts for a version that was submitted again.
+        # Prefer its active attempt, but never guess between multiple active or completed attempts.
+        active = matching.reject { |submission| submission.dig("attributes", "state") == "COMPLETE" }
+        matching = active unless active.empty?
         if matching.empty?
           raise Error,
                 "Missing #{platform} review submission for App Store version #{existing_version}"
