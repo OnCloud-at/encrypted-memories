@@ -10,15 +10,21 @@ extension View {
         modifier(MobileNavigationTitleModifier(title: title, isVisible: isVisible))
     }
 
-    /// iOS 26 needs an always-visible background to keep the floating tab bar legible over the Metal grid.
-    /// iOS 27 renders that preference as an additional full-width material behind the native glass controls,
-    /// so restore the system's automatic background policy there.
+    /// Keep the established iOS 26 Metal-grid background policy; let iOS 27 manage its native tab material.
+    /// This does not hide an inactive bottom toolbar: its visibility must be managed separately.
     @ViewBuilder func mobileTabBarBackgroundPolicy() -> some View {
         if #available(iOS 27.0, *) {
             toolbarBackgroundVisibility(.automatic, for: .tabBar)
         } else {
             toolbarBackgroundVisibility(.visible, for: .tabBar)
         }
+    }
+
+    /// Keep selection items mounted for native transitions, but hide their bar outside selection.
+    /// Transparent items alone leave a full-width toolbar background visible on iOS 27.
+    func mobileSelectionBars(isSelecting: Bool) -> some View {
+        toolbarVisibility(isSelecting ? .hidden : .automatic, for: .tabBar)
+            .toolbarVisibility(isSelecting ? .visible : .hidden, for: .bottomBar)
     }
 }
 

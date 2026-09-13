@@ -1909,15 +1909,15 @@ struct ProductionRouteGuardTests {
             "a toolbar-search wrapper on TabView renders ordinary top search chrome")
         #expect(
             mobileApp.contains(".mobileTabBarBackgroundPolicy()"),
-            "the mobile tab shell must preserve iOS 26 legibility without forcing iOS 27's full-width material")
+            "the mobile tab shell must preserve the platform tab-background policy")
         let mobileRootChrome = try String(
             contentsOf: Self.repoRoot.appendingPathComponent("iOSApp/MobileRootChrome.swift"), encoding: .utf8)
         #expect(mobileRootChrome.contains("if #available(iOS 27.0, *)"))
         #expect(mobileRootChrome.contains("toolbarBackgroundVisibility(.automatic, for: .tabBar)"))
         #expect(mobileRootChrome.contains("toolbarBackgroundVisibility(.visible, for: .tabBar)"))
         #expect(
-            !mobileApp.contains(".toolbarBackground(.visible, for: .tabBar)"),
-            "an unconditional visible tab-bar background becomes a second glass sheet on iOS 27")
+            mobileTimeline.contains(".mobileSelectionBars(isSelecting: selection.isSelecting)"),
+            "the timeline must hide the inactive selection bar itself, not only its transparent items")
         #expect(
             !mobileApp.contains("--search-tab-diagnostic") && !mobileApp.contains("Search-tab baseline"),
             "temporary search diagnostics must not remain reachable in production")

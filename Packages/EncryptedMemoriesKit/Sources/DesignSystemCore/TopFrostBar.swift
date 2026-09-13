@@ -27,8 +27,8 @@ public struct TopFrostBar: View {
     @ViewBuilder public var body: some View {
         #if canImport(UIKit)
             if #available(iOS 27.0, *) {
-                // iOS 27 applies its own edge treatment around native navigation chrome. Keeping this
-                // UIKit material as well produces a second full-width glass band behind the floating controls.
+                // iOS 27 supplies a native scroll-edge effect over the Metal sibling layer. The grid
+                // configures its soft style directly; iOS 26 still needs this title-legibility fallback.
                 EmptyView()
             } else {
                 frost
