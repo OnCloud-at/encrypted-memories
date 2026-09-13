@@ -17,9 +17,6 @@ concurrency:
   group: apple-distribution
   cancel-in-progress: false
 
-env:
-  DEVELOPER_DIR: /Applications/Xcode.app/Contents/Developer
-
 jobs:
   prepare:
     name: Validate GitHub release
@@ -101,7 +98,9 @@ jobs:
             exit 1
           }
           echo "commit_sha=$release_sha" >> "$GITHUB_OUTPUT"
-          ruby .github/scripts/release_build_number.rb "$release_sha" "$RUNNER_TEMP/release.json"
+          public_flag=""
+          [[ "${{ steps.release.outputs.prerelease }}" == "false" ]] && public_flag="--public"
+          ruby .github/scripts/release_build_number.rb "$release_sha" "$RUNNER_TEMP/release.json" "$public_flag"
 
       - name: Check out the exact release tag
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -139,9 +138,11 @@ jobs:
   upload:
     name: Upload ${{ matrix.platform }}
     needs: [prepare, in-app-purchase-preflight]
-    runs-on: xcode-27
+    runs-on: ${{ needs.prepare.outputs.prerelease == 'false' && 'macos-26' || 'xcode-27' }}
     timeout-minutes: 60
     environment: testflight-internal
+    env:
+      DEVELOPER_DIR: ${{ needs.prepare.outputs.prerelease == 'false' && '/Applications/Xcode_26.6.app/Contents/Developer' || '/Applications/Xcode.app/Contents/Developer' }}
     strategy:
       fail-fast: false
       matrix:
@@ -167,6 +168,23 @@ jobs:
             profile_app_identifier_key: com.apple.application-identifier
             profile_expected_platform: OSX
     steps:
+      - name: Select stable Xcode for public App Store releases
+        if: needs.prepare.outputs.prerelease == 'false'
+        run: |
+          set -euo pipefail
+          sudo xcode-select --switch /Applications/Xcode_26.6.app/Contents/Developer
+          xcodebuild -version
+
+      - name: Reject preview toolchains for public App Store releases
+        if: needs.prepare.outputs.prerelease == 'false'
+        run: |
+          set -euo pipefail
+          version="$(xcodebuild -version | sed -n '1p')"
+          [[ "$version" == "Xcode 26.6" ]] || {
+            echo "Public App Store builds require the stable Xcode 26.6 toolchain; found $version." >&2
+            exit 1
+          }
+
       - name: Check out source
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:

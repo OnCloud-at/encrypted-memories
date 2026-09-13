@@ -488,6 +488,7 @@ module AppStoreConnect
       create_versions: false,
       automatic_release: false
     )
+      @first_public_platforms = [] unless submit
       builds = require_valid_builds(version: version, build_number: build_number)
       validate_in_app_purchases(require_approved_products: submit)
       versions = if submit
@@ -518,6 +519,8 @@ module AppStoreConnect
 
       versions.each do |platform, app_store_version|
         ensure_automatic_release(app_store_version, platform: platform, state: states.fetch(platform)) if automatic_release
+        next if @first_public_platforms&.include?(platform)
+
         upsert_app_store_localizations(
           app_store_version.fetch("id"),
           localization_paths.fetch(platform, {})
@@ -1174,6 +1177,10 @@ module AppStoreConnect
         )]
       end
 
+      @first_public_platforms = plans.filter_map do |platform, plan|
+        platform if plan.fetch(:first_public)
+      end
+
       validate_localization_paths(localization_paths)
       materialize_missing_app_store_versions(plans, version: version)
       preflight_app_store_version_plans(
@@ -1264,6 +1271,7 @@ module AppStoreConnect
         platform: platform,
         target: target,
         replacement: replacement,
+        first_public: versions.none? { |item| version_state(item) == "READY_FOR_SALE" },
         cancellations: cancellation_plans(platform: platform, candidates: active_candidates)
       }
     end
