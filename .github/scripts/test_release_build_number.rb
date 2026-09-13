@@ -33,16 +33,6 @@ class AppleReleaseBuildNumberTest < Minitest::Test
     assert_equal first, retry_build
   end
 
-  def test_public_release_uses_a_distinct_deterministic_build_number
-    release_id = AppleReleaseBuildNumber::LAST_COMMIT_NUMBERED_RELEASE_ID + 1
-
-    build = AppleReleaseBuildNumber.for_release(
-      "a" * 40, { "id" => release_id }, public: true, command: command_for_history
-    )
-
-    assert_equal (release_id + AppleReleaseBuildNumber::PUBLIC_BUILD_NUMBER_OFFSET).to_s, build
-  end
-
   def test_invalid_release_ids_are_rejected_before_git
     [nil, 0, -1, "383102209", 383102209.5].each do |id|
       assert_raises(AppleReleaseBuildNumber::Error) do

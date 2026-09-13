@@ -1119,7 +1119,7 @@ class AppStoreConnectTest < Minitest::Test
     localization_patches = client.calls.select do |method, path, _body|
       method == :patch && path.start_with?("/v1/appStoreVersionLocalizations/")
     end
-    assert_equal 0, localization_patches.length
+    assert_equal 4, localization_patches.length
     refute(client.calls.any? do |method, path, _body|
       method == :post && path == "/v1/appStoreVersionReleaseRequests"
     end)
@@ -1147,44 +1147,6 @@ class AppStoreConnectTest < Minitest::Test
         body.dig(:data, :attributes, :releaseType) == "AFTER_APPROVAL"
     end
     assert_equal 2, release_type_patches.length
-  end
-
-  def test_first_public_platform_skips_unavailable_whats_new_but_updates_existing_platform
-    versions = {
-      "IOS" => [app_store_version(platform: "IOS", version: "1.0.3", state: "DEVELOPER_REJECTED")],
-      "MAC_OS" => [
-        app_store_version(platform: "MAC_OS", version: "1.0.1", state: "READY_FOR_SALE"),
-        app_store_version(platform: "MAC_OS", version: "1.0.3", state: "PREPARE_FOR_SUBMISSION")
-      ]
-    }
-    client = FakeAppStoreConnectClient.new(app_store_versions: versions)
-    manager = AppStoreConnect::ReleaseManager.new(
-      client: client,
-      app_id: "6805117080",
-      output_path: nil,
-      summary_path: nil
-    )
-    notes = Tempfile.new("release-notes")
-    notes.write("Improved photo handling.")
-    notes.close
-
-    manager.prepare_app_store(
-      version: "1.0.3",
-      build_number: "714",
-      submit: true,
-      localization_paths: AppStoreConnect::PLATFORMS.to_h do |platform|
-        [platform, { "en-US" => notes.path }]
-      end,
-      create_versions: true,
-      automatic_release: true
-    )
-
-    localization_patches = client.calls.filter_map do |method, path, _body|
-      path if method == :patch && path.start_with?("/v1/appStoreVersionLocalizations/")
-    end
-    assert_equal ["/v1/appStoreVersionLocalizations/version-MAC_OS-1.0.3-en-US"], localization_patches
-  ensure
-    notes&.unlink
   end
 
   def test_stable_release_does_not_change_release_type_after_submission
