@@ -716,6 +716,75 @@ struct ThumbnailFeedCoreTests {
         #expect(after.ramDecoded)
     }
 
+    @Test func prefetchCompletionWaitIncludesLastDownloadAfterQueueDrains() async throws {
+        let uid = Self.uid("prefetch-completion")
+        let cache = Self.cache("prefetch-completion")
+        let loader = ControlledLateLoader(payloads: [uid: Self.pngData(width: 8, height: 8)])
+        let feed = ThumbnailFeedCore(
+            cache: cache, loader: loader,
+            configuration: Self.configuration(downloadConcurrencyLimit: 1, batchSize: 1, downloadTimeoutSeconds: 10)
+        )
+        await feed.startPrefetch([uid])
+        try await Self.waitUntil { await loader.isWaiting() }
+        #expect(await feed.prefetchStatus().currentQueueLength == 0)
+        #expect(await feed.prefetchStatus().downloadsInFlight == 1)
+
+        let completed = Counter()
+        let waiter = Task {
+            try await feed.waitForPrefetchToFinish()
+            completed.increment()
+        }
+        try await Task.sleep(for: .milliseconds(300))
+        #expect(completed.value() == 0, "An empty queue must not hide the last in-flight thumbnail")
+        await loader.release()
+        try await Self.waitUntil { completed.value() == 1 }
+        try await waiter.value
+        #expect(cache.has(uid))
+        await feed.stopPrefetchAndWait()
+    }
+
+    @Test func cancellingPrefetchWaitDoesNotCancelTheThumbnailDownload() async throws {
+        let uid = Self.uid("cancel-prefetch-wait")
+        let loader = ControlledLateLoader(payloads: [uid: Self.pngData(width: 8, height: 8)])
+        let feed = ThumbnailFeedCore(
+            cache: Self.cache("cancel-prefetch-wait"), loader: loader,
+            configuration: Self.configuration(downloadConcurrencyLimit: 1, batchSize: 1, downloadTimeoutSeconds: 10)
+        )
+        await feed.startPrefetch([uid])
+        try await Self.waitUntil { await loader.isWaiting() }
+        let waiter = Task { try await feed.waitForPrefetchToFinish() }
+        waiter.cancel()
+        do {
+            try await waiter.value
+            Issue.record("Cancelled presentation waiter must finish without joining the blocked download")
+        } catch is CancellationError {}
+        #expect(await loader.isWaiting())
+        await loader.release()
+        try await feed.waitForPrefetchToFinish()
+        #expect(await feed.prefetchStatus().downloadCompleted == 1)
+        await feed.stopPrefetchAndWait()
+    }
+
+    @Test func prefetchCompletionWaitSettlesCachedAndUnavailableThumbnails() async throws {
+        let cached = Self.uid("prefetch-cached")
+        let unavailable = Self.uid("prefetch-unavailable")
+        let cache = Self.cache("prefetch-settled")
+        cache.storeToDisk(Self.pngData(width: 8, height: 8), for: cached)
+        let loader = RecordingLoader(itemErrors: [unavailable: "No thumbnail"])
+        let feed = ThumbnailFeedCore(cache: cache, loader: loader, configuration: Self.configuration())
+        await feed.startPrefetch([cached, unavailable])
+        let completed = Counter()
+        let waiter = Task {
+            try await feed.waitForPrefetchToFinish()
+            completed.increment()
+        }
+        try await Self.waitUntil { completed.value() == 1 }
+        try await waiter.value
+        #expect(await loader.requestCount() == 1, "Already cached photos must not download again")
+        #expect(feed.isKnownUnfetchable(unavailable))
+        await feed.stopPrefetchAndWait()
+    }
+
     @Test func libraryUpdateResolutionTreatsDiskThumbnailAsSettledWithoutNetwork() async {
         let uid = Self.uid("library-update-disk")
         let cache = Self.cache("library-update-disk")

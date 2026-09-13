@@ -190,8 +190,10 @@ final class MobileLibraryModel {
     /// identity cannot issue a second write while the first partial-success contract is still settling.
     private(set) var favoriteMutationsInFlight: Set<PhotoUID> = []
     private(set) var thumbnailFeed: UIKitThumbnailFeed?
-    /// Indicates that thumbnails for newly discovered authoritative assets remain unresolved.
-    private(set) var isBackgroundLoading = false
+    /// Keep the launch activity pill until known missing thumbnails finish, as well as later new-asset batches.
+    var isBackgroundLoading: Bool { isThumbnailPrefetchLoading || isNewAssetThumbnailLoading }
+    private var isThumbnailPrefetchLoading = false
+    private var isNewAssetThumbnailLoading = false
     /// Indicates that explicit sign-out is closing account owners and deleting account data.
     /// Transient session replacement does not set this flag.
     private(set) var isSigningOut = false
@@ -605,6 +607,7 @@ final class MobileLibraryModel {
                 self.loadToken &+= 1
                 activeRetry?.cancel()
                 self.prefetchStartTask?.cancel()
+                self.isThumbnailPrefetchLoading = false
                 self.favoriteLoadTask?.cancel()
                 self.snapshot = TimelineSnapshot()
                 self.sections = []
@@ -714,12 +717,20 @@ final class MobileLibraryModel {
         prefetchStartTask?.cancel()
         let crawlItems = items
         let token = loadToken
+        isThumbnailPrefetchLoading = !crawlItems.isEmpty
         prefetchStartTask = Task { [weak self] in
             let uids = await Task.detached(priority: .utility) {
                 ThumbnailCrawlOrder.newestToOldestFromChronological(crawlItems)
             }.value
-            guard let self, !Task.isCancelled, token == self.loadToken else { return }
+            guard !Task.isCancelled, token == self?.loadToken else { return }
             await feed.startPrefetch(uids)
+            do {
+                try await feed.waitForPrefetchToFinish()
+            } catch {
+                return  // A replacement task or teardown owns the current presentation state.
+            }
+            guard !Task.isCancelled, token == self?.loadToken else { return }
+            self?.isThumbnailPrefetchLoading = false
         }
     }
 
@@ -735,7 +746,7 @@ final class MobileLibraryModel {
                 current: currentUIDs
             ),
             onStateChange: { [weak self] state in
-                self?.isBackgroundLoading = state.isActive
+                self?.isNewAssetThumbnailLoading = state.isActive
             },
             resolver: { uids, enqueueMissing in
                 await feed.libraryUpdateResolution(for: uids, enqueueMissing: enqueueMissing)
@@ -1016,6 +1027,7 @@ final class MobileLibraryModel {
         transitionTask = nil
         prefetchStartTask?.cancel()
         prefetchStartTask = nil
+        isThumbnailPrefetchLoading = false
         favoriteLoadTask?.cancel()
         favoriteLoadTask = nil
         favoriteMutationsInFlight = []
@@ -1114,6 +1126,7 @@ final class MobileLibraryModel {
         transitionTask = nil
         prefetchStartTask?.cancel()
         prefetchStartTask = nil
+        isThumbnailPrefetchLoading = false
         favoriteLoadTask?.cancel()
         favoriteLoadTask = nil
         favoriteMutationsInFlight = []
@@ -1254,6 +1267,7 @@ final class MobileLibraryModel {
         loadTask?.cancel()
         prefetchStartTask?.cancel()
         prefetchStartTask = nil
+        isThumbnailPrefetchLoading = false
         favoriteLoadTask?.cancel()
         favoriteLoadTask = nil
         favoriteLoadOverrides.removeAll(keepingCapacity: false)
