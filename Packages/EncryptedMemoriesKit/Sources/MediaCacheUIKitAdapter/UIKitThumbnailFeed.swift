@@ -161,6 +161,10 @@
             await core.startPrefetch(uids)
         }
 
+        public func waitForPrefetchToFinish() async throws {
+            try await core.waitForPrefetchToFinish()
+        }
+
         public func stopPrefetch() async {
             imageWrappers.invalidateAll()
             await core.stopPrefetchAndWait()

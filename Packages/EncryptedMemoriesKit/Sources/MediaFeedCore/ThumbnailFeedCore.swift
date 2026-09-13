@@ -820,6 +820,18 @@ public actor ThumbnailFeedCore {
         return !priority.isEmpty || sequentialIndex < sequential.count
     }
 
+    /// Waits for an already-started thumbnail crawl, including authenticated disk probes and its final
+    /// downloads. A drained queue alone is not completion: workers may still be writing the last batch.
+    /// Cancelling the waiter leaves the feed running, so account teardown can join the caller before the feed.
+    public func waitForPrefetchToFinish() async throws {
+        while prefetchEnabled, ownerLeaseIsCurrent(),
+            workersRunning || diskProbeBatchesInFlight > 0 || downloadInFlight > 0 || timedOutLoaders > 0
+        {
+            try await Task.sleep(for: .milliseconds(250))
+        }
+        try Task.checkCancellation()
+    }
+
     /// True only while the grid needs the backend: queued visible-priority work or live viewport demand.
     /// Unlike `hasPendingThumbnailWork()`, this excludes the whole-library
     /// sequential fill: lower-priority background work (the Map's GPS crawl) yields on this, so it backs

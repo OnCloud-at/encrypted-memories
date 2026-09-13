@@ -735,6 +735,9 @@
             scrollView.alwaysBounceVertical = true
             scrollView.showsHorizontalScrollIndicator = false
             scrollView.contentInsetAdjustmentBehavior = .never
+            // The native soft edge keeps navigation controls floating over the photo grid on iOS 27.
+            // SwiftUI's scrollEdgeEffectStyle does not reach this embedded UIKit scroll surface.
+            scrollView.topEdgeEffect.style = .soft
             contentView.backgroundColor = .clear
             scrollView.addSubview(contentView)
             addSubview(scrollView)

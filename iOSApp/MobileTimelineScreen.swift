@@ -146,7 +146,7 @@ struct MobileTimelineScreen: View {
                     isVisible: launchChromeVisible
                 )
                 .toolbar { toolbarContent }
-                .toolbar(selection.isSelecting ? .hidden : .automatic, for: .tabBar)
+                .mobileSelectionBars(isSelecting: selection.isSelecting)
                 .animation(reduceMotion ? nil : .smooth(duration: 0.22), value: selection.isSelecting)
                 .onChange(of: searchScope) { _, scope in semanticQuery?.setScope(scope) }
                 .onChange(of: searchText) { _, value in scheduleSearchCommit(value) }

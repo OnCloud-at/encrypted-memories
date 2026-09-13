@@ -24,7 +24,21 @@ public struct TopFrostBar: View {
         self.intensity = intensity
     }
 
-    public var body: some View {
+    @ViewBuilder public var body: some View {
+        #if canImport(UIKit)
+            if #available(iOS 27.0, *) {
+                // iOS 27 supplies a native scroll-edge effect over the Metal sibling layer. The grid
+                // configures its soft style directly; iOS 26 still needs this title-legibility fallback.
+                EmptyView()
+            } else {
+                frost
+            }
+        #else
+            frost
+        #endif
+    }
+
+    private var frost: some View {
         FrostBlur(
             intensity: intensity,
             isActive: !loadingCoverPresented,
