@@ -187,8 +187,8 @@
             await core.resumePrefetch()
         }
 
-        public nonisolated func setUserInteractionActive(_ active: Bool) {
-            core.setUserInteractionActive(active)
+        public nonisolated func setUserInteractionActive(_ active: Bool, owner: ThumbnailInteractionOwner) {
+            core.setUserInteractionActive(active, owner: owner)
         }
 
         public func prefetchStatus() async -> PrefetchStatus {

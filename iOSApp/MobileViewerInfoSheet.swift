@@ -17,8 +17,7 @@ struct MobileViewerInfoSheet: View {
     let albumMembershipsLoadFailed: Bool
     let placeName: String?
     let onRetry: () -> Void
-
-    @Environment(\.dismiss) private var dismiss
+    let onClose: () -> Void
 
     private var metadata: PhotoMetadata? {
         metadataLoadState.metadata
@@ -40,9 +39,7 @@ struct MobileViewerInfoSheet: View {
             .mobileNavigationTitle(L10n.string("infopanel.info"))
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
-                    Button {
-                        dismiss()
-                    } label: {
+                    Button(action: onClose) {
                         Image(systemName: "xmark")
                     }
                     .accessibilityLabel(L10n.string("infopanel.close"))

@@ -31,9 +31,10 @@ protocol MetalGridDataSource: AnyObject {
     func thumbnailOverlay(for uid: PhotoUID) -> GridThumbnailOverlay
     /// Resolve metadata omitted by the lightweight timeline only for the resident visible window.
     func resolveOverlays(for uids: [PhotoUID])
-    /// Reports real pointer/gesture interaction to shared background scheduling. A mounted grid or
-    /// outstanding thumbnail request is not interaction.
-    func setUserInteractionActive(_ active: Bool)
+    /// Reports real pointer/gesture interaction of one grid host to shared background scheduling. A mounted
+    /// grid or outstanding thumbnail request is not interaction. The owner scopes the report so several
+    /// windows over one feed never clear each other's live gesture.
+    func setUserInteractionActive(_ active: Bool, owner: ThumbnailInteractionOwner)
 }
 
 extension MetalGridDataSource {
@@ -41,7 +42,7 @@ extension MetalGridDataSource {
     func resolveOverlays(for uids: [PhotoUID]) {}
     func canRetryThumbnail(for uid: PhotoUID) -> Bool { true }
     func prefetchWarm(_ uids: [PhotoUID]) {}  // only the real source decodes; test sources opt out
-    func setUserInteractionActive(_ active: Bool) {}
+    func setUserInteractionActive(_ active: Bool, owner: ThumbnailInteractionOwner) {}
 }
 
 // MARK: - Real data (ThumbnailFeed-backed)
@@ -102,8 +103,8 @@ final class RealMetalGridDataSource: MetalGridDataSource {
         overlayResolver.noteVisible(uids, metadataProvider: metadataProvider)
     }
 
-    func setUserInteractionActive(_ active: Bool) {
-        feed.setUserInteractionActive(active)
+    func setUserInteractionActive(_ active: Bool, owner: ThumbnailInteractionOwner) {
+        feed.setUserInteractionActive(active, owner: owner)
     }
 
     func hasImage(for uid: PhotoUID) -> Bool { feed.memoryCGImage(for: uid) != nil }

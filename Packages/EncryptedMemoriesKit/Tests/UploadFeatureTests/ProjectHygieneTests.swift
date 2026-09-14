@@ -681,12 +681,24 @@ final class ProjectHygieneTests: XCTestCase {
         XCTAssertTrue(mobileApp.contains("UIKitTimelineMetalCapability.supportsTimelineGrid(device: device)"))
         XCTAssertTrue(mobileApp.contains("Metal3UnsupportedDeviceView(productName: ProductBrand.displayName)"))
 
+        // Auth state is owned by the process-wide account runtime; the only place that touches it is the
+        // supported-device root, so an unsupported GPU never constructs a session model.
+        let mobileRuntime = try String(
+            contentsOf: repoRoot.appendingPathComponent("iOSApp/MobileAccountRuntime.swift"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(mobileRuntime.contains("sessionModel = MobileSessionModel()"))
+        XCTAssertFalse(mobileApp.contains("MobileSessionModel()"))
         let supportedRootDeclaration = try XCTUnwrap(mobileApp.range(of: "private struct MobileSupportedAppRoot: View"))
-        let sessionConstruction = try XCTUnwrap(mobileApp.range(of: "MobileSessionModel()"))
+        let runtimeAccess = try XCTUnwrap(mobileApp.range(of: "MobileAccountRuntime.shared"))
         XCTAssertLessThan(
             mobileApp.distance(from: mobileApp.startIndex, to: supportedRootDeclaration.lowerBound),
-            mobileApp.distance(from: mobileApp.startIndex, to: sessionConstruction.lowerBound),
-            "mobile auth state must only be constructed inside the supported-device root"
+            mobileApp.distance(from: mobileApp.startIndex, to: runtimeAccess.lowerBound),
+            "mobile auth state must only be reached inside the supported-device root"
+        )
+        XCTAssertEqual(
+            mobileApp.components(separatedBy: "MobileAccountRuntime.shared").count - 1, 1,
+            "exactly one scene-root attachment to the shared account runtime"
         )
     }
 
@@ -863,11 +875,16 @@ final class ProjectHygieneTests: XCTestCase {
             "temporary search diagnostics must not remain reachable in production"
         )
         XCTAssertFalse(
-            mobileApp.contains("MobileTab.settings") || mobileApp.contains("MobileSettingsScreen("),
+            mobileApp.contains("MobileTab.settings") || mobileApp.contains("case settings"),
             "Settings must not consume a bottom-tab slot"
         )
         XCTAssertTrue(
-            mobileTimeline.contains("MobileSettingsScreen(showsDismissButton: true)")
+            mobileApp.contains(".sheet(isPresented: $sceneContext.settingsPresented)")
+                && mobileApp.contains("MobileSettingsScreen(showsDismissButton: true)"),
+            "Settings is one scene-level sheet above the tab shell, shared by the toolbar control and the ⌘, command"
+        )
+        XCTAssertTrue(
+            mobileTimeline.contains("sceneContext.settingsPresented = true")
                 && mobileTimeline.contains("person.crop.circle"),
             "the stable library account control must present Settings"
         )

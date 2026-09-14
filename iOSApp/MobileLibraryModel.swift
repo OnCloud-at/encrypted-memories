@@ -1684,3 +1684,36 @@ final class MobileLibraryModel {
         (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
     }
 }
+
+#if DEBUG
+    // MARK: - Isolated fixture (hosted tests only)
+
+    extension MobileLibraryModel {
+        /// Installs a deterministic, already loaded account into this model without any network or keychain
+        /// access. The production composition above it (scene roots, tab shell, timeline screens, grids, viewer)
+        /// is untouched; only the account backend and its content are replaced by the given values.
+        ///
+        /// `configure(session:store:)` for the same session becomes a no-op because the account is already
+        /// configured, and `configure(session: nil, …)` runs the ordinary ordered teardown. Debug builds only.
+        func installIsolatedLibrary(
+            session: ProtonSession,
+            store: SessionKeychainStore,
+            backend: any PhotosBackend,
+            sections: [TimelineSection],
+            thumbnailFeed: UIKitThumbnailFeed
+        ) {
+            let projection = TimelineContentProjection(sections: sections)
+            self.store = store
+            self.session = session
+            configuredUID = session.uid
+            self.backend = backend
+            self.thumbnailFeed = thumbnailFeed
+            snapshot = projection.snapshot
+            self.sections = projection.sections
+            favoriteUIDs = []
+            favoriteFilterAvailability = .available
+            timelineRevision &+= 1
+            loadState = .contentReady(count: projection.snapshot.items.count)
+        }
+    }
+#endif

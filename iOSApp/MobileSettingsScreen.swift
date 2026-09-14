@@ -400,6 +400,7 @@ private struct MobileTipJarScreen: View {
 /// from the shared `PhotoLibraryBackupController` + `BackupStatus`; this view is layout only.
 private struct MobilePhotoBackupRows: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(MobileSceneContext.self) private var sceneContext
     @AppStorage(AppSettingsKey.keepDisplayAwakeDuringForegroundBackup)
     private var keepDisplayAwake = AppSettingsDefault.keepDisplayAwakeDuringForegroundBackup
     @State var controller: PhotoLibraryBackupController
@@ -713,10 +714,7 @@ private struct MobilePhotoBackupRows: View {
     /// The system's limited-library selection UI (iOS/iPadOS only - the picker is UIKit-hosted,
     /// which is exactly why this call lives in the app layer, not the shared adapter).
     private func presentLimitedLibraryPicker() {
-        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
-        guard let root = scenes.first?.keyWindow?.rootViewController else { return }
-        var presenter = root
-        while let presented = presenter.presentedViewController { presenter = presented }
+        guard let presenter = sceneContext.topmostPresenter else { return }
         PHPhotoLibrary.shared().presentLimitedLibraryPicker(from: presenter)
     }
 }

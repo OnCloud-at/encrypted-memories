@@ -131,7 +131,6 @@ struct MobilePhotoViewer: View {
                     )
                     .id(item.uid)
                 }
-                .ignoresSafeArea()
             }
         } topChrome: {
             viewerTopChrome
@@ -142,6 +141,7 @@ struct MobilePhotoViewer: View {
         }
         .statusBarHidden(!chromeVisible)
         .persistentSystemOverlays(chromeVisible ? .automatic : .hidden)
+        .background { keyboardCommands }
         .task {
             // Register the viewer's transient display cache with the shared memory governor (identity-keyed:
             // a newly opened viewer replaces the previous registration; the weak capture makes a dismissed
@@ -158,7 +158,9 @@ struct MobilePhotoViewer: View {
         .task(id: metadataTaskID) {
             await resolveCurrentTitleMetadata()
         }
-        .sheet(isPresented: $showInfo) {
+        // A native inspector: a trailing column beside the media in regular iPad windows, the familiar sheet in
+        // compact widths. The immersive viewer, its pager and its gestures stay mounted in both cases.
+        .inspector(isPresented: $showInfo) {
             if let item = currentDisplayedItem {
                 MobileViewerInfoSheet(
                     item: item,
@@ -168,8 +170,10 @@ struct MobilePhotoViewer: View {
                     isLoadingAlbumMemberships: isLoadingAlbumMemberships,
                     albumMembershipsLoadFailed: albumMembershipsLoadFailed,
                     placeName: titleMetadataState.resolution?.placeName,
-                    onRetry: retryCurrentMetadata
+                    onRetry: retryCurrentMetadata,
+                    onClose: { showInfo = false }
                 )
+                .inspectorColumnWidth(min: 300, ideal: 360, max: 480)
             }
         }
         .mobileSharePresentation(selection: selection)
@@ -784,6 +788,25 @@ struct MobilePhotoViewer: View {
         index = selected
     }
 
+    /// Hardware-keyboard parity with the macOS viewer: arrow keys page, Escape closes. The buttons render
+    /// nothing; they only register shortcuts for the presented viewer.
+    private var keyboardCommands: some View {
+        Group {
+            Button("") { stepPage(-1) }.keyboardShortcut(.leftArrow, modifiers: [])
+            Button("") { stepPage(1) }.keyboardShortcut(.rightArrow, modifiers: [])
+            Button("") { dismiss() }.keyboardShortcut(.cancelAction)
+        }
+        .frame(width: 0, height: 0)
+        .opacity(0)
+        .accessibilityHidden(true)
+    }
+
+    private func stepPage(_ delta: Int) {
+        let next = index + delta
+        guard items.indices.contains(next) else { return }
+        index = next
+    }
+
     private var burstBelongsToCurrentPage: Bool {
         burstBaseUID == currentBaseItem?.uid
     }
@@ -981,6 +1004,9 @@ private struct MobileViewerPager<Page: View>: UIViewControllerRepresentable {
         init(index: Int, root: AnyView) {
             self.pageIndex = index
             super.init(rootView: root)
+            // The outer SwiftUI layout accounts for device safe areas and the inspector column.
+            // A nested page must not apply the pager's cached safe area a second time.
+            safeAreaRegions = []
             view.backgroundColor = .clear  // never flash the hosting default background between pages
         }
         @available(*, unavailable)
