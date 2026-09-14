@@ -1,6 +1,7 @@
 import AppKit
 import CoreGraphics
 import GridCore
+import MediaFeedCore
 import MetalGridComposeCore
 import MetalGridTextureAppKitAdapter
 import MetalGridTextureCore
@@ -302,8 +303,8 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
     var orderedUIDs: [PhotoUID] { dataSource.flatUIDs }
     var gridProfileID: String { gridProfile.id }
 
-    func setUserInteractionActive(_ active: Bool) {
-        dataSource.setUserInteractionActive(active)
+    func setUserInteractionActive(_ active: Bool, owner: ThumbnailInteractionOwner) {
+        dataSource.setUserInteractionActive(active, owner: owner)
     }
 
     @discardableResult

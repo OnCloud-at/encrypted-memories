@@ -1654,15 +1654,23 @@ public actor ThumbnailFeedCore {
         startWorkers()
     }
 
-    public nonisolated func setUserInteractionActive(_ active: Bool) {
-        interactionState.set(active)
+    /// One platform grid host reports only its own gesture state. Several windows can drive the same shared
+    /// feed at once; the feed stays interacting while any owner is active, and a host that stops, switches
+    /// feeds, or goes away removes only its own contribution.
+    public nonisolated func setUserInteractionActive(_ active: Bool, owner: ThumbnailInteractionOwner) {
+        interactionState.set(active, owner: owner)
     }
 
-    /// True only while a platform host reports an active gesture or scroll deceleration. A visible
+    /// True only while at least one platform host reports an active gesture or scroll deceleration. A visible
     /// grid and queued/missing thumbnails do not count: those may remain pending indefinitely and
     /// must not starve background indexing after the user becomes idle.
     public nonisolated func hasActiveUserInteraction() -> Bool {
-        interactionState.get()
+        interactionState.hasActiveOwners()
+    }
+
+    /// Number of hosts currently reporting an active gesture (diagnostics and tests).
+    public nonisolated func activeUserInteractionOwnerCount() -> Int {
+        interactionState.activeOwnerCount()
     }
 
     public struct PrefetchStatus: Sendable, Equatable {
@@ -3124,18 +3132,39 @@ private final class LastDemandBox: @unchecked Sendable {
     }
 }
 
+/// Identity of one platform grid host that reports its own gesture state to a shared thumbnail feed.
+///
+/// A host creates one owner for its lifetime and passes it with every interaction report. Owners are only
+/// compared for identity; the feed never keeps a reference to the host itself.
+public struct ThumbnailInteractionOwner: Hashable, Sendable {
+    private let id = UUID()
+
+    public init() {}
+}
+
 /// Lock-guarded gesture state shared with synchronous background-work governors. Platform hosts
 /// update it only at interaction boundaries, so an idle viewport never generates polling or writes.
+/// Contributions are keyed by owner so one grid stopping cannot clear another grid's live gesture.
 private final class InteractionStateBox: @unchecked Sendable {
     private let lock = NSLock()
-    private var active = false
+    private var activeOwners: Set<ThumbnailInteractionOwner> = []
 
-    func set(_ value: Bool) {
-        lock.withLock { active = value }
+    func set(_ active: Bool, owner: ThumbnailInteractionOwner) {
+        lock.withLock {
+            if active {
+                activeOwners.insert(owner)
+            } else {
+                activeOwners.remove(owner)
+            }
+        }
     }
 
-    func get() -> Bool {
-        lock.withLock { active }
+    func hasActiveOwners() -> Bool {
+        lock.withLock { !activeOwners.isEmpty }
+    }
+
+    func activeOwnerCount() -> Int {
+        lock.withLock { activeOwners.count }
     }
 }
 

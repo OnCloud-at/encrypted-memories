@@ -1,5 +1,6 @@
 import AppKit
 import GridCore
+import MediaFeedCore
 import MetalGridTextureAppKitAdapter
 import MetalKit
 import PhotosCore
@@ -119,6 +120,8 @@ final class MetalGridScrollHost: NSView {
     private var liveScrollInputActive = false
     private var marqueeInputActive = false
     private var reportedFeedInteractionActive = false
+    /// This host's identity in the shared feed's interaction aggregate (one owner per grid host).
+    private let interactionOwner = ThumbnailInteractionOwner()
     private var pinchBaseLevel = 0
     private var pinchCumulativeMagnification: CGFloat = 0
 
@@ -869,7 +872,7 @@ final class MetalGridScrollHost: NSView {
         let active = liveScrollInputActive || pinchActive || marqueeInputActive
         guard active != reportedFeedInteractionActive else { return }
         reportedFeedInteractionActive = active
-        coordinator.setUserInteractionActive(active)
+        coordinator.setUserInteractionActive(active, owner: interactionOwner)
     }
 
     private func ensureDisplayLink() {
@@ -1406,7 +1409,7 @@ final class MetalGridScrollHost: NSView {
             pendingInitialViewport = initialViewport
             coordinator.resetCommittedPhase()  // canonical bottom-right phase, BEFORE the size callback
         }
-        coordinator.setUserInteractionActive(false)
+        coordinator.setUserInteractionActive(false, owner: interactionOwner)
         coordinator.setDataSource(source)  // Rebuild, then apply content size from the callback.
         reportedFeedInteractionActive = false
         updateFeedInteractionState()

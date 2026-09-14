@@ -998,11 +998,65 @@ struct ThumbnailFeedCoreTests {
             feed.hasActiveUserInteraction() == false,
             "a queued or stalled thumbnail must not indefinitely block unrelated background work")
 
-        feed.setUserInteractionActive(true)
+        let grid = ThumbnailInteractionOwner()
+        feed.setUserInteractionActive(true, owner: grid)
         #expect(feed.hasActiveUserInteraction())
-        feed.setUserInteractionActive(false)
+        feed.setUserInteractionActive(false, owner: grid)
         #expect(feed.hasActiveUserInteraction() == false)
         await feed.stopPrefetch()
+    }
+
+    /// Several windows scroll one shared feed. The aggregate must stay active while any grid still interacts,
+    /// and a grid that stops, disconnects, or switches feeds must remove only its own contribution.
+    @Test func sharedFeedAggregatesInteractionPerOwner() async throws {
+        let feed = ThumbnailFeedCore(
+            cache: Self.cache("owners"), loader: RecordingLoader(), configuration: Self.configuration())
+        let gridA = ThumbnailInteractionOwner()
+        let gridB = ThumbnailInteractionOwner()
+
+        // Overlap: B stops first while A keeps scrolling.
+        feed.setUserInteractionActive(true, owner: gridA)
+        feed.setUserInteractionActive(true, owner: gridB)
+        #expect(feed.activeUserInteractionOwnerCount() == 2)
+        feed.setUserInteractionActive(false, owner: gridB)
+        #expect(feed.hasActiveUserInteraction(), "A still scrolls after B stops")
+        #expect(feed.activeUserInteractionOwnerCount() == 1)
+        feed.setUserInteractionActive(false, owner: gridA)
+        #expect(feed.hasActiveUserInteraction() == false)
+        #expect(feed.activeUserInteractionOwnerCount() == 0)
+
+        // Reverse completion order: A stops first while B keeps pinching.
+        feed.setUserInteractionActive(true, owner: gridA)
+        feed.setUserInteractionActive(true, owner: gridB)
+        feed.setUserInteractionActive(false, owner: gridA)
+        #expect(feed.hasActiveUserInteraction(), "B still pinches after A stops")
+        feed.setUserInteractionActive(false, owner: gridB)
+        #expect(feed.hasActiveUserInteraction() == false)
+
+        // Repeated reports from one owner are idempotent; a stop for an unknown owner is a no-op.
+        feed.setUserInteractionActive(true, owner: gridA)
+        feed.setUserInteractionActive(true, owner: gridA)
+        #expect(feed.activeUserInteractionOwnerCount() == 1)
+        feed.setUserInteractionActive(false, owner: ThumbnailInteractionOwner())
+        #expect(feed.hasActiveUserInteraction(), "a stranger cannot clear A")
+        feed.setUserInteractionActive(false, owner: gridA)
+        #expect(feed.activeUserInteractionOwnerCount() == 0)
+
+        // Feed switch: a grid that moves to another feed while scrolling releases the old feed only.
+        let otherFeed = ThumbnailFeedCore(
+            cache: Self.cache("owners-other"), loader: RecordingLoader(), configuration: Self.configuration())
+        feed.setUserInteractionActive(true, owner: gridA)
+        feed.setUserInteractionActive(true, owner: gridB)
+        feed.setUserInteractionActive(false, owner: gridA)
+        otherFeed.setUserInteractionActive(true, owner: gridA)
+        #expect(feed.hasActiveUserInteraction(), "B keeps the old feed active")
+        #expect(otherFeed.activeUserInteractionOwnerCount() == 1)
+        feed.setUserInteractionActive(false, owner: gridB)
+        otherFeed.setUserInteractionActive(false, owner: gridA)
+        #expect(feed.hasActiveUserInteraction() == false)
+        #expect(otherFeed.hasActiveUserInteraction() == false)
+        await feed.stopPrefetch()
+        await otherFeed.stopPrefetch()
     }
 
     @Test func corruptDiskBlobDoesNotStarveVisibleFetch() async throws {
@@ -2277,14 +2331,15 @@ struct ThumbnailFeedCoreTests {
             payloads: Dictionary(uniqueKeysWithValues: uids.map { ($0, Self.pngData(width: 8, height: 8)) }))
         let feed = ThumbnailFeedCore(cache: Self.cache("interact"), loader: loader, configuration: Self.configuration())
 
-        feed.setUserInteractionActive(true)
+        let grid = ThumbnailInteractionOwner()
+        feed.setUserInteractionActive(true, owner: grid)
         await feed.startPrefetch(uids)
         try await Self.waitUntil { await feed.prefetchStatus().downloadCompleted == 2 }
         let status = await feed.prefetchStatus()
         #expect(!status.paused)
         #expect(status.pausedReason == "none")
         #expect(await loader.requestCount() == 2)
-        feed.setUserInteractionActive(false)
+        feed.setUserInteractionActive(false, owner: grid)
     }
 
     @Test func refusedItemsAreQuarantinedUntilNextCrawlStart() async throws {

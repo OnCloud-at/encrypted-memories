@@ -2,6 +2,7 @@ import CoreGraphics
 import Foundation
 import MediaByteCache
 import MediaCache
+import MediaFeedCore
 import PhotosCore
 import Testing
 
@@ -170,12 +171,13 @@ struct AppInfrastructureTests {
             concurrency: 1, batch: 1)
         await feed.startPrefetch([PhotoUID(volumeID: "v", nodeID: "a")])
 
-        feed.setUserInteractionActive(true)
+        let grid = ThumbnailInteractionOwner()
+        feed.setUserInteractionActive(true, owner: grid)
         var status = await feed.prefetchStatus()
         #expect(!status.paused)
         #expect(status.pausedReason == "none")  // interaction must not starve visible thumbnails
 
-        feed.setUserInteractionActive(false)
+        feed.setUserInteractionActive(false, owner: grid)
         await feed.pausePrefetch()
         status = await feed.prefetchStatus()
         #expect(status.pausedReason == "manual")

@@ -378,7 +378,7 @@ struct ProductionRouteGuardTests {
         )
         #expect(timeline.contains("private var selectionOptionsMenu: some View"))
         #expect(
-            timeline.contains("Image(systemName: \"ellipsis\")"),
+            timeline.contains("Label(String(localized: \"selection.more_a11y\"), systemImage: \"ellipsis\")"),
             "bulk favorite must live in the selection More menu beside Select/Done")
         #expect(
             !timeline.contains("Image(systemName: selectedAllFavorited ? \"heart.fill\" : \"heart\")"),
@@ -2729,7 +2729,7 @@ struct ProductionRouteGuardTests {
             capture.contains("lastLaidOutViewportSize"),
             "the old scroll offset must be interpreted with the old viewport geometry")
         #expect(
-            capture.contains("itemUIDs[top.index]"),
+            capture.contains("itemID: itemUIDs[anchorSlot.index]"),
             "the preserved position must be keyed by photo identity, never a raw offset")
         #expect(
             capture.contains("return .newest"),

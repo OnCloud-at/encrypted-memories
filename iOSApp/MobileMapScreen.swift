@@ -11,6 +11,7 @@ import UIKit
 /// and scan failures. Pins open the viewer; clusters open `MobileMapClusterSeriesScreen`.
 struct MobileMapScreen: View {
     @Environment(\.verticalSizeClass) private var verticalSizeClass
+    @Environment(MobileSceneContext.self) private var sceneContext
     @Environment(MobileLibraryModel.self) private var model
     @Environment(MobileViewerRouter.self) private var viewerRouter
     @State private var networkMonitor = NetworkMonitor.shared
@@ -85,7 +86,7 @@ struct MobileMapScreen: View {
             .overlay(alignment: .top) { TopFrostBar(height: topFrostHeight) }
             .task(id: verticalSizeClass) {
                 await Task.yield()
-                topFrostHeight = mobileTopBarFrostHeight()
+                topFrostHeight = mobileTopBarFrostHeight(in: sceneContext)
             }
             .mobileNavigationTitle(String(localized: "tab.map"))
             .navigationDestination(item: $clusterPresentation) { presentation in

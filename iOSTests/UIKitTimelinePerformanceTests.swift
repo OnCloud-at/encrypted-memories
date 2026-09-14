@@ -206,10 +206,10 @@ struct UIKitTimelinePerformanceTests {
         setup.host.requestRender()
         #expect(setup.driver.isRunning)
 
-        setup.host.applicationDidEnterBackground()
+        setup.host.hostSceneDidEnterBackground()
         #expect(!setup.driver.isRunning)
         #expect(link.invalidationCount == 0)
-        setup.host.applicationDidBecomeActive()
+        setup.host.hostSceneWillEnterForeground()
         #expect(setup.driver.isRunning)
         #expect(setup.driver.installationCount == 1)
 
@@ -225,6 +225,20 @@ struct UIKitTimelinePerformanceTests {
         #expect(!setup.driver.isRunning)
         #expect(link.invalidationCount == 0)
         setup.window.addSubview(setup.host)
+        #expect(setup.driver.isRunning)
+        #expect(setup.driver.installationCount == 1)
+    }
+
+    @Test func inactiveHostReattachedToForegroundRefreshesSceneStateBeforeActivation() throws {
+        let setup = makeTestHost(outcomes: [.drawn(hasPendingWork: false)])
+        setup.host.hostSceneDidEnterBackground()
+        setup.host.setActive(false)
+        setup.host.removeFromSuperview()
+        // This host misses the scene's foreground notification while it has no window. Reattachment must
+        // refresh the scene state even though its tab stays inactive until the following selection.
+        setup.window.addSubview(setup.host)
+        #expect(!setup.driver.isRunning)
+        setup.host.setActive(true)
         #expect(setup.driver.isRunning)
         #expect(setup.driver.installationCount == 1)
     }

@@ -4,6 +4,7 @@ import SwiftUI
 
 struct MobileLoginView: View {
     @EnvironmentObject private var sessionModel: MobileSessionModel
+    @Environment(MobileSceneContext.self) private var sceneContext
 
     var body: some View {
         VStack(spacing: 20) {
@@ -32,7 +33,7 @@ struct MobileLoginView: View {
             Spacer()
 
             Button {
-                sessionModel.signIn()
+                sessionModel.signIn(presentationAnchor: { [weak sceneContext] in sceneContext?.window })
             } label: {
                 HStack(spacing: 10) {
                     if sessionModel.isSigningIn {

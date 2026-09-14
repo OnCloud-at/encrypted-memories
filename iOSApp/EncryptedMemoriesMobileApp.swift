@@ -50,6 +50,9 @@ struct EncryptedMemoriesMobileApp: App {
                 }
             }
         }
+        .commands {
+            MobileNavigationCommands()
+        }
     }
 
     /// One shared reference for the BG task handler - the handler outlives any scene, so it must
@@ -60,37 +63,33 @@ struct EncryptedMemoriesMobileApp: App {
     }
 }
 
-/// Owns account and library state only after the physical device passes the Metal 3 capability gate.
+/// One window scene's root after the physical device passes the Metal 3 capability gate.
+///
+/// The account (session, library, backup, ML, caches) is process-wide and owned by `MobileAccountRuntime`.
+/// This root attaches the scene to it and owns only scene state: the window anchor for presentations and
+/// the celebration overlay of this window. Several iPad windows therefore share one account runtime while
+/// keeping independent navigation, search, selection, scroll and viewer state.
 private struct MobileSupportedAppRoot: View {
-    @StateObject private var sessionModel: MobileSessionModel
-    /// `@State` (not `@StateObject`) because `MobileLibraryModel` is `@Observable`: SwiftUI then tracks its
-    /// properties individually, so non-grid tabs don't re-render on a timeline snapshot change.
-    @State private var libraryModel: MobileLibraryModel
+    private let runtime = MobileAccountRuntime.shared
+    @State private var sceneContext = MobileSceneContext()
     @State private var confettiMotion = MobileConfettiMotion.shared
     @State private var tipJarCelebration = TipJarCelebrationCoordinator.shared
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @Environment(\.scenePhase) private var scenePhase
-
-    init() {
-        _sessionModel = StateObject(wrappedValue: MobileSessionModel())
-        _libraryModel = State(initialValue: MobileLibraryModel())
-    }
 
     var body: some View {
         MobileRootView()
-            .environmentObject(sessionModel)
-            .environment(libraryModel)
+            .environmentObject(runtime.sessionModel)
+            .environment(runtime.libraryModel)
+            .environment(sceneContext)
+            .mobileSceneWindowAnchor(sceneContext)
             .background {
                 TipJarCelebrationWindowOverlay(horizontalBias: confettiMotion.horizontalBias)
             }
             .task {
-                libraryModel.configure(session: sessionModel.session, store: sessionModel.sessionStore)
+                runtime.start()
             }
             .task {
                 await TipJarTransactionProcessor.shared.start()
-            }
-            .onChange(of: sessionModel.session) { _, session in
-                libraryModel.configure(session: session, store: sessionModel.sessionStore)
             }
             .onChange(of: tipJarCelebration.activeCelebration?.id) { _, celebrationID in
                 if celebrationID == nil || reduceMotion {
@@ -106,43 +105,8 @@ private struct MobileSupportedAppRoot: View {
                     confettiMotion.start()
                 }
             }
-            .onChange(of: scenePhase) { _, phase in
-                let opportunity: LibraryExecutionOpportunity
-                switch phase {
-                case .active: opportunity = .foregroundActive
-                case .inactive: opportunity = .foregroundInactive
-                case .background: opportunity = .backgroundPermitted
-                @unknown default: opportunity = .foregroundInactive
-                }
-                AppleLibraryRuntimeAdapter.shared.setExecutionOpportunity(opportunity)
-                AppleSmartSearchBackgroundCoordinator.shared.applicationStateChanged(isForeground: phase != .background)
-                if phase == .background {
-                    PhotoBackupBackgroundCoordinator.shared.applicationDidEnterBackground(
-                        controller: EncryptedMemoriesMobileApp.currentPhotoBackup()
-                    )
-                } else if phase == .active {
-                    PhotoBackupBackgroundCoordinator.shared.applicationDidBecomeActive(
-                        controller: EncryptedMemoriesMobileApp.currentPhotoBackup()
-                    )
-                    // Foregrounding reopens the background-indexing gate promptly.
-                    libraryModel.smartSearch?.noteConditionsChanged()
-                    Task { await libraryModel.refreshAccountInfo() }
-                }
-                libraryModel.setApplicationActive(phase == .active)
-            }
             .onDisappear {
                 confettiMotion.stop()
-            }
-            .onChange(of: libraryModel.photoBackup?.uploadedLibraryMutationRevision) { _, _ in
-                libraryModel.refreshAfterLocalUpload()
-            }
-            .onChange(of: libraryModel.facade?.uploadCoordinator.completedUploadRevision) { _, _ in
-                libraryModel.refreshAfterLocalUpload()
-            }
-            .onChange(of: libraryModel.isSigningOut) { _, signingOut in
-                if !signingOut {
-                    sessionModel.completeSignOutPresentation()
-                }
             }
     }
 }
@@ -159,8 +123,8 @@ private enum MobileBuildProvenanceLog {
     }
 }
 
-/// Top-level mobile routes. They are shared by the compact iPhone tab shell and the regular-width iPad sidebar
-/// shell, so navigation chrome can adapt without duplicating feature screens or Core logic.
+/// Top-level mobile routes. The system adapts the tab shell to the available window size without duplicating
+/// feature screens or Core logic.
 enum MobileTab: CaseIterable, Hashable, Identifiable {
     case photos, collections, map, search
 
@@ -287,6 +251,7 @@ private struct MobileRootView: View {
 /// Shared tab hierarchy; the system adapts its presentation for iPhone and iPad.
 private struct MobileMainTabView: View {
     @Environment(MobileLibraryModel.self) private var libraryModel
+    @Environment(MobileSceneContext.self) private var sceneContext
     @State private var selection: MobileTab = .photos
     @State private var networkMonitor = NetworkMonitor.shared
     @Namespace private var libraryActivityTransition
@@ -310,6 +275,7 @@ private struct MobileMainTabView: View {
     }
 
     var body: some View {
+        @Bindable var sceneContext = sceneContext
         MobileAdaptiveTabShell(selection: $selection)
             .environment(viewerRouter)
             .overlay {
@@ -323,6 +289,18 @@ private struct MobileMainTabView: View {
                 namespace: libraryActivityTransition,
                 loadingCoverPresented: showsLibraryLoadingCover
             )
+            // Keyboard and menu commands target the focused window; each window publishes its own tab state.
+            .focusedSceneValue(
+                \.mobileSceneCommands,
+                MobileSceneCommandTarget(
+                    selectTab: { selection = $0 },
+                    openSettings: { sceneContext.settingsPresented = true }
+                )
+            )
+            // Settings is a scene-level presentation so the toolbar button and the command open it over any tab.
+            .sheet(isPresented: $sceneContext.settingsPresented) {
+                MobileSettingsScreen(showsDismissButton: true)
+            }
             .fullScreenCover(
                 item: Binding(
                     get: { viewerRouter.presentation },
@@ -392,6 +370,9 @@ private struct MobileAdaptiveTabShell: View {
             }
         }
         .tabViewSearchActivation(.searchTabSelection)
+        // One native container for every width: a bottom tab bar in compact windows, the system's top tab bar in
+        // regular iPad windows. A sidebar toggle would only repeat these four destinations, so the tab-only
+        // style stays until the sidebar can offer additional sections over the same routes.
         .tabViewStyle(.tabBarOnly)
         .tint(ProtonColor.primary)
         .mobileTabBarBackgroundPolicy()
@@ -475,6 +456,37 @@ private struct MobileSearchTabScreen: View {
 
     private var searchDiscoveryRevision: String {
         "\(libraryModel.timelineRevision)|\(history.queries.joined(separator: "\u{1F}"))"
+    }
+}
+
+/// Hardware-keyboard and iPadOS menu-bar commands. They act on the focused window through the target that
+/// `MobileMainTabView` publishes, so two windows never share navigation state.
+private struct MobileNavigationCommands: Commands {
+    @FocusedValue(\.mobileSceneCommands) private var target
+
+    var body: some Commands {
+        CommandGroup(replacing: .appSettings) {
+            Button(String(localized: "tab.settings")) {
+                target?.openSettings()
+            }
+            .keyboardShortcut(",", modifiers: .command)
+            .disabled(target == nil)
+        }
+        CommandMenu(String(localized: "menu.go")) {
+            ForEach(Array(MobileTab.allCases.enumerated()), id: \.element) { index, tab in
+                Button(tab.title) {
+                    target?.selectTab(tab)
+                }
+                .keyboardShortcut(KeyEquivalent(Character(String(index + 1))), modifiers: .command)
+                .disabled(target == nil)
+            }
+            Divider()
+            Button(MobileTab.search.title) {
+                target?.selectTab(.search)
+            }
+            .keyboardShortcut("f", modifiers: .command)
+            .disabled(target == nil)
+        }
     }
 }
 
