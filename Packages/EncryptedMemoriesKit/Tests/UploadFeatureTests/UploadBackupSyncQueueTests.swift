@@ -565,6 +565,52 @@ final class UploadBackupSyncQueueTests: XCTestCase {
         XCTAssertNil(BackupIssueRecord.decode("plain text"))
     }
 
+    func testEarliestRunnableEntryPicksTheOldestAcrossRunnableStatesAndSkipsOthers() throws {
+        let url = tempDir.appendingPathComponent(UploadBackupSyncQueueManifestStore.databaseFileName)
+        let store = try XCTUnwrap(UploadBackupSyncQueueManifestStore(url: url))
+        // The oldest row overall is failed and must never be picked; the oldest runnable row is
+        // in needsRemoteReconciliation; discovered and queuedForUpload are strictly newer.
+        let failed = UploadBackupSyncQueueEntry(
+            source: source("failed"), revision: revision(10), originalFilename: "failed.heic",
+            state: .failed, updatedAt: Date(timeIntervalSince1970: 10)
+        )
+        let reconciling = UploadBackupSyncQueueEntry(
+            source: source("reconciling"), revision: revision(20), originalFilename: "reconciling.heic",
+            state: .needsRemoteReconciliation, updatedAt: Date(timeIntervalSince1970: 20)
+        )
+        let discovered = UploadBackupSyncQueueEntry(
+            source: source("discovered"), revision: revision(30), originalFilename: "discovered.heic",
+            state: .discovered, updatedAt: Date(timeIntervalSince1970: 30)
+        )
+        let queued = UploadBackupSyncQueueEntry(
+            source: source("queued"), revision: revision(40), originalFilename: "queued.heic",
+            state: .queuedForUpload, updatedAt: Date(timeIntervalSince1970: 40)
+        )
+        for entry in [failed, discovered, queued, reconciling] {
+            XCTAssertTrue(store.upsert(entry))
+        }
+
+        let first = try XCTUnwrap(store.earliestRunnableEntry())
+        XCTAssertEqual(
+            first.source.identifier, "reconciling", "oldest runnable row wins even when a failed row is older")
+        XCTAssertEqual(first.state, .needsRemoteReconciliation)
+
+        XCTAssertTrue(
+            store.updateState(
+                source: reconciling.source,
+                revision: reconciling.revision,
+                state: .completed,
+                attempts: nil,
+                lastError: nil,
+                updatedAt: Date(timeIntervalSince1970: 21)
+            ))
+
+        let second = try XCTUnwrap(store.earliestRunnableEntry())
+        XCTAssertEqual(
+            second.source.identifier, "discovered", "after the oldest runnable row leaves, the next oldest wins")
+        XCTAssertEqual(second.state, .discovered)
+    }
+
     func testSQLiteQueueAtomicallyClaimsRunnableRowsAndSkipsFutureBackoff() throws {
         let url = tempDir.appendingPathComponent(UploadBackupSyncQueueManifestStore.databaseFileName)
         let store = try XCTUnwrap(UploadBackupSyncQueueManifestStore(url: url))

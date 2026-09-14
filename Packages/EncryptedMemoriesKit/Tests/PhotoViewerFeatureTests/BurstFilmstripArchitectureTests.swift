@@ -1,12 +1,25 @@
 import Foundation
 import MediaByteCache
 import MediaCache
+import PhotoViewerCore
 import PhotosCore
 import XCTest
 
 @testable import PhotoViewerFeature
 
 final class BurstFilmstripArchitectureTests: XCTestCase {
+    func testShortCallFormReloadsOnlyOnIdentityChangeNotSelection() {
+        let uids = [PhotoUID(volumeID: "v", nodeID: "a"), PhotoUID(volumeID: "v", nodeID: "b")]
+        let update = BurstFilmstripUpdatePolicy.resolve(
+            previousItems: uids,
+            currentItems: uids,
+            previousSelectedUID: uids[0],
+            currentSelectedUID: uids[1]
+        )
+        XCTAssertFalse(update.reloadData, "same UIDs must not trigger a full reload")
+        XCTAssertTrue(update.selectCurrent, "a selection change must still move the native selection")
+    }
+
     func testViewerFullImageCacheIsCostBounded() throws {
         let repo = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()  // PhotoViewerFeatureTests

@@ -60,6 +60,8 @@ public actor ThumbnailCache {
     /// Shared derivative cap. Directory scans run through `automaticDiskCapScheduler`, never on the cache caller.
     private nonisolated let automaticDiskCapBytes: Int64?
     private nonisolated let automaticDiskCapScheduler: ThumbnailCacheDiskCapScheduler?
+    /// Estimated on-disk byte total, so a debounced cap pass under budget skips enumerating the directory.
+    private nonisolated let diskUsage = ThumbnailCacheDiskUsage()
 
     public init(
         namespace: String = "thumbnails",
@@ -225,6 +227,7 @@ public actor ThumbnailCache {
             _ = writerGeneration.performIfCurrent(generation) {
                 try? FileManager.default.removeItem(at: url)  // Drop unreadable data so the network path refetches it.
                 validated.remove(name, generation: generation)
+                diskUsage.invalidate()
             }
             return false
         }
@@ -258,6 +261,7 @@ public actor ThumbnailCache {
             _ = writerGeneration.performIfCurrent(generation) {
                 try? FileManager.default.removeItem(at: url)  // Drop auth failures or corruption for a later refetch.
                 validated.remove(name, generation: generation)
+                diskUsage.invalidate()
             }
             return nil
         }
@@ -353,6 +357,8 @@ public actor ThumbnailCache {
                     return ThumbnailCacheStoreResult.ioFailure
                 }
             } ?? .stale
+        // Every stored blob counts, including caches whose cap is enforced explicitly (originals).
+        if result == .stored { diskUsage.add(Int64(sealed.count)) }
         if result == .stored, let automaticDiskCapBytes, let automaticDiskCapScheduler {
             // Use the current generation when the utility pass runs. A cache clear or account switch can happen
             // between this write and the trim; the new generation still needs its shared bound enforced.
@@ -433,7 +439,11 @@ public actor ThumbnailCache {
         generation: CacheWriterGeneration.Token
     ) -> Bool {
         guard capBytes >= 0 else { return true }
+        if let knownBytes = diskUsage.get(), knownBytes <= capBytes {
+            return writerGeneration.isCurrent(generation)
+        }
         let keys: Set<URLResourceKey> = [.fileSizeKey, .contentModificationDateKey]
+        let scan = diskUsage.beginScan()
         guard
             let urls = try? FileManager.default.contentsOfDirectory(
                 at: directory, includingPropertiesForKeys: Array(keys), options: [.skipsHiddenFiles]
@@ -441,15 +451,21 @@ public actor ThumbnailCache {
         else { return false }
         var entries: [(url: URL, size: Int64, modified: Date)] = []
         var total: Int64 = 0
+        var sizesKnown = true
         for url in urls {
             let vals = try? url.resourceValues(forKeys: keys)
+            if vals?.fileSize == nil { sizesKnown = false }
             let size = Int64(vals?.fileSize ?? 0)
             entries.append((url, size, vals?.contentModificationDate ?? .distantPast))
             total += size
         }
-        guard total > capBytes else { return writerGeneration.isCurrent(generation) }
+        guard total > capBytes else {
+            if sizesKnown { diskUsage.finishScan(total: total, token: scan) } else { diskUsage.invalidate() }
+            return writerGeneration.isCurrent(generation)
+        }
+        let evictionTarget = ThumbnailCacheDiskCapPolicy.evictionTarget(capBytes: capBytes)
         for entry in entries.sorted(by: { $0.modified < $1.modified }) {  // oldest first
-            if total <= capBytes { break }
+            if total <= evictionTarget { break }
             let removed =
                 writerGeneration.performIfCurrent(generation) {
                     do {
@@ -460,9 +476,13 @@ public actor ThumbnailCache {
                         return false
                     }
                 } ?? false
-            guard removed else { return false }
+            guard removed else {
+                diskUsage.invalidate()
+                return false
+            }
             total -= entry.size
         }
+        if sizesKnown { diskUsage.finishScan(total: total, token: scan) } else { diskUsage.invalidate() }
         return writerGeneration.isCurrent(generation)
     }
 
@@ -535,6 +555,7 @@ public actor ThumbnailCache {
                     do {
                         try FileManager.default.removeItem(at: url)
                         removedDiskFiles += 1
+                        diskUsage.invalidate()
                     } catch {
                         failed = true
                     }
@@ -558,6 +579,7 @@ public actor ThumbnailCache {
                         do {
                             try FileManager.default.removeItem(at: url)
                             removedDiskFiles += 1
+                            diskUsage.invalidate()
                         } catch {
                             failed = true
                         }
@@ -588,6 +610,16 @@ public actor ThumbnailCache {
         }
     }
 
+    /// Empties the cache directory and reports whether it is verifiably empty afterwards. A failed removal must
+    /// leave the byte estimate unknown, or a later cap pass would trust zero and skip enforcement.
+    private nonisolated func purgeDirectoryContents() -> Bool {
+        try? FileManager.default.removeItem(at: directory)
+        try? FileManager.default.removeItem(at: coverageCheckpointDir)
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        guard let remaining = try? FileManager.default.contentsOfDirectory(atPath: directory.path) else { return false }
+        return remaining.isEmpty
+    }
+
     /// Erases the on-disk cache (keeps the account key - re-crawl refills). Used by "Delete Offline Cache".
     public func clear() {
         // Advance before removing files. A late non-cooperative loader can still invoke its callback,
@@ -595,9 +627,7 @@ public actor ThumbnailCache {
         writerGeneration.invalidateAndPerform {
             memory.removeAllObjects()
             validated.clearAll()
-            try? FileManager.default.removeItem(at: directory)
-            try? FileManager.default.removeItem(at: coverageCheckpointDir)
-            try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            if purgeDirectoryContents() { diskUsage.reset() } else { diskUsage.invalidate() }
         }
     }
 
@@ -608,9 +638,7 @@ public actor ThumbnailCache {
                 retentionAuthorization.reset()
                 memory.removeAllObjects()
                 validated.clearAll()
-                try? FileManager.default.removeItem(at: directory)
-                try? FileManager.default.removeItem(at: coverageCheckpointDir)
-                try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                if purgeDirectoryContents() { diskUsage.reset() } else { diskUsage.invalidate() }
                 crypto.set(
                     cipher: SecureBlobCipher(
                         key: SymmetricKey(size: .bits256),
@@ -625,11 +653,10 @@ public actor ThumbnailCache {
 
     // MARK: - Stats
 
-    public nonisolated func diskCoverage(for uids: [PhotoUID]) -> (present: Int, total: Int, percent: Double) {
-        let total = uids.count
-        guard total > 0 else { return (0, 0, 1) }
-        let present = uids.reduce(0) { $0 + (has($1) ? 1 : 0) }
-        return (present, total, Double(present) / Double(total))
+    /// The automatic disk-cap pass's cached byte estimate, or `nil` when unknown (forces the next pass to
+    /// enumerate the directory). Test-only visibility into `enforceByteCap`'s enumeration-skip behavior.
+    package nonisolated func diskUsageEstimateForTesting() -> Int64? {
+        diskUsage.get()
     }
 
     public nonisolated func diskFileCount() -> Int {
@@ -810,4 +837,57 @@ private final class ValidatedPresence: @unchecked Sendable {
     }
 
     func clearAll() { lock.withLock { good.removeAll() } }
+}
+
+/// Tracks an estimate of the encrypted cache directory's total on-disk bytes, so the automatic cap pass can
+/// skip enumerating the directory while under budget. Writes that land after a scan's listing are re-added to
+/// the scan result and a removal during a scan discards that result, so the estimate can only over-count; every
+/// removal path that does not recompute the total calls `invalidate()`.
+package final class ThumbnailCacheDiskUsage: @unchecked Sendable {
+    package struct ScanToken {
+        let invalidations: UInt64
+        let addedBytes: Int64
+    }
+
+    private let lock = NSLock()
+    private var knownBytes: Int64?
+    private var invalidations: UInt64 = 0
+    private var cumulativeAddedBytes: Int64 = 0
+
+    package init() {}
+
+    package func get() -> Int64? { lock.withLock { knownBytes } }
+
+    package func add(_ bytes: Int64) {
+        lock.withLock {
+            cumulativeAddedBytes += bytes
+            if let current = knownBytes { knownBytes = current + bytes }
+        }
+    }
+
+    package func invalidate() {
+        lock.withLock {
+            invalidations &+= 1
+            knownBytes = nil
+        }
+    }
+
+    /// The directory was emptied; a scan still in flight must not overwrite the zero.
+    package func reset() {
+        lock.withLock {
+            invalidations &+= 1
+            knownBytes = 0
+        }
+    }
+
+    package func beginScan() -> ScanToken {
+        lock.withLock { ScanToken(invalidations: invalidations, addedBytes: cumulativeAddedBytes) }
+    }
+
+    package func finishScan(total: Int64, token: ScanToken) {
+        lock.withLock {
+            guard invalidations == token.invalidations else { return }
+            knownBytes = total + (cumulativeAddedBytes - token.addedBytes)
+        }
+    }
 }

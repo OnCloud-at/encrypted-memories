@@ -97,12 +97,6 @@ public struct PhotoLibraryCatalogEntry: Sendable, Equatable {
         self.isRemoved = isRemoved
         self.removedAt = removedAt
     }
-
-    /// True when `other` describes the same asset content as this row: identical structure and the
-    /// same metadata revision. Used by the store to classify an observation as unchanged.
-    public func matchesContent(of other: PhotoLibraryCatalogEntry) -> Bool {
-        contentFingerprint == other.contentFingerprint && metadataRevision == other.metadataRevision
-    }
 }
 
 /// What an upsert did to the catalog. Drives whether the adapter emits a backup candidate.

@@ -197,7 +197,7 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
                         SELECT source_kind, source_id, resource, revision_us, original_filename, byte_count,
                                state, attempts, last_error, updated_at, remote_commit_reconciliation
                         FROM backup_sync_queue
-                        WHERE state IN ('discovered', 'queuedForUpload', 'needsRemoteReconciliation')
+                        WHERE state IN (\(Self.runnableStateList))
                         ORDER BY revision_us DESC, updated_at ASC
                         LIMIT ?;
                         """,
@@ -231,7 +231,7 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
                     sqlite3_prepare_v2(
                         db,
                         "SELECT MIN(updated_at) FROM backup_sync_queue "
-                            + "WHERE state IN ('discovered', 'queuedForUpload', 'needsRemoteReconciliation');",
+                            + "WHERE state IN (\(Self.runnableStateList));",
                         -1, &stmt, nil
                     ) == SQLITE_OK)
             else { return nil }
@@ -245,12 +245,28 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
         }
     }
 
+    private static let runnableStates: [String] = ["discovered", "queuedForUpload", "needsRemoteReconciliation"]
+    /// SQL literal of `runnableStates`; every runnable-set query interpolates this one list.
+    private static let runnableStateList = runnableStates.map { "'\($0)'" }.joined(separator: ", ")
+
+    private static let entryColumns = """
+        source_kind, source_id, resource, revision_us, original_filename, byte_count,
+               state, attempts, last_error, updated_at, remote_commit_reconciliation
+        """
+
+    private static func earliestEntrySQL(forState state: String) -> String {
+        "SELECT \(entryColumns) FROM backup_sync_queue WHERE state='\(state)' ORDER BY updated_at ASC LIMIT 1"
+    }
+
     public func earliestRunnableEntry() -> UploadBackupSyncQueueEntry? {
-        earliestEntry(whereClause: "state IN ('discovered', 'queuedForUpload', 'needsRemoteReconciliation')")
+        let perState = Self.runnableStates
+            .map { "SELECT * FROM (\(Self.earliestEntrySQL(forState: $0)))" }
+            .joined(separator: " UNION ALL ")
+        return earliestEntry(sql: "SELECT * FROM (\(perState)) ORDER BY updated_at ASC LIMIT 1;")
     }
 
     public func earliestEntry(in state: UploadBackupSyncQueueState) -> UploadBackupSyncQueueEntry? {
-        earliestEntry(whereClause: "state='\(state.rawValue)'")
+        earliestEntry(sql: Self.earliestEntrySQL(forState: state.rawValue) + ";")
     }
 
     public func containsAny(in states: [UploadBackupSyncQueueState]) -> Bool {
@@ -288,7 +304,7 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
                         SELECT source_kind, source_id, resource, revision_us, original_filename, byte_count,
                                state, attempts, last_error, updated_at, remote_commit_reconciliation
                         FROM backup_sync_queue
-                        WHERE state IN ('discovered', 'queuedForUpload', 'needsRemoteReconciliation')
+                        WHERE state IN (\(Self.runnableStateList))
                           AND updated_at <= ?
                         ORDER BY revision_us DESC, updated_at ASC
                         LIMIT ?;
@@ -341,7 +357,7 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
                         UPDATE backup_sync_queue
                         SET state='checking', updated_at=?
                         WHERE source_kind=? AND source_id=? AND resource=? AND revision_us=?
-                          AND state IN ('discovered', 'queuedForUpload', 'needsRemoteReconciliation');
+                          AND state IN (\(Self.runnableStateList));
                         """,
                         -1, &updateStmt, nil
                     ) == SQLITE_OK)
@@ -1050,15 +1066,9 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
         return UploadSourceIdentity(kind: kind, identifier: id, resource: resource)
     }
 
-    private func earliestEntry(whereClause: String) -> UploadBackupSyncQueueEntry? {
+    private func earliestEntry(sql: String) -> UploadBackupSyncQueueEntry? {
         lock.withLock {
             var stmt: OpaquePointer?
-            let sql = """
-                SELECT source_kind, source_id, resource, revision_us, original_filename, byte_count,
-                       state, attempts, last_error, updated_at, remote_commit_reconciliation
-                FROM backup_sync_queue WHERE \(whereClause)
-                ORDER BY updated_at ASC LIMIT 1;
-                """
             guard requireOperational(sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK) else { return nil }
             defer { sqlite3_finalize(stmt) }
             let result = sqlite3_step(stmt)

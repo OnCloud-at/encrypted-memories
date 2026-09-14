@@ -30,22 +30,9 @@ public enum UploadBackupSyncQueueState: String, Sendable, Codable, CaseIterable 
         self == .alreadyBackedUp || self == .completed || self == .skippedRemoteDeletion
     }
 
-    public var isTerminalFailure: Bool {
-        self == .failed || self == .failedPermanent || self == .dismissedFailure || self == .sourceMissing
-    }
-
     public var isActive: Bool {
         switch self {
         case .checking, .hashing, .duplicateChecking, .uploading, .finalizing:
-            return true
-        default:
-            return false
-        }
-    }
-
-    public var isRunnable: Bool {
-        switch self {
-        case .discovered, .queuedForUpload, .needsRemoteReconciliation:
             return true
         default:
             return false

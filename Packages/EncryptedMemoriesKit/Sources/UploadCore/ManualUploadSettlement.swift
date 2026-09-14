@@ -504,6 +504,3 @@ public final class UploadManualSettlementStore: UploadManualSettlementStoreProto
         return String(cString: pointer)
     }
 }
-
-/// Descriptive alias for composition and diagnostics.
-public typealias UploadManualSettlementSQLiteStore = UploadManualSettlementStore

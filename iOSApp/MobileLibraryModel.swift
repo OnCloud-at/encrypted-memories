@@ -218,8 +218,11 @@ final class MobileLibraryModel {
     /// Bumped by the shared album-sync controller after remote album mutations so Collections can
     /// refresh without reloading the whole timeline.
     private(set) var albumCatalogRevision = 0
-    /// Account-scoped Smart Search lifecycle. MLSearchCore owns lifecycle decisions.
-    private(set) var smartSearch: MLSmartSearchController?
+    /// Account-scoped Smart Search session. MLSearchCore owns lifecycle decisions.
+    @ObservationIgnored private let smartSearchSession = AppleSmartSearchSession(
+        backgroundHost: AppleSmartSearchBackgroundCoordinator.shared
+    )
+    var smartSearch: MLSmartSearchController? { smartSearchSession.controller }
 
     /// Encrypted GPS index shared with the Map tab. The per-account key protects it at rest.
     let locationIndex = PhotoLocationIndex()
@@ -274,13 +277,10 @@ final class MobileLibraryModel {
     private(set) var isRefreshingLibrary = false
     /// Wakes analysis-only presentation after a source inventory becomes readable.
     private(set) var sourceAnalysisRevision: UInt64 = 0
-    @ObservationIgnored private var smartSearchMemoryRegistration: MemoryPressureRegistration?
-    @ObservationIgnored private let smartSearchAssets = MLAssetUniverse()
+    private var smartSearchAssets: MLAssetUniverse { smartSearchSession.assets }
     @ObservationIgnored private var primaryInventoryAuthority: SourceInventoryAuthority = .hydrating
     @ObservationIgnored private var pendingTimelineRemovals = Set<PhotoUID>()
     @ObservationIgnored private var timelineMutationGeneration = 0
-    /// The most recent ordered Smart Search shutdown; teardown awaits it before the sign-out purge.
-    @ObservationIgnored private var smartSearchShutdownTask: Task<Void, Never>?
     @ObservationIgnored private var sourceAnalysisRuntime: LibrarySourceAnalysisRuntime?
     @ObservationIgnored private var sourceAnalysisActivityTask: Task<Void, Never>?
     @ObservationIgnored private var sourceAnalysisShutdownTask: Task<Void, Never>?
@@ -885,41 +885,18 @@ final class MobileLibraryModel {
     /// Builds the account-scoped Smart Search lifecycle. MLSearchCore owns lifecycle decisions.
     private func configureSmartSearch(session: ProtonSession, client: ProtonClientFacade, feed: UIKitThumbnailFeed) {
         guard AppleSmartSearchBootstrap.featureAvailability() == .available else {
-            smartSearch = nil
+            smartSearchSession.stop()
             return
         }
-        #if DEBUG
-            let allowsDeveloperModels = true
-        #else
-            let allowsDeveloperModels = false
-        #endif
-        #if DEBUG
-            let catalogEndpoint = AppleSmartSearchCatalogEndpoint.debugEndpoint(
-                environment: ProcessInfo.processInfo.environment
-            )
-        #else
-            let catalogEndpoint = AppleSmartSearchCatalogEndpoint.production
-        #endif
-        smartSearchAssets.beginHydration()
-        let lifecycle = AppleSmartSearchBootstrap.makeLifecycle(
+        // iOS rebuilds the lifecycle on every library load; the assets universe restarts hydration first.
+        smartSearchSession.assets.beginHydration()
+        smartSearchSession.configure(
             accountDirectory: client.accountDataDirectory,
             accountUID: session.uid,
             keyPassword: session.keyPassword,
             feed: feed.feedCore,
-            assetsProvider: { [smartSearchAssets] in smartSearchAssets.snapshot() },
-            allowsDeveloperModels: allowsDeveloperModels,
-            databasePolicy: client.accountDatabasePolicy,
-            catalogEndpoint: catalogEndpoint
+            databasePolicy: client.accountDatabasePolicy
         )
-        smartSearch = MLSmartSearchController(lifecycle: lifecycle)
-        AppleSmartSearchBackgroundCoordinator.shared.configure(lifecycle: lifecycle)
-        // Under memory pressure the search stack drops cached vector blocks and unloads the
-        // CoreML model; both rebuild on demand.
-        smartSearchMemoryRegistration?.end()
-        smartSearchMemoryRegistration = MemoryPressureGovernor.shared.register { tier in
-            guard tier.requiresImmediatePurge else { return }
-            Task { await lifecycle.releaseMemory() }
-        }
     }
 
     private func configureSourceAnalysis(client: ProtonClientFacade, feed: UIKitThumbnailFeed) {
@@ -961,26 +938,6 @@ final class MobileLibraryModel {
         )
     }
 
-    /// Stops Smart Search and returns a task that completes after all prior shutdowns and the current
-    /// lifecycle shutdown finish.
-    @discardableResult
-    private func stopSmartSearch() -> Task<Void, Never>? {
-        let lifecycle = smartSearch?.lifecycleActor
-        if let lifecycle { AppleSmartSearchBackgroundCoordinator.shared.detach(lifecycle: lifecycle) }
-        smartSearch = nil
-        smartSearchAssets.beginHydration()
-        smartSearchMemoryRegistration?.end()
-        smartSearchMemoryRegistration = nil
-        guard let lifecycle else { return smartSearchShutdownTask }
-        let previous = smartSearchShutdownTask
-        let task = Task {
-            await previous?.value
-            await lifecycle.shutdown()
-        }
-        smartSearchShutdownTask = task
-        return task
-    }
-
     @discardableResult
     private func stopSourceAnalysis() -> Task<Void, Never>? {
         smartSearchAssets.invalidateSourceSession()
@@ -1017,7 +974,7 @@ final class MobileLibraryModel {
         let activeChangeMonitor = libraryChangeMonitor
         let activeLocationCrawl = locationCrawl
         let activeLocationCrawlStarter = locationCrawlStartTask
-        let smartSearchShutdown = stopSmartSearch()
+        let smartSearchShutdown = smartSearchSession.stop()
         let sourceAnalysisShutdown = stopSourceAnalysis()
 
         if advanceLoadToken { loadToken &+= 1 }
@@ -1155,7 +1112,7 @@ final class MobileLibraryModel {
         favoriteMutationsInFlight = []
         timelineRevision &+= 1
         thumbnailFeed = nil
-        let smartSearchShutdown = stopSmartSearch()
+        let smartSearchShutdown = smartSearchSession.stop()
         let sourceAnalysisShutdown = stopSourceAnalysis()
         thumbnailCache = nil
         originalsCache = nil
@@ -1293,7 +1250,7 @@ final class MobileLibraryModel {
             timelineRevision &+= 1
         }
         thumbnailFeed = nil
-        stopSmartSearch()
+        smartSearchSession.stop()
         stopSourceAnalysis()
         loadState = .preparingInventory
 

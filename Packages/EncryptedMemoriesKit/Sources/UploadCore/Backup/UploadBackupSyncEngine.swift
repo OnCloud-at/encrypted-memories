@@ -216,21 +216,6 @@ public actor UploadBackupSyncEngine: UploadBackupCandidateEnqueueing {
         }
     }
 
-    public func markAlreadyBackedUp(_ candidate: UploadBackupAssetCandidate) async throws {
-        try await preflight.markBackedUp(candidate.snapshot)
-        try Task.checkCancellation()
-        guard queue.upsert(entry(for: candidate, state: .alreadyBackedUp)) else {
-            throw UploadError.backend("Backup queue could not persist duplicate completion")
-        }
-    }
-
-    public func markFailed(_ candidate: UploadBackupAssetCandidate, message: String, attempts: Int) {
-        var entry = entry(for: candidate, state: .failed)
-        entry.attempts = max(0, attempts)
-        entry.lastError = message
-        queue.upsert(entry)
-    }
-
     public func summary() -> UploadBackupSyncQueueSummary {
         queue.summary()
     }

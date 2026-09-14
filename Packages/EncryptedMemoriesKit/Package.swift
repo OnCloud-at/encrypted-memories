@@ -301,7 +301,8 @@ let package = Package(
             name: "MLSearchAppleAdapter", dependencies: ["MLSearchCore", "MediaFeedCore", "PhotosCore"],
             resources: [.process("Resources")], swiftSettings: disableDynamicActorIsolation),
         .testTarget(
-            name: "MLSearchAppleAdapterTests", dependencies: ["MLSearchAppleAdapter", "MLSearchCore", "PhotosCore"],
+            name: "MLSearchAppleAdapterTests",
+            dependencies: ["MLSearchAppleAdapter", "MLSearchCore", "PhotosCore", "MediaFeedCore", "MediaByteCache"],
             swiftSettings: disableDynamicActorIsolation),
         .target(
             name: "MLSearchBackgroundAppleAdapter", dependencies: ["MLSearchCore", "PhotosCore"],

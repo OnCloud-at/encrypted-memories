@@ -233,15 +233,6 @@ actor PhotoVideoStreamSource {
         return (filename, link.mimeType, link.size, xattr)
     }
 
-    /// Decrypts a node's name (used for album titles) with its parent node key.
-    func nodeName(linkID: String) async throws -> String? {
-        let link = try await fetchLink(linkID)
-        guard let name = link.name, let parentID = link.parentLinkID, !parentID.isEmpty else { return nil }
-        let parentLink = try await fetchLink(parentID)
-        let parentKey = try await nodeKey(for: parentLink)
-        return try? crypto.decryptName(name, parent: parentKey)
-    }
-
     // MARK: - Key chain
 
     private func nodeKey(for link: LinkBody) async throws -> UnlockableKey {

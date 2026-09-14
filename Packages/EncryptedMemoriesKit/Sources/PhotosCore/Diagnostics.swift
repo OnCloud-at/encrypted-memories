@@ -111,74 +111,6 @@ public struct WarmDecodedResult: Equatable, Sendable {
     }
 }
 
-public struct WarmTextureResult: Equatable, Sendable {
-    public let requested: Int
-    public let alreadyResident: Int
-    public let decodedWarmed: Int
-    public let uploadQueued: Int
-    public let missing: Int
-
-    public init(
-        requested: Int,
-        alreadyResident: Int,
-        decodedWarmed: Int,
-        uploadQueued: Int,
-        missing: Int
-    ) {
-        self.requested = requested
-        self.alreadyResident = alreadyResident
-        self.decodedWarmed = decodedWarmed
-        self.uploadQueued = uploadQueued
-        self.missing = missing
-    }
-}
-
-public struct ThumbnailHealthSnapshot: Equatable, Sendable {
-    public let visibleCellCount: Int
-    public let realThumbnailCount: Int
-    public let lowResThumbnailCount: Int
-    public let sourceFallbackCount: Int
-    public let placeholderCount: Int
-    public let missingDiskCount: Int
-    public let missingNetworkCount: Int
-    public let decodeInFlightCount: Int
-    public let downloadInFlightCount: Int
-    public let diskCacheHitCount: Int
-    public let ramDecodedHitCount: Int
-    public let gpuTextureHitCount: Int
-    public let gpuTextureMissCount: Int
-
-    public init(
-        visibleCellCount: Int = 0,
-        realThumbnailCount: Int = 0,
-        lowResThumbnailCount: Int = 0,
-        sourceFallbackCount: Int = 0,
-        placeholderCount: Int = 0,
-        missingDiskCount: Int = 0,
-        missingNetworkCount: Int = 0,
-        decodeInFlightCount: Int = 0,
-        downloadInFlightCount: Int = 0,
-        diskCacheHitCount: Int = 0,
-        ramDecodedHitCount: Int = 0,
-        gpuTextureHitCount: Int = 0,
-        gpuTextureMissCount: Int = 0
-    ) {
-        self.visibleCellCount = visibleCellCount
-        self.realThumbnailCount = realThumbnailCount
-        self.lowResThumbnailCount = lowResThumbnailCount
-        self.sourceFallbackCount = sourceFallbackCount
-        self.placeholderCount = placeholderCount
-        self.missingDiskCount = missingDiskCount
-        self.missingNetworkCount = missingNetworkCount
-        self.decodeInFlightCount = decodeInFlightCount
-        self.downloadInFlightCount = downloadInFlightCount
-        self.diskCacheHitCount = diskCacheHitCount
-        self.ramDecodedHitCount = ramDecodedHitCount
-        self.gpuTextureHitCount = gpuTextureHitCount
-        self.gpuTextureMissCount = gpuTextureMissCount
-    }
-}
-
 public enum ThumbnailVisualState: String, CaseIterable, Codable, Sendable {
     case realImageDrawn
     case placeholderDrawn
@@ -251,7 +183,6 @@ public struct GridZoomHotPathCounters: Sendable, Equatable {
     public var diskPresenceCheckDuringPinch = 0
     public var decodeDuringPinch = 0
     public var networkRequestDuringPinch = 0
-    public var mainThreadDecodeDuringPinch = 0
 
     public init() {}
 }

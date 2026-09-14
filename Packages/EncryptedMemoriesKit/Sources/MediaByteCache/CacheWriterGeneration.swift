@@ -94,16 +94,6 @@ public final class CacheWriterGeneration: @unchecked Sendable {
         return (token, sessionToken, result)
     }
 
-    /// Runs a synchronous cache write only when the token still belongs to the active generation.
-    /// Returns `false` when a destructive clear or session invalidation superseded the writer.
-    @discardableResult
-    public func writeIfCurrent(_ token: Token, _ write: () -> Void) -> Bool {
-        performIfCurrent(token) {
-            write()
-            return true
-        } ?? false
-    }
-
     /// Runs a short atomic operation in the captured generation. The operation is serialized with the
     /// invalidation boundary, but the generation lock is not held during unrelated maintenance.
     @discardableResult

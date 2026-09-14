@@ -209,10 +209,6 @@ private final class LibraryWindowVisibilityController: NSObject {
         window.makeKeyAndOrderFront(nil)
         return true
     }
-
-    private func hideLibrary() {
-        libraryWindow?.orderOut(nil)
-    }
 }
 
 /// Intercepts only the close decision and forwards every other optional NSWindowDelegate callback to

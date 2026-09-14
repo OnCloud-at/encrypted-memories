@@ -21,7 +21,6 @@ public struct AppleSmartSearchCatalogEndpoint: Sendable, Equatable {
     public var catalogRootURL: URL { artifactBaseURL.deletingLastPathComponent() }
     public var activePairURL: URL { catalogRootURL.appendingPathComponent("active-pair.json") }
     public var catalogV1URL: URL { catalogRootURL.appendingPathComponent("catalog-v1.json") }
-    public var catalogV1SignatureURL: URL { catalogRootURL.appendingPathComponent("catalog-v1.sig") }
     public var catalogV2URL: URL { catalogRootURL.appendingPathComponent("catalog-v2.json") }
     public var catalogV2SignatureURL: URL { catalogRootURL.appendingPathComponent("catalog-v2.sig") }
 

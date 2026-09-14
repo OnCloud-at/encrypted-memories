@@ -427,6 +427,156 @@ struct MediaByteCacheTests {
         #expect(cache.storeToDisk(png(), for: retained, ifCurrent: existingWriter) == .stored)
         #expect(FileManager.default.fileExists(atPath: checkpoint.path))
     }
+
+    @Test func secondCapPassUnderBudgetSkipsDirectoryEnumeration() async throws {
+        let cache = ThumbnailCache(
+            namespace: uniqueNamespace(),
+            configuration: ThumbnailCacheConfiguration(diskByteBudgetBytes: 1_000_000),
+            rootDirectory: uniqueRoot()
+        )
+        cache.configure(accountUID: "acct-A", key: byteCacheTestKey)
+        let a = uid("skip-scan-a")
+        let b = uid("skip-scan-b")
+        let generation = cache.captureWriterGeneration()
+
+        #expect(cache.storeToDisk(png(), for: a, ifCurrent: generation) == .stored)
+        #expect(cache.enforceByteCap(1_000_000, ifCurrent: generation))
+        #expect(cache.diskUsageEstimateForTesting() == cache.diskSizeBytes())
+        let afterFirstPass = cache.diskUsageEstimateForTesting()
+
+        #expect(cache.enforceByteCap(1_000_000, ifCurrent: generation))
+        #expect(cache.diskUsageEstimateForTesting() == afterFirstPass)
+        #expect(cache.diskData(for: a) != nil)
+
+        let beforeSecondStore = try #require(cache.diskUsageEstimateForTesting())
+        #expect(cache.storeToDisk(png(), for: b, ifCurrent: generation) == .stored)
+        let afterSecondStore = try #require(cache.diskUsageEstimateForTesting())
+        #expect(afterSecondStore - beforeSecondStore > 0)
+        #expect(cache.diskData(for: b) != nil)
+
+        await cache.clear()
+        #expect(cache.diskUsageEstimateForTesting() == 0)
+    }
+
+    @Test func explicitCapPassAfterFurtherStoresStillEvicts() throws {
+        // Originals have no automatic budget and rely on explicit passes. Stored bytes must still count, or a
+        // pass after further writes would trust a stale under-budget estimate and leave the cache over its cap.
+        let cache = ThumbnailCache(namespace: uniqueNamespace(), derivative: "original", rootDirectory: uniqueRoot())
+        cache.configure(accountUID: "acct-A", key: byteCacheTestKey)
+        let first = uid("explicit-cap-a")
+        let second = uid("explicit-cap-b")
+
+        cache.storeToDisk(Data(repeating: 0x11, count: 300), for: first)
+        #expect(cache.enforceByteCap(1_000_000, ifCurrent: cache.captureWriterGeneration()))
+        let firstSize = try #require(cache.diskUsageEstimateForTesting())
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date(timeIntervalSince1970: 1)], ofItemAtPath: cache.diskURL(for: first).path)
+
+        cache.storeToDisk(Data(repeating: 0x22, count: 300), for: second)
+        #expect(try #require(cache.diskUsageEstimateForTesting()) > firstSize)
+        #expect(cache.enforceByteCap(firstSize + 1, ifCurrent: cache.captureWriterGeneration()))
+
+        #expect(cache.diskData(for: first) == nil)
+        #expect(cache.diskData(for: second) != nil)
+        #expect(cache.diskUsageEstimateForTesting() == cache.diskSizeBytes())
+    }
+
+    @Test func failedClearLeavesEstimateUnknownAndNextCapPassEvicts() async throws {
+        let cache = ThumbnailCache(namespace: uniqueNamespace(), derivative: "original", rootDirectory: uniqueRoot())
+        cache.configure(accountUID: "acct-A", key: byteCacheTestKey)
+        let first = uid("failed-clear-a")
+
+        cache.storeToDisk(Data(repeating: 0x11, count: 300), for: first)
+
+        let directory = cache.diskURL(for: first).deletingLastPathComponent()
+        try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: directory.path)
+        defer {
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o700], ofItemAtPath: directory.path)
+        }
+
+        await cache.clear()
+
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
+
+        #expect(cache.diskData(for: first) != nil)
+        #expect(cache.diskUsageEstimateForTesting() == nil)
+        #expect(cache.enforceByteCap(0, ifCurrent: cache.captureWriterGeneration()))
+        #expect(cache.diskSizeBytes() == 0)
+    }
+
+    @Test func failedSignOutClearLeavesEstimateUnknown() throws {
+        let cache = ThumbnailCache(namespace: uniqueNamespace(), derivative: "original", rootDirectory: uniqueRoot())
+        cache.configure(accountUID: "acct-A", key: byteCacheTestKey)
+        let first = uid("failed-signout-clear-a")
+
+        cache.storeToDisk(Data(repeating: 0x11, count: 300), for: first)
+
+        let directory = cache.diskURL(for: first).deletingLastPathComponent()
+        try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: directory.path)
+        defer {
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o700], ofItemAtPath: directory.path)
+        }
+
+        cache.clearForSignOut()
+
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
+
+        #expect(cache.diskUsageEstimateForTesting() == nil)
+        #expect(cache.diskSizeBytes() > 0)
+
+        #expect(cache.enforceByteCap(0, ifCurrent: cache.captureWriterGeneration()))
+        #expect(cache.diskSizeBytes() == 0)
+    }
+}
+
+@Suite("ThumbnailCacheDiskUsage")
+struct ThumbnailCacheDiskUsageTests {
+    @Test func writesAfterTheListingAreReAddedToTheScanResult() {
+        let usage = ThumbnailCacheDiskUsage()
+        let scan = usage.beginScan()
+        usage.add(5)
+        usage.finishScan(total: 100, token: scan)
+        #expect(usage.get() == 105)
+    }
+
+    @Test func removalDuringScanDiscardsTheScanResult() {
+        let usage = ThumbnailCacheDiskUsage()
+        let scan = usage.beginScan()
+        usage.invalidate()
+        usage.finishScan(total: 100, token: scan)
+        #expect(usage.get() == nil)
+    }
+
+    @Test func clearDuringScanKeepsZero() {
+        let usage = ThumbnailCacheDiskUsage()
+        let scan = usage.beginScan()
+        usage.reset()
+        usage.finishScan(total: 100, token: scan)
+        #expect(usage.get() == 0)
+    }
+}
+
+@Suite("ThumbnailCacheDiskCapPolicy")
+struct ThumbnailCacheDiskCapPolicyTests {
+    @Test func evictionTargetKeepsExactCapBelowHysteresisFloor() {
+        #expect(ThumbnailCacheDiskCapPolicy.evictionTarget(capBytes: 0) == 0)
+        #expect(ThumbnailCacheDiskCapPolicy.evictionTarget(capBytes: 4096) == 4096)
+        #expect(ThumbnailCacheDiskCapPolicy.evictionTarget(capBytes: 63 * 1024 * 1024) == 63 * 1024 * 1024)
+    }
+
+    @Test func evictionTargetAppliesHysteresisAboveFloor() {
+        let twoGiB: Int64 = 2 * 1024 * 1024 * 1024
+        let fiveHundredTwelveMiB: Int64 = 512 * 1024 * 1024
+        let sixtyFourMiB: Int64 = 64 * 1024 * 1024
+        let thirtyTwoMiB: Int64 = 32 * 1024 * 1024
+
+        #expect(ThumbnailCacheDiskCapPolicy.evictionTarget(capBytes: twoGiB) == twoGiB - sixtyFourMiB)
+        #expect(
+            ThumbnailCacheDiskCapPolicy.evictionTarget(capBytes: fiveHundredTwelveMiB)
+                == fiveHundredTwelveMiB - thirtyTwoMiB)
+    }
 }
 
 @Suite("MediaByteCache platform purity")
