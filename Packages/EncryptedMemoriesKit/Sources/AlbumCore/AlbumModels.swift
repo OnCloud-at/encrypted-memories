@@ -160,19 +160,6 @@ public struct AlbumCapabilities: Sendable, Equatable {
         canSetCover: false
     )
 
-    /// SDK 0.22 catalog without the app's direct-HTTP write adapter.
-    public static let sdkReadOnlyCatalog = AlbumCapabilities(
-        canList: true,
-        canCreate: false,
-        canDelete: false,
-        canAddPhotos: false,
-        canRemovePhotos: false,
-        canSetCover: false,
-        canListSharedWithMe: true,
-        canLeaveSharedAlbum: true,
-        canReadMemberships: true
-    )
-
     /// SDK reads plus the narrow direct-HTTP write surface that SDK 0.25.0 cannot replace.
     public static let sdkCatalogWithHTTPWrites = AlbumCapabilities(
         canList: true,

@@ -51,12 +51,12 @@ final class AppModel {
     private(set) var albumCatalogRevision = 0
     /// Wakes analysis-only presentation after a source inventory becomes readable.
     private(set) var sourceAnalysisRevision: UInt64 = 0
-    /// Account-scoped Smart Search controller. Lifecycle decisions stay in MLSearchCore.
-    private(set) var smartSearch: MLSmartSearchController?
-    @ObservationIgnored private var smartSearchMemoryRegistration: MemoryPressureRegistration?
-    @ObservationIgnored private let smartSearchAssets = MLAssetUniverse()
-    /// The most recent ordered Smart Search shutdown; sign-out awaits it before purging.
-    @ObservationIgnored private var smartSearchShutdownTask: Task<Void, Never>?
+    /// Account-scoped Smart Search session. Lifecycle decisions stay in MLSearchCore.
+    @ObservationIgnored private let smartSearchSession = AppleSmartSearchSession(
+        backgroundHost: AppleSmartSearchBackgroundCoordinator.shared
+    )
+    var smartSearch: MLSmartSearchController? { smartSearchSession.controller }
+    private var smartSearchAssets: MLAssetUniverse { smartSearchSession.assets }
     @ObservationIgnored private var sourceAnalysisRuntime: LibrarySourceAnalysisRuntime?
     @ObservationIgnored private var sourceAnalysisStartupTask: Task<Void, Never>?
     @ObservationIgnored private var sourceAnalysisShutdownTask: Task<Void, Never>?
@@ -224,7 +224,7 @@ final class AppModel {
         backendTask?.cancel()
         backendTask = nil
         backend = .idle
-        let smartSearchShutdown = stopSmartSearch()
+        let smartSearchShutdown = smartSearchSession.stop()
         let sourceAnalysisShutdown = stopSourceAnalysis()
         backupController = nil
         photoBackupScheduler.invalidate()
@@ -322,7 +322,7 @@ final class AppModel {
         let folderBackup = backupController
         let photoBackup = photoBackupController
         let albumSync = albumSyncController
-        let smartSearchShutdown = stopSmartSearch()
+        let smartSearchShutdown = smartSearchSession.stop()
         let sourceAnalysisShutdown = stopSourceAnalysis()
         let policy = ProtonDriveBackendPolicy.standard(
             libraryDatabasePolicy: ProtonDriveBackendPolicy.desktopLibraryDatabasePolicy
@@ -399,26 +399,6 @@ final class AppModel {
         await task.value
     }
 
-    /// Stop Smart Search and return the ordered-shutdown task. Consecutive stops chain, so a
-    /// later awaiter always sees every previous lifecycle fully torn down.
-    @discardableResult
-    private func stopSmartSearch() -> Task<Void, Never>? {
-        let lifecycle = smartSearch?.lifecycleActor
-        if let lifecycle { AppleSmartSearchBackgroundCoordinator.shared.detach(lifecycle: lifecycle) }
-        smartSearch = nil
-        smartSearchAssets.beginHydration()
-        smartSearchMemoryRegistration?.end()
-        smartSearchMemoryRegistration = nil
-        guard let lifecycle else { return smartSearchShutdownTask }
-        let previous = smartSearchShutdownTask
-        let task = Task {
-            await previous?.value
-            await lifecycle.shutdown()
-        }
-        smartSearchShutdownTask = task
-        return task
-    }
-
     @discardableResult
     private func stopSourceAnalysis() -> Task<Void, Never>? {
         smartSearchAssets.invalidateSourceSession()
@@ -486,40 +466,15 @@ final class AppModel {
             }
         }
 
-        guard AppleSmartSearchBootstrap.featureAvailability() == .available,
-            smartSearch == nil
-        else { return }
-        #if DEBUG
-            let allowsDeveloperModels = true
-        #else
-            let allowsDeveloperModels = false
-        #endif
-        #if DEBUG
-            let catalogEndpoint = AppleSmartSearchCatalogEndpoint.debugEndpoint(
-                environment: ProcessInfo.processInfo.environment
-            )
-        #else
-            let catalogEndpoint = AppleSmartSearchCatalogEndpoint.production
-        #endif
-        let lifecycle = AppleSmartSearchBootstrap.makeLifecycle(
+        // macOS configures once per MainView life; the session keeps the first lifecycle.
+        guard smartSearchSession.controller == nil else { return }
+        smartSearchSession.configure(
             accountDirectory: facade.accountDataDirectory,
             accountUID: session.uid,
             keyPassword: session.keyPassword,
             feed: feedCore,
-            assetsProvider: { [smartSearchAssets] in smartSearchAssets.snapshot() },
-            allowsDeveloperModels: allowsDeveloperModels,
-            databasePolicy: facade.accountDatabasePolicy,
-            catalogEndpoint: catalogEndpoint
+            databasePolicy: facade.accountDatabasePolicy
         )
-        smartSearch = MLSmartSearchController(lifecycle: lifecycle)
-        AppleSmartSearchBackgroundCoordinator.shared.configure(lifecycle: lifecycle)
-        // Under memory pressure the search stack drops cached vector blocks and unloads the
-        // CoreML model; both rebuild on demand.
-        smartSearchMemoryRegistration?.end()
-        smartSearchMemoryRegistration = MemoryPressureGovernor.shared.register { tier in
-            guard tier.requiresImmediatePurge else { return }
-            Task { await lifecycle.releaseMemory() }
-        }
     }
 
     func updateSmartSearchAssets(
@@ -557,7 +512,7 @@ final class AppModel {
         LibraryRuntimeState.shared.beginNewGeneration()
         backendTask?.cancel()
         libraryReady = false
-        stopSmartSearch()
+        smartSearchSession.stop()
         stopSourceAnalysis()
         // Install the per-account encrypted-cache key derived from the restored session before the grid
         // renders or the crawl begins.

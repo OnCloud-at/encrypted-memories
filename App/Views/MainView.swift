@@ -122,6 +122,7 @@ struct MainView: View {
     @State private var dragOutFailureMessage: String?
     // Favorites (read from server so iOS favorites show up; toggle writes back).
     @State private var favorites: Set<PhotoUID> = []
+    @State private var favoriteMutationsInFlight: Set<PhotoUID> = []
     @State private var uploadRefreshTask: Task<Void, Never>?
     @State private var uploadRefreshGeneration: UInt64 = 0
     @State private var backupUploadRefreshCoordinator = TimelineUploadRefreshCoordinator()
@@ -385,7 +386,7 @@ struct MainView: View {
                 PhotoViewerView(
                     model: viewerModel,
                     isFavorite: { favorites.contains($0) },
-                    onToggleFavorite: toggleFavorite,
+                    onToggleFavorite: { mutateFavorites([$0]) },
                     onClose: { closePhoto() },
                     onPinchDismissBegan: beginInteractiveDismiss,
                     onPinchDismissChanged: updateInteractiveDismiss,
@@ -1500,14 +1501,18 @@ struct MainView: View {
 
     // MARK: - Favorites / trash
 
-    private func toggleFavorite(_ uid: PhotoUID) {
-        let selection = Set([uid])
+    /// Applies an optimistic favorite mutation for `selection`, rejecting a call that overlaps any
+    /// mutation already in flight so a stale rollback cannot clobber a newer optimistic state.
+    private func mutateFavorites(_ selection: Set<PhotoUID>) {
+        guard favoriteMutationsInFlight.isDisjoint(with: selection) else { return }
         guard let target = FavoriteMutationPolicy.target(for: selection, current: favorites) else { return }
         let requested = FavoriteMutationPolicy.requestedUIDs(
             selection: selection,
             current: favorites,
             target: target
         )
+        guard !requested.isEmpty else { return }
+        favoriteMutationsInFlight.formUnion(requested)
         favorites = FavoriteMutationPolicy.optimisticState(
             current: favorites,
             requested: requested,
@@ -1521,37 +1526,13 @@ struct MainView: View {
             } catch {
                 rollbackFavoriteMutation(requested, target: target)
             }
+            favoriteMutationsInFlight.subtract(requested)
         }
     }
 
     /// Indicates whether every selected photo is a favorite.
     private var selectedAllFavorited: Bool {
         !selectedUIDs.isEmpty && selectedUIDs.allSatisfy { favorites.contains($0) }
-    }
-
-    /// Toggles the favorite state for the selection and rolls back only failed items.
-    private func favoriteSelected() {
-        guard let target = FavoriteMutationPolicy.target(for: selectedUIDs, current: favorites) else { return }
-        let uids = FavoriteMutationPolicy.requestedUIDs(
-            selection: selectedUIDs,
-            current: favorites,
-            target: target
-        )
-        guard !uids.isEmpty else { return }
-        favorites = FavoriteMutationPolicy.optimisticState(
-            current: favorites,
-            requested: uids,
-            target: target
-        )
-        Task {
-            do {
-                try await backend.setFavorites(Array(uids), target)
-            } catch let partial as FavoriteMutationError {
-                rollbackFavoriteMutation(partial.failed, target: target)
-            } catch {
-                rollbackFavoriteMutation(Set(uids), target: target)
-            }
-        }
     }
 
     private func rollbackFavoriteMutation(_ failed: Set<PhotoUID>, target: Bool) {
@@ -1889,7 +1870,7 @@ struct MainView: View {
                 }
 
                 Button {
-                    toggleFavorite(viewerModel.current.uid)
+                    mutateFavorites([viewerModel.current.uid])
                 } label: {
                     Label(
                         favorites.contains(viewerModel.current.uid) ? "toolbar.remove_favorite" : "toolbar.favorite",
@@ -2000,7 +1981,7 @@ struct MainView: View {
                 .help("toolbar.move_to_trash")
                 .accessibilityLabel("toolbar.move_selected_to_trash")
                 Button {
-                    favoriteSelected()
+                    mutateFavorites(selectedUIDs)
                 } label: {
                     Label(
                         selectedAllFavorited ? "toolbar.remove_favorite" : "toolbar.favorite_selected",

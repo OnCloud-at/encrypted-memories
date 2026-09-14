@@ -109,7 +109,6 @@ public final class PhotoViewerModel {
     public var burstItems: [PhotoItem] { burstSelection.items }
     public var burstIndex: Int? { burstSelection.selectedIndex }
     public var isLoadingBurst: Bool { burstSelection.isLoading }
-    public var burstLoadFailed: Bool { burstSelection.loadFailed }
 
     public init(
         items: [PhotoItem], index: Int, feed: ThumbnailFeed, media: FullMediaProvider,

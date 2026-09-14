@@ -82,11 +82,6 @@ public final class VideoByteRangeCache: @unchecked Sendable {
         writerGeneration.capture()
     }
 
-    /// Compatibility read for diagnostics and callers that do not need to persist a miss.
-    func encryptedBlock(uid: PhotoUID, block: Int) -> Data? {
-        lookup(uid: uid, block: block).encrypted
-    }
-
     /// Persists a block's encrypted bytes for the exact lookup ticket, then enforces the budget. A missing,
     /// failed, or cancelled request carries no cache-side reservation and therefore cannot leak state.
     @discardableResult

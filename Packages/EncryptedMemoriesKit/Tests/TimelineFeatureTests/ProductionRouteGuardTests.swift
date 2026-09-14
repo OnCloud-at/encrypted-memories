@@ -548,7 +548,7 @@ struct ProductionRouteGuardTests {
         let macRecovery = try Self.body(
             of: macModel,
             from: "func recoverBackendAfterScopeAccessLoss() async {",
-            to: "    /// Stop Smart Search")
+            to: "    @discardableResult\n    private func stopSourceAnalysis()")
         #expect(macRecovery.contains("AccountTeardownCoordinator"))
         #expect(macRecovery.contains("purgeCachesForAccountTeardown"))
         #expect(macRecovery.contains("ProtonDriveBackendFactory.purgeLocalAccountData"))

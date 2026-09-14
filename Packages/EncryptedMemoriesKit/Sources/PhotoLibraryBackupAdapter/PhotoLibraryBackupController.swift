@@ -418,17 +418,6 @@ public final class PhotoLibraryBackupController {
         refreshFromQueue()
     }
 
-    /// Real work projection for OS execution windows. The app's backup row continues to use
-    /// `status`; catalog discovery is included here only so a long PhotoKit scan cannot look stalled
-    /// to the operating system before queue reconciliation has a denominator.
-    public var backgroundExecutionProgress: BackupExecutionProgress? {
-        PhotoLibraryBackupExecutionProgress.combined(
-            catalog: lastCatalogProgress?.executionProgress,
-            queue: status.executionProgress,
-            isScanning: isScanning
-        )
-    }
-
     /// Runs one catch-up pass for an OS background window.
     /// `onRunStarted` receives the run ID for expiration-safe cancellation.
     /// Checkpointed state lets the next pass resume unfinished work.

@@ -1,4 +1,5 @@
 import MediaCacheUIKitAdapter
+import PhotoViewerCore
 import PhotosCore
 import SwiftUI
 import UIKit
@@ -110,20 +111,24 @@ struct MobileViewerFilmstrip: UIViewRepresentable {
             feed: UIKitThumbnailFeed?,
             onSelect: @escaping (PhotoUID) -> Void
         ) {
-            let itemsChanged = items != self.items
             let oldSelectedUID = self.selectedUID
-            let selectedChanged = selectedUID != oldSelectedUID
             let feedChanged = !sameFeed(feed, self.feed)
+            let update = BurstFilmstripUpdatePolicy.resolve(
+                previousItems: self.items.map(\.uid),
+                currentItems: items.map(\.uid),
+                previousSelectedUID: oldSelectedUID,
+                currentSelectedUID: selectedUID
+            )
 
             self.items = items
             self.selectedUID = selectedUID
             self.feed = feed
             self.onSelect = onSelect
 
-            if itemsChanged || feedChanged {
+            if update.reloadData || feedChanged {
                 collectionView.reloadData()
                 scheduleCentering(in: collectionView, animated: false)
-            } else if selectedChanged {
+            } else if update.selectCurrent {
                 reloadSelectionCells(in: collectionView, oldUID: oldSelectedUID, newUID: selectedUID)
                 scheduleCentering(in: collectionView, animated: true)
             }

@@ -48,6 +48,11 @@ final class OfflineLibraryManager {
     private var locationConfigurationGeneration: UInt64 = 0
     private var locationCrawlStartTask: Task<Void, Never>?
     private var locationConfigurationTask: Task<Void, Never>?
+    private var originalsCapEnforcementTask: Task<Void, Never>?
+    /// Admission for account-bound cap passes. Teardown closes it before its first suspension, so a Settings
+    /// change during sign-out cannot start a pass that outlives the purge; the persisted cap applies at the
+    /// next `configure(session:)`.
+    private var originalsCapGate = JoinedShutdownGate()
     private var configuredAccountUID: String?
     private var latestLocationInventoryTask: Task<LocationCrawlInventory, Never>?
 
@@ -206,15 +211,31 @@ final class OfflineLibraryManager {
             self.locationIndex.replaceAll(snapshot)
             self.locationConfigurationTask = nil
         }
+        if originalsCapGate.isClosed { originalsCapGate = JoinedShutdownGate() }
         if let cap = originalsCapBytes {
-            let oc = originalsCache
-            Task.detached { oc.enforceByteCap(cap) }
+            enforceOriginalsCap(cap)
         }
+    }
+
+    /// Chains cap passes so a later cap replaces, rather than races, an earlier one. Each pass is admitted
+    /// through `originalsCapGate`; a pass that reaches the gate after teardown closed it does nothing.
+    @discardableResult
+    private func enforceOriginalsCap(_ cap: Int64) -> Task<Void, Never> {
+        let oc = originalsCache
+        let gate = originalsCapGate
+        let previous = originalsCapEnforcementTask
+        let task = Task.detached(priority: .utility) {
+            await previous?.value
+            try? await gate.withAdmission { oc.enforceByteCap(cap) }
+        }
+        originalsCapEnforcementTask = task
+        return task
     }
 
     /// Stops account-bound location and activity work before any facade or cache owner is closed.
     /// Kept separate from cache deletion so the shared account teardown stages stay explicit.
     func stopForAccountTeardown() async {
+        originalsCapGate.closeAdmission()
         let retiringStatsSession = statsTeardownSession
         let activeLocationCrawlStarter = locationCrawlStartTask
         let activeLocationConfiguration = locationConfigurationTask
@@ -238,6 +259,9 @@ final class OfflineLibraryManager {
         await activeLocationConfiguration?.value
         await activeLocationCrawlStarter?.value
         await activeThumbnailUpdateTask?.value
+        // Joins every admitted cap pass; a pass admitted after `closeAdmission()` never runs.
+        await originalsCapGate.closeAdmissionAndJoin()
+        originalsCapEnforcementTask = nil
         if let retiringStatsSession {
             await statsCoordinator.stopAndJoin(retiringStatsSession)
             if statsTeardownSession == retiringStatsSession { statsTeardownSession = nil }
@@ -388,9 +412,9 @@ final class OfflineLibraryManager {
         d.set(unlimited, forKey: AppSettingsKey.offlineOriginalsCapUnlimited)
         d.set(gigabytes, forKey: AppSettingsKey.offlineOriginalsCapGB)
         guard let cap = originalsCapBytes else { return }  // An unbounded cache needs no cap enforcement.
-        let oc = originalsCache
+        let task = enforceOriginalsCap(cap)
         Task {
-            await Task.detached { oc.enforceByteCap(cap) }.value  // file I/O off the main actor
+            await task.value  // file I/O off the main actor
             markStatusDirty()
             await refreshStatus()
         }

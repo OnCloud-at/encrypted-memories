@@ -17,7 +17,7 @@ public final class JoinedShutdownGate: @unchecked Sendable {
     }
 
     private let lock = NSLock()
-    private var isClosed = false
+    private var admissionClosed = false
     private var admitted: [UUID: OperationHandle] = [:]
     private var joinTask: Task<Void, Never>?
     private var shutdownTask: Task<Void, Never>?
@@ -27,9 +27,12 @@ public final class JoinedShutdownGate: @unchecked Sendable {
     /// Closes admission without an await. Repeated calls are harmless.
     public func closeAdmission() {
         lock.lock()
-        isClosed = true
+        admissionClosed = true
         lock.unlock()
     }
+
+    /// True once admission has closed; a new session must create a new gate.
+    public var isClosed: Bool { lock.withLock { admissionClosed } }
 
     /// Admits one operation and joins it before returning its result.
     ///
@@ -40,7 +43,7 @@ public final class JoinedShutdownGate: @unchecked Sendable {
     ) async throws -> T {
         let id = UUID()
         let task: Task<T, any Error> = try lock.withLock {
-            guard !isClosed else { throw CancellationError() }
+            guard !admissionClosed else { throw CancellationError() }
             let task = Task { try await operation() }
             admitted[id] = OperationHandle(
                 cancel: { task.cancel() },

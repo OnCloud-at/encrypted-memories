@@ -40,12 +40,3 @@ public struct CoreMLComputePolicy: Sendable, Equatable {
         return config
     }
 }
-
-#if DEBUG
-    /// Debug-only factory for testing alternate compute-unit selections.
-    internal extension CoreMLComputePolicy {
-        static func debugOnlyTestingFactory(computeUnits: MLComputeUnits) -> CoreMLComputePolicy {
-            .init(computeUnits: computeUnits)
-        }
-    }
-#endif
