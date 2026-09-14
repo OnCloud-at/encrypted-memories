@@ -25,38 +25,7 @@ struct SettingsView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            TabView {
-                if isAccountAvailable {
-                    AccountSettingsTab(signOut: {
-                        dismissWindow()
-                        signOut()
-                    })
-                    .tabItem { Label("settings.account_tab", systemImage: "person.crop.circle") }
-                }
-                SupportSettingsTab()
-                    .tabItem { Label(L10n.string("settings.support_tab"), systemImage: "heart") }
-                if isAccountAvailable {
-                    LibrarySettingsTab()
-                        .tabItem { Label("settings.library_tab", systemImage: "photo.on.rectangle.angled") }
-                    if let smartSearch {
-                        SmartSearchSettingsTab(controller: smartSearch)
-                            .tabItem {
-                                Label(MLSmartSearchPresentation.productName, systemImage: "sparkle.magnifyingglass")
-                            }
-                    }
-                    if let backup {
-                        BackupSettingsTab(
-                            backup: backup, photoBackup: photoBackup, albumSync: albumSync,
-                            uploadCoordinator: uploadCoordinator
-                        )
-                        .tabItem { Label("settings.backup_tab", systemImage: "arrow.triangle.2.circlepath.icloud") }
-                    }
-                    CacheStatusTab()
-                        .tabItem { Label("settings.diagnostics_tab", systemImage: "internaldrive") }
-                }
-            }
-            // Native grouped tabs survive account changes without retaining stale Settings toolbar items.
-            .tabViewStyle(.grouped)
+            MacSettingsTabs(tabs: tabs)
             Divider()
             AppBuildInfoLabel()
                 .frame(maxWidth: .infinity)
@@ -72,6 +41,57 @@ struct SettingsView: View {
                 await refreshAccountInfo()
             }
         }
+    }
+
+    private var tabs: [MacSettingsTabs.Tab] {
+        var tabs: [MacSettingsTabs.Tab] = []
+        if isAccountAvailable {
+            tabs.append(
+                .init(id: .account, title: L10n.string("settings.account_tab"), systemImage: "person.crop.circle") {
+                    AccountSettingsTab(signOut: {
+                        dismissWindow()
+                        signOut()
+                    })
+                })
+        }
+        tabs.append(
+            .init(id: .support, title: L10n.string("settings.support_tab"), systemImage: "heart") {
+                SupportSettingsTab()
+            })
+        if isAccountAvailable {
+            tabs.append(
+                .init(
+                    id: .library, title: L10n.string("settings.library_tab"), systemImage: "photo.on.rectangle.angled"
+                ) {
+                    LibrarySettingsTab()
+                })
+            if let smartSearch {
+                tabs.append(
+                    .init(
+                        id: .smartSearch, title: MLSmartSearchPresentation.productName,
+                        systemImage: "sparkle.magnifyingglass"
+                    ) {
+                        SmartSearchSettingsTab(controller: smartSearch)
+                    })
+            }
+            if let backup {
+                tabs.append(
+                    .init(
+                        id: .backup, title: L10n.string("settings.backup_tab"),
+                        systemImage: "arrow.triangle.2.circlepath.icloud"
+                    ) {
+                        BackupSettingsTab(
+                            backup: backup, photoBackup: photoBackup, albumSync: albumSync,
+                            uploadCoordinator: uploadCoordinator
+                        )
+                    })
+            }
+            tabs.append(
+                .init(id: .diagnostics, title: L10n.string("settings.diagnostics_tab"), systemImage: "internaldrive") {
+                    CacheStatusTab()
+                })
+        }
+        return tabs
     }
 }
 
