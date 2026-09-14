@@ -47,7 +47,8 @@ struct SettingsView: View {
         var tabs: [MacSettingsTabs.Tab] = []
         if isAccountAvailable {
             tabs.append(
-                .init(id: .account, title: L10n.string("settings.account_tab"), systemImage: "person.crop.circle") {
+                .init(id: .account, title: String(localized: "settings.account_tab"), systemImage: "person.crop.circle")
+                {
                     AccountSettingsTab(signOut: {
                         dismissWindow()
                         signOut()
@@ -61,7 +62,8 @@ struct SettingsView: View {
         if isAccountAvailable {
             tabs.append(
                 .init(
-                    id: .library, title: L10n.string("settings.library_tab"), systemImage: "photo.on.rectangle.angled"
+                    id: .library, title: String(localized: "settings.library_tab"),
+                    systemImage: "photo.on.rectangle.angled"
                 ) {
                     LibrarySettingsTab()
                 })
@@ -77,7 +79,7 @@ struct SettingsView: View {
             if let backup {
                 tabs.append(
                     .init(
-                        id: .backup, title: L10n.string("settings.backup_tab"),
+                        id: .backup, title: String(localized: "settings.backup_tab"),
                         systemImage: "arrow.triangle.2.circlepath.icloud"
                     ) {
                         BackupSettingsTab(
@@ -87,7 +89,9 @@ struct SettingsView: View {
                     })
             }
             tabs.append(
-                .init(id: .diagnostics, title: L10n.string("settings.diagnostics_tab"), systemImage: "internaldrive") {
+                .init(
+                    id: .diagnostics, title: String(localized: "settings.diagnostics_tab"), systemImage: "internaldrive"
+                ) {
                     CacheStatusTab()
                 })
         }
