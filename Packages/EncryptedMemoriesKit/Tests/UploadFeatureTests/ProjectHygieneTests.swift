@@ -96,7 +96,8 @@ final class ProjectHygieneTests: XCTestCase {
 
         XCTAssertLessThan(accountTab.lowerBound, supportTab.lowerBound)
         XCTAssertLessThan(supportTab.lowerBound, libraryTab.lowerBound)
-        XCTAssertTrue(source.contains("Label(L10n.string(\"settings.support_tab\"), systemImage: \"heart\")"))
+        XCTAssertTrue(
+            source.contains("id: .support, title: L10n.string(\"settings.support_tab\"), systemImage: \"heart\""))
         XCTAssertTrue(source.contains("@Environment(\\.dismissWindow)"))
         let dismissCall = try XCTUnwrap(source.range(of: "dismissWindow()"))
         let signOutCall = try XCTUnwrap(source.range(of: "signOut()"))
