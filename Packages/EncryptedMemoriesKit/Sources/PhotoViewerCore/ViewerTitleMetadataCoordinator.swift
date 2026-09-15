@@ -4,10 +4,17 @@ import PhotosCore
 public struct ViewerTitleMetadataResolution: Equatable, Sendable {
     public let metadata: PhotoMetadata?
     public let placeName: String?
+    public let metadataLoadFailed: Bool
 
-    public init(metadata: PhotoMetadata?, placeName: String?) {
+    public init(metadata: PhotoMetadata?, placeName: String?, metadataLoadFailed: Bool = false) {
         self.metadata = metadata
         self.placeName = placeName
+        self.metadataLoadFailed = metadataLoadFailed
+    }
+
+    public var metadataLoadState: PhotoMetadataLoadState {
+        if let metadata { return .loaded(metadata) }
+        return metadataLoadFailed ? .failed : .unavailable
     }
 }
 
@@ -112,7 +119,7 @@ public final class ViewerTitleMetadataCoordinator {
             do {
                 metadata = try await metadataProvider.metadata(for: item.uid)
             } catch {
-                return .init(metadata: nil, placeName: nil)
+                return .init(metadata: nil, placeName: nil, metadataLoadFailed: !Task.isCancelled)
             }
             guard !Task.isCancelled else { return .init(metadata: nil, placeName: nil) }
             guard !Task.isCancelled,

@@ -15,6 +15,7 @@ final class FakeAlbumBackend: AlbumCatalogBackend, AlbumWriteBackend, @unchecked
     private(set) var leftSharedAlbums: [AlbumNodeIdentifier] = []
     private(set) var membershipRequests: [[PhotoUID]] = []
     private(set) var listAlbumRequests = 0
+    private(set) var listSharedAlbumRequests = 0
     var albums: [AlbumSummary]
     var sharedAlbums: [SharedAlbumSummary] = []
     var memberships: [PhotoUID: Set<AlbumNodeIdentifier>] = [:]
@@ -29,7 +30,10 @@ final class FakeAlbumBackend: AlbumCatalogBackend, AlbumWriteBackend, @unchecked
         listAlbumRequests += 1
         return albums
     }
-    func listSharedWithMeAlbums() async throws -> [SharedAlbumSummary] { sharedAlbums }
+    func listSharedWithMeAlbums() async throws -> [SharedAlbumSummary] {
+        listSharedAlbumRequests += 1
+        return sharedAlbums
+    }
     func leaveSharedAlbum(_ album: AlbumNodeIdentifier) async throws {
         leftSharedAlbums.append(album)
         sharedAlbums.removeAll { $0.node == album }
@@ -137,6 +141,30 @@ final class AlbumsRepositoryTests: XCTestCase {
         XCTAssertEqual(titles, ["Family", "Summer"])
         XCTAssertEqual(cachedTitles, titles)
         XCTAssertEqual(backend.listAlbumRequests, 1)
+        XCTAssertEqual(backend.membershipRequests.count, 1)
+    }
+
+    func testViewerResolvesSharedAlbumTitleWithoutCrossVolumeCollision() async throws {
+        let photo = PhotoUID(volumeID: "foreign", nodeID: "photo")
+        let sharedNode = AlbumNodeIdentifier(volumeID: "foreign", nodeID: "album")
+        let backend = FakeAlbumBackend(
+            capabilities: .sdkCatalogWithHTTPWrites,
+            albums: [AlbumSummary(id: "album", volumeID: "vol", title: "Wrong album", photoCount: 1, coverPhotoID: nil)]
+        )
+        backend.sharedAlbums = [
+            SharedAlbumSummary(
+                node: sharedNode, title: "Shared family", photoCount: 1, coverPhotoID: nil,
+                owner: nil, lastActivityTime: nil, isSharedByURL: false, isMetadataDegraded: false)
+        ]
+        backend.memberships[photo] = [sharedNode]
+        let repo = repository(backend)
+
+        let titles = try await repo.albumMembershipTitles(for: photo)
+        let cached = try await repo.albumMembershipTitles(for: photo)
+
+        XCTAssertEqual(titles, ["Shared family"])
+        XCTAssertEqual(cached, titles)
+        XCTAssertEqual(backend.listSharedAlbumRequests, 1)
         XCTAssertEqual(backend.membershipRequests.count, 1)
     }
 

@@ -648,11 +648,8 @@ struct MobilePhotoViewer: View {
         guard !Task.isCancelled, currentDisplayedItem?.uid == uid else { return }
         applyAlbumMembershipResult(membershipResult)
         titleMetadataState = .resolved(resolution)
-        guard let metadata = resolution.metadata else {
-            metadataLoadState = .failed
-            return
-        }
-        metadataLoadState = .loaded(metadata)
+        metadataLoadState = resolution.metadataLoadState
+        guard let metadata = resolution.metadata else { return }
         let resolvedKind = VideoContentSniffer.kind(mimeType: metadata.mimeType)
         if resolvedKind != .unknown {
             resolvedMediaKinds[uid] = resolvedKind
