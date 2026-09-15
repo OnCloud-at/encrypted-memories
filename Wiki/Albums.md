@@ -16,4 +16,12 @@ Controls that the current account or backend cannot perform stay hidden or disab
 
 Browsing the contents of albums shared with you is not available yet.
 
+Each album shared with you shows your access: Viewer, Editor, Admin, or Inherited access. When Proton reports a direct invitation, the row also shows who invited you and when. An inviter whose invitation signature could not be verified is marked as unverified.
+
+Albums shared with you are read-only in the app for every role:
+
+- Viewers and inherited access cannot edit the album.
+- Editors and admins cannot add or remove photos or change the cover here yet. The app's album editing only works with albums in your own Proton Drive. Use Proton Drive to edit an album shared with you.
+- Sharing an album, inviting people, and changing roles are not available in the app.
+
 Local Apple Photos album mirroring is separate. See [[Album Sync|Album-Sync]].

@@ -9,6 +9,10 @@ from urllib.parse import quote
 from github_llm_client import MAX_LLM_REQUEST_BYTES, RequestFailure
 
 
+class EvidenceValidationError(RuntimeError):
+    """A claimed finding failed client validation and must be regenerated."""
+
+
 def verify_findings(review, payload, files, snapshot, repo, *, token, api_url, request, fetch, redact):
     if not review["findings"]:
         return review
@@ -64,7 +68,7 @@ def verify_findings(review, payload, files, snapshot, repo, *, token, api_url, r
         "introduced": {"type": "boolean"},
         "line": {"type": "integer", "minimum": 1},
         **{key: {"type": "string", "maxLength": 300}
-           for key in ("quote", "trigger", "impact", "counterevidence")},
+           for key in ("quote", "trigger", "impact", "counterevidence", "missing_context")},
     }
     verification = copy.deepcopy(payload)
     verification["response_format"]["json_schema"] = {
@@ -82,6 +86,9 @@ def verify_findings(review, payload, files, snapshot, repo, *, token, api_url, r
             "the claim. Record the counterevidence you considered. Confirm only a reachable defect introduced by "
             "this patch, with a specific trigger and impact. Existing bugs, style, optional improvements and "
             "missing tests alone are dismissed. Missing required caller or framework context means uncertain. "
+            "For uncertain decisions, identify the exact missing caller, symbol, or contract in missing_context. "
+            "Low confidence alone does not establish a coverage gap; dismiss unsupported suspicions when no "
+            "specific essential context is missing. Use an empty missing_context for other decisions. "
             "The base source is the current base tip; the supplied patch defines what this PR changed. "
             "A partial source window does not prove absence elsewhere. High severity requires a serious supported "
             "failure: data loss, reachable security violation, crash, or broken build. A speculative worst case "
@@ -126,6 +133,7 @@ def verify_findings(review, payload, files, snapshot, repo, *, token, api_url, r
         if not isinstance(decisions, list) or len(decisions) != len(candidates):
             raise RuntimeError("Incomplete verification decisions")
         seen, findings, gaps = set(), [], list(review["testing_gaps"])
+        counts = dict(dismissed=0, existing_issue=0, low_confidence=0, missing_context=0, unavailable_source=0)
         for decision in decisions:
             if not isinstance(decision, dict) or set(decision) != set(fields):
                 raise RuntimeError("Invalid verification decision")
@@ -144,24 +152,43 @@ def verify_findings(review, payload, files, snapshot, repo, *, token, api_url, r
             context = contexts[identity]
             candidate = context["candidate"]
             if decision["decision"] == "dismissed":
+                counts["dismissed"] += 1
+                continue
+            if decision["decision"] == "uncertain":
+                if not decision["missing_context"].strip():
+                    raise EvidenceValidationError("An uncertain decision must identify specific missing context.")
+                counts["missing_context"] += 1
+                gaps.append(f"Missing review context: {decision['missing_context'].strip()}")
+                continue
+            if not context["head"]["available"]:
+                counts["unavailable_source"] += 1
+                gaps.append("Head source was unavailable for evidence verification.")
+                continue
+            if not decision["introduced"]:
+                counts["existing_issue"] += 1
+                continue
+            if decision["confidence"] != "high":
+                counts["low_confidence"] += 1
                 continue
             quote_text = decision["quote"].strip()
             evidence = any(line["line"] == decision["line"] and quote_text in line["text"]
                            and "[REDACTED" not in line["text"] for line in context["head"]["lines"])
-            confirmed = (decision["decision"] == "confirmed" and decision["confidence"] == "high"
-                         and decision["introduced"] and quote_text and evidence
+            confirmed = (quote_text and evidence
                          and decision["line"] == candidate["line"]
                          and all(decision[key].strip() for key in ("trigger", "impact", "counterevidence")))
             if not confirmed:
-                gaps.append("A candidate lacked sufficient evidence and was not published as a defect.")
-                continue
+                print("LLM verification: invalid_evidence; regenerate the result.", flush=True)
+                raise EvidenceValidationError("A confirmed finding needs an exact source quote at its candidate line, "
+                                              "a trigger, impact and considered counterevidence.")
             severity = ("blocking" if decision["severity"] == "high"
                         and decision["category"] != "correctness" else "warning")
             finding = dict(candidate, severity=severity,
                            detail=f"{decision['trigger']} {decision['impact']}")
             if not any(item["file_id"] == finding["file_id"] and item["line"] == finding["line"] for item in findings):
                 findings.append(finding)
-        return {"summary": "No actionable findings survived verification." if not findings else "",
+        print("LLM verification: " + json.dumps(dict(counts, published=len(findings)), sort_keys=True), flush=True)
+        return {"summary": ("Some findings could not be verified." if gaps else "No actionable findings.")
+                if not findings else "",
                 "findings": findings, "testing_gaps": list(dict.fromkeys(gaps))}
 
     return request(verification, validate)

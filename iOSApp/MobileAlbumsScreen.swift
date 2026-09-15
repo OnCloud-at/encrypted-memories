@@ -172,7 +172,7 @@ struct MobileCollectionsScreen: View {
                     .foregroundStyle(ProtonColor.textWeak)
             } else {
                 ForEach(coordinator.sharedAlbums) { album in
-                    MobileSharedAlbumRow(album: album)
+                    MobileSharedAlbumRow(album: album, presentation: coordinator.presentation(for: album))
                         .swipeActions {
                             if coordinator.canLeaveSharedAlbum {
                                 Button(role: .destructive) {
@@ -201,6 +201,7 @@ struct MobileCollectionsScreen: View {
 private struct MobileSharedAlbumRow: View {
     @Environment(MobileLibraryModel.self) private var model
     let album: SharedAlbumSummary
+    let presentation: SharedAlbumPresentation
     @State private var coverImage: UIImage?
     @State private var loadedCoverUID: PhotoUID?
 
@@ -210,18 +211,6 @@ private struct MobileSharedAlbumRow: View {
     }
 
     private var coverUID: PhotoUID? { album.coverPhotoUID }
-
-    private var details: String {
-        var parts: [String] = []
-        if let owner = album.owner, !owner.isEmpty {
-            parts.append(L10n.string("albums.shared_owner \(owner)"))
-        }
-        parts.append(L10n.string("albums.photo_count \(album.photoCount)"))
-        if album.isSharedByURL {
-            parts.append(L10n.string("albums.shared_via_link"))
-        }
-        return parts.joined(separator: " • ")
-    }
 
     var body: some View {
         HStack(spacing: 12) {
@@ -243,14 +232,23 @@ private struct MobileSharedAlbumRow: View {
                 Text(album.title)
                     .font(.body.weight(.medium))
                     .foregroundStyle(ProtonColor.textNorm)
-                Text(details)
+                Text(presentation.detailLine)
                     .font(.caption)
                     .foregroundStyle(ProtonColor.textWeak)
                     .lineLimit(2)
+                if let invitation = presentation.invitationDetail {
+                    Text(invitation)
+                        .font(.caption2)
+                        .foregroundStyle(ProtonColor.textWeak)
+                        .lineLimit(2)
+                }
             }
             Spacer()
         }
         .padding(.vertical, 4)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(presentation.accessibilityLabel)
+        .accessibilityHint(presentation.accessibilityHint ?? "")
         .task(id: CoverLoadKey(uid: coverUID, analysisRevision: model.sourceAnalysisRevision)) {
             if loadedCoverUID != coverUID {
                 coverImage = nil

@@ -189,6 +189,7 @@ struct MainView: View {
                         isLoadingAlbums: albumActions.showsInitialAlbumLoadingPlaceholder,
                         albumCatalogFailed: albumCatalogFailed,
                         sharedAlbums: albumActions.sharedAlbums,
+                        sharedAlbumPresentation: albumActions.presentation(for:),
                         isLoadingSharedAlbums: albumActions.showsInitialSharedAlbumLoadingPlaceholder,
                         sharedAlbumCatalogFailed: albumActions.sharedLoadErrorMessage != nil,
                         canLeaveSharedAlbum: albumActions.canLeaveSharedAlbum,
@@ -2439,6 +2440,7 @@ private struct SidebarView: View {
     let isLoadingAlbums: Bool
     let albumCatalogFailed: Bool
     let sharedAlbums: [SharedAlbumSummary]
+    let sharedAlbumPresentation: (SharedAlbumSummary) -> SharedAlbumPresentation
     let isLoadingSharedAlbums: Bool
     let sharedAlbumCatalogFailed: Bool
     let canLeaveSharedAlbum: Bool
@@ -2509,6 +2511,7 @@ private struct SidebarView: View {
                 ForEach(sharedAlbums) { album in
                     SharedAlbumSidebarRow(
                         album: album,
+                        presentation: sharedAlbumPresentation(album),
                         thumbnailFeed: thumbnailFeed,
                         sourceAnalysisRevision: sourceAnalysisRevision
                     )
@@ -2561,6 +2564,7 @@ private struct SidebarView: View {
 
 private struct SharedAlbumSidebarRow: View {
     let album: SharedAlbumSummary
+    let presentation: SharedAlbumPresentation
     let thumbnailFeed: ThumbnailFeed
     let sourceAnalysisRevision: UInt64
     @State private var coverImage: NSImage?
@@ -2573,16 +2577,11 @@ private struct SharedAlbumSidebarRow: View {
 
     private var coverUID: PhotoUID? { album.coverPhotoUID }
 
-    private var details: String {
-        var parts: [String] = []
-        if let owner = album.owner, !owner.isEmpty {
-            parts.append(L10n.string("albums.shared_owner \(owner)"))
-        }
-        parts.append(L10n.string("albums.photo_count \(album.photoCount)"))
-        if album.isSharedByURL {
-            parts.append(L10n.string("albums.shared_via_link"))
-        }
-        return parts.joined(separator: " • ")
+    /// The one-line row stays compact; invitation details and the read-only reason use the tooltip.
+    private var helpText: String {
+        [presentation.detailLine, presentation.invitationDetail, presentation.writeRestrictionReason]
+            .compactMap { $0 }
+            .joined(separator: "\n")
     }
 
     var body: some View {
@@ -2604,12 +2603,16 @@ private struct SharedAlbumSidebarRow: View {
             VStack(alignment: .leading, spacing: 1) {
                 Text(album.title)
                     .lineLimit(1)
-                Text(details)
+                Text(presentation.detailLine)
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
             }
         }
+        .help(helpText)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(presentation.accessibilityLabel)
+        .accessibilityHint(presentation.accessibilityHint ?? "")
         .task(id: CoverLoadKey(uid: coverUID, analysisRevision: sourceAnalysisRevision)) {
             if loadedCoverUID != coverUID {
                 coverImage = nil

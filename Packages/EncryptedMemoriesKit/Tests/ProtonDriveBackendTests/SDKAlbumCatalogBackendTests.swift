@@ -86,6 +86,63 @@ struct SDKAlbumCatalogBackendTests {
         #expect(albums[0].isSharedByURL)
     }
 
+    @Test func sharedCatalogMapsEffectiveRoleFromDirectRoleAndKeepsInvitationSeparate() async throws {
+        let client = FakeSDKPhotoCatalogClient()
+        let inherited = albumNode(id: "a-inherited", name: .success("A"), photoCount: 1, directRole: .inherited)
+        let viewer = albumNode(
+            id: "b-viewer", name: .success("B"), photoCount: 1, directRole: .viewer,
+            membership: Membership(
+                role: .viewer, inviteTime: 1_700_000_000,
+                sharedBy: Author(emailAddress: "inviter@example.test", signatureVerificationError: nil)))
+        // The effective role can be higher than the direct invitation (access also inherited).
+        let editor = albumNode(
+            id: "c-editor", name: .success("C"), photoCount: 1, directRole: .editor,
+            membership: Membership(
+                role: .viewer, inviteTime: 0,
+                sharedBy: Author(emailAddress: nil, signatureVerificationError: "bad signature")))
+        let admin = albumNode(
+            id: "d-admin", name: .success("D"), photoCount: 1, directRole: .admin,
+            membership: Membership(
+                role: .admin, inviteTime: 1_700_000_000,
+                sharedBy: Author(emailAddress: "claimed@example.test", signatureVerificationError: "forged")))
+        await client.configureShared(
+            [inherited.uid, viewer.uid, editor.uid, admin.uid],
+            nodes: Dictionary(
+                uniqueKeysWithValues: [inherited, viewer, editor, admin].map {
+                    ($0.uid.sdkCompatibleIdentifier, .init(albumNode: $0))
+                }))
+
+        let albums = try await SDKAlbumCatalogBackend(client: client).listSharedWithMeAlbums()
+
+        #expect(albums.map(\.role) == [.inherited, .viewer, .editor, .admin])
+        #expect(albums[0].invitation == nil)
+        #expect(
+            albums[1].invitation
+                == SharedAlbumInvitation(
+                    role: .viewer, sharedBy: "inviter@example.test", isSharedByVerified: true,
+                    inviteTime: Date(timeIntervalSince1970: 1_700_000_000)))
+        #expect(albums[1].invitation?.isDegraded == false)
+        #expect(albums[2].invitation?.role == .viewer)
+        #expect(albums[2].invitation?.sharedBy == nil)
+        #expect(albums[2].invitation?.inviteTime == nil)
+        #expect(albums[2].invitation?.isDegraded == true)
+        #expect(albums[3].invitation?.sharedBy == "claimed@example.test")
+        #expect(albums[3].invitation?.isSharedByVerified == false)
+    }
+
+    @Test func memberRoleMappingCoversEverySDKRole() {
+        #expect(SDKAlbumCatalogBackend.role(.inherited) == .inherited)
+        #expect(SDKAlbumCatalogBackend.role(.viewer) == .viewer)
+        #expect(SDKAlbumCatalogBackend.role(.editor) == .editor)
+        #expect(SDKAlbumCatalogBackend.role(.admin) == .admin)
+        let future = Membership(
+            role: .editor, inviteTime: 4_000_000_000,
+            sharedBy: Author(emailAddress: "a@example.test", signatureVerificationError: nil))
+        #expect(
+            SDKAlbumCatalogBackend.invitation(future, now: Date(timeIntervalSince1970: 1_800_000_000)).inviteTime
+                == nil)
+    }
+
     @Test func sharedCatalogAndSourceDiscoveryJoinOneHydrationSweep() async throws {
         let client = FakeSDKPhotoCatalogClient(nodeDelay: .milliseconds(30))
         let shared = albumNode(
@@ -611,7 +668,9 @@ private func albumNode(
     owner: String? = nil,
     isShared: Bool = false,
     isSharedByURL: Bool = false,
-    errors: [ProtonDriveSDKDriveError] = []
+    errors: [ProtonDriveSDKDriveError] = [],
+    directRole: MemberRole = .inherited,
+    membership: Membership? = nil
 ) -> AlbumNode {
     let uid = SDKNodeUid(volumeID: "volume", nodeID: id)
     return AlbumNode(
@@ -625,8 +684,8 @@ private func albumNode(
         ownedBy: OwnedBy(email: owner, organization: nil),
         isShared: isShared,
         isSharedByUrl: isSharedByURL,
-        directRole: .inherited,
-        membership: nil,
+        directRole: directRole,
+        membership: membership,
         errors: errors,
         photoCount: photoCount,
         coverPhotoNodeUid: coverID.map { SDKNodeUid(volumeID: "volume", nodeID: $0) },

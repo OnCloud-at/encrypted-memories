@@ -61,6 +61,7 @@ struct SDKCapabilities {
             albumDelete=\(albums.canDelete)
             albumAdd=\(albums.canAddPhotos)
             albumSetCover=\(albums.canSetCover)
+            sharedAlbumWrites=\(albums.canWriteSharedAlbums)
             """
         DebugLog.log(lines)
     }

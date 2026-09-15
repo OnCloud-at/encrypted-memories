@@ -15,13 +15,13 @@ from unittest.mock import patch
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 import github_llm_client as client
 import review_pull_request as review
-from review_evidence import verify_findings
+from review_evidence import EvidenceValidationError, verify_findings
 from review_monitor import ReviewMonitor, ReviewTimeout
 from test_review_pull_request import changed_file, pull_request, valid_review
 
 
 class EvidenceTests(unittest.TestCase):
-    def verify(self, **overrides):
+    def verify(self, *, unavailable=False, retry_quote=False, **overrides):
         files = [changed_file()]
         payload, _, _, paths = review.llm_payload(pull_request(), files, model="test", reasoning_effort=None)
         candidate = {"severity": "blocking", "file_id": "file-001", "path": paths["file-001"],
@@ -29,16 +29,27 @@ class EvidenceTests(unittest.TestCase):
         decision = {"id": "0", "decision": "confirmed", "severity": "high", "category": "data_loss",
                     "confidence": "high", "introduced": True, "line": 1, "quote": "new",
                     "trigger": "Retry runs after an error.", "impact": "The item is removed.",
-                    "counterevidence": "The supplied guard does not cover retries."}
+                    "counterevidence": "The supplied guard does not cover retries.", "missing_context": ""}
         decision.update(overrides)
         source = {"type": "file", "encoding": "base64", "size": 3,
                   "content": base64.b64encode(b"new").decode()}
-        with patch.object(review, "github_request", return_value=source) as fetch:
+        def request(payload, validator):
+            if not retry_quote:
+                return validator(json.dumps({"decisions": [decision]}))
+            broken = dict(decision, quote="fabricated source")
+            responses = [json.dumps({"decisions": [value]}) for value in (broken, decision)]
+            with patch.object(client, "request_llm_content", side_effect=responses) as generate:
+                result = client.request_validated_llm_result(
+                    "https://provider.test", token="test", payload=payload, validator=validator)
+            self.assertEqual(generate.call_count, 2)
+            return result
+
+        with patch.object(review, "github_request", return_value=None if unavailable else source) as fetch:
             result = verify_findings(
                 valid_review(findings=[candidate]), payload, files, review.pull_request_snapshot(pull_request()),
                 "example/repo", token="test", api_url="https://api.github.test", fetch=fetch,
                 redact=lambda text: [{"line": 1, "text": text}],
-                request=lambda payload, validator: validator(json.dumps({"decisions": [decision]})))
+                request=request)
         self.assertIn("ref=abc123", fetch.call_args_list[0].args[1])
         self.assertIn("ref=base123", fetch.call_args_list[1].args[1])
         return result
@@ -46,14 +57,45 @@ class EvidenceTests(unittest.TestCase):
     def test_serious_finding_requires_specific_evidence(self):
         self.assertEqual(self.verify()["findings"][0]["severity"], "blocking")
 
-    def test_unproven_candidates_do_not_become_defects(self):
-        for change in ({"decision": "uncertain"}, {"introduced": False}, {"confidence": "low"},
-                       {"quote": "invented"}, {"quote": ""}, {"line": 2}, {"trigger": ""},
-                       {"counterevidence": ""}):
+    def test_filtered_candidates_do_not_imply_missing_coverage(self):
+        for change in ({"introduced": False}, {"confidence": "low"}):
             with self.subTest(change=change):
                 result = self.verify(**change)
                 self.assertEqual(result["findings"], [])
-                self.assertTrue(result["testing_gaps"])
+                self.assertEqual(result["testing_gaps"], [])
+                self.assertIn("🟢", review.render_review(result, {}, "abc123", []))
+
+    def test_missing_context_stays_grey_with_specific_reason(self):
+        result = self.verify(decision="uncertain", missing_context="The retry caller and its error contract.")
+        body = review.render_review(result, {}, "abc123", [])
+        self.assertIn("⚪", body)
+        self.assertIn("retry caller", body)
+        self.assertNotIn("No actionable findings", body)
+
+    def test_uncertainty_requires_a_specific_context_request(self):
+        with self.assertRaises(EvidenceValidationError):
+            self.verify(decision="uncertain")
+
+    def test_missing_head_source_is_a_real_coverage_gap(self):
+        result = self.verify(unavailable=True)
+        self.assertEqual(result["findings"], [])
+        self.assertIn("Head source was unavailable", result["testing_gaps"][0])
+
+    def test_invalid_evidence_requests_regeneration(self):
+        for change in ({"quote": "invented"}, {"quote": ""}, {"line": 2}, {"trigger": ""},
+                       {"counterevidence": ""}):
+            with self.subTest(change=change), self.assertRaises(EvidenceValidationError):
+                self.verify(**change)
+
+    def test_regeneration_can_recover_invalid_evidence(self):
+        self.assertEqual(len(self.verify(retry_quote=True)["findings"]), 1)
+
+    def test_verification_logs_only_reason_counts(self):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.verify(decision="uncertain", missing_context="private-source-description")
+        self.assertIn('"missing_context": 1', output.getvalue())
+        self.assertNotIn("private-source-description", output.getvalue())
 
     def test_disproved_candidate_leaves_no_warning(self):
         self.assertEqual(self.verify(decision="dismissed")["testing_gaps"], [])
