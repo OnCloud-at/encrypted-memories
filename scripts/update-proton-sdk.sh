@@ -8,7 +8,7 @@ cd "$(dirname "$0")/.."
 ROOT="$(pwd)"
 SDK_DIR="Vendor/sdk-swift"
 REPO="https://github.com/ProtonDriveApps/sdk-swift.git"
-TAG="${1:-0.25.0}"
+TAG="${1:-0.27.0}"
 PATCH_DIR="$ROOT/VendorPatches/sdk-swift/$TAG"
 PIN_FILE="$PATCH_DIR/UPSTREAM_COMMIT"
 shopt -s nullglob
@@ -102,6 +102,11 @@ lipo -create \
   "$SDK_DIR/Resources/libbootstrapperdll.osx-x64.o" \
   -output "$SDK_DIR/Resources/libbootstrapperdll.osx-universal.o"
 
+# The vendored test target links ProtonCore GoLibs with a version range so the app remains the only
+# exact pin. Seed the standalone lock from the committed merged lock so `swift test` in Vendor/sdk-swift
+# resolves the same ProtonCore revision as the app instead of floating to a newer release.
+cp "$ROOT/BuildSupport/Package.resolved" "$SDK_DIR/Package.resolved"
+
 echo "Clearing local Xcode module caches that may reference the previous SDK..."
 source "$ROOT/scripts/build-paths.sh"
 rm -rf "$ENCRYPTED_MEMORIES_BUILD_ROOT/DD.noindex" \
@@ -120,13 +125,21 @@ for LEGACY_BUILD_DIR in "$ROOT/build" "$ROOT/Packages/EncryptedMemoriesKit/.buil
   fi
 done
 
-CORE=$(grep -o 'protoncore_ios.git", exact: "[^"]*"' "$SDK_DIR/Package.swift" | grep -o '[0-9][0-9.]*')
+CORE=$(grep -o 'protoncore_ios.git", exact: "[^"]*"' "$SDK_DIR/Package.swift" | grep -o '[0-9][0-9.]*' || true)
 echo ""
 echo "  sdk-swift now at: $TAG ($(git -C "$SDK_DIR" rev-parse --short HEAD))"
-echo "  REQUIRED ProtonCore exactVersion: $CORE"
+if [ -n "$CORE" ]; then
+  echo "  REQUIRED ProtonCore exactVersion: $CORE"
+else
+  echo "  ProtonCore: not pinned by the SDK; project.yml keeps the app's own exactVersion."
+fi
 echo ""
 echo "Next:"
-echo "  1. Set project.yml -> packages.ProtonCore.exactVersion to $CORE (if different)."
+if [ -n "$CORE" ]; then
+  echo "  1. Set project.yml -> packages.ProtonCore.exactVersion to $CORE (if different)."
+else
+  echo "  1. The ProtonCore version in project.yml is chosen by the app."
+fi
 echo "  2. Update the clone hint in .gitignore to $TAG."
 echo "  3. xcodegen generate"
 echo "  4. ./scripts/rebuild.sh"

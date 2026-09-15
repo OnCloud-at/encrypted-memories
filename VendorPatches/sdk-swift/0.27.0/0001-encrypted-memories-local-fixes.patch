@@ -1,5 +1,5 @@
 diff --git a/Package.swift b/Package.swift
-index a119f72..f70ebb5 100644
+index 533470e..8ff4c48 100644
 --- a/Package.swift
 +++ b/Package.swift
 @@ -3,0 +4 @@
@@ -8,7 +8,10 @@ index a119f72..f70ebb5 100644
 +let packageDirectory = URL(fileURLWithPath: #filePath).deletingLastPathComponent().path
 +let sdkResourceLibrarySearchPath = "-L\(packageDirectory)/Resources"
 +
-@@ -51,6 +55 @@ let package = Package(
+@@ -26,0 +31,2 @@ let package = Package(
++        // Test-only: the CProtonDriveSDK binary resolves its PGP symbols from ProtonCore GoLibs. The app pins the exact version.
++        .package(url: "https://github.com/ProtonMail/protoncore_ios.git", from: "37.3.0"),
+@@ -49,6 +55 @@ let package = Package(
 -                .unsafeFlags([
 -                    // path used in normal builds
 -                    "-L${BUILD_DIR}/../../SourcePackages/checkouts/sdk-swift/Resources",
@@ -16,11 +19,11 @@ index a119f72..f70ebb5 100644
 -                    "-L${BUILD_DIR}/../../../../../SourcePackages/checkouts/sdk-swift/Resources",
 -                ]),
 +                .unsafeFlags([sdkResourceLibrarySearchPath]),
-@@ -60,2 +59 @@ let package = Package(
+@@ -58,2 +59 @@ let package = Package(
 -                    "-llibbootstrapperdll.osx-arm64.o",
 -                    "-llibbootstrapperdll.osx-x64.o",
 +                    "-llibbootstrapperdll.osx-universal.o",
-@@ -69,6 +67 @@ let package = Package(
+@@ -67,6 +67 @@ let package = Package(
 -                .unsafeFlags([
 -                    // path used in normal builds
 -                    "-L${BUILD_DIR}/../../SourcePackages/checkouts/sdk-swift/Resources",
@@ -28,7 +31,7 @@ index a119f72..f70ebb5 100644
 -                    "-L${BUILD_DIR}/../../../../../SourcePackages/checkouts/sdk-swift/Resources",
 -                ]),
 +                .unsafeFlags([sdkResourceLibrarySearchPath]),
-@@ -81,0 +75,10 @@ let package = Package(
+@@ -79,0 +75,10 @@ let package = Package(
 +        .testTarget(
 +            name: "ProtonDriveSDKTests",
 +            dependencies: [
@@ -190,12 +193,12 @@ index 1680d0c..6f3fe32 100644
 @@ -486,0 +522 @@ extension EncryptedMemoriesClient {
 +            overrideExistingDraft: overrideExistingDraft,
 diff --git a/Sources/Client/ProtonDriveClient/ProtonDriveClient.swift b/Sources/Client/ProtonDriveClient/ProtonDriveClient.swift
-index 9b0c0ec..c2db90b 100644
+index a67a327..6a82c68 100644
 --- a/Sources/Client/ProtonDriveClient/ProtonDriveClient.swift
 +++ b/Sources/Client/ProtonDriveClient/ProtonDriveClient.swift
-@@ -354,0 +355 @@ extension ProtonDriveClient {
+@@ -352,0 +353 @@ extension ProtonDriveClient {
 +        try operation.claimStart()
-@@ -386,0 +388 @@ extension ProtonDriveClient {
+@@ -384,0 +386 @@ extension ProtonDriveClient {
 +        try operation.claimStart()
 diff --git a/Sources/FileOperations/Downloads/DownloadThumbnailsManager.swift b/Sources/FileOperations/Downloads/DownloadThumbnailsManager.swift
 index 367242f..f6b161f 100644
