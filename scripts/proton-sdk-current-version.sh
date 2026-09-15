@@ -12,13 +12,17 @@ fi
 
 TAG=$(git -C "$SDK_DIR" describe --tags --exact-match 2>/dev/null || echo "(no exact tag)")
 SHA=$(git -C "$SDK_DIR" rev-parse HEAD)
-CORE=$(grep -o 'protoncore_ios.git", exact: "[^"]*"' "$SDK_DIR/Package.swift" | grep -o '[0-9][0-9.]*')
+CORE=$(grep -o 'protoncore_ios.git", exact: "[^"]*"' "$SDK_DIR/Package.swift" | grep -o '[0-9][0-9.]*' || true)
 APPCORE=$(grep -o 'exactVersion: *[0-9][0-9.]*' project.yml | grep -o '[0-9][0-9.]*' | head -1)
 
 echo "sdk-swift tag:        $TAG"
 echo "sdk-swift commit:     $SHA"
-echo "SDK wants ProtonCore: $CORE"
-echo "project.yml pins:     $APPCORE"
-if [ "$CORE" != "$APPCORE" ]; then
-  echo "WARNING: project.yml ($APPCORE) != SDK-required ProtonCore ($CORE). SwiftPM resolution will fail." >&2
+if [ -n "$CORE" ]; then
+  echo "SDK wants ProtonCore: $CORE"
+  if [ "$CORE" != "$APPCORE" ]; then
+    echo "WARNING: project.yml ($APPCORE) != SDK-required ProtonCore ($CORE). SwiftPM resolution will fail." >&2
+  fi
+else
+  echo "SDK wants ProtonCore: (not pinned)"
 fi
+echo "project.yml pins:     $APPCORE"

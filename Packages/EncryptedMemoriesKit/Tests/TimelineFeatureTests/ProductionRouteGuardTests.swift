@@ -433,7 +433,7 @@ struct ProductionRouteGuardTests {
             to: "self.photosClient = try await EncryptedMemoriesClient(")
         #expect(
             !config.contains("cachePath:"),
-            "SDK 0.25.0 does not dispose its SQLite repository, so sign-out must not persist that cache")
+            "SDK 0.27.0 does not dispose its SQLite repository, so sign-out must not persist that cache")
         #expect(
             !config.contains("cacheEncryptionKey:"),
             "an absent cache path selects the SDK's supported in-memory cache")
@@ -2427,7 +2427,7 @@ struct ProductionRouteGuardTests {
             encoding: .utf8
         )
         #expect(
-            sdkManifest.contains("releases/download/0.25.0/CProtonDriveSDK.xcframework.zip"),
+            sdkManifest.contains("releases/download/0.27.0/CProtonDriveSDK.xcframework.zip"),
             "the vendored SDK release changed; re-evaluate the parked P3 contract before updating this pin"
         )
 

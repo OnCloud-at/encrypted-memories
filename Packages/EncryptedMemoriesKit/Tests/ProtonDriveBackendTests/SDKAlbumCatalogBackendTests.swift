@@ -625,6 +625,8 @@ private func albumNode(
         ownedBy: OwnedBy(email: owner, organization: nil),
         isShared: isShared,
         isSharedByUrl: isSharedByURL,
+        directRole: .inherited,
+        membership: nil,
         errors: errors,
         photoCount: photoCount,
         coverPhotoNodeUid: coverID.map { SDKNodeUid(volumeID: "volume", nodeID: $0) },
@@ -660,6 +662,8 @@ private func photoNode(id: String, albumIDs: [SDKNodeUid]) -> PhotoNode {
         activeRevision: revision,
         isShared: false,
         isSharedByUrl: false,
+        directRole: .inherited,
+        membership: nil,
         errors: [],
         captureTime: 1,
         albumUids: albumIDs
