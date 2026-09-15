@@ -14,8 +14,16 @@ class EvidenceValidationError(RuntimeError):
 
 
 def verify_findings(review, payload, files, snapshot, repo, *, token, api_url, request, fetch, redact):
+    # Legacy callers used testing_gaps for optional notes. New parsed reviews keep
+    # those notes in review_notes and reserve testing_gaps for real limitations.
+    has_explicit_notes = "review_notes" in review
+    review_notes = list(review.get("review_notes", []))
+    if not has_explicit_notes:
+        review_notes.extend(review.get("testing_gaps", []))
+    review_notes = list(dict.fromkeys(review_notes))
+    initial_gaps = list(review.get("testing_gaps", [])) if has_explicit_notes else []
     if not review["findings"]:
-        return review
+        return dict(review, review_notes=review_notes, testing_gaps=initial_gaps)
     source_input = json.loads(payload["messages"][1]["content"])
     candidates = review["findings"]
     contexts = {}
@@ -120,7 +128,8 @@ def verify_findings(review, payload, files, snapshot, repo, *, token, api_url, r
             break
     if len(json.dumps(verification, ensure_ascii=False).encode()) > MAX_LLM_REQUEST_BYTES:
         return {"summary": "Candidate verification exceeded the context limit.", "findings": [],
-                "testing_gaps": ["Candidate findings could not be verified within the context limit."]}
+                "testing_gaps": ["Candidate findings could not be verified within the context limit."],
+                "review_notes": review_notes}
 
     def validate(content):
         try:
@@ -132,7 +141,7 @@ def verify_findings(review, payload, files, snapshot, repo, *, token, api_url, r
         decisions = value["decisions"]
         if not isinstance(decisions, list) or len(decisions) != len(candidates):
             raise RuntimeError("Incomplete verification decisions")
-        seen, findings, gaps = set(), [], list(review["testing_gaps"])
+        seen, findings, gaps = set(), [], initial_gaps
         counts = dict(dismissed=0, existing_issue=0, low_confidence=0, missing_context=0, unavailable_source=0)
         for decision in decisions:
             if not isinstance(decision, dict) or set(decision) != set(fields):
@@ -187,8 +196,12 @@ def verify_findings(review, payload, files, snapshot, repo, *, token, api_url, r
             if not any(item["file_id"] == finding["file_id"] and item["line"] == finding["line"] for item in findings):
                 findings.append(finding)
         print("LLM verification: " + json.dumps(dict(counts, published=len(findings)), sort_keys=True), flush=True)
-        return {"summary": ("Some findings could not be verified." if gaps else "No actionable findings.")
-                if not findings else "",
-                "findings": findings, "testing_gaps": list(dict.fromkeys(gaps))}
+        return {
+            "summary": ("Some findings could not be verified." if gaps else "No actionable findings.")
+            if not findings else "",
+            "findings": findings,
+            "testing_gaps": list(dict.fromkeys(gaps)),
+            "review_notes": review_notes,
+        }
 
     return request(verification, validate)
