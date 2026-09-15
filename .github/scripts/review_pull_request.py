@@ -648,7 +648,7 @@ def render_review(
 ) -> str:
     findings = sorted(review["findings"], key=lambda item: item["severity"] != "blocking")
     serious = sum(item["severity"] == "blocking" for item in findings)
-    # Evidence verification returns `review_notes` and verified `testing_gaps` separately.
+    # Evidence verification returns `review_notes` separately and carries `testing_gaps` forward.
     # Keep the fallback for unavailable or legacy direct callers.
     notes = list(review.get("review_notes", []))
     if "review_notes" not in review:
