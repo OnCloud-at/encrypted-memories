@@ -2079,7 +2079,14 @@ struct ProductionRouteGuardTests {
         #expect(
             !viewerModel.contains("let meta = try? await metadataProvider.metadata"),
             "metadata failures must not become an eternal nil/loading state")
-        #expect(viewerModel.contains("metadataLoadState = .failed"))
+        #expect(
+            viewerModel.contains("metadataLoadState = resolution.metadataLoadState"),
+            "the viewer must preserve the shared distinction between unavailable metadata and request failure")
+        let titleMetadata = try String(
+            contentsOf: Self.repoRoot.appendingPathComponent(
+                "Packages/EncryptedMemoriesKit/Sources/PhotoViewerCore/ViewerTitleMetadataCoordinator.swift"),
+            encoding: .utf8)
+        #expect(titleMetadata.contains("metadataLoadFailed ? .failed : .unavailable"))
         #expect(viewerModel.contains("public func retryMetadata()"))
         #expect(
             viewerModel.contains("albumMembershipProvider.albumMembershipTitles"),

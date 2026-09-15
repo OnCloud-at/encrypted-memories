@@ -1289,38 +1289,20 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     }
 
     private func metadataImpl(for uid: PhotoUID) async throws -> PhotoMetadata {
-        let source = try await fileSource()
-        let raw = try await source.fileMetadata(linkID: uid.nodeID)
-        if let mimeType = raw.mimeType {
+        let metadata = try await SDKPhotoMetadataReader.metadata(for: uid, client: photosClient)
+        if let mimeType = metadata.mimeType {
             let result = timelineStore?.recordMediaTypeEvidence([uid: mimeType])
             if result?.succeeded == false {
                 DebugLog.log("timeline: could not persist media type resolved by viewer")
             }
         }
-        let xa = raw.xattr
-        let duration = xa?.media?.duration
-        if let duration {
+        if let duration = metadata.durationSeconds {
             let result = timelineStore?.updateDurations([uid: duration])
             if result?.succeeded == false {
                 DebugLog.log("timeline: could not persist video duration resolved from metadata")
             }
         }
-        var mod: Date?
-        if let s = xa?.common?.modificationTime {
-            mod = ISO8601DateFormatter().date(from: s)
-        }
-        return PhotoMetadata(
-            filename: raw.filename,
-            mimeType: raw.mimeType,
-            fileSize: raw.size ?? xa?.common?.size,
-            pixelWidth: xa?.media?.width,
-            pixelHeight: xa?.media?.height,
-            device: xa?.camera?.device,
-            durationSeconds: duration,
-            modificationTime: mod,
-            latitude: xa?.location?.latitude,
-            longitude: xa?.location?.longitude
-        )
+        return metadata
     }
 
     // MARK: - BurstGroupProvider

@@ -23,6 +23,7 @@ public actor AlbumsRepository: AlbumManaging {
     /// Last shared-with-me catalog. Owned-album writes take a bare link id, so this guards against a
     /// shared album reaching the owned-share HTTP path.
     private var sharedAlbumCatalogCache: [SharedAlbumSummary] = []
+    private var hasLoadedSharedAlbumCatalog = false
     /// Session-local on-demand membership cache. Successful writes update it in place, so opening a
     /// picker after a mutation cannot show a stale checkmark or schedule a redundant attach.
     private var membershipCache: [PhotoUID: Set<AlbumNodeIdentifier>] = [:]
@@ -64,6 +65,7 @@ public actor AlbumsRepository: AlbumManaging {
         do {
             let albums = try await catalogBackend.listSharedWithMeAlbums()
             sharedAlbumCatalogCache = albums
+            hasLoadedSharedAlbumCatalog = true
             return albums
         } catch {
             throw Self.normalized(error)
@@ -118,22 +120,25 @@ public actor AlbumsRepository: AlbumManaging {
 
     public func albumMembershipTitles(for photoUID: PhotoUID) async throws -> [String] {
         let membershipsByPhoto = try await albumMemberships(for: [photoUID])
+        let memberships = membershipsByPhoto[photoUID] ?? []
+        guard !memberships.isEmpty else { return [] }
         let albums: [AlbumSummary]
         if let albumCatalogCache {
             albums = albumCatalogCache
         } else {
             albums = try await listAlbums()
         }
-        let memberships = membershipsByPhoto[photoUID] ?? []
-        return
-            albums
-            .filter { album in
-                memberships.contains { membership in
-                    membership.nodeID == album.id
-                        && (album.volumeID == nil || album.volumeID == membership.volumeID)
-                }
+        let owned = albums.filter { album in
+            memberships.contains { membership in
+                membership.nodeID == album.id
+                    && (album.volumeID == nil || album.volumeID == membership.volumeID)
             }
-            .map(\.title)
+        }
+        if owned.count < memberships.count, capabilities.canListSharedWithMe, !hasLoadedSharedAlbumCatalog {
+            _ = try await listSharedWithMeAlbums()
+        }
+        let shared = sharedAlbumCatalogCache.filter { memberships.contains($0.node) }
+        return Set(owned.map(\.title) + shared.map(\.title))
             .sorted { $0.localizedStandardCompare($1) == .orderedAscending }
     }
 

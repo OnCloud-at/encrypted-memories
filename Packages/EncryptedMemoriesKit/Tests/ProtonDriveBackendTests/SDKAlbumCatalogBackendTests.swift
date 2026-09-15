@@ -8,6 +8,68 @@ import Testing
 
 @Suite("SDK album catalog")
 struct SDKAlbumCatalogBackendTests {
+    @Test func photoMetadataUsesForeignVolumeAndKeepsMissingAttributesOptional() async throws {
+        let client = FakeSDKPhotoCatalogClient()
+        let photo = photoNode(id: "same-node", albumIDs: [], volumeID: "foreign-volume")
+        await client.configureNodes([photo.uid.sdkCompatibleIdentifier: DriveNode(photoNode: photo)])
+
+        let metadata = try await SDKPhotoMetadataReader.metadata(
+            for: PhotoUID(volumeID: "foreign-volume", nodeID: "same-node"), client: client)
+
+        #expect(metadata.filename == "same-node.jpg")
+        #expect(metadata.mimeType == "image/jpeg")
+        #expect(metadata.fileSize == 1)
+        #expect(metadata.pixelWidth == nil)
+        #expect(metadata.device == nil)
+        #expect(metadata.latitude == nil)
+        #expect(await client.getNodeCalls == 1)
+    }
+
+    @Test func photoMetadataPreservesIndependentSDKSectionsAndOriginalSize() {
+        let revision = FileRevision(
+            uid: SDKRevisionUid(volumeID: "foreign", nodeID: "photo", revisionID: "revision"),
+            state: .active, creationTime: 1, storageSize: 9999, claimedSize: 1234,
+            claimedDigests: FileContentDigests(sha1: nil, sha1Verified: false),
+            claimedModificationTime: 123, thumbnails: [],
+            claimedAdditionalMetadata: [
+                AdditionalMetadata(
+                    name: "Media", utf8JsonValue: Data(#"{"Width":4032,"Height":3024,"Duration":2.5}"#.utf8)),
+                AdditionalMetadata(name: "Camera", utf8JsonValue: Data(#"{"Device":"iPhone"}"#.utf8)),
+                AdditionalMetadata(name: "Location", utf8JsonValue: Data(#"{"Latitude":48.2,"Longitude":16.3}"#.utf8)),
+            ], contentAuthor: nil)
+        let metadata = SDKPhotoMetadataReader.metadata(
+            name: .success("photo.heic"), mimeType: "image/heic", revision: revision)
+
+        #expect(metadata.fileSize == 1234, "encrypted storage size is not the original photo size")
+        #expect(metadata.pixelWidth == 4032)
+        #expect(metadata.pixelHeight == 3024)
+        #expect(metadata.durationSeconds == 2.5)
+        #expect(metadata.device == "iPhone")
+        #expect(metadata.latitude == 48.2)
+        #expect(metadata.longitude == 16.3)
+        #expect(metadata.modificationTime == Date(timeIntervalSince1970: 123))
+    }
+
+    @Test func malformedOptionalSDKSectionDoesNotDiscardAvailableMetadata() {
+        let revision = FileRevision(
+            uid: SDKRevisionUid(volumeID: "foreign", nodeID: "photo", revisionID: "revision"),
+            state: .active, creationTime: 1, storageSize: 9999, claimedSize: nil,
+            claimedDigests: FileContentDigests(sha1: nil, sha1Verified: false),
+            claimedModificationTime: nil, thumbnails: [],
+            claimedAdditionalMetadata: [
+                AdditionalMetadata(name: "Media", utf8JsonValue: Data("unsupported".utf8)),
+                AdditionalMetadata(name: "Camera", utf8JsonValue: Data(#"{"Device":"Camera"}"#.utf8)),
+            ], contentAuthor: nil)
+        let metadata = SDKPhotoMetadataReader.metadata(
+            name: .failure(ProtonDriveSDKDriveError(message: "name unavailable")), mimeType: "", revision: revision)
+
+        #expect(metadata.filename == nil)
+        #expect(metadata.mimeType == nil)
+        #expect(metadata.fileSize == nil)
+        #expect(metadata.pixelWidth == nil)
+        #expect(metadata.device == "Camera")
+    }
+
     @Test func ownedCatalogMapsSDKMetadataSortsAndKeepsDegradedNodesVisible() async throws {
         let client = FakeSDKPhotoCatalogClient()
         let z = albumNode(id: "z", name: .success("Zoo"), photoCount: 7, coverID: "cover-z")
@@ -693,10 +755,10 @@ private func albumNode(
     )
 }
 
-private func photoNode(id: String, albumIDs: [SDKNodeUid]) -> PhotoNode {
-    let uid = SDKNodeUid(volumeID: "volume", nodeID: id)
+private func photoNode(id: String, albumIDs: [SDKNodeUid], volumeID: String = "volume") -> PhotoNode {
+    let uid = SDKNodeUid(volumeID: volumeID, nodeID: id)
     let revision = FileRevision(
-        uid: SDKRevisionUid(volumeID: "volume", nodeID: id, revisionID: "revision"),
+        uid: SDKRevisionUid(volumeID: volumeID, nodeID: id, revisionID: "revision"),
         state: .active,
         creationTime: 1,
         storageSize: 1,

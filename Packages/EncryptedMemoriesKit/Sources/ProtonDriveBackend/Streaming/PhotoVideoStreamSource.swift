@@ -207,32 +207,6 @@ actor PhotoVideoStreamSource {
         }
     }
 
-    /// Decrypted file metadata for the info panel: filename (decrypted with the parent node key),
-    /// MIME type, size, and the XAttr (dimensions, device, duration, GPS).
-    func fileMetadata(
-        linkID: String
-    ) async throws -> (filename: String?, mimeType: String?, size: Int?, xattr: ExtendedAttributes?) {
-        let link = try await fetchLink(linkID)
-        let fileKey = try await nodeKey(for: link)
-
-        var filename: String?
-        if let name = link.name, let parentID = link.parentLinkID, !parentID.isEmpty {
-            let parentLink = try await fetchLink(parentID)
-            let parentKey = try await nodeKey(for: parentLink)
-            filename = try? crypto.decryptName(name, parent: parentKey)
-        }
-        var xattr: ExtendedAttributes?
-        // Link-level XAttr first, then the embedded active-revision XAttr - photos uploaded by Proton's
-        // clients frequently carry it only on the revision, and without this fallback the info panel and
-        // the Map GPS crawl saw `nil` (no dimensions, no Location) for those photos.
-        if let xa = link.xAttr ?? link.fileProperties?.activeRevision?.xAttr,
-            let data = try? crypto.decryptXAttr(xa, node: fileKey)
-        {
-            xattr = try? JSONDecoder().decode(ExtendedAttributes.self, from: data)
-        }
-        return (filename, link.mimeType, link.size, xattr)
-    }
-
     // MARK: - Key chain
 
     private func nodeKey(for link: LinkBody) async throws -> UnlockableKey {
@@ -386,51 +360,6 @@ struct LinkBody: Decodable {
         case xAttr = "XAttr"
         case
             fileProperties = "FileProperties"
-    }
-}
-
-/// Decrypted XAttr (extended attributes) - Proton stores a device string + dimensions + duration +
-/// GPS, but no full EXIF (no aperture/ISO/lens). Field names match Proton's exact PascalCase JSON.
-struct ExtendedAttributes: Decodable {
-    let common: Common?
-    let location: Location?
-    let camera: Camera?
-    let media: Media?
-    enum CodingKeys: String, CodingKey {
-        case common = "Common"
-        case location = "Location"
-        case camera = "Camera"
-        case media = "Media"
-    }
-    struct Common: Decodable {
-        let modificationTime: String?
-        let size: Int?
-        enum CodingKeys: String, CodingKey {
-            case modificationTime = "ModificationTime"
-            case size = "Size"
-        }
-    }
-    struct Location: Decodable {
-        let latitude: Double?
-        let longitude: Double?
-        enum CodingKeys: String, CodingKey {
-            case latitude = "Latitude"
-            case longitude = "Longitude"
-        }
-    }
-    struct Camera: Decodable {
-        let device: String?
-        enum CodingKeys: String, CodingKey { case device = "Device" }
-    }
-    struct Media: Decodable {
-        let width: Int?
-        let height: Int?
-        let duration: Double?
-        enum CodingKeys: String, CodingKey {
-            case width = "Width"
-            case height = "Height"
-            case duration = "Duration"
-        }
     }
 }
 

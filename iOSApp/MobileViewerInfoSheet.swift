@@ -96,6 +96,9 @@ struct MobileViewerInfoSheet: View {
         case .loaded(let metadata):
             loadedMetadataSection(metadata)
 
+        case .unavailable:
+            EmptyView()
+
         case .failed:
             ContentUnavailableView {
                 Label(

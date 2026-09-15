@@ -1392,7 +1392,8 @@ struct ThumbnailFeedCoreTests {
         await feed.stopPrefetchAndWait()
     }
 
-    @Test func visibleNetworkDemandBeforeAuthorizationRecoversAndDecodesArrival() async throws {
+    @Test(arguments: [true, false])
+    func visibleNetworkDemandBeforeAuthorizationRecoversAndDecodesArrival(includedInLibrary: Bool) async throws {
         let uid = Self.uid("visible-network-before-scope")
         let cache = Self.cache("visible-network-before-scope")
         let loader = RecordingLoader(payloads: [uid: Self.pngData(width: 8, height: 8)])
@@ -1401,7 +1402,7 @@ struct ThumbnailFeedCoreTests {
         // cannot exercise the supported visible-network path.
         await feed.pausePrefetch()
         let graph = LibrarySourceGraph()
-        let change = Self.visibleScope(in: graph, uids: [uid])
+        let change = Self.visibleScope(in: graph, uids: [uid], includedInLibrary: includedInLibrary)
         #expect(await feed.bindDerivedDataEpoch(graph.runtimeEpoch))
         feed.submitVisibleDiskDecodeDemand([ThumbnailRequest(uid: uid)])
         #expect(await feed.replaceVisiblePriorityDemand([uid]) == 0)
@@ -1416,7 +1417,8 @@ struct ThumbnailFeedCoreTests {
         await feed.stopPrefetchAndWait()
     }
 
-    @Test func sourceAdmissionWakesAwaitedVisibleWarmPath() async throws {
+    @Test(arguments: [true, false])
+    func sourceAdmissionWakesAwaitedVisibleWarmPath(includedInLibrary: Bool) async throws {
         let uid = Self.uid("awaited-visible-before-scope")
         let cache = Self.cache("awaited-visible-before-scope")
         cache.storeToDisk(Self.pngData(width: 8, height: 8), for: uid)
@@ -1424,7 +1426,7 @@ struct ThumbnailFeedCoreTests {
         let feed = ThumbnailFeedCore(cache: cache, loader: loader, configuration: Self.configuration())
         await feed.setPrefetchEnabled(false)
         let graph = LibrarySourceGraph()
-        let change = Self.visibleScope(in: graph, uids: [uid])
+        let change = Self.visibleScope(in: graph, uids: [uid], includedInLibrary: includedInLibrary)
         #expect(await feed.bindDerivedDataEpoch(graph.runtimeEpoch))
         let requests = [ThumbnailRequest(uid: uid)]
         let blocked = await feed.warmVisibleDecoded(requests, limit: 1)
@@ -1443,8 +1445,11 @@ struct ThumbnailFeedCoreTests {
         await feed.stopPrefetchAndWait()
     }
 
-    private static func visibleScope(in graph: LibrarySourceGraph, uids: [PhotoUID]) -> LibrarySourceChange {
-        let source = LibrarySource(id: SourceID("visible-demand-test"), capabilities: .readThumbnail)
+    private static func visibleScope(
+        in graph: LibrarySourceGraph, uids: [PhotoUID], includedInLibrary: Bool = true
+    ) -> LibrarySourceChange {
+        let source = LibrarySource(
+            id: SourceID("visible-demand-test"), capabilities: .readThumbnail, isIncluded: includedInLibrary)
         _ = graph.commitSourceSet([source], using: graph.beginSourceSetRefresh())
         return graph.commit(Self.sourceItems(uids), validationToken: nil, using: graph.beginRefresh(source.id)!)!
     }
@@ -1552,8 +1557,12 @@ struct ThumbnailFeedCoreTests {
         #expect(status.diskFileCount == 1)
         #expect(status.downloadCompleted == 1)
         #expect(cache.diskFileCount() == 2)
-        #expect(await feed.cachedDecoded(for: analysisUID) == nil)
+        #expect(feed.memoryDecoded(for: analysisUID) == nil, "the background crawl must not decode into the grid LRU")
         #expect(await feed.backgroundCachedDecoded(for: analysisUID) != nil)
+        #expect(feed.memoryDecoded(for: analysisUID) == nil, "background analysis must remain cache-only")
+        #expect(
+            await feed.cachedDecoded(for: analysisUID) != nil, "an opened shared album can display its cached tiles")
+        #expect(feed.memoryDecoded(for: analysisUID) != nil)
 
         let replacementLease = graph.beginSourceSetRefresh()
         let replacement = graph.commitSourceSet([primarySource], using: replacementLease)!
@@ -1565,6 +1574,9 @@ struct ThumbnailFeedCoreTests {
         #expect(cache.diskData(for: primaryUID) != nil)
         #expect(cache.diskData(for: analysisUID) == nil)
         #expect(await feed.backgroundCachedDecoded(for: analysisUID) == nil)
+        #expect(feed.memoryDecoded(for: analysisUID) == nil)
+        #expect(await feed.cachedDecoded(for: analysisUID) == nil)
+        #expect(await feed.requestPriority(analysisUID) == false)
     }
 
     @Test func feedScopeReplacementCoalescesNewerRevisionDuringWorkerJoin() async throws {

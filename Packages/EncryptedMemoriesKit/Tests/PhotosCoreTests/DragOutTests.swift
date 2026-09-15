@@ -165,7 +165,7 @@ final class DragOutTests: XCTestCase {
         await stager.setProgressHandler(nil)
         await stager.finishAndCleanup()
 
-        let fractions = await recorder.fractions()
+        let fractions = recorder.fractions()
         XCTAssertFalse(fractions.isEmpty)
         XCTAssertEqual(fractions.last, 1.0)
         for (a, b) in zip(fractions, fractions.dropFirst()) {
@@ -267,22 +267,18 @@ final class DragOutTests: XCTestCase {
 
 // MARK: - Test helpers
 
-/// Records progress callbacks thread-safely.
-private actor ProgressRecorder {
-    private var recorded: [Double] = []
+/// Records progress callbacks synchronously and thread-safely.
+private final class ProgressRecorder: @unchecked Sendable {
+    private let lock = OSAllocatedUnfairLock(initialState: [Double]())
 
     var handler: @Sendable (PhotoUID, Double) -> Void {
-        { [weak self] _, fraction in
-            Task { await self?.append(fraction) }
+        { [self] _, fraction in
+            lock.withLock { $0.append(fraction) }
         }
     }
 
-    private func append(_ fraction: Double) {
-        recorded.append(fraction)
-    }
-
     func fractions() -> [Double] {
-        recorded
+        lock.withLock { $0 }
     }
 }
 

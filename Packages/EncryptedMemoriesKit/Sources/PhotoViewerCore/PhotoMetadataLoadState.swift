@@ -6,6 +6,8 @@ public enum PhotoMetadataLoadState: Equatable, Sendable {
     case idle
     case loading
     case loaded(PhotoMetadata)
+    /// The provider or optional details are absent. This is a normal state, without a retry warning.
+    case unavailable
     case failed
 
     public var metadata: PhotoMetadata? {
