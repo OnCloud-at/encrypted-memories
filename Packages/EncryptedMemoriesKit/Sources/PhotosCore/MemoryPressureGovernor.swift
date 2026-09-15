@@ -18,11 +18,19 @@ public struct MemoryConditions: Sendable, Equatable {
     /// Carried for crawl and prefetch policy. It does not
     /// shrink caches (that would force re-decodes and cost *more* energy, defeating Low Power Mode).
     public var lowPowerMode: Bool
+    /// Reduces cache residency proactively without reporting observed memory pressure.
+    public var isBackgrounded: Bool
 
-    public init(pressure: Pressure = .normal, thermal: Thermal = .nominal, lowPowerMode: Bool = false) {
+    public init(
+        pressure: Pressure = .normal,
+        thermal: Thermal = .nominal,
+        lowPowerMode: Bool = false,
+        isBackgrounded: Bool = false
+    ) {
         self.pressure = pressure
         self.thermal = thermal
         self.lowPowerMode = lowPowerMode
+        self.isBackgrounded = isBackgrounded
     }
 }
 
@@ -35,7 +43,7 @@ public enum MemoryBudgetTier: Int, Sendable, Comparable, CaseIterable {
     /// Full budgets, nothing purged.
     case normal = 0
     /// Lower future budgets without a hard purge. This matches the `DispatchSource` elevated-pressure semantic
-    /// ("reduce future cache sizes", per dispatch/source.h) and Apple's thermal `.serious` guidance.
+    /// ("reduce future cache sizes", per dispatch/source.h), backgrounding and thermal `.serious` guidance.
     case reduced = 1
     /// Lowest budgets with immediate release of non-essential holdings. This matches the UIKit
     /// `didReceiveMemoryWarning` / `DispatchSource` critical semantic (purge now).
@@ -61,11 +69,13 @@ public enum MemoryBudgetTier: Int, Sendable, Comparable, CaseIterable {
 }
 
 /// Pure, platform-free policy mapping adapter-fed conditions to a coordinated tier. Testable in
-/// isolation; this is the only place that maps pressure and thermal state to a tier.
+/// isolation; this is the only place that maps pressure, thermal state and background activity to a tier.
 public enum MemoryBudgetPolicy {
     public static func tier(for conditions: MemoryConditions) -> MemoryBudgetTier {
         if conditions.pressure == .critical || conditions.thermal == .critical { return .minimal }
-        if conditions.pressure == .warning || conditions.thermal == .serious { return .reduced }
+        if conditions.pressure == .warning || conditions.thermal == .serious || conditions.isBackgrounded {
+            return .reduced
+        }
         // `.fair` thermal and Low Power Mode do not shrink caches (Apple's `.fair`
         // mitigation is "defer prefetching", a crawl concern; shrinking caches would only add
         // re-decode work). They remain visible via `MemoryPressureGovernor.conditions`.

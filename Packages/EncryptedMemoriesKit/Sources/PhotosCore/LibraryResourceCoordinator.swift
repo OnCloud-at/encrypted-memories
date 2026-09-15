@@ -213,7 +213,7 @@ public struct LibraryResourcePolicy: Sendable, Equatable {
         if snapshot.executionOpportunity == .suspended {
             return result(false, 0, .executionSuspended)
         }
-        if snapshot.thermalLevel == .critical || snapshot.memoryBudgetTier == .minimal
+        if snapshot.thermalLevel == .critical || snapshot.memoryPressure == .critical
             || snapshot.memoryHeadroom == .critical
         {
             return result(false, 0, .criticalPressure)
@@ -221,7 +221,7 @@ public struct LibraryResourcePolicy: Sendable, Equatable {
         if recoveryIsPending, request.intent < .interactive {
             return result(false, 0, .recoveryHysteresis)
         }
-        if snapshot.thermalLevel == .serious || snapshot.memoryBudgetTier == .reduced
+        if snapshot.thermalLevel == .serious || snapshot.memoryPressure == .warning
             || snapshot.memoryHeadroom == .constrained
         {
             let isSmallInteractiveInference =
@@ -371,7 +371,7 @@ private final class LibraryWorkLeaseState: @unchecked Sendable {
         if snapshot.thermalLevel == .serious || snapshot.thermalLevel == .critical {
             return .thermalPressure
         }
-        if snapshot.memoryBudgetTier != .normal || snapshot.memoryHeadroom == .constrained
+        if snapshot.memoryPressure != .normal || snapshot.memoryHeadroom == .constrained
             || snapshot.memoryHeadroom == .critical
         {
             return .memoryPressure
@@ -687,6 +687,7 @@ public actor LibraryResourceCoordinator {
         let signature = [
             snapshot.thermalLevel.rawValue.description,
             String(describing: snapshot.memoryBudgetTier),
+            String(describing: snapshot.memoryPressure),
             String(describing: snapshot.memoryHeadroom),
             "\(snapshot.isLowPowerMode)",
             String(describing: snapshot.executionOpportunity),
@@ -706,6 +707,7 @@ public actor LibraryResourceCoordinator {
                 "headroom": String(describing: snapshot.memoryHeadroom),
                 "lowPower": "\(snapshot.isLowPowerMode)",
                 "memory": String(describing: snapshot.memoryBudgetTier),
+                "memoryPressure": String(describing: snapshot.memoryPressure),
                 "networkConstrained": "\(snapshot.network.isConstrained)",
                 "networkExpensive": "\(snapshot.network.isExpensive)",
                 "networkReachable": "\(snapshot.network.isReachable)",
@@ -722,6 +724,13 @@ public actor LibraryResourceCoordinator {
     }
 
     private static func pressureRank(_ snapshot: LibraryRuntimeSnapshot) -> Int {
+        // Cache resizing alone must not start pressure recovery or delay automatic work.
+        let memoryRank =
+            switch snapshot.memoryPressure {
+            case .normal: 0
+            case .warning: 2
+            case .critical: 4
+            }
         let headroomRank =
             switch snapshot.memoryHeadroom {
             case .unknown, .healthy: 0
@@ -729,8 +738,8 @@ public actor LibraryResourceCoordinator {
             case .critical: 3
             }
         return max(
-            snapshot.thermalLevel.rawValue,
-            snapshot.memoryBudgetTier.rawValue * 2,
+            snapshot.thermalLevel == .critical ? 4 : snapshot.thermalLevel.rawValue,
+            memoryRank,
             headroomRank,
             snapshot.executionOpportunity == .suspended ? 4 : 0
         )

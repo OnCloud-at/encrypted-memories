@@ -39,6 +39,7 @@ public enum LibraryExecutionOpportunity: Int, Sendable, Comparable, Equatable {
 public struct LibraryRuntimeSnapshot: Sendable, Equatable {
     public var thermalLevel: LibraryThermalLevel
     public var memoryPressure: MemoryConditions.Pressure
+    /// Cache footprint, including proactive background reduction. This is not a pressure signal.
     public var memoryBudgetTier: MemoryBudgetTier
     public var memoryHeadroom: LibraryMemoryHeadroom
     public var isLowPowerMode: Bool

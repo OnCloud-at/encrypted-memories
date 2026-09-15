@@ -21,7 +21,7 @@ from test_review_pull_request import changed_file, pull_request, valid_review
 
 
 class EvidenceTests(unittest.TestCase):
-    def verify(self, *, unavailable=False, retry_quote=False, **overrides):
+    def verify(self, *, unavailable=False, retry_quote=False, testing_gaps=None, review_notes=None, **overrides):
         files = [changed_file()]
         payload, _, _, paths = review.llm_payload(pull_request(), files, model="test", reasoning_effort=None)
         candidate = {"severity": "blocking", "file_id": "file-001", "path": paths["file-001"],
@@ -46,7 +46,14 @@ class EvidenceTests(unittest.TestCase):
 
         with patch.object(review, "github_request", return_value=None if unavailable else source) as fetch:
             result = verify_findings(
-                valid_review(findings=[candidate]), payload, files, review.pull_request_snapshot(pull_request()),
+                valid_review(
+                    findings=[candidate],
+                    testing_gaps=testing_gaps or [],
+                    review_notes=review_notes or [],
+                ),
+                payload,
+                files,
+                review.pull_request_snapshot(pull_request()),
                 "example/repo", token="test", api_url="https://api.github.test", fetch=fetch,
                 redact=lambda text: [{"line": 1, "text": text}],
                 request=request)
@@ -64,6 +71,27 @@ class EvidenceTests(unittest.TestCase):
                 self.assertEqual(result["findings"], [])
                 self.assertEqual(result["testing_gaps"], [])
                 self.assertIn("🟢", review.render_review(result, {}, "abc123", []))
+
+    def test_nonblocking_model_test_notes_do_not_make_review_incomplete(self):
+        result = self.verify(
+            decision="dismissed",
+            review_notes=["The test could assert one more cache invariant."],
+        )
+        self.assertEqual(result["findings"], [])
+        self.assertEqual(result["testing_gaps"], [])
+        self.assertEqual(result["review_notes"], ["The test could assert one more cache invariant."])
+        body = review.render_review(result, {}, "abc123", [])
+        self.assertIn("🟢", body)
+        self.assertNotIn("⚪ Review incomplete", body)
+        self.assertIn("Review notes", body)
+        self.assertIn("cache invariant", body)
+
+    def test_model_coverage_gaps_remain_incomplete(self):
+        result = self.verify(testing_gaps=["The changed caller was not supplied."])
+        self.assertEqual(result["testing_gaps"], ["The changed caller was not supplied."])
+        body = review.render_review(result, {}, "abc123", [])
+        self.assertIn("partial review", body)
+        self.assertIn("The changed caller was not supplied.", body)
 
     def test_missing_context_stays_grey_with_specific_reason(self):
         result = self.verify(decision="uncertain", missing_context="The retry caller and its error contract.")

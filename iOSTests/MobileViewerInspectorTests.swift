@@ -10,6 +10,17 @@ import XCTest
 /// The photo information inspector of the production viewer: a trailing column beside the media in a regular
 /// width window and a sheet in a compact width window, with the same viewer, pager and photo kept mounted while
 /// the window resizes between the two (Split View, Slide Over, Stage Manager). This does not simulate a hinge.
+///
+/// The viewer is presented through the production route (`MobileViewerRouter` -> `.fullScreenCover(item:)`, as
+/// `MobileMainTabView` does), not hosted directly as a window root. A directly hosted viewer takes a synthetic
+/// resize path (window frame plus trait overrides, no presentation container) in which the native inspector split
+/// collapses but leaves its 360 pt trailing content inset behind whenever the main thread is contended, for
+/// example by the previous test's account teardown. The presented route resets the inset in every probe.
+///
+/// The cover is presented without animation. With the animated presentation, iPadOS 27 laid the split out during
+/// the transition and never applied the inspector's content inset (photo under the column, pager 1032). This
+/// fixture verifies the width adaptation, not the OS presentation transition; that initial-inset miss is recorded
+/// as an open iPadOS 27 finding (Onyx: viewer-inspector-compact-viewport-regression).
 final class MobileViewerInspectorTests: XCTestCase {
     @MainActor func testInspectorAdaptsBetweenColumnAndSheetWhileTheViewerStaysMounted() async throws {
         try XCTSkipUnless(
@@ -35,17 +46,27 @@ final class MobileViewerInspectorTests: XCTestCase {
         let previousKeyWindow = scene.windows.first(where: \.isKeyWindow)
         let window = UIWindow(windowScene: scene)
         window.frame = fullBounds
-        window.rootViewController = UIHostingController(
-            rootView: MobilePhotoViewer(
-                items: fixture.items, startIndex: 2, context: ViewerCollectionContext(filter: .all),
-                libraryModel: model, viewerRouter: router, showsInfoInitially: inspector))
+        let root = UIHostingController(rootView: ViewerPresentationHost(router: router, libraryModel: model))
+        window.rootViewController = root
         window.makeKeyAndVisible()
         defer {
+            root.presentedViewController?.dismiss(animated: false)
             window.isHidden = true
             window.rootViewController = nil
             previousKeyWindow?.makeKey()
         }
+        try await Task.sleep(for: .milliseconds(300))
+        // Present without animation: see the type comment.
+        var noAnimation = Transaction()
+        noAnimation.disablesAnimations = true
+        withTransaction(noAnimation) {
+            router.presentation = MobileViewerPresentation(
+                index: 2, items: fixture.items, context: ViewerCollectionContext(filter: .all),
+                showsInfoInitially: inspector)
+        }
         try await Task.sleep(for: .seconds(2))
+        let viewerHost = try XCTUnwrap(
+            root.presentedViewController, "the router presents the production viewer as a full-screen cover")
         var report: [String] = []
         defer { writeArtifact("viewer-inspector-report.txt", Data(report.joined(separator: "\n").utf8)) }
 
@@ -56,7 +77,7 @@ final class MobileViewerInspectorTests: XCTestCase {
                 if let pageController = controller as? UIPageViewController { result = pageController }
                 controller.children.forEach(walk)
             }
-            walk(window.rootViewController)
+            walk(viewerHost)
             return result
         }
         /// The zoomable media viewport of the current page: the UIScrollView of MobileZoomableImage, identified by
@@ -80,9 +101,9 @@ final class MobileViewerInspectorTests: XCTestCase {
             let pagerWidth = try XCTUnwrap(pager(), "the production viewer hosts its UIPageViewController").view.bounds
                 .width
             let viewport = try zoomableViewport()
-            let presented = window.rootViewController?.presentedViewController != nil
+            let presented = viewerHost.presentedViewController != nil
             report.append(
-                "\(label): window=\(Int(window.bounds.width)) controllerSizeClass=\(window.rootViewController?.traitCollection.horizontalSizeClass.rawValue ?? -1) pager=\(Int(pagerWidth)) viewport=\(Int(viewport.bounds.width)) presentedSheet=\(presented)"
+                "\(label): window=\(Int(window.bounds.width)) controllerSizeClass=\(viewerHost.traitCollection.horizontalSizeClass.rawValue) pager=\(Int(pagerWidth)) viewport=\(Int(viewport.bounds.width)) presentedSheet=\(presented)"
             )
             return (viewport.bounds.width, presented)
         }
@@ -94,7 +115,8 @@ final class MobileViewerInspectorTests: XCTestCase {
 
         func resize(_ bounds: CGRect, sizeClass: UIUserInterfaceSizeClass) {
             window.traitOverrides.horizontalSizeClass = sizeClass
-            window.rootViewController?.traitOverrides.horizontalSizeClass = sizeClass
+            root.traitOverrides.horizontalSizeClass = sizeClass
+            viewerHost.traitOverrides.horizontalSizeClass = sizeClass
             window.frame = bounds
             window.layoutIfNeeded()
         }
@@ -153,7 +175,7 @@ final class MobileViewerInspectorTests: XCTestCase {
 
             resize(compactBounds, sizeClass: .compact)
             try await Task.sleep(for: .milliseconds(1500))
-            if let sheet = window.rootViewController?.presentedViewController {
+            if let sheet = viewerHost.presentedViewController {
                 func descendants(_ view: UIView) -> [UIView] { [view] + view.subviews.flatMap(descendants) }
                 let bars = descendants(sheet.presentationController?.containerView ?? window).compactMap {
                     $0 as? UINavigationBar
@@ -252,5 +274,32 @@ final class MobileViewerInspectorTests: XCTestCase {
         let url = URL(fileURLWithPath: directory, isDirectory: true)
         try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         try? data.write(to: url.appendingPathComponent(name))
+    }
+}
+
+/// The production viewer presentation: one `.fullScreenCover(item:)` bound to the viewer router, the way
+/// `MobileMainTabView` presents `MobilePhotoViewer` (see `EncryptedMemoriesMobileApp.swift`).
+private struct ViewerPresentationHost: View {
+    let router: MobileViewerRouter
+    let libraryModel: MobileLibraryModel
+
+    var body: some View {
+        Color.black
+            .ignoresSafeArea()
+            .fullScreenCover(
+                item: Binding(
+                    get: { router.presentation },
+                    set: { router.presentation = $0 }
+                )
+            ) { presentation in
+                MobilePhotoViewer(
+                    items: presentation.items,
+                    startIndex: presentation.index,
+                    context: presentation.context,
+                    libraryModel: libraryModel,
+                    viewerRouter: router,
+                    showsInfoInitially: presentation.showsInfoInitially
+                )
+            }
     }
 }

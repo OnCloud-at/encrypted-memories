@@ -86,6 +86,7 @@ def valid_review(**overrides: object) -> dict[str, object]:
         "summary": "The retry path changes.",
         "findings": [],
         "testing_gaps": [],
+        "review_notes": [],
     }
     value.update(overrides)
     return value
@@ -136,6 +137,7 @@ class PayloadTests(unittest.TestCase):
         self.assertIn("not issue triage", system_prompt)
         self.assertIn("Do not claim to decide GitHub mergeability", system_prompt)
         self.assertIn("untrusted data", system_prompt)
+        self.assertIn("review_notes", system_prompt)
         self.assertIn("single-expression", system_prompt)
         self.assertIn("repository-wide reference evidence", system_prompt)
         self.assertIn("Do not report hypothetical risks", system_prompt)
@@ -155,6 +157,10 @@ class PayloadTests(unittest.TestCase):
             review_pull_request.MAX_PATCH_CHARS,
         )
         self.assertLessEqual(len(json.dumps(payload).encode("utf-8")), review_pull_request.MAX_LLM_REQUEST_BYTES)
+        self.assertEqual(
+            payload["response_format"]["json_schema"]["schema"]["required"],
+            ["summary", "findings", "testing_gaps", "review_notes"],
+        )
         self.assertEqual(changed_lines, {"file-001": {1}})
         self.assertEqual(file_paths, {"file-001": "Sources/Backup.swift"})
         self.assertTrue(any("truncated" in gap for gap in gaps))
@@ -281,6 +287,19 @@ class ParsingAndRenderingTests(unittest.TestCase):
                 {"file-001": {1}},
                 {"file-001": "Sources/Backup.swift"},
             )
+
+    def test_review_notes_are_kept_separate_from_coverage_gaps(self) -> None:
+        parsed = review_pull_request.parse_review(
+            llm_content(valid_review(review_notes=["The test could assert one more invariant."])),
+            {"file-001": {1}},
+            {"file-001": "Sources/Backup.swift"},
+        )
+
+        self.assertEqual(parsed["testing_gaps"], [])
+        self.assertEqual(parsed["review_notes"], ["The test could assert one more invariant."])
+        body = review_pull_request.render_review(parsed, pull_request(), "abc123", [])
+        self.assertIn("🟢", body)
+        self.assertIn("Review notes", body)
 
     def test_review_rejects_a_non_string_file_id(self) -> None:
         review = valid_review(

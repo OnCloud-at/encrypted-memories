@@ -79,6 +79,10 @@ final class MobileSignedInMultiwindowTests: XCTestCase {
         XCTAssertTrue(gridB.thumbnailFeed === fixture.feed, "both windows share one thumbnail feed")
         XCTAssertTrue(gridB.thumbnailFeed?.feedCore === gridA.thumbnailFeed?.feedCore)
         XCTAssertTrue(MobileAccountRuntime.shared.libraryModel === runtime.libraryModel)
+        try await waitUntil("both window scenes reach the shared activity ledger") {
+            runtime.sceneLedger.phase(of: firstScene.session.persistentIdentifier) != nil
+                && runtime.sceneLedger.phase(of: secondScene.session.persistentIdentifier) != nil
+        }
         XCTAssertGreaterThanOrEqual(runtime.sceneLedger.sceneCount, 2)
         try await waitUntil("one window scene becomes active after the open transition") {
             windowScenes().contains { $0.activationState == .foregroundActive }

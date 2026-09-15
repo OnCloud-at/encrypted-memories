@@ -64,7 +64,7 @@ Code links point to the reviewed commit; they do not create unresolved review th
 - Green: no actionable findings in the reviewed changes.
 - Yellow: actionable notices without a serious finding.
 - Red: serious findings survived evidence verification; this remains advice.
-- Grey: review unavailable or incomplete. Partial findings also carry a coverage note.
+- Grey: review unavailable or incomplete because required source or context was missing. Partial findings also carry a coverage note.
 
 The comment shows at most three findings. Expand the details for evidence and coverage limitations.
 A second model pass challenges candidate findings using the patch and redacted source windows
@@ -84,7 +84,8 @@ The issue-triage workflow keeps its existing shorter timeout policy.
 Review coverage is bounded: 80 files, 96,000 patch characters, and 3,000 patch lines.
 Source reads accept text files up to 200,000 bytes and select windows around candidate lines.
 Large inputs can reduce these windows. Omitted patches, unavailable source, and specific missing context produce coverage limitations.
-Dismissed suspicions, low-confidence candidates, and existing issues do not count as coverage gaps.
+Dismissed suspicions, low-confidence candidates, existing issues, and optional test improvements do not count as coverage gaps.
+The model reports optional test improvements as review notes, so they do not change the review status.
 Invalid evidence triggers regeneration; repeated validation failure makes the review unavailable.
 Logs report decision counts without candidate text. An uncertain decision must identify its missing context.
 The reviewer does not execute PR code or search the entire repository for callers and tests.
