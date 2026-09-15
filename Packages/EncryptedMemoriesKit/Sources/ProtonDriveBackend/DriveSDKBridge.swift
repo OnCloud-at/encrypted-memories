@@ -1,4 +1,5 @@
 import AVFoundation
+import AlbumCore
 import Foundation
 import PhotosCore
 import ProtonAuth
@@ -1160,6 +1161,17 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                 volumeID: root.volumeID,
                 mediaTypeOverrides: timelineStore?.mediaTypeEvidence(volumeID: root.volumeID) ?? [:]
             )
+        case .sharedAlbum(let volumeID, let nodeID, _):
+            // Shared albums live on another user's volume, so the owned-volume HTTP album route cannot list
+            // them. The SDK catalog adapter is the only content source; it proves identity and capture time only.
+            let items = try await makeAlbumCatalogBackend()
+                .librarySourceItems(for: AlbumNodeIdentifier(volumeID: volumeID, nodeID: nodeID))
+                .map(\.item)
+                .sorted(by: TimelineOrder.areInIncreasingOrder)
+            return [
+                TimelineSection(
+                    id: "shared-album", date: items.first?.captureTime ?? .distantPast, title: "", items: items)
+            ]
         case .trash:
             let root = try await resolvePhotosRoot()
             let links = try await driveSession.listTrash(volumeID: root.volumeID)

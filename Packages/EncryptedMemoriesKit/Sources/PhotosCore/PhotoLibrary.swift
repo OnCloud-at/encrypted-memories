@@ -49,9 +49,19 @@ public enum PhotoFilter: Equatable, Hashable, Sendable {
     case all
     case tag(PhotoTag)
     case album(id: String, title: String)
+    /// A read-only album shared with the account. Lossless volume + node identity because the album lives on
+    /// another user's volume; contents come from the SDK, never from the owned-volume HTTP album route.
+    case sharedAlbum(volumeID: String, nodeID: String, title: String)
     case trash
     /// The whole-library Map view - no timeline load; the detail shows the map instead.
     case map
+
+    /// True for routes whose items live on another account's volume. Every mutation (trash, favorite,
+    /// album membership, cover) targets the owned volume and must stay hidden on these routes.
+    public var isReadOnly: Bool {
+        if case .sharedAlbum = self { return true }
+        return false
+    }
 
     /// Whether selecting this route should load timeline sections into the Metal grid.
     public var hasTimeline: Bool {
@@ -91,7 +101,7 @@ public extension PhotoFilter {
                 description: L10n.string("empty.filter_description"),
                 systemImage: tag.systemImage
             )
-        case .album:
+        case .album, .sharedAlbum:
             PhotoFilterEmptyStateCopy(
                 title: L10n.string("empty.album_title"),
                 description: L10n.string("empty.album_description"),

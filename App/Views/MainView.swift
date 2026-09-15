@@ -1105,6 +1105,7 @@ struct MainView: View {
         case .all: return L10n.string("library.title")
         case .tag(let t): return t.title
         case .album(_, let name): return name
+        case .sharedAlbum(_, _, let name): return name
         case .trash: return String(localized: "sidebar.recently_deleted")
         case .map: return "Map"
         }
@@ -1949,7 +1950,7 @@ struct MainView: View {
     }
 
     @ToolbarContentBuilder private var librarySelectionAndViewToolbarContent: some ToolbarContent {
-        if selection != .trash {
+        if selection != .trash, !selection.isReadOnly {
             ToolbarItemGroup(placement: .secondaryAction) {
                 downloadActionItem
                 Button {
@@ -2486,8 +2487,12 @@ private struct SidebarView: View {
                     .buttonStyle(.plain)
                 }
                 ForEach(albums) { album in
-                    Label(album.title, systemImage: "rectangle.stack")
-                        .tag(PhotoFilter.album(id: album.id, title: album.title))
+                    OwnedAlbumSidebarRow(
+                        album: album,
+                        thumbnailFeed: thumbnailFeed,
+                        sourceAnalysisRevision: sourceAnalysisRevision
+                    )
+                    .tag(PhotoFilter.album(id: album.id, title: album.title))
                 }
             }
             Section(L10n.string("collections.section_shared_with_me")) {
@@ -2514,6 +2519,13 @@ private struct SidebarView: View {
                         presentation: sharedAlbumPresentation(album),
                         thumbnailFeed: thumbnailFeed,
                         sourceAnalysisRevision: sourceAnalysisRevision
+                    )
+                    .tag(
+                        PhotoFilter.sharedAlbum(
+                            volumeID: album.node.volumeID,
+                            nodeID: album.node.nodeID,
+                            title: album.title
+                        )
                     )
                     .contextMenu {
                         if canLeaveSharedAlbum {
@@ -2562,9 +2574,11 @@ private struct SidebarView: View {
     }
 }
 
-private struct SharedAlbumSidebarRow: View {
-    let album: SharedAlbumSummary
-    let presentation: SharedAlbumPresentation
+/// Sidebar cover thumbnail shared by owned and shared album rows. Falls back to a symbol until the
+/// thumbnail feed has the cover in memory or on disk.
+private struct AlbumSidebarCover: View {
+    let coverUID: PhotoUID?
+    let fallbackSystemImage: String
     let thumbnailFeed: ThumbnailFeed
     let sourceAnalysisRevision: UInt64
     @State private var coverImage: NSImage?
@@ -2575,44 +2589,21 @@ private struct SharedAlbumSidebarRow: View {
         let analysisRevision: UInt64
     }
 
-    private var coverUID: PhotoUID? { album.coverPhotoUID }
-
-    /// The one-line row stays compact; invitation details and the read-only reason use the tooltip.
-    private var helpText: String {
-        [presentation.detailLine, presentation.invitationDetail, presentation.writeRestrictionReason]
-            .compactMap { $0 }
-            .joined(separator: "\n")
-    }
-
     var body: some View {
-        HStack(spacing: 8) {
-            ZStack {
-                RoundedRectangle(cornerRadius: 6)
-                    .fill(.quaternary)
-                if let coverImage {
-                    Image(nsImage: coverImage)
-                        .resizable()
-                        .scaledToFill()
-                } else {
-                    Image(systemName: "person.2.crop.square.stack")
-                        .foregroundStyle(.secondary)
-                }
-            }
-            .frame(width: 32, height: 32)
-            .clipShape(RoundedRectangle(cornerRadius: 6))
-            VStack(alignment: .leading, spacing: 1) {
-                Text(album.title)
-                    .lineLimit(1)
-                Text(presentation.detailLine)
-                    .font(.caption)
+        ZStack {
+            RoundedRectangle(cornerRadius: 6)
+                .fill(.quaternary)
+            if let coverImage {
+                Image(nsImage: coverImage)
+                    .resizable()
+                    .scaledToFill()
+            } else {
+                Image(systemName: fallbackSystemImage)
                     .foregroundStyle(.secondary)
-                    .lineLimit(1)
             }
         }
-        .help(helpText)
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel(presentation.accessibilityLabel)
-        .accessibilityHint(presentation.accessibilityHint ?? "")
+        .frame(width: 32, height: 32)
+        .clipShape(RoundedRectangle(cornerRadius: 6))
         .task(id: CoverLoadKey(uid: coverUID, analysisRevision: sourceAnalysisRevision)) {
             if loadedCoverUID != coverUID {
                 coverImage = nil
@@ -2625,5 +2616,67 @@ private struct SharedAlbumSidebarRow: View {
                 coverImage = await thumbnailFeed.analysisImage(for: coverUID)
             }
         }
+    }
+}
+
+private struct OwnedAlbumSidebarRow: View {
+    let album: AlbumSummary
+    let thumbnailFeed: ThumbnailFeed
+    let sourceAnalysisRevision: UInt64
+
+    var body: some View {
+        HStack(spacing: 8) {
+            AlbumSidebarCover(
+                coverUID: album.coverPhotoUID,
+                fallbackSystemImage: "rectangle.stack",
+                thumbnailFeed: thumbnailFeed,
+                sourceAnalysisRevision: sourceAnalysisRevision
+            )
+            Text(album.title)
+                .lineLimit(1)
+        }
+    }
+}
+
+private struct SharedAlbumSidebarRow: View {
+    let album: SharedAlbumSummary
+    let presentation: SharedAlbumPresentation
+    let thumbnailFeed: ThumbnailFeed
+    let sourceAnalysisRevision: UInt64
+
+    /// The row stays compact; the read-only reason lives in the tooltip and accessibility hint.
+    private var helpText: String {
+        [presentation.detailLine, presentation.invitationDetail, presentation.writeRestrictionReason]
+            .compactMap { $0 }
+            .joined(separator: "\n")
+    }
+
+    var body: some View {
+        HStack(spacing: 8) {
+            AlbumSidebarCover(
+                coverUID: album.coverPhotoUID,
+                fallbackSystemImage: "person.2.crop.square.stack",
+                thumbnailFeed: thumbnailFeed,
+                sourceAnalysisRevision: sourceAnalysisRevision
+            )
+            VStack(alignment: .leading, spacing: 1) {
+                Text(album.title)
+                    .lineLimit(1)
+                Text(presentation.detailLine)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                if let invitation = presentation.invitationDetail {
+                    Text(invitation)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+            }
+        }
+        .help(helpText)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(presentation.accessibilityLabel)
+        .accessibilityHint(presentation.accessibilityHint ?? "")
     }
 }
