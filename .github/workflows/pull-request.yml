@@ -74,6 +74,7 @@ jobs:
           python3 .github/scripts/test_remind_llm_key_expiry.py
           python3 .github/scripts/test_triage_issue.py
           python3 .github/scripts/test_review_pull_request.py
+          python3 .github/scripts/test_review_advisory.py
 
       - name: Lint GitHub Actions workflows
         env:
