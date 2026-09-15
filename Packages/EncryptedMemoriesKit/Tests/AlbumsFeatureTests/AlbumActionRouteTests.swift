@@ -44,6 +44,25 @@ final class AlbumActionRouteTests: XCTestCase {
         XCTAssertTrue(collections.contains("AlbumCreationSheet("))
     }
 
+    func testSharedAlbumRowsUseTheSharedPresentationAndNeverEvaluateRoles() throws {
+        for path in ["App/Views/MainView.swift", "iOSApp/MobileAlbumsScreen.swift"] {
+            let view = try source(path)
+            XCTAssertTrue(view.contains("presentation.detailLine"), "\(path) must show the shared role line")
+            XCTAssertTrue(
+                view.contains(".accessibilityLabel(presentation.accessibilityLabel)"),
+                "\(path) must expose the effective role to VoiceOver")
+            for forbidden in [
+                "SharedAlbumPermissions.resolve", "album.role", "invitation?.role", "canWriteSharedAlbums",
+                "SharedAlbumRole",
+            ] {
+                XCTAssertFalse(view.contains(forbidden), "\(path) must not evaluate shared roles (\(forbidden))")
+            }
+            XCTAssertFalse(view.contains("import ProtonDriveSDK"), "\(path) must not import SDK types")
+        }
+        let core = try source("Packages/EncryptedMemoriesKit/Sources/AlbumCore/AlbumModels.swift")
+        XCTAssertFalse(core.contains("import ProtonDriveSDK"))
+    }
+
     func testMobileFilteredCollectionsRecoverAfterTransientLoadFailure() throws {
         let collections = try source("iOSApp/MobileAlbumsScreen.swift")
         XCTAssertTrue(collections.contains("Button(L10n.string(\"action.retry\"))"))

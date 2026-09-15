@@ -46,6 +46,16 @@ public final class AlbumActionCoordinator {
     public var canListSharedWithMe: Bool { repository.capabilities.canListSharedWithMe }
     public var canLeaveSharedAlbum: Bool { repository.capabilities.canLeaveSharedAlbum }
     public var canReadMemberships: Bool { repository.capabilities.canReadMemberships }
+    public var capabilities: AlbumCapabilities { repository.capabilities }
+
+    /// Per-album shared permissions. Views must use this instead of evaluating roles themselves.
+    public func permissions(for album: SharedAlbumSummary) -> SharedAlbumPermissions {
+        repository.permissions(for: album)
+    }
+
+    public func presentation(for album: SharedAlbumSummary) -> SharedAlbumPresentation {
+        SharedAlbumPresentation(album: album, permissions: permissions(for: album))
+    }
     public var showsInitialAlbumLoadingPlaceholder: Bool {
         !hasCompletedInitialAlbumLoad && albums.isEmpty
     }

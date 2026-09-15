@@ -67,7 +67,122 @@ public struct AlbumNodeIdentifier: Hashable, Sendable, Codable {
     }
 }
 
-/// A read-only album shared with the current account.
+/// App-owned mirror of the SDK 0.27.0 `MemberRole`. Core never imports SDK types.
+public enum SharedAlbumRole: Sendable, Equatable, CaseIterable {
+    /// Access comes from an ancestor node. The node itself is not shared directly with the user,
+    /// so the effective level is unknown here and the app treats it as read-only.
+    case inherited
+    case viewer
+    case editor
+    case admin
+}
+
+/// Metadata of the direct invitation (`AlbumNode.membership`). It is descriptive only: effective
+/// permissions always come from `SharedAlbumSummary.role` (`AlbumNode.directRole`).
+public struct SharedAlbumInvitation: Sendable, Equatable {
+    /// Role granted by this invitation. It can be lower than the effective role.
+    public let role: SharedAlbumRole
+    /// The inviter's claimed address, or nil when the SDK returned none.
+    public let sharedBy: String?
+    /// False when the SDK could not verify the invitation signature. The address is then only claimed.
+    public let isSharedByVerified: Bool
+    /// Nil when the SDK value is not a plausible invitation time.
+    public let inviteTime: Date?
+
+    public init(role: SharedAlbumRole, sharedBy: String?, isSharedByVerified: Bool, inviteTime: Date?) {
+        let trimmed = sharedBy?.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.role = role
+        self.sharedBy = trimmed?.isEmpty == false ? trimmed : nil
+        self.isSharedByVerified = isSharedByVerified
+        self.inviteTime = inviteTime
+    }
+
+    /// True when part of the invitation metadata is missing or unverified.
+    public var isDegraded: Bool { sharedBy == nil || !isSharedByVerified || inviteTime == nil }
+
+    /// Earliest accepted invitation time (2000-01-01T00:00:00Z). Older values indicate a zero or
+    /// corrupt timestamp.
+    public static let earliestPlausibleInviteTime = Date(timeIntervalSince1970: 946_684_800)
+    /// Tolerated clock skew for invitation times in the future.
+    public static let inviteTimeFutureTolerance: TimeInterval = 24 * 60 * 60
+
+    /// Returns a date only for a finite time between 2000-01-01 and `now` plus one day.
+    public static func plausibleInviteTime(_ interval: TimeInterval, now: Date = Date()) -> Date? {
+        guard interval.isFinite else { return nil }
+        let date = Date(timeIntervalSince1970: interval)
+        guard date >= earliestPlausibleInviteTime,
+            date <= now.addingTimeInterval(inviteTimeFutureTolerance)
+        else { return nil }
+        return date
+    }
+}
+
+/// Why a shared album stays read-only in this app.
+public enum SharedAlbumWriteRestriction: Sendable, Equatable {
+    /// The effective role (viewer, or inherited access) does not permit edits.
+    case roleDoesNotPermitEditing
+    /// The role permits edits, but no wired write transport addresses shared albums.
+    case transportUnsupported
+}
+
+extension SharedAlbumWriteRestriction {
+    /// User-facing reason shared by rows, hints and errors.
+    public var localizedReason: String {
+        switch self {
+        case .roleDoesNotPermitEditing: L10n.string("albums.shared_read_only_role")
+        case .transportUnsupported: L10n.string("albums.shared_read_only_transport")
+        }
+    }
+}
+
+/// Per-album permissions for one shared album. Owned albums keep using `AlbumCapabilities`.
+public struct SharedAlbumPermissions: Sendable, Equatable {
+    public let canView: Bool
+    public let canAddPhotos: Bool
+    public let canRemovePhotos: Bool
+    public let canSetCover: Bool
+    /// Always false: deleting a shared album is not an editor/admin action in this app.
+    public let canDelete: Bool
+    /// Always false: member and role management is not implemented.
+    public let canManageMembers: Bool
+    /// Nil when at least one write is permitted.
+    public let writeRestriction: SharedAlbumWriteRestriction?
+
+    public var isReadOnly: Bool { !canAddPhotos && !canRemovePhotos && !canSetCover }
+
+    /// The single rule for shared-album writes. It uses the effective role (`directRole`) and the
+    /// wired transport, never the invitation role alone.
+    public static func resolve(role: SharedAlbumRole, capabilities: AlbumCapabilities) -> SharedAlbumPermissions {
+        let roleAllowsEditing: Bool
+        switch role {
+        case .editor, .admin: roleAllowsEditing = true
+        case .viewer, .inherited: roleAllowsEditing = false
+        }
+        let transport = capabilities.canWriteSharedAlbums
+        let canAdd = roleAllowsEditing && transport && capabilities.canAddPhotos
+        let canRemove = roleAllowsEditing && transport && capabilities.canRemovePhotos
+        let canSetCover = roleAllowsEditing && transport && capabilities.canSetCover
+        let restriction: SharedAlbumWriteRestriction?
+        if !roleAllowsEditing {
+            restriction = .roleDoesNotPermitEditing
+        } else if !(canAdd || canRemove || canSetCover) {
+            restriction = .transportUnsupported
+        } else {
+            restriction = nil
+        }
+        return SharedAlbumPermissions(
+            canView: true,
+            canAddPhotos: canAdd,
+            canRemovePhotos: canRemove,
+            canSetCover: canSetCover,
+            canDelete: false,
+            canManageMembers: false,
+            writeRestriction: restriction
+        )
+    }
+}
+
+/// An album shared with the current account.
 public struct SharedAlbumSummary: Identifiable, Sendable, Equatable {
     public var id: AlbumNodeIdentifier { node }
     public let node: AlbumNodeIdentifier
@@ -79,6 +194,10 @@ public struct SharedAlbumSummary: Identifiable, Sendable, Equatable {
     public let lastActivityTime: Date?
     public let isSharedByURL: Bool
     public let isMetadataDegraded: Bool
+    /// Effective role (`AlbumNode.directRole`). Use only this value for permission decisions.
+    public let role: SharedAlbumRole
+    /// Direct invitation (`AlbumNode.membership`). Nil for inherited access.
+    public let invitation: SharedAlbumInvitation?
 
     public init(
         node: AlbumNodeIdentifier,
@@ -89,7 +208,9 @@ public struct SharedAlbumSummary: Identifiable, Sendable, Equatable {
         owner: String?,
         lastActivityTime: Date?,
         isSharedByURL: Bool,
-        isMetadataDegraded: Bool
+        isMetadataDegraded: Bool,
+        role: SharedAlbumRole = .inherited,
+        invitation: SharedAlbumInvitation? = nil
     ) {
         self.node = node
         self.title = title
@@ -104,6 +225,8 @@ public struct SharedAlbumSummary: Identifiable, Sendable, Equatable {
         self.lastActivityTime = lastActivityTime
         self.isSharedByURL = isSharedByURL
         self.isMetadataDegraded = isMetadataDegraded
+        self.role = role
+        self.invitation = invitation
     }
 }
 
@@ -127,6 +250,9 @@ public struct AlbumCapabilities: Sendable, Equatable {
     public var canListSharedWithMe: Bool
     public var canLeaveSharedAlbum: Bool
     public var canReadMemberships: Bool
+    /// True only when a wired write transport addresses albums on another user's volume. The
+    /// owned-album writes above never imply this.
+    public var canWriteSharedAlbums: Bool
 
     public init(
         canList: Bool,
@@ -137,7 +263,8 @@ public struct AlbumCapabilities: Sendable, Equatable {
         canSetCover: Bool,
         canListSharedWithMe: Bool = false,
         canLeaveSharedAlbum: Bool = false,
-        canReadMemberships: Bool = false
+        canReadMemberships: Bool = false,
+        canWriteSharedAlbums: Bool = false
     ) {
         self.canList = canList
         self.canCreate = canCreate
@@ -148,6 +275,7 @@ public struct AlbumCapabilities: Sendable, Equatable {
         self.canListSharedWithMe = canListSharedWithMe
         self.canLeaveSharedAlbum = canLeaveSharedAlbum
         self.canReadMemberships = canReadMemberships
+        self.canWriteSharedAlbums = canWriteSharedAlbums
     }
 
     /// Read-only: list works, writes are not supported.
@@ -161,6 +289,8 @@ public struct AlbumCapabilities: Sendable, Equatable {
     )
 
     /// SDK reads plus the narrow direct-HTTP write surface that SDK 0.27.0 cannot replace.
+    /// The HTTP writes resolve the account's own Photos share, volume and root key, so they address
+    /// only owned albums. `canWriteSharedAlbums` therefore stays false.
     public static let sdkCatalogWithHTTPWrites = AlbumCapabilities(
         canList: true,
         canCreate: true,
@@ -190,12 +320,16 @@ public enum AlbumError: LocalizedError, Equatable {
     /// Proton accepted some membership writes and rejected others. Existing successful membership
     /// must never be hidden behind an all-or-nothing UI claim.
     case partialAdd(succeeded: Int, total: Int, message: String)
+    /// A write targeted a shared album. It is rejected before any network request.
+    case sharedAlbumReadOnly(SharedAlbumWriteRestriction)
     case backend(String)
 
     public var errorDescription: String? {
         switch self {
         case .unsupported:
             L10n.string("error.album_action_unavailable")
+        case .sharedAlbumReadOnly(let restriction):
+            restriction.localizedReason
         case .albumCreatedButPhotosNotAdded(_, let albumName, _):
             L10n.string("error.album_created_add_failed \(albumName)")
         case .partialAdd(let succeeded, let total, _):
@@ -211,6 +345,8 @@ public enum AlbumError: LocalizedError, Equatable {
         switch self {
         case .unsupported(let operation, let gap):
             "\(operation): \(gap)"
+        case .sharedAlbumReadOnly(let restriction):
+            "shared album write rejected: \(restriction)"
         case .albumCreatedButPhotosNotAdded(_, _, let message),
             .partialAdd(_, _, let message),
             .backend(let message):
