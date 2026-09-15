@@ -7,7 +7,7 @@ violations=0
 
 is_public_markdown() {
   case "$1" in
-    README.md | SECURITY.md | CONTRIBUTING.md | .github/pull_request_template.md | \
+    README.md | SECURITY.md | CONTRIBUTING.md | PROJECT-TRAPS.md | .github/pull_request_template.md | \
       Wiki/*.md | Tools/MLModels/README.md | Tools/MLModels/SigLIP2/README.md)
       return 0
       ;;
