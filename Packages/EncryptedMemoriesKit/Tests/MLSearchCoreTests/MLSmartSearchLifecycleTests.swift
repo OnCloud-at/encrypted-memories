@@ -1237,6 +1237,41 @@ import Testing
         #expect(!results.isEmpty)
     }
 
+    @Test func backgroundExecutionWindowIndexesWithReducedCacheBudget() async throws {
+        let runtimeState = LibraryRuntimeState(
+            initial: LibraryRuntimeSnapshot(executionOpportunity: .backgroundPermitted))
+        await MainActor.run {
+            MemoryPressureGovernor(runtimeState: runtimeState).update(MemoryConditions(isBackgrounded: true))
+        }
+        let coordinator = LibraryResourceCoordinator(runtimeState: runtimeState)
+        let budget = await coordinator.budget(for: LibraryWorkRequest(workload: .mlIndexing, intent: .automatic))
+        try #require(budget.isAdmitted)
+        let payload = Data("background-model".utf8)
+        let (entry, url) = downloadableEntry(id: "background-model", payload: payload)
+        let photo = uid("background-photo")
+        let harness = try makeHarness(
+            catalog: MLModelCatalog(entries: [entry]), payloads: [url: payload], assets: [photo],
+            resourceCoordinator: coordinator
+        )
+        defer { try? FileManager.default.removeItem(at: harness.layout.rootDirectory) }
+        await harness.lifecycle.setIndexingExecutionAllowed(false)
+        await harness.lifecycle.start()
+        await harness.lifecycle.setEnabled(true)
+        await harness.lifecycle.select(entry.id)
+        #expect(harness.provider.embedder.totalCalls == 0)
+        #expect(await harness.lifecycle.performBackgroundCatchUp() == .deferred)
+
+        await harness.lifecycle.setIndexingExecutionAllowed(true)
+        #expect(await harness.lifecycle.performBackgroundCatchUp() == .complete)
+        #expect(harness.provider.embedder.callCount(photo) == 1)
+        #expect(harness.storeProvider.store.count(for: entry.descriptor) == 1)
+        #expect(runtimeState.snapshot().memoryBudgetTier == .reduced)
+        await harness.lifecycle.shutdown()
+        let metrics = await coordinator.metrics()
+        #expect(metrics.permitsAcquired > 0)
+        #expect(metrics.permitsAcquired == metrics.permitsReleased)
+    }
+
     @Test func executionWindowsReuseOneIndexAndRespectPendingLibraryChanges() async throws {
         let payload = Data("background-model".utf8)
         let (entry, url) = downloadableEntry(id: "background-model", payload: payload)

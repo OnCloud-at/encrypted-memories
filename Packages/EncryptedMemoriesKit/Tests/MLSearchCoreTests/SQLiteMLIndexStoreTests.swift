@@ -536,12 +536,125 @@ struct TestMLVectorCipher: MLVectorCipher {
                     record("a\($0)", descriptorV1, [Float32($0), 0, 0, 0])
                 })
             var pages: [[String]] = []
-            store.forEachVectorBlock(for: descriptorV1, maximumRows: 2) { block in
+            try store.forEachVectorBlock(for: descriptorV1, maximumRows: 2) { block in
                 pages.append(block.uids.map(\.nodeID))
                 #expect(block.count <= 2)
             }
 
             #expect(pages == [["a0", "a1"], ["a2", "a3"], ["a4"]])
+        }
+    }
+
+    @Test(arguments: [1, 2, 3, 7])
+    func vectorBlockPagesCrossVolumesWithoutMixingEpochs(maximumRows: Int) throws {
+        try withStore { store, _ in
+            let uids = ["a", "b", "c"].flatMap { volume in
+                ["first", "last"].map { PhotoUID(volumeID: volume, nodeID: $0) }
+            }
+            for descriptor in [descriptorV1, descriptorV2] {
+                store.upsert(
+                    uids.reversed().map {
+                        MLEmbeddingRecord(
+                            uid: $0, descriptor: descriptor, vector: [Float32(descriptor.version), 0, 0, 0])
+                    })
+            }
+            var streamed: [PhotoUID] = []
+            try store.forEachVectorBlock(for: descriptorV1, maximumRows: maximumRows) { block in
+                #expect(block.count <= maximumRows)
+                streamed.append(contentsOf: block.uids)
+                let scores = ReferenceDotProductScorer().rank(block: block, query: [1, 0, 0, 0], limit: block.count)
+                #expect(scores.results.allSatisfy { $0.score == 1 })
+            }
+            #expect(streamed == uids)
+        }
+    }
+
+    @Test func vectorBlockPagesAdvancePastAnEntireCorruptVolume() throws {
+        try withStore { store, url in
+            let uids = ["a", "b"].flatMap { volume in
+                ["first", "last"].map { PhotoUID(volumeID: volume, nodeID: $0) }
+            }
+            store.upsert(uids.map { MLEmbeddingRecord(uid: $0, descriptor: descriptorV1, vector: [1, 0, 0, 0]) })
+            var handle: OpaquePointer?
+            #expect(sqlite3_open(url.path, &handle) == SQLITE_OK)
+            defer { sqlite3_close(handle) }
+            #expect(
+                sqlite3_exec(handle, "UPDATE ml_embeddings SET vector=X'00' WHERE volume_id='a';", nil, nil, nil)
+                    == SQLITE_OK)
+
+            var streamed: [PhotoUID] = []
+            try store.forEachVectorBlock(for: descriptorV1, maximumRows: 2) { streamed.append(contentsOf: $0.uids) }
+            #expect(streamed == Array(uids.suffix(2)))
+            #expect(store.count(for: descriptorV1) == 2)
+        }
+    }
+
+    @Test func vectorBlockPagesKeepCursorStableAcrossInterleavedWrites() throws {
+        try withStore { store, _ in
+            let first = PhotoUID(volumeID: "a", nodeID: "first")
+            let cursor = PhotoUID(volumeID: "a", nodeID: "last")
+            let removed = PhotoUID(volumeID: "b", nodeID: "first")
+            let last = PhotoUID(volumeID: "b", nodeID: "last")
+            store.upsert(
+                [first, cursor, removed, last].map {
+                    MLEmbeddingRecord(uid: $0, descriptor: descriptorV1, vector: [1, 0, 0, 0])
+                })
+            let insertedAfterCursor = PhotoUID(volumeID: "b", nodeID: "inserted")
+            var pages: [[PhotoUID]] = []
+            try store.forEachVectorBlock(for: descriptorV1, maximumRows: 2) { block in
+                pages.append(block.uids)
+                guard pages.count == 1 else { return }
+                // Page callbacks run outside the lock. Deleting the cursor must not shift later pages.
+                store.remove(uids: [first, cursor, removed], descriptor: descriptorV1)
+                store.upsert(
+                    [PhotoUID(volumeID: "a", nodeID: "before"), insertedAfterCursor].map {
+                        MLEmbeddingRecord(uid: $0, descriptor: descriptorV1, vector: [1, 0, 0, 0])
+                    })
+            }
+            #expect(pages == [[first, cursor], [insertedAfterCursor, last]])
+        }
+    }
+
+    @Test(arguments: [1, 2, 3])
+    func vectorStreamRejectsStepFailureWithoutPublishingTheFailedPage(maximumRows: Int) throws {
+        try withStore { store, url in
+            store.upsert(["a", "b", "fail", "z"].map { record($0, descriptorV1, [1, 0, 0, 0]) })
+            try SQLiteMLIndexReadFailureFixture.install(at: url)
+            var visited: [PhotoUID] = []
+            #expect(throws: MLIndexStoreReadError.storageUnavailable) {
+                try store.forEachVectorBlock(for: descriptorV1, maximumRows: maximumRows) {
+                    visited.append(contentsOf: $0.uids)
+                }
+            }
+            #expect(visited == (maximumRows < 3 ? [uid("a"), uid("b")] : []))
+        }
+    }
+
+    @Test func vectorStreamRejectsClosedStorage() throws {
+        try withStore { store, _ in
+            store.close()
+            #expect(throws: MLIndexStoreReadError.storageUnavailable) {
+                try store.forEachVectorBlock(for: descriptorV1, maximumRows: 2) { _ in
+                    Issue.record("Closed storage must not publish a block")
+                }
+            }
+        }
+    }
+
+    @Test func vectorStreamRejectsPrepareFailureAfterACompletedPage() throws {
+        try withStore { store, url in
+            store.upsert(["a", "b"].map { record($0, descriptorV1, [1, 0, 0, 0]) })
+            var handle: OpaquePointer?
+            try #require(sqlite3_open(url.path, &handle) == SQLITE_OK)
+            defer { sqlite3_close(handle) }
+            var visited: [PhotoUID] = []
+            #expect(throws: MLIndexStoreReadError.storageUnavailable) {
+                try store.forEachVectorBlock(for: descriptorV1, maximumRows: 1) { block in
+                    visited.append(contentsOf: block.uids)
+                    #expect(sqlite3_exec(handle, "DROP TABLE ml_embeddings;", nil, nil, nil) == SQLITE_OK)
+                }
+            }
+            #expect(visited == [uid("a")])
         }
     }
 

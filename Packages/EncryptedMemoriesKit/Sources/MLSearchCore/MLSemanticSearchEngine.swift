@@ -58,7 +58,7 @@ public actor MLSemanticSearchEngine {
         let startedAt = ContinuousClock.now
         var rankedResults: [MLSearchResult] = []
         if query.limit > 0 {
-            store.forEachVectorBlock(
+            try store.forEachVectorBlock(
                 for: query.descriptor,
                 maximumRows: queryBlockRowLimit
             ) { block in

@@ -49,11 +49,12 @@ public protocol MLIndexStore: Sendable {
     ///
     /// Production stores must keep each block bounded independently of epoch size. The default
     /// implementation exists for small or legacy stores and preserves the older read APIs.
+    /// A storage failure throws even if earlier blocks were delivered. Callers must discard partial results.
     func forEachVectorBlock(
         for descriptor: MLModelDescriptor,
         maximumRows: Int,
         _ body: (MLVectorBlock) -> Void
-    )
+    ) throws
 
     /// Remove the record for `(uid, descriptor)` when an asset is deleted or must be
     /// re-embedded (explicit remove-then-upsert is the only reindex path).

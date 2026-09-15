@@ -119,7 +119,8 @@ final class LibraryResourceCoordinatorTests: XCTestCase {
                 (.userInteraction, { state in state.update { $0.hasActiveUserInteraction = true } }),
                 (.lowPowerMode, { state in state.update { $0.isLowPowerMode = true } }),
                 (.thermalPressure, { state in state.update { $0.thermalLevel = .serious } }),
-                (.memoryPressure, { state in state.update { $0.memoryBudgetTier = .reduced } }),
+                (.memoryPressure, { state in state.update { $0.memoryPressure = .warning } }),
+                (.memoryPressure, { state in state.update { $0.memoryHeadroom = .constrained } }),
                 (.executionSuspended, { state in state.update { $0.executionOpportunity = .suspended } }),
                 (.generationChanged, { state in _ = state.beginNewGeneration() }),
             ]
@@ -311,6 +312,52 @@ final class LibraryResourceCoordinatorTests: XCTestCase {
         XCTAssertTrue(recovered)
     }
 
+    func testCacheBudgetRecoveryDoesNotDelayForegroundWork() async {
+        let state = LibraryRuntimeState(
+            initial: LibraryRuntimeSnapshot(memoryBudgetTier: .reduced, executionOpportunity: .backgroundPermitted)
+        )
+        let coordinator = LibraryResourceCoordinator(runtimeState: state)
+        await coordinator.startObserving()
+        state.update {
+            $0.executionOpportunity = .foregroundActive
+            $0.memoryBudgetTier = .normal
+        }
+        let request = LibraryWorkRequest(workload: .mlIndexing, intent: .automatic)
+        let foregroundApplied = await waitUntilAsync {
+            let budget = await coordinator.budget(for: request)
+            return budget.isAdmitted && budget.memoryTier == .normal
+        }
+        XCTAssertTrue(foregroundApplied)
+        let metrics = await coordinator.metrics()
+        XCTAssertEqual(metrics.recoveries, 0)
+    }
+
+    func testMemoryPressureRecoveryWaitsEvenWhenBackgroundCacheTierStaysReduced() async throws {
+        let state = LibraryRuntimeState(
+            initial: LibraryRuntimeSnapshot(
+                memoryPressure: .warning, memoryBudgetTier: .reduced, executionOpportunity: .backgroundPermitted
+            )
+        )
+        let recoveryGate = RecoveryDelayGate()
+        let coordinator = LibraryResourceCoordinator(
+            runtimeState: state,
+            recoveryDelay: .seconds(30),
+            recoverySleep: { await recoveryGate.wait(for: $0) }
+        )
+        await coordinator.startObserving()
+        state.update { $0.memoryPressure = .normal }
+        let enteredRecovery = await waitUntilAsync { await recoveryGate.hasEntered() }
+        XCTAssertTrue(enteredRecovery)
+        let request = LibraryWorkRequest(workload: .mlIndexing, intent: .automatic)
+        let duringRecovery = await coordinator.budget(for: request)
+        XCTAssertFalse(duringRecovery.isAdmitted)
+        await recoveryGate.open()
+        let recovered = await waitUntilAsync { await coordinator.budget(for: request).isAdmitted }
+        XCTAssertTrue(recovered)
+        let metrics = await coordinator.metrics()
+        XCTAssertEqual(metrics.recoveries, 1)
+    }
+
     func testGenerationChangeRejectsAQueuedOldSessionPermit() async throws {
         let state = LibraryRuntimeState()
         let coordinator = LibraryResourceCoordinator(runtimeState: state)
@@ -362,6 +409,8 @@ private actor RecoveryDelayGate {
     private var requestedDelay: Duration?
     private var isOpen = false
     private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func hasEntered() -> Bool { requestedDelay != nil }
 
     func wait(for delay: Duration) async {
         requestedDelay = delay

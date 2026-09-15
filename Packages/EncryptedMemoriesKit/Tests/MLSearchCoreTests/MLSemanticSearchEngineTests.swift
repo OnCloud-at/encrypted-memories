@@ -32,6 +32,56 @@ import Testing
         }
     }
 
+    @Test func sqliteSearchPreservesRankingAndTiesAcrossVolumeBoundaries() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = try #require(
+            SQLiteMLIndexStore(url: directory.appendingPathComponent("index.sqlite"), cipher: TestMLVectorCipher())
+        )
+        defer { store.close() }
+        let uids = ["a", "b", "c"].flatMap { volume in
+            ["first", "last"].map { PhotoUID(volumeID: volume, nodeID: $0) }
+        }
+        store.upsert(
+            uids.enumerated().map { index, uid in
+                MLEmbeddingRecord(uid: uid, descriptor: descriptor, vector: index == 2 ? [0, 1, 0] : [1, 0, 0])
+            })
+        var reference: [MLSearchResult]?
+        for pageSize in [1, 2, 3, MLSemanticSearchEngine.defaultQueryBlockRowLimit] {
+            let engine = MLSemanticSearchEngine(
+                store: store,
+                encoder: Encoder(vector: [1, 0, 0]),
+                scorer: ReferenceDotProductScorer(),
+                queryBlockRowLimit: pageSize
+            )
+            let result = try await engine.search(MLSearchQuery(descriptor: descriptor, queryText: "fixture", limit: 4))
+            #expect(result.results.map(\.uid) == [uids[0], uids[1], uids[3], uids[4]])
+            if let reference { #expect(result.results == reference) }
+            reference = result.results
+        }
+    }
+
+    @Test(arguments: [1, 2, 3])
+    func sqliteReadFailureNeverReturnsSuccessfulPartialSearch(maximumRows: Int) async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("index.sqlite")
+        let store = try #require(SQLiteMLIndexStore(url: url, cipher: TestMLVectorCipher()))
+        defer { store.close() }
+        store.upsert(
+            ["a", "b", "fail", "z"].map {
+                MLEmbeddingRecord(uid: uid($0), descriptor: descriptor, vector: [1, 0, 0])
+            })
+        try SQLiteMLIndexReadFailureFixture.install(at: url)
+        let engine = MLSemanticSearchEngine(
+            store: store, encoder: Encoder(vector: [1, 0, 0]), scorer: ReferenceDotProductScorer(),
+            queryBlockRowLimit: maximumRows
+        )
+        await #expect(throws: MLIndexStoreReadError.storageUnavailable) {
+            try await engine.search(MLSearchQuery(descriptor: descriptor, queryText: "fixture", limit: 4))
+        }
+    }
+
     private final class SelfHealingStore: MLIndexStore, @unchecked Sendable {
         private let backing = InMemoryMLIndexStore()
         private let invalidUID: PhotoUID

@@ -1763,6 +1763,33 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertEqual(progress.uploaded, 1)
     }
 
+    func testAutomaticBackgroundBackupCompletesWithReducedCacheBudget() async throws {
+        let entry = seedEntry("background.jpg")
+        resolver.setDeferredMaterialization(for: entry.source.identifier)
+        let runtimeState = LibraryRuntimeState(
+            initial: LibraryRuntimeSnapshot(executionOpportunity: .backgroundPermitted))
+        await MainActor.run {
+            MemoryPressureGovernor(runtimeState: runtimeState).update(MemoryConditions(isBackgrounded: true))
+        }
+        let coordinator = LibraryResourceCoordinator(runtimeState: runtimeState)
+        let budget = await coordinator.budget(
+            for: LibraryWorkRequest(workload: .backupMaterialization, intent: .automatic))
+        XCTAssertTrue(budget.isAdmitted)
+        guard budget.isAdmitted else { return }
+
+        let progress = await makeRunner(resourceCoordinator: coordinator).runUntilDrained(
+            mode: .eligibleOnly, workIntent: .automatic
+        )
+
+        XCTAssertEqual(state(of: entry), .completed)
+        XCTAssertEqual(progress.uploaded, 1)
+        XCTAssertEqual(resolver.materializeCount(for: entry.source.identifier), 1)
+        XCTAssertEqual(runtimeState.snapshot().memoryBudgetTier, .reduced)
+        let metrics = await coordinator.metrics()
+        XCTAssertGreaterThanOrEqual(metrics.permitsAcquired, 2)
+        XCTAssertEqual(metrics.permitsAcquired, metrics.permitsReleased)
+    }
+
     func testEnforcedCoordinatorDefersAutomaticBackupHeavyWorkUntilStableRecovery() async throws {
         let entry = seedEntry("coordinated.jpg")
         let runtimeState = LibraryRuntimeState(initial: LibraryRuntimeSnapshot(thermalLevel: .critical))

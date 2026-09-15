@@ -154,12 +154,10 @@ public final class AppleLibraryRuntimeAdapter {
         let info = ProcessInfo.processInfo
         let opportunity = runtimeState.snapshot().executionOpportunity
         memoryGovernor.update(
-            MemoryConditions(
-                pressure: AppleRuntimeMemoryPolicy.pressure(
-                    dispatchPressure: dispatchPressure,
-                    memoryWarningLatched: memoryWarningLatched,
-                    isBackgrounded: opportunity == .backgroundPermitted || opportunity == .suspended
-                ),
+            AppleRuntimeMemoryPolicy.conditions(
+                dispatchPressure: dispatchPressure,
+                memoryWarningLatched: memoryWarningLatched,
+                executionOpportunity: opportunity,
                 thermal: Self.thermal(info.thermalState),
                 lowPowerMode: info.isLowPowerModeEnabled
             ))
@@ -176,16 +174,35 @@ public final class AppleLibraryRuntimeAdapter {
     }
 }
 
-/// Pure merger for independent memory-pressure signals. A UIKit warning is purge-now; backgrounding
-/// proactively reduces future budgets but never masks a stronger Dispatch pressure event.
+/// Merges observed pressure independently from proactive background cache reduction.
+/// A UIKit warning retains purge-now semantics in every execution opportunity.
 public enum AppleRuntimeMemoryPolicy {
+    /// Background activity affects cache budgets, not observed pressure. Keep the argument for source compatibility.
     public static func pressure(
         dispatchPressure: MemoryConditions.Pressure,
         memoryWarningLatched: Bool,
-        isBackgrounded: Bool
+        isBackgrounded _: Bool
     ) -> MemoryConditions.Pressure {
-        if memoryWarningLatched || dispatchPressure == .critical { return .critical }
-        if dispatchPressure == .warning || isBackgrounded { return .warning }
-        return .normal
+        memoryWarningLatched ? .critical : dispatchPressure
+    }
+
+    public static func conditions(
+        dispatchPressure: MemoryConditions.Pressure,
+        memoryWarningLatched: Bool,
+        executionOpportunity: LibraryExecutionOpportunity,
+        thermal: MemoryConditions.Thermal,
+        lowPowerMode: Bool
+    ) -> MemoryConditions {
+        let isBackgrounded = executionOpportunity == .backgroundPermitted || executionOpportunity == .suspended
+        return MemoryConditions(
+            pressure: pressure(
+                dispatchPressure: dispatchPressure,
+                memoryWarningLatched: memoryWarningLatched,
+                isBackgrounded: isBackgrounded
+            ),
+            thermal: thermal,
+            lowPowerMode: lowPowerMode,
+            isBackgrounded: isBackgrounded
+        )
     }
 }
