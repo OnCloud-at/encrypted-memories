@@ -83,7 +83,10 @@ The issue-triage workflow keeps its existing shorter timeout policy.
 
 Review coverage is bounded: 80 files, 96,000 patch characters, and 3,000 patch lines.
 Source reads accept text files up to 200,000 bytes and select windows around candidate lines.
-Large inputs can reduce these windows. Omitted patches and unverified candidates produce coverage limitations.
+Large inputs can reduce these windows. Omitted patches, unavailable source, and specific missing context produce coverage limitations.
+Dismissed suspicions, low-confidence candidates, and existing issues do not count as coverage gaps.
+Invalid evidence triggers regeneration; repeated validation failure makes the review unavailable.
+Logs report decision counts without candidate text. An uncertain decision must identify its missing context.
 The reviewer does not execute PR code or search the entire repository for callers and tests.
 The trusted default-branch script reads PR source as data, including for fork PRs.
 Stale runs cannot replace comments for a newer PR snapshot.
