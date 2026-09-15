@@ -8,9 +8,10 @@ import os
 import re
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 from github_llm_client import (
     LLMStreamRetryableError,
@@ -23,6 +24,9 @@ from github_llm_client import (
     request_validated_llm_result,
 )
 
+from review_evidence import verify_findings
+from review_monitor import ReviewMonitor
+
 
 MAX_FILES = 80
 MAX_PATCH_CHARS = 24_000
@@ -30,13 +34,13 @@ MAX_TOTAL_PATCH_CHARS = 96_000
 MAX_PATCH_LINES = 3_000
 MAX_TITLE_CHARS = 500
 MAX_BODY_CHARS = 8_000
-MAX_SUMMARY_CHARS = 2_000
+MAX_SUMMARY_CHARS = 280
 MAX_FINDING_TITLE_CHARS = 200
-MAX_FINDING_DETAIL_CHARS = 1_200
+MAX_FINDING_DETAIL_CHARS = 600
 MAX_TESTING_GAP_CHARS = 500
 MAX_FINDINGS = 8
 MAX_TESTING_GAPS = 4
-REVIEW_LLM_TOTAL_SECONDS = 360.0
+REVIEW_LLM_TOTAL_SECONDS = 1800.0
 REVIEW_PROVIDER_ATTEMPTS = 2
 REVIEW_COMMENT_MARKER = "<!-- oncloud-pr-review:v2 -->"
 ALLOWED_SEVERITIES = {"blocking", "warning", "suggestion"}
@@ -457,8 +461,10 @@ def llm_payload(
                     "because the callback cannot await it or does not store its handle. Require a concrete lost barrier. "
                     "Do not claim to "
                     "decide GitHub mergeability, status checks, approvals, or branch-protection requirements; trusted "
-                    "GitHub state handles those separately. Use blocking only for a concrete code problem that should "
-                    "prevent merge. Use warning for a likely defect that needs maintainer judgment. Use suggestion for "
+                    "GitHub state handles those separately. Missing tests, documentation, refactoring preferences, and "
+                    "unknown context never justify blocking. Zero findings is a valid result. Use blocking only "
+                    "for a demonstrated serious regression (data loss, security failure, crash, broken build) that needs "
+                    "urgent maintainer attention. Use warning for a likely defect that needs maintainer judgment. Use suggestion for "
                     "a bounded improvement. Reference only a supplied "
                     "file_id and exact new-file line from a supplied patch hunk. If no supplied new-file line proves "
                     "the issue, do not return a finding; record missing context only as a testing gap. Keep the "
@@ -487,18 +493,25 @@ def request_review_with_retries(
     payload: dict[str, Any],
     changed_lines: dict[str, set[int]],
     file_paths: dict[str, str],
+    deadline: float | None = None,
+    idle_seconds: float = 600,
+    validator: Callable[[str], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Retry only bounded provider/stream failures; deterministic validation failures still fail once."""
+    """Retry bounded provider failures within one shared deadline."""
 
+    deadline = deadline or time.monotonic() + REVIEW_LLM_TOTAL_SECONDS
+    monitor = ReviewMonitor(deadline, idle_seconds)
     for attempt in range(REVIEW_PROVIDER_ATTEMPTS):
         try:
-            return request_validated_llm_result(
+            return monitor.run(lambda: request_validated_llm_result(
                 llm_api_url,
                 token=token,
                 payload=payload,
-                validator=lambda content: parse_review(content, changed_lines, file_paths),
-                total_seconds=REVIEW_LLM_TOTAL_SECONDS,
-            )
+                validator=validator or (lambda content: parse_review(content, changed_lines, file_paths)),
+                total_seconds=max(0.001, deadline - time.monotonic()),
+                socket_seconds=idle_seconds,
+                on_activity=monitor.activity,
+            ))
         except LLMStreamRetryableError as error:
             if attempt == REVIEW_PROVIDER_ATTEMPTS - 1:
                 raise
@@ -610,80 +623,47 @@ def safe_markdown(value: object, limit: int) -> str:
     )[:limit]
 
 
-def github_merge_state(pull_request: dict[str, Any]) -> str:
-    mergeable = pull_request.get("mergeable")
-    if mergeable is False:
-        return "GitHub currently reports this pull request as not mergeable."
-    if mergeable is True:
-        return "GitHub currently reports this pull request as mergeable. Required checks and review rules still apply."
-    return "GitHub has not finished calculating mergeability."
-
-
-def assessment(review: dict[str, Any], coverage_gaps: list[str], pull_request: dict[str, Any]) -> str:
-    if pull_request.get("mergeable") is False:
-        return "Not ready to merge because GitHub reports the pull request as not mergeable."
-    if any(finding["severity"] == "blocking" for finding in review["findings"]):
-        return "Changes are required before merge."
-    if coverage_gaps:
-        return "A maintainer must review the omitted or truncated diff sections before merge."
-    return "No blocking problem was found in the reviewed diff. Required checks and maintainer review still decide merge."
-
-
 def render_review(
-    review: dict[str, Any],
-    pull_request: dict[str, Any],
-    head_sha: str,
-    coverage_gaps: list[str],
+    review: dict[str, Any], pull_request: dict[str, Any], head_sha: str, coverage_gaps: list[str],
 ) -> str:
-    lines = [
-        REVIEW_COMMENT_MARKER,
-        "## Automated pull request review",
-        "",
-        f"**Assessment:** {assessment(review, coverage_gaps, pull_request)}",
-        "",
-        f"**GitHub mergeability:** {github_merge_state(pull_request)}",
-        "",
-        f"**Reviewed commit:** `{head_sha}`",
-        "",
-        "### Summary",
-        "",
-        safe_markdown(review["summary"], MAX_SUMMARY_CHARS) or "No summary was returned.",
-        "",
-        "### Findings",
-        "",
-    ]
-    if review["findings"]:
-        for finding in review["findings"]:
-            location = safe_markdown(finding.get("path") or finding.get("file_id") or "", 500)
-            if finding["line"]:
-                location = f"{location}:{finding['line']}"
-            lines.extend(
-                [
-                    f"- **{finding['severity'].upper()}** `{location}`: "
-                    f"{safe_markdown(finding['title'], MAX_FINDING_TITLE_CHARS)}",
-                    f"  {safe_markdown(finding['detail'], MAX_FINDING_DETAIL_CHARS)}",
-                ]
-            )
+    findings = sorted(review["findings"], key=lambda item: item["severity"] != "blocking")
+    serious = sum(item["severity"] == "blocking" for item in findings)
+    gaps = list(dict.fromkeys(coverage_gaps + review["testing_gaps"]))
+    incomplete = bool(gaps or review.get("unavailable"))
+    if serious:
+        heading = f"🔴 Serious findings: {serious} · Notices: {len(findings) - serious}"
+    elif findings:
+        heading = f"🟡 Notices: {len(findings)} · No serious findings"
+    elif incomplete:
+        heading = "⚪ Review incomplete"
     else:
-        lines.append("- No concrete finding was returned for the reviewed diff.")
+        heading = "🟢 No actionable findings in the reviewed changes"
+    if incomplete and findings:
+        heading += " · partial review"
+    lines = [REVIEW_COMMENT_MARKER, f"## {heading}", "",
+             "Advisory only · never approves, blocks, or merges a pull request.",
+             f"**Reviewed commit:** `{head_sha}`", ""]
 
-    lines.extend(["", "### Testing gaps", ""])
-    if review["testing_gaps"]:
-        lines.extend(f"- {safe_markdown(gap, MAX_TESTING_GAP_CHARS)}" for gap in review["testing_gaps"])
-    else:
-        lines.append("- No specific testing gap was identified from the supplied diff.")
+    def finding_line(finding: dict[str, Any]) -> str:
+        path = finding.get("path") or finding.get("file_id") or ""
+        label = safe_markdown(f"{path}:{finding['line']}", 300)
+        repo = os.environ.get("GITHUB_REPOSITORY", "")
+        location = f"`{label}`"
+        if re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo) and re.fullmatch(r"[0-9a-f]{40}", head_sha):
+            location = f"[{label}](https://github.com/{repo}/blob/{head_sha}/{quote(path, safe='/')}#L{finding['line']})"
+        return f"- **{safe_markdown(finding['title'], 140)}** — {location}"
 
-    lines.extend(["", "### Review coverage", ""])
-    if coverage_gaps:
-        lines.extend(f"- {gap}" for gap in coverage_gaps)
-    else:
-        lines.append("- GitHub supplied a textual patch for every reviewed file within the configured limits.")
-    lines.extend(
-        [
-            "",
-            "This review is advisory. It never approves, blocks, or merges a pull request automatically.",
-        ]
-    )
+    lines.extend(finding_line(item) for item in findings[:3])
+    if not findings:
+        lines.append(safe_markdown(review["summary"], MAX_SUMMARY_CHARS))
+    if findings or gaps:
+        lines.extend(["", "<details>", "<summary>Evidence and review coverage</summary>", ""])
+        for item in findings:
+            lines.extend([finding_line(item), safe_markdown(item["detail"], MAX_FINDING_DETAIL_CHARS), ""])
+        lines.extend(f"- {safe_markdown(gap, 300)}" for gap in gaps[:8])
+        if len(gaps) > 8:
+            lines.append(f"- {len(gaps) - 8} additional coverage limitations.")
+        lines.extend(["", "</details>"])
     return "\n".join(lines)
 
 
@@ -769,6 +749,10 @@ def main() -> int:
     if not same_pull_request_snapshot(event_snapshot, pull_request_after_files):
         print("::notice::The pull request snapshot changed; this stale review run was skipped.")
         return 0
+    deadline = time.monotonic() + REVIEW_LLM_TOTAL_SECONDS
+    idle_seconds = float(os.environ.get("LLM_REVIEW_IDLE_SECONDS") or 600)
+    if not 120 <= idle_seconds <= REVIEW_LLM_TOTAL_SECONDS:
+        raise RuntimeError("LLM_REVIEW_IDLE_SECONDS must be between 120 and 1800")
     llm_api_url, model, reasoning_effort = llm_configuration()
     payload, changed_lines, coverage_gaps, file_paths = llm_payload(
         pull_request_after_files,
@@ -782,6 +766,22 @@ def main() -> int:
         payload=payload,
         changed_lines=changed_lines,
         file_paths=file_paths,
+        deadline=deadline,
+        idle_seconds=idle_seconds,
+    )
+
+    def source_lines(text):
+        records = tuple(PatchLine("source", index, "context", "", index, line)
+                        for index, line in enumerate(text.splitlines(), 1))
+        redacted, _, _ = _redact_patch_lines(records, 400_000, len(records))
+        return [{"line": item["new_line"], "text": item["text"]} for item in redacted]
+
+    review = verify_findings(
+        review, payload, files, event_snapshot, repo, token=github_token, api_url=api_url,
+        fetch=github_request, redact=source_lines,
+        request=lambda verification, validator: request_review_with_retries(
+            llm_api_url, token=llm_token, payload=verification, changed_lines=changed_lines,
+            file_paths=file_paths, deadline=deadline, idle_seconds=idle_seconds, validator=validator),
     )
     pull_request_before_publish = fetch_pull_request(repo, number, token=github_token, api_url=api_url)
     if not same_pull_request_snapshot(event_snapshot, pull_request_before_publish):
@@ -801,9 +801,36 @@ def main() -> int:
     return 0
 
 
-if __name__ == "__main__":
+def publish_unavailable() -> None:
+    """Replace outdated findings only if the event still describes the current PR."""
+    snapshot = load_event(os.environ["GITHUB_EVENT_PATH"])
+    if snapshot.state != "open" or snapshot.draft:
+        return
+    repo = os.environ["GITHUB_REPOSITORY"]
+    token = os.environ["GH_TOKEN"]
+    api_url = os.environ.get("GITHUB_API_URL", "https://api.github.com")
+    body = render_review(
+        {"summary": "Automated review unavailable. You can merge when the required checks pass.",
+         "findings": [], "testing_gaps": [], "unavailable": True}, {}, snapshot.head_sha, [])
+    upsert_review_comment(repo, snapshot.number, body, token=token, api_url=api_url,
+                          expected_snapshot=snapshot)
+
+
+def run_advisory() -> int:
     try:
-        raise SystemExit(main())
-    except (RequestFailure, RuntimeError) as error:
-        print(f"::error::{error}", file=sys.stderr)
-        raise SystemExit(1) from None
+        if "--unavailable" in sys.argv or not os.environ.get("LLM_API_KEY"):
+            publish_unavailable()
+        else:
+            return main()
+    except Exception as error:
+        # Do not print provider content, request paths, tokens or arbitrary exception messages.
+        print(f"::warning::Advisory review unavailable ({type(error).__name__}).", file=sys.stderr)
+        try:
+            publish_unavailable()
+        except Exception:
+            print("::warning::Could not update the advisory review comment.", file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(run_advisory())

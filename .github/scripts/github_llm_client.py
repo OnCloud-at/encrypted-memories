@@ -154,7 +154,10 @@ def redact_text(value: object, limit: int) -> str:
     return bounded_text(text, limit)
 
 
-def read_llm_stream_content(response: Any, *, deadline: float | None = None) -> str:
+def read_llm_stream_content(
+    response: Any, *, deadline: float | None = None,
+    on_activity: Callable[[str], None] | None = None,
+) -> str:
     """Read one bounded chat-completion SSE stream and return visible content."""
 
     if deadline is None:
@@ -219,6 +222,8 @@ def read_llm_stream_content(response: Any, *, deadline: float | None = None) -> 
                 if reasoning is not None and not isinstance(reasoning, str):
                     raise LLMStreamError("LLM API returned invalid reasoning content")
                 if isinstance(reasoning, str):
+                    if reasoning and on_activity:
+                        on_activity("reasoning")
                     try:
                         reasoning.encode("utf-8")
                     except UnicodeEncodeError as error:
@@ -227,6 +232,8 @@ def read_llm_stream_content(response: Any, *, deadline: float | None = None) -> 
             if content is not None and not isinstance(content, str):
                 raise LLMStreamError("LLM API returned invalid visible content")
             if isinstance(content, str):
+                if content and on_activity:
+                    on_activity("content")
                 try:
                     encoded_content = content.encode("utf-8")
                 except UnicodeEncodeError as error:
@@ -311,6 +318,8 @@ def read_llm_stream_content(response: Any, *, deadline: float | None = None) -> 
             break
         if not isinstance(raw_chunk, bytes):
             raise LLMStreamError("LLM API returned invalid stream bytes")
+        if on_activity:
+            on_activity("transport")
         wire_bytes += len(raw_chunk)
         if wire_bytes > MAX_LLM_WIRE_BYTES:
             raise LLMResponseLimitError("LLM API stream exceeded the configured wire limit")
@@ -328,6 +337,8 @@ def request_llm_content(
     token: str,
     payload: dict[str, Any],
     deadline: float | None = None,
+    socket_seconds: float = MAX_LLM_SOCKET_SECONDS,
+    on_activity: Callable[[str], None] | None = None,
 ) -> str:
     """POST one bounded request and return only validated visible SSE content."""
 
@@ -356,9 +367,9 @@ def request_llm_content(
         try:
             with AUTHENTICATED_OPENER.open(
                 Request(url, data=body, headers=headers, method="POST"),
-                timeout=min(MAX_LLM_SOCKET_SECONDS, remaining),
+                timeout=min(socket_seconds, remaining),
             ) as response:
-                return read_llm_stream_content(response, deadline=deadline)
+                return read_llm_stream_content(response, deadline=deadline, on_activity=on_activity)
         except HTTPError as error:
             if error.code not in {429, 500, 502, 503, 504} or attempt == LLM_API_ATTEMPTS - 1:
                 raise RequestFailure("LLM API", error.code, urlsplit(url).path) from None
@@ -438,6 +449,8 @@ def request_validated_llm_result(
     payload: dict[str, Any],
     validator: Callable[[str], ValidatedResult],
     total_seconds: float = MAX_LLM_TOTAL_SECONDS,
+    socket_seconds: float = MAX_LLM_SOCKET_SECONDS,
+    on_activity: Callable[[str], None] | None = None,
 ) -> ValidatedResult:
     """Request, validate, and once regenerate an invalid complete model result."""
 
@@ -451,6 +464,8 @@ def request_validated_llm_result(
             token=token,
             payload=attempt_payload,
             deadline=deadline,
+            socket_seconds=socket_seconds,
+            on_activity=on_activity,
         )
         try:
             return validator(content)

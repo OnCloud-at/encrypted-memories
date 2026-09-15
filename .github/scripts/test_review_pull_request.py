@@ -208,7 +208,7 @@ class ReviewProviderRetryTests(unittest.TestCase):
         self.assertEqual(request.call_count, 2)
         self.assertTrue(
             all(
-                call.kwargs["total_seconds"] == review_pull_request.REVIEW_LLM_TOTAL_SECONDS
+                0 < call.kwargs["total_seconds"] <= review_pull_request.REVIEW_LLM_TOTAL_SECONDS
                 for call in request.call_args_list
             )
         )
@@ -439,12 +439,12 @@ class ParsingAndRenderingTests(unittest.TestCase):
 
         self.assertTrue(body.startswith(review_pull_request.REVIEW_COMMENT_MARKER))
         self.assertIn("**Reviewed commit:** `abc123`", body)
-        self.assertIn("＠maintainers (now)", body)
+        self.assertNotIn("@maintainers", body)
         self.assertIn("＠owner", body)
         self.assertNotIn("<script>", body)
-        self.assertIn("WARNING", body)
+        self.assertIn("🟡", body)
 
-    def test_blocking_finding_requires_changes(self) -> None:
+    def test_serious_finding_is_advisory(self) -> None:
         review = valid_review(
             findings=[
                 {
@@ -459,9 +459,10 @@ class ParsingAndRenderingTests(unittest.TestCase):
 
         body = review_pull_request.render_review(review, pull_request(), "abc123", [])
 
-        self.assertIn("Changes are required before merge", body)
+        self.assertIn("🔴", body)
+        self.assertNotIn("Changes are required", body)
 
-    def test_incomplete_coverage_requires_human_review(self) -> None:
+    def test_incomplete_coverage_is_grey(self) -> None:
         body = review_pull_request.render_review(
             valid_review(),
             pull_request(),
@@ -469,7 +470,7 @@ class ParsingAndRenderingTests(unittest.TestCase):
             ["A binary patch was omitted."],
         )
 
-        self.assertIn("must review the omitted or truncated diff", body)
+        self.assertIn("⚪ Review incomplete", body)
 
     def test_github_mergeability_is_reported_separately_from_code_review(self) -> None:
         body = review_pull_request.render_review(
@@ -479,8 +480,8 @@ class ParsingAndRenderingTests(unittest.TestCase):
             [],
         )
 
-        self.assertIn("Not ready to merge because GitHub reports", body)
-        self.assertIn("GitHub currently reports this pull request as not mergeable", body)
+        self.assertIn("🟢", body)
+        self.assertNotIn("Not ready to merge", body)
         self.assertIn("never approves, blocks, or merges", body)
 
     def test_pending_github_mergeability_is_not_guessed(self) -> None:
@@ -491,8 +492,8 @@ class ParsingAndRenderingTests(unittest.TestCase):
             [],
         )
 
-        self.assertIn("GitHub has not finished calculating mergeability", body)
-        self.assertIn("Required checks and maintainer review still decide merge", body)
+        self.assertIn("🟢", body)
+        self.assertNotIn("GitHub mergeability", body)
 
 
 class ReviewPublicationTests(unittest.TestCase):
