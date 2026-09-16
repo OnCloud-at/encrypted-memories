@@ -40,10 +40,11 @@ struct MobileViewerInfoSheet: View {
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button(action: onClose) {
-                        Image(systemName: "xmark")
+                        Label(L10n.string("infopanel.close"), systemImage: "xmark")
                     }
                     .accessibilityLabel(L10n.string("infopanel.close"))
                 }
+                .mobileVisibilityPriority(.high)
             }
             .presentationDragIndicator(.visible)
         }

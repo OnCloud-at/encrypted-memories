@@ -67,10 +67,11 @@ struct MobileCollectionsScreen: View {
                         }
                         .disabled(model.albumActions?.canCreate != true)
                     } label: {
-                        Image(systemName: "plus")
+                        Label(L10n.string("albums.create_title"), systemImage: "plus")
                     }
                     .accessibilityLabel(L10n.string("albums.create_title"))
                 }
+                .mobileVisibilityPriority(.high)
             }
             .task(id: AlbumsReloadKey(backendReady: model.backend != nil, revision: model.albumCatalogRevision)) {
                 await loadAlbums()
@@ -381,7 +382,7 @@ private struct MobileFilterGridScreen: View {
             ProtonColor.backgroundNorm.ignoresSafeArea()
             gridContent
         }
-        .mobileNavigationTitle(title)
+        .mobileNavigationTitle(selection.barTitle(default: title))
         .mobileSelectionBars(isSelecting: selection.isSelecting)
         .toolbar(content: routeToolbarContent)
     }
@@ -508,6 +509,7 @@ private struct MobileFilterGridScreen: View {
 
     @ToolbarContentBuilder private func routeToolbarContent() -> some ToolbarContent {
         ToolbarItem(placement: .topBarTrailing) { topTrailingToolbarAction }
+            .mobileVisibilityPriority(.high)
         if filter == .trash {
             ToolbarItem(placement: .bottomBar) {
                 Button {
@@ -524,6 +526,7 @@ private struct MobileFilterGridScreen: View {
                 .mobileSelectionItemVisibility(selection.isSelecting)
             }
             .sharedBackgroundVisibility(selection.isSelecting ? .automatic : .hidden)
+            .mobileVisibilityPriority(.high)
         } else if !filter.isReadOnly {
             MobileSelectionToolbarItems(
                 selection: selection,

@@ -37,7 +37,7 @@ struct MobileMapClusterSeriesScreen: View {
     var body: some View {
         content
             .mobileGridContextMenu(contextMenu, model: model)
-            .mobileNavigationTitle(placeName ?? L10n.string("map.cluster_title"))
+            .mobileNavigationTitle(selection.barTitle(default: placeName ?? L10n.string("map.cluster_title")))
             .toolbar { toolbarContent }
             .mobileSelectionBars(isSelecting: selection.isSelecting)
             .task { await resolvePlaceName() }
@@ -60,6 +60,7 @@ struct MobileMapClusterSeriesScreen: View {
                 }
                 .disabled(currentPage?.hasPrevious != true || selectionBusy)
             }
+            .mobileVisibilityPriority(.high)
             ToolbarItem(placement: .principal) {
                 Text("\(pageIndex + 1)/\(pager.pageCount)")
                     .monospacedDigit()
@@ -73,6 +74,7 @@ struct MobileMapClusterSeriesScreen: View {
                 }
                 .disabled(currentPage?.hasNext != true || selectionBusy)
             }
+            .mobileVisibilityPriority(.high)
         }
         if !clusterItems.isEmpty {
             ToolbarItem(placement: .topBarTrailing) {

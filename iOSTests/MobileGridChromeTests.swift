@@ -165,7 +165,7 @@ struct ChromeProbeShell: View {
             Tab(role: .search) { NavigationStack { Text("Suche").searchable(text: .constant("")) } }
         }
         .tabViewSearchActivation(.searchTabSelection)
-        .tabViewStyle(.tabBarOnly)
+        .tabViewStyle(.sidebarAdaptable)
         .mobileTabBarBackgroundPolicy()
         .tint(.purple)
         .overlay {

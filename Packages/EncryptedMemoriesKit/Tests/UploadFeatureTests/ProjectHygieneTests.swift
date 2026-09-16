@@ -821,7 +821,7 @@ final class ProjectHygieneTests: XCTestCase {
         )
     }
 
-    func testMobileShellUsesOneNativeTabOnlyHierarchy() throws {
+    func testMobileShellUsesOneNativeAdaptiveTabHierarchy() throws {
         let mobileApp = try String(
             contentsOf: repoRoot.appendingPathComponent("iOSApp/EncryptedMemoriesMobileApp.swift"),
             encoding: .utf8
@@ -843,8 +843,13 @@ final class ProjectHygieneTests: XCTestCase {
 
         XCTAssertTrue(
             mobileApp.contains("MobileAdaptiveTabShell(selection: $selection)")
-                && mobileApp.contains(".tabViewStyle(.tabBarOnly)"),
-            "iPhone and iPad must share the native tab-only hierarchy without a redundant iPad sidebar toggle"
+                && mobileApp.contains(".tabViewStyle(.sidebarAdaptable)"),
+            "iPhone and iPad must share one native adaptive tab hierarchy: a bottom tab bar in compact windows, "
+                + "the system top tab bar with its sidebar toggle in regular windows"
+        )
+        XCTAssertFalse(
+            mobileApp.contains(".tabViewStyle(.tabBarOnly)") || mobileApp.contains(".tabBarMinimizeBehavior("),
+            "the shell must not lock the tab bar to one form or minimize it in navigation-focused browsing"
         )
         XCTAssertTrue(
             mobileApp.contains("surface: .library,") && mobileApp.contains("MobileCollectionsScreen()")
@@ -901,9 +906,14 @@ final class ProjectHygieneTests: XCTestCase {
         let contracts = [
             ("iOSApp/MobileTimelineScreen.swift", ".mobileNavigationTitle("),
             ("iOSApp/MobileAlbumsScreen.swift", ".mobileNavigationTitle(String(localized: \"tab.collections\"))"),
-            ("iOSApp/MobileAlbumsScreen.swift", ".mobileNavigationTitle(title)"),
+            // Grid routes show the selected count as the bar title in selection mode (Photos: "3 Items Selected").
+            ("iOSApp/MobileAlbumsScreen.swift", ".mobileNavigationTitle(selection.barTitle(default: title))"),
             ("iOSApp/MobileMapScreen.swift", ".mobileNavigationTitle(String(localized: \"tab.map\"))"),
-            ("iOSApp/MobileMapClusterSeriesScreen.swift", ".mobileNavigationTitle(placeName"),
+            (
+                "iOSApp/MobileMapClusterSeriesScreen.swift",
+                ".mobileNavigationTitle(selection.barTitle(default: placeName"
+            ),
+            ("iOSApp/MobileTimelineScreen.swift", "selection.barTitle(default: surface.title)"),
             ("iOSApp/MobileSettingsScreen.swift", ".mobileNavigationTitle(String(localized: \"tab.settings\"))"),
             ("iOSApp/MobileSettingsScreen.swift", ".mobileNavigationTitle(L10n.string(\"backup.failed_sheet_title\"))"),
             ("iOSApp/MobileSmartSearchScreen.swift", ".mobileNavigationTitle(MLSmartSearchPresentation.productName)"),
@@ -943,13 +953,24 @@ final class ProjectHygieneTests: XCTestCase {
             at: iosAppURL,
             includingPropertiesForKeys: nil
         ).filter { $0.pathExtension == "swift" && $0.lastPathComponent != "MobileRootChrome.swift" }
-        for file in swiftFiles {
+        for file in swiftFiles where file.lastPathComponent != "MobilePhotoViewer.swift" {
             let source = try String(contentsOf: file, encoding: .utf8)
             XCTAssertFalse(
                 source.contains(".navigationTitle("),
                 "\(file.lastPathComponent) must use mobileNavigationTitle so every route shares one native title policy"
             )
         }
+        // The full-screen viewer is the one documented exception: the Photos viewer centres its date/location
+        // title with a subtitle in the inline navigation bar, so it uses the standard title and subtitle, not the
+        // leading `.browser` root-title style.
+        let viewer = try String(
+            contentsOf: repoRoot.appendingPathComponent("iOSApp/MobilePhotoViewer.swift"), encoding: .utf8
+        )
+        XCTAssertTrue(viewer.contains(".navigationTitle(viewerTitle.line1)"))
+        XCTAssertTrue(viewer.contains(".navigationSubtitle(viewerTitle.line2)"))
+        XCTAssertTrue(viewer.contains(".toolbarTitleDisplayMode(.inline)"))
+        XCTAssertFalse(viewer.contains(".mobileNavigationTitle("), "the viewer title stays centred, not leading")
+        XCTAssertEqual(viewer.components(separatedBy: ".navigationTitle(").count - 1, 1)
 
         let timeline = try String(
             contentsOf: repoRoot.appendingPathComponent("iOSApp/MobileTimelineScreen.swift"),

@@ -135,7 +135,7 @@ final class BurstFilmstripArchitectureTests: XCTestCase {
         XCTAssertTrue(mainView.contains("downloadViewerSelection(viewerModel)"))
     }
 
-    func testMobileViewerUsesSharedBurstStateAndOverlayFilmstrip() throws {
+    func testMobileViewerUsesSharedBurstStateAndSafeAreaFilmstrip() throws {
         let repo = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
@@ -155,14 +155,18 @@ final class BurstFilmstripArchitectureTests: XCTestCase {
         XCTAssertTrue(mobile.contains("burstSelection.seedKnownGroup"))
         XCTAssertTrue(mobile.contains("provider.burstGroup(containing: item.uid)"))
         XCTAssertTrue(mobile.contains("MobileBurstFilmstrip("))
-        XCTAssertTrue(viewerSupport.contains(".opacity(showsChrome ? 1 : 0)"))
-        XCTAssertTrue(viewerSupport.contains(".allowsHitTesting(showsChrome)"))
+        // The burst strip and the route filmstrip are bottom safe-area content below the media, as in the Photos
+        // app: the native bars stack below them and the media refits when a tap hides the chrome.
+        XCTAssertTrue(mobile.contains(".safeAreaInset(edge: .bottom, spacing: 0) { viewerBottomAccessory }"))
+        XCTAssertTrue(
+            mobile.contains("@ViewBuilder private var viewerBottomAccessory: some View {\n        if chromeVisible {"),
+            "the strips leave the safe area together with the bars")
         XCTAssertFalse(
             mobile.contains(".transition(.move(edge: .bottom).combined(with: .opacity))"),
-            "the mounted chrome must animate without replacing its overlay tree")
+            "the strips fade; the safe-area change animates the media refit")
         XCTAssertFalse(
-            mobile.contains("safeAreaInset"),
-            "the mobile filmstrip must overlay media instead of shifting fitted viewer geometry")
+            viewerSupport.contains("MobileViewerChromeOverlay") || mobile.contains("MobileViewerChromeOverlay"),
+            "the retired app-owned chrome overlay must not remain beside the native bars")
     }
 
     @MainActor
