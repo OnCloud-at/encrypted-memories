@@ -51,6 +51,7 @@ struct MobileSettingsScreen: View {
                     ToolbarItem(placement: .confirmationAction) {
                         Button(L10n.string("action.done")) { dismiss() }
                     }
+                    .mobileVisibilityPriority(.high)
                 }
             }
             .task(id: scenePhase) {
@@ -358,6 +359,7 @@ private struct MobileBugReportSheet: View {
                 ToolbarItem(placement: .cancellationAction) {
                     Button(L10n.string("action.done")) { dismiss() }
                 }
+                .mobileVisibilityPriority(.high)
             }
             .mobileSharePresentation(payload: $supportExport)
         }
@@ -780,6 +782,7 @@ private struct MobileFailedBackupSheet: View {
                 ToolbarItem(placement: .cancellationAction) {
                     Button(L10n.string("backup.failed_sheet_done")) { dismiss() }
                 }
+                .mobileVisibilityPriority(.high)
                 if controller.hasRetryableFailures {
                     ToolbarItem(placement: .confirmationAction) {
                         Button(L10n.string("backup.failed_sheet_retry")) {

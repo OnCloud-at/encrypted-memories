@@ -370,10 +370,13 @@ private struct MobileAdaptiveTabShell: View {
             }
         }
         .tabViewSearchActivation(.searchTabSelection)
-        // One native container for every width: a bottom tab bar in compact windows, the system's top tab bar in
-        // regular iPad windows. A sidebar toggle would only repeat these four destinations, so the tab-only
-        // style stays until the sidebar can offer additional sections over the same routes.
-        .tabViewStyle(.tabBarOnly)
+        // One native container for every width, the Photos-app shell: a bottom tab bar in compact windows, the
+        // system's top tab bar with its sidebar toggle in regular iPad windows (and the iPhone Duo inner display).
+        // The four routes stay the same in both forms; `TabSection` album lists are not added because album
+        // routes are per-scene navigation state, not tabs. The tab bar keeps the default compression: every tab
+        // is a navigation-focused browsing surface (HIG: only task-oriented views minimize the tab bar), and the
+        // Metal grid is a UIKit scroll view that the SwiftUI minimize behavior does not observe.
+        .tabViewStyle(.sidebarAdaptable)
         .tint(ProtonColor.primary)
         .mobileTabBarBackgroundPolicy()
         .onChange(of: selection) { _, tab in
