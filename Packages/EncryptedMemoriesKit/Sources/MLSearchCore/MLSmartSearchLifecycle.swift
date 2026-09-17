@@ -473,6 +473,11 @@ public actor MLSmartSearchLifecycle {
         return false
     }
 
+    /// True while `operation` is still the journaled operation of enabled Smart Search.
+    private func isCurrentOperation(_ operation: MLSmartSearchPendingOperation) -> Bool {
+        !isShutDown && persistent.isEnabled && persistent.pendingOperation == operation
+    }
+
     /// Select a model. The same selection is a no-op; another model runs the transactional switch,
     /// retires the old epoch, activates the new model, and starts a clean reindex.
     public func select(_ id: MLModelID) async {
@@ -656,6 +661,15 @@ public actor MLSmartSearchLifecycle {
         }
     }
 
+    #if DEBUG
+        /// Test seam: runs after a developer artifact copy returns and before its result is applied.
+        private var developerInstallContinuationGate: (@Sendable () async -> Void)?
+
+        func setDeveloperInstallContinuationGate(_ gate: (@Sendable () async -> Void)?) {
+            developerInstallContinuationGate = gate
+        }
+    #endif
+
     /// Install a developer-provided local model artifact for `id` (developer environments
     /// only). The artifact is hashed, staged and installed with the same guarantees as a
     /// download.
@@ -668,9 +682,27 @@ public actor MLSmartSearchLifecycle {
         else { return }
         phase = .installing
         emit()
+        let installResult: Result<MLModelInstallRecord, any Error>
         do {
-            _ = try await deps.installer.installFromLocalArtifact(entry, artifactDirectory: artifactDirectory)
+            installResult = .success(
+                try await deps.installer.installFromLocalArtifact(entry, artifactDirectory: artifactDirectory))
         } catch {
+            installResult = .failure(error)
+        }
+        #if DEBUG
+            await developerInstallContinuationGate?()
+        #endif
+        // The copy runs outside this actor. Turning Visual Search off or purging Smart Search meanwhile
+        // supersedes the install: it must neither re-enable Visual Search nor leave an orphaned model.
+        guard !isShutDown, persistent.isEnabled, persistent.isVisualSearchEnabled, !isRemovingVisualSearch
+        else {
+            // Uninstall is idempotent. A pending removal may already have passed its own uninstall.
+            if case .success = installResult, !isShutDown {
+                await deps.installer.uninstall(entry)
+            }
+            return
+        }
+        if case .failure(let error) = installResult {
             phase = .failed(
                 MLSmartSearchFailure(
                     kind: .installation,
@@ -2150,9 +2182,13 @@ public actor MLSmartSearchLifecycle {
         model: MLModelID?,
         descriptor: MLModelDescriptor?
     ) async -> Bool {
+        let removal = MLSmartSearchPendingOperation.disableVisualSearch(model: model)
         await stopActivations()
         await stopIndexing()
         await teardownSession()
+        // A full purge may replace this journal while teardown awaits. The purge then owns every
+        // file and the state; this stale removal must not touch the store or rewrite the journal.
+        guard isCurrentOperation(removal) else { return false }
 
         if let model {
             if let descriptor {
@@ -2171,6 +2207,7 @@ public actor MLSmartSearchLifecycle {
             }
             if let entry = catalog.entry(for: model) {
                 await deps.installer.uninstall(entry)
+                guard isCurrentOperation(removal) else { return false }
             }
         }
 
