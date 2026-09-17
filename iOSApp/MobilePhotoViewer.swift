@@ -741,7 +741,7 @@ private struct MobileBurstFilmstrip: View {
             .accessibilityLabel(L10n.string("viewer.burst_filmstrip_label"))
         }
         .padding(8)
-        .protonGlass(in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+        .glassEffect(in: RoundedRectangle(cornerRadius: 20, style: .continuous))
     }
 }
 
@@ -1017,7 +1017,7 @@ struct MobileImagePage: View {
                         .controlSize(.large)
                         .tint(.white)
                         .padding(16)
-                        .protonGlass(in: Circle())
+                        .glassEffect(in: Circle())
                         .allowsHitTesting(false)
                         .zIndex(2)
                 case .failed:
@@ -1025,7 +1025,7 @@ struct MobileImagePage: View {
                         .font(.system(size: 26))
                         .foregroundStyle(.white)
                         .padding(14)
-                        .protonGlass(in: Circle())
+                        .glassEffect(in: Circle())
                         .accessibilityLabel(L10n.string("viewer.playback_failed"))
                         .allowsHitTesting(false)
                         .zIndex(2)
@@ -1493,7 +1493,7 @@ private struct MobileVideoPlaybackControls: View {
             }
             .padding(.horizontal, 16)
             .frame(height: layoutProfile.controlSide)
-            .protonGlass(in: Capsule())
+            .glassEffect(in: Capsule())
             .padding(.horizontal, MobileViewerBottomLayout.horizontalPadding)
             // The filmstrip is safe-area content below the page, so the transport keeps only its row spacing.
             .padding(.bottom, layoutProfile.rowSpacing)
@@ -2309,7 +2309,7 @@ private struct MobileLiveBadge: View {
         .foregroundStyle(.white)
         .padding(.horizontal, 8)
         .padding(.vertical, 4)
-        .protonGlass(in: Capsule())
+        .glassEffect(in: Capsule())
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(L10n.string("viewer.live_photo_a11y"))
     }

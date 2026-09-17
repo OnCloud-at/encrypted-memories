@@ -400,7 +400,7 @@ private struct MobileFilterGridScreen: View {
                 Button(L10n.string("action.retry")) {
                     Task { await load() }
                 }
-                .protonProminentGlassButton()
+                .buttonStyle(.glassProminent)
             }
         case .loaded:
             if snapshot.isEmpty {

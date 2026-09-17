@@ -193,8 +193,8 @@ private final class PlayerLayerHostView: NSView {
     required init?(coder: NSCoder) { fatalError("init(coder:) is unavailable") }
 }
 
-/// Full-screen photo/video viewer: shows the best available image sharp (no blur) with a Liquid
-/// Glass loading indicator while the full original downloads, then pinch-to-zoom + two-finger pan.
+/// Full-screen photo/video viewer: shows the best available image sharp (no blur) with a native progress
+/// indicator while the full original downloads, then pinch-to-zoom + two-finger pan.
 public struct PhotoViewerView: View {
     @State private var model: PhotoViewerModel
     private let onClose: () -> Void
@@ -207,13 +207,7 @@ public struct PhotoViewerView: View {
     /// background and image but stays mounted and hit-testable for the pinch gesture.
     private let isDismissing: Bool
 
-    @State private var hovering = false
-
-    /// Width reported after layout. Used only to clamp the fixed-width info inspector; the media content
-    /// remains flexible. The geometry transform stays independent of the model state.
-    @State private var containerWidth: CGFloat = 0
     private let mediaTransition = ViewerMediaTransitionStyle.standard
-    private let chromePresentation = ViewerChromePresentationStyle.standard
 
     /// Size of the media area, used to place the Live badge at the displayed image's top-left corner.
     /// The image is aspect-fit (letterboxed), so a portrait photo in a wide window must show
@@ -254,78 +248,69 @@ public struct PhotoViewerView: View {
             viewerBody
 
             loadingOverlay.opacity(isDismissing ? 0 : 1)
-
-            navigationControls.opacity(isDismissing ? 0 : 1)
-            shortcuts
         }
+        // The native inspector column. The toolbar Info button toggles it through the model, which also loads
+        // the metadata when the inspector opens.
+        .inspector(isPresented: infoPresented) {
+            InfoPanelView(
+                item: model.current,
+                metadataLoadState: model.metadataLoadState,
+                albumTitles: model.albumTitles,
+                canLoadAlbumMemberships: model.canLoadAlbumMemberships,
+                isLoadingAlbumMemberships: model.isLoadingAlbumMemberships,
+                albumMembershipsLoadFailed: model.albumMembershipsLoadFailed,
+                onRetry: { model.retryMetadata() }
+            )
+            .inspectorColumnWidth(min: 300, ideal: 340, max: 480)
+        }
+        // Previous and Next are native View menu commands with arrow-key equivalents.
+        .focusedSceneValue(
+            \.photoViewerNavigation,
+            PhotoViewerNavigation(
+                canGoPrevious: model.canNavigatePrevious,
+                canGoNext: model.canNavigateNext,
+                goPrevious: { model.previousInContext() },
+                goNext: { model.nextInContext() }
+            )
+        )
         .onAppear {
             model.start()
         }
         .onDisappear { model.stop() }  // closing cancels in-flight work + stops playback
-        .onHover { hovering = $0 }
         .onExitCommand { onClose() }  // Esc closes the photo
     }
 
-    /// The media and info inspector below the native window toolbar. The media uses its final frame from the
-    /// first layout pass.
+    private var infoPresented: Binding<Bool> {
+        Binding(
+            get: { model.showInfo },
+            set: { if $0 != model.showInfo { model.toggleInfo() } }
+        )
+    }
+
+    /// The media below the native window toolbar. The media uses its final frame from the first layout pass.
     private var viewerBody: some View {
-        // The inspector has a fixed width clamped to the window and does not change the container width.
-        let inspectorWidth =
-            model.showInfo
-            ? ViewerChromeLayout.clampedInspectorWidth(in: CGRect(x: 0, y: 0, width: containerWidth, height: 0))
-            : 0
-        return HStack(spacing: 0) {
-            // The media fills the remaining width and does not depend on a not-yet-measured container width.
-            self.content
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .clipped()
-                .onGeometryChange(for: CGSize.self) {
-                    $0.size
-                } action: {
-                    contentSize = $0
-                }
-                // Live and burst badges stay at the image edge after aspect-fit letterboxing.
-                .overlay(alignment: .topLeading) {
-                    if model.player == nil, model.image != nil, !isDismissing,
-                        model.current.isLivePhoto || model.isLoadingBurst || model.hasBurstFilmstrip
-                    {
-                        let inset = livePhotoBadgeImageInset(in: contentSize)
-                        mediaBadges.offset(x: inset.width, y: inset.height)
-                    }
-                }
-                .safeAreaInset(edge: .bottom, spacing: 0) {
-                    if model.hasBurstFilmstrip, !isDismissing {
-                        burstFilmstrip
-                    }
-                }
-            if model.showInfo {
-                InfoPanelView(
-                    item: model.current,
-                    metadataLoadState: model.metadataLoadState,
-                    albumTitles: model.albumTitles,
-                    canLoadAlbumMemberships: model.canLoadAlbumMemberships,
-                    isLoadingAlbumMemberships: model.isLoadingAlbumMemberships,
-                    albumMembershipsLoadFailed: model.albumMembershipsLoadFailed,
-                    onRetry: { model.retryMetadata() },
-                    onClose: {
-                        withAnimation(.easeInOut(duration: chromePresentation.inspectorDuration)) {
-                            model.toggleInfo()
-                        }
-                    }
-                )
-                .frame(width: inspectorWidth)
-                .frame(maxHeight: .infinity)
-                .transition(.move(edge: .trailing).combined(with: .opacity))
+        content
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .clipped()
+            .onGeometryChange(for: CGSize.self) {
+                $0.size
+            } action: {
+                contentSize = $0
             }
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        // Read only the scalar width in the geometry transform. Keep the transform independent of model state
-        // and reference captures so the layout update stays outside the viewer's actor state.
-        .onGeometryChange(for: CGFloat.self) { proxy in
-            proxy.size.width
-        } action: { newWidth in
-            containerWidth = newWidth
-        }
+            // Live and burst badges stay at the image edge after aspect-fit letterboxing.
+            .overlay(alignment: .topLeading) {
+                if model.player == nil, model.image != nil, !isDismissing,
+                    model.current.isLivePhoto || model.isLoadingBurst || model.hasBurstFilmstrip
+                {
+                    let inset = livePhotoBadgeImageInset(in: contentSize)
+                    mediaBadges.offset(x: inset.width, y: inset.height)
+                }
+            }
+            .safeAreaInset(edge: .bottom, spacing: 0) {
+                if model.hasBurstFilmstrip, !isDismissing {
+                    burstFilmstrip
+                }
+            }
     }
 
     /// Top-left inset of the displayed aspect-fit image within the content area. The Live badge follows the
@@ -400,25 +385,21 @@ public struct PhotoViewerView: View {
         }
     }
 
-    /// Apple-style Live indicator at the top-left of the full view. Hovering or force-clicking plays the
-    /// preloaded motion clip with sound; leaving or releasing stops it.
+    /// Live indicator at the top-left of the full view. AppKit offers no system Live badge image, so the badge is
+    /// a native label on Liquid Glass. Hovering or force-clicking plays the preloaded motion clip with sound;
+    /// leaving or releasing stops it.
     private var livePhotoBadge: some View {
-        HStack(spacing: 5) {
-            Image(systemName: "livephoto")
-                .font(.system(size: 12, weight: .medium))
-            Text(L10n.string("viewer.live_badge"))
-                .font(.system(size: 11, weight: .semibold))
-        }
-        .foregroundStyle(.primary)
-        .padding(.horizontal, 9)
-        .padding(.vertical, 5)
-        .protonGlass(in: Capsule())
-        .padding(.top, 14)
-        .padding(.leading, 14)
-        .onHover { hovering in
-            if hovering { model.playMotion() } else { model.stopMotion() }
-        }
-        .accessibilityLabel(L10n.string("viewer.live_photo_a11y"))
+        Label(L10n.string("viewer.live_badge"), systemImage: "livephoto")
+            .font(.system(size: 11, weight: .semibold))
+            .padding(.horizontal, 9)
+            .padding(.vertical, 5)
+            .glassEffect(in: Capsule())
+            .padding(.top, 14)
+            .padding(.leading, 14)
+            .onHover { hovering in
+                if hovering { model.playMotion() } else { model.stopMotion() }
+            }
+            .accessibilityLabel(L10n.string("viewer.live_photo_a11y"))
     }
 
     @ViewBuilder private var mediaBadges: some View {
@@ -449,7 +430,7 @@ public struct PhotoViewerView: View {
         .foregroundStyle(.primary)
         .padding(.horizontal, 9)
         .padding(.vertical, 5)
-        .protonGlass(in: Capsule())
+        .glassEffect(in: Capsule())
         .padding(.top, model.current.isLivePhoto ? 0 : 14)
         .padding(.leading, 14)
         .accessibilityLabel(Text(L10n.string("viewer.burst_filmstrip_label")))
@@ -482,7 +463,7 @@ public struct PhotoViewerView: View {
         .padding(.top, 10)
         .padding(.bottom, 12)
         .frame(width: width)
-        .protonGlass(in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .glassEffect(in: RoundedRectangle(cornerRadius: 18, style: .continuous))
         .padding(.bottom, 16)
     }
 
@@ -525,124 +506,55 @@ public struct PhotoViewerView: View {
         }
     }
 
-    @ViewBuilder private func failureCard(_ error: VideoPlaybackError) -> some View {
-        VStack(spacing: 10) {
-            Image(systemName: "exclamationmark.triangle")
-                .font(.system(size: 30))
-            Text(L10n.string("viewer.playback_failed"))
-                .font(.headline)
+    private func failureCard(_ error: VideoPlaybackError) -> some View {
+        ContentUnavailableView {
+            Label(L10n.string("viewer.playback_failed"), systemImage: "exclamationmark.triangle")
+        } description: {
             Text(error.userMessage)
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-                .frame(maxWidth: 320)
+        } actions: {
             if error.isRetryable {
                 Button(L10n.string("action.retry")) { model.retry() }
                     .buttonStyle(.borderedProminent)
-                    .padding(.top, 4)
             }
-        }
-        .padding(22)
-        .protonGlass(in: RoundedRectangle(cornerRadius: 12))
-    }
-
-    @ViewBuilder private var busyOverlay: some View {
-        let progress = model.videoState.progress
-        if case .downloading = model.videoState, progress > 0.001, progress < 0.995 {
-            VStack(spacing: 8) {
-                ProgressView().controlSize(.large)
-                Text("\(Int(progress * 100))%")
-                    .font(.headline.monospacedDigit())
-            }
-            .padding(18)
-            .protonGlass(in: RoundedRectangle(cornerRadius: 12))
-        } else {
-            ProgressView().controlSize(.large)
-                .padding(16)
-                .protonGlass(in: Circle())
         }
     }
 
-    @ViewBuilder private var imageLoadingOverlay: some View {
-        if model.originalProgress > 0.001, model.originalProgress < 0.995 {
-            VStack(spacing: 8) {
-                ProgressView().controlSize(.large)
-                Text("\(Int(model.originalProgress * 100))%")
-                    .font(.headline.monospacedDigit())
+    private var busyOverlay: some View {
+        let isDownloading = if case .downloading = model.videoState { true } else { false }
+        return progressIndicator(model.videoState.progress, isDownloading: isDownloading)
+    }
+
+    private var imageLoadingOverlay: some View {
+        progressIndicator(model.originalProgress, isDownloading: true)
+    }
+
+    /// A native determinate indicator with a percentage while bytes arrive, otherwise the indeterminate spinner.
+    @ViewBuilder private func progressIndicator(_ progress: Double, isDownloading: Bool) -> some View {
+        if isDownloading, progress > 0.001, progress < 0.995 {
+            ProgressView(value: progress) {
+                EmptyView()
+            } currentValueLabel: {
+                Text(progress, format: .percent.precision(.fractionLength(0)))
+                    .monospacedDigit()
             }
-            .padding(18)
-            .protonGlass(in: RoundedRectangle(cornerRadius: 12))
+            .progressViewStyle(.circular)
+            .controlSize(.large)
         } else {
             ProgressView().controlSize(.large)
-                .padding(16)
-                .protonGlass(in: Circle())
         }
     }
 
     private var livePhotoLoadFailureOverlay: some View {
-        Image(systemName: "exclamationmark.triangle")
-            .font(.system(size: 26))
-            .padding(14)
-            .protonGlass(in: Circle())
-            .accessibilityLabel(L10n.string("viewer.playback_failed"))
+        Label(L10n.string("viewer.playback_failed"), systemImage: "exclamationmark.triangle")
+            .labelStyle(.iconOnly)
+            .font(.largeTitle)
+            .foregroundStyle(.secondary)
     }
-
-    private func goPrevious() { model.previousInContext() }
-    private func goNext() { model.nextInContext() }
 
     private func handlePageSwipe(_ direction: ViewerPageSwipeDirection) {
         switch direction {
         case .previous: model.previousInContext()
         case .next: model.nextInContext()
-        }
-    }
-
-    // MARK: Controls + shortcuts
-
-    @ViewBuilder private var navigationControls: some View {
-        HStack {
-            iconButton("chevron.left", size: 40, enabled: model.canNavigatePrevious) { goPrevious() }
-            Spacer()
-            iconButton("chevron.right", size: 40, enabled: model.canNavigateNext) { goNext() }
-        }
-        .padding(.horizontal, 18)
-        .opacity(hovering ? 1 : 0)
-        .animation(.easeInOut(duration: 0.15), value: hovering)
-    }
-
-    private var shortcuts: some View {
-        ZStack {
-            Button("", action: goPrevious).keyboardShortcut(.leftArrow, modifiers: [])
-            Button("", action: goNext).keyboardShortcut(.rightArrow, modifiers: [])
-            Button("", action: goNext).keyboardShortcut(.space, modifiers: [])
-            Button("", action: onClose).keyboardShortcut(.cancelAction)
-        }
-        .opacity(0)
-        .allowsHitTesting(false)
-    }
-
-    private func iconButton(
-        _ symbol: String, size: CGFloat, enabled: Bool = true, action: @escaping () -> Void
-    ) -> some View {
-        Button(action: action) {
-            Label(accessibilityTitle(for: symbol), systemImage: symbol)
-                .labelStyle(.iconOnly)
-                .font(.system(size: size * 0.42, weight: .semibold))
-                .frame(width: size, height: size)
-                .contentShape(Rectangle())  // whole frame is clickable, not just the glyph pixels
-        }
-        .buttonStyle(.plain)
-        .protonGlass(in: Circle())
-        .opacity(enabled ? 1 : 0.25)
-        .disabled(!enabled)
-        .accessibilityLabel(accessibilityTitle(for: symbol))
-    }
-
-    private func accessibilityTitle(for symbol: String) -> String {
-        switch symbol {
-        case "chevron.left": L10n.string("a11y.previous_photo")
-        case "chevron.right": L10n.string("a11y.next_photo")
-        default: L10n.string("a11y.action")
         }
     }
 }

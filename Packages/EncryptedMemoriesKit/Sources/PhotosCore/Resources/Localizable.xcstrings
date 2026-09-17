@@ -2193,24 +2193,6 @@
         }
       }
     },
-    "a11y.action": {
-      "extractionState": "manual",
-      "comment": "Fallback VoiceOver label for an icon button.",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Action"
-          }
-        },
-        "de": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Aktion"
-          }
-        }
-      }
-    },
     "infopanel.info": {
       "extractionState": "manual",
       "comment": "Info-panel header title.",

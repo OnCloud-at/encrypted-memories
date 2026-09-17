@@ -1840,13 +1840,7 @@ struct MainView: View {
             }
             ToolbarItemGroup(placement: .primaryAction) {
                 Button {
-                    withAnimation(
-                        .easeInOut(
-                            duration: ViewerChromePresentationStyle.standard.inspectorDuration
-                        )
-                    ) {
-                        viewerModel.toggleInfo()
-                    }
+                    viewerModel.toggleInfo()
                 } label: {
                     Label("toolbar.info", systemImage: viewerModel.showInfo ? "info.circle.fill" : "info.circle")
                         .labelStyle(.iconOnly)
