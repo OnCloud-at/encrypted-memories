@@ -13,10 +13,11 @@ struct MobileViewerFilmstrip: UIViewRepresentable {
     let selectedUID: PhotoUID?
     let feed: UIKitThumbnailFeed?
     let itemSide: CGFloat
+    /// The route strip separates its photos; a series strip sets them edge to edge like the Photos app.
+    var itemSpacing: CGFloat = 8
     let onSelect: (PhotoUID) -> Void
 
     private static let minimumInteractionSide: CGFloat = 44
-    private static let itemSpacing: CGFloat = 8
 
     func makeCoordinator() -> Coordinator {
         Coordinator(items: items, selectedUID: selectedUID, feed: feed, onSelect: onSelect)
@@ -27,7 +28,7 @@ struct MobileViewerFilmstrip: UIViewRepresentable {
         let layout = MobileViewerFilmstripFlowLayout()
         layout.scrollDirection = .horizontal
         layout.itemSize = CGSize(width: itemSide, height: itemSide)
-        layout.minimumLineSpacing = Self.itemSpacing
+        layout.minimumLineSpacing = itemSpacing
         layout.minimumInteritemSpacing = 0
         layout.sectionInset = .zero
 
@@ -251,6 +252,43 @@ struct MobileViewerFilmstrip: UIViewRepresentable {
     }
 }
 
+/// Loads one thumbnail for a view that is on screen, and keeps trying until the image exists.
+///
+/// A single feed request can return no image: series members are not library items, so their bytes may still
+/// be on the way when the cell appears. The loader asks with visible priority, then waits for the feed's
+/// arrival wake or for a bounded backoff, whichever comes first, and asks again. Cancelling the task ends it.
+enum MobileThumbnailArrival {
+    private static let firstRetryDelay: Duration = .seconds(1)
+    private static let longestRetryDelay: Duration = .seconds(16)
+
+    static func image(for uid: PhotoUID, feed: UIKitThumbnailFeed) async -> UIImage? {
+        var delay = firstRetryDelay
+        while !Task.isCancelled {
+            // The wait starts before the request, so an arrival during the request already ends it.
+            let wait = Task { try? await Task.sleep(for: delay) }
+            let registration = feed.setOnCacheArrivalWake { wait.cancel() }
+            defer { registration.end() }
+            await feed.requestPriority(uid, priority: .visibleNow)
+            if let image = await feed.image(for: uid) {
+                wait.cancel()
+                return image
+            }
+            // The feed proved that this photo has no thumbnail. Another request cannot change that.
+            if feed.isKnownUnfetchable(uid) {
+                wait.cancel()
+                return nil
+            }
+            await withTaskCancellationHandler {
+                _ = await wait.value
+            } onCancel: {
+                wait.cancel()
+            }
+            delay = min(delay * 2, longestRetryDelay)
+        }
+        return nil
+    }
+}
+
 @MainActor
 final class MobileViewerFilmstripCollectionView: UICollectionView {
     var onLayout: ((MobileViewerFilmstripCollectionView) -> Void)?
@@ -332,7 +370,7 @@ private final class MobileViewerFilmstripCell: UICollectionViewCell {
         guard imageView.image == nil, let feed else { return }
         let uid = item.uid
         thumbnailTask = Task { [weak self, feed] in
-            let image = await feed.image(for: uid)
+            let image = await MobileThumbnailArrival.image(for: uid, feed: feed)
             guard !Task.isCancelled else { return }
             guard let self,
                 self.representedUID == uid,

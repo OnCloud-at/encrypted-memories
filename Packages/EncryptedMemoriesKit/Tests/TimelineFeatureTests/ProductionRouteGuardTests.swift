@@ -1088,7 +1088,7 @@ struct ProductionRouteGuardTests {
             "app-drawn header pills and action rows must not remain beside the native bars")
         #expect(
             body.contains(
-                ".overlay(alignment: .topLeading) {\n                if currentDisplayedItem?.isLivePhoto == true {")
+                ".overlay(alignment: .topLeading) {\n                if currentBaseItem?.isLivePhoto == true {")
                 && body.contains("viewerLiveIndicator"),
             "Live Photo status must sit on the media below the navigation bar, not disappear over bright media")
         let liveIndicator = try Self.body(
@@ -1220,7 +1220,7 @@ struct ProductionRouteGuardTests {
         #expect(viewer.contains("favoriteTask: Task<Void, Never>?"))
         #expect(viewer.contains("restoreTask: Task<Void, Never>?"))
         #expect(
-            viewer.contains("currentDisplayedItem?.uid == uid"),
+            viewer.contains("currentBaseItem?.uid == uid"),
             "late viewer mutations must not publish an error or dismissal for a different page")
         let restore = try Self.body(
             of: viewer,

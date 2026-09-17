@@ -5,7 +5,43 @@ import UniformTypeIdentifiers
 /// The only place PhotoKit types become `PhotoBackupAssetInfo`. Reads local metadata only -
 /// `PHAssetResource.assetResources(for:)` is synchronous and never triggers downloads.
 enum PhotoKitAssetMapper {
+    /// The asset as backup sees it. A photo of a burst (series) also carries its series role, so that only
+    /// the series' main photo becomes a backup candidate and its members travel in that compound.
     static func info(for asset: PHAsset, cloudIdentifier: String? = nil) -> PhotoBackupAssetInfo {
+        let info = assetInfo(for: asset, cloudIdentifier: cloudIdentifier)
+        guard let plan = burstPlan(for: asset) else { return info }
+        return PhotoBurstUploadPlanner.applying(plan, to: info)
+    }
+
+    /// Fetches every photo of the asset's series, including the ones PhotoKit hides by default, and plans
+    /// the upload. Nil for an asset outside a series. Metadata only; never downloads bytes.
+    static func burstPlan(for asset: PHAsset) -> PhotoBurstUploadPlan? {
+        guard let burstIdentifier = asset.burstIdentifier else { return nil }
+        let options = PHFetchOptions()
+        options.includeAllBurstAssets = true
+        let fetch = PHAsset.fetchAssets(withBurstIdentifier: burstIdentifier, options: options)
+        var descriptors: [PhotoBurstAssetDescriptor] = []
+        descriptors.reserveCapacity(fetch.count)
+        fetch.enumerateObjects { member, _, _ in
+            descriptors.append(
+                PhotoBurstAssetDescriptor(
+                    info: assetInfo(for: member, cloudIdentifier: nil),
+                    isUserPick: member.burstSelectionTypes.contains(.userPick),
+                    representsBurst: member.representsBurst
+                ))
+        }
+        return PhotoBurstUploadPlanner.plan(for: descriptors)
+    }
+
+    /// One asset by identifier, series members included. The default fetch hides every photo of a series
+    /// except the representative and the user's picks, so a member lookup must include all burst assets.
+    static func asset(withLocalIdentifier identifier: String) -> PHAsset? {
+        let options = PHFetchOptions()
+        options.includeAllBurstAssets = true
+        return PHAsset.fetchAssets(withLocalIdentifiers: [identifier], options: options).firstObject
+    }
+
+    private static func assetInfo(for asset: PHAsset, cloudIdentifier: String?) -> PhotoBackupAssetInfo {
         let resources = PHAssetResource.assetResources(for: asset).map { resource in
             PhotoBackupAssetInfo.Resource(
                 role: role(for: resource.type),

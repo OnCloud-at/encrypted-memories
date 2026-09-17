@@ -135,7 +135,7 @@ final class BurstFilmstripArchitectureTests: XCTestCase {
         XCTAssertTrue(mainView.contains("downloadViewerSelection(viewerModel)"))
     }
 
-    func testMobileViewerUsesSharedBurstStateAndSafeAreaFilmstrip() throws {
+    func testMobileViewerUsesSharedBurstStateAndOpensTheSeriesInSelectFavorites() throws {
         let repo = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
@@ -154,9 +154,21 @@ final class BurstFilmstripArchitectureTests: XCTestCase {
         XCTAssertTrue(mobile.contains("@State private var burstSelection = BurstSelectionModel()"))
         XCTAssertTrue(mobile.contains("burstSelection.seedKnownGroup"))
         XCTAssertTrue(mobile.contains("provider.burstGroup(containing: item.uid)"))
-        XCTAssertTrue(mobile.contains("MobileBurstFilmstrip("))
-        // The burst strip and the route filmstrip are bottom safe-area content below the media, as in the Photos
-        // app: the native bars stack below them and the media refits when a tap hides the chrome.
+        // The viewer shows the series' main photo and a count button, as the Photos app does. The other photos
+        // open in the "Select Favorites" mode; the former always-visible burst strip must not return beside it.
+        XCTAssertTrue(mobile.contains("viewerSeriesButton(count: seriesItems.count)"))
+        XCTAssertTrue(mobile.contains(".fullScreenCover(item: $seriesModel)"))
+        XCTAssertFalse(mobile.contains("MobileBurstFilmstrip") || mobile.contains("MobileBurstThumbnail"))
+        let seriesScreen = try String(
+            contentsOf: repo.appendingPathComponent("iOSApp/MobileSeriesFavoritesScreen.swift"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(seriesScreen.contains("private(set) var selection: SeriesFavoritesSelection"))
+        XCTAssertFalse(
+            seriesScreen.contains("seriesDissolution") || seriesScreen.contains("burstGroup(containing:"),
+            "the mode receives its backend operation as a closure and never reaches the transport")
+        // The route filmstrip is bottom safe-area content below the media, as in the Photos app: the native
+        // bars stack below it and the media refits when a tap hides the chrome.
         XCTAssertTrue(mobile.contains(".safeAreaInset(edge: .bottom, spacing: 0) { viewerBottomAccessory }"))
         XCTAssertTrue(
             mobile.contains("@ViewBuilder private var viewerBottomAccessory: some View {\n        if chromeVisible {"),

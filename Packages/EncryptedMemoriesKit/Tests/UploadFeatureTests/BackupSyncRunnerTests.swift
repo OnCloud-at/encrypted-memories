@@ -31,6 +31,24 @@ final class BackupTestClock: BackupSchedulerClock, @unchecked Sendable {
     }
 }
 
+/// Records the tags that backup adds to existing photos; can fail every call.
+final class SpyTagAdder: PhotoTagAdding, @unchecked Sendable {
+    private let lock = NSLock()
+    private let failing: Bool
+    private var _calls: [(tags: [Int], uid: PhotoUID)] = []
+
+    init(failing: Bool = false) {
+        self.failing = failing
+    }
+
+    var calls: [(tags: [Int], uid: PhotoUID)] { lock.withLock { _calls } }
+
+    func addTags(_ tags: [Int], to uid: PhotoUID) async throws {
+        lock.withLock { _calls.append((tags, uid)) }
+        if failing { throw UploadError.backend("tag update rejected") }
+    }
+}
+
 /// Scripted `BackupResourceResolving`: per-source behavior, resolve counting.
 final class ScriptedBackupResolver: BackupResourceResolving, @unchecked Sendable {
     enum Behavior {
@@ -62,6 +80,13 @@ final class ScriptedBackupResolver: BackupResourceResolving, @unchecked Sendable
 
     func setSecondaries(_ names: [String], for identifier: String) {
         lock.withLock { secondaryNames[identifier] = names }
+    }
+
+    /// Member filenames per source id - the resolved entry becomes the main photo of a series compound.
+    private var burstMemberNames: [String: [String]] = [:]
+
+    func setBurstMembers(_ names: [String], for identifier: String) {
+        lock.withLock { burstMemberNames[identifier] = names }
     }
 
     func setAdditionalMetadata(_ metadata: [PhotoUploadAdditionalMetadata], for identifier: String) {
@@ -141,13 +166,14 @@ final class ScriptedBackupResolver: BackupResourceResolving, @unchecked Sendable
         do {
             let modified = lock.withLock { modifiedOverrides[id] } ?? defaultModified
             let secondaries = lock.withLock { secondaryNames[id] } ?? []
+            let burstMembers = lock.withLock { burstMemberNames[id] } ?? []
             let additionalMetadata = lock.withLock { metadataByIdentifier[id] } ?? []
             let isDeferred = lock.withLock { deferredIdentifiers.contains(id) }
             let snapshot = UploadBackupAssetSnapshot(
                 source: entry.source,
                 revision: UploadBackupRevision(date: modified),
                 editRevision: .unavailable,
-                resourceCount: 1 + secondaries.count
+                resourceCount: 1 + secondaries.count + burstMembers.count
             )
             let descriptor = UploadResourceDescriptor(
                 source: entry.source,
@@ -204,7 +230,24 @@ final class ScriptedBackupResolver: BackupResourceResolving, @unchecked Sendable
                         mediaType: "video/quicktime",
                         additionalMetadata: additionalMetadata
                     )
-                },
+                }
+                    + burstMembers.enumerated().map { ordinal, name in
+                        BackupSecondaryResource(
+                            descriptor: UploadResourceDescriptor(
+                                source: UploadSourceIdentity(
+                                    kind: entry.source.kind,
+                                    identifier: entry.source.identifier,
+                                    resource: .burstMember(ordinal: ordinal)
+                                ),
+                                fileURL: URL(fileURLWithPath: "\(entry.source.identifier)#\(name)"),
+                                filename: name,
+                                fileSize: 3,
+                                modificationDate: modified
+                            ),
+                            mediaType: "image/jpeg",
+                            additionalMetadata: additionalMetadata
+                        )
+                    },
                 materialize: materialize
             )
         }
@@ -965,6 +1008,7 @@ final class BackupSyncRunnerTests: XCTestCase {
 
     private func makeRunner(
         uploader: (any PhotoUploading)? = nil,
+        tagAdder: (any PhotoTagAdding)? = nil,
         identityResolver: (any UploadIdentityResolving)? = nil,
         resolver: (any BackupResourceResolving)? = nil,
         queue: (any UploadBackupSyncQueueStore)? = nil,
@@ -981,6 +1025,7 @@ final class BackupSyncRunnerTests: XCTestCase {
             resolver: resolver ?? self.resolver,
             identityResolver: identityResolver ?? makePipeline(resourceCoordinator: resourceCoordinator),
             uploader: uploader ?? self.uploader,
+            tagAdder: tagAdder,
             resourceCoordinator: resourceCoordinator,
             configuration: BackupSyncRunner.Configuration(
                 uploadStallTimeout: uploadStallTimeout,
@@ -1194,11 +1239,14 @@ final class BackupSyncRunnerTests: XCTestCase {
         _ id: String,
         state: UploadBackupSyncQueueState = .discovered,
         attempts: Int = 0,
-        ageSeconds: TimeInterval = 60
+        ageSeconds: TimeInterval = 60,
+        revisionOffset: Int64 = 0
     ) -> UploadBackupSyncQueueEntry {
         let entry = UploadBackupSyncQueueEntry(
             source: .file(URL(fileURLWithPath: "/backup/\(id)")),
-            revision: UploadBackupRevision(date: resolver.defaultModified),
+            // A nonzero offset queues the same source again under a new revision, as a rescan does.
+            revision: UploadBackupRevision(
+                rawValue: UploadBackupRevision(date: resolver.defaultModified).rawValue + revisionOffset),
             originalFilename: id,
             byteCount: 4,
             state: state,
@@ -1883,6 +1931,64 @@ final class BackupSyncRunnerTests: XCTestCase {
         )
         XCTAssertEqual(record?.isComplete, true)
         XCTAssertEqual(record?.resourceCount, 2)
+    }
+
+    func testSeriesUploadsMembersAsRelatedPhotosWithTheBurstsTag() async throws {
+        let entry = seedEntry("IMG_0001.HEIC")
+        resolver.setBurstMembers(["IMG_0002.HEIC", "IMG_0003.HEIC"], for: entry.source.identifier)
+        let tagAdder = SpyTagAdder()
+
+        let progress = await makeRunner(tagAdder: tagAdder).runUntilDrained()
+
+        XCTAssertEqual(uploader.requests.map(\.name), ["IMG_0001.HEIC", "IMG_0002.HEIC", "IMG_0003.HEIC"])
+        XCTAssertEqual(
+            uploader.requests.map(\.tags),
+            Array(repeating: [PhotoTag.bursts.rawValue], count: 3),
+            "the main photo and every member carry Proton's bursts tag at creation")
+        XCTAssertEqual(
+            uploader.requests.map(\.mainPhotoUID),
+            [nil, testUID("IMG_0001.HEIC"), testUID("IMG_0001.HEIC")],
+            "every member is a related photo of the freshly uploaded main photo")
+        XCTAssertEqual(state(of: entry), .completed)
+        XCTAssertEqual(progress.uploaded, 1, "a series is ONE user-facing item")
+        XCTAssertTrue(tagAdder.calls.isEmpty, "a main photo that uploads now is tagged at creation, not afterwards")
+    }
+
+    func testSeriesMigrationUploadsOnlyMissingMembersAndTagsTheExistingMainPhoto() async throws {
+        // Build 77 state: the representative photo is already uploaded as a plain, untagged photo.
+        let entry = seedEntry("IMG_0001.HEIC")
+        _ = await makeRunner().runUntilDrained()
+        XCTAssertEqual(uploader.requests.map(\.name), ["IMG_0001.HEIC"])
+        XCTAssertEqual(uploader.requests.first?.tags, [])
+
+        // The fixed planner now reports the members, so the same main photo is queued under its series revision.
+        resolver.setBurstMembers(["IMG_0002.HEIC", "IMG_0003.HEIC"], for: entry.source.identifier)
+        let reopened = seedEntry("IMG_0001.HEIC", revisionOffset: 1)
+        let tagAdder = SpyTagAdder()
+        _ = await makeRunner(tagAdder: tagAdder).runUntilDrained()
+
+        XCTAssertEqual(
+            uploader.requests.map(\.name), ["IMG_0001.HEIC", "IMG_0002.HEIC", "IMG_0003.HEIC"],
+            "the representative photo must never upload a second time")
+        let members = uploader.requests.dropFirst()
+        XCTAssertTrue(members.allSatisfy { $0.mainPhotoUID?.nodeID == testUID("IMG_0001.HEIC").nodeID })
+        XCTAssertTrue(members.allSatisfy { $0.tags == [PhotoTag.bursts.rawValue] })
+        XCTAssertEqual(tagAdder.calls.map(\.tags), [[PhotoTag.bursts.rawValue]])
+        XCTAssertEqual(tagAdder.calls.first?.uid.nodeID, testUID("IMG_0001.HEIC").nodeID)
+        XCTAssertEqual(state(of: reopened), .alreadyBackedUp)
+    }
+
+    func testSeriesMigrationStaysPendingWhenTheExistingMainPhotoCannotBeTagged() async throws {
+        let entry = seedEntry("IMG_0001.HEIC")
+        _ = await makeRunner().runUntilDrained()
+        resolver.setBurstMembers(["IMG_0002.HEIC"], for: entry.source.identifier)
+        let reopened = seedEntry("IMG_0001.HEIC", revisionOffset: 1)
+
+        _ = await makeRunner(tagAdder: SpyTagAdder(failing: true)).runUntilDrained()
+
+        XCTAssertNotEqual(
+            state(of: reopened)?.isTerminalSuccess, true,
+            "an untagged main photo would still show as a normal photo, so the series is not backed up yet")
     }
 
     func testPhotoMetadataFlowsToPrimaryAndSecondaryUploads() async throws {

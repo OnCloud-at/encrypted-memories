@@ -32,6 +32,17 @@ public struct UploadSourceIdentity: Sendable, Hashable, Codable {
         public static func photoKit(role: String, ordinal: Int) -> Resource {
             Resource(rawValue: "photoKit.\(role).\(max(0, ordinal))")
         }
+
+        private static let burstMemberRole = "burstMember"
+
+        /// One additional photo of a burst (series), uploaded as a related photo of the burst's main photo.
+        public static func burstMember(ordinal: Int) -> Resource {
+            photoKit(role: burstMemberRole, ordinal: ordinal)
+        }
+
+        public var isBurstMember: Bool {
+            rawValue.hasPrefix("photoKit.\(Self.burstMemberRole).")
+        }
     }
 
     public let kind: Kind

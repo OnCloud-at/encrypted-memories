@@ -71,6 +71,9 @@ public actor BackupSyncRunner {
     /// uploads, so a missing manifest must fail composition, not silently degrade.
     private let identityResolver: any UploadIdentityResolving
     private let uploader: any PhotoUploading
+    /// Marks an existing main photo as a series when only its missing members upload. Nil for sources
+    /// that never produce a series (folder backup).
+    private let tagAdder: (any PhotoTagAdding)?
     private let resourceCoordinator: LibraryResourceCoordinator
     private let configuration: Configuration
     private let throttleInputs: @Sendable () -> BackupThrottleInputs
@@ -130,6 +133,7 @@ public actor BackupSyncRunner {
         resolver: any BackupResourceResolving,
         identityResolver: any UploadIdentityResolving,
         uploader: any PhotoUploading,
+        tagAdder: (any PhotoTagAdding)? = nil,
         resourceCoordinator: LibraryResourceCoordinator = .shared,
         configuration: Configuration = Configuration(),
         throttleInputs: @Sendable @escaping () -> BackupThrottleInputs = { .unconstrained },
@@ -141,6 +145,7 @@ public actor BackupSyncRunner {
         self.resolver = resolver
         self.identityResolver = identityResolver
         self.uploader = uploader
+        self.tagAdder = tagAdder
         self.resourceCoordinator = resourceCoordinator
         self.configuration = configuration
         self.throttleInputs = throttleInputs
@@ -824,9 +829,7 @@ public actor BackupSyncRunner {
             fileSize: descriptor.fileSize,
             captureTime: resolved.captureDate,
             modificationDate: resolved.descriptor.modificationDate,
-            tags: resolved.secondaries.contains {
-                $0.descriptor.source.resource == .livePairedVideo
-            } ? [PhotoTag.livePhotos.rawValue] : [],
+            tags: Self.primaryTags(for: resolved.secondaries),
             additionalMetadata: resolved.additionalMetadata
         )
         .applying(identity: preflightResult.identity)
@@ -1090,6 +1093,18 @@ public actor BackupSyncRunner {
                 revert(entry, from: persistedState)
                 return
             }
+            // Series migration: an earlier build uploaded this main photo alone and untagged. Its members are
+            // related to it now, so the existing node needs the bursts tag. The main photo never uploads again.
+            if terminal == .alreadyBackedUp, let tagAdder,
+                resolved.secondaries.contains(where: { $0.descriptor.source.resource.isBurstMember })
+            {
+                do {
+                    try await tagAdder.addTags([PhotoTag.bursts.rawValue], to: primaryUID)
+                } catch {
+                    retryOrPark(entry, from: persistedState, error: error)
+                    return
+                }
+            }
         }
         do {
             try await preflight.markBackedUp(resolved.candidate.snapshot)
@@ -1259,6 +1274,24 @@ public actor BackupSyncRunner {
             )
     }
 
+    /// Proton tags of a compound's main photo. A Live Photo needs tag 3 and a series needs tag 7 at creation.
+    static func primaryTags(for secondaries: [BackupSecondaryResource]) -> [Int] {
+        var tags: [Int] = []
+        if secondaries.contains(where: { $0.descriptor.source.resource == .livePairedVideo }) {
+            tags.append(PhotoTag.livePhotos.rawValue)
+        }
+        if secondaries.contains(where: { $0.descriptor.source.resource.isBurstMember }) {
+            tags.append(PhotoTag.bursts.rawValue)
+        }
+        return tags
+    }
+
+    static func secondaryTags(for resource: UploadSourceIdentity.Resource) -> [Int] {
+        if resource == .livePairedVideo { return [PhotoTag.livePhotos.rawValue] }
+        if resource.isBurstMember { return [PhotoTag.bursts.rawValue] }
+        return []
+    }
+
     private enum SecondaryScopedOutcome: Sendable {
         case settled
         case blockedByDraft
@@ -1291,9 +1324,7 @@ public actor BackupSyncRunner {
             fileSize: descriptor.fileSize,
             captureTime: secondary.descriptor.modificationDate,
             modificationDate: descriptor.modificationDate,
-            tags: descriptor.source.resource == .livePairedVideo
-                ? [PhotoTag.livePhotos.rawValue]
-                : [],
+            tags: Self.secondaryTags(for: descriptor.source.resource),
             additionalMetadata: secondary.additionalMetadata,
             mainPhotoUID: primaryUID
         )
