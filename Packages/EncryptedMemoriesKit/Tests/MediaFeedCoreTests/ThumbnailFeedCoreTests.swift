@@ -254,6 +254,7 @@ private actor RecordingLoader: ThumbnailBatchLoader {
     }
 
     func fetched(_ uid: PhotoUID) -> Bool { order.contains(uid) }
+    func requestOrder() -> [PhotoUID] { order }
     func requestCount() -> Int { order.count }
     func finishedBatches() -> Int { finishedBatchCount }
 }
@@ -1474,6 +1475,45 @@ struct ThumbnailFeedCoreTests {
         #expect(await feed.decoded(for: member) != nil, "an opened series must load its member thumbnails")
         #expect(feed.memoryDecoded(for: member) != nil)
         #expect(await loader.requestCount() == 1)
+        await feed.stopPrefetchAndWait()
+    }
+
+    @Test func burstMembersAreCrawledToDiskAfterEveryLibraryThumbnail() async throws {
+        let key = Self.uid("crawl-burst-key")
+        let other = Self.uid("crawl-library-item")
+        let members = [Self.uid("crawl-burst-member-1"), Self.uid("crawl-burst-member-2")]
+        let cache = Self.cache("burst-member-crawl")
+        let payload = Self.pngData(width: 8, height: 8)
+        let payloads = Dictionary(uniqueKeysWithValues: ([key, other] + members).map { ($0, payload) })
+        let loader = RecordingLoader(payloads: payloads)
+        let feed = ThumbnailFeedCore(cache: cache, loader: loader, configuration: Self.configuration())
+        let graph = LibrarySourceGraph()
+        let source = LibrarySource(id: SourceID("burst-crawl"), capabilities: .readThumbnail, isIncluded: true)
+        _ = graph.commitSourceSet([source], using: graph.beginSourceSetRefresh())
+        let items: [LibrarySourceItem] = [
+            .complete(
+                PhotoItem(
+                    uid: key,
+                    captureTime: Date(timeIntervalSince1970: 2),
+                    mediaType: "image/jpeg",
+                    burstMemberIDs: [key.nodeID] + members.map(\.nodeID)
+                )),
+            .complete(PhotoItem(uid: other, captureTime: Date(timeIntervalSince1970: 1), mediaType: "image/jpeg")),
+        ]
+        let change = try #require(graph.commit(items, validationToken: nil, using: graph.beginRefresh(source.id)!))
+        #expect(await feed.bindDerivedDataEpoch(graph.runtimeEpoch))
+
+        _ = await feed.reconcile(
+            selected: change.selectedScope, analysis: change.analysisScope,
+            retention: change.thumbnailRetentionScope)
+        try await Self.waitUntil { members.allSatisfy { cache.diskData(for: $0) != nil } }
+
+        let order = await loader.requestOrder()
+        let lastLibraryRequest = try #require([key, other].compactMap { order.firstIndex(of: $0) }.max())
+        for member in members {
+            let memberRequest = try #require(order.firstIndex(of: member))
+            #expect(memberRequest > lastLibraryRequest, "burst members follow every library thumbnail")
+        }
         await feed.stopPrefetchAndWait()
     }
 

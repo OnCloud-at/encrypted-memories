@@ -1241,18 +1241,33 @@ public actor ThumbnailFeedCore {
     }
 
     public func startPrefetch(_ uids: [PhotoUID]) async {
-        if let lastSelectedScope, let lastAnalysisScope {
-            var orderedUIDs = lastSelectedScope.orderedUIDs
-            var seen = Set(orderedUIDs)
-            orderedUIDs.append(contentsOf: lastAnalysisScope.orderedUIDs.filter { seen.insert($0).inserted })
+        if let lastSelectedScope, let lastAnalysisScope, let lastRetentionScope {
             await startPrefetch(
-                orderedUIDs,
+                Self.crawlOrder(
+                    selected: lastSelectedScope,
+                    analysis: lastAnalysisScope,
+                    retention: lastRetentionScope
+                ),
                 reporting: lastSelectedScope.uids,
                 requiringSourceRevision: lastAnalysisScope.revision
             )
         } else {
             await startPrefetch(uids, reporting: Set(uids), requiringSourceRevision: nil)
         }
+    }
+
+    /// Background crawl order: the main library grid first, then thumbnails of additional sources, and last the
+    /// burst members, which only a series filmstrip shows. Visible demand still preempts the whole crawl.
+    private static func crawlOrder(
+        selected: SelectedDerivedDataScope,
+        analysis: AnalysisDerivedDataScope,
+        retention: ThumbnailRetentionDerivedDataScope
+    ) -> [PhotoUID] {
+        var orderedUIDs = selected.orderedUIDs
+        var seen = Set(orderedUIDs)
+        orderedUIDs.append(contentsOf: analysis.orderedUIDs.filter { seen.insert($0).inserted })
+        orderedUIDs.append(contentsOf: retention.orderedUIDs.filter { seen.insert($0).inserted })
+        return orderedUIDs
     }
 
     private func startPrefetch(
@@ -1571,15 +1586,13 @@ public actor ThumbnailFeedCore {
             }
 
             if prefetchEnabled, !request.analysisScope.orderedUIDs.isEmpty {
-                let selectedUIDs = request.selectedScope.uids
-                var orderedUIDs = request.selectedScope.orderedUIDs
-                var seen = Set(orderedUIDs)
-                orderedUIDs.append(
-                    contentsOf: request.analysisScope.orderedUIDs.filter { seen.insert($0).inserted }
-                )
                 await startPrefetch(
-                    orderedUIDs,
-                    reporting: selectedUIDs,
+                    Self.crawlOrder(
+                        selected: request.selectedScope,
+                        analysis: request.analysisScope,
+                        retention: request.retentionScope
+                    ),
+                    reporting: request.selectedScope.uids,
                     requiringSourceRevision: request.analysisScope.revision
                 )
             }
