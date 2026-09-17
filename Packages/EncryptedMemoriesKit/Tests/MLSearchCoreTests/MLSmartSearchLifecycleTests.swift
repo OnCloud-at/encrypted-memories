@@ -2176,6 +2176,57 @@ import Testing
         #expect(await harness.lifecycle.currentSnapshot().isEnabled)
     }
 
+    @Test func visualDisableIgnoresEnableAndSelectionUntilRemovalCommits() async throws {
+        let payloadA = Data("model-a-bytes".utf8)
+        let payloadB = Data("model-b-bytes".utf8)
+        let (entryA, urlA) = downloadableEntry(id: "model-a", payload: payloadA)
+        let (entryB, urlB) = downloadableEntry(id: "model-b", payload: payloadB)
+        let harness = try makeHarness(
+            catalog: MLModelCatalog(entries: [entryA, entryB]),
+            payloads: [urlA: payloadA, urlB: payloadB],
+            assets: [uid("asset")]
+        )
+        defer { try? FileManager.default.removeItem(at: harness.layout.rootDirectory) }
+
+        await harness.lifecycle.start()
+        await harness.lifecycle.setEnabled(true)
+        harness.provider.blockNextSessionLoad()
+        let activation = Task { await harness.lifecycle.select(entryA.id) }
+        #expect(await waitUntil { harness.provider.sessionLoadStarted })
+
+        let disable = Task { await harness.lifecycle.setVisualSearchEnabled(false) }
+        #expect(await waitUntil { harness.provider.sessionLoadCancellations == 1 })
+        #expect(try harness.stateStore.load()?.pendingOperation == .disableVisualSearch(model: entryA.id))
+
+        // Rapid toggling while teardown is blocked must not start a competing activation.
+        await harness.lifecycle.setVisualSearchEnabled(true)
+        await harness.lifecycle.select(entryA.id)
+        await harness.lifecycle.select(entryB.id)
+        let pending = try harness.stateStore.load()
+        #expect(pending?.pendingOperation == .disableVisualSearch(model: entryA.id))
+        #expect(pending?.isVisualSearchEnabled == false)
+        #expect(pending?.selectedModelID == entryA.id)
+        #expect(harness.transport.downloadCount == 1)
+
+        harness.provider.releaseBlockedSessionLoad()
+        await disable.value
+        await activation.value
+
+        let removed = await harness.lifecycle.currentSnapshot()
+        #expect(!removed.isVisualSearchEnabled)
+        #expect(removed.selectedModelID == nil)
+        #expect(removed.phase == .selectingModel)
+        #expect(try harness.stateStore.load()?.pendingOperation == nil)
+        #expect(harness.transport.downloadCount == 1)
+        #expect(!FileManager.default.fileExists(atPath: harness.layout.modelDirectory(for: entryA.id).path))
+        #expect(!FileManager.default.fileExists(atPath: harness.layout.modelDirectory(for: entryB.id).path))
+
+        // After the removal commits, a new choice is accepted again.
+        await harness.lifecycle.select(entryB.id)
+        #expect(await harness.lifecycle.currentSnapshot().selectedModelID == entryB.id)
+        #expect(harness.transport.downloadCount == 2)
+    }
+
     @Test func activationCannotCommitAfterNewerSelection() async throws {
         let payloadA = Data("model-a-bytes".utf8)
         let payloadB = Data("model-b-bytes".utf8)
