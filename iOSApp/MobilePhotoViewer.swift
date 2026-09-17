@@ -683,6 +683,9 @@ struct MobilePhotoViewer: View {
                         onProgress: onProgress
                     )
                 },
+                abandonKeepOnlyFavorites: {
+                    libraryModel.abandonKeepOnlySeriesFavorites(seriesMainUID: base.uid)
+                },
                 onFinished: { seriesDissolved in
                     seriesModel = nil
                     guard seriesDissolved else { return }

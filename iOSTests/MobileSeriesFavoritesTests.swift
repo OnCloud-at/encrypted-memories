@@ -62,6 +62,30 @@ final class MobileSeriesFavoritesTests: XCTestCase {
         XCTAssertNil(model.failureMessage)
         XCTAssertEqual(probe.keepOnlyCalls.count, 2, "the retry calls the journaled operation again")
         XCTAssertEqual(probe.finished, [true])
+        XCTAssertEqual(probe.abandonCalls, 0, "a finished operation has nothing to abandon")
+    }
+
+    @MainActor func testLeavingTheModeAfterAFailureAbandonsThePendingOperation() async {
+        for leave in [
+            { (model: MobileSeriesFavoritesModel) in model.cancel() },
+            { (model: MobileSeriesFavoritesModel) in model.keepEverything() },
+        ] {
+            let probe = FlowProbe()
+            probe.failuresBeforeSuccess = 1
+            let model = probe.makeModel(canKeepOnlyFavorites: true)
+            model.toggleFavorite(probe.items[0].uid)
+            await model.keepOnlyMarkedFavorites()
+            model.dismissFailure()
+
+            leave(model)
+
+            XCTAssertEqual(probe.abandonCalls, 1, "no later activation may finish what the user left")
+            XCTAssertEqual(probe.finished, [false])
+        }
+
+        let untouched = FlowProbe()
+        untouched.makeModel(canKeepOnlyFavorites: true).cancel()
+        XCTAssertEqual(untouched.abandonCalls, 0, "Cancel without an attempt touches no journal")
     }
 
     @MainActor func testSeriesOutsideTheOwnLibraryIsBrowseOnly() {
@@ -86,6 +110,7 @@ final class MobileSeriesFavoritesTests: XCTestCase {
             request: MobileSeriesSelectionRequest(seriesMainUID: items[0].uid, items: items, focusedUID: items[1].uid),
             canKeepOnlyFavorites: true,
             keepOnlyFavorites: { _, _ in },
+            abandonKeepOnlyFavorites: {},
             onFinished: { _ in }
         )
         let cover = CoverContent()
@@ -148,6 +173,7 @@ final class MobileSeriesFavoritesTests: XCTestCase {
     }
     var finished: [Bool] = []
     var keepOnlyCalls: [[PhotoUID]] = []
+    var abandonCalls = 0
     var failuresBeforeSuccess = 0
 
     func makeModel(canKeepOnlyFavorites: Bool) -> MobileSeriesFavoritesModel {
@@ -162,6 +188,7 @@ final class MobileSeriesFavoritesTests: XCTestCase {
                     throw SeriesDissolutionError.copyNotConfirmed
                 }
             },
+            abandonKeepOnlyFavorites: { [self] in abandonCalls += 1 },
             onFinished: { [self] in finished.append($0) }
         )
     }

@@ -127,6 +127,13 @@ public struct SeriesDissolutionProgress: Sendable, Equatable {
     }
 }
 
+/// What `resumePending` did for one journaled series. `result` holds the standalone copies once the whole series
+/// is in the trash, or the error that keeps the journal pending.
+public struct SeriesDissolutionResumeOutcome: Sendable {
+    public let seriesUIDs: [PhotoUID]
+    public let result: Result<[PhotoUID], any Error>
+}
+
 // MARK: - Orchestrator
 
 /// Runs "Keep Only Favorites" for a series: journal, copy every favorite, verify, then trash the series.
@@ -188,12 +195,34 @@ public actor SeriesDissolutionOrchestrator {
         return try await run(&journal, onProgress: onProgress)
     }
 
-    /// Finishes every operation that a crash or an error interrupted. Failures stay journaled for the next call.
-    public func resumePending() async {
-        guard let journals = try? journalStore.pendingJournals() else { return }
-        for var journal in journals {
-            _ = try? await run(&journal, onProgress: { _ in })
+    /// Drops the operation of a series that the user left after a failure: Cancel, "Keep Everything" or closing
+    /// the mode. Only a journal that still copies favorites is removed. The series is untouched in that phase,
+    /// and copies that are already confirmed stay as standalone photos; no photo is deleted. A journal in the
+    /// trash step stays, because the user's consent and the copies are final there.
+    public func abandon(seriesMainUID: PhotoUID) throws {
+        guard !running.contains(seriesMainUID) else { throw SeriesDissolutionError.alreadyRunning }
+        guard try journalStore.journal(forSeries: seriesMainUID)?.phase == .copyingFavorites else { return }
+        try journalStore.remove(forSeries: seriesMainUID)
+    }
+
+    /// Finishes every interrupted operation that reached the trash step, and reports each result to the host.
+    /// A failure stays journaled for the next call.
+    ///
+    /// A journal that still copies favorites never runs here. No user confirmed it in this session, and its
+    /// selection is not final. It waits on disk: "Keep Only Favorites" on the same series continues it with the
+    /// confirmed copies, and `abandon` removes it.
+    public func resumePending() async throws -> [SeriesDissolutionResumeOutcome] {
+        var outcomes: [SeriesDissolutionResumeOutcome] = []
+        for var journal in try journalStore.pendingJournals() where journal.phase == .trashingSeries {
+            let result: Result<[PhotoUID], any Error>
+            do {
+                result = .success(try await run(&journal, onProgress: { _ in }))
+            } catch {
+                result = .failure(error)
+            }
+            outcomes.append(.init(seriesUIDs: journal.seriesUIDs, result: result))
         }
+        return outcomes
     }
 
     private func run(

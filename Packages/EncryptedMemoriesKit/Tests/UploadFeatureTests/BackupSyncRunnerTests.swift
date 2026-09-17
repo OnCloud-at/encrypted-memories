@@ -1991,6 +1991,73 @@ final class BackupSyncRunnerTests: XCTestCase {
             "an untagged main photo would still show as a normal photo, so the series is not backed up yet")
     }
 
+    func testSeriesMigrationRelatesAPickThatAnEarlierBuildUploadedStandalone() async throws {
+        // An earlier build uploaded the user's pick as a standalone photo. Its bytes are an active remote photo.
+        let entry = seedEntry("IMG_0001.HEIC")
+        resolver.setBurstMembers(["IMG_0002.HEIC", "IMG_0003.HEIC"], for: entry.source.identifier)
+        let pickContentHash = expectedContentHash(path: "/backup/IMG_0001.HEIC#IMG_0002.HEIC")
+        checker.remoteItemsByNameHash["nh(IMG_0002.HEIC)"] = [
+            RemotePhotoDuplicate(
+                nameHash: "nh(IMG_0002.HEIC)",
+                contentHash: pickContentHash,
+                linkState: .active,
+                linkID: "standalone-pick"
+            )
+        ]
+
+        _ = await makeRunner(tagAdder: SpyTagAdder()).runUntilDrained()
+
+        XCTAssertEqual(
+            uploader.requests.map(\.name), ["IMG_0001.HEIC", "IMG_0002.HEIC", "IMG_0003.HEIC"],
+            "an active standalone photo is not a related photo, so the pick uploads into the series")
+        XCTAssertEqual(
+            uploader.requests.dropFirst().map(\.mainPhotoUID),
+            [testUID("IMG_0001.HEIC"), testUID("IMG_0001.HEIC")])
+        XCTAssertEqual(state(of: entry), .completed)
+    }
+
+    func testSeriesMemberThatIsAlreadyARelatedPhotoOfTheMainPhotoNeverUploadsAgain() async throws {
+        // Another device, or this one before its manifest was lost, uploaded the member into the series.
+        let entry = seedEntry("IMG_0001.HEIC")
+        resolver.setBurstMembers(["IMG_0002.HEIC", "IMG_0003.HEIC"], for: entry.source.identifier)
+        checker.remoteItemsByNameHash["nh(IMG_0002.HEIC)"] = [
+            RemotePhotoDuplicate(
+                nameHash: "nh(IMG_0002.HEIC)",
+                contentHash: expectedContentHash(path: "/backup/IMG_0001.HEIC#IMG_0002.HEIC"),
+                linkState: .active,
+                linkID: "related-member"
+            )
+        ]
+        checker.relatedLinkIDsByMainLinkID[testUID("IMG_0001.HEIC").nodeID] = ["related-member"]
+
+        _ = await makeRunner(tagAdder: SpyTagAdder()).runUntilDrained()
+
+        XCTAssertEqual(uploader.requests.map(\.name), ["IMG_0001.HEIC", "IMG_0003.HEIC"])
+        XCTAssertEqual(state(of: entry), .completed)
+    }
+
+    func testRemotelyTrashedSeriesMemberSkipsOnlyThatMember() async throws {
+        let entry = seedEntry("IMG_0001.HEIC")
+        resolver.setBurstMembers(["IMG_0002.HEIC", "IMG_0003.HEIC"], for: entry.source.identifier)
+        checker.remoteItemsByNameHash["nh(IMG_0002.HEIC)"] = [
+            RemotePhotoDuplicate(
+                nameHash: "nh(IMG_0002.HEIC)",
+                contentHash: expectedContentHash(path: "/backup/IMG_0001.HEIC#IMG_0002.HEIC"),
+                linkState: .trashed,
+                linkID: "trashed-pick"
+            )
+        ]
+
+        let progress = await makeRunner(tagAdder: SpyTagAdder()).runUntilDrained()
+
+        XCTAssertEqual(
+            uploader.requests.map(\.name), ["IMG_0001.HEIC", "IMG_0003.HEIC"],
+            "the deleted photo stays deleted, and the other member still uploads")
+        XCTAssertEqual(uploader.requests.last?.mainPhotoUID, testUID("IMG_0001.HEIC"))
+        XCTAssertEqual(state(of: entry), .completed)
+        XCTAssertEqual(progress.uploaded, 1)
+    }
+
     func testPhotoMetadataFlowsToPrimaryAndSecondaryUploads() async throws {
         let entry = seedEntry("metadata.heic")
         let metadata = PhotoUploadAdditionalMetadata(name: "Media", utf8JsonValue: Data(#"{"Width":4032}"#.utf8))

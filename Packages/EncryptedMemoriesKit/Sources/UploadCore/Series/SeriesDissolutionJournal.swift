@@ -54,7 +54,8 @@ public protocol SeriesDissolutionJournalStore: Sendable {
     func journal(forSeries mainUID: PhotoUID) throws -> SeriesDissolutionJournal?
     func save(_ journal: SeriesDissolutionJournal) throws
     func remove(forSeries mainUID: PhotoUID) throws
-    /// Operations that a crash or an error interrupted. The host resumes them after account activation.
+    /// Operations that a crash or an error interrupted. After account activation the host resumes only those
+    /// in the trash step; one that still copies favorites waits for the user.
     func pendingJournals() throws -> [SeriesDissolutionJournal]
 }
 

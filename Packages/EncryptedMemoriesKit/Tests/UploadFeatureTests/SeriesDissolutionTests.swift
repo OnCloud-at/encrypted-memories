@@ -76,8 +76,16 @@ final class SeriesDissolutionTests: XCTestCase {
         XCTAssertEqual(journal.phase, .copyingFavorites)
         XCTAssertEqual(journal.confirmedFavoriteCount, 1, "the confirmed copy is durable across the failure")
 
-        // Next launch: the journal alone resumes the operation.
-        await makeOrchestrator().resumePending()
+        // Next launch: nobody confirmed the operation in this session, so the automatic resume leaves it alone.
+        let outcomes = try await makeOrchestrator().resumePending()
+        XCTAssertTrue(outcomes.isEmpty)
+        XCTAssertEqual(server.uploads.map(\.name), ["m2.HEIC", "m4.HEIC"])
+        XCTAssertTrue(server.trashCalls.isEmpty, "a series the user may have abandoned is never trashed")
+        XCTAssertEqual(try journalStore.journal(forSeries: main), journal)
+
+        // The user's Retry continues the journaled operation.
+        try await makeOrchestrator().keepOnlyFavorites(
+            seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2"), member("m4")])
 
         XCTAssertEqual(
             server.uploads.map(\.name), ["m2.HEIC", "m4.HEIC", "m4.HEIC"],
@@ -117,13 +125,59 @@ final class SeriesDissolutionTests: XCTestCase {
         // Half of the series already moved before the failure.
         server.markTrashed(["m1", "m2"])
 
-        await makeOrchestrator().resumePending()
+        let outcomes = try await makeOrchestrator().resumePending()
 
+        XCTAssertEqual(outcomes.map(\.seriesUIDs), [series], "the host learns which series left the library")
+        XCTAssertEqual(try outcomes.first?.result.get().count, 1)
         XCTAssertEqual(server.uploads.count, 1)
         XCTAssertEqual(
             server.trashCalls.last, [member("m3"), member("m4")],
             "the resumed trash step skips photos that are already in the trash")
         XCTAssertEqual(try journalStore.pendingJournals(), [])
+    }
+
+    func testAbandonRemovesACopyingJournalAndKeepsTheConfirmedCopies() async throws {
+        server.failUploads(named: "m4.HEIC", times: 1)
+        do {
+            try await makeOrchestrator().keepOnlyFavorites(
+                seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2"), member("m4")])
+            XCTFail("the second favorite fails")
+        } catch {}
+
+        // The user answers the failure with Cancel.
+        try await makeOrchestrator().abandon(seriesMainUID: main)
+
+        XCTAssertEqual(try journalStore.pendingJournals(), [])
+        XCTAssertEqual(server.activeCopyUIDs.count, 1, "the confirmed copy stays as a standalone photo")
+        let outcomes = try await makeOrchestrator().resumePending()
+        XCTAssertTrue(outcomes.isEmpty)
+        XCTAssertTrue(server.trashCalls.isEmpty, "the abandoned series stays in the library")
+    }
+
+    func testAbandonKeepsAJournalWhoseTrashStepStarted() async throws {
+        server.failNextTrash()
+        do {
+            try await makeOrchestrator().keepOnlyFavorites(
+                seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m3")])
+            XCTFail("the trash step fails")
+        } catch {}
+
+        try await makeOrchestrator().abandon(seriesMainUID: main)
+
+        XCTAssertEqual(try journalStore.journal(forSeries: main)?.phase, .trashingSeries)
+    }
+
+    func testResumeReportsAFailedTrashStepAndKeepsItsJournal() async throws {
+        server.failNextTrash()
+        _ = try? await makeOrchestrator().keepOnlyFavorites(
+            seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m3")])
+        server.failNextTrash()
+
+        let outcomes = try await makeOrchestrator().resumePending()
+
+        XCTAssertEqual(outcomes.count, 1)
+        XCTAssertThrowsError(try outcomes.first?.result.get(), "the host receives the error instead of silence")
+        XCTAssertEqual(try journalStore.journal(forSeries: main)?.phase, .trashingSeries)
     }
 
     func testACopyThatVanishedIsCopiedAgainBeforeTheSeriesIsTrashed() async throws {
@@ -413,6 +467,7 @@ private final class FakeSeriesServer: SeriesDissolutionRemote, PhotoUploading, U
     func nameHash(forCorrectedName name: String) async throws -> String { "nh(\(name))" }
     func contentHash(forSHA1Hex sha1Hex: String) async throws -> String { "ch(\(sha1Hex))" }
     func hashKeyEpoch() async throws -> String { "epoch" }
+    func relatedPhotoLinkIDs(ofMainLinkID mainLinkID: String) async throws -> Set<String> { [] }
 
     func findDuplicates(nameHashes: [String]) async throws -> [RemotePhotoDuplicate] {
         lock.withLock {

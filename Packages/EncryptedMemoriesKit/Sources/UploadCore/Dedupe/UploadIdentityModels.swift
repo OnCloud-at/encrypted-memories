@@ -84,6 +84,9 @@ public struct UploadResourceDescriptor: Sendable {
     /// The primary resource of this compound when `source.resource` is secondary - lets a future
     /// Live Photo path upload only the missing paired video via `mainPhotoUid`.
     public let mainResource: UploadSourceIdentity?
+    /// The remote main photo that a burst member becomes a related photo of. The dedupe rule for burst members
+    /// reads the relation from it. It is never persisted.
+    public let mainRemoteLinkID: String?
 
     public init(
         source: UploadSourceIdentity,
@@ -93,7 +96,8 @@ public struct UploadResourceDescriptor: Sendable {
         modificationDate: Date,
         precomputedSHA1Digest: Data? = nil,
         workIntent: LibraryWorkIntent = .userInitiated,
-        mainResource: UploadSourceIdentity? = nil
+        mainResource: UploadSourceIdentity? = nil,
+        mainRemoteLinkID: String? = nil
     ) {
         self.source = source
         self.fileURL = fileURL
@@ -103,6 +107,7 @@ public struct UploadResourceDescriptor: Sendable {
         self.precomputedSHA1Digest = precomputedSHA1Digest
         self.workIntent = workIntent
         self.mainResource = mainResource
+        self.mainRemoteLinkID = mainRemoteLinkID
     }
 
     public func withWorkIntent(_ intent: LibraryWorkIntent) -> UploadResourceDescriptor {
@@ -114,7 +119,22 @@ public struct UploadResourceDescriptor: Sendable {
             modificationDate: modificationDate,
             precomputedSHA1Digest: precomputedSHA1Digest,
             workIntent: intent,
-            mainResource: mainResource
+            mainResource: mainResource,
+            mainRemoteLinkID: mainRemoteLinkID
+        )
+    }
+
+    public func relatedTo(mainRemoteLinkID: String) -> UploadResourceDescriptor {
+        UploadResourceDescriptor(
+            source: source,
+            fileURL: fileURL,
+            filename: filename,
+            fileSize: fileSize,
+            modificationDate: modificationDate,
+            precomputedSHA1Digest: precomputedSHA1Digest,
+            workIntent: workIntent,
+            mainResource: mainResource,
+            mainRemoteLinkID: mainRemoteLinkID
         )
     }
 }
@@ -614,6 +634,9 @@ public protocol UploadDuplicateChecking: Sendable {
     /// Optional stronger lookup: an active remote photo with the same content hash, independent
     /// of filename/name hash. Backends that cannot provide a remote content index return nil.
     func findDuplicate(contentHash: String) async throws -> RemotePhotoDuplicate?
+    /// Link IDs of the photos that are related photos of `mainLinkID` now: a Live Photo's video, a series'
+    /// members. The burst-member dedupe rule uses it, because no duplicate row names a link's main photo.
+    func relatedPhotoLinkIDs(ofMainLinkID mainLinkID: String) async throws -> Set<String>
     /// Brings the persistent remote identity index current before a queue starts resolving items.
     /// Backends without such an index use the default no-op implementation.
     func prepareRemoteIndex(

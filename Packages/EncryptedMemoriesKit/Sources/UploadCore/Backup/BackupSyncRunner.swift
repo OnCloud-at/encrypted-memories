@@ -1144,7 +1144,7 @@ public actor BackupSyncRunner {
             if stopRequested { return .cancelled }
             do {
                 let outcome: SecondaryScopedOutcome = try await identityResolver.withUploadDecision(
-                    secondary.descriptor.withWorkIntent(workIntent),
+                    secondary.descriptor.withWorkIntent(workIntent).relatedTo(mainRemoteLinkID: primaryUID.nodeID),
                     onRemoteCommit: { [queue, now] identity, receipt in
                         let reconciliation = UploadRemoteCommitReconciliation(
                             source: secondary.descriptor.source,
@@ -1175,7 +1175,10 @@ public actor BackupSyncRunner {
                         case .skip(.activeDuplicate, _), .skip(.knownFromManifest, _):
                             return .noUpload(.settled)
                         case .skip(.trashedDuplicate, _), .skip(.deletedRemotely, _):
-                            return .noUpload(.skippedRemoteDeletion)
+                            // The user deleted this one photo of the series. The deletion removes that member
+                            // only; the main photo and the other members still form the series.
+                            return .noUpload(
+                                secondary.descriptor.source.resource.isBurstMember ? .settled : .skippedRemoteDeletion)
                         case .skip(.draftExists, _):
                             return .noUpload(.blockedByDraft)
                         case .skip(.inconsistentRemoteState, _), .uploadMissingSecondaries:

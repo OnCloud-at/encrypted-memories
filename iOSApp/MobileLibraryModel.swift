@@ -362,6 +362,42 @@ final class MobileLibraryModel {
         refreshAfterLocalUpload()
     }
 
+    /// The user left "Keep Only Favorites" after a failure. The pending journal goes away, so no later activation
+    /// can finish the operation without the user. Copies that are already saved stay as standalone photos.
+    func abandonKeepOnlySeriesFavorites(seriesMainUID: PhotoUID) {
+        guard let dissolution = facade?.seriesDissolution else { return }
+        Task {
+            do {
+                try await dissolution.abandon(seriesMainUID: seriesMainUID)
+            } catch {
+                DebugLog.log("series: abandoning the pending operation failed - \(error)")
+            }
+        }
+    }
+
+    /// A crash or an error can interrupt "Keep Only Favorites" in its trash step, after the user's consent and
+    /// every copy are final. Activation finishes only such operations. The series is already in the trash then,
+    /// so the authoritative refresh removes it and adds the copies. The optimistic removal of the interactive
+    /// path is not used: it advances the timeline mutation generation and would reject the initial load.
+    private func resumePendingSeriesDissolutions(_ dissolution: SeriesDissolutionOrchestrator) async {
+        do {
+            let outcomes = try await dissolution.resumePending()
+            var didFinishAny = false
+            for outcome in outcomes {
+                switch outcome.result {
+                case .success:
+                    didFinishAny = true
+                    DebugLog.log("series: resumed trash step finished photos=\(outcome.seriesUIDs.count)")
+                case .failure(let error):
+                    DebugLog.log("series: resumed trash step failed, the journal stays pending - \(error)")
+                }
+            }
+            if didFinishAny { refreshAfterLocalUpload() }
+        } catch {
+            DebugLog.log("series: pending operations could not be read - \(error)")
+        }
+    }
+
     /// Runs a remote mutation that takes `uids` out of the library, then removes them from the visible timeline.
     private func removeFromVisibleLibrary(
         _ uids: Set<PhotoUID>,
@@ -1378,9 +1414,10 @@ final class MobileLibraryModel {
                     return
                 }
                 self.facade = client
-                // A crash can interrupt "Keep Only Favorites". Its journal finishes the operation now.
                 if let seriesDissolution = client.seriesDissolution {
-                    Task(priority: .utility) { await seriesDissolution.resumePending() }
+                    Task(priority: .utility) { [weak self] in
+                        await self?.resumePendingSeriesDissolutions(seriesDissolution)
+                    }
                 }
                 self.albumActions = AlbumActionCoordinator(repository: client.albums)
                 self.photoBackup = photoBackup

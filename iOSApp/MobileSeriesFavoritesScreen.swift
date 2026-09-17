@@ -34,12 +34,16 @@ final class MobileSeriesFavoritesModel: Identifiable {
     private(set) var operation: Operation = .idle
     var showsKeepChoice = false
     private let keepOnlyFavorites: KeepOnlyFavorites
+    private let abandonKeepOnlyFavorites: @MainActor () -> Void
+    /// True after a failed attempt that no later attempt finished: its journal can still be pending.
+    private var hasUnfinishedAttempt = false
     private let onFinished: @MainActor (_ seriesDissolved: Bool) -> Void
 
     init(
         request: MobileSeriesSelectionRequest,
         canKeepOnlyFavorites: Bool,
         keepOnlyFavorites: @escaping KeepOnlyFavorites,
+        abandonKeepOnlyFavorites: @escaping @MainActor () -> Void,
         onFinished: @escaping @MainActor (_ seriesDissolved: Bool) -> Void
     ) {
         selection = SeriesFavoritesSelection(
@@ -48,6 +52,7 @@ final class MobileSeriesFavoritesModel: Identifiable {
             canKeepOnlyFavorites: canKeepOnlyFavorites
         )
         self.keepOnlyFavorites = keepOnlyFavorites
+        self.abandonKeepOnlyFavorites = abandonKeepOnlyFavorites
         self.onFinished = onFinished
     }
 
@@ -72,19 +77,29 @@ final class MobileSeriesFavoritesModel: Identifiable {
 
     func cancel() {
         guard !isRunning else { return }
-        onFinished(false)
+        closeKeepingTheSeries()
     }
 
     func confirm() {
         guard !isRunning else { return }
         switch selection.confirmation {
-        case .close: onFinished(false)
+        case .close: closeKeepingTheSeries()
         case .choose: showsKeepChoice = true
         }
     }
 
     /// "Keep Everything" changes nothing: no backend call, the series stays a series.
     func keepEverything() {
+        closeKeepingTheSeries()
+    }
+
+    /// Every exit that keeps the series. After a failed attempt the user abandons the operation here, so its
+    /// journal must not survive: nothing may finish "Keep Only Favorites" later without the user.
+    private func closeKeepingTheSeries() {
+        if hasUnfinishedAttempt {
+            hasUnfinishedAttempt = false
+            abandonKeepOnlyFavorites()
+        }
         onFinished(false)
     }
 
@@ -103,9 +118,11 @@ final class MobileSeriesFavoritesModel: Identifiable {
                     self.operation = .running(progress)
                 }
             }
+            hasUnfinishedAttempt = false
             operation = .idle
             onFinished(true)
         } catch {
+            hasUnfinishedAttempt = true
             operation = .failed((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
         }
     }

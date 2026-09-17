@@ -92,12 +92,15 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
         let cached = store.record(for: descriptor.source)
         let hmacReusable =
             cached.map { $0.isValid(for: descriptor, hashKeyEpoch: epoch) && $0.correctedName == corrected } ?? false
+        // Burst-member rule, see `UploadDuplicateDecisionPolicy.burstMemberCandidates`: the same bytes as an active
+        // photo prove nothing. Only this member's own upload, or the server's related list, proves the relation.
+        let isBurstMember = descriptor.source.resource.isBurstMember
 
         // Manifest fast path: this exact resource (same name/size/mtime/key epoch) is known to be
         // on the server - uploaded by us or confirmed as an active duplicate. No hash, no query.
         if let cached, hmacReusable,
             let outcome = cached.outcome.flatMap(UploadIdentityManifestStore.Outcome.init(rawValue:)),
-            outcome == .uploaded || outcome == .duplicateActive,
+            outcome == .uploaded || (outcome == .duplicateActive && !isBurstMember),
             let remoteLink = cached.remoteLinkID,
             let digest = UploadContentSHA1.digest(fromHex: cached.sha1Hex)
         {
@@ -175,7 +178,8 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
         while true {
             // Bytes already proven on the server under ANY source path/filename (copied folder,
             // renamed file): adopt that remote link for this source - no remote query, no upload.
-            if let known = store.trustedRecord(contentHash: contentHash, hashKeyEpoch: epoch),
+            if !isBurstMember,
+                let known = store.trustedRecord(contentHash: contentHash, hashKeyEpoch: epoch),
                 known.sha1Hex == sha1Hex,
                 let knownLink = known.remoteLinkID
             {
@@ -226,10 +230,13 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
             // The SDK gives us a safe exact fallback: a positive result proves the bytes are
             // already active; an empty/failed result cannot authorize an upload, so fail closed
             // with the original detailed-lookup error.
-            let exactMatches = await checker.findExactActiveDuplicates(
-                correctedName: corrected,
-                sha1Digest: sha1Digest
-            )
+            let exactMatches =
+                isBurstMember
+                ? []
+                : await checker.findExactActiveDuplicates(
+                    correctedName: corrected,
+                    sha1Digest: sha1Digest
+                )
             if let exact = exactMatches.first {
                 let decision = UploadDuplicateDecision.skip(.activeDuplicate, remoteLinkID: exact.nodeID)
                 do {
@@ -245,9 +252,19 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
             throw detailedLookupError
         }
 
+        let nameCandidates: [RemotePhotoDuplicate]
+        do {
+            nameCandidates =
+                isBurstMember
+                ? try await burstMemberCandidates(remoteItems, contentHash: contentHash, descriptor: descriptor)
+                : remoteItems
+        } catch {
+            releasePendingUploadClaims(ownedBy: descriptor)
+            throw error
+        }
         let nameDecision = UploadDuplicateDecisionPolicy.decide(
             primary: .init(source: descriptor.source, nameHash: nameHash, contentHash: contentHash),
-            remoteItems: remoteItems,
+            remoteItems: nameCandidates,
             currentClientUID: currentClientUID
         )
 
@@ -256,7 +273,12 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
         // expensive account-wide content fallback for renamed/copied originals.
         if nameDecision.uploadsBytes {
             do {
-                if let remoteContent = try await checker.findDuplicate(contentHash: contentHash) {
+                if let found = try await checker.findDuplicate(contentHash: contentHash),
+                    let remoteContent = isBurstMember
+                        ? try await burstMemberCandidates([found], contentHash: contentHash, descriptor: descriptor)
+                            .first
+                        : found
+                {
                     let contentDecision = decisionForRemoteContent(
                         remoteContent,
                         replacingNameHash: nameDecision == .uploadReplacingDraft ? nameHash : nil
@@ -286,6 +308,22 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
         // Both claims stay held: the caller now owns this content/name upload and must settle it via
         // `recordUploaded` (success) or `uploadDidFail` (anything else).
         return UploadPreflightResult(identity: identity, decision: nameDecision)
+    }
+
+    /// Applies the burst-member rule. The server names the related photos of the member's main photo only when
+    /// an active row with the member's content exists, so a new series costs no extra request.
+    private func burstMemberCandidates(
+        _ remoteItems: [RemotePhotoDuplicate],
+        contentHash: String,
+        descriptor: UploadResourceDescriptor
+    ) async throws -> [RemotePhotoDuplicate] {
+        let hasActiveContentMatch = remoteItems.contains { $0.linkState == .active && $0.contentHash == contentHash }
+        var relatedLinkIDs: Set<String> = []
+        if hasActiveContentMatch, let mainLinkID = descriptor.mainRemoteLinkID {
+            relatedLinkIDs = try await checker.relatedPhotoLinkIDs(ofMainLinkID: mainLinkID)
+        }
+        return UploadDuplicateDecisionPolicy.burstMemberCandidates(
+            remoteItems, contentHash: contentHash, relatedLinkIDs: relatedLinkIDs)
     }
 
     /// Validates a manifest-proven remote resource against current server state. Unlike `resolve`,
