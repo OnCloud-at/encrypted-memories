@@ -316,6 +316,7 @@ import Testing
         private let lock = NSLock()
         private var failing = false
         private var failingActivationWrites = false
+        private var failingWhere: (@Sendable (MLSmartSearchPersistentState) -> Bool)?
 
         init(layout: MLModelInstallLayout) {
             backing = FileMLSmartSearchStateStore(layout: layout)
@@ -325,9 +326,15 @@ import Testing
         func setFailingActivationWrites(_ value: Bool) {
             lock.withLock { failingActivationWrites = value }
         }
+        func setFailing(where predicate: (@Sendable (MLSmartSearchPersistentState) -> Bool)?) {
+            lock.withLock { failingWhere = predicate }
+        }
         func load() throws -> MLSmartSearchPersistentState? { try backing.load() }
         func save(_ state: MLSmartSearchPersistentState) throws {
-            if lock.withLock({ failing || (failingActivationWrites && state.activatedRevision != nil) }) {
+            if lock.withLock({
+                failing || (failingActivationWrites && state.activatedRevision != nil)
+                    || failingWhere?(state) == true
+            }) {
                 throw WriteFailure()
             }
             try backing.save(state)
@@ -2386,6 +2393,152 @@ import Testing
             }
             waiting?.resume()
         }
+    }
+
+    @Test func failedVisualRemovalShowsRetryAndTogglingFinishesItWithNativeSearchActive() async throws {
+        let payload = Data("model-bytes".utf8)
+        let (entry, url) = downloadableEntry(id: "model", payload: payload)
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ml-native-failed-removal-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let flaky = FlakyStateStore(layout: MLModelInstallLayout(rootDirectory: root))
+        let assets = [uid("a")]
+        let harness = try makeHarness(
+            catalog: MLModelCatalog(entries: [entry]),
+            payloads: [url: payload],
+            assets: assets,
+            root: root,
+            stateStoreOverride: flaky,
+            nativeSearch: RecordingNativeSearch(results: assets)
+        )
+
+        await harness.lifecycle.start()
+        await harness.lifecycle.setEnabled(true)
+        await harness.lifecycle.select(entry.id)
+        #expect(await waitForCompleteIndex(harness, total: assets.count))
+
+        // The journal write succeeds; the final commit fails.
+        flaky.setFailing(where: { $0.pendingOperation == nil && !$0.isVisualSearchEnabled })
+        await harness.lifecycle.setVisualSearchEnabled(false)
+        let failed = await harness.lifecycle.currentSnapshot()
+        #expect(try flaky.load()?.pendingOperation == .disableVisualSearch(model: entry.id))
+        #expect(MLSmartSearchPresentation(snapshot: failed).canRetry)
+
+        // Turning Visual Search on again finishes the stalled removal; the model is chosen again later.
+        flaky.setFailing(where: nil)
+        await harness.lifecycle.setVisualSearchEnabled(true)
+        let finished = await harness.lifecycle.currentSnapshot()
+        #expect(try flaky.load()?.pendingOperation == nil)
+        #expect(!finished.isVisualSearchEnabled)
+        #expect(finished.selectedModelID == nil)
+        #expect(!FileManager.default.fileExists(atPath: harness.layout.modelDirectory(for: entry.id).path))
+    }
+
+    @Test func offlineStartFinishesJournaledVisualRemoval() async throws {
+        let payload = Data("model-bytes".utf8)
+        let (entry, url) = downloadableEntry(id: "model", payload: payload)
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ml-offline-removal-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let layout = MLModelInstallLayout(rootDirectory: root)
+        _ = try await MLModelInstaller(layout: layout, transport: ScriptedTransport(payloads: [url: payload]))
+            .install(entry) { _ in }
+        let stateStore = FileMLSmartSearchStateStore(layout: layout)
+        try stateStore.save(
+            MLSmartSearchPersistentState(
+                isEnabled: true,
+                isVisualSearchEnabled: false,
+                selectedModelID: entry.id,
+                activatedDescriptor: entry.descriptor,
+                pendingOperation: .disableVisualSearch(model: entry.id)
+            ))
+
+        let harness = try makeHarness(
+            catalog: MLModelCatalog(entries: [entry]),
+            payloads: [url: payload],
+            assets: [uid("a")],
+            root: root,
+            stateStoreOverride: stateStore,
+            catalogProvider: FailingCatalogProvider()
+        )
+        await harness.lifecycle.start()
+
+        #expect(try stateStore.load()?.pendingOperation == nil)
+        #expect(await harness.lifecycle.currentSnapshot().selectedModelID == nil)
+        #expect(!FileManager.default.fileExists(atPath: layout.modelDirectory(for: entry.id).path))
+    }
+
+    @Test func retryFinishesAFailedRemovalWithoutSelectedModel() async throws {
+        let payload = Data("model-bytes".utf8)
+        let (entry, url) = downloadableEntry(id: "model", payload: payload)
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ml-nil-model-removal-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let flaky = FlakyStateStore(layout: MLModelInstallLayout(rootDirectory: root))
+        let harness = try makeHarness(
+            catalog: MLModelCatalog(entries: [entry]),
+            payloads: [url: payload],
+            assets: [uid("a")],
+            root: root,
+            stateStoreOverride: flaky
+        )
+
+        await harness.lifecycle.start()
+        await harness.lifecycle.setEnabled(true)
+        await harness.lifecycle.setVisualSearchEnabled(true)
+        #expect(await harness.lifecycle.currentSnapshot().selectedModelID == nil)
+
+        flaky.setFailing(where: { $0.pendingOperation == nil && !$0.isVisualSearchEnabled })
+        await harness.lifecycle.setVisualSearchEnabled(false)
+        #expect(await waitForStorageFailure(harness))
+        #expect(try flaky.load()?.pendingOperation == .disableVisualSearch(model: nil))
+
+        flaky.setFailing(where: nil)
+        await harness.lifecycle.retry()
+        #expect(try flaky.load()?.pendingOperation == nil)
+        #expect(await harness.lifecycle.currentSnapshot().phase == .selectingModel)
+    }
+
+    @Test func visualRemovalDeletesEveryCatalogModelIncludingInterruptedSwitchTargets() async throws {
+        let payloadA = Data("model-a-bytes".utf8)
+        let payloadB = Data("model-b-bytes".utf8)
+        let (entryA, urlA) = downloadableEntry(id: "model-a", payload: payloadA)
+        let (entryB, urlB) = downloadableEntry(id: "model-b", payload: payloadB)
+        let assets = [uid("a")]
+        let harness = try makeHarness(
+            catalog: MLModelCatalog(entries: [entryA, entryB]),
+            payloads: [urlA: payloadA, urlB: payloadB],
+            assets: assets
+        )
+        defer { try? FileManager.default.removeItem(at: harness.layout.rootDirectory) }
+
+        await harness.lifecycle.start()
+        await harness.lifecycle.setEnabled(true)
+        await harness.lifecycle.select(entryA.id)
+        #expect(await waitForCompleteIndex(harness, total: assets.count))
+
+        // State an interrupted switch leaves behind: B is installed, a partial staging tree exists,
+        // and B already has vectors, while A is still the journaled model.
+        _ = try await MLModelInstaller(
+            layout: harness.layout,
+            transport: ScriptedTransport(payloads: [urlB: payloadB])
+        ).install(entryB) { _ in }
+        let partial = harness.layout.stagingDirectory(for: entryB.id, revision: "rev2")
+        try FileManager.default.createDirectory(at: partial, withIntermediateDirectories: true)
+        harness.storeProvider.store.upsert([
+            MLEmbeddingRecord(uid: assets[0], descriptor: entryB.descriptor, vector: [1, 0, 0, 0])
+        ])
+
+        await harness.lifecycle.setVisualSearchEnabled(false)
+
+        for entry in [entryA, entryB] {
+            #expect(!FileManager.default.fileExists(atPath: harness.layout.modelDirectory(for: entry.id).path))
+            #expect(harness.storeProvider.store.count(for: entry.descriptor) == 0)
+        }
+        #expect(!FileManager.default.fileExists(atPath: partial.path))
     }
 
     @Test func activationCannotCommitAfterNewerSelection() async throws {
