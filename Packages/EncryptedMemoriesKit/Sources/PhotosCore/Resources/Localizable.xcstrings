@@ -2193,6 +2193,14 @@
         }
       }
     },
+    "viewer.close_photo": {
+      "extractionState": "manual",
+      "comment": "View menu command that closes the open photo. Its key equivalent is Esc.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Close Photo" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Foto schließen" } }
+      }
+    },
     "infopanel.info": {
       "extractionState": "manual",
       "comment": "Info-panel header title.",

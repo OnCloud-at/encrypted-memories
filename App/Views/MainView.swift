@@ -386,8 +386,6 @@ struct MainView: View {
             if let viewerModel, zoom == nil || zoom?.interactive == true {
                 PhotoViewerView(
                     model: viewerModel,
-                    isFavorite: { favorites.contains($0) },
-                    onToggleFavorite: { mutateFavorites([$0]) },
                     onClose: { closePhoto() },
                     onPinchDismissBegan: beginInteractiveDismiss,
                     onPinchDismissChanged: updateInteractiveDismiss,

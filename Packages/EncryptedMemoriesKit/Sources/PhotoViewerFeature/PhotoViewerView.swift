@@ -198,8 +198,6 @@ private final class PlayerLayerHostView: NSView {
 public struct PhotoViewerView: View {
     @State private var model: PhotoViewerModel
     private let onClose: () -> Void
-    private let isFavorite: (PhotoUID) -> Bool
-    private let onToggleFavorite: (PhotoUID) -> Void
     private let onPinchDismissBegan: () -> Void
     private let onPinchDismissChanged: (CGFloat) -> Void
     private let onPinchDismissEnded: (Bool) -> Void
@@ -220,8 +218,6 @@ public struct PhotoViewerView: View {
 
     public init(
         model: PhotoViewerModel,
-        isFavorite: @escaping (PhotoUID) -> Bool = { _ in false },
-        onToggleFavorite: @escaping (PhotoUID) -> Void = { _ in },
         onClose: @escaping () -> Void,
         onPinchDismissBegan: @escaping () -> Void = {},
         onPinchDismissChanged: @escaping (CGFloat) -> Void = { _ in },
@@ -229,8 +225,6 @@ public struct PhotoViewerView: View {
         isDismissing: Bool = false
     ) {
         _model = State(initialValue: model)
-        self.isFavorite = isFavorite
-        self.onToggleFavorite = onToggleFavorite
         self.onClose = onClose
         self.onPinchDismissBegan = onPinchDismissBegan
         self.onPinchDismissChanged = onPinchDismissChanged
@@ -263,15 +257,20 @@ public struct PhotoViewerView: View {
             )
             .inspectorColumnWidth(min: 300, ideal: 340, max: 480)
         }
-        // Previous and Next are native View menu commands with arrow-key equivalents.
+        // Previous, Next and Close are native View menu commands with their key equivalents. While the
+        // interactive dismiss runs, the viewer publishes no navigation: a paging command would change the
+        // photo under the shrinking image.
         .focusedSceneValue(
             \.photoViewerNavigation,
-            PhotoViewerNavigation(
-                canGoPrevious: model.canNavigatePrevious,
-                canGoNext: model.canNavigateNext,
-                goPrevious: { model.previousInContext() },
-                goNext: { model.nextInContext() }
-            )
+            isDismissing
+                ? nil
+                : PhotoViewerNavigation(
+                    canGoPrevious: model.canNavigatePrevious,
+                    canGoNext: model.canNavigateNext,
+                    goPrevious: { model.previousInContext() },
+                    goNext: { model.nextInContext() },
+                    close: onClose
+                )
         )
         .onAppear {
             model.start()
@@ -506,6 +505,8 @@ public struct PhotoViewerView: View {
         }
     }
 
+    /// The native unavailable state on glass. The card sits above the photo, whose colors are unknown, so it
+    /// keeps a backing surface instead of drawing bare text onto the image.
     private func failureCard(_ error: VideoPlaybackError) -> some View {
         ContentUnavailableView {
             Label(L10n.string("viewer.playback_failed"), systemImage: "exclamationmark.triangle")
@@ -514,9 +515,12 @@ public struct PhotoViewerView: View {
         } actions: {
             if error.isRetryable {
                 Button(L10n.string("action.retry")) { model.retry() }
-                    .buttonStyle(.borderedProminent)
+                    .buttonStyle(.glassProminent)
             }
         }
+        .fixedSize()
+        .padding(24)
+        .glassEffect(in: RoundedRectangle(cornerRadius: 20, style: .continuous))
     }
 
     private var busyOverlay: some View {
@@ -539,8 +543,13 @@ public struct PhotoViewerView: View {
             }
             .progressViewStyle(.circular)
             .controlSize(.large)
+            .padding(20)
+            .glassEffect(in: Circle())
         } else {
-            ProgressView().controlSize(.large)
+            ProgressView()
+                .controlSize(.large)
+                .padding(20)
+                .glassEffect(in: Circle())
         }
     }
 
@@ -548,7 +557,9 @@ public struct PhotoViewerView: View {
         Label(L10n.string("viewer.playback_failed"), systemImage: "exclamationmark.triangle")
             .labelStyle(.iconOnly)
             .font(.largeTitle)
-            .foregroundStyle(.secondary)
+            .foregroundStyle(.primary)
+            .padding(20)
+            .glassEffect(in: Circle())
     }
 
     private func handlePageSwipe(_ direction: ViewerPageSwipeDirection) {

@@ -266,7 +266,8 @@ private struct WindowConfigurator: NSViewRepresentable {
     }
 }
 
-/// Previous and Next photo for the open viewer. The commands are disabled while no viewer has focus.
+/// Previous photo, Next photo and Close for the open viewer. The commands are disabled while no viewer has
+/// focus, and Close carries the Esc equivalent, which the responder chain alone does not guarantee.
 private struct PhotoViewerNavigationCommands: Commands {
     @FocusedValue(\.photoViewerNavigation) private var navigation
 
@@ -279,6 +280,9 @@ private struct PhotoViewerNavigationCommands: Commands {
             Button(L10n.string("a11y.next_photo")) { navigation?.goNext() }
                 .keyboardShortcut(.rightArrow, modifiers: [])
                 .disabled(navigation?.canGoNext != true)
+            Button(L10n.string("viewer.close_photo")) { navigation?.close() }
+                .keyboardShortcut(.cancelAction)
+                .disabled(navigation == nil)
         }
     }
 }
