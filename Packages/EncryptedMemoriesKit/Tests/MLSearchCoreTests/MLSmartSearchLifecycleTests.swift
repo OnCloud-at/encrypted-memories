@@ -2373,11 +2373,13 @@ import Testing
 
         var hasEntered: Bool { lock.withLock { entered } }
 
+        /// Only the first caller blocks. Later callers pass through, so a regression that starts a
+        /// second operation fails its assertions instead of hanging the test run.
         func wait() async {
             await withCheckedContinuation { continuation in
                 let resumeNow = lock.withLock {
+                    if released || entered { return true }
                     entered = true
-                    if released { return true }
                     self.continuation = continuation
                     return false
                 }
@@ -2433,6 +2435,73 @@ import Testing
         #expect(!finished.isVisualSearchEnabled)
         #expect(finished.selectedModelID == nil)
         #expect(!FileManager.default.fileExists(atPath: harness.layout.modelDirectory(for: entry.id).path))
+    }
+
+    @Test func overlappingIntentsFinishAStalledRemovalExactlyOnce() async throws {
+        let payload = Data("model-bytes".utf8)
+        let (entry, url) = downloadableEntry(id: "model", payload: payload)
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ml-overlapping-removal-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let flaky = FlakyStateStore(layout: MLModelInstallLayout(rootDirectory: root))
+        let assets = [uid("a")]
+        let harness = try makeHarness(
+            catalog: MLModelCatalog(entries: [entry]),
+            payloads: [url: payload],
+            assets: assets,
+            root: root,
+            stateStoreOverride: flaky,
+            nativeSearch: RecordingNativeSearch(results: assets)
+        )
+
+        await harness.lifecycle.start()
+        await harness.lifecycle.setEnabled(true)
+        await harness.lifecycle.select(entry.id)
+        #expect(await waitForCompleteIndex(harness, total: assets.count))
+
+        let isRemovalCommit: @Sendable (MLSmartSearchPersistentState) -> Bool = {
+            $0.pendingOperation == nil && !$0.isVisualSearchEnabled
+        }
+        flaky.setFailing(where: isRemovalCommit)
+        await harness.lifecycle.setVisualSearchEnabled(false)
+        #expect(await waitForStorageFailure(harness))
+
+        let commits = CommitCounter()
+        flaky.setFailing(where: { state in
+            if isRemovalCommit(state) { commits.increment() }
+            return false
+        })
+        let gate = ContinuationGate()
+        await harness.lifecycle.setVisualRemovalContinuationGate { await gate.wait() }
+
+        let toggle = Task { await harness.lifecycle.setVisualSearchEnabled(true) }
+        #expect(await waitUntil { gate.hasEntered })
+        let running = await harness.lifecycle.currentSnapshot()
+        #expect(running.phase == .deleting)
+        #expect(!MLSmartSearchPresentation(snapshot: running).canRetry)
+
+        // Every overlapping intent must leave the running completion alone.
+        await harness.lifecycle.retry()
+        await harness.lifecycle.select(entry.id)
+        await harness.lifecycle.noteConditionsChanged()
+        await harness.lifecycle.setVisualSearchEnabled(true)
+        #expect(commits.value == 0)
+
+        gate.release()
+        await toggle.value
+
+        #expect(commits.value == 1)
+        #expect(await harness.lifecycle.currentSnapshot().phase == .selectingModel)
+        #expect(try flaky.load()?.pendingOperation == nil)
+        #expect(try flaky.load()?.selectedModelID == nil)
+    }
+
+    private final class CommitCounter: @unchecked Sendable {
+        private let lock = NSLock()
+        private var count = 0
+        func increment() { lock.withLock { count += 1 } }
+        var value: Int { lock.withLock { count } }
     }
 
     @Test func offlineStartFinishesJournaledVisualRemoval() async throws {
