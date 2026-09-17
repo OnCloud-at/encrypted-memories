@@ -696,6 +696,13 @@ public actor MLSmartSearchLifecycle {
         func setDeveloperInstallContinuationGate(_ gate: (@Sendable () async -> Void)?) {
             developerInstallContinuationGate = gate
         }
+
+        /// Test seam: runs when a Visual Search removal has published `.deleting`, before teardown.
+        private var visualRemovalContinuationGate: (@Sendable () async -> Void)?
+
+        func setVisualRemovalContinuationGate(_ gate: (@Sendable () async -> Void)?) {
+            visualRemovalContinuationGate = gate
+        }
     #endif
 
     /// Install a developer-provided local model artifact for `id` (developer environments
@@ -2202,17 +2209,30 @@ public actor MLSmartSearchLifecycle {
         return true
     }
 
-    /// Crash-recoverable cleanup for the optional visual backend. The selected model ID remains
-    /// as the user's preference, but no model bytes, semantic vectors or runtime session remain
-    /// while the switch is off. Native derived artifacts live in a separate store and survive.
+    /// Crash-recoverable cleanup for the optional visual backend. It forgets the model choice and
+    /// removes every catalog model, partial download, semantic vector epoch and the runtime session.
+    /// Native derived artifacts live in a separate store and survive. Only one removal runs at a time.
     @discardableResult
     private func completeVisualSearchDisable(
         model: MLModelID?,
         descriptor: MLModelDescriptor?
     ) async -> Bool {
         let removal = MLSmartSearchPendingOperation.disableVisualSearch(model: model)
+        // A second completion would stop indexing after the first one committed and restarted it.
+        guard visualRemovalsInFlight == 0 else { return false }
         visualRemovalsInFlight += 1
         defer { visualRemovalsInFlight -= 1 }
+        if phase != .deleting {
+            // A stalled journal is finishing: hide Retry and disable the toggle while it runs.
+            phase = .deleting
+            if case .failed = indexingState {
+                indexingState = .waiting(aggregateProgress())
+            }
+            emit()
+        }
+        #if DEBUG
+            await visualRemovalContinuationGate?()
+        #endif
         await stopActivations()
         await stopIndexing()
         await teardownSession()
