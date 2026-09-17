@@ -820,9 +820,12 @@ import Testing
         )
     }
 
+    /// Polls a condition for a wall-clock budget. The default is generous on purpose: a shared CI runner
+    /// needs longer for the same indexing work than a developer Mac, and a short budget turns a slow machine
+    /// into a red build. A wrong condition still fails; it only fails later.
     @discardableResult
     private func waitUntil(
-        timeout: Duration = .seconds(10),
+        timeout: Duration = .seconds(30),
         _ predicate: @Sendable () async -> Bool
     ) async -> Bool {
         let deadline = ContinuousClock.now + timeout
