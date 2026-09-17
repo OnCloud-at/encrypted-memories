@@ -24,6 +24,8 @@
 	<string>$(CURRENT_PROJECT_VERSION)</string>
 	<key>EncryptedMemoriesBuildCommit</key>
 	<string>$(ENCRYPTED_MEMORIES_BUILD_COMMIT)</string>
+	<key>EncryptedMemoriesProtonChannel</key>
+	<string>$(ENCRYPTED_MEMORIES_PROTON_CHANNEL)</string>
 	<key>LSApplicationCategoryType</key>
 	<string>public.app-category.photography</string>
 	<key>ITSAppUsesNonExemptEncryption</key>

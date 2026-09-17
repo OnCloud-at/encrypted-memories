@@ -63,6 +63,7 @@ xcodebuild build -project "$PROJECT" -scheme "$MAC_SCHEME" \
     -disableAutomaticPackageResolution \
     -skipPackagePluginValidation -skipMacroValidation \
     CURRENT_PROJECT_VERSION="$SOURCE_BUILD_NUMBER" \
+    ENCRYPTED_MEMORIES_BUILD_COMMIT="$SOURCE_BUILD_COMMIT" \
     "${MAC_PROVISIONING_ARGS[@]}" "${MAC_SIGN_ARGS[@]}"
 
 MAC_APP="$MAC_DD/Build/Products/$MAC_CONFIGURATION/Encrypted Memories.app"

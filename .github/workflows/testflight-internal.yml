@@ -478,6 +478,7 @@ jobs:
             MARKETING_VERSION="$APPLE_RELEASE_VERSION" \
             CURRENT_PROJECT_VERSION="$APPLE_BUILD_NUMBER" \
             ENCRYPTED_MEMORIES_BUILD_COMMIT="${{ needs.prepare.outputs.commit_sha }}" \
+            ENCRYPTED_MEMORIES_PROTON_CHANNEL="${{ needs.prepare.outputs.prerelease == 'true' && 'beta' || 'stable' }}" \
             ENCRYPTED_MEMORIES_CODE_SIGN_STYLE=Manual \
             ENCRYPTED_MEMORIES_CODE_SIGN_IDENTITY="$DISTRIBUTION_SHA1" \
             ENCRYPTED_MEMORIES_PROVISIONING_PROFILE_SPECIFIER="$PROFILE_NAME" \

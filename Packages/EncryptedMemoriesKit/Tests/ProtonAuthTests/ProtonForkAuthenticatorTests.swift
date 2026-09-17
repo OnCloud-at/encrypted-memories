@@ -22,18 +22,50 @@ struct ProtonForkAuthenticatorTests {
         )
     }
 
-    @Test func defaultProtonAPIConfigUsesOfficialExternalDriveIdentifierShape() {
+    @Test func defaultProtonAPIConfigUsesOfficialExternalDriveIdentifierShape() throws {
         let config = ProtonAPIConfig()
 
-        #expect(config.appVersion == "external-drive-encryptedmemories@1.0.0-stable")
+        #expect(config.appVersion == ProtonAppVersionHeader.current())
+        let pattern = /external-drive-encryptedmemories@\d+\.\d+\.\d+-(stable|beta|alpha)(\+[0-9a-f]{7,12})?/
+        #expect(try pattern.wholeMatch(in: config.appVersion) != nil)
         #expect(config.authClientID == "external-drive")
     }
 
     @Test func sharedClientConfigUsesProtonDocumentedExternalDriveNamespace() {
-        #expect(
-            ProtonAPIConfig.externalDriveEncryptedMemories.appVersion == "external-drive-encryptedmemories@1.0.0-stable"
-        )
+        #expect(ProtonAPIConfig.externalDriveEncryptedMemories.appVersion == ProtonAppVersionHeader.current())
         #expect(ProtonAPIConfig.externalDriveEncryptedMemories.authClientID == "external-drive")
+    }
+
+    @Test func appVersionHeaderDescribesReleaseBuildsHonestly() {
+        #expect(
+            ProtonAppVersionHeader.value(version: "1.0.3", channel: "beta", buildCommit: "289e494abcdef0123456789")
+                == "external-drive-encryptedmemories@1.0.3-beta+289e494abcde"
+        )
+        #expect(
+            ProtonAppVersionHeader.value(version: "1.0.3", channel: "stable", buildCommit: nil)
+                == "external-drive-encryptedmemories@1.0.3-stable"
+        )
+        #expect(
+            ProtonAppVersionHeader.value(version: " 2.1 ", channel: "BETA", buildCommit: "ABC123F")
+                == "external-drive-encryptedmemories@2.1.0-beta+abc123f"
+        )
+    }
+
+    @Test func appVersionHeaderNeverClaimsAReleaseForUnknownBuilds() {
+        #expect(
+            ProtonAppVersionHeader.value(version: nil, channel: nil, buildCommit: "unknown")
+                == "external-drive-encryptedmemories@0.0.0-alpha"
+        )
+        #expect(
+            ProtonAppVersionHeader.value(
+                version: "1.0.3-beta.15",
+                channel: "rc",
+                buildCommit: "$(ENCRYPTED_MEMORIES_BUILD_COMMIT)"
+            ) == "external-drive-encryptedmemories@0.0.0-alpha"
+        )
+        #expect(ProtonAppVersionHeader.semanticVersion("01.002.3") == "1.2.3")
+        #expect(ProtonAppVersionHeader.semanticVersion("1.2.3.4") == "0.0.0")
+        #expect(ProtonAppVersionHeader.buildMetadata("abc12") == nil)
     }
 
     @Test func defaultSignInPayloadIdentifiesEncryptedMemoriesClient() async throws {
