@@ -1065,6 +1065,40 @@ final class ProjectHygieneTests: XCTestCase {
         XCTAssertTrue(rebuild.contains("xcrun dwarfdump --uuid"))
     }
 
+    func testProtonAppVersionHeaderInputsReachEveryShippedApp() throws {
+        func read(_ path: String) throws -> String {
+            try String(contentsOf: repoRoot.appendingPathComponent(path), encoding: .utf8)
+        }
+        let project = try read("project.yml")
+        let workflow = try read(".github/workflows/testflight-internal.yml")
+        let rebuild = try read("scripts/rebuild.sh")
+
+        // x-pm-appversion is built from these bundle keys; both platforms must carry them.
+        for plist in ["iOSApp/Info.plist", "App/Info.plist"] {
+            let contents = try read(plist)
+            XCTAssertTrue(contents.contains("<key>EncryptedMemoriesBuildCommit</key>"), plist)
+            XCTAssertTrue(
+                contents.contains(
+                    "<key>EncryptedMemoriesProtonChannel</key>\n\t<string>$(ENCRYPTED_MEMORIES_PROTON_CHANNEL)</string>"
+                ),
+                plist
+            )
+        }
+        XCTAssertTrue(project.contains("INFOPLIST_FILE: App/Info.plist"))
+        XCTAssertTrue(project.contains("ENCRYPTED_MEMORIES_PROTON_CHANNEL: alpha"))
+        XCTAssertTrue(
+            workflow.contains(
+                "ENCRYPTED_MEMORIES_PROTON_CHANNEL=\"${{ needs.prepare.outputs.prerelease == 'true' && 'beta' || 'stable' }}\""
+            ),
+            "release archives must report beta for TestFlight tags and stable for App Store tags"
+        )
+        XCTAssertEqual(
+            rebuild.components(separatedBy: "ENCRYPTED_MEMORIES_BUILD_COMMIT=\"$SOURCE_BUILD_COMMIT\"").count - 1,
+            2,
+            "signed macOS and iOS builds must report the source commit"
+        )
+    }
+
     func testMobileViewerResolvesTheSharedMetadataLocationTitle() throws {
         let viewer = try String(
             contentsOf: repoRoot.appendingPathComponent("iOSApp/MobilePhotoViewer.swift"),

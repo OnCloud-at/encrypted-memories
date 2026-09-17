@@ -11,7 +11,8 @@ settings:
   base:
     # ProtonCore exposes process-global crypto state that Swift 6 language mode rejects.
     SWIFT_VERSION: "5.0"
-    MARKETING_VERSION: "1.0.0"
+    # Local builds match the current release line. Release automation overrides it from the tag.
+    MARKETING_VERSION: "1.0.3"
     # Fallback for ad-hoc Xcode builds. scripts/rebuild.sh injects the exact Git commit count.
     CURRENT_PROJECT_VERSION: "713"
     DEAD_CODE_STRIPPING: YES
@@ -22,6 +23,9 @@ settings:
     ENCRYPTED_MEMORIES_CODE_SIGN_STYLE: Automatic
     ENCRYPTED_MEMORIES_CODE_SIGN_IDENTITY: Apple Development
     ENCRYPTED_MEMORIES_PROVISIONING_PROFILE_SPECIFIER: ""
+    # Source of the x-pm-appversion header. Release automation sets beta or stable; local builds stay alpha.
+    ENCRYPTED_MEMORIES_PROTON_CHANNEL: alpha
+    ENCRYPTED_MEMORIES_BUILD_COMMIT: unknown
 
 packages:
   ProtonDriveSDK:
@@ -102,6 +106,8 @@ targets:
         INFOPLIST_KEY_CFBundleDisplayName: $(APP_DISPLAY_NAME)
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         GENERATE_INFOPLIST_FILE: YES
+        # Custom build provenance keys; Xcode merges the generated keys into this file.
+        INFOPLIST_FILE: App/Info.plist
         INFOPLIST_KEY_LSApplicationCategoryType: "public.app-category.photography"
         INFOPLIST_KEY_NSPrincipalClass: NSApplication
         INFOPLIST_KEY_NSHumanReadableCopyright: "© 2026 Encrypted Memories contributors"
