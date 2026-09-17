@@ -1145,6 +1145,49 @@ public final class LibrarySourceGraph {
         )
     }
 
+    /// Issues leases for burst members through the source items that list them. Burst members are not library
+    /// items, so `accessLease(for:)` refuses them; each lease stays bound to the owning item's relationship.
+    public func burstMemberAccessLeases(
+        for memberUIDs: Set<PhotoUID>,
+        requiring capability: LibrarySourceCapabilities,
+        includeExcludedSources: Bool = true
+    ) -> [PhotoUID: SourceAccessLease] {
+        guard !memberUIDs.isEmpty else { return [:] }
+        let relationshipField = LibrarySourceRelationship.burstMember.metadataField
+        var ownersByMember: [PhotoUID: [PhotoUID]] = [:]
+        for record in records.values
+        where record.accessState != .accessLost
+            && (includeExcludedSources || record.source.isIncluded)
+            && record.source.capabilities.contains(capability)
+        {
+            for sourceItem in record.items
+            where sourceItem.knownFields.contains(relationshipField) && !sourceItem.item.burstMemberIDs.isEmpty {
+                for nodeID in sourceItem.item.burstMemberIDs {
+                    let memberUID = PhotoUID(volumeID: sourceItem.uid.volumeID, nodeID: nodeID)
+                    if memberUIDs.contains(memberUID) {
+                        ownersByMember[memberUID, default: []].append(sourceItem.uid)
+                    }
+                }
+            }
+        }
+        var leases: [PhotoUID: SourceAccessLease] = [:]
+        for (memberUID, ownerUIDs) in ownersByMember {
+            for ownerUID in ownerUIDs {
+                if let lease = relatedAccessLease(
+                    for: memberUID,
+                    of: ownerUID,
+                    relationship: .burstMember,
+                    requiring: capability,
+                    includeExcludedSources: includeExcludedSources
+                ) {
+                    leases[memberUID] = lease
+                    break
+                }
+            }
+        }
+        return leases
+    }
+
     /// Checks the lease again before publishing a late asynchronous result.
     public func isCurrent(_ lease: SourceAccessLease) -> Bool {
         guard lease.epoch == epoch, let record = records[lease.sourceID] else { return false }
