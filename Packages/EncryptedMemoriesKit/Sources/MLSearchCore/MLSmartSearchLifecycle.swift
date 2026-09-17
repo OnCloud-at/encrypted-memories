@@ -428,7 +428,8 @@ public actor MLSmartSearchLifecycle {
     /// remains enabled and keeps its durable progress.
     public func setVisualSearchEnabled(_ enabled: Bool) async {
         guard !isShutDown, persistent.isEnabled,
-            enabled != persistent.isVisualSearchEnabled
+            enabled != persistent.isVisualSearchEnabled,
+            !isRemovingVisualSearch
         else { return }
         activationGeneration &+= 1
 
@@ -464,10 +465,18 @@ public actor MLSmartSearchLifecycle {
         )
     }
 
+    /// A journaled Visual Search removal owns the model state until it commits. Its cleanup awaits
+    /// teardown, so a re-enable or selection accepted meanwhile would be overwritten by the final
+    /// removal state. Both intents are ignored until the removal completes or `retry()` finishes it.
+    private var isRemovingVisualSearch: Bool {
+        if case .disableVisualSearch = persistent.pendingOperation { return true }
+        return false
+    }
+
     /// Select a model. The same selection is a no-op; another model runs the transactional switch,
     /// retires the old epoch, activates the new model, and starts a clean reindex.
     public func select(_ id: MLModelID) async {
-        guard !isShutDown, persistent.isEnabled else { return }
+        guard !isShutDown, persistent.isEnabled, !isRemovingVisualSearch else { return }
         guard let target = catalog.entry(for: id), isSelectable(target) else { return }
 
         if id == persistent.selectedModelID {
