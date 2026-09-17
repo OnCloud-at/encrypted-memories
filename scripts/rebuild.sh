@@ -20,6 +20,14 @@ IOS_DEVELOPMENT_TEAM="${ENCRYPTED_MEMORIES_IOS_DEVELOPMENT_TEAM:-$DEVELOPMENT_TE
 IOS_BUNDLE_ID="at.oncloud.encryptedmemories"
 SOURCE_BUILD_COMMIT="$(git rev-parse --short=12 HEAD)"
 SOURCE_BUILD_NUMBER="$(git rev-list --count HEAD)"
+# The newest release tag supplies the marketing version, so local builds need no manual bump.
+SOURCE_RELEASE_TAG="$(git describe --tags --abbrev=0 --match 'v[0-9]*' 2>/dev/null || true)"
+if [[ "$SOURCE_RELEASE_TAG" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)(-(beta|rc)\.[1-9][0-9]*)?$ ]]; then
+    SOURCE_MARKETING_VERSION="${BASH_REMATCH[1]}"
+else
+    echo "Could not derive the marketing version from release tag '${SOURCE_RELEASE_TAG:-none}'." >&2
+    exit 65
+fi
 
 if [[ -z "$DEVELOPMENT_TEAM" ]]; then
     echo "Set ENCRYPTED_MEMORIES_DEVELOPMENT_TEAM to the signing team before running this script." >&2
@@ -62,6 +70,7 @@ xcodebuild build -project "$PROJECT" -scheme "$MAC_SCHEME" \
     -packageCachePath "$ENCRYPTED_MEMORIES_XCODE_PACKAGE_CACHE" \
     -disableAutomaticPackageResolution \
     -skipPackagePluginValidation -skipMacroValidation \
+    MARKETING_VERSION="$SOURCE_MARKETING_VERSION" \
     CURRENT_PROJECT_VERSION="$SOURCE_BUILD_NUMBER" \
     ENCRYPTED_MEMORIES_BUILD_COMMIT="$SOURCE_BUILD_COMMIT" \
     "${MAC_PROVISIONING_ARGS[@]}" "${MAC_SIGN_ARGS[@]}"
@@ -137,6 +146,7 @@ xcodebuild build -project "$PROJECT" -scheme "$IOS_SCHEME" \
     -disableAutomaticPackageResolution \
     -skipPackagePluginValidation -skipMacroValidation -allowProvisioningUpdates \
     DEVELOPMENT_TEAM="$IOS_DEVELOPMENT_TEAM" CODE_SIGN_STYLE=Automatic \
+    MARKETING_VERSION="$SOURCE_MARKETING_VERSION" \
     CURRENT_PROJECT_VERSION="$SOURCE_BUILD_NUMBER" \
     ENCRYPTED_MEMORIES_BUILD_COMMIT="$SOURCE_BUILD_COMMIT"
 

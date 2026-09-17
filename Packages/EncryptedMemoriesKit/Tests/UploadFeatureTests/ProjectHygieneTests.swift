@@ -1097,6 +1097,13 @@ final class ProjectHygieneTests: XCTestCase {
             2,
             "signed macOS and iOS builds must report the source commit"
         )
+        XCTAssertTrue(rebuild.contains("git describe --tags --abbrev=0 --match 'v[0-9]*'"))
+        XCTAssertEqual(
+            rebuild.components(separatedBy: "MARKETING_VERSION=\"$SOURCE_MARKETING_VERSION\"").count - 1,
+            2,
+            "signed macOS and iOS builds must take the marketing version from the release tag"
+        )
+        XCTAssertTrue(workflow.contains("MARKETING_VERSION=\"$APPLE_RELEASE_VERSION\""))
     }
 
     func testMobileViewerResolvesTheSharedMetadataLocationTitle() throws {
