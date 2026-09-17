@@ -2278,6 +2278,116 @@ import Testing
         #expect(!FileManager.default.fileExists(atPath: harness.layout.modelDirectory(for: entry.id).path))
     }
 
+    @Test func fullPurgeSupersedesPendingVisualRemoval() async throws {
+        let payload = Data("model-bytes".utf8)
+        let (entry, url) = downloadableEntry(id: "model", payload: payload)
+        let harness = try makeHarness(
+            catalog: MLModelCatalog(entries: [entry]),
+            payloads: [url: payload],
+            assets: [uid("asset")]
+        )
+        defer { try? FileManager.default.removeItem(at: harness.layout.rootDirectory) }
+
+        await harness.lifecycle.start()
+        await harness.lifecycle.setEnabled(true)
+        harness.provider.blockNextSessionLoad()
+        let activation = Task { await harness.lifecycle.select(entry.id) }
+        #expect(await waitUntil { harness.provider.sessionLoadStarted })
+
+        let removal = Task { await harness.lifecycle.setVisualSearchEnabled(false) }
+        #expect(await waitUntil { harness.provider.sessionLoadCancellations == 1 })
+        let purge = Task { await harness.lifecycle.disableAndPurge() }
+        #expect(await waitUntil { (try? harness.stateStore.load()?.pendingOperation) == .purge })
+
+        harness.provider.releaseBlockedSessionLoad()
+        await removal.value
+        await purge.value
+        await activation.value
+
+        // The stale removal must neither rewrite the purge journal nor recreate state after the purge.
+        let snapshot = await harness.lifecycle.currentSnapshot()
+        #expect(snapshot.phase == .disabled)
+        #expect(!snapshot.isEnabled)
+        #expect(!FileManager.default.fileExists(atPath: harness.layout.rootDirectory.path))
+    }
+
+    @Test func developerInstallAfterVisualRemovalNeitherRevivesNorOrphansTheModel() async throws {
+        let entry = MLModelCatalogEntry(
+            id: MLModelID("dev-model"),
+            displayName: "dev-model",
+            family: "Test",
+            descriptor: MLModelDescriptor(identifier: "dev-model", version: 1, embeddingDimension: 4),
+            tokenizerID: "t",
+            preprocessingID: "p",
+            license: .mit,
+            releaseTrack: .production,
+            estimatedInstalledBytes: 1,
+            downloadPlan: nil
+        )
+        let harness = try makeHarness(
+            catalog: MLModelCatalog(entries: [entry]),
+            payloads: [:],
+            assets: [uid("asset")]
+        )
+        defer { try? FileManager.default.removeItem(at: harness.layout.rootDirectory) }
+        let artifact = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ml-dev-artifact-\(UUID().uuidString)", isDirectory: true)
+        let model = artifact.appendingPathComponent("Test.mlmodelc", isDirectory: true)
+        try FileManager.default.createDirectory(at: model, withIntermediateDirectories: true)
+        try Data("weights".utf8).write(to: model.appendingPathComponent("model.bin"))
+        defer { try? FileManager.default.removeItem(at: artifact) }
+
+        await harness.lifecycle.start()
+        await harness.lifecycle.setEnabled(true)
+        await harness.lifecycle.setVisualSearchEnabled(true)
+        let gate = ContinuationGate()
+        await harness.lifecycle.setDeveloperInstallContinuationGate { await gate.wait() }
+
+        let install = Task { await harness.lifecycle.installDeveloperModel(from: artifact, for: entry.id) }
+        #expect(await waitUntil { gate.hasEntered })
+        #expect(FileManager.default.fileExists(atPath: harness.layout.modelDirectory(for: entry.id).path))
+
+        await harness.lifecycle.setVisualSearchEnabled(false)
+        #expect(!(await harness.lifecycle.currentSnapshot().isVisualSearchEnabled))
+        gate.release()
+        await install.value
+
+        let snapshot = await harness.lifecycle.currentSnapshot()
+        #expect(!snapshot.isVisualSearchEnabled)
+        #expect(snapshot.selectedModelID == nil)
+        #expect(!FileManager.default.fileExists(atPath: harness.layout.modelDirectory(for: entry.id).path))
+    }
+
+    private final class ContinuationGate: @unchecked Sendable {
+        private let lock = NSLock()
+        private var entered = false
+        private var released = false
+        private var continuation: CheckedContinuation<Void, Never>?
+
+        var hasEntered: Bool { lock.withLock { entered } }
+
+        func wait() async {
+            await withCheckedContinuation { continuation in
+                let resumeNow = lock.withLock {
+                    entered = true
+                    if released { return true }
+                    self.continuation = continuation
+                    return false
+                }
+                if resumeNow { continuation.resume() }
+            }
+        }
+
+        func release() {
+            let waiting = lock.withLock {
+                released = true
+                defer { continuation = nil }
+                return continuation
+            }
+            waiting?.resume()
+        }
+    }
+
     @Test func activationCannotCommitAfterNewerSelection() async throws {
         let payloadA = Data("model-a-bytes".utf8)
         let payloadB = Data("model-b-bytes".utf8)
