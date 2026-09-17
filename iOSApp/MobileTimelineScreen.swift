@@ -142,7 +142,7 @@ struct MobileTimelineScreen: View {
             content
                 .mobileGridContextMenu(contextMenu, model: model)
                 .mobileNavigationTitle(
-                    surface.title,
+                    selection.barTitle(default: surface.title),
                     isVisible: launchChromeVisible
                 )
                 .toolbar { toolbarContent }
@@ -208,24 +208,48 @@ struct MobileTimelineScreen: View {
         // Keep every trailing slot present from the first rendered frame. Adding either control after the
         // library becomes ready makes SwiftUI recompute the semantic `.title` placement and visibly jump it.
         if surface == .library {
-            ToolbarItem(placement: .topBarTrailing) {
-                ZStack {
-                    libraryOptionsMenu
-                        .opacity(selection.isSelecting ? 0 : 1)
-                        .allowsHitTesting(!selection.isSelecting)
-                        .accessibilityHidden(selection.isSelecting)
-
-                    selectionOptionsMenu
-                        .opacity(selection.isSelecting ? 1 : 0)
-                        .allowsHitTesting(selection.isSelecting)
-                        .accessibilityHidden(!selection.isSelecting)
+            if #available(iOS 27.0, *) {
+                // iOS 27: the display options own the slot outside selection. In selection mode the slot leaves the
+                // bar and the bulk actions join the system overflow menu (HIG: reserve the ellipsis for overflow).
+                // Neither menu is mounted invisibly or empty: a compressed bar could surface a hidden menu, an
+                // empty item still paints glass, and UIKit shows the overflow button for any mounted overflow
+                // content, which truncated the library title.
+                if selection.isSelecting {
+                    ToolbarOverflowMenu {
+                        selectionOverflowActions
+                    }
+                } else {
+                    ToolbarItem(placement: .topBarTrailing) {
+                        libraryOptionsMenu
+                            .disabled(!canSelect)
+                            .opacity(launchChromeVisible ? 1 : 0)
+                            .allowsHitTesting(launchChromeVisible)
+                            .accessibilityHidden(!launchChromeVisible)
+                    }
+                    .sharedBackgroundVisibility(launchChromeVisible ? .automatic : .hidden)
+                    // Display options refine the grid; Select/Done outranks them in a compressed bar.
+                    .mobileVisibilityPriority(.low)
                 }
-                .disabled(!canSelect)
-                .opacity(launchChromeVisible ? 1 : 0)
-                .allowsHitTesting(launchChromeVisible)
-                .accessibilityHidden(!launchChromeVisible)
+            } else {
+                // iOS 26 has no system overflow menu for these actions, so the slot holds one menu at a time: the
+                // display options outside selection and the app-owned bulk-action menu inside it. Keeping both
+                // mounted behind opacity reported the hidden menu's label for the bar item and did not stop the
+                // 2 pt title shift that the longer selection title causes on iOS 26.5.
+                ToolbarItem(placement: .topBarTrailing) {
+                    Group {
+                        if selection.isSelecting {
+                            selectionOptionsMenu
+                        } else {
+                            libraryOptionsMenu
+                        }
+                    }
+                    .disabled(!canSelect)
+                    .opacity(launchChromeVisible ? 1 : 0)
+                    .allowsHitTesting(launchChromeVisible)
+                    .accessibilityHidden(!launchChromeVisible)
+                }
+                .sharedBackgroundVisibility(launchChromeVisible ? .automatic : .hidden)
             }
-            .sharedBackgroundVisibility(launchChromeVisible ? .automatic : .hidden)
             ToolbarSpacer(.fixed, placement: .topBarTrailing)
         }
         ToolbarItem(placement: .topBarTrailing) {
@@ -343,19 +367,25 @@ struct MobileTimelineScreen: View {
         )
     }
 
+    /// Bulk actions on the selection. iOS 27 places them in the system overflow menu; iOS 26 shows them in the
+    /// app-owned ellipsis menu below.
+    private var selectionOverflowActions: some View {
+        Button {
+            toggleSelectedFavorites()
+        } label: {
+            Label(
+                selectedAllFavorited
+                    ? String(localized: "viewer.remove_favorite_action")
+                    : String(localized: "viewer.favorite_action"),
+                systemImage: selectedAllFavorited ? "heart.slash" : "heart"
+            )
+        }
+        .disabled(selection.selected.isEmpty || selectionBusy)
+    }
+
     private var selectionOptionsMenu: some View {
         Menu {
-            Button {
-                toggleSelectedFavorites()
-            } label: {
-                Label(
-                    selectedAllFavorited
-                        ? String(localized: "viewer.remove_favorite_action")
-                        : String(localized: "viewer.favorite_action"),
-                    systemImage: selectedAllFavorited ? "heart.slash" : "heart"
-                )
-            }
-            .disabled(selection.selected.isEmpty || selectionBusy)
+            selectionOverflowActions
         } label: {
             Label(String(localized: "selection.more_a11y"), systemImage: "ellipsis")
         }

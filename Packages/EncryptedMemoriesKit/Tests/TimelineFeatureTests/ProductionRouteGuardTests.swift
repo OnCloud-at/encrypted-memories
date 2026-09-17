@@ -975,10 +975,10 @@ struct ProductionRouteGuardTests {
             contentsOf: Self.repoRoot.appendingPathComponent("iOSApp/MobilePhotoViewer.swift"),
             encoding: .utf8
         )
-        let viewerHeader = try Self.body(
+        let viewerToolbar = try Self.body(
             of: source,
-            from: "private var viewerHeader: some View",
-            to: "private var viewerBackButton: some View"
+            from: "@ToolbarContentBuilder private var viewerToolbar: some ToolbarContent",
+            to: "private var viewerCloseItem: some ToolbarContent"
         )
         let videoPlayer = try Self.body(
             of: source,
@@ -991,14 +991,16 @@ struct ProductionRouteGuardTests {
             to: "private struct MobileVideoPage: View"
         )
 
-        #expect(viewerHeader.contains("viewerBackButton"))
-        #expect(viewerHeader.contains("viewerTitlePill"))
+        // One native toolbar owns close, the more-actions menu and the per-photo actions for every media type.
+        #expect(viewerToolbar.contains("viewerCloseItem"))
+        #expect(viewerToolbar.contains("viewerMoreActions"))
         #expect(
-            viewerHeader.contains("viewerActionButton"),
-            "photos and videos must use the same compact top-row ownership")
+            viewerToolbar.contains("ToolbarItem(placement: .bottomBar) { viewerShareButton }")
+                && viewerToolbar.contains("ToolbarItem(placement: .bottomBar) { viewerMutationButton }"),
+            "photos and videos must use the same native bar ownership")
         #expect(
-            !viewerHeader.contains("currentItemUsesNativeVideoChrome"),
-            "asynchronous media routing must not insert or remove top-row controls")
+            !viewerToolbar.contains("currentItemUsesNativeVideoChrome"),
+            "asynchronous media routing must not insert or remove bar items")
         #expect(
             videoPlayer.contains("controller.showsPlaybackControls = false"),
             "AVKit's AirPlay, volume, and duplicate close controls must stay hidden")
@@ -1013,8 +1015,9 @@ struct ProductionRouteGuardTests {
             source.containsCodeFragmentIgnoringWhitespace("Slider(value:"),
             "the app-owned video surface must retain deterministic seeking")
         #expect(
-            source.contains("layoutProfile.bottomChromeHeight"),
-            "video transport must reserve the responsive filmstrip and action rows without moving them")
+            videoControls.contains(".padding(.bottom, layoutProfile.rowSpacing)")
+                && !source.contains("layoutProfile.bottomChromeHeight"),
+            "the filmstrip is safe-area content below the page, so the transport must not reserve its height again")
         #expect(
             source.contains("playbackIntendsToPlay"),
             "a buffering player must retain the user's play intent so Pause can stop it")
@@ -1060,37 +1063,43 @@ struct ProductionRouteGuardTests {
             contentsOf: Self.repoRoot.appendingPathComponent("iOSApp/MobilePhotoViewer.swift"),
             encoding: .utf8
         )
-
-        #expect(
-            source.contains("MobileViewerChromeOverlay(showsChrome: chromeVisible)"),
-            "photo and video pages must mount one shared chrome tree so metadata cannot jump between rows")
-        #expect(
-            source.contains("private var viewerHeader: some View"),
-            "one shared first row must own close, POI/date, and actions for every media type")
-        #expect(
-            source.contains("MobileViewerHeaderLayout.titleWidth(containerWidth: proxy.size.width)"),
-            "the centered title pill must consume only the space left on compact iPhones")
-        let viewerChrome = try Self.body(
+        let body = try Self.body(
             of: source,
-            from: "private var viewerTopChrome: some View",
-            to: "private var viewerHeader: some View"
+            from: "    var body: some View {\n        // Native bars inside the cover",
+            to: "@ViewBuilder private var viewerBottomAccessory: some View"
         )
-        #expect(viewerChrome.contains(".frame(maxWidth: .infinity)"))
+
+        // One NavigationStack with native bars hosts every media type, so the title and the bar items never move
+        // between rows while paging. The system owns bar axis, edge and overflow (iPhone Duo, iPad).
+        #expect(body.contains("NavigationStack {"), "the viewer must present native bars inside its cover")
         #expect(
-            !viewerChrome.contains("maxHeight: .infinity"),
-            "the shared header must stay top-anchored without claiming the native media gesture surface")
-        #expect(viewerChrome.contains("if currentDisplayedItem?.isLivePhoto == true"))
+            body.contains(".navigationTitle(viewerTitle.line1)")
+                && body.contains(".navigationSubtitle(viewerTitle.line2)"),
+            "the Photos-style two-line title must be the navigation title and subtitle")
+        #expect(body.contains(".toolbarTitleDisplayMode(.inline)"))
+        #expect(body.contains(".toolbar { viewerToolbar }"))
         #expect(
-            viewerChrome.contains("viewerLiveIndicator"),
-            "Live Photo status must use the fixed second header row instead of disappearing over bright media")
+            body.contains(".toolbarVisibility(chromeVisible ? .automatic : .hidden, for: .navigationBar, .bottomBar)")
+                && body.contains(".statusBarHidden(!chromeVisible)")
+                && body.contains(".persistentSystemOverlays(chromeVisible ? .automatic : .hidden)"),
+            "one chrome tap must hide both bars, the status bar and the home indicator together")
+        #expect(
+            !source.contains("MobileViewerChromeOverlay") && !source.contains("MobileViewerHeaderLayout")
+                && !source.contains("viewerTitlePill") && !source.contains("viewerActionRow"),
+            "app-drawn header pills and action rows must not remain beside the native bars")
+        #expect(
+            body.contains(
+                ".overlay(alignment: .topLeading) {\n                if currentDisplayedItem?.isLivePhoto == true {")
+                && body.contains("viewerLiveIndicator"),
+            "Live Photo status must sit on the media below the navigation bar, not disappear over bright media")
         let liveIndicator = try Self.body(
             of: source,
             from: "private var viewerLiveIndicator: some View",
-            to: "private var viewerActionMenu: some View"
+            to: "private var viewerShareButton: some View"
         )
         #expect(
             liveIndicator.contains(".allowsHitTesting(false)"),
-            "the fixed Live Photo status row must not steal paging or dismiss gestures")
+            "the Live Photo status must not steal paging or dismiss gestures")
         #expect(
             !liveIndicator.contains(".accessibilityHidden(true)"),
             "the visible Live Photo status must remain discoverable to VoiceOver")
@@ -1113,19 +1122,21 @@ struct ProductionRouteGuardTests {
             contentsOf: Self.repoRoot.appendingPathComponent("iOSApp/MobileViewerSupport.swift"),
             encoding: .utf8
         )
-        let bottomChrome = try Self.body(
+        let bottomAccessory = try Self.body(
             of: source,
-            from: "private var viewerBottomChrome: some View",
-            to: "private var viewerHeader: some View"
+            from: "@ViewBuilder private var viewerBottomAccessory: some View",
+            to: "private var isCompactLandscape: Bool"
         )
 
         #expect(
-            !bottomChrome.contains(".allowsHitTesting(true)"),
-            "a full-screen bottom chrome layer must not claim long presses outside its visible controls")
-        #expect(support.contains(".overlay(alignment: .top)"))
+            !bottomAccessory.contains(".allowsHitTesting(true)") && !bottomAccessory.contains("maxHeight: .infinity"),
+            "the filmstrip accessory must stay bounded to its rows and never claim long presses on the media")
         #expect(
-            support.contains(".overlay(alignment: .bottom)"),
-            "top and bottom controls must use separate bounded hit-test regions")
+            source.contains(".safeAreaInset(edge: .bottom, spacing: 0) { viewerBottomAccessory }"),
+            "the strips are safe-area content below the media, so no overlay covers the media gesture surface")
+        #expect(
+            !support.contains(".overlay(alignment: .top)") && !support.contains(".overlay(alignment: .bottom)"),
+            "the retired full-width chrome overlays must not remain in the support file")
         #expect(
             source.containsCodeFragmentIgnoringWhitespace("UILongPressGestureRecognizer(target: context.coordinator"),
             "the native image surface must retain its Live Photo press recognizer")
@@ -1193,13 +1204,13 @@ struct ProductionRouteGuardTests {
         #expect(
             viewer.contains("selectedUID: currentBaseItem?.uid"),
             "the outer route strip must not confuse a nested burst selection with its library page")
-        #expect(support.contains(".overlay(alignment: .bottom)"))
         #expect(
-            !support.contains("maxHeight: .infinity, alignment: .bottom"),
-            "bottom controls must overlay media without becoming a full-screen hit-test surface")
+            !support.contains("maxHeight: .infinity, alignment: .bottom") && !support.contains(".overlay("),
+            "the support file must not host a full-screen bottom hit-test surface")
         #expect(
-            !viewer.contains("safeAreaInset(edge: .bottom"),
-            "viewer controls must overlay media instead of refitting it when chrome changes")
+            viewer.contains(".safeAreaInset(edge: .bottom, spacing: 0) { viewerBottomAccessory }")
+                && !viewer.contains(".overlay(alignment: .bottom)"),
+            "the filmstrip is bottom safe-area content: the media refits when the chrome toggles, like Photos")
         #expect(
             filmstrip.contains("UICollectionView"),
             "large libraries need reusable visible cells rather than one SwiftUI view per asset")

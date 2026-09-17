@@ -167,6 +167,8 @@ public actor MLSmartSearchLifecycle {
     /// `true` while a model switch is mid-flight: the still-running old-epoch index loop must
     /// not overwrite switch/download phases.
     private var switchInProgress = false
+    /// Number of `completeVisualSearchDisable` calls currently running (they await teardown).
+    private var visualRemovalsInFlight = 0
     private var indexTask: Task<Void, Never>?
     private var indexTaskID: UUID?
     private var activationTasks: [UUID: Task<Void, Never>] = [:]
@@ -287,6 +289,12 @@ public actor MLSmartSearchLifecycle {
             startCatalogRefreshLoopIfNeeded()
         }
         if persistent.isEnabled, !(await refreshCatalog()) {
+            if case .disableVisualSearch(let model) = persistent.pendingOperation {
+                // Removal needs no network. Finish it with the current catalog instead of leaving the
+                // journal pending, which would also block native indexing.
+                _ = await completeVisualSearchDisable(model: model, descriptor: persistent.activatedDescriptor)
+                return
+            }
             await recoverLocallyInstalledSemanticModelAfterCatalogFailure()
             return
         }
@@ -430,6 +438,13 @@ public actor MLSmartSearchLifecycle {
         guard !isShutDown, persistent.isEnabled,
             enabled != persistent.isVisualSearchEnabled
         else { return }
+        if case .disableVisualSearch(let model) = persistent.pendingOperation {
+            // A running removal owns the state. A stalled one (after a failure) is finished first.
+            // Either way the model choice is gone, so the user selects a model again afterwards.
+            guard visualRemovalsInFlight == 0 else { return }
+            _ = await completeVisualSearchDisable(model: model, descriptor: persistent.activatedDescriptor)
+            return
+        }
         activationGeneration &+= 1
 
         if enabled {
@@ -464,10 +479,30 @@ public actor MLSmartSearchLifecycle {
         )
     }
 
+    /// A journaled Visual Search removal owns the model state until it commits. Its cleanup awaits
+    /// teardown, so a re-enable or selection accepted meanwhile would be overwritten by the final
+    /// removal state. Intents wait for a running removal and finish a stalled one first.
+    private var isRemovingVisualSearch: Bool {
+        if case .disableVisualSearch = persistent.pendingOperation { return true }
+        return false
+    }
+
+    /// True while `operation` is still the journaled operation of enabled Smart Search.
+    private func isCurrentOperation(_ operation: MLSmartSearchPendingOperation) -> Bool {
+        !isShutDown && persistent.isEnabled && persistent.pendingOperation == operation
+    }
+
     /// Select a model. The same selection is a no-op; another model runs the transactional switch,
     /// retires the old epoch, activates the new model, and starts a clean reindex.
     public func select(_ id: MLModelID) async {
         guard !isShutDown, persistent.isEnabled else { return }
+        if case .disableVisualSearch(let model) = persistent.pendingOperation {
+            // An explicit choice waits for a running removal and finishes a stalled one first.
+            guard visualRemovalsInFlight == 0,
+                await completeVisualSearchDisable(model: model, descriptor: persistent.activatedDescriptor),
+                !isShutDown, persistent.isEnabled
+            else { return }
+        }
         guard let target = catalog.entry(for: id), isSelectable(target) else { return }
 
         if id == persistent.selectedModelID {
@@ -608,6 +643,11 @@ public actor MLSmartSearchLifecycle {
         else { return }
         if failure.kind == .catalog {
             guard await refreshCatalog() else { return }
+            if case .disableVisualSearch(let model) = persistent.pendingOperation {
+                guard visualRemovalsInFlight == 0 else { return }
+                _ = await completeVisualSearchDisable(model: model, descriptor: persistent.activatedDescriptor)
+                return
+            }
             if persistent.selectedModelID == nil {
                 phase = .selectingModel
                 emit()
@@ -617,7 +657,9 @@ public actor MLSmartSearchLifecycle {
             }
             return
         }
-        if failure.kind == .storage, persistent.isEnabled, persistent.selectedModelID == nil {
+        if failure.kind == .storage, persistent.isEnabled, persistent.selectedModelID == nil,
+            persistent.pendingOperation == nil
+        {
             guard persistState() else { return }
             await activateNativeSearch(intent: .userInitiated)
             phase = .selectingModel
@@ -647,6 +689,22 @@ public actor MLSmartSearchLifecycle {
         }
     }
 
+    #if DEBUG
+        /// Test seam: runs after a developer artifact copy returns and before its result is applied.
+        private var developerInstallContinuationGate: (@Sendable () async -> Void)?
+
+        func setDeveloperInstallContinuationGate(_ gate: (@Sendable () async -> Void)?) {
+            developerInstallContinuationGate = gate
+        }
+
+        /// Test seam: runs when a Visual Search removal has published `.deleting`, before teardown.
+        private var visualRemovalContinuationGate: (@Sendable () async -> Void)?
+
+        func setVisualRemovalContinuationGate(_ gate: (@Sendable () async -> Void)?) {
+            visualRemovalContinuationGate = gate
+        }
+    #endif
+
     /// Install a developer-provided local model artifact for `id` (developer environments
     /// only). The artifact is hashed, staged and installed with the same guarantees as a
     /// download.
@@ -659,9 +717,27 @@ public actor MLSmartSearchLifecycle {
         else { return }
         phase = .installing
         emit()
+        let installResult: Result<MLModelInstallRecord, any Error>
         do {
-            _ = try await deps.installer.installFromLocalArtifact(entry, artifactDirectory: artifactDirectory)
+            installResult = .success(
+                try await deps.installer.installFromLocalArtifact(entry, artifactDirectory: artifactDirectory))
         } catch {
+            installResult = .failure(error)
+        }
+        #if DEBUG
+            await developerInstallContinuationGate?()
+        #endif
+        // The copy runs outside this actor. Turning Visual Search off or purging Smart Search meanwhile
+        // supersedes the install: it must neither re-enable Visual Search nor leave an orphaned model.
+        guard !isShutDown, persistent.isEnabled, persistent.isVisualSearchEnabled, !isRemovingVisualSearch
+        else {
+            // Uninstall is idempotent. A pending removal may already have passed its own uninstall.
+            if case .success = installResult, !isShutDown {
+                await deps.installer.uninstall(entry)
+            }
+            return
+        }
+        if case .failure(let error) = installResult {
             phase = .failed(
                 MLSmartSearchFailure(
                     kind: .installation,
@@ -2133,45 +2209,72 @@ public actor MLSmartSearchLifecycle {
         return true
     }
 
-    /// Crash-recoverable cleanup for the optional visual backend. The selected model ID remains
-    /// as the user's preference, but no model bytes, semantic vectors or runtime session remain
-    /// while the switch is off. Native derived artifacts live in a separate store and survive.
+    /// Crash-recoverable cleanup for the optional visual backend. It forgets the model choice and
+    /// removes every catalog model, partial download, semantic vector epoch and the runtime session.
+    /// Native derived artifacts live in a separate store and survive. Only one removal runs at a time.
     @discardableResult
     private func completeVisualSearchDisable(
         model: MLModelID?,
         descriptor: MLModelDescriptor?
     ) async -> Bool {
+        let removal = MLSmartSearchPendingOperation.disableVisualSearch(model: model)
+        // A second completion would stop indexing after the first one committed and restarted it.
+        guard visualRemovalsInFlight == 0 else { return false }
+        visualRemovalsInFlight += 1
+        defer { visualRemovalsInFlight -= 1 }
+        if phase != .deleting {
+            // A stalled journal is finishing: hide Retry and disable the toggle while it runs.
+            phase = .deleting
+            if case .failed = indexingState {
+                indexingState = .waiting(aggregateProgress())
+            }
+            emit()
+        }
+        #if DEBUG
+            await visualRemovalContinuationGate?()
+        #endif
         await stopActivations()
         await stopIndexing()
         await teardownSession()
+        // A full purge may replace this journal while teardown awaits. The purge then owns every
+        // file and the state; this stale removal must not touch the store or rewrite the journal.
+        guard isCurrentOperation(removal) else { return false }
 
-        if let model {
-            if let descriptor {
-                guard let store = deps.storeProvider.openStore(),
-                    store.removeAll(for: descriptor)
-                else {
-                    phase = .failed(
-                        MLSmartSearchFailure(
-                            kind: .storage,
-                            isRetryable: true,
-                            debugDescription: "visual index cleanup failed"
-                        ))
-                    emit()
-                    return false
-                }
+        // Visual Search off means no semantic model or vector epoch may remain. Remove every catalog
+        // model, not only the journaled one: a removal that interrupts a model switch or a download
+        // would otherwise leave the other model's files, partial download or vectors behind.
+        if model != nil || descriptor != nil {
+            var descriptors = catalog.entries.map(\.descriptor)
+            if let descriptor, !descriptors.contains(descriptor) {
+                descriptors.append(descriptor)
             }
-            if let entry = catalog.entry(for: model) {
-                await deps.installer.uninstall(entry)
+            guard let store = deps.storeProvider.openStore(),
+                descriptors.allSatisfy({ store.removeAll(for: $0) })
+            else {
+                failVisualRemoval("visual index cleanup failed")
+                return false
             }
         }
+        for entry in catalog.entries {
+            await deps.installer.uninstall(entry)
+            guard isCurrentOperation(removal) else { return false }
+        }
 
+        // "Turn Off and Remove" also forgets the model choice. Re-enabling Visual Search must ask
+        // for a model again instead of silently downloading the removed one.
         persistent.isVisualSearchEnabled = false
+        persistent.selectedModelID = nil
         persistent.activatedRevision = nil
         persistent.activatedDescriptor = nil
         persistent.pendingOperation = nil
         guard persistState() else {
-            persistent.pendingOperation = .disableVisualSearch(model: model)
+            persistent.pendingOperation = removal
+            persistent.selectedModelID = model
             persistent.activatedDescriptor = descriptor
+            if case .failed(let failure) = phase {
+                indexingState = .failed(failure)
+                emit()
+            }
             return false
         }
 
@@ -2181,6 +2284,15 @@ public actor MLSmartSearchLifecycle {
         emit()
         startIndexingLoopIfAvailable()
         return true
+    }
+
+    /// Settings shows native indexing status ahead of the phase. Publish a removal failure in both, so
+    /// its Retry action stays visible while native search is active.
+    private func failVisualRemoval(_ debugDescription: String) {
+        let failure = MLSmartSearchFailure(kind: .storage, isRetryable: true, debugDescription: debugDescription)
+        phase = .failed(failure)
+        indexingState = .failed(failure)
+        emit()
     }
 
     /// Full disable: stop everything, close every handle, delete every Smart Search artifact,
@@ -2322,6 +2434,14 @@ public actor MLSmartSearchLifecycle {
                 false
             }
         if previousCatalog != refreshed || recoveredFromCatalogFailure { emit() }
+        if case .disableVisualSearch(let model) = persistent.pendingOperation {
+            // A running removal owns the phase. A stalled one, for example after an offline start or a
+            // storage failure, is finished now instead of being hidden behind selectingModel.
+            if visualRemovalsInFlight == 0 {
+                _ = await completeVisualSearchDisable(model: model, descriptor: persistent.activatedDescriptor)
+            }
+            return
+        }
 
         if persistent.selectedModelID == nil {
             phase = .selectingModel

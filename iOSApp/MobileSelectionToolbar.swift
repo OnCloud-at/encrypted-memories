@@ -7,6 +7,8 @@ import SwiftUI
 /// symbol; vertical bars and overflow menus (iPhone Duo) can use the title. All items stay mounted so the
 /// system morphs the bar in one transition; `mobileSelectionBars` hides the bar outside selection, which is
 /// the verified iOS 26/27 chrome contract (a transparent item alone still paints a full-width background).
+/// `ToolbarSpacer(.flexible)` is the documented system space item ("Spacers can ... be flexible and push items
+/// apart"); it separates the three Liquid Glass groups and adapts with the bar, unlike manual padding.
 struct MobileSelectionToolbarItems<AlbumPicker: View>: ToolbarContent {
     let selection: MobileGridSelectionController
     /// Whether the surface can add the selection to an album (the shared album coordinator is available).
@@ -38,13 +40,12 @@ struct MobileSelectionToolbarItems<AlbumPicker: View>: ToolbarContent {
         .mobileVisibilityPriority(.high)
         ToolbarSpacer(.flexible, placement: .bottomBar)
         ToolbarItem(placement: .bottomBar) {
+            // The selected count is the bar title in selection mode (`barTitle(default:)`), so this slot is a
+            // symbol item like its neighbours and a vertical bar can show it.
             Button {
                 showAlbumPicker = true
             } label: {
-                Text(L10n.selectionCenterText(selectedCount: selection.selected.count))
-                    .font(.body)
-                    .monospacedDigit()
-                    .fixedSize()
+                Label(L10n.string("albums.add_selection_title"), systemImage: "rectangle.stack.badge.plus")
             }
             .disabled(actionsDisabled || !canAddToAlbum)
             .accessibilityLabel(L10n.string("albums.add_selection_title"))
@@ -52,6 +53,8 @@ struct MobileSelectionToolbarItems<AlbumPicker: View>: ToolbarContent {
             .mobileSelectionItemVisibility(isSelecting)
         }
         .sharedBackgroundVisibility(isSelecting ? .automatic : .hidden)
+        // Album filing is the least frequent selection action; it leaves a compressed bar before Share and Trash.
+        .mobileVisibilityPriority(.low)
         ToolbarSpacer(.flexible, placement: .bottomBar)
         ToolbarItem(placement: .bottomBar) {
             Button(role: .destructive, action: onTrash) {
@@ -62,6 +65,15 @@ struct MobileSelectionToolbarItems<AlbumPicker: View>: ToolbarContent {
             .mobileSelectionItemVisibility(isSelecting)
         }
         .sharedBackgroundVisibility(isSelecting ? .automatic : .hidden)
+        .mobileVisibilityPriority(.high)
+    }
+}
+
+extension MobileGridSelectionController {
+    /// The bar title of a grid route. In selection mode the selected count replaces the route title, the way
+    /// the Photos app reports "Select Items" and "3 Items Selected"; the bottom bar then keeps symbol items only.
+    func barTitle(default title: String) -> String {
+        isSelecting ? L10n.selectionCenterText(selectedCount: selected.count) : title
     }
 }
 

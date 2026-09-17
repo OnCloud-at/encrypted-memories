@@ -113,6 +113,20 @@ final class MobileViewerInspectorTests: XCTestCase {
         let initialSizeClass = window.traitCollection.horizontalSizeClass
         report.append("initial sizeClass regular=\(isRegular)")
 
+        // Native chrome: the viewer's own navigation bar is mounted inside the cover, and the media surface keeps
+        // the touch centre (the Live Photo press and the chrome tap land on the zoomable page, not on a bar).
+        func viewerDescendants(_ view: UIView) -> [UIView] { [view] + view.subviews.flatMap(viewerDescendants) }
+        let viewerBars = viewerDescendants(viewerHost.view).filter { $0 is UINavigationBar }
+        XCTAssertFalse(viewerBars.isEmpty, "the production viewer must mount a native navigation bar")
+        let mediaCenter = initialViewport.convert(
+            CGPoint(x: initialViewport.bounds.midX, y: initialViewport.bounds.midY), to: viewerHost.view)
+        let centerHit = viewerHost.view.hitTest(mediaCenter, with: nil)
+        XCTAssertTrue(
+            centerHit.map { $0 === initialViewport || $0.isDescendant(of: initialViewport) } ?? false,
+            "the media centre must hit-test to the zoomable page, not to chrome")
+        let centerHitType = centerHit.map { String(describing: type(of: $0)) } ?? "nil"
+        report.append("native chrome: navigationBars=\(viewerBars.count) centerHit=\(centerHitType)")
+
         func resize(_ bounds: CGRect, sizeClass: UIUserInterfaceSizeClass) {
             window.traitOverrides.horizontalSizeClass = sizeClass
             root.traitOverrides.horizontalSizeClass = sizeClass

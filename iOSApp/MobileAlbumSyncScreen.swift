@@ -39,6 +39,7 @@ struct MobileAlbumSyncScreen: View {
                 }
                 .disabled(!controller.isAvailable)
             }
+            .mobileVisibilityPriority(.high)
         }
         .sheet(isPresented: $showPicker) {
             MobileAlbumPickerSheet(controller: controller)
@@ -247,6 +248,7 @@ private struct MobileAlbumPickerSheet: View {
                 ToolbarItem(placement: .cancellationAction) {
                     Button(L10n.string("action.cancel")) { dismiss() }
                 }
+                .mobileVisibilityPriority(.high)
                 ToolbarItem(placement: .confirmationAction) {
                     Button(L10n.string("settings.albumsync_picker_apply")) {
                         controller.applySelection(draft)
@@ -254,6 +256,7 @@ private struct MobileAlbumPickerSheet: View {
                     }
                     .fontWeight(.semibold)
                 }
+                .mobileVisibilityPriority(.high)
                 ToolbarItem(placement: .status) {
                     Text(L10n.string("settings.albumsync_picker_selected \(draft.count)"))
                         .font(.footnote.monospacedDigit())
