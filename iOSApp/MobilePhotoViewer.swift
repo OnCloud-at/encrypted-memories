@@ -153,6 +153,9 @@ struct MobilePhotoViewer: View {
             .toolbarVisibility(chromeVisible ? .automatic : .hidden, for: .navigationBar, .bottomBar)
             .background { keyboardCommands }
         }
+        // The app shell passes the brand tint into this cover. Bar glyphs over the photo keep the system's light
+        // appearance, like the Photos app; the information inspector outside the stack keeps the brand tint.
+        .tint(nil)
         .statusBarHidden(!chromeVisible)
         .persistentSystemOverlays(chromeVisible ? .automatic : .hidden)
         .task {

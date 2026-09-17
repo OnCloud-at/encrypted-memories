@@ -851,6 +851,20 @@ final class ProjectHygieneTests: XCTestCase {
             mobileApp.contains(".tabViewStyle(.tabBarOnly)") || mobileApp.contains(".tabBarMinimizeBehavior("),
             "the shell must not lock the tab bar to one form or minimize it in navigation-focused browsing"
         )
+        let mainTabView = try sourceBlock(
+            from: "private struct MobileMainTabView: View",
+            to: "private struct MobileAdaptiveTabShell: View",
+            in: mobileApp
+        )
+        let presentations = try XCTUnwrap(mainTabView.range(of: ".fullScreenCover("))
+        let brandTint = try XCTUnwrap(
+            mainTabView.range(of: ".tint(ProtonColor.primary)", options: .backwards),
+            "the main shell must apply the brand tint")
+        XCTAssertLessThan(
+            presentations.lowerBound, brandTint.lowerBound,
+            "the brand tint must wrap the Settings sheet and viewer cover so their content inherits it; a tint "
+                + "only inside the tab shell left Settings icons in system blue with the Xcode 27.0 SDK"
+        )
         XCTAssertTrue(
             mobileApp.contains("surface: .library,") && mobileApp.contains("MobileCollectionsScreen()")
                 && mobileApp.contains("MobileMapScreen()")

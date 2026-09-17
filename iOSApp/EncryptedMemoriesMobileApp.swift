@@ -320,6 +320,10 @@ private struct MobileMainTabView: View {
                 guard restored else { return }
                 libraryModel.refreshLibrarySources()
             }
+            // The brand tint sits outside the Settings sheet and viewer cover, so their content inherits it through
+            // the SwiftUI environment. A tint set only inside the tab shell does not reach them when built with the
+            // Xcode 27.0 SDK: Settings icons fell back to system blue.
+            .tint(ProtonColor.primary)
     }
 }
 
