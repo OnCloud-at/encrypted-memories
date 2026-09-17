@@ -270,7 +270,9 @@
             guard let host,
                 host.dragOutProvider != nil,
                 // Reuse the host's tap hit-testing exactly; no duplicated grid geometry here.
-                let pressed = host.item(at: session.location(in: host.contentView))
+                let pressed = host.item(at: session.location(in: host.contentView)),
+                // In selection mode a hold on an unselected photo selects a range instead of lifting it.
+                !host.swipeSelection.ownsLongPress(on: pressed)
             else { return [] }
             let items = liftItems(around: pressed)
             beginStagingIfNeeded(for: items)
@@ -340,7 +342,9 @@
             guard !sessionActive, let host, host.dragOutProvider != nil else { return nil }
             // The delegate hands us the location in the interaction's view (the scroll view);
             // hit-testing needs the engine's content space (origin at the library top, y down).
-            guard let pressed = host.item(at: host.contentView.convert(location, from: host.scrollView)) else {
+            guard let pressed = host.item(at: host.contentView.convert(location, from: host.scrollView)),
+                !host.swipeSelection.ownsLongPress(on: pressed)
+            else {
                 return nil
             }
             let items = liftItems(around: pressed)

@@ -164,6 +164,72 @@ struct TimelineContextMenuTests {
         #expect(router.presentation?.showsInfoInitially == true)
     }
 
+    @Test func swipeSelectionOwnsUnselectedPressesWhileSelectedPhotosStillDrag() async throws {
+        let fixture = try await Fixture()
+        defer { fixture.close() }
+        let host = fixture.host
+        let controller = try #require(host.dragOutController)
+        let swipe = host.swipeSelection
+        #expect(!swipe.pan.isEnabled)
+        #expect(!swipe.hold.isEnabled)
+        #expect(!swipe.ownsLongPress(on: fixture.photos[0]))
+
+        var reported: [Set<PhotoUID>] = []
+        host.onSelectionChanged = { reported.append($0) }
+        host.configure(
+            items: fixture.photos, thumbnailFeed: fixture.feed, level: 0, fillOrder: .topLeading,
+            selectionMode: true, selectedUIDs: [fixture.photos[1].uid])
+        #expect(swipe.pan.isEnabled)
+        #expect(swipe.hold.isEnabled)
+
+        let drag = UIDragInteraction(delegate: controller)
+        let menu = UIContextMenuInteraction(delegate: controller)
+        let unselected = TestDragSession(point: try fixture.center(of: 0))
+        #expect(swipe.ownsLongPress(on: fixture.photos[0]))
+        #expect(controller.dragInteraction(drag, itemsForBeginning: unselected).isEmpty)
+        #expect(
+            controller.contextMenuInteraction(
+                menu, configurationForMenuAtLocation: host.scrollView.convert(unselected.point, from: host.contentView))
+                == nil)
+
+        let selected = TestDragSession(point: try fixture.center(of: 1))
+        #expect(!swipe.ownsLongPress(on: fixture.photos[1]))
+        #expect(controller.dragInteraction(drag, itemsForBeginning: selected).count == 1)
+        controller.dragInteraction(drag, session: selected, didEndWith: .cancel)
+        #expect(
+            controller.contextMenuInteraction(
+                menu, configurationForMenuAtLocation: host.scrollView.convert(selected.point, from: host.contentView))
+                != nil)
+
+        // Sweep from the first to the last photo, then back: the range grows and shrinks to the prior state.
+        let uids = fixture.photos.map(\.uid)
+        swipe.begin(anchorPoint: try fixture.center(of: 0), fingerLocation: try fixture.hostPoint(of: 0))
+        #expect(swipe.isActive)
+        #expect(!host.scrollView.isScrollEnabled)
+        swipe.move(to: try fixture.hostPoint(of: 2))
+        swipe.move(to: try fixture.hostPoint(of: 0))
+        swipe.finish()
+        #expect(!swipe.isActive)
+        #expect(host.scrollView.isScrollEnabled)
+        #expect(reported == [[uids[0], uids[1]], Set(uids), [uids[0], uids[1]]])
+        #expect(host.selectedUIDs == [uids[0], uids[1]])
+
+        // A selected anchor removes the swept range.
+        reported.removeAll()
+        swipe.begin(anchorPoint: try fixture.center(of: 1), fingerLocation: try fixture.hostPoint(of: 1))
+        swipe.move(to: try fixture.hostPoint(of: 2))
+        swipe.finish()
+        #expect(reported == [[uids[0]]])
+
+        host.dragOutProvider = nil
+        #expect(swipe.ownsLongPress(on: fixture.photos[0]))
+        host.configure(
+            items: fixture.photos, thumbnailFeed: fixture.feed, level: 0, fillOrder: .topLeading,
+            selectionMode: false)
+        #expect(!swipe.pan.isEnabled)
+        #expect(!swipe.ownsLongPress(on: fixture.photos[0]))
+    }
+
     @Test func disabledProviderCannotOfferMenu() async throws {
         let fixture = try await Fixture()
         defer { fixture.close() }
@@ -221,6 +287,10 @@ struct TimelineContextMenuTests {
                     flatIndex: index, level: context.level, width: host.bounds.width,
                     columnPhase: host.committedPhase))
             return CGPoint(x: slot.midX, y: slot.midY)
+        }
+
+        func hostPoint(of index: Int) throws -> CGPoint {
+            host.convert(try center(of: index), from: host.contentView)
         }
     }
 }

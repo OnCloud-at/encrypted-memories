@@ -56,6 +56,7 @@
         private let onFirstContentReady: (() -> Void)?
         private let onOpenPhoto: ((PhotoItem) -> Void)?
         private let onToggleSelection: ((PhotoItem) -> Void)?
+        private let onSelectionChanged: ((Set<PhotoUID>) -> Void)?
         private let dragOutProvider: (any OriginalFileProvider)?
         private let onDragOutFailed: ((DragOutFailureKind) -> Void)?
         private let contextMenuActions: (([PhotoItem]) -> [PhotoContextMenuAction])?
@@ -84,6 +85,7 @@
             onFirstContentReady: (() -> Void)? = nil,
             onOpenPhoto: ((PhotoItem) -> Void)? = nil,
             onToggleSelection: ((PhotoItem) -> Void)? = nil,
+            onSelectionChanged: ((Set<PhotoUID>) -> Void)? = nil,
             dragOutProvider: (any OriginalFileProvider)? = nil,
             onDragOutFailed: ((DragOutFailureKind) -> Void)? = nil,
             contextMenuActions: (([PhotoItem]) -> [PhotoContextMenuAction])? = nil,
@@ -111,6 +113,7 @@
             self.onFirstContentReady = onFirstContentReady
             self.onOpenPhoto = onOpenPhoto
             self.onToggleSelection = onToggleSelection
+            self.onSelectionChanged = onSelectionChanged
             self.dragOutProvider = dragOutProvider
             self.onDragOutFailed = onDragOutFailed
             self.contextMenuActions = contextMenuActions
@@ -151,6 +154,7 @@
             view.onFirstContentReady = onFirstContentReady
             view.onOpenPhoto = onOpenPhoto
             view.onToggleSelection = onToggleSelection
+            view.onSelectionChanged = onSelectionChanged
             view.dragOutProvider = dragOutProvider
             view.onDragOutFailed = onDragOutFailed
             view.contextMenuActions = contextMenuActions
@@ -172,6 +176,7 @@
             uiView.onFirstContentReady = onFirstContentReady
             uiView.onOpenPhoto = onOpenPhoto
             uiView.onToggleSelection = onToggleSelection
+            uiView.onSelectionChanged = onSelectionChanged
             uiView.dragOutProvider = dragOutProvider
             uiView.onDragOutFailed = onDragOutFailed
             uiView.contextMenuActions = contextMenuActions
@@ -406,6 +411,12 @@
         /// toggles that item's membership in the selection set.
         public var onToggleSelection: ((PhotoItem) -> Void)?
 
+        /// Called on the main actor with the complete selection whenever a swipe selection changes it. Setting nil
+        /// disables swipe selection; tap and accessibility toggles still use `onToggleSelection`.
+        public var onSelectionChanged: ((Set<PhotoUID>) -> Void)? {
+            didSet { swipeSelection.updateEnabled() }
+        }
+
         /// The original-file backend that powers native drag-out. Setting it installs the drag interaction;
         /// setting nil removes drag-out support without affecting tap or zoom.
         public var dragOutProvider: (any OriginalFileProvider)? {
@@ -426,6 +437,10 @@
         /// Retained drag-out machinery; owned by the host but implemented entirely in
         /// UIKitTimelineGridHostDrag.swift to keep this file focused on hosting duties.
         var dragOutController: UIKitTimelineGridDragOutController?
+
+        /// Photos-style swipe and press-and-hold range selection; implemented in
+        /// UIKitTimelineGridHostSwipeSelection.swift.
+        private(set) lazy var swipeSelection = UIKitTimelineGridSwipeSelectionController(host: self)
 
         public override init(frame: CGRect = .zero) {
             displayLink = UIKitTimelineDisplayLinkDriver()
@@ -489,6 +504,7 @@
         ) {
             self.selectionMode = selectionMode
             self.selectedUIDs = selectedUIDs
+            swipeSelection.updateEnabled()
             let feedChanged = wiredFeed !== thumbnailFeed
             let contentChanged: Bool
             if let contentRevision {
@@ -558,6 +574,8 @@
             self.levelOverride = level
             self.displayMode = displayMode
             if uidsChanged {
+                // A range anchored in the previous item order cannot continue in the new one.
+                swipeSelection.cancel()
                 resizeAnchorItemID = nil
                 contentGeneration &+= 1
                 committedPhase = nil
@@ -708,6 +726,7 @@
             aheadWarmTask?.cancel()
             aheadWarmInFlight = false
             cancelLiveZoomState()
+            swipeSelection.cancel()
             scrollInputActive = false
             pinchInputActive = false
             updateFeedInteractionState()
@@ -767,6 +786,11 @@
             let tap = UITapGestureRecognizer(target: self, action: #selector(handleTap(_:)))
             tap.delegate = self
             scrollView.addGestureRecognizer(tap)
+
+            // Selection mode only: a horizontal swipe or a press-and-hold selects a range. Releasing a hold must not
+            // also toggle its anchor as a tap.
+            swipeSelection.install(on: scrollView)
+            tap.require(toFail: swipeSelection.hold)
 
             let pinch = UIPinchGestureRecognizer(target: self, action: #selector(handlePinch(_:)))
             pinch.delegate = self
@@ -1819,14 +1843,13 @@
 
     extension UIKitTimelineGridHostView: UIGestureRecognizerDelegate {
         /// Let tap / pinch coexist with the scroll view's own pan (and each other) - a two-finger pinch and a
-        /// one-finger scroll never contend, and a tap requires no movement. The drag-select long press also begins
-        /// alongside the scroll pan (both must track the touch so the press can mature); it disables scrolling itself
-        /// once it begins, so the two never move the grid at the same time.
+        /// one-finger scroll never contend, and a tap requires no movement. A swipe selection is exclusive, so a
+        /// pinch cannot start while a range is being selected.
         public func gestureRecognizer(
             _ gestureRecognizer: UIGestureRecognizer,
             shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer
         ) -> Bool {
-            true
+            other !== swipeSelection.pan && other !== swipeSelection.hold
         }
     }
 #endif
