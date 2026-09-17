@@ -1445,6 +1445,38 @@ struct ThumbnailFeedCoreTests {
         await feed.stopPrefetchAndWait()
     }
 
+    @Test func burstFilmstripMembersAreReadableAlthoughTheyAreNotLibraryItems() async throws {
+        let key = Self.uid("burst-key")
+        let member = Self.uid("burst-member")
+        let cache = Self.cache("burst-member-read")
+        let loader = RecordingLoader(payloads: [member: Self.pngData(width: 8, height: 8)])
+        let feed = ThumbnailFeedCore(cache: cache, loader: loader, configuration: Self.configuration())
+        await feed.setPrefetchEnabled(false)
+        let graph = LibrarySourceGraph()
+        let source = LibrarySource(id: SourceID("burst-test"), capabilities: .readThumbnail, isIncluded: true)
+        _ = graph.commitSourceSet([source], using: graph.beginSourceSetRefresh())
+        let keyItem = PhotoItem(
+            uid: key,
+            captureTime: Date(timeIntervalSince1970: 0),
+            mediaType: "image/jpeg",
+            burstMemberIDs: [key.nodeID, member.nodeID]
+        )
+        let change = try #require(
+            graph.commit([.complete(keyItem)], validationToken: nil, using: graph.beginRefresh(source.id)!))
+        // A burst member belongs to the thumbnail retention scope, not to the analysis scope.
+        #expect(!change.analysisScope.uids.contains(member))
+        #expect(change.thumbnailRetentionScope.uids.contains(member))
+        #expect(await feed.bindDerivedDataEpoch(graph.runtimeEpoch))
+        _ = await feed.reconcile(
+            selected: change.selectedScope, analysis: change.analysisScope,
+            retention: change.thumbnailRetentionScope)
+
+        #expect(await feed.decoded(for: member) != nil, "an opened series must load its member thumbnails")
+        #expect(feed.memoryDecoded(for: member) != nil)
+        #expect(await loader.requestCount() == 1)
+        await feed.stopPrefetchAndWait()
+    }
+
     private static func visibleScope(
         in graph: LibrarySourceGraph, uids: [PhotoUID], includedInLibrary: Bool = true
     ) -> LibrarySourceChange {
