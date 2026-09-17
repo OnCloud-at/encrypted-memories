@@ -2335,6 +2335,9 @@ public actor MLSmartSearchLifecycle {
                 false
             }
         if previousCatalog != refreshed || recoveredFromCatalogFailure { emit() }
+        // A pending Visual Search removal owns the phase. Replacing its retryable failure would hide
+        // the only way to finish the journaled cleanup.
+        guard !isRemovingVisualSearch else { return }
 
         if persistent.selectedModelID == nil {
             phase = .selectingModel

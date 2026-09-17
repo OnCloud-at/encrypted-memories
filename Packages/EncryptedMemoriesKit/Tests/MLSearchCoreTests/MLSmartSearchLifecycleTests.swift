@@ -2227,6 +2227,57 @@ import Testing
         #expect(harness.transport.downloadCount == 2)
     }
 
+    @Test func failedVisualRemovalStaysRetryableAcrossCatalogRefresh() async throws {
+        let payload = Data("model-bytes".utf8)
+        let (entry, url) = downloadableEntry(id: "model", payload: payload)
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ml-failed-visual-removal-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let flaky = FlakyStateStore(layout: MLModelInstallLayout(rootDirectory: root))
+        let harness = try makeHarness(
+            catalog: MLModelCatalog(entries: [entry]),
+            payloads: [url: payload],
+            assets: [uid("asset")],
+            root: root,
+            stateStoreOverride: flaky,
+            catalogRefreshInterval: .zero
+        )
+
+        await harness.lifecycle.start()
+        await harness.lifecycle.setEnabled(true)
+        harness.provider.blockNextSessionLoad()
+        let activation = Task { await harness.lifecycle.select(entry.id) }
+        #expect(await waitUntil { harness.provider.sessionLoadStarted })
+
+        let disable = Task { await harness.lifecycle.setVisualSearchEnabled(false) }
+        #expect(await waitUntil { harness.provider.sessionLoadCancellations == 1 })
+        // The journal is written; the commit after cleanup fails.
+        flaky.setFailing(true)
+        harness.provider.releaseBlockedSessionLoad()
+        await disable.value
+        await activation.value
+        #expect(await waitForStorageFailure(harness))
+
+        await harness.lifecycle.noteConditionsChanged()
+        guard case .failed(let failure) = await harness.lifecycle.currentSnapshot().phase else {
+            Issue.record("catalog refresh replaced the retryable removal failure")
+            return
+        }
+        #expect(failure.isRetryable)
+        #expect(try flaky.load()?.pendingOperation == .disableVisualSearch(model: entry.id))
+
+        flaky.setFailing(false)
+        await harness.lifecycle.retry()
+        #expect(
+            await waitUntil {
+                await harness.lifecycle.currentSnapshot().phase == .selectingModel
+            })
+        #expect(try flaky.load()?.pendingOperation == nil)
+        #expect(try flaky.load()?.selectedModelID == nil)
+        #expect(!FileManager.default.fileExists(atPath: harness.layout.modelDirectory(for: entry.id).path))
+    }
+
     @Test func activationCannotCommitAfterNewerSelection() async throws {
         let payloadA = Data("model-a-bytes".utf8)
         let payloadB = Data("model-b-bytes".utf8)
