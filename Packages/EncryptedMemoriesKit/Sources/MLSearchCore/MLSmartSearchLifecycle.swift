@@ -2165,12 +2165,16 @@ public actor MLSmartSearchLifecycle {
             }
         }
 
+        // "Turn Off and Remove" also forgets the model choice. Re-enabling Visual Search must ask
+        // for a model again instead of silently downloading the removed one.
         persistent.isVisualSearchEnabled = false
+        persistent.selectedModelID = nil
         persistent.activatedRevision = nil
         persistent.activatedDescriptor = nil
         persistent.pendingOperation = nil
         guard persistState() else {
             persistent.pendingOperation = .disableVisualSearch(model: model)
+            persistent.selectedModelID = model
             persistent.activatedDescriptor = descriptor
             return false
         }

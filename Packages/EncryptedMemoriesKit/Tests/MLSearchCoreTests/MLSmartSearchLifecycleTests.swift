@@ -2171,6 +2171,7 @@ import Testing
         #expect(!FileManager.default.fileExists(atPath: modelDirectory.path))
         #expect(try harness.stateStore.load()?.pendingOperation == nil)
         #expect(try harness.stateStore.load()?.isVisualSearchEnabled == false)
+        #expect(try harness.stateStore.load()?.selectedModelID == nil)
         #expect(try harness.stateStore.load()?.activatedRevision == nil)
         #expect(await harness.lifecycle.currentSnapshot().isEnabled)
     }
@@ -2669,7 +2670,8 @@ import Testing
         let disabled = await harness.lifecycle.currentSnapshot()
         #expect(disabled.isEnabled)
         #expect(!disabled.isVisualSearchEnabled)
-        #expect(disabled.selectedModelID == entry.id)
+        #expect(disabled.selectedModelID == nil)
+        #expect(try harness.stateStore.load()?.selectedModelID == nil)
         #expect(harness.storeProvider.store.count(for: entry.descriptor) == 0)
         #expect(!FileManager.default.fileExists(atPath: harness.layout.modelDirectory(for: entry.id).path))
         #expect(nativeSearch.shutdownCount == 0)
@@ -2678,7 +2680,14 @@ import Testing
             _ = try await harness.lifecycle.search("anything", limit: 5)
         }
 
+        // Re-enabling after removal asks for a model again; it must not download the removed one.
         await harness.lifecycle.setVisualSearchEnabled(true)
+        let awaitingChoice = await harness.lifecycle.currentSnapshot()
+        #expect(awaitingChoice.selectedModelID == nil)
+        #expect(awaitingChoice.phase == .selectingModel)
+        #expect(harness.transport.downloadCount == 1)
+
+        await harness.lifecycle.select(entry.id)
         #expect(await waitForCompleteIndex(harness, total: assets.count))
         let reenabled = await harness.lifecycle.currentSnapshot()
         #expect(reenabled.isVisualSearchEnabled)
@@ -2724,7 +2733,7 @@ import Testing
         let recovered = await harness.lifecycle.currentSnapshot()
         #expect(recovered.isEnabled)
         #expect(!recovered.isVisualSearchEnabled)
-        #expect(recovered.selectedModelID == entry.id)
+        #expect(recovered.selectedModelID == nil)
         #expect(harness.storeProvider.store.count(for: entry.descriptor) == 0)
         #expect(!FileManager.default.fileExists(atPath: layout.modelDirectory(for: entry.id).path))
         #expect(try stateStore.load()?.pendingOperation == nil)
