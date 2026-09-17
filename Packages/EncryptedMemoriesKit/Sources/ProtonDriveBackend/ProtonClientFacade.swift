@@ -161,7 +161,10 @@ public final class ProtonClientFacade {
             uploadCoordinator: coordinator,
             photoUploader: bridge,
             photoTagAdder: bridge,
-            seriesDissolution: bridge.makeSeriesDissolution(duplicateChecker: identityComposition.duplicateChecker),
+            seriesDissolution: bridge.makeSeriesDissolution(
+                duplicateChecker: identityComposition.duplicateChecker,
+                albums: AlbumRepositorySeriesCarryOver(repository: albumsRepo)
+            ),
             uploadIdentityResolver: identityResolver,
             accountDataDirectory: bridge.uploadManifestURL.deletingLastPathComponent(),
             accountDatabasePolicy: bridge.uploadManifestPolicy,

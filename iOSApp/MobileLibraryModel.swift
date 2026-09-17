@@ -265,6 +265,9 @@ final class MobileLibraryModel {
     /// state immediately, but monitoring is gated until this launch has one stable result or a handled failure.
     private var initialLibraryLoadSettled = false
     private var favoriteLoadTask: Task<Void, Never>?
+    /// Resume and abandon work of "Keep Only Favorites". Teardown cancels it, so no journal write survives
+    /// the account. The orchestrator's own admission gate joins a write that is already in flight.
+    private var seriesDissolutionTask: Task<Void, Never>?
     /// Mutations newer than the in-flight authoritative favorite read. The loader merges this journal before
     /// publishing, so a slow response cannot erase a newer heart tap.
     @ObservationIgnored private var favoriteLoadOverrides: [PhotoUID: Bool] = [:]
@@ -366,7 +369,9 @@ final class MobileLibraryModel {
     /// can finish the operation without the user. Copies that are already saved stay as standalone photos.
     func abandonKeepOnlySeriesFavorites(seriesMainUID: PhotoUID) {
         guard let dissolution = facade?.seriesDissolution else { return }
-        Task {
+        let previous = seriesDissolutionTask
+        seriesDissolutionTask = Task {
+            await previous?.value
             do {
                 try await dissolution.abandon(seriesMainUID: seriesMainUID)
             } catch {
@@ -403,7 +408,9 @@ final class MobileLibraryModel {
         _ uids: Set<PhotoUID>,
         after remoteMutation: () async throws -> Void
     ) async throws {
-        guard let mutationLease = currentMutationLease() else { return }
+        // No session means no library to mutate. The caller must see that nothing happened: a remote
+        // operation like "Keep Only Favorites" would otherwise report success without doing anything.
+        guard let mutationLease = currentMutationLease() else { throw CancellationError() }
         try Task.checkCancellation()
         let locationStoreLease = locationStore.captureSessionLease()
         try await remoteMutation()
@@ -683,6 +690,7 @@ final class MobileLibraryModel {
                 self.prefetchStartTask?.cancel()
                 self.isThumbnailPrefetchLoading = false
                 self.favoriteLoadTask?.cancel()
+                self.seriesDissolutionTask?.cancel()
                 self.snapshot = TimelineSnapshot()
                 self.sections = []
                 self.favoriteUIDs = []
@@ -1061,6 +1069,8 @@ final class MobileLibraryModel {
         isThumbnailPrefetchLoading = false
         favoriteLoadTask?.cancel()
         favoriteLoadTask = nil
+        seriesDissolutionTask?.cancel()
+        seriesDissolutionTask = nil
         favoriteMutationsInFlight = []
         favoriteLoadOverrides.removeAll(keepingCapacity: false)
         favoriteLoadSettled = false
@@ -1415,7 +1425,8 @@ final class MobileLibraryModel {
                 }
                 self.facade = client
                 if let seriesDissolution = client.seriesDissolution {
-                    Task(priority: .utility) { [weak self] in
+                    self.seriesDissolutionTask?.cancel()
+                    self.seriesDissolutionTask = Task(priority: .utility) { [weak self] in
                         await self?.resumePendingSeriesDissolutions(seriesDissolution)
                     }
                 }

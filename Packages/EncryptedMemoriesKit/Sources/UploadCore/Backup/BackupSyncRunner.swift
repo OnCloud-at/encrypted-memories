@@ -2085,7 +2085,8 @@ private enum BackupUploadResolution: @unchecked Sendable {
     case cancelled
 }
 
-private final class BackupUploadCancellation: @unchecked Sendable {
+/// Requests the native cancellation of one upload token once. Every caller joins the same request.
+final class BackupUploadCancellation: @unchecked Sendable {
     private let lock = NSLock()
     private var task: Task<Void, Never>?
 

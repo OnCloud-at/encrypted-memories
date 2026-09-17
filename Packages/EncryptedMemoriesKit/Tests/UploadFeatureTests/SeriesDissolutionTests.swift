@@ -10,10 +10,15 @@ final class SeriesDissolutionTests: XCTestCase {
     private var tempDir: URL!
     private var server: FakeSeriesServer!
     private var journalStore: SeriesDissolutionJournalFileStore!
+    private var admission: JoinedShutdownGate!
 
     private let main = PhotoUID(volumeID: "own", nodeID: "m1")
     private var series: [PhotoUID] { ["m1", "m2", "m3", "m4"].map { PhotoUID(volumeID: "own", nodeID: $0) } }
     private func member(_ id: String) -> PhotoUID { PhotoUID(volumeID: "own", nodeID: id) }
+    /// The expected node ids of a carry-over target: the series rows that had it plus every standalone copy.
+    private func expected(_ sourceNodeIDs: [String], _ copies: [PhotoUID]) -> Set<String> {
+        Set(sourceNodeIDs).union(copies.map(\.nodeID))
+    }
 
     override func setUpWithError() throws {
         tempDir = FileManager.default.temporaryDirectory
@@ -21,6 +26,7 @@ final class SeriesDissolutionTests: XCTestCase {
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
         server = FakeSeriesServer(ownVolumeID: "own", seriesNodeIDs: ["m1", "m2", "m3", "m4"])
         journalStore = SeriesDissolutionJournalFileStore(accountDataDirectory: tempDir)
+        admission = JoinedShutdownGate()
     }
 
     override func tearDownWithError() throws {
@@ -31,9 +37,11 @@ final class SeriesDissolutionTests: XCTestCase {
     private func makeOrchestrator() -> SeriesDissolutionOrchestrator {
         SeriesDissolutionOrchestrator(
             remote: server,
+            albums: server,
             uploader: server,
             duplicateChecker: server,
             journalStore: journalStore,
+            admission: admission,
             tempDirectory: tempDir.appendingPathComponent("work", isDirectory: true),
             currentClientUID: "this-installation"
         )
@@ -207,6 +215,109 @@ final class SeriesDissolutionTests: XCTestCase {
         XCTAssertEqual(copies.count, 2)
     }
 
+    // MARK: Favorite tag and album carryover
+
+    func testCopiesKeepTheFavoriteTagAndTheOwnAlbumsOfTheSeries() async throws {
+        server.markFavoriteNodeIDs(["m1"])  // the user favorited the series; Proton tags its main photo
+        server.addAlbum("album-own", volumeID: "own", members: ["m1"])
+        server.addAlbum("album-shared", volumeID: "shared-volume", members: ["m1"])
+
+        let copies = try await makeOrchestrator().keepOnlyFavorites(
+            seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2"), member("m4")])
+
+        XCTAssertEqual(
+            server.favoriteNodeIDs, expected(["m1"], copies), "every copy keeps the favorite state")
+        XCTAssertEqual(
+            server.albumMembers("album-own"), expected(["m1"], copies), "every copy joins the own album")
+        XCTAssertEqual(
+            server.albumMembers("album-shared"), ["m1"],
+            "a shared album lies in a foreign volume; the operation never writes there")
+        XCTAssertEqual(server.trashCalls, [series])
+    }
+
+    func testAMemberThatIsFavoritedAloneOnlyTagsItsOwnCopy() async throws {
+        server.markFavoriteNodeIDs(["m2"])
+
+        let copies = try await makeOrchestrator().keepOnlyFavorites(
+            seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2"), member("m4")])
+
+        let copyOfM2 = try XCTUnwrap(copies.first)
+        XCTAssertEqual(server.favoriteNodeIDs, ["m2", copyOfM2.nodeID])
+    }
+
+    func testAFailedAlbumWriteKeepsTheSeriesAndTheRetryAddsEachCopyOnce() async throws {
+        server.addAlbum("album-own", volumeID: "own", members: ["m1"])
+        server.failNextAlbumWrite()
+        do {
+            try await makeOrchestrator().keepOnlyFavorites(
+                seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2")])
+            XCTFail("the album write failed, so the operation must not finish")
+        } catch {}
+        XCTAssertTrue(server.trashCalls.isEmpty, "the series stays until every copy carries its albums")
+        XCTAssertEqual(try journalStore.journal(forSeries: main)?.phase, .copyingFavorites)
+
+        let copies = try await makeOrchestrator().keepOnlyFavorites(
+            seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2")])
+
+        XCTAssertEqual(server.uploads.count, 1, "the confirmed copy is reused instead of uploaded again")
+        XCTAssertEqual(server.albumMembers("album-own"), expected(["m1"], copies))
+        XCTAssertEqual(server.trashCalls, [series])
+    }
+
+    func testTheCarryoverRunsBeforeTheSeriesReachesTheTrash() async throws {
+        server.markFavoriteNodeIDs(["m1"])
+        server.addAlbum("album-own", volumeID: "own", members: ["m1"])
+
+        _ = try await makeOrchestrator().keepOnlyFavorites(
+            seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2")])
+
+        XCTAssertEqual(server.events, [.upload, .favorite, .albumAdd, .trash])
+    }
+
+    // MARK: Server-side membership and the trash confirmation
+
+    func testAMemberThatOnlyTheServerKnowsMovesToTheTrashWithTheSeries() async throws {
+        server.addRemoteRow(name: "m5.HEIC", contentOf: "m3", state: .active, linkID: "m5", clientUID: nil)
+        server.addServerRelatedNodeIDs(["m1", "m2", "m3", "m4", "m5"])  // m5 arrived after the caller read the series
+
+        _ = try await makeOrchestrator().keepOnlyFavorites(
+            seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2")])
+
+        XCTAssertEqual(server.trashCalls.first?.map(\.nodeID).sorted(), ["m1", "m2", "m3", "m4", "m5"])
+    }
+
+    func testARetryKeepsAMemberThatOnlyTheJournalKnows() async throws {
+        server.addRemoteRow(name: "m5.HEIC", contentOf: "m3", state: .active, linkID: "m5", clientUID: nil)
+        server.failUploads(named: "m2.HEIC", times: 1)
+        let full = series + [member("m5")]
+        _ = try? await makeOrchestrator().keepOnlyFavorites(
+            seriesMainUID: main, seriesUIDs: full, favoriteUIDs: [member("m2")])
+
+        // The retry passes the shorter list that the timeline still shows.
+        _ = try await makeOrchestrator().keepOnlyFavorites(
+            seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2")])
+
+        XCTAssertEqual(server.trashCalls.first?.map(\.nodeID).sorted(), ["m1", "m2", "m3", "m4", "m5"])
+    }
+
+    func testASeriesThatStaysActiveAfterTheTrashRequestKeepsItsJournal() async throws {
+        server.acceptNextTrashWithoutEffect()
+        do {
+            try await makeOrchestrator().keepOnlyFavorites(
+                seriesMainUID: main, seriesUIDs: series, favoriteUIDs: [member("m2")])
+            XCTFail("the photos stayed active, so the operation must not report success")
+        } catch let error as SeriesDissolutionError {
+            XCTAssertEqual(error, .trashNotConfirmed)
+        }
+        XCTAssertEqual(try journalStore.journal(forSeries: main)?.phase, .trashingSeries)
+
+        let outcomes = try await makeOrchestrator().resumePending()
+        XCTAssertEqual(outcomes.count, 1)
+        XCTAssertNoThrow(try outcomes[0].result.get())
+        XCTAssertEqual(server.uploads.count, 1, "the resume never copies again")
+        XCTAssertEqual(try journalStore.pendingJournals(), [])
+    }
+
     // MARK: Refusals
 
     func testSharedAlbumSeriesIsRefusedBeforeAnyRemoteWrite() async throws {
@@ -253,7 +364,17 @@ final class SeriesDissolutionTests: XCTestCase {
         let decision = SeriesFavoriteCopyPolicy.decide(
             nameHash: "nh", contentHash: "ch",
             remoteItems: [.init(nameHash: "nh", contentHash: "ch", linkState: .active, linkID: "m2")],
-            seriesLinkIDs: ["m1", "m2"], currentClientUID: "me")
+            memberLinkID: "m2", seriesLinkIDs: ["m1", "m2"], currentClientUID: "me")
+        XCTAssertEqual(decision, .upload(replacingDraft: false))
+    }
+
+    func testTheMembersOwnRowIsIgnoredEvenWhenTheMembershipIsStale() {
+        // The journal lost this member from its list, so `seriesLinkIDs` does not name it. Adopting its own
+        // row would link the favorite to the photo that the trash step removes.
+        let decision = SeriesFavoriteCopyPolicy.decide(
+            nameHash: "nh", contentHash: "ch",
+            remoteItems: [.init(nameHash: "nh", contentHash: "ch", linkState: .active, linkID: "m2")],
+            memberLinkID: "m2", seriesLinkIDs: ["m1"], currentClientUID: "me")
         XCTAssertEqual(decision, .upload(replacingDraft: false))
     }
 
@@ -264,7 +385,7 @@ final class SeriesDissolutionTests: XCTestCase {
                 .init(nameHash: "nh", contentHash: "ch", linkState: .active, linkID: "m2"),
                 .init(nameHash: "nh", contentHash: "ch", linkState: .active, linkID: "standalone"),
             ],
-            seriesLinkIDs: ["m1", "m2"], currentClientUID: "me")
+            memberLinkID: "m2", seriesLinkIDs: ["m1", "m2"], currentClientUID: "me")
         XCTAssertEqual(decision, .adopt(remoteLinkID: "standalone"))
     }
 
@@ -275,7 +396,7 @@ final class SeriesDissolutionTests: XCTestCase {
                 remoteItems: [
                     .init(nameHash: "nh", contentHash: nil, linkState: .draft, linkID: "d", clientUID: clientUID)
                 ],
-                seriesLinkIDs: ["m1"], currentClientUID: "me")
+                memberLinkID: "m1", seriesLinkIDs: ["m1"], currentClientUID: "me")
         }
         XCTAssertEqual(decide(clientUID: "me"), .upload(replacingDraft: true))
         XCTAssertEqual(decide(clientUID: "other-device"), .blockedByForeignDraft)
@@ -291,7 +412,7 @@ final class SeriesDissolutionTests: XCTestCase {
                 .init(nameHash: "nh", contentHash: "other", linkState: .active, linkID: "same-name"),
                 .init(nameHash: "unrelated", contentHash: "ch", linkState: .active, linkID: "other-name"),
             ],
-            seriesLinkIDs: [], currentClientUID: "me")
+            memberLinkID: "m2", seriesLinkIDs: [], currentClientUID: "me")
         XCTAssertEqual(
             decision, .upload(replacingDraft: false),
             "the user keeps this favorite now; an older deletion of an identical file must not remove it")
@@ -337,10 +458,10 @@ final class SeriesDissolutionTests: XCTestCase {
 
 /// In-memory Proton for the dissolution seams: nodes with names, bytes and states, the duplicates endpoint,
 /// uploads and the trash. Thread-safe; failure injection models errors and crashes.
-private final class FakeSeriesServer: SeriesDissolutionRemote, PhotoUploading, UploadDuplicateChecking,
-    @unchecked Sendable
+private final class FakeSeriesServer: SeriesDissolutionRemote, SeriesAlbumCarryOver, PhotoUploading,
+    UploadDuplicateChecking, @unchecked Sendable
 {
-    enum Event: Equatable { case upload, trash }
+    enum Event: Equatable { case upload, trash, favorite, albumAdd }
 
     private struct Node {
         var name: String
@@ -357,9 +478,17 @@ private final class FakeSeriesServer: SeriesDissolutionRemote, PhotoUploading, U
     private var uploadFailures: [String: Int] = [:]
     private var commitThenFail: [String: Int] = [:]
     private var trashFailures = 0
+    private var favoriteFailures = 0
+    private var albumFailures = 0
     private var _uploads: [PhotoUploadRequest] = []
     private var _trashCalls: [[PhotoUID]] = []
     private var _events: [Event] = []
+    private var _favorites = Set<String>()
+    /// Album memberships of this fake Proton, keyed by album node id, plus the volume the album lives in.
+    private var _albums: [String: (volumeID: String, members: Set<String>)] = [:]
+    /// Related photos that the server reports for the main photo, even when the caller did not know them.
+    private var _serverRelatedNodeIDs = Set<String>()
+    private var _trashRemainsActive = false
 
     init(ownVolumeID: String, seriesNodeIDs: [String]) {
         self.ownVolumeID = ownVolumeID
@@ -380,6 +509,19 @@ private final class FakeSeriesServer: SeriesDissolutionRemote, PhotoUploading, U
     func captureTime(of id: String) -> Date {
         Date(timeIntervalSince1970: 1_700_000_000 + Double(id.unicodeScalars.last?.value ?? 0))
     }
+
+    var favoriteNodeIDs: Set<String> { lock.withLock { _favorites } }
+    func albumMembers(_ albumID: String) -> Set<String> { lock.withLock { _albums[albumID]?.members ?? [] } }
+
+    func markFavoriteNodeIDs(_ ids: [String]) { lock.withLock { _favorites.formUnion(ids) } }
+    func addAlbum(_ albumID: String, volumeID: String, members: [String]) {
+        lock.withLock { _albums[albumID] = (volumeID, Set(members)) }
+    }
+    func addServerRelatedNodeIDs(_ ids: [String]) { lock.withLock { _serverRelatedNodeIDs.formUnion(ids) } }
+    func failNextFavoriteWrite() { lock.withLock { favoriteFailures = 1 } }
+    func failNextAlbumWrite() { lock.withLock { albumFailures = 1 } }
+    /// The next trash request reports success while its photos stay active, as Proton did in the field.
+    func acceptNextTrashWithoutEffect() { lock.withLock { _trashRemainsActive = true } }
 
     func failUploads(named name: String, times: Int) { lock.withLock { uploadFailures[name] = times } }
     func commitThenFailUploads(named name: String, times: Int) { lock.withLock { commitThenFail[name] = times } }
@@ -433,7 +575,48 @@ private final class FakeSeriesServer: SeriesDissolutionRemote, PhotoUploading, U
             }
             _trashCalls.append(uids)
             _events.append(.trash)
+            guard !_trashRemainsActive else {
+                _trashRemainsActive = false
+                return
+            }
             for uid in uids { nodes[uid.nodeID]?.state = .trashed }
+        }
+    }
+
+    func favoriteUIDs(among uids: [PhotoUID]) async throws -> Set<PhotoUID> {
+        lock.withLock { Set(uids.filter { _favorites.contains($0.nodeID) }) }
+    }
+
+    func markFavorite(_ uids: [PhotoUID]) async throws {
+        try lock.withLock {
+            if favoriteFailures > 0 {
+                favoriteFailures -= 1
+                throw UploadError.retryableBackend(code: 503, message: "tag write unavailable")
+            }
+            _events.append(.favorite)
+            _favorites.formUnion(uids.map(\.nodeID))
+        }
+    }
+
+    // SeriesAlbumCarryOver
+
+    func albums(containing uid: PhotoUID) async throws -> [SeriesAlbumReference] {
+        lock.withLock {
+            _albums
+                .filter { $0.value.members.contains(uid.nodeID) }
+                .map { SeriesAlbumReference(volumeID: $0.value.volumeID, albumID: $0.key) }
+                .sorted { $0.albumID < $1.albumID }
+        }
+    }
+
+    func addPhotos(_ uids: [PhotoUID], toOwnAlbum albumID: String) async throws {
+        try lock.withLock {
+            if albumFailures > 0 {
+                albumFailures -= 1
+                throw UploadError.retryableBackend(code: 503, message: "album write unavailable")
+            }
+            _events.append(.albumAdd)
+            _albums[albumID]?.members.formUnion(uids.map(\.nodeID))
         }
     }
 
@@ -467,7 +650,9 @@ private final class FakeSeriesServer: SeriesDissolutionRemote, PhotoUploading, U
     func nameHash(forCorrectedName name: String) async throws -> String { "nh(\(name))" }
     func contentHash(forSHA1Hex sha1Hex: String) async throws -> String { "ch(\(sha1Hex))" }
     func hashKeyEpoch() async throws -> String { "epoch" }
-    func relatedPhotoLinkIDs(ofMainLinkID mainLinkID: String) async throws -> Set<String> { [] }
+    func relatedPhotoLinkIDs(ofMainLinkID mainLinkID: String) async throws -> Set<String> {
+        lock.withLock { _serverRelatedNodeIDs }
+    }
 
     func findDuplicates(nameHashes: [String]) async throws -> [RemotePhotoDuplicate] {
         lock.withLock {

@@ -20,16 +20,38 @@ public struct SeriesDissolutionJournal: Codable, Sendable, Equatable {
         public let memberUID: PhotoUID
         /// The standalone photo that holds this favorite's original bytes. Nil until it is confirmed.
         public var copyUID: PhotoUID?
+        /// True once the copy carries Proton's favorite tag. The tag is written once per copy.
+        public var favoriteTagAdded: Bool
+        /// Albums of the own library that already contain the copy. One entry per confirmed album write.
+        public var addedAlbumIDs: [String]
 
-        public init(memberUID: PhotoUID, copyUID: PhotoUID? = nil) {
+        public init(
+            memberUID: PhotoUID,
+            copyUID: PhotoUID? = nil,
+            favoriteTagAdded: Bool = false,
+            addedAlbumIDs: [String] = []
+        ) {
             self.memberUID = memberUID
             self.copyUID = copyUID
+            self.favoriteTagAdded = favoriteTagAdded
+            self.addedAlbumIDs = addedAlbumIDs
+        }
+
+        // An app update can meet a journal that an older build wrote without the carry-over fields.
+        // Their absence means "nothing carried over yet", which is the safe state for a resume.
+        public init(from decoder: any Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            memberUID = try container.decode(PhotoUID.self, forKey: .memberUID)
+            copyUID = try container.decodeIfPresent(PhotoUID.self, forKey: .copyUID)
+            favoriteTagAdded = try container.decodeIfPresent(Bool.self, forKey: .favoriteTagAdded) ?? false
+            addedAlbumIDs = try container.decodeIfPresent([String].self, forKey: .addedAlbumIDs) ?? []
         }
     }
 
     public let seriesMainUID: PhotoUID
     /// Every photo of the series, the main photo included. All of them move to the trash together.
-    public let seriesUIDs: [PhotoUID]
+    /// A retry or a server read can add a member that the caller did not know.
+    public var seriesUIDs: [PhotoUID]
     public var favorites: [Favorite]
     public var phase: Phase
 

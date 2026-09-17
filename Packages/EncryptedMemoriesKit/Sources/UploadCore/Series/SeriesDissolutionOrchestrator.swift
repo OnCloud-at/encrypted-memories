@@ -27,6 +27,17 @@ public struct SeriesMemberSource: Sendable, Equatable {
     }
 }
 
+/// One album that contains a photo. `volumeID` tells an album of the own library from a shared album.
+public struct SeriesAlbumReference: Sendable, Hashable {
+    public let volumeID: String
+    public let albumID: String
+
+    public init(volumeID: String, albumID: String) {
+        self.volumeID = volumeID
+        self.albumID = albumID
+    }
+}
+
 /// Remote reads and the trash write of a series dissolution. The backend implements it; tests use a fake.
 public protocol SeriesDissolutionRemote: OriginalFileProvider {
     /// The account's own photos volume. A series in any other volume belongs to a shared album.
@@ -34,8 +45,21 @@ public protocol SeriesDissolutionRemote: OriginalFileProvider {
     func source(for member: PhotoUID) async throws -> SeriesMemberSource
     /// The subset of `uids` that are active photos now: not trashed, not deleted, not drafts.
     func activeUIDs(among uids: [PhotoUID]) async throws -> Set<PhotoUID>
+    /// The subset of `uids` that carry Proton's favorite tag now.
+    func favoriteUIDs(among uids: [PhotoUID]) async throws -> Set<PhotoUID>
+    /// Adds Proton's favorite tag to the photos. Fails when any photo does not confirm the tag.
+    func markFavorite(_ uids: [PhotoUID]) async throws
     /// Moves the photos to the Proton trash, where the user can restore them.
     func trashSeries(_ uids: [PhotoUID]) async throws
+}
+
+/// Reads the albums of a series photo and adds its standalone copies to the same albums.
+public protocol SeriesAlbumCarryOver: Sendable {
+    /// Every album that contains the photo now, shared albums included.
+    func albums(containing uid: PhotoUID) async throws -> [SeriesAlbumReference]
+    /// Adds the photos to an album of the account's own library. A shared album is never a valid target.
+    /// Succeeds only when every photo is a member afterwards; an existing membership counts as success.
+    func addPhotos(_ uids: [PhotoUID], toOwnAlbum albumID: String) async throws
 }
 
 // MARK: - Dedupe collision rule
@@ -47,7 +71,8 @@ public protocol SeriesDissolutionRemote: OriginalFileProvider {
 /// member that is about to move to the trash. The favorite would be lost.
 ///
 /// Rule. The copy keeps the member's original filename. Proton's duplicate rows for that name are read, and
-/// every row that belongs to the series is ignored, because the series is the source and not a copy. Then:
+/// every row that belongs to the series is ignored, because the series is the source and not a copy. The
+/// member's own row is ignored even when a stale membership misses it. Then:
 /// 1. An active row with the same content is a standalone copy that already exists: an earlier attempt
 ///    committed it before the journal recorded it, or the user uploaded the same file separately. It is
 ///    adopted. No bytes upload, so a retry never creates a duplicate.
@@ -67,11 +92,13 @@ public enum SeriesFavoriteCopyPolicy {
         nameHash: String,
         contentHash: String,
         remoteItems: [RemotePhotoDuplicate],
+        memberLinkID: String,
         seriesLinkIDs: Set<String>,
         currentClientUID: String?
     ) -> Decision {
         let candidates = remoteItems.filter { item in
-            item.nameHash == nameHash && !(item.linkID.map(seriesLinkIDs.contains) ?? false)
+            item.nameHash == nameHash && item.linkID != memberLinkID
+                && !(item.linkID.map(seriesLinkIDs.contains) ?? false)
         }
         if let existing = candidates.first(where: { $0.linkState == .active && $0.contentHash == contentHash }),
             let linkID = existing.linkID, !linkID.isEmpty
@@ -98,6 +125,8 @@ public enum SeriesDissolutionError: LocalizedError, Equatable {
     case blockedByForeignDraft(String)
     /// A confirmed copy was not active remotely even after a second copy attempt. The series is untouched.
     case copyNotConfirmed
+    /// The trash request returned, but a photo of the series is still active. The operation stays pending.
+    case trashNotConfirmed
 
     public var errorDescription: String? {
         switch self {
@@ -106,6 +135,7 @@ public enum SeriesDissolutionError: LocalizedError, Equatable {
         case .alreadyRunning: L10n.string("error.series_already_running")
         case .blockedByForeignDraft(let name): L10n.string("error.series_draft_blocked \(name)")
         case .copyNotConfirmed: L10n.string("error.series_copy_not_confirmed")
+        case .trashNotConfirmed: L10n.string("error.series_trash_not_confirmed")
         }
     }
 }
@@ -136,29 +166,38 @@ public struct SeriesDissolutionResumeOutcome: Sendable {
 
 // MARK: - Orchestrator
 
-/// Runs "Keep Only Favorites" for a series: journal, copy every favorite, verify, then trash the series.
-/// "Keep Everything" makes no backend call and never reaches this type.
+/// Runs "Keep Only Favorites" for a series: journal, copy every favorite, verify, carry over the favorite tag and
+/// the albums, then trash the series. "Keep Everything" makes no backend call and never reaches this type.
+///
+/// Every entry point runs inside the account's shutdown gate. Account teardown cancels and joins the running
+/// operation before the sign-out purge, so no journal file or duplicate lookup outlives the account.
 public actor SeriesDissolutionOrchestrator {
     private let remote: any SeriesDissolutionRemote
+    private let albums: any SeriesAlbumCarryOver
     private let uploader: any PhotoUploading
     private let duplicateChecker: any UploadDuplicateChecking
     private let journalStore: any SeriesDissolutionJournalStore
+    private let admission: JoinedShutdownGate
     private let tempDirectory: URL
     private let currentClientUID: String?
     private var running: Set<PhotoUID> = []
 
     public init(
         remote: any SeriesDissolutionRemote,
+        albums: any SeriesAlbumCarryOver,
         uploader: any PhotoUploading,
         duplicateChecker: any UploadDuplicateChecking,
         journalStore: any SeriesDissolutionJournalStore,
+        admission: JoinedShutdownGate,
         tempDirectory: URL,
         currentClientUID: String?
     ) {
         self.remote = remote
+        self.albums = albums
         self.uploader = uploader
         self.duplicateChecker = duplicateChecker
         self.journalStore = journalStore
+        self.admission = admission
         self.tempDirectory = tempDirectory
         self.currentClientUID = currentClientUID
     }
@@ -166,8 +205,7 @@ public actor SeriesDissolutionOrchestrator {
     /// True only for a series that lies completely in the account's own photos volume. Shared albums live in
     /// a foreign volume, and the trash and upload writes address the own volume only.
     public func canDissolve(seriesUIDs: [PhotoUID]) async -> Bool {
-        guard !seriesUIDs.isEmpty, let own = try? await remote.ownPhotosVolumeID() else { return false }
-        return seriesUIDs.allSatisfy { $0.volumeID == own }
+        (try? await admission.withAdmission { [self] in await self.isOwnLibrary(seriesUIDs) }) ?? false
     }
 
     /// Copies every favorite into a standalone photo and then moves the whole series to the trash.
@@ -179,30 +217,24 @@ public actor SeriesDissolutionOrchestrator {
         favoriteUIDs: [PhotoUID],
         onProgress: @escaping @Sendable (SeriesDissolutionProgress) -> Void = { _ in }
     ) async throws -> [PhotoUID] {
-        guard await canDissolve(seriesUIDs: seriesUIDs) else { throw SeriesDissolutionError.notOwnLibrary }
-        let series = Set(seriesUIDs)
-        guard !favoriteUIDs.isEmpty, series.contains(seriesMainUID), favoriteUIDs.allSatisfy(series.contains)
-        else { throw SeriesDissolutionError.invalidSelection }
-
-        var journal =
-            try journalStore.journal(forSeries: seriesMainUID)
-            .map { Self.merging(favoriteUIDs, into: $0) }
-            ?? SeriesDissolutionJournal(
+        try await admission.withAdmission { [self] in
+            try await self.admittedKeepOnlyFavorites(
                 seriesMainUID: seriesMainUID,
                 seriesUIDs: seriesUIDs,
-                favorites: favoriteUIDs.map { .init(memberUID: $0) }
+                favoriteUIDs: favoriteUIDs,
+                onProgress: onProgress
             )
-        return try await run(&journal, onProgress: onProgress)
+        }
     }
 
     /// Drops the operation of a series that the user left after a failure: Cancel, "Keep Everything" or closing
     /// the mode. Only a journal that still copies favorites is removed. The series is untouched in that phase,
     /// and copies that are already confirmed stay as standalone photos; no photo is deleted. A journal in the
     /// trash step stays, because the user's consent and the copies are final there.
-    public func abandon(seriesMainUID: PhotoUID) throws {
-        guard !running.contains(seriesMainUID) else { throw SeriesDissolutionError.alreadyRunning }
-        guard try journalStore.journal(forSeries: seriesMainUID)?.phase == .copyingFavorites else { return }
-        try journalStore.remove(forSeries: seriesMainUID)
+    public func abandon(seriesMainUID: PhotoUID) async throws {
+        try await admission.withAdmission { [self] in
+            try await self.admittedAbandon(seriesMainUID: seriesMainUID)
+        }
     }
 
     /// Finishes every interrupted operation that reached the trash step, and reports each result to the host.
@@ -212,8 +244,50 @@ public actor SeriesDissolutionOrchestrator {
     /// selection is not final. It waits on disk: "Keep Only Favorites" on the same series continues it with the
     /// confirmed copies, and `abandon` removes it.
     public func resumePending() async throws -> [SeriesDissolutionResumeOutcome] {
+        try await admission.withAdmission { [self] in
+            try await self.admittedResumePending()
+        }
+    }
+
+    private func isOwnLibrary(_ seriesUIDs: [PhotoUID]) async -> Bool {
+        guard !seriesUIDs.isEmpty, let own = try? await remote.ownPhotosVolumeID() else { return false }
+        return seriesUIDs.allSatisfy { $0.volumeID == own }
+    }
+
+    private func admittedKeepOnlyFavorites(
+        seriesMainUID: PhotoUID,
+        seriesUIDs: [PhotoUID],
+        favoriteUIDs: [PhotoUID],
+        onProgress: @escaping @Sendable (SeriesDissolutionProgress) -> Void
+    ) async throws -> [PhotoUID] {
+        let existing = try journalStore.journal(forSeries: seriesMainUID)
+        // A retry keeps every photo that either attempt knew. The caller's list can be older than the journal.
+        let membership = Self.union(existing?.seriesUIDs ?? [], seriesUIDs)
+        guard await isOwnLibrary(membership) else { throw SeriesDissolutionError.notOwnLibrary }
+        let series = Set(membership)
+        guard !favoriteUIDs.isEmpty, series.contains(seriesMainUID), favoriteUIDs.allSatisfy(series.contains)
+        else { throw SeriesDissolutionError.invalidSelection }
+
+        var journal =
+            existing.map { Self.merging(favoriteUIDs, membership: membership, into: $0) }
+            ?? SeriesDissolutionJournal(
+                seriesMainUID: seriesMainUID,
+                seriesUIDs: membership,
+                favorites: favoriteUIDs.map { .init(memberUID: $0) }
+            )
+        return try await run(&journal, onProgress: onProgress)
+    }
+
+    private func admittedAbandon(seriesMainUID: PhotoUID) throws {
+        guard !running.contains(seriesMainUID) else { throw SeriesDissolutionError.alreadyRunning }
+        guard try journalStore.journal(forSeries: seriesMainUID)?.phase == .copyingFavorites else { return }
+        try journalStore.remove(forSeries: seriesMainUID)
+    }
+
+    private func admittedResumePending() async throws -> [SeriesDissolutionResumeOutcome] {
         var outcomes: [SeriesDissolutionResumeOutcome] = []
         for var journal in try journalStore.pendingJournals() where journal.phase == .trashingSeries {
+            try Task.checkCancellation()
             let result: Result<[PhotoUID], any Error>
             do {
                 result = .success(try await run(&journal, onProgress: { _ in }))
@@ -237,6 +311,9 @@ public actor SeriesDissolutionOrchestrator {
         try journalStore.save(journal)
 
         if journal.phase == .copyingFavorites {
+            // The server's related photos of the main photo are authoritative. A member that the caller did not
+            // know is excluded from the copy rule and moves to the trash with the rest of the series.
+            try await addServerMembers(to: &journal)
             try await copyPendingFavorites(&journal, onProgress: onProgress)
             // A copy can vanish between its confirmation and now (a crash, then a manual delete). Check the
             // server, copy again once, and only then allow the trash step.
@@ -245,6 +322,8 @@ public actor SeriesDissolutionOrchestrator {
                 let stillInactive = try await resetInactiveCopies(&journal)
                 guard !stillInactive else { throw SeriesDissolutionError.copyNotConfirmed }
             }
+            try await carryOverFavoriteAndAlbums(&journal)
+            try await addServerMembers(to: &journal)
             journal.phase = .trashingSeries
             try journalStore.save(journal)
         }
@@ -254,6 +333,11 @@ public actor SeriesDissolutionOrchestrator {
         let remaining = try await remote.activeUIDs(among: journal.seriesUIDs)
         if !remaining.isEmpty {
             try await remote.trashSeries(journal.seriesUIDs.filter(remaining.contains))
+            // A trash request has reported success before while its photos stayed active. Only the server's
+            // state ends the operation; otherwise the journal stays for the next attempt.
+            guard try await remote.activeUIDs(among: journal.seriesUIDs).isEmpty else {
+                throw SeriesDissolutionError.trashNotConfirmed
+            }
         }
         try journalStore.remove(forSeries: mainUID)
         await duplicateChecker.invalidateCachedRemoteState()
@@ -262,21 +346,38 @@ public actor SeriesDissolutionOrchestrator {
     }
 
     /// A retry may carry another selection while no series photo is trashed yet. Confirmed copies of favorites
-    /// that stay selected are kept. A confirmed copy of a favorite that the new selection drops stays in the
-    /// library: the operation never deletes a standalone photo. Once the trash step started, the recorded
-    /// selection is final.
+    /// that stay selected are kept with their carried-over favorite tag and albums. A confirmed copy of a
+    /// favorite that the new selection drops stays in the library: the operation never deletes a standalone
+    /// photo. Once the trash step started, the recorded membership and selection are final.
     private static func merging(
         _ favoriteUIDs: [PhotoUID],
+        membership: [PhotoUID],
         into journal: SeriesDissolutionJournal
     ) -> SeriesDissolutionJournal {
         guard journal.phase == .copyingFavorites else { return journal }
         var merged = journal
+        merged.seriesUIDs = membership
         let confirmed = Dictionary(
-            journal.favorites.compactMap { favorite in favorite.copyUID.map { (favorite.memberUID, $0) } },
+            journal.favorites.filter { $0.copyUID != nil }.map { ($0.memberUID, $0) },
             uniquingKeysWith: { first, _ in first }
         )
-        merged.favorites = favoriteUIDs.map { .init(memberUID: $0, copyUID: confirmed[$0]) }
+        merged.favorites = favoriteUIDs.map { confirmed[$0] ?? .init(memberUID: $0) }
         return merged
+    }
+
+    private static func union(_ first: [PhotoUID], _ second: [PhotoUID]) -> [PhotoUID] {
+        var seen = Set<PhotoUID>()
+        return (first + second).filter { seen.insert($0).inserted }
+    }
+
+    private func addServerMembers(to journal: inout SeriesDissolutionJournal) async throws {
+        let main = journal.seriesMainUID
+        let related = try await duplicateChecker.relatedPhotoLinkIDs(ofMainLinkID: main.nodeID)
+        let known = Set(journal.seriesUIDs.map(\.nodeID))
+        let added = related.subtracting(known).sorted().map { PhotoUID(volumeID: main.volumeID, nodeID: $0) }
+        guard !added.isEmpty else { return }
+        journal.seriesUIDs += added
+        try journalStore.save(journal)
     }
 
     private func copyPendingFavorites(
@@ -313,11 +414,54 @@ public actor SeriesDissolutionOrchestrator {
         var didReset = false
         for index in journal.favorites.indices {
             guard let copy = journal.favorites[index].copyUID, !active.contains(copy) else { continue }
-            journal.favorites[index].copyUID = nil
+            journal.favorites[index] = .init(memberUID: journal.favorites[index].memberUID)
             didReset = true
         }
         if didReset { try journalStore.save(journal) }
         return didReset
+    }
+
+    /// Gives every copy what its source had in the library before the series leaves it: the favorite tag of its
+    /// member or of the main photo, and the own albums of the main photo. The server state is read on each
+    /// attempt. Each confirmed write is journaled, so a retry never adds a copy to the same album twice.
+    /// Shared albums are skipped: their writes cannot address a foreign volume.
+    private func carryOverFavoriteAndAlbums(_ journal: inout SeriesDissolutionJournal) async throws {
+        try Task.checkCancellation()
+        // Every copy is confirmed in this phase. A missing identifier would silently skip a carry-over write.
+        guard journal.allFavoritesConfirmed else { throw SeriesDissolutionError.copyNotConfirmed }
+        let mainUID = journal.seriesMainUID
+        let favorites = try await remote.favoriteUIDs(among: journal.seriesUIDs)
+        let untagged = journal.favorites.indices.filter { index in
+            !journal.favorites[index].favoriteTagAdded
+                && (favorites.contains(mainUID) || favorites.contains(journal.favorites[index].memberUID))
+        }
+        if !untagged.isEmpty {
+            try await remote.markFavorite(try untagged.map { try copyUID(of: journal.favorites[$0]) })
+            for index in untagged { journal.favorites[index].favoriteTagAdded = true }
+            try journalStore.save(journal)
+        }
+
+        let ownVolumeID = try await remote.ownPhotosVolumeID()
+        var seenAlbumIDs = Set<String>()
+        let ownAlbumIDs = try await albums.albums(containing: mainUID)
+            .filter { $0.volumeID == ownVolumeID && seenAlbumIDs.insert($0.albumID).inserted }
+            .map(\.albumID)
+        for albumID in ownAlbumIDs {
+            try Task.checkCancellation()
+            let missing = journal.favorites.indices.filter { !journal.favorites[$0].addedAlbumIDs.contains(albumID) }
+            guard !missing.isEmpty else { continue }
+            try await albums.addPhotos(
+                try missing.map { try copyUID(of: journal.favorites[$0]) },
+                toOwnAlbum: albumID
+            )
+            for index in missing { journal.favorites[index].addedAlbumIDs.append(albumID) }
+            try journalStore.save(journal)
+        }
+    }
+
+    private func copyUID(of favorite: SeriesDissolutionJournal.Favorite) throws -> PhotoUID {
+        guard let copyUID = favorite.copyUID else { throw SeriesDissolutionError.copyNotConfirmed }
+        return copyUID
     }
 
     /// Downloads the member's original bytes and makes them a standalone photo under the collision rule.
@@ -344,6 +488,7 @@ public actor SeriesDissolutionOrchestrator {
             nameHash: nameHash,
             contentHash: contentHash,
             remoteItems: try await duplicateChecker.findDuplicates(nameHashes: [nameHash]),
+            memberLinkID: member.nodeID,
             seriesLinkIDs: seriesLinkIDs,
             currentClientUID: currentClientUID
         )
@@ -355,9 +500,10 @@ public actor SeriesDissolutionOrchestrator {
             throw SeriesDissolutionError.blockedByForeignDraft(source.filename)
         case .upload(let replacingDraft):
             let attributes = try FileManager.default.attributesOfItem(atPath: fileURL.path)
+            let token = UUID()
             let request = PhotoUploadRequest(
                 queueItemID: UUID(),
-                cancellationToken: UUID(),
+                cancellationToken: token,
                 fileURL: fileURL,
                 name: correctedName,
                 mediaType: source.mediaType,
@@ -370,8 +516,22 @@ public actor SeriesDissolutionOrchestrator {
                 expectedSHA1: sha1Digest,
                 overrideExistingDraft: replacingDraft
             )
-            let uid = try await uploader.upload(request) { progress in
-                if progress.phase == .uploading { onProgress(0.5 + progress.fraction * 0.5) }
+            let uploader = self.uploader
+            let cancellation = BackupUploadCancellation()
+            let uid: PhotoUID
+            do {
+                uid = try await withTaskCancellationHandler {
+                    try await uploader.upload(request) { progress in
+                        if progress.phase == .uploading { onProgress(0.5 + progress.fraction * 0.5) }
+                    }
+                } onCancel: {
+                    // Task cancellation does not reach the native upload; only its token stops it.
+                    Task { await cancellation.request(uploader: uploader, token: token) }
+                }
+            } catch {
+                // Join the native cancellation, so the upload has stopped before the operation reports it.
+                if Task.isCancelled { await cancellation.request(uploader: uploader, token: token) }
+                throw error
             }
             await duplicateChecker.recordUploaded(contentHash: contentHash, remoteLinkID: uid.nodeID)
             return uid

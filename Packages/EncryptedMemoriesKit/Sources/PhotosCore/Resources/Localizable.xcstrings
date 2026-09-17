@@ -3242,6 +3242,14 @@
         "de": { "stringUnit": { "state": "translated", "value": "Ein gesicherter Favorit konnte nicht bestätigt werden. Die Serie wurde nicht in den Papierkorb bewegt." } }
       }
     },
+    "error.series_trash_not_confirmed": {
+      "extractionState": "manual",
+      "comment": "The trash request returned, but the burst photos were still in the library.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "The burst could not be moved to the trash. Your favorites are saved, and the app tries again." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Die Serie konnte nicht in den Papierkorb bewegt werden. Die Favoriten sind gesichert, die App versucht es erneut." } }
+      }
+    },
     "error.upload_file_missing %@": {
       "extractionState": "manual",
       "comment": "File not found. %@ is the file name.",

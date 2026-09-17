@@ -1846,6 +1846,18 @@ extension DriveSDKBridge: SeriesDissolutionRemote {
         }
     }
 
+    func favoriteUIDs(among uids: [PhotoUID]) async throws -> Set<PhotoUID> {
+        guard !uids.isEmpty else { return [] }
+        // One tag listing per operation. Proton exposes no per-node tag read, and the series is small.
+        let favorites = try await favoriteUIDs()
+        return Set(uids.filter(favorites.contains))
+    }
+
+    func markFavorite(_ uids: [PhotoUID]) async throws {
+        // `setFavorites` throws unless every node confirms the tag, so a partial write never counts as success.
+        try await setFavorites(uids, true)
+    }
+
     func trashSeries(_ uids: [PhotoUID]) async throws {
         try await trash(uids)
         try await withOpenSession { bridge in
@@ -1858,15 +1870,20 @@ extension DriveSDKBridge: SeriesDissolutionRemote {
     /// The dissolution of this account's series. It shares the duplicate service with uploads, so both see
     /// one remote content index. Nil when the upload manifest is unavailable, as uploads are then disabled.
     nonisolated func makeSeriesDissolution(
-        duplicateChecker: (any UploadDuplicateChecking)?
+        duplicateChecker: (any UploadDuplicateChecking)?,
+        albums: any SeriesAlbumCarryOver
     ) -> SeriesDissolutionOrchestrator? {
         guard let duplicateChecker else { return nil }
         let accountDataDirectory = uploadManifestURL.deletingLastPathComponent()
         return SeriesDissolutionOrchestrator(
             remote: self,
+            albums: albums,
             uploader: self,
             duplicateChecker: duplicateChecker,
             journalStore: SeriesDissolutionJournalFileStore(accountDataDirectory: accountDataDirectory),
+            // The shared account gate: bridge teardown cancels and joins a running dissolution before the
+            // sign-out purge removes the journal directory.
+            admission: shutdownGate,
             tempDirectory: accountDataDirectory.appendingPathComponent("series-dissolution-temp", isDirectory: true),
             currentClientUID: uploadClientUID
         )
