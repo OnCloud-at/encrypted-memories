@@ -1486,7 +1486,10 @@ struct ThumbnailFeedCoreTests {
         let payload = Self.pngData(width: 8, height: 8)
         let payloads = Dictionary(uniqueKeysWithValues: ([key, other] + members).map { ($0, payload) })
         let loader = RecordingLoader(payloads: payloads)
-        let feed = ThumbnailFeedCore(cache: cache, loader: loader, configuration: Self.configuration())
+        // One worker and single-item batches keep the loader's call order equal to the crawl order.
+        let feed = ThumbnailFeedCore(
+            cache: cache, loader: loader,
+            configuration: Self.configuration(downloadConcurrencyLimit: 1, batchSize: 1))
         let graph = LibrarySourceGraph()
         let source = LibrarySource(id: SourceID("burst-crawl"), capabilities: .readThumbnail, isIncluded: true)
         _ = graph.commitSourceSet([source], using: graph.beginSourceSetRefresh())
