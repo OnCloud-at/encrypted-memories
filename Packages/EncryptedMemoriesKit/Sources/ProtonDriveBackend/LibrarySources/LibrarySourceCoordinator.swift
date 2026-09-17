@@ -464,8 +464,18 @@ public actor LibrarySourceCoordinator: PriorityThumbnailBatchLoader {
         guard !closed else { return ThumbnailBatchLoadResult(batchError: "source runtime closed") }
         var leases: [PhotoUID: SourceAccessLease] = [:]
         var denied: [PhotoUID: String] = [:]
+        var unleased = Set<PhotoUID>()
         for uid in Set(uids) {
             if let lease = graph.accessLease(for: uid, requiring: .readThumbnail) {
+                leases[uid] = lease
+            } else {
+                unleased.insert(uid)
+            }
+        }
+        // A series filmstrip requests burst members, which are authorized through the item that lists them.
+        let burstLeases = graph.burstMemberAccessLeases(for: unleased, requiring: .readThumbnail)
+        for uid in unleased {
+            if let lease = burstLeases[uid] {
                 leases[uid] = lease
             } else {
                 denied[uid] = "source unavailable"

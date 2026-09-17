@@ -674,6 +674,8 @@ public final class LibrarySourceGraph {
         var items: [LibrarySourceItem]
         /// Constant-time membership and relationship lookup without duplicating item payloads.
         var itemIndexByUID: [PhotoUID: Int]
+        /// Items that list each burst member, so a filmstrip or crawl lease needs no inventory scan.
+        var burstOwnersByMemberUID: [PhotoUID: [PhotoUID]]
         var validationToken: String?
         var refreshGeneration: UInt64
         var accessGeneration: UInt64
@@ -713,6 +715,7 @@ public final class LibrarySourceGraph {
                 authority: restoredAuthority,
                 items: items,
                 itemIndexByUID: Self.itemIndexByUID(items),
+                burstOwnersByMemberUID: Self.burstOwnersByMemberUID(items),
                 validationToken: inventory.accessState == .accessLost ? nil : inventory.validationToken,
                 refreshGeneration: 0,
                 accessGeneration: 0,
@@ -792,6 +795,7 @@ public final class LibrarySourceGraph {
             record.authority = .authoritative
             record.items = []
             record.itemIndexByUID = [:]
+            record.burstOwnersByMemberUID = [:]
             record.validationToken = nil
             records[sourceID] = record
         }
@@ -809,6 +813,7 @@ public final class LibrarySourceGraph {
                     record.authority = .hydrating
                     record.items = []
                     record.itemIndexByUID = [:]
+                    record.burstOwnersByMemberUID = [:]
                     record.validationToken = nil
                 }
                 if !reactivating, record.source.capabilities != discoveredSource.capabilities {
@@ -823,6 +828,7 @@ public final class LibrarySourceGraph {
                     authority: .hydrating,
                     items: [],
                     itemIndexByUID: [:],
+                    burstOwnersByMemberUID: [:],
                     validationToken: nil,
                     refreshGeneration: 0,
                     accessGeneration: 1,
@@ -892,6 +898,7 @@ public final class LibrarySourceGraph {
         record.refreshGeneration &+= 1
         record.items = canonicalItems
         record.itemIndexByUID = Self.itemIndexByUID(canonicalItems)
+        record.burstOwnersByMemberUID = Self.burstOwnersByMemberUID(canonicalItems)
         record.validationToken = validationToken
         record.accessState = .available
         record.authority = .authoritative
@@ -932,6 +939,7 @@ public final class LibrarySourceGraph {
         record.refreshGeneration &+= 1
         record.items = canonicalItems
         record.itemIndexByUID = Self.itemIndexByUID(canonicalItems)
+        record.burstOwnersByMemberUID = Self.burstOwnersByMemberUID(canonicalItems)
         record.validationToken = validationToken
         record.accessState = .temporarilyUnavailable
         record.authority = nextAuthority
@@ -989,6 +997,7 @@ public final class LibrarySourceGraph {
         record.authority = .authoritative
         record.items = []
         record.itemIndexByUID = [:]
+        record.burstOwnersByMemberUID = [:]
         record.validationToken = nil
         records[sourceID] = record
         revision &+= 1
@@ -1143,6 +1152,44 @@ public final class LibrarySourceGraph {
             membershipUID: ownerUID,
             relationship: relationship
         )
+    }
+
+    /// Issues leases for burst members through the source items that list them. Burst members are not library
+    /// items, so `accessLease(for:)` refuses them; each lease stays bound to the owning item's relationship.
+    public func burstMemberAccessLeases(
+        for memberUIDs: Set<PhotoUID>,
+        requiring capability: LibrarySourceCapabilities,
+        includeExcludedSources: Bool = true
+    ) -> [PhotoUID: SourceAccessLease] {
+        guard !memberUIDs.isEmpty else { return [:] }
+        var ownersByMember: [PhotoUID: [PhotoUID]] = [:]
+        for record in records.values
+        where record.accessState != .accessLost
+            && (includeExcludedSources || record.source.isIncluded)
+            && record.source.capabilities.contains(capability)
+        {
+            for memberUID in memberUIDs {
+                if let owners = record.burstOwnersByMemberUID[memberUID] {
+                    ownersByMember[memberUID, default: []].append(contentsOf: owners)
+                }
+            }
+        }
+        var leases: [PhotoUID: SourceAccessLease] = [:]
+        for (memberUID, ownerUIDs) in ownersByMember {
+            for ownerUID in ownerUIDs {
+                if let lease = relatedAccessLease(
+                    for: memberUID,
+                    of: ownerUID,
+                    relationship: .burstMember,
+                    requiring: capability,
+                    includeExcludedSources: includeExcludedSources
+                ) {
+                    leases[memberUID] = lease
+                    break
+                }
+            }
+        }
+        return leases
     }
 
     /// Checks the lease again before publishing a late asynchronous result.
@@ -1491,6 +1538,18 @@ public final class LibrarySourceGraph {
             return lhs.uid.volumeID.utf8.lexicographicallyPrecedes(rhs.uid.volumeID.utf8)
         }
         return lhs.uid.nodeID.utf8.lexicographicallyPrecedes(rhs.uid.nodeID.utf8)
+    }
+
+    private static func burstOwnersByMemberUID(_ items: [LibrarySourceItem]) -> [PhotoUID: [PhotoUID]] {
+        let relationshipField = LibrarySourceRelationship.burstMember.metadataField
+        var owners: [PhotoUID: [PhotoUID]] = [:]
+        for sourceItem in items
+        where sourceItem.knownFields.contains(relationshipField) && !sourceItem.item.burstMemberIDs.isEmpty {
+            for nodeID in sourceItem.item.burstMemberIDs {
+                owners[PhotoUID(volumeID: sourceItem.uid.volumeID, nodeID: nodeID), default: []].append(sourceItem.uid)
+            }
+        }
+        return owners
     }
 
     private static func itemIndexByUID(_ items: [LibrarySourceItem]) -> [PhotoUID: Int] {
