@@ -1,6 +1,7 @@
 import Foundation
 import PhotosCore
 import ProtonDriveSDK
+import UploadCore
 
 /// Reads the volume-qualified SDK node. A shared photo cannot use the account's own Photos share key chain.
 enum SDKPhotoMetadataReader {
@@ -20,6 +21,46 @@ enum SDKPhotoMetadataReader {
         default:
             throw CocoaError(.fileReadUnknown)
         }
+    }
+
+    /// What a standalone copy of a series member keeps. The node must be a photo: only a photo node carries
+    /// the capture time that places the copy in the timeline.
+    static func seriesMemberSource(
+        for uid: PhotoUID, client: any SDKPhotoCatalogClient
+    ) async throws -> SeriesMemberSource {
+        let node = try await SDKCancellableOperation.run { token in
+            try await client.getNode(
+                nodeUid: SDKNodeUid(volumeID: uid.volumeID, nodeID: uid.nodeID), cancellationToken: token)
+        } cancel: { token in
+            try? await client.cancelGetNode(cancellationToken: token)
+        }
+        try Task.checkCancellation()
+        guard case .photo(let photo) = node else { throw CocoaError(.fileReadUnknown) }
+        return seriesMemberSource(
+            name: try photo.name.get(),
+            mimeType: photo.mediaType,
+            captureTime: photo.captureTime,
+            revision: photo.activeRevision
+        )
+    }
+
+    /// `iOS.photos` identifies the source asset of the series compound. The copy is a new photo without a
+    /// source asset, so that section stays behind; every other section travels unchanged.
+    static func seriesMemberSource(
+        name: String, mimeType: String, captureTime: TimeInterval, revision: FileRevision
+    ) -> SeriesMemberSource {
+        let captureDate = Date(timeIntervalSince1970: captureTime)
+        return SeriesMemberSource(
+            filename: name,
+            mediaType: mimeType.isEmpty ? "application/octet-stream" : mimeType,
+            captureTime: captureDate,
+            modificationDate: revision.claimedModificationTime.flatMap {
+                $0.isFinite ? Date(timeIntervalSince1970: $0) : nil
+            } ?? captureDate,
+            additionalMetadata: (revision.claimedAdditionalMetadata ?? [])
+                .filter { $0.name != "iOS.photos" }
+                .map { PhotoUploadAdditionalMetadata(name: $0.name, utf8JsonValue: $0.utf8JsonValue) }
+        )
     }
 
     static func metadata(

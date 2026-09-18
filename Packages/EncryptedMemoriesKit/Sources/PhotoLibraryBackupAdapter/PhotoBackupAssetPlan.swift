@@ -22,6 +22,12 @@ public struct PhotoBackupAssetInfo: Sendable, Equatable {
             case adjustmentBaseVideo
             case adjustmentBasePairedVideo
             case photoProxy
+            /// Another photo of the same series, carried by the series' main photo. `originalFilename` is
+            /// the member's upload filename. Not a `PHAssetResourceType`; see `PhotoBurstUploadPlanner`.
+            case burstMember
+            /// Marks a series photo whose main photo is another asset. `originalFilename` is that asset's
+            /// local identifier. The marked asset uploads only as a member of the main photo's compound.
+            case burstMainReference
             case other
         }
 
@@ -154,8 +160,14 @@ public enum PhotoBackupAssetPlanner {
 
     /// Metadata revision: PhotoKit moves `modificationDate` on content AND metadata changes, so
     /// this drifts often - the edit-revision evidence below keeps drift cheap for unedited assets.
+    ///
+    /// A series main photo mixes its structural fingerprint in: PhotoKit leaves the main photo's dates alone
+    /// when members appear or change, and a main photo that an earlier build backed up as a plain photo must
+    /// re-open so that its missing members upload.
     public static func metadataRevision(for info: PhotoBackupAssetInfo) -> UploadBackupRevision {
-        UploadBackupRevision(date: info.modificationDate ?? info.creationDate ?? .distantPast)
+        let dateRevision = UploadBackupRevision(date: info.modificationDate ?? info.creationDate ?? .distantPast)
+        guard info.resources.contains(where: { $0.role == .burstMember }) else { return dateRevision }
+        return revision(hashing: "series#\(dateRevision.rawValue)#\(fingerprintRevision(for: info).rawValue)")
     }
 
     private static func externalIdentity(for info: PhotoBackupAssetInfo) -> UploadBackupExternalIdentity? {
@@ -181,6 +193,10 @@ public enum PhotoBackupAssetPlanner {
             .joined(separator: "|")
         let material =
             "\(parts)#\(info.pixelWidth)x\(info.pixelHeight)#\(Int(info.durationSeconds * 1000))#live=\(info.isLivePhoto)"
+        return revision(hashing: material)
+    }
+
+    private static func revision(hashing material: String) -> UploadBackupRevision {
         let digest = SHA256.hash(data: Data(material.utf8))
         var raw: Int64 = 0
         for byte in digest.prefix(8) { raw = (raw << 8) | Int64(byte) }
@@ -199,7 +215,11 @@ public enum PhotoBackupAssetPlanner {
     /// `IMG_1234.HEIC` + `FullSizeRender.jpg` becomes primary `IMG_1234.jpg` and the untouched
     /// `IMG_1234.HEIC` is retained as a secondary. That avoids lying about bytes vs extension while
     /// preserving the recognizable camera filename.
+    ///
+    /// A series main photo also lists every other photo of the series as a `.burstMember` secondary. A series
+    /// photo that references another main photo has no plan of its own.
     public static func exportPlan(for info: PhotoBackupAssetInfo) -> PhotoBackupExportPlan? {
+        guard !info.resources.contains(where: { $0.role == .burstMainReference }) else { return nil }
         let resources = normalizedResources(info.resources)
         func resource(_ role: PhotoBackupAssetInfo.Resource.Role) -> PhotoBackupAssetInfo.Resource? {
             resources.first { $0.role == role }
@@ -275,6 +295,9 @@ public enum PhotoBackupAssetPlanner {
         if resource.role == .pairedVideo && resource.ordinal == 0 {
             return .livePairedVideo
         }
+        if resource.role == .burstMember {
+            return .burstMember(ordinal: resource.ordinal)
+        }
         return .photoKit(role: resource.role.rawValue, ordinal: resource.ordinal)
     }
 
@@ -336,6 +359,8 @@ public enum PhotoBackupAssetPlanner {
         case .adjustmentBasePhoto: 10
         case .adjustmentBaseVideo: 11
         case .adjustmentBasePairedVideo: 12
+        case .burstMember: 13
+        case .burstMainReference: 14
         case .other: 100
         }
     }
@@ -374,16 +399,14 @@ public enum PhotoBackupAssetPlanner {
 
     private static func roleExtension(_ role: PhotoBackupAssetInfo.Resource.Role) -> String {
         switch role {
-        case .originalPhoto, .alternatePhoto, .fullSizePhoto, .adjustmentBasePhoto, .photoProxy:
+        case .originalPhoto, .alternatePhoto, .fullSizePhoto, .adjustmentBasePhoto, .photoProxy, .burstMember:
             return "img"
         case .originalVideo, .fullSizeVideo, .pairedVideo, .fullSizePairedVideo, .adjustmentBaseVideo,
             .adjustmentBasePairedVideo:
             return "mov"
         case .audio:
             return "audio"
-        case .adjustmentData:
-            return "dat"
-        case .other:
+        case .adjustmentData, .burstMainReference, .other:
             return "dat"
         }
     }

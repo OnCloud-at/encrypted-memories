@@ -1575,6 +1575,7 @@ extension DriveSDKBridge: PhotoUploading {
                     base: DedupeUnavailableIdentityResolver(),
                     admission: shutdownGate
                 ),
+                duplicateChecker: nil,
                 close: {}
             )
         }
@@ -1593,6 +1594,7 @@ extension DriveSDKBridge: PhotoUploading {
         )
         return UploadIdentityResolverComposition(
             resolver: ShutdownGatedUploadIdentityResolver(base: pipeline, admission: shutdownGate),
+            duplicateChecker: service,
             close: { store.close() }
         )
     }
@@ -1806,6 +1808,85 @@ extension DriveSDKBridge: PhotoUploading {
                 DebugLog.log("[Upload] native cancellation failed token=\(token) err=\(error)")
             }
         }
+    }
+}
+
+// MARK: - Series (burst) writes
+
+extension DriveSDKBridge: PhotoTagAdding {
+    func addTags(_ tags: [Int], to uid: PhotoUID) async throws {
+        try await withOpenSession { bridge in
+            // Backup may know only the main photo's link id; see `PhotoUploadRequest.mainPhotoUID`.
+            let volumeID = uid.volumeID.isEmpty ? try await bridge.resolvePhotosRoot().volumeID : uid.volumeID
+            try await SDKPhotoTagAdder(client: bridge.photosClient).addTags(
+                tags.compactMap(ProtonDriveSDK.PhotoTag.init(rawValue:)),
+                to: SDKNodeUid(volumeID: volumeID, nodeID: uid.nodeID)
+            )
+        }
+    }
+}
+
+extension DriveSDKBridge: SeriesDissolutionRemote {
+    func ownPhotosVolumeID() async throws -> String {
+        try await withOpenSession { bridge in
+            try await bridge.resolvePhotosRoot().volumeID
+        }
+    }
+
+    func source(for member: PhotoUID) async throws -> SeriesMemberSource {
+        try await withOpenSession { bridge in
+            try await SDKPhotoMetadataReader.seriesMemberSource(for: member, client: bridge.photosClient)
+        }
+    }
+
+    func activeUIDs(among uids: [PhotoUID]) async throws -> Set<PhotoUID> {
+        try await withOpenSession { bridge in
+            let active = try await bridge.activeNodeIDs(Set(uids.map(\.nodeID)))
+            return Set(uids.filter { active.contains($0.nodeID) })
+        }
+    }
+
+    func favoriteUIDs(among uids: [PhotoUID]) async throws -> Set<PhotoUID> {
+        guard !uids.isEmpty else { return [] }
+        // One tag listing per operation. Proton exposes no per-node tag read, and the series is small.
+        let favorites = try await favoriteUIDs()
+        return Set(uids.filter(favorites.contains))
+    }
+
+    func markFavorite(_ uids: [PhotoUID]) async throws {
+        // `setFavorites` throws unless every node confirms the tag, so a partial write never counts as success.
+        try await setFavorites(uids, true)
+    }
+
+    func trashSeries(_ uids: [PhotoUID]) async throws {
+        try await trash(uids)
+        try await withOpenSession { bridge in
+            // The cached bursts listing still names the trashed series; the next lookup must read it again.
+            bridge.burstCatalogEntries = nil
+            bridge.burstCatalogLookup = [:]
+        }
+    }
+
+    /// The dissolution of this account's series. It shares the duplicate service with uploads, so both see
+    /// one remote content index. Nil when the upload manifest is unavailable, as uploads are then disabled.
+    nonisolated func makeSeriesDissolution(
+        duplicateChecker: (any UploadDuplicateChecking)?,
+        albums: any SeriesAlbumCarryOver
+    ) -> SeriesDissolutionOrchestrator? {
+        guard let duplicateChecker else { return nil }
+        let accountDataDirectory = uploadManifestURL.deletingLastPathComponent()
+        return SeriesDissolutionOrchestrator(
+            remote: self,
+            albums: albums,
+            uploader: self,
+            duplicateChecker: duplicateChecker,
+            journalStore: SeriesDissolutionJournalFileStore(accountDataDirectory: accountDataDirectory),
+            // The shared account gate: bridge teardown cancels and joins a running dissolution before the
+            // sign-out purge removes the journal directory.
+            admission: shutdownGate,
+            tempDirectory: accountDataDirectory.appendingPathComponent("series-dissolution-temp", isDirectory: true),
+            currentClientUID: uploadClientUID
+        )
     }
 }
 

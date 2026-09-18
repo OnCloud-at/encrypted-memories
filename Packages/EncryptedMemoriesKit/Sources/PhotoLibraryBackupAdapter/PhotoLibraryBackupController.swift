@@ -180,7 +180,8 @@ public final class PhotoLibraryBackupController {
     public init(
         configuration: Configuration,
         identityResolver: (any UploadIdentityResolving)?,
-        uploader: any PhotoUploading
+        uploader: any PhotoUploading,
+        tagAdder: (any PhotoTagAdding)? = nil
     ) {
         let directory = configuration.accountDataDirectory
         defaults = configuration.defaults
@@ -237,6 +238,7 @@ public final class PhotoLibraryBackupController {
                 ),
                 identityResolver: identityResolver,
                 uploader: uploader,
+                tagAdder: tagAdder,
                 configuration: .init(retry: retryPolicy),
                 throttleInputs: { AppleBackupRuntimeSignals.current() }
             )

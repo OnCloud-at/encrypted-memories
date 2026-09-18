@@ -967,7 +967,8 @@ final class ProjectHygieneTests: XCTestCase {
             at: iosAppURL,
             includingPropertiesForKeys: nil
         ).filter { $0.pathExtension == "swift" && $0.lastPathComponent != "MobileRootChrome.swift" }
-        for file in swiftFiles where file.lastPathComponent != "MobilePhotoViewer.swift" {
+        let centredTitleScreens = ["MobilePhotoViewer.swift", "MobileSeriesFavoritesScreen.swift"]
+        for file in swiftFiles where !centredTitleScreens.contains(file.lastPathComponent) {
             let source = try String(contentsOf: file, encoding: .utf8)
             XCTAssertFalse(
                 source.contains(".navigationTitle("),
@@ -985,6 +986,14 @@ final class ProjectHygieneTests: XCTestCase {
         XCTAssertTrue(viewer.contains(".toolbarTitleDisplayMode(.inline)"))
         XCTAssertFalse(viewer.contains(".mobileNavigationTitle("), "the viewer title stays centred, not leading")
         XCTAssertEqual(viewer.components(separatedBy: ".navigationTitle(").count - 1, 1)
+        // The viewer's "Select Favorites" mode is the second exception. It is a modal full-screen mode over the
+        // viewer, and the Photos app centres its title between Cancel and Confirm.
+        let seriesScreen = try String(
+            contentsOf: repoRoot.appendingPathComponent("iOSApp/MobileSeriesFavoritesScreen.swift"), encoding: .utf8
+        )
+        XCTAssertTrue(seriesScreen.contains(".toolbarTitleDisplayMode(.inline)"))
+        XCTAssertFalse(seriesScreen.contains(".mobileNavigationTitle("), "the mode title stays centred, not leading")
+        XCTAssertEqual(seriesScreen.components(separatedBy: ".navigationTitle(").count - 1, 1)
 
         let timeline = try String(
             contentsOf: repoRoot.appendingPathComponent("iOSApp/MobileTimelineScreen.swift"),

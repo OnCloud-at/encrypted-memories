@@ -18,6 +18,7 @@ import ProtonDriveBackend
 import SwiftUI
 import TimelineCore
 import UIKit
+import UploadCore
 
 struct MobileRetryOwnerGraph {
     typealias Shutdown = @MainActor @Sendable () async -> Void
@@ -264,6 +265,9 @@ final class MobileLibraryModel {
     /// state immediately, but monitoring is gated until this launch has one stable result or a handled failure.
     private var initialLibraryLoadSettled = false
     private var favoriteLoadTask: Task<Void, Never>?
+    /// Resume and abandon work of "Keep Only Favorites". Teardown cancels it, so no journal write survives
+    /// the account. The orchestrator's own admission gate joins a write that is already in flight.
+    private var seriesDissolutionTask: Task<Void, Never>?
     /// Mutations newer than the in-flight authoritative favorite read. The loader merges this journal before
     /// publishing, so a slow response cannot erase a newer heart tap.
     @ObservationIgnored private var favoriteLoadOverrides: [PhotoUID: Bool] = [:]
@@ -329,10 +333,87 @@ final class MobileLibraryModel {
     /// Moves items to Trash through the shared backend. The move is recoverable, not permanent.
     /// On success, the items leave the visible library. Errors propagate to the caller.
     func trashItems(_ uids: Set<PhotoUID>) async throws {
-        guard let backend, let mutationLease = currentMutationLease(), !uids.isEmpty else { return }
+        guard let backend, !uids.isEmpty else { return }
+        try await removeFromVisibleLibrary(uids) { try await backend.trash(Array(uids)) }
+    }
+
+    /// True when "Keep Only Favorites" may run for the series: uploads work, and every photo of the series
+    /// lies in the account's own library. A series of a shared album never qualifies.
+    func canKeepOnlySeriesFavorites(seriesUIDs: [PhotoUID]) async -> Bool {
+        guard let dissolution = facade?.seriesDissolution else { return false }
+        return await dissolution.canDissolve(seriesUIDs: seriesUIDs)
+    }
+
+    /// Saves the favorites of a series as standalone photos and moves the whole series to Trash. The shared
+    /// orchestrator journals the operation, so calling this again after a failure resumes it without duplicates.
+    func keepOnlySeriesFavorites(
+        seriesMainUID: PhotoUID,
+        seriesUIDs: [PhotoUID],
+        favoriteUIDs: [PhotoUID],
+        onProgress: @escaping @Sendable (SeriesDissolutionProgress) -> Void
+    ) async throws {
+        guard let dissolution = facade?.seriesDissolution else { throw SeriesDissolutionError.notOwnLibrary }
+        try await removeFromVisibleLibrary(Set(seriesUIDs)) {
+            try await dissolution.keepOnlyFavorites(
+                seriesMainUID: seriesMainUID,
+                seriesUIDs: seriesUIDs,
+                favoriteUIDs: favoriteUIDs,
+                onProgress: onProgress
+            )
+        }
+        // The standalone copies are new library photos; the refresh brings them into the timeline.
+        refreshAfterLocalUpload()
+    }
+
+    /// The user left "Keep Only Favorites" after a failure. The pending journal goes away, so no later activation
+    /// can finish the operation without the user. Copies that are already saved stay as standalone photos.
+    func abandonKeepOnlySeriesFavorites(seriesMainUID: PhotoUID) {
+        guard let dissolution = facade?.seriesDissolution else { return }
+        let previous = seriesDissolutionTask
+        seriesDissolutionTask = Task {
+            await previous?.value
+            do {
+                try await dissolution.abandon(seriesMainUID: seriesMainUID)
+            } catch {
+                DebugLog.log("series: abandoning the pending operation failed - \(error)")
+            }
+        }
+    }
+
+    /// A crash or an error can interrupt "Keep Only Favorites" in its trash step, after the user's consent and
+    /// every copy are final. Activation finishes only such operations. The series is already in the trash then,
+    /// so the authoritative refresh removes it and adds the copies. The optimistic removal of the interactive
+    /// path is not used: it advances the timeline mutation generation and would reject the initial load.
+    private func resumePendingSeriesDissolutions(_ dissolution: SeriesDissolutionOrchestrator) async {
+        do {
+            let outcomes = try await dissolution.resumePending()
+            var didFinishAny = false
+            for outcome in outcomes {
+                switch outcome.result {
+                case .success:
+                    didFinishAny = true
+                    DebugLog.log("series: resumed trash step finished photos=\(outcome.seriesUIDs.count)")
+                case .failure(let error):
+                    DebugLog.log("series: resumed trash step failed, the journal stays pending - \(error)")
+                }
+            }
+            if didFinishAny { refreshAfterLocalUpload() }
+        } catch {
+            DebugLog.log("series: pending operations could not be read - \(error)")
+        }
+    }
+
+    /// Runs a remote mutation that takes `uids` out of the library, then removes them from the visible timeline.
+    private func removeFromVisibleLibrary(
+        _ uids: Set<PhotoUID>,
+        after remoteMutation: () async throws -> Void
+    ) async throws {
+        // No session means no library to mutate. The caller must see that nothing happened: a remote
+        // operation like "Keep Only Favorites" would otherwise report success without doing anything.
+        guard let mutationLease = currentMutationLease() else { throw CancellationError() }
         try Task.checkCancellation()
         let locationStoreLease = locationStore.captureSessionLease()
-        try await backend.trash(Array(uids))
+        try await remoteMutation()
         try requireCurrentMutation(mutationLease)
         pendingTimelineRemovals.formUnion(uids)
         timelineMutationGeneration &+= 1
@@ -609,6 +690,7 @@ final class MobileLibraryModel {
                 self.prefetchStartTask?.cancel()
                 self.isThumbnailPrefetchLoading = false
                 self.favoriteLoadTask?.cancel()
+                self.seriesDissolutionTask?.cancel()
                 self.snapshot = TimelineSnapshot()
                 self.sections = []
                 self.favoriteUIDs = []
@@ -987,6 +1069,8 @@ final class MobileLibraryModel {
         isThumbnailPrefetchLoading = false
         favoriteLoadTask?.cancel()
         favoriteLoadTask = nil
+        seriesDissolutionTask?.cancel()
+        seriesDissolutionTask = nil
         favoriteMutationsInFlight = []
         favoriteLoadOverrides.removeAll(keepingCapacity: false)
         favoriteLoadSettled = false
@@ -1310,7 +1394,8 @@ final class MobileLibraryModel {
                         databasePolicy: client.accountDatabasePolicy
                     ),
                     identityResolver: client.uploadIdentityResolver,
-                    uploader: client.photoUploader
+                    uploader: client.photoUploader,
+                    tagAdder: client.photoTagAdder
                 )
                 let albumSync = AlbumSyncController(
                     configuration: .init(
@@ -1339,6 +1424,12 @@ final class MobileLibraryModel {
                     return
                 }
                 self.facade = client
+                if let seriesDissolution = client.seriesDissolution {
+                    self.seriesDissolutionTask?.cancel()
+                    self.seriesDissolutionTask = Task(priority: .utility) { [weak self] in
+                        await self?.resumePendingSeriesDissolutions(seriesDissolution)
+                    }
+                }
                 self.albumActions = AlbumActionCoordinator(repository: client.albums)
                 self.photoBackup = photoBackup
                 PhotoBackupBackgroundCoordinator.shared.configure(controller: photoBackup)

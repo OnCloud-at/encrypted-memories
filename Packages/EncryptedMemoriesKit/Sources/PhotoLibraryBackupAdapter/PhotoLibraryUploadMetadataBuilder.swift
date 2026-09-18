@@ -4,11 +4,15 @@ import Photos
 import UploadCore
 
 enum PhotoLibraryUploadMetadataBuilder {
+    /// `memberCaptureDate` describes a series member that uploads inside `asset`'s compound. The member keeps
+    /// the main photo's source identity, because a remote asset proof requires one identity on every
+    /// resource of a compound; only its capture time is its own.
     static func metadata(
         for asset: PHAsset,
-        cloudIdentifier cachedCloudIdentifier: String? = nil
+        cloudIdentifier cachedCloudIdentifier: String? = nil,
+        memberCaptureDate: Date? = nil
     ) throws -> [PhotoUploadAdditionalMetadata] {
-        let captureDate = asset.creationDate ?? asset.modificationDate
+        let captureDate = memberCaptureDate ?? asset.creationDate ?? asset.modificationDate
         let modificationDate = asset.modificationDate ?? asset.creationDate
         let location = location(from: asset.location)
         let camera = PhotoUploadMetadataEncoder.Camera(captureTime: captureDate.map(format))

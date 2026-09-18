@@ -110,6 +110,12 @@ final class FakeChecker: UploadDuplicateChecking, @unchecked Sendable {
         }
     }
 
+    var relatedLinkIDsByMainLinkID: [String: Set<String>] = [:]
+
+    func relatedPhotoLinkIDs(ofMainLinkID mainLinkID: String) async throws -> Set<String> {
+        lock.withLock { relatedLinkIDsByMainLinkID[mainLinkID] ?? [] }
+    }
+
     func findExactActiveDuplicates(correctedName: String, sha1Digest: Data) async -> [PhotoUID] {
         lock.withLock {
             exactFindCount += 1

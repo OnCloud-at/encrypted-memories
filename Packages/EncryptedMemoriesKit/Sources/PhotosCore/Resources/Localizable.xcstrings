@@ -3205,6 +3205,51 @@
         }
       }
     },
+    "error.series_not_own_library": {
+      "extractionState": "manual",
+      "comment": "Keep Only Favorites refused: the burst is in a shared album, not in the user's own library.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Only bursts in your own library can be reduced to favorites." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Nur Serien in deiner eigenen Mediathek lassen sich auf Favoriten reduzieren." } }
+      }
+    },
+    "error.series_invalid_selection": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "The selected favorites do not belong to this burst." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Die gewählten Favoriten gehören nicht zu dieser Serie." } }
+      }
+    },
+    "error.series_already_running": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "The favorites of this burst are already being saved." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Die Favoriten dieser Serie werden bereits gesichert." } }
+      }
+    },
+    "error.series_draft_blocked %@": {
+      "extractionState": "manual",
+      "comment": "Another device holds an unfinished upload with the same name. %@ is the file name.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Another device is uploading “%@”. Try again later." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Ein anderes Gerät lädt „%@“ gerade hoch. Versuche es später erneut." } }
+      }
+    },
+    "error.series_copy_not_confirmed": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "A saved favorite could not be confirmed. The burst was not moved to the trash." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Ein gesicherter Favorit konnte nicht bestätigt werden. Die Serie wurde nicht in den Papierkorb bewegt." } }
+      }
+    },
+    "error.series_trash_not_confirmed": {
+      "extractionState": "manual",
+      "comment": "The trash request returned, but the burst photos were still in the library.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "The burst could not be moved to the trash. Your favorites are saved, and the app tries again." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Die Serie konnte nicht in den Papierkorb bewegt werden. Die Favoriten sind gesichert, die App versucht es erneut." } }
+      }
+    },
     "error.upload_file_missing %@": {
       "extractionState": "manual",
       "comment": "File not found. %@ is the file name.",

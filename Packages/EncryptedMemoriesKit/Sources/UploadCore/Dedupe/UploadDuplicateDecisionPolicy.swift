@@ -76,4 +76,26 @@ public enum UploadDuplicateDecisionPolicy {
         // A matching filename with different bytes is a different photo and uploads unchanged.
         return .upload
     }
+
+    /// Remote rows that count for a burst member (a related photo of a series' main photo).
+    ///
+    /// Earlier builds uploaded the representative and every user pick of a series as standalone photos, so a
+    /// member's bytes can already be an active photo. Proton has no write that sets `MainPhotoLinkID` on an
+    /// existing link. An active row with the member's content therefore settles the member only when its link is
+    /// a related photo of the member's main photo now (`relatedLinkIDs`): this installation after a lost
+    /// manifest, or another device, uploaded the series. Every other active row is a standalone photo and is
+    /// dropped here, so the member uploads as a related photo of its main photo. The old standalone photo is user
+    /// data and stays untouched; the user sees the pick twice and can delete the standalone photo. Trashed,
+    /// deleted and draft rows keep their standard meaning, and the backup runner applies a respected deletion to
+    /// that member only.
+    public static func burstMemberCandidates(
+        _ remoteItems: [RemotePhotoDuplicate],
+        contentHash: String,
+        relatedLinkIDs: Set<String>
+    ) -> [RemotePhotoDuplicate] {
+        remoteItems.filter { item in
+            guard item.linkState == .active, item.contentHash == contentHash else { return true }
+            return item.linkID.map(relatedLinkIDs.contains) ?? false
+        }
+    }
 }

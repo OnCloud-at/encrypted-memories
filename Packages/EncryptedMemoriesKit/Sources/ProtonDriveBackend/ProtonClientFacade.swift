@@ -6,6 +6,8 @@ import UploadCore
 
 struct UploadIdentityResolverComposition: Sendable {
     let resolver: any UploadIdentityResolving
+    /// The Proton-keyed duplicate service behind `resolver`. Nil when the upload manifest is unavailable.
+    let duplicateChecker: (any UploadDuplicateChecking)?
     let close: @Sendable () -> Void
 }
 
@@ -29,6 +31,10 @@ public final class ProtonClientFacade {
     /// The raw upload transport (the SDK bridge) for the backup sync runner - shares the exact
     /// upload semantics with the manual queue.
     public let photoUploader: any PhotoUploading
+    /// Marks a main photo as a series when backup adds the members that an earlier build left out.
+    public let photoTagAdder: any PhotoTagAdding
+    /// "Keep Only Favorites" for a series of the account's own library. Nil while uploads are disabled.
+    public let seriesDissolution: SeriesDissolutionOrchestrator?
     /// The single dedupe resolver for this account, shared by manual uploads and backup sync so both
     /// see the same manifest and remote duplicate view. If the manifest database cannot open,
     /// the bridge supplies a fail-closed resolver; uploads must never silently run without dedupe.
@@ -53,6 +59,8 @@ public final class ProtonClientFacade {
         uploads: UploadManager,
         uploadCoordinator: UploadCoordinator,
         photoUploader: any PhotoUploading,
+        photoTagAdder: any PhotoTagAdding,
+        seriesDissolution: SeriesDissolutionOrchestrator?,
         uploadIdentityResolver: (any UploadIdentityResolving)?,
         accountDataDirectory: URL,
         accountDatabasePolicy: LibraryDatabasePolicy,
@@ -66,6 +74,8 @@ public final class ProtonClientFacade {
         self.uploads = uploads
         self.uploadCoordinator = uploadCoordinator
         self.photoUploader = photoUploader
+        self.photoTagAdder = photoTagAdder
+        self.seriesDissolution = seriesDissolution
         self.uploadIdentityResolver = uploadIdentityResolver
         self.accountDataDirectory = accountDataDirectory
         self.accountDatabasePolicy = accountDatabasePolicy
@@ -150,6 +160,11 @@ public final class ProtonClientFacade {
             uploads: manager,
             uploadCoordinator: coordinator,
             photoUploader: bridge,
+            photoTagAdder: bridge,
+            seriesDissolution: bridge.makeSeriesDissolution(
+                duplicateChecker: identityComposition.duplicateChecker,
+                albums: AlbumRepositorySeriesCarryOver(repository: albumsRepo)
+            ),
             uploadIdentityResolver: identityResolver,
             accountDataDirectory: bridge.uploadManifestURL.deletingLastPathComponent(),
             accountDatabasePolicy: bridge.uploadManifestPolicy,

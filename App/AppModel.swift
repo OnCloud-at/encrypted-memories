@@ -538,7 +538,8 @@ final class AppModel {
                         databasePolicy: client.accountDatabasePolicy
                     ),
                     identityResolver: client.uploadIdentityResolver,
-                    uploader: client.photoUploader
+                    uploader: client.photoUploader,
+                    tagAdder: client.photoTagAdder
                 )
                 photoBackupController = photoBackup
                 photoBackupScheduler.configure(controller: photoBackup)

@@ -1,6 +1,7 @@
 import Foundation
 import PhotosCore
 import ProtonDriveSDK
+import UploadCore
 
 protocol SDKPhotoTagsClient: Sendable {
     func updatePhotos(
@@ -10,6 +11,29 @@ protocol SDKPhotoTagsClient: Sendable {
 }
 
 extension EncryptedMemoriesClient: SDKPhotoTagsClient {}
+
+/// Adds tags to one existing photo. A missing or failed per-node result is a failure, as for favorites.
+struct SDKPhotoTagAdder: Sendable {
+    private let client: any SDKPhotoTagsClient
+
+    init(client: any SDKPhotoTagsClient) {
+        self.client = client
+    }
+
+    func addTags(_ tags: [ProtonDriveSDK.PhotoTag], to uid: SDKNodeUid) async throws {
+        guard !tags.isEmpty else { return }
+        let collector = SDKEnumerationCollector<NodeResult>()
+        try await client.updatePhotos(
+            [PhotoTagsUpdate(nodeUid: uid, tagsToAdd: tags)],
+            onNodeResult: { result in collector.receive(result) }
+        )
+        let result = try collector.collected().first {
+            $0.nodeUid.sdkCompatibleIdentifier == uid.sdkCompatibleIdentifier
+        }
+        guard let result else { throw UploadError.backend("SDK omitted the photo tag result") }
+        if let error = result.error { throw UploadError.backend(error.localizedDescription) }
+    }
+}
 
 /// SDK-backed favorite mutation with strict per-node result accounting. Missing or failed SDK
 /// results are failures; callers receive exact identities for selective optimistic-UI rollback.

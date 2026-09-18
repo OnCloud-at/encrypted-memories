@@ -81,6 +81,15 @@ public extension PhotoUploading {
     func resume(token: UUID) async throws {}
 }
 
+// MARK: - Photo tags (series migration seam, optional)
+
+/// Adds Proton photo tags to an existing photo. Backup uses it only to mark a main photo that an earlier
+/// build uploaded without the bursts tag, after its missing series members are related to it. An empty
+/// `volumeID` means "the photos volume", as for `PhotoUploadRequest.mainPhotoUID`.
+public protocol PhotoTagAdding: Sendable {
+    func addTags(_ tags: [Int], to uid: PhotoUID) async throws
+}
+
 // MARK: - Album attachment (albums seam, optional)
 
 /// The album side of an upload. Optional: when nil, only library uploads are possible. Implemented in
