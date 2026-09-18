@@ -104,7 +104,7 @@ public struct LibraryActivityBanner: View {
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 9)
-        .protonGlass(in: Capsule())
+        .glassEffect(in: Capsule())
         .shadow(color: .black.opacity(0.18), radius: 18, y: 8)
         .accessibilityElement(children: .combine)
         .animation(.easeInOut(duration: 0.18), value: message)

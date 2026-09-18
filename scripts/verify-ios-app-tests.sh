@@ -5,7 +5,43 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEVELOPER_DIR="${DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Developer}"
 source "$ROOT/scripts/build-paths.sh"
 DERIVED_DATA="${ENCRYPTED_MEMORIES_IOS_TEST_DERIVED_DATA:-$ENCRYPTED_MEMORIES_BUILD_ROOT/DD.tests.ios.noindex}"
-DESTINATION="${IOS_TEST_DESTINATION:-platform=iOS Simulator,name=iPhone 17 Pro,OS=latest}"
+# The runner image decides which iPhone simulators exist, and Apple renames the lineup every year. A
+# pinned device name therefore fails as "Unable to find a device matching the provided destination
+# specifier" on a new image. Resolve an installed iPhone instead; IOS_TEST_DESTINATION still overrides it.
+resolve_iphone_simulator() {
+  xcrun simctl list devices available --json | python3 -c '
+import json, re, sys
+
+preferred = ["iPhone 17 Pro", "iPhone 17 Pro Max", "iPhone 17"]
+names = {
+    device["name"]
+    for devices in json.load(sys.stdin)["devices"].values()
+    for device in devices
+    if device.get("isAvailable") and device["name"].startswith("iPhone")
+}
+for name in preferred:
+    if name in names:
+        print(name)
+        raise SystemExit
+
+def rank(name):
+    model = re.search(r"\d+", name)
+    return (int(model.group()) if model else 0, "Pro" in name, "Max" in name, name)
+
+print(max(names, key=rank) if names else "")
+'
+}
+
+if [[ -n "${IOS_TEST_DESTINATION:-}" ]]; then
+  DESTINATION="$IOS_TEST_DESTINATION"
+else
+  SIMULATOR_NAME="$(resolve_iphone_simulator)"
+  if [[ -z "$SIMULATOR_NAME" ]]; then
+    echo "[ios-tests] no available iPhone simulator; install an iOS runtime or set IOS_TEST_DESTINATION." >&2
+    exit 69
+  fi
+  DESTINATION="platform=iOS Simulator,name=$SIMULATOR_NAME,OS=latest"
+fi
 export DEVELOPER_DIR
 
 encryptedmemories_acquire_build_lock "verify-ios-app-tests"

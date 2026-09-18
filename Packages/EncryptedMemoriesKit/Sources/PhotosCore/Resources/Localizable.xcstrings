@@ -2193,22 +2193,12 @@
         }
       }
     },
-    "a11y.action": {
+    "viewer.close_photo": {
       "extractionState": "manual",
-      "comment": "Fallback VoiceOver label for an icon button.",
+      "comment": "View menu command that closes the open photo. Its key equivalent is Esc.",
       "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Action"
-          }
-        },
-        "de": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Aktion"
-          }
-        }
+        "en": { "stringUnit": { "state": "translated", "value": "Close Photo" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Foto schließen" } }
       }
     },
     "infopanel.info": {

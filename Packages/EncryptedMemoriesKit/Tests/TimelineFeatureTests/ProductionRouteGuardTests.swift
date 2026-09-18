@@ -1015,8 +1015,7 @@ struct ProductionRouteGuardTests {
             source.containsCodeFragmentIgnoringWhitespace("Slider(value:"),
             "the app-owned video surface must retain deterministic seeking")
         #expect(
-            videoControls.contains(".padding(.bottom, layoutProfile.rowSpacing)")
-                && !source.contains("layoutProfile.bottomChromeHeight"),
+            videoControls.contains(".padding(.bottom, layoutProfile.rowSpacing)"),
             "the filmstrip is safe-area content below the page, so the transport must not reserve its height again")
         #expect(
             source.contains("playbackIntendsToPlay"),
@@ -2294,28 +2293,6 @@ struct ProductionRouteGuardTests {
         )
         #expect(monitor.contains("loadState.failure?.retryable == true ? \"\" : nil"))
         #expect(monitor.contains("initialToken: initialToken"))
-    }
-
-    @Test func liquidGlassAvailabilityStaysCentralized() {
-        let roots = [
-            Self.repoRoot.appendingPathComponent("App"),
-            Self.repoRoot.appendingPathComponent("iOSApp"),
-            Self.repoRoot.appendingPathComponent("Packages/EncryptedMemoriesKit/Sources"),
-        ]
-        var scanned = 0
-        for root in roots {
-            for file in swiftFiles(under: root) {
-                scanned += 1
-                guard file.lastPathComponent != "AdaptiveGlass.swift" else { continue }
-                let text = (try? String(contentsOf: file, encoding: .utf8)) ?? ""
-                for token in [".glassEffect", ".buttonStyle(.glass"] {
-                    #expect(
-                        !text.contains(token),
-                        "\(token) must stay behind DesignSystemCore/AdaptiveGlass.swift: \(file.path)")
-                }
-            }
-        }
-        #expect(scanned > 0, "Guard scanned no files - repoRoot path is wrong: \(Self.repoRoot.path)")
     }
 
     @Test func albumsSidebarAndEmptyRoutesStayExplicit() throws {

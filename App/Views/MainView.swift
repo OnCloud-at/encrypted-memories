@@ -386,8 +386,6 @@ struct MainView: View {
             if let viewerModel, zoom == nil || zoom?.interactive == true {
                 PhotoViewerView(
                     model: viewerModel,
-                    isFavorite: { favorites.contains($0) },
-                    onToggleFavorite: { mutateFavorites([$0]) },
                     onClose: { closePhoto() },
                     onPinchDismissBegan: beginInteractiveDismiss,
                     onPinchDismissChanged: updateInteractiveDismiss,
@@ -1840,13 +1838,7 @@ struct MainView: View {
             }
             ToolbarItemGroup(placement: .primaryAction) {
                 Button {
-                    withAnimation(
-                        .easeInOut(
-                            duration: ViewerChromePresentationStyle.standard.inspectorDuration
-                        )
-                    ) {
-                        viewerModel.toggleInfo()
-                    }
+                    viewerModel.toggleInfo()
                 } label: {
                     Label("toolbar.info", systemImage: viewerModel.showInfo ? "info.circle.fill" : "info.circle")
                         .labelStyle(.iconOnly)
