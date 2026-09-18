@@ -298,7 +298,7 @@ struct MobileSeriesFavoritesScreen: View {
                     .multilineTextAlignment(.center)
             }
             .padding(20)
-            .protonGlass(in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+            .glassEffect(in: RoundedRectangle(cornerRadius: 22, style: .continuous))
             .accessibilityElement(children: .combine)
         }
     }

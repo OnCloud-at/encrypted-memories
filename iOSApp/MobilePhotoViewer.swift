@@ -357,7 +357,7 @@ struct MobilePhotoViewer: View {
             }
             .font(.footnote.weight(.semibold))
         }
-        .protonGlassButton()
+        .buttonStyle(.glass)
         .buttonBorderShape(.capsule)
         .controlSize(.small)
         .padding(.horizontal, 16)
