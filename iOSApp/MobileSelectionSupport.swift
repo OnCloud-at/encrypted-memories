@@ -45,6 +45,12 @@ final class MobileGridSelectionController {
         }
     }
 
+    /// Applies the complete selection reported by a grid swipe. The grid derives it from the state before the swipe.
+    func replace(with uids: Set<PhotoUID>) {
+        guard isSelecting, !isBusy else { return }
+        selected = uids
+    }
+
     func finish() {
         finish(reduceMotion: UIAccessibility.isReduceMotionEnabled)
     }

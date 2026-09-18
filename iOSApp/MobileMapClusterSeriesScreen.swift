@@ -122,6 +122,7 @@ struct MobileMapClusterSeriesScreen: View {
                     isActive: true,
                     onOpenPhoto: open,
                     onToggleSelection: selection.toggle,
+                    onSelectionChanged: selection.replace(with:),
                     dragOutProvider: model.backend,
                     onDragOutFailed: { selection.actionError = MobileSelectionError(message: $0.localizedMessage) },
                     contextMenuActions: { contextMenu.actions(for: $0, model: model) },
