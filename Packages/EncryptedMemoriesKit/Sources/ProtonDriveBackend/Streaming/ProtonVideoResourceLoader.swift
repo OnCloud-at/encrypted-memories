@@ -112,11 +112,13 @@ final class ProtonVideoResourceLoader: NSObject, AVAssetResourceLoaderDelegate, 
         let head = prepared.blockMap
             .forwardBlocks(afterClearOffset: -1, count: openingPrefetchBlockCount)
             .compactMap { prepared.block(at: $0.index) }
-        for block in head {
-            schedulePrefetch(block, reason: "open")
+        // The first block and the tail gate the open, so they must not wait behind other prefetch work.
+        for (position, block) in head.enumerated() {
+            schedulePrefetch(
+                block, reason: "open", priority: position == 0 ? .userInitiated : .foregroundPrefetch)
         }
         if let tail = prepared.blocks.last, !head.contains(where: { $0.index == tail.index }) {
-            schedulePrefetch(tail, reason: "open-tail")
+            schedulePrefetch(tail, reason: "open-tail", priority: .userInitiated)
         }
     }
 
@@ -181,13 +183,8 @@ final class ProtonVideoResourceLoader: NSObject, AVAssetResourceLoaderDelegate, 
         let key = ObjectIdentifier(loadingRequest)
         let task = lock.withLock { tasks.removeValue(forKey: key)?.task }
         task?.cancel()
-        let obsoletePrefetch = lock.withLock { () -> [Task<Void, Never>] in
-            lastForwardPrefetchOffset = -1
-            let tasks = prefetchTasks.values.map(\.task)
-            prefetchTasks.removeAll()
-            return tasks
-        }
-        obsoletePrefetch.forEach { $0.cancel() }
+        // The read-ahead stays alive: AVFoundation also cancels for reasons other than a seek (for example
+        // a full buffer), and the next served block re-schedules the window without duplicates.
         PhotoDiagnostics.shared.emit(
             "VideoStream",
             [
@@ -216,15 +213,20 @@ final class ProtonVideoResourceLoader: NSObject, AVAssetResourceLoaderDelegate, 
         for slice in slices {
             try Task.checkCancellation()
             guard let block = prepared.block(at: slice.blockIndex) else { continue }
-            let (clear, hit) = try await decryptedBlock(block, priority: .immediate)
+            let (clear, hit) = try await decryptedBlock(block, priority: .immediate, joinsPrefetch: true)
             if hit { cacheHits += 1 } else { cacheMisses += 1 }
             let from = slice.inBlock.lower
             let to = min(slice.inBlock.upper, clear.count)
             guard from < to else { continue }
             dataRequest.respond(with: clear.subdata(in: from..<to))
             served += to - from
+            // Per block, not per request: one open-ended request can span the whole file, and the
+            // read-ahead must keep moving while it is served.
+            scheduleForwardPrefetch(afterClearOffset: offset + served, reason: "blockServed")
         }
-        scheduleForwardPrefetch(afterClearOffset: offset + served, reason: "requestServed")
+        if served == 0 {
+            scheduleForwardPrefetch(afterClearOffset: offset, reason: "requestServed")
+        }
 
         PhotoDiagnostics.shared.emit(
             "VideoStream",
@@ -243,12 +245,24 @@ final class ProtonVideoResourceLoader: NSObject, AVAssetResourceLoaderDelegate, 
 
     /// Decrypted bytes for a block + whether it came from a cache (in-memory or disk). Network is the
     /// last resort; fetched encrypted bytes are persisted so reopen / seek-back reuses them.
+    ///
+    /// `joinsPrefetch` makes a demand read wait for an in-flight prefetch of the same block instead of
+    /// downloading it a second time. A prefetch task must pass `false`, or it would wait for itself.
     private func decryptedBlock(
         _ block: VideoBlock,
-        priority: ProtonRequestPriority
+        priority: ProtonRequestPriority,
+        joinsPrefetch: Bool = false
     ) async throws -> (Data, hit: Bool) {
         let key = NSNumber(value: block.index)
         if let cached = decryptedCache.object(forKey: key) { return (cached as Data, true) }
+
+        if joinsPrefetch, let prefetch = lock.withLock({ prefetchTasks[block.index]?.task }) {
+            await prefetch.value
+            try Task.checkCancellation()
+            if let cached = decryptedCache.object(forKey: key) { return (cached as Data, true) }
+            // A deep warm leaves only encrypted bytes on disk, and a failed prefetch leaves nothing:
+            // both continue with the lookup below.
+        }
 
         var hit = true
         let encrypted: Data
@@ -275,7 +289,7 @@ final class ProtonVideoResourceLoader: NSObject, AVAssetResourceLoaderDelegate, 
     /// on reopen/resume: the first requested range may be fully cached and play instantly, but without
     /// read-ahead the next uncached block is only requested when playback reaches the edge.
     ///
-    /// Driven from a single point (after serving) since served bytes reflect actual progress. The
+    /// Driven from a single point (after each served block) since served bytes reflect actual progress. The
     /// read-ahead set is found with a binary search instead of a linear filter over every block, and a
     /// repeat at the same `clearOffset` is skipped wholesale (a seek changes the offset and re-schedules).
     private func scheduleForwardPrefetch(afterClearOffset clearOffset: Int, reason: String) {
@@ -357,7 +371,11 @@ final class ProtonVideoResourceLoader: NSObject, AVAssetResourceLoaderDelegate, 
         )
     }
 
-    private func schedulePrefetch(_ block: VideoBlock, reason: String) {
+    private func schedulePrefetch(
+        _ block: VideoBlock,
+        reason: String,
+        priority: ProtonRequestPriority = .foregroundPrefetch
+    ) {
         let key = NSNumber(value: block.index)
         guard decryptedCache.object(forKey: key) == nil else {
             PhotoDiagnostics.shared.increment("perf.videoPrefetchDeduped")
@@ -371,7 +389,7 @@ final class ProtonVideoResourceLoader: NSObject, AVAssetResourceLoaderDelegate, 
                 guard let self else { return }
                 do {
                     let (_, hit) = try await self.admission.withAdmission { [self] in
-                        try await self.decryptedBlock(block, priority: .foregroundPrefetch)
+                        try await self.decryptedBlock(block, priority: priority)
                     }
                     PhotoDiagnostics.shared.emit(
                         "VideoStream",
