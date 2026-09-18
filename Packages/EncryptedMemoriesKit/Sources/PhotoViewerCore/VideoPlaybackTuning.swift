@@ -1,4 +1,5 @@
 import AVFoundation
+import PhotosCore
 
 /// One place for the playback buffering policy of a streamed Proton video.
 ///
@@ -21,5 +22,24 @@ public enum VideoPlaybackTuning {
         if isStreaming {
             item.preferredForwardBufferDuration = streamingForwardBuffer
         }
+    }
+
+    /// Loads the duration from the asset and reports it to the loader. Used where no player-item observation
+    /// exists; the load is cheap because the header is already being fetched for playback.
+    public static func reportDuration(of asset: StreamingVideoAsset) async {
+        guard let tuning = asset.readAheadTuning,
+            let duration = try? await asset.asset.load(.duration),
+            duration.isNumeric, duration.seconds.isFinite, duration.seconds > 0
+        else { return }
+        tuning.useReadAhead(forPlaybackDuration: duration.seconds)
+    }
+
+    /// Reports the clip's duration to the loader once AVFoundation knows it, so the loader can size its
+    /// read-ahead from the real bitrate. A clip of unknown or indefinite length keeps the default window.
+    public static func reportDuration(of item: AVPlayerItem, to asset: StreamingVideoAsset?) {
+        guard let tuning = asset?.readAheadTuning else { return }
+        let duration = item.duration
+        guard duration.isNumeric, duration.seconds.isFinite, duration.seconds > 0 else { return }
+        tuning.useReadAhead(forPlaybackDuration: duration.seconds)
     }
 }

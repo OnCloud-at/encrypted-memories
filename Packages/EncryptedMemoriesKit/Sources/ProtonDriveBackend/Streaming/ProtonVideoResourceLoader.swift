@@ -7,7 +7,9 @@ import PhotosCore
 /// Each request maps to the encrypted blocks that cover it, fetches only those blocks, decrypts them,
 /// and returns a contiguous file-order window. Obsolete requests are cancelled on seek; encrypted disk
 /// data and a small decrypted-block LRU avoid repeated fetches.
-final class ProtonVideoResourceLoader: NSObject, AVAssetResourceLoaderDelegate, @unchecked Sendable {
+final class ProtonVideoResourceLoader: NSObject, AVAssetResourceLoaderDelegate, VideoStreamReadAheadTuning,
+    @unchecked Sendable
+{
     private let prepared: PreparedVideo
     private let source: PhotoVideoStreamSource
     private let crypto: DriveCrypto
@@ -32,7 +34,15 @@ final class ProtonVideoResourceLoader: NSObject, AVAssetResourceLoaderDelegate, 
     /// How many ~4 MB blocks to warm ahead of the bytes AVFoundation just consumed. Deep enough that the
     /// network-fetch+decrypt read-ahead stays in front of playback (the shallow 4-block window micro-stalled
     /// higher-bitrate video). Paired with a roomier `decryptedCache` so warmed blocks survive until requested.
+    /// Blocks warmed as decrypted data ahead of the served bytes. This is the hot window; it stays small
+    /// because each entry holds about 4 MB of cleartext in memory.
     private let forwardPrefetchBlockCount = 8
+    /// Blocks warmed beyond the hot window as encrypted bytes on disk. Deep enough for a high-bitrate clip
+    /// to survive a slow stretch, cheap in memory because nothing is decrypted before it is needed.
+    /// Sized from the clip's own bitrate once the player reports its duration.
+    private var deepPrefetchBlockCount = 8
+    /// Bound for a very high bitrate, so one clip cannot queue unbounded fetches.
+    private static let deepPrefetchBlockLimit = 48
     /// Blocks warmed at open time, before AVFoundation asks for anything. The player decides on its own
     /// when playback can start without stalling (`automaticallyWaitsToMinimizeStalling`), and that decision
     /// is only as good as the bytes we can already serve: without this warm-up the first block is fetched
@@ -58,6 +68,39 @@ final class ProtonVideoResourceLoader: NSObject, AVAssetResourceLoaderDelegate, 
         super.init()
         // Keep the read-ahead window and recent blocks. At about 4 MB per block, the transient limit is 80 MB.
         decryptedCache.countLimit = 20
+    }
+
+    /// Sizes the deep read-ahead from the clip's average bitrate. A 4K clip needs several times the bytes of
+    /// a 1080p clip for the same seconds of playback, and a small clip needs no deep window at all.
+    ///
+    /// This never delays playback: the extra blocks are fetched in the background at prefetch priority, and
+    /// the player alone decides when it starts. A fast connection with a small clip therefore waits no longer
+    /// than before; it simply has the whole file on disk sooner.
+    func useReadAhead(forPlaybackDuration seconds: Double) {
+        guard
+            let bounded = VideoReadAheadWindow.blockCount(
+                totalSize: prepared.totalSize,
+                durationSeconds: seconds,
+                blockCount: prepared.blocks.count,
+                minimumBlocks: forwardPrefetchBlockCount,
+                maximumBlocks: Self.deepPrefetchBlockLimit
+            )
+        else { return }
+        let bytesPerSecond = Double(prepared.totalSize) / seconds
+        let changed = lock.withLock { () -> Bool in
+            guard bounded > deepPrefetchBlockCount else { return false }
+            deepPrefetchBlockCount = bounded
+            lastForwardPrefetchOffset = -1  // let the next served range schedule the wider window
+            return true
+        }
+        guard changed else { return }
+        PhotoDiagnostics.shared.emit(
+            "VideoStream",
+            [
+                "uid": uidKey, "strategy": "readAhead",
+                "blocks": "\(bounded)",
+                "mbitPerSecond": String(format: "%.1f", bytesPerSecond * 8 / 1_000_000),
+            ], throttleSeconds: 0.5)
     }
 
     /// Warms the start of the file and its last block before the player requests anything.
@@ -251,13 +294,67 @@ final class ProtonVideoResourceLoader: NSObject, AVAssetResourceLoaderDelegate, 
                 ], throttleSeconds: 0.5)
             return
         }
-        let candidates = prepared.blockMap
-            .forwardBlocks(afterClearOffset: clearOffset, count: forwardPrefetchBlockCount)
+        let deepCount = lock.withLock { deepPrefetchBlockCount }
+        let window = prepared.blockMap
+            .forwardBlocks(afterClearOffset: clearOffset, count: max(forwardPrefetchBlockCount, deepCount))
             .compactMap { prepared.block(at: $0.index) }
-        guard !candidates.isEmpty else { return }
-        for block in candidates {
-            schedulePrefetch(block, reason: reason)
+        guard !window.isEmpty else { return }
+        for (position, block) in window.enumerated() {
+            if position < forwardPrefetchBlockCount {
+                schedulePrefetch(block, reason: reason)
+            } else {
+                // Beyond the hot window keep the bytes encrypted on disk. Decrypting them early would cost
+                // about 4 MB of memory per block for content the player may never reach.
+                scheduleEncryptedWarm(block, reason: reason)
+            }
         }
+    }
+
+    /// Fetches one block's encrypted bytes into the disk cache without decrypting them.
+    private func scheduleEncryptedWarm(_ block: VideoBlock, reason: String) {
+        let key = NSNumber(value: block.index)
+        guard decryptedCache.object(forKey: key) == nil else { return }
+        let scheduled = lock.withLock { () -> Bool in
+            guard prefetchTasks[block.index] == nil else { return false }
+            let taskID = UUID()
+            let task = Task { [weak self] in
+                guard let self else { return }
+                do {
+                    try await self.admission.withAdmission { [self] in
+                        try await self.warmEncryptedBlock(block)
+                    }
+                } catch is CancellationError {
+                } catch {
+                    PhotoDiagnostics.shared.emit(
+                        "VideoStream",
+                        [
+                            "uid": self.uidKey, "strategy": "deepWarm",
+                            "block": "\(block.index)", "reason": reason, "error": "\(error)",
+                        ], throttleSeconds: 0.5)
+                }
+                self.lock.withLock {
+                    guard self.prefetchTasks[block.index]?.id == taskID else { return }
+                    self.prefetchTasks.removeValue(forKey: block.index)
+                }
+            }
+            prefetchTasks[block.index] = PrefetchTask(id: taskID, task: task)
+            return true
+        }
+        if scheduled { PhotoDiagnostics.shared.increment("perf.videoDeepWarmScheduled") }
+    }
+
+    /// Stores the block's encrypted bytes for a later serve. A block already on disk costs nothing.
+    private func warmEncryptedBlock(_ block: VideoBlock) async throws {
+        let lookup = await cache.lookupAsync(uid: prepared.uid, block: block.index)
+        guard lookup.encrypted == nil else { return }
+        let encrypted = try await source.encryptedBlockData(block, priority: .foregroundPrefetch)
+        _ = await cache.storeAsync(
+            uid: prepared.uid,
+            block: block.index,
+            encrypted: encrypted,
+            ticket: lookup.ticket,
+            ownerGeneration: ownerGeneration
+        )
     }
 
     private func schedulePrefetch(_ block: VideoBlock, reason: String) {

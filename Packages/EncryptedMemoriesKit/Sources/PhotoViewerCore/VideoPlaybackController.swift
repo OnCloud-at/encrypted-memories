@@ -120,6 +120,11 @@ public final class VideoPlaybackController {
                 let ranges = observed.loadedTimeRanges.map { $0.timeRangeValue }
                 Task { @MainActor in box.value?.onLoadedRanges(ranges, uid: uid) }
             })
+        // The loader sizes its read-ahead from the clip's bitrate, which needs the duration.
+        observations.append(
+            item.observe(\.duration, options: [.new, .initial]) { observed, _ in
+                Task { @MainActor in box.value?.onDurationKnown(of: observed, uid: uid) }
+            })
         observations.append(
             player.observe(\.timeControlStatus, options: [.new]) { observed, _ in
                 let raw = observed.timeControlStatus.rawValue
@@ -146,6 +151,11 @@ public final class VideoPlaybackController {
     }
 
     // MARK: - Observation handlers
+
+    private func onDurationKnown(of item: AVPlayerItem, uid: PhotoUID) {
+        guard uid == currentUID, isStreaming else { return }
+        VideoPlaybackTuning.reportDuration(of: item, to: streamingAsset as? StreamingVideoAsset)
+    }
 
     private func onStatus(_ raw: Int, error: Error?, uid: PhotoUID) {
         guard uid == currentUID, let player else { return }
