@@ -114,6 +114,14 @@ struct VideoBlockMapBinarySearchTests {
         }
     }
 
+    @Test func theOpeningWindowStartsAtTheFirstBlock() {
+        // The loader warms the start of the file before AVFoundation requests anything. An offset of -1
+        // must therefore include block 1; any offset of 0 or more would already skip it.
+        let m = VideoBlockMap(blockSizes: [(1, 100), (2, 100), (3, 100)], totalOverride: 300)
+        #expect(m.forwardBlocks(afterClearOffset: -1, count: 2).map(\.index) == [1, 2])
+        #expect(m.forwardBlocks(afterClearOffset: -1, count: 99).map(\.index) == [1, 2, 3])
+    }
+
     @Test func forwardBlocksIsDeterministicAndAdvances() {
         // Repeating the same offset yields the identical read-ahead set - the loader dedups against the
         // last scheduled offset, so an unchanged offset re-schedules nothing new.

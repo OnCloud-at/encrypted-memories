@@ -184,6 +184,16 @@ public actor LibrarySourceCoordinator: PriorityThumbnailBatchLoader {
         return closed ? .unavailable : .accepted
     }
 
+    /// Registers what a route outside every inventory currently shows, today Recently Deleted.
+    ///
+    /// A trashed photo left the inventory, so no scope and no lease authorized its thumbnail and each tile
+    /// stayed black. The set authorizes explicit reads only; no crawl fetches it. Leaving the route passes an
+    /// empty set, which releases the retained bytes again.
+    public func setIdentitiesOutsideInventory(_ uids: [PhotoUID]) async {
+        guard !closed else { return }
+        if let change = graph.setIdentitiesOutsideInventory(Set(uids)) { await publish(change) }
+    }
+
     /// Applies an already-confirmed remote access loss without waiting for another catalog sweep.
     /// This invalidates byte-route leases and derived-data memberships in the same graph mutation.
     func revokeAdditionalSource(for locator: AlbumNodeIdentifier) async {
@@ -474,8 +484,13 @@ public actor LibrarySourceCoordinator: PriorityThumbnailBatchLoader {
         }
         // A series filmstrip requests burst members, which are authorized through the item that lists them.
         let burstLeases = graph.burstMemberAccessLeases(for: unleased, requiring: .readThumbnail)
+        // Recently Deleted requests photos that left every inventory; their route registered them.
+        let outsideInventoryLeases = graph.identityOutsideInventoryAccessLeases(
+            for: unleased.subtracting(burstLeases.keys),
+            requiring: .readThumbnail
+        )
         for uid in unleased {
-            if let lease = burstLeases[uid] {
+            if let lease = burstLeases[uid] ?? outsideInventoryLeases[uid] {
                 leases[uid] = lease
             } else {
                 denied[uid] = "source unavailable"
@@ -585,16 +600,19 @@ public actor LibrarySourceCoordinator: PriorityThumbnailBatchLoader {
 private struct ConsumerScopeSignature: Equatable {
     let sourceIDs: Set<SourceID>
     let orderedUIDs: [PhotoUID]
+    let authorizationOnlyUIDs: Set<PhotoUID>
     let isAuthoritative: Bool
 
     init<Kind>(_ scope: DerivedDataScope<Kind>) {
         sourceIDs = scope.sourceIDs
         orderedUIDs = scope.orderedUIDs
+        authorizationOnlyUIDs = scope.authorizationOnlyUIDs
         isAuthoritative = scope.isAuthoritative
     }
 
     func hasSameInventory(as other: Self) -> Bool {
         sourceIDs == other.sourceIDs && orderedUIDs == other.orderedUIDs
+            && authorizationOnlyUIDs == other.authorizationOnlyUIDs
     }
 }
 

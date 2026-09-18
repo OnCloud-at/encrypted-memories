@@ -1721,8 +1721,15 @@ private struct MobileVideoPage: View {
         do {
             let streaming = try await backend.makeStreamingAsset(for: item.uid)
             guard !Task.isCancelled else { return }  // A cancelled page must not attach a player.
-            let newPlayer = AVPlayer(playerItem: AVPlayerItem(asset: streaming.asset))
+            let playerItem = AVPlayerItem(asset: streaming.asset)
+            let newPlayer = AVPlayer(playerItem: playerItem)
+            // Same buffering policy as the macOS viewer: AVFoundation decides when playback may start,
+            // and the forward window keeps the block loader ahead of it.
+            VideoPlaybackTuning.configure(player: newPlayer, item: playerItem, isStreaming: true)
             streamingAsset = streaming  // retain the resource loader for the player's lifetime
+            // The loader sizes its read-ahead from the clip's bitrate; a 4K clip needs a wider window than
+            // a 1080p clip for the same seconds of playback.
+            Task { await VideoPlaybackTuning.reportDuration(of: streaming) }
             player = newPlayer
             if isCurrent {
                 playbackIntendsToPlay = true

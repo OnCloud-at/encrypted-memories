@@ -166,9 +166,14 @@ struct ProductionRouteGuardTests {
                 "Packages/EncryptedMemoriesKit/Sources/ProtonDriveBackend/Streaming/ProtonVideoResourceLoader.swift"
             ), encoding: .utf8)
         #expect(videoLoader.contains("private let admission: JoinedShutdownGate"))
+        // Every unstructured task of the loader fetches remote bytes, so each one must join bridge
+        // shutdown. Counting the gates against the tasks keeps that true when a new warm path is added.
+        let createdTasks = videoLoader.components(separatedBy: "= Task {").count - 1
+        let gatedRoutes = videoLoader.components(separatedBy: "admission.withAdmission").count - 1
+        #expect(createdTasks > 0, "the guard must observe the loader's actual tasks")
         #expect(
-            videoLoader.components(separatedBy: "admission.withAdmission").count == 3,
-            "issued AV assets must gate both range requests and forward-prefetch tasks")
+            gatedRoutes >= createdTasks,
+            "issued AV assets must gate range requests and every prefetch or warm task")
         #expect(
             bridge.contains("admission: shutdownGate"),
             "the AV resource loader must share the bridge shutdown admission owner")

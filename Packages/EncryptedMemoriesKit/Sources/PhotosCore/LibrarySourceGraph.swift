@@ -343,6 +343,9 @@ public struct SourceAccessLease: Hashable, Sendable {
     fileprivate let requiresInclusion: Bool
     fileprivate let membershipUID: PhotoUID
     fileprivate let relationship: LibrarySourceRelationship?
+    /// True for an identity the user addresses outside every source inventory, such as a photo in the
+    /// volume trash. The source proves access; no inventory membership exists to prove.
+    fileprivate var readsIdentityOutsideInventory: Bool = false
 }
 
 /// A relationship whose target bytes are addressed separately from the owning timeline item.
@@ -388,6 +391,9 @@ public struct DerivedDataScope<Kind: DerivedDataScopeKind>: Sendable, Equatable 
     /// Stable timeline order for deterministic indexing and crawl scheduling.
     public let orderedUIDs: [PhotoUID]
     public let uids: Set<PhotoUID>
+    /// Identities the consumer may read on explicit demand although no crawl order contains them: the
+    /// volume trash listing. A background crawl must never fetch them; only a visible tile may.
+    public let authorizationOnlyUIDs: Set<PhotoUID>
     public let isAuthoritative: Bool
     public let revision: UInt64
 
@@ -395,6 +401,7 @@ public struct DerivedDataScope<Kind: DerivedDataScopeKind>: Sendable, Equatable 
         epoch: LibrarySourceEpoch = LibrarySourceEpoch(),
         sourceIDs: Set<SourceID>,
         orderedUIDs: [PhotoUID],
+        authorizationOnlyUIDs: Set<PhotoUID> = [],
         isAuthoritative: Bool,
         revision: UInt64
     ) {
@@ -402,7 +409,8 @@ public struct DerivedDataScope<Kind: DerivedDataScopeKind>: Sendable, Equatable 
         self.sourceIDs = sourceIDs
         var seen = Set<PhotoUID>()
         self.orderedUIDs = orderedUIDs.filter { seen.insert($0).inserted }
-        self.uids = seen
+        self.authorizationOnlyUIDs = authorizationOnlyUIDs.subtracting(seen)
+        self.uids = seen.union(self.authorizationOnlyUIDs)
         self.isAuthoritative = isAuthoritative
         self.revision = revision
     }
@@ -685,6 +693,9 @@ public final class LibrarySourceGraph {
     }
 
     private var records: [SourceID: Record] = [:]
+    /// Identities the user addresses although no source inventory lists them: the volume trash listing.
+    /// They authorize a thumbnail read on explicit demand and never enter a crawl order.
+    private var identitiesOutsideInventory: Set<PhotoUID> = []
     private let epoch = LibrarySourceEpoch()
     private var sourceSetGeneration: UInt64 = 0
     public private(set) var sourceSetAuthority: SourceSetAuthority
@@ -1004,6 +1015,62 @@ public final class LibrarySourceGraph {
         return makeChange(previousRetentionUIDs: previousRetentionUIDs)
     }
 
+    /// Registers the identities of a route that reads outside every inventory, currently Recently Deleted.
+    ///
+    /// A trashed photo is still the user's own photo on an accessible source, but it left the inventory, so
+    /// neither a scope nor a lease could authorize its thumbnail and every tile stayed black. The set
+    /// authorizes explicit thumbnail reads only: it never joins a crawl order, and leaving the route clears
+    /// it, which releases the retained bytes again.
+    public func setIdentitiesOutsideInventory(_ uids: Set<PhotoUID>) -> LibrarySourceChange? {
+        guard identitiesOutsideInventory != uids else { return nil }
+        let previousRetentionUIDs = retentionUIDs()
+        identitiesOutsideInventory = uids
+        revision &+= 1
+        return makeChange(previousRetentionUIDs: previousRetentionUIDs)
+    }
+
+    /// Leases for identities registered through `setIdentitiesOutsideInventory`. The lease proves source
+    /// access, not inventory membership, so it stays valid while that route shows the photo.
+    public func identityOutsideInventoryAccessLeases(
+        for uids: Set<PhotoUID>,
+        requiring capability: LibrarySourceCapabilities,
+        includeExcludedSources: Bool = true
+    ) -> [PhotoUID: SourceAccessLease] {
+        let requested = uids.intersection(identitiesOutsideInventory)
+        guard !requested.isEmpty, !capability.isEmpty, capability.subtracting(.all).isEmpty else { return [:] }
+        var selectedID: SourceID?
+        for (sourceID, record) in records
+        where record.accessState != .accessLost
+            && (includeExcludedSources || record.source.isIncluded)
+            && record.source.capabilities.contains(capability)
+        {
+            if let selectedID, let selected = records[selectedID],
+                !LibrarySourceProjection.sourcePrecedes(record.source, selected.source)
+            {
+                continue
+            }
+            selectedID = sourceID
+        }
+        guard let selectedID, let record = records[selectedID] else { return [:] }
+        return Dictionary(
+            uniqueKeysWithValues: requested.map { uid in
+                (
+                    uid,
+                    SourceAccessLease(
+                        sourceID: selectedID,
+                        uid: uid,
+                        capability: capability,
+                        epoch: epoch,
+                        generation: record.accessGeneration,
+                        requiresInclusion: !includeExcludedSources,
+                        membershipUID: uid,
+                        relationship: nil,
+                        readsIdentityOutsideInventory: true
+                    )
+                )
+            })
+    }
+
     /// Changes main-projection participation without changing access or retention reachability.
     public func setIncluded(_ included: Bool, for sourceID: SourceID) -> LibrarySourceChange? {
         guard var record = records[sourceID], record.source.isIncluded != included else { return nil }
@@ -1195,11 +1262,16 @@ public final class LibrarySourceGraph {
     /// Checks the lease again before publishing a late asynchronous result.
     public func isCurrent(_ lease: SourceAccessLease) -> Bool {
         guard lease.epoch == epoch, let record = records[lease.sourceID] else { return false }
-        return record.accessState != .accessLost
-            && record.accessGeneration == lease.generation
-            && record.source.capabilities.contains(lease.capability)
-            && (!lease.requiresInclusion || record.source.isIncluded)
-            && record.itemIndexByUID[lease.membershipUID] != nil
+        guard record.accessState != .accessLost,
+            record.accessGeneration == lease.generation,
+            record.source.capabilities.contains(lease.capability),
+            !lease.requiresInclusion || record.source.isIncluded
+        else { return false }
+        if lease.readsIdentityOutsideInventory {
+            // No inventory lists this identity. The registration of its route is the only membership proof.
+            return identitiesOutsideInventory.contains(lease.uid)
+        }
+        return record.itemIndexByUID[lease.membershipUID] != nil
             && isCurrentRelationship(lease, record: record)
     }
 
@@ -1280,6 +1352,9 @@ public final class LibrarySourceGraph {
                 records: included,
                 relationship: .burstMember
             ),
+            // A photo in the volume trash left every inventory but stays visible in Recently Deleted.
+            // Its tile may load a thumbnail; no crawl fetches it.
+            authorizationOnlyUIDs: included.isEmpty ? [] : identitiesOutsideInventory,
             requiredCapability: .readThumbnail
         )
     }
@@ -1332,6 +1407,9 @@ public final class LibrarySourceGraph {
                 relationship: .burstMember,
                 directOrder: analysisOrder
             ),
+            // Recently Deleted reads photos that left every inventory. They authorize an explicit read and
+            // stay out of every crawl order.
+            authorizationOnlyUIDs: analysisRecords.isEmpty ? [] : identitiesOutsideInventory,
             requiredCapability: .readThumbnail
         )
         let videoRecords = retentionRecords.filter {
@@ -1436,6 +1514,7 @@ public final class LibrarySourceGraph {
     private func makeScope<Kind: DerivedDataScopeKind>(
         records included: [Record],
         orderedUIDs: [PhotoUID],
+        authorizationOnlyUIDs: Set<PhotoUID> = [],
         requiredCapability: LibrarySourceCapabilities = []
     ) -> DerivedDataScope<Kind> {
         let sourceIDs = Set(included.map(\.source.id))
@@ -1449,6 +1528,7 @@ public final class LibrarySourceGraph {
             epoch: epoch,
             sourceIDs: sourceIDs,
             orderedUIDs: orderedUIDs,
+            authorizationOnlyUIDs: authorizationOnlyUIDs,
             isAuthoritative: authoritative,
             revision: revision
         )
