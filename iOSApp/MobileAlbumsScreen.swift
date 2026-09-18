@@ -419,6 +419,7 @@ private struct MobileFilterGridScreen: View {
                     selectedUIDs: selection.selected,
                     onOpenPhoto: open,
                     onToggleSelection: toggleSelectionHandler,
+                    onSelectionChanged: filter.isReadOnly ? nil : { selection.replace(with: $0) },
                     dragOutProvider: model.backend,
                     onDragOutFailed: {
                         actionErrorTitle = L10n.string("dragout.error.title")

@@ -610,15 +610,24 @@ struct ProductionRouteGuardTests {
         #expect(mobileRoot.contains(".id(libraryModel.scopePresentationRevision)"))
     }
 
-    @Test func iOSLongPressIsDragOutOrContextMenuNeverSelection() throws {
+    @Test func iOSLongPressNeverEntersSelectionAndSwipeSelectionYieldsToDragOut() throws {
         let host = try String(
             contentsOf: Self.repoRoot.appendingPathComponent(
                 "Packages/EncryptedMemoriesKit/Sources/TimelineUIKitFeature/UIKitTimelineGridHost.swift"
             ), encoding: .utf8)
         #expect(!host.contains("onBeginSelection"))
         #expect(!host.contains("beginSelection"))
-        #expect(!host.contains("dragSelect"))
         #expect(!host.contains("onDragSelectionChanged"))
+
+        // Swipe selection runs only inside selection mode and yields a selected photo's hold to drag-out.
+        let swipe = try String(
+            contentsOf: Self.repoRoot.appendingPathComponent(
+                "Packages/EncryptedMemoriesKit/Sources/TimelineUIKitFeature/UIKitTimelineGridHostSwipeSelection.swift"
+            ), encoding: .utf8)
+        #expect(swipe.contains("$0.selectionMode && $0.onSelectionChanged != nil"))
+        #expect(swipe.contains("host.dragOutProvider == nil || !host.selectedUIDs.contains(item.uid)"))
+        #expect(swipe.contains("scrollView.panGestureRecognizer.require(toFail: pan)"))
+        #expect(host.contains("tap.require(toFail: swipeSelection.hold)"))
 
         let drag = try String(
             contentsOf: Self.repoRoot.appendingPathComponent(
@@ -637,6 +646,9 @@ struct ProductionRouteGuardTests {
         #expect(drag.contains("onContextMenuAction?(action, items)"))
         #expect(drag.contains("effectiveContentMode(preferred: host.displayMode"))
         #expect(drag.contains("configuration.preferredMenuElementOrder = .fixed"))
+        #expect(
+            drag.components(separatedBy: "!host.swipeSelection.ownsLongPress(on: pressed)").count - 1 == 2,
+            "drag lift and context menu must both decline a press that swipe selection owns")
 
         for path in [
             "iOSApp/MobileTimelineScreen.swift",
@@ -645,19 +657,8 @@ struct ProductionRouteGuardTests {
         ] {
             let screen = try String(contentsOf: Self.repoRoot.appendingPathComponent(path), encoding: .utf8)
             #expect(!screen.contains("onBeginSelection"), "\(path) must not wire long-press selection")
-            #expect(!screen.contains("onDragSelectionChanged"), "\(path) must not wire range-drag selection")
+            #expect(screen.contains("onSelectionChanged:"), "\(path) must wire swipe selection")
         }
-
-        let gridDragRange = Self.repoRoot.appendingPathComponent(
-            "Packages/EncryptedMemoriesKit/Sources/GridCore/GridDragRangeSelection.swift")
-        let gridAutoScroll = Self.repoRoot.appendingPathComponent(
-            "Packages/EncryptedMemoriesKit/Sources/GridCore/GridEdgeAutoScrollPolicy.swift")
-        #expect(
-            !FileManager.default.fileExists(atPath: gridDragRange.path),
-            "long-press range selection is removed; selection is Select-button-only")
-        #expect(
-            !FileManager.default.fileExists(atPath: gridAutoScroll.path),
-            "range-drag edge auto-scroll policy is removed along with its only caller")
     }
 
     @Test func mobileGridBinaryConfirmationsUseSharedNativeAlerts() throws {
