@@ -52,6 +52,9 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     private var mediaTypeReconciliationTask: Task<Void, Never>?
     private var isShutDown = false
     private nonisolated let shutdownGate = JoinedShutdownGate()
+    /// Receives the identities of a listing that no source inventory contains, currently the volume trash.
+    /// The library source coordinator authorizes their thumbnails; without it every tile stays black.
+    private nonisolated let identitiesOutsideInventoryObserver = IdentitiesOutsideInventoryObserver()
     /// Where the per-account upload-identity manifest lives (next to `library-v1.sqlite`, so the
     /// sign-out purge covers it) and the platform SQLite tuning it opens with. Module-internal:
     /// the facade derives the account data directory + store policy for the backup sync stores
@@ -1141,6 +1144,13 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         }
     }
 
+    /// Wired by the account composition. Every trash listing then authorizes what it shows.
+    nonisolated func setIdentitiesOutsideInventoryObserver(
+        _ observer: @escaping @Sendable ([PhotoUID]) async -> Void
+    ) {
+        identitiesOutsideInventoryObserver.set(observer)
+    }
+
     private func timelineImpl(filter: PhotoFilter) async throws -> [TimelineSection] {
         switch filter {
         case .all:
@@ -1189,6 +1199,8 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                         tags: isVideo ? [.videos] : [])
                 }
                 .sorted(by: TimelineOrder.areInIncreasingOrder)
+            // A trashed photo left every inventory, so only this listing proves that the user may read it.
+            await identitiesOutsideInventoryObserver.report(photos.map(\.uid))
             return [
                 TimelineSection(id: "trash", date: photos.first?.captureTime ?? .distantPast, title: "", items: photos)
             ]
@@ -1931,5 +1943,21 @@ private final class BatchFailureBox: @unchecked Sendable {
 
     var result: ThumbnailBatchLoadResult {
         lock.withLock { ThumbnailBatchLoadResult(batchError: streamError, itemErrors: itemErrors) }
+    }
+}
+
+/// Holds the observer that authorizes identities outside every source inventory. The box is set once at
+/// composition time and read from the actor, so it needs no isolation of its own.
+final class IdentitiesOutsideInventoryObserver: @unchecked Sendable {
+    private let lock = NSLock()
+    private var observer: (@Sendable ([PhotoUID]) async -> Void)?
+
+    func set(_ observer: @escaping @Sendable ([PhotoUID]) async -> Void) {
+        lock.withLock { self.observer = observer }
+    }
+
+    func report(_ uids: [PhotoUID]) async {
+        guard let observer = lock.withLock({ observer }) else { return }
+        await observer(uids)
     }
 }

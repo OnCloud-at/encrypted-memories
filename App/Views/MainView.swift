@@ -1971,6 +1971,9 @@ struct MainView: View {
                 } label: {
                     Label("toolbar.move_selected_to_trash", systemImage: "trash").labelStyle(.iconOnly)
                 }
+                // Command-Delete is the system-wide delete key equivalent. It opens the same confirmation
+                // as the button, so no selection leaves the library without the user confirming it.
+                .keyboardShortcut(.delete, modifiers: .command)
                 .disabled(selectedUIDs.isEmpty || isTrashMutating)
                 .help("toolbar.move_to_trash")
                 .accessibilityLabel("toolbar.move_selected_to_trash")

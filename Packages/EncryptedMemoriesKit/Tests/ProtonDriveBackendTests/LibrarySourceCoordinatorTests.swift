@@ -72,6 +72,37 @@ struct LibrarySourceCoordinatorTests {
         await coordinator.shutdown()
     }
 
+    @Test func recentlyDeletedThumbnailsLoadAfterTheirRouteRegistersThem() async throws {
+        let itemUID = PhotoUID(volumeID: "primary-volume", nodeID: "library-item")
+        let trashedUID = PhotoUID(volumeID: "primary-volume", nodeID: "trashed-photo")
+        let backend = ControlledLibrarySourceBackend()
+        let coordinator = LibrarySourceCoordinator(remote: backend, thumbnailLoader: backend, inventoryStore: nil)
+        await coordinator.prepare()
+        await coordinator.replacePrimaryInventory(
+            [PhotoItem(uid: itemUID, captureTime: Date(timeIntervalSince1970: 1), mediaType: "image/jpeg")],
+            authority: .authoritative)
+        let delivered = ThumbnailDeliveryRecorder()
+
+        // Before the trash listing runs, nothing proves that the user may read this photo.
+        let refused = await coordinator.loadThumbnails(for: [trashedUID], priority: .visibleNow) { uid, data in
+            delivered.store(data, for: uid)
+        }
+        #expect(refused.itemErrors[trashedUID] == "source unavailable")
+
+        await coordinator.setIdentitiesOutsideInventory([trashedUID])
+        let result = await coordinator.loadThumbnails(for: [trashedUID], priority: .visibleNow) { uid, data in
+            delivered.store(data, for: uid)
+        }
+
+        #expect(delivered.data(for: trashedUID) != nil, "a Recently Deleted tile must load its thumbnail")
+        #expect(result.itemErrors[trashedUID] == nil)
+
+        await coordinator.setIdentitiesOutsideInventory([])
+        let withdrawn = await coordinator.loadThumbnails(for: [trashedUID], priority: .visibleNow) { _, _ in }
+        #expect(withdrawn.itemErrors[trashedUID] == "source unavailable")
+        await coordinator.shutdown()
+    }
+
     @Test func removedSourceRejectsThumbnailBytesWhichArriveAfterRevocation() async throws {
         let remoteUID = PhotoUID(volumeID: "remote-volume", nodeID: "remote-photo")
         let backend = ControlledLibrarySourceBackend(blockThumbnailLoads: true)

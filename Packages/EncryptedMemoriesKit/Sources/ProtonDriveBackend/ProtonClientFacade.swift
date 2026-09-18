@@ -92,6 +92,11 @@ public final class ProtonClientFacade {
     ) -> ProtonClientFacade {
         // Albums: SDK 0.27.0 is the sole catalog/sharing/membership reader. Direct Photos HTTP is
         // retained only for writes the SDK does not expose.
+        // Recently Deleted lists photos that left every inventory. The coordinator authorizes their
+        // thumbnails from that listing; a weak reference keeps the bridge from retaining the coordinator.
+        bridge.setIdentitiesOutsideInventoryObserver { [weak librarySources] uids in
+            await librarySources?.setIdentitiesOutsideInventory(uids)
+        }
         let albumWrite = bridge.makeAlbumWriteService()
         let albumCatalog = bridge.makeAlbumCatalogBackend()
         let albumWrites = HTTPAlbumWriteBackend(

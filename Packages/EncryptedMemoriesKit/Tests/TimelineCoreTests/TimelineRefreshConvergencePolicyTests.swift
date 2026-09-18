@@ -6,12 +6,25 @@ import Testing
 @Suite struct TimelineRefreshConvergencePolicyTests {
     private let policy = TimelineRefreshConvergencePolicy()
 
-    @Test func pendingVisibilityUsesTheExistingBoundedUploadSchedule() {
-        #expect(policy.decision(after: .pendingInventoryVisibility, attempt: 0) == .retry(after: .seconds(1)))
-        #expect(policy.decision(after: .pendingInventoryVisibility, attempt: 1) == .retry(after: .seconds(3)))
-        #expect(policy.decision(after: .pendingInventoryVisibility, attempt: 2) == .retry(after: .seconds(8)))
-        #expect(policy.decision(after: .pendingInventoryVisibility, attempt: 3) == .retry(after: .seconds(18)))
-        #expect(policy.decision(after: .pendingInventoryVisibility, attempt: 4) == .notYetVisible)
+    @Test func pendingVisibilityFollowsTheBoundedUploadSchedule() {
+        let delays = TimelineRefreshRetrySchedule.uploadDefault.delays
+        for attempt in 0..<(delays.count - 1) {
+            #expect(
+                policy.decision(after: .pendingInventoryVisibility, attempt: attempt)
+                    == .retry(after: delays[attempt + 1]))
+        }
+        #expect(
+            policy.decision(after: .pendingInventoryVisibility, attempt: delays.count - 1) == .notYetVisible,
+            "the last delay ends the convergence window")
+    }
+
+    @Test func theFirstRetryOfALocallyCreatedPhotoStaysSubSecond() {
+        // A kept series favorite or a manual upload is usually listed within a second. A one-second first
+        // retry made the grid show it only after four seconds.
+        #expect(
+            policy.decision(after: .pendingInventoryVisibility, attempt: 0)
+                == .retry(after: TimelineRefreshRetrySchedule.uploadDefault.delays[1]))
+        #expect(TimelineRefreshRetrySchedule.uploadDefault.delays[1] <= .milliseconds(400))
     }
 
     @Test func successAndTerminalFailureNeverRetry() {

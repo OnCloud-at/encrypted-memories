@@ -1478,6 +1478,65 @@ struct ThumbnailFeedCoreTests {
         await feed.stopPrefetchAndWait()
     }
 
+    @Test func recentlyDeletedPhotosAreReadableAlthoughNoInventoryListsThem() async throws {
+        let item = Self.uid("library-item")
+        let trashed = Self.uid("trashed-photo")
+        let cache = Self.cache("trash-read")
+        let payload = Self.pngData(width: 8, height: 8)
+        let loader = RecordingLoader(payloads: [item: payload, trashed: payload])
+        // One worker and single-item batches keep the loader's call order equal to the crawl order.
+        let feed = ThumbnailFeedCore(
+            cache: cache, loader: loader,
+            configuration: Self.configuration(downloadConcurrencyLimit: 1, batchSize: 1))
+        let graph = LibrarySourceGraph()
+        let source = LibrarySource(id: SourceID("trash-test"), capabilities: .readThumbnail, isIncluded: true)
+        _ = graph.commitSourceSet([source], using: graph.beginSourceSetRefresh())
+        let libraryItem = PhotoItem(
+            uid: item, captureTime: Date(timeIntervalSince1970: 0), mediaType: "image/jpeg")
+        _ = graph.commit([.complete(libraryItem)], validationToken: nil, using: graph.beginRefresh(source.id)!)
+        // The trash listing registers what Recently Deleted shows.
+        let change = try #require(graph.setIdentitiesOutsideInventory([trashed]))
+        #expect(change.thumbnailRetentionScope.uids.contains(trashed))
+        #expect(change.thumbnailRetentionScope.authorizationOnlyUIDs == [trashed])
+        #expect(
+            !change.thumbnailRetentionScope.orderedUIDs.contains(trashed),
+            "a background crawl must never fetch a trashed photo")
+        #expect(await feed.bindDerivedDataEpoch(graph.runtimeEpoch))
+        _ = await feed.reconcile(
+            selected: change.selectedScope, analysis: change.analysisScope,
+            retention: change.thumbnailRetentionScope)
+
+        #expect(await feed.decoded(for: trashed) != nil, "a Recently Deleted tile must show its thumbnail")
+        #expect(feed.memoryDecoded(for: trashed) != nil)
+        await feed.stopPrefetchAndWait()
+    }
+
+    @Test func leavingRecentlyDeletedWithdrawsItsThumbnailAuthorization() async throws {
+        let trashed = Self.uid("trashed-photo-withdrawn")
+        let cache = Self.cache("trash-withdraw")
+        let loader = RecordingLoader(payloads: [trashed: Self.pngData(width: 8, height: 8)])
+        let feed = ThumbnailFeedCore(cache: cache, loader: loader, configuration: Self.configuration())
+        await feed.setPrefetchEnabled(false)
+        let graph = LibrarySourceGraph()
+        let source = LibrarySource(id: SourceID("trash-test"), capabilities: .readThumbnail, isIncluded: true)
+        _ = graph.commitSourceSet([source], using: graph.beginSourceSetRefresh())
+        _ = graph.commit([], validationToken: nil, using: graph.beginRefresh(source.id)!)
+        let registered = try #require(graph.setIdentitiesOutsideInventory([trashed]))
+        #expect(await feed.bindDerivedDataEpoch(graph.runtimeEpoch))
+        _ = await feed.reconcile(
+            selected: registered.selectedScope, analysis: registered.analysisScope,
+            retention: registered.thumbnailRetentionScope)
+        #expect(await feed.decoded(for: trashed) != nil)
+
+        let cleared = try #require(graph.setIdentitiesOutsideInventory([]))
+        _ = await feed.reconcile(
+            selected: cleared.selectedScope, analysis: cleared.analysisScope,
+            retention: cleared.thumbnailRetentionScope)
+
+        #expect(await feed.decoded(for: trashed) == nil, "the route no longer shows this photo")
+        await feed.stopPrefetchAndWait()
+    }
+
     @Test func burstMembersAreCrawledToDiskAfterEveryLibraryThumbnail() async throws {
         let key = Self.uid("crawl-burst-key")
         let other = Self.uid("crawl-library-item")
