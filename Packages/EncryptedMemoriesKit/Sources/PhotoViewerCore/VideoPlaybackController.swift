@@ -90,12 +90,7 @@ public final class VideoPlaybackController {
     private func attach(_ item: AVPlayerItem, uid: PhotoUID, initial: VideoViewerState) {
         didReachPlaying = false
         let player = AVPlayer(playerItem: item)
-        player.automaticallyWaitsToMinimizeStalling = true
-        if isStreaming {
-            // Buffer ahead of playback. The custom range loader fetches and decrypts each block, so use an
-            // explicit forward buffer instead of AVFoundation's automatic window. (0 = automatic.)
-            item.preferredForwardBufferDuration = 30
-        }
+        VideoPlaybackTuning.configure(player: player, item: item, isStreaming: isStreaming)
         self.player = player
         transition(initial)
         logPlayer(item: item, player: player)

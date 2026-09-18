@@ -1412,6 +1412,9 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         let asset = AVURLAsset(url: URL(string: "protonvideo://\(host)")!)
         let queue = DispatchQueue(label: "me.proton.photos.video-loader")
         asset.resourceLoader.setDelegate(loader, queue: queue)
+        // Fetch and decrypt the first blocks while AVFoundation still inspects the asset, so its own
+        // start-of-playback decision can already count on served bytes.
+        loader.primePlaybackStart()
         await requestGovernor.endPriorityScope(priorityScope)
         return StreamingVideoAsset(asset: asset, retaining: loader)
     }

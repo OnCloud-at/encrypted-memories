@@ -33,6 +33,11 @@ final class ProtonVideoResourceLoader: NSObject, AVAssetResourceLoaderDelegate, 
     /// network-fetch+decrypt read-ahead stays in front of playback (the shallow 4-block window micro-stalled
     /// higher-bitrate video). Paired with a roomier `decryptedCache` so warmed blocks survive until requested.
     private let forwardPrefetchBlockCount = 8
+    /// Blocks warmed at open time, before AVFoundation asks for anything. The player decides on its own
+    /// when playback can start without stalling (`automaticallyWaitsToMinimizeStalling`), and that decision
+    /// is only as good as the bytes we can already serve: without this warm-up the first block is fetched
+    /// and decrypted while the player is already waiting for it.
+    private let openingPrefetchBlockCount = 6
     /// Clear offset the forward read-ahead window was last scheduled from. Lets a repeated request for
     /// the same position skip re-scanning the block map; a seek (any other offset) still re-schedules.
     private var lastForwardPrefetchOffset = -1
@@ -53,6 +58,23 @@ final class ProtonVideoResourceLoader: NSObject, AVAssetResourceLoaderDelegate, 
         super.init()
         // Keep the read-ahead window and recent blocks. At about 4 MB per block, the transient limit is 80 MB.
         decryptedCache.countLimit = 20
+    }
+
+    /// Warms the start of the file and its last block before the player requests anything.
+    ///
+    /// The start carries the first samples. The last block matters because a container whose moov atom sits
+    /// at the end makes AVFoundation read the tail first; serving that from a warm block removes one
+    /// network round trip from every open.
+    func primePlaybackStart() {
+        let head = prepared.blockMap
+            .forwardBlocks(afterClearOffset: -1, count: openingPrefetchBlockCount)
+            .compactMap { prepared.block(at: $0.index) }
+        for block in head {
+            schedulePrefetch(block, reason: "open")
+        }
+        if let tail = prepared.blocks.last, !head.contains(where: { $0.index == tail.index }) {
+            schedulePrefetch(tail, reason: "open-tail")
+        }
     }
 
     deinit {
