@@ -4,7 +4,17 @@
 require "minitest/autorun"
 require "openssl"
 require "tempfile"
+require "tmpdir"
 require_relative "app_store_connect"
+
+# Compatibility shim for Ruby 2.6 (CI runs Ruby 3.x)
+unless Array.method_defined?(:filter_map)
+  class Array
+    def filter_map(&block)
+      map(&block).compact
+    end
+  end
+end
 
 class FakeAppStoreConnectClient
   attr_reader :calls
@@ -35,7 +45,10 @@ class FakeAppStoreConnectClient
     cancel_error_status: nil,
     cancel_transition_reads: 0,
     rename_error_status: nil,
-    rename_mutates_before_error: false
+    rename_mutates_before_error: false,
+    localization_lock_conflicts: 0, # how many localization writes raise a 409 whatsNew lock
+    localization_lock_codes: ["STATE_ERROR"], # error codes carried by simulated whatsNew lock errors
+    localization_conflict_transitions_to_submitted: false # whether the conflict also moves versions to WAITING_FOR_REVIEW
   )
     @version_state = version_state
     @release_type = release_type
@@ -69,6 +82,9 @@ class FakeAppStoreConnectClient
     @rename_error_status = rename_error_status
     @rename_error_consumed = false
     @rename_mutates_before_error = rename_mutates_before_error
+    @localization_lock_conflicts = localization_lock_conflicts
+    @localization_lock_codes = localization_lock_codes
+    @localization_conflict_transitions_to_submitted = localization_conflict_transitions_to_submitted
     @app_store_localizations = app_store_localizations
     @calls = []
   end
@@ -235,6 +251,13 @@ class FakeAppStoreConnectClient
 
   def post(path, body:)
     @calls << [:post, path, body]
+    if localization_write?(path) && (conflict = localization_lock_conflict!)
+      raise AppStoreConnect::APIError.new(
+        "Simulated App Store Connect whatsNew lock: Attribute 'whatsNew' cannot be edited at this time",
+        status: 409,
+        codes: @localization_lock_codes
+      )
+    end
     if path == "/v1/appStoreVersions"
       platform = body.dig(:data, :attributes, :platform)
       version = {
@@ -268,6 +291,13 @@ class FakeAppStoreConnectClient
 
   def patch(path, body:)
     @calls << [:patch, path, body]
+    if localization_write?(path) && (conflict = localization_lock_conflict!)
+      raise AppStoreConnect::APIError.new(
+        "Simulated App Store Connect whatsNew lock: Attribute 'whatsNew' cannot be edited at this time",
+        status: 409,
+        codes: @localization_lock_codes
+      )
+    end
     if body.dig(:data, :attributes, :canceled) == true &&
        (match = %r{\A/v1/reviewSubmissions/(.+)\z}.match(path))
       submission = @review_submissions.find { |item| item.fetch("id") == match[1] }
@@ -313,6 +343,33 @@ class FakeAppStoreConnectClient
   end
 
   private
+
+  def localization_write?(path)
+    path.start_with?("/v1/appStoreVersionLocalizations")
+  end
+
+  # Consumes one simulated 409 whatsNew lock. When configured, also transitions the
+  # known versions to WAITING_FOR_REVIEW so a subsequent state re-read sees a
+  # submitted state (mirrors Apple locking notes once a version is in review).
+  # Apple pairs a version waiting for review with an active review submission, so a
+  # completed attempt for a re-submitted version is reopened alongside the transition.
+  def localization_lock_conflict!
+    return false unless @localization_lock_conflicts.positive?
+
+    @localization_lock_conflicts -= 1
+    if @localization_conflict_transitions_to_submitted
+      @known_app_store_versions.each_value do |version|
+        version["attributes"]["appVersionState"] = "WAITING_FOR_REVIEW"
+        @review_submissions.each do |submission|
+          next unless submission.dig("relationships", "appStoreVersionForReview", "data", "id") == version.fetch("id")
+          next unless submission.dig("attributes", "state") == "COMPLETE"
+
+          submission["attributes"]["state"] = "WAITING_FOR_REVIEW"
+        end
+      end
+    end
+    true
+  end
 
   def finish_pending_cancellation(version)
     remaining_reads = @pending_cancellations[version.fetch("id")]
@@ -1265,6 +1322,47 @@ class AppStoreConnectTest < Minitest::Test
     assert_equal ["/v1/appStoreVersions/version-MAC_OS/relationships/build"], attachment_paths
   end
 
+  def test_whats_new_409_skip_when_state_becomes_submitted_mid_flight
+    versions = AppStoreConnect::PLATFORMS.to_h do |platform|
+      [platform, [app_store_version(platform: platform, version: "1.0.0", state: "PREPARE_FOR_SUBMISSION")]]
+    end
+    # The first localization write raises a 409 whatsNew lock; Apple moved the version
+    # to WAITING_FOR_REVIEW between our state read and the write. The manager must
+    # re-read the state, see the submitted state, and skip the write with a summary.
+    client = FakeAppStoreConnectClient.new(
+      app_store_versions: versions,
+      localization_lock_conflicts: 4,
+      localization_conflict_transitions_to_submitted: true
+    )
+    summary_file = Tempfile.new("release-summary")
+    manager = AppStoreConnect::ReleaseManager.new(
+      client: client,
+      app_id: "6805117080",
+      output_path: nil,
+      summary_path: summary_file.path,
+      sleeper: ->(_seconds) {},
+      monotonic_clock: -> { 0 }
+    )
+
+    manager.prepare_app_store(
+      version: "1.0.0",
+      build_number: "714",
+      submit: false,
+      localization_paths: {
+        "IOS" => { "en-US" => __FILE__ },
+        "MAC_OS" => { "en-US" => __FILE__ }
+      }
+    )
+    summary_file.rewind
+    summary_content = summary_file.read
+    summary_file.close
+    summary_file.unlink
+
+    assert_match(/Skipped whatsNew update for en-US \(App Store version moved to WAITING_FOR_REVIEW on Apple's side\)/, summary_content)
+  ensure
+    summary_file&.unlink
+  end
+
   def test_new_stable_release_validates_then_cancels_and_renames_older_versions
     versions = AppStoreConnect::PLATFORMS.to_h do |platform|
       [platform, [app_store_version(platform: platform, version: "1.0.1", state: "WAITING_FOR_REVIEW")]]
@@ -1929,6 +2027,492 @@ class AppStoreConnectTest < Minitest::Test
       manager.prepare_app_store(version: "1.0.0", build_number: "714", submit: true)
     end
     assert_match(/already contains another app version/, error.message)
+  end
+
+  def test_resubmit_ignores_outdated_notes_when_state_matches_and_files_are_identical
+    # SUBMITTED + matching notes ("Old notes" file vs default localizations),
+    # WAITING_FOR_REVIEW 1.0.3 versions, submit:true → no writes/cancels + "release notes already match"
+    versions = AppStoreConnect::PLATFORMS.to_h do |platform|
+      [platform, [app_store_version(platform: platform, version: "1.0.3", state: "WAITING_FOR_REVIEW")]]
+    end
+    client = FakeAppStoreConnectClient.new(
+      app_store_versions: versions,
+      app_store_localizations: [
+        { "type" => "appStoreVersionLocalizations", "id" => "version-IOS-1.0.3-de-DE", "attributes" => { "locale" => "de-DE", "whatsNew" => "Old notes" } },
+        { "type" => "appStoreVersionLocalizations", "id" => "version-IOS-1.0.3-en-US", "attributes" => { "locale" => "en-US", "whatsNew" => "Old notes" } },
+        { "type" => "appStoreVersionLocalizations", "id" => "version-MAC_OS-1.0.3-de-DE", "attributes" => { "locale" => "de-DE", "whatsNew" => "Old notes" } },
+        { "type" => "appStoreVersionLocalizations", "id" => "version-MAC_OS-1.0.3-en-US", "attributes" => { "locale" => "en-US", "whatsNew" => "Old notes" } }
+      ]
+    )
+    summary_file = Tempfile.new("release-summary")
+    manager = AppStoreConnect::ReleaseManager.new(
+      client: client,
+      app_id: "6805117080",
+      output_path: nil,
+      summary_path: summary_file.path,
+      sleeper: ->(_seconds) {},
+      monotonic_clock: -> { 0 }
+    )
+
+    Dir.mktmpdir do |dir|
+      %w[de-DE en-US].each do |locale|
+        File.write("#{dir}/#{locale}.md", "Old notes")
+      end
+      manager.prepare_app_store(
+        version: "1.0.3",
+        build_number: "715",
+        submit: true,
+        localization_paths: {
+          "IOS" => { "de-DE" => "#{dir}/de-DE.md", "en-US" => "#{dir}/en-US.md" },
+          "MAC_OS" => { "de-DE" => "#{dir}/de-DE.md", "en-US" => "#{dir}/en-US.md" }
+        }
+      )
+    end
+
+    summary_file.rewind
+    summary_content = summary_file.read
+    summary_file.close
+    summary_file.unlink
+
+    assert_match(/Skipped IOS whatsNew update.*version 1\.0\.3 in WAITING_FOR_REVIEW.*release notes already match/, summary_content)
+    assert_match(/Skipped MAC_OS whatsNew update.*version 1\.0\.3 in WAITING_FOR_REVIEW.*release notes already match/, summary_content)
+    assert_empty(client.calls.select { |m, p, _| m == :post && p == "/v1/appStoreVersionLocalizations" })
+    assert_empty(client.calls.select { |m, _, b| m == :patch && b.dig(:data, :attributes, :canceled) == true })
+  ensure
+    summary_file&.unlink
+  end
+
+  def test_resubmit_tolerates_whitespace_drift_in_stored_release_notes
+    # Stored notes carry CRLF line endings and double spaces vs. the local
+    # files; normalized comparison must treat them as matching and must not
+    # cancel App Review for invisible differences.
+    versions = AppStoreConnect::PLATFORMS.to_h do |platform|
+      [platform, [app_store_version(platform: platform, version: "1.0.3", state: "WAITING_FOR_REVIEW")]]
+    end
+    client = FakeAppStoreConnectClient.new(
+      app_store_versions: versions,
+      app_store_localizations: [
+        { "type" => "appStoreVersionLocalizations", "id" => "version-IOS-1.0.3-de-DE", "attributes" => { "locale" => "de-DE", "whatsNew" => "Alte  Notizen\r\nzweite Zeile" } },
+        { "type" => "appStoreVersionLocalizations", "id" => "version-IOS-1.0.3-en-US", "attributes" => { "locale" => "en-US", "whatsNew" => "Old\r\nnotes" } },
+        { "type" => "appStoreVersionLocalizations", "id" => "version-MAC_OS-1.0.3-de-DE", "attributes" => { "locale" => "de-DE", "whatsNew" => "Alte  Notizen\r\nzweite Zeile" } },
+        { "type" => "appStoreVersionLocalizations", "id" => "version-MAC_OS-1.0.3-en-US", "attributes" => { "locale" => "en-US", "whatsNew" => "Old\r\nnotes" } }
+      ]
+    )
+    summary_file = Tempfile.new("release-summary")
+    manager = AppStoreConnect::ReleaseManager.new(
+      client: client,
+      app_id: "6805117080",
+      output_path: nil,
+      summary_path: summary_file.path,
+      sleeper: ->(_seconds) {},
+      monotonic_clock: -> { 0 }
+    )
+
+    Dir.mktmpdir do |dir|
+      File.write("#{dir}/de-DE.md", "Alte Notizen\nzweite Zeile")
+      File.write("#{dir}/en-US.md", "Old notes")
+      manager.prepare_app_store(
+        version: "1.0.3",
+        build_number: "715",
+        submit: true,
+        localization_paths: {
+          "IOS" => { "de-DE" => "#{dir}/de-DE.md", "en-US" => "#{dir}/en-US.md" },
+          "MAC_OS" => { "de-DE" => "#{dir}/de-DE.md", "en-US" => "#{dir}/en-US.md" }
+        }
+      )
+    end
+
+    summary_file.rewind
+    summary_content = summary_file.read
+    summary_file.close
+    summary_file.unlink
+
+    assert_match(/Skipped IOS whatsNew update.*version 1\.0\.3 in WAITING_FOR_REVIEW.*release notes already match/, summary_content)
+    assert_match(/Skipped MAC_OS whatsNew update.*version 1\.0\.3 in WAITING_FOR_REVIEW.*release notes already match/, summary_content)
+    assert_empty(client.calls.select { |m, p, _| m == :post && p == "/v1/appStoreVersionLocalizations" })
+    assert_empty(client.calls.select { |m, _, b| m == :patch && b.dig(:data, :attributes, :canceled) == true })
+  ensure
+    summary_file&.unlink
+  end
+
+  def test_resubmit_cancels_when_only_one_locale_matches_on_submitted_version
+    # partial match: de-DE matches, en-US differs → must still cancel-and-resubmit both locales
+    versions = AppStoreConnect::PLATFORMS.to_h do |platform|
+      [platform, [app_store_version(platform: platform, version: "1.0.3", state: "WAITING_FOR_REVIEW")]]
+    end
+    submissions = AppStoreConnect::PLATFORMS.map do |platform|
+      review_submission(
+        platform: platform,
+        version_id: "version-#{platform}-1.0.3",
+        state: "WAITING_FOR_REVIEW"
+      )
+    end
+    client = FakeAppStoreConnectClient.new(
+      app_store_versions: versions,
+      app_store_localizations: [
+        { "type" => "appStoreVersionLocalizations", "id" => "version-IOS-1.0.3-de-DE", "attributes" => { "locale" => "de-DE", "whatsNew" => "Matching de-DE notes" } },
+        { "type" => "appStoreVersionLocalizations", "id" => "version-IOS-1.0.3-en-US", "attributes" => { "locale" => "en-US", "whatsNew" => "Different en-US notes" } }
+      ],
+      review_submissions: submissions
+    )
+    summary_file = Tempfile.new("release-summary")
+    manager = AppStoreConnect::ReleaseManager.new(
+      client: client,
+      app_id: "6805117080",
+      output_path: nil,
+      summary_path: summary_file.path,
+      sleeper: ->(_seconds) {},
+      monotonic_clock: -> { 0 }
+    )
+
+    Dir.mktmpdir do |dir|
+      File.write("#{dir}/de-DE.md", "Matching de-DE notes")
+      File.write("#{dir}/en-US.md", "Updated en-US notes")
+      manager.prepare_app_store(
+        version: "1.0.3",
+        build_number: "715",
+        submit: true,
+        localization_paths: {
+          "IOS" => { "de-DE" => "#{dir}/de-DE.md", "en-US" => "#{dir}/en-US.md" }
+        }
+      )
+    end
+
+    summary_file.rewind
+    summary_content = summary_file.read
+    summary_file.close
+    summary_file.unlink
+
+    # Still triggers cancel+resubmit because en-US differs
+    assert_match(/Removed IOS 1\.0\.3 from App Review/, summary_content)
+    cancellations = client.calls.select { |m, p, b| m == :patch && b.dig(:data, :attributes, :canceled) == true }
+    assert_equal 1, cancellations.size
+    submissions_post = client.calls.select { |m, p, _| m == :post && p == "/v1/reviewSubmissions" }
+    assert_equal 1, submissions_post.size
+  ensure
+    summary_file&.unlink
+  end
+
+  def test_resubmit_cancels_and_re_submits_with_outdated_notes
+    # outdated + submit:true + WAITING_FOR_REVIEW target with review_submission fixtures
+    # version_id "version-#{platform}-1.0.3" → cancel patch + localization writes + review submission POSTs + submit patches
+    versions = AppStoreConnect::PLATFORMS.to_h do |platform|
+      [platform, [app_store_version(platform: platform, version: "1.0.3", state: "WAITING_FOR_REVIEW")]]
+    end
+    submissions = AppStoreConnect::PLATFORMS.map do |platform|
+      review_submission(
+        platform: platform,
+        version_id: "version-#{platform}-1.0.3",
+        state: "WAITING_FOR_REVIEW"
+      )
+    end
+    client = FakeAppStoreConnectClient.new(
+      app_store_versions: versions,
+      review_submissions: submissions
+    )
+    summary_file = Tempfile.new("release-summary")
+    manager = AppStoreConnect::ReleaseManager.new(
+      client: client,
+      app_id: "6805117080",
+      output_path: nil,
+      summary_path: summary_file.path,
+      sleeper: ->(_seconds) {},
+      monotonic_clock: -> { 0 }
+    )
+
+    Dir.mktmpdir do |dir|
+      %w[de-DE en-US].each do |locale|
+        File.write("#{dir}/#{locale}.md", "Updated release notes for 1.0.3")
+      end
+      manager.prepare_app_store(
+        version: "1.0.3",
+        build_number: "715",
+        submit: true,
+        localization_paths: {
+          "IOS" => { "de-DE" => "#{dir}/de-DE.md", "en-US" => "#{dir}/en-US.md" },
+          "MAC_OS" => { "de-DE" => "#{dir}/de-DE.md", "en-US" => "#{dir}/en-US.md" }
+        }
+      )
+    end
+
+    summary_file.rewind
+    summary_content = summary_file.read
+    summary_file.close
+    summary_file.unlink
+
+    # Should have cancel patches
+    cancels = client.calls.select { |m, p, b| m == :patch && b.dig(:data, :attributes, :canceled) == true }
+    assert_equal 2, cancels.size
+    # Should have new review submissions
+    submissions_post = client.calls.select { |m, p, _| m == :post && p == "/v1/reviewSubmissions" }
+    assert_equal 2, submissions_post.size
+  ensure
+    summary_file&.unlink
+  end
+
+  def test_resubmit_skips_cancel_when_non_submit_and_differing_notes
+    # non-submit + submitted + differing → no cancel + "not canceled because submission was not requested"
+    versions = AppStoreConnect::PLATFORMS.to_h do |platform|
+      [platform, [app_store_version(platform: platform, version: "1.0.3", state: "WAITING_FOR_REVIEW")]]
+    end
+    submissions = AppStoreConnect::PLATFORMS.map do |platform|
+      review_submission(
+        platform: platform,
+        version_id: "version-#{platform}-1.0.3",
+        state: "WAITING_FOR_REVIEW"
+      )
+    end
+    client = FakeAppStoreConnectClient.new(
+      app_store_versions: versions,
+      review_submissions: submissions
+    )
+    summary_file = Tempfile.new("release-summary")
+    manager = AppStoreConnect::ReleaseManager.new(
+      client: client,
+      app_id: "6805117080",
+      output_path: nil,
+      summary_path: summary_file.path,
+      sleeper: ->(_seconds) {},
+      monotonic_clock: -> { 0 }
+    )
+
+    Dir.mktmpdir do |dir|
+      %w[de-DE en-US].each do |locale|
+        File.write("#{dir}/#{locale}.md", "Different notes that would normally require cancel")
+      end
+      manager.prepare_app_store(
+        version: "1.0.3",
+        build_number: "715",
+        submit: false,
+        localization_paths: {
+          "IOS" => { "de-DE" => "#{dir}/de-DE.md", "en-US" => "#{dir}/en-US.md" },
+          "MAC_OS" => { "de-DE" => "#{dir}/de-DE.md", "en-US" => "#{dir}/en-US.md" }
+        }
+      )
+    end
+
+    summary_file.rewind
+    summary_content = summary_file.read
+    summary_file.close
+    summary_file.unlink
+
+    assert_match(/App Review was not canceled because submission was not requested/, summary_content)
+    assert_empty(client.calls.select { |m, p, b| m == :patch && b.dig(:data, :attributes, :canceled) == true })
+  ensure
+    summary_file&.unlink
+  end
+
+  def test_resubmit_raises_hard_error_for_non_pre_acceptance_states
+    # PENDING_DEVELOPER_RELEASE + differing + submit:true → raises "Apple cannot cancel App Review from that state"
+    versions = AppStoreConnect::PLATFORMS.to_h do |platform|
+      [platform, [app_store_version(platform: platform, version: "1.0.3", state: "PENDING_DEVELOPER_RELEASE")]]
+    end
+    client = FakeAppStoreConnectClient.new(app_store_versions: versions)
+    summary_file = Tempfile.new("release-summary")
+    manager = AppStoreConnect::ReleaseManager.new(
+      client: client,
+      app_id: "6805117080",
+      output_path: nil,
+      summary_path: summary_file.path,
+      sleeper: ->(_seconds) {},
+      monotonic_clock: -> { 0 }
+    )
+
+    Dir.mktmpdir do |dir|
+      File.write("#{dir}/de-DE.md", "Notes requiring cancel")
+      File.write("#{dir}/en-US.md", "Notes requiring cancel")
+      error = assert_raises(AppStoreConnect::Error) do
+        manager.prepare_app_store(
+          version: "1.0.3",
+          build_number: "715",
+          submit: true,
+          localization_paths: {
+            "IOS" => { "de-DE" => "#{dir}/de-DE.md", "en-US" => "#{dir}/en-US.md" },
+            "MAC_OS" => { "de-DE" => "#{dir}/de-DE.md", "en-US" => "#{dir}/en-US.md" }
+          }
+        )
+      end
+      assert_match(/Apple cannot cancel App Review from that state/, error.message)
+    end
+  ensure
+    summary_file&.unlink
+  end
+
+  def test_resubmit_preflight_blocks_mixed_states_before_any_cancellation
+    # IOS is cancelable but MAC_OS sits in a post-acceptance state with
+    # different notes: the release must fail before IOS loses its App Review.
+    versions = AppStoreConnect::PLATFORMS.to_h do |platform|
+      state = platform == "IOS" ? "WAITING_FOR_REVIEW" : "PENDING_DEVELOPER_RELEASE"
+      [platform, [app_store_version(platform: platform, version: "1.0.3", state: state)]]
+    end
+    client = FakeAppStoreConnectClient.new(app_store_versions: versions)
+    summary_file = Tempfile.new("release-summary")
+    manager = AppStoreConnect::ReleaseManager.new(
+      client: client,
+      app_id: "6805117080",
+      output_path: nil,
+      summary_path: summary_file.path,
+      sleeper: ->(_seconds) {},
+      monotonic_clock: -> { 0 }
+    )
+
+    Dir.mktmpdir do |dir|
+      File.write("#{dir}/de-DE.md", "Notes requiring cancel")
+      File.write("#{dir}/en-US.md", "Notes requiring cancel")
+      error = assert_raises(AppStoreConnect::Error) do
+        manager.prepare_app_store(
+          version: "1.0.3",
+          build_number: "715",
+          submit: true,
+          localization_paths: {
+            "IOS" => { "de-DE" => "#{dir}/de-DE.md", "en-US" => "#{dir}/en-US.md" },
+            "MAC_OS" => { "de-DE" => "#{dir}/de-DE.md", "en-US" => "#{dir}/en-US.md" }
+          }
+        )
+      end
+      assert_match(/MAC_OS.*Apple cannot cancel App Review from that state/, error.message)
+      # No platform may lose its App Review because another platform cannot change notes.
+      assert_empty(client.calls.select { |m, _, b| m == :patch && b.dig(:data, :attributes, :canceled) == true })
+    end
+  ensure
+    summary_file&.unlink
+  end
+
+  def test_resubmit_handles_multiple_lock_conflicts_with_submit_true
+    # conflicts:1 + transitions + submit:true + review_submissions in WAITING_FOR_REVIEW → cancel-and-resubmit both platforms
+    # (2 cancellation patches, 2 POSTs, 2 submit patches)
+    versions = AppStoreConnect::PLATFORMS.to_h do |platform|
+      [platform, [app_store_version(platform: platform, version: "1.0.3", state: "PREPARE_FOR_SUBMISSION")]]
+    end
+    submissions = AppStoreConnect::PLATFORMS.map do |platform|
+      review_submission(
+        platform: platform,
+        version_id: "version-#{platform}-1.0.3",
+        state: "WAITING_FOR_REVIEW"
+      )
+    end
+    client = FakeAppStoreConnectClient.new(
+      app_store_versions: versions,
+      review_submissions: submissions,
+      localization_lock_conflicts: 1,
+      localization_conflict_transitions_to_submitted: true
+    )
+    summary_file = Tempfile.new("release-summary")
+    manager = AppStoreConnect::ReleaseManager.new(
+      client: client,
+      app_id: "6805117080",
+      output_path: nil,
+      summary_path: summary_file.path,
+      sleeper: ->(_seconds) {},
+      monotonic_clock: -> { 0 }
+    )
+
+    Dir.mktmpdir do |dir|
+      %w[de-DE en-US].each do |locale|
+        File.write("#{dir}/#{locale}.md", "Updated notes after conflict resolution")
+      end
+      manager.prepare_app_store(
+        version: "1.0.3",
+        build_number: "715",
+        submit: true,
+        localization_paths: {
+          "IOS" => { "de-DE" => "#{dir}/de-DE.md", "en-US" => "#{dir}/en-US.md" },
+          "MAC_OS" => { "de-DE" => "#{dir}/de-DE.md", "en-US" => "#{dir}/en-US.md" }
+        }
+      )
+    end
+
+    # Should have 2 cancellation patches
+    cancels = client.calls.select { |m, p, b| m == :patch && b.dig(:data, :attributes, :canceled) == true }
+    assert_equal 2, cancels.size
+    # Should have 2 new review submissions
+    submissions_post = client.calls.select { |m, p, _| m == :post && p == "/v1/reviewSubmissions" }
+    assert_equal 2, submissions_post.size
+  ensure
+    summary_file&.unlink
+  end
+
+  def test_resubmit_detects_lock_exhaustion_and_raises
+    # exhaustion: conflicts:100, no transition, ticks advance by 50 each poll, no-op sleeper, submit:false
+    # → raises /stayed locked in PREPARE_FOR_SUBMISSION.*300s/
+    versions = AppStoreConnect::PLATFORMS.to_h do |platform|
+      [platform, [app_store_version(platform: platform, version: "1.0.3", state: "PREPARE_FOR_SUBMISSION")]]
+    end
+    client = FakeAppStoreConnectClient.new(
+      app_store_versions: versions,
+      localization_lock_conflicts: 100
+    )
+    summary_file = Tempfile.new("release-summary")
+    tick_count = 0
+    manager = AppStoreConnect::ReleaseManager.new(
+      client: client,
+      app_id: "6805117080",
+      output_path: nil,
+      summary_path: summary_file.path,
+      sleeper: ->(_s) {},
+      monotonic_clock: -> { tick_count; tick_count += 50 } # advances by 50 on each call
+    )
+
+    Dir.mktmpdir do |dir|
+      File.write("#{dir}/de-DE.md", "Some notes")
+      File.write("#{dir}/en-US.md", "Some notes")
+      error = assert_raises(AppStoreConnect::Error) do
+        manager.prepare_app_store(
+          version: "1.0.3",
+          build_number: "715",
+          submit: false,
+          localization_paths: {
+            "IOS" => { "de-DE" => "#{dir}/de-DE.md", "en-US" => "#{dir}/en-US.md" },
+            "MAC_OS" => { "de-DE" => "#{dir}/de-DE.md", "en-US" => "#{dir}/en-US.md" }
+          }
+        )
+      end
+      assert_match(/stayed locked in PREPARE_FOR_SUBMISSION.*300s/, error.message)
+    end
+  ensure
+    summary_file&.unlink
+  end
+
+  def test_resubmit_propagates_raw_api_error_for_wrong_codes
+    # localization_lock_codes: ["ENTITY_ERROR"] → raw AppStoreConnect::APIError propagates
+    versions = AppStoreConnect::PLATFORMS.to_h do |platform|
+      [platform, [app_store_version(platform: platform, version: "1.0.3", state: "PREPARE_FOR_SUBMISSION")]]
+    end
+    client = FakeAppStoreConnectClient.new(
+      app_store_versions: versions,
+      localization_lock_conflicts: 1,
+      localization_lock_codes: ["ENTITY_ERROR"]
+    )
+    summary_file = Tempfile.new("release-summary")
+    manager = AppStoreConnect::ReleaseManager.new(
+      client: client,
+      app_id: "6805117080",
+      output_path: nil,
+      summary_path: summary_file.path,
+      sleeper: ->(_seconds) {},
+      monotonic_clock: -> { 0 }
+    )
+
+    error = assert_raises(AppStoreConnect::APIError) do
+      Dir.mktmpdir do |dir|
+        %w[de-DE en-US].each do |locale|
+          File.write("#{dir}/#{locale}.md", "Notes for lock propagation test")
+        end
+        manager.prepare_app_store(
+          version: "1.0.3",
+          build_number: "715",
+          submit: true,
+          localization_paths: {
+            "IOS" => { "de-DE" => "#{dir}/de-DE.md", "en-US" => "#{dir}/en-US.md" },
+            "MAC_OS" => { "de-DE" => "#{dir}/de-DE.md", "en-US" => "#{dir}/en-US.md" }
+          }
+        )
+      end
+    end
+    assert_match(/whatsNew/, error.message)
+    assert_includes(error.codes, "ENTITY_ERROR")
+  ensure
+    summary_file&.unlink
   end
 
   private
