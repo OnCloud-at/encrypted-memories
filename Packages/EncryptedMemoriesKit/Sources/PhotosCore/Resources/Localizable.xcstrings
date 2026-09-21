@@ -5078,8 +5078,8 @@
     },
     "search.suggestions_indexing": {
       "localizations": {
-        "de": { "stringUnit": { "state": "translated", "value": "Deine Mediathek wird analysiert. Weitere Vorschläge folgen." } },
-        "en": { "stringUnit": { "state": "translated", "value": "Analyzing your library. More suggestions will follow." } }
+        "de": { "stringUnit": { "state": "translated", "value": "Vorschläge zu Bildinhalten erscheinen nach der Indexierung." } },
+        "en": { "stringUnit": { "state": "translated", "value": "Suggestions for photo content appear once indexing is done." } }
       }
     },
     "search.suggestions_ml_hint": {
@@ -5344,6 +5344,12 @@
           "one": { "stringUnit": { "state": "translated", "value": "%lld photo" } },
           "other": { "stringUnit": { "state": "translated", "value": "%lld photos" } }
         } } }
+      }
+    },
+    "search.suggestions_loading": {
+      "localizations": {
+        "de": { "stringUnit": { "state": "translated", "value": "Vorschläge werden geladen" } },
+        "en": { "stringUnit": { "state": "translated", "value": "Loading suggestions" } }
       }
     }
   },

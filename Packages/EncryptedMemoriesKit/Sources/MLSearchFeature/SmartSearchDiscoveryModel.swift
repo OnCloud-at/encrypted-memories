@@ -54,6 +54,18 @@ public enum SmartSearchSuggestionRebindResult: Equatable {
 public final class SmartSearchDiscoveryModel {
     public typealias PlaceNameResolver = @Sendable (_ latitude: Double, _ longitude: Double) async -> String?
 
+    /// When suggestions are recomputed.
+    public enum RefreshPolicy: Sendable {
+        /// Every library, favorites or availability change recomputes them. Published sets always match the
+        /// current content.
+        case continuous
+        /// They are computed once per app session: the first published rows stay on screen, and after the first
+        /// complete refresh nothing is recomputed until the next launch. Library changes never bring the loading
+        /// placeholder back. An applied suggestion keeps its session result set, intersected with the current
+        /// items, and visual concepts still disappear at once when visual search turns off.
+        case oncePerSession
+    }
+
     /// Raw published rows. Hosts display `forYou(content:snapshot:)` and `chips(content:snapshot:)`, which
     /// re-check availability against the current state at render time.
     public private(set) var forYou: [TimelineSearchSuggestion] = []
@@ -76,12 +88,16 @@ public final class SmartSearchDiscoveryModel {
     /// of `forYou` left out. Never displayed; a selected or typed suggestion is resolved against it, so a valid
     /// suggestion that is ranked out of the rows is still found. Observed, so hosts follow each publish.
     private var candidates: [TimelineSearchSuggestion] = []
-    /// Visual search is on but still indexing, so concept suggestions can still appear.
-    public private(set) var showsIndexingNote = false
     /// No on-device analysis is enabled, so only metadata suggestions exist.
     public private(set) var showsSmartSearchHint = false
 
     @ObservationIgnored private let placeName: PlaceNameResolver
+    @ObservationIgnored private let refreshPolicy: RefreshPolicy
+    /// Whether this session computed visual concepts with a finished visual index. Until then, turning visual
+    /// search on or finishing the indexing allows one more refresh, the only exception to `.oncePerSession`.
+    private var visualConceptsCompletedWhenReady = false
+    /// Indexing state of the refresh in progress, read when it settles.
+    @ObservationIgnored private var refreshIndexingReady = false
     @ObservationIgnored private var metadata = TimelineSearchDiscoveryResult()
     @ObservationIgnored private var places: [TimelineSearchSuggestion] = []
     @ObservationIgnored private var concepts: [TimelineSearchSuggestion] = []
@@ -91,8 +107,47 @@ public final class SmartSearchDiscoveryModel {
     @ObservationIgnored private var conceptKey: String?
     @ObservationIgnored private var conceptEvidence: [MLSearchConceptEvidence] = []
 
-    public init(placeName: @escaping PlaceNameResolver) {
+    public init(refreshPolicy: RefreshPolicy = .continuous, placeName: @escaping PlaceNameResolver) {
+        self.refreshPolicy = refreshPolicy
         self.placeName = placeName
+    }
+
+    /// Whether this session's suggestions are final: a complete refresh ran once under `.oncePerSession`.
+    public var isSessionComplete: Bool {
+        refreshPolicy == .oncePerSession && settledContent != nil
+    }
+
+    /// Whether the visual index can answer for the whole library.
+    public nonisolated static func visualIndexReady(_ snapshot: MLSmartSearchSnapshot?) -> Bool {
+        guard visualConceptsAvailable(snapshot), case .ready = snapshot?.indexingState else { return false }
+        return true
+    }
+
+    /// The one exception to a complete `.oncePerSession`: visual search is on and its index is finished, but this
+    /// session has no visual concepts from a finished index yet. Turning visual search on then still yields
+    /// suggestions for photo content, after the indexing.
+    public func needsVisualCompletion(_ snapshot: MLSmartSearchSnapshot?) -> Bool {
+        refreshPolicy == .oncePerSession && Self.visualIndexReady(snapshot) && !visualConceptsCompletedWhenReady
+    }
+
+    /// Whether to show the short note that suggestions for photo content appear after the indexing. It is read at
+    /// render time, so it follows a visual search toggle at once without a refresh.
+    public func showsVisualSuggestionsPendingNote(_ snapshot: MLSmartSearchSnapshot?) -> Bool {
+        guard Self.visualConceptsAvailable(snapshot) else { return false }
+        return !Self.visualIndexReady(snapshot) || !visualConceptsCompletedWhenReady
+    }
+
+    /// Changes whenever the visual completion exception could apply. Hosts add it to their refresh key, because
+    /// after the first publish library changes no longer restart the refresh.
+    public func visualCompletionKey(_ snapshot: MLSmartSearchSnapshot?) -> String {
+        "\(Self.visualConceptsAvailable(snapshot))|\(Self.visualIndexReady(snapshot))|\(visualConceptsCompletedWhenReady)"
+    }
+
+    /// The content that published rows are checked against. Under `.oncePerSession`, published rows stay valid
+    /// for the whole session, so later library changes neither hide them nor show the placeholder again.
+    private func effective(_ content: SmartSearchContentIdentity) -> SmartSearchContentIdentity {
+        guard refreshPolicy == .oncePerSession, hasComputed, let computedContent else { return content }
+        return computedContent
     }
 
     /// Visual concept suggestions can work only while Smart Search and visual search are both on.
@@ -162,10 +217,11 @@ public final class SmartSearchDiscoveryModel {
 
     /// `isDecisive` for the published state of this model.
     public func isDecisive(for kind: TimelineSearchSuggestionKind, content: SmartSearchContentIdentity) -> Bool {
-        Self.isDecisive(
+        let effectiveContent = effective(content)
+        return Self.isDecisive(
             for: kind,
-            isCurrent: isCurrent(content: content),
-            isSettled: isSettled(content: content),
+            isCurrent: isCurrent(content: effectiveContent),
+            isSettled: isSettled(content: effectiveContent),
             settledWithVisualConcepts: settledVisualAvailability != nil
         )
     }
@@ -177,20 +233,21 @@ public final class SmartSearchDiscoveryModel {
 
     /// Whether rows for this content are published. Later stages can still add places and visual concepts.
     public func isCurrent(content: SmartSearchContentIdentity) -> Bool {
-        hasComputed && computedContent == content
+        hasComputed && computedContent == effective(content)
     }
 
     /// Whether a refresh for this content ran every stage to its end.
     public func isSettled(content: SmartSearchContentIdentity) -> Bool {
-        settledContent == content
+        settledContent == effective(content)
     }
 
     public func forYou(
         content: SmartSearchContentIdentity,
         snapshot: MLSmartSearchSnapshot?
     ) -> [TimelineSearchSuggestion] {
-        forYou.filter {
-            Self.isDisplayable($0, computedContent: computedContent, content: content, snapshot: snapshot)
+        let effectiveContent = effective(content)
+        return forYou.filter {
+            Self.isDisplayable($0, computedContent: computedContent, content: effectiveContent, snapshot: snapshot)
         }
     }
 
@@ -198,8 +255,9 @@ public final class SmartSearchDiscoveryModel {
         content: SmartSearchContentIdentity,
         snapshot: MLSmartSearchSnapshot?
     ) -> [TimelineSearchSuggestion] {
-        chips.filter {
-            Self.isDisplayable($0, computedContent: computedContent, content: content, snapshot: snapshot)
+        let effectiveContent = effective(content)
+        return chips.filter {
+            Self.isDisplayable($0, computedContent: computedContent, content: effectiveContent, snapshot: snapshot)
         }
     }
 
@@ -227,8 +285,9 @@ public final class SmartSearchDiscoveryModel {
         content: SmartSearchContentIdentity,
         snapshot: MLSmartSearchSnapshot?
     ) -> [TimelineSearchSuggestion] {
-        candidates.filter {
-            Self.isDisplayable($0, computedContent: computedContent, content: content, snapshot: snapshot)
+        let effectiveContent = effective(content)
+        return candidates.filter {
+            Self.isDisplayable($0, computedContent: computedContent, content: effectiveContent, snapshot: snapshot)
         }
     }
 
@@ -309,7 +368,15 @@ public final class SmartSearchDiscoveryModel {
         let lifecycle = smartSearch?.lifecycleActor
         let visualAvailable = Self.visualConceptsAvailable(snapshot)
         let content = SmartSearchContentIdentity(timelineRevision: timelineRevision, favoriteUIDs: favoriteUIDs)
-        if computedContent?.timelineRevision != timelineRevision {
+        showsSmartSearchHint = snapshot?.isEnabled != true
+        // A complete session refresh is final until the next launch: no compute for a UI feature.
+        guard !isSessionComplete || needsVisualCompletion(snapshot) else { return }
+        refreshIndexingReady = Self.visualIndexReady(snapshot)
+        // Under `.oncePerSession` the first published rows stay on screen while a later refresh replaces them.
+        let keepsRows = refreshPolicy == .oncePerSession && hasComputed
+        if keepsRows {
+            // The next publish replaces the rows at once; nothing is cleared, so no placeholder appears.
+        } else if computedContent?.timelineRevision != timelineRevision {
             // Result sets from another library revision may reference removed items; never reuse them.
             metadata = TimelineSearchDiscoveryResult()
             places = []
@@ -333,14 +400,6 @@ public final class SmartSearchDiscoveryModel {
         if !visualAvailable {
             clearVisualEvidence()
         }
-        showsSmartSearchHint = snapshot?.isEnabled != true
-        showsIndexingNote = {
-            guard Self.visualConceptsAvailable(snapshot) else { return false }
-            switch snapshot?.indexingState {
-            case .indexing, .waiting: return true
-            default: return false
-            }
-        }()
 
         // Stage 1: the sensitive gate must finish before any preview is chosen.
         var covered = 0
@@ -471,6 +530,9 @@ public final class SmartSearchDiscoveryModel {
     private func settle(content: SmartSearchContentIdentity, visualAvailable: Bool, ranVisualStages: Bool) {
         if ranVisualStages {
             settledVisualAvailability = visualAvailable
+            if visualAvailable && refreshIndexingReady {
+                visualConceptsCompletedWhenReady = true
+            }
         }
         // Every stage ran, so an earlier place that is not published now is gone. An earlier visual concept
         // stays only while a later refresh can still find it.
