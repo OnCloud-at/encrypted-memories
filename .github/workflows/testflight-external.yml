@@ -25,10 +25,16 @@ jobs:
       - name: Validate workflow source
         run: |
           set -euo pipefail
-          [[ "$GITHUB_REF" == "refs/heads/main" ]] || {
-            echo "Run this workflow from main." >&2
-            exit 1
-          }
+          # The helper is absent before checkout and in release tags older than the helper.
+          if [[ -f .github/scripts/release_failure.sh ]]; then
+            source .github/scripts/release_failure.sh
+          else
+            release_fail() { echo "::error title=Apple release failed ($1)::$2 Remediation: $3"; exit 1; }
+            retry_command() { while [[ "$1" != "--" ]]; do shift; done; shift; "$@"; }
+          fi
+          [[ "$GITHUB_REF" == "refs/heads/main" ]] || release_fail configuration \
+            "External TestFlight workflow used ref '$GITHUB_REF'; expected refs/heads/main." \
+            "Run the workflow from main."
 
       - name: Check out trusted automation
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -46,6 +52,7 @@ jobs:
           ruby .github/scripts/test_release_contract.rb
           ruby -c .github/scripts/release_build_number.rb
           ruby .github/scripts/test_release_build_number.rb
+          bash -n .github/scripts/release_failure.sh
 
       - name: Resolve published release
         id: release
@@ -54,16 +61,42 @@ jobs:
           RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
           set -euo pipefail
-          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" \
-            > "$RUNNER_TEMP/release.json"
+          # The helper is absent before checkout and in release tags older than the helper.
+          if [[ -f .github/scripts/release_failure.sh ]]; then
+            source .github/scripts/release_failure.sh
+          else
+            release_fail() { echo "::error title=Apple release failed ($1)::$2 Remediation: $3"; exit 1; }
+            retry_command() { while [[ "$1" != "--" ]]; do shift; done; shift; "$@"; }
+          fi
+          [[ -n "$RELEASE_TAG" ]] || release_fail configuration \
+            "The release_tag input was empty; expected a published GitHub release tag." \
+            "Publish the release, then run this workflow with its tag."
+          api_log="$RUNNER_TEMP/release-api.log"
+          if ! retry_command 4 5 "GitHub release metadata request" -- \
+            gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" \
+            > "$RUNNER_TEMP/release.json" 2> "$api_log"; then
+            api_cause="$(tail -20 "$api_log" 2>/dev/null || true)"
+            if grep -qiE 'HTTP 404|Not Found|status 404' <<< "$api_cause"; then
+              release_fail metadata \
+                "GitHub returned HTTP 404 for release tag '$RELEASE_TAG'. The release was deleted or the tag is wrong." \
+                "Publish the release again and run this workflow with the published tag."
+            elif grep -qiE 'rate limit|HTTP 5[0-9][0-9]|502|503|504' <<< "$api_cause"; then
+              release_fail github-outage \
+                "GitHub release metadata request failed after retries: $api_cause" \
+                "Re-run the workflow later after the GitHub outage or rate limit clears."
+            else
+              release_fail metadata \
+                "GitHub release metadata request failed after retries: $api_cause" \
+                "Verify the tag and GitHub token permissions, then re-run the workflow."
+            fi
+          fi
           ruby .github/scripts/release_contract.rb \
             "$RUNNER_TEMP/release.json" \
             "$RUNNER_TEMP/apple-release-notes"
           release_sha="$(git rev-parse --verify "refs/tags/$RELEASE_TAG^{commit}")"
-          git merge-base --is-ancestor "$release_sha" HEAD || {
-            echo "The release tag must point to a commit on main." >&2
-            exit 1
-          }
+          git merge-base --is-ancestor "$release_sha" HEAD || release_fail configuration \
+            "Release tag '$RELEASE_TAG' resolves to '$release_sha', which is not an ancestor of trusted automation HEAD." \
+            "Publish the release from a commit on main and retry."
 
       - name: Resolve release build number
         id: build
@@ -85,21 +118,43 @@ jobs:
           RELEASE_BUILD_NUMBER: ${{ steps.build.outputs.build_number }}
         run: |
           set -euo pipefail
+          # The helper is absent before checkout and in release tags older than the helper.
+          if [[ -f .github/scripts/release_failure.sh ]]; then
+            source .github/scripts/release_failure.sh
+          else
+            release_fail() { echo "::error title=Apple release failed ($1)::$2 Remediation: $3"; exit 1; }
+            retry_command() { while [[ "$1" != "--" ]]; do shift; done; shift; "$@"; }
+          fi
+          for secret_name in APP_STORE_CONNECT_APP_ID APP_STORE_CONNECT_ISSUER_ID APP_STORE_CONNECT_KEY_ID APP_STORE_CONNECT_PRIVATE_KEY_BASE64; do
+            [[ -n "${!secret_name:-}" ]] || release_fail configuration \
+              "Secret or variable $secret_name was empty." \
+              "Set $secret_name in the testflight-external environment and re-run the workflow."
+          done
           beta_group_name="${BETA_GROUP_NAME:-External Testers}"
           [[ "$beta_group_name" =~ ^[^[:cntrl:]]{1,100}$ ]] || {
-            echo "The external TestFlight group name must contain 1 to 100 printable characters." >&2
-            exit 1
+            release_fail configuration \
+              "The external TestFlight group name was '$beta_group_name'; expected 1 to 100 printable characters." \
+              "Set TESTFLIGHT_EXTERNAL_GROUP_NAME to a valid TestFlight group name."
           }
 
-          ruby .github/scripts/app_store_connect.rb wait-builds \
+          apple_log="$RUNNER_TEMP/apple-promote.log"
+          if ! ruby .github/scripts/app_store_connect.rb wait-builds \
             --version "$RELEASE_VERSION" \
-            --build-number "$RELEASE_BUILD_NUMBER"
+            --build-number "$RELEASE_BUILD_NUMBER" 2>&1 | tee "$apple_log"; then
+            release_fail app-store-connect \
+              "App Store Connect build processing failed: $(tail -20 "$apple_log")" \
+              "Confirm the build exists and is valid in App Store Connect, then re-run after any Apple outage clears."
+          fi
 
-          ruby .github/scripts/app_store_connect.rb distribute-external \
+          if ! ruby .github/scripts/app_store_connect.rb distribute-external \
             --version "$RELEASE_VERSION" \
             --build-number "$RELEASE_BUILD_NUMBER" \
             --group "$beta_group_name" \
             --localization "IOS:de-DE=$RUNNER_TEMP/apple-release-notes/ios.de-DE.txt" \
             --localization "IOS:en-US=$RUNNER_TEMP/apple-release-notes/ios.en-US.txt" \
             --localization "MAC_OS:de-DE=$RUNNER_TEMP/apple-release-notes/macos.de-DE.txt" \
-            --localization "MAC_OS:en-US=$RUNNER_TEMP/apple-release-notes/macos.en-US.txt"
+            --localization "MAC_OS:en-US=$RUNNER_TEMP/apple-release-notes/macos.en-US.txt" 2>&1 | tee -a "$apple_log"; then
+            release_fail app-store-connect \
+              "External TestFlight distribution failed: $(tail -20 "$apple_log")" \
+              "Verify the external group and localized notes, then re-run after any Apple outage clears."
+          fi
