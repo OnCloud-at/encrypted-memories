@@ -250,7 +250,7 @@ actor SDKSharedAlbumSnapshotCache {
     }
 }
 
-/// SDK 0.25.0 catalog/sharing/membership adapter. Enumerations publish only after their native
+/// SDK 0.27.0 catalog/sharing/membership adapter. Enumerations publish only after their native
 /// callback stream completes, and node hydration uses a bounded task group so a large catalog
 /// cannot create one unbounded task per album.
 struct SDKAlbumCatalogBackend: AlbumCatalogBackend {
@@ -510,7 +510,28 @@ struct SDKAlbumCatalogBackend: AlbumCatalogBackend {
             owner: album.ownedBy.email ?? album.ownedBy.organization,
             lastActivityTime: album.lastActivityTime.map(Date.init(timeIntervalSince1970:)),
             isSharedByURL: album.isSharedByUrl,
-            isMetadataDegraded: name.isDegraded || !album.errors.isEmpty
+            isMetadataDegraded: name.isDegraded || !album.errors.isEmpty,
+            role: role(album.directRole),
+            invitation: album.membership.map { invitation($0) }
+        )
+    }
+
+    /// `directRole` is the effective role. `membership.role` is kept only as invitation metadata.
+    static func role(_ role: MemberRole) -> SharedAlbumRole {
+        switch role {
+        case .inherited: .inherited
+        case .viewer: .viewer
+        case .editor: .editor
+        case .admin: .admin
+        }
+    }
+
+    static func invitation(_ membership: Membership, now: Date = Date()) -> SharedAlbumInvitation {
+        SharedAlbumInvitation(
+            role: role(membership.role),
+            sharedBy: membership.sharedBy.emailAddress,
+            isSharedByVerified: membership.sharedBy.signatureVerificationError == nil,
+            inviteTime: SharedAlbumInvitation.plausibleInviteTime(membership.inviteTime, now: now)
         )
     }
 

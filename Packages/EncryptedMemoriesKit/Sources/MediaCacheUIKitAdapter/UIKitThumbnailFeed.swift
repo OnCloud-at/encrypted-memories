@@ -113,6 +113,14 @@
             await core.requestPriority(uid, priority: requestedPriority)
         }
 
+        /// Fires when downloaded thumbnail bytes become durable in the encrypted cache. A view whose request
+        /// returned no image subscribes and requests again, so it never stays empty until it is recreated.
+        public nonisolated func setOnCacheArrivalWake(
+            _ callback: @escaping @Sendable () -> Void
+        ) -> ThumbnailFeedWakeRegistration {
+            core.setOnCacheArrivalWake(callback)
+        }
+
         public func hasRecentVisibleDemand(within: TimeInterval = 2.0) async -> Bool {
             core.hasRecentVisibleDemand(within: within)
         }
@@ -187,8 +195,8 @@
             await core.resumePrefetch()
         }
 
-        public nonisolated func setUserInteractionActive(_ active: Bool) {
-            core.setUserInteractionActive(active)
+        public nonisolated func setUserInteractionActive(_ active: Bool, owner: ThumbnailInteractionOwner) {
+            core.setUserInteractionActive(active, owner: owner)
         }
 
         public func prefetchStatus() async -> PrefetchStatus {

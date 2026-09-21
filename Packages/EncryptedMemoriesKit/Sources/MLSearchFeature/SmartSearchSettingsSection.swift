@@ -55,6 +55,8 @@ public struct SmartSearchSettingsSection: View {
                 Toggle(isOn: visualSearchBinding) {
                     Text(L10n.string("mlsearch.semantic_section_title"))
                 }
+                // Removal must commit before Visual Search can be turned on again.
+                .disabled(controller.snapshot.phase == .deleting)
                 .accessibilityIdentifier("smartsearch.visual.toggle")
 
                 Text(L10n.string("mlsearch.visual_search_intro"))

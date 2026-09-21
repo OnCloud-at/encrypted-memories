@@ -86,6 +86,7 @@ def valid_review(**overrides: object) -> dict[str, object]:
         "summary": "The retry path changes.",
         "findings": [],
         "testing_gaps": [],
+        "review_notes": [],
     }
     value.update(overrides)
     return value
@@ -136,6 +137,7 @@ class PayloadTests(unittest.TestCase):
         self.assertIn("not issue triage", system_prompt)
         self.assertIn("Do not claim to decide GitHub mergeability", system_prompt)
         self.assertIn("untrusted data", system_prompt)
+        self.assertIn("review_notes", system_prompt)
         self.assertIn("single-expression", system_prompt)
         self.assertIn("repository-wide reference evidence", system_prompt)
         self.assertIn("Do not report hypothetical risks", system_prompt)
@@ -155,6 +157,10 @@ class PayloadTests(unittest.TestCase):
             review_pull_request.MAX_PATCH_CHARS,
         )
         self.assertLessEqual(len(json.dumps(payload).encode("utf-8")), review_pull_request.MAX_LLM_REQUEST_BYTES)
+        self.assertEqual(
+            payload["response_format"]["json_schema"]["schema"]["required"],
+            ["summary", "findings", "testing_gaps", "review_notes"],
+        )
         self.assertEqual(changed_lines, {"file-001": {1}})
         self.assertEqual(file_paths, {"file-001": "Sources/Backup.swift"})
         self.assertTrue(any("truncated" in gap for gap in gaps))
@@ -208,7 +214,7 @@ class ReviewProviderRetryTests(unittest.TestCase):
         self.assertEqual(request.call_count, 2)
         self.assertTrue(
             all(
-                call.kwargs["total_seconds"] == review_pull_request.REVIEW_LLM_TOTAL_SECONDS
+                0 < call.kwargs["total_seconds"] <= review_pull_request.REVIEW_LLM_TOTAL_SECONDS
                 for call in request.call_args_list
             )
         )
@@ -281,6 +287,19 @@ class ParsingAndRenderingTests(unittest.TestCase):
                 {"file-001": {1}},
                 {"file-001": "Sources/Backup.swift"},
             )
+
+    def test_review_notes_are_kept_separate_from_coverage_gaps(self) -> None:
+        parsed = review_pull_request.parse_review(
+            llm_content(valid_review(review_notes=["The test could assert one more invariant."])),
+            {"file-001": {1}},
+            {"file-001": "Sources/Backup.swift"},
+        )
+
+        self.assertEqual(parsed["testing_gaps"], [])
+        self.assertEqual(parsed["review_notes"], ["The test could assert one more invariant."])
+        body = review_pull_request.render_review(parsed, pull_request(), "abc123", [])
+        self.assertIn("🟢", body)
+        self.assertIn("Review notes", body)
 
     def test_review_rejects_a_non_string_file_id(self) -> None:
         review = valid_review(
@@ -439,12 +458,12 @@ class ParsingAndRenderingTests(unittest.TestCase):
 
         self.assertTrue(body.startswith(review_pull_request.REVIEW_COMMENT_MARKER))
         self.assertIn("**Reviewed commit:** `abc123`", body)
-        self.assertIn("＠maintainers (now)", body)
+        self.assertNotIn("@maintainers", body)
         self.assertIn("＠owner", body)
         self.assertNotIn("<script>", body)
-        self.assertIn("WARNING", body)
+        self.assertIn("🟡", body)
 
-    def test_blocking_finding_requires_changes(self) -> None:
+    def test_serious_finding_is_advisory(self) -> None:
         review = valid_review(
             findings=[
                 {
@@ -459,9 +478,10 @@ class ParsingAndRenderingTests(unittest.TestCase):
 
         body = review_pull_request.render_review(review, pull_request(), "abc123", [])
 
-        self.assertIn("Changes are required before merge", body)
+        self.assertIn("🔴", body)
+        self.assertNotIn("Changes are required", body)
 
-    def test_incomplete_coverage_requires_human_review(self) -> None:
+    def test_incomplete_coverage_is_grey(self) -> None:
         body = review_pull_request.render_review(
             valid_review(),
             pull_request(),
@@ -469,7 +489,7 @@ class ParsingAndRenderingTests(unittest.TestCase):
             ["A binary patch was omitted."],
         )
 
-        self.assertIn("must review the omitted or truncated diff", body)
+        self.assertIn("⚪ Review incomplete", body)
 
     def test_github_mergeability_is_reported_separately_from_code_review(self) -> None:
         body = review_pull_request.render_review(
@@ -479,8 +499,8 @@ class ParsingAndRenderingTests(unittest.TestCase):
             [],
         )
 
-        self.assertIn("Not ready to merge because GitHub reports", body)
-        self.assertIn("GitHub currently reports this pull request as not mergeable", body)
+        self.assertIn("🟢", body)
+        self.assertNotIn("Not ready to merge", body)
         self.assertIn("never approves, blocks, or merges", body)
 
     def test_pending_github_mergeability_is_not_guessed(self) -> None:
@@ -491,8 +511,8 @@ class ParsingAndRenderingTests(unittest.TestCase):
             [],
         )
 
-        self.assertIn("GitHub has not finished calculating mergeability", body)
-        self.assertIn("Required checks and maintainer review still decide merge", body)
+        self.assertIn("🟢", body)
+        self.assertNotIn("GitHub mergeability", body)
 
 
 class ReviewPublicationTests(unittest.TestCase):

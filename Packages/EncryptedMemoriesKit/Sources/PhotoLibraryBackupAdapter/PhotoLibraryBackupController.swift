@@ -180,7 +180,8 @@ public final class PhotoLibraryBackupController {
     public init(
         configuration: Configuration,
         identityResolver: (any UploadIdentityResolving)?,
-        uploader: any PhotoUploading
+        uploader: any PhotoUploading,
+        tagAdder: (any PhotoTagAdding)? = nil
     ) {
         let directory = configuration.accountDataDirectory
         defaults = configuration.defaults
@@ -237,6 +238,7 @@ public final class PhotoLibraryBackupController {
                 ),
                 identityResolver: identityResolver,
                 uploader: uploader,
+                tagAdder: tagAdder,
                 configuration: .init(retry: retryPolicy),
                 throttleInputs: { AppleBackupRuntimeSignals.current() }
             )
@@ -416,17 +418,6 @@ public final class PhotoLibraryBackupController {
         guard executionOpportunityIssue != issue else { return }
         executionOpportunityIssue = issue
         refreshFromQueue()
-    }
-
-    /// Real work projection for OS execution windows. The app's backup row continues to use
-    /// `status`; catalog discovery is included here only so a long PhotoKit scan cannot look stalled
-    /// to the operating system before queue reconciliation has a denominator.
-    public var backgroundExecutionProgress: BackupExecutionProgress? {
-        PhotoLibraryBackupExecutionProgress.combined(
-            catalog: lastCatalogProgress?.executionProgress,
-            queue: status.executionProgress,
-            isScanning: isScanning
-        )
     }
 
     /// Runs one catch-up pass for an OS background window.

@@ -13,13 +13,17 @@ public protocol AlbumManaging: AlbumOperations {
 
 /// Default implementation over separate catalog and write backends. This split makes the SDK the
 /// only owned/shared catalog and membership reader while preserving the narrow HTTP write surface
-/// for operations SDK 0.25.0 does not expose.
+/// for operations SDK 0.27.0 does not expose.
 public actor AlbumsRepository: AlbumManaging {
     public nonisolated let capabilities: AlbumCapabilities
     private let catalogBackend: any AlbumCatalogBackend
     private let writeBackend: any AlbumWriteBackend
     private let didLeaveSharedAlbum: @Sendable (AlbumNodeIdentifier) async -> Void
     private var albumCatalogCache: [AlbumSummary]?
+    /// Last shared-with-me catalog. Owned-album writes take a bare link id, so this guards against a
+    /// shared album reaching the owned-share HTTP path.
+    private var sharedAlbumCatalogCache: [SharedAlbumSummary] = []
+    private var hasLoadedSharedAlbumCatalog = false
     /// Session-local on-demand membership cache. Successful writes update it in place, so opening a
     /// picker after a mutation cannot show a stale checkmark or schedule a redundant attach.
     private var membershipCache: [PhotoUID: Set<AlbumNodeIdentifier>] = [:]
@@ -59,10 +63,18 @@ public actor AlbumsRepository: AlbumManaging {
             )
         }
         do {
-            return try await catalogBackend.listSharedWithMeAlbums()
+            let albums = try await catalogBackend.listSharedWithMeAlbums()
+            sharedAlbumCatalogCache = albums
+            hasLoadedSharedAlbumCatalog = true
+            return albums
         } catch {
             throw Self.normalized(error)
         }
+    }
+
+    /// Per-album permissions from the effective role and the wired transport.
+    public nonisolated func permissions(for album: SharedAlbumSummary) -> SharedAlbumPermissions {
+        SharedAlbumPermissions.resolve(role: album.role, capabilities: capabilities)
     }
 
     public func leaveSharedAlbum(_ album: AlbumNodeIdentifier) async throws {
@@ -74,6 +86,7 @@ public actor AlbumsRepository: AlbumManaging {
         }
         do {
             try await catalogBackend.leaveSharedAlbum(album)
+            sharedAlbumCatalogCache.removeAll { $0.node == album }
             await didLeaveSharedAlbum(album)
         } catch {
             throw Self.normalized(error)
@@ -107,22 +120,25 @@ public actor AlbumsRepository: AlbumManaging {
 
     public func albumMembershipTitles(for photoUID: PhotoUID) async throws -> [String] {
         let membershipsByPhoto = try await albumMemberships(for: [photoUID])
+        let memberships = membershipsByPhoto[photoUID] ?? []
+        guard !memberships.isEmpty else { return [] }
         let albums: [AlbumSummary]
         if let albumCatalogCache {
             albums = albumCatalogCache
         } else {
             albums = try await listAlbums()
         }
-        let memberships = membershipsByPhoto[photoUID] ?? []
-        return
-            albums
-            .filter { album in
-                memberships.contains { membership in
-                    membership.nodeID == album.id
-                        && (album.volumeID == nil || album.volumeID == membership.volumeID)
-                }
+        let owned = albums.filter { album in
+            memberships.contains { membership in
+                membership.nodeID == album.id
+                    && (album.volumeID == nil || album.volumeID == membership.volumeID)
             }
-            .map(\.title)
+        }
+        if owned.count < memberships.count, capabilities.canListSharedWithMe, !hasLoadedSharedAlbumCatalog {
+            _ = try await listSharedWithMeAlbums()
+        }
+        let shared = sharedAlbumCatalogCache.filter { memberships.contains($0.node) }
+        return Set(owned.map(\.title) + shared.map(\.title))
             .sorted { $0.localizedStandardCompare($1) == .orderedAscending }
     }
 
@@ -185,6 +201,7 @@ public actor AlbumsRepository: AlbumManaging {
                 gap: "the wired album backend exposes no safe album-delete operation"
             )
         }
+        try rejectSharedAlbumTarget(albumID)
         do {
             try await writeBackend.deleteAlbum(albumID: albumID)
             for uid in membershipCache.keys {
@@ -204,6 +221,7 @@ public actor AlbumsRepository: AlbumManaging {
                 gap: "the wired album backend has no SDK-backed album photo attachment operation yet"
             )
         }
+        try rejectSharedAlbumTarget(albumID)
         do {
             try await writeBackend.addPhotos(uniqueUIDs, to: albumID)
             noteAdded(uniqueUIDs, to: albumID)
@@ -221,6 +239,7 @@ public actor AlbumsRepository: AlbumManaging {
                 gap: "the wired album backend has no album membership removal operation"
             )
         }
+        try rejectSharedAlbumTarget(albumID)
         do {
             try await writeBackend.removePhotos(uniqueUIDs, from: albumID)
             for uid in uniqueUIDs {
@@ -238,11 +257,25 @@ public actor AlbumsRepository: AlbumManaging {
                 gap: "the wired album backend exposes no album-cover write"
             )
         }
+        try rejectSharedAlbumTarget(albumID)
         do {
             try await writeBackend.setAlbumCover(albumID: albumID, photoUID: photoUID)
         } catch {
             throw Self.normalized(error)
         }
+    }
+
+    /// Owned-album writes use the account's own Photos share and volume. A known shared album that is
+    /// not also an owned album is rejected before any request, with its per-album reason. This is
+    /// defence in depth: no UI routes shared albums here, and the server remains the authority.
+    /// The match uses the link id only; a collision can only reject, never misroute, a write.
+    private func rejectSharedAlbumTarget(_ albumID: AlbumID) throws {
+        guard albumCatalogCache?.contains(where: { $0.id == albumID }) != true,
+            let shared = sharedAlbumCatalogCache.first(where: { $0.node.nodeID == albumID })
+        else { return }
+        throw AlbumError.sharedAlbumReadOnly(
+            permissions(for: shared).writeRestriction ?? .transportUnsupported
+        )
     }
 
     private static func normalized(_ error: Error) -> AlbumError {

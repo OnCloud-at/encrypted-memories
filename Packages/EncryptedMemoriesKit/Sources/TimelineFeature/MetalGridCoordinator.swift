@@ -1,6 +1,7 @@
 import AppKit
 import CoreGraphics
 import GridCore
+import MediaFeedCore
 import MetalGridComposeCore
 import MetalGridTextureAppKitAdapter
 import MetalGridTextureCore
@@ -89,7 +90,6 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
     // Overview dissolves blend two complete settled grids in the offscreen compositor. They are separate from
     // the per-cell transition and are used at overview boundaries and for discrete +/- clicks.
     private(set) var overviewDissolve: OverviewLayerDissolvePlan?
-    var isOverviewDissolving: Bool { overviewDissolve != nil }
     var isOverviewClickDissolving: Bool { overviewClickDissolveActive }
     private var overviewClickDissolveActive = false
     private var overviewClickDissolveStart: CFTimeInterval = 0
@@ -303,8 +303,8 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
     var orderedUIDs: [PhotoUID] { dataSource.flatUIDs }
     var gridProfileID: String { gridProfile.id }
 
-    func setUserInteractionActive(_ active: Bool) {
-        dataSource.setUserInteractionActive(active)
+    func setUserInteractionActive(_ active: Bool, owner: ThumbnailInteractionOwner) {
+        dataSource.setUserInteractionActive(active, owner: owner)
     }
 
     @discardableResult
@@ -437,17 +437,6 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
 
     var levelCount: Int { engine.levelCount }
     func clampLevel(_ l: Int) -> Int { engine.clampLevel(l) }
-
-    /// Scroll Y that keeps the item under `cursorContentPoint` at the same viewport position after changing
-    /// to `newLevel` (zoom toward the cursor - the Apple rule). The engine owns the capture + rebase; this
-    /// just supplies the live view width + scroll origin. nil if no item resolvable.
-    func cursorAnchoredScrollOffsetY(toLevel newLevel: Int, cursorContentPoint: CGPoint) -> CGFloat? {
-        let width = layoutWidth
-        let originY = clipView?.bounds.origin.y ?? 0
-        return engine.cursorAnchoredScrollOffsetY(
-            levelChangeFrom: level, to: newLevel, width: width,
-            cursorContentPoint: cursorContentPoint, sourceScrollOriginY: originY)
-    }
 
     // MARK: - Live focus-row zoom transaction (driven by the host's trackpad pinch)
 

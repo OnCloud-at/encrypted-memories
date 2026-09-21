@@ -66,8 +66,11 @@ final class MobileGridChromeTests: XCTestCase {
             }
             XCTAssertEqual(grid.scrollView.topEdgeEffect.style, .soft)
             try await Task.sleep(for: .seconds(1))
-            let tabBar = try XCTUnwrap(descendants(window).compactMap { $0 as? UITabBar }.first)
-            XCTAssertEqual(tabBar.isHidden, isSelecting, "Selection actions and root tabs must alternate")
+            // iPhone keeps a UITabBar; iPadOS renders its top tab bar with a system container view.
+            if UIDevice.current.userInterfaceIdiom == .phone {
+                let tabBar = try XCTUnwrap(descendants(window).compactMap { $0 as? UITabBar }.first)
+                XCTAssertEqual(tabBar.isHidden, isSelecting, "Selection actions and root tabs must alternate")
+            }
             let navigationBar = try XCTUnwrap(descendants(window).compactMap { $0 as? UINavigationBar }.first)
             XCTAssertFalse(navigationBar.isHidden)
             let name = "chrome-iOS-\(UIDevice.current.systemVersion)-step-\(step)-selecting-\(isSelecting)"
@@ -78,6 +81,13 @@ final class MobileGridChromeTests: XCTestCase {
             attachment.name = name
             attachment.lifetime = .keepAlways
             add(attachment)
+            if let directory = ProcessInfo.processInfo.environment["ENCRYPTED_MEMORIES_UI_SNAPSHOT_DIR"],
+                let data = shot.pngData()
+            {
+                let url = URL(fileURLWithPath: directory, isDirectory: true)
+                try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+                try? data.write(to: url.appendingPathComponent("\(name).png"))
+            }
         }
     }
 
@@ -86,13 +96,20 @@ final class MobileGridChromeTests: XCTestCase {
     }
 }
 
-@MainActor @Observable private final class ChromeProbeState {
-    var isSelecting = false
+@MainActor @Observable final class ChromeProbeState {
+    let selection = MobileGridSelectionController()
     var showsLoadingCover = true
     var showsActivity = true
+    var isSelecting: Bool {
+        get { selection.isSelecting }
+        set {
+            selection.isSelecting = newValue
+            if !newValue { selection.selected.removeAll() }
+        }
+    }
 }
 
-private struct ChromeProbeShell: View {
+struct ChromeProbeShell: View {
     @Namespace private var activityTransition
     let items: [PhotoItem]
     let feed: UIKitThumbnailFeed
@@ -124,19 +141,14 @@ private struct ChromeProbeShell: View {
                         }
                         ToolbarSpacer(.fixed, placement: .topBarTrailing)
                         ToolbarItem(placement: .topBarTrailing) { Button("Auswählen") {} }
-                        ToolbarItem(placement: .bottomBar) {
-                            HStack {
-                                Image(systemName: "square.and.arrow.up")
-                                Spacer(minLength: 28)
-                                Text("Auswahl")
-                                Spacer(minLength: 28)
-                                Image(systemName: "trash")
-                            }
-                            .frame(minWidth: 300)
-                            .opacity(state.isSelecting ? 1 : 0)
-                            .allowsHitTesting(state.isSelecting)
-                        }
-                        .sharedBackgroundVisibility(state.isSelecting ? .automatic : .hidden)
+                        MobileSelectionToolbarItems(
+                            selection: state.selection,
+                            canAddToAlbum: true,
+                            showAlbumPicker: .constant(false),
+                            onShare: {},
+                            onTrash: {},
+                            albumPicker: { EmptyView() }
+                        )
                     }
                     .mobileSelectionBars(isSelecting: state.isSelecting)
                 }
@@ -153,7 +165,7 @@ private struct ChromeProbeShell: View {
             Tab(role: .search) { NavigationStack { Text("Suche").searchable(text: .constant("")) } }
         }
         .tabViewSearchActivation(.searchTabSelection)
-        .tabViewStyle(.tabBarOnly)
+        .tabViewStyle(.sidebarAdaptable)
         .mobileTabBarBackgroundPolicy()
         .tint(.purple)
         .overlay {
@@ -167,7 +179,7 @@ private struct ChromeProbeShell: View {
     }
 }
 
-private struct ChromeProbeLoader: ThumbnailBatchLoader {
+struct ChromeProbeLoader: ThumbnailBatchLoader {
     func loadThumbnails(
         for uids: [PhotoUID], onLoaded: @Sendable @escaping (PhotoUID, Data) -> Void
     ) async -> ThumbnailBatchLoadResult { .delivered }

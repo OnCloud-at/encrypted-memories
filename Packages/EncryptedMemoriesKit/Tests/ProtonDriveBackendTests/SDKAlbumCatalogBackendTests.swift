@@ -8,6 +8,68 @@ import Testing
 
 @Suite("SDK album catalog")
 struct SDKAlbumCatalogBackendTests {
+    @Test func photoMetadataUsesForeignVolumeAndKeepsMissingAttributesOptional() async throws {
+        let client = FakeSDKPhotoCatalogClient()
+        let photo = photoNode(id: "same-node", albumIDs: [], volumeID: "foreign-volume")
+        await client.configureNodes([photo.uid.sdkCompatibleIdentifier: DriveNode(photoNode: photo)])
+
+        let metadata = try await SDKPhotoMetadataReader.metadata(
+            for: PhotoUID(volumeID: "foreign-volume", nodeID: "same-node"), client: client)
+
+        #expect(metadata.filename == "same-node.jpg")
+        #expect(metadata.mimeType == "image/jpeg")
+        #expect(metadata.fileSize == 1)
+        #expect(metadata.pixelWidth == nil)
+        #expect(metadata.device == nil)
+        #expect(metadata.latitude == nil)
+        #expect(await client.getNodeCalls == 1)
+    }
+
+    @Test func photoMetadataPreservesIndependentSDKSectionsAndOriginalSize() {
+        let revision = FileRevision(
+            uid: SDKRevisionUid(volumeID: "foreign", nodeID: "photo", revisionID: "revision"),
+            state: .active, creationTime: 1, storageSize: 9999, claimedSize: 1234,
+            claimedDigests: FileContentDigests(sha1: nil, sha1Verified: false),
+            claimedModificationTime: 123, thumbnails: [],
+            claimedAdditionalMetadata: [
+                AdditionalMetadata(
+                    name: "Media", utf8JsonValue: Data(#"{"Width":4032,"Height":3024,"Duration":2.5}"#.utf8)),
+                AdditionalMetadata(name: "Camera", utf8JsonValue: Data(#"{"Device":"iPhone"}"#.utf8)),
+                AdditionalMetadata(name: "Location", utf8JsonValue: Data(#"{"Latitude":48.2,"Longitude":16.3}"#.utf8)),
+            ], contentAuthor: nil)
+        let metadata = SDKPhotoMetadataReader.metadata(
+            name: .success("photo.heic"), mimeType: "image/heic", revision: revision)
+
+        #expect(metadata.fileSize == 1234, "encrypted storage size is not the original photo size")
+        #expect(metadata.pixelWidth == 4032)
+        #expect(metadata.pixelHeight == 3024)
+        #expect(metadata.durationSeconds == 2.5)
+        #expect(metadata.device == "iPhone")
+        #expect(metadata.latitude == 48.2)
+        #expect(metadata.longitude == 16.3)
+        #expect(metadata.modificationTime == Date(timeIntervalSince1970: 123))
+    }
+
+    @Test func malformedOptionalSDKSectionDoesNotDiscardAvailableMetadata() {
+        let revision = FileRevision(
+            uid: SDKRevisionUid(volumeID: "foreign", nodeID: "photo", revisionID: "revision"),
+            state: .active, creationTime: 1, storageSize: 9999, claimedSize: nil,
+            claimedDigests: FileContentDigests(sha1: nil, sha1Verified: false),
+            claimedModificationTime: nil, thumbnails: [],
+            claimedAdditionalMetadata: [
+                AdditionalMetadata(name: "Media", utf8JsonValue: Data("unsupported".utf8)),
+                AdditionalMetadata(name: "Camera", utf8JsonValue: Data(#"{"Device":"Camera"}"#.utf8)),
+            ], contentAuthor: nil)
+        let metadata = SDKPhotoMetadataReader.metadata(
+            name: .failure(ProtonDriveSDKDriveError(message: "name unavailable")), mimeType: "", revision: revision)
+
+        #expect(metadata.filename == nil)
+        #expect(metadata.mimeType == nil)
+        #expect(metadata.fileSize == nil)
+        #expect(metadata.pixelWidth == nil)
+        #expect(metadata.device == "Camera")
+    }
+
     @Test func ownedCatalogMapsSDKMetadataSortsAndKeepsDegradedNodesVisible() async throws {
         let client = FakeSDKPhotoCatalogClient()
         let z = albumNode(id: "z", name: .success("Zoo"), photoCount: 7, coverID: "cover-z")
@@ -84,6 +146,63 @@ struct SDKAlbumCatalogBackendTests {
         #expect(albums[0].photoCount == 11)
         #expect(albums[0].coverPhotoUID == PhotoUID(volumeID: "volume", nodeID: "cover"))
         #expect(albums[0].isSharedByURL)
+    }
+
+    @Test func sharedCatalogMapsEffectiveRoleFromDirectRoleAndKeepsInvitationSeparate() async throws {
+        let client = FakeSDKPhotoCatalogClient()
+        let inherited = albumNode(id: "a-inherited", name: .success("A"), photoCount: 1, directRole: .inherited)
+        let viewer = albumNode(
+            id: "b-viewer", name: .success("B"), photoCount: 1, directRole: .viewer,
+            membership: Membership(
+                role: .viewer, inviteTime: 1_700_000_000,
+                sharedBy: Author(emailAddress: "inviter@example.test", signatureVerificationError: nil)))
+        // The effective role can be higher than the direct invitation (access also inherited).
+        let editor = albumNode(
+            id: "c-editor", name: .success("C"), photoCount: 1, directRole: .editor,
+            membership: Membership(
+                role: .viewer, inviteTime: 0,
+                sharedBy: Author(emailAddress: nil, signatureVerificationError: "bad signature")))
+        let admin = albumNode(
+            id: "d-admin", name: .success("D"), photoCount: 1, directRole: .admin,
+            membership: Membership(
+                role: .admin, inviteTime: 1_700_000_000,
+                sharedBy: Author(emailAddress: "claimed@example.test", signatureVerificationError: "forged")))
+        await client.configureShared(
+            [inherited.uid, viewer.uid, editor.uid, admin.uid],
+            nodes: Dictionary(
+                uniqueKeysWithValues: [inherited, viewer, editor, admin].map {
+                    ($0.uid.sdkCompatibleIdentifier, .init(albumNode: $0))
+                }))
+
+        let albums = try await SDKAlbumCatalogBackend(client: client).listSharedWithMeAlbums()
+
+        #expect(albums.map(\.role) == [.inherited, .viewer, .editor, .admin])
+        #expect(albums[0].invitation == nil)
+        #expect(
+            albums[1].invitation
+                == SharedAlbumInvitation(
+                    role: .viewer, sharedBy: "inviter@example.test", isSharedByVerified: true,
+                    inviteTime: Date(timeIntervalSince1970: 1_700_000_000)))
+        #expect(albums[1].invitation?.isDegraded == false)
+        #expect(albums[2].invitation?.role == .viewer)
+        #expect(albums[2].invitation?.sharedBy == nil)
+        #expect(albums[2].invitation?.inviteTime == nil)
+        #expect(albums[2].invitation?.isDegraded == true)
+        #expect(albums[3].invitation?.sharedBy == "claimed@example.test")
+        #expect(albums[3].invitation?.isSharedByVerified == false)
+    }
+
+    @Test func memberRoleMappingCoversEverySDKRole() {
+        #expect(SDKAlbumCatalogBackend.role(.inherited) == .inherited)
+        #expect(SDKAlbumCatalogBackend.role(.viewer) == .viewer)
+        #expect(SDKAlbumCatalogBackend.role(.editor) == .editor)
+        #expect(SDKAlbumCatalogBackend.role(.admin) == .admin)
+        let future = Membership(
+            role: .editor, inviteTime: 4_000_000_000,
+            sharedBy: Author(emailAddress: "a@example.test", signatureVerificationError: nil))
+        #expect(
+            SDKAlbumCatalogBackend.invitation(future, now: Date(timeIntervalSince1970: 1_800_000_000)).inviteTime
+                == nil)
     }
 
     @Test func sharedCatalogAndSourceDiscoveryJoinOneHydrationSweep() async throws {
@@ -611,7 +730,9 @@ private func albumNode(
     owner: String? = nil,
     isShared: Bool = false,
     isSharedByURL: Bool = false,
-    errors: [ProtonDriveSDKDriveError] = []
+    errors: [ProtonDriveSDKDriveError] = [],
+    directRole: MemberRole = .inherited,
+    membership: Membership? = nil
 ) -> AlbumNode {
     let uid = SDKNodeUid(volumeID: "volume", nodeID: id)
     return AlbumNode(
@@ -625,6 +746,8 @@ private func albumNode(
         ownedBy: OwnedBy(email: owner, organization: nil),
         isShared: isShared,
         isSharedByUrl: isSharedByURL,
+        directRole: directRole,
+        membership: membership,
         errors: errors,
         photoCount: photoCount,
         coverPhotoNodeUid: coverID.map { SDKNodeUid(volumeID: "volume", nodeID: $0) },
@@ -632,10 +755,10 @@ private func albumNode(
     )
 }
 
-private func photoNode(id: String, albumIDs: [SDKNodeUid]) -> PhotoNode {
-    let uid = SDKNodeUid(volumeID: "volume", nodeID: id)
+private func photoNode(id: String, albumIDs: [SDKNodeUid], volumeID: String = "volume") -> PhotoNode {
+    let uid = SDKNodeUid(volumeID: volumeID, nodeID: id)
     let revision = FileRevision(
-        uid: SDKRevisionUid(volumeID: "volume", nodeID: id, revisionID: "revision"),
+        uid: SDKRevisionUid(volumeID: volumeID, nodeID: id, revisionID: "revision"),
         state: .active,
         creationTime: 1,
         storageSize: 1,
@@ -660,6 +783,8 @@ private func photoNode(id: String, albumIDs: [SDKNodeUid]) -> PhotoNode {
         activeRevision: revision,
         isShared: false,
         isSharedByUrl: false,
+        directRole: .inherited,
+        membership: nil,
         errors: [],
         captureTime: 1,
         albumUids: albumIDs

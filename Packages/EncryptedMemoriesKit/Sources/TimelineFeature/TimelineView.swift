@@ -330,18 +330,18 @@ private struct TimelineDateScrubber: View {
             ZStack(alignment: .trailing) {
                 Color.clear
                     .frame(width: hovering || active != nil ? 7 : 4)
-                    .protonGlass(in: Capsule(style: .continuous))
+                    .glassEffect(in: Capsule(style: .continuous))
                     .opacity(hovering || active != nil ? 0.72 : 0.22)
                     .padding(.trailing, 10)
 
                 if let active, let index = activeIndex {
                     Text(active.text)
                         .font(.system(size: 13, weight: .semibold))
-                        .foregroundStyle(.white)
-                        .shadow(color: .black.opacity(0.35), radius: 2, x: 0, y: 1)
+                        // Regular Liquid Glass flips its content between light and dark over the photos.
+                        .foregroundStyle(.primary)
                         .padding(.horizontal, 10)
                         .padding(.vertical, 6)
-                        .protonGlass(in: Capsule(style: .continuous))
+                        .glassEffect(in: Capsule(style: .continuous))
                         .position(
                             x: geometry.size.width - 66,
                             y: markerY(index: index, height: geometry.size.height))

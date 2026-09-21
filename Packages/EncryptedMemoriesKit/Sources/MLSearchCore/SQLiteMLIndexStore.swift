@@ -633,12 +633,12 @@ public final class SQLiteMLIndexStore: MLIndexStore, @unchecked Sendable {
         for descriptor: MLModelDescriptor,
         maximumRows: Int,
         _ body: (MLVectorBlock) -> Void
-    ) {
+    ) throws {
         guard maximumRows > 0 else { return }
         var lastUID: PhotoUID?
         while true {
             if Task.isCancelled { return }
-            let page: (block: MLVectorBlock, rowCount: Int, lastUID: PhotoUID?) = lock.withLock {
+            let page: (block: MLVectorBlock, rowCount: Int, lastUID: PhotoUID?) = try lock.withLock {
                 var stmt: OpaquePointer?
                 let sql: String
                 if lastUID == nil {
@@ -649,10 +649,11 @@ public final class SQLiteMLIndexStore: MLIndexStore, @unchecked Sendable {
                         LIMIT ?;
                         """
                 } else {
+                    // The composite range lets SQLite seek past the cursor instead of scanning earlier rows.
                     sql = """
                         SELECT volume_id, node_id, vector FROM ml_embeddings
                         WHERE model_identifier=? AND model_version=? AND embedding_dimension=? AND embedding_precision=?
-                          AND (volume_id > ? OR (volume_id = ? AND node_id > ?))
+                          AND (volume_id, node_id) > (?, ?)
                         ORDER BY volume_id, node_id
                         LIMIT ?;
                         """
@@ -660,16 +661,15 @@ public final class SQLiteMLIndexStore: MLIndexStore, @unchecked Sendable {
                 guard db != nil,
                     sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK
                 else {
-                    return (MLVectorBlock(descriptor: descriptor), 0, nil)
+                    throw MLIndexStoreReadError.storageUnavailable
                 }
                 defer { sqlite3_finalize(stmt) }
                 bindEpochRead(stmt, descriptor)
                 var limitIndex: Int32 = 5
                 if let lastUID {
                     bindText(stmt, 5, lastUID.volumeID)
-                    bindText(stmt, 6, lastUID.volumeID)
-                    bindText(stmt, 7, lastUID.nodeID)
-                    limitIndex = 8
+                    bindText(stmt, 6, lastUID.nodeID)
+                    limitIndex = 7
                 }
                 sqlite3_bind_int64(stmt, limitIndex, Int64(maximumRows))
 
@@ -681,7 +681,12 @@ public final class SQLiteMLIndexStore: MLIndexStore, @unchecked Sendable {
                 let expectedBytes = descriptor.embeddingDimension * MLFloat16Codec.bytesPerElement
                 let expectedSealedBytes = cipher.sealedByteCount(forPlaintextByteCount: expectedBytes)
 
-                while sqlite3_step(stmt) == SQLITE_ROW {
+                readRows: while true {
+                    switch sqlite3_step(stmt) {
+                    case SQLITE_ROW: break
+                    case SQLITE_DONE: break readRows
+                    default: throw MLIndexStoreReadError.storageUnavailable
+                    }
                     rowCount += 1
                     let uid = PhotoUID(volumeID: columnText(stmt, 0), nodeID: columnText(stmt, 1))
                     pageLastUID = uid

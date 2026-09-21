@@ -166,9 +166,14 @@ struct ProductionRouteGuardTests {
                 "Packages/EncryptedMemoriesKit/Sources/ProtonDriveBackend/Streaming/ProtonVideoResourceLoader.swift"
             ), encoding: .utf8)
         #expect(videoLoader.contains("private let admission: JoinedShutdownGate"))
+        // Every unstructured task of the loader fetches remote bytes, so each one must join bridge
+        // shutdown. Counting the gates against the tasks keeps that true when a new warm path is added.
+        let createdTasks = videoLoader.components(separatedBy: "= Task {").count - 1
+        let gatedRoutes = videoLoader.components(separatedBy: "admission.withAdmission").count - 1
+        #expect(createdTasks > 0, "the guard must observe the loader's actual tasks")
         #expect(
-            videoLoader.components(separatedBy: "admission.withAdmission").count == 3,
-            "issued AV assets must gate both range requests and forward-prefetch tasks")
+            gatedRoutes >= createdTasks,
+            "issued AV assets must gate range requests and every prefetch or warm task")
         #expect(
             bridge.contains("admission: shutdownGate"),
             "the AV resource loader must share the bridge shutdown admission owner")
@@ -378,7 +383,7 @@ struct ProductionRouteGuardTests {
         )
         #expect(timeline.contains("private var selectionOptionsMenu: some View"))
         #expect(
-            timeline.contains("Image(systemName: \"ellipsis\")"),
+            timeline.contains("Label(String(localized: \"selection.more_a11y\"), systemImage: \"ellipsis\")"),
             "bulk favorite must live in the selection More menu beside Select/Done")
         #expect(
             !timeline.contains("Image(systemName: selectedAllFavorited ? \"heart.fill\" : \"heart\")"),
@@ -433,7 +438,7 @@ struct ProductionRouteGuardTests {
             to: "self.photosClient = try await EncryptedMemoriesClient(")
         #expect(
             !config.contains("cachePath:"),
-            "SDK 0.25.0 does not dispose its SQLite repository, so sign-out must not persist that cache")
+            "SDK 0.27.0 does not dispose its SQLite repository, so sign-out must not persist that cache")
         #expect(
             !config.contains("cacheEncryptionKey:"),
             "an absent cache path selects the SDK's supported in-memory cache")
@@ -548,7 +553,7 @@ struct ProductionRouteGuardTests {
         let macRecovery = try Self.body(
             of: macModel,
             from: "func recoverBackendAfterScopeAccessLoss() async {",
-            to: "    /// Stop Smart Search")
+            to: "    @discardableResult\n    private func stopSourceAnalysis()")
         #expect(macRecovery.contains("AccountTeardownCoordinator"))
         #expect(macRecovery.contains("purgeCachesForAccountTeardown"))
         #expect(macRecovery.contains("ProtonDriveBackendFactory.purgeLocalAccountData"))
@@ -610,15 +615,24 @@ struct ProductionRouteGuardTests {
         #expect(mobileRoot.contains(".id(libraryModel.scopePresentationRevision)"))
     }
 
-    @Test func iOSLongPressIsDragOutOrContextMenuNeverSelection() throws {
+    @Test func iOSLongPressNeverEntersSelectionAndSwipeSelectionYieldsToDragOut() throws {
         let host = try String(
             contentsOf: Self.repoRoot.appendingPathComponent(
                 "Packages/EncryptedMemoriesKit/Sources/TimelineUIKitFeature/UIKitTimelineGridHost.swift"
             ), encoding: .utf8)
         #expect(!host.contains("onBeginSelection"))
         #expect(!host.contains("beginSelection"))
-        #expect(!host.contains("dragSelect"))
         #expect(!host.contains("onDragSelectionChanged"))
+
+        // Swipe selection runs only inside selection mode and yields a selected photo's hold to drag-out.
+        let swipe = try String(
+            contentsOf: Self.repoRoot.appendingPathComponent(
+                "Packages/EncryptedMemoriesKit/Sources/TimelineUIKitFeature/UIKitTimelineGridHostSwipeSelection.swift"
+            ), encoding: .utf8)
+        #expect(swipe.contains("$0.selectionMode && $0.onSelectionChanged != nil"))
+        #expect(swipe.contains("host.dragOutProvider == nil || !host.selectedUIDs.contains(item.uid)"))
+        #expect(swipe.contains("scrollView.panGestureRecognizer.require(toFail: pan)"))
+        #expect(host.contains("tap.require(toFail: swipeSelection.hold)"))
 
         let drag = try String(
             contentsOf: Self.repoRoot.appendingPathComponent(
@@ -637,6 +651,9 @@ struct ProductionRouteGuardTests {
         #expect(drag.contains("onContextMenuAction?(action, items)"))
         #expect(drag.contains("effectiveContentMode(preferred: host.displayMode"))
         #expect(drag.contains("configuration.preferredMenuElementOrder = .fixed"))
+        #expect(
+            drag.components(separatedBy: "!host.swipeSelection.ownsLongPress(on: pressed)").count - 1 == 2,
+            "drag lift and context menu must both decline a press that swipe selection owns")
 
         for path in [
             "iOSApp/MobileTimelineScreen.swift",
@@ -645,19 +662,8 @@ struct ProductionRouteGuardTests {
         ] {
             let screen = try String(contentsOf: Self.repoRoot.appendingPathComponent(path), encoding: .utf8)
             #expect(!screen.contains("onBeginSelection"), "\(path) must not wire long-press selection")
-            #expect(!screen.contains("onDragSelectionChanged"), "\(path) must not wire range-drag selection")
+            #expect(screen.contains("onSelectionChanged:"), "\(path) must wire swipe selection")
         }
-
-        let gridDragRange = Self.repoRoot.appendingPathComponent(
-            "Packages/EncryptedMemoriesKit/Sources/GridCore/GridDragRangeSelection.swift")
-        let gridAutoScroll = Self.repoRoot.appendingPathComponent(
-            "Packages/EncryptedMemoriesKit/Sources/GridCore/GridEdgeAutoScrollPolicy.swift")
-        #expect(
-            !FileManager.default.fileExists(atPath: gridDragRange.path),
-            "long-press range selection is removed; selection is Select-button-only")
-        #expect(
-            !FileManager.default.fileExists(atPath: gridAutoScroll.path),
-            "range-drag edge auto-scroll policy is removed along with its only caller")
     }
 
     @Test func mobileGridBinaryConfirmationsUseSharedNativeAlerts() throws {
@@ -975,10 +981,10 @@ struct ProductionRouteGuardTests {
             contentsOf: Self.repoRoot.appendingPathComponent("iOSApp/MobilePhotoViewer.swift"),
             encoding: .utf8
         )
-        let viewerHeader = try Self.body(
+        let viewerToolbar = try Self.body(
             of: source,
-            from: "private var viewerHeader: some View",
-            to: "private var viewerBackButton: some View"
+            from: "@ToolbarContentBuilder private var viewerToolbar: some ToolbarContent",
+            to: "private var viewerCloseItem: some ToolbarContent"
         )
         let videoPlayer = try Self.body(
             of: source,
@@ -991,14 +997,16 @@ struct ProductionRouteGuardTests {
             to: "private struct MobileVideoPage: View"
         )
 
-        #expect(viewerHeader.contains("viewerBackButton"))
-        #expect(viewerHeader.contains("viewerTitlePill"))
+        // One native toolbar owns close, the more-actions menu and the per-photo actions for every media type.
+        #expect(viewerToolbar.contains("viewerCloseItem"))
+        #expect(viewerToolbar.contains("viewerMoreActions"))
         #expect(
-            viewerHeader.contains("viewerActionButton"),
-            "photos and videos must use the same compact top-row ownership")
+            viewerToolbar.contains("ToolbarItem(placement: .bottomBar) { viewerShareButton }")
+                && viewerToolbar.contains("ToolbarItem(placement: .bottomBar) { viewerMutationButton }"),
+            "photos and videos must use the same native bar ownership")
         #expect(
-            !viewerHeader.contains("currentItemUsesNativeVideoChrome"),
-            "asynchronous media routing must not insert or remove top-row controls")
+            !viewerToolbar.contains("currentItemUsesNativeVideoChrome"),
+            "asynchronous media routing must not insert or remove bar items")
         #expect(
             videoPlayer.contains("controller.showsPlaybackControls = false"),
             "AVKit's AirPlay, volume, and duplicate close controls must stay hidden")
@@ -1013,8 +1021,8 @@ struct ProductionRouteGuardTests {
             source.containsCodeFragmentIgnoringWhitespace("Slider(value:"),
             "the app-owned video surface must retain deterministic seeking")
         #expect(
-            source.contains("layoutProfile.bottomChromeHeight"),
-            "video transport must reserve the responsive filmstrip and action rows without moving them")
+            videoControls.contains(".padding(.bottom, layoutProfile.rowSpacing)"),
+            "the filmstrip is safe-area content below the page, so the transport must not reserve its height again")
         #expect(
             source.contains("playbackIntendsToPlay"),
             "a buffering player must retain the user's play intent so Pause can stop it")
@@ -1060,37 +1068,43 @@ struct ProductionRouteGuardTests {
             contentsOf: Self.repoRoot.appendingPathComponent("iOSApp/MobilePhotoViewer.swift"),
             encoding: .utf8
         )
-
-        #expect(
-            source.contains("MobileViewerChromeOverlay(showsChrome: chromeVisible)"),
-            "photo and video pages must mount one shared chrome tree so metadata cannot jump between rows")
-        #expect(
-            source.contains("private var viewerHeader: some View"),
-            "one shared first row must own close, POI/date, and actions for every media type")
-        #expect(
-            source.contains("MobileViewerHeaderLayout.titleWidth(containerWidth: proxy.size.width)"),
-            "the centered title pill must consume only the space left on compact iPhones")
-        let viewerChrome = try Self.body(
+        let body = try Self.body(
             of: source,
-            from: "private var viewerTopChrome: some View",
-            to: "private var viewerHeader: some View"
+            from: "    var body: some View {\n        // Native bars inside the cover",
+            to: "@ViewBuilder private var viewerBottomAccessory: some View"
         )
-        #expect(viewerChrome.contains(".frame(maxWidth: .infinity)"))
+
+        // One NavigationStack with native bars hosts every media type, so the title and the bar items never move
+        // between rows while paging. The system owns bar axis, edge and overflow (iPhone Duo, iPad).
+        #expect(body.contains("NavigationStack {"), "the viewer must present native bars inside its cover")
         #expect(
-            !viewerChrome.contains("maxHeight: .infinity"),
-            "the shared header must stay top-anchored without claiming the native media gesture surface")
-        #expect(viewerChrome.contains("if currentDisplayedItem?.isLivePhoto == true"))
+            body.contains(".navigationTitle(viewerTitle.line1)")
+                && body.contains(".navigationSubtitle(viewerTitle.line2)"),
+            "the Photos-style two-line title must be the navigation title and subtitle")
+        #expect(body.contains(".toolbarTitleDisplayMode(.inline)"))
+        #expect(body.contains(".toolbar { viewerToolbar }"))
         #expect(
-            viewerChrome.contains("viewerLiveIndicator"),
-            "Live Photo status must use the fixed second header row instead of disappearing over bright media")
+            body.contains(".toolbarVisibility(chromeVisible ? .automatic : .hidden, for: .navigationBar, .bottomBar)")
+                && body.contains(".statusBarHidden(!chromeVisible)")
+                && body.contains(".persistentSystemOverlays(chromeVisible ? .automatic : .hidden)"),
+            "one chrome tap must hide both bars, the status bar and the home indicator together")
+        #expect(
+            !source.contains("MobileViewerChromeOverlay") && !source.contains("MobileViewerHeaderLayout")
+                && !source.contains("viewerTitlePill") && !source.contains("viewerActionRow"),
+            "app-drawn header pills and action rows must not remain beside the native bars")
+        #expect(
+            body.contains(
+                ".overlay(alignment: .topLeading) {\n                if currentBaseItem?.isLivePhoto == true {")
+                && body.contains("viewerLiveIndicator"),
+            "Live Photo status must sit on the media below the navigation bar, not disappear over bright media")
         let liveIndicator = try Self.body(
             of: source,
             from: "private var viewerLiveIndicator: some View",
-            to: "private var viewerActionMenu: some View"
+            to: "private var viewerShareButton: some View"
         )
         #expect(
             liveIndicator.contains(".allowsHitTesting(false)"),
-            "the fixed Live Photo status row must not steal paging or dismiss gestures")
+            "the Live Photo status must not steal paging or dismiss gestures")
         #expect(
             !liveIndicator.contains(".accessibilityHidden(true)"),
             "the visible Live Photo status must remain discoverable to VoiceOver")
@@ -1113,19 +1127,21 @@ struct ProductionRouteGuardTests {
             contentsOf: Self.repoRoot.appendingPathComponent("iOSApp/MobileViewerSupport.swift"),
             encoding: .utf8
         )
-        let bottomChrome = try Self.body(
+        let bottomAccessory = try Self.body(
             of: source,
-            from: "private var viewerBottomChrome: some View",
-            to: "private var viewerHeader: some View"
+            from: "@ViewBuilder private var viewerBottomAccessory: some View",
+            to: "private var isCompactLandscape: Bool"
         )
 
         #expect(
-            !bottomChrome.contains(".allowsHitTesting(true)"),
-            "a full-screen bottom chrome layer must not claim long presses outside its visible controls")
-        #expect(support.contains(".overlay(alignment: .top)"))
+            !bottomAccessory.contains(".allowsHitTesting(true)") && !bottomAccessory.contains("maxHeight: .infinity"),
+            "the filmstrip accessory must stay bounded to its rows and never claim long presses on the media")
         #expect(
-            support.contains(".overlay(alignment: .bottom)"),
-            "top and bottom controls must use separate bounded hit-test regions")
+            source.contains(".safeAreaInset(edge: .bottom, spacing: 0) { viewerBottomAccessory }"),
+            "the strips are safe-area content below the media, so no overlay covers the media gesture surface")
+        #expect(
+            !support.contains(".overlay(alignment: .top)") && !support.contains(".overlay(alignment: .bottom)"),
+            "the retired full-width chrome overlays must not remain in the support file")
         #expect(
             source.containsCodeFragmentIgnoringWhitespace("UILongPressGestureRecognizer(target: context.coordinator"),
             "the native image surface must retain its Live Photo press recognizer")
@@ -1193,13 +1209,13 @@ struct ProductionRouteGuardTests {
         #expect(
             viewer.contains("selectedUID: currentBaseItem?.uid"),
             "the outer route strip must not confuse a nested burst selection with its library page")
-        #expect(support.contains(".overlay(alignment: .bottom)"))
         #expect(
-            !support.contains("maxHeight: .infinity, alignment: .bottom"),
-            "bottom controls must overlay media without becoming a full-screen hit-test surface")
+            !support.contains("maxHeight: .infinity, alignment: .bottom") && !support.contains(".overlay("),
+            "the support file must not host a full-screen bottom hit-test surface")
         #expect(
-            !viewer.contains("safeAreaInset(edge: .bottom"),
-            "viewer controls must overlay media instead of refitting it when chrome changes")
+            viewer.contains(".safeAreaInset(edge: .bottom, spacing: 0) { viewerBottomAccessory }")
+                && !viewer.contains(".overlay(alignment: .bottom)"),
+            "the filmstrip is bottom safe-area content: the media refits when the chrome toggles, like Photos")
         #expect(
             filmstrip.contains("UICollectionView"),
             "large libraries need reusable visible cells rather than one SwiftUI view per asset")
@@ -1210,7 +1226,7 @@ struct ProductionRouteGuardTests {
         #expect(viewer.contains("favoriteTask: Task<Void, Never>?"))
         #expect(viewer.contains("restoreTask: Task<Void, Never>?"))
         #expect(
-            viewer.contains("currentDisplayedItem?.uid == uid"),
+            viewer.contains("currentBaseItem?.uid == uid"),
             "late viewer mutations must not publish an error or dismissal for a different page")
         let restore = try Self.body(
             of: viewer,
@@ -2086,7 +2102,14 @@ struct ProductionRouteGuardTests {
         #expect(
             !viewerModel.contains("let meta = try? await metadataProvider.metadata"),
             "metadata failures must not become an eternal nil/loading state")
-        #expect(viewerModel.contains("metadataLoadState = .failed"))
+        #expect(
+            viewerModel.contains("metadataLoadState = resolution.metadataLoadState"),
+            "the viewer must preserve the shared distinction between unavailable metadata and request failure")
+        let titleMetadata = try String(
+            contentsOf: Self.repoRoot.appendingPathComponent(
+                "Packages/EncryptedMemoriesKit/Sources/PhotoViewerCore/ViewerTitleMetadataCoordinator.swift"),
+            encoding: .utf8)
+        #expect(titleMetadata.contains("metadataLoadFailed ? .failed : .unavailable"))
         #expect(viewerModel.contains("public func retryMetadata()"))
         #expect(
             viewerModel.contains("albumMembershipProvider.albumMembershipTitles"),
@@ -2285,28 +2308,6 @@ struct ProductionRouteGuardTests {
         #expect(monitor.contains("initialToken: initialToken"))
     }
 
-    @Test func liquidGlassAvailabilityStaysCentralized() {
-        let roots = [
-            Self.repoRoot.appendingPathComponent("App"),
-            Self.repoRoot.appendingPathComponent("iOSApp"),
-            Self.repoRoot.appendingPathComponent("Packages/EncryptedMemoriesKit/Sources"),
-        ]
-        var scanned = 0
-        for root in roots {
-            for file in swiftFiles(under: root) {
-                scanned += 1
-                guard file.lastPathComponent != "AdaptiveGlass.swift" else { continue }
-                let text = (try? String(contentsOf: file, encoding: .utf8)) ?? ""
-                for token in [".glassEffect", ".buttonStyle(.glass"] {
-                    #expect(
-                        !text.contains(token),
-                        "\(token) must stay behind DesignSystemCore/AdaptiveGlass.swift: \(file.path)")
-                }
-            }
-        }
-        #expect(scanned > 0, "Guard scanned no files - repoRoot path is wrong: \(Self.repoRoot.path)")
-    }
-
     @Test func albumsSidebarAndEmptyRoutesStayExplicit() throws {
         let mainView = try String(
             contentsOf: Self.repoRoot.appendingPathComponent("App/Views/MainView.swift"), encoding: .utf8)
@@ -2434,7 +2435,7 @@ struct ProductionRouteGuardTests {
             encoding: .utf8
         )
         #expect(
-            sdkManifest.contains("releases/download/0.25.0/CProtonDriveSDK.xcframework.zip"),
+            sdkManifest.contains("releases/download/0.27.0/CProtonDriveSDK.xcframework.zip"),
             "the vendored SDK release changed; re-evaluate the parked P3 contract before updating this pin"
         )
 
@@ -2736,7 +2737,7 @@ struct ProductionRouteGuardTests {
             capture.contains("lastLaidOutViewportSize"),
             "the old scroll offset must be interpreted with the old viewport geometry")
         #expect(
-            capture.contains("itemUIDs[top.index]"),
+            capture.contains("itemID: itemUIDs[anchorSlot.index]"),
             "the preserved position must be keyed by photo identity, never a raw offset")
         #expect(
             capture.contains("return .newest"),

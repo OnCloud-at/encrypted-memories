@@ -82,7 +82,6 @@ public struct MLSmartSearchAggregateProgress: Sendable, Equatable {
         self.unavailableAssetReasons = unavailableAssetReasons.filter { $0.value > 0 }
     }
 
-    public var pendingWorkUnits: Int { max(0, totalWorkUnits - settledWorkUnits) }
     public var fraction: Double? {
         totalWorkUnits > 0 ? Double(settledWorkUnits) / Double(totalWorkUnits) : nil
     }

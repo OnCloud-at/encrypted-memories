@@ -41,6 +41,7 @@ struct MobileTimelineScreen: View {
     /// Selected structured suggestion. It owns the result while the field still shows its title.
     private let activeSearchSuggestion: TimelineSearchSuggestion?
     @Environment(MobileViewerRouter.self) private var viewerRouter
+    @Environment(MobileSceneContext.self) private var sceneContext
     @State private var selection = MobileGridSelectionController()
     @State private var networkMonitor = NetworkMonitor.shared
     /// Frosted-bar height, read once from the key window and cached. Reading it during `body` would cycle
@@ -69,7 +70,6 @@ struct MobileTimelineScreen: View {
     @State private var searchSessionActive = false
     @State private var contextMenu = MobileGridContextMenuController()
     @State private var showAlbumPicker = false
-    @State private var showSettings = false
     /// The native toolbar keeps its slots mounted from frame one, but its content appears only after the
     /// launch cover has finished dissolving. This prevents both chrome-over-cover and title relocation.
     @State private var launchChromeVisible = false
@@ -134,7 +134,7 @@ struct MobileTimelineScreen: View {
             content
                 .mobileGridContextMenu(contextMenu, model: model)
                 .mobileNavigationTitle(
-                    surface.title,
+                    selection.barTitle(default: surface.title),
                     isVisible: launchChromeVisible
                 )
                 .toolbar { toolbarContent }
@@ -179,9 +179,6 @@ struct MobileTimelineScreen: View {
                 bottomPadding: selection.isSelecting ? 84 : 20
             )
         }
-        .sheet(isPresented: $showSettings) {
-            MobileSettingsScreen(showsDismissButton: true)
-        }
         .mobileSelectionAlerts(selection: selection) { performTrash() }
     }
 
@@ -189,9 +186,9 @@ struct MobileTimelineScreen: View {
         if surface == .library {
             ToolbarItem(placement: .topBarLeading) {
                 Button {
-                    showSettings = true
+                    sceneContext.settingsPresented = true
                 } label: {
-                    Image(systemName: "person.crop.circle")
+                    Label(String(localized: "library.account_settings"), systemImage: "person.crop.circle")
                 }
                 .disabled(selection.isSelecting)
                 .opacity(launchChromeVisible && !selection.isSelecting ? 1 : 0)
@@ -200,28 +197,54 @@ struct MobileTimelineScreen: View {
                 .accessibilityHidden(!launchChromeVisible || selection.isSelecting)
             }
             .sharedBackgroundVisibility(launchChromeVisible && !selection.isSelecting ? .automatic : .hidden)
+            // Also reachable through the Settings command (⌘,), so it may leave a compressed bar first.
+            .mobileVisibilityPriority(.low)
         }
         // Keep every trailing slot present from the first rendered frame. Adding either control after the
         // library becomes ready makes SwiftUI recompute the semantic `.title` placement and visibly jump it.
         if surface == .library {
-            ToolbarItem(placement: .topBarTrailing) {
-                ZStack {
-                    libraryOptionsMenu
-                        .opacity(selection.isSelecting ? 0 : 1)
-                        .allowsHitTesting(!selection.isSelecting)
-                        .accessibilityHidden(selection.isSelecting)
-
-                    selectionOptionsMenu
-                        .opacity(selection.isSelecting ? 1 : 0)
-                        .allowsHitTesting(selection.isSelecting)
-                        .accessibilityHidden(!selection.isSelecting)
+            if #available(iOS 27.0, *) {
+                // iOS 27: the display options own the slot outside selection. In selection mode the slot leaves the
+                // bar and the bulk actions join the system overflow menu (HIG: reserve the ellipsis for overflow).
+                // Neither menu is mounted invisibly or empty: a compressed bar could surface a hidden menu, an
+                // empty item still paints glass, and UIKit shows the overflow button for any mounted overflow
+                // content, which truncated the library title.
+                if selection.isSelecting {
+                    ToolbarOverflowMenu {
+                        selectionOverflowActions
+                    }
+                } else {
+                    ToolbarItem(placement: .topBarTrailing) {
+                        libraryOptionsMenu
+                            .disabled(!canSelect)
+                            .opacity(launchChromeVisible ? 1 : 0)
+                            .allowsHitTesting(launchChromeVisible)
+                            .accessibilityHidden(!launchChromeVisible)
+                    }
+                    .sharedBackgroundVisibility(launchChromeVisible ? .automatic : .hidden)
+                    // Display options refine the grid; Select/Done outranks them in a compressed bar.
+                    .mobileVisibilityPriority(.low)
                 }
-                .disabled(!canSelect)
-                .opacity(launchChromeVisible ? 1 : 0)
-                .allowsHitTesting(launchChromeVisible)
-                .accessibilityHidden(!launchChromeVisible)
+            } else {
+                // iOS 26 has no system overflow menu for these actions, so the slot holds one menu at a time: the
+                // display options outside selection and the app-owned bulk-action menu inside it. Keeping both
+                // mounted behind opacity reported the hidden menu's label for the bar item and did not stop the
+                // 2 pt title shift that the longer selection title causes on iOS 26.5.
+                ToolbarItem(placement: .topBarTrailing) {
+                    Group {
+                        if selection.isSelecting {
+                            selectionOptionsMenu
+                        } else {
+                            libraryOptionsMenu
+                        }
+                    }
+                    .disabled(!canSelect)
+                    .opacity(launchChromeVisible ? 1 : 0)
+                    .allowsHitTesting(launchChromeVisible)
+                    .accessibilityHidden(!launchChromeVisible)
+                }
+                .sharedBackgroundVisibility(launchChromeVisible ? .automatic : .hidden)
             }
-            .sharedBackgroundVisibility(launchChromeVisible ? .automatic : .hidden)
             ToolbarSpacer(.fixed, placement: .topBarTrailing)
         }
         ToolbarItem(placement: .topBarTrailing) {
@@ -234,63 +257,29 @@ struct MobileTimelineScreen: View {
             .accessibilityHidden(!launchChromeVisible)
         }
         .sharedBackgroundVisibility(launchChromeVisible ? .automatic : .hidden)
+        // Select/Done must stay in the bar on every bar axis: it is the only way to leave selection mode.
+        .mobileVisibilityPriority(.high)
         // Keep all item identities mounted. The system can then morph the bar as one native transition.
-        ToolbarItem(placement: .bottomBar) {
-            HStack {
-                Button {
-                    startShare()
-                } label: {
-                    if selection.isExporting {
-                        ProgressView()
-                    } else {
-                        Image(systemName: "square.and.arrow.up")
-                    }
+        MobileSelectionToolbarItems(
+            selection: selection,
+            canAddToAlbum: model.albumActions?.canAddPhotos == true,
+            showAlbumPicker: $showAlbumPicker,
+            onShare: startShare,
+            onTrash: { selection.showTrashConfirm = true },
+            albumPicker: {
+                if let coordinator = model.albumActions {
+                    AlbumDestinationPicker(
+                        coordinator: coordinator,
+                        photoUIDs: model.selectedUIDs(selection.selected),
+                        onAlbumsChanged: { model.noteAlbumsChanged() },
+                        onCompleted: { _ in
+                            showAlbumPicker = false
+                            selection.finish(reduceMotion: reduceMotion)
+                        }
+                    )
                 }
-                .disabled(selection.selected.isEmpty || selectionBusy)
-                .accessibilityLabel(String(localized: "selection.share_a11y"))
-
-                Spacer(minLength: 28)
-
-                Button {
-                    showAlbumPicker = true
-                } label: {
-                    Text(selectionCenterText ?? "")
-                        .font(.body)
-                        .monospacedDigit()
-                        .fixedSize()
-                }
-                .disabled(selection.selected.isEmpty || selectionBusy || model.albumActions?.canAddPhotos != true)
-                .accessibilityLabel(L10n.string("albums.add_selection_title"))
-                .popover(isPresented: $showAlbumPicker, arrowEdge: .bottom) {
-                    if let coordinator = model.albumActions {
-                        AlbumDestinationPicker(
-                            coordinator: coordinator,
-                            photoUIDs: model.selectedUIDs(selection.selected),
-                            onAlbumsChanged: { model.noteAlbumsChanged() },
-                            onCompleted: { _ in
-                                showAlbumPicker = false
-                                selection.finish(reduceMotion: reduceMotion)
-                            }
-                        )
-                    }
-                }
-
-                Spacer(minLength: 28)
-
-                Button(role: .destructive) {
-                    selection.showTrashConfirm = true
-                } label: {
-                    Image(systemName: "trash")
-                }
-                .disabled(selection.selected.isEmpty || selectionBusy)
-                .accessibilityLabel(String(localized: "selection.trash_a11y"))
             }
-            .frame(minWidth: 300)
-            .opacity(selection.isSelecting ? 1 : 0)
-            .allowsHitTesting(selection.isSelecting)
-            .accessibilityHidden(!selection.isSelecting)
-        }
-        .sharedBackgroundVisibility(selection.isSelecting ? .automatic : .hidden)
+        )
     }
 
     private var libraryOptionsMenu: some View {
@@ -364,7 +353,7 @@ struct MobileTimelineScreen: View {
                 Label(String(localized: "library.display_options"), systemImage: "rectangle.grid.3x2")
             }
         } label: {
-            Image(systemName: "line.3.horizontal.decrease")
+            Label(String(localized: "library.options"), systemImage: "line.3.horizontal.decrease")
                 .foregroundStyle(refinement.isActive ? ProtonColor.primary : ProtonColor.textNorm)
         }
         .accessibilityLabel(String(localized: "library.options"))
@@ -373,21 +362,27 @@ struct MobileTimelineScreen: View {
         )
     }
 
+    /// Bulk actions on the selection. iOS 27 places them in the system overflow menu; iOS 26 shows them in the
+    /// app-owned ellipsis menu below.
+    private var selectionOverflowActions: some View {
+        Button {
+            toggleSelectedFavorites()
+        } label: {
+            Label(
+                selectedAllFavorited
+                    ? String(localized: "viewer.remove_favorite_action")
+                    : String(localized: "viewer.favorite_action"),
+                systemImage: selectedAllFavorited ? "heart.slash" : "heart"
+            )
+        }
+        .disabled(selection.selected.isEmpty || selectionBusy)
+    }
+
     private var selectionOptionsMenu: some View {
         Menu {
-            Button {
-                toggleSelectedFavorites()
-            } label: {
-                Label(
-                    selectedAllFavorited
-                        ? String(localized: "viewer.remove_favorite_action")
-                        : String(localized: "viewer.favorite_action"),
-                    systemImage: selectedAllFavorited ? "heart.slash" : "heart"
-                )
-            }
-            .disabled(selection.selected.isEmpty || selectionBusy)
+            selectionOverflowActions
         } label: {
-            Image(systemName: "ellipsis")
+            Label(String(localized: "selection.more_a11y"), systemImage: "ellipsis")
         }
         .accessibilityLabel(String(localized: "selection.more_a11y"))
     }
@@ -454,11 +449,6 @@ struct MobileTimelineScreen: View {
         return ListFormatter.localizedString(byJoining: labels)
     }
 
-    /// Localized center text for the shared selection-toolbar policy.
-    private var selectionCenterText: String? {
-        L10n.selectionCenterText(selectedCount: selection.selected.count)
-    }
-
     private var selectedAllFavorited: Bool {
         !selection.selected.isEmpty && selection.selected.allSatisfy(model.favoriteUIDs.contains)
     }
@@ -514,6 +504,7 @@ struct MobileTimelineScreen: View {
                     onFirstContentReady: { withAnimation(.spring(duration: 0.55)) { model.markFirstContentReady() } },
                     onOpenPhoto: open,
                     onToggleSelection: selection.toggle,
+                    onSelectionChanged: selection.replace(with:),
                     dragOutProvider: model.backend,
                     onDragOutFailed: { selection.actionError = MobileSelectionError(message: $0.localizedMessage) },
                     contextMenuActions: { contextMenu.actions(for: $0, model: model) },
@@ -543,7 +534,7 @@ struct MobileTimelineScreen: View {
         .task(id: verticalSizeClass) {
             // Wait until UIKit has committed the new safe-area insets for a rotation before sizing the frost.
             await Task.yield()
-            topFrostHeight = mobileTopBarFrostHeight()
+            topFrostHeight = mobileTopBarFrostHeight(in: sceneContext)
         }
     }
 
@@ -805,18 +796,13 @@ struct MobileViewerMutation: Equatable {
     }
 }
 
-/// Frost height uses the key-window top inset plus the inline navigation-bar height.
+/// Frost height uses the scene window's top inset plus the inline navigation-bar height.
 ///
 /// Read the inset after layout settles; initialization-time reads can trigger a SwiftUI layout cycle under
 /// full-bleed overlays.
 let mobileTopBarFrostHeightDefault: CGFloat = 91
 
-func mobileTopBarFrostHeight() -> CGFloat {
-    let topSafeArea =
-        UIApplication.shared.connectedScenes
-        .compactMap { $0 as? UIWindowScene }
-        .flatMap(\.windows)
-        .first(where: \.isKeyWindow)?
-        .safeAreaInsets.top ?? 47
-    return topSafeArea + 44
+@MainActor
+func mobileTopBarFrostHeight(in scene: MobileSceneContext) -> CGFloat {
+    scene.topSafeAreaInset + 44
 }

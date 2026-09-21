@@ -28,7 +28,6 @@ import Testing
     @Test func translatesEveryDualEncoderErrorFamily() {
         let cases: [(CoreMLDualEncoderError, MLRuntimeFailureCategory)] = [
             (.descriptorMismatch, .incompatibleModel),
-            (.invalidModelSchema("legacy"), .incompatibleModel),
             (.invalidStaticInputContract("input_ids"), .invalidStaticInputContract),
             (.invalidOutputSchema("embedding"), .invalidOutputSchema),
             (.invalidEmbedding, .invalidOutputSchema),

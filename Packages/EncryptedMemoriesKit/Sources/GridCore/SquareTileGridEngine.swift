@@ -265,7 +265,6 @@ public struct SquareTileGridEngine: Equatable, Sendable {
     public var levelCount: Int { levels.count }
     /// Configured starting level. Custom ladders clamp this value to their valid range.
     public var defaultLevel: Int { configuredDefaultLevel }
-    public var sectionCount: Int { sectionCounts.count }
 
     public func clampLevel(_ l: Int) -> Int { min(max(l, 0), levels.count - 1) }
     public func metrics(level: Int) -> GridLevelMetrics { levels[clampLevel(level)] }
@@ -630,13 +629,6 @@ public struct SquareTileGridEngine: Equatable, Sendable {
     /// One item's square content-space frame at a settled level (nil if out of range).
     public func slotRect(flatIndex: Int, level: Int, width: CGFloat, columnPhase: Int? = nil) -> CGRect? {
         resolvedForLevel(level, width: width, columnPhase: columnPhase).placement(globalIndex: flatIndex)?.rect
-    }
-
-    /// The section's header rect at a settled level (full width × headerHeight at the section top).
-    public func sectionHeaderRect(section: Int, level: Int, width: CGFloat) -> CGRect? {
-        let grid = resolvedForLevel(level, width: width)
-        guard section >= 0, section < grid.sectionHeaderTop.count else { return nil }
-        return CGRect(x: 0, y: grid.sectionHeaderTop[section], width: grid.width, height: grid.headerHeight)
     }
 
     /// The content-space Y where a section's first grid row begins.

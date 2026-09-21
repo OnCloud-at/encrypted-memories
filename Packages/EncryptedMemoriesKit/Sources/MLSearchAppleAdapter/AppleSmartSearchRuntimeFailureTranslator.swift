@@ -37,10 +37,6 @@ public enum AppleSmartSearchRuntimeFailureTranslator {
                 return failure(category: .invalidStaticInputContract, error: error)
             case .invalidOutputSchema, .invalidEmbedding:
                 return failure(category: .invalidOutputSchema, error: error)
-            case .invalidModelSchema:
-                // Older callers do not identify whether the schema failure came from an input
-                // or output. Treat it as an incompatible model rather than guessing a contract.
-                return failure(category: .incompatibleModel, error: error)
             }
         }
         if let urlError = error as? URLError {
@@ -120,6 +116,3 @@ public enum AppleSmartSearchRuntimeFailureTranslator {
         }
     }
 }
-
-/// Short name for Core-facing tests and callers that do not need the Apple prefix.
-public typealias MLRuntimeFailureTranslator = AppleSmartSearchRuntimeFailureTranslator

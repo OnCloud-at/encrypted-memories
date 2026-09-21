@@ -1,4 +1,5 @@
 import AVFoundation
+import AlbumCore
 import Foundation
 import PhotosCore
 import ProtonAuth
@@ -51,6 +52,9 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     private var mediaTypeReconciliationTask: Task<Void, Never>?
     private var isShutDown = false
     private nonisolated let shutdownGate = JoinedShutdownGate()
+    /// Receives the identities of a listing that no source inventory contains, currently the volume trash.
+    /// The library source coordinator authorizes their thumbnails; without it every tile stays black.
+    private nonisolated let identitiesOutsideInventoryObserver = IdentitiesOutsideInventoryObserver()
     /// Where the per-account upload-identity manifest lives (next to `library-v1.sqlite`, so the
     /// sign-out purge covers it) and the platform SQLite tuning it opens with. Module-internal:
     /// the facade derives the account data directory + store policy for the backup sync stores
@@ -123,7 +127,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         )
         self.uploadManifestURL = libraryDirectory.appendingPathComponent(UploadIdentityManifestStore.databaseFileName)
         self.uploadManifestPolicy = policy.libraryDatabasePolicy
-        // Keep the optional native SDK cache in memory. SDK 0.25.0 only frees the managed client handle;
+        // Keep the optional native SDK cache in memory. SDK 0.27.0 only frees the managed client handle;
         // it does not deterministically dispose its SQLite repository. A persistent native cache can therefore
         // still own WAL files after shutdown and makes the required same-process sign-out purge unsafe.
         // The app-owned encrypted account cache and timeline store provide offline and warm-launch persistence.
@@ -1095,7 +1099,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         )
     }
 
-    /// Sets an album's cover to an already-uploaded photo (direct REST; SDK 0.25.0 has no album-write API).
+    /// Sets an album's cover to an already-uploaded photo (direct REST; SDK 0.27.0 has no album-write API).
     /// The photo's `nodeID` is its Drive link id.
     func setAlbumCover(albumID: String, photoUID: PhotoUID) async throws {
         try await withOpenSession { bridge in
@@ -1140,6 +1144,13 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         }
     }
 
+    /// Wired by the account composition. Every trash listing then authorizes what it shows.
+    nonisolated func setIdentitiesOutsideInventoryObserver(
+        _ observer: @escaping @Sendable ([PhotoUID]) async -> Void
+    ) {
+        identitiesOutsideInventoryObserver.set(observer)
+    }
+
     private func timelineImpl(filter: PhotoFilter) async throws -> [TimelineSection] {
         switch filter {
         case .all:
@@ -1160,6 +1171,17 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                 volumeID: root.volumeID,
                 mediaTypeOverrides: timelineStore?.mediaTypeEvidence(volumeID: root.volumeID) ?? [:]
             )
+        case .sharedAlbum(let volumeID, let nodeID, _):
+            // Shared albums live on another user's volume, so the owned-volume HTTP album route cannot list
+            // them. The SDK catalog adapter is the only content source; it proves identity and capture time only.
+            let items = try await makeAlbumCatalogBackend()
+                .librarySourceItems(for: AlbumNodeIdentifier(volumeID: volumeID, nodeID: nodeID))
+                .map(\.item)
+                .sorted(by: TimelineOrder.areInIncreasingOrder)
+            return [
+                TimelineSection(
+                    id: "shared-album", date: items.first?.captureTime ?? .distantPast, title: "", items: items)
+            ]
         case .trash:
             let root = try await resolvePhotosRoot()
             let links = try await driveSession.listTrash(volumeID: root.volumeID)
@@ -1177,6 +1199,8 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                         tags: isVideo ? [.videos] : [])
                 }
                 .sorted(by: TimelineOrder.areInIncreasingOrder)
+            // A trashed photo left every inventory, so only this listing proves that the user may read it.
+            await identitiesOutsideInventoryObserver.report(photos.map(\.uid))
             return [
                 TimelineSection(id: "trash", date: photos.first?.captureTime ?? .distantPast, title: "", items: photos)
             ]
@@ -1277,38 +1301,20 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     }
 
     private func metadataImpl(for uid: PhotoUID) async throws -> PhotoMetadata {
-        let source = try await fileSource()
-        let raw = try await source.fileMetadata(linkID: uid.nodeID)
-        if let mimeType = raw.mimeType {
+        let metadata = try await SDKPhotoMetadataReader.metadata(for: uid, client: photosClient)
+        if let mimeType = metadata.mimeType {
             let result = timelineStore?.recordMediaTypeEvidence([uid: mimeType])
             if result?.succeeded == false {
                 DebugLog.log("timeline: could not persist media type resolved by viewer")
             }
         }
-        let xa = raw.xattr
-        let duration = xa?.media?.duration
-        if let duration {
+        if let duration = metadata.durationSeconds {
             let result = timelineStore?.updateDurations([uid: duration])
             if result?.succeeded == false {
                 DebugLog.log("timeline: could not persist video duration resolved from metadata")
             }
         }
-        var mod: Date?
-        if let s = xa?.common?.modificationTime {
-            mod = ISO8601DateFormatter().date(from: s)
-        }
-        return PhotoMetadata(
-            filename: raw.filename,
-            mimeType: raw.mimeType,
-            fileSize: raw.size ?? xa?.common?.size,
-            pixelWidth: xa?.media?.width,
-            pixelHeight: xa?.media?.height,
-            device: xa?.camera?.device,
-            durationSeconds: duration,
-            modificationTime: mod,
-            latitude: xa?.location?.latitude,
-            longitude: xa?.location?.longitude
-        )
+        return metadata
     }
 
     // MARK: - BurstGroupProvider
@@ -1406,6 +1412,9 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         let asset = AVURLAsset(url: URL(string: "protonvideo://\(host)")!)
         let queue = DispatchQueue(label: "me.proton.photos.video-loader")
         asset.resourceLoader.setDelegate(loader, queue: queue)
+        // Fetch and decrypt the first blocks while AVFoundation still inspects the asset, so its own
+        // start-of-playback decision can already count on served bytes.
+        loader.primePlaybackStart()
         await requestGovernor.endPriorityScope(priorityScope)
         return StreamingVideoAsset(asset: asset, retaining: loader)
     }
@@ -1581,6 +1590,7 @@ extension DriveSDKBridge: PhotoUploading {
                     base: DedupeUnavailableIdentityResolver(),
                     admission: shutdownGate
                 ),
+                duplicateChecker: nil,
                 close: {}
             )
         }
@@ -1599,6 +1609,7 @@ extension DriveSDKBridge: PhotoUploading {
         )
         return UploadIdentityResolverComposition(
             resolver: ShutdownGatedUploadIdentityResolver(base: pipeline, admission: shutdownGate),
+            duplicateChecker: service,
             close: { store.close() }
         )
     }
@@ -1815,6 +1826,85 @@ extension DriveSDKBridge: PhotoUploading {
     }
 }
 
+// MARK: - Series (burst) writes
+
+extension DriveSDKBridge: PhotoTagAdding {
+    func addTags(_ tags: [Int], to uid: PhotoUID) async throws {
+        try await withOpenSession { bridge in
+            // Backup may know only the main photo's link id; see `PhotoUploadRequest.mainPhotoUID`.
+            let volumeID = uid.volumeID.isEmpty ? try await bridge.resolvePhotosRoot().volumeID : uid.volumeID
+            try await SDKPhotoTagAdder(client: bridge.photosClient).addTags(
+                tags.compactMap(ProtonDriveSDK.PhotoTag.init(rawValue:)),
+                to: SDKNodeUid(volumeID: volumeID, nodeID: uid.nodeID)
+            )
+        }
+    }
+}
+
+extension DriveSDKBridge: SeriesDissolutionRemote {
+    func ownPhotosVolumeID() async throws -> String {
+        try await withOpenSession { bridge in
+            try await bridge.resolvePhotosRoot().volumeID
+        }
+    }
+
+    func source(for member: PhotoUID) async throws -> SeriesMemberSource {
+        try await withOpenSession { bridge in
+            try await SDKPhotoMetadataReader.seriesMemberSource(for: member, client: bridge.photosClient)
+        }
+    }
+
+    func activeUIDs(among uids: [PhotoUID]) async throws -> Set<PhotoUID> {
+        try await withOpenSession { bridge in
+            let active = try await bridge.activeNodeIDs(Set(uids.map(\.nodeID)))
+            return Set(uids.filter { active.contains($0.nodeID) })
+        }
+    }
+
+    func favoriteUIDs(among uids: [PhotoUID]) async throws -> Set<PhotoUID> {
+        guard !uids.isEmpty else { return [] }
+        // One tag listing per operation. Proton exposes no per-node tag read, and the series is small.
+        let favorites = try await favoriteUIDs()
+        return Set(uids.filter(favorites.contains))
+    }
+
+    func markFavorite(_ uids: [PhotoUID]) async throws {
+        // `setFavorites` throws unless every node confirms the tag, so a partial write never counts as success.
+        try await setFavorites(uids, true)
+    }
+
+    func trashSeries(_ uids: [PhotoUID]) async throws {
+        try await trash(uids)
+        try await withOpenSession { bridge in
+            // The cached bursts listing still names the trashed series; the next lookup must read it again.
+            bridge.burstCatalogEntries = nil
+            bridge.burstCatalogLookup = [:]
+        }
+    }
+
+    /// The dissolution of this account's series. It shares the duplicate service with uploads, so both see
+    /// one remote content index. Nil when the upload manifest is unavailable, as uploads are then disabled.
+    nonisolated func makeSeriesDissolution(
+        duplicateChecker: (any UploadDuplicateChecking)?,
+        albums: any SeriesAlbumCarryOver
+    ) -> SeriesDissolutionOrchestrator? {
+        guard let duplicateChecker else { return nil }
+        let accountDataDirectory = uploadManifestURL.deletingLastPathComponent()
+        return SeriesDissolutionOrchestrator(
+            remote: self,
+            albums: albums,
+            uploader: self,
+            duplicateChecker: duplicateChecker,
+            journalStore: SeriesDissolutionJournalFileStore(accountDataDirectory: accountDataDirectory),
+            // The shared account gate: bridge teardown cancels and joins a running dissolution before the
+            // sign-out purge removes the journal directory.
+            admission: shutdownGate,
+            tempDirectory: accountDataDirectory.appendingPathComponent("series-dissolution-temp", isDirectory: true),
+            currentClientUID: uploadClientUID
+        )
+    }
+}
+
 enum DriveBridgeError: LocalizedError {
     case noPhotosShare
     var errorDescription: String? {
@@ -1856,5 +1946,21 @@ private final class BatchFailureBox: @unchecked Sendable {
 
     var result: ThumbnailBatchLoadResult {
         lock.withLock { ThumbnailBatchLoadResult(batchError: streamError, itemErrors: itemErrors) }
+    }
+}
+
+/// Holds the observer that authorizes identities outside every source inventory. The box is set once at
+/// composition time and read from the actor, so it needs no isolation of its own.
+final class IdentitiesOutsideInventoryObserver: @unchecked Sendable {
+    private let lock = NSLock()
+    private var observer: (@Sendable ([PhotoUID]) async -> Void)?
+
+    func set(_ observer: @escaping @Sendable ([PhotoUID]) async -> Void) {
+        lock.withLock { self.observer = observer }
+    }
+
+    func report(_ uids: [PhotoUID]) async {
+        guard let observer = lock.withLock({ observer }) else { return }
+        await observer(uids)
     }
 }

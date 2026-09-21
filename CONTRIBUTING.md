@@ -53,6 +53,53 @@ Run the platform shell build when your change affects that app:
 
 Use the shared build root documented in the README. Do not create build caches in the repository or `/private/tmp`.
 
+## Automated PR review
+
+The LLM review is advisory. You can merge if it fails, times out, or reports a serious finding,
+provided the required checks and repository rules allow the merge.
+Never make `Review changed code` a required check or make this workflow a required workflow.
+The automation only updates a conversation comment. It never submits an approval or requests changes.
+Code links point to the reviewed commit; they do not create unresolved review threads that can block merging.
+
+- Green: no actionable findings in the reviewed changes.
+- Yellow: actionable notices without a serious finding.
+- Red: serious findings survived evidence verification; this remains advice.
+- Grey: review unavailable or incomplete because required source or context was missing. Partial findings also carry a coverage note.
+
+The comment shows at most three findings. Expand the details for evidence and coverage limitations.
+A second model pass challenges candidate findings using the patch and redacted source windows
+from the exact head and base commits. It checks the trigger, impact, counterevidence, and source quotation.
+Missing tests, style preferences, and speculative risks do not justify a serious finding.
+Model agreement and a matching quotation cannot prove correctness; human judgment remains necessary.
+
+The review logs activity once per minute without logging response or reasoning text.
+Reasoning and answer events count as model output. Transport heartbeats only show connection activity.
+Without provider output, the client cannot distinguish silent computation from a stalled model.
+It waits ten minutes by default before returning an unavailable review.
+Set repository variable `LLM_REVIEW_IDLE_SECONDS` between `120` and `1800` to change this waiting limit.
+All model passes and retries share a thirty-minute analysis budget.
+The workflow reserves additional time for source reads and comment publication.
+The issue-triage workflow keeps its existing shorter timeout policy.
+
+Review coverage is bounded: 80 files, 96,000 patch characters, and 3,000 patch lines.
+Source reads accept text files up to 200,000 bytes and select windows around candidate lines.
+Large inputs can reduce these windows. Omitted patches, unavailable source, and specific missing context produce coverage limitations.
+Dismissed suspicions, low-confidence candidates, existing issues, and optional test improvements do not count as coverage gaps.
+The model reports optional test improvements as review notes, so they do not change the review status.
+Invalid evidence triggers regeneration; repeated validation failure makes the review unavailable.
+Logs report decision counts without candidate text. An uncertain decision must identify its missing context.
+The reviewer does not execute PR code or search the entire repository for callers and tests.
+The trusted default-branch script reads PR source as data, including for fork PRs.
+Stale runs cannot replace comments for a newer PR snapshot.
+
+Run `python3 .github/scripts/test_review_advisory.py` for evidence-policy and HTTP-stream tests.
+Also run the existing review and issue-triage tests when changing their shared client.
+Before claiming improved model accuracy, replay maintainer-adjudicated true findings and false positives
+through the configured provider. Deterministic tests alone do not establish model accuracy.
+
+References: [GitHub required checks](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches),
+[CodeRabbit context verification](https://www.coderabbit.ai/blog/context-engineering-ai-code-reviews).
+
 ## Release ownership
 
 A pull request must not set an app version, build number, release tag, or release notes.

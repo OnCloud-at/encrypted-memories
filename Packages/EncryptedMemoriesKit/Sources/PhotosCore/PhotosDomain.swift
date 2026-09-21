@@ -288,10 +288,3 @@ public extension FullMediaProvider {
 public protocol BurstGroupProvider: Sendable {
     func burstGroup(containing uid: PhotoUID) async throws -> [PhotoItem]
 }
-
-/// Authentication lifecycle, abstracted away from the concrete fork mechanism.
-public protocol AuthenticationService: Sendable {
-    var isSignedIn: Bool { get async }
-    func currentAccountEmail() async -> String?
-    func signOut() async
-}

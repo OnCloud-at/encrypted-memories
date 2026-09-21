@@ -49,8 +49,10 @@ struct MobilePhotoViewer: View {
     @State private var resolvedMediaKinds: [PhotoUID: MediaKind] = [:]
     @State private var titleMetadataState: ViewerTitleMetadataState = .resolving
     @State private var titleMetadataCoordinator: ViewerTitleMetadataCoordinator
-    /// Ties the sub-selection to its library page so an index change can never flash the previous page's burst.
+    /// Ties the loaded series to its library page so an index change can never show the previous page's series.
     @State private var burstBaseUID: PhotoUID?
+    /// The presented "Select Favorites" mode of the current series.
+    @State private var seriesModel: MobileSeriesFavoritesModel?
     /// Bounded, shared image loader for the pages (thumbnail to screen-bounded preview, off-main and cached).
     /// the shared `PhotoViewerUIKitAdapter` store, wired to the feed's RAM tier via a closure so the
     /// adapter never depends on a concrete feed type.
@@ -99,7 +101,9 @@ struct MobilePhotoViewer: View {
     }
 
     var body: some View {
-        MobileViewerChromeOverlay(showsChrome: chromeVisible) {
+        // Native bars inside the cover: the system owns the bar axis, edge, overflow and Liquid Glass, so the
+        // viewer receives the iPhone Duo vertical layout and the iPad top-bar placement without app geometry.
+        NavigationStack {
             ZStack {
                 Color.black.ignoresSafeArea()
 
@@ -110,7 +114,7 @@ struct MobilePhotoViewer: View {
                 // `.id` was a hard cut instead). UIPageViewController participates in the size transition and keeps
                 // the current page centred through the whole rotation - the Photos-app behavior.
                 MobileViewerPager(count: items.count, index: $index) { i, isCurrent in
-                    let item = displayedItem(at: i)
+                    let item = items[i]
                     MobileViewerPage(
                         item: item,
                         isCurrent: isCurrent,
@@ -131,15 +135,35 @@ struct MobilePhotoViewer: View {
                     )
                     .id(item.uid)
                 }
-                .ignoresSafeArea()
             }
-        } topChrome: {
-            viewerTopChrome
-                .zIndex(2)
-        } bottomChrome: {
-            viewerBottomChrome
-                .zIndex(3)
+            // The Live Photo status sits on the media inside the safe area, below the navigation bar.
+            .overlay(alignment: .topLeading) {
+                if currentBaseItem?.isLivePhoto == true {
+                    viewerLiveIndicator
+                }
+            }
+            // A series shows its photo count in the same place; a burst is never a Live Photo.
+            .overlay(alignment: .topLeading) {
+                if let seriesItems = currentSeriesItems {
+                    viewerSeriesButton(count: seriesItems.count)
+                }
+            }
+            // The filmstrip is bottom safe-area content, the Photos-app contract: the media refits when the chrome
+            // toggles, and the native bottom bar stacks below the strip.
+            .safeAreaInset(edge: .bottom, spacing: 0) { viewerBottomAccessory }
+            .navigationTitle(viewerTitle.line1)
+            .navigationSubtitle(viewerTitle.line2)
+            .toolbarTitleDisplayMode(.inline)
+            .toolbar { viewerToolbar }
+            // The media background is always black; the bars keep light glyphs and titles over it.
+            .toolbarColorScheme(.dark, for: .navigationBar, .bottomBar)
+            // One tap hides both bars, the filmstrip, the status bar and the home indicator together.
+            .toolbarVisibility(chromeVisible ? .automatic : .hidden, for: .navigationBar, .bottomBar)
+            .background { keyboardCommands }
         }
+        // The app shell passes the brand tint into this cover. Bar glyphs over the photo keep the system's light
+        // appearance, like the Photos app; the information inspector outside the stack keeps the brand tint.
+        .tint(nil)
         .statusBarHidden(!chromeVisible)
         .persistentSystemOverlays(chromeVisible ? .automatic : .hidden)
         .task {
@@ -158,8 +182,10 @@ struct MobilePhotoViewer: View {
         .task(id: metadataTaskID) {
             await resolveCurrentTitleMetadata()
         }
-        .sheet(isPresented: $showInfo) {
-            if let item = currentDisplayedItem {
+        // A native inspector: a trailing column beside the media in regular iPad windows, the familiar sheet in
+        // compact widths. The immersive viewer, its pager and its gestures stay mounted in both cases.
+        .inspector(isPresented: $showInfo) {
+            if let item = currentBaseItem {
                 MobileViewerInfoSheet(
                     item: item,
                     metadataLoadState: metadataLoadState,
@@ -168,9 +194,14 @@ struct MobilePhotoViewer: View {
                     isLoadingAlbumMemberships: isLoadingAlbumMemberships,
                     albumMembershipsLoadFailed: albumMembershipsLoadFailed,
                     placeName: titleMetadataState.resolution?.placeName,
-                    onRetry: retryCurrentMetadata
+                    onRetry: retryCurrentMetadata,
+                    onClose: { showInfo = false }
                 )
+                .inspectorColumnWidth(min: 300, ideal: 360, max: 480)
             }
+        }
+        .fullScreenCover(item: $seriesModel) { model in
+            MobileSeriesFavoritesScreen(model: model, libraryModel: libraryModel)
         }
         .mobileSharePresentation(selection: selection)
         .mobileSelectionAlerts(
@@ -189,7 +220,7 @@ struct MobilePhotoViewer: View {
         } message: {
             Text(String(localized: "viewer.favorite_failed_message"))
         }
-        .onChange(of: currentDisplayedItem?.uid) { _, _ in
+        .onChange(of: currentBaseItem?.uid) { _, _ in
             cancelViewerMutationPresentation()
         }
         .onDisappear {
@@ -202,31 +233,12 @@ struct MobilePhotoViewer: View {
         )
     }
 
-    /// One stable Apple-Photos-style header stays mounted while paging between photos, Live Photos, and videos.
-    /// Fixed-width edge buttons leave a measured, bounded center pill even on the smallest supported iPhone.
-    private var viewerTopChrome: some View {
-        VStack(spacing: 6) {
-            viewerHeader
-
-            if currentDisplayedItem?.isLivePhoto == true {
-                viewerLiveIndicator
-            }
-        }
-        .frame(maxWidth: .infinity)
-    }
-
-    private var viewerBottomChrome: some View {
-        let profile = chromeLayoutProfile
-        return VStack(spacing: profile.rowSpacing) {
-            if burstBelongsToCurrentPage, burstSelection.hasFilmstrip {
-                MobileBurstFilmstrip(
-                    selection: burstSelection,
-                    feed: libraryModel.thumbnailFeed,
-                    onSelect: selectBurstIndex
-                )
-                .frame(maxHeight: 124)
-            }
-
+    /// Bottom safe-area content below the media: the route filmstrip. It leaves with the bars on a chrome tap,
+    /// so the media refits to the full window the way the Photos app does. The strip keeps its bounded UIKit
+    /// collection view; it is not a bar item, so the system never moves it to a vertical bar.
+    @ViewBuilder private var viewerBottomAccessory: some View {
+        if chromeVisible {
+            let profile = chromeLayoutProfile
             MobileViewerFilmstrip(
                 items: items,
                 selectedUID: currentBaseItem?.uid,
@@ -235,15 +247,12 @@ struct MobilePhotoViewer: View {
                 onSelect: selectPage
             )
             .frame(height: profile.filmstripHeight)
-
-            if profile.showsBottomActionRow {
-                viewerActionRow
-                    .frame(height: profile.controlSide)
-            }
+            .padding(.horizontal, MobileViewerBottomLayout.horizontalPadding)
+            .padding(.top, profile.rowSpacing)
+            .padding(.bottom, profile.bottomPadding)
+            .frame(maxWidth: .infinity)
+            .transition(.opacity)
         }
-        .padding(.horizontal, MobileViewerBottomLayout.horizontalPadding)
-        .safeAreaPadding(.bottom, profile.bottomPadding)
-        .frame(maxWidth: .infinity)
     }
 
     private var isCompactLandscape: Bool { verticalSizeClass == .compact }
@@ -251,335 +260,175 @@ struct MobilePhotoViewer: View {
         MobileViewerBottomLayout.profile(compactLandscape: isCompactLandscape)
     }
 
-    @ViewBuilder
-    private var viewerHeader: some View {
-        if isCompactLandscape {
-            compactLandscapeHeader
+    /// Native bar content. Close leads the navigation bar and the more-actions menu trails it; the per-photo
+    /// actions are bottom bar items with a symbol and a title, so the system can show either representation.
+    /// Regular iPad windows move the bottom bar items into the navigation bar; iPhone Duo moves both bars to
+    /// the vertical edge. Photos and videos share this one toolbar, so paging never inserts or removes items.
+    @ToolbarContentBuilder private var viewerToolbar: some ToolbarContent {
+        viewerCloseItem
+        viewerMoreActions
+        ToolbarItem(placement: .bottomBar) { viewerShareButton }
+            .mobileVisibilityPriority(.high)
+        ToolbarSpacer(.flexible, placement: .bottomBar)
+        ToolbarItemGroup(placement: .bottomBar) {
+            viewerFavoriteButton
+            viewerInfoButton
+        }
+        // Favorite and Info are the first to leave a compressed bar; the overflow menu keeps their titles.
+        .mobileVisibilityPriority(.low)
+        ToolbarSpacer(.flexible, placement: .bottomBar)
+        ToolbarItem(placement: .bottomBar) { viewerMutationButton }
+            .mobileVisibilityPriority(.high)
+    }
+
+    /// Close is the primary navigation control: it stays at the top of a vertical bar and never overflows.
+    private var viewerCloseItem: some ToolbarContent {
+        ToolbarItem(placement: .topBarLeading) {
+            Button {
+                dismiss()
+            } label: {
+                Label(String(localized: "viewer.close_a11y"), systemImage: "chevron.left")
+            }
+            .accessibilityLabel(String(localized: "viewer.close_a11y"))
+        }
+        .mobileVisibilityPriority(.high)
+    }
+
+    /// The system overflow menu owns the ellipsis on iOS 27 (HIG: reserve the ellipsis for overflow). iOS 26 has
+    /// no system overflow, so it keeps the app-owned ellipsis menu with the same actions.
+    @ToolbarContentBuilder private var viewerMoreActions: some ToolbarContent {
+        if #available(iOS 27.0, *) {
+            ToolbarOverflowMenu {
+                viewerActionMenu
+            }
         } else {
-            regularViewerHeader
-        }
-    }
-
-    private var regularViewerHeader: some View {
-        GeometryReader { proxy in
-            ZStack {
-                viewerTitlePill
-                    .frame(width: MobileViewerHeaderLayout.titleWidth(containerWidth: proxy.size.width))
-
-                HStack {
-                    viewerBackButton
-                    Spacer()
-                    viewerActionButton
-                }
-                .padding(.horizontal, MobileViewerHeaderLayout.horizontalPadding)
-            }
-        }
-        .frame(height: 44)
-        .padding(.top, 10)
-    }
-
-    private var compactLandscapeHeader: some View {
-        GeometryReader { proxy in
-            ZStack {
-                viewerTitlePill
-                    .frame(width: min(280, max(160, proxy.size.width - 320)))
-
-                HStack {
-                    HStack(spacing: 0) {
-                        compactActionButton(symbol: "chevron.left", label: String(localized: "viewer.close_a11y")) {
-                            dismiss()
-                        }
-                        compactActionButton(
-                            symbol: "square.and.arrow.up",
-                            label: String(localized: "viewer.share_action"),
-                            disabled: currentDisplayedItem == nil || selection.isBusy,
-                            action: shareCurrentItem
-                        )
-                        compactFavoriteButton
+            ToolbarItem(placement: .topBarTrailing) {
+                Menu {
+                    viewerActionMenu
+                } label: {
+                    if selection.isBusy || isRestoring {
+                        ProgressView()
+                    } else {
+                        Label(String(localized: "viewer.more_actions_a11y"), systemImage: "ellipsis")
                     }
-                    .protonGlass(in: Capsule())
-
-                    Spacer(minLength: 16)
-
-                    HStack(spacing: 0) {
-                        compactActionButton(
-                            symbol: "info.circle",
-                            label: String(localized: "viewer.info_action"),
-                            disabled: currentDisplayedItem == nil
-                        ) { showInfo = true }
-                        compactActionButton(
-                            symbol: viewerMutationAction == .restore ? "arrow.uturn.backward" : "trash",
-                            label: viewerMutationAction == .restore
-                                ? String(localized: "viewer.restore_action")
-                                : String(localized: "viewer.move_to_trash_action"),
-                            disabled: currentDisplayedItem == nil || isRestoring || selection.isBusy,
-                            action: requestViewerMutation
-                        )
-                        compactActionMenu
-                    }
-                    .protonGlass(in: Capsule())
                 }
-                .padding(.horizontal, MobileViewerHeaderLayout.horizontalPadding)
+                .disabled(currentBaseItem == nil || selection.isBusy || isRestoring)
+                .accessibilityLabel(String(localized: "viewer.more_actions_a11y"))
             }
+            .mobileVisibilityPriority(.low)
         }
-        .frame(height: ViewerChromeLayoutProfile.compactLandscape.controlSide)
-        .padding(.top, 6)
     }
 
-    private func compactActionButton(
-        symbol: String,
-        label: String,
-        disabled: Bool = false,
-        action: @escaping () -> Void
-    ) -> some View {
-        Button(action: action) {
-            Image(systemName: symbol)
-                .font(.body.weight(.semibold))
-                .foregroundStyle(.primary)
-                .frame(width: 44, height: 44)
-        }
-        .disabled(disabled)
-        .accessibilityLabel(label)
-    }
-
-    private var compactFavoriteButton: some View {
-        let uid = currentDisplayedItem?.uid
-        let favorite = uid.map { libraryModel.favoriteUIDs.contains($0) } ?? false
-        let busy = uid.map { libraryModel.favoriteMutationsInFlight.contains($0) } ?? false
-        return Button {
-            guard let uid else { return }
-            toggleFavorite(uid)
-        } label: {
-            Group {
-                if busy {
-                    ProgressView().tint(Color.primary)
-                } else {
-                    Image(systemName: favorite ? "heart.fill" : "heart")
-                }
-            }
-            .font(.body.weight(.semibold))
-            .foregroundStyle(.primary)
-            .frame(width: 44, height: 44)
-        }
-        .disabled(uid == nil || busy)
-        .accessibilityLabel(
-            favorite
-                ? String(localized: "viewer.remove_favorite_action")
-                : String(localized: "viewer.favorite_action")
+    /// The Apple-Photos-style two-line bar title: location or date first, date/time and position second. While a
+    /// known location resolves, line one stays blank so the title does not jump from date to place.
+    private var viewerTitle: ViewerTitle {
+        guard let current = currentBaseItem else { return ViewerTitle(line1: "", line2: "") }
+        return ViewerTitleFormatter.make(
+            captureDate: current.captureTime,
+            index: index,
+            total: items.count,
+            locationName: titleMetadataState.resolution?.placeName,
+            locationIsResolving: titleMetadataState.shouldReservePlaceNameLine(
+                hasKnownLocation: libraryModel.locationIndex.hasKnownLocation(current.uid)
+            ),
+            filename: metadataLoadState.metadata?.filename
         )
     }
 
-    private var compactActionMenu: some View {
-        Menu {
-            viewerActionMenu
-        } label: {
-            Group {
-                if selection.isBusy || isRestoring {
-                    ProgressView().tint(Color.primary)
-                } else {
-                    Image(systemName: "ellipsis")
-                }
-            }
-            .font(.body.weight(.semibold))
-            .foregroundStyle(.primary)
-            .frame(width: 44, height: 44)
-        }
-        .disabled(selection.isBusy || isRestoring)
-        .accessibilityLabel(String(localized: "viewer.more_actions_a11y"))
-    }
-
-    private var viewerBackButton: some View {
-        Button {
-            dismiss()
-        } label: {
-            Image(systemName: "chevron.left")
-                .font(.title3.weight(.semibold))
-                .foregroundStyle(.primary)
-                .frame(
-                    width: MobileViewerHeaderLayout.buttonWidth,
-                    height: MobileViewerHeaderLayout.buttonWidth
-                )
-                .protonGlass(in: Circle())
-        }
-        .accessibilityLabel(String(localized: "viewer.close_a11y"))
-    }
-
-    @ViewBuilder
-    private var viewerActionButton: some View {
-        if currentDisplayedItem != nil {
-            Menu {
-                viewerActionMenu
-            } label: {
-                Group {
-                    if selection.isBusy || isRestoring {
-                        ProgressView().tint(Color.primary)
-                    } else {
-                        Image(systemName: "ellipsis")
-                    }
-                }
-                .font(.body.weight(.semibold))
-                .foregroundStyle(.primary)
-                .frame(
-                    width: MobileViewerHeaderLayout.buttonWidth,
-                    height: MobileViewerHeaderLayout.buttonWidth
-                )
-                .protonGlass(in: Circle())
-            }
-            .disabled(selection.isBusy || isRestoring)
-            .accessibilityLabel(String(localized: "viewer.more_actions_a11y"))
-        } else {
-            Color.clear.frame(
-                width: MobileViewerHeaderLayout.buttonWidth,
-                height: MobileViewerHeaderLayout.buttonWidth
-            )
-        }
-    }
-
-    private var viewerTitlePill: some View {
-        viewerTitle
-            .frame(maxWidth: .infinity)
-            .padding(.horizontal, 12)
-            .padding(.vertical, 6)
-            .protonGlass(in: Capsule())
-            .contentTransition(.interpolate)
-    }
-
-    @ViewBuilder
-    private var viewerTitle: some View {
-        if let current = currentDisplayedItem {
-            let title = ViewerTitleFormatter.make(
-                captureDate: current.captureTime,
-                index: index,
-                total: items.count,
-                locationName: titleMetadataState.resolution?.placeName,
-                locationIsResolving: titleMetadataState.shouldReservePlaceNameLine(
-                    hasKnownLocation: libraryModel.locationIndex.hasKnownLocation(current.uid)
-                ),
-                filename: metadataLoadState.metadata?.filename
-            )
-            VStack(spacing: 1) {
-                Text(title.line1)
-                    .font(.subheadline.weight(.semibold))
-                    .opacity(title.reservesLocationLine ? 0 : 1)
-                Text(title.line2)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            .foregroundStyle(.primary)
-            .lineLimit(1)
-            .minimumScaleFactor(0.72)
-            .truncationMode(.tail)
-        }
-    }
-
+    /// The Live Photo status leaves with the chrome and never steals paging, press or dismiss gestures.
     private var viewerLiveIndicator: some View {
-        HStack {
-            MobileLiveBadge()
-            Spacer()
-        }
-        .padding(.horizontal, 16)
-        .allowsHitTesting(false)
+        MobileLiveBadge()
+            .padding(16)
+            .opacity(chromeVisible ? 1 : 0)
+            .allowsHitTesting(false)
+            // It leaves VoiceOver with the rest of the chrome and returns with it.
+            .accessibilityHidden(!chromeVisible)
     }
 
-    private var viewerActionRow: some View {
-        HStack(spacing: MobileViewerBottomLayout.rowSpacing) {
-            Button(action: shareCurrentItem) {
-                Group {
-                    if selection.isBusy {
-                        ProgressView().tint(Color.primary)
-                    } else {
-                        Image(systemName: "square.and.arrow.up")
-                    }
-                }
-                .font(.title3.weight(.semibold))
-                .foregroundStyle(.primary)
-                .frame(
-                    width: MobileViewerBottomLayout.actionButtonSize,
-                    height: MobileViewerBottomLayout.actionButtonSize
-                )
-                .protonGlass(in: Circle())
+    /// The Photos-style series control: the photo count with a disclosure chevron, in system Liquid Glass. It
+    /// leaves with the chrome. Opening it shows every photo of the series in the "Select Favorites" mode.
+    private func viewerSeriesButton(count: Int) -> some View {
+        Button(action: openSeriesSelection) {
+            HStack(spacing: 4) {
+                Image(systemName: "square.stack.3d.down.right")
+                Text(String(localized: "viewer.series_button \(count)"))
+                Image(systemName: "chevron.right")
+                    .imageScale(.small)
             }
-            .disabled(currentDisplayedItem == nil || selection.isBusy)
-            .accessibilityLabel(String(localized: "viewer.share_action"))
-
-            Spacer(minLength: 0)
-
-            HStack(spacing: 0) {
-                viewerFavoriteButton
-                viewerInfoButton
-            }
-            .frame(width: MobileViewerBottomLayout.centerPillWidth, height: MobileViewerBottomLayout.actionButtonSize)
-            .protonGlass(in: Capsule())
-
-            Spacer(minLength: 0)
-
-            Button(action: requestViewerMutation) {
-                Group {
-                    if isRestoring || selection.isTrashing {
-                        ProgressView().tint(Color.primary)
-                    } else {
-                        Image(systemName: viewerMutationAction == .restore ? "arrow.uturn.backward" : "trash")
-                    }
-                }
-                .font(.title3.weight(.semibold))
-                .foregroundStyle(.primary)
-                .frame(
-                    width: MobileViewerBottomLayout.actionButtonSize,
-                    height: MobileViewerBottomLayout.actionButtonSize
-                )
-                .protonGlass(in: Circle())
-            }
-            .disabled(currentDisplayedItem == nil || isRestoring || selection.isBusy)
-            .accessibilityLabel(
-                viewerMutationAction == .restore
-                    ? String(localized: "viewer.restore_action")
-                    : String(localized: "viewer.move_to_trash_action")
-            )
+            .font(.footnote.weight(.semibold))
         }
+        .buttonStyle(.glass)
+        .buttonBorderShape(.capsule)
+        .controlSize(.small)
+        .padding(.horizontal, 16)
+        .padding(.top, 8)
+        .opacity(chromeVisible ? 1 : 0)
+        .allowsHitTesting(chromeVisible)
+        .accessibilityHidden(!chromeVisible)
+        .accessibilityLabel(String(localized: "viewer.series_button \(count)"))
+        .accessibilityHint(String(localized: "viewer.series_button_hint"))
+        .accessibilityIdentifier("viewer.seriesButton")
+    }
+
+    private var viewerShareButton: some View {
+        Button(action: shareCurrentItem) {
+            if selection.isBusy {
+                ProgressView()
+            } else {
+                Label(String(localized: "viewer.share_action"), systemImage: "square.and.arrow.up")
+            }
+        }
+        .disabled(currentBaseItem == nil || selection.isBusy)
+        .accessibilityLabel(String(localized: "viewer.share_action"))
     }
 
     private var viewerFavoriteButton: some View {
-        let uid = currentDisplayedItem?.uid
+        let uid = currentBaseItem?.uid
         let favorite = uid.map { libraryModel.favoriteUIDs.contains($0) } ?? false
         let busy = uid.map { libraryModel.favoriteMutationsInFlight.contains($0) } ?? false
+        let title =
+            favorite
+            ? String(localized: "viewer.remove_favorite_action")
+            : String(localized: "viewer.favorite_action")
         return Button {
             guard let uid else { return }
             toggleFavorite(uid)
         } label: {
-            Group {
-                if busy {
-                    ProgressView().tint(Color.primary)
-                } else {
-                    Image(systemName: favorite ? "heart.fill" : "heart")
-                }
+            if busy {
+                ProgressView()
+            } else {
+                Label(title, systemImage: favorite ? "heart.fill" : "heart")
             }
-            .font(.title3.weight(.semibold))
-            .foregroundStyle(.primary)
-            .frame(
-                width: MobileViewerBottomLayout.centerPillWidth / 2, height: MobileViewerBottomLayout.actionButtonSize)
         }
         .disabled(uid == nil || busy)
-        .accessibilityLabel(
-            favorite
-                ? String(localized: "viewer.remove_favorite_action")
-                : String(localized: "viewer.favorite_action")
-        )
+        .accessibilityLabel(title)
     }
 
     private var viewerInfoButton: some View {
         Button {
             showInfo = true
         } label: {
-            Image(systemName: "info.circle")
-                .font(.title3.weight(.semibold))
-                .foregroundStyle(.primary)
-                .frame(
-                    width: MobileViewerBottomLayout.centerPillWidth / 2,
-                    height: MobileViewerBottomLayout.actionButtonSize
-                )
+            Label(String(localized: "viewer.info_action"), systemImage: "info.circle")
         }
-        .disabled(currentDisplayedItem == nil)
+        .disabled(currentBaseItem == nil)
         .accessibilityLabel(String(localized: "viewer.info_action"))
+    }
+
+    /// Move to Trash in the library, Restore in Recently Deleted: one slot, the shared mutation policy.
+    private var viewerMutationButton: some View {
+        let title =
+            viewerMutationAction == .restore
+            ? String(localized: "viewer.restore_action")
+            : String(localized: "viewer.move_to_trash_action")
+        return Button(role: viewerMutationAction == .restore ? nil : .destructive, action: requestViewerMutation) {
+            if isRestoring || selection.isTrashing {
+                ProgressView()
+            } else {
+                Label(title, systemImage: viewerMutationAction == .restore ? "arrow.uturn.backward" : "trash")
+            }
+        }
+        .disabled(currentBaseItem == nil || isRestoring || selection.isBusy)
+        .accessibilityLabel(title)
     }
 
     @ViewBuilder
@@ -596,6 +445,7 @@ struct MobilePhotoViewer: View {
         } label: {
             Label(String(localized: "viewer.share_action"), systemImage: "square.and.arrow.up")
         }
+        .disabled(currentBaseItem == nil || selection.isBusy)
 
         Divider()
 
@@ -605,12 +455,14 @@ struct MobilePhotoViewer: View {
             } label: {
                 Label(String(localized: "viewer.restore_action"), systemImage: "arrow.uturn.backward")
             }
+            .disabled(currentBaseItem == nil || isRestoring || selection.isBusy)
         } else {
             Button(role: .destructive) {
                 requestViewerMutation()
             } label: {
                 Label(String(localized: "viewer.move_to_trash_action"), systemImage: "trash")
             }
+            .disabled(currentBaseItem == nil || isRestoring || selection.isBusy)
         }
     }
 
@@ -624,7 +476,7 @@ struct MobilePhotoViewer: View {
     }
 
     private var metadataTaskID: MetadataTaskID {
-        MetadataTaskID(uid: currentDisplayedItem?.uid, generation: metadataRequestGeneration)
+        MetadataTaskID(uid: currentBaseItem?.uid, generation: metadataRequestGeneration)
     }
 
     private func resolveCurrentTitleMetadata() async {
@@ -632,7 +484,7 @@ struct MobilePhotoViewer: View {
         metadataLoadState = .idle
         albumTitles = []
         albumMembershipsLoadFailed = false
-        guard let item = currentDisplayedItem else { return }
+        guard let item = currentBaseItem else { return }
         let uid = item.uid
         titleMetadataState = titleMetadataCoordinator.state(for: uid)
         metadataLoadState = .loading
@@ -641,14 +493,11 @@ struct MobilePhotoViewer: View {
         async let titleResolution = titleMetadataCoordinator.resolve(item)
         let membershipResult = await memberships
         let resolution = await titleResolution
-        guard !Task.isCancelled, currentDisplayedItem?.uid == uid else { return }
+        guard !Task.isCancelled, currentBaseItem?.uid == uid else { return }
         applyAlbumMembershipResult(membershipResult)
         titleMetadataState = .resolved(resolution)
-        guard let metadata = resolution.metadata else {
-            metadataLoadState = .failed
-            return
-        }
-        metadataLoadState = .loaded(metadata)
+        metadataLoadState = resolution.metadataLoadState
+        guard let metadata = resolution.metadata else { return }
         let resolvedKind = VideoContentSniffer.kind(mimeType: metadata.mimeType)
         if resolvedKind != .unknown {
             resolvedMediaKinds[uid] = resolvedKind
@@ -656,7 +505,7 @@ struct MobilePhotoViewer: View {
     }
 
     private func retryCurrentMetadata() {
-        guard let uid = currentDisplayedItem?.uid else { return }
+        guard let uid = currentBaseItem?.uid else { return }
         titleMetadataCoordinator.invalidate(uid)
         metadataRequestGeneration &+= 1
     }
@@ -687,7 +536,7 @@ struct MobilePhotoViewer: View {
     }
 
     private func shareCurrentItem() {
-        guard let item = currentDisplayedItem, let backend = libraryModel.backend else { return }
+        guard let item = currentBaseItem, let backend = libraryModel.backend else { return }
         let items = burstBelongsToCurrentPage ? burstSelection.exportItems(current: item) : [item]
         selection.startShare(
             items: items, backend: backend,
@@ -696,7 +545,7 @@ struct MobilePhotoViewer: View {
     }
 
     private func requestViewerMutation() {
-        guard let item = currentDisplayedItem else { return }
+        guard let item = currentBaseItem else { return }
         switch viewerMutationAction {
         case .moveToTrash:
             selection.selected = [item.uid]
@@ -707,7 +556,7 @@ struct MobilePhotoViewer: View {
     }
 
     private func confirmMoveToTrash() {
-        guard let item = currentDisplayedItem else { return }
+        guard let item = currentBaseItem else { return }
         selection.performTrash(failureMessage: String(localized: "viewer.trash_failed")) { uids in
             try await libraryModel.trashItems(uids)
             viewerRouter.noteCompletedMutation(uid: item.uid)
@@ -730,7 +579,7 @@ struct MobilePhotoViewer: View {
                 restoreTask = nil
                 isRestoring = false
                 guard requestGeneration == restoreRequestGeneration,
-                    currentDisplayedItem?.uid == uid
+                    currentBaseItem?.uid == uid
                 else { return }
                 dismiss()
             } catch is CancellationError {
@@ -740,7 +589,7 @@ struct MobilePhotoViewer: View {
                 restoreTask = nil
                 isRestoring = false
                 guard requestGeneration == restoreRequestGeneration,
-                    currentDisplayedItem?.uid == uid
+                    currentBaseItem?.uid == uid
                 else { return }
                 showRestoreError = true
             }
@@ -755,7 +604,7 @@ struct MobilePhotoViewer: View {
             let succeeded = await libraryModel.toggleFavorite(uid)
             guard !Task.isCancelled,
                 requestGeneration == favoriteRequestGeneration,
-                currentDisplayedItem?.uid == uid
+                currentBaseItem?.uid == uid
             else { return }
             favoriteTask = nil
             if !succeeded {
@@ -784,19 +633,68 @@ struct MobilePhotoViewer: View {
         index = selected
     }
 
+    /// Hardware-keyboard parity with the macOS viewer: arrow keys page, Escape closes. The buttons render
+    /// nothing; they only register shortcuts for the presented viewer.
+    private var keyboardCommands: some View {
+        Group {
+            Button("") { stepPage(-1) }.keyboardShortcut(.leftArrow, modifiers: [])
+            Button("") { stepPage(1) }.keyboardShortcut(.rightArrow, modifiers: [])
+            Button("") { dismiss() }.keyboardShortcut(.cancelAction)
+        }
+        .frame(width: 0, height: 0)
+        .opacity(0)
+        .accessibilityHidden(true)
+    }
+
+    private func stepPage(_ delta: Int) {
+        let next = index + delta
+        guard items.indices.contains(next) else { return }
+        index = next
+    }
+
     private var burstBelongsToCurrentPage: Bool {
         burstBaseUID == currentBaseItem?.uid
     }
 
-    private var currentDisplayedItem: PhotoItem? {
-        guard let base = currentBaseItem else { return nil }
-        return burstBelongsToCurrentPage ? burstSelection.current(fallback: base) : base
+    /// The series of the current page, once it is loaded. The viewer itself shows only the series' main photo,
+    /// as the Photos app does; the other photos open in the "Select Favorites" mode.
+    private var currentSeriesItems: [PhotoItem]? {
+        burstBelongsToCurrentPage && burstSelection.hasFilmstrip ? burstSelection.items : nil
     }
 
-    private func displayedItem(at pageIndex: Int) -> PhotoItem {
-        let base = items[pageIndex]
-        guard pageIndex == index, burstBaseUID == base.uid else { return base }
-        return burstSelection.current(fallback: base)
+    private func openSeriesSelection() {
+        guard let base = currentBaseItem, let seriesItems = currentSeriesItems, seriesModel == nil else { return }
+        let request = MobileSeriesSelectionRequest(seriesMainUID: base.uid, items: seriesItems, focusedUID: base.uid)
+        let seriesUIDs = seriesItems.map(\.uid)
+        let inLibrary = viewerMutationAction == .moveToTrash
+        Task { @MainActor in
+            // Recently Deleted and shared albums only browse a series; "Keep Only Favorites" needs the own library.
+            let canKeepOnlyFavorites =
+                inLibrary ? await libraryModel.canKeepOnlySeriesFavorites(seriesUIDs: seriesUIDs) : false
+            guard currentBaseItem?.uid == base.uid, seriesModel == nil else { return }
+            seriesModel = MobileSeriesFavoritesModel(
+                request: request,
+                canKeepOnlyFavorites: canKeepOnlyFavorites,
+                keepOnlyFavorites: { favoriteUIDs, onProgress in
+                    try await libraryModel.keepOnlySeriesFavorites(
+                        seriesMainUID: base.uid,
+                        seriesUIDs: seriesUIDs,
+                        favoriteUIDs: favoriteUIDs,
+                        onProgress: onProgress
+                    )
+                },
+                abandonKeepOnlyFavorites: {
+                    libraryModel.abandonKeepOnlySeriesFavorites(seriesMainUID: base.uid)
+                },
+                onFinished: { seriesDissolved in
+                    seriesModel = nil
+                    guard seriesDissolved else { return }
+                    // The series left the library: the source route reconciles and the viewer closes.
+                    viewerRouter.noteCompletedMutation(uid: base.uid)
+                    dismiss()
+                }
+            )
+        }
     }
 
     @MainActor private func loadBurst(for item: PhotoItem) async {
@@ -822,119 +720,6 @@ struct MobilePhotoViewer: View {
         } catch {
             guard !Task.isCancelled, currentBaseItem?.uid == item.uid else { return }
             burstSelection.failLoading()
-        }
-    }
-
-    @MainActor private func selectBurstIndex(_ newIndex: Int) {
-        withAnimation(
-            MobileViewerMotionPolicy.animation(
-                .easeInOut(duration: 0.16), reduceMotion: reduceMotion
-            )
-        ) {
-            _ = burstSelection.selectIndex(newIndex)
-        }
-    }
-}
-
-/// Native mobile presentation of the shared burst selection state. It overlays the media rather than changing
-/// safe-area/layout geometry, so appearing or changing selection never makes the fitted photo jump.
-private struct MobileBurstFilmstrip: View {
-    let selection: BurstSelectionModel
-    let feed: UIKitThumbnailFeed?
-    let onSelect: (Int) -> Void
-
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-
-    private var position: Int { (selection.selectedIndex ?? 0) + 1 }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Label(
-                selection.isLoading
-                    ? L10n.string("viewer.burst_loading")
-                    : L10n.string("viewer.burst_badge \(position) \(selection.items.count)"),
-                systemImage: "square.stack.3d.down.right"
-            )
-            .font(.caption.weight(.semibold))
-            .foregroundStyle(.white)
-            .padding(.horizontal, 2)
-
-            ScrollViewReader { proxy in
-                ScrollView(.horizontal) {
-                    LazyHStack(spacing: 8) {
-                        ForEach(Array(selection.items.enumerated()), id: \.element.uid) { index, item in
-                            Button {
-                                onSelect(index)
-                            } label: {
-                                MobileBurstThumbnail(
-                                    item: item,
-                                    selected: selection.selectedIndex == index,
-                                    feed: feed
-                                )
-                            }
-                            .buttonStyle(.plain)
-                            .id(item.uid)
-                            .accessibilityLabel(
-                                L10n.string("viewer.burst_badge \(index + 1) \(selection.items.count)")
-                            )
-                            .accessibilityAddTraits(selection.selectedIndex == index ? .isSelected : [])
-                        }
-                    }
-                    .padding(.horizontal, 2)
-                }
-                .scrollIndicators(.hidden)
-                .onChange(of: selection.selectedIndex, initial: true) { _, selected in
-                    guard let selected, selection.items.indices.contains(selected) else { return }
-                    withAnimation(
-                        MobileViewerMotionPolicy.animation(
-                            .easeInOut(duration: 0.2), reduceMotion: reduceMotion
-                        )
-                    ) {
-                        proxy.scrollTo(selection.items[selected].uid, anchor: .center)
-                    }
-                }
-            }
-            .frame(height: 54)
-            .accessibilityLabel(L10n.string("viewer.burst_filmstrip_label"))
-        }
-        .padding(8)
-        .protonGlass(in: RoundedRectangle(cornerRadius: 20, style: .continuous))
-    }
-}
-
-private struct MobileBurstThumbnail: View {
-    let item: PhotoItem
-    let selected: Bool
-    let feed: UIKitThumbnailFeed?
-
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var image: UIImage?
-
-    var body: some View {
-        ZStack {
-            Color.white.opacity(0.08)
-            if let image {
-                Image(uiImage: image)
-                    .resizable()
-                    .scaledToFill()
-            } else {
-                ProgressView().tint(.white)
-            }
-        }
-        .frame(width: 46, height: 46)
-        .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: 9, style: .continuous)
-                .stroke(.white, lineWidth: selected ? 3 : 0)
-        }
-        .scaleEffect(selected ? 1 : 0.92)
-        .animation(
-            MobileViewerMotionPolicy.animation(.smooth(duration: 0.2), reduceMotion: reduceMotion),
-            value: selected
-        )
-        .task(id: item.uid) {
-            image = feed?.memoryImage(for: item.uid)
-            if image == nil { image = await feed?.image(for: item.uid) }
         }
     }
 }
@@ -981,6 +766,9 @@ private struct MobileViewerPager<Page: View>: UIViewControllerRepresentable {
         init(index: Int, root: AnyView) {
             self.pageIndex = index
             super.init(rootView: root)
+            // The outer SwiftUI layout accounts for device safe areas and the inspector column.
+            // A nested page must not apply the pager's cached safe area a second time.
+            safeAreaRegions = []
             view.backgroundColor = .clear  // never flash the hosting default background between pages
         }
         @available(*, unavailable)
@@ -1171,7 +959,7 @@ struct MobileImagePage: View {
                         .controlSize(.large)
                         .tint(.white)
                         .padding(16)
-                        .protonGlass(in: Circle())
+                        .glassEffect(in: Circle())
                         .allowsHitTesting(false)
                         .zIndex(2)
                 case .failed:
@@ -1179,7 +967,7 @@ struct MobileImagePage: View {
                         .font(.system(size: 26))
                         .foregroundStyle(.white)
                         .padding(14)
-                        .protonGlass(in: Circle())
+                        .glassEffect(in: Circle())
                         .accessibilityLabel(L10n.string("viewer.playback_failed"))
                         .allowsHitTesting(false)
                         .zIndex(2)
@@ -1647,10 +1435,10 @@ private struct MobileVideoPlaybackControls: View {
             }
             .padding(.horizontal, 16)
             .frame(height: layoutProfile.controlSide)
-            .protonGlass(in: Capsule())
+            .glassEffect(in: Capsule())
             .padding(.horizontal, MobileViewerBottomLayout.horizontalPadding)
-            .padding(.bottom, layoutProfile.bottomChromeHeight + layoutProfile.rowSpacing)
-            .safeAreaPadding(.bottom, layoutProfile.bottomPadding)
+            // The filmstrip is safe-area content below the page, so the transport keeps only its row spacing.
+            .padding(.bottom, layoutProfile.rowSpacing)
         }
     }
 
@@ -1933,8 +1721,15 @@ private struct MobileVideoPage: View {
         do {
             let streaming = try await backend.makeStreamingAsset(for: item.uid)
             guard !Task.isCancelled else { return }  // A cancelled page must not attach a player.
-            let newPlayer = AVPlayer(playerItem: AVPlayerItem(asset: streaming.asset))
+            let playerItem = AVPlayerItem(asset: streaming.asset)
+            let newPlayer = AVPlayer(playerItem: playerItem)
+            // Same buffering policy as the macOS viewer: AVFoundation decides when playback may start,
+            // and the forward window keeps the block loader ahead of it.
+            VideoPlaybackTuning.configure(player: newPlayer, item: playerItem, isStreaming: true)
             streamingAsset = streaming  // retain the resource loader for the player's lifetime
+            // The loader sizes its read-ahead from the clip's bitrate; a 4K clip needs a wider window than
+            // a 1080p clip for the same seconds of playback.
+            Task { await VideoPlaybackTuning.reportDuration(of: streaming) }
             player = newPlayer
             if isCurrent {
                 playbackIntendsToPlay = true
@@ -2463,7 +2258,7 @@ private struct MobileLiveBadge: View {
         .foregroundStyle(.white)
         .padding(.horizontal, 8)
         .padding(.vertical, 4)
-        .protonGlass(in: Capsule())
+        .glassEffect(in: Capsule())
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(L10n.string("viewer.live_photo_a11y"))
     }

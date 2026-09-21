@@ -17,8 +17,7 @@ struct MobileViewerInfoSheet: View {
     let albumMembershipsLoadFailed: Bool
     let placeName: String?
     let onRetry: () -> Void
-
-    @Environment(\.dismiss) private var dismiss
+    let onClose: () -> Void
 
     private var metadata: PhotoMetadata? {
         metadataLoadState.metadata
@@ -40,13 +39,12 @@ struct MobileViewerInfoSheet: View {
             .mobileNavigationTitle(L10n.string("infopanel.info"))
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
-                    Button {
-                        dismiss()
-                    } label: {
-                        Image(systemName: "xmark")
+                    Button(action: onClose) {
+                        Label(L10n.string("infopanel.close"), systemImage: "xmark")
                     }
                     .accessibilityLabel(L10n.string("infopanel.close"))
                 }
+                .mobileVisibilityPriority(.high)
             }
             .presentationDragIndicator(.visible)
         }
@@ -98,6 +96,9 @@ struct MobileViewerInfoSheet: View {
 
         case .loaded(let metadata):
             loadedMetadataSection(metadata)
+
+        case .unavailable:
+            EmptyView()
 
         case .failed:
             ContentUnavailableView {

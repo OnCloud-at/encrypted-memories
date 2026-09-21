@@ -18,6 +18,7 @@ import ProtonDriveBackend
 import SwiftUI
 import TimelineCore
 import UIKit
+import UploadCore
 
 struct MobileRetryOwnerGraph {
     typealias Shutdown = @MainActor @Sendable () async -> Void
@@ -218,8 +219,11 @@ final class MobileLibraryModel {
     /// Bumped by the shared album-sync controller after remote album mutations so Collections can
     /// refresh without reloading the whole timeline.
     private(set) var albumCatalogRevision = 0
-    /// Account-scoped Smart Search lifecycle. MLSearchCore owns lifecycle decisions.
-    private(set) var smartSearch: MLSmartSearchController?
+    /// Account-scoped Smart Search session. MLSearchCore owns lifecycle decisions.
+    @ObservationIgnored private let smartSearchSession = AppleSmartSearchSession(
+        backgroundHost: AppleSmartSearchBackgroundCoordinator.shared
+    )
+    var smartSearch: MLSmartSearchController? { smartSearchSession.controller }
 
     /// Encrypted GPS index shared with the Map tab. The per-account key protects it at rest.
     let locationIndex = PhotoLocationIndex()
@@ -261,6 +265,9 @@ final class MobileLibraryModel {
     /// state immediately, but monitoring is gated until this launch has one stable result or a handled failure.
     private var initialLibraryLoadSettled = false
     private var favoriteLoadTask: Task<Void, Never>?
+    /// Resume and abandon work of "Keep Only Favorites". Teardown cancels it, so no journal write survives
+    /// the account. The orchestrator's own admission gate joins a write that is already in flight.
+    private var seriesDissolutionTask: Task<Void, Never>?
     /// Mutations newer than the in-flight authoritative favorite read. The loader merges this journal before
     /// publishing, so a slow response cannot erase a newer heart tap.
     @ObservationIgnored private var favoriteLoadOverrides: [PhotoUID: Bool] = [:]
@@ -274,13 +281,10 @@ final class MobileLibraryModel {
     private(set) var isRefreshingLibrary = false
     /// Wakes analysis-only presentation after a source inventory becomes readable.
     private(set) var sourceAnalysisRevision: UInt64 = 0
-    @ObservationIgnored private var smartSearchMemoryRegistration: MemoryPressureRegistration?
-    @ObservationIgnored private let smartSearchAssets = MLAssetUniverse()
+    private var smartSearchAssets: MLAssetUniverse { smartSearchSession.assets }
     @ObservationIgnored private var primaryInventoryAuthority: SourceInventoryAuthority = .hydrating
     @ObservationIgnored private var pendingTimelineRemovals = Set<PhotoUID>()
     @ObservationIgnored private var timelineMutationGeneration = 0
-    /// The most recent ordered Smart Search shutdown; teardown awaits it before the sign-out purge.
-    @ObservationIgnored private var smartSearchShutdownTask: Task<Void, Never>?
     @ObservationIgnored private var sourceAnalysisRuntime: LibrarySourceAnalysisRuntime?
     @ObservationIgnored private var sourceAnalysisActivityTask: Task<Void, Never>?
     @ObservationIgnored private var sourceAnalysisShutdownTask: Task<Void, Never>?
@@ -329,10 +333,87 @@ final class MobileLibraryModel {
     /// Moves items to Trash through the shared backend. The move is recoverable, not permanent.
     /// On success, the items leave the visible library. Errors propagate to the caller.
     func trashItems(_ uids: Set<PhotoUID>) async throws {
-        guard let backend, let mutationLease = currentMutationLease(), !uids.isEmpty else { return }
+        guard let backend, !uids.isEmpty else { return }
+        try await removeFromVisibleLibrary(uids) { try await backend.trash(Array(uids)) }
+    }
+
+    /// True when "Keep Only Favorites" may run for the series: uploads work, and every photo of the series
+    /// lies in the account's own library. A series of a shared album never qualifies.
+    func canKeepOnlySeriesFavorites(seriesUIDs: [PhotoUID]) async -> Bool {
+        guard let dissolution = facade?.seriesDissolution else { return false }
+        return await dissolution.canDissolve(seriesUIDs: seriesUIDs)
+    }
+
+    /// Saves the favorites of a series as standalone photos and moves the whole series to Trash. The shared
+    /// orchestrator journals the operation, so calling this again after a failure resumes it without duplicates.
+    func keepOnlySeriesFavorites(
+        seriesMainUID: PhotoUID,
+        seriesUIDs: [PhotoUID],
+        favoriteUIDs: [PhotoUID],
+        onProgress: @escaping @Sendable (SeriesDissolutionProgress) -> Void
+    ) async throws {
+        guard let dissolution = facade?.seriesDissolution else { throw SeriesDissolutionError.notOwnLibrary }
+        try await removeFromVisibleLibrary(Set(seriesUIDs)) {
+            try await dissolution.keepOnlyFavorites(
+                seriesMainUID: seriesMainUID,
+                seriesUIDs: seriesUIDs,
+                favoriteUIDs: favoriteUIDs,
+                onProgress: onProgress
+            )
+        }
+        // The standalone copies are new library photos; the refresh brings them into the timeline.
+        refreshAfterLocalUpload()
+    }
+
+    /// The user left "Keep Only Favorites" after a failure. The pending journal goes away, so no later activation
+    /// can finish the operation without the user. Copies that are already saved stay as standalone photos.
+    func abandonKeepOnlySeriesFavorites(seriesMainUID: PhotoUID) {
+        guard let dissolution = facade?.seriesDissolution else { return }
+        let previous = seriesDissolutionTask
+        seriesDissolutionTask = Task {
+            await previous?.value
+            do {
+                try await dissolution.abandon(seriesMainUID: seriesMainUID)
+            } catch {
+                DebugLog.log("series: abandoning the pending operation failed - \(error)")
+            }
+        }
+    }
+
+    /// A crash or an error can interrupt "Keep Only Favorites" in its trash step, after the user's consent and
+    /// every copy are final. Activation finishes only such operations. The series is already in the trash then,
+    /// so the authoritative refresh removes it and adds the copies. The optimistic removal of the interactive
+    /// path is not used: it advances the timeline mutation generation and would reject the initial load.
+    private func resumePendingSeriesDissolutions(_ dissolution: SeriesDissolutionOrchestrator) async {
+        do {
+            let outcomes = try await dissolution.resumePending()
+            var didFinishAny = false
+            for outcome in outcomes {
+                switch outcome.result {
+                case .success:
+                    didFinishAny = true
+                    DebugLog.log("series: resumed trash step finished photos=\(outcome.seriesUIDs.count)")
+                case .failure(let error):
+                    DebugLog.log("series: resumed trash step failed, the journal stays pending - \(error)")
+                }
+            }
+            if didFinishAny { refreshAfterLocalUpload() }
+        } catch {
+            DebugLog.log("series: pending operations could not be read - \(error)")
+        }
+    }
+
+    /// Runs a remote mutation that takes `uids` out of the library, then removes them from the visible timeline.
+    private func removeFromVisibleLibrary(
+        _ uids: Set<PhotoUID>,
+        after remoteMutation: () async throws -> Void
+    ) async throws {
+        // No session means no library to mutate. The caller must see that nothing happened: a remote
+        // operation like "Keep Only Favorites" would otherwise report success without doing anything.
+        guard let mutationLease = currentMutationLease() else { throw CancellationError() }
         try Task.checkCancellation()
         let locationStoreLease = locationStore.captureSessionLease()
-        try await backend.trash(Array(uids))
+        try await remoteMutation()
         try requireCurrentMutation(mutationLease)
         pendingTimelineRemovals.formUnion(uids)
         timelineMutationGeneration &+= 1
@@ -609,6 +690,7 @@ final class MobileLibraryModel {
                 self.prefetchStartTask?.cancel()
                 self.isThumbnailPrefetchLoading = false
                 self.favoriteLoadTask?.cancel()
+                self.seriesDissolutionTask?.cancel()
                 self.snapshot = TimelineSnapshot()
                 self.sections = []
                 self.favoriteUIDs = []
@@ -885,41 +967,18 @@ final class MobileLibraryModel {
     /// Builds the account-scoped Smart Search lifecycle. MLSearchCore owns lifecycle decisions.
     private func configureSmartSearch(session: ProtonSession, client: ProtonClientFacade, feed: UIKitThumbnailFeed) {
         guard AppleSmartSearchBootstrap.featureAvailability() == .available else {
-            smartSearch = nil
+            smartSearchSession.stop()
             return
         }
-        #if DEBUG
-            let allowsDeveloperModels = true
-        #else
-            let allowsDeveloperModels = false
-        #endif
-        #if DEBUG
-            let catalogEndpoint = AppleSmartSearchCatalogEndpoint.debugEndpoint(
-                environment: ProcessInfo.processInfo.environment
-            )
-        #else
-            let catalogEndpoint = AppleSmartSearchCatalogEndpoint.production
-        #endif
-        smartSearchAssets.beginHydration()
-        let lifecycle = AppleSmartSearchBootstrap.makeLifecycle(
+        // iOS rebuilds the lifecycle on every library load; the assets universe restarts hydration first.
+        smartSearchSession.assets.beginHydration()
+        smartSearchSession.configure(
             accountDirectory: client.accountDataDirectory,
             accountUID: session.uid,
             keyPassword: session.keyPassword,
             feed: feed.feedCore,
-            assetsProvider: { [smartSearchAssets] in smartSearchAssets.snapshot() },
-            allowsDeveloperModels: allowsDeveloperModels,
-            databasePolicy: client.accountDatabasePolicy,
-            catalogEndpoint: catalogEndpoint
+            databasePolicy: client.accountDatabasePolicy
         )
-        smartSearch = MLSmartSearchController(lifecycle: lifecycle)
-        AppleSmartSearchBackgroundCoordinator.shared.configure(lifecycle: lifecycle)
-        // Under memory pressure the search stack drops cached vector blocks and unloads the
-        // CoreML model; both rebuild on demand.
-        smartSearchMemoryRegistration?.end()
-        smartSearchMemoryRegistration = MemoryPressureGovernor.shared.register { tier in
-            guard tier.requiresImmediatePurge else { return }
-            Task { await lifecycle.releaseMemory() }
-        }
     }
 
     private func configureSourceAnalysis(client: ProtonClientFacade, feed: UIKitThumbnailFeed) {
@@ -961,26 +1020,6 @@ final class MobileLibraryModel {
         )
     }
 
-    /// Stops Smart Search and returns a task that completes after all prior shutdowns and the current
-    /// lifecycle shutdown finish.
-    @discardableResult
-    private func stopSmartSearch() -> Task<Void, Never>? {
-        let lifecycle = smartSearch?.lifecycleActor
-        if let lifecycle { AppleSmartSearchBackgroundCoordinator.shared.detach(lifecycle: lifecycle) }
-        smartSearch = nil
-        smartSearchAssets.beginHydration()
-        smartSearchMemoryRegistration?.end()
-        smartSearchMemoryRegistration = nil
-        guard let lifecycle else { return smartSearchShutdownTask }
-        let previous = smartSearchShutdownTask
-        let task = Task {
-            await previous?.value
-            await lifecycle.shutdown()
-        }
-        smartSearchShutdownTask = task
-        return task
-    }
-
     @discardableResult
     private func stopSourceAnalysis() -> Task<Void, Never>? {
         smartSearchAssets.invalidateSourceSession()
@@ -1017,7 +1056,7 @@ final class MobileLibraryModel {
         let activeChangeMonitor = libraryChangeMonitor
         let activeLocationCrawl = locationCrawl
         let activeLocationCrawlStarter = locationCrawlStartTask
-        let smartSearchShutdown = stopSmartSearch()
+        let smartSearchShutdown = smartSearchSession.stop()
         let sourceAnalysisShutdown = stopSourceAnalysis()
 
         if advanceLoadToken { loadToken &+= 1 }
@@ -1030,6 +1069,8 @@ final class MobileLibraryModel {
         isThumbnailPrefetchLoading = false
         favoriteLoadTask?.cancel()
         favoriteLoadTask = nil
+        seriesDissolutionTask?.cancel()
+        seriesDissolutionTask = nil
         favoriteMutationsInFlight = []
         favoriteLoadOverrides.removeAll(keepingCapacity: false)
         favoriteLoadSettled = false
@@ -1155,7 +1196,7 @@ final class MobileLibraryModel {
         favoriteMutationsInFlight = []
         timelineRevision &+= 1
         thumbnailFeed = nil
-        let smartSearchShutdown = stopSmartSearch()
+        let smartSearchShutdown = smartSearchSession.stop()
         let sourceAnalysisShutdown = stopSourceAnalysis()
         thumbnailCache = nil
         originalsCache = nil
@@ -1293,7 +1334,7 @@ final class MobileLibraryModel {
             timelineRevision &+= 1
         }
         thumbnailFeed = nil
-        stopSmartSearch()
+        smartSearchSession.stop()
         stopSourceAnalysis()
         loadState = .preparingInventory
 
@@ -1353,7 +1394,8 @@ final class MobileLibraryModel {
                         databasePolicy: client.accountDatabasePolicy
                     ),
                     identityResolver: client.uploadIdentityResolver,
-                    uploader: client.photoUploader
+                    uploader: client.photoUploader,
+                    tagAdder: client.photoTagAdder
                 )
                 let albumSync = AlbumSyncController(
                     configuration: .init(
@@ -1382,6 +1424,12 @@ final class MobileLibraryModel {
                     return
                 }
                 self.facade = client
+                if let seriesDissolution = client.seriesDissolution {
+                    self.seriesDissolutionTask?.cancel()
+                    self.seriesDissolutionTask = Task(priority: .utility) { [weak self] in
+                        await self?.resumePendingSeriesDissolutions(seriesDissolution)
+                    }
+                }
                 self.albumActions = AlbumActionCoordinator(repository: client.albums)
                 self.photoBackup = photoBackup
                 PhotoBackupBackgroundCoordinator.shared.configure(controller: photoBackup)
@@ -1727,3 +1775,36 @@ final class MobileLibraryModel {
         (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
     }
 }
+
+#if DEBUG
+    // MARK: - Isolated fixture (hosted tests only)
+
+    extension MobileLibraryModel {
+        /// Installs a deterministic, already loaded account into this model without any network or keychain
+        /// access. The production composition above it (scene roots, tab shell, timeline screens, grids, viewer)
+        /// is untouched; only the account backend and its content are replaced by the given values.
+        ///
+        /// `configure(session:store:)` for the same session becomes a no-op because the account is already
+        /// configured, and `configure(session: nil, …)` runs the ordinary ordered teardown. Debug builds only.
+        func installIsolatedLibrary(
+            session: ProtonSession,
+            store: SessionKeychainStore,
+            backend: any PhotosBackend,
+            sections: [TimelineSection],
+            thumbnailFeed: UIKitThumbnailFeed
+        ) {
+            let projection = TimelineContentProjection(sections: sections)
+            self.store = store
+            self.session = session
+            configuredUID = session.uid
+            self.backend = backend
+            self.thumbnailFeed = thumbnailFeed
+            snapshot = projection.snapshot
+            self.sections = projection.sections
+            favoriteUIDs = []
+            favoriteFilterAvailability = .available
+            timelineRevision &+= 1
+            loadState = .contentReady(count: projection.snapshot.items.count)
+        }
+    }
+#endif

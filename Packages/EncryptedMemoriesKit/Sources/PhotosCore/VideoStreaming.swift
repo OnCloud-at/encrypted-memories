@@ -15,6 +15,20 @@ public final class StreamingVideoAsset: @unchecked Sendable {
         self.asset = asset
         self.retained = retaining
     }
+
+    /// The loader behind this asset, when it can size its read-ahead from the playback duration.
+    public var readAheadTuning: (any VideoStreamReadAheadTuning)? { retained as? any VideoStreamReadAheadTuning }
+}
+
+/// A resource loader that sizes its read-ahead from the clip's own bitrate.
+///
+/// Only the player knows the duration; only the loader knows the encrypted byte layout. Together they give
+/// the average bitrate, which decides how many bytes of read-ahead one second of playback costs. A 4K clip
+/// at about 50 Mbit/s needs several times the window of a 1080p clip for the same number of seconds.
+public protocol VideoStreamReadAheadTuning: AnyObject, Sendable {
+    /// Called once the player reports a numeric duration. Never blocks playback: the extra blocks are warmed
+    /// in the background, and AVFoundation alone decides when playback may start.
+    func useReadAhead(forPlaybackDuration seconds: Double)
 }
 
 /// Signals raised by a `VideoStreamProvider`. `.notAVideo` lets the viewer tell "this item is an

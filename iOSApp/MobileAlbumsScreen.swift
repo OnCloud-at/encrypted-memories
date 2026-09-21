@@ -67,10 +67,11 @@ struct MobileCollectionsScreen: View {
                         }
                         .disabled(model.albumActions?.canCreate != true)
                     } label: {
-                        Image(systemName: "plus")
+                        Label(L10n.string("albums.create_title"), systemImage: "plus")
                     }
                     .accessibilityLabel(L10n.string("albums.create_title"))
                 }
+                .mobileVisibilityPriority(.high)
             }
             .task(id: AlbumsReloadKey(backendReady: model.backend != nil, revision: model.albumCatalogRevision)) {
                 await loadAlbums()
@@ -172,19 +173,26 @@ struct MobileCollectionsScreen: View {
                     .foregroundStyle(ProtonColor.textWeak)
             } else {
                 ForEach(coordinator.sharedAlbums) { album in
-                    MobileSharedAlbumRow(album: album)
-                        .swipeActions {
-                            if coordinator.canLeaveSharedAlbum {
-                                Button(role: .destructive) {
-                                    pendingSharedAlbumLeave = album
-                                } label: {
-                                    Label(
-                                        L10n.string("albums.leave_shared_action"),
-                                        systemImage: "rectangle.portrait.and.arrow.right"
-                                    )
-                                }
+                    NavigationLink {
+                        MobileFilterGridScreen(
+                            title: album.title,
+                            filter: .sharedAlbum(
+                                volumeID: album.node.volumeID, nodeID: album.node.nodeID, title: album.title))
+                    } label: {
+                        MobileSharedAlbumRow(album: album, presentation: coordinator.presentation(for: album))
+                    }
+                    .swipeActions {
+                        if coordinator.canLeaveSharedAlbum {
+                            Button(role: .destructive) {
+                                pendingSharedAlbumLeave = album
+                            } label: {
+                                Label(
+                                    L10n.string("albums.leave_shared_action"),
+                                    systemImage: "rectangle.portrait.and.arrow.right"
+                                )
                             }
                         }
+                    }
                 }
             }
         }
@@ -198,9 +206,12 @@ struct MobileCollectionsScreen: View {
     }
 }
 
-private struct MobileSharedAlbumRow: View {
+/// Row cover shared by owned and shared album rows. Shows a symbol until the thumbnail feed has the
+/// cover in memory or on disk.
+private struct MobileAlbumCover: View {
     @Environment(MobileLibraryModel.self) private var model
-    let album: SharedAlbumSummary
+    let coverUID: PhotoUID?
+    let fallbackSystemImage: String
     @State private var coverImage: UIImage?
     @State private var loadedCoverUID: PhotoUID?
 
@@ -209,48 +220,21 @@ private struct MobileSharedAlbumRow: View {
         let analysisRevision: UInt64
     }
 
-    private var coverUID: PhotoUID? { album.coverPhotoUID }
-
-    private var details: String {
-        var parts: [String] = []
-        if let owner = album.owner, !owner.isEmpty {
-            parts.append(L10n.string("albums.shared_owner \(owner)"))
-        }
-        parts.append(L10n.string("albums.photo_count \(album.photoCount)"))
-        if album.isSharedByURL {
-            parts.append(L10n.string("albums.shared_via_link"))
-        }
-        return parts.joined(separator: " • ")
-    }
-
     var body: some View {
-        HStack(spacing: 12) {
-            ZStack {
-                ProtonColor.primary.opacity(0.12)
-                if let coverImage {
-                    Image(uiImage: coverImage)
-                        .resizable()
-                        .scaledToFill()
-                } else {
-                    Image(systemName: "person.2.crop.square.stack.fill")
-                        .font(.title3)
-                        .foregroundStyle(ProtonColor.primary)
-                }
+        ZStack {
+            ProtonColor.primary.opacity(0.12)
+            if let coverImage {
+                Image(uiImage: coverImage)
+                    .resizable()
+                    .scaledToFill()
+            } else {
+                Image(systemName: fallbackSystemImage)
+                    .font(.title3)
+                    .foregroundStyle(ProtonColor.primary)
             }
-            .frame(width: 44, height: 44)
-            .clipShape(RoundedRectangle(cornerRadius: 10))
-            VStack(alignment: .leading, spacing: 2) {
-                Text(album.title)
-                    .font(.body.weight(.medium))
-                    .foregroundStyle(ProtonColor.textNorm)
-                Text(details)
-                    .font(.caption)
-                    .foregroundStyle(ProtonColor.textWeak)
-                    .lineLimit(2)
-            }
-            Spacer()
         }
-        .padding(.vertical, 4)
+        .frame(width: 44, height: 44)
+        .clipShape(RoundedRectangle(cornerRadius: 10))
         .task(id: CoverLoadKey(uid: coverUID, analysisRevision: model.sourceAnalysisRevision)) {
             if loadedCoverUID != coverUID {
                 coverImage = nil
@@ -263,6 +247,37 @@ private struct MobileSharedAlbumRow: View {
                 coverImage = await feed.analysisImage(for: coverUID)
             }
         }
+    }
+}
+
+private struct MobileSharedAlbumRow: View {
+    let album: SharedAlbumSummary
+    let presentation: SharedAlbumPresentation
+
+    var body: some View {
+        HStack(spacing: 12) {
+            MobileAlbumCover(coverUID: album.coverPhotoUID, fallbackSystemImage: "person.2.crop.square.stack.fill")
+            VStack(alignment: .leading, spacing: 2) {
+                Text(album.title)
+                    .font(.body.weight(.medium))
+                    .foregroundStyle(ProtonColor.textNorm)
+                Text(presentation.detailLine)
+                    .font(.caption)
+                    .foregroundStyle(ProtonColor.textWeak)
+                    .lineLimit(1)
+                if let invitation = presentation.invitationDetail {
+                    Text(invitation)
+                        .font(.caption)
+                        .foregroundStyle(ProtonColor.textWeak)
+                        .lineLimit(1)
+                }
+            }
+            Spacer()
+        }
+        .padding(.vertical, 4)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(presentation.accessibilityLabel)
+        .accessibilityHint(presentation.accessibilityHint ?? "")
     }
 }
 
@@ -290,11 +305,7 @@ private struct MobileAlbumRow: View {
 
     var body: some View {
         HStack(spacing: 12) {
-            Image(systemName: "rectangle.stack.fill")
-                .font(.title3)
-                .foregroundStyle(ProtonColor.primary)
-                .frame(width: 44, height: 44)
-                .background(ProtonColor.primary.opacity(0.12), in: RoundedRectangle(cornerRadius: 10))
+            MobileAlbumCover(coverUID: album.coverPhotoUID, fallbackSystemImage: "rectangle.stack.fill")
             VStack(alignment: .leading, spacing: 2) {
                 Text(album.title)
                     .font(.body.weight(.medium))
@@ -371,8 +382,8 @@ private struct MobileFilterGridScreen: View {
             ProtonColor.backgroundNorm.ignoresSafeArea()
             gridContent
         }
-        .mobileNavigationTitle(title)
-        .toolbar(selection.isSelecting ? .hidden : .automatic, for: .tabBar)
+        .mobileNavigationTitle(selection.barTitle(default: title))
+        .mobileSelectionBars(isSelecting: selection.isSelecting)
         .toolbar(content: routeToolbarContent)
     }
 
@@ -389,7 +400,7 @@ private struct MobileFilterGridScreen: View {
                 Button(L10n.string("action.retry")) {
                     Task { await load() }
                 }
-                .protonProminentGlassButton()
+                .buttonStyle(.glassProminent)
             }
         case .loaded:
             if snapshot.isEmpty {
@@ -408,22 +419,27 @@ private struct MobileFilterGridScreen: View {
                     selectedUIDs: selection.selected,
                     onOpenPhoto: open,
                     onToggleSelection: toggleSelectionHandler,
+                    onSelectionChanged: filter.isReadOnly ? nil : { selection.replace(with: $0) },
                     dragOutProvider: model.backend,
                     onDragOutFailed: {
                         actionErrorTitle = L10n.string("dragout.error.title")
                         actionError = $0.localizedMessage
                     },
-                    contextMenuActions: {
-                        contextMenu.actions(
-                            for: $0, model: model,
-                            context: ViewerCollectionContext(filter: filter), albumID: albumID)
-                    },
-                    onContextMenuAction: { action, items in
-                        contextMenu.perform(
-                            action, items: items, model: model, router: viewerRouter,
-                            context: ViewerCollectionContext(filter: filter), albumID: albumID,
-                            onRemoved: removeContextItems)
-                    }
+                    contextMenuActions: filter.isReadOnly
+                        ? nil
+                        : {
+                            contextMenu.actions(
+                                for: $0, model: model,
+                                context: ViewerCollectionContext(filter: filter), albumID: albumID)
+                        },
+                    onContextMenuAction: filter.isReadOnly
+                        ? nil
+                        : { action, items in
+                            contextMenu.perform(
+                                action, items: items, model: model, router: viewerRouter,
+                                context: ViewerCollectionContext(filter: filter), albumID: albumID,
+                                onRemoved: removeContextItems)
+                        }
                 )
                 .ignoresSafeArea(edges: .bottom)
             }
@@ -431,7 +447,8 @@ private struct MobileFilterGridScreen: View {
     }
 
     private var toggleSelectionHandler: ((PhotoItem) -> Void)? {
-        return { selection.toggle($0) }
+        // Shared albums are read-only: no selection mode, so no trash, album or favorite actions.
+        filter.isReadOnly ? nil : { selection.toggle($0) }
     }
 
     private var selectionDialogContent: some View {
@@ -493,10 +510,52 @@ private struct MobileFilterGridScreen: View {
 
     @ToolbarContentBuilder private func routeToolbarContent() -> some ToolbarContent {
         ToolbarItem(placement: .topBarTrailing) { topTrailingToolbarAction }
-        ToolbarItemGroup(placement: .bottomBar) {
-            if selection.isSelecting {
-                selectionBottomBar
+            .mobileVisibilityPriority(.high)
+        if filter == .trash {
+            ToolbarItem(placement: .bottomBar) {
+                Button {
+                    restoreSelected()
+                } label: {
+                    if isRestoring {
+                        ProgressView()
+                    } else {
+                        Label(String(localized: "trash.restore_button"), systemImage: "arrow.uturn.backward")
+                    }
+                }
+                .disabled(selection.selected.isEmpty || selection.isBusy || isRestoring)
+                .accessibilityLabel(String(localized: "trash.restore_a11y"))
+                .mobileSelectionItemVisibility(selection.isSelecting)
             }
+            .sharedBackgroundVisibility(selection.isSelecting ? .automatic : .hidden)
+            .mobileVisibilityPriority(.high)
+        } else if !filter.isReadOnly {
+            MobileSelectionToolbarItems(
+                selection: selection,
+                canAddToAlbum: model.albumActions?.canAddPhotos == true,
+                isTrashBusy: isRemovingFromAlbum,
+                showAlbumPicker: $showAlbumPicker,
+                onShare: startShare,
+                onTrash: {
+                    if albumID == nil {
+                        selection.showTrashConfirm = true
+                    } else {
+                        showAlbumPhotoActions = true
+                    }
+                },
+                albumPicker: {
+                    if let coordinator = model.albumActions {
+                        AlbumDestinationPicker(
+                            coordinator: coordinator,
+                            photoUIDs: snapshot.orderedUIDs(including: selection.selected),
+                            onAlbumsChanged: { model.noteAlbumsChanged() },
+                            onCompleted: { _ in
+                                showAlbumPicker = false
+                                selection.finish()
+                            }
+                        )
+                    }
+                }
+            )
         }
     }
 
@@ -525,7 +584,7 @@ private struct MobileFilterGridScreen: View {
                 }
                 .disabled(snapshot.isEmpty || phase != .loaded || isEmptyingTrash)
             } label: {
-                Image(systemName: "ellipsis")
+                Label(L10n.string("albums.more_actions"), systemImage: "ellipsis")
             }
             .accessibilityLabel(L10n.string("albums.more_actions"))
         }
@@ -550,93 +609,9 @@ private struct MobileFilterGridScreen: View {
             }
             .disabled(isDeletingAlbum || model.facade?.albums.capabilities.canDelete != true)
         } label: {
-            Image(systemName: "ellipsis")
+            Label(L10n.string("albums.more_actions"), systemImage: "ellipsis")
         }
         .accessibilityLabel(L10n.string("albums.more_actions"))
-    }
-
-    @ViewBuilder private var selectionBottomBar: some View {
-        if filter == .trash {
-            HStack {
-                Spacer()
-                Button {
-                    restoreSelected()
-                } label: {
-                    if isRestoring {
-                        ProgressView()
-                    } else {
-                        Label(String(localized: "trash.restore_button"), systemImage: "arrow.uturn.backward")
-                    }
-                }
-                .disabled(selection.selected.isEmpty || selection.isBusy || isRestoring)
-                .accessibilityLabel(String(localized: "trash.restore_a11y"))
-                Spacer()
-            }
-        } else {
-            standardSelectionBottomBar
-        }
-    }
-
-    private var standardSelectionBottomBar: some View {
-        HStack {
-            Button {
-                startShare()
-            } label: {
-                if selection.isExporting {
-                    ProgressView()
-                } else {
-                    Image(systemName: "square.and.arrow.up")
-                }
-            }
-            .disabled(selection.selected.isEmpty || selection.isBusy)
-            .accessibilityLabel(String(localized: "selection.share_a11y"))
-
-            Spacer()
-
-            if let centerText = selectionCenterText {
-                Button {
-                    showAlbumPicker = true
-                } label: {
-                    Text(centerText)
-                        .font(.body)
-                        .monospacedDigit()
-                        .fixedSize()
-                }
-                .disabled(selection.selected.isEmpty || selection.isBusy || model.albumActions?.canAddPhotos != true)
-                .accessibilityLabel(L10n.string("albums.add_selection_title"))
-                .popover(isPresented: $showAlbumPicker, arrowEdge: .bottom) {
-                    if let coordinator = model.albumActions {
-                        AlbumDestinationPicker(
-                            coordinator: coordinator,
-                            photoUIDs: snapshot.orderedUIDs(including: selection.selected),
-                            onAlbumsChanged: { model.noteAlbumsChanged() },
-                            onCompleted: { _ in
-                                showAlbumPicker = false
-                                selection.finish()
-                            }
-                        )
-                    }
-                }
-            }
-
-            Spacer()
-
-            Button(role: .destructive) {
-                if albumID == nil {
-                    selection.showTrashConfirm = true
-                } else {
-                    showAlbumPhotoActions = true
-                }
-            } label: {
-                Image(systemName: "trash")
-            }
-            .disabled(selection.selected.isEmpty || selection.isBusy || isRemovingFromAlbum)
-            .accessibilityLabel(String(localized: "selection.trash_a11y"))
-        }
-    }
-
-    private var selectionCenterText: String? {
-        L10n.selectionCenterText(selectedCount: selection.selected.count)
     }
 
     private func load() async {

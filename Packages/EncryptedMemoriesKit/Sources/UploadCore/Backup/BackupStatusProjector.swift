@@ -127,27 +127,6 @@ public actor BackupStatusProjector {
         _ = await publishNow()
     }
 
-    /// Context transitions are sparse lifecycle events, so they bypass callback coalescing. Starting
-    /// or ending a run also clears stale in-flight fields from the previous run.
-    public func updateContext(
-        _ context: BackupStatusProjectionContext,
-        generation: UUID,
-        revision: UInt64,
-        publishImmediately: Bool = true
-    ) async {
-        guard generation == self.generation, revision >= contextRevision else { return }
-        if self.context.isRunning != context.isRunning {
-            lastRawPhase = nil
-        }
-        self.context = context
-        contextRevision = revision
-        if publishImmediately {
-            delayedPublicationTask?.cancel()
-            delayedPublicationTask = nil
-            _ = await publishNow()
-        }
-    }
-
     /// Explicit durable refresh for launch/finalization and the low-frequency one-second truth
     /// heartbeat. The queue read executes on this actor, never on `MainActor`.
     @discardableResult

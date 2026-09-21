@@ -254,10 +254,11 @@ public actor ThumbnailFeedCore {
     private nonisolated let onDecoded: @Sendable (PhotoUID, DecodedThumbnail) -> Void
     private nonisolated let decoded: DecodedThumbnailCache
     private nonisolated let diskPresence = DiskPresenceCache()
-    private nonisolated let selectedAuthorization =
-        DerivedDataResourceAuthorization<SelectedDerivedDataScopeKind>()
-    private nonisolated let analysisAuthorization =
-        DerivedDataResourceAuthorization<AnalysisDerivedDataScopeKind>()
+    /// Thumbnail reads are authorized by the thumbnail retention scope: every accessible thumbnail-capable
+    /// identity plus the burst members they own. Burst members are not library items, so the analysis scope
+    /// alone refused a series filmstrip even though its bytes are retained on disk.
+    private nonisolated let thumbnailReadAuthorization =
+        DerivedDataResourceAuthorization<ThumbnailRetentionDerivedDataScopeKind>()
     private nonisolated let configuration: ThumbnailFeedCoreConfiguration
     private nonisolated let coverageStore: (any ThumbnailCoverageCheckpointStore)?
     private nonisolated let diagnostics: PhotoDiagnostics
@@ -499,7 +500,7 @@ public actor ThumbnailFeedCore {
     }
 
     public func cachedDecoded(for uid: PhotoUID) async -> DecodedThumbnail? {
-        guard selectedAuthorization.isAllowed(uid) else { return nil }
+        guard thumbnailReadAuthorization.isAllowed(uid) else { return nil }
         guard ownerLeaseIsCurrent() else {
             decoded.removeAll()
             return nil
@@ -518,7 +519,7 @@ public actor ThumbnailFeedCore {
             return (true, ThumbnailImageDecoder.downsample(data, maxPixelSize: maxPixels))
         }
         guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(generation),
-            selectedAuthorization.isAllowed(uid)
+            thumbnailReadAuthorization.isAllowed(uid)
         else {
             decoded.removeAll()
             return nil
@@ -552,7 +553,7 @@ public actor ThumbnailFeedCore {
     /// Source-aware direct decode for an explicitly visible analysis-only surface, such as an additional
     /// collection cover. It never publishes into the main grid's decoded LRU.
     public func analysisDecoded(for uid: PhotoUID) async -> DecodedThumbnail? {
-        guard ownerLeaseIsCurrent(), analysisAuthorization.isAllowed(uid) else { return nil }
+        guard ownerLeaseIsCurrent(), thumbnailReadAuthorization.isAllowed(uid) else { return nil }
         if case .decoded(let cached) = await backgroundThumbnailDecodeResult(for: uid) {
             return cached
         }
@@ -572,7 +573,7 @@ public actor ThumbnailFeedCore {
             }
         }
         guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(generation),
-            analysisAuthorization.isAllowed(uid)
+            thumbnailReadAuthorization.isAllowed(uid)
         else { return nil }
         guard let data = buffer.value else {
             if result.itemErrors[uid] != nil { unfetchable.insert(uid) }
@@ -584,7 +585,7 @@ public actor ThumbnailFeedCore {
             return ThumbnailImageDecoder.downsample(data, maxPixelSize: maxPixels)
         }
         guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(generation),
-            analysisAuthorization.isAllowed(uid)
+            thumbnailReadAuthorization.isAllowed(uid)
         else { return nil }
         return decoded
     }
@@ -595,7 +596,7 @@ public actor ThumbnailFeedCore {
         let generation = cache.captureWriterGeneration()
         let isCurrent: @Sendable () -> Bool = { [self] in
             ownerLeaseIsCurrent() && cache.isCurrentWriterGeneration(generation)
-                && analysisAuthorization.isAllowed(uid)
+                && thumbnailReadAuthorization.isAllowed(uid)
         }
         return isCurrent() ? isCurrent : nil
     }
@@ -604,18 +605,18 @@ public actor ThumbnailFeedCore {
     /// that may still arrive from bytes that are present but cannot be decoded.
     public nonisolated func backgroundThumbnailDecodeResult(for uid: PhotoUID) async -> BackgroundThumbnailDecodeResult
     {
-        guard analysisAuthorization.isAllowed(uid) else { return .missing }
+        guard thumbnailReadAuthorization.isAllowed(uid) else { return .missing }
         let cache = self.cache
         let generation = cache.captureWriterGeneration()
         guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(generation),
-            analysisAuthorization.isAllowed(uid)
+            thumbnailReadAuthorization.isAllowed(uid)
         else {
             decoded.removeAll()
             return .missing
         }
         if let image = decoded.image(for: uid) {
             guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(generation),
-                analysisAuthorization.isAllowed(uid)
+                thumbnailReadAuthorization.isAllowed(uid)
             else {
                 decoded.removeAll()
                 return .missing
@@ -629,21 +630,21 @@ public actor ThumbnailFeedCore {
             return (true, ThumbnailImageDecoder.downsample(data, maxPixelSize: maxPixels))
         }.value
         guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(generation),
-            analysisAuthorization.isAllowed(uid)
+            thumbnailReadAuthorization.isAllowed(uid)
         else {
             decoded.removeAll()
             return .missing
         }
         guard result.dataPresent else {
             guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(generation),
-                analysisAuthorization.isAllowed(uid)
+                thumbnailReadAuthorization.isAllowed(uid)
             else {
                 decoded.removeAll()
                 return .missing
             }
             diskPresence.set(uid, present: false)
             guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(generation),
-                analysisAuthorization.isAllowed(uid)
+                thumbnailReadAuthorization.isAllowed(uid)
             else {
                 decoded.removeAll()
                 return .missing
@@ -651,21 +652,21 @@ public actor ThumbnailFeedCore {
             return .missing
         }
         guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(generation),
-            analysisAuthorization.isAllowed(uid)
+            thumbnailReadAuthorization.isAllowed(uid)
         else {
             decoded.removeAll()
             return .missing
         }
         diskPresence.set(uid, present: true)
         guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(generation),
-            analysisAuthorization.isAllowed(uid)
+            thumbnailReadAuthorization.isAllowed(uid)
         else {
             decoded.removeAll()
             return .missing
         }
         guard let image = result.image else {
             guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(generation),
-                analysisAuthorization.isAllowed(uid)
+                thumbnailReadAuthorization.isAllowed(uid)
             else {
                 decoded.removeAll()
                 return .missing
@@ -673,7 +674,7 @@ public actor ThumbnailFeedCore {
             return .undecodable
         }
         guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(generation),
-            analysisAuthorization.isAllowed(uid)
+            thumbnailReadAuthorization.isAllowed(uid)
         else {
             decoded.removeAll()
             return .missing
@@ -682,7 +683,7 @@ public actor ThumbnailFeedCore {
     }
 
     public nonisolated func memoryDecoded(for uid: PhotoUID) -> DecodedThumbnail? {
-        guard ownerLeaseIsCurrent(), selectedAuthorization.isAllowed(uid) else {
+        guard ownerLeaseIsCurrent(), thumbnailReadAuthorization.isAllowed(uid) else {
             decoded.removeAll()
             return nil
         }
@@ -694,7 +695,7 @@ public actor ThumbnailFeedCore {
     /// ordinary missing-tile path) or already adequate, so a settled render loop that keys retry work on
     /// this can never spin on a source-limited image.
     public nonisolated func decodedNeedsSharperSource(_ uid: PhotoUID, forPixels pixels: Int) -> Bool {
-        guard ownerLeaseIsCurrent(), selectedAuthorization.isAllowed(uid) else { return false }
+        guard ownerLeaseIsCurrent(), thumbnailReadAuthorization.isAllowed(uid) else { return false }
         return decoded.needsSharperDecode(for: uid, requestedPixels: pixels)
     }
 
@@ -710,13 +711,13 @@ public actor ThumbnailFeedCore {
     }
 
     public nonisolated func isKnownUnfetchable(_ uid: PhotoUID) -> Bool {
-        analysisAuthorization.isAllowed(uid) && unfetchable.contains(uid)
+        thumbnailReadAuthorization.isAllowed(uid) && unfetchable.contains(uid)
     }
 
     public func cacheState(
         for request: ThumbnailRequest, gpuTextureResident: Bool = false
     ) async -> ThumbnailCacheTierState {
-        guard ownerLeaseIsCurrent(), selectedAuthorization.isAllowed(request.uid) else {
+        guard ownerLeaseIsCurrent(), thumbnailReadAuthorization.isAllowed(request.uid) else {
             return ThumbnailCacheTierState(
                 knownInTimeline: true,
                 diskThumbnail: false,
@@ -751,7 +752,7 @@ public actor ThumbnailFeedCore {
     /// because a first-time cache validation performs a real file read and AES-GCM open.
     @discardableResult
     public func requestPriority(_ uid: PhotoUID, priority requestedPriority: ThumbnailPriority = .visibleNow) -> Bool {
-        guard selectedAuthorization.isAllowed(uid) else { return false }
+        guard thumbnailReadAuthorization.isAllowed(uid) else { return false }
         if requestedPriority != .idleLibraryCrawl { lastDemand.set(clock()) }
         if let index = priorityReservations.firstIndex(where: { $0.uid == uid }) {
             if requestedPriority < priorityReservations[index].priority {
@@ -884,7 +885,7 @@ public actor ThumbnailFeedCore {
         guard !sourceReconciliationInFlight, ownerLeaseIsCurrent() else { return }
         var seen = Set<PhotoUID>()
         let jobs = requests.compactMap { request -> LatestVisibleDecodeDemand.Job? in
-            guard selectedAuthorization.isAllowed(request.uid) else { return nil }
+            guard thumbnailReadAuthorization.isAllowed(request.uid) else { return nil }
             guard seen.insert(request.uid).inserted else { return nil }
             let pixels = visibleDecodePixels(for: request)
             guard !decoded.hasAdequateEntry(for: request.uid, requestedPixels: Int(pixels)) else { return nil }
@@ -951,7 +952,7 @@ public actor ThumbnailFeedCore {
                 visibleDiskDemand.complete(job)
                 continue
             }
-            guard selectedAuthorization.isAllowed(job.uid) else {
+            guard thumbnailReadAuthorization.isAllowed(job.uid) else {
                 decoded.remove(job.uid)
                 visibleDiskDemand.complete(job)
                 continue
@@ -972,7 +973,7 @@ public actor ThumbnailFeedCore {
             decoded.removeAll()
             return
         }
-        guard selectedAuthorization.isAllowed(tile.uid) else {
+        guard thumbnailReadAuthorization.isAllowed(tile.uid) else {
             decoded.remove(tile.uid)
             return
         }
@@ -1010,7 +1011,7 @@ public actor ThumbnailFeedCore {
     ) async -> WarmDecodedResult {
         let targets = Array(
             requests.lazy
-                .filter { self.selectedAuthorization.isAllowed($0.uid) }
+                .filter { self.thumbnailReadAuthorization.isAllowed($0.uid) }
                 .prefix(max(0, limit))
         )
         lastDemand.set(clock())
@@ -1088,7 +1089,7 @@ public actor ThumbnailFeedCore {
                     }
                     if let tile {
                         guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(decodeGeneration),
-                            selectedAuthorization.isAllowed(tile.uid)
+                            thumbnailReadAuthorization.isAllowed(tile.uid)
                         else {
                             group.cancelAll()
                             continue
@@ -1157,7 +1158,7 @@ public actor ThumbnailFeedCore {
     }
 
     public func decoded(for uid: PhotoUID) async -> DecodedThumbnail? {
-        guard ownerLeaseIsCurrent(), selectedAuthorization.isAllowed(uid) else {
+        guard ownerLeaseIsCurrent(), thumbnailReadAuthorization.isAllowed(uid) else {
             decoded.removeAll()
             return nil
         }
@@ -1187,7 +1188,7 @@ public actor ThumbnailFeedCore {
     }
 
     private func loadDirectDecoded(for uid: PhotoUID) async -> DecodedThumbnail? {
-        guard selectedAuthorization.isAllowed(uid) else { return nil }
+        guard thumbnailReadAuthorization.isAllowed(uid) else { return nil }
         let box = ByteBox()
         let cache = self.cache
         let writerGeneration = cache.captureWriterGeneration()
@@ -1204,7 +1205,7 @@ public actor ThumbnailFeedCore {
             }
         }
         guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(writerGeneration),
-            selectedAuthorization.isAllowed(uid)
+            thumbnailReadAuthorization.isAllowed(uid)
         else {
             decoded.removeAll()
             return nil
@@ -1224,7 +1225,7 @@ public actor ThumbnailFeedCore {
             return ThumbnailImageDecoder.downsample(data, maxPixelSize: maxPixels)
         }
         guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(writerGeneration),
-            selectedAuthorization.isAllowed(uid)
+            thumbnailReadAuthorization.isAllowed(uid)
         else {
             decoded.removeAll()
             return nil
@@ -1240,18 +1241,33 @@ public actor ThumbnailFeedCore {
     }
 
     public func startPrefetch(_ uids: [PhotoUID]) async {
-        if let lastSelectedScope, let lastAnalysisScope {
-            var orderedUIDs = lastSelectedScope.orderedUIDs
-            var seen = Set(orderedUIDs)
-            orderedUIDs.append(contentsOf: lastAnalysisScope.orderedUIDs.filter { seen.insert($0).inserted })
+        if let lastSelectedScope, let lastAnalysisScope, let lastRetentionScope {
             await startPrefetch(
-                orderedUIDs,
+                Self.crawlOrder(
+                    selected: lastSelectedScope,
+                    analysis: lastAnalysisScope,
+                    retention: lastRetentionScope
+                ),
                 reporting: lastSelectedScope.uids,
                 requiringSourceRevision: lastAnalysisScope.revision
             )
         } else {
             await startPrefetch(uids, reporting: Set(uids), requiringSourceRevision: nil)
         }
+    }
+
+    /// Background crawl order: the main library grid first, then thumbnails of additional sources, and last the
+    /// burst members, which only a series filmstrip shows. Visible demand still preempts the whole crawl.
+    private static func crawlOrder(
+        selected: SelectedDerivedDataScope,
+        analysis: AnalysisDerivedDataScope,
+        retention: ThumbnailRetentionDerivedDataScope
+    ) -> [PhotoUID] {
+        var orderedUIDs = selected.orderedUIDs
+        var seen = Set(orderedUIDs)
+        orderedUIDs.append(contentsOf: analysis.orderedUIDs.filter { seen.insert($0).inserted })
+        orderedUIDs.append(contentsOf: retention.orderedUIDs.filter { seen.insert($0).inserted })
+        return orderedUIDs
     }
 
     private func startPrefetch(
@@ -1263,7 +1279,7 @@ public actor ThumbnailFeedCore {
         if let requiredSourceRevision {
             guard lastAnalysisScope?.revision == requiredSourceRevision else { return }
         }
-        let uids = uids.filter { analysisAuthorization.isAllowed($0) }
+        let uids = uids.filter { thumbnailReadAuthorization.isAllowed($0) }
         prefetchReportingUIDs = reportingUIDs
         flushCheckpointUpdates()
         restorePriorityReservationsForRestart()
@@ -1419,8 +1435,7 @@ public actor ThumbnailFeedCore {
     public func bindDerivedDataEpoch(_ epoch: LibrarySourceEpoch) -> Bool {
         guard sourceEpoch == nil || sourceEpoch == epoch else { return false }
         guard cache.bindDerivedDataEpoch(epoch, sessionLease: ownerSessionLease) else { return false }
-        selectedAuthorization.requireScope()
-        analysisAuthorization.requireScope()
+        thumbnailReadAuthorization.requireScope()
         if sourceEpoch == nil { highestSourceReconciliationRevision = nil }
         sourceEpoch = epoch
         return true
@@ -1428,8 +1443,9 @@ public actor ThumbnailFeedCore {
 
     /// Replaces every source-aware feed projection from one atomic graph change.
     ///
-    /// The retention scope controls encrypted disk bytes. The selected scope controls visible work and decoded
-    /// grid plaintext. The analysis scope extends only the low-priority crawl and cache-only background decode.
+    /// The retention scope controls encrypted disk bytes and authorizes thumbnail reads, including explicit demand
+    /// from shared album grids and burst filmstrips. The selected scope controls main-library coverage.
+    /// Background crawling does not decode into the grid LRU; only a foreground request does that.
     /// All scopes must come from the same graph revision.
     @discardableResult
     public func reconcile(
@@ -1461,8 +1477,7 @@ public actor ThumbnailFeedCore {
         // Authorization changes immediately even when another reconciliation owns the slow worker/cache
         // boundary. That owner consumes only the newest queued revision, so an older continuation can never
         // overwrite a newer feed state after one of the awaits below.
-        selectedAuthorization.apply(selectedScope)
-        analysisAuthorization.apply(analysisScope)
+        thumbnailReadAuthorization.apply(retentionScope)
         let incomingRequest = SourceReconciliationRequest(
             selectedScope: selectedScope,
             analysisScope: analysisScope,
@@ -1544,9 +1559,9 @@ public actor ThumbnailFeedCore {
             lastAnalysisScope = request.analysisScope
             lastRetentionScope = request.retentionScope
 
-            // Join first, then remove only plaintext which left the visible projection. The source and cache
+            // Join first, then remove only plaintext which lost thumbnail access. The source and cache
             // fences already reject a cancellation-ignoring loader, so retained tiles stay immediately usable.
-            decoded.retainOnly(request.selectedScope.uids)
+            decoded.retainOnly(request.retentionScope.uids)
             checkpointPresent.removeAll(keepingCapacity: true)
             checkpointHints.removeAll(keepingCapacity: true)
             pendingCheckpointUpdates.removeAll(keepingCapacity: true)
@@ -1571,15 +1586,13 @@ public actor ThumbnailFeedCore {
             }
 
             if prefetchEnabled, !request.analysisScope.orderedUIDs.isEmpty {
-                let selectedUIDs = request.selectedScope.uids
-                var orderedUIDs = request.selectedScope.orderedUIDs
-                var seen = Set(orderedUIDs)
-                orderedUIDs.append(
-                    contentsOf: request.analysisScope.orderedUIDs.filter { seen.insert($0).inserted }
-                )
                 await startPrefetch(
-                    orderedUIDs,
-                    reporting: selectedUIDs,
+                    Self.crawlOrder(
+                        selected: request.selectedScope,
+                        analysis: request.analysisScope,
+                        retention: request.retentionScope
+                    ),
+                    reporting: request.selectedScope.uids,
                     requiringSourceRevision: request.analysisScope.revision
                 )
             }
@@ -1654,15 +1667,23 @@ public actor ThumbnailFeedCore {
         startWorkers()
     }
 
-    public nonisolated func setUserInteractionActive(_ active: Bool) {
-        interactionState.set(active)
+    /// One platform grid host reports only its own gesture state. Several windows can drive the same shared
+    /// feed at once; the feed stays interacting while any owner is active, and a host that stops, switches
+    /// feeds, or goes away removes only its own contribution.
+    public nonisolated func setUserInteractionActive(_ active: Bool, owner: ThumbnailInteractionOwner) {
+        interactionState.set(active, owner: owner)
     }
 
-    /// True only while a platform host reports an active gesture or scroll deceleration. A visible
+    /// True only while at least one platform host reports an active gesture or scroll deceleration. A visible
     /// grid and queued/missing thumbnails do not count: those may remain pending indefinitely and
     /// must not starve background indexing after the user becomes idle.
     public nonisolated func hasActiveUserInteraction() -> Bool {
-        interactionState.get()
+        interactionState.hasActiveOwners()
+    }
+
+    /// Number of hosts currently reporting an active gesture (diagnostics and tests).
+    public nonisolated func activeUserInteractionOwnerCount() -> Int {
+        interactionState.activeOwnerCount()
     }
 
     public struct PrefetchStatus: Sendable, Equatable {
@@ -2626,13 +2647,13 @@ public actor ThumbnailFeedCore {
         for uid: PhotoUID,
         decodePixelCap: Int
     ) -> DecodedThumbnail? {
-        guard ownerLeaseIsCurrent(), selectedAuthorization.isAllowed(uid) else { return nil }
+        guard ownerLeaseIsCurrent(), thumbnailReadAuthorization.isAllowed(uid) else { return nil }
         let becameCurrent = decoded.set(image, for: uid, decodePixelCap: decodePixelCap)
         guard ownerLeaseIsCurrent() else {
             decoded.removeAll()
             return nil
         }
-        guard selectedAuthorization.isAllowed(uid) else {
+        guard thumbnailReadAuthorization.isAllowed(uid) else {
             decoded.remove(uid)
             return nil
         }
@@ -3124,18 +3145,39 @@ private final class LastDemandBox: @unchecked Sendable {
     }
 }
 
+/// Identity of one platform grid host that reports its own gesture state to a shared thumbnail feed.
+///
+/// A host creates one owner for its lifetime and passes it with every interaction report. Owners are only
+/// compared for identity; the feed never keeps a reference to the host itself.
+public struct ThumbnailInteractionOwner: Hashable, Sendable {
+    private let id = UUID()
+
+    public init() {}
+}
+
 /// Lock-guarded gesture state shared with synchronous background-work governors. Platform hosts
 /// update it only at interaction boundaries, so an idle viewport never generates polling or writes.
+/// Contributions are keyed by owner so one grid stopping cannot clear another grid's live gesture.
 private final class InteractionStateBox: @unchecked Sendable {
     private let lock = NSLock()
-    private var active = false
+    private var activeOwners: Set<ThumbnailInteractionOwner> = []
 
-    func set(_ value: Bool) {
-        lock.withLock { active = value }
+    func set(_ active: Bool, owner: ThumbnailInteractionOwner) {
+        lock.withLock {
+            if active {
+                activeOwners.insert(owner)
+            } else {
+                activeOwners.remove(owner)
+            }
+        }
     }
 
-    func get() -> Bool {
-        lock.withLock { active }
+    func hasActiveOwners() -> Bool {
+        lock.withLock { !activeOwners.isEmpty }
+    }
+
+    func activeOwnerCount() -> Int {
+        lock.withLock { activeOwners.count }
     }
 }
 

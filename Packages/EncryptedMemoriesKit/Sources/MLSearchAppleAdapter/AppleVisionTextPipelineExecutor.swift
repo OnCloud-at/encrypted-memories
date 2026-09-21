@@ -140,7 +140,8 @@ public final class AppleVisionPipelineExecutor: MLDerivedPipelineExecutor, Senda
         guard #available(macOS 15.0, iOS 18.0, *) else {
             return Dictionary(uniqueKeysWithValues: contexts.keys.map { ($0, .unsupported) })
         }
-        var results = await analyzeRoutingRequests(source: source, contexts: contexts)
+        let handler = ImageRequestHandler(source.cgImage, orientation: source.orientation)
+        var results = await analyzeRoutingRequests(handler: handler, contexts: contexts)
         let textKinds: Set<MLNativeAnalysisKind> = [
             .textRecognition, .documentRecognition, .barcodeDetection,
         ]
@@ -148,7 +149,7 @@ public final class AppleVisionPipelineExecutor: MLDerivedPipelineExecutor, Senda
         if !textContexts.isEmpty {
             results.merge(
                 await analyzeTextRequests(
-                    source: source,
+                    handler: handler,
                     contexts: textContexts,
                     routingResults: results
                 ),
@@ -162,7 +163,7 @@ public final class AppleVisionPipelineExecutor: MLDerivedPipelineExecutor, Senda
             !textKinds.contains($0.key) && !routedKinds.contains($0.key)
         }
         results.merge(
-            await analyzeAdditionalRequests(source: source, contexts: otherContexts),
+            await analyzeAdditionalRequests(handler: handler, contexts: otherContexts),
             uniquingKeysWith: { _, newer in newer }
         )
         return results
@@ -170,11 +171,10 @@ public final class AppleVisionPipelineExecutor: MLDerivedPipelineExecutor, Senda
 
     @available(macOS 15.0, iOS 18.0, *)
     private static func analyzeTextRequests(
-        source: CoreMLSourceImage,
+        handler: ImageRequestHandler,
         contexts: [MLNativeAnalysisKind: MLNativeResultContext],
         routingResults: [MLNativeAnalysisKind: ArtifactAnalysisResult]
     ) async -> [MLNativeAnalysisKind: ArtifactAnalysisResult] {
-        let handler = ImageRequestHandler(source.cgImage, orientation: source.orientation)
         var results: [MLNativeAnalysisKind: ArtifactAnalysisResult] = [:]
         let barcodeDetectionRevision =
             await AppleVisionRuntimeSupport
@@ -632,14 +632,13 @@ private extension AppleVisionPipelineExecutor {
     }
 
     static func analyzeRoutingRequests(
-        source: CoreMLSourceImage,
+        handler: ImageRequestHandler,
         contexts: [MLNativeAnalysisKind: MLNativeResultContext]
     ) async -> [MLNativeAnalysisKind: ArtifactAnalysisResult] {
         let routingKinds: [MLNativeAnalysisKind] = [
             .documentSegmentation,
             .textRectangles,
         ]
-        let handler = ImageRequestHandler(source.cgImage, orientation: source.orientation)
         var results: [MLNativeAnalysisKind: ArtifactAnalysisResult] = [:]
         for kind in routingKinds {
             guard !Task.isCancelled else { return results }
@@ -650,11 +649,10 @@ private extension AppleVisionPipelineExecutor {
     }
 
     static func analyzeAdditionalRequests(
-        source: CoreMLSourceImage,
+        handler: ImageRequestHandler,
         contexts: [MLNativeAnalysisKind: MLNativeResultContext]
     ) async -> [MLNativeAnalysisKind: ArtifactAnalysisResult] {
         guard !contexts.isEmpty else { return [:] }
-        let handler = ImageRequestHandler(source.cgImage, orientation: source.orientation)
         var results: [MLNativeAnalysisKind: ArtifactAnalysisResult] = [:]
         let faceKinds: Set<MLNativeAnalysisKind> = [
             .faceDetection, .faceLandmarks, .faceCaptureQuality,

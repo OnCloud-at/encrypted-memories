@@ -43,7 +43,6 @@ public struct MLIndexCoverage: Sendable, Equatable {
     }
 
     public var pending: Int { max(0, total - indexed - permanentlyUnindexable) }
-    public var searchableFraction: Double { total > 0 ? Double(indexed) / Double(total) : 0 }
     public var accountedFraction: Double {
         total > 0 ? Double(indexed + permanentlyUnindexable) / Double(total) : 0
     }

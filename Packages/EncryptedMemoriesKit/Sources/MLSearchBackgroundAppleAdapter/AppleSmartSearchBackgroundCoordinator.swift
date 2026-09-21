@@ -224,6 +224,8 @@ public final class AppleSmartSearchBackgroundCoordinator {
     #endif
 }
 
+extension AppleSmartSearchBackgroundCoordinator: MLSmartSearchBackgroundHost {}
+
 #if os(iOS)
     @MainActor
     private final class IndexingDrainGrace {

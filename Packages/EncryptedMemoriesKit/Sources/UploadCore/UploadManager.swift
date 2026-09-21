@@ -1375,13 +1375,6 @@ public actor UploadManager: UploadManaging {
         pump()
     }
 
-    /// Global gate - stop dispatching new uploads (in-flight items finish).
-    public func pauseAll() {
-        guard !isShuttingDown else { return }
-        globalPaused = true
-        notify()
-    }
-
     public func resumeAll() {
         guard !isShuttingDown else { return }
         globalPaused = false

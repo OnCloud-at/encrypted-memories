@@ -73,9 +73,6 @@ public struct CoreMLDualEncoderSchema: Sendable, Equatable {
 
 public enum CoreMLDualEncoderError: Error, Equatable {
     case descriptorMismatch
-    /// Kept for source compatibility with older adapter callers. New validation paths use the
-    /// input/output-specific cases below so Core can choose the correct retry disposition.
-    case invalidModelSchema(String)
     case invalidStaticInputContract(String)
     case invalidOutputSchema(String)
     case invalidEmbedding

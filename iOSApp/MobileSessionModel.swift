@@ -24,7 +24,14 @@ final class MobileSessionModel: ObservableObject {
     private var startupCleanupTask: Task<Void, Never>?
     private var protectedDataObserver: NSObjectProtocol?
     private let webAuthenticationSession = ManagedWebAuthenticationSession()
-    private let webAuthenticationPresentationContext = ManagedWebAuthenticationPresentationContext {
+    /// The window of the scene that started sign-in. The managed browser must appear in that window, not in
+    /// whichever window happens to be key when Proton returns the authentication URL.
+    private var presentationAnchorProvider: (@MainActor () -> UIWindow?)?
+    private lazy var webAuthenticationPresentationContext = ManagedWebAuthenticationPresentationContext {
+        [weak self] in
+        if let window = self?.presentationAnchorProvider?() {
+            return window
+        }
         let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
         let windows = scenes.flatMap(\.windows)
         guard
@@ -91,8 +98,13 @@ final class MobileSessionModel: ObservableObject {
         }
     }
 
-    func signIn() {
+    /// Starts sign-in from the scene that owns `presentationAnchor`. The anchor is kept for the deferred
+    /// startup-cleanup retry so the browser still opens in the initiating window.
+    func signIn(presentationAnchor: (@MainActor () -> UIWindow?)? = nil) {
         guard !isSigningOut else { return }
+        if let presentationAnchor {
+            presentationAnchorProvider = presentationAnchor
+        }
         guard startupCleanupTask == nil else { return }
         guard startupPurgeSucceeded, !BackupLocalDataPurge.isPurgePending() else {
             beginStartupCleanup(signInAfterCleanup: true)
@@ -190,3 +202,19 @@ final class MobileSessionModel: ObservableObject {
         apply(authController.bootstrap())
     }
 }
+
+#if DEBUG
+    // MARK: - Isolated fixture (hosted tests only)
+
+    extension MobileSessionModel {
+        /// Publishes a session without keychain or network access. `nil` behaves like a completed sign-out:
+        /// the shared account runtime observes the change and runs the ordinary library teardown. Debug builds only.
+        func installIsolatedSession(_ session: ProtonSession?) {
+            isCheckingSession = false
+            isSigningIn = false
+            errorText = nil
+            self.session = session
+            statusText = session == nil ? Self.signInPrompt : ""
+        }
+    }
+#endif

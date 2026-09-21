@@ -87,8 +87,8 @@ import Testing
             for descriptor: MLModelDescriptor,
             maximumRows: Int,
             _ body: (MLVectorBlock) -> Void
-        ) {
-            backing.forEachVectorBlock(for: descriptor, maximumRows: maximumRows) { block in
+        ) throws {
+            try backing.forEachVectorBlock(for: descriptor, maximumRows: maximumRows) { block in
                 lock.withLock { blockLoads += 1 }
                 body(block)
             }

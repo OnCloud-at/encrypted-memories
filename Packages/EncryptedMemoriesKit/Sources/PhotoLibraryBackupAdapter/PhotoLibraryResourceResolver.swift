@@ -116,9 +116,30 @@ public struct PhotoLibraryResourceResolver: BackupResourceResolving {
                 )
             }
 
+        // A series main photo carries its members as secondaries. Each member's bytes and capture date come
+        // from the member's own asset, not from the main photo.
+        let burstMembers = PhotoKitAssetMapper.burstPlan(for: asset)?.members ?? []
         var secondaries: [BackupSecondaryResource] = []
         for (secondaryIndex, item) in plan.secondaries.enumerated() {
-            guard let resource = PhotoKitAssetMapper.resource(for: item.role, ordinal: item.ordinal, of: asset) else {
+            let owner: PHAsset
+            let role: PhotoBackupAssetInfo.Resource.Role
+            let ordinal: Int
+            if item.role == .burstMember {
+                guard burstMembers.indices.contains(item.ordinal),
+                    let member = PhotoKitAssetMapper.asset(
+                        withLocalIdentifier: burstMembers[item.ordinal].localIdentifier)
+                else {
+                    throw UploadError.fileMissing(item.uploadFilename)
+                }
+                owner = member
+                role = burstMembers[item.ordinal].exportedRole
+                ordinal = 0
+            } else {
+                owner = asset
+                role = item.role
+                ordinal = item.ordinal
+            }
+            guard let resource = PhotoKitAssetMapper.resource(for: role, ordinal: ordinal, of: owner) else {
                 throw UploadError.fileMissing(item.uploadFilename)
             }
             let identity = try await readIdentity(resource, filename: item.uploadFilename) { fraction in
@@ -129,16 +150,15 @@ public struct PhotoLibraryResourceResolver: BackupResourceResolving {
                 identifier: entry.source.identifier,
                 resource: item.sourceResource
             )
-            let role = item.role
-            let ordinal = item.ordinal
+            let isBurstMember = item.role == .burstMember
+            let ownerIdentifier = owner.localIdentifier
+            let stableDate = isBurstMember ? owner.creationDate ?? captureDate : captureDate
             let filename = item.uploadFilename
             let expectedByteCount = identity.byteCount
             let materializer: @Sendable (BackupResourcePreparationReporter) async throws -> UploadResourceDescriptor = {
                 progress in
                 guard
-                    let currentAsset = PHAsset.fetchAssets(
-                        withLocalIdentifiers: [localIdentifier], options: nil
-                    ).firstObject,
+                    let currentAsset = PhotoKitAssetMapper.asset(withLocalIdentifier: ownerIdentifier),
                     let currentResource = PhotoKitAssetMapper.resource(
                         for: role, ordinal: ordinal, of: currentAsset
                     )
@@ -165,7 +185,7 @@ public struct PhotoLibraryResourceResolver: BackupResourceResolving {
                     source: source,
                     export: export,
                     filename: filename,
-                    stableDate: captureDate
+                    stableDate: stableDate
                 )
             }
             secondaries.append(
@@ -174,13 +194,19 @@ public struct PhotoLibraryResourceResolver: BackupResourceResolving {
                         source: source,
                         identity: identity,
                         filename: item.uploadFilename,
-                        stableDate: captureDate,
+                        stableDate: stableDate,
                         tempStore: tempStore
                     ),
                     mediaType: item.mimeType
                         ?? SupportedMedia.mimeType(for: URL(fileURLWithPath: item.uploadFilename))
                         ?? "application/octet-stream",
-                    additionalMetadata: additionalMetadata,
+                    additionalMetadata: isBurstMember
+                        ? try PhotoLibraryUploadMetadataBuilder.metadata(
+                            for: asset,
+                            cloudIdentifier: cloudIdentifierProvider(entry.source.identifier),
+                            memberCaptureDate: stableDate
+                        )
+                        : additionalMetadata,
                     materializeWithProgress: materializer
                 ))
         }

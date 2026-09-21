@@ -1,12 +1,25 @@
 import Foundation
 import MediaByteCache
 import MediaCache
+import PhotoViewerCore
 import PhotosCore
 import XCTest
 
 @testable import PhotoViewerFeature
 
 final class BurstFilmstripArchitectureTests: XCTestCase {
+    func testShortCallFormReloadsOnlyOnIdentityChangeNotSelection() {
+        let uids = [PhotoUID(volumeID: "v", nodeID: "a"), PhotoUID(volumeID: "v", nodeID: "b")]
+        let update = BurstFilmstripUpdatePolicy.resolve(
+            previousItems: uids,
+            currentItems: uids,
+            previousSelectedUID: uids[0],
+            currentSelectedUID: uids[1]
+        )
+        XCTAssertFalse(update.reloadData, "same UIDs must not trigger a full reload")
+        XCTAssertTrue(update.selectCurrent, "a selection change must still move the native selection")
+    }
+
     func testViewerFullImageCacheIsCostBounded() throws {
         let repo = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()  // PhotoViewerFeatureTests
@@ -122,7 +135,7 @@ final class BurstFilmstripArchitectureTests: XCTestCase {
         XCTAssertTrue(mainView.contains("downloadViewerSelection(viewerModel)"))
     }
 
-    func testMobileViewerUsesSharedBurstStateAndOverlayFilmstrip() throws {
+    func testMobileViewerUsesSharedBurstStateAndOpensTheSeriesInSelectFavorites() throws {
         let repo = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
@@ -141,15 +154,31 @@ final class BurstFilmstripArchitectureTests: XCTestCase {
         XCTAssertTrue(mobile.contains("@State private var burstSelection = BurstSelectionModel()"))
         XCTAssertTrue(mobile.contains("burstSelection.seedKnownGroup"))
         XCTAssertTrue(mobile.contains("provider.burstGroup(containing: item.uid)"))
-        XCTAssertTrue(mobile.contains("MobileBurstFilmstrip("))
-        XCTAssertTrue(viewerSupport.contains(".opacity(showsChrome ? 1 : 0)"))
-        XCTAssertTrue(viewerSupport.contains(".allowsHitTesting(showsChrome)"))
+        // The viewer shows the series' main photo and a count button, as the Photos app does. The other photos
+        // open in the "Select Favorites" mode; the former always-visible burst strip must not return beside it.
+        XCTAssertTrue(mobile.contains("viewerSeriesButton(count: seriesItems.count)"))
+        XCTAssertTrue(mobile.contains(".fullScreenCover(item: $seriesModel)"))
+        XCTAssertFalse(mobile.contains("MobileBurstFilmstrip") || mobile.contains("MobileBurstThumbnail"))
+        let seriesScreen = try String(
+            contentsOf: repo.appendingPathComponent("iOSApp/MobileSeriesFavoritesScreen.swift"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(seriesScreen.contains("private(set) var selection: SeriesFavoritesSelection"))
+        XCTAssertFalse(
+            seriesScreen.contains("seriesDissolution") || seriesScreen.contains("burstGroup(containing:"),
+            "the mode receives its backend operation as a closure and never reaches the transport")
+        // The route filmstrip is bottom safe-area content below the media, as in the Photos app: the native
+        // bars stack below it and the media refits when a tap hides the chrome.
+        XCTAssertTrue(mobile.contains(".safeAreaInset(edge: .bottom, spacing: 0) { viewerBottomAccessory }"))
+        XCTAssertTrue(
+            mobile.contains("@ViewBuilder private var viewerBottomAccessory: some View {\n        if chromeVisible {"),
+            "the strips leave the safe area together with the bars")
         XCTAssertFalse(
             mobile.contains(".transition(.move(edge: .bottom).combined(with: .opacity))"),
-            "the mounted chrome must animate without replacing its overlay tree")
+            "the strips fade; the safe-area change animates the media refit")
         XCTAssertFalse(
-            mobile.contains("safeAreaInset"),
-            "the mobile filmstrip must overlay media instead of shifting fitted viewer geometry")
+            viewerSupport.contains("MobileViewerChromeOverlay") || mobile.contains("MobileViewerChromeOverlay"),
+            "the retired app-owned chrome overlay must not remain beside the native bars")
     }
 
     @MainActor

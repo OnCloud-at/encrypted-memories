@@ -179,4 +179,27 @@ final class MemoryPressureGovernorTests: XCTestCase {
         governor.update(MemoryConditions(pressure: .critical))
         XCTAssertEqual(runtimeState.snapshot().memoryHeadroom, .critical)
     }
+
+    func testBackgroundCacheTierDoesNotMaskRealPressureTransitions() {
+        let state = LibraryRuntimeState()
+        let governor = MemoryPressureGovernor(runtimeState: state)
+        var tiers: [MemoryBudgetTier] = []
+        governor.register { tiers.append($0) }
+
+        governor.update(MemoryConditions(isBackgrounded: true))
+        XCTAssertEqual(state.snapshot().memoryBudgetTier, .reduced)
+        XCTAssertEqual(state.snapshot().memoryPressure, .normal)
+        XCTAssertEqual(state.snapshot().memoryHeadroom, .healthy)
+        governor.update(MemoryConditions(pressure: .warning, isBackgrounded: true))
+        XCTAssertEqual(tiers, [.normal, .reduced])
+        XCTAssertEqual(state.snapshot().memoryPressure, .warning)
+        XCTAssertEqual(state.snapshot().memoryHeadroom, .constrained)
+        governor.update(MemoryConditions(pressure: .critical, isBackgrounded: true))
+        XCTAssertTrue(governor.tier.requiresImmediatePurge)
+        governor.update(MemoryConditions(isBackgrounded: true))
+        XCTAssertEqual(state.snapshot().memoryPressure, .normal)
+        XCTAssertEqual(state.snapshot().memoryHeadroom, .healthy)
+        governor.update(MemoryConditions())
+        XCTAssertEqual(tiers, [.normal, .reduced, .minimal, .reduced, .normal])
+    }
 }

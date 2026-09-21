@@ -4,6 +4,24 @@ import XCTest
 @testable import PhotoViewerCore
 
 final class ViewerTitleMetadataCoordinatorTests: XCTestCase {
+    @MainActor
+    func testMissingProviderIsUnavailableWithoutFailure() async {
+        let coordinator = ViewerTitleMetadataCoordinator(metadataProvider: nil, placeNameResolver: nil)
+        let item = PhotoItem(uid: PhotoUID(volumeID: "v", nodeID: "p"), captureTime: .distantPast, mediaType: "")
+        let resolution = await coordinator.resolve(item)
+        XCTAssertEqual(resolution.metadataLoadState, .unavailable)
+        XCTAssertFalse(resolution.metadataLoadFailed)
+    }
+
+    func testEmptyOptionalMetadataIsLoadedWithoutWarning() {
+        let resolution = ViewerTitleMetadataResolution(metadata: PhotoMetadata(), placeName: nil)
+        XCTAssertEqual(resolution.metadataLoadState, .loaded(PhotoMetadata()))
+        XCTAssertFalse(resolution.metadataLoadFailed)
+        XCTAssertEqual(
+            ViewerTitleMetadataResolution(metadata: nil, placeName: nil, metadataLoadFailed: true).metadataLoadState,
+            .failed)
+    }
+
     func testOnlyKnownGPSReservesThePOIHeadline() {
         XCTAssertFalse(ViewerTitleMetadataState.resolving.shouldReservePlaceNameLine(hasKnownLocation: false))
         XCTAssertTrue(ViewerTitleMetadataState.resolving.shouldReservePlaceNameLine(hasKnownLocation: true))

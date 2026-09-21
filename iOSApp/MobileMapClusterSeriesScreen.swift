@@ -37,9 +37,9 @@ struct MobileMapClusterSeriesScreen: View {
     var body: some View {
         content
             .mobileGridContextMenu(contextMenu, model: model)
-            .mobileNavigationTitle(placeName ?? L10n.string("map.cluster_title"))
+            .mobileNavigationTitle(selection.barTitle(default: placeName ?? L10n.string("map.cluster_title")))
             .toolbar { toolbarContent }
-            .toolbar(selection.isSelecting ? .hidden : .automatic, for: .tabBar)
+            .mobileSelectionBars(isSelecting: selection.isSelecting)
             .task { await resolvePlaceName() }
             .task(id: "\(model.timelineRevision)-\(pageIndex)") {
                 guard let currentPage else { return }
@@ -60,6 +60,7 @@ struct MobileMapClusterSeriesScreen: View {
                 }
                 .disabled(currentPage?.hasPrevious != true || selectionBusy)
             }
+            .mobileVisibilityPriority(.high)
             ToolbarItem(placement: .principal) {
                 Text("\(pageIndex + 1)/\(pager.pageCount)")
                     .monospacedDigit()
@@ -73,6 +74,7 @@ struct MobileMapClusterSeriesScreen: View {
                 }
                 .disabled(currentPage?.hasNext != true || selectionBusy)
             }
+            .mobileVisibilityPriority(.high)
         }
         if !clusterItems.isEmpty {
             ToolbarItem(placement: .topBarTrailing) {
@@ -80,64 +82,28 @@ struct MobileMapClusterSeriesScreen: View {
                     selection.toggleMode()
                 }
             }
+            .mobileVisibilityPriority(.high)
         }
-        if selection.isSelecting {
-            ToolbarItem(placement: .bottomBar) {
-                Button {
-                    startShare()
-                } label: {
-                    if selection.isExporting {
-                        ProgressView()
-                    } else {
-                        Image(systemName: "square.and.arrow.up")
-                    }
-                }
-                .disabled(selection.selected.isEmpty || selectionBusy)
-                .accessibilityLabel(String(localized: "selection.share_a11y"))
-            }
-            ToolbarSpacer(.flexible, placement: .bottomBar)
-            if let centerText = selectionCenterText {
-                ToolbarItem(placement: .bottomBar) {
-                    Button {
-                        showAlbumPicker = true
-                    } label: {
-                        Text(centerText)
-                            .font(.body)
-                            .monospacedDigit()
-                            .fixedSize()
-                    }
-                    .disabled(selection.selected.isEmpty || selectionBusy || model.albumActions?.canAddPhotos != true)
-                    .accessibilityLabel(L10n.string("albums.add_selection_title"))
-                    .popover(isPresented: $showAlbumPicker, arrowEdge: .bottom) {
-                        if let coordinator = model.albumActions {
-                            AlbumDestinationPicker(
-                                coordinator: coordinator,
-                                photoUIDs: model.selectedUIDs(selection.selected),
-                                onAlbumsChanged: { model.noteAlbumsChanged() },
-                                onCompleted: { _ in
-                                    showAlbumPicker = false
-                                    selection.finish()
-                                }
-                            )
+        MobileSelectionToolbarItems(
+            selection: selection,
+            canAddToAlbum: model.albumActions?.canAddPhotos == true,
+            showAlbumPicker: $showAlbumPicker,
+            onShare: startShare,
+            onTrash: { selection.showTrashConfirm = true },
+            albumPicker: {
+                if let coordinator = model.albumActions {
+                    AlbumDestinationPicker(
+                        coordinator: coordinator,
+                        photoUIDs: model.selectedUIDs(selection.selected),
+                        onAlbumsChanged: { model.noteAlbumsChanged() },
+                        onCompleted: { _ in
+                            showAlbumPicker = false
+                            selection.finish()
                         }
-                    }
+                    )
                 }
-                ToolbarSpacer(.flexible, placement: .bottomBar)
             }
-            ToolbarItem(placement: .bottomBar) {
-                Button(role: .destructive) {
-                    selection.showTrashConfirm = true
-                } label: {
-                    Image(systemName: "trash")
-                }
-                .disabled(selection.selected.isEmpty || selectionBusy)
-                .accessibilityLabel(String(localized: "selection.trash_a11y"))
-            }
-        }
-    }
-
-    private var selectionCenterText: String? {
-        L10n.selectionCenterText(selectedCount: selection.selected.count)
+        )
     }
 
     @ViewBuilder private var content: some View {
@@ -156,6 +122,7 @@ struct MobileMapClusterSeriesScreen: View {
                     isActive: true,
                     onOpenPhoto: open,
                     onToggleSelection: selection.toggle,
+                    onSelectionChanged: selection.replace(with:),
                     dragOutProvider: model.backend,
                     onDragOutFailed: { selection.actionError = MobileSelectionError(message: $0.localizedMessage) },
                     contextMenuActions: { contextMenu.actions(for: $0, model: model) },

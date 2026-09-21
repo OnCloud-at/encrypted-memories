@@ -10,52 +10,6 @@ import UploadCore
 
 @testable import EncryptedMemoriesMobile
 
-private final class ViewerChromeHitProbeView: UIView {
-    let role: String
-
-    init(role: String) {
-        self.role = role
-        super.init(frame: .zero)
-        isUserInteractionEnabled = true
-    }
-
-    @available(*, unavailable)
-    required init?(coder: NSCoder) { nil }
-}
-
-private struct ViewerChromeHitProbe: UIViewRepresentable {
-    let role: String
-
-    func makeUIView(context: Context) -> ViewerChromeHitProbeView {
-        ViewerChromeHitProbeView(role: role)
-    }
-
-    func updateUIView(_ uiView: ViewerChromeHitProbeView, context: Context) {}
-}
-
-@MainActor
-private func viewerChromeHitRole(at point: CGPoint, in root: UIView) -> String? {
-    var view = root.hitTest(point, with: nil)
-    while let current = view {
-        if let probe = current as? ViewerChromeHitProbeView { return probe.role }
-        view = current.superview
-    }
-    return nil
-}
-
-@MainActor
-private func viewerChromeProbe(role: String, in root: UIView) -> ViewerChromeHitProbeView? {
-    if let probe = root as? ViewerChromeHitProbeView, probe.role == role {
-        return probe
-    }
-    for subview in root.subviews {
-        if let probe = viewerChromeProbe(role: role, in: subview) {
-            return probe
-        }
-    }
-    return nil
-}
-
 private actor MobileRetryLifecycleLatch {
     private var entered: [String] = []
     private var released = Set<String>()
@@ -537,16 +491,6 @@ private func waitUntil(
         #expect(MobileViewerMediaRoute.isVideo(item: falsePositiveVideo, resolvedKind: .image) == false)
     }
 
-    @Test func viewerHeaderLeavesAUsableTitlePillOnCompactIPhones() {
-        let compactWidth = MobileViewerHeaderLayout.titleWidth(containerWidth: 320)
-        #expect(compactWidth == 192)
-        #expect(
-            (320 - compactWidth) / 2 >= MobileViewerHeaderLayout.horizontalPadding
-                + MobileViewerHeaderLayout.buttonWidth)
-        #expect(MobileViewerHeaderLayout.titleWidth(containerWidth: 375) > 128)
-        #expect(MobileViewerHeaderLayout.titleWidth(containerWidth: 956) <= MobileViewerHeaderLayout.maximumTitleWidth)
-    }
-
     @Test func videoPlaybackIntentDistinguishesBufferingPauseAndCompletion() {
         #expect(MobileVideoPlaybackIntent.isActivelyPlaying(.playing))
         #expect(!MobileVideoPlaybackIntent.isActivelyPlaying(.waitingToPlayAtSpecifiedRate))
@@ -559,15 +503,18 @@ private func waitUntil(
         #expect(!MobileVideoPlaybackIntent.reachedEnd(current: 36.5, duration: 37))
     }
 
-    @Test func viewerBottomChromeFitsCompactIPhoneWithoutChangingMediaGeometry() {
-        #expect(MobileViewerBottomLayout.minimumRequiredWidth == 252)
-        #expect(MobileViewerBottomLayout.minimumRequiredWidth <= 320)
-        #expect(MobileViewerBottomLayout.actionButtonSize >= 44)
-        #expect(MobileViewerBottomLayout.baseChromeHeight == 122)
+    /// The bars are native; the app owns only the filmstrip rows below the media. Both orientations keep a
+    /// touch-sized strip, and compact landscape trades height for the shorter window.
+    @Test func viewerFilmstripAccessoryKeepsTouchTargetsInBothOrientations() {
+        let regular = MobileViewerBottomLayout.profile(compactLandscape: false)
         let landscape = MobileViewerBottomLayout.profile(compactLandscape: true)
-        #expect(!landscape.showsBottomActionRow)
-        #expect(landscape.controlSide == 44)
-        #expect(landscape.bottomChromeHeight == 50)
+        #expect(regular == .regular)
+        #expect(landscape == .compactLandscape)
+        #expect(regular.filmstripHeight >= 44)
+        #expect(landscape.filmstripHeight >= 44)
+        #expect(landscape.filmstripHeight < regular.filmstripHeight)
+        #expect(landscape.rowSpacing > 0 && landscape.bottomPadding >= 0)
+        #expect(MobileViewerBottomLayout.horizontalPadding == 12)
     }
 
     @Test
@@ -730,60 +677,6 @@ private func waitUntil(
         )
         expectClose(newAnchor.x, oldAnchor.x, tolerance: 0.02)
         expectClose(newAnchor.y, oldAnchor.y, tolerance: 0.02)
-    }
-
-    @Test @MainActor
-    func viewerChromeHitTestingLeavesTheMediaCenterReachable() throws {
-        let host = UIHostingController(
-            rootView:
-                MobileViewerChromeOverlay(showsChrome: true) {
-                    ViewerChromeHitProbe(role: "media")
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                } topChrome: {
-                    ViewerChromeHitProbe(role: "top")
-                        .frame(maxWidth: .infinity)
-                        .frame(height: 96)
-                } bottomChrome: {
-                    ViewerChromeHitProbe(role: "bottom")
-                        .frame(maxWidth: .infinity)
-                        .frame(height: 140)
-                }
-        )
-        let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
-        let window = UIWindow(windowScene: scene)
-        defer {
-            window.isHidden = true
-            window.rootViewController = nil
-        }
-        window.frame = CGRect(x: 0, y: 0, width: 390, height: 844)
-        window.rootViewController = host
-        window.makeKeyAndVisible()
-        host.view.frame = window.bounds
-        host.view.setNeedsLayout()
-        host.view.layoutIfNeeded()
-        RunLoop.main.run(until: Date().addingTimeInterval(0.01))
-
-        #expect(
-            viewerChromeHitRole(at: CGPoint(x: 195, y: 422), in: host.view) == "media",
-            "the visible chrome must not intercept a Live Photo long press in the media center")
-
-        let topProbe = try #require(viewerChromeProbe(role: "top", in: host.view))
-        let topCenter = topProbe.convert(
-            CGPoint(x: topProbe.bounds.midX, y: topProbe.bounds.midY),
-            to: host.view
-        )
-        #expect(
-            viewerChromeHitRole(at: topCenter, in: host.view) == "top",
-            "bounding the chrome must keep its top controls interactive")
-
-        let bottomProbe = try #require(viewerChromeProbe(role: "bottom", in: host.view))
-        let bottomCenter = bottomProbe.convert(
-            CGPoint(x: bottomProbe.bounds.midX, y: bottomProbe.bounds.midY),
-            to: host.view
-        )
-        #expect(
-            viewerChromeHitRole(at: bottomCenter, in: host.view) == "bottom",
-            "bounding the chrome must keep its bottom controls interactive")
     }
 
     @Test func libraryMutationLeaseRejectsAccountAndLoadGenerationReplacement() {

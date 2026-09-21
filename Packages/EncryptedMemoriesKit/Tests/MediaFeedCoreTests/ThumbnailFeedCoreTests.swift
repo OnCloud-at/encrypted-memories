@@ -254,6 +254,7 @@ private actor RecordingLoader: ThumbnailBatchLoader {
     }
 
     func fetched(_ uid: PhotoUID) -> Bool { order.contains(uid) }
+    func requestOrder() -> [PhotoUID] { order }
     func requestCount() -> Int { order.count }
     func finishedBatches() -> Int { finishedBatchCount }
 }
@@ -998,11 +999,65 @@ struct ThumbnailFeedCoreTests {
             feed.hasActiveUserInteraction() == false,
             "a queued or stalled thumbnail must not indefinitely block unrelated background work")
 
-        feed.setUserInteractionActive(true)
+        let grid = ThumbnailInteractionOwner()
+        feed.setUserInteractionActive(true, owner: grid)
         #expect(feed.hasActiveUserInteraction())
-        feed.setUserInteractionActive(false)
+        feed.setUserInteractionActive(false, owner: grid)
         #expect(feed.hasActiveUserInteraction() == false)
         await feed.stopPrefetch()
+    }
+
+    /// Several windows scroll one shared feed. The aggregate must stay active while any grid still interacts,
+    /// and a grid that stops, disconnects, or switches feeds must remove only its own contribution.
+    @Test func sharedFeedAggregatesInteractionPerOwner() async throws {
+        let feed = ThumbnailFeedCore(
+            cache: Self.cache("owners"), loader: RecordingLoader(), configuration: Self.configuration())
+        let gridA = ThumbnailInteractionOwner()
+        let gridB = ThumbnailInteractionOwner()
+
+        // Overlap: B stops first while A keeps scrolling.
+        feed.setUserInteractionActive(true, owner: gridA)
+        feed.setUserInteractionActive(true, owner: gridB)
+        #expect(feed.activeUserInteractionOwnerCount() == 2)
+        feed.setUserInteractionActive(false, owner: gridB)
+        #expect(feed.hasActiveUserInteraction(), "A still scrolls after B stops")
+        #expect(feed.activeUserInteractionOwnerCount() == 1)
+        feed.setUserInteractionActive(false, owner: gridA)
+        #expect(feed.hasActiveUserInteraction() == false)
+        #expect(feed.activeUserInteractionOwnerCount() == 0)
+
+        // Reverse completion order: A stops first while B keeps pinching.
+        feed.setUserInteractionActive(true, owner: gridA)
+        feed.setUserInteractionActive(true, owner: gridB)
+        feed.setUserInteractionActive(false, owner: gridA)
+        #expect(feed.hasActiveUserInteraction(), "B still pinches after A stops")
+        feed.setUserInteractionActive(false, owner: gridB)
+        #expect(feed.hasActiveUserInteraction() == false)
+
+        // Repeated reports from one owner are idempotent; a stop for an unknown owner is a no-op.
+        feed.setUserInteractionActive(true, owner: gridA)
+        feed.setUserInteractionActive(true, owner: gridA)
+        #expect(feed.activeUserInteractionOwnerCount() == 1)
+        feed.setUserInteractionActive(false, owner: ThumbnailInteractionOwner())
+        #expect(feed.hasActiveUserInteraction(), "a stranger cannot clear A")
+        feed.setUserInteractionActive(false, owner: gridA)
+        #expect(feed.activeUserInteractionOwnerCount() == 0)
+
+        // Feed switch: a grid that moves to another feed while scrolling releases the old feed only.
+        let otherFeed = ThumbnailFeedCore(
+            cache: Self.cache("owners-other"), loader: RecordingLoader(), configuration: Self.configuration())
+        feed.setUserInteractionActive(true, owner: gridA)
+        feed.setUserInteractionActive(true, owner: gridB)
+        feed.setUserInteractionActive(false, owner: gridA)
+        otherFeed.setUserInteractionActive(true, owner: gridA)
+        #expect(feed.hasActiveUserInteraction(), "B keeps the old feed active")
+        #expect(otherFeed.activeUserInteractionOwnerCount() == 1)
+        feed.setUserInteractionActive(false, owner: gridB)
+        otherFeed.setUserInteractionActive(false, owner: gridA)
+        #expect(feed.hasActiveUserInteraction() == false)
+        #expect(otherFeed.hasActiveUserInteraction() == false)
+        await feed.stopPrefetch()
+        await otherFeed.stopPrefetch()
     }
 
     @Test func corruptDiskBlobDoesNotStarveVisibleFetch() async throws {
@@ -1338,7 +1393,8 @@ struct ThumbnailFeedCoreTests {
         await feed.stopPrefetchAndWait()
     }
 
-    @Test func visibleNetworkDemandBeforeAuthorizationRecoversAndDecodesArrival() async throws {
+    @Test(arguments: [true, false])
+    func visibleNetworkDemandBeforeAuthorizationRecoversAndDecodesArrival(includedInLibrary: Bool) async throws {
         let uid = Self.uid("visible-network-before-scope")
         let cache = Self.cache("visible-network-before-scope")
         let loader = RecordingLoader(payloads: [uid: Self.pngData(width: 8, height: 8)])
@@ -1347,7 +1403,7 @@ struct ThumbnailFeedCoreTests {
         // cannot exercise the supported visible-network path.
         await feed.pausePrefetch()
         let graph = LibrarySourceGraph()
-        let change = Self.visibleScope(in: graph, uids: [uid])
+        let change = Self.visibleScope(in: graph, uids: [uid], includedInLibrary: includedInLibrary)
         #expect(await feed.bindDerivedDataEpoch(graph.runtimeEpoch))
         feed.submitVisibleDiskDecodeDemand([ThumbnailRequest(uid: uid)])
         #expect(await feed.replaceVisiblePriorityDemand([uid]) == 0)
@@ -1362,7 +1418,8 @@ struct ThumbnailFeedCoreTests {
         await feed.stopPrefetchAndWait()
     }
 
-    @Test func sourceAdmissionWakesAwaitedVisibleWarmPath() async throws {
+    @Test(arguments: [true, false])
+    func sourceAdmissionWakesAwaitedVisibleWarmPath(includedInLibrary: Bool) async throws {
         let uid = Self.uid("awaited-visible-before-scope")
         let cache = Self.cache("awaited-visible-before-scope")
         cache.storeToDisk(Self.pngData(width: 8, height: 8), for: uid)
@@ -1370,7 +1427,7 @@ struct ThumbnailFeedCoreTests {
         let feed = ThumbnailFeedCore(cache: cache, loader: loader, configuration: Self.configuration())
         await feed.setPrefetchEnabled(false)
         let graph = LibrarySourceGraph()
-        let change = Self.visibleScope(in: graph, uids: [uid])
+        let change = Self.visibleScope(in: graph, uids: [uid], includedInLibrary: includedInLibrary)
         #expect(await feed.bindDerivedDataEpoch(graph.runtimeEpoch))
         let requests = [ThumbnailRequest(uid: uid)]
         let blocked = await feed.warmVisibleDecoded(requests, limit: 1)
@@ -1389,8 +1446,144 @@ struct ThumbnailFeedCoreTests {
         await feed.stopPrefetchAndWait()
     }
 
-    private static func visibleScope(in graph: LibrarySourceGraph, uids: [PhotoUID]) -> LibrarySourceChange {
-        let source = LibrarySource(id: SourceID("visible-demand-test"), capabilities: .readThumbnail)
+    @Test func burstFilmstripMembersAreReadableAlthoughTheyAreNotLibraryItems() async throws {
+        let key = Self.uid("burst-key")
+        let member = Self.uid("burst-member")
+        let cache = Self.cache("burst-member-read")
+        let loader = RecordingLoader(payloads: [member: Self.pngData(width: 8, height: 8)])
+        let feed = ThumbnailFeedCore(cache: cache, loader: loader, configuration: Self.configuration())
+        await feed.setPrefetchEnabled(false)
+        let graph = LibrarySourceGraph()
+        let source = LibrarySource(id: SourceID("burst-test"), capabilities: .readThumbnail, isIncluded: true)
+        _ = graph.commitSourceSet([source], using: graph.beginSourceSetRefresh())
+        let keyItem = PhotoItem(
+            uid: key,
+            captureTime: Date(timeIntervalSince1970: 0),
+            mediaType: "image/jpeg",
+            burstMemberIDs: [key.nodeID, member.nodeID]
+        )
+        let change = try #require(
+            graph.commit([.complete(keyItem)], validationToken: nil, using: graph.beginRefresh(source.id)!))
+        // A burst member belongs to the thumbnail retention scope, not to the analysis scope.
+        #expect(!change.analysisScope.uids.contains(member))
+        #expect(change.thumbnailRetentionScope.uids.contains(member))
+        #expect(await feed.bindDerivedDataEpoch(graph.runtimeEpoch))
+        _ = await feed.reconcile(
+            selected: change.selectedScope, analysis: change.analysisScope,
+            retention: change.thumbnailRetentionScope)
+
+        #expect(await feed.decoded(for: member) != nil, "an opened series must load its member thumbnails")
+        #expect(feed.memoryDecoded(for: member) != nil)
+        #expect(await loader.requestCount() == 1)
+        await feed.stopPrefetchAndWait()
+    }
+
+    @Test func recentlyDeletedPhotosAreReadableAlthoughNoInventoryListsThem() async throws {
+        let item = Self.uid("library-item")
+        let trashed = Self.uid("trashed-photo")
+        let cache = Self.cache("trash-read")
+        let payload = Self.pngData(width: 8, height: 8)
+        let loader = RecordingLoader(payloads: [item: payload, trashed: payload])
+        // One worker and single-item batches keep the loader's call order equal to the crawl order.
+        let feed = ThumbnailFeedCore(
+            cache: cache, loader: loader,
+            configuration: Self.configuration(downloadConcurrencyLimit: 1, batchSize: 1))
+        let graph = LibrarySourceGraph()
+        let source = LibrarySource(id: SourceID("trash-test"), capabilities: .readThumbnail, isIncluded: true)
+        _ = graph.commitSourceSet([source], using: graph.beginSourceSetRefresh())
+        let libraryItem = PhotoItem(
+            uid: item, captureTime: Date(timeIntervalSince1970: 0), mediaType: "image/jpeg")
+        _ = graph.commit([.complete(libraryItem)], validationToken: nil, using: graph.beginRefresh(source.id)!)
+        // The trash listing registers what Recently Deleted shows.
+        let change = try #require(graph.setIdentitiesOutsideInventory([trashed]))
+        #expect(change.thumbnailRetentionScope.uids.contains(trashed))
+        #expect(change.thumbnailRetentionScope.authorizationOnlyUIDs == [trashed])
+        #expect(
+            !change.thumbnailRetentionScope.orderedUIDs.contains(trashed),
+            "a background crawl must never fetch a trashed photo")
+        #expect(await feed.bindDerivedDataEpoch(graph.runtimeEpoch))
+        _ = await feed.reconcile(
+            selected: change.selectedScope, analysis: change.analysisScope,
+            retention: change.thumbnailRetentionScope)
+
+        #expect(await feed.decoded(for: trashed) != nil, "a Recently Deleted tile must show its thumbnail")
+        #expect(feed.memoryDecoded(for: trashed) != nil)
+        await feed.stopPrefetchAndWait()
+    }
+
+    @Test func leavingRecentlyDeletedWithdrawsItsThumbnailAuthorization() async throws {
+        let trashed = Self.uid("trashed-photo-withdrawn")
+        let cache = Self.cache("trash-withdraw")
+        let loader = RecordingLoader(payloads: [trashed: Self.pngData(width: 8, height: 8)])
+        let feed = ThumbnailFeedCore(cache: cache, loader: loader, configuration: Self.configuration())
+        await feed.setPrefetchEnabled(false)
+        let graph = LibrarySourceGraph()
+        let source = LibrarySource(id: SourceID("trash-test"), capabilities: .readThumbnail, isIncluded: true)
+        _ = graph.commitSourceSet([source], using: graph.beginSourceSetRefresh())
+        _ = graph.commit([], validationToken: nil, using: graph.beginRefresh(source.id)!)
+        let registered = try #require(graph.setIdentitiesOutsideInventory([trashed]))
+        #expect(await feed.bindDerivedDataEpoch(graph.runtimeEpoch))
+        _ = await feed.reconcile(
+            selected: registered.selectedScope, analysis: registered.analysisScope,
+            retention: registered.thumbnailRetentionScope)
+        #expect(await feed.decoded(for: trashed) != nil)
+
+        let cleared = try #require(graph.setIdentitiesOutsideInventory([]))
+        _ = await feed.reconcile(
+            selected: cleared.selectedScope, analysis: cleared.analysisScope,
+            retention: cleared.thumbnailRetentionScope)
+
+        #expect(await feed.decoded(for: trashed) == nil, "the route no longer shows this photo")
+        await feed.stopPrefetchAndWait()
+    }
+
+    @Test func burstMembersAreCrawledToDiskAfterEveryLibraryThumbnail() async throws {
+        let key = Self.uid("crawl-burst-key")
+        let other = Self.uid("crawl-library-item")
+        let members = [Self.uid("crawl-burst-member-1"), Self.uid("crawl-burst-member-2")]
+        let cache = Self.cache("burst-member-crawl")
+        let payload = Self.pngData(width: 8, height: 8)
+        let payloads = Dictionary(uniqueKeysWithValues: ([key, other] + members).map { ($0, payload) })
+        let loader = RecordingLoader(payloads: payloads)
+        // One worker and single-item batches keep the loader's call order equal to the crawl order.
+        let feed = ThumbnailFeedCore(
+            cache: cache, loader: loader,
+            configuration: Self.configuration(downloadConcurrencyLimit: 1, batchSize: 1))
+        let graph = LibrarySourceGraph()
+        let source = LibrarySource(id: SourceID("burst-crawl"), capabilities: .readThumbnail, isIncluded: true)
+        _ = graph.commitSourceSet([source], using: graph.beginSourceSetRefresh())
+        let items: [LibrarySourceItem] = [
+            .complete(
+                PhotoItem(
+                    uid: key,
+                    captureTime: Date(timeIntervalSince1970: 2),
+                    mediaType: "image/jpeg",
+                    burstMemberIDs: [key.nodeID] + members.map(\.nodeID)
+                )),
+            .complete(PhotoItem(uid: other, captureTime: Date(timeIntervalSince1970: 1), mediaType: "image/jpeg")),
+        ]
+        let change = try #require(graph.commit(items, validationToken: nil, using: graph.beginRefresh(source.id)!))
+        #expect(await feed.bindDerivedDataEpoch(graph.runtimeEpoch))
+
+        _ = await feed.reconcile(
+            selected: change.selectedScope, analysis: change.analysisScope,
+            retention: change.thumbnailRetentionScope)
+        try await Self.waitUntil { members.allSatisfy { cache.diskData(for: $0) != nil } }
+
+        let order = await loader.requestOrder()
+        let lastLibraryRequest = try #require([key, other].compactMap { order.firstIndex(of: $0) }.max())
+        for member in members {
+            let memberRequest = try #require(order.firstIndex(of: member))
+            #expect(memberRequest > lastLibraryRequest, "burst members follow every library thumbnail")
+        }
+        await feed.stopPrefetchAndWait()
+    }
+
+    private static func visibleScope(
+        in graph: LibrarySourceGraph, uids: [PhotoUID], includedInLibrary: Bool = true
+    ) -> LibrarySourceChange {
+        let source = LibrarySource(
+            id: SourceID("visible-demand-test"), capabilities: .readThumbnail, isIncluded: includedInLibrary)
         _ = graph.commitSourceSet([source], using: graph.beginSourceSetRefresh())
         return graph.commit(Self.sourceItems(uids), validationToken: nil, using: graph.beginRefresh(source.id)!)!
     }
@@ -1498,8 +1691,12 @@ struct ThumbnailFeedCoreTests {
         #expect(status.diskFileCount == 1)
         #expect(status.downloadCompleted == 1)
         #expect(cache.diskFileCount() == 2)
-        #expect(await feed.cachedDecoded(for: analysisUID) == nil)
+        #expect(feed.memoryDecoded(for: analysisUID) == nil, "the background crawl must not decode into the grid LRU")
         #expect(await feed.backgroundCachedDecoded(for: analysisUID) != nil)
+        #expect(feed.memoryDecoded(for: analysisUID) == nil, "background analysis must remain cache-only")
+        #expect(
+            await feed.cachedDecoded(for: analysisUID) != nil, "an opened shared album can display its cached tiles")
+        #expect(feed.memoryDecoded(for: analysisUID) != nil)
 
         let replacementLease = graph.beginSourceSetRefresh()
         let replacement = graph.commitSourceSet([primarySource], using: replacementLease)!
@@ -1511,6 +1708,9 @@ struct ThumbnailFeedCoreTests {
         #expect(cache.diskData(for: primaryUID) != nil)
         #expect(cache.diskData(for: analysisUID) == nil)
         #expect(await feed.backgroundCachedDecoded(for: analysisUID) == nil)
+        #expect(feed.memoryDecoded(for: analysisUID) == nil)
+        #expect(await feed.cachedDecoded(for: analysisUID) == nil)
+        #expect(await feed.requestPriority(analysisUID) == false)
     }
 
     @Test func feedScopeReplacementCoalescesNewerRevisionDuringWorkerJoin() async throws {
@@ -2277,14 +2477,15 @@ struct ThumbnailFeedCoreTests {
             payloads: Dictionary(uniqueKeysWithValues: uids.map { ($0, Self.pngData(width: 8, height: 8)) }))
         let feed = ThumbnailFeedCore(cache: Self.cache("interact"), loader: loader, configuration: Self.configuration())
 
-        feed.setUserInteractionActive(true)
+        let grid = ThumbnailInteractionOwner()
+        feed.setUserInteractionActive(true, owner: grid)
         await feed.startPrefetch(uids)
         try await Self.waitUntil { await feed.prefetchStatus().downloadCompleted == 2 }
         let status = await feed.prefetchStatus()
         #expect(!status.paused)
         #expect(status.pausedReason == "none")
         #expect(await loader.requestCount() == 2)
-        feed.setUserInteractionActive(false)
+        feed.setUserInteractionActive(false, owner: grid)
     }
 
     @Test func refusedItemsAreQuarantinedUntilNextCrawlStart() async throws {

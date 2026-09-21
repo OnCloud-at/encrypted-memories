@@ -14,7 +14,7 @@ public struct Metal3UnsupportedDeviceView: View {
             VStack(spacing: 18) {
                 MemoriesBrandMark(height: 68)
                     .padding(18)
-                    .protonGlass(in: RoundedRectangle(cornerRadius: 26, style: .continuous))
+                    .glassEffect(in: RoundedRectangle(cornerRadius: 26, style: .continuous))
 
                 Text(L10n.string("device.unsupported_title"))
                     .font(.title2.weight(.semibold))

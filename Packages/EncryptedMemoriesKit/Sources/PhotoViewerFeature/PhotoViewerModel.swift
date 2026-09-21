@@ -109,7 +109,6 @@ public final class PhotoViewerModel {
     public var burstItems: [PhotoItem] { burstSelection.items }
     public var burstIndex: Int? { burstSelection.selectedIndex }
     public var isLoadingBurst: Bool { burstSelection.isLoading }
-    public var burstLoadFailed: Bool { burstSelection.loadFailed }
 
     public init(
         items: [PhotoItem], index: Int, feed: ThumbnailFeed, media: FullMediaProvider,
@@ -215,22 +214,14 @@ public final class PhotoViewerModel {
         albumMembershipTask?.cancel()
         let item = current
         if let resolution = titleMetadataCoordinator.state(for: item.uid).resolution {
-            if let metadata = resolution.metadata {
-                metadataLoadState = .loaded(metadata)
-            } else {
-                metadataLoadState = .failed
-            }
+            metadataLoadState = resolution.metadataLoadState
             return
         }
         metadataLoadState = .loading
         metadataTask = Task {
             let resolution = await titleMetadataCoordinator.resolve(item)
             guard !Task.isCancelled, self.isDisplaying(item) else { return }
-            if let metadata = resolution.metadata {
-                self.metadataLoadState = .loaded(metadata)
-            } else {
-                self.metadataLoadState = .failed
-            }
+            self.metadataLoadState = resolution.metadataLoadState
         }
     }
 

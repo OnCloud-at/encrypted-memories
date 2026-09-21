@@ -3,6 +3,7 @@ import DesignSystem
 import DesignSystemCore
 import LibraryRuntimeAppleAdapter
 import MetalRenderingCore
+import PhotoViewerFeature
 import PhotosCore
 import SwiftUI
 import TimelineFeature
@@ -93,6 +94,7 @@ struct EncryptedMemoriesApp: App {
                 }
             }
             OpenLibraryWindowCommands()
+            PhotoViewerNavigationCommands()
         }
 
         // Use the native Settings scene so macOS owns the application menu command and shortcut.
@@ -209,10 +211,6 @@ private final class LibraryWindowVisibilityController: NSObject {
         window.makeKeyAndOrderFront(nil)
         return true
     }
-
-    private func hideLibrary() {
-        libraryWindow?.orderOut(nil)
-    }
 }
 
 /// Intercepts only the close decision and forwards every other optional NSWindowDelegate callback to
@@ -265,6 +263,27 @@ private struct WindowConfigurator: NSViewRepresentable {
 
     @MainActor final class Coordinator {
         let frameController = MainWindowFrameController(defaultSize: CGSize(width: 1080, height: 720))
+    }
+}
+
+/// Previous photo, Next photo and Close for the open viewer. The commands are disabled while no viewer has
+/// focus, and Close carries the Esc equivalent, which the responder chain alone does not guarantee.
+private struct PhotoViewerNavigationCommands: Commands {
+    @FocusedValue(\.photoViewerNavigation) private var navigation
+
+    var body: some Commands {
+        CommandGroup(after: .toolbar) {
+            Divider()
+            Button(L10n.string("a11y.previous_photo")) { navigation?.goPrevious() }
+                .keyboardShortcut(.leftArrow, modifiers: [])
+                .disabled(navigation?.canGoPrevious != true)
+            Button(L10n.string("a11y.next_photo")) { navigation?.goNext() }
+                .keyboardShortcut(.rightArrow, modifiers: [])
+                .disabled(navigation?.canGoNext != true)
+            Button(L10n.string("viewer.close_photo")) { navigation?.close() }
+                .keyboardShortcut(.cancelAction)
+                .disabled(navigation == nil)
+        }
     }
 }
 
@@ -542,7 +561,7 @@ private struct BackendErrorView: View {
                 .multilineTextAlignment(.center)
                 .frame(maxWidth: 380)
             HStack(spacing: 10) {
-                Button(L10n.string("action.retry"), action: retry).protonProminentGlassButton().frame(width: 120)
+                Button(L10n.string("action.retry"), action: retry).buttonStyle(.glassProminent).frame(width: 120)
                 Button(L10n.string("action.sign_out")) { confirmSignOut = true }
                     .buttonStyle(.plain)
                     .foregroundStyle(ProtonColor.textHint)

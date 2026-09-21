@@ -70,6 +70,19 @@ struct JoinedShutdownGateTests {
         #expect(await probe.snapshot().starts == 1)
     }
 
+    @Test func closedGateRejectsNewAdmissionWithoutRunningIt() async {
+        let gate = JoinedShutdownGate()
+        #expect(!gate.isClosed)
+        gate.closeAdmission()
+        #expect(gate.isClosed)
+        final class Flag: @unchecked Sendable { var ran = false }
+        let flag = Flag()
+        await #expect(throws: CancellationError.self) {
+            try await gate.withAdmission { flag.ran = true }
+        }
+        #expect(!flag.ran)
+    }
+
     @Test func closeCancelsAndJoinsAdmittedWorkBeforeTeardown() async throws {
         let gate = JoinedShutdownGate()
         let operationEntered = ShutdownGateLatch()

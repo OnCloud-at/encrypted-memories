@@ -4,8 +4,8 @@ import PhotoViewerCore
 import PhotosCore
 import SwiftUI
 
-/// Liquid-Glass info panel that slides in from the right edge of the viewer, listing all available
-/// file metadata for the current photo/video plus a native map when GPS is present.
+/// Content of the viewer's native inspector: all available file metadata for the current photo or video plus a
+/// native map when GPS is present.
 struct InfoPanelView: View {
     let item: PhotoItem
     let metadataLoadState: PhotoMetadataLoadState
@@ -14,45 +14,22 @@ struct InfoPanelView: View {
     let isLoadingAlbumMemberships: Bool
     let albumMembershipsLoadFailed: Bool
     let onRetry: () -> Void
-    let onClose: () -> Void
 
     private var metadata: PhotoMetadata? { metadataLoadState.metadata }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            header
-            ScrollView {
-                VStack(alignment: .leading, spacing: 18) {
-                    captureSection
-                    if let m = metadata, m.hasLocation { mapSection(m) }
-                    fileSection
-                    if canLoadAlbumMemberships {
-                        albumSection
-                    }
+        ScrollView {
+            VStack(alignment: .leading, spacing: 18) {
+                captureSection
+                if let m = metadata, m.hasLocation { mapSection(m) }
+                fileSection
+                if canLoadAlbumMemberships {
+                    albumSection
                 }
-                .padding(20)
             }
+            .padding(20)
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .frame(width: ViewerChromeLayout.inspectorWidth)
-        .frame(maxHeight: .infinity)
-        .protonGlass(in: Rectangle())
-    }
-
-    private var header: some View {
-        HStack {
-            Text(L10n.string("infopanel.info"))
-                .font(.headline)
-            Spacer()
-            Button(action: onClose) {
-                Label(L10n.string("infopanel.close"), systemImage: "xmark")
-                    .labelStyle(.iconOnly)
-            }
-            .buttonStyle(.borderless)
-            .accessibilityLabel(L10n.string("infopanel.close"))
-        }
-        .padding(.horizontal, 20)
-        .padding(.top, 18)
-        .padding(.bottom, 4)
     }
 
     // MARK: Sections

@@ -41,6 +41,9 @@ module AppStoreConnect
   PRE_ACCEPTANCE_VERSION_STATES = %w[
     WAITING_FOR_EXPORT_COMPLIANCE WAITING_FOR_REVIEW IN_REVIEW
   ].freeze
+  WHATS_NEW_LOCK_TIMEOUT_SECONDS = 300
+  WHATS_NEW_LOCK_POLL_SECONDS = 10
+  RELEASE_NOTE_RESUBMIT_LIMIT = 2
   APP_VERSION_PATTERN = /\A[0-9]+\.[0-9]+\.[0-9]+\z/
 
   class Error < StandardError; end
@@ -516,14 +519,31 @@ module AppStoreConnect
         raise Error, "App versions cannot use this release workflow from states: #{invalid.map { |key, value| "#{key}=#{value}" }.join(", ")}"
       end
 
-      versions.each do |platform, app_store_version|
-        ensure_automatic_release(app_store_version, platform: platform, state: states.fetch(platform)) if automatic_release
-        upsert_app_store_localizations(
-          app_store_version.fetch("id"),
-          localization_paths.fetch(platform, {})
-        )
-      end
+      # Both platforms must pass the review-details preflight before any release
+      # note synchronization may cancel a running App Review (see PROJECT-TRAPS:
+      # stable-release-review-notes-preflight). Review details are keyed by the
+      # immutable version id, so validating the pre-sync snapshot is equivalent.
       validate_app_store_review_details(versions)
+      preflight_release_note_changes!(versions, localization_paths, submit: submit)
+
+      versions.each do |platform, app_store_version|
+        state = states.fetch(platform)
+        ensure_automatic_release(app_store_version, platform: platform, state: state) if automatic_release
+
+        # Apple locks whatsNew once a version enters any SUBMITTED state; synchronize
+        # release notes for editable versions, and decide on skip/cancel/resubmit otherwise.
+        refreshed = synchronize_app_store_release_notes(
+          platform: platform,
+          app_store_version: app_store_version,
+          version: version,
+          localization_paths: localization_paths.fetch(platform, {}),
+          submit: submit
+        )
+        next if refreshed.nil?
+
+        versions[platform] = refreshed
+        states[platform] = version_state(refreshed)
+      end
 
       versions.each do |platform, app_store_version|
         build_id = builds.fetch(platform).fetch("id")
@@ -1099,25 +1119,191 @@ module AppStoreConnect
       end
     end
 
-    def upsert_app_store_localizations(version_id, localization_paths)
-      return if localization_paths.empty?
+    # Read-only cross-platform preflight. The per-platform sync loop can only
+    # reject un-cancelable release-note changes after earlier platforms already
+    # canceled their App Review; checking every platform first makes a
+    # mixed-state release fail without any side effect. The sync loop stays
+    # authoritative for what actually gets written.
+    def preflight_release_note_changes!(versions, localization_paths, submit:)
+      versions.each do |platform, app_store_version|
+        paths = localization_paths.fetch(platform, {})
+        next if paths.empty?
 
-      existing = @client.collection(
+        state = version_state(app_store_version)
+        next unless SUBMITTED_VERSION_STATES.include?(state)
+        next if PRE_ACCEPTANCE_VERSION_STATES.include?(state)
+        next if app_store_release_notes_match?(app_store_version.fetch("id"), paths)
+        next unless submit
+
+        raise Error,
+              "#{platform} App Store version #{app_store_version.dig('attributes', 'versionString')} is in #{state} with different release notes; " \
+              "Apple cannot cancel App Review from that state"
+      end
+    end
+
+    # Cross-platform preflight for planned release-note changes. Invoked inside
+    # resolve_app_store_versions_for_submission AFTER materialization but BEFORE
+    # any cancellation or replacement mutation (see PROJECT-TRAPS:
+    # stable-release-review-notes-preflight). Two-phase procedure guarantees
+    # equivalence with the old single-pass behavior while adding coverage for
+    # finding 2 (non-pre-acceptance differing-notes) and finding 3 (missing sibling
+    # submission when one platform is cancelable).
+    def preflight_planned_release_note_changes!(plans, localization_paths)
+      # Phase 1: hard-block all non-pre-acceptance platforms with differing notes.
+      # This preserves the existing error ordering for mixed-state scenarios.
+      plans.each do |platform, plan|
+        next unless plan[:target]
+
+        state = version_state(plan.fetch(:target))
+        next unless SUBMITTED_VERSION_STATES.include?(state)
+
+        paths = localization_paths.fetch(platform, {})
+        next if paths.empty? || app_store_release_notes_match?(plan.fetch(:target).fetch("id"), paths)
+
+        unless PRE_ACCEPTANCE_VERSION_STATES.include?(state)
+          raise Error,
+                "#{platform} App Store version #{plan.fetch(:target).dig('attributes', 'versionString')} is in #{state} with different release notes; " \
+                "Apple cannot cancel App Review from that state"
+        end
+      end
+
+      # Phase 2: read-only feasibility probes for PRE_ACCEPTANCE targets with
+      # differing notes. The probe result is discarded; we only care that it
+      # would not raise a missing-submission or ambiguous-review error.
+      plans.each do |platform, plan|
+        next unless plan[:target]
+
+        state = version_state(plan.fetch(:target))
+        next unless PRE_ACCEPTANCE_VERSION_STATES.include?(state)
+
+        paths = localization_paths.fetch(platform, {})
+        next if paths.empty? || app_store_release_notes_match?(plan.fetch(:target).fetch("id"), paths)
+
+        # Pre-mutation feasibility check (finding 3): would this target's
+        # cancellation be blocked by a missing review submission?
+        cancellation_plans(platform: platform, candidates: [plan.fetch(:target)])
+      end
+    end
+
+    # Synchronizes App Store release notes for one platform. Apple locks whatsNew
+    # once a version enters a submitted state: editable versions get their notes
+    # written, submitted versions only get new notes when a requested submission
+    # cancels the running App Review first. Returns the refreshed app version
+    # when its state changed mid-run, nil when nothing changed.
+    def synchronize_app_store_release_notes(platform:, app_store_version:, version:, localization_paths:, submit:)
+      return nil if localization_paths.empty?
+
+      current = app_store_version
+      changed = false
+      cancellations = 0
+      loop do
+        state = version_state(current)
+        unless SUBMITTED_VERSION_STATES.include?(state)
+          refreshed = upsert_app_store_localizations(current.fetch("id"), localization_paths)
+          return changed ? current : nil if refreshed.nil?
+
+          current = refreshed
+          changed = true
+          next
+        end
+
+        if app_store_release_notes_match?(current.fetch("id"), localization_paths)
+          append_summary(
+            "Skipped #{platform} whatsNew update (version #{version} in #{state}); release notes already match."
+          )
+          return changed ? current : nil
+        end
+        unless submit
+          append_summary(
+            "Skipped #{platform} whatsNew update (version #{version} in #{state}). " \
+            "App Review was not canceled because submission was not requested."
+          )
+          return changed ? current : nil
+        end
+        unless PRE_ACCEPTANCE_VERSION_STATES.include?(state)
+          raise Error,
+                "#{platform} App Store version #{version} is in #{state} with different release notes; " \
+                "Apple cannot cancel App Review from that state"
+        end
+        if cancellations >= RELEASE_NOTE_RESUBMIT_LIMIT
+          raise Error,
+                "#{platform} App Store version #{version} kept locking release notes after " \
+                "#{cancellations} review cancellations"
+        end
+
+        plan = cancellation_plans(platform: platform, candidates: [current]).fetch(0)
+        cancel_superseded_app_version(plan, target_version: version)
+        current = read_app_store_version(current.fetch("id"))
+        changed = true
+        cancellations += 1
+      end
+    end
+
+    def app_store_release_notes_match?(version_id, localization_paths)
+      existing = read_app_store_localization_notes(version_id)
+      localization_paths.all? do |locale, path|
+        item = existing[locale]
+        # Compare whitespace-insensitively: editors that touch App Store Connect
+        # notes manually can introduce line-ending or spacing drift that must not
+        # trigger a needless review cancellation.
+        item && normalized_text(item.dig("attributes", "whatsNew")) == normalized_text(File.read(path, encoding: "UTF-8"))
+      end
+    end
+
+    def read_app_store_localization_notes(version_id)
+      @client.collection(
         "/v1/appStoreVersions/#{version_id}/appStoreVersionLocalizations",
         query: {
           "fields[appStoreVersionLocalizations]" => "locale,whatsNew",
           "limit" => "50"
         }
       ).to_h { |item| [item.dig("attributes", "locale"), item] }
+    end
+
+    def upsert_app_store_localizations(
+      version_id,
+      localization_paths,
+      timeout_seconds: WHATS_NEW_LOCK_TIMEOUT_SECONDS,
+      poll_seconds: WHATS_NEW_LOCK_POLL_SECONDS
+    )
+      return nil if localization_paths.empty?
+
+      existing = read_app_store_localization_notes(version_id)
 
       localization_paths.each do |locale, path|
         text = File.read(path, encoding: "UTF-8").strip
         raise Error, "App Store release notes are empty for #{locale}" if text.empty?
 
         item = existing[locale]
-        if item
-          next if item.dig("attributes", "whatsNew") == text
+        next if item && item.dig("attributes", "whatsNew") == text
 
+        refreshed = write_app_store_localization(
+          version_id,
+          item,
+          locale,
+          text,
+          timeout_seconds: timeout_seconds,
+          poll_seconds: poll_seconds
+        )
+        return refreshed if refreshed
+      end
+      nil
+    end
+
+    # Writes one whatsNew locale. Returns the refreshed app version when Apple
+    # moved the version into a submitted state mid-flight (the caller must stop
+    # editing); returns nil after a successful write.
+    def write_app_store_localization(
+      version_id,
+      item,
+      locale,
+      text,
+      timeout_seconds: WHATS_NEW_LOCK_TIMEOUT_SECONDS,
+      poll_seconds: WHATS_NEW_LOCK_POLL_SECONDS
+    )
+      deadline = @monotonic_clock.call + timeout_seconds
+      begin
+        if item
           @client.patch(
             "/v1/appStoreVersionLocalizations/#{item.fetch('id')}",
             body: AppStoreConnect.app_store_localization_update_payload(
@@ -1135,7 +1321,33 @@ module AppStoreConnect
             )
           )
         end
+        nil
+      rescue APIError => error
+        # Apple can transition a version to a submitted state, or keep notes briefly
+        # locked while a review cancellation settles, between our state read and
+        # the write.
+        raise unless error.status == 409 && whats_new_locked?(error)
+
+        current = read_app_store_version(version_id)
+        state = version_state(current)
+        if SUBMITTED_VERSION_STATES.include?(state)
+          append_summary(
+            "Skipped whatsNew update for #{locale} (App Store version moved to #{state} on Apple's side)."
+          )
+          return current
+        end
+
+        if @monotonic_clock.call >= deadline
+          raise Error,
+                "App Store version stayed locked in #{state} for #{timeout_seconds}s: #{error.message}"
+        end
+        @sleeper.call(poll_seconds)
+        retry
       end
+    end
+
+    def whats_new_locked?(error)
+      error.codes.include?("STATE_ERROR") && error.message.include?("whatsNew")
     end
 
     def submit_beta_review(build)
@@ -1176,6 +1388,7 @@ module AppStoreConnect
 
       validate_localization_paths(localization_paths)
       materialize_missing_app_store_versions(plans, version: version)
+      preflight_planned_release_note_changes!(plans, localization_paths)
       preflight_app_store_version_plans(
         plans,
         builds: builds,

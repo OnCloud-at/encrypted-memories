@@ -24,15 +24,6 @@ public enum BackupIssueKind: String, Codable, Sendable, Equatable {
             true
         }
     }
-
-    public var requiresUserAction: Bool {
-        switch self {
-        case .deviceStorage, .remoteDraftStale, .sourceMissing, .permission, .unsupported, .localState:
-            true
-        default:
-            false
-        }
-    }
 }
 
 /// Versioned payload stored in the queue's `last_error` column. `nextAttemptAt` is explicit so

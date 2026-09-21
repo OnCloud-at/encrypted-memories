@@ -66,7 +66,6 @@ public struct TimelineTemporalDayGroup: Equatable, Sendable {
     public let placeLabels: [String]
 
     public var photoUIDs: [PhotoUID] { itemUIDs }
-    public var eventGroups: [TimelineTemporalEventGroup] { events }
     public var placeLabel: String? { placeLabels.count == 1 ? placeLabels[0] : nil }
 }
 

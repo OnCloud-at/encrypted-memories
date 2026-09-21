@@ -156,9 +156,19 @@ final class UploadRefreshAndInteractionTests: XCTestCase {
         XCTAssertEqual(model.allItems.map(\.uid), [rawItem.uid])  // filtered route intact, not clobbered by All
     }
 
-    func testUploadRefreshRetryScheduleIsBounded() {
+    func testUploadRefreshRetryScheduleStartsFastAndStaysBounded() {
         let schedule = TimelineRefreshRetrySchedule.uploadDefault
-        XCTAssertEqual(schedule.delays, [.zero, .seconds(1), .seconds(3), .seconds(8), .seconds(18)])
+
+        XCTAssertEqual(schedule.delays.first, .zero, "the first refresh runs without any delay")
+        // A locally created photo must not wait seconds for its first retry.
+        XCTAssertLessThanOrEqual(schedule.delays[1], .milliseconds(400))
+        let untilTwoSeconds = schedule.delays.prefix { $0 <= .seconds(2) }
+        XCTAssertGreaterThanOrEqual(
+            untilTwoSeconds.count, 4, "the grid retries several times inside the first seconds")
+        XCTAssertEqual(
+            schedule.delays.sorted(), schedule.delays, "delays grow monotonically into the long tail")
+        let total = schedule.delays.reduce(Duration.zero, +)
+        XCTAssertLessThanOrEqual(total, .seconds(35), "the whole convergence window stays bounded")
     }
 
     @MainActor

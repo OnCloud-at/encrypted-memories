@@ -20,10 +20,10 @@ public enum BurstFilmstripUpdatePolicy {
         currentItems: [PhotoUID],
         previousSelectedUID: PhotoUID?,
         currentSelectedUID: PhotoUID?,
-        previousItemSide: Double?,
-        currentItemSide: Double,
-        previousShowsScroller: Bool?,
-        currentShowsScroller: Bool
+        previousItemSide: Double? = nil,
+        currentItemSide: Double = 0,
+        previousShowsScroller: Bool? = nil,
+        currentShowsScroller: Bool = false
     ) -> BurstFilmstripUpdate {
         let reloadData = previousItems != currentItems
         let selectionChanged = previousSelectedUID != currentSelectedUID

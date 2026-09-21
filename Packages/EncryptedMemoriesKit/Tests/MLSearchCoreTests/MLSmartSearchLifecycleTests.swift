@@ -316,6 +316,7 @@ import Testing
         private let lock = NSLock()
         private var failing = false
         private var failingActivationWrites = false
+        private var failingWhere: (@Sendable (MLSmartSearchPersistentState) -> Bool)?
 
         init(layout: MLModelInstallLayout) {
             backing = FileMLSmartSearchStateStore(layout: layout)
@@ -325,9 +326,15 @@ import Testing
         func setFailingActivationWrites(_ value: Bool) {
             lock.withLock { failingActivationWrites = value }
         }
+        func setFailing(where predicate: (@Sendable (MLSmartSearchPersistentState) -> Bool)?) {
+            lock.withLock { failingWhere = predicate }
+        }
         func load() throws -> MLSmartSearchPersistentState? { try backing.load() }
         func save(_ state: MLSmartSearchPersistentState) throws {
-            if lock.withLock({ failing || (failingActivationWrites && state.activatedRevision != nil) }) {
+            if lock.withLock({
+                failing || (failingActivationWrites && state.activatedRevision != nil)
+                    || failingWhere?(state) == true
+            }) {
                 throw WriteFailure()
             }
             try backing.save(state)
@@ -813,9 +820,12 @@ import Testing
         )
     }
 
+    /// Polls a condition for a wall-clock budget. The default is generous on purpose: a shared CI runner
+    /// needs longer for the same indexing work than a developer Mac, and a short budget turns a slow machine
+    /// into a red build. A wrong condition still fails; it only fails later.
     @discardableResult
     private func waitUntil(
-        timeout: Duration = .seconds(10),
+        timeout: Duration = .seconds(30),
         _ predicate: @Sendable () async -> Bool
     ) async -> Bool {
         let deadline = ContinuousClock.now + timeout
@@ -1235,6 +1245,41 @@ import Testing
         let results = try await harness.lifecycle.search("anything", limit: 5)
         #expect(results.descriptor == entryA.descriptor)
         #expect(!results.isEmpty)
+    }
+
+    @Test func backgroundExecutionWindowIndexesWithReducedCacheBudget() async throws {
+        let runtimeState = LibraryRuntimeState(
+            initial: LibraryRuntimeSnapshot(executionOpportunity: .backgroundPermitted))
+        await MainActor.run {
+            MemoryPressureGovernor(runtimeState: runtimeState).update(MemoryConditions(isBackgrounded: true))
+        }
+        let coordinator = LibraryResourceCoordinator(runtimeState: runtimeState)
+        let budget = await coordinator.budget(for: LibraryWorkRequest(workload: .mlIndexing, intent: .automatic))
+        try #require(budget.isAdmitted)
+        let payload = Data("background-model".utf8)
+        let (entry, url) = downloadableEntry(id: "background-model", payload: payload)
+        let photo = uid("background-photo")
+        let harness = try makeHarness(
+            catalog: MLModelCatalog(entries: [entry]), payloads: [url: payload], assets: [photo],
+            resourceCoordinator: coordinator
+        )
+        defer { try? FileManager.default.removeItem(at: harness.layout.rootDirectory) }
+        await harness.lifecycle.setIndexingExecutionAllowed(false)
+        await harness.lifecycle.start()
+        await harness.lifecycle.setEnabled(true)
+        await harness.lifecycle.select(entry.id)
+        #expect(harness.provider.embedder.totalCalls == 0)
+        #expect(await harness.lifecycle.performBackgroundCatchUp() == .deferred)
+
+        await harness.lifecycle.setIndexingExecutionAllowed(true)
+        #expect(await harness.lifecycle.performBackgroundCatchUp() == .complete)
+        #expect(harness.provider.embedder.callCount(photo) == 1)
+        #expect(harness.storeProvider.store.count(for: entry.descriptor) == 1)
+        #expect(runtimeState.snapshot().memoryBudgetTier == .reduced)
+        await harness.lifecycle.shutdown()
+        let metrics = await coordinator.metrics()
+        #expect(metrics.permitsAcquired > 0)
+        #expect(metrics.permitsAcquired == metrics.permitsReleased)
     }
 
     @Test func executionWindowsReuseOneIndexAndRespectPendingLibraryChanges() async throws {
@@ -2136,8 +2181,436 @@ import Testing
         #expect(!FileManager.default.fileExists(atPath: modelDirectory.path))
         #expect(try harness.stateStore.load()?.pendingOperation == nil)
         #expect(try harness.stateStore.load()?.isVisualSearchEnabled == false)
+        #expect(try harness.stateStore.load()?.selectedModelID == nil)
         #expect(try harness.stateStore.load()?.activatedRevision == nil)
         #expect(await harness.lifecycle.currentSnapshot().isEnabled)
+    }
+
+    @Test func visualDisableIgnoresEnableAndSelectionUntilRemovalCommits() async throws {
+        let payloadA = Data("model-a-bytes".utf8)
+        let payloadB = Data("model-b-bytes".utf8)
+        let (entryA, urlA) = downloadableEntry(id: "model-a", payload: payloadA)
+        let (entryB, urlB) = downloadableEntry(id: "model-b", payload: payloadB)
+        let harness = try makeHarness(
+            catalog: MLModelCatalog(entries: [entryA, entryB]),
+            payloads: [urlA: payloadA, urlB: payloadB],
+            assets: [uid("asset")]
+        )
+        defer { try? FileManager.default.removeItem(at: harness.layout.rootDirectory) }
+
+        await harness.lifecycle.start()
+        await harness.lifecycle.setEnabled(true)
+        harness.provider.blockNextSessionLoad()
+        let activation = Task { await harness.lifecycle.select(entryA.id) }
+        #expect(await waitUntil { harness.provider.sessionLoadStarted })
+
+        let disable = Task { await harness.lifecycle.setVisualSearchEnabled(false) }
+        #expect(await waitUntil { harness.provider.sessionLoadCancellations == 1 })
+        #expect(try harness.stateStore.load()?.pendingOperation == .disableVisualSearch(model: entryA.id))
+
+        // Rapid toggling while teardown is blocked must not start a competing activation.
+        await harness.lifecycle.setVisualSearchEnabled(true)
+        await harness.lifecycle.select(entryA.id)
+        await harness.lifecycle.select(entryB.id)
+        let pending = try harness.stateStore.load()
+        #expect(pending?.pendingOperation == .disableVisualSearch(model: entryA.id))
+        #expect(pending?.isVisualSearchEnabled == false)
+        #expect(pending?.selectedModelID == entryA.id)
+        #expect(harness.transport.downloadCount == 1)
+
+        harness.provider.releaseBlockedSessionLoad()
+        await disable.value
+        await activation.value
+
+        let removed = await harness.lifecycle.currentSnapshot()
+        #expect(!removed.isVisualSearchEnabled)
+        #expect(removed.selectedModelID == nil)
+        #expect(removed.phase == .selectingModel)
+        #expect(try harness.stateStore.load()?.pendingOperation == nil)
+        #expect(harness.transport.downloadCount == 1)
+        #expect(!FileManager.default.fileExists(atPath: harness.layout.modelDirectory(for: entryA.id).path))
+        #expect(!FileManager.default.fileExists(atPath: harness.layout.modelDirectory(for: entryB.id).path))
+
+        // After the removal commits, a new choice is accepted again.
+        await harness.lifecycle.select(entryB.id)
+        #expect(await harness.lifecycle.currentSnapshot().selectedModelID == entryB.id)
+        #expect(harness.transport.downloadCount == 2)
+    }
+
+    @Test func failedVisualRemovalStaysRetryableAcrossCatalogRefresh() async throws {
+        let payload = Data("model-bytes".utf8)
+        let (entry, url) = downloadableEntry(id: "model", payload: payload)
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ml-failed-visual-removal-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let flaky = FlakyStateStore(layout: MLModelInstallLayout(rootDirectory: root))
+        let harness = try makeHarness(
+            catalog: MLModelCatalog(entries: [entry]),
+            payloads: [url: payload],
+            assets: [uid("asset")],
+            root: root,
+            stateStoreOverride: flaky,
+            catalogRefreshInterval: .zero
+        )
+
+        await harness.lifecycle.start()
+        await harness.lifecycle.setEnabled(true)
+        harness.provider.blockNextSessionLoad()
+        let activation = Task { await harness.lifecycle.select(entry.id) }
+        #expect(await waitUntil { harness.provider.sessionLoadStarted })
+
+        let disable = Task { await harness.lifecycle.setVisualSearchEnabled(false) }
+        #expect(await waitUntil { harness.provider.sessionLoadCancellations == 1 })
+        // The journal is written; the commit after cleanup fails.
+        flaky.setFailing(true)
+        harness.provider.releaseBlockedSessionLoad()
+        await disable.value
+        await activation.value
+        #expect(await waitForStorageFailure(harness))
+
+        await harness.lifecycle.noteConditionsChanged()
+        guard case .failed(let failure) = await harness.lifecycle.currentSnapshot().phase else {
+            Issue.record("catalog refresh replaced the retryable removal failure")
+            return
+        }
+        #expect(failure.isRetryable)
+        #expect(try flaky.load()?.pendingOperation == .disableVisualSearch(model: entry.id))
+
+        flaky.setFailing(false)
+        await harness.lifecycle.retry()
+        #expect(
+            await waitUntil {
+                await harness.lifecycle.currentSnapshot().phase == .selectingModel
+            })
+        #expect(try flaky.load()?.pendingOperation == nil)
+        #expect(try flaky.load()?.selectedModelID == nil)
+        #expect(!FileManager.default.fileExists(atPath: harness.layout.modelDirectory(for: entry.id).path))
+    }
+
+    @Test func fullPurgeSupersedesPendingVisualRemoval() async throws {
+        let payload = Data("model-bytes".utf8)
+        let (entry, url) = downloadableEntry(id: "model", payload: payload)
+        let harness = try makeHarness(
+            catalog: MLModelCatalog(entries: [entry]),
+            payloads: [url: payload],
+            assets: [uid("asset")]
+        )
+        defer { try? FileManager.default.removeItem(at: harness.layout.rootDirectory) }
+
+        await harness.lifecycle.start()
+        await harness.lifecycle.setEnabled(true)
+        harness.provider.blockNextSessionLoad()
+        let activation = Task { await harness.lifecycle.select(entry.id) }
+        #expect(await waitUntil { harness.provider.sessionLoadStarted })
+
+        let removal = Task { await harness.lifecycle.setVisualSearchEnabled(false) }
+        #expect(await waitUntil { harness.provider.sessionLoadCancellations == 1 })
+        let purge = Task { await harness.lifecycle.disableAndPurge() }
+        #expect(await waitUntil { (try? harness.stateStore.load()?.pendingOperation) == .purge })
+
+        harness.provider.releaseBlockedSessionLoad()
+        await removal.value
+        await purge.value
+        await activation.value
+
+        // The stale removal must neither rewrite the purge journal nor recreate state after the purge.
+        let snapshot = await harness.lifecycle.currentSnapshot()
+        #expect(snapshot.phase == .disabled)
+        #expect(!snapshot.isEnabled)
+        #expect(!FileManager.default.fileExists(atPath: harness.layout.rootDirectory.path))
+    }
+
+    @Test func developerInstallAfterVisualRemovalNeitherRevivesNorOrphansTheModel() async throws {
+        let entry = MLModelCatalogEntry(
+            id: MLModelID("dev-model"),
+            displayName: "dev-model",
+            family: "Test",
+            descriptor: MLModelDescriptor(identifier: "dev-model", version: 1, embeddingDimension: 4),
+            tokenizerID: "t",
+            preprocessingID: "p",
+            license: .mit,
+            releaseTrack: .production,
+            estimatedInstalledBytes: 1,
+            downloadPlan: nil
+        )
+        let harness = try makeHarness(
+            catalog: MLModelCatalog(entries: [entry]),
+            payloads: [:],
+            assets: [uid("asset")]
+        )
+        defer { try? FileManager.default.removeItem(at: harness.layout.rootDirectory) }
+        let artifact = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ml-dev-artifact-\(UUID().uuidString)", isDirectory: true)
+        let model = artifact.appendingPathComponent("Test.mlmodelc", isDirectory: true)
+        try FileManager.default.createDirectory(at: model, withIntermediateDirectories: true)
+        try Data("weights".utf8).write(to: model.appendingPathComponent("model.bin"))
+        defer { try? FileManager.default.removeItem(at: artifact) }
+
+        await harness.lifecycle.start()
+        await harness.lifecycle.setEnabled(true)
+        await harness.lifecycle.setVisualSearchEnabled(true)
+        let gate = ContinuationGate()
+        await harness.lifecycle.setDeveloperInstallContinuationGate { await gate.wait() }
+
+        let install = Task { await harness.lifecycle.installDeveloperModel(from: artifact, for: entry.id) }
+        #expect(await waitUntil { gate.hasEntered })
+        #expect(FileManager.default.fileExists(atPath: harness.layout.modelDirectory(for: entry.id).path))
+
+        await harness.lifecycle.setVisualSearchEnabled(false)
+        #expect(!(await harness.lifecycle.currentSnapshot().isVisualSearchEnabled))
+        gate.release()
+        await install.value
+
+        let snapshot = await harness.lifecycle.currentSnapshot()
+        #expect(!snapshot.isVisualSearchEnabled)
+        #expect(snapshot.selectedModelID == nil)
+        #expect(!FileManager.default.fileExists(atPath: harness.layout.modelDirectory(for: entry.id).path))
+    }
+
+    private final class ContinuationGate: @unchecked Sendable {
+        private let lock = NSLock()
+        private var entered = false
+        private var released = false
+        private var continuation: CheckedContinuation<Void, Never>?
+
+        var hasEntered: Bool { lock.withLock { entered } }
+
+        /// Only the first caller blocks. Later callers pass through, so a regression that starts a
+        /// second operation fails its assertions instead of hanging the test run.
+        func wait() async {
+            await withCheckedContinuation { continuation in
+                let resumeNow = lock.withLock {
+                    if released || entered { return true }
+                    entered = true
+                    self.continuation = continuation
+                    return false
+                }
+                if resumeNow { continuation.resume() }
+            }
+        }
+
+        func release() {
+            let waiting = lock.withLock {
+                released = true
+                defer { continuation = nil }
+                return continuation
+            }
+            waiting?.resume()
+        }
+    }
+
+    @Test func failedVisualRemovalShowsRetryAndTogglingFinishesItWithNativeSearchActive() async throws {
+        let payload = Data("model-bytes".utf8)
+        let (entry, url) = downloadableEntry(id: "model", payload: payload)
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ml-native-failed-removal-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let flaky = FlakyStateStore(layout: MLModelInstallLayout(rootDirectory: root))
+        let assets = [uid("a")]
+        let harness = try makeHarness(
+            catalog: MLModelCatalog(entries: [entry]),
+            payloads: [url: payload],
+            assets: assets,
+            root: root,
+            stateStoreOverride: flaky,
+            nativeSearch: RecordingNativeSearch(results: assets)
+        )
+
+        await harness.lifecycle.start()
+        await harness.lifecycle.setEnabled(true)
+        await harness.lifecycle.select(entry.id)
+        #expect(await waitForCompleteIndex(harness, total: assets.count))
+
+        // The journal write succeeds; the final commit fails.
+        flaky.setFailing(where: { $0.pendingOperation == nil && !$0.isVisualSearchEnabled })
+        await harness.lifecycle.setVisualSearchEnabled(false)
+        let failed = await harness.lifecycle.currentSnapshot()
+        #expect(try flaky.load()?.pendingOperation == .disableVisualSearch(model: entry.id))
+        #expect(MLSmartSearchPresentation(snapshot: failed).canRetry)
+
+        // Turning Visual Search on again finishes the stalled removal; the model is chosen again later.
+        flaky.setFailing(where: nil)
+        await harness.lifecycle.setVisualSearchEnabled(true)
+        let finished = await harness.lifecycle.currentSnapshot()
+        #expect(try flaky.load()?.pendingOperation == nil)
+        #expect(!finished.isVisualSearchEnabled)
+        #expect(finished.selectedModelID == nil)
+        #expect(!FileManager.default.fileExists(atPath: harness.layout.modelDirectory(for: entry.id).path))
+    }
+
+    @Test func overlappingIntentsFinishAStalledRemovalExactlyOnce() async throws {
+        let payload = Data("model-bytes".utf8)
+        let (entry, url) = downloadableEntry(id: "model", payload: payload)
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ml-overlapping-removal-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let flaky = FlakyStateStore(layout: MLModelInstallLayout(rootDirectory: root))
+        let assets = [uid("a")]
+        let harness = try makeHarness(
+            catalog: MLModelCatalog(entries: [entry]),
+            payloads: [url: payload],
+            assets: assets,
+            root: root,
+            stateStoreOverride: flaky,
+            nativeSearch: RecordingNativeSearch(results: assets)
+        )
+
+        await harness.lifecycle.start()
+        await harness.lifecycle.setEnabled(true)
+        await harness.lifecycle.select(entry.id)
+        #expect(await waitForCompleteIndex(harness, total: assets.count))
+
+        let isRemovalCommit: @Sendable (MLSmartSearchPersistentState) -> Bool = {
+            $0.pendingOperation == nil && !$0.isVisualSearchEnabled
+        }
+        flaky.setFailing(where: isRemovalCommit)
+        await harness.lifecycle.setVisualSearchEnabled(false)
+        #expect(await waitForStorageFailure(harness))
+
+        let commits = CommitCounter()
+        flaky.setFailing(where: { state in
+            if isRemovalCommit(state) { commits.increment() }
+            return false
+        })
+        let gate = ContinuationGate()
+        await harness.lifecycle.setVisualRemovalContinuationGate { await gate.wait() }
+
+        let toggle = Task { await harness.lifecycle.setVisualSearchEnabled(true) }
+        #expect(await waitUntil { gate.hasEntered })
+        let running = await harness.lifecycle.currentSnapshot()
+        #expect(running.phase == .deleting)
+        #expect(!MLSmartSearchPresentation(snapshot: running).canRetry)
+
+        // Every overlapping intent must leave the running completion alone.
+        await harness.lifecycle.retry()
+        await harness.lifecycle.select(entry.id)
+        await harness.lifecycle.noteConditionsChanged()
+        await harness.lifecycle.setVisualSearchEnabled(true)
+        #expect(commits.value == 0)
+
+        gate.release()
+        await toggle.value
+
+        #expect(commits.value == 1)
+        #expect(await harness.lifecycle.currentSnapshot().phase == .selectingModel)
+        #expect(try flaky.load()?.pendingOperation == nil)
+        #expect(try flaky.load()?.selectedModelID == nil)
+    }
+
+    private final class CommitCounter: @unchecked Sendable {
+        private let lock = NSLock()
+        private var count = 0
+        func increment() { lock.withLock { count += 1 } }
+        var value: Int { lock.withLock { count } }
+    }
+
+    @Test func offlineStartFinishesJournaledVisualRemoval() async throws {
+        let payload = Data("model-bytes".utf8)
+        let (entry, url) = downloadableEntry(id: "model", payload: payload)
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ml-offline-removal-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let layout = MLModelInstallLayout(rootDirectory: root)
+        _ = try await MLModelInstaller(layout: layout, transport: ScriptedTransport(payloads: [url: payload]))
+            .install(entry) { _ in }
+        let stateStore = FileMLSmartSearchStateStore(layout: layout)
+        try stateStore.save(
+            MLSmartSearchPersistentState(
+                isEnabled: true,
+                isVisualSearchEnabled: false,
+                selectedModelID: entry.id,
+                activatedDescriptor: entry.descriptor,
+                pendingOperation: .disableVisualSearch(model: entry.id)
+            ))
+
+        let harness = try makeHarness(
+            catalog: MLModelCatalog(entries: [entry]),
+            payloads: [url: payload],
+            assets: [uid("a")],
+            root: root,
+            stateStoreOverride: stateStore,
+            catalogProvider: FailingCatalogProvider()
+        )
+        await harness.lifecycle.start()
+
+        #expect(try stateStore.load()?.pendingOperation == nil)
+        #expect(await harness.lifecycle.currentSnapshot().selectedModelID == nil)
+        #expect(!FileManager.default.fileExists(atPath: layout.modelDirectory(for: entry.id).path))
+    }
+
+    @Test func retryFinishesAFailedRemovalWithoutSelectedModel() async throws {
+        let payload = Data("model-bytes".utf8)
+        let (entry, url) = downloadableEntry(id: "model", payload: payload)
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ml-nil-model-removal-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let flaky = FlakyStateStore(layout: MLModelInstallLayout(rootDirectory: root))
+        let harness = try makeHarness(
+            catalog: MLModelCatalog(entries: [entry]),
+            payloads: [url: payload],
+            assets: [uid("a")],
+            root: root,
+            stateStoreOverride: flaky
+        )
+
+        await harness.lifecycle.start()
+        await harness.lifecycle.setEnabled(true)
+        await harness.lifecycle.setVisualSearchEnabled(true)
+        #expect(await harness.lifecycle.currentSnapshot().selectedModelID == nil)
+
+        flaky.setFailing(where: { $0.pendingOperation == nil && !$0.isVisualSearchEnabled })
+        await harness.lifecycle.setVisualSearchEnabled(false)
+        #expect(await waitForStorageFailure(harness))
+        #expect(try flaky.load()?.pendingOperation == .disableVisualSearch(model: nil))
+
+        flaky.setFailing(where: nil)
+        await harness.lifecycle.retry()
+        #expect(try flaky.load()?.pendingOperation == nil)
+        #expect(await harness.lifecycle.currentSnapshot().phase == .selectingModel)
+    }
+
+    @Test func visualRemovalDeletesEveryCatalogModelIncludingInterruptedSwitchTargets() async throws {
+        let payloadA = Data("model-a-bytes".utf8)
+        let payloadB = Data("model-b-bytes".utf8)
+        let (entryA, urlA) = downloadableEntry(id: "model-a", payload: payloadA)
+        let (entryB, urlB) = downloadableEntry(id: "model-b", payload: payloadB)
+        let assets = [uid("a")]
+        let harness = try makeHarness(
+            catalog: MLModelCatalog(entries: [entryA, entryB]),
+            payloads: [urlA: payloadA, urlB: payloadB],
+            assets: assets
+        )
+        defer { try? FileManager.default.removeItem(at: harness.layout.rootDirectory) }
+
+        await harness.lifecycle.start()
+        await harness.lifecycle.setEnabled(true)
+        await harness.lifecycle.select(entryA.id)
+        #expect(await waitForCompleteIndex(harness, total: assets.count))
+
+        // State an interrupted switch leaves behind: B is installed, a partial staging tree exists,
+        // and B already has vectors, while A is still the journaled model.
+        _ = try await MLModelInstaller(
+            layout: harness.layout,
+            transport: ScriptedTransport(payloads: [urlB: payloadB])
+        ).install(entryB) { _ in }
+        let partial = harness.layout.stagingDirectory(for: entryB.id, revision: "rev2")
+        try FileManager.default.createDirectory(at: partial, withIntermediateDirectories: true)
+        harness.storeProvider.store.upsert([
+            MLEmbeddingRecord(uid: assets[0], descriptor: entryB.descriptor, vector: [1, 0, 0, 0])
+        ])
+
+        await harness.lifecycle.setVisualSearchEnabled(false)
+
+        for entry in [entryA, entryB] {
+            #expect(!FileManager.default.fileExists(atPath: harness.layout.modelDirectory(for: entry.id).path))
+            #expect(harness.storeProvider.store.count(for: entry.descriptor) == 0)
+        }
+        #expect(!FileManager.default.fileExists(atPath: partial.path))
     }
 
     @Test func activationCannotCommitAfterNewerSelection() async throws {
@@ -2634,7 +3107,8 @@ import Testing
         let disabled = await harness.lifecycle.currentSnapshot()
         #expect(disabled.isEnabled)
         #expect(!disabled.isVisualSearchEnabled)
-        #expect(disabled.selectedModelID == entry.id)
+        #expect(disabled.selectedModelID == nil)
+        #expect(try harness.stateStore.load()?.selectedModelID == nil)
         #expect(harness.storeProvider.store.count(for: entry.descriptor) == 0)
         #expect(!FileManager.default.fileExists(atPath: harness.layout.modelDirectory(for: entry.id).path))
         #expect(nativeSearch.shutdownCount == 0)
@@ -2643,7 +3117,14 @@ import Testing
             _ = try await harness.lifecycle.search("anything", limit: 5)
         }
 
+        // Re-enabling after removal asks for a model again; it must not download the removed one.
         await harness.lifecycle.setVisualSearchEnabled(true)
+        let awaitingChoice = await harness.lifecycle.currentSnapshot()
+        #expect(awaitingChoice.selectedModelID == nil)
+        #expect(awaitingChoice.phase == .selectingModel)
+        #expect(harness.transport.downloadCount == 1)
+
+        await harness.lifecycle.select(entry.id)
         #expect(await waitForCompleteIndex(harness, total: assets.count))
         let reenabled = await harness.lifecycle.currentSnapshot()
         #expect(reenabled.isVisualSearchEnabled)
@@ -2689,7 +3170,7 @@ import Testing
         let recovered = await harness.lifecycle.currentSnapshot()
         #expect(recovered.isEnabled)
         #expect(!recovered.isVisualSearchEnabled)
-        #expect(recovered.selectedModelID == entry.id)
+        #expect(recovered.selectedModelID == nil)
         #expect(harness.storeProvider.store.count(for: entry.descriptor) == 0)
         #expect(!FileManager.default.fileExists(atPath: layout.modelDirectory(for: entry.id).path))
         #expect(try stateStore.load()?.pendingOperation == nil)

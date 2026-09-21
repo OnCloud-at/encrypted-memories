@@ -122,6 +122,7 @@ struct MainView: View {
     @State private var dragOutFailureMessage: String?
     // Favorites (read from server so iOS favorites show up; toggle writes back).
     @State private var favorites: Set<PhotoUID> = []
+    @State private var favoriteMutationsInFlight: Set<PhotoUID> = []
     @State private var uploadRefreshTask: Task<Void, Never>?
     @State private var uploadRefreshGeneration: UInt64 = 0
     @State private var backupUploadRefreshCoordinator = TimelineUploadRefreshCoordinator()
@@ -188,6 +189,7 @@ struct MainView: View {
                         isLoadingAlbums: albumActions.showsInitialAlbumLoadingPlaceholder,
                         albumCatalogFailed: albumCatalogFailed,
                         sharedAlbums: albumActions.sharedAlbums,
+                        sharedAlbumPresentation: albumActions.presentation(for:),
                         isLoadingSharedAlbums: albumActions.showsInitialSharedAlbumLoadingPlaceholder,
                         sharedAlbumCatalogFailed: albumActions.sharedLoadErrorMessage != nil,
                         canLeaveSharedAlbum: albumActions.canLeaveSharedAlbum,
@@ -384,8 +386,6 @@ struct MainView: View {
             if let viewerModel, zoom == nil || zoom?.interactive == true {
                 PhotoViewerView(
                     model: viewerModel,
-                    isFavorite: { favorites.contains($0) },
-                    onToggleFavorite: toggleFavorite,
                     onClose: { closePhoto() },
                     onPinchDismissBegan: beginInteractiveDismiss,
                     onPinchDismissChanged: updateInteractiveDismiss,
@@ -1103,6 +1103,7 @@ struct MainView: View {
         case .all: return L10n.string("library.title")
         case .tag(let t): return t.title
         case .album(_, let name): return name
+        case .sharedAlbum(_, _, let name): return name
         case .trash: return String(localized: "sidebar.recently_deleted")
         case .map: return "Map"
         }
@@ -1500,14 +1501,18 @@ struct MainView: View {
 
     // MARK: - Favorites / trash
 
-    private func toggleFavorite(_ uid: PhotoUID) {
-        let selection = Set([uid])
+    /// Applies an optimistic favorite mutation for `selection`, rejecting a call that overlaps any
+    /// mutation already in flight so a stale rollback cannot clobber a newer optimistic state.
+    private func mutateFavorites(_ selection: Set<PhotoUID>) {
+        guard favoriteMutationsInFlight.isDisjoint(with: selection) else { return }
         guard let target = FavoriteMutationPolicy.target(for: selection, current: favorites) else { return }
         let requested = FavoriteMutationPolicy.requestedUIDs(
             selection: selection,
             current: favorites,
             target: target
         )
+        guard !requested.isEmpty else { return }
+        favoriteMutationsInFlight.formUnion(requested)
         favorites = FavoriteMutationPolicy.optimisticState(
             current: favorites,
             requested: requested,
@@ -1521,37 +1526,13 @@ struct MainView: View {
             } catch {
                 rollbackFavoriteMutation(requested, target: target)
             }
+            favoriteMutationsInFlight.subtract(requested)
         }
     }
 
     /// Indicates whether every selected photo is a favorite.
     private var selectedAllFavorited: Bool {
         !selectedUIDs.isEmpty && selectedUIDs.allSatisfy { favorites.contains($0) }
-    }
-
-    /// Toggles the favorite state for the selection and rolls back only failed items.
-    private func favoriteSelected() {
-        guard let target = FavoriteMutationPolicy.target(for: selectedUIDs, current: favorites) else { return }
-        let uids = FavoriteMutationPolicy.requestedUIDs(
-            selection: selectedUIDs,
-            current: favorites,
-            target: target
-        )
-        guard !uids.isEmpty else { return }
-        favorites = FavoriteMutationPolicy.optimisticState(
-            current: favorites,
-            requested: uids,
-            target: target
-        )
-        Task {
-            do {
-                try await backend.setFavorites(Array(uids), target)
-            } catch let partial as FavoriteMutationError {
-                rollbackFavoriteMutation(partial.failed, target: target)
-            } catch {
-                rollbackFavoriteMutation(Set(uids), target: target)
-            }
-        }
     }
 
     private func rollbackFavoriteMutation(_ failed: Set<PhotoUID>, target: Bool) {
@@ -1857,13 +1838,7 @@ struct MainView: View {
             }
             ToolbarItemGroup(placement: .primaryAction) {
                 Button {
-                    withAnimation(
-                        .easeInOut(
-                            duration: ViewerChromePresentationStyle.standard.inspectorDuration
-                        )
-                    ) {
-                        viewerModel.toggleInfo()
-                    }
+                    viewerModel.toggleInfo()
                 } label: {
                     Label("toolbar.info", systemImage: viewerModel.showInfo ? "info.circle.fill" : "info.circle")
                         .labelStyle(.iconOnly)
@@ -1889,7 +1864,7 @@ struct MainView: View {
                 }
 
                 Button {
-                    toggleFavorite(viewerModel.current.uid)
+                    mutateFavorites([viewerModel.current.uid])
                 } label: {
                     Label(
                         favorites.contains(viewerModel.current.uid) ? "toolbar.remove_favorite" : "toolbar.favorite",
@@ -1967,7 +1942,7 @@ struct MainView: View {
     }
 
     @ToolbarContentBuilder private var librarySelectionAndViewToolbarContent: some ToolbarContent {
-        if selection != .trash {
+        if selection != .trash, !selection.isReadOnly {
             ToolbarItemGroup(placement: .secondaryAction) {
                 downloadActionItem
                 Button {
@@ -1996,11 +1971,14 @@ struct MainView: View {
                 } label: {
                     Label("toolbar.move_selected_to_trash", systemImage: "trash").labelStyle(.iconOnly)
                 }
+                // Command-Delete is the system-wide delete key equivalent. It opens the same confirmation
+                // as the button, so no selection leaves the library without the user confirming it.
+                .keyboardShortcut(.delete, modifiers: .command)
                 .disabled(selectedUIDs.isEmpty || isTrashMutating)
                 .help("toolbar.move_to_trash")
                 .accessibilityLabel("toolbar.move_selected_to_trash")
                 Button {
-                    favoriteSelected()
+                    mutateFavorites(selectedUIDs)
                 } label: {
                     Label(
                         selectedAllFavorited ? "toolbar.remove_favorite" : "toolbar.favorite_selected",
@@ -2458,6 +2436,7 @@ private struct SidebarView: View {
     let isLoadingAlbums: Bool
     let albumCatalogFailed: Bool
     let sharedAlbums: [SharedAlbumSummary]
+    let sharedAlbumPresentation: (SharedAlbumSummary) -> SharedAlbumPresentation
     let isLoadingSharedAlbums: Bool
     let sharedAlbumCatalogFailed: Bool
     let canLeaveSharedAlbum: Bool
@@ -2503,8 +2482,12 @@ private struct SidebarView: View {
                     .buttonStyle(.plain)
                 }
                 ForEach(albums) { album in
-                    Label(album.title, systemImage: "rectangle.stack")
-                        .tag(PhotoFilter.album(id: album.id, title: album.title))
+                    OwnedAlbumSidebarRow(
+                        album: album,
+                        thumbnailFeed: thumbnailFeed,
+                        sourceAnalysisRevision: sourceAnalysisRevision
+                    )
+                    .tag(PhotoFilter.album(id: album.id, title: album.title))
                 }
             }
             Section(L10n.string("collections.section_shared_with_me")) {
@@ -2528,8 +2511,16 @@ private struct SidebarView: View {
                 ForEach(sharedAlbums) { album in
                     SharedAlbumSidebarRow(
                         album: album,
+                        presentation: sharedAlbumPresentation(album),
                         thumbnailFeed: thumbnailFeed,
                         sourceAnalysisRevision: sourceAnalysisRevision
+                    )
+                    .tag(
+                        PhotoFilter.sharedAlbum(
+                            volumeID: album.node.volumeID,
+                            nodeID: album.node.nodeID,
+                            title: album.title
+                        )
                     )
                     .contextMenu {
                         if canLeaveSharedAlbum {
@@ -2578,8 +2569,11 @@ private struct SidebarView: View {
     }
 }
 
-private struct SharedAlbumSidebarRow: View {
-    let album: SharedAlbumSummary
+/// Sidebar cover thumbnail shared by owned and shared album rows. Falls back to a symbol until the
+/// thumbnail feed has the cover in memory or on disk.
+private struct AlbumSidebarCover: View {
+    let coverUID: PhotoUID?
+    let fallbackSystemImage: String
     let thumbnailFeed: ThumbnailFeed
     let sourceAnalysisRevision: UInt64
     @State private var coverImage: NSImage?
@@ -2590,45 +2584,21 @@ private struct SharedAlbumSidebarRow: View {
         let analysisRevision: UInt64
     }
 
-    private var coverUID: PhotoUID? { album.coverPhotoUID }
-
-    private var details: String {
-        var parts: [String] = []
-        if let owner = album.owner, !owner.isEmpty {
-            parts.append(L10n.string("albums.shared_owner \(owner)"))
-        }
-        parts.append(L10n.string("albums.photo_count \(album.photoCount)"))
-        if album.isSharedByURL {
-            parts.append(L10n.string("albums.shared_via_link"))
-        }
-        return parts.joined(separator: " • ")
-    }
-
     var body: some View {
-        HStack(spacing: 8) {
-            ZStack {
-                RoundedRectangle(cornerRadius: 6)
-                    .fill(.quaternary)
-                if let coverImage {
-                    Image(nsImage: coverImage)
-                        .resizable()
-                        .scaledToFill()
-                } else {
-                    Image(systemName: "person.2.crop.square.stack")
-                        .foregroundStyle(.secondary)
-                }
-            }
-            .frame(width: 32, height: 32)
-            .clipShape(RoundedRectangle(cornerRadius: 6))
-            VStack(alignment: .leading, spacing: 1) {
-                Text(album.title)
-                    .lineLimit(1)
-                Text(details)
-                    .font(.caption)
+        ZStack {
+            RoundedRectangle(cornerRadius: 6)
+                .fill(.quaternary)
+            if let coverImage {
+                Image(nsImage: coverImage)
+                    .resizable()
+                    .scaledToFill()
+            } else {
+                Image(systemName: fallbackSystemImage)
                     .foregroundStyle(.secondary)
-                    .lineLimit(1)
             }
         }
+        .frame(width: 32, height: 32)
+        .clipShape(RoundedRectangle(cornerRadius: 6))
         .task(id: CoverLoadKey(uid: coverUID, analysisRevision: sourceAnalysisRevision)) {
             if loadedCoverUID != coverUID {
                 coverImage = nil
@@ -2641,5 +2611,67 @@ private struct SharedAlbumSidebarRow: View {
                 coverImage = await thumbnailFeed.analysisImage(for: coverUID)
             }
         }
+    }
+}
+
+private struct OwnedAlbumSidebarRow: View {
+    let album: AlbumSummary
+    let thumbnailFeed: ThumbnailFeed
+    let sourceAnalysisRevision: UInt64
+
+    var body: some View {
+        HStack(spacing: 8) {
+            AlbumSidebarCover(
+                coverUID: album.coverPhotoUID,
+                fallbackSystemImage: "rectangle.stack",
+                thumbnailFeed: thumbnailFeed,
+                sourceAnalysisRevision: sourceAnalysisRevision
+            )
+            Text(album.title)
+                .lineLimit(1)
+        }
+    }
+}
+
+private struct SharedAlbumSidebarRow: View {
+    let album: SharedAlbumSummary
+    let presentation: SharedAlbumPresentation
+    let thumbnailFeed: ThumbnailFeed
+    let sourceAnalysisRevision: UInt64
+
+    /// The row stays compact; the read-only reason lives in the tooltip and accessibility hint.
+    private var helpText: String {
+        [presentation.detailLine, presentation.invitationDetail, presentation.writeRestrictionReason]
+            .compactMap { $0 }
+            .joined(separator: "\n")
+    }
+
+    var body: some View {
+        HStack(spacing: 8) {
+            AlbumSidebarCover(
+                coverUID: album.coverPhotoUID,
+                fallbackSystemImage: "person.2.crop.square.stack",
+                thumbnailFeed: thumbnailFeed,
+                sourceAnalysisRevision: sourceAnalysisRevision
+            )
+            VStack(alignment: .leading, spacing: 1) {
+                Text(album.title)
+                    .lineLimit(1)
+                Text(presentation.detailLine)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                if let invitation = presentation.invitationDetail {
+                    Text(invitation)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+            }
+        }
+        .help(helpText)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(presentation.accessibilityLabel)
+        .accessibilityHint(presentation.accessibilityHint ?? "")
     }
 }

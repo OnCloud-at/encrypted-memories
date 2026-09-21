@@ -2193,22 +2193,12 @@
         }
       }
     },
-    "a11y.action": {
+    "viewer.close_photo": {
       "extractionState": "manual",
-      "comment": "Fallback VoiceOver label for an icon button.",
+      "comment": "View menu command that closes the open photo. Its key equivalent is Esc.",
       "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Action"
-          }
-        },
-        "de": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Aktion"
-          }
-        }
+        "en": { "stringUnit": { "state": "translated", "value": "Close Photo" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Foto schließen" } }
       }
     },
     "infopanel.info": {
@@ -3213,6 +3203,51 @@
             "value": "„%@“ ist kein unterstütztes Foto oder Video."
           }
         }
+      }
+    },
+    "error.series_not_own_library": {
+      "extractionState": "manual",
+      "comment": "Keep Only Favorites refused: the burst is in a shared album, not in the user's own library.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Only bursts in your own library can be reduced to favorites." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Nur Serien in deiner eigenen Mediathek lassen sich auf Favoriten reduzieren." } }
+      }
+    },
+    "error.series_invalid_selection": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "The selected favorites do not belong to this burst." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Die gewählten Favoriten gehören nicht zu dieser Serie." } }
+      }
+    },
+    "error.series_already_running": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "The favorites of this burst are already being saved." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Die Favoriten dieser Serie werden bereits gesichert." } }
+      }
+    },
+    "error.series_draft_blocked %@": {
+      "extractionState": "manual",
+      "comment": "Another device holds an unfinished upload with the same name. %@ is the file name.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Another device is uploading “%@”. Try again later." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Ein anderes Gerät lädt „%@“ gerade hoch. Versuche es später erneut." } }
+      }
+    },
+    "error.series_copy_not_confirmed": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "A saved favorite could not be confirmed. The burst was not moved to the trash." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Ein gesicherter Favorit konnte nicht bestätigt werden. Die Serie wurde nicht in den Papierkorb bewegt." } }
+      }
+    },
+    "error.series_trash_not_confirmed": {
+      "extractionState": "manual",
+      "comment": "The trash request returned, but the burst photos were still in the library.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "The burst could not be moved to the trash. Your favorites are saved, and the app tries again." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Die Serie konnte nicht in den Papierkorb bewegt werden. Die Favoriten sind gesichert, die App versucht es erneut." } }
       }
     },
     "error.upload_file_missing %@": {
@@ -4837,6 +4872,91 @@
       "localizations": {
         "en": { "stringUnit": { "state": "translated", "value": "Link share" } },
         "de": { "stringUnit": { "state": "translated", "value": "Linkfreigabe" } }
+      }
+    },
+    "albums.shared_role_viewer": {
+      "extractionState": "manual",
+      "comment": "Effective shared-album role from the Proton Drive SDK (directRole).",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Viewer" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Betrachter" } }
+      }
+    },
+    "albums.shared_role_editor": {
+      "extractionState": "manual",
+      "comment": "Effective shared-album role from the Proton Drive SDK (directRole).",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Editor" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Bearbeiter" } }
+      }
+    },
+    "albums.shared_role_admin": {
+      "extractionState": "manual",
+      "comment": "Effective shared-album role from the Proton Drive SDK (directRole).",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Admin" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Administrator" } }
+      }
+    },
+    "albums.shared_role_inherited": {
+      "extractionState": "manual",
+      "comment": "Access comes from a parent item. It is not a direct invitation.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Inherited access" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Geerbter Zugriff" } }
+      }
+    },
+    "albums.shared_role_read_only %@": {
+      "extractionState": "manual",
+      "comment": "Role title for an editor/admin role that this app cannot use for edits yet.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "%@ (read-only in this app)" } },
+        "de": { "stringUnit": { "state": "translated", "value": "%@ (in dieser App schreibgeschützt)" } }
+      }
+    },
+    "albums.shared_invited_by %@": {
+      "extractionState": "manual",
+      "comment": "Verified inviter of a shared album.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Invited by %@" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Eingeladen von %@" } }
+      }
+    },
+    "albums.shared_invited_by_unverified %@": {
+      "extractionState": "manual",
+      "comment": "Inviter address whose invitation signature could not be verified.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Invited by %@ (unverified)" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Eingeladen von %@ (nicht verifiziert)" } }
+      }
+    },
+    "albums.shared_inviter_unverified": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Inviter not verified" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Einladende Person nicht verifiziert" } }
+      }
+    },
+    "albums.shared_invited_on %@": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Invited on %@" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Eingeladen am %@" } }
+      }
+    },
+    "albums.shared_read_only_role": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "This album can’t be edited with your access." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Dieses Album kann mit diesem Zugriff nicht bearbeitet werden." } }
+      }
+    },
+    "albums.shared_read_only_transport": {
+      "extractionState": "manual",
+      "comment": "Editor/admin role, but the app has no write path for albums owned by another account.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Editing albums shared with you isn’t supported in this app yet." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Das Bearbeiten geteilter Alben wird von dieser App noch nicht unterstützt." } }
       }
     },
     "collections.empty_shared_albums": {
