@@ -7,6 +7,7 @@ require "json"
 require "net/http"
 require "openssl"
 require "optparse"
+require "time"
 require "uri"
 
 module AppStoreConnect
@@ -35,7 +36,17 @@ module AppStoreConnect
     WAITING_FOR_EXPORT_COMPLIANCE WAITING_FOR_REVIEW IN_REVIEW
     PENDING_DEVELOPER_RELEASE PENDING_APPLE_RELEASE
   ].freeze
-  EDITABLE_VERSION_STATES = %w[PREPARE_FOR_SUBMISSION READY_FOR_REVIEW DEVELOPER_REJECTED].freeze
+  # App Review ended these versions without approval. Apple keeps them editable: the owner
+  # corrects metadata or attaches a new build and submits again. Their review submission stays
+  # open in UNRESOLVED_ISSUES and must be settled before a new submission can exist.
+  APPLE_REJECTED_VERSION_STATES = %w[REJECTED METADATA_REJECTED INVALID_BINARY].freeze
+  EDITABLE_VERSION_STATES = (
+    %w[PREPARE_FOR_SUBMISSION READY_FOR_REVIEW DEVELOPER_REJECTED] + APPLE_REJECTED_VERSION_STATES
+  ).freeze
+  # One review submission per platform can be open. These states block a new submission.
+  OPEN_REVIEW_SUBMISSION_STATES = %w[
+    READY_FOR_REVIEW WAITING_FOR_REVIEW IN_REVIEW UNRESOLVED_ISSUES CANCELING COMPLETING
+  ].freeze
   CANCELABLE_REVIEW_SUBMISSION_STATES = %w[WAITING_FOR_REVIEW IN_REVIEW COMPLETE].freeze
   TRANSITIONAL_REVIEW_SUBMISSION_STATES = %w[CANCELING COMPLETING].freeze
   PRE_ACCEPTANCE_VERSION_STATES = %w[
@@ -46,12 +57,20 @@ module AppStoreConnect
   RELEASE_NOTE_RESUBMIT_LIMIT = 2
   APP_VERSION_PATTERN = /\A[0-9]+\.[0-9]+\.[0-9]+\z/
 
-  class Error < StandardError; end
+  class Error < StandardError
+    attr_reader :remediation, :category
+
+    def initialize(message = nil, remediation: nil, category: nil)
+      super(message)
+      @remediation = remediation
+      @category = category
+    end
+  end
   class APIError < Error
     attr_reader :status, :codes
 
-    def initialize(message, status:, codes: [])
-      super(message)
+    def initialize(message, status:, codes: [], remediation: nil, category: nil)
+      super(message, remediation: remediation, category: category)
       @status = status
       @codes = codes.freeze
     end
@@ -59,6 +78,70 @@ module AppStoreConnect
   class TransportError < Error; end
 
   module_function
+
+  def failure_report(error)
+    category, remediation, rerun_safe = classify_failure(error)
+    {
+      category: error.respond_to?(:category) && error.category || category,
+      cause: error.message.to_s,
+      remediation: error.respond_to?(:remediation) && error.remediation || remediation,
+      rerun_safe: rerun_safe
+    }
+  end
+
+  def classify_failure(error)
+    if error.is_a?(TransportError)
+      [
+        :apple_or_network_outage,
+        "check https://developer.apple.com/system-status/ and the runner network, then re-run the failed jobs.",
+        true
+      ]
+    elsif error.is_a?(APIError)
+      case error.status
+      when 401, 403
+        [
+          :credentials,
+          "verify the App Store Connect API key secrets (APP_STORE_CONNECT_ISSUER_ID, " \
+            "APP_STORE_CONNECT_KEY_ID, APP_STORE_CONNECT_PRIVATE_KEY_BASE64), that the key is not revoked, " \
+            "and that it has the App Manager role; also check for a pending Apple agreement in App Store Connect.",
+          true
+        ]
+      when 429
+        [:rate_limit, "Wait for Apple's rate limit to clear, then re-run the failed jobs.", true]
+      when 500..599
+        [:apple_outage, "Check https://developer.apple.com/system-status/, then re-run the failed jobs.", true]
+      when 409
+        [
+          :apple_state_conflict,
+          "open the named version in App Store Connect, compare its state with the message, resolve it, then re-run.",
+          true
+        ]
+      when 404
+        [:apple_resource_missing, "verify the named App Store Connect resource, then re-run the failed jobs.", false]
+      else
+        [
+          :request_rejected,
+          "read the App Store Connect response, correct the request, then re-run the failed jobs.",
+          false
+        ]
+      end
+    elsif error.message.to_s.start_with?("Missing ")
+      missing = error.message.to_s.delete_prefix("Missing ")
+      remediation = if missing.start_with?("--")
+                      "Provide the required CLI option #{missing}, then re-run the failed jobs."
+                    else
+                      "Set the repository secret #{missing}, then re-run the failed jobs."
+                    end
+      [:configuration, remediation, false]
+    else
+      [
+        :release_state,
+        "Read the cause, correct the named App Store Connect or GitHub release state, then re-run the failed jobs. " \
+          "The workflow is idempotent.",
+        false
+      ]
+    end
+  end
 
   def base64url(value)
     Base64.urlsafe_encode64(value, padding: false)
@@ -291,24 +374,34 @@ module AppStoreConnect
       uri = path.start_with?("http") ? URI(path) : URI("#{API_ROOT}#{path}")
       uri.query = URI.encode_www_form(query) unless query.empty?
       attempts = 0
+      unauthorized_retries = 0
 
       loop do
         attempts += 1
-        request = request_class(method).new(uri)
-        request["Authorization"] = "Bearer #{token}"
-        request["Accept"] = "application/json"
-        if body
-          request["Content-Type"] = "application/json"
-          request.body = JSON.generate(body)
-        end
+        begin
+          request = request_class(method).new(uri)
+          request["Authorization"] = "Bearer #{token}"
+          request["Accept"] = "application/json"
+          if body
+            request["Content-Type"] = "application/json"
+            request.body = JSON.generate(body)
+          end
 
-        response = Net::HTTP.start(
-          uri.hostname,
-          uri.port,
-          use_ssl: true,
-          open_timeout: 15,
-          read_timeout: 60
-        ) { |http| http.request(request) }
+          response = Net::HTTP.start(
+            uri.hostname,
+            uri.port,
+            use_ssl: true,
+            open_timeout: 15,
+            read_timeout: 60
+          ) { |http| http.request(request) }
+        rescue Timeout::Error, SocketError, EOFError, SystemCallError, OpenSSL::SSL::SSLError => error
+          unless retryable_exception?(method, error) && attempts < 6
+            raise TransportError, "App Store Connect transport failed: #{error.class}"
+          end
+
+          retry_request(method, uri, attempts, error.class.name, nil)
+          next
+        end
 
         if response.is_a?(Net::HTTPSuccess)
           return {} if response.body.nil? || response.body.empty?
@@ -316,9 +409,14 @@ module AppStoreConnect
           return JSON.parse(response.body)
         end
 
-        if retryable?(method, response) && attempts < 5
-          wait = [response["Retry-After"].to_i, 2**attempts].max
-          @sleeper.call([wait, 30].min)
+        if response.code.to_i == 401 && unauthorized_retries.zero? && attempts < 6
+          unauthorized_retries += 1
+          retry_request(method, uri, attempts, "HTTP 401", response)
+          next
+        end
+
+        if retryable?(method, response) && attempts < 6
+          retry_request(method, uri, attempts, "HTTP #{response.code}", response)
           next
         end
 
@@ -328,8 +426,6 @@ module AppStoreConnect
       raise Error, "App Store Connect returned invalid JSON"
     rescue OpenSSL::PKey::PKeyError
       raise Error, "The App Store Connect private key is invalid"
-    rescue Timeout::Error, SocketError, EOFError, SystemCallError, OpenSSL::SSL::SSLError => error
-      raise TransportError, "App Store Connect transport failed: #{error.class}"
     end
 
     def token
@@ -345,10 +441,47 @@ module AppStoreConnect
     end
 
     def retryable?(method, response)
-      return true if response.code.to_i == 429
+      status = response.code.to_i
+      # Apple rejects a rate-limited request before it applies it. Every other POST response,
+      # including 503, leaves the outcome unknown, and a second POST could duplicate a resource.
+      return true if status == 429
       return false if method == :post
 
-      response.code.to_i >= 500
+      status >= 500 && status <= 599
+    end
+
+    def retryable_exception?(method, error)
+      return false unless [Timeout::Error, SocketError, EOFError, SystemCallError, OpenSSL::SSL::SSLError].any? do |klass|
+        error.is_a?(klass)
+      end
+
+      return true unless method == :post
+
+      [Net::OpenTimeout, SocketError, Errno::ECONNREFUSED, Errno::EHOSTUNREACH, Errno::ENETUNREACH].any? do |klass|
+        error.is_a?(klass)
+      end
+    end
+
+    def retry_request(method, uri, attempt, reason, response)
+      wait = retry_wait(attempt, response)
+      puts "Retrying #{method.to_s.upcase} #{uri.path} (#{reason}) attempt #{attempt}/6 wait #{wait}s"
+      @sleeper.call(wait)
+    end
+
+    def retry_wait(attempt, response)
+      retry_after = response && response["Retry-After"]
+      return [[retry_after.to_i, 0].max, 120].min if retry_after && retry_after.match?(/\A\d+\z/)
+
+      if retry_after && !retry_after.empty?
+        begin
+          seconds = (Time.httpdate(retry_after) - Time.now).ceil
+          return [[seconds, 0].max, 120].min
+        rescue ArgumentError
+          # Fall back to exponential backoff for an invalid Retry-After value.
+        end
+      end
+
+      [2**attempt, 120].min
     end
 
     def api_error(response)
@@ -431,9 +564,9 @@ module AppStoreConnect
           [platform, find_build(platform: platform, version: version, build_number: build_number)]
         end
 
-        failures = builds.filter_map do |platform, build|
+        failures = builds.each_with_object([]) do |(platform, build), result|
           state = build&.dig("attributes", "processingState")
-          "#{platform}=#{state}" if %w[FAILED INVALID].include?(state)
+          result << "#{platform}=#{state}" if %w[FAILED INVALID].include?(state)
         end
         raise Error, "Apple rejected build processing: #{failures.join(", ")}" unless failures.empty?
 
@@ -446,7 +579,14 @@ module AppStoreConnect
         states = builds.map do |platform, build|
           "#{platform}=#{build&.dig("attributes", "processingState") || "MISSING"}"
         end
-        raise Error, "Timed out while Apple processed builds: #{states.join(", ")}" if monotonic_time >= deadline
+        if monotonic_time >= deadline
+          raise Error.new(
+            "Timed out while Apple processed builds: #{states.join(", ")}",
+            remediation: "Apple is still processing. Open App Store Connect > TestFlight and check the build. " \
+              "Re-run the failed jobs later; the uploaded build is reused. If processing exceeds 24 hours, " \
+              "contact Apple Developer Support."
+          )
+        end
 
         puts "Waiting for App Store Connect processing: #{states.join(", ")}"
         sleep(poll_seconds)
@@ -457,10 +597,12 @@ module AppStoreConnect
       builds = require_valid_builds(version: version, build_number: build_number)
       group = find_or_create_group(name: group_name, internal: true)
       disable_mobile_builds_on_other_platforms(group)
-      builds.each do |platform, build|
-        upsert_build_localizations(build.fetch("id"), localization_paths.fetch(platform, {}))
+      with_current_builds(builds, version: version, build_number: build_number) do |current|
+        current.each do |platform, build|
+          upsert_build_localizations(build.fetch("id"), localization_paths.fetch(platform, {}))
+        end
+        add_builds_to_group(group.fetch("id"), current.values.map { |build| build.fetch("id") })
       end
-      add_builds_to_group(group.fetch("id"), builds.values.map { |build| build.fetch("id") })
       append_summary("Distributed #{version} (#{build_number}) to internal group #{group.dig("attributes", "name")}.")
     end
 
@@ -475,12 +617,43 @@ module AppStoreConnect
       group = find_or_create_group(name: group_name, internal: false)
       disable_mobile_builds_on_other_platforms(group)
 
-      builds.each do |platform, build|
-        upsert_build_localizations(build.fetch("id"), localization_paths.fetch(platform, {}))
+      with_current_builds(builds, version: version, build_number: build_number) do |current|
+        current.each do |platform, build|
+          upsert_build_localizations(build.fetch("id"), localization_paths.fetch(platform, {}))
+        end
+        add_builds_to_group(group.fetch("id"), current.values.map { |build| build.fetch("id") })
+        current.each_value { |build| submit_beta_review(build) }
       end
-      add_builds_to_group(group.fetch("id"), builds.values.map { |build| build.fetch("id") })
-      builds.each_value { |build| submit_beta_review(build) }
       append_summary("Submitted #{version} (#{build_number}) for external TestFlight testing in #{group_name}.")
+    end
+
+    # Apple can list a build and still answer HTTP 404 for its id for a short time, and Apple
+    # replaces the build record when the same build number is processed again (run 34993650537).
+    # Every operation in the block tolerates repetition (upserts, group membership, and a
+    # reconciled beta review submission), so the block runs again with newly resolved build ids. A build that stays missing is an owner decision, not a retry case.
+    def with_current_builds(builds, version:, build_number:, attempts: 4, wait_seconds: 20)
+      attempt = 0
+      begin
+        attempt += 1
+        yield builds
+      rescue APIError => error
+        raise unless error.status == 404 && error.message.include?("builds")
+
+        if attempt >= attempts
+          raise Error.new(
+            "Apple no longer returns build #{version} (#{build_number}): #{error.message}",
+            category: :apple_resource_missing,
+            remediation: "Open App Store Connect > TestFlight and check build #{build_number} on both " \
+                         "platforms. If Apple removed or expired it, publish a release with a higher " \
+                         "build number. If it is listed, re-run the failed jobs."
+          )
+        end
+        puts "Apple returned HTTP 404 for a listed build; resolving the build ids again " \
+             "(attempt #{attempt} of #{attempts})."
+        @sleeper.call(wait_seconds)
+        builds = require_valid_builds(version: version, build_number: build_number)
+        retry
+      end
     end
 
     def prepare_app_store(
@@ -516,7 +689,12 @@ module AppStoreConnect
         SUBMITTED_VERSION_STATES.include?(state) || EDITABLE_VERSION_STATES.include?(state)
       end
       unless invalid.empty?
-        raise Error, "App versions cannot use this release workflow from states: #{invalid.map { |key, value| "#{key}=#{value}" }.join(", ")}"
+        raise Error.new(
+          "App versions cannot use this release workflow from states: " \
+          "#{invalid.map { |key, value| "#{key}=#{value}" }.join(", ")}",
+          category: :release_state,
+          remediation: unusable_version_state_remediation
+        )
       end
 
       # Both platforms must pass the review-details preflight before any release
@@ -567,7 +745,10 @@ module AppStoreConnect
       versions.each do |platform, app_store_version|
         next if SUBMITTED_VERSION_STATES.include?(states.fetch(platform))
 
-        submission = find_or_create_review_submission(platform: platform)
+        submission = find_or_create_review_submission(
+          platform: platform,
+          version_id: app_store_version.fetch("id")
+        )
         add_version_to_review_submission(
           submission_id: submission.fetch("id"),
           version_id: app_store_version.fetch("id")
@@ -949,7 +1130,11 @@ module AppStoreConnect
       value = build.dig("attributes", "usesNonExemptEncryption")
       return if value == false
 
-      raise Error, "Build #{build.fetch("id")} does not declare exempt encryption"
+      raise Error.new(
+        "Build #{build.fetch("id")} does not declare exempt encryption",
+        remediation: "Set ITSAppUsesNonExemptEncryption in Info.plist or answer the export compliance " \
+          "question for the build in App Store Connect."
+      )
     end
 
     def beta_groups
@@ -1363,10 +1548,28 @@ module AppStoreConnect
       return if REVIEWED_BUILD_STATES.include?(state)
       raise Error, "Build #{build.fetch("id")} was rejected by TestFlight review" if state == "REJECTED"
 
-      @client.post(
-        "/v1/betaAppReviewSubmissions",
-        body: AppStoreConnect.beta_review_payload(build.fetch("id"))
+      begin
+        @client.post(
+          "/v1/betaAppReviewSubmissions",
+          body: AppStoreConnect.beta_review_payload(build.fetch("id"))
+        )
+      rescue APIError => error
+        # A repeated distribution can post before Apple exposes the first submission.
+        raise unless [409, 422].include?(error.status)
+
+        puts "Apple reports an existing TestFlight review submission for build #{build.fetch('id')}: " \
+             "#{error.message}"
+        raise unless beta_review_state(build) && beta_review_state(build) != "REJECTED"
+      end
+    end
+
+    def beta_review_state(build)
+      response = @client.get(
+        "/v1/builds/#{build.fetch("id")}",
+        query: { "include" => "betaAppReviewSubmission" }
       )
+      response.fetch("included", []).find { |item| item["type"] == "betaAppReviewSubmissions" }
+              &.dig("attributes", "betaReviewState")
     end
 
     def resolve_app_store_versions_for_submission(
@@ -1387,6 +1590,10 @@ module AppStoreConnect
       end
 
       validate_localization_paths(localization_paths)
+      # Validate the state of every existing target on both platforms before the first mutation.
+      # Creating a missing version is idempotent, but it must not precede a predictable failure
+      # on the other platform.
+      preflight_existing_target_states!(plans)
       materialize_missing_app_store_versions(plans, version: version)
       preflight_planned_release_note_changes!(plans, localization_paths)
       preflight_app_store_version_plans(
@@ -1460,14 +1667,14 @@ module AppStoreConnect
         replacement = active_candidates.first
         unless replacement
           recoverable = versions.select do |item|
-            next false unless version_state(item) == "DEVELOPER_REJECTED"
+            next false unless EDITABLE_VERSION_STATES.include?(version_state(item))
 
             existing_version = item.dig("attributes", "versionString").to_s
             (app_version_components(existing_version) <=> target_components).negative?
           end
           if recoverable.length > 1
             versions_text = recoverable.map { |item| item.dig("attributes", "versionString") }.join(", ")
-            raise Error, "Apple returned multiple rejected #{platform} versions to rename: #{versions_text}"
+            raise Error, "Apple returned multiple editable #{platform} versions to rename: #{versions_text}"
           end
           replacement = recoverable.first
         end
@@ -1481,11 +1688,37 @@ module AppStoreConnect
       }
     end
 
+    def preflight_existing_target_states!(plans)
+      invalid = plans.to_a.filter_map do |platform, plan|
+        target = plan[:target]
+        next unless target
+
+        state = version_state(target)
+        next if SUBMITTED_VERSION_STATES.include?(state) || EDITABLE_VERSION_STATES.include?(state)
+
+        "#{platform}=#{state}"
+      end
+      return if invalid.empty?
+
+      raise Error.new(
+        "App versions cannot use this release workflow from states: #{invalid.join(', ')}",
+        category: :release_state,
+        remediation: unusable_version_state_remediation
+      )
+    end
+
+    def unusable_version_state_remediation
+      "The named version is no longer editable (for example REPLACED_WITH_NEW_VERSION or " \
+        "DEVELOPER_REMOVED_FROM_SALE). Publish the GitHub release with a higher version number. " \
+        "No Apple state was changed."
+    end
+
     def materialize_missing_app_store_versions(plans, version:)
       plans.each do |platform, plan|
         next if plan[:target] || plan[:replacement]
 
         plan[:target] = find_or_create_app_store_version(platform: platform, version: version)
+        append_summary("Prepared #{platform} App Store version #{version}.")
       end
     end
 
@@ -1570,7 +1803,7 @@ module AppStoreConnect
       version_id = app_store_version.fetch("id")
       current = read_app_store_version(version_id)
       state = version_state(current)
-      unless state == "DEVELOPER_REJECTED"
+      unless EDITABLE_VERSION_STATES.include?(state)
         raise Error,
               "#{platform} App Store version #{current.dig('attributes', 'versionString')} changed to #{state} " \
               "before it could be renamed to #{target_version}"
@@ -1781,17 +2014,107 @@ module AppStoreConnect
       app_store_version["attributes"]["releaseType"] = "AFTER_APPROVAL"
     end
 
-    def find_or_create_review_submission(platform:)
-      submissions = review_submissions(platform: platform, states: ["READY_FOR_REVIEW"])
-      ready = submissions.select { |item| item.dig("attributes", "state") == "READY_FOR_REVIEW" }
-      raise Error, "Apple returned multiple open #{platform} review submissions" if ready.length > 1
-      return ready.first if ready.one?
+    def find_or_create_review_submission(platform:, version_id: nil, timeout_seconds: 900, poll_seconds: 10)
+      deadline = @monotonic_clock.call + timeout_seconds
+      cancel_requested = {}
+      loop do
+        open = review_submissions(platform: platform, states: OPEN_REVIEW_SUBMISSION_STATES).select do |item|
+          OPEN_REVIEW_SUBMISSION_STATES.include?(item.dig("attributes", "state"))
+        end
+        ready = open.select { |item| item.dig("attributes", "state") == "READY_FOR_REVIEW" }
+        if ready.length > 1
+          raise Error.new(
+            "Apple returned multiple open #{platform} review submissions: #{submission_list(ready)}",
+            category: :apple_state_conflict,
+            remediation: "Open App Store Connect > App Review, remove all but one draft submission for " \
+                         "#{platform}, then re-run the failed jobs."
+          )
+        end
+        blocking = open - ready
+        return ready.first if ready.one? && blocking.empty?
 
-      response = @client.post(
-        "/v1/reviewSubmissions",
-        body: AppStoreConnect.review_submission_payload(app_id: @app_id, platform: platform)
-      )
-      response.fetch("data")
+        if blocking.empty?
+          response = @client.post(
+            "/v1/reviewSubmissions",
+            body: AppStoreConnect.review_submission_payload(app_id: @app_id, platform: platform)
+          )
+          return response.fetch("data")
+        end
+
+        blocking.each do |submission|
+          settle_blocking_review_submission(
+            submission,
+            platform: platform,
+            version_id: version_id,
+            cancel_requested: cancel_requested
+          )
+        end
+
+        if @monotonic_clock.call >= deadline
+          raise Error.new(
+            "Timed out while #{platform} review submissions settled: #{submission_list(blocking)}",
+            category: :apple_state_conflict,
+            remediation: "Apple is still processing the cancellation. Wait some minutes, check App Store " \
+                         "Connect > App Review, then re-run the failed jobs."
+          )
+        end
+        @sleeper.call(poll_seconds)
+      end
+    end
+
+    # A rejected attempt stays open in UNRESOLVED_ISSUES and blocks the next submission of the
+    # same platform. Apple does not accept new items in that state. The workflow cancels only
+    # a rejected attempt of the version that it submits now. Every other open submission belongs
+    # to a different owner decision and stops the run with an exact instruction.
+    def settle_blocking_review_submission(submission, platform:, version_id:, cancel_requested:)
+      submission_id = submission.fetch("id")
+      state = submission.dig("attributes", "state")
+      return if TRANSITIONAL_REVIEW_SUBMISSION_STATES.include?(state)
+      return if cancel_requested[submission_id]
+
+      same_version = version_id && review_submission_version_id_or_nil(submission) == version_id
+      unless state == "UNRESOLVED_ISSUES" && same_version
+        raise Error.new(
+          "#{platform} review submission #{submission_id} is open in #{state} and blocks a new submission",
+          category: :apple_state_conflict,
+          remediation: "Open App Store Connect > App Review > submission #{submission_id}. Cancel it or " \
+                       "finish it, then re-run the failed jobs. The workflow cancels only a rejected " \
+                       "attempt of the version that it submits."
+        )
+      end
+
+      begin
+        @client.patch(
+          "/v1/reviewSubmissions/#{submission_id}",
+          body: AppStoreConnect.cancel_review_payload(submission_id)
+        )
+        append_summary("Canceled the rejected #{platform} review submission #{submission_id} before resubmission.")
+      rescue APIError => error
+        raise unless [409, 422].include?(error.status)
+
+        refreshed = read_review_submission(submission_id).dig("attributes", "state")
+        unless TRANSITIONAL_REVIEW_SUBMISSION_STATES.include?(refreshed) || refreshed == "COMPLETE"
+          raise Error.new(
+            "Apple refused to cancel the rejected #{platform} review submission #{submission_id} " \
+            "(#{refreshed}): #{error.message}",
+            category: :apple_state_conflict,
+            remediation: "Open App Store Connect > App Review > submission #{submission_id}, resolve the " \
+                         "rejected items or choose Resubmit to App Review there. Then re-run the failed " \
+                         "jobs; an already submitted version is accepted."
+          )
+        end
+      end
+      cancel_requested[submission_id] = true
+    end
+
+    def review_submission_version_id_or_nil(submission)
+      review_submission_version_id(submission)
+    rescue Error
+      nil
+    end
+
+    def submission_list(submissions)
+      submissions.map { |item| "#{item.fetch('id')} (#{item.dig('attributes', 'state')})" }.join(", ")
     end
 
     def add_version_to_review_submission(submission_id:, version_id:)
@@ -1808,7 +2131,13 @@ module AppStoreConnect
         item.dig("relationships", "appStoreVersion", "data", "id")
       end.uniq
       unless other_version_ids.empty?
-        raise Error, "Open review submission #{submission_id} already contains another app version"
+        raise Error.new(
+          "Open review submission #{submission_id} already contains another app version " \
+          "(appStoreVersion ids: #{other_version_ids.join(', ')})",
+          category: :apple_state_conflict,
+          remediation: "Open App Store Connect > App Review > draft submission #{submission_id} and remove " \
+                       "the other app version, or delete the draft. Then re-run the failed jobs."
+        )
       end
 
       @client.post(
@@ -1919,8 +2248,56 @@ module AppStoreConnect
         raise Error, "Unknown command #{command.inspect}"
       end
     rescue Error, KeyError, ArgumentError => error
-      warn "Apple release action failed: #{error.message}"
+      report_failure(command, error)
       exit 1
+    rescue StandardError => error
+      report_failure(command, error, unexpected: true)
+      exit 1
+    end
+
+    def self.report_failure(command, error, unexpected: false)
+      report = if unexpected
+                 {
+                   category: :workflow_defect,
+                   cause: (["#{error.class}: #{error.message}"] + error.backtrace.to_a.first(5)).join("\n"),
+                   remediation: "This is a defect in .github/scripts/app_store_connect.rb. Open an issue with this log.",
+                   rerun_safe: false
+                 }
+               else
+                 AppStoreConnect.failure_report(error)
+               end
+      warn "Apple release action failed: #{error.message}"
+      warn "Category: #{report.fetch(:category)}"
+      warn "Remediation: #{report.fetch(:remediation)}"
+      warn "Safe to re-run: #{report.fetch(:rerun_safe)}"
+
+      annotation = "::error title=Apple release failed (#{report.fetch(:category)})::" \
+        "#{escape_workflow_command(report.fetch(:cause))} Remediation: " \
+        "#{escape_workflow_command(report.fetch(:remediation))}"
+      puts annotation
+
+      summary_path = ENV["GITHUB_STEP_SUMMARY"]
+      return if summary_path.nil? || summary_path.empty?
+
+      File.open(summary_path, "a") do |file|
+        file.puts("## Apple release failed")
+        file.puts
+        file.puts("| Command | Category | Cause | Remediation | Safe to re-run |")
+        file.puts("| --- | --- | --- | --- | --- |")
+        file.puts(
+          "| #{summary_value(command)} | #{summary_value(report.fetch(:category))} | " \
+            "#{summary_value(report.fetch(:cause))} | #{summary_value(report.fetch(:remediation))} | " \
+            "#{summary_value(report.fetch(:rerun_safe))} |"
+        )
+      end
+    end
+
+    def self.escape_workflow_command(value)
+      value.to_s.gsub("%", "%25").gsub("\r", "%0D").gsub("\n", "%0A")
+    end
+
+    def self.summary_value(value)
+      value.to_s.gsub("|", "\\|").gsub("\r", " ").gsub("\n", "<br>")
     end
 
     def self.parse_options(argv)

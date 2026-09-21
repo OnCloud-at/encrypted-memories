@@ -43,9 +43,17 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
         run: |
           set -euo pipefail
+          # The helper is absent before checkout and in release tags older than the helper.
+          if [[ -f .github/scripts/release_failure.sh ]]; then
+            source .github/scripts/release_failure.sh
+          else
+            release_fail() { echo "::error title=Apple release failed ($1)::$2 Remediation: $3"; exit 1; }
+            retry_command() { while [[ "$1" != "--" ]]; do shift; done; shift; "$@"; }
+          fi
           if [[ "$EVENT_NAME" == "workflow_dispatch" && "$GITHUB_REF" != "refs/heads/main" ]]; then
-            echo "Run a manual Apple release retry from main." >&2
-            exit 1
+            release_fail configuration \
+              "Manual retry used ref '$GITHUB_REF'; expected refs/heads/main." \
+              "Run the manual Apple release retry from main."
           fi
 
       - name: Check out trusted automation
@@ -69,6 +77,7 @@ jobs:
           ruby -c .github/scripts/release_build_number.rb
           ruby .github/scripts/test_release_build_number.rb
           bash -n .github/scripts/validate_apple_distribution.sh
+          bash -n .github/scripts/release_failure.sh
 
       - name: Resolve published release
         id: release
@@ -78,12 +87,36 @@ jobs:
           REQUESTED_TAG: ${{ inputs.release_tag }}
         run: |
           set -euo pipefail
+          # The helper is absent before checkout and in release tags older than the helper.
+          if [[ -f .github/scripts/release_failure.sh ]]; then
+            source .github/scripts/release_failure.sh
+          else
+            release_fail() { echo "::error title=Apple release failed ($1)::$2 Remediation: $3"; exit 1; }
+            retry_command() { while [[ "$1" != "--" ]]; do shift; done; shift; "$@"; }
+          fi
           tag="${EVENT_TAG:-$REQUESTED_TAG}"
-          [[ -n "$tag" ]] || {
-            echo "A published GitHub release tag is required." >&2
-            exit 1
-          }
-          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" > "$RUNNER_TEMP/release.json"
+          [[ -n "$tag" ]] || release_fail configuration \
+            "The release tag input was empty; expected a published GitHub release tag." \
+            "Publish the GitHub release, then run this workflow with its tag."
+          api_log="$RUNNER_TEMP/release-api.log"
+          if ! retry_command 4 5 "GitHub release metadata request" -- \
+            gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" \
+            > "$RUNNER_TEMP/release.json" 2> "$api_log"; then
+            api_cause="$(tail -20 "$api_log" 2>/dev/null || true)"
+            if grep -qiE 'HTTP 404|Not Found|status 404' <<< "$api_cause"; then
+              release_fail metadata \
+                "GitHub returned HTTP 404 for release tag '$tag'. The release was deleted or the tag is wrong." \
+                "Publish the release again and run this workflow with the published tag."
+            elif grep -qiE 'rate limit|HTTP 5[0-9][0-9]|502|503|504' <<< "$api_cause"; then
+              release_fail github-outage \
+                "GitHub release metadata request failed after retries: $api_cause" \
+                "Re-run the workflow later after the GitHub outage or rate limit clears."
+            else
+              release_fail metadata \
+                "GitHub release metadata request failed after retries: $api_cause" \
+                "Verify the tag and GitHub token permissions, then re-run the workflow."
+            fi
+          fi
           ruby .github/scripts/release_contract.rb \
             "$RUNNER_TEMP/release.json" \
             "$RUNNER_TEMP/apple-release-notes"
@@ -95,11 +128,17 @@ jobs:
           RELEASE_TAG: ${{ steps.release.outputs.tag }}
         run: |
           set -euo pipefail
+          # The helper is absent before checkout and in release tags older than the helper.
+          if [[ -f .github/scripts/release_failure.sh ]]; then
+            source .github/scripts/release_failure.sh
+          else
+            release_fail() { echo "::error title=Apple release failed ($1)::$2 Remediation: $3"; exit 1; }
+            retry_command() { while [[ "$1" != "--" ]]; do shift; done; shift; "$@"; }
+          fi
           release_sha="$(git rev-parse --verify "refs/tags/$RELEASE_TAG^{commit}")"
-          git merge-base --is-ancestor "$release_sha" "$AUTOMATION_SHA" || {
-            echo "The release tag must point to a commit on main." >&2
-            exit 1
-          }
+          git merge-base --is-ancestor "$release_sha" "$AUTOMATION_SHA" || release_fail configuration \
+            "Release tag '$RELEASE_TAG' resolves to '$release_sha', which is not an ancestor of trusted automation '$AUTOMATION_SHA'." \
+            "Publish the release from a commit on main and retry."
           echo "commit_sha=$release_sha" >> "$GITHUB_OUTPUT"
           ruby .github/scripts/release_build_number.rb "$release_sha" "$RUNNER_TEMP/release.json"
 
@@ -178,11 +217,32 @@ jobs:
           EXPECTED_RELEASE_SHA: ${{ needs.prepare.outputs.commit_sha }}
         run: |
           set -euo pipefail
+          # The helper is absent before checkout and in release tags older than the helper.
+          if [[ -f .github/scripts/release_failure.sh ]]; then
+            source .github/scripts/release_failure.sh
+          else
+            release_fail() { echo "::error title=Apple release failed ($1)::$2 Remediation: $3"; exit 1; }
+            retry_command() { while [[ "$1" != "--" ]]; do shift; done; shift; "$@"; }
+          fi
           actual_release_sha="$(git rev-parse HEAD)"
-          [[ "$actual_release_sha" == "$EXPECTED_RELEASE_SHA" ]] || {
-            echo "The checked-out source does not match the validated release commit." >&2
-            exit 1
-          }
+          [[ "$actual_release_sha" == "$EXPECTED_RELEASE_SHA" ]] || release_fail configuration \
+            "Checked out release '$actual_release_sha'; expected '$EXPECTED_RELEASE_SHA'." \
+            "Re-run with the validated release commit and trusted checkout."
+
+      - name: Record Apple toolchain diagnostics
+        run: |
+          set -euo pipefail
+          xcode_version="$(xcodebuild -version)"
+          macos_version="$(sw_vers)"
+          printf '%s\n%s\n' "$xcode_version" "$macos_version"
+          if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+            {
+              echo "## Apple build toolchain"
+              echo '```text'
+              printf '%s\n%s\n' "$xcode_version" "$macos_version"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Check for an existing upload
         id: build
@@ -192,6 +252,19 @@ jobs:
           APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
           APP_STORE_CONNECT_PRIVATE_KEY_BASE64: ${{ secrets.APP_STORE_CONNECT_PRIVATE_KEY_BASE64 }}
         run: |
+          set -euo pipefail
+          # The helper is absent before checkout and in release tags older than the helper.
+          if [[ -f .github/scripts/release_failure.sh ]]; then
+            source .github/scripts/release_failure.sh
+          else
+            release_fail() { echo "::error title=Apple release failed ($1)::$2 Remediation: $3"; exit 1; }
+            retry_command() { while [[ "$1" != "--" ]]; do shift; done; shift; "$@"; }
+          fi
+          for secret_name in APP_STORE_CONNECT_APP_ID APP_STORE_CONNECT_ISSUER_ID APP_STORE_CONNECT_KEY_ID APP_STORE_CONNECT_PRIVATE_KEY_BASE64; do
+            [[ -n "${!secret_name:-}" ]] || release_fail configuration \
+              "Secret or variable $secret_name was empty." \
+              "Set $secret_name in the testflight-internal environment and re-run the workflow."
+          done
           ruby .github/scripts/app_store_connect.rb inspect-build \
             --platform "${{ matrix.api_platform }}" \
             --version "${{ needs.prepare.outputs.version }}" \
@@ -201,10 +274,19 @@ jobs:
         env:
           PROCESSING_STATE: ${{ steps.build.outputs.processing_state }}
         run: |
+          set -euo pipefail
+          # The helper is absent before checkout and in release tags older than the helper.
+          if [[ -f .github/scripts/release_failure.sh ]]; then
+            source .github/scripts/release_failure.sh
+          else
+            release_fail() { echo "::error title=Apple release failed ($1)::$2 Remediation: $3"; exit 1; }
+            retry_command() { while [[ "$1" != "--" ]]; do shift; done; shift; "$@"; }
+          fi
           case "$PROCESSING_STATE" in
             FAILED|INVALID)
-              echo "Apple already rejected this build number. Start a new workflow run." >&2
-              exit 1
+              release_fail app-store-connect \
+                "App Store Connect reported processing state '$PROCESSING_STATE' for this build number." \
+                "Start a new workflow run with a new build number after correcting the Apple rejection."
               ;;
           esac
 
@@ -214,22 +296,60 @@ jobs:
           APPLE_SIGNING_CERTIFICATES_P12_BASE64: ${{ secrets.APPLE_SIGNING_CERTIFICATES_P12_BASE64 }}
         run: |
           set -euo pipefail
+          # The helper is absent before checkout and in release tags older than the helper.
+          if [[ -f .github/scripts/release_failure.sh ]]; then
+            source .github/scripts/release_failure.sh
+          else
+            release_fail() { echo "::error title=Apple release failed ($1)::$2 Remediation: $3"; exit 1; }
+            retry_command() { while [[ "$1" != "--" ]]; do shift; done; shift; "$@"; }
+          fi
+          [[ -n "${APPLE_SIGNING_CERTIFICATES_P12_BASE64:-}" ]] || release_fail configuration \
+            "Secret APPLE_SIGNING_CERTIFICATES_P12_BASE64 was empty." \
+            "Set APPLE_SIGNING_CERTIFICATES_P12_BASE64 to the base64 P12 archive."
           certificate_archive="$RUNNER_TEMP/apple-signing-certificates.p12"
-          ruby -rbase64 -e '
+          if ! ruby -rbase64 -e '
             File.binwrite(
               ARGV.fetch(0),
               Base64.strict_decode64(ENV.fetch("APPLE_SIGNING_CERTIFICATES_P12_BASE64"))
             )
-          ' "$certificate_archive"
+          ' "$certificate_archive"; then
+            release_fail configuration \
+              "Secret APPLE_SIGNING_CERTIFICATES_P12_BASE64 could not be decoded into a P12 archive." \
+              "Export the certificate archive again, base64-encode it, and update APPLE_SIGNING_CERTIFICATES_P12_BASE64."
+          fi
           chmod 600 "$certificate_archive"
 
       - name: Import certificates with pinned community action
         if: steps.build.outputs.exists != 'true'
+        continue-on-error: true
         uses: Apple-Actions/import-codesign-certs@5142e029c445c10ffc7149d172e540235a065466 # v7.0.0
         with:
           keychain: encrypted_memories_signing
           p12-filepath: ${{ runner.temp }}/apple-signing-certificates.p12
           p12-password: ${{ secrets.APPLE_SIGNING_CERTIFICATES_PASSWORD }}
+
+      - name: Verify imported certificate archive
+        if: steps.build.outputs.exists != 'true'
+        env:
+          APPLE_SIGNING_CERTIFICATES_PASSWORD: ${{ secrets.APPLE_SIGNING_CERTIFICATES_PASSWORD }}
+        run: |
+          set -euo pipefail
+          # The helper is absent before checkout and in release tags older than the helper.
+          if [[ -f .github/scripts/release_failure.sh ]]; then
+            source .github/scripts/release_failure.sh
+          else
+            release_fail() { echo "::error title=Apple release failed ($1)::$2 Remediation: $3"; exit 1; }
+            retry_command() { while [[ "$1" != "--" ]]; do shift; done; shift; "$@"; }
+          fi
+          [[ -n "${APPLE_SIGNING_CERTIFICATES_PASSWORD:-}" ]] || release_fail configuration \
+            "Secret APPLE_SIGNING_CERTIFICATES_PASSWORD was empty." \
+            "Export the certificate archive again and update APPLE_SIGNING_CERTIFICATES_PASSWORD."
+          certificate_archive="$RUNNER_TEMP/apple-signing-certificates.p12"
+          if ! openssl pkcs12 -in "$certificate_archive" -passin "pass:$APPLE_SIGNING_CERTIFICATES_PASSWORD" -noout >/dev/null 2>&1; then
+            release_fail credentials \
+              "The P12 archive could not be imported with APPLE_SIGNING_CERTIFICATES_PASSWORD." \
+              "Export the certificate again and update APPLE_SIGNING_CERTIFICATES_P12_BASE64 and APPLE_SIGNING_CERTIFICATES_PASSWORD."
+          fi
 
       - name: Resolve imported signing identities
         id: signing-identities
@@ -239,9 +359,22 @@ jobs:
           SCRIPT_PLATFORM: ${{ matrix.script_platform }}
         run: |
           set -euo pipefail
+          # The helper is absent before checkout and in release tags older than the helper.
+          if [[ -f .github/scripts/release_failure.sh ]]; then
+            source .github/scripts/release_failure.sh
+          else
+            release_fail() { echo "::error title=Apple release failed ($1)::$2 Remediation: $3"; exit 1; }
+            retry_command() { while [[ "$1" != "--" ]]; do shift; done; shift; "$@"; }
+          fi
           identities_path="$RUNNER_TEMP/signing-identities.txt"
-          security find-identity -v encrypted_memories_signing.keychain > "$identities_path"
-          ruby - "$identities_path" <<'RUBY'
+          if ! security find-identity -v encrypted_memories_signing.keychain > "$identities_path" 2>&1; then
+            release_fail credentials \
+              "The signing keychain could not be inspected for $SCRIPT_PLATFORM." \
+              "Import a valid certificate archive and update APPLE_SIGNING_CERTIFICATES_P12_BASE64."
+          fi
+          set +e
+          identity_log="$RUNNER_TEMP/signing-identities.log"
+          ruby - "$identities_path" <<'RUBY' 2>"$identity_log"
           path = ARGV.fetch(0)
           team_id = ENV.fetch("APPLE_DEVELOPER_TEAM_ID")
           platform = ENV.fetch("SCRIPT_PLATFORM")
@@ -273,7 +406,52 @@ jobs:
             output.puts("installer_sha1=#{installer.first}") if platform == "macos"
           end
           RUBY
+          identity_status=$?
+          set -e
+          if (( identity_status != 0 )); then
+            identity_output="$(cat "$identity_log" 2>/dev/null || true)"
+            release_fail credentials \
+              "Signing identity check failed: $identity_output" \
+              "Import exactly one Apple Distribution identity for APPLE_DEVELOPER_TEAM_ID and update the named certificate secret."
+          fi
           rm -f "$identities_path"
+          distribution_sha1="$(sed -n 's/^distribution_sha1=//p' "$GITHUB_OUTPUT" | tail -1)"
+          installer_sha1="$(sed -n 's/^installer_sha1=//p' "$GITHUB_OUTPUT" | tail -1)"
+          cert_pem="$RUNNER_TEMP/signing-certificates.pem"
+          if ! security find-certificate -a -p encrypted_memories_signing.keychain > "$cert_pem" 2>/dev/null; then
+            release_fail credentials \
+              "The imported signing certificates could not be read from encrypted_memories_signing." \
+              "Export the certificate again and update APPLE_SIGNING_CERTIFICATES_P12_BASE64."
+          fi
+          set +e
+          certificate_output="$(CERT_PEM="$cert_pem" DISTRIBUTION_SHA1="$distribution_sha1" INSTALLER_SHA1="$installer_sha1" \
+            ruby -ropenssl -rtime <<'RUBY'
+          pem = File.read(ENV.fetch("CERT_PEM"))
+          selected = [ENV.fetch("DISTRIBUTION_SHA1"), ENV["INSTALLER_SHA1"]].compact.reject(&:empty?)
+          certificates = pem.scan(/-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----/m).map do |value|
+            OpenSSL::X509::Certificate.new(value)
+          end
+          matches = certificates.select { |certificate| selected.include?(OpenSSL::Digest::SHA1.hexdigest(certificate.to_der).upcase) }
+          abort "No imported certificate matched the selected signing identity." if matches.empty?
+          matches.each do |certificate|
+            expiry = certificate.not_after
+            label = OpenSSL::Digest::SHA1.hexdigest(certificate.to_der).upcase
+            if expiry <= Time.now
+              abort "Certificate #{label} expired on #{expiry.utc.iso8601}."
+            elsif expiry <= Time.now + (14 * 86_400)
+              puts "::warning title=Apple signing certificate expires soon::Certificate #{label} expires on #{expiry.utc.iso8601}; renew it within 14 days."
+            end
+            puts "Signing certificate #{label} expires on #{expiry.utc.iso8601}."
+          end
+          RUBY
+          )"
+          certificate_status=$?
+          set -e
+          if (( certificate_status != 0 )); then
+            release_fail credentials \
+              "An imported signing certificate is expired or could not be checked: $certificate_output" \
+              "Renew the certificate, export it again, and update APPLE_SIGNING_CERTIFICATES_P12_BASE64."
+          fi
           echo "Validated the imported distribution identities."
 
       - name: Create or install App Store provisioning profile
@@ -297,10 +475,22 @@ jobs:
           SIGH_IGNORE_PROFILES_WITH_DIFFERENT_NAME: "true"
         run: |
           set -euo pipefail
+          # The helper is absent before checkout and in release tags older than the helper.
+          if [[ -f .github/scripts/release_failure.sh ]]; then
+            source .github/scripts/release_failure.sh
+          else
+            release_fail() { echo "::error title=Apple release failed ($1)::$2 Remediation: $3"; exit 1; }
+            retry_command() { while [[ "$1" != "--" ]]; do shift; done; shift; "$@"; }
+          fi
+          for secret_name in APP_STORE_CONNECT_ISSUER_ID APP_STORE_CONNECT_KEY_ID APP_STORE_CONNECT_PRIVATE_KEY_BASE64 APPLE_DEVELOPER_TEAM_ID DISTRIBUTION_SHA1 PROFILE_NAME; do
+            [[ -n "${!secret_name:-}" ]] || release_fail configuration \
+              "Secret or signing value $secret_name was empty." \
+              "Set $secret_name in the testflight-internal environment and re-run the workflow."
+          done
           api_key_path="$RUNNER_TEMP/app-store-connect-api-key.json"
           profile_output="$RUNNER_TEMP/provisioning-profile"
           mkdir -p "$profile_output"
-          ruby -rbase64 -rjson -ropenssl -e '
+          if ! ruby -rbase64 -rjson -ropenssl -e '
             key = Base64.strict_decode64(ENV.fetch("APP_STORE_CONNECT_PRIVATE_KEY_BASE64"))
             OpenSSL::PKey.read(key)
             File.write(
@@ -312,7 +502,11 @@ jobs:
                 in_house: false
               )
             )
-          ' "$api_key_path"
+          ' "$api_key_path"; then
+            release_fail credentials \
+              "The App Store Connect private key from APP_STORE_CONNECT_PRIVATE_KEY_BASE64 was invalid." \
+              "Create a new App Store Connect API key and update APP_STORE_CONNECT_PRIVATE_KEY_BASE64."
+          fi
           chmod 600 "$api_key_path"
 
           actual_fastlane_version="$(
@@ -320,61 +514,99 @@ jobs:
               | awk '/^fastlane [0-9]+\./ { print $2 }' \
               | tail -1
           )"
-          [[ -n "$actual_fastlane_version" ]] || {
-            echo "Could not determine the installed fastlane version." >&2
-            exit 69
-          }
-          ruby -rrubygems -e '
+          [[ -n "$actual_fastlane_version" ]] || release_fail toolchain \
+            "The installed fastlane version could not be determined." \
+            "Install the pinned fastlane version on the xcode-27 runner."
+          if ! ruby -rrubygems -e '
             version = Gem::Version.new(ARGV.fetch(0))
             requirement = Gem::Requirement.new(
               ">= #{ENV.fetch("FASTLANE_MIN_VERSION")}",
               "< #{ENV.fetch("FASTLANE_MAX_VERSION")}"
             )
             abort "Expected fastlane #{requirement}, found #{version}." unless requirement.satisfied_by?(version)
-          ' "$actual_fastlane_version"
+          ' "$actual_fastlane_version"; then
+            release_fail toolchain \
+              "Installed fastlane version '$actual_fastlane_version' was outside the supported range $FASTLANE_MIN_VERSION to $FASTLANE_MAX_VERSION." \
+              "Install a fastlane version in the supported range on the xcode-27 runner."
+          fi
           echo "Using compatible fastlane $actual_fastlane_version."
-          fastlane sigh \
+          if ! retry_command 3 15 "fastlane provisioning profile request" -- fastlane sigh \
             --api_key_path "$api_key_path" \
             --app_identifier at.oncloud.encryptedmemories \
             --force \
             --team_id "$APPLE_DEVELOPER_TEAM_ID" \
             --platform "$PROFILE_PLATFORM" \
             --provisioning_name "$PROFILE_NAME" \
-            --output_path "$profile_output"
+            --output_path "$profile_output"; then
+            release_fail credentials \
+              "fastlane could not create or download provisioning profile '$PROFILE_NAME'." \
+              "Renew the profile and verify APP_STORE_CONNECT_ISSUER_ID, APP_STORE_CONNECT_KEY_ID, APP_STORE_CONNECT_PRIVATE_KEY_BASE64, and APPLE_DEVELOPER_TEAM_ID."
+          fi
 
           shopt -s nullglob
           profiles=("$profile_output"/*)
-          [[ "${#profiles[@]}" -eq 1 ]] || {
-            echo "Expected one provisioning profile, found ${#profiles[@]}." >&2
-            exit 65
-          }
+          [[ "${#profiles[@]}" -eq 1 ]] || release_fail signing \
+            "Checked downloaded provisioning profiles; actual count was ${#profiles[@]}; expected exactly 1." \
+            "Renew the named provisioning profile and remove stale profiles from the App Store Connect account."
           profile_plist="$RUNNER_TEMP/provisioning-profile.plist"
-          security cms -D -i "${profiles[0]}" > "$profile_plist"
-          plutil -lint "$profile_plist"
+          if ! security cms -D -i "${profiles[0]}" > "$profile_plist" 2>"$RUNNER_TEMP/profile-decode.log"; then
+            release_fail signing \
+              "The downloaded provisioning profile could not be decoded: $(tail -20 "$RUNNER_TEMP/profile-decode.log")" \
+              "Renew the named provisioning profile and retry the workflow."
+          fi
+          if ! plutil -lint "$profile_plist" >/dev/null 2>"$RUNNER_TEMP/profile-lint.log"; then
+            release_fail signing \
+              "The downloaded provisioning profile plist was invalid: $(tail -20 "$RUNNER_TEMP/profile-lint.log")" \
+              "Renew the named provisioning profile and retry the workflow."
+          fi
 
-          actual_name="$(plutil -extract Name raw -o - "$profile_plist")"
-          actual_team="$(plutil -extract TeamIdentifier.0 raw -o - "$profile_plist")"
-          actual_app_identifier="$(
-            /usr/libexec/PlistBuddy \
-              -c "Print :Entitlements:$PROFILE_APP_IDENTIFIER_KEY" \
-              "$profile_plist"
-          )"
-          expiration="$(plutil -extract ExpirationDate raw -o - "$profile_plist")"
-          xcode_managed="$(plutil -extract IsXcodeManaged raw -o - "$profile_plist" 2>/dev/null || true)"
-          platforms="$(plutil -extract Platform json -o - "$profile_plist")"
-
-          [[ "$actual_name" == "$PROFILE_NAME" ]]
-          [[ "$actual_team" == "$APPLE_DEVELOPER_TEAM_ID" ]]
-          [[ "$actual_app_identifier" == "$APPLE_DEVELOPER_TEAM_ID.at.oncloud.encryptedmemories" ]]
-          [[ "$xcode_managed" != "true" ]] || {
-            echo "The provisioning profile is Xcode managed and cannot be used for manual signing." >&2
-            exit 65
+          read_profile_value() {
+            local label="$1" remediation="$2"
+            shift 2
+            local output
+            if ! output="$("$@" 2>&1)"; then
+              release_fail signing \
+                "Checked $label; actual command failed: $output" "$remediation"
+            fi
+            printf '%s' "$output"
           }
-          jq -e --arg platform "$PROFILE_EXPECTED_PLATFORM" \
-            'index($platform) != null' <<< "$platforms" >/dev/null
-          ruby -rtime -e \
-            'exit(Time.parse(ARGV.fetch(0)) > Time.now + 86_400 ? 0 : 1)' \
-            "$expiration"
+          actual_name="$(read_profile_value "profile name" "Renew the named provisioning profile." plutil -extract Name raw -o - "$profile_plist")"
+          actual_team="$(read_profile_value "profile team" "Renew the provisioning profile for the configured Apple team." plutil -extract TeamIdentifier.0 raw -o - "$profile_plist")"
+          actual_app_identifier="$(read_profile_value "profile application identifier" "Renew the profile for the configured bundle identifier." \
+            /usr/libexec/PlistBuddy -c "Print :Entitlements:$PROFILE_APP_IDENTIFIER_KEY" "$profile_plist")"
+          expiration="$(read_profile_value "profile expiration" "Renew the named provisioning profile." plutil -extract ExpirationDate raw -o - "$profile_plist")"
+          xcode_managed="$(plutil -extract IsXcodeManaged raw -o - "$profile_plist" 2>/dev/null || true)"
+          platforms="$(read_profile_value "profile platforms" "Renew the provisioning profile for the required platform." plutil -extract Platform json -o - "$profile_plist")"
+
+          [[ "$actual_name" == "$PROFILE_NAME" ]] || release_fail signing \
+            "Checked provisioning profile name; actual value was '$actual_name'; expected '$PROFILE_NAME'." \
+            "Renew and select the named provisioning profile."
+          [[ "$actual_team" == "$APPLE_DEVELOPER_TEAM_ID" ]] || release_fail signing \
+            "Checked provisioning profile team; actual value was '$actual_team'; expected '$APPLE_DEVELOPER_TEAM_ID'." \
+            "Renew the profile for the configured Apple team."
+          [[ "$actual_app_identifier" == "$APPLE_DEVELOPER_TEAM_ID.at.oncloud.encryptedmemories" ]] || release_fail signing \
+            "Checked provisioning profile application identifier; actual value was '$actual_app_identifier'; expected '$APPLE_DEVELOPER_TEAM_ID.at.oncloud.encryptedmemories'." \
+            "Renew the profile for at.oncloud.encryptedmemories."
+          [[ "$xcode_managed" != "true" ]] || {
+            release_fail signing \
+              "Checked IsXcodeManaged; actual value was true; expected false for manual signing." \
+              "Create a non-Xcode-managed App Store provisioning profile."
+          }
+          if ! jq -e --arg platform "$PROFILE_EXPECTED_PLATFORM" \
+            'index($platform) != null' <<< "$platforms" >/dev/null; then
+            release_fail signing \
+              "Checked provisioning profile platforms; actual value was '$platforms'; expected '$PROFILE_EXPECTED_PLATFORM'." \
+              "Renew the provisioning profile for the required platform."
+          fi
+          expiration_epoch="$(ruby -rtime -e 'puts Time.parse(ARGV.fetch(0)).to_i' "$expiration")"
+          now_epoch="$(date +%s)"
+          if (( expiration_epoch <= now_epoch )); then
+            release_fail credentials \
+              "Provisioning profile '$PROFILE_NAME' expired on $expiration." \
+              "Renew the provisioning profile and update the App Store Connect profile configuration."
+          elif (( expiration_epoch <= now_epoch + 14 * 86_400 )); then
+            echo "::warning title=Provisioning profile expires soon::Profile '$PROFILE_NAME' expires on $expiration; renew it within 14 days."
+          fi
 
           profile_certificate="$RUNNER_TEMP/provisioning-profile-certificate.der"
           profile_certificate_count=0
@@ -395,14 +627,12 @@ jobs:
             fi
             profile_certificate_count="$((profile_certificate_count + 1))"
           done
-          [[ "$profile_certificate_count" -gt 0 ]] || {
-            echo "The provisioning profile does not contain a distribution certificate." >&2
-            exit 65
-          }
-          [[ "$profile_certificate_matches" -eq 1 ]] || {
-            echo "The provisioning profile does not contain the imported distribution certificate." >&2
-            exit 65
-          }
+          (( profile_certificate_count > 0 )) || release_fail signing \
+            "Checked provisioning profile DeveloperCertificates; actual count was 0; expected at least 1." \
+            "Renew the provisioning profile with the distribution certificate."
+          (( profile_certificate_matches == 1 )) || release_fail signing \
+            "Checked provisioning profile certificate matches; actual count was $profile_certificate_matches; expected exactly 1." \
+            "Renew the profile and export the matching distribution certificate again."
 
           echo "name=$actual_name" >> "$GITHUB_OUTPUT"
           echo "Installed $actual_name, valid until $expiration."
@@ -421,6 +651,18 @@ jobs:
           PROFILE_NAME: ${{ steps.profile.outputs.name }}
         run: |
           set -euo pipefail
+          # The helper is absent before checkout and in release tags older than the helper.
+          if [[ -f .github/scripts/release_failure.sh ]]; then
+            source .github/scripts/release_failure.sh
+          else
+            release_fail() { echo "::error title=Apple release failed ($1)::$2 Remediation: $3"; exit 1; }
+            retry_command() { while [[ "$1" != "--" ]]; do shift; done; shift; "$@"; }
+          fi
+          for signing_value in APPLE_DEVELOPER_TEAM_ID DISTRIBUTION_SHA1 PROFILE_NAME; do
+            [[ -n "${!signing_value:-}" ]] || release_fail signing \
+              "Signing value $signing_value was empty." \
+              "Import the signing assets and provisioning profile before creating export options."
+          done
           options="$RUNNER_TEMP/ExportOptions-${{ matrix.script_platform }}.plist"
           plutil -create xml1 "$options"
           plutil -insert destination -string export "$options"
@@ -435,6 +677,9 @@ jobs:
           plutil -insert teamID -string "$APPLE_DEVELOPER_TEAM_ID" "$options"
           plutil -insert uploadSymbols -bool true "$options"
           if [[ "${{ matrix.script_platform }}" == "macos" ]]; then
+            [[ -n "${INSTALLER_SHA1:-}" ]] || release_fail signing \
+              "Signing value INSTALLER_SHA1 was empty for macOS." \
+              "Import the Mac Installer Distribution certificate and update the certificate secret."
             plutil -insert installerSigningCertificate \
               -string "$INSTALLER_SHA1" \
               "$options"
@@ -455,11 +700,18 @@ jobs:
           PACKAGE_CACHE_PATH: ${{ steps.apple-build.outputs.package-cache-path }}
         run: |
           set -euo pipefail
+          # The helper is absent before checkout and in release tags older than the helper.
+          if [[ -f .github/scripts/release_failure.sh ]]; then
+            source .github/scripts/release_failure.sh
+          else
+            release_fail() { echo "::error title=Apple release failed ($1)::$2 Remediation: $3"; exit 1; }
+            retry_command() { while [[ "$1" != "--" ]]; do shift; done; shift; "$@"; }
+          fi
           archive_path="$RUNNER_TEMP/EncryptedMemories-${{ matrix.script_platform }}.xcarchive"
           derived_data="$RUNNER_TEMP/DerivedData-${{ matrix.script_platform }}.noindex"
           result_bundle="$RUNNER_TEMP/EncryptedMemories-${{ matrix.script_platform }}.xcresult"
           log_path="$RUNNER_TEMP/EncryptedMemories-${{ matrix.script_platform }}.log"
-          xcrun xcodebuild archive \
+          if ! xcrun xcodebuild archive \
             -project EncryptedMemories.xcodeproj \
             -scheme "${{ matrix.scheme }}" \
             -configuration Release \
@@ -483,7 +735,12 @@ jobs:
             ENCRYPTED_MEMORIES_CODE_SIGN_IDENTITY="$DISTRIBUTION_SHA1" \
             ENCRYPTED_MEMORIES_PROVISIONING_PROFILE_SPECIFIER="$PROFILE_NAME" \
             COMPILER_INDEX_STORE_ENABLE=NO \
-            2>&1 | tee "$log_path"
+            2>&1 | tee "$log_path"; then
+            archive_cause="$(tail -20 "$log_path" 2>/dev/null || true)"
+            release_fail build \
+              "xcodebuild archive failed for ${{ matrix.platform }}: $archive_cause" \
+              "Inspect the retained Xcode log, correct the reported build or signing cause, and re-run the failed job."
+          fi
           echo "path=$archive_path" >> "$GITHUB_OUTPUT"
           echo "log-path=$log_path" >> "$GITHUB_OUTPUT"
 
@@ -496,12 +753,24 @@ jobs:
           ARCHIVE_LOG_PATH: ${{ steps.archive.outputs.log-path }}
         run: |
           set -euo pipefail
+          # The helper is absent before checkout and in release tags older than the helper.
+          if [[ -f .github/scripts/release_failure.sh ]]; then
+            source .github/scripts/release_failure.sh
+          else
+            release_fail() { echo "::error title=Apple release failed ($1)::$2 Remediation: $3"; exit 1; }
+            retry_command() { while [[ "$1" != "--" ]]; do shift; done; shift; "$@"; }
+          fi
           export_path="$RUNNER_TEMP/export-${{ matrix.script_platform }}"
-          xcrun xcodebuild -exportArchive \
+          if ! xcrun xcodebuild -exportArchive \
             -archivePath "$ARCHIVE_PATH" \
             -exportPath "$export_path" \
             -exportOptionsPlist "$EXPORT_OPTIONS_PATH" \
-            2>&1 | tee -a "$ARCHIVE_LOG_PATH"
+            2>&1 | tee -a "$ARCHIVE_LOG_PATH"; then
+            export_cause="$(tail -20 "$ARCHIVE_LOG_PATH" 2>/dev/null || true)"
+            release_fail build \
+              "xcodebuild export failed for ${{ matrix.platform }}: $export_cause" \
+              "Inspect the retained Xcode log, correct the reported export or signing cause, and re-run the failed job."
+          fi
           echo "path=$export_path" >> "$GITHUB_OUTPUT"
 
       - name: Validate signed archive and export
@@ -527,28 +796,46 @@ jobs:
           ARTIFACT_PATH: ${{ steps.artifact.outputs.path }}
         run: |
           set -euo pipefail
+          # The helper is absent before checkout and in release tags older than the helper.
+          if [[ -f .github/scripts/release_failure.sh ]]; then
+            source .github/scripts/release_failure.sh
+          else
+            release_fail() { echo "::error title=Apple release failed ($1)::$2 Remediation: $3"; exit 1; }
+            retry_command() { while [[ "$1" != "--" ]]; do shift; done; shift; "$@"; }
+          fi
+          for secret_name in APP_STORE_CONNECT_ISSUER_ID APP_STORE_CONNECT_KEY_ID APP_STORE_CONNECT_PRIVATE_KEY_BASE64; do
+            [[ -n "${!secret_name:-}" ]] || release_fail configuration \
+              "Secret $secret_name was empty." \
+              "Set $secret_name in the testflight-internal environment and re-run the workflow."
+          done
+          [[ -n "${ARTIFACT_PATH:-}" ]] || release_fail configuration \
+            "The validated upload artifact path was empty." \
+            "Complete archive, export, and validation before uploading the package."
           private_key_directory="$RUNNER_TEMP/app-store-connect-private-keys"
           private_key="$private_key_directory/AuthKey_${APP_STORE_CONNECT_KEY_ID}.p8"
           mkdir -p "$private_key_directory"
-          ruby -rbase64 -e '
+          if ! ruby -rbase64 -e '
             File.binwrite(
               ARGV.fetch(0),
               Base64.strict_decode64(ENV.fetch("APP_STORE_CONNECT_PRIVATE_KEY_BASE64"))
             )
-          ' "$private_key"
+          ' "$private_key"; then
+            release_fail credentials \
+              "Secret APP_STORE_CONNECT_PRIVATE_KEY_BASE64 could not be decoded." \
+              "Create a valid App Store Connect API key and update APP_STORE_CONNECT_PRIVATE_KEY_BASE64."
+          fi
           chmod 600 "$private_key"
-          openssl pkey -in "$private_key" -noout
-          # Retry every altool failure, not only failures before the upload
-          # starts. Most failures are transient runner-side network errors.
-          # If Apple already ingested this build and the connection dropped
-          # afterwards, the retry fails with ITMS-90189 "Redundant Binary
-          # Upload"; treat that as success instead of failing the workflow.
-          max_attempts=3
-          attempt=1
-          delay_seconds=30
-          while [[ "$attempt" -le "$max_attempts" ]]; do
+          if ! openssl pkey -in "$private_key" -noout >/dev/null 2>&1; then
+            release_fail credentials \
+              "The App Store Connect private key from APP_STORE_CONNECT_PRIVATE_KEY_BASE64 was not a valid P8 key." \
+              "Create a new App Store Connect API key and update APP_STORE_CONNECT_PRIVATE_KEY_BASE64."
+          fi
+          altool_attempt=0
+          run_altool_upload() {
+            local upload_log altool_status
+            altool_attempt=$((altool_attempt + 1))
+            local attempt="$altool_attempt"
             upload_log="$RUNNER_TEMP/altool-upload-${{ matrix.script_platform }}-attempt-${attempt}.log"
-            set +e
             xcrun altool --upload-package "$ARTIFACT_PATH" \
               --api-key "$APP_STORE_CONNECT_KEY_ID" \
               --api-issuer "$APP_STORE_CONNECT_ISSUER_ID" \
@@ -556,23 +843,28 @@ jobs:
               --show-progress \
               --output-format json 2>&1 | tee "$upload_log"
             altool_status="${PIPESTATUS[0]}"
-            set -e
             if [[ "$altool_status" -eq 0 ]]; then
-              break
+              return 0
             fi
-            if grep -qiE 'ITMS-90189|Redundant Binary Upload' "$upload_log"; then
-              echo "::notice::App Store Connect already holds this build (ITMS-90189); treating the upload as complete."
-              break
+            if grep -qiE 'ITMS-90189|Redundant Binary Upload|already uploaded|already exists' "$upload_log"; then
+              echo "::notice::App Store Connect already holds this build; treating the upload as complete."
+              return 0
             fi
-            if [[ "$attempt" -ge "$max_attempts" ]]; then
-              echo "altool upload failed after $attempt attempts; see $upload_log." >&2
-              exit 1
+            return "$altool_status"
+          }
+          if ! retry_command 4 30 "xcrun altool upload" -- run_altool_upload; then
+            last_log="$RUNNER_TEMP/altool-upload-${{ matrix.script_platform }}-attempt-4.log"
+            last_output="$(tail -20 "$last_log" 2>/dev/null | sed 's/^/\"/; s/$/\"/' || true)"
+            if grep -qiE 'authentication|unauthorized|invalid .*key|invalid issuer|401|403|JWT|credentials' "$last_log" 2>/dev/null; then
+              release_fail credentials \
+                "App Store Connect authentication failed. Last altool output: $last_output" \
+                "Verify APP_STORE_CONNECT_ISSUER_ID, APP_STORE_CONNECT_KEY_ID, and APP_STORE_CONNECT_PRIVATE_KEY_BASE64, then update those named secrets."
+            else
+              release_fail upload \
+                "xcrun altool failed after 4 attempts. Last 20 altool output lines: $last_output" \
+                "Re-run the workflow for transient Defaults.properties, network, timeout, 5xx, or unknown runner failures; inspect the retained altool log if it persists."
             fi
-            echo "::warning::altool upload attempt $attempt failed (exit $altool_status); retrying in ${delay_seconds}s."
-            sleep "$delay_seconds"
-            attempt=$((attempt + 1))
-            delay_seconds=$((delay_seconds * 3))
-          done
+          fi
 
       - name: Remove temporary release credentials
         if: always()
@@ -583,6 +875,7 @@ jobs:
 
       - name: Retain build diagnostics
         if: failure() || cancelled()
+        continue-on-error: true
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: testflight-${{ matrix.script_platform }}-${{ github.run_id }}-${{ github.run_attempt }}
@@ -636,17 +929,33 @@ jobs:
           APP_STORE_CONNECT_PRIVATE_KEY_BASE64: ${{ secrets.APP_STORE_CONNECT_PRIVATE_KEY_BASE64 }}
         run: |
           set -euo pipefail
-          ruby .github/scripts/app_store_connect.rb wait-builds \
+          # The helper is absent before checkout and in release tags older than the helper.
+          if [[ -f .github/scripts/release_failure.sh ]]; then
+            source .github/scripts/release_failure.sh
+          else
+            release_fail() { echo "::error title=Apple release failed ($1)::$2 Remediation: $3"; exit 1; }
+            retry_command() { while [[ "$1" != "--" ]]; do shift; done; shift; "$@"; }
+          fi
+          apple_log="$RUNNER_TEMP/apple-distribute.log"
+          if ! ruby .github/scripts/app_store_connect.rb wait-builds \
             --version "${{ needs.prepare.outputs.version }}" \
-            --build-number "${{ needs.prepare.outputs.build_number }}"
+            --build-number "${{ needs.prepare.outputs.build_number }}" 2>&1 | tee "$apple_log"; then
+            release_fail app-store-connect \
+              "App Store Connect build processing failed: $(tail -20 "$apple_log")" \
+              "Confirm the builds exist and are valid in App Store Connect, then re-run after any Apple outage clears."
+          fi
 
-          ruby .github/scripts/app_store_connect.rb distribute-internal \
+          if ! ruby .github/scripts/app_store_connect.rb distribute-internal \
             --version "${{ needs.prepare.outputs.version }}" \
             --build-number "${{ needs.prepare.outputs.build_number }}" \
             --localization "IOS:de-DE=$RUNNER_TEMP/apple-release-notes/ios.de-DE.txt" \
             --localization "IOS:en-US=$RUNNER_TEMP/apple-release-notes/ios.en-US.txt" \
             --localization "MAC_OS:de-DE=$RUNNER_TEMP/apple-release-notes/macos.de-DE.txt" \
-            --localization "MAC_OS:en-US=$RUNNER_TEMP/apple-release-notes/macos.en-US.txt"
+            --localization "MAC_OS:en-US=$RUNNER_TEMP/apple-release-notes/macos.en-US.txt" 2>&1 | tee -a "$apple_log"; then
+            release_fail app-store-connect \
+              "Internal TestFlight distribution failed: $(tail -20 "$apple_log")" \
+              "Verify the localized release notes and App Store Connect state, then re-run after any Apple outage clears."
+          fi
 
   submit-app-store:
     name: Submit iOS and macOS to App Review
@@ -687,10 +996,22 @@ jobs:
           APP_STORE_CONNECT_PRIVATE_KEY_BASE64: ${{ secrets.APP_STORE_CONNECT_PRIVATE_KEY_BASE64 }}
         run: |
           set -euo pipefail
-          ruby .github/scripts/app_store_connect.rb wait-builds \
+          # The helper is absent before checkout and in release tags older than the helper.
+          if [[ -f .github/scripts/release_failure.sh ]]; then
+            source .github/scripts/release_failure.sh
+          else
+            release_fail() { echo "::error title=Apple release failed ($1)::$2 Remediation: $3"; exit 1; }
+            retry_command() { while [[ "$1" != "--" ]]; do shift; done; shift; "$@"; }
+          fi
+          apple_log="$RUNNER_TEMP/apple-submit.log"
+          if ! ruby .github/scripts/app_store_connect.rb wait-builds \
             --version "${{ needs.prepare.outputs.version }}" \
-            --build-number "${{ needs.prepare.outputs.build_number }}"
-          ruby .github/scripts/app_store_connect.rb prepare-app-store \
+            --build-number "${{ needs.prepare.outputs.build_number }}" 2>&1 | tee "$apple_log"; then
+            release_fail app-store-connect \
+              "App Store Connect build processing failed: $(tail -20 "$apple_log")" \
+              "Confirm the builds exist and are valid in App Store Connect, then re-run after any Apple outage clears."
+          fi
+          if ! ruby .github/scripts/app_store_connect.rb prepare-app-store \
             --version "${{ needs.prepare.outputs.version }}" \
             --build-number "${{ needs.prepare.outputs.build_number }}" \
             --localization "IOS:de-DE=$RUNNER_TEMP/apple-release-notes/ios.de-DE.txt" \
@@ -699,4 +1020,8 @@ jobs:
             --localization "MAC_OS:en-US=$RUNNER_TEMP/apple-release-notes/macos.en-US.txt" \
             --create-versions \
             --automatic-release \
-            --submit
+            --submit 2>&1 | tee -a "$apple_log"; then
+            release_fail app-store-connect \
+              "App Store submission failed: $(tail -20 "$apple_log")" \
+              "Verify App Store Connect metadata and credentials, then re-run after any Apple outage clears."
+          fi

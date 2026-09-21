@@ -42,6 +42,7 @@ runs:
         SDK_VERSION: ${{ inputs.sdk-version }}
       run: |
         set -euo pipefail
+        source .github/scripts/release_failure.sh
         key_material="$RUNNER_TEMP/encrypted-memories-package-cache-inputs"
         : > "$key_material"
         while IFS= read -r file; do
@@ -52,7 +53,12 @@ runs:
           esac
         done < <(git ls-files)
         digest="$(shasum -a 256 "$key_material" | awk '{print $1}')"
-        printf 'key=%s-sdk-%s-xcode-26.6-package-cache-%s\n' "$RUNNER_OS" "$SDK_VERSION" "$digest" >> "$GITHUB_OUTPUT"
+        xcode_version="$(xcodebuild -version | awk '/^Xcode / { print $2; exit }')"
+        [[ -n "$xcode_version" ]] || release_fail toolchain \
+          "xcodebuild -version did not report an Xcode version." \
+          "Use the configured xcode-27 runner with a working Xcode installation."
+        printf 'key=%s-sdk-%s-xcode-%s-package-cache-%s\n' \
+          "$RUNNER_OS" "$SDK_VERSION" "$xcode_version" "$digest" >> "$GITHUB_OUTPUT"
 
     - name: Restore SwiftPM and Xcode package caches
       uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
