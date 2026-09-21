@@ -124,16 +124,21 @@ struct MobileSearchLandingScreen: View {
                 sectionTitle(L10n.string("search.for_you"))
                 VStack(spacing: 0) {
                     if isLoading {
-                        ForEach(0..<3, id: \.self) { index in
-                            if index > 0 { Divider().padding(.leading, 132) }
-                            MobileSearchSuggestionRow(
-                                suggestion: nil,
-                                thumbnailFeed: libraryModel.thumbnailFeed
-                            )
+                        // One sweep over the whole placeholder block, as a single continuous band.
+                        VStack(spacing: 0) {
+                            ForEach(0..<3, id: \.self) { index in
+                                if index > 0 { Divider().padding(.leading, 132) }
+                                MobileSearchSuggestionRow(
+                                    suggestion: nil,
+                                    thumbnailFeed: libraryModel.thumbnailFeed
+                                )
+                            }
                         }
                         .redacted(reason: .placeholder)
                         .placeholderShimmer()
-                        .accessibilityHidden(true)
+                        // VoiceOver hears that suggestions are loading, also when Reduce Motion stops the sweep.
+                        .accessibilityElement(children: .ignore)
+                        .accessibilityLabel(L10n.string("search.suggestions_loading"))
                     } else {
                         ForEach(Array(suggestions.enumerated()), id: \.element.id) { index, suggestion in
                             if index > 0 { Divider().padding(.leading, 132) }

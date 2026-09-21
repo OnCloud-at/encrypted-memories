@@ -217,11 +217,11 @@ public final class SmartSearchDiscoveryModel {
 
     /// `isDecisive` for the published state of this model.
     public func isDecisive(for kind: TimelineSearchSuggestionKind, content: SmartSearchContentIdentity) -> Bool {
-        let content = effective(content)
+        let effectiveContent = effective(content)
         return Self.isDecisive(
             for: kind,
-            isCurrent: isCurrent(content: content),
-            isSettled: isSettled(content: content),
+            isCurrent: isCurrent(content: effectiveContent),
+            isSettled: isSettled(content: effectiveContent),
             settledWithVisualConcepts: settledVisualAvailability != nil
         )
     }
@@ -245,9 +245,9 @@ public final class SmartSearchDiscoveryModel {
         content: SmartSearchContentIdentity,
         snapshot: MLSmartSearchSnapshot?
     ) -> [TimelineSearchSuggestion] {
-        let content = effective(content)
+        let effectiveContent = effective(content)
         return forYou.filter {
-            Self.isDisplayable($0, computedContent: computedContent, content: content, snapshot: snapshot)
+            Self.isDisplayable($0, computedContent: computedContent, content: effectiveContent, snapshot: snapshot)
         }
     }
 
@@ -255,9 +255,9 @@ public final class SmartSearchDiscoveryModel {
         content: SmartSearchContentIdentity,
         snapshot: MLSmartSearchSnapshot?
     ) -> [TimelineSearchSuggestion] {
-        let content = effective(content)
+        let effectiveContent = effective(content)
         return chips.filter {
-            Self.isDisplayable($0, computedContent: computedContent, content: content, snapshot: snapshot)
+            Self.isDisplayable($0, computedContent: computedContent, content: effectiveContent, snapshot: snapshot)
         }
     }
 
@@ -285,9 +285,9 @@ public final class SmartSearchDiscoveryModel {
         content: SmartSearchContentIdentity,
         snapshot: MLSmartSearchSnapshot?
     ) -> [TimelineSearchSuggestion] {
-        let content = effective(content)
+        let effectiveContent = effective(content)
         return candidates.filter {
-            Self.isDisplayable($0, computedContent: computedContent, content: content, snapshot: snapshot)
+            Self.isDisplayable($0, computedContent: computedContent, content: effectiveContent, snapshot: snapshot)
         }
     }
 
