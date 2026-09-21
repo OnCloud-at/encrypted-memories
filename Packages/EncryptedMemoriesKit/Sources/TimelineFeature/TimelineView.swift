@@ -22,6 +22,8 @@ public struct TimelineView: View {
     private let isSearchPending: Bool
     /// UIDs the on-device Smart Search ranked for `searchText` (nil = semantic search inactive).
     private let semanticMatches: Set<PhotoUID>?
+    /// Resolved result set of a selected structured suggestion. `searchText` is then its display title only.
+    private let requiredUIDs: Set<PhotoUID>?
     private let selectionMode: Bool
     private let onSelectionChange: (Set<PhotoUID>) -> Void
     private let media: FullMediaProvider?
@@ -51,6 +53,7 @@ public struct TimelineView: View {
         searchText: String = "",
         isSearchPending: Bool = false,
         semanticMatches: Set<PhotoUID>? = nil,
+        requiredUIDs: Set<PhotoUID>? = nil,
         selectionMode: Bool = false,
         media: FullMediaProvider? = nil,
         metadataProvider: PhotoMetadataProvider? = nil,
@@ -74,6 +77,7 @@ public struct TimelineView: View {
         self.searchText = searchText
         self.isSearchPending = isSearchPending
         self.semanticMatches = semanticMatches
+        self.requiredUIDs = requiredUIDs
         self.selectionMode = selectionMode
         self.media = media
         self.metadataProvider = metadataProvider
@@ -224,15 +228,16 @@ public struct TimelineView: View {
     }
 
     private var hasSearchQuery: Bool {
-        !TimelineSearchQuery(normalizedSearchText).isEmpty
+        requiredUIDs != nil || !TimelineSearchQuery(normalizedSearchText).isEmpty
     }
 
     private var searchKey: TimelineSearchProjectionKey {
         TimelineSearchProjectionKey(
             sourceRevision: model.contentRevision,
-            query: normalizedSearchText,
+            query: requiredUIDs == nil ? normalizedSearchText : "",
             context: TimelineSearchContext(activeFilter: model.filter, favoriteUIDs: favoriteUIDs),
-            semanticMatches: semanticMatches
+            semanticMatches: requiredUIDs == nil ? semanticMatches : nil,
+            requiredUIDs: requiredUIDs
         )
     }
 

@@ -5,6 +5,7 @@ import LibraryRuntimeAppleAdapter
 import MLSearchBackgroundAppleAdapter
 import MLSearchCore
 import MLSearchFeature
+import MapUIKitAdapter
 import Metal
 import PhotoLibraryBackupAdapter
 import PhotosCore
@@ -401,7 +402,9 @@ private struct MobileSearchTabScreen: View {
     @State private var historySuggestions: [String: TimelineSearchSuggestion] = [:]
     @State private var recentRepresentatives: [String: PhotoUID] = [:]
     @State private var activeSuggestion: TimelineSearchSuggestion?
-    @State private var discovery = MobileSearchDiscoveryModel()
+    @State private var discovery = SmartSearchDiscoveryModel { latitude, longitude in
+        await NativePlaceNameResolver.shared.cityName(latitude: latitude, longitude: longitude)
+    }
 
     var body: some View {
         MobileTimelineScreen(
@@ -434,8 +437,17 @@ private struct MobileSearchTabScreen: View {
                 self.activeSuggestion = nil
             }
         }
-        .task(id: MobileSearchDiscoveryModel.revisionKey(libraryModel: libraryModel)) {
-            await discovery.refresh(libraryModel: libraryModel)
+        .task(id: discoveryTaskKey) {
+            // Discovery runs only while its landing is visible. Typing or leaving the tab cancels it, so its
+            // background ML queries never compete with an interactive search.
+            guard isLandingVisible else { return }
+            await discovery.refresh(
+                sections: libraryModel.sections,
+                timelineRevision: libraryModel.timelineRevision,
+                favoriteUIDs: libraryModel.favoriteUIDs,
+                coordinates: libraryModel.locationIndex.coordinates,
+                smartSearch: libraryModel.smartSearch
+            )
         }
         .task(id: recentRepresentativesRevision) {
             let sections = libraryModel.sections
@@ -498,6 +510,20 @@ private struct MobileSearchTabScreen: View {
         history.clear()
         historySuggestions = [:]
         recentRepresentatives = [:]
+    }
+
+    private var isLandingVisible: Bool {
+        isActive && searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private var discoveryTaskKey: String {
+        let revision = SmartSearchDiscoveryModel.revisionKey(
+            timelineRevision: libraryModel.timelineRevision,
+            favoriteCount: libraryModel.favoriteUIDs.count,
+            coordinateCount: libraryModel.locationIndex.coordinates.count,
+            snapshot: libraryModel.smartSearch?.snapshot
+        )
+        return "\(isLandingVisible)|\(revision)"
     }
 
     private var recentRepresentativesRevision: String {

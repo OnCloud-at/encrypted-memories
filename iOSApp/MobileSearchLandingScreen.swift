@@ -1,4 +1,5 @@
 import DesignSystemCore
+import MLSearchFeature
 import MediaCacheUIKitAdapter
 import PhotosCore
 import SwiftUI
@@ -19,7 +20,7 @@ struct MobileSearchRecentEntry: Identifiable, Equatable {
 /// owned by the Search tab; the landing only scrolls above it.
 struct MobileSearchLandingContent {
     var recents: [MobileSearchRecentEntry] = []
-    var discovery: MobileSearchDiscoveryModel?
+    var discovery: SmartSearchDiscoveryModel?
     var onSelectRecent: (MobileSearchRecentEntry) -> Void = { _ in }
     var onSelectSuggestion: (TimelineSearchSuggestion) -> Void = { _ in }
     var onClearHistory: () -> Void = {}
@@ -29,7 +30,7 @@ struct MobileSearchLandingScreen: View {
     @Environment(MobileLibraryModel.self) private var libraryModel
     let content: MobileSearchLandingContent
 
-    private var discovery: MobileSearchDiscoveryModel? { content.discovery }
+    private var discovery: SmartSearchDiscoveryModel? { content.discovery }
 
     var body: some View {
         ScrollView {

@@ -71,7 +71,11 @@ struct MainView: View {
     @State private var searchScope: MLSearchScope = .all
     @State private var searchDebounceTask: Task<Void, Never>?
     @State private var searchHistory = TimelineSearchHistory()
-    @State private var searchSuggestions: [TimelineSearchSuggestion] = []
+    @State private var searchDiscovery = SmartSearchDiscoveryModel { latitude, longitude in
+        await NativePlaceNameResolver.shared.cityName(latitude: latitude, longitude: longitude)
+    }
+    /// The structured suggestion that owned `committedSearchText` when it was committed.
+    @State private var committedSuggestion: TimelineSearchSuggestion?
     // Shared-element transition between a photo and its grid cell.
     @State private var gridProxy = GridProxy<PhotoUID>()
     @State private var mapClusterGridProxy = GridProxy<PhotoUID>()
@@ -225,13 +229,17 @@ struct MainView: View {
             }
             .onChange(of: librarySettled) { _, _ in evaluateVeilLift() }
             .onChange(of: timelineModel.contentRevision) { _, _ in evaluateVeilLift() }
-            .task(id: timelineModel.contentRevision) {
-                let sections = currentTimelineSections
-                let resolved = await Task.detached(priority: .utility) {
-                    TimelineSearchDiscovery.recentDateSuggestions(sections: sections)
-                }.value
-                guard !Task.isCancelled else { return }
-                searchSuggestions = resolved
+            .task(id: searchDiscoveryTaskKey) {
+                // Suggestions are refreshed only while the search field is empty. Typing cancels the refresh,
+                // so its background ML queries never compete with an interactive search.
+                guard searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+                await searchDiscovery.refresh(
+                    sections: currentTimelineSections,
+                    timelineRevision: UInt64(truncatingIfNeeded: timelineModel.contentRevision),
+                    favoriteUIDs: favorites,
+                    coordinates: OfflineLibraryManager.shared.locationIndex.coordinates,
+                    smartSearch: model.smartSearch
+                )
             }
             .task(id: temporalProjectionRequestID) {
                 await rebuildTemporalProjection()
@@ -361,6 +369,7 @@ struct MainView: View {
                     searchText: committedSearchText,
                     isSearchPending: isCommittedSemanticSearchPending,
                     semanticMatches: committedSemanticMatches,
+                    requiredUIDs: committedSuggestionMatches,
                     selectionMode: selectionMode,
                     media: backend,
                     metadataProvider: backend,
@@ -604,6 +613,7 @@ struct MainView: View {
                     searchText: committedSearchText,
                     isSearchPending: isCommittedSemanticSearchPending,
                     semanticMatches: committedSemanticMatches,
+                    requiredUIDs: committedSuggestionMatches,
                     selectionMode: selectionMode,
                     media: backend,
                     metadataProvider: backend,
@@ -636,7 +646,7 @@ struct MainView: View {
             placement: .toolbar,
             prompt: Text(L10n.string("search.prompt \(title)")),
             recentSearches: searchHistory.queries,
-            suggestions: searchSuggestions.map {
+            suggestions: searchDiscovery.textSuggestions().map {
                 SmartSearchSuggestionItem(id: $0.id, title: $0.title, query: $0.query)
             },
             onClearRecentSearches: clearSearchHistory
@@ -1693,8 +1703,27 @@ struct MainView: View {
                 initialScope: searchScope
             )
         }
+        if let suggestion = searchDiscovery.structuredSuggestion(owning: value) {
+            // A chosen suggestion carries its exact result set. Commit it at once instead of debouncing and
+            // skip the semantic query for its display title.
+            semanticQuery?.clear()
+            if temporalMode != .allPhotos {
+                withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.16)) {
+                    temporalMode = .allPhotos
+                    focusedTemporalYear = nil
+                }
+            }
+            routeInitialScrollAnchor = nil
+            routeScrollGeneration += 1
+            committedSuggestion = suggestion
+            committedSearchText = value
+            recordSearchHistory(suggestion.query)
+            searchDebounceTask = nil
+            return
+        }
         semanticQuery?.update(query: value)
         if value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            committedSuggestion = nil
             committedSearchText = ""
             // Clearing the search returns the full timeline to its newest item.
             routeInitialScrollAnchor = nil
@@ -1713,9 +1742,27 @@ struct MainView: View {
             guard !Task.isCancelled else { return }
             routeInitialScrollAnchor = nil
             routeScrollGeneration += 1
+            committedSuggestion = nil
             committedSearchText = value
             searchDebounceTask = nil
         }
+    }
+
+    private var searchDiscoveryTaskKey: String {
+        let revision = SmartSearchDiscoveryModel.revisionKey(
+            timelineRevision: UInt64(truncatingIfNeeded: timelineModel.contentRevision),
+            favoriteCount: favorites.count,
+            coordinateCount: OfflineLibraryManager.shared.locationIndex.coordinates.count,
+            snapshot: model.smartSearch?.snapshot
+        )
+        return "\(searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)|\(revision)"
+    }
+
+    /// Resolved result set of the committed suggestion while the committed text still shows its title.
+    private var committedSuggestionMatches: Set<PhotoUID>? {
+        guard let committedSuggestion, committedSuggestion.owns(searchText: normalizedCommittedSearchText)
+        else { return nil }
+        return committedSuggestion.matchingUIDs
     }
 
     private var currentTimelineSections: [TimelineSection] {
@@ -1739,7 +1786,8 @@ struct MainView: View {
     }
 
     private var isCommittedSemanticSearchPending: Bool {
-        semanticQuery?.requestedQuery == normalizedCommittedSearchText
+        committedSuggestionMatches == nil
+            && semanticQuery?.requestedQuery == normalizedCommittedSearchText
             && semanticQuery?.isSearching == true
     }
 
