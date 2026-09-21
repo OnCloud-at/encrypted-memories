@@ -132,6 +132,7 @@ struct MobileSearchLandingScreen: View {
                             )
                         }
                         .redacted(reason: .placeholder)
+                        .placeholderShimmer()
                         .accessibilityHidden(true)
                     } else {
                         ForEach(Array(suggestions.enumerated()), id: \.element.id) { index, suggestion in
@@ -179,7 +180,7 @@ struct MobileSearchLandingScreen: View {
     }
 
     @ViewBuilder private var notes: some View {
-        if discovery?.showsIndexingNote == true {
+        if discovery?.showsVisualSuggestionsPendingNote(libraryModel.smartSearch?.snapshot) == true {
             Label(L10n.string("search.suggestions_indexing"), systemImage: "sparkles")
                 .font(.footnote)
                 .foregroundStyle(.secondary)

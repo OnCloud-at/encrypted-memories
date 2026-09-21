@@ -402,7 +402,8 @@ private struct MobileSearchTabScreen: View {
     @State private var historySuggestions: [String: TimelineSearchSuggestion] = [:]
     @State private var recentRepresentatives: [String: PhotoUID] = [:]
     @State private var activeSuggestion: TimelineSearchSuggestion?
-    @State private var discovery = SmartSearchDiscoveryModel { latitude, longitude in
+    /// Suggestions are computed once per app session: a UI feature must not spend compute on every library change.
+    @State private var discovery = SmartSearchDiscoveryModel(refreshPolicy: .oncePerSession) { latitude, longitude in
         await NativePlaceNameResolver.shared.cityName(latitude: latitude, longitude: longitude)
     }
 
@@ -610,12 +611,15 @@ private struct MobileSearchTabScreen: View {
             snapshot: libraryModel.smartSearch?.snapshot
         )
         let visual = isLandingVisible || activeSuggestion?.kind == .concept
+        // After the first published rows, library changes no longer restart the session's refresh, so a sync
+        // cannot keep cancelling it before it completes.
+        let contentKey = discovery.hasComputed ? "session" : "\(discoveryContent.favoritesHash)|\(revision)"
         return [
             "\(isLandingVisible)",
             "\(needsActiveSuggestionRefresh)",
             "\(visual)",
-            "\(discoveryContent.favoritesHash)",
-            revision,
+            contentKey,
+            discovery.visualCompletionKey(libraryModel.smartSearch?.snapshot),
         ].joined(separator: "|")
     }
 

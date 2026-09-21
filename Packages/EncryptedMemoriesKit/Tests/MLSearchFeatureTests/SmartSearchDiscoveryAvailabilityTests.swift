@@ -410,6 +410,62 @@ import TimelineCore
 
     /// Twenty items of one summer day: eight favorites and five videos, enough for a favorites row, a season
     /// row and media chips without any machine learning.
+    /// Once per session: after the first complete refresh, library changes neither recompute the suggestions nor
+    /// hide them, so the loading placeholder cannot come back until the next launch.
+    @MainActor @Test func aCompleteSessionRefreshIsFinalUntilTheNextLaunch() async throws {
+        let model = SmartSearchDiscoveryModel(refreshPolicy: .oncePerSession) { _, _ in nil }
+        let one = await refresh(model, revision: 1)
+        let rows = model.forYou(content: one, snapshot: nil)
+        #expect(!rows.isEmpty)
+        #expect(model.isSessionComplete)
+
+        // Background loading changes the library: nothing is recomputed and the same rows stay current.
+        let two = await refresh(model, revision: 2, favorites: [], itemCount: 24)
+        #expect(model.isCurrent(content: two))
+        #expect(model.forYou(content: two, snapshot: nil) == rows)
+        let first = try #require(rows.first)
+        #expect(model.commitDecision(for: first.query, content: two, snapshot: nil) == .structured(first))
+        #expect(model.rebind(first, content: two, snapshot: nil) == .keep(first))
+    }
+
+    /// Before the session is complete, a later refresh replaces the rows without clearing them first, so the
+    /// placeholder appears only until the very first publish.
+    @MainActor @Test func aSessionRefreshNeverClearsPublishedRows() async throws {
+        let model = SmartSearchDiscoveryModel(refreshPolicy: .oncePerSession) { _, _ in nil }
+        let two = Self.content(2, favorites: Self.favorites())
+        #expect(!model.isCurrent(content: two))
+
+        let one = await refresh(model, revision: 1)
+        #expect(!model.forYou(content: one, snapshot: nil).isEmpty)
+        // A refresh that stops before its first publish leaves the published rows visible.
+        let interrupted = Task { @MainActor in _ = await refresh(model, revision: 2) }
+        interrupted.cancel()
+        await interrupted.value
+        #expect(model.isCurrent(content: two))
+        #expect(!model.forYou(content: two, snapshot: nil).isEmpty)
+    }
+
+    /// The one exception to a complete session: once visual search is on and its index is finished, visual
+    /// concepts may be computed one more time. Until then a short note explains that they follow the indexing.
+    @MainActor @Test func visualSearchStillYieldsSuggestionsAfterTheIndexingFinishes() async {
+        let model = SmartSearchDiscoveryModel(refreshPolicy: .oncePerSession) { _, _ in nil }
+        await refresh(model, revision: 1)
+        #expect(model.isSessionComplete)
+
+        let off = snapshot(enabled: true, visual: false)
+        let indexing = snapshot(enabled: true, visual: true, indexing: .indexing(progress()))
+        let ready = snapshot(enabled: true, visual: true, indexing: .ready(progress()))
+        #expect(!model.showsVisualSuggestionsPendingNote(off))
+        #expect(model.showsVisualSuggestionsPendingNote(indexing))
+        #expect(!model.needsVisualCompletion(indexing))
+        #expect(model.showsVisualSuggestionsPendingNote(ready))
+        #expect(model.needsVisualCompletion(ready))
+        #expect(model.visualCompletionKey(indexing) != model.visualCompletionKey(ready))
+
+        let continuous = SmartSearchDiscoveryModel { _, _ in nil }
+        #expect(!continuous.needsVisualCompletion(ready))
+    }
+
     @MainActor @discardableResult private func refresh(
         _ model: SmartSearchDiscoveryModel,
         revision: UInt64,
@@ -459,6 +515,25 @@ import TimelineCore
         TimelineSearchSuggestion(
             id: "\(kind)", query: "\(kind)", title: "\(kind)", subtitle: nil, systemImage: "photo",
             kind: kind, matchingUIDs: [PhotoUID(volumeID: "v", nodeID: "\(kind)")], representativeUIDs: [])
+    }
+
+    private func progress() -> MLSmartSearchAggregateProgress {
+        MLSmartSearchAggregateProgress(totalWorkUnits: 10, settledWorkUnits: 10, permanentlyUnavailableAssets: 0)
+    }
+
+    private func snapshot(
+        enabled: Bool, visual: Bool, indexing: MLSmartSearchIndexingState
+    ) -> MLSmartSearchSnapshot {
+        MLSmartSearchSnapshot(
+            isEnabled: enabled,
+            isVisualSearchEnabled: visual,
+            selectedModelID: nil,
+            phase: .disabled,
+            installedModelBytes: 0,
+            availableModels: [],
+            isSearchAvailable: enabled,
+            indexingState: indexing
+        )
     }
 
     private func snapshot(enabled: Bool, visual: Bool) -> MLSmartSearchSnapshot {

@@ -71,7 +71,9 @@ struct MainView: View {
     @State private var searchScope: MLSearchScope = .all
     @State private var searchDebounceTask: Task<Void, Never>?
     @State private var searchHistory = TimelineSearchHistory()
-    @State private var searchDiscovery = SmartSearchDiscoveryModel { latitude, longitude in
+    /// Suggestions are computed once per app session: a UI feature must not spend compute on every library change.
+    @State private var searchDiscovery = SmartSearchDiscoveryModel(refreshPolicy: .oncePerSession) {
+        latitude, longitude in
         await NativePlaceNameResolver.shared.cityName(latitude: latitude, longitude: longitude)
     }
     /// The structured suggestion that owned `committedSearchText` when it was committed.
@@ -1829,12 +1831,15 @@ struct MainView: View {
             coordinateCount: OfflineLibraryManager.shared.locationIndex.coordinates.count,
             snapshot: model.smartSearch?.snapshot
         )
+        // After the first published rows, library changes no longer restart the session's refresh.
+        let contentKey =
+            searchDiscovery.hasComputed ? "session" : "\(searchDiscoveryContent.favoritesHash)|\(revision)"
         return [
             "\(isSearchTextEmpty)",
             "\(needsSuggestionRefresh)",
             "\(searchDiscoveryIncludesVisualConcepts)",
-            "\(searchDiscoveryContent.favoritesHash)",
-            revision,
+            contentKey,
+            searchDiscovery.visualCompletionKey(model.smartSearch?.snapshot),
         ].joined(separator: "|")
     }
 
