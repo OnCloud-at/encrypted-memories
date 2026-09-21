@@ -11,7 +11,7 @@ import Testing
     private let beach = MLSearchConcept(
         id: "beach", prompt: "a photo of a beach by the sea", systemImage: "beach.umbrella")
 
-    @Test func conceptsNeedEnoughHitsAndSensitiveMatchesNeverCount() async {
+    @Test func conceptsNeedEnoughHitsAndSensitiveMatchesNeverCount() async throws {
         let beachHits = uids("b", 0..<8)
         let sensitive = Set(beachHits.prefix(4))
         let responses: [String: [PhotoUID]] = [
@@ -20,14 +20,28 @@ import Testing
             beach.prompt: beachHits,
             MLSearchConceptCatalog.sensitivePrompts[0]: Array(sensitive),
         ]
+        let search: MLSearchConceptDiscovery.Search = { prompt, _ in responses[prompt] ?? [] }
 
-        let result = await MLSearchConceptDiscovery.evaluate(
+        let gate = try await MLSearchConceptDiscovery.sensitiveUIDs(search: search)
+        let evidence = await MLSearchConceptDiscovery.evaluate(
             concepts: [nature, dog, beach],
-            coveredAssetCount: 100
-        ) { prompt, _ in responses[prompt] ?? [] }
+            coveredAssetCount: 100,
+            sensitiveUIDs: gate,
+            search: search
+        )
 
-        #expect(result.evidence.map(\.concept.id) == ["nature"])
-        #expect(result.sensitiveUIDs == sensitive)
+        #expect(gate == sensitive)
+        #expect(evidence.map(\.concept.id) == ["nature"])
+    }
+
+    @Test func theSensitiveGateFailsClosedWhenAnyQueryFails() async {
+        struct QueryFailure: Error {}
+        await #expect(throws: QueryFailure.self) {
+            _ = try await MLSearchConceptDiscovery.sensitiveUIDs { prompt, _ in
+                if prompt == MLSearchConceptCatalog.sensitivePrompts[1] { throw QueryFailure() }
+                return []
+            }
+        }
     }
 
     @Test func aConceptThatMostlyRepeatsAStrongerConceptIsDropped() async {
@@ -38,25 +52,27 @@ import Testing
             dog.prompt: uids("d", 0..<7),
         ]
 
-        let result = await MLSearchConceptDiscovery.evaluate(
+        let evidence = await MLSearchConceptDiscovery.evaluate(
             concepts: [forest, nature, dog],
-            coveredAssetCount: 100
+            coveredAssetCount: 100,
+            sensitiveUIDs: []
         ) { prompt, _ in responses[prompt] ?? [] }
 
-        #expect(result.evidence.map(\.concept.id) == ["nature", "dog"])
+        #expect(evidence.map(\.concept.id) == ["nature", "dog"])
     }
 
-    @Test func aFailingQuerySkipsOnlyThatConcept() async {
+    @Test func aFailingConceptQuerySkipsOnlyThatConcept() async {
         struct QueryFailure: Error {}
-        let result = await MLSearchConceptDiscovery.evaluate(
+        let evidence = await MLSearchConceptDiscovery.evaluate(
             concepts: [dog, nature],
-            coveredAssetCount: 10
+            coveredAssetCount: 10,
+            sensitiveUIDs: []
         ) { prompt, _ in
             if prompt == dog.prompt { throw QueryFailure() }
             return prompt == nature.prompt ? uids("n", 0..<6) : []
         }
 
-        #expect(result.evidence.map(\.concept.id) == ["nature"])
+        #expect(evidence.map(\.concept.id) == ["nature"])
     }
 
     @Test func thresholdScalesWithCoverageAndNeverDropsBelowSix() {

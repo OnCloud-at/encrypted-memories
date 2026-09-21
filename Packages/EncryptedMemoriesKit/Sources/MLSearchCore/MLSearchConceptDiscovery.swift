@@ -75,16 +75,6 @@ public struct MLSearchConceptEvidence: Equatable, Sendable {
     }
 }
 
-public struct MLSearchConceptDiscoveryResult: Equatable, Sendable {
-    public let evidence: [MLSearchConceptEvidence]
-    public let sensitiveUIDs: Set<PhotoUID>
-
-    public init(evidence: [MLSearchConceptEvidence], sensitiveUIDs: Set<PhotoUID>) {
-        self.evidence = evidence
-        self.sensitiveUIDs = sensitiveUIDs
-    }
-}
-
 /// Finds the curated concepts that are actually present in this library.
 ///
 /// Each prompt runs through the model-calibrated semantic search, so the existing relevance policy already
@@ -97,31 +87,39 @@ public enum MLSearchConceptDiscovery {
         max(6, Int((Double(coveredAssetCount) * 0.004).rounded(.up)))
     }
 
+    /// Runs every internal sensitive prompt. The gate fails closed: any failed or cancelled query throws, and
+    /// callers must then show no previews and no concept suggestions.
+    public static func sensitiveUIDs(limit: Int = 400, search: Search) async throws -> Set<PhotoUID> {
+        var sensitive = Set<PhotoUID>()
+        for prompt in MLSearchConceptCatalog.sensitivePrompts {
+            try Task.checkCancellation()
+            sensitive.formUnion(try await search(prompt, limit))
+        }
+        try Task.checkCancellation()
+        return sensitive
+    }
+
+    /// Evaluates the curated concepts. `sensitiveUIDs` must come from a successful `sensitiveUIDs(search:)`;
+    /// those items never count towards a concept. A failed concept query skips only that concept.
     public static func evaluate(
         concepts: [MLSearchConcept] = MLSearchConceptCatalog.curated,
         coveredAssetCount: Int,
+        sensitiveUIDs: Set<PhotoUID>,
         limit: Int = 400,
         maximumOverlap: Double = 0.8,
         search: Search
-    ) async -> MLSearchConceptDiscoveryResult {
-        var sensitive = Set<PhotoUID>()
-        for prompt in MLSearchConceptCatalog.sensitivePrompts {
-            guard !Task.isCancelled else { return MLSearchConceptDiscoveryResult(evidence: [], sensitiveUIDs: []) }
-            if let uids = try? await search(prompt, limit) {
-                sensitive.formUnion(uids)
-            }
-        }
-
+    ) async -> [MLSearchConceptEvidence] {
         let threshold = minimumHits(coveredAssetCount: coveredAssetCount)
         var candidates: [MLSearchConceptEvidence] = []
         for concept in concepts {
-            guard !Task.isCancelled else { return MLSearchConceptDiscoveryResult(evidence: [], sensitiveUIDs: []) }
+            guard !Task.isCancelled else { return [] }
             guard let uids = try? await search(concept.prompt, limit) else { continue }
-            let ranked = uids.filter { !sensitive.contains($0) }
+            let ranked = uids.filter { !sensitiveUIDs.contains($0) }
             if ranked.count >= threshold {
                 candidates.append(MLSearchConceptEvidence(concept: concept, rankedUIDs: ranked))
             }
         }
+        guard !Task.isCancelled else { return [] }
 
         var accepted: [MLSearchConceptEvidence] = []
         var acceptedSets: [Set<PhotoUID>] = []
@@ -134,6 +132,6 @@ public enum MLSearchConceptDiscovery {
             accepted.append(candidate)
             acceptedSets.append(hits)
         }
-        return MLSearchConceptDiscoveryResult(evidence: accepted, sensitiveUIDs: sensitive)
+        return accepted
     }
 }

@@ -50,6 +50,9 @@ struct MobileTimelineScreen: View {
     // Search uses the same shared coordinator as macOS. Core owns semantic/native execution and
     // rank fusion; this view only commits the resulting UID order to the grid.
     @State private var committedSearchText = ""
+    /// The structured suggestion that owned `committedSearchText` when it was committed. It keeps the result
+    /// authoritative while an edit of its title is still debouncing.
+    @State private var committedSuggestion: TimelineSearchSuggestion?
     @State private var searchDebounceTask: Task<Void, Never>?
     @State private var semanticQuery: MLSmartSearchQueryCoordinator?
     /// Identity of the lifecycle the coordinator is bound to - a new session rebinds it.
@@ -608,9 +611,9 @@ struct MobileTimelineScreen: View {
 
     /// The resolved result set of the selected suggestion while the committed text still shows its title.
     private var committedSuggestionMatches: Set<PhotoUID>? {
-        guard let activeSearchSuggestion, activeSearchSuggestion.owns(searchText: normalizedCommittedSearchText)
+        guard let committedSuggestion, committedSuggestion.owns(searchText: normalizedCommittedSearchText)
         else { return nil }
-        return activeSearchSuggestion.matchingUIDs
+        return committedSuggestion.matchingUIDs
     }
 
     private var hasSearchQuery: Bool {
@@ -731,13 +734,21 @@ struct MobileTimelineScreen: View {
             semanticQuery = nil
             semanticQueryLifecycle = nil
         }
-        if activeSearchSuggestion?.owns(searchText: normalizedValue) == true {
-            // The suggestion already carries its result set; a semantic query for its title would only compete.
+        if let activeSearchSuggestion, activeSearchSuggestion.matchingUIDs != nil,
+            activeSearchSuggestion.owns(searchText: normalizedValue)
+        {
+            // A selected suggestion already carries its result set. Commit it in the same update, without the
+            // typing debounce, so the grid never shows the full library in between; a semantic query for its
+            // title would only compete.
             semanticQuery?.clear()
-        } else {
-            semanticQuery?.update(query: value)
+            committedSuggestion = activeSearchSuggestion
+            committedSearchText = value
+            searchDebounceTask = nil
+            return
         }
+        semanticQuery?.update(query: value)
         if normalizedValue.isEmpty {
+            committedSuggestion = nil
             committedSearchText = ""
             searchDebounceTask = nil
             return
@@ -745,6 +756,7 @@ struct MobileTimelineScreen: View {
         searchDebounceTask = Task { @MainActor in
             try? await Task.sleep(for: .milliseconds(280))
             guard !Task.isCancelled else { return }
+            committedSuggestion = nil
             committedSearchText = value
             searchDebounceTask = nil
         }
