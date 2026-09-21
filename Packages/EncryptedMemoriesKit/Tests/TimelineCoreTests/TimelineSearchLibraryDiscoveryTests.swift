@@ -218,6 +218,98 @@ import Testing
         #expect(ranked.map(\.id) == ["c1", "p1", "c2"])
     }
 
+    // MARK: Every offered suggestion works
+
+    /// Builds a realistic multi-year library and proves, for every suggestion the metadata and place families
+    /// offer, that running it returns exactly its announced result set, with at least three items, and that its
+    /// previews come from that set. No family may produce a visual concept without ML.
+    @Test func everyOfferedSuggestionReturnsExactlyItsAnnouncedResults() {
+        let now = date(2026, 9, 21)
+        var items: [PhotoItem] = []
+        var coordinates: [PhotoCoordinate] = []
+        for year in 2019...2026 {
+            for month in 1...12 {
+                for day in stride(from: 1, through: 28, by: 3) {
+                    let id = "\(year)-\(month)-\(day)"
+                    let captured = date(year, month, day)
+                    guard captured < now else { continue }
+                    let mediaType =
+                        day % 10 == 1 ? "video/mp4" : (day % 13 == 0 ? "image/png" : "image/jpeg")
+                    items.append(item(id, captured, mediaType: mediaType))
+                    // Home near Vienna, plus spring visits near Klosterneuburg.
+                    let isTrip = (3...5).contains(month) && day % 2 == 0
+                    coordinates.append(
+                        coordinate(id, isTrip ? 48.3064 : 48.2082, isTrip ? 16.3259 : 16.3738, captured))
+                }
+            }
+        }
+        // A dense trip, and the same days one and three years before `now`.
+        items += (0..<60).map { item("trip-\($0)", date(2023, 8, 3 + $0 / 20, hour: $0 % 20)) }
+        items += (0..<5).map { item("y1-\($0)", date(2025, 9, 20, hour: 8 + $0)) }
+        items += (0..<4).map { item("y3-\($0)", date(2023, 9, 22, hour: 8 + $0)) }
+        let favorites = Set(items.filter { $0.uid.nodeID.hasSuffix("-7") }.map(\.uid))
+        let sections = [TimelineSection(id: "all", date: now, title: "", items: items)]
+        let context = TimelineSearchDiscoveryContext(
+            now: now, calendar: calendar, locale: Locale(identifier: "de_AT"), favoriteUIDs: favorites)
+
+        let metadata = TimelineSearchDiscovery.librarySuggestions(sections: sections, context: context)
+        let candidates = TimelineSearchDiscovery.placeCandidates(coordinates: coordinates)
+        let names = Dictionary(
+            uniqueKeysWithValues: candidates.map { ($0.id, $0.isHome ? "Wien" : "Klosterneuburg") })
+        let places = TimelineSearchDiscovery.placeSuggestions(
+            candidates: candidates,
+            names: names,
+            itemsByUID: Dictionary(uniqueKeysWithValues: items.map { ($0.uid, $0) }),
+            context: context
+        )
+        let offered = metadata.forYou + metadata.chips + places
+
+        let kinds = Set(offered.map(\.kind))
+        for expected: TimelineSearchSuggestionKind in [.onThisDay, .trip, .season, .favorites, .mediaType, .place] {
+            #expect(kinds.contains(expected), "fixture must exercise \(expected)")
+        }
+        #expect(!kinds.contains(.concept))
+        for suggestion in offered {
+            let announced = suggestion.matchingUIDs ?? []
+            let results = TimelineSearch.filter(
+                sections, query: "", context: TimelineSearchContext(favoriteUIDs: favorites),
+                requiredUIDs: announced
+            ).flatMap(\.items).map(\.uid)
+            #expect(announced.count >= 3, "\(suggestion.id) offers fewer than three results")
+            #expect(Set(results) == announced, "\(suggestion.id) does not return its announced results")
+            #expect(results.count == announced.count, "\(suggestion.id) returns duplicates")
+            #expect(
+                Set(suggestion.representativeUIDs).isSubset(of: announced),
+                "\(suggestion.id) shows a preview outside its results")
+        }
+
+        // The announced sets are also correct: each is compared with a set derived from the fixture alone.
+        func announced(_ id: String) -> Set<PhotoUID>? {
+            offered.first { $0.id == id }?.matchingUIDs
+        }
+        func localDay(_ date: Date) -> Date { calendar.startOfDay(for: date) }
+        #expect(announced("media:\(PhotoTag.favorites.rawValue)") == favorites)
+        #expect(
+            announced("media:\(PhotoTag.videos.rawValue)")
+                == Set(items.filter { $0.mediaType.hasPrefix("video/") }.map(\.uid)))
+
+        let anniversary = localDay(date(2025, 9, 21))
+        let aroundAnniversary = items.filter {
+            let distance = calendar.dateComponents([.day], from: anniversary, to: localDay($0.captureTime)).day
+            return abs(distance ?? .max) <= 3
+        }
+        #expect(aroundAnniversary.contains { $0.uid == uid("y1-0") })
+        #expect(announced("on-this-day:1") == Set(aroundAnniversary.map(\.uid)))
+
+        let tripDays = Set([3, 4, 5].map { localDay(date(2023, 8, $0)) })
+        let onTripDays = items.filter { tripDays.contains(localDay($0.captureTime)) }
+        #expect(Set(onTripDays.map(\.uid)).isSuperset(of: (0..<60).map { uid("trip-\($0)") }))
+        #expect(onTripDays.count > 60, "fixture must include base items on the trip days")
+        let trips = offered.filter { $0.kind == .trip }
+        #expect(trips.count == 1)
+        #expect(trips.first?.matchingUIDs == Set(onTripDays.map(\.uid)))
+    }
+
     // MARK: Fixtures
 
     private func context(now: Date) -> TimelineSearchDiscoveryContext {

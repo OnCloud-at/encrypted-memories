@@ -311,7 +311,9 @@ let package = Package(
             name: "MLSearchFeature", dependencies: ["MLSearchCore", "PhotosCore", "TimelineCore"],
             swiftSettings: disableDynamicActorIsolation),
         .testTarget(
-            name: "MLSearchFeatureTests", dependencies: ["MLSearchFeature"], swiftSettings: disableDynamicActorIsolation
+            name: "MLSearchFeatureTests",
+            dependencies: ["MLSearchFeature", "MLSearchCore", "PhotosCore", "TimelineCore"],
+            swiftSettings: disableDynamicActorIsolation
         ),
     ]
 )
