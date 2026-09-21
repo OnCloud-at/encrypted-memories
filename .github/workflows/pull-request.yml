@@ -58,6 +58,12 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: bash scripts/check-public-tree.sh "$BASE_SHA" "$HEAD_SHA"
 
+      - name: Enforce public commit identities
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: bash scripts/check-commit-identities.sh "$BASE_SHA" "$HEAD_SHA"
+
       - name: Test Apple release automation
         run: |
           set -euo pipefail
