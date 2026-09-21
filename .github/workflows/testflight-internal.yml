@@ -137,7 +137,7 @@ jobs:
           fi
           release_sha="$(git rev-parse --verify "refs/tags/$RELEASE_TAG^{commit}")"
           git merge-base --is-ancestor "$release_sha" "$AUTOMATION_SHA" || release_fail configuration \
-            "Release tag '$RELEASE_TAG' resolves to '$release_sha', which is not an ancestor of trusted automation '$AUTOMATION_SHA'." \
+            "The release tag must point to a commit on main. Tag '$RELEASE_TAG' resolves to '$release_sha', which is not an ancestor of trusted automation '$AUTOMATION_SHA'." \
             "Publish the release from a commit on main and retry."
           echo "commit_sha=$release_sha" >> "$GITHUB_OUTPUT"
           ruby .github/scripts/release_build_number.rb "$release_sha" "$RUNNER_TEMP/release.json"
