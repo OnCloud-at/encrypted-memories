@@ -12,6 +12,8 @@ struct MobileSearchRecentEntry: Identifiable, Equatable {
     let representativeUID: PhotoUID?
     /// Set when the entry came from a structured suggestion, so selecting it again restores the same result.
     let suggestion: TimelineSearchSuggestion?
+    /// False while a structured entry waits for current suggestions: it is shown but cannot be selected.
+    var isAvailable = true
 
     var id: String { query }
 }
@@ -32,6 +34,23 @@ struct MobileSearchLandingScreen: View {
 
     private var discovery: SmartSearchDiscoveryModel? { content.discovery }
 
+    /// Suggestions are re-checked against the current library revision and search availability at render time,
+    /// so a row that can no longer work is never offered.
+    private var displayedForYou: [TimelineSearchSuggestion] {
+        discovery?.forYou(content: discoveryContent, snapshot: libraryModel.smartSearch?.snapshot) ?? []
+    }
+
+    private var displayedChips: [TimelineSearchSuggestion] {
+        discovery?.chips(content: discoveryContent, snapshot: libraryModel.smartSearch?.snapshot) ?? []
+    }
+
+    private var discoveryContent: SmartSearchContentIdentity {
+        SmartSearchContentIdentity(
+            timelineRevision: libraryModel.timelineRevision,
+            favoriteUIDs: libraryModel.favoriteUIDs
+        )
+    }
+
     var body: some View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 28) {
@@ -39,8 +58,8 @@ struct MobileSearchLandingScreen: View {
                     recentSection
                 }
                 forYouSection
-                if let chips = discovery?.chips, !chips.isEmpty {
-                    chipSection(chips)
+                if !displayedChips.isEmpty {
+                    chipSection(displayedChips)
                 }
                 notes
             }
@@ -91,14 +110,15 @@ struct MobileSearchLandingScreen: View {
                         .contentShape(.rect)
                     }
                     .buttonStyle(.plain)
+                    .disabled(!entry.isAvailable)
                 }
             }
         }
     }
 
     @ViewBuilder private var forYouSection: some View {
-        let suggestions = discovery?.forYou ?? []
-        let isLoading = discovery?.hasComputed != true
+        let suggestions = displayedForYou
+        let isLoading = discovery?.isCurrent(content: discoveryContent) != true
         if isLoading || !suggestions.isEmpty {
             VStack(alignment: .leading, spacing: 10) {
                 sectionTitle(L10n.string("search.for_you"))

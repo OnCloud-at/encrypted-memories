@@ -76,6 +76,10 @@ struct MainView: View {
     }
     /// The structured suggestion that owned `committedSearchText` when it was committed.
     @State private var committedSuggestion: TimelineSearchSuggestion?
+    /// A search text that may be a suggestion title, held until a current refresh decides how to run it.
+    @State private var pendingSuggestionText: String?
+    /// Bounds the wait for `pendingSuggestionText`; cancelled when the text changes or is decided.
+    @State private var pendingSuggestionDeadlineTask: Task<Void, Never>?
     // Shared-element transition between a photo and its grid cell.
     @State private var gridProxy = GridProxy<PhotoUID>()
     @State private var mapClusterGridProxy = GridProxy<PhotoUID>()
@@ -229,18 +233,8 @@ struct MainView: View {
             }
             .onChange(of: librarySettled) { _, _ in evaluateVeilLift() }
             .onChange(of: timelineModel.contentRevision) { _, _ in evaluateVeilLift() }
-            .task(id: searchDiscoveryTaskKey) {
-                // Suggestions are refreshed only while the search field is empty. Typing cancels the refresh,
-                // so its background ML queries never compete with an interactive search.
-                guard searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
-                await searchDiscovery.refresh(
-                    sections: currentTimelineSections,
-                    timelineRevision: UInt64(truncatingIfNeeded: timelineModel.contentRevision),
-                    favoriteUIDs: favorites,
-                    coordinates: OfflineLibraryManager.shared.locationIndex.coordinates,
-                    smartSearch: model.smartSearch
-                )
-            }
+            // Split out of this chain: inline, the added handlers exceed the type-checker's time budget.
+            .applying { searchDiscoveryLifecycle($0) }
             .task(id: temporalProjectionRequestID) {
                 await rebuildTemporalProjection()
             }
@@ -578,6 +572,7 @@ struct MainView: View {
     private func handleDisappear() {
         searchDebounceTask?.cancel()
         searchDebounceTask = nil
+        clearPendingSuggestionText()
         cancelVeilTasks()
         let backupRefresh = backupUploadRefreshCoordinator
         Task { await backupRefresh.cancel() }
@@ -646,7 +641,10 @@ struct MainView: View {
             placement: .toolbar,
             prompt: Text(L10n.string("search.prompt \(title)")),
             recentSearches: searchHistory.queries,
-            suggestions: searchDiscovery.textSuggestions().map {
+            suggestions: searchDiscovery.textSuggestions(
+                content: searchDiscoveryContent,
+                snapshot: model.smartSearch?.snapshot
+            ).map {
                 SmartSearchSuggestionItem(id: $0.id, title: $0.title, query: $0.query)
             },
             onClearRecentSearches: clearSearchHistory
@@ -1703,24 +1701,70 @@ struct MainView: View {
                 initialScope: searchScope
             )
         }
-        if let suggestion = searchDiscovery.structuredSuggestion(owning: value) {
-            // A chosen suggestion carries its exact result set. Commit it at once instead of debouncing and
-            // skip the semantic query for its display title.
-            semanticQuery?.clear()
-            if temporalMode != .allPhotos {
-                withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.16)) {
-                    temporalMode = .allPhotos
-                    focusedTemporalYear = nil
-                }
-            }
-            routeInitialScrollAnchor = nil
-            routeScrollGeneration += 1
-            committedSuggestion = suggestion
-            committedSearchText = value
-            recordSearchHistory(suggestion.query)
+        clearPendingSuggestionText()
+        switch searchDiscovery.commitDecision(
+            for: value, content: searchDiscoveryContent, snapshot: model.smartSearch?.snapshot)
+        {
+        case .structured(let suggestion):
+            commitSuggestion(suggestion, text: value)
+        case .deferUntilRefresh:
+            // The menu delivers a click as plain text. While the suggestions are not current, the text and the
+            // grid stay as they are; `resolvePendingSuggestionText` decides after the refresh or the deadline.
             searchDebounceTask = nil
-            return
+            pendingSuggestionText = value
+            pendingSuggestionDeadlineTask = Task { @MainActor in
+                try? await Task.sleep(for: .seconds(2))
+                guard !Task.isCancelled else { return }
+                resolvePendingSuggestionText(force: true)
+            }
+        case .text:
+            scheduleTextCommit(value)
         }
+    }
+
+    /// A chosen suggestion carries its exact result set. Commit it at once instead of debouncing and skip the
+    /// semantic query for its display title.
+    private func commitSuggestion(_ suggestion: TimelineSearchSuggestion, text value: String) {
+        semanticQuery?.clear()
+        if temporalMode != .allPhotos {
+            withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.16)) {
+                temporalMode = .allPhotos
+                focusedTemporalYear = nil
+            }
+        }
+        routeInitialScrollAnchor = nil
+        routeScrollGeneration += 1
+        committedSuggestion = suggestion
+        committedSearchText = value
+        recordSearchHistory(suggestion.query)
+        searchDebounceTask = nil
+    }
+
+    private func clearPendingSuggestionText() {
+        pendingSuggestionDeadlineTask?.cancel()
+        pendingSuggestionDeadlineTask = nil
+        pendingSuggestionText = nil
+    }
+
+    /// Decides a deferred search text as soon as the published suggestions are final for the kind that owned
+    /// it, or at the deadline (`force`): a suggestion that owns it is committed, any other text runs as an
+    /// ordinary search. The text is never erased.
+    private func resolvePendingSuggestionText(force: Bool = false) {
+        guard let pending = pendingSuggestionText else { return }
+        let decision = searchDiscovery.commitDecision(
+            for: pending, content: searchDiscoveryContent, snapshot: model.smartSearch?.snapshot)
+        if case .deferUntilRefresh = decision, !force { return }
+        clearPendingSuggestionText()
+        guard pending == searchText else { return }
+        if case .structured(let suggestion) = decision {
+            commitSuggestion(suggestion, text: pending)
+        } else {
+            scheduleTextCommit(pending)
+        }
+    }
+
+    private func scheduleTextCommit(_ value: String) {
+        searchDebounceTask?.cancel()
         semanticQuery?.update(query: value)
         if value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             committedSuggestion = nil
@@ -1748,6 +1792,36 @@ struct MainView: View {
         }
     }
 
+    /// Search-suggestion refresh and rebinding, split out of `body`: inline, these handlers exceed the
+    /// type-checker's time budget for the main modifier chain.
+    private func searchDiscoveryLifecycle<Content: View>(_ view: Content) -> some View {
+        view
+            .onChange(of: searchDiscoveryContent) { _, _ in rebindCommittedSuggestion() }
+            .onChange(of: model.smartSearch?.snapshot) { _, _ in rebindCommittedSuggestion() }
+            .onChange(of: searchDiscovery.settledGeneration) { _, _ in
+                rebindCommittedSuggestion()
+                resolvePendingSuggestionText()
+            }
+            // The first publish already decides a deferred title that no place or visual concept owned.
+            .onChange(of: searchDiscovery.isCurrent(content: searchDiscoveryContent)) { _, _ in
+                resolvePendingSuggestionText()
+            }
+            .task(id: searchDiscoveryTaskKey) {
+                // Suggestions are refreshed while the search field is empty, to keep a committed suggestion
+                // current, and to decide a deferred suggestion title. Typing cancels the refresh, so its
+                // background ML queries never compete with an interactive search.
+                guard isSearchTextEmpty || needsSuggestionRefresh else { return }
+                await searchDiscovery.refresh(
+                    sections: currentTimelineSections,
+                    timelineRevision: UInt64(truncatingIfNeeded: timelineModel.contentRevision),
+                    favoriteUIDs: favorites,
+                    coordinates: OfflineLibraryManager.shared.locationIndex.coordinates,
+                    smartSearch: model.smartSearch,
+                    includeVisualConcepts: searchDiscoveryIncludesVisualConcepts
+                )
+            }
+    }
+
     private var searchDiscoveryTaskKey: String {
         let revision = SmartSearchDiscoveryModel.revisionKey(
             timelineRevision: UInt64(truncatingIfNeeded: timelineModel.contentRevision),
@@ -1755,14 +1829,108 @@ struct MainView: View {
             coordinateCount: OfflineLibraryManager.shared.locationIndex.coordinates.count,
             snapshot: model.smartSearch?.snapshot
         )
-        return "\(searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)|\(revision)"
+        return [
+            "\(isSearchTextEmpty)",
+            "\(needsSuggestionRefresh)",
+            "\(searchDiscoveryIncludesVisualConcepts)",
+            "\(searchDiscoveryContent.favoritesHash)",
+            revision,
+        ].joined(separator: "|")
     }
 
-    /// Resolved result set of the committed suggestion while the committed text still shows its title.
-    private var committedSuggestionMatches: Set<PhotoUID>? {
+    private var isSearchTextEmpty: Bool {
+        searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private var searchDiscoveryContent: SmartSearchContentIdentity {
+        SmartSearchContentIdentity(
+            timelineRevision: UInt64(truncatingIfNeeded: timelineModel.contentRevision),
+            favoriteUIDs: favorites
+        )
+    }
+
+    /// The committed suggestion while the committed text still shows its title.
+    private var activeCommittedSuggestion: TimelineSearchSuggestion? {
         guard let committedSuggestion, committedSuggestion.owns(searchText: normalizedCommittedSearchText)
         else { return nil }
-        return committedSuggestion.matchingUIDs
+        return committedSuggestion
+    }
+
+    /// A deferred suggestion title needs a refresh, and a committed suggestion needs one until the suggestions
+    /// are settled for the current library content. A visual concept also follows the indexing progress.
+    private var needsSuggestionRefresh: Bool {
+        if pendingSuggestionText != nil { return true }
+        guard let active = activeCommittedSuggestion else { return false }
+        return active.kind == .concept || !searchDiscovery.isSettled(content: searchDiscoveryContent)
+    }
+
+    /// While results show, the visual stages run only for a visual concept, committed or deferred.
+    private var searchDiscoveryIncludesVisualConcepts: Bool {
+        isSearchTextEmpty || pendingSuggestionIsConcept || activeCommittedSuggestion?.kind == .concept
+    }
+
+    private var pendingSuggestionIsConcept: Bool {
+        guard let pendingSuggestionText else { return false }
+        return searchDiscovery.publishedKind(owning: pendingSuggestionText) == .concept
+    }
+
+    /// Resolved result set of the committed suggestion while the committed text still shows its title. While the
+    /// suggestions are not current the committed set stays; the grid intersects it with the current items.
+    private var committedSuggestionMatches: Set<PhotoUID>? {
+        guard let active = activeCommittedSuggestion else { return nil }
+        switch searchDiscovery.rebind(
+            active, content: searchDiscoveryContent, snapshot: model.smartSearch?.snapshot)
+        {
+        case .keep(let current): return current.matchingUIDs
+        case .pending: return active.matchingUIDs
+        // Nothing matches until `rebindCommittedSuggestion` runs: it clears a dropped concept, or commits any other
+        // dropped title as ordinary text.
+        case .drop: return []
+        }
+    }
+
+    /// Keeps the committed suggestion current after a library change, a search availability change or a
+    /// finished refresh. A suggestion that can no longer work is left; its title must not fall back to a lexical
+    /// or semantic search while visual search is unavailable: only then is the field cleared. Any other
+    /// suggestion that no longer exists keeps its text, which the user may have typed, as an ordinary search.
+    private func rebindCommittedSuggestion() {
+        guard let active = activeCommittedSuggestion, active.owns(searchText: searchText) else { return }
+        switch searchDiscovery.rebind(
+            active, content: searchDiscoveryContent, snapshot: model.smartSearch?.snapshot)
+        {
+        case .keep(let current):
+            guard current != active else { break }
+            committedSuggestion = current
+            if !current.owns(searchText: normalizedCommittedSearchText) {
+                // The title changed: the field, the committed text and the stored suggestion must agree, or
+                // the grid would lose the suggestion and run the old title as text.
+                searchDebounceTask?.cancel()
+                searchDebounceTask = nil
+                clearPendingSuggestionText()
+                committedSearchText = current.query
+                searchText = current.query
+            }
+        case .pending:
+            break
+        case .drop:
+            let visualAvailable = SmartSearchDiscoveryModel.visualConceptsAvailable(model.smartSearch?.snapshot)
+            if active.kind == .concept, !visualAvailable {
+                clearUnavailableSuggestionSearch()
+            } else {
+                committedSuggestion = nil
+                scheduleTextCommit(searchText)
+            }
+        }
+    }
+
+    private func clearUnavailableSuggestionSearch() {
+        searchDebounceTask?.cancel()
+        searchDebounceTask = nil
+        clearPendingSuggestionText()
+        semanticQuery?.clear()
+        committedSuggestion = nil
+        committedSearchText = ""
+        searchText = ""
     }
 
     private var currentTimelineSections: [TimelineSection] {
@@ -2721,5 +2889,12 @@ private struct SharedAlbumSidebarRow: View {
         .accessibilityElement(children: .combine)
         .accessibilityLabel(presentation.accessibilityLabel)
         .accessibilityHint(presentation.accessibilityHint ?? "")
+    }
+}
+
+private extension View {
+    /// Applies a view-building function; keeps long modifier chains within the type-checker's budget.
+    func applying<Transformed: View>(_ transform: (Self) -> Transformed) -> Transformed {
+        transform(self)
     }
 }

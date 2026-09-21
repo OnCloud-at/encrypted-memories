@@ -149,6 +149,15 @@ struct MobileTimelineScreen: View {
                 .animation(reduceMotion ? nil : .smooth(duration: 0.22), value: selection.isSelecting)
                 .onChange(of: searchScope) { _, scope in semanticQuery?.setScope(scope) }
                 .onChange(of: searchText) { _, value in scheduleSearchCommit(value) }
+                .onChange(of: activeSearchSuggestion) { _, suggestion in
+                    // The search tab replaces the selected suggestion with its current version after a library
+                    // change. The grid follows it while the committed text still shows its title.
+                    guard let suggestion, suggestion.matchingUIDs != nil,
+                        committedSuggestion?.id == suggestion.id,
+                        suggestion.owns(searchText: normalizedCommittedSearchText)
+                    else { return }
+                    committedSuggestion = suggestion
+                }
                 .onDisappear {
                     searchDebounceTask?.cancel()
                     searchDebounceTask = nil

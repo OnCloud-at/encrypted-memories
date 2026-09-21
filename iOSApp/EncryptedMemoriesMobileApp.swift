@@ -437,16 +437,21 @@ private struct MobileSearchTabScreen: View {
                 self.activeSuggestion = nil
             }
         }
+        .onChange(of: discoveryContent) { _, _ in rebindActiveSuggestion() }
+        .onChange(of: libraryModel.smartSearch?.snapshot) { _, _ in rebindActiveSuggestion() }
+        .onChange(of: discovery.settledGeneration) { _, _ in rebindActiveSuggestion() }
         .task(id: discoveryTaskKey) {
-            // Discovery runs only while its landing is visible. Typing or leaving the tab cancels it, so its
-            // background ML queries never compete with an interactive search.
-            guard isLandingVisible else { return }
+            // Discovery runs while its landing is visible, and to keep a selected suggestion current. Typing or
+            // leaving the tab cancels it, so its background ML queries never compete with an interactive search.
+            // While results show, the visual stages run only for a selected visual concept.
+            guard isLandingVisible || needsActiveSuggestionRefresh else { return }
             await discovery.refresh(
                 sections: libraryModel.sections,
                 timelineRevision: libraryModel.timelineRevision,
                 favoriteUIDs: libraryModel.favoriteUIDs,
                 coordinates: libraryModel.locationIndex.coordinates,
-                smartSearch: libraryModel.smartSearch
+                smartSearch: libraryModel.smartSearch,
+                includeVisualConcepts: isLandingVisible || activeSuggestion?.kind == .concept
             )
         }
         .task(id: recentRepresentativesRevision) {
@@ -465,15 +470,90 @@ private struct MobileSearchTabScreen: View {
         }
     }
 
+    /// A structured entry is shown through its current, displayable version, which also provides the preview.
+    /// While the suggestions are not current it stays visible without a preview and cannot be selected. It is
+    /// hidden only when it cannot work. Typed entries are always shown.
     private var recents: [MobileSearchRecentEntry] {
-        history.queries.map { query in
-            let suggestion = historySuggestions[query]
-            return MobileSearchRecentEntry(
-                query: query,
-                representativeUID: suggestion?.representativeUID ?? recentRepresentatives[query],
-                suggestion: suggestion
-            )
+        history.queries.compactMap { query in
+            guard let stored = historySuggestions[query] else {
+                return MobileSearchRecentEntry(
+                    query: query,
+                    representativeUID: recentRepresentatives[query],
+                    suggestion: nil
+                )
+            }
+            switch discovery.rebind(
+                stored, content: discoveryContent, snapshot: libraryModel.smartSearch?.snapshot)
+            {
+            case .keep(let current):
+                return MobileSearchRecentEntry(
+                    query: query,
+                    representativeUID: current.representativeUID,
+                    suggestion: current
+                )
+            case .pending:
+                // The last thumbnail stays while its item still exists. A visual concept shows none: its
+                // sensitive gate is not confirmed for the current library.
+                let lastRepresentative =
+                    stored.kind == .concept
+                    ? nil : stored.representativeUID.flatMap { libraryModel.snapshot.index(of: $0) == nil ? nil : $0 }
+                return MobileSearchRecentEntry(
+                    query: query,
+                    representativeUID: lastRepresentative,
+                    suggestion: stored,
+                    isAvailable: false
+                )
+            case .drop:
+                return nil
+            }
         }
+    }
+
+    private var discoveryContent: SmartSearchContentIdentity {
+        SmartSearchContentIdentity(
+            timelineRevision: libraryModel.timelineRevision,
+            favoriteUIDs: libraryModel.favoriteUIDs
+        )
+    }
+
+    /// Keeps a selected suggestion current after a library change, a search availability change or a finished
+    /// refresh. A suggestion that can no longer work is left; this clears only its title, never typed text.
+    private func rebindActiveSuggestion() {
+        guard let activeSuggestion else { return }
+        switch discovery.rebind(
+            activeSuggestion, content: discoveryContent, snapshot: libraryModel.smartSearch?.snapshot)
+        {
+        case .keep(let current):
+            if current != activeSuggestion {
+                self.activeSuggestion = current
+                if current.query != activeSuggestion.query {
+                    // The title changed: the old title must not stay as a structured recent entry.
+                    historySuggestions[activeSuggestion.query] = nil
+                    // The new title can already be in the history. The initializer keeps its first occurrence
+                    // only, so the identifiers of the recent entries stay unique.
+                    history = TimelineSearchHistory(
+                        queries: history.queries.map { $0 == activeSuggestion.query ? current.query : $0 })
+                }
+                historySuggestions[current.query] = current
+                if !current.owns(searchText: searchText) {
+                    searchText = current.query
+                }
+            }
+        case .pending:
+            break
+        case .drop:
+            self.activeSuggestion = nil
+            if activeSuggestion.owns(searchText: searchText) {
+                searchText = ""
+            }
+        }
+    }
+
+    /// A selected suggestion needs a refresh until the suggestions are settled for the current library content.
+    /// A visual concept also follows the indexing progress.
+    private var needsActiveSuggestionRefresh: Bool {
+        guard isActive, let activeSuggestion else { return false }
+        return activeSuggestion.kind == .concept || !discovery.isSettled(content: discoveryContent)
     }
 
     private func select(_ suggestion: TimelineSearchSuggestion) {
@@ -488,13 +568,19 @@ private struct MobileSearchTabScreen: View {
     }
 
     private func selectRecent(_ entry: MobileSearchRecentEntry) {
-        if let suggestion = entry.suggestion {
-            select(suggestion)
-        } else {
+        guard let stored = entry.suggestion else {
             activeSuggestion = nil
             searchText = entry.query
             record(entry.query)
+            return
         }
+        // Replay a structured entry only through its current, displayable version. Its title is never run as
+        // a text search, so an entry that cannot work now does nothing.
+        guard
+            case .keep(let current) = discovery.rebind(
+                stored, content: discoveryContent, snapshot: libraryModel.smartSearch?.snapshot)
+        else { return }
+        select(current)
     }
 
     private func record(_ query: String) {
@@ -523,7 +609,14 @@ private struct MobileSearchTabScreen: View {
             coordinateCount: libraryModel.locationIndex.coordinates.count,
             snapshot: libraryModel.smartSearch?.snapshot
         )
-        return "\(isLandingVisible)|\(revision)"
+        let visual = isLandingVisible || activeSuggestion?.kind == .concept
+        return [
+            "\(isLandingVisible)",
+            "\(needsActiveSuggestionRefresh)",
+            "\(visual)",
+            "\(discoveryContent.favoritesHash)",
+            revision,
+        ].joined(separator: "|")
     }
 
     private var recentRepresentativesRevision: String {

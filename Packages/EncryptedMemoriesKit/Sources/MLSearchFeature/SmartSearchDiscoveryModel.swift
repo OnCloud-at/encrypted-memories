@@ -4,6 +4,41 @@ import Observation
 import PhotosCore
 import TimelineCore
 
+/// Identity of the library content a suggestion result set depends on: the timeline revision and the favorite
+/// set. Coordinates only name places, so they are not part of it.
+public struct SmartSearchContentIdentity: Hashable, Sendable {
+    public let timelineRevision: UInt64
+    public let favoriteCount: Int
+    public let favoritesHash: Int
+
+    public init(timelineRevision: UInt64, favoriteUIDs: Set<PhotoUID>) {
+        self.timelineRevision = timelineRevision
+        favoriteCount = favoriteUIDs.count
+        favoritesHash = favoriteUIDs.hashValue
+    }
+}
+
+/// What a host does with a search text that may be the title of a structured suggestion.
+public enum SmartSearchSuggestionCommitDecision: Equatable {
+    /// A displayable suggestion owns the text: commit its exact result set.
+    case structured(TimelineSearchSuggestion)
+    /// A published suggestion owns the text but the suggestions are not current: keep the text and decide again
+    /// after the refresh.
+    case deferUntilRefresh
+    /// No suggestion owns the text: it is ordinary typed text.
+    case text
+}
+
+/// What a host does with a structured suggestion that was selected earlier.
+public enum SmartSearchSuggestionRebindResult: Equatable {
+    /// The current version of the suggestion, with its current result set.
+    case keep(TimelineSearchSuggestion)
+    /// The suggestions are not current yet: keep the selected one until the refresh finishes.
+    case pending
+    /// The suggestion can no longer work: leave the structured search.
+    case drop
+}
+
 /// Library-aware search suggestions shared by the iOS search landing and the macOS search menu.
 ///
 /// Stages run off the main actor and check cancellation:
@@ -19,9 +54,28 @@ import TimelineCore
 public final class SmartSearchDiscoveryModel {
     public typealias PlaceNameResolver = @Sendable (_ latitude: Double, _ longitude: Double) async -> String?
 
+    /// Raw published rows. Hosts display `forYou(content:snapshot:)` and `chips(content:snapshot:)`, which
+    /// re-check availability against the current state at render time.
     public private(set) var forYou: [TimelineSearchSuggestion] = []
     public private(set) var chips: [TimelineSearchSuggestion] = []
     public private(set) var hasComputed = false
+    /// Library content the published suggestions were computed from.
+    public private(set) var computedContent: SmartSearchContentIdentity?
+    /// Library content of the last refresh that ran every stage to its end. Rows are published stage by stage,
+    /// so only a settled refresh proves that a suggestion no longer exists.
+    public private(set) var settledContent: SmartSearchContentIdentity?
+    /// Increases each time a refresh settles. Hosts re-check a selected suggestion when it changes.
+    public private(set) var settledGeneration = 0
+    /// Visual search availability the settled refresh ran with; nil when it skipped the visual stages.
+    @ObservationIgnored private var settledVisualAvailability: Bool?
+    /// Resolved suggestions of the last publish. Never displayed and never run: only their titles and kinds
+    /// are read, to recognize a suggestion title while a refresh has cleared the published rows. Earlier places
+    /// and visual concepts stay in it until a settle proves that they are gone.
+    @ObservationIgnored private var lastPublished: [TimelineSearchSuggestion] = []
+    /// Every resolved suggestion of the last publish: the ranked rows first, then the ones that the row limits
+    /// of `forYou` left out. Never displayed; a selected or typed suggestion is resolved against it, so a valid
+    /// suggestion that is ranked out of the rows is still found. Observed, so hosts follow each publish.
+    private var candidates: [TimelineSearchSuggestion] = []
     /// Visual search is on but still indexing, so concept suggestions can still appear.
     public private(set) var showsIndexingNote = false
     /// No on-device analysis is enabled, so only metadata suggestions exist.
@@ -41,14 +95,175 @@ public final class SmartSearchDiscoveryModel {
         self.placeName = placeName
     }
 
-    /// A short text list for menu-style hosts: the most specific rows first, then media types.
-    public func textSuggestions(limit: Int = 8) -> [TimelineSearchSuggestion] {
-        Array((forYou + chips).prefix(limit))
+    /// Visual concept suggestions can work only while Smart Search and visual search are both on.
+    public nonisolated static func visualConceptsAvailable(_ snapshot: MLSmartSearchSnapshot?) -> Bool {
+        snapshot?.isEnabled == true && snapshot?.isVisualSearchEnabled == true
     }
 
-    /// The structured suggestion whose title the search text still shows, if any.
-    public func structuredSuggestion(owning text: String) -> TimelineSearchSuggestion? {
-        (forYou + chips).first { $0.matchingUIDs != nil && $0.owns(searchText: text) }
+    /// Whether a published suggestion may be shown for the current state. A suggestion from other library
+    /// content is never shown, and a visual concept is never shown while visual search is unavailable.
+    public nonisolated static func isDisplayable(
+        _ suggestion: TimelineSearchSuggestion,
+        computedContent: SmartSearchContentIdentity?,
+        content: SmartSearchContentIdentity,
+        snapshot: MLSmartSearchSnapshot?
+    ) -> Bool {
+        guard computedContent == content, let matches = suggestion.matchingUIDs, !matches.isEmpty
+        else { return false }
+        return suggestion.kind != .concept || visualConceptsAvailable(snapshot)
+    }
+
+    /// What to do with a search text. The title of a suggestion is run as ordinary text only after a current
+    /// refresh has confirmed that no suggestion owns it; text the user typed is never erased.
+    public nonisolated static func commitDecision(
+        for text: String,
+        displayable: [TimelineSearchSuggestion],
+        published: [TimelineSearchSuggestion],
+        isCurrent: Bool
+    ) -> SmartSearchSuggestionCommitDecision {
+        if let suggestion = displayable.first(where: { $0.owns(searchText: text) }) {
+            return .structured(suggestion)
+        }
+        if !isCurrent, published.contains(where: { $0.matchingUIDs != nil && $0.owns(searchText: text) }) {
+            return .deferUntilRefresh
+        }
+        return .text
+    }
+
+    /// What to do with a suggestion that was selected earlier, after the library or the search availability
+    /// changed. While the suggestions are not current the host keeps the selected result set; the grid
+    /// intersects it with the current items.
+    public nonisolated static func rebind(
+        _ active: TimelineSearchSuggestion,
+        displayable: [TimelineSearchSuggestion],
+        isCurrent: Bool,
+        visualAvailable: Bool
+    ) -> SmartSearchSuggestionRebindResult {
+        if active.kind == .concept, !visualAvailable { return .drop }
+        if let fresh = displayable.first(where: { $0.id == active.id }) { return .keep(fresh) }
+        return isCurrent ? .drop : .pending
+    }
+
+    /// Whether the published rows are final for a suggestion of this kind. Metadata rows are final with the
+    /// first publish, places only after every stage, and visual concepts only after a settled refresh that ran
+    /// the visual stages.
+    public nonisolated static func isDecisive(
+        for kind: TimelineSearchSuggestionKind,
+        isCurrent: Bool,
+        isSettled: Bool,
+        settledWithVisualConcepts: Bool
+    ) -> Bool {
+        switch kind {
+        case .concept: return isSettled && settledWithVisualConcepts
+        case .place, .placeSeason: return isSettled
+        default: return isCurrent
+        }
+    }
+
+    /// `isDecisive` for the published state of this model.
+    public func isDecisive(for kind: TimelineSearchSuggestionKind, content: SmartSearchContentIdentity) -> Bool {
+        Self.isDecisive(
+            for: kind,
+            isCurrent: isCurrent(content: content),
+            isSettled: isSettled(content: content),
+            settledWithVisualConcepts: settledVisualAvailability != nil
+        )
+    }
+
+    /// Kind of the last published suggestion that owns the text. It survives the start of a refresh.
+    public func publishedKind(owning text: String) -> TimelineSearchSuggestionKind? {
+        lastPublished.first { $0.owns(searchText: text) }?.kind
+    }
+
+    /// Whether rows for this content are published. Later stages can still add places and visual concepts.
+    public func isCurrent(content: SmartSearchContentIdentity) -> Bool {
+        hasComputed && computedContent == content
+    }
+
+    /// Whether a refresh for this content ran every stage to its end.
+    public func isSettled(content: SmartSearchContentIdentity) -> Bool {
+        settledContent == content
+    }
+
+    public func forYou(
+        content: SmartSearchContentIdentity,
+        snapshot: MLSmartSearchSnapshot?
+    ) -> [TimelineSearchSuggestion] {
+        forYou.filter {
+            Self.isDisplayable($0, computedContent: computedContent, content: content, snapshot: snapshot)
+        }
+    }
+
+    public func chips(
+        content: SmartSearchContentIdentity,
+        snapshot: MLSmartSearchSnapshot?
+    ) -> [TimelineSearchSuggestion] {
+        chips.filter {
+            Self.isDisplayable($0, computedContent: computedContent, content: content, snapshot: snapshot)
+        }
+    }
+
+    /// A short text list for menu-style hosts: the most specific rows first, then media types.
+    public func textSuggestions(
+        content: SmartSearchContentIdentity,
+        snapshot: MLSmartSearchSnapshot?,
+        limit: Int = 8
+    ) -> [TimelineSearchSuggestion] {
+        let rows = forYou(content: content, snapshot: snapshot) + chips(content: content, snapshot: snapshot)
+        return Array(rows.prefix(limit))
+    }
+
+    /// Every displayable suggestion, without the menu limit.
+    public func displayableSuggestions(
+        content: SmartSearchContentIdentity,
+        snapshot: MLSmartSearchSnapshot?
+    ) -> [TimelineSearchSuggestion] {
+        textSuggestions(content: content, snapshot: snapshot, limit: .max)
+    }
+
+    /// Every suggestion that can work for the current state, including the ones that the row limits left out.
+    /// Hosts resolve a selected, recent or typed suggestion against it and never display it.
+    public func resolvableSuggestions(
+        content: SmartSearchContentIdentity,
+        snapshot: MLSmartSearchSnapshot?
+    ) -> [TimelineSearchSuggestion] {
+        candidates.filter {
+            Self.isDisplayable($0, computedContent: computedContent, content: content, snapshot: snapshot)
+        }
+    }
+
+    /// `commitDecision` for the published state of this model.
+    public func commitDecision(
+        for text: String,
+        content: SmartSearchContentIdentity,
+        snapshot: MLSmartSearchSnapshot?
+    ) -> SmartSearchSuggestionCommitDecision {
+        // A visual concept cannot work while visual search is unavailable, so its title is ordinary text at once.
+        let isCurrent = publishedKind(owning: text).map { kind in
+            (kind == .concept && !Self.visualConceptsAvailable(snapshot)) || isDecisive(for: kind, content: content)
+        }
+        return Self.commitDecision(
+            for: text,
+            displayable: resolvableSuggestions(content: content, snapshot: snapshot),
+            published: lastPublished,
+            isCurrent: isCurrent ?? true
+        )
+    }
+
+    /// `rebind` for the published state of this model.
+    public func rebind(
+        _ active: TimelineSearchSuggestion,
+        content: SmartSearchContentIdentity,
+        snapshot: MLSmartSearchSnapshot?
+    ) -> SmartSearchSuggestionRebindResult {
+        Self.rebind(
+            active,
+            displayable: resolvableSuggestions(content: content, snapshot: snapshot),
+            // A settle that skipped the visual stages does not prove that a visual concept is gone.
+            isCurrent: active.kind == .concept
+                ? isDecisive(for: .concept, content: content) : isSettled(content: content),
+            visualAvailable: Self.visualConceptsAvailable(snapshot)
+        )
     }
 
     /// Identity of every input that can change the suggestions. Hosts restart `refresh` when it changes.
@@ -87,13 +302,40 @@ public final class SmartSearchDiscoveryModel {
         timelineRevision: UInt64,
         favoriteUIDs: Set<PhotoUID>,
         coordinates: [PhotoCoordinate],
-        smartSearch: MLSmartSearchController?
+        smartSearch: MLSmartSearchController?,
+        includeVisualConcepts: Bool = true
     ) async {
         let snapshot = smartSearch?.snapshot
         let lifecycle = smartSearch?.lifecycleActor
+        let visualAvailable = Self.visualConceptsAvailable(snapshot)
+        let content = SmartSearchContentIdentity(timelineRevision: timelineRevision, favoriteUIDs: favoriteUIDs)
+        if computedContent?.timelineRevision != timelineRevision {
+            // Result sets from another library revision may reference removed items; never reuse them.
+            metadata = TimelineSearchDiscoveryResult()
+            places = []
+            clearVisualEvidence()
+            forYou = []
+            chips = []
+            candidates = []
+            hasComputed = false
+        } else if computedContent != content {
+            // Only the favorites changed. Places and visual concepts do not depend on them and are kept.
+            metadata = TimelineSearchDiscoveryResult()
+            forYou = []
+            chips = []
+            candidates = []
+            hasComputed = false
+        }
+        if settledContent != content || (includeVisualConcepts && settledVisualAvailability != visualAvailable) {
+            settledContent = nil
+            settledVisualAvailability = nil
+        }
+        if !visualAvailable {
+            clearVisualEvidence()
+        }
         showsSmartSearchHint = snapshot?.isEnabled != true
         showsIndexingNote = {
-            guard snapshot?.isVisualSearchEnabled == true else { return false }
+            guard Self.visualConceptsAvailable(snapshot) else { return false }
             switch snapshot?.indexingState {
             case .indexing, .waiting: return true
             default: return false
@@ -103,12 +345,17 @@ public final class SmartSearchDiscoveryModel {
         // Stage 1: the sensitive gate must finish before any preview is chosen.
         var covered = 0
         var gatePassed = true
-        if snapshot?.isVisualSearchEnabled == true, let lifecycle {
+        if Self.visualConceptsAvailable(snapshot), let lifecycle {
             covered = await lifecycle.semanticIndexedAssetCount()
             guard !Task.isCancelled else { return }
-            if covered > 0 {
+            if covered == 0 {
+                clearVisualEvidence()
+            } else {
                 let key = evidenceKey(timelineRevision: timelineRevision, snapshot: snapshot)
-                if gateKey != key {
+                if gateKey != key, !includeVisualConcepts {
+                    // The gate needs inference, which this refresh skips. Fail closed: no previews.
+                    gatePassed = false
+                } else if gateKey != key {
                     do {
                         sensitiveUIDs = try await MLSearchConceptDiscovery.sensitiveUIDs { prompt, limit in
                             try await lifecycle.search(prompt, limit: limit, intent: .automatic).results.map(\.uid)
@@ -117,14 +364,10 @@ public final class SmartSearchDiscoveryModel {
                     } catch {
                         guard !Task.isCancelled else { return }
                         gatePassed = false
-                        sensitiveUIDs = []
-                        gateKey = nil
+                        clearVisualEvidence()
                     }
                 }
             }
-        } else {
-            sensitiveUIDs = []
-            gateKey = nil
         }
         let context = TimelineSearchDiscoveryContext(
             favoriteUIDs: favoriteUIDs,
@@ -137,7 +380,7 @@ public final class SmartSearchDiscoveryModel {
             TimelineSearchDiscovery.librarySuggestions(sections: sections, context: context)
         }.value
         guard !Task.isCancelled else { return }
-        publish()
+        publish(content: content)
 
         // Stage 3: places. Only centroids of photo clusters are named.
         let itemsByUID = await Task.detached(priority: .utility) {
@@ -168,14 +411,20 @@ public final class SmartSearchDiscoveryModel {
             )
         }.value
         guard !Task.isCancelled else { return }
-        publish()
+        publish(content: content)
 
-        // Stage 4: curated visual concepts, only behind a passed gate.
+        // Stage 4: curated visual concepts, only behind a passed gate. A host that only keeps a selected
+        // metadata or place suggestion current skips it, so no background inference runs while results show.
+        guard includeVisualConcepts else {
+            settle(content: content, visualAvailable: visualAvailable, ranVisualStages: false)
+            return
+        }
         guard gatePassed, covered > 0, let lifecycle else {
             concepts = []
             conceptEvidence = []
             conceptKey = nil
-            publish()
+            publish(content: content)
+            settle(content: content, visualAvailable: visualAvailable, ranVisualStages: true)
             return
         }
         let key = evidenceKey(timelineRevision: timelineRevision, snapshot: snapshot)
@@ -213,7 +462,26 @@ public final class SmartSearchDiscoveryModel {
             }
         }.value
         guard !Task.isCancelled else { return }
-        publish()
+        publish(content: content)
+        settle(content: content, visualAvailable: visualAvailable, ranVisualStages: true)
+    }
+
+    /// Marks the refresh as complete. A refresh that skipped the visual stages keeps the availability of an
+    /// earlier complete refresh for the same content.
+    private func settle(content: SmartSearchContentIdentity, visualAvailable: Bool, ranVisualStages: Bool) {
+        if ranVisualStages {
+            settledVisualAvailability = visualAvailable
+        }
+        // Every stage ran, so an earlier place that is not published now is gone. An earlier visual concept
+        // stays only while a later refresh can still find it.
+        lastPublished = Self.mergedPublished(
+            rows: candidates,
+            previous: lastPublished,
+            keepsPlaces: false,
+            keepsConcepts: visualAvailable && !ranVisualStages
+        )
+        settledContent = content
+        settledGeneration &+= 1
     }
 
     private func evidenceKey(timelineRevision: UInt64, snapshot: MLSmartSearchSnapshot?) -> String {
@@ -224,7 +492,18 @@ public final class SmartSearchDiscoveryModel {
         ].joined(separator: "|")
     }
 
-    private func publish() {
+    /// Drops the sensitive gate and every visual concept, so none can be shown or reused.
+    private func clearVisualEvidence() {
+        sensitiveUIDs = []
+        gateKey = nil
+        concepts = []
+        conceptEvidence = []
+        conceptKey = nil
+        forYou.removeAll { $0.kind == .concept }
+        candidates.removeAll { $0.kind == .concept }
+    }
+
+    private func publish(content: SmartSearchContentIdentity) {
         // Concepts lead when they exist: they are the most library-specific signal. Places and anniversaries
         // follow, then trips, seasons and favorites.
         let byKind = Dictionary(grouping: metadata.forYou, by: \.kind)
@@ -241,6 +520,39 @@ public final class SmartSearchDiscoveryModel {
             perKind: 3
         )
         chips = metadata.chips
+        var seenIDs = Set<String>()
+        candidates = (forYou + chips + concepts + places + metadata.forYou).filter {
+            $0.matchingUIDs != nil && seenIDs.insert($0.id).inserted
+        }
+        // Places and visual concepts come from later stages, so a publish before the settle does not prove
+        // that an earlier one is gone. `settle` drops them.
+        lastPublished = Self.mergedPublished(
+            rows: candidates, previous: lastPublished, keepsPlaces: true, keepsConcepts: true)
+        computedContent = content
         hasComputed = true
+    }
+
+    /// The resolved rows of a publish, followed by the earlier place and concept entries that no new row
+    /// replaces. An entry is replaced by a row with its identifier or its title.
+    nonisolated static func mergedPublished(
+        rows: [TimelineSearchSuggestion],
+        previous: [TimelineSearchSuggestion],
+        keepsPlaces: Bool,
+        keepsConcepts: Bool
+    ) -> [TimelineSearchSuggestion] {
+        let resolved = rows.filter { $0.matchingUIDs != nil }
+        let carried = previous.filter { old in
+            let isKept: Bool
+            switch old.kind {
+            case .place, .placeSeason: isKept = keepsPlaces
+            case .concept: isKept = keepsConcepts
+            default: isKept = false
+            }
+            return isKept
+                && !resolved.contains {
+                    $0.id == old.id || $0.owns(searchText: old.query) || $0.owns(searchText: old.title)
+                }
+        }
+        return resolved + carried
     }
 }
