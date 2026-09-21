@@ -54,14 +54,18 @@ public enum TimelineSearch {
     /// `semanticMatches` are UIDs the on-device semantic engine ranked for the same query, so a
     /// photo matches when either the text query or the semantic engine says it does. Timeline
     /// order is preserved (results stay date-organized, not score-ordered).
+    ///
+    /// `requiredUIDs` is the resolved result set of a structured suggestion. It narrows with AND semantics:
+    /// an item must be in the set and, when a query exists, also match the query.
     public static func filter(
         _ sections: [TimelineSection], query rawQuery: String,
         context: TimelineSearchContext = TimelineSearchContext(),
         semanticMatches: Set<PhotoUID>? = nil,
-        refinement: TimelineRefinement = .all
+        refinement: TimelineRefinement = .all,
+        requiredUIDs: Set<PhotoUID>? = nil
     ) -> [TimelineSection] {
         let query = TimelineSearchQuery(rawQuery)
-        guard !query.isEmpty || refinement.isActive else { return sections }
+        guard !query.isEmpty || refinement.isActive || requiredUIDs != nil else { return sections }
 
         var filteredSections: [TimelineSection] = []
         filteredSections.reserveCapacity(sections.count)
@@ -71,6 +75,7 @@ public enum TimelineSearch {
             items.reserveCapacity(section.items.count)
             for item in section.items {
                 guard !Task.isCancelled else { return [] }
+                if let requiredUIDs, !requiredUIDs.contains(item.uid) { continue }
                 let matchesQuery =
                     query.isEmpty
                     || query.matches(item: item, in: section, context: context)

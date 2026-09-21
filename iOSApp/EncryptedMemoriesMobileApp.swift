@@ -409,8 +409,11 @@ private struct MobileSearchTabScreen: View {
     @Binding var searchText: String
     @Binding var searchScope: MLSearchScope
     @State private var history = TimelineSearchHistory()
-    @State private var suggestions: [TimelineSearchSuggestion] = []
+    /// Structured suggestions that were selected from the landing, keyed by their title in the history.
+    @State private var historySuggestions: [String: TimelineSearchSuggestion] = [:]
     @State private var recentRepresentatives: [String: PhotoUID] = [:]
+    @State private var activeSuggestion: TimelineSearchSuggestion?
+    @State private var discovery = MobileSearchDiscoveryModel()
 
     var body: some View {
         MobileTimelineScreen(
@@ -418,11 +421,14 @@ private struct MobileSearchTabScreen: View {
             isActive: isActive,
             searchText: $searchText,
             searchScope: $searchScope,
-            searchHistory: history,
-            searchSuggestions: suggestions,
-            searchRecentRepresentatives: recentRepresentatives,
-            onSelectSearchQuery: selectQuery,
-            onClearSearchHistory: clearHistory
+            searchLanding: MobileSearchLandingContent(
+                recents: recents,
+                discovery: discovery,
+                onSelectRecent: selectRecent,
+                onSelectSuggestion: select,
+                onClearHistory: clearHistory
+            ),
+            activeSearchSuggestion: activeSuggestion
         )
         .searchable(
             text: $searchText,
@@ -434,31 +440,61 @@ private struct MobileSearchTabScreen: View {
             isEnabled: libraryModel.smartSearch?.snapshot.isSearchAvailable == true
         )
         .onSubmit(of: .search) { record(searchText) }
-        .task(id: searchDiscoveryRevision) {
+        .onChange(of: searchText) { _, text in
+            // Editing the text leaves the structured suggestion and returns to ordinary search.
+            if let activeSuggestion, !activeSuggestion.owns(searchText: text) {
+                self.activeSuggestion = nil
+            }
+        }
+        .task(id: MobileSearchDiscoveryModel.revisionKey(libraryModel: libraryModel)) {
+            await discovery.refresh(libraryModel: libraryModel)
+        }
+        .task(id: recentRepresentativesRevision) {
             let sections = libraryModel.sections
-            let recentQueries = Array(history.queries.prefix(6))
-            let result: ([TimelineSearchSuggestion], [String: PhotoUID]) = await Task.detached(priority: .utility) {
-                let suggestions = TimelineSearchDiscovery.recentDateSuggestions(sections: sections)
+            let typedQueries = history.queries.prefix(6).filter { historySuggestions[$0] == nil }
+            let representatives: [String: PhotoUID] = await Task.detached(priority: .utility) {
                 var representatives: [String: PhotoUID] = [:]
-                for query in recentQueries {
-                    guard !Task.isCancelled else {
-                        return ([TimelineSearchSuggestion](), [String: PhotoUID]())
-                    }
-                    representatives[query] =
-                        TimelineSearch.filter(sections, query: query)
-                        .last?.items.last?.uid
+                for query in typedQueries {
+                    guard !Task.isCancelled else { return [:] }
+                    representatives[query] = TimelineSearch.filter(sections, query: query).last?.items.last?.uid
                 }
-                return (suggestions, representatives)
+                return representatives
             }.value
             guard !Task.isCancelled else { return }
-            suggestions = result.0
-            recentRepresentatives = result.1
+            recentRepresentatives = representatives
         }
     }
 
-    private func selectQuery(_ query: String) {
-        searchText = query
-        record(query)
+    private var recents: [MobileSearchRecentEntry] {
+        history.queries.map { query in
+            let suggestion = historySuggestions[query]
+            return MobileSearchRecentEntry(
+                query: query,
+                representativeUID: suggestion?.representativeUID ?? recentRepresentatives[query],
+                suggestion: suggestion
+            )
+        }
+    }
+
+    private func select(_ suggestion: TimelineSearchSuggestion) {
+        if suggestion.matchingUIDs != nil {
+            activeSuggestion = suggestion
+            historySuggestions[suggestion.query] = suggestion
+        } else {
+            activeSuggestion = nil
+        }
+        searchText = suggestion.query
+        record(suggestion.query)
+    }
+
+    private func selectRecent(_ entry: MobileSearchRecentEntry) {
+        if let suggestion = entry.suggestion {
+            select(suggestion)
+        } else {
+            activeSuggestion = nil
+            searchText = entry.query
+            record(entry.query)
+        }
     }
 
     private func record(_ query: String) {
@@ -466,14 +502,17 @@ private struct MobileSearchTabScreen: View {
         next.record(query)
         guard next != history else { return }
         history = next
+        // Keep structured entries only while their title is still in the bounded history.
+        historySuggestions = historySuggestions.filter { next.queries.contains($0.key) }
     }
 
     private func clearHistory() {
         history.clear()
+        historySuggestions = [:]
         recentRepresentatives = [:]
     }
 
-    private var searchDiscoveryRevision: String {
+    private var recentRepresentativesRevision: String {
         "\(libraryModel.timelineRevision)|\(history.queries.joined(separator: "\u{1F}"))"
     }
 }

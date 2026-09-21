@@ -6,19 +6,23 @@ public struct TimelineSearchProjectionKey: Hashable, Sendable {
     public let context: TimelineSearchContext
     public let semanticMatches: Set<PhotoUID>?
     public let refinement: TimelineRefinement
+    /// Resolved result set of a selected structured suggestion; `nil` for ordinary text search.
+    public let requiredUIDs: Set<PhotoUID>?
 
     public init(
         sourceRevision: UInt64,
         query: String,
         context: TimelineSearchContext,
         semanticMatches: Set<PhotoUID>?,
-        refinement: TimelineRefinement = .all
+        refinement: TimelineRefinement = .all,
+        requiredUIDs: Set<PhotoUID>? = nil
     ) {
         self.sourceRevision = sourceRevision
         self.query = query
         self.context = context
         self.semanticMatches = semanticMatches
         self.refinement = refinement
+        self.requiredUIDs = requiredUIDs
     }
 }
 
@@ -40,12 +44,13 @@ public struct TimelineSearchProjection: Sendable {
             query: key.query,
             context: key.context,
             semanticMatches: key.semanticMatches,
-            refinement: key.refinement
+            refinement: key.refinement,
+            requiredUIDs: key.requiredUIDs
         )
         let projection = TimelineContentProjection(sections: filtered)
         self.sections = projection.sections
         snapshot = projection.snapshot
-        if key.refinement.isActive, TimelineSearchQuery(key.query).isEmpty {
+        if key.refinement.isActive, TimelineSearchQuery(key.query).isEmpty, key.requiredUIDs == nil {
             presentationItems = Array(projection.snapshot.items.reversed())
         } else {
             presentationItems = projection.snapshot.items

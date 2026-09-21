@@ -37,11 +37,9 @@ struct MobileTimelineScreen: View {
     var scrollToLatestSignal: Int = 0
     @Binding private var searchText: String
     @Binding private var searchScope: MLSearchScope
-    private let searchHistory: TimelineSearchHistory
-    private let searchSuggestions: [TimelineSearchSuggestion]
-    private let searchRecentRepresentatives: [String: PhotoUID]
-    private let onSelectSearchQuery: (String) -> Void
-    private let onClearSearchHistory: () -> Void
+    private let searchLanding: MobileSearchLandingContent
+    /// Selected structured suggestion. It owns the result while the field still shows its title.
+    private let activeSearchSuggestion: TimelineSearchSuggestion?
     @Environment(MobileViewerRouter.self) private var viewerRouter
     @State private var selection = MobileGridSelectionController()
     @State private var networkMonitor = NetworkMonitor.shared
@@ -82,22 +80,16 @@ struct MobileTimelineScreen: View {
         scrollToLatestSignal: Int = 0,
         searchText: Binding<String> = .constant(""),
         searchScope: Binding<MLSearchScope> = .constant(.all),
-        searchHistory: TimelineSearchHistory = TimelineSearchHistory(),
-        searchSuggestions: [TimelineSearchSuggestion] = [],
-        searchRecentRepresentatives: [String: PhotoUID] = [:],
-        onSelectSearchQuery: @escaping (String) -> Void = { _ in },
-        onClearSearchHistory: @escaping () -> Void = {}
+        searchLanding: MobileSearchLandingContent = MobileSearchLandingContent(),
+        activeSearchSuggestion: TimelineSearchSuggestion? = nil
     ) {
         self.surface = surface
         self.isActive = isActive
         self.scrollToLatestSignal = scrollToLatestSignal
         _searchText = searchText
         _searchScope = searchScope
-        self.searchHistory = searchHistory
-        self.searchSuggestions = searchSuggestions
-        self.searchRecentRepresentatives = searchRecentRepresentatives
-        self.onSelectSearchQuery = onSelectSearchQuery
-        self.onClearSearchHistory = onClearSearchHistory
+        self.searchLanding = searchLanding
+        self.activeSearchSuggestion = activeSearchSuggestion
     }
 
     /// Indicates that a selection action is running, so the other toolbar buttons disable together.
@@ -146,6 +138,10 @@ struct MobileTimelineScreen: View {
                     isVisible: launchChromeVisible
                 )
                 .toolbar { toolbarContent }
+                // The UIKit share presenter must stay inside the stack. As a sibling of the NavigationStack it
+                // hides the navigation controller from the role-search tab, and iOS falls back to a top drawer
+                // field that collapses after the tab is re-entered instead of the bottom field above the keyboard.
+                .mobileSharePresentation(selection: selection)
                 .mobileSelectionBars(isSelecting: selection.isSelecting)
                 .animation(reduceMotion ? nil : .smooth(duration: 0.22), value: selection.isSelecting)
                 .onChange(of: searchScope) { _, scope in semanticQuery?.setScope(scope) }
@@ -183,7 +179,6 @@ struct MobileTimelineScreen: View {
                 bottomPadding: selection.isSelecting ? 84 : 20
             )
         }
-        .mobileSharePresentation(selection: selection)
         .sheet(isPresented: $showSettings) {
             MobileSettingsScreen(showsDismissButton: true)
         }
@@ -537,14 +532,8 @@ struct MobileTimelineScreen: View {
             }
 
             if showsSearchLanding {
-                MobileSearchLandingScreen(
-                    history: searchHistory,
-                    suggestions: searchSuggestions,
-                    recentRepresentatives: searchRecentRepresentatives,
-                    onSelectQuery: onSelectSearchQuery,
-                    onClearHistory: onClearSearchHistory
-                )
-                .transition(.opacity)
+                MobileSearchLandingScreen(content: searchLanding)
+                    .transition(.opacity)
             }
         }
         .animation(reduceMotion ? nil : .easeInOut(duration: 0.16), value: showsSearchLanding)
@@ -626,8 +615,15 @@ struct MobileTimelineScreen: View {
         committedSearchText.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    /// The resolved result set of the selected suggestion while the committed text still shows its title.
+    private var committedSuggestionMatches: Set<PhotoUID>? {
+        guard let activeSearchSuggestion, activeSearchSuggestion.owns(searchText: normalizedCommittedSearchText)
+        else { return nil }
+        return activeSearchSuggestion.matchingUIDs
+    }
+
     private var hasSearchQuery: Bool {
-        !TimelineSearchQuery(normalizedCommittedSearchText).isEmpty
+        committedSuggestionMatches != nil || !TimelineSearchQuery(normalizedCommittedSearchText).isEmpty
     }
 
     private var hasProjectionCriteria: Bool {
@@ -635,7 +631,8 @@ struct MobileTimelineScreen: View {
     }
 
     private var isCommittedSemanticSearchPending: Bool {
-        semanticQuery?.requestedQuery == normalizedCommittedSearchText
+        committedSuggestionMatches == nil
+            && semanticQuery?.requestedQuery == normalizedCommittedSearchText
             && semanticQuery?.isSearching == true
     }
 
@@ -645,7 +642,18 @@ struct MobileTimelineScreen: View {
     }
 
     private var searchKey: TimelineSearchProjectionKey {
-        TimelineSearchProjectionKey(
+        if let committedSuggestionMatches {
+            // A structured suggestion replaces the text query: its title is display text, not search terms.
+            return TimelineSearchProjectionKey(
+                sourceRevision: model.timelineRevision,
+                query: "",
+                context: TimelineSearchContext(favoriteUIDs: model.favoriteUIDs),
+                semanticMatches: nil,
+                refinement: refinement,
+                requiredUIDs: committedSuggestionMatches
+            )
+        }
+        return TimelineSearchProjectionKey(
             sourceRevision: model.timelineRevision,
             query: normalizedCommittedSearchText,
             context: TimelineSearchContext(favoriteUIDs: model.favoriteUIDs),
@@ -732,7 +740,12 @@ struct MobileTimelineScreen: View {
             semanticQuery = nil
             semanticQueryLifecycle = nil
         }
-        semanticQuery?.update(query: value)
+        if activeSearchSuggestion?.owns(searchText: normalizedValue) == true {
+            // The suggestion already carries its result set; a semantic query for its title would only compete.
+            semanticQuery?.clear()
+        } else {
+            semanticQuery?.update(query: value)
+        }
         if normalizedValue.isEmpty {
             committedSearchText = ""
             searchDebounceTask = nil
