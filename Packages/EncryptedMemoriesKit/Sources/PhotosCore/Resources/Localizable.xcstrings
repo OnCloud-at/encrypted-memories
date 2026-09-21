@@ -123,8 +123,8 @@
     "search.suggestions_empty_description": {
       "extractionState": "manual",
       "localizations": {
-        "de": { "stringUnit": { "state": "translated", "value": "Sobald Fotos geladen sind, erscheinen hier passende Datumsvorschläge." } },
-        "en": { "stringUnit": { "state": "translated", "value": "Date suggestions appear here after photos load." } }
+        "de": { "stringUnit": { "state": "translated", "value": "Sobald Fotos geladen sind, erscheinen hier Vorschläge aus deiner Mediathek." } },
+        "en": { "stringUnit": { "state": "translated", "value": "Suggestions from your library appear here after photos load." } }
       }
     },
     "library.view_years": {
@@ -5056,6 +5056,294 @@
       "localizations": {
         "en": { "stringUnit": { "state": "translated", "value": "Tips are currently unavailable. Please try again later." } },
         "de": { "stringUnit": { "state": "translated", "value": "Trinkgelder sind derzeit nicht verfügbar. Bitte später erneut versuchen." } }
+      }
+    },
+    "search.for_you": {
+      "localizations": {
+        "de": { "stringUnit": { "state": "translated", "value": "Für dich" } },
+        "en": { "stringUnit": { "state": "translated", "value": "For You" } }
+      }
+    },
+    "search.discover": {
+      "localizations": {
+        "de": { "stringUnit": { "state": "translated", "value": "Entdecken" } },
+        "en": { "stringUnit": { "state": "translated", "value": "Browse" } }
+      }
+    },
+    "search.recent_searches": {
+      "localizations": {
+        "de": { "stringUnit": { "state": "translated", "value": "Zuletzt gesucht" } },
+        "en": { "stringUnit": { "state": "translated", "value": "Recent Searches" } }
+      }
+    },
+    "search.suggestions_indexing": {
+      "localizations": {
+        "de": { "stringUnit": { "state": "translated", "value": "Deine Mediathek wird analysiert. Weitere Vorschläge folgen." } },
+        "en": { "stringUnit": { "state": "translated", "value": "Analyzing your library. More suggestions will follow." } }
+      }
+    },
+    "search.suggestions_ml_hint": {
+      "localizations": {
+        "de": { "stringUnit": { "state": "translated", "value": "Schalte in den Einstellungen die intelligente Suche ein, um auch Vorschläge zu Bildinhalten zu erhalten." } },
+        "en": { "stringUnit": { "state": "translated", "value": "Turn on Smart Search in Settings to also get suggestions for what is in your photos." } }
+      }
+    },
+    "search.season.spring": {
+      "localizations": {
+        "de": { "stringUnit": { "state": "translated", "value": "Frühling" } },
+        "en": { "stringUnit": { "state": "translated", "value": "Spring" } }
+      }
+    },
+    "search.season.summer": {
+      "localizations": {
+        "de": { "stringUnit": { "state": "translated", "value": "Sommer" } },
+        "en": { "stringUnit": { "state": "translated", "value": "Summer" } }
+      }
+    },
+    "search.season.autumn": {
+      "localizations": {
+        "de": { "stringUnit": { "state": "translated", "value": "Herbst" } },
+        "en": { "stringUnit": { "state": "translated", "value": "Autumn" } }
+      }
+    },
+    "search.season.winter": {
+      "localizations": {
+        "de": { "stringUnit": { "state": "translated", "value": "Winter" } },
+        "en": { "stringUnit": { "state": "translated", "value": "Winter" } }
+      }
+    },
+    "search.suggestion.place_spring %@": {
+      "localizations": {
+        "de": { "stringUnit": { "state": "translated", "value": "%@ im Frühling" } },
+        "en": { "stringUnit": { "state": "translated", "value": "%@ in spring" } }
+      }
+    },
+    "search.suggestion.place_summer %@": {
+      "localizations": {
+        "de": { "stringUnit": { "state": "translated", "value": "%@ im Sommer" } },
+        "en": { "stringUnit": { "state": "translated", "value": "%@ in summer" } }
+      }
+    },
+    "search.suggestion.place_autumn %@": {
+      "localizations": {
+        "de": { "stringUnit": { "state": "translated", "value": "%@ im Herbst" } },
+        "en": { "stringUnit": { "state": "translated", "value": "%@ in autumn" } }
+      }
+    },
+    "search.suggestion.place_winter %@": {
+      "localizations": {
+        "de": { "stringUnit": { "state": "translated", "value": "%@ im Winter" } },
+        "en": { "stringUnit": { "state": "translated", "value": "%@ in winter" } }
+      }
+    },
+    "search.suggestion.favorites_year %@": {
+      "localizations": {
+        "de": { "stringUnit": { "state": "translated", "value": "Favoriten aus %@" } },
+        "en": { "stringUnit": { "state": "translated", "value": "Favorites from %@" } }
+      }
+    },
+    "search.concept.people": {
+      "localizations": {
+        "de": { "stringUnit": { "state": "translated", "value": "Menschen" } },
+        "en": { "stringUnit": { "state": "translated", "value": "People" } }
+      }
+    },
+    "search.concept.dog": {
+      "localizations": {
+        "de": { "stringUnit": { "state": "translated", "value": "Hunde" } },
+        "en": { "stringUnit": { "state": "translated", "value": "Dogs" } }
+      }
+    },
+    "search.concept.cat": {
+      "localizations": {
+        "de": { "stringUnit": { "state": "translated", "value": "Katzen" } },
+        "en": { "stringUnit": { "state": "translated", "value": "Cats" } }
+      }
+    },
+    "search.concept.bird": {
+      "localizations": {
+        "de": { "stringUnit": { "state": "translated", "value": "Vögel" } },
+        "en": { "stringUnit": { "state": "translated", "value": "Birds" } }
+      }
+    },
+    "search.concept.nature": {
+      "localizations": {
+        "de": { "stringUnit": { "state": "translated", "value": "Natur" } },
+        "en": { "stringUnit": { "state": "translated", "value": "Nature" } }
+      }
+    },
+    "search.concept.mountains": {
+      "localizations": {
+        "de": { "stringUnit": { "state": "translated", "value": "Berge" } },
+        "en": { "stringUnit": { "state": "translated", "value": "Mountains" } }
+      }
+    },
+    "search.concept.beach": {
+      "localizations": {
+        "de": { "stringUnit": { "state": "translated", "value": "Strand" } },
+        "en": { "stringUnit": { "state": "translated", "value": "Beach" } }
+      }
+    },
+    "search.concept.water": {
+      "localizations": {
+        "de": { "stringUnit": { "state": "translated", "value": "Seen & Flüsse" } },
+        "en": { "stringUnit": { "state": "translated", "value": "Lakes & Rivers" } }
+      }
+    },
+    "search.concept.forest": {
+      "localizations": {
+        "de": { "stringUnit": { "state": "translated", "value": "Wald" } },
+        "en": { "stringUnit": { "state": "translated", "value": "Forest" } }
+      }
+    },
+    "search.concept.flowers": {
+      "localizations": {
+        "de": { "stringUnit": { "state": "translated", "value": "Blumen" } },
+        "en": { "stringUnit": { "state": "translated", "value": "Flowers" } }
+      }
+    },
+    "search.concept.snow": {
+      "localizations": {
+        "de": { "stringUnit": { "state": "translated", "value": "Schnee" } },
+        "en": { "stringUnit": { "state": "translated", "value": "Snow" } }
+      }
+    },
+    "search.concept.sunset": {
+      "localizations": {
+        "de": { "stringUnit": { "state": "translated", "value": "Sonnenuntergänge" } },
+        "en": { "stringUnit": { "state": "translated", "value": "Sunsets" } }
+      }
+    },
+    "search.concept.night": {
+      "localizations": {
+        "de": { "stringUnit": { "state": "translated", "value": "Nachtaufnahmen" } },
+        "en": { "stringUnit": { "state": "translated", "value": "Night" } }
+      }
+    },
+    "search.concept.city": {
+      "localizations": {
+        "de": { "stringUnit": { "state": "translated", "value": "Stadt" } },
+        "en": { "stringUnit": { "state": "translated", "value": "City" } }
+      }
+    },
+    "search.concept.architecture": {
+      "localizations": {
+        "de": { "stringUnit": { "state": "translated", "value": "Architektur" } },
+        "en": { "stringUnit": { "state": "translated", "value": "Architecture" } }
+      }
+    },
+    "search.concept.food": {
+      "localizations": {
+        "de": { "stringUnit": { "state": "translated", "value": "Essen" } },
+        "en": { "stringUnit": { "state": "translated", "value": "Food" } }
+      }
+    },
+    "search.concept.drinks": {
+      "localizations": {
+        "de": { "stringUnit": { "state": "translated", "value": "Getränke" } },
+        "en": { "stringUnit": { "state": "translated", "value": "Drinks" } }
+      }
+    },
+    "search.concept.birthday": {
+      "localizations": {
+        "de": { "stringUnit": { "state": "translated", "value": "Geburtstage" } },
+        "en": { "stringUnit": { "state": "translated", "value": "Birthdays" } }
+      }
+    },
+    "search.concept.christmas": {
+      "localizations": {
+        "de": { "stringUnit": { "state": "translated", "value": "Weihnachten" } },
+        "en": { "stringUnit": { "state": "translated", "value": "Christmas" } }
+      }
+    },
+    "search.concept.concert": {
+      "localizations": {
+        "de": { "stringUnit": { "state": "translated", "value": "Konzerte" } },
+        "en": { "stringUnit": { "state": "translated", "value": "Concerts" } }
+      }
+    },
+    "search.concept.sports": {
+      "localizations": {
+        "de": { "stringUnit": { "state": "translated", "value": "Sport" } },
+        "en": { "stringUnit": { "state": "translated", "value": "Sports" } }
+      }
+    },
+    "search.concept.hiking": {
+      "localizations": {
+        "de": { "stringUnit": { "state": "translated", "value": "Wandern" } },
+        "en": { "stringUnit": { "state": "translated", "value": "Hiking" } }
+      }
+    },
+    "search.concept.bicycle": {
+      "localizations": {
+        "de": { "stringUnit": { "state": "translated", "value": "Fahrrad" } },
+        "en": { "stringUnit": { "state": "translated", "value": "Cycling" } }
+      }
+    },
+    "search.concept.car": {
+      "localizations": {
+        "de": { "stringUnit": { "state": "translated", "value": "Autos" } },
+        "en": { "stringUnit": { "state": "translated", "value": "Cars" } }
+      }
+    },
+    "search.concept.train": {
+      "localizations": {
+        "de": { "stringUnit": { "state": "translated", "value": "Züge" } },
+        "en": { "stringUnit": { "state": "translated", "value": "Trains" } }
+      }
+    },
+    "search.concept.airplane": {
+      "localizations": {
+        "de": { "stringUnit": { "state": "translated", "value": "Flugreisen" } },
+        "en": { "stringUnit": { "state": "translated", "value": "Flights" } }
+      }
+    },
+    "search.concept.boat": {
+      "localizations": {
+        "de": { "stringUnit": { "state": "translated", "value": "Boote" } },
+        "en": { "stringUnit": { "state": "translated", "value": "Boats" } }
+      }
+    },
+    "search.concept.art": {
+      "localizations": {
+        "de": { "stringUnit": { "state": "translated", "value": "Kunst" } },
+        "en": { "stringUnit": { "state": "translated", "value": "Art" } }
+      }
+    },
+    "search.concept.garden": {
+      "localizations": {
+        "de": { "stringUnit": { "state": "translated", "value": "Garten" } },
+        "en": { "stringUnit": { "state": "translated", "value": "Garden" } }
+      }
+    },
+    "search.concept.documents": {
+      "localizations": {
+        "de": { "stringUnit": { "state": "translated", "value": "Dokumente" } },
+        "en": { "stringUnit": { "state": "translated", "value": "Documents" } }
+      }
+    },
+    "search.suggestion.years_ago %lld": {
+      "localizations": {
+        "de": { "variations": { "plural": {
+          "one": { "stringUnit": { "state": "translated", "value": "Vor einem Jahr" } },
+          "other": { "stringUnit": { "state": "translated", "value": "Vor %lld Jahren" } }
+        } } },
+        "en": { "variations": { "plural": {
+          "one": { "stringUnit": { "state": "translated", "value": "One year ago" } },
+          "other": { "stringUnit": { "state": "translated", "value": "%lld years ago" } }
+        } } }
+      }
+    },
+    "search.suggestion.count %lld": {
+      "localizations": {
+        "de": { "variations": { "plural": {
+          "one": { "stringUnit": { "state": "translated", "value": "%lld Foto" } },
+          "other": { "stringUnit": { "state": "translated", "value": "%lld Fotos" } }
+        } } },
+        "en": { "variations": { "plural": {
+          "one": { "stringUnit": { "state": "translated", "value": "%lld photo" } },
+          "other": { "stringUnit": { "state": "translated", "value": "%lld photos" } }
+        } } }
       }
     }
   },

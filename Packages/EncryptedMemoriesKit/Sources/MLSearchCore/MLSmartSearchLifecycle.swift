@@ -835,8 +835,13 @@ public actor MLSmartSearchLifecycle {
     // MARK: - Search
 
     /// Epoch-guarded semantic query against the active model. Results from a superseded model
-    /// generation are discarded, never returned.
-    public func search(_ text: String, limit: Int = 50) async throws -> MLSearchResults {
+    /// generation are discarded, never returned. Suggestion discovery passes `.automatic` so it never
+    /// competes with a query the user is typing.
+    public func search(
+        _ text: String,
+        limit: Int = 50,
+        intent: LibraryWorkIntent = .interactive
+    ) async throws -> MLSearchResults {
         guard !isShutDown, persistent.isEnabled, persistent.isVisualSearchEnabled,
             let session, lastCoverage.indexed > 0
         else {
@@ -848,7 +853,7 @@ public actor MLSmartSearchLifecycle {
             throw MLSmartSearchQueryError.staleEpoch
         }
         let results = try await deps.resourceCoordinator.withHeavyPermit(
-            LibraryWorkRequest(workload: .mlInference, intent: .interactive, memoryClass: .small)
+            LibraryWorkRequest(workload: .mlInference, intent: intent, memoryClass: .small)
         ) { _ in
             try await session.search(text, limit: limit)
         }
@@ -866,6 +871,12 @@ public actor MLSmartSearchLifecycle {
             results: results.results.filter { allowedUIDs.contains($0.uid) },
             durationMs: results.durationMs
         )
+    }
+
+    /// Number of assets the active visual model can answer for; 0 when visual search is off or not ready.
+    public func semanticIndexedAssetCount() -> Int {
+        guard !isShutDown, persistent.isEnabled, persistent.isVisualSearchEnabled, session != nil else { return 0 }
+        return lastCoverage.indexed
     }
 
     public func availableSearchScopes() async -> [MLSearchScope] {

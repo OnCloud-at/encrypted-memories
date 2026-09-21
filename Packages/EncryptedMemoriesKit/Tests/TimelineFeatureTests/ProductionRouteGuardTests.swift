@@ -1934,6 +1934,13 @@ struct ProductionRouteGuardTests {
         #expect(
             mobileTimeline.contains(".mobileSelectionBars(isSelecting: selection.isSelecting)"),
             "the timeline must hide the inactive selection bar itself, not only its transparent items")
+        let timelineStack = sourceBlock(
+            from: "NavigationStack {", to: "LibraryActivityBannerOverlay(", in: mobileTimeline)
+        #expect(
+            timelineStack.contains(".mobileSharePresentation(selection: selection)")
+                && mobileTimeline.components(separatedBy: ".mobileSharePresentation(").count - 1 == 1,
+            "the UIKit share presenter must stay inside the NavigationStack; as its sibling it forces the role-search tab back to a collapsing top drawer field"
+        )
         #expect(
             !mobileApp.contains("--search-tab-diagnostic") && !mobileApp.contains("Search-tab baseline"),
             "temporary search diagnostics must not remain reachable in production")
