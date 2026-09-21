@@ -10,19 +10,24 @@ public struct TimelineSearchDiscoveryContext: Sendable {
     public var favoriteUIDs: Set<PhotoUID>
     /// Items that may appear in results but never as a landing preview (for example the ML sensitive gate).
     public var excludedRepresentativeUIDs: Set<PhotoUID>
+    /// Set when the sensitive gate should run but could not complete. Suggestions then carry no previews at
+    /// all, so an unchecked photo is never shown on the landing.
+    public var suppressesRepresentatives: Bool
 
     public init(
         now: Date = Date(),
         calendar: Calendar = .current,
         locale: Locale = .current,
         favoriteUIDs: Set<PhotoUID> = [],
-        excludedRepresentativeUIDs: Set<PhotoUID> = []
+        excludedRepresentativeUIDs: Set<PhotoUID> = [],
+        suppressesRepresentatives: Bool = false
     ) {
         self.now = now
         self.calendar = calendar
         self.locale = locale
         self.favoriteUIDs = favoriteUIDs
         self.excludedRepresentativeUIDs = excludedRepresentativeUIDs
+        self.suppressesRepresentatives = suppressesRepresentatives
     }
 }
 
@@ -528,6 +533,7 @@ extension TimelineSearchDiscovery {
         count: Int = 2,
         context: TimelineSearchDiscoveryContext
     ) -> [PhotoUID] {
+        guard !context.suppressesRepresentatives else { return [] }
         let eligible = matches.filter { !context.excludedRepresentativeUIDs.contains($0.uid) }
             .sorted { $0.captureTime < $1.captureTime }
         guard !eligible.isEmpty, count > 0 else { return [] }

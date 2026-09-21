@@ -189,6 +189,14 @@ import Testing
         #expect(picked.last == items[8].uid)
     }
 
+    @Test func aFailedSensitiveGateSuppressesEveryPreview() {
+        let items = (1...5).map { item("g\($0)", date(2024, 1, $0)) }
+        let context = TimelineSearchDiscoveryContext(
+            now: date(2026, 1, 1), calendar: calendar, suppressesRepresentatives: true)
+
+        #expect(TimelineSearchDiscovery.representatives(for: items, context: context).isEmpty)
+    }
+
     @Test func rankingInterleavesFamiliesCapsEachKindAndDropsDuplicateResults() {
         func suggestion(
             _ id: String, _ kind: TimelineSearchSuggestionKind, _ uids: Set<PhotoUID>
