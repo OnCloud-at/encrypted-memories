@@ -7,8 +7,168 @@ import TimelineCore
 @testable import MLSearchFeature
 
 @MainActor @Suite struct SmartSearchDiscoverySchedulerTests {
+    @Test(arguments: [8, 50_000], [false, true]) func relaunchRestoresSuggestionsWhileSearchIsAlreadyActive(
+        itemCount: Int, recoveringMemoryPressure: Bool
+    ) async throws {
+        let probe = EvidenceProbe()
+        let cache = SnapshotCache()
+        let items = (0..<itemCount).map {
+            PhotoItem(
+                uid: PhotoUID(volumeID: "v", nodeID: String(format: "%064d", $0)), captureTime: Date(),
+                mediaType: "image/jpeg")
+        }
+        let sections = [TimelineSection(id: "all", date: Date(), title: "", items: items)]
+        let favorites = Set(items.map(\.uid))
+        func apply(_ scheduler: SmartSearchDiscoveryScheduler, revision: UInt64) {
+            scheduler.update(
+                sections: sections, timelineRevision: revision, favoriteUIDs: favorites, coordinates: [],
+                snapshot: visualSnapshot(settled: itemCount, ready: true), indexedAssetCount: { itemCount },
+                searchEvidence: { await probe.query(sensitive: items[0].uid, scanned: Set(items.map(\.uid))) },
+                cacheAccess: { await cache.access() })
+        }
+        let first = SmartSearchDiscoveryScheduler(runtimeState: LibraryRuntimeState(), debounce: .zero) { _, _ in nil }
+        apply(first, revision: 50)
+        for _ in 0..<6_000 where !first.discovery.lastRefreshCompleted || first.isRefreshing {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        try #require(first.discovery.lastRefreshCompleted)
+        let expected = first.discovery.forYou
+        try #require(expected.contains { !$0.representativeUIDs.isEmpty })
+        first.reset()
+        let runtime = LibraryRuntimeState()
+        runtime.update { $0.activeSearchCount = 1 }
+        if recoveringMemoryPressure { runtime.update { $0.memoryPressure = .critical } }
+        let relaunched = SmartSearchDiscoveryScheduler(runtimeState: runtime, debounce: .zero) { _, _ in nil }
+        defer { relaunched.reset() }
+        let restoreStarted = ContinuousClock.now
+        apply(relaunched, revision: 1)
+        if recoveringMemoryPressure {
+            try await Task.sleep(for: .milliseconds(25))
+            #expect(!relaunched.discovery.hasComputed)
+            runtime.update { $0.memoryPressure = .normal }
+        }
+        for _ in 0..<6_000 where !relaunched.discovery.hasComputed {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        #expect(
+            relaunched.discovery.forYou == expected, "relaunch must preserve completed suggestions without inference")
+        #expect(relaunched.discovery.computedContent?.timelineRevision == 1)
+        #expect(await probe.calls == 1, "opening Search must not require another full index scan")
+        #expect(!relaunched.isRefreshing)
+        let bytes = await cache.data?.count ?? 0
+        #expect(bytes < 64 * 1_024 * 1_024)
+        if itemCount == 50_000 {
+            print("Suggestion cache fixture: assets=50000 bytes=\(bytes) restore=\(restoreStarted.duration(to: .now))")
+        }
+    }
+
+    private actor SnapshotCache {
+        var data: Data?
+        func access() -> MLSearchSuggestionCacheAccess {
+            MLSearchSuggestionCacheAccess(data: data) { data in await self.save(data) }
+        }
+        func save(_ data: Data) { self.data = data }
+    }
+
+    @Test(arguments: ["unsettled", "favorites", "missingGate"])
+    func relaunchDoesNotPresentProvisionalOrChangedContentAsCurrent(
+        change: String
+    ) async throws {
+        let probe = EvidenceProbe()
+        let cache = SnapshotCache()
+        let items = (0..<8).map {
+            PhotoItem(uid: PhotoUID(volumeID: "v", nodeID: "\($0)"), captureTime: Date(), mediaType: "image/jpeg")
+        }
+        let sections = [TimelineSection(id: "all", date: Date(), title: "", items: items)]
+        func apply(_ scheduler: SmartSearchDiscoveryScheduler, favorites: Set<PhotoUID>, settled: Bool) {
+            scheduler.update(
+                sections: sections, timelineRevision: 1, favoriteUIDs: favorites, coordinates: [],
+                snapshot: visualSnapshot(settled: 8, ready: true), indexedAssetCount: { 8 },
+                searchEvidence: { await probe.query(sensitive: items[0].uid) }, libraryIsSettled: settled,
+                cacheAccess: { await cache.access() })
+        }
+        let first = SmartSearchDiscoveryScheduler(runtimeState: LibraryRuntimeState(), debounce: .zero) { _, _ in nil }
+        apply(first, favorites: Set(items.map(\.uid)), settled: true)
+        for _ in 0..<200 where !first.discovery.lastRefreshCompleted || first.isRefreshing {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        try #require(first.discovery.lastRefreshCompleted)
+        first.reset()
+        let runtime = LibraryRuntimeState()
+        runtime.update { $0.activeSearchCount = 1 }
+        let next = SmartSearchDiscoveryScheduler(runtimeState: runtime, debounce: .zero) { _, _ in nil }
+        defer { next.reset() }
+        let favorites = Set((change == "favorites" ? Array(items.dropFirst()) : items).map(\.uid))
+        if change == "missingGate" {
+            let data = try #require(await cache.data)
+            let saved = try PropertyListDecoder().decode(SmartSearchDiscoveryPersistence.self, from: data)
+            let evidence = try #require(saved.evidence)
+            let invalid = SmartSearchDiscoveryPersistence(
+                version: saved.version, modelKey: saved.modelKey, fingerprint: saved.fingerprint,
+                snapshot: saved.snapshot,
+                evidence: MLSearchBatchResults(
+                    results: Array(evidence.results.dropFirst()), scannedUIDs: evidence.scannedUIDs))
+            await cache.save(try invalid.encoded())
+        }
+        apply(next, favorites: favorites, settled: change != "unsettled")
+        try await Task.sleep(for: .milliseconds(50))
+        #expect(!next.discovery.hasComputed, "unsettled or different content must not become a current saved snapshot")
+        runtime.update { $0.activeSearchCount = 0 }
+        apply(next, favorites: favorites, settled: true)
+        for _ in 0..<200 where !next.discovery.lastRefreshCompleted || next.isRefreshing {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        #expect(next.discovery.lastRefreshCompleted)
+        #expect(next.discovery.computedContent?.favoriteCount == favorites.count)
+        #expect(await probe.calls == (change == "missingGate" ? 2 : 1))
+    }
+
+    @Test func metadataChangeAfterRelaunchReusesVisualEvidenceAndResolvedPlaces() async throws {
+        let probe = EvidenceProbe()
+        let cache = SnapshotCache()
+        let items = (0..<8).map {
+            PhotoItem(uid: PhotoUID(volumeID: "v", nodeID: "\($0)"), captureTime: Date(), mediaType: "image/jpeg")
+        }
+        let sections = [TimelineSection(id: "all", date: Date(), title: "", items: items)]
+        let coordinates = items.map {
+            PhotoCoordinate(uid: $0.uid, latitude: 48.2, longitude: 16.3, date: $0.captureTime)
+        }
+        func apply(_ scheduler: SmartSearchDiscoveryScheduler, favorites: Set<PhotoUID>, revision: UInt64) {
+            scheduler.update(
+                sections: sections, timelineRevision: revision, favoriteUIDs: favorites, coordinates: coordinates,
+                snapshot: visualSnapshot(settled: 8, ready: true), indexedAssetCount: { 8 },
+                searchEvidence: { await probe.query(sensitive: items[0].uid) }, cacheAccess: { await cache.access() })
+        }
+        let first = SmartSearchDiscoveryScheduler(runtimeState: LibraryRuntimeState(), debounce: .zero) { _, _ in
+            await probe.placeName()
+        }
+        apply(first, favorites: Set(items.map(\.uid)), revision: 20)
+        for _ in 0..<200 where !first.discovery.lastRefreshCompleted || first.isRefreshing {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        try #require(first.discovery.lastRefreshCompleted)
+        try #require(await probe.placeCalls == 1)
+        first.reset()
+        let second = SmartSearchDiscoveryScheduler(runtimeState: LibraryRuntimeState(), debounce: .zero) { _, _ in
+            await probe.placeName()
+        }
+        defer { second.reset() }
+        apply(second, favorites: Set(items.dropFirst().map(\.uid)), revision: 1)
+        for _ in 0..<200 where !second.discovery.lastRefreshCompleted || second.isRefreshing {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        #expect(second.discovery.computedContent?.favoriteCount == 7)
+        #expect(await probe.calls == 1, "metadata changes must reuse saved evidence")
+        #expect(await probe.placeCalls == 1, "unchanged place cells must not request their names again after relaunch")
+    }
+
     private actor EvidenceProbe {
         var calls = 0
+        var placeCalls = 0
+        func placeName() -> String {
+            placeCalls += 1
+            return "Vienna"
+        }
         var failuresRemaining = 0
         func failNext(_ count: Int) { failuresRemaining = count }
         func retryableQuery(sensitive: PhotoUID) throws -> MLSearchBatchResults {
@@ -33,10 +193,13 @@ import TimelineCore
                         results: uids.map { MLSearchResult(uid: $0, score: 1) })
                 }, scannedUIDs: MLScannedUIDMembership(scanned))
         }
-        func query(sensitive: PhotoUID, conceptUIDs: [PhotoUID] = []) -> MLSearchBatchResults {
+        func query(
+            sensitive: PhotoUID, conceptUIDs: [PhotoUID] = [], scanned: Set<PhotoUID>? = nil
+        ) -> MLSearchBatchResults {
             calls += 1
             return Self.evidence(
-                sensitive: [sensitive], scanned: Set((0..<8).map { PhotoUID(volumeID: "v", nodeID: "\($0)") }),
+                sensitive: [sensitive],
+                scanned: scanned ?? Set((0..<8).map { PhotoUID(volumeID: "v", nodeID: "\($0)") }),
                 conceptUIDs: conceptUIDs)
         }
     }

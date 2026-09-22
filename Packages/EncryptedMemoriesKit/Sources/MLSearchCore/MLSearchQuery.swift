@@ -22,7 +22,7 @@ public struct MLSearchQuery: Sendable, Equatable {
 }
 
 /// A single ranked result from a semantic search.
-public struct MLSearchResult: Sendable, Equatable {
+public struct MLSearchResult: Sendable, Equatable, Codable {
     public let uid: PhotoUID
     public let score: Float
 
@@ -33,7 +33,7 @@ public struct MLSearchResult: Sendable, Equatable {
 }
 
 /// A collection of ranked results.
-public struct MLSearchResults: Sendable, Equatable {
+public struct MLSearchResults: Sendable, Equatable, Codable {
     public let descriptor: MLModelDescriptor
     public let queryText: String
     public let results: [MLSearchResult]
@@ -64,7 +64,7 @@ public struct MLSearchResults: Sendable, Equatable {
 
 /// Exact scan membership. Store each volume once instead of retaining its string for every decoded row.
 /// Memory still scales with checked node IDs; no fingerprint or probabilistic match can authorize a preview.
-public struct MLScannedUIDMembership: Sendable, ExpressibleByArrayLiteral {
+public struct MLScannedUIDMembership: Sendable, ExpressibleByArrayLiteral, Codable {
     private var nodesByVolume: [String: Set<String>] = [:]
 
     public init() {}
@@ -99,7 +99,7 @@ public struct MLScannedUIDMembership: Sendable, ExpressibleByArrayLiteral {
 
 /// A completed shared scan, including every valid row checked by all batch prompts.
 /// Membership must come from the scan itself, not from a separate index-count snapshot.
-public struct MLSearchBatchResults: Sendable {
+public struct MLSearchBatchResults: Sendable, Codable {
     public let results: [MLSearchResults]
     public let scannedUIDs: MLScannedUIDMembership
 

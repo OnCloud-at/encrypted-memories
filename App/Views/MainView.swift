@@ -354,7 +354,6 @@ struct MainView: View {
                 TimelineView(
                     model: mapClusterModel,
                     level: $level,
-                    gridProfile: TimelineGridProfiles.secondaryCollectionProfile,
                     gridFillOrder: .topLeading,
                     initialViewportPlacement: .oldest,
                     proxy: mapClusterGridProxy,

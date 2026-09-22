@@ -355,27 +355,6 @@ public enum TimelineGridProfiles {
     public static var productionDefaultProfile: GridLevelProfile {
         TimelineGridProfileConfiguration.production.defaultProfile
     }
-
-    /// Sparse secondary collections (for example a selected map cluster) start as a readable four-column,
-    /// top-leading grid instead of inheriting the nine-column desktop library density. Three columns is the
-    /// largest supported zoom so a thumbnail is never stretched into a one- or two-column detail surrogate.
-    /// The same ladder is shared by UIKit and AppKit so pinch/toolbar zoom remains consistent across platforms.
-    public static let secondaryCollectionProfile = GridLevelProfile(
-        id: "secondaryCollection",
-        levels: [
-            GridLevelMetrics(
-                levelID: 0, nominalColumns: 3, gap: 10, monthLabels: false,
-                supportedContentModes: [.aspectFitInsideSquare, .squareFillCrop],
-                defaultContentMode: .aspectFitInsideSquare),
-            GridLevelMetrics(
-                levelID: 1, nominalColumns: 4, gap: 8, monthLabels: false,
-                supportedContentModes: [.aspectFitInsideSquare, .squareFillCrop],
-                defaultContentMode: .aspectFitInsideSquare),
-            GridLevelMetrics(levelID: 2, nominalColumns: 8, gap: 2, monthLabels: false),
-            GridLevelMetrics(levelID: 3, nominalColumns: 12, gap: 1, monthLabels: false),
-        ],
-        defaultLevel: 1
-    )
 }
 
 private struct ConfigurationDTO: Decodable {

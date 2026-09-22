@@ -1582,12 +1582,15 @@ struct ProductionRouteGuardTests {
             !clusterOverlay.contains(".environment(\\.gridLeadingEventInset, leadingObstructionInset)"),
             "the root-ZStack host already moves beside the sidebar and must not inset its Metal layout again")
         #expect(
-            clusterOverlay.contains("gridProfile: TimelineGridProfiles.secondaryCollectionProfile"),
-            "the macOS cluster grid must use the shared sparse-collection profile capped at three columns")
+            !clusterOverlay.contains("gridProfile:"),
+            "the macOS cluster grid must resolve the same platform profile as the library")
 
         let mobileCluster = try String(
             contentsOf: Self.repoRoot.appendingPathComponent("iOSApp/MobileMapClusterSeriesScreen.swift"),
             encoding: .utf8)
+        #expect(
+            !mobileCluster.contains("gridProfile:"),
+            "map clusters must retain the shared UIKit grid's touch and width profile resolution")
         let openBody = try Self.body(
             of: mobileCluster,
             from: "private func open(_ item: PhotoItem) {",

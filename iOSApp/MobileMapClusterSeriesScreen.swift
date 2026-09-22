@@ -114,7 +114,6 @@ struct MobileMapClusterSeriesScreen: View {
                 UIKitTimelineGrid(
                     items: clusterItems,
                     thumbnailFeed: feed,
-                    gridProfile: TimelineGridProfiles.secondaryCollectionProfile,
                     fillOrder: .topLeading,
                     initialViewportPlacement: .oldest,
                     selectionMode: selection.isSelecting,

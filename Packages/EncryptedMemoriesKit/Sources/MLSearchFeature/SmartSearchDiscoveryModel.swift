@@ -115,6 +115,61 @@ public final class SmartSearchDiscoveryModel {
         self.placeName = placeName
     }
 
+    struct PersistedSnapshot: Codable, Sendable {
+        let candidates: [TimelineSearchSuggestion]
+        let forYouIDs: [String]
+        let chipIDs: [String]
+        let showsSmartSearchHint: Bool
+        let visualAvailability: Bool?
+        let visualCompletedWhenReady: Bool
+        let placeNames: [String: String]
+        let placeNamesLocale: String
+    }
+
+    func persistedSnapshot() -> PersistedSnapshot? {
+        guard lastRefreshCompleted else { return nil }
+        return PersistedSnapshot(
+            candidates: candidates, forYouIDs: forYou.map(\.id), chipIDs: chips.map(\.id),
+            showsSmartSearchHint: showsSmartSearchHint, visualAvailability: settledVisualAvailability,
+            visualCompletedWhenReady: visualConceptsCompletedWhenReady,
+            placeNames: placeNames, placeNamesLocale: Self.placeNamesLocale)
+    }
+
+    private static var placeNamesLocale: String {
+        Locale.current.identifier + "|" + Locale.preferredLanguages.joined(separator: "|")
+    }
+
+    func reusePlaceNames(from previous: SmartSearchDiscoveryModel) {
+        placeNames = previous.placeNames
+    }
+
+    func restorePlaceNames(from snapshot: PersistedSnapshot) {
+        placeNames = snapshot.placeNamesLocale == Self.placeNamesLocale ? snapshot.placeNames : [:]
+    }
+
+    func restore(
+        _ snapshot: PersistedSnapshot, content: SmartSearchContentIdentity,
+        isExactContent: Bool
+    ) {
+        var seen = Set<String>()
+        candidates = snapshot.candidates.filter {
+            seen.insert($0.id).inserted && $0.matchingUIDs?.isEmpty == false
+        }
+        let byID = Dictionary(uniqueKeysWithValues: candidates.map { ($0.id, $0) })
+        forYou = snapshot.forYouIDs.compactMap { byID[$0] }
+        chips = snapshot.chipIDs.compactMap { byID[$0] }
+        lastPublished = candidates
+        restorePlaceNames(from: snapshot)
+        showsSmartSearchHint = snapshot.showsSmartSearchHint
+        computedContent = content
+        hasComputed = true
+        settledContent = isExactContent ? content : nil
+        settledVisualAvailability = isExactContent ? snapshot.visualAvailability : nil
+        visualConceptsCompletedWhenReady = isExactContent && snapshot.visualCompletedWhenReady
+        lastRefreshCompleted = isExactContent
+        settledGeneration &+= 1
+    }
+
     /// Whether this session's suggestions are final: a complete refresh ran once under `.oncePerSession`.
     public var isSessionComplete: Bool {
         refreshPolicy == .oncePerSession && settledContent != nil
@@ -591,7 +646,7 @@ public final class SmartSearchDiscoveryModel {
     }
 
     /// A cancelled host also cancels its utility worker. Results still require the refresh generation check.
-    private nonisolated static func background<Value: Sendable>(
+    nonisolated static func background<Value: Sendable>(
         _ operation: @escaping @Sendable () -> Value
     ) async -> Value {
         let task = Task.detached(priority: .utility, operation: operation)

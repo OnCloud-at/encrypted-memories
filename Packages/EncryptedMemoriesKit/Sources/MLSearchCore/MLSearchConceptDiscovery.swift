@@ -21,6 +21,9 @@ public struct MLSearchConcept: Identifiable, Hashable, Sendable {
 /// The allow-list of concepts that may become suggestions. It is a compiled constant on purpose: no code
 /// path turns library content into a concept title, so sensitive content can never be proposed by name.
 public enum MLSearchConceptCatalog {
+    /// Complete internal batch contract. These model-facing strings are never suggestion titles.
+    public static var suggestionPrompts: [String] { sensitivePrompts + curated.map(\.prompt) }
+
     public static let curated: [MLSearchConcept] = [
         .init(id: "people", prompt: "a photo of people", systemImage: "person.2"),
         .init(id: "dog", prompt: "a photo of a dog", systemImage: "dog"),

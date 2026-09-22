@@ -90,6 +90,7 @@ public actor MLSmartSearchLifecycle {
         public var indexingCapacityProfile: MLIndexingCapacityProfile
         /// Shared adapter caches outlive individual native/semantic sessions.
         public var releaseDerivedResources: @Sendable () async -> Void
+        public var suggestionCache: MLSearchSuggestionCache?
 
         public init(
             catalog: MLModelCatalog,
@@ -107,7 +108,8 @@ public actor MLSmartSearchLifecycle {
             allowsDeveloperModels: Bool,
             featureAvailability: AppFeatureAvailability = .available,
             indexingCapacityProfile: MLIndexingCapacityProfile = .constrained,
-            releaseDerivedResources: @escaping @Sendable () async -> Void = {}
+            releaseDerivedResources: @escaping @Sendable () async -> Void = {},
+            suggestionCache: MLSearchSuggestionCache? = nil
         ) {
             self.catalog = catalog
             self.catalogProvider = catalogProvider ?? StaticMLModelCatalogProvider(catalog)
@@ -125,6 +127,7 @@ public actor MLSmartSearchLifecycle {
             self.featureAvailability = featureAvailability
             self.indexingCapacityProfile = indexingCapacityProfile
             self.releaseDerivedResources = releaseDerivedResources
+            self.suggestionCache = suggestionCache
         }
     }
 
@@ -222,6 +225,51 @@ public actor MLSmartSearchLifecycle {
     // MARK: - Observation
 
     public func currentSnapshot() -> MLSmartSearchSnapshot { makeSnapshot() }
+
+    /// Reading completed suggestions requires no model inference or automatic-work permit.
+    /// The durable index generation survives relaunch; the separate session generation fences writes.
+    public func suggestionCacheAccess() -> MLSearchSuggestionCacheAccess? {
+        guard let cache = deps.suggestionCache, let identity = suggestionCacheIdentity() else { return nil }
+        let generation = sessionGeneration
+        let data: Data?
+        do {
+            data = try cache.load(identity: identity)
+        } catch {
+            PhotoDiagnostics.shared.increment("ml.suggestions.cacheReadFailed")
+            data = nil
+        }
+        return MLSearchSuggestionCacheAccess(data: data) { [weak self] payload in
+            guard let self else { throw CancellationError() }
+            try await self.saveSuggestionCache(payload, identity: identity, generation: generation)
+        }
+    }
+
+    private func suggestionCacheIdentity() -> MLSearchSuggestionCacheIdentity? {
+        guard !isShutDown, !Task.isCancelled, persistent.isEnabled, persistent.pendingOperation == nil else {
+            return nil
+        }
+        guard persistent.isVisualSearchEnabled else {
+            return MLSearchSuggestionCacheIdentity(
+                descriptor: nil, modelRevision: nil, indexGeneration: nil, visualSearchEnabled: false)
+        }
+        guard session != nil, let activeModel, activeModel.entry.id == persistent.selectedModelID,
+            let store = deps.storeProvider.openStore()
+        else { return nil }
+        let generation = store.generation(for: activeModel.entry.descriptor)
+        guard generation > 0 else { return nil }
+        return MLSearchSuggestionCacheIdentity(
+            descriptor: activeModel.entry.descriptor, modelRevision: activeModel.record.revision,
+            indexGeneration: generation, visualSearchEnabled: true)
+    }
+
+    private func saveSuggestionCache(
+        _ data: Data, identity: MLSearchSuggestionCacheIdentity, generation: UInt64
+    ) throws {
+        try Task.checkCancellation()
+        guard generation == sessionGeneration, identity == suggestionCacheIdentity(), let cache = deps.suggestionCache
+        else { throw MLSmartSearchQueryError.staleEpoch }
+        try cache.save(data, identity: identity)
+    }
 
     public func storageBreakdown() async -> MLSmartSearchStorageBreakdown {
         await storageMeter.measure()
@@ -884,7 +932,7 @@ public actor MLSmartSearchLifecycle {
         let generation = sessionGeneration
         let initialInventory = await deps.assetsProvider()
         guard generation == sessionGeneration, !isShutDown else { throw MLSmartSearchQueryError.staleEpoch }
-        let prompts = MLSearchConceptCatalog.sensitivePrompts + MLSearchConceptCatalog.curated.map(\.prompt)
+        let prompts = MLSearchConceptCatalog.suggestionPrompts
         let results = try await deps.resourceCoordinator.withHeavyPermit(
             LibraryWorkRequest(workload: .mlInference, intent: .automatic, memoryClass: .small)
         ) { lease in
@@ -2239,6 +2287,15 @@ public actor MLSmartSearchLifecycle {
         {
             return false
         }
+        do {
+            try deps.suggestionCache?.remove()
+        } catch {
+            phase = .failed(
+                MLSmartSearchFailure(
+                    kind: .storage, isRetryable: true, debugDescription: "suggestion cache cleanup failed"))
+            emit()
+            return false
+        }
         persistent.selectedModelID = to
         persistent.isVisualSearchEnabled = true
         persistent.activatedRevision = nil
@@ -2302,6 +2359,12 @@ public actor MLSmartSearchLifecycle {
         for entry in catalog.entries {
             await deps.installer.uninstall(entry)
             guard isCurrentOperation(removal) else { return false }
+        }
+        do {
+            try deps.suggestionCache?.remove()
+        } catch {
+            failVisualRemoval("suggestion cache cleanup failed")
+            return false
         }
 
         // "Turn Off and Remove" also forgets the model choice. Re-enabling Visual Search must ask
