@@ -3,6 +3,21 @@ import XCTest
 @testable import PhotosCore
 
 final class SupportDiagnosticsExporterTests: XCTestCase {
+    func testSuggestionCacheDiagnosticsExposeOutcomesWithoutContent() {
+        let diagnostics = PhotoDiagnostics(debugConsoleLogsEnabled: false)
+        diagnostics.emitSupport(
+            "SearchSuggestions",
+            [
+                "action": "restore", "result": "restored", "durationMs": "25",
+                "uid": "private-photo", "fingerprint": "private-hash", "query": "private-query",
+            ])
+        diagnostics.increment("ml.suggestions.snapshotRestored")
+        diagnostics.increment("ml.suggestions.private-photo")
+        let snapshot = diagnostics.supportSnapshot()
+        XCTAssertEqual(snapshot.events.first?.fields, ["action": "restore", "result": "restored", "durationMs": "25"])
+        XCTAssertEqual(snapshot.counters, ["ml.suggestions.snapshotRestored": 1])
+    }
+
     func testDisabledDebugLoggingDoesNotBuildFields() {
         let diagnostics = PhotoDiagnostics(debugConsoleLogsEnabled: false)
         var evaluations = 0

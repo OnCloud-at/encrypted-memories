@@ -284,6 +284,15 @@ public final class PhotoDiagnostics: @unchecked Sendable {
     private static let supportCounterKeys: Set<String> = [
         "metrickit.diagnosticPayloads",
         "metrickit.metricPayloads",
+        "ml.suggestions.cacheReadFailed",
+        "ml.suggestions.evidenceBatchFailed",
+        "ml.suggestions.evidenceRetryExhausted",
+        "ml.suggestions.persistenceRetryExhausted",
+        "ml.suggestions.snapshotDecodeFailed",
+        "ml.suggestions.snapshotPreparationFailed",
+        "ml.suggestions.snapshotRestored",
+        "ml.suggestions.snapshotWriteFailed",
+        "ml.suggestions.snapshotWriteSuperseded",
         "perf.videoPrefetchDeduped",
         "perf.videoPrefetchScheduled",
         "thumb.decodedUpgrade",
@@ -620,6 +629,8 @@ public final class PhotoDiagnostics: @unchecked Sendable {
             allowedFields = ["action", "headroom", "pressure", "reason", "tier"]
         case "MetricKit":
             allowedFields = ["diagnosticPayloads", "metricPayloads"]
+        case "SearchSuggestions":
+            allowedFields = ["action", "result", "durationMs"]
         default:
             return nil
         }

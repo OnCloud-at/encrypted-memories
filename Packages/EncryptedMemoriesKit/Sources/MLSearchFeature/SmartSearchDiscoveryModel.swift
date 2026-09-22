@@ -192,7 +192,8 @@ public final class SmartSearchDiscoveryModel {
     /// render time, so it follows a visual search toggle at once without a refresh.
     public func showsVisualSuggestionsPendingNote(_ snapshot: MLSmartSearchSnapshot?) -> Bool {
         guard Self.visualConceptsAvailable(snapshot) else { return false }
-        return !Self.visualIndexReady(snapshot)
+        // Restored completed suggestions do not become pending while runtime coverage hydrates.
+        return !visualConceptsCompletedWhenReady && !Self.visualIndexReady(snapshot)
     }
 
     /// Changes whenever the visual completion exception could apply. Hosts add it to their refresh key, because

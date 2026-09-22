@@ -64,10 +64,152 @@ import TimelineCore
 
     private actor SnapshotCache {
         var data: Data?
+        var failuresRemaining = 0
+        var saves = 0
+        func failNextSave(count: Int = 1) { failuresRemaining = count }
         func access() -> MLSearchSuggestionCacheAccess {
-            MLSearchSuggestionCacheAccess(data: data) { data in await self.save(data) }
+            MLSearchSuggestionCacheAccess(data: data) { data in
+                await self.noteSave()
+                if await self.takeFailure() { throw CocoaError(.fileWriteUnknown) }
+                await self.save(data)
+            }
+        }
+        private func noteSave() { saves += 1 }
+        private func takeFailure() -> Bool {
+            guard failuresRemaining > 0 else { return false }
+            failuresRemaining -= 1
+            return true
         }
         func save(_ data: Data) { self.data = data }
+    }
+
+    @Test func indexProgressDoesNotRearmAnExhaustedPersistenceWrite() async throws {
+        let cache = SnapshotCache()
+        await cache.failNextSave(count: 100)
+        let probe = EvidenceProbe()
+        let items = (0..<8).map {
+            PhotoItem(uid: PhotoUID(volumeID: "v", nodeID: "\($0)"), captureTime: Date(), mediaType: "image/jpeg")
+        }
+        let scheduler = SmartSearchDiscoveryScheduler(runtimeState: LibraryRuntimeState(), debounce: .zero) { _, _ in
+            nil
+        }
+        defer { scheduler.reset() }
+        func apply(settled: Int) {
+            scheduler.update(
+                sections: [TimelineSection(id: "all", date: Date(), title: "", items: items)],
+                timelineRevision: 1, favoriteUIDs: Set(items.map(\.uid)), coordinates: [],
+                snapshot: visualSnapshot(settled: settled, ready: false), indexedAssetCount: { 8 },
+                searchEvidence: { await probe.query(sensitive: items[0].uid) },
+                cacheAccess: { await cache.access() })
+        }
+        apply(settled: 8)
+        for _ in 0..<2_000 where await cache.saves < 4 || scheduler.isRefreshing {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        try #require(await cache.saves == 4)
+        apply(settled: 20)
+        try await Task.sleep(for: .milliseconds(50))
+        apply(settled: 40)
+        try await Task.sleep(for: .milliseconds(50))
+        #expect(await cache.saves == 4, "index progress must not renew an exhausted disk-write budget")
+        #expect(await probe.calls == 1)
+        #expect(scheduler.discovery.hasComputed, "failed persistence must retain usable rows")
+    }
+
+    @Test func transientSaveFailureRetriesOnlyPersistenceAndSurvivesRelaunch() async throws {
+        let cache = SnapshotCache()
+        await cache.failNextSave()
+        let probe = EvidenceProbe()
+        let items = (0..<8).map {
+            PhotoItem(uid: PhotoUID(volumeID: "v", nodeID: "\($0)"), captureTime: Date(), mediaType: "image/jpeg")
+        }
+        let sections = [TimelineSection(id: "all", date: Date(), title: "", items: items)]
+        let coordinates = items.map {
+            PhotoCoordinate(uid: $0.uid, latitude: 48.2, longitude: 16.3, date: $0.captureTime)
+        }
+        func apply(_ scheduler: SmartSearchDiscoveryScheduler) {
+            scheduler.update(
+                sections: sections, timelineRevision: 1, favoriteUIDs: Set(items.map(\.uid)), coordinates: coordinates,
+                snapshot: visualSnapshot(settled: 8, ready: true), indexedAssetCount: { 8 },
+                searchEvidence: { await probe.query(sensitive: items[0].uid) },
+                cacheAccess: { await cache.access() })
+        }
+        let first = SmartSearchDiscoveryScheduler(runtimeState: LibraryRuntimeState(), debounce: .zero) { _, _ in
+            await probe.placeName()
+        }
+        apply(first)
+        for _ in 0..<200 where await cache.saves == 0 {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        let publishedModel = first.discovery
+        for _ in 0..<500 where await cache.data == nil {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        #expect(await cache.data != nil, "a transient disk failure must not finalize an unsaved presentation")
+        #expect(await cache.saves == 2)
+        #expect(first.discovery === publishedModel, "a persistence retry must not rebuild suggestion rows")
+        let expected = first.discovery.forYou
+        first.reset()
+        let runtime = LibraryRuntimeState()
+        runtime.update { $0.activeSearchCount = 1 }
+        let next = SmartSearchDiscoveryScheduler(runtimeState: runtime, debounce: .zero) { _, _ in
+            await probe.placeName()
+        }
+        defer { next.reset() }
+        apply(next)
+        for _ in 0..<200 where !next.discovery.hasComputed {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        #expect(next.discovery.forYou == expected)
+        #expect(await probe.calls == 1)
+        #expect(await probe.placeCalls == 1)
+        #expect(!next.discovery.showsVisualSuggestionsPendingNote(visualSnapshot(settled: 0, ready: false)))
+    }
+
+    @Test func relaunchRetriesCacheWhenModelStartupFinishesBeforeCoverageRestores() async throws {
+        let probe = EvidenceProbe()
+        let cache = SnapshotCache()
+        let items = (0..<8).map {
+            PhotoItem(uid: PhotoUID(volumeID: "v", nodeID: "\($0)"), captureTime: Date(), mediaType: "image/jpeg")
+        }
+        let sections = [TimelineSection(id: "all", date: Date(), title: "", items: items)]
+        let ready = visualSnapshot(settled: 8, ready: true)
+        func apply(_ scheduler: SmartSearchDiscoveryScheduler, phase: MLSmartSearchPhase, cacheReady: Bool) {
+            let snapshot = MLSmartSearchSnapshot(
+                isEnabled: ready.isEnabled, isVisualSearchEnabled: ready.isVisualSearchEnabled,
+                selectedModelID: ready.selectedModelID, phase: phase,
+                installedModelBytes: ready.installedModelBytes, availableModels: ready.availableModels,
+                isSearchAvailable: false, indexingState: .idle)
+            scheduler.update(
+                sections: sections, timelineRevision: 1, favoriteUIDs: Set(items.map(\.uid)), coordinates: [],
+                snapshot: snapshot, indexedAssetCount: { cacheReady ? 8 : 0 },
+                searchEvidence: { await probe.query(sensitive: items[0].uid) },
+                cacheAccess: { cacheReady ? await cache.access() : nil })
+        }
+        let first = SmartSearchDiscoveryScheduler(runtimeState: LibraryRuntimeState(), debounce: .zero) { _, _ in nil }
+        apply(first, phase: ready.phase, cacheReady: true)
+        for _ in 0..<200 where await cache.data == nil {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        try #require(await cache.data != nil)
+        let expected = first.discovery.forYou
+        try #require(expected.contains { !$0.representativeUIDs.isEmpty })
+        first.reset()
+
+        let runtime = LibraryRuntimeState()
+        let search = runtime.beginActivity(.search)
+        defer { search.end() }
+        let next = SmartSearchDiscoveryScheduler(runtimeState: runtime, debounce: .zero) { _, _ in nil }
+        defer { next.reset() }
+        apply(next, phase: .preparingModel, cacheReady: false)
+        try await Task.sleep(for: .milliseconds(25))
+        #expect(!next.discovery.hasComputed)
+        apply(next, phase: .waiting(.init(total: 0, indexed: 0, permanentlyUnindexable: 0)), cacheReady: true)
+        for _ in 0..<200 where !next.discovery.hasComputed {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        #expect(next.discovery.forYou == expected, "saved suggestions must not wait for a new coverage pass")
+        #expect(await probe.calls == 1, "restoring completed rows must not rerun their evidence scan")
     }
 
     @Test(arguments: ["unsettled", "favorites", "missingGate"])
