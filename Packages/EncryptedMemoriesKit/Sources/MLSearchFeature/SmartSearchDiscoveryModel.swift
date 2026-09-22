@@ -45,8 +45,8 @@ public enum SmartSearchSuggestionRebindResult: Equatable {
 /// 1. The sensitive gate, when visual search can answer. It fails closed: if it cannot complete, no suggestion
 ///    carries a preview and no visual concept is offered.
 /// 2. Metadata families (dates, trips, seasons, favorites, media types), published immediately.
-/// 3. Places from the existing location index, named by the host-provided resolver.
-/// 4. Curated visual concepts.
+/// 3. Curated visual concepts, published before network-backed place names.
+/// 4. Places from the existing location index, named by the host-provided resolver.
 /// Gate and concept evidence are cached per library revision, model and coarse indexing progress, so a
 /// cancelled refresh (for example when the user starts typing) resumes cheaply.
 @MainActor
@@ -392,7 +392,10 @@ public final class SmartSearchDiscoveryModel {
         snapshot: MLSmartSearchSnapshot?,
         indexedAssetCount: @Sendable () async -> Int,
         search: MLSearchConceptDiscovery.Search?,
-        includeVisualConcepts: Bool = true
+        includeVisualConcepts: Bool = true,
+        metadataOnly: Bool = false,
+        allowsRepresentative: (@Sendable (PhotoUID) -> Bool)? = nil,
+        previewsDidPublish: (@MainActor () -> Void)? = nil
     ) async {
         let visualAvailable = Self.visualConceptsAvailable(snapshot)
         let content = SmartSearchContentIdentity(timelineRevision: timelineRevision, favoriteUIDs: favoriteUIDs)
@@ -471,6 +474,7 @@ public final class SmartSearchDiscoveryModel {
         let context = TimelineSearchDiscoveryContext(
             favoriteUIDs: favoriteUIDs,
             excludedRepresentativeUIDs: sensitiveUIDs,
+            allowsRepresentative: visualAvailable ? allowsRepresentative : nil,
             suppressesRepresentatives: !gatePassed
         )
 
@@ -485,8 +489,17 @@ public final class SmartSearchDiscoveryModel {
         }
         metadata = newMetadata
         publish(content: content)
+        previewsDidPublish?()
 
-        // Stage 3: places. Only centroids of photo clusters are named.
+        // The scheduler's first publication must not wait for network-backed place names before its gate.
+        if metadataOnly {
+            settle(
+                content: content, visualAvailable: visualAvailable, ranVisualStages: false,
+                indexingReady: refreshIndexingReady)
+            return
+        }
+
+        // Prepare the local lookup once for concepts and places.
         let itemsByUID: [PhotoUID: PhotoItem] = await Self.background {
             var index: [PhotoUID: PhotoItem] = [:]
             for section in sections {
@@ -496,6 +509,57 @@ public final class SmartSearchDiscoveryModel {
             return index
         }
         guard !Task.isCancelled, generation == refreshGeneration else { return }
+        // Stage 3: publish checked visual concepts before any network-backed place names.
+        var visualStagesComplete = gatePassed
+        if includeVisualConcepts {
+            if gatePassed, covered > 0, let search {
+                let key = evidenceKey(timelineRevision: timelineRevision, snapshot: snapshot)
+                if conceptKey != key {
+                    let sensitive = sensitiveUIDs
+                    let evaluation = await MLSearchConceptDiscovery.evaluateWithCompletion(
+                        coveredAssetCount: covered,
+                        sensitiveUIDs: sensitive,
+                        search: search
+                    )
+                    guard !Task.isCancelled, generation == refreshGeneration else { return }
+                    conceptEvidence = evaluation.evidence
+                    visualStagesComplete = evaluation.isComplete
+                    conceptKey = evaluation.isComplete ? key : nil
+                }
+                let evidence = conceptEvidence
+                let newConcepts = await Self.background {
+                    evidence.map { entry in
+                        let matches = entry.rankedUIDs.compactMap { itemsByUID[$0] }
+                        // The best-ranked matches make the most convincing previews.
+                        let previews = TimelineSearchDiscovery.representatives(
+                            for: Array(matches.prefix(12)),
+                            context: context
+                        )
+                        return TimelineSearchSuggestion(
+                            id: "concept:\(entry.concept.id)",
+                            query: entry.concept.title,
+                            title: entry.concept.title,
+                            subtitle: TimelineSearchDiscovery.countText(matches.count),
+                            systemImage: entry.concept.systemImage,
+                            kind: .concept,
+                            matchingUIDs: Set(matches.map(\.uid)),
+                            representativeUIDs: previews
+                        )
+                    }
+                }
+                guard !Task.isCancelled, generation == refreshGeneration else { return }
+                concepts = newConcepts
+                publish(content: content)
+                previewsDidPublish?()
+            } else {
+                concepts = []
+                conceptEvidence = []
+                conceptKey = nil
+                publish(content: content)
+            }
+        }
+
+        // Stage 4: only centroids of photo clusters are named.
         let candidates = await Self.background {
             TimelineSearchDiscovery.placeCandidates(coordinates: coordinates)
         }
@@ -520,66 +584,9 @@ public final class SmartSearchDiscoveryModel {
         guard !Task.isCancelled, generation == refreshGeneration else { return }
         places = newPlaces
         publish(content: content)
-
-        // Stage 4: curated visual concepts, only behind a passed gate. A host that only keeps a selected
-        // metadata or place suggestion current skips it, so no background inference runs while results show.
-        guard includeVisualConcepts else {
-            settle(
-                content: content, visualAvailable: visualAvailable, ranVisualStages: false,
-                indexingReady: refreshIndexingReady)
-            return
-        }
-        guard gatePassed, covered > 0, let search else {
-            concepts = []
-            conceptEvidence = []
-            conceptKey = nil
-            publish(content: content)
-            settle(
-                content: content, visualAvailable: visualAvailable, ranVisualStages: gatePassed,
-                indexingReady: refreshIndexingReady)
-            return
-        }
-        var visualStagesComplete = true
-        let key = evidenceKey(timelineRevision: timelineRevision, snapshot: snapshot)
-        if conceptKey != key {
-            let sensitive = sensitiveUIDs
-            let evaluation = await MLSearchConceptDiscovery.evaluateWithCompletion(
-                coveredAssetCount: covered,
-                sensitiveUIDs: sensitive,
-                search: search
-            )
-            guard !Task.isCancelled, generation == refreshGeneration else { return }
-            conceptEvidence = evaluation.evidence
-            visualStagesComplete = evaluation.isComplete
-            conceptKey = evaluation.isComplete ? key : nil
-        }
-        let evidence = conceptEvidence
-        let newConcepts = await Self.background {
-            evidence.map { entry in
-                let matches = entry.rankedUIDs.compactMap { itemsByUID[$0] }
-                // The best-ranked matches make the most convincing previews.
-                let previews = TimelineSearchDiscovery.representatives(
-                    for: Array(matches.prefix(12)),
-                    context: context
-                )
-                return TimelineSearchSuggestion(
-                    id: "concept:\(entry.concept.id)",
-                    query: entry.concept.title,
-                    title: entry.concept.title,
-                    subtitle: TimelineSearchDiscovery.countText(matches.count),
-                    systemImage: entry.concept.systemImage,
-                    kind: .concept,
-                    matchingUIDs: Set(matches.map(\.uid)),
-                    representativeUIDs: previews
-                )
-            }
-        }
-        guard !Task.isCancelled, generation == refreshGeneration else { return }
-        concepts = newConcepts
-        publish(content: content)
         settle(
             content: content, visualAvailable: visualAvailable,
-            ranVisualStages: visualStagesComplete, indexingReady: refreshIndexingReady
+            ranVisualStages: includeVisualConcepts && visualStagesComplete, indexingReady: refreshIndexingReady
         )
     }
 
@@ -623,13 +630,15 @@ public final class SmartSearchDiscoveryModel {
         Self.visualEvidenceKey(timelineRevision: timelineRevision, snapshot: snapshot)
     }
 
-    static func visualEvidenceKey(timelineRevision: UInt64, snapshot: MLSmartSearchSnapshot?) -> String {
+    static func visualEvidenceKey(
+        timelineRevision: UInt64, snapshot: MLSmartSearchSnapshot?, indexingKey: String? = nil
+    ) -> String {
         let selected = snapshot?.availableModels.first { $0.id == snapshot?.selectedModelID }
         return [
             "\(timelineRevision)",
             snapshot?.selectedModelID.map { "\($0)" } ?? "-",
             selected.map { "\($0.descriptor.displayName)|\($0.downloadPlan?.revision ?? "local")" } ?? "-",
-            indexingBucket(snapshot),
+            indexingKey ?? indexingBucket(snapshot),
         ].joined(separator: "|")
     }
 

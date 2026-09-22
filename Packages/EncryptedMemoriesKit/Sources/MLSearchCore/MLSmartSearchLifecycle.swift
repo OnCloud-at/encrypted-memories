@@ -699,7 +699,6 @@ public actor MLSmartSearchLifecycle {
 
         /// Test seam: runs when a Visual Search removal has published `.deleting`, before teardown.
         private var visualRemovalContinuationGate: (@Sendable () async -> Void)?
-
         func setVisualRemovalContinuationGate(_ gate: (@Sendable () async -> Void)?) {
             visualRemovalContinuationGate = gate
         }
@@ -878,7 +877,7 @@ public actor MLSmartSearchLifecycle {
 
     /// All reviewed suggestion prompts share one automatic, preemptible scan of the active index.
     /// The complete result is required before the sensitive gate can authorize any previews.
-    public func searchSuggestionEvidence() async throws -> [String: [PhotoUID]] {
+    public func searchSuggestionEvidence() async throws -> MLSearchBatchResults {
         guard !isShutDown, persistent.isEnabled, persistent.isVisualSearchEnabled,
             let session, lastCoverage.indexed > 0
         else { throw MLSmartSearchQueryError.unavailable }
@@ -895,11 +894,16 @@ public actor MLSmartSearchLifecycle {
         guard generation == sessionGeneration, !isShutDown,
             inventory.sourceEpoch == initialInventory.sourceEpoch
         else { throw MLSmartSearchQueryError.staleEpoch }
-        let allowedUIDs = Set(inventory.uids)
-        return Dictionary(
-            uniqueKeysWithValues: results.map { result in
-                (result.queryText, result.results.map(\.uid).filter { allowedUIDs.contains($0) })
-            })
+        // Result candidates are bounded by prompts × limit. Do not allocate another whole-library set.
+        var removedUIDs = Set(results.results.flatMap { $0.results.map(\.uid) })
+        for uid in inventory.uids { removedUIDs.remove(uid) }
+        return MLSearchBatchResults(
+            results: results.results.map { result in
+                MLSearchResults(
+                    descriptor: result.descriptor, queryText: result.queryText,
+                    results: result.results.filter { !removedUIDs.contains($0.uid) }, durationMs: result.durationMs)
+            },
+            scannedUIDs: results.scannedUIDs.intersection(inventory.uids))
     }
 
     /// Number of assets the active visual model can answer for; 0 when visual search is off or not ready.

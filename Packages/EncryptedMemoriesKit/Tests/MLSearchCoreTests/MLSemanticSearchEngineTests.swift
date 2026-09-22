@@ -96,15 +96,49 @@ import Testing
         for query in queries { expected.append(try await engine.search(query).results) }
         let priorReads = cipher.reads
         let actual = try await engine.searchBatch(queries)
-        #expect(actual.map(\.results) == expected)
-        #expect(actual.map(\.queryText) == queries.map(\.queryText))
+        #expect(actual.results.map(\.results) == expected)
+        #expect(actual.results.map(\.queryText) == queries.map(\.queryText))
         #expect(cipher.reads - priorReads == 601, "each encrypted row is read once for the whole batch")
+        #expect(actual.scannedUIDs.isEmpty, "a skipped prompt cannot authorize previews")
+        let checked = try await engine.searchBatch(Array(queries.dropFirst()))
+        #expect(checked.scannedUIDs.count == 601)
+        #expect((0..<601).allSatisfy { checked.scannedUIDs.contains(uid("item-\($0)")) })
         let encoded = await encoder.count
         _ = try await engine.searchBatch(queries)
         #expect(await encoder.count == encoded)
         await engine.purgeCachedBlocks()
         _ = try await engine.searchBatch(queries)
         #expect(await encoder.count == encoded + queries.count)
+    }
+
+    @Test func scanMembershipPreservesExactUIDEqualityAndSnapshotIsolation() {
+        let original =
+            (0..<1_031).map {
+                PhotoUID(volumeID: "volume-\($0 % 7)", nodeID: "node-\($0)")
+            } + [
+                PhotoUID(volumeID: "é", nodeID: "🌿"),
+                PhotoUID(volumeID: "e\u{301}", nodeID: "🌿"),
+                PhotoUID(volumeID: "", nodeID: ""),
+            ]
+        let reference = Set(original)
+        var membership = MLScannedUIDMembership()
+        for start in stride(from: 0, to: original.count, by: 256) {
+            membership.formUnion(original[start..<min(original.count, start + 256)])
+        }
+        #expect(membership.count == reference.count)
+        let probes = original + original.map { PhotoUID(volumeID: $0.volumeID + "-other", nodeID: $0.nodeID) }
+        for candidate in probes { #expect(membership.contains(candidate) == reference.contains(candidate)) }
+
+        let completed = membership
+        let later = PhotoUID(volumeID: "volume-0", nodeID: "indexed-after-batch")
+        membership.formUnion([later])
+        #expect(!completed.contains(later), "later indexing cannot authorize an unchecked preview")
+        let current = Array(original.prefix(300)) + [later]
+        let restricted = completed.intersection(current)
+        let expected = reference.intersection(current)
+        #expect(restricted.count == expected.count)
+        for candidate in probes + [later] { #expect(restricted.contains(candidate) == expected.contains(candidate)) }
+        #expect(MLScannedUIDMembership().intersection(original).isEmpty)
     }
 
     private struct DualEncoder: MLAssetEmbedder, MLTextQueryEncoder {
@@ -339,6 +373,24 @@ import Testing
         #expect(try await engine.search(MLSearchQuery(descriptor: descriptor, queryText: "first")).count == 1)
         #expect(try await engine.search(MLSearchQuery(descriptor: descriptor, queryText: "second")).count == 1)
         #expect(store.blockLoads == 2)
+    }
+
+    @Test func batchCoverageExcludesRowsRemovedDuringSelfHealing() async throws {
+        let invalid = uid("invalid")
+        let valid = uid("valid")
+        let store = SelfHealingStore(invalidUID: invalid)
+        _ = store.upsert([
+            MLEmbeddingRecord(uid: valid, descriptor: descriptor, vector: [1, 0, 0]),
+            MLEmbeddingRecord(uid: invalid, descriptor: descriptor, vector: [0, 1, 0]),
+        ])
+        let engine = MLSemanticSearchEngine(
+            store: store, encoder: Encoder(vector: [1, 0, 0]), scorer: ReferenceDotProductScorer())
+        let result = try await engine.searchBatch([MLSearchQuery(descriptor: descriptor, queryText: "fixture")])
+        #expect(result.scannedUIDs.count == 1)
+        #expect(result.scannedUIDs.contains(valid))
+        #expect(!result.scannedUIDs.contains(invalid))
+        #expect(result.results.first?.results.map(\.uid) == [valid])
+        #expect(store.blockLoads == 1)
     }
 
     @Test func streamingKeepsRankingAndTieOrderAcrossBoundedBlocks() async throws {

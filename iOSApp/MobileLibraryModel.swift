@@ -197,6 +197,10 @@ final class MobileLibraryModel {
     var isBackgroundLoading: Bool { isThumbnailPrefetchLoading || isNewAssetThumbnailLoading }
     private var isThumbnailPrefetchLoading = false
     private var isNewAssetThumbnailLoading = false
+    /// Automatic suggestion scans must wait for the library's startup and thumbnail work.
+    var allowsAutomaticSuggestionRefresh: Bool {
+        initialLibraryLoadSettled && loadState.hasSettled && !isBackgroundLoading && !isRefreshingLibrary
+    }
     /// Indicates that explicit sign-out is closing account owners and deleting account data.
     /// Transient session replacement does not set this flag.
     private(set) var isSigningOut = false

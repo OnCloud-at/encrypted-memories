@@ -107,8 +107,8 @@ public actor MLSemanticSearchEngine {
     public func searchBatch(
         _ queries: [MLSearchQuery],
         shouldContinue: @escaping @Sendable () -> Bool = { true }
-    ) async throws -> [MLSearchResults] {
-        guard let first = queries.first else { return [] }
+    ) async throws -> MLSearchBatchResults {
+        guard let first = queries.first else { return MLSearchBatchResults(results: [], scannedUIDs: []) }
         guard queries.count <= 40, queries.allSatisfy({ $0.descriptor == first.descriptor }) else {
             throw MLSemanticSearchError.incompatibleBatch
         }
@@ -146,6 +146,7 @@ public actor MLSemanticSearchEngine {
             vectors.append(vector)
         }
         var ranked = Array(repeating: [MLSearchResult](), count: queries.count)
+        var scannedUIDs = MLScannedUIDMembership()
         if queries.contains(where: { $0.limit > 0 }) {
             try store.forEachVectorBlock(
                 for: first.descriptor, maximumRows: min(queryBlockRowLimit, 256)
@@ -157,6 +158,9 @@ public actor MLSemanticSearchEngine {
                     ).results
                     ranked[index] = Self.mergeTopResults(ranked[index], results, limit: queries[index].limit)
                 }
+                if queries.allSatisfy({ $0.limit > 0 }) {
+                    scannedUIDs.formUnion(block.uids)
+                }
             }
         }
         try checkContinuation()
@@ -164,12 +168,13 @@ public actor MLSemanticSearchEngine {
         let durationMs =
             Double(duration.components.seconds) * 1_000
             + Double(duration.components.attoseconds) / 1_000_000_000_000_000
-        return queries.indices.map { index in
+        let results = queries.indices.map { index in
             MLSearchResults(
                 descriptor: first.descriptor, queryText: texts[index],
                 results: relevancePolicy.relevantResults(from: ranked[index]), durationMs: durationMs
             )
         }
+        return MLSearchBatchResults(results: results, scannedUIDs: scannedUIDs)
     }
 
     public func coverage(for descriptor: MLModelDescriptor, allAssets: [PhotoUID]) throws -> MLIndexCoverage {

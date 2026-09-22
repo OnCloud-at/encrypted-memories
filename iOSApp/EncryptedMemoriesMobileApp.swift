@@ -271,7 +271,7 @@ private struct MobileMainTabView: View {
         SmartSearchDiscoveryScheduler.revisionKey(
             timelineRevision: libraryModel.timelineRevision, favoriteUIDs: libraryModel.favoriteUIDs,
             coordinateCount: libraryModel.locationIndex.coordinates.count, smartSearch: libraryModel.smartSearch
-        )
+        ) + "|librarySettled:\(libraryModel.allowsAutomaticSuggestionRefresh)"
     }
 
     private func updateSearchActivity() {
@@ -302,7 +302,8 @@ private struct MobileMainTabView: View {
                 libraryModel.searchSuggestions.update(
                     sections: libraryModel.sections, timelineRevision: libraryModel.timelineRevision,
                     favoriteUIDs: libraryModel.favoriteUIDs, coordinates: libraryModel.locationIndex.coordinates,
-                    smartSearch: libraryModel.smartSearch
+                    smartSearch: libraryModel.smartSearch,
+                    libraryIsSettled: libraryModel.allowsAutomaticSuggestionRefresh
                 )
             }
             .onChange(of: selection, initial: true) { _, _ in updateSearchActivity() }

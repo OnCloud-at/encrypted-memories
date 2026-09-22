@@ -38,10 +38,12 @@ import Testing
         #expect(projection.snapshot.items.map(\.uid) == [a.uid, b.uid])
     }
 
-    @Test func coordinatorDropsSupersededLargeLibraryResult() async {
+    @Test func coordinatorDropsSupersededLargeLibraryResult() async throws {
         let items = (0..<30_000).map { item("item-\($0)", seconds: Double($0)) }
         let sections = [section(items)]
-        let coordinator = TimelineSearchProjectionCoordinator()
+        let gate = ProjectionGate()
+        defer { gate.release() }
+        let coordinator = TimelineSearchProjectionCoordinator(beforeProjection: { await gate.wait() })
         let staleKey = TimelineSearchProjectionKey(
             sourceRevision: 1,
             query: "does-not-exist",
@@ -56,13 +58,45 @@ import Testing
         )
 
         let staleTask = Task { await coordinator.resolve(sections: sections, key: staleKey) }
-        await Task.yield()
+        let deadline = ContinuousClock.now + .seconds(5)
+        while !gate.hasEntered, ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(1)) }
+        try #require(gate.hasEntered, "the stale request must own a pending projection before replacement")
         let newest = await coordinator.resolve(sections: sections, key: newestKey)
+        gate.release()
         let stale = await staleTask.value
 
         #expect(stale == nil)
         #expect(newest?.key == newestKey)
         #expect(newest?.snapshot.items.map(\.uid.nodeID) == ["item-29999"])
+    }
+
+    private final class ProjectionGate: @unchecked Sendable {
+        private let lock = NSLock()
+        private var entered = false
+        private var released = false
+        private var continuation: CheckedContinuation<Void, Never>?
+        var hasEntered: Bool { lock.withLock { entered } }
+
+        func wait() async {
+            await withCheckedContinuation { continuation in
+                let resumeNow = lock.withLock {
+                    if entered || released { return true }
+                    entered = true
+                    self.continuation = continuation
+                    return false
+                }
+                if resumeNow { continuation.resume() }
+            }
+        }
+
+        func release() {
+            let waiting = lock.withLock {
+                released = true
+                defer { continuation = nil }
+                return continuation
+            }
+            waiting?.resume()
+        }
     }
 
     @Test func cancelReleasesCachedProjection() async {

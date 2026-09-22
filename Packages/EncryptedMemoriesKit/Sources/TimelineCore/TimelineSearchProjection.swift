@@ -68,6 +68,15 @@ public actor TimelineSearchProjectionCoordinator {
 
     public init() {}
 
+    #if DEBUG
+        private var beforeProjection: (@Sendable () async -> Void)?
+
+        /// Deterministic overlap seam; release builds retain the normal projection path only.
+        init(beforeProjection: @escaping @Sendable () async -> Void) {
+            self.beforeProjection = beforeProjection
+        }
+    #endif
+
     deinit {
         pendingTask?.cancel()
     }
@@ -81,8 +90,14 @@ public actor TimelineSearchProjectionCoordinator {
         generation &+= 1
         let requestGeneration = generation
         pendingTask?.cancel()
+        #if DEBUG
+            let beforeProjection = beforeProjection
+        #endif
         let task = Task.detached(priority: .userInitiated) {
-            TimelineSearchProjection(key: key, sections: sections, revision: requestGeneration)
+            #if DEBUG
+                await beforeProjection?()
+            #endif
+            return TimelineSearchProjection(key: key, sections: sections, revision: requestGeneration)
         }
         pendingTask = task
         let projection = await withTaskCancellationHandler {

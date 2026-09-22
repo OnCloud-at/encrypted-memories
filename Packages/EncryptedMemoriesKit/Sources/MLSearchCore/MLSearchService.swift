@@ -141,7 +141,7 @@ public actor MLSearchService {
 
     public func searchBatch(
         _ texts: [String], limit: Int, shouldContinue: @escaping @Sendable () -> Bool
-    ) async throws -> [MLSearchResults] {
+    ) async throws -> MLSearchBatchResults {
         try await searchEngine.searchBatch(
             texts.map { MLSearchQuery(descriptor: descriptor, queryText: $0, limit: limit) },
             shouldContinue: shouldContinue

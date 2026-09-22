@@ -10,6 +10,8 @@ public struct TimelineSearchDiscoveryContext: Sendable {
     public var favoriteUIDs: Set<PhotoUID>
     /// Items that may appear in results but never as a landing preview (for example the ML sensitive gate).
     public var excludedRepresentativeUIDs: Set<PhotoUID>
+    /// When supplied, only items accepted by this check may become previews. Result membership stays unchanged.
+    public var allowsRepresentative: (@Sendable (PhotoUID) -> Bool)?
     /// Set when the sensitive gate should run but could not complete. Suggestions then carry no previews at
     /// all, so an unchecked photo is never shown on the landing.
     public var suppressesRepresentatives: Bool
@@ -20,6 +22,7 @@ public struct TimelineSearchDiscoveryContext: Sendable {
         locale: Locale = .current,
         favoriteUIDs: Set<PhotoUID> = [],
         excludedRepresentativeUIDs: Set<PhotoUID> = [],
+        allowsRepresentative: (@Sendable (PhotoUID) -> Bool)? = nil,
         suppressesRepresentatives: Bool = false
     ) {
         self.now = now
@@ -27,6 +30,7 @@ public struct TimelineSearchDiscoveryContext: Sendable {
         self.locale = locale
         self.favoriteUIDs = favoriteUIDs
         self.excludedRepresentativeUIDs = excludedRepresentativeUIDs
+        self.allowsRepresentative = allowsRepresentative
         self.suppressesRepresentatives = suppressesRepresentatives
     }
 }
@@ -534,8 +538,11 @@ extension TimelineSearchDiscovery {
         context: TimelineSearchDiscoveryContext
     ) -> [PhotoUID] {
         guard !context.suppressesRepresentatives else { return [] }
-        let eligible = matches.filter { !context.excludedRepresentativeUIDs.contains($0.uid) }
-            .sorted { $0.captureTime < $1.captureTime }
+        let eligible = matches.filter {
+            !context.excludedRepresentativeUIDs.contains($0.uid)
+                && (context.allowsRepresentative?($0.uid) ?? true)
+        }
+        .sorted { $0.captureTime < $1.captureTime }
         guard !eligible.isEmpty, count > 0 else { return [] }
         let first =
             eligible.last(where: { context.favoriteUIDs.contains($0.uid) })

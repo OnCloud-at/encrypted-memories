@@ -166,7 +166,7 @@ public protocol MLSmartSearchSession: Sendable {
     ) async throws -> MLSearchResults
     func searchBatch(
         _ texts: [String], limit: Int, shouldContinue: @escaping @Sendable () -> Bool
-    ) async throws -> [MLSearchResults]
+    ) async throws -> MLSearchBatchResults
     func releaseMemory() async
     func shutdown() async
 }
@@ -174,12 +174,13 @@ public protocol MLSmartSearchSession: Sendable {
 public extension MLSmartSearchSession {
     func searchBatch(
         _ texts: [String], limit: Int, shouldContinue: @escaping @Sendable () -> Bool
-    ) async throws -> [MLSearchResults] {
+    ) async throws -> MLSearchBatchResults {
         var results: [MLSearchResults] = []
         for text in texts {
             results.append(try await search(text, limit: limit, shouldContinue: shouldContinue))
         }
-        return results
+        // A fallback session cannot establish shared scan membership. Fail closed for previews.
+        return MLSearchBatchResults(results: results, scannedUIDs: [])
     }
 
     func search(
