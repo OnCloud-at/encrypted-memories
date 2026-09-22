@@ -77,6 +77,8 @@ public final class LivePhotoMotionController {
                 guard self?.isCurrentPreparation(generation, isStillCurrent: isStillCurrent) == true else { return }
                 // Build the streaming player. Its resource loader serves entirely from the local encrypted cache.
                 let stream = try await streamer.makeStreamingAsset(for: motionUID)
+                var adopted = false
+                defer { if !adopted { stream.close() } }
                 guard self?.isCurrentPreparation(generation, isStillCurrent: isStillCurrent) == true else { return }
                 let player = AVPlayer(playerItem: AVPlayerItem(asset: stream.asset))
                 player.actionAtItemEnd = .pause
@@ -105,6 +107,7 @@ public final class LivePhotoMotionController {
                     self.isCurrentPreparation(generation, isStillCurrent: isStillCurrent)
                 else { return }
                 self.asset = stream
+                adopted = true
                 self.player = player
                 self.loadState = .ready
                 self.startPlaybackIfRequested()
@@ -169,7 +172,9 @@ public final class LivePhotoMotionController {
         player?.pause()
         isPlayRequested = false
         isPlaying = false
+        player?.replaceCurrentItem(with: nil)
         player = nil
+        asset?.close()
         asset = nil
         loadState = .idle
     }

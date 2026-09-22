@@ -5,6 +5,8 @@ import LibrarySourceRuntime
 import MLSearchAppleAdapter
 import MLSearchBackgroundAppleAdapter
 import MLSearchCore
+import MLSearchFeature
+import MapUIKitAdapter
 import MediaByteCache
 import MediaCacheCore
 import MediaCacheUIKitAdapter
@@ -224,6 +226,9 @@ final class MobileLibraryModel {
         backgroundHost: AppleSmartSearchBackgroundCoordinator.shared
     )
     var smartSearch: MLSmartSearchController? { smartSearchSession.controller }
+    let searchSuggestions = SmartSearchDiscoveryScheduler { latitude, longitude in
+        await NativePlaceNameResolver.shared.cityName(latitude: latitude, longitude: longitude)
+    }
 
     /// Encrypted GPS index shared with the Map tab. The per-account key protects it at rest.
     let locationIndex = PhotoLocationIndex()
@@ -967,6 +972,7 @@ final class MobileLibraryModel {
     /// Builds the account-scoped Smart Search lifecycle. MLSearchCore owns lifecycle decisions.
     private func configureSmartSearch(session: ProtonSession, client: ProtonClientFacade, feed: UIKitThumbnailFeed) {
         guard AppleSmartSearchBootstrap.featureAvailability() == .available else {
+            searchSuggestions.reset()
             smartSearchSession.stop()
             return
         }
@@ -1056,6 +1062,7 @@ final class MobileLibraryModel {
         let activeChangeMonitor = libraryChangeMonitor
         let activeLocationCrawl = locationCrawl
         let activeLocationCrawlStarter = locationCrawlStartTask
+        searchSuggestions.reset()
         let smartSearchShutdown = smartSearchSession.stop()
         let sourceAnalysisShutdown = stopSourceAnalysis()
 
@@ -1196,6 +1203,7 @@ final class MobileLibraryModel {
         favoriteMutationsInFlight = []
         timelineRevision &+= 1
         thumbnailFeed = nil
+        searchSuggestions.reset()
         let smartSearchShutdown = smartSearchSession.stop()
         let sourceAnalysisShutdown = stopSourceAnalysis()
         thumbnailCache = nil
@@ -1334,6 +1342,7 @@ final class MobileLibraryModel {
             timelineRevision &+= 1
         }
         thumbnailFeed = nil
+        searchSuggestions.reset()
         smartSearchSession.stop()
         stopSourceAnalysis()
         loadState = .preparingInventory

@@ -240,6 +240,12 @@ public struct LibraryResourcePolicy: Sendable, Equatable {
             }
             return result(true, 1, .seriousPressure)
         }
+        if request.intent < .userInitiated,
+            snapshot.activeVideoPlaybackCount > 0 || snapshot.activeUserTransferCount > 0
+                || snapshot.activeSearchCount > 0
+        {
+            return result(false, 0, .visibleDemand)
+        }
         if snapshot.hasVisibleMediaDemand || snapshot.hasActiveUserInteraction {
             guard request.intent == .interactive else {
                 return result(false, 0, .visibleDemand)

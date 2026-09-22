@@ -59,6 +59,8 @@ public final class SmartSearchDiscoveryModel {
         /// Every library, favorites or availability change recomputes them. Published sets always match the
         /// current content.
         case continuous
+        /// Refresh while idle, preserving the last published rows until replacement metadata is ready.
+        case background
         /// They are computed once per app session: the first published rows stay on screen, and after the first
         /// complete refresh nothing is recomputed until the next launch. Library changes never bring the loading
         /// placeholder back. An applied suggestion keeps its session result set, intersected with the current
@@ -98,6 +100,7 @@ public final class SmartSearchDiscoveryModel {
     private var visualConceptsCompletedWhenReady = false
     /// Only the current refresh may publish after an asynchronous boundary.
     @ObservationIgnored private var refreshGeneration: UInt64 = 0
+    @ObservationIgnored private(set) var lastRefreshCompleted = false
     @ObservationIgnored private var metadata = TimelineSearchDiscoveryResult()
     @ObservationIgnored private var places: [TimelineSearchSuggestion] = []
     @ObservationIgnored private var concepts: [TimelineSearchSuggestion] = []
@@ -134,7 +137,7 @@ public final class SmartSearchDiscoveryModel {
     /// render time, so it follows a visual search toggle at once without a refresh.
     public func showsVisualSuggestionsPendingNote(_ snapshot: MLSmartSearchSnapshot?) -> Bool {
         guard Self.visualConceptsAvailable(snapshot) else { return false }
-        return !Self.visualIndexReady(snapshot) || !visualConceptsCompletedWhenReady
+        return !Self.visualIndexReady(snapshot)
     }
 
     /// Changes whenever the visual completion exception could apply. Hosts add it to their refresh key, because
@@ -146,7 +149,7 @@ public final class SmartSearchDiscoveryModel {
     /// The content that published rows are checked against. Under `.oncePerSession`, published rows stay valid
     /// for the whole session, so later library changes neither hide them nor show the placeholder again.
     private func effective(_ content: SmartSearchContentIdentity) -> SmartSearchContentIdentity {
-        guard refreshPolicy == .oncePerSession, hasComputed, let computedContent else { return content }
+        guard refreshPolicy != .continuous, hasComputed, let computedContent else { return content }
         return computedContent
     }
 
@@ -396,11 +399,12 @@ public final class SmartSearchDiscoveryModel {
         showsSmartSearchHint = snapshot?.isEnabled != true
         // A complete session refresh is final until the next launch: no compute for a UI feature.
         guard !isSessionComplete || needsVisualCompletion(snapshot) else { return }
+        lastRefreshCompleted = false
         refreshGeneration &+= 1
         let generation = refreshGeneration
         let refreshIndexingReady = Self.visualIndexReady(snapshot)
         // Under `.oncePerSession` the first published rows stay on screen while a later refresh replaces them.
-        let keepsRows = refreshPolicy == .oncePerSession && hasComputed
+        let keepsRows = refreshPolicy != .continuous && hasComputed
         if keepsRows {
             // The next publish replaces the rows at once; nothing is cleared, so no placeholder appears.
         } else if computedContent?.timelineRevision != timelineRevision {
@@ -424,19 +428,23 @@ public final class SmartSearchDiscoveryModel {
             settledContent = nil
             settledVisualAvailability = nil
         }
+        if refreshPolicy == .background, visualAvailable, !includeVisualConcepts {
+            settledVisualAvailability = nil
+        }
         if !visualAvailable {
             clearVisualEvidence()
         }
 
         // Stage 1: the sensitive gate must finish before any preview is chosen.
         var covered = 0
-        var gatePassed = true
+        var gatePassed = !visualAvailable
         if Self.visualConceptsAvailable(snapshot), let search {
             covered = await indexedAssetCount()
             guard !Task.isCancelled, generation == refreshGeneration else { return }
             if covered == 0 {
                 clearVisualEvidence()
             } else {
+                gatePassed = true
                 let key = evidenceKey(timelineRevision: timelineRevision, snapshot: snapshot)
                 if gateKey != key, !includeVisualConcepts {
                     // The gate needs inference, which this refresh skips. Fail closed: no previews.
@@ -449,11 +457,16 @@ public final class SmartSearchDiscoveryModel {
                         gateKey = key
                     } catch {
                         guard !Task.isCancelled, generation == refreshGeneration else { return }
+                        PhotoDiagnostics.shared.increment("ml.suggestions.sensitiveGateFailed")
                         gatePassed = false
                         clearVisualEvidence()
                     }
                 }
             }
+        }
+        if !gatePassed {
+            clearVisualEvidence()
+            places = []
         }
         let context = TimelineSearchDiscoveryContext(
             favoriteUIDs: favoriteUIDs,
@@ -466,6 +479,10 @@ public final class SmartSearchDiscoveryModel {
             TimelineSearchDiscovery.librarySuggestions(sections: sections, context: context)
         }
         guard !Task.isCancelled, generation == refreshGeneration else { return }
+        if computedContent != content {
+            places = []
+            concepts = []
+        }
         metadata = newMetadata
         publish(content: content)
 
@@ -583,6 +600,7 @@ public final class SmartSearchDiscoveryModel {
     private func settle(
         content: SmartSearchContentIdentity, visualAvailable: Bool, ranVisualStages: Bool, indexingReady: Bool
     ) {
+        lastRefreshCompleted = !visualAvailable || ranVisualStages
         if ranVisualStages {
             settledVisualAvailability = visualAvailable
             if visualAvailable && indexingReady {
@@ -602,10 +620,16 @@ public final class SmartSearchDiscoveryModel {
     }
 
     private func evidenceKey(timelineRevision: UInt64, snapshot: MLSmartSearchSnapshot?) -> String {
-        [
+        Self.visualEvidenceKey(timelineRevision: timelineRevision, snapshot: snapshot)
+    }
+
+    static func visualEvidenceKey(timelineRevision: UInt64, snapshot: MLSmartSearchSnapshot?) -> String {
+        let selected = snapshot?.availableModels.first { $0.id == snapshot?.selectedModelID }
+        return [
             "\(timelineRevision)",
             snapshot?.selectedModelID.map { "\($0)" } ?? "-",
-            Self.indexingBucket(snapshot),
+            selected.map { "\($0.descriptor.displayName)|\($0.downloadPlan?.revision ?? "local")" } ?? "-",
+            indexingBucket(snapshot),
         ].joined(separator: "|")
     }
 

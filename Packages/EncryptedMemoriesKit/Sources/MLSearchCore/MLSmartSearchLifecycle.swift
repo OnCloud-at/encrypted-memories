@@ -854,8 +854,11 @@ public actor MLSmartSearchLifecycle {
         }
         let results = try await deps.resourceCoordinator.withHeavyPermit(
             LibraryWorkRequest(workload: .mlInference, intent: intent, memoryClass: .small)
-        ) { _ in
-            try await session.search(text, limit: limit)
+        ) { lease in
+            try await session.search(
+                text, limit: limit,
+                shouldContinue: { intent >= .userInitiated || lease.shouldContinue() }
+            )
         }
         guard generation == sessionGeneration else {
             throw MLSmartSearchQueryError.staleEpoch
@@ -871,6 +874,32 @@ public actor MLSmartSearchLifecycle {
             results: results.results.filter { allowedUIDs.contains($0.uid) },
             durationMs: results.durationMs
         )
+    }
+
+    /// All reviewed suggestion prompts share one automatic, preemptible scan of the active index.
+    /// The complete result is required before the sensitive gate can authorize any previews.
+    public func searchSuggestionEvidence() async throws -> [String: [PhotoUID]] {
+        guard !isShutDown, persistent.isEnabled, persistent.isVisualSearchEnabled,
+            let session, lastCoverage.indexed > 0
+        else { throw MLSmartSearchQueryError.unavailable }
+        let generation = sessionGeneration
+        let initialInventory = await deps.assetsProvider()
+        guard generation == sessionGeneration, !isShutDown else { throw MLSmartSearchQueryError.staleEpoch }
+        let prompts = MLSearchConceptCatalog.sensitivePrompts + MLSearchConceptCatalog.curated.map(\.prompt)
+        let results = try await deps.resourceCoordinator.withHeavyPermit(
+            LibraryWorkRequest(workload: .mlInference, intent: .automatic, memoryClass: .small)
+        ) { lease in
+            try await session.searchBatch(prompts, limit: 400, shouldContinue: { lease.shouldContinue() })
+        }
+        let inventory = await deps.assetsProvider()
+        guard generation == sessionGeneration, !isShutDown,
+            inventory.sourceEpoch == initialInventory.sourceEpoch
+        else { throw MLSmartSearchQueryError.staleEpoch }
+        let allowedUIDs = Set(inventory.uids)
+        return Dictionary(
+            uniqueKeysWithValues: results.map { result in
+                (result.queryText, result.results.map(\.uid).filter { allowedUIDs.contains($0) })
+            })
     }
 
     /// Number of assets the active visual model can answer for; 0 when visual search is off or not ready.

@@ -27,6 +27,8 @@ public extension View {
         prompt: Text,
         recentSearches: [String] = [],
         suggestions: [SmartSearchSuggestionItem] = [],
+        isUpdatingSuggestions: Bool = false,
+        onPresentationChange: @escaping (Bool) -> Void = { _ in },
         onClearRecentSearches: @escaping () -> Void = {}
     ) -> some View {
         modifier(
@@ -40,6 +42,8 @@ public extension View {
                 prompt: prompt,
                 recentSearches: recentSearches,
                 suggestions: suggestions,
+                isUpdatingSuggestions: isUpdatingSuggestions,
+                onPresentationChange: onPresentationChange,
                 onClearRecentSearches: onClearRecentSearches
             ))
     }
@@ -69,6 +73,8 @@ private struct SmartSearchToolbarModifier: ViewModifier {
     let prompt: Text
     let recentSearches: [String]
     let suggestions: [SmartSearchSuggestionItem]
+    let isUpdatingSuggestions: Bool
+    let onPresentationChange: (Bool) -> Void
     let onClearRecentSearches: () -> Void
 
     func body(content: Content) -> some View {
@@ -96,6 +102,9 @@ private struct SmartSearchToolbarModifier: ViewModifier {
                 isEnabled: isEnabled
             )
             .searchSuggestions {
+                if isUpdatingSuggestions {
+                    Text(L10n.string("search.suggestions_loading"))
+                }
                 if !recentSearches.isEmpty {
                     Section(L10n.string("search.recent")) {
                         ForEach(recentSearches, id: \.self) { query in
@@ -114,6 +123,7 @@ private struct SmartSearchToolbarModifier: ViewModifier {
                     }
                 }
             }
+            .onChange(of: isPresented) { _, presented in onPresentationChange(presented) }
             .onChange(of: text) { oldQuery, newQuery in
                 reconcileSearchQueryChange(from: oldQuery, to: newQuery)
             }

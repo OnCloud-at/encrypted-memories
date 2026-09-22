@@ -53,6 +53,22 @@ final class MobileSignedInMultiwindowTests: XCTestCase {
             windowScenes().first { $0.activationState == .foregroundActive } ?? windowScenes().first)
         let firstWindow = try XCTUnwrap(firstScene.keyWindow ?? firstScene.windows.first)
         let existingSessions = Set(windowScenes().map(\.session.persistentIdentifier))
+        addTeardownBlock { @MainActor in
+            // A thrown assertion must not leave fixture scenes active for the next suite.
+            for scene in self.windowScenes() where !existingSessions.contains(scene.session.persistentIdentifier) {
+                UIApplication.shared.requestSceneSessionDestruction(scene.session, options: nil)
+            }
+            try await self.waitUntil("fixture scenes are removed during teardown") {
+                self.windowScenes().allSatisfy { existingSessions.contains($0.session.persistentIdentifier) }
+            }
+            UIApplication.shared.activateSceneSession(for: UISceneSessionActivationRequest(session: firstScene.session))
+            {
+                error in XCTFail("original scene reactivation failed: \(error)")
+            }
+            try await self.waitUntil("original scene is active after teardown") {
+                firstScene.activationState == .foregroundActive
+            }
+        }
 
         // 1. Signed-in production composition renders the shared library in the first window.
         fixture.install()
@@ -318,8 +334,22 @@ final class MobileSignedInMultiwindowTests: XCTestCase {
 
     @MainActor private func waitForSearchField(in window: UIWindow) async throws -> UISearchTextField {
         var field: UISearchTextField?
+        var requestedSearchPresentation = false
         try await waitUntil("search field appears") {
             field = descendants(window).compactMap { $0 as? UISearchTextField }.first
+            if field == nil, !requestedSearchPresentation,
+                let tabController = viewControllers(in: window).compactMap({ $0 as? UITabBarController }).first,
+                let selectedSearch = tabController.selectedTab as? UISearchTab,
+                selectedSearch.automaticallyActivatesSearch,
+                let search = viewControllers(in: window)
+                    .filter({ $0.viewIfLoaded?.window === window })
+                    .compactMap({ $0.navigationItem.searchController }).first
+            {
+                // The iPadOS 27 fixture's programmatic tab selection leaves native search inactive.
+                // Activate its real controller, then require the field in this window before typing.
+                requestedSearchPresentation = true
+                search.isActive = true
+            }
             return field != nil
         }
         return try XCTUnwrap(field)

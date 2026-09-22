@@ -90,7 +90,8 @@ public final class VideoByteRangeCache: @unchecked Sendable {
         block: Int,
         encrypted: Data,
         ticket: CacheWriterGeneration.Token,
-        ownerGeneration: CacheWriterGeneration.Token
+        ownerGeneration: CacheWriterGeneration.Token,
+        publicationOwner: VideoCacheWriteOwner? = nil
     ) -> Bool {
         // A fresh post-clear lookup must not let an old owner write. Equality also rejects a stale miss
         // ticket when a caller mixes requests from different generations.
@@ -104,12 +105,19 @@ public final class VideoByteRangeCache: @unchecked Sendable {
                 let url = d.appendingPathComponent("\(block).blk")
                 let previousTotal = sizeOnDiskLocked()
                 let oldSize = fileSize(url)
-                do {
-                    try encrypted.write(to: url, options: .atomic)
-                } catch {
-                    return false
+                let publish = { () -> Bool in
+                    do {
+                        try encrypted.write(to: url, options: .atomic)
+                    } catch {
+                        return false
+                    }
+                    self.sizeOnDisk = max(0, previousTotal - oldSize + encrypted.count)
+                    return true
                 }
-                sizeOnDisk = max(0, previousTotal - oldSize + encrypted.count)
+                // The owner fence covers publication, not the later budget scan. Close waits at most
+                // for this block's write, and queued writes recheck ownership on the I/O queue.
+                let published = publicationOwner.map { $0.performIfOpen(publish) ?? false } ?? publish()
+                guard published else { return false }
                 enforceBudgetLocked(keep: d.lastPathComponent, ticket: ticket)
                 return true
             }
@@ -123,7 +131,8 @@ public final class VideoByteRangeCache: @unchecked Sendable {
         block: Int,
         encrypted: Data,
         ticket: CacheWriterGeneration.Token,
-        ownerGeneration: CacheWriterGeneration.Token
+        ownerGeneration: CacheWriterGeneration.Token,
+        publicationOwner: VideoCacheWriteOwner? = nil
     ) async -> Bool {
         await withCheckedContinuation { continuation in
             ioQueue.async {
@@ -133,7 +142,8 @@ public final class VideoByteRangeCache: @unchecked Sendable {
                         block: block,
                         encrypted: encrypted,
                         ticket: ticket,
-                        ownerGeneration: ownerGeneration
+                        ownerGeneration: ownerGeneration,
+                        publicationOwner: publicationOwner
                     ))
             }
         }

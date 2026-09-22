@@ -6,6 +6,36 @@ import Testing
 
 @Suite("Proton request governor")
 struct ProtonRequestGovernorTests {
+    @Test(arguments: [false, true])
+    func demandedPrefetchOvertakesOtherWorkWithoutRestarting(promoteBeforeEnqueue: Bool) async throws {
+        let governor = ProtonRequestGovernor(configuration: Self.configuration(initial: 1, maximum: 1))
+        let first = try await governor.acquire(scope: .storageDownload)
+        let handle = ProtonRequestGovernor.PriorityHandle(priority: .foregroundPrefetch)
+        let order = OrderRecorder()
+        let other = Task {
+            let permit = try await governor.acquire(scope: .storageDownload, priority: .userInitiated)
+            await order.append("other")
+            await governor.finish(permit, statusCode: 200)
+        }
+        try await Self.waitUntil { await governor.snapshot().storageDownload.queued == 1 }
+        if promoteBeforeEnqueue { await governor.promote(handle, to: .immediate) }
+        let prefetch = Task {
+            let permit = try await governor.acquire(
+                scope: .storageDownload, priority: .foregroundPrefetch, priorityHandle: handle)
+            await order.append("prefetch")
+            await governor.finish(permit, statusCode: 200)
+        }
+        try await Self.waitUntil { await governor.snapshot().storageDownload.queued == 2 }
+        await governor.promote(handle, to: .immediate)
+        await governor.promote(handle, to: .immediate)
+        #expect(await governor.snapshot().storageDownload.queued == 2)
+        await governor.finish(first, statusCode: 200)
+        try await prefetch.value
+        try await other.value
+        #expect(await order.values == ["prefetch", "other"])
+        #expect(await governor.snapshot().storageDownload.inFlight == 0)
+    }
+
     @Test func immediateWorkOvertakesQueuedBackgroundWork() async throws {
         let governor = ProtonRequestGovernor(configuration: Self.configuration(initial: 1, maximum: 1))
         let first = try await governor.acquire(scope: .api, priority: .background)

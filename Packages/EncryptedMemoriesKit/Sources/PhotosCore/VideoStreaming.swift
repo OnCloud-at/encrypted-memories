@@ -10,6 +10,8 @@ import Foundation
 public final class StreamingVideoAsset: @unchecked Sendable {
     public let asset: AVURLAsset
     private let retained: AnyObject
+    private let lock = NSLock()
+    private var isClosed = false
 
     public init(asset: AVURLAsset, retaining: AnyObject) {
         self.asset = asset
@@ -18,6 +20,23 @@ public final class StreamingVideoAsset: @unchecked Sendable {
 
     /// The loader behind this asset, when it can size its read-ahead from the playback duration.
     public var readAheadTuning: (any VideoStreamReadAheadTuning)? { retained as? any VideoStreamReadAheadTuning }
+
+    /// Ends this player's loader work even when a running task still retains the loader.
+    public func close() {
+        let shouldClose = lock.withLock {
+            guard !isClosed else { return false }
+            isClosed = true
+            return true
+        }
+        if shouldClose { (retained as? any VideoStreamLifetime)?.close() }
+    }
+
+    deinit { close() }
+}
+
+/// Closes only the work owned by one streaming asset, never its account's shared admission gate.
+public protocol VideoStreamLifetime: AnyObject, Sendable {
+    func close()
 }
 
 /// A resource loader that sizes its read-ahead from the clip's own bitrate.

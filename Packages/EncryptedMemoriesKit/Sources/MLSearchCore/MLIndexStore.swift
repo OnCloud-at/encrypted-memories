@@ -53,7 +53,7 @@ public protocol MLIndexStore: Sendable {
     func forEachVectorBlock(
         for descriptor: MLModelDescriptor,
         maximumRows: Int,
-        _ body: (MLVectorBlock) -> Void
+        _ body: (MLVectorBlock) throws -> Void
     ) throws
 
     /// Remove the record for `(uid, descriptor)` when an asset is deleted or must be
@@ -93,8 +93,8 @@ extension MLIndexStore {
     public func forEachVectorBlock(
         for descriptor: MLModelDescriptor,
         maximumRows: Int,
-        _ body: (MLVectorBlock) -> Void
-    ) {
+        _ body: (MLVectorBlock) throws -> Void
+    ) throws {
         guard maximumRows > 0 else { return }
         let records = allRecords(for: descriptor)
         var block = MLVectorBlock(descriptor: descriptor)
@@ -102,13 +102,13 @@ extension MLIndexStore {
         for record in records {
             if Task.isCancelled { return }
             if block.count == maximumRows {
-                body(block)
+                try body(block)
                 block = MLVectorBlock(descriptor: descriptor)
                 block.reserveCapacity(maximumRows)
             }
             _ = block.append(uid: record.uid, vector: record.vector)
         }
-        if !block.isEmpty { body(block) }
+        if !block.isEmpty { try body(block) }
     }
 
     public func coverage(for descriptor: MLModelDescriptor, allAssets: [PhotoUID]) throws -> MLIndexCoverage {

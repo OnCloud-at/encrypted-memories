@@ -142,9 +142,8 @@ struct VideoPlaybackTests {
     }
 
     @Test func everyTerminalStatusLeavesLoading() {
-        // readyToPlay and failed are always terminal (never nil, so never "keep spinning"); only
-        // `unknown` keeps the current state, and that is what the watchdog guards.
-        #expect(VideoPlayerItemStatus.readyToPlay.nextState(error: nil) != nil)
+        // Readiness is observable but does not claim playback. Only actual `.playing` ends the watchdog.
+        #expect(VideoPlayerItemStatus.readyToPlay.nextState(error: nil) == .ready)
         #expect(VideoPlayerItemStatus.failed.nextState(error: nil) != nil)
 
         // Busy states are mutually exclusive with playing/failed; nothing is both "busy" and terminal.

@@ -334,8 +334,8 @@ struct ProductionRouteGuardTests {
             support.contains("MobileMediaExporter.cleanup(info.urls)"),
             "cancelling a partial share must delete the already-downloaded originals")
         #expect(
-            support.contains("if exported.isEmpty { cleanup([]) }"),
-            "a failed export run must remove its empty staging directory immediately")
+            support.contains("if exported.isEmpty { try? FileManager.default.removeItem(at: directory) }"),
+            "a failed export run must remove only its own empty staging directory immediately")
 
         for path in [
             "iOSApp/MobileTimelineScreen.swift",
@@ -876,7 +876,7 @@ struct ProductionRouteGuardTests {
             ))
         let video = String(source[start.lowerBound..<end.lowerBound])
 
-        #expect(video.contains("if let player {\n                MobileNativeVideoPlayer("))
+        #expect(video.contains("else if let player {\n                MobileNativeVideoPlayer("))
         #expect(
             video.contains("poster: poster"),
             "the native AVKit surface must retain the existing thumbnail as its startup poster")
@@ -899,6 +899,47 @@ struct ProductionRouteGuardTests {
             "display readiness must not regress to a periodic playback-time observer")
     }
 
+    @Test func macVideoRouteDoesNotOverrideNativeControlsAndUsesAttachmentFences() throws {
+        let controller = try String(
+            contentsOf: Self.repoRoot.appendingPathComponent(
+                "Packages/EncryptedMemoriesKit/Sources/PhotoViewerCore/VideoPlaybackController.swift"
+            ),
+            encoding: .utf8
+        )
+        let tuning = try String(
+            contentsOf: Self.repoRoot.appendingPathComponent(
+                "Packages/EncryptedMemoriesKit/Sources/PhotoViewerCore/VideoPlaybackTuning.swift"
+            ),
+            encoding: .utf8
+        )
+        let view = try String(
+            contentsOf: Self.repoRoot.appendingPathComponent(
+                "Packages/EncryptedMemoriesKit/Sources/PhotoViewerFeature/PhotoViewerView.swift"
+            ),
+            encoding: .utf8
+        )
+        let status = try Self.body(of: controller, from: "private func onStatus(", to: "private func onBufferEmpty(")
+        let timeControl = try Self.body(
+            of: controller,
+            from: "private func onTimeControl(",
+            to: "private func onFailedToPlayToEnd("
+        )
+
+        #expect(tuning.contains("player.automaticallyWaitsToMinimizeStalling = true"))
+        #expect(!tuning.contains("player.automaticallyWaitsToMinimizeStalling = false"))
+        #expect(status.contains("case .ready:"))
+        #expect(!status.contains("player.play()") && !status.contains("cancelWatchdog()"))
+        #expect(timeControl.contains("case .playing:"))
+        #expect(timeControl.contains("hasStartedPlayback = true"))
+        #expect(timeControl.contains("case .paused:\n            cancelWatchdog()"))
+        #expect(!timeControl.contains("player.play()") && !timeControl.contains("player.pause()"))
+        #expect(controller.contains("startWatchdogIfNeeded(uid: uid, identity: identity)"))
+        #expect(controller.contains("guard watchdog == nil, !hasStartedPlayback else { return }"))
+        #expect(controller.contains("guard self.watchdogGeneration == generation else { return }"))
+        #expect(controller.contains("identity.matches(generation: identity.generation, player: player, item: item)"))
+        #expect(!view.contains("view.attachPoster(poster)\n        player.play()"))
+    }
+
     @Test func mobileVideoCancellationDoesNotBecomePlaybackFailure() throws {
         let source = try String(
             contentsOf: Self.repoRoot.appendingPathComponent("iOSApp/MobilePhotoViewer.swift"),
@@ -915,21 +956,50 @@ struct ProductionRouteGuardTests {
 
         #expect(
             prepare.containsCodeFragmentIgnoringWhitespace(
-                "guard isCurrent, player == nil, let backend = libraryModel.backend else { return } failed = false"
+                "guard isCurrent, player == nil, let backend = libraryModel.backend else { return }"
             ),
-            "a new current preparation must clear a stale failure before streaming starts")
+            "only the current page may create a streaming player")
+        #expect(
+            prepare.containsCodeFragmentIgnoringWhitespace(
+                "playbackGeneration &+= 1 let generation = playbackGeneration failed = false"
+            ),
+            "a new attachment must get a generation and clear a stale failure")
         #expect(
             prepare.containsCodeFragmentIgnoringWhitespace("} catch is CancellationError { return }"),
             "cancelled video preparation must not render the playback failure state")
         #expect(
             prepare.containsCodeFragmentIgnoringWhitespace(
-                "guard !Task.isCancelled, isCurrent else { return } failed = true"
+                "guard !Task.isCancelled, isCurrent, generation == playbackGeneration, requestedSourceIdentity == sourceIdentity, requestedSourceRevision == libraryModel.scopePresentationRevision else { return } failed = true"
             ),
-            "only a current, non-cancelled real error may render playback failure")
+            "only the current source generation may render playback failure")
         #expect(
-            prepare.range(of: "guard !Task.isCancelled else { return }")!.lowerBound
+            prepare.range(of: "guard !Task.isCancelled, isCurrent,")!.lowerBound
                 < prepare.range(of: "let newPlayer = AVPlayer")!.lowerBound,
             "cancellation must be checked before attaching an AVPlayer")
+        #expect(
+            video.range(of: "if failed {")!.lowerBound < video.range(of: "else if let player {")!.lowerBound,
+            "a late item failure must remain visible even while an old player reference exists")
+        let observe = try Self.body(
+            of: video,
+            from: "private func observePlayback(_ observedPlayer: AVPlayer, generation: UInt64) async",
+            to: "private func togglePlayback()"
+        )
+        #expect(
+            observe.contains("isCurrentAttachment(generation: generation, player: observedPlayer, item: observedItem)"),
+            "polling must reject callbacks from an older concrete attachment")
+        #expect(
+            observe.contains("observedItem.status == .failed"),
+            "polling must surface a player-item failure that arrives after player creation")
+        #expect(
+            !observe.contains("observedPlayer.play()") && !observe.contains("observedPlayer.pause()"),
+            "polling may mirror native AVKit state but must not override PiP or interruption behavior")
+        #expect(
+            video.contains("playbackSourceIdentity != requestedSourceIdentity")
+                && video.contains("playbackSourceRevision != requestedSourceRevision"),
+            "an account or source change must retire the previous attachment")
+        #expect(
+            !video.contains("AVAudioSession.interruptionNotification"),
+            "the viewer must preserve AVKit audio-interruption handling")
     }
 
     @Test func mobileVideoKeepsViewerGesturesOnTheNativePlayerSurface() throws {
@@ -2025,8 +2095,9 @@ struct ProductionRouteGuardTests {
             smartSearchToolbar.contains("isPresented = false"),
             "clearing the query must dismiss Apple's scope presentation instead of leaving stale filters")
         #expect(
-            !smartSearchToolbar.contains(".onChange(of: isPresented)"),
-            "collapsing a populated search field must retain its selected scope")
+            smartSearchToolbar.contains(
+                ".onChange(of: isPresented) { _, presented in onPresentationChange(presented) }"),
+            "search presentation must report resource demand without changing the selected scope")
         #expect(
             !smartSearchToolbar.contains(".dismiss(clearText: true)"),
             "unavailable Smart Search must not reject ordinary lexical library queries")

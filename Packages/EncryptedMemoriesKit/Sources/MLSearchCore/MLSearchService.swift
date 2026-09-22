@@ -130,6 +130,24 @@ public actor MLSearchService {
         )
     }
 
+    public func search(
+        _ text: String, limit: Int, shouldContinue: @escaping @Sendable () -> Bool
+    ) async throws -> MLSearchResults {
+        try await searchEngine.search(
+            MLSearchQuery(descriptor: descriptor, queryText: text, limit: limit),
+            shouldContinue: shouldContinue
+        )
+    }
+
+    public func searchBatch(
+        _ texts: [String], limit: Int, shouldContinue: @escaping @Sendable () -> Bool
+    ) async throws -> [MLSearchResults] {
+        try await searchEngine.searchBatch(
+            texts.map { MLSearchQuery(descriptor: descriptor, queryText: $0, limit: limit) },
+            shouldContinue: shouldContinue
+        )
+    }
+
     public func coverage(for assets: [PhotoUID]) async throws -> MLIndexCoverage {
         try await searchEngine.coverage(for: descriptor, allAssets: assets)
     }

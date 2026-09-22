@@ -14,7 +14,7 @@ public enum VideoViewerState: Equatable, Sendable {
     case downloading(Double)  // full-download fallback in progress (0…1)
     case buffering(Double?)  // player exists but is waiting on bytes (streaming stall / initial fill)
     case ready  // a playable AVPlayer exists, awaiting first frame
-    case playing  // AVPlayerItem reached .readyToPlay and playback started
+    case playing  // AVPlayer.timeControlStatus reached .playing
     case seeking  // user scrubbed; waiting for the new position to buffer
     case failed(VideoPlaybackError)  // gave up - message is shown to the user + logged
 
@@ -77,7 +77,7 @@ public enum VideoPlayerItemStatus: Int, Sendable {
     public func nextState(error: VideoPlaybackError?) -> VideoViewerState? {
         switch self {
         case .unknown: return nil  // keep current state
-        case .readyToPlay: return .playing
+        case .readyToPlay: return .ready
         case .failed: return .failed(error ?? .playerItemFailed(detail: nil))
         }
     }

@@ -116,7 +116,7 @@ struct AppInfrastructureTests {
     }
 
     @Test func videoStateMachineTransitions() {
-        #expect(VideoPlayerItemStatus.readyToPlay.nextState(error: nil) == .playing)
+        #expect(VideoPlayerItemStatus.readyToPlay.nextState(error: nil) == .ready)
         #expect(VideoPlayerItemStatus.failed.nextState(error: .decryptionFailed) == .failed(.decryptionFailed))
         #expect(VideoPlayerItemStatus.unknown.nextState(error: nil) == nil)  // keep current state
 

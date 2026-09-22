@@ -348,7 +348,7 @@ import TimelineCore
         )
         #expect(model.hasComputed)
         #expect(model.needsVisualCompletion(ready))
-        #expect(model.showsVisualSuggestionsPendingNote(ready))
+        #expect(!model.showsVisualSuggestionsPendingNote(ready))
         #expect(model.forYou.allSatisfy { $0.representativeUIDs.isEmpty })
 
         await model.refresh(
@@ -509,7 +509,7 @@ import TimelineCore
         #expect(!model.showsVisualSuggestionsPendingNote(off))
         #expect(model.showsVisualSuggestionsPendingNote(indexing))
         #expect(!model.needsVisualCompletion(indexing))
-        #expect(model.showsVisualSuggestionsPendingNote(ready))
+        #expect(!model.showsVisualSuggestionsPendingNote(ready))
         #expect(model.needsVisualCompletion(ready))
         #expect(model.visualCompletionKey(indexing) != model.visualCompletionKey(ready))
 

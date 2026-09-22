@@ -57,6 +57,19 @@ struct ProtonRequestGovernorSnapshot: Sendable, Equatable {
 /// to find a sustainable rate again. Feature-level work remains concurrent; only network starts are
 /// queued here so visible work can overtake background prefetch and backup requests.
 actor ProtonRequestGovernor {
+    /// A single fetch keeps this handle while demand may join its queued prefetch.
+    /// Promotion before enqueue is retained, so it cannot be lost at an actor boundary.
+    final class PriorityHandle: @unchecked Sendable {
+        private let lock = NSLock()
+        private var priority: ProtonRequestPriority
+
+        init(priority: ProtonRequestPriority) { self.priority = priority }
+        fileprivate var current: ProtonRequestPriority { lock.withLock { priority } }
+        fileprivate func promote(to value: ProtonRequestPriority) {
+            lock.withLock { priority = min(priority, value) }
+        }
+    }
+
     struct Permit: Sendable {
         fileprivate let id: UUID
         fileprivate let scope: ProtonRequestScope
@@ -99,7 +112,8 @@ actor ProtonRequestGovernor {
 
     private struct Waiter {
         let id: UUID
-        let priority: ProtonRequestPriority
+        var priority: ProtonRequestPriority
+        let priorityHandle: PriorityHandle?
         let sequence: UInt64
         let enqueuedAt: Date
         let continuation: CheckedContinuation<Permit, Error>
@@ -156,7 +170,8 @@ actor ProtonRequestGovernor {
 
     func acquire(
         scope: ProtonRequestScope,
-        priority: ProtonRequestPriority? = nil
+        priority: ProtonRequestPriority? = nil,
+        priorityHandle: PriorityHandle? = nil
     ) async throws -> Permit {
         try Task.checkCancellation()
         let id = UUID()
@@ -178,7 +193,8 @@ actor ProtonRequestGovernor {
                 states[scope]?.waiters.append(
                     Waiter(
                         id: id,
-                        priority: effectivePriority,
+                        priority: min(effectivePriority, priorityHandle?.current ?? effectivePriority),
+                        priorityHandle: priorityHandle,
                         sequence: sequence,
                         enqueuedAt: now(),
                         continuation: continuation
@@ -187,6 +203,19 @@ actor ProtonRequestGovernor {
             }
         } onCancel: {
             Task { await self.cancel(id: id, scope: scope) }
+        }
+    }
+
+    /// Changes only this fetch. Already admitted requests keep their permit and transport.
+    func promote(_ handle: PriorityHandle, to priority: ProtonRequestPriority) {
+        handle.promote(to: priority)
+        for scope in ProtonRequestScope.allCases {
+            guard var state = states[scope] else { continue }
+            for index in state.waiters.indices where state.waiters[index].priorityHandle === handle {
+                state.waiters[index].priority = min(state.waiters[index].priority, handle.current)
+            }
+            states[scope] = state
+            drain(scope)
         }
     }
 

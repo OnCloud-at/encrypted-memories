@@ -188,7 +188,8 @@ struct MobileTimelineScreen: View {
                 isPresented: libraryBannerIsPresented,
                 message: libraryBannerMessage,
                 state: libraryBannerVisualState,
-                bottomPadding: selection.isSelecting ? 84 : 20
+                bottomPadding: selection.isSelecting ? 84 : 20,
+                isActiveSurface: isActive
             )
         }
         .mobileSelectionAlerts(selection: selection) { performTrash() }

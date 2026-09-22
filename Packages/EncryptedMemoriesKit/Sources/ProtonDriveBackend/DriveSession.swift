@@ -309,7 +309,8 @@ extension DriveSession {
     func fetchBlock(
         url: String,
         token: String?,
-        priority: ProtonRequestPriority = ProtonRequestContext.priority
+        priority: ProtonRequestPriority = ProtonRequestContext.priority,
+        priorityHandle: ProtonRequestGovernor.PriorityHandle? = nil
     ) async throws -> Data {
         guard let u = URL(string: url), u.scheme == "https", u.host != nil else {
             throw ProtonAuthError.invalidResponse
@@ -321,7 +322,8 @@ extension DriveSession {
         } else if isTrustedAPIURL(u) {
             for (k, v) in authHeaders() { req.setValue(v, forHTTPHeaderField: k) }
         }
-        let permit = try await requestGovernor.acquire(scope: .storageDownload, priority: priority)
+        let permit = try await requestGovernor.acquire(
+            scope: .storageDownload, priority: priority, priorityHandle: priorityHandle)
         let data: Data
         let response: URLResponse
         do {
@@ -367,12 +369,19 @@ extension DriveSession {
     /// Streams one decoded page at a time. Callers that need a complete list can use
     /// `fetchPhotosList`; index builders should use this seam to keep remote catalog rows out of
     /// memory while retaining the same cursor and cancellation contract.
+    ///
+    /// Pagination integrity: a full page whose last link repeats an already-used cursor is a
+    /// repeating cursor (a direct repeat or a cycle like A-B-A). That loop cannot reach completion,
+    /// so it must fail with `DrivePaginationError.repeatedPhotosCursor` instead of fetching the
+    /// same pages forever or silently returning an incomplete list as a confirmed inventory.
     func forEachPhotosListPage(
         volumeID: String,
         tag: Int? = nil,
         pageSize: Int = 500,
         onPage: @escaping ([PhotosListEntry]) async throws -> Void
     ) async throws {
+        guard pageSize > 0 else { throw DrivePaginationError.invalidPageSize(pageSize) }
+        var usedCursors = Set<String>()
         var cursor: String?
         while true {
             try Task.checkCancellation()
@@ -380,8 +389,17 @@ extension DriveSession {
             if let tag { path += "&Tag=\(tag)" }
             if let cursor { path += "&PreviousPageLastLinkID=\(cursor)" }
             let page = try await getJSON(path, as: PhotosListResponse.self)
+            try Task.checkCancellation()
+            guard page.photos.count == pageSize, let last = page.photos.last?.linkID else {
+                try await onPage(page.photos)  // partial or empty terminal page
+                return
+            }
+            // Full page: compute the follow cursor and check novelty before delivering the page,
+            // so a repeating cursor never advances the scan or reaches onPage twice.
+            guard usedCursors.insert(last).inserted else {
+                throw DrivePaginationError.repeatedPhotosCursor(last)
+            }
             try await onPage(page.photos)
-            guard page.photos.count == pageSize, let last = page.photos.last?.linkID else { break }
             cursor = last
         }
     }
@@ -484,25 +502,41 @@ extension DriveSession {
 
     /// Lists trashed links. The trash endpoint returns only share and link IDs. Fetch metadata with
     /// the link endpoint before constructing the result.
+    ///
+    /// Pagination integrity: a full page that contributes zero new (shareID, linkID) identities is
+    /// an infinite loop signal; it must fail with `DrivePaginationError.trashPageWithoutNewIDs`
+    /// instead of repeating forever or returning an incomplete list.
     func listTrash(volumeID: String, pageSize: Int = 150) async throws -> [TrashLink] {
+        guard pageSize > 0 else { throw DrivePaginationError.invalidPageSize(pageSize) }
         var idsByShare: [String: [String]] = [:]
-        var page = 0
-        var totalIDs = 0
+        var seenByShare: [String: Set<String>] = [:]
+        var pageIndex = 0
         while true {
+            try Task.checkCancellation()
             let r = try await getJSON(
-                "/drive/volumes/\(volumeID)/trash?Page=\(page)&PageSize=\(pageSize)", as: VolumeTrashResponse.self)
-            var pageLinkCount = 0
+                "/drive/volumes/\(volumeID)/trash?Page=\(pageIndex)&PageSize=\(pageSize)", as: VolumeTrashResponse.self)
+            try Task.checkCancellation()
+            var rawCount = 0
+            var newCount = 0
             for group in r.trash ?? [] {
-                idsByShare[group.shareID, default: []].append(contentsOf: group.linkIDs)
-                pageLinkCount += group.linkIDs.count
+                rawCount += group.linkIDs.count
+                let key = group.shareID
+                let newIds = group.linkIDs.filter { seenByShare[key, default: []].insert($0).inserted }
+                if !newIds.isEmpty {
+                    idsByShare[key, default: []].append(contentsOf: newIds)
+                    newCount += newIds.count
+                }
             }
-            totalIDs += pageLinkCount
-            if pageLinkCount < pageSize { break }  // web client: hasNextPage = totalLinks >= PageSize
-            page += 1
+            if rawCount < pageSize { break }  // terminal page (server returned less than a full page)
+            if rawCount >= pageSize && newCount == 0 {
+                throw DrivePaginationError.trashPageWithoutNewIDs(pageIndex)
+            }
+            pageIndex += 1
         }
         var all: [TrashLink] = []
         for (shareID, ids) in idsByShare {
             for chunk in Self.chunked(ids, size: Self.metadataBatchSize) {
+                try Task.checkCancellation()
                 let data = try await send(
                     "/drive/shares/\(shareID)/links/fetch_metadata",
                     method: "POST",
@@ -513,6 +547,8 @@ extension DriveSession {
                 all.append(contentsOf: decoded.links ?? [])
             }
         }
+        try Task.checkCancellation()
+        let totalIDs = seenByShare.values.reduce(0) { $0 + $1.count }
         DebugLog.log("listTrash: vol=\(volumeID.prefix(8))… trashedIDs=\(totalIDs) resolved=\(all.count)")
         return all
     }
@@ -623,6 +659,41 @@ struct DriveBatchActionError: LocalizedError {
     let total: Int
     var errorDescription: String? {
         L10n.string("error.batch_action_incomplete \(failed) \(total)")
+    }
+}
+
+/// A paginated Drive listing made no forward progress (invalid page size or a repeating
+/// page cursor), so the scan cannot reach completion. Failing beats silently looping forever
+/// or reporting an incomplete result as a confirmed-complete inventory.
+struct DrivePaginationError: LocalizedError, Equatable {
+    let reason: Reason
+    enum Reason: Equatable {
+        /// The requested page size is not a positive integer.
+        case invalidPageSize(Int)
+        /// A photos listing full page reused an already-seen cursor (direct repeat or a cycle).
+        case repeatedPhotosCursor(String)
+        /// A trash listing returned a full page that contained no new (shareID, linkID) identities.
+        case trashPageWithoutNewIDs(pageIndex: Int)
+    }
+    static func invalidPageSize(_ pageSize: Int) -> DrivePaginationError {
+        DrivePaginationError(reason: .invalidPageSize(pageSize))
+    }
+    static func repeatedPhotosCursor(_ cursor: String) -> DrivePaginationError {
+        DrivePaginationError(reason: .repeatedPhotosCursor(cursor))
+    }
+    static func trashPageWithoutNewIDs(_ pageIndex: Int) -> DrivePaginationError {
+        DrivePaginationError(reason: .trashPageWithoutNewIDs(pageIndex: pageIndex))
+    }
+    var errorDescription: String? {
+        switch reason {
+        case .invalidPageSize(let pageSize):
+            return "Drive pagination requires a positive page size (got \(pageSize))."
+        case .repeatedPhotosCursor:
+            return "Drive photos listing did not advance. Please try again."
+        case .trashPageWithoutNewIDs(let pageIndex):
+            return
+                "Drive trash listing page \(pageIndex) returned a full page with no new link identities; aborting to avoid an infinite pagination loop."
+        }
     }
 }
 

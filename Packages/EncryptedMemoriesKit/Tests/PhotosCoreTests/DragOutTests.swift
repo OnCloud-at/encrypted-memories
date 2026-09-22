@@ -215,6 +215,24 @@ final class DragOutTests: XCTestCase {
 
     // MARK: - Cancellation
 
+    func testActiveDragOwnsTransferDemandUntilCancellationFinishes() async throws {
+        let directory = stagingDirectory
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let provider = SlowFileProvider()
+        let runtimeState = LibraryRuntimeState()
+        let stager = DragOutStager(
+            fileProvider: provider, stagingDirectory: directory,
+            safetyMarginBytes: 0, runtimeState: runtimeState)
+        _ = await stager.beginPrefetch(items: [item(5)])
+        _ = await provider.started.first { _ in true }
+        XCTAssertEqual(runtimeState.snapshot().activeUserTransferCount, 1)
+        await stager.cancelAll()
+        for _ in 0..<100 where runtimeState.snapshot().activeUserTransferCount != 0 {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertEqual(runtimeState.snapshot().activeUserTransferCount, 0)
+    }
+
     func testCancelAllFailsAwaitStagedWithCancelled() async throws {
         let directory = stagingDirectory
         let provider = SlowFileProvider()

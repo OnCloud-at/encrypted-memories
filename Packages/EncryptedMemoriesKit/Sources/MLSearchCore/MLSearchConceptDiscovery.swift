@@ -83,6 +83,7 @@ public struct MLSearchConceptEvidence: Equatable, Sendable {
 public enum MLSearchConceptDiscovery {
     public typealias Search = @Sendable (_ prompt: String, _ limit: Int) async throws -> [PhotoUID]
 
+    /// Six matches are always required. A retrieval limit below six cannot qualify any concept.
     public static func minimumHits(coveredAssetCount: Int, limit: Int = 400) -> Int {
         // Search returns at most `limit` matches. Keep qualification attainable even for
         // very large libraries, without increasing the amount of work per query.
@@ -141,6 +142,9 @@ public enum MLSearchConceptDiscovery {
             do {
                 uids = try await search(concept.prompt, limit)
             } catch {
+                if !(error is CancellationError), !Task.isCancelled {
+                    PhotoDiagnostics.shared.increment("ml.suggestions.conceptQueryFailed")
+                }
                 isComplete = false
                 continue
             }

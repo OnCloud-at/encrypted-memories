@@ -19,6 +19,27 @@ final class MetalGridInteractionController {
         self.selection = selection
     }
 
+    /// Activate a cell programmatically (VoiceOver press): routes through the CURRENT selection mode,
+    /// unlike a raw pointer single click which only ever selects. Stale UIDs fail without side effects.
+    func activate(uid: PhotoUID) -> Bool {
+        guard let coordinator else { return false }
+        guard let flatIndex = coordinator.orderedUIDs.firstIndex(of: uid) else {
+            logInteraction(event: "activateRejected", uid: uid, openViewer: false)
+            return false
+        }
+        if selectionMode {
+            selection.click(
+                flatIndex: flatIndex, uid: uid, orderedUIDs: coordinator.orderedUIDs,
+                modifiers: [], selectionMode: true)
+            logInteraction(event: "activateToggle", uid: uid, openViewer: false)
+        } else {
+            guard let onOpen else { return false }
+            onOpen(uid)
+            logInteraction(event: "activateOpen", uid: uid, openViewer: true)
+        }
+        return true
+    }
+
     /// Handle a mouse-down at a content-space point with its click count + modifiers.
     func handleClick(contentPoint: CGPoint, clickCount: Int, modifiers: GridClickModifiers) {
         guard let coordinator else { return }

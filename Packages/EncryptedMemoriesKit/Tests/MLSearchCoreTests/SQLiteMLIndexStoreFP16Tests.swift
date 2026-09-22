@@ -86,11 +86,11 @@ import Testing
         func forEachVectorBlock(
             for descriptor: MLModelDescriptor,
             maximumRows: Int,
-            _ body: (MLVectorBlock) -> Void
+            _ body: (MLVectorBlock) throws -> Void
         ) throws {
             try backing.forEachVectorBlock(for: descriptor, maximumRows: maximumRows) { block in
                 lock.withLock { blockLoads += 1 }
-                body(block)
+                try body(block)
             }
         }
         func remove(uid: PhotoUID, descriptor: MLModelDescriptor) { backing.remove(uid: uid, descriptor: descriptor) }

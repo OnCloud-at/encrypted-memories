@@ -8,6 +8,7 @@ import PhotosCore
 /// and returns a contiguous file-order window. Obsolete requests are cancelled on seek; encrypted disk
 /// data and a small decrypted-block LRU avoid repeated fetches.
 final class ProtonVideoResourceLoader: NSObject, AVAssetResourceLoaderDelegate, VideoStreamReadAheadTuning,
+    VideoStreamLifetime,
     @unchecked Sendable
 {
     private let prepared: PreparedVideo
@@ -17,13 +18,16 @@ final class ProtonVideoResourceLoader: NSObject, AVAssetResourceLoaderDelegate, 
     private let admission: JoinedShutdownGate
     /// Stable owner lease for this loader lifetime. A later lookup after clear cannot authorize an old loader.
     private let ownerGeneration: CacheWriterGeneration.Token
+    private let publicationOwner = VideoCacheWriteOwner()
     private let decryptedCache = NSCache<NSNumber, NSData>()
 
     // In-flight serving tasks, keyed by the loading request, so a seek can cancel obsolete prefetch.
     private let lock = NSLock()
+    private var isClosed = false
     private struct RequestTask {
         let id: UUID
         let task: Task<Void, Never>
+        let completion: VideoLoadingRequestCompletion
     }
     private var tasks: [ObjectIdentifier: RequestTask] = [:]
     private struct PrefetchTask {
@@ -31,6 +35,14 @@ final class ProtonVideoResourceLoader: NSObject, AVAssetResourceLoaderDelegate, 
         let task: Task<Void, Never>
     }
     private var prefetchTasks: [Int: PrefetchTask] = [:]
+    private struct EncryptedFetch {
+        let id: UUID
+        let task: Task<(Data, Bool), Error>
+        let completion: VideoPrefetchCompletion
+        let priorityHandle: ProtonRequestGovernor.PriorityHandle
+        let startedAsPrefetch: Bool
+    }
+    private var encryptedFetches: [Int: EncryptedFetch] = [:]
     /// How many ~4 MB blocks to warm ahead of the bytes AVFoundation just consumed. Deep enough that the
     /// network-fetch+decrypt read-ahead stays in front of playback (the shallow 4-block window micro-stalled
     /// higher-bitrate video). Paired with a roomier `decryptedCache` so warmed blocks survive until requested.
@@ -88,7 +100,7 @@ final class ProtonVideoResourceLoader: NSObject, AVAssetResourceLoaderDelegate, 
         else { return }
         let bytesPerSecond = Double(prepared.totalSize) / seconds
         let changed = lock.withLock { () -> Bool in
-            guard bounded > deepPrefetchBlockCount else { return false }
+            guard !isClosed, bounded > deepPrefetchBlockCount else { return false }
             deepPrefetchBlockCount = bounded
             lastForwardPrefetchOffset = -1  // let the next served range schedule the wider window
             return true
@@ -122,20 +134,49 @@ final class ProtonVideoResourceLoader: NSObject, AVAssetResourceLoaderDelegate, 
         }
     }
 
-    deinit {
-        let activeTasks = lock.withLock {
-            let activeTasks = tasks.values.map(\.task) + prefetchTasks.values.map(\.task)
+    func close() {
+        // Never hold the loader lock while joining a cache publication.
+        publicationOwner.close()
+        let active = lock.withLock { () -> ([RequestTask], [PrefetchTask], [EncryptedFetch]) in
+            guard !isClosed else { return ([], [], []) }
+            isClosed = true
+            let requests = Array(tasks.values)
+            let prefetches = Array(prefetchTasks.values)
+            let fetches = Array(encryptedFetches.values)
             tasks.removeAll()
             prefetchTasks.removeAll()
-            return activeTasks
+            encryptedFetches.removeAll()
+            decryptedCache.removeAllObjects()
+            return (requests, prefetches, fetches)
         }
-        activeTasks.forEach { $0.cancel() }
+        active.0.forEach {
+            $0.task.cancel()
+            $0.completion.finish(CancellationError())
+        }
+        active.1.forEach { $0.task.cancel() }
+        active.2.forEach {
+            $0.task.cancel()
+            $0.completion.finish()
+        }
+    }
+
+    deinit { close() }
+
+    private func checkOpen() throws {
+        try Task.checkCancellation()
+        try lock.withLock {
+            guard !isClosed else { throw CancellationError() }
+        }
     }
 
     func resourceLoader(
         _ resourceLoader: AVAssetResourceLoader,
         shouldWaitForLoadingOfRequestedResource loadingRequest: AVAssetResourceLoadingRequest
     ) -> Bool {
+        guard !lock.withLock({ isClosed }) else {
+            loadingRequest.finishLoading(with: CancellationError() as NSError)
+            return true
+        }
         if let info = loadingRequest.contentInformationRequest {
             info.contentType = prepared.contentTypeUTI
             info.isByteRangeAccessSupported = true
@@ -147,32 +188,30 @@ final class ProtonVideoResourceLoader: NSObject, AVAssetResourceLoaderDelegate, 
         }
         let key = ObjectIdentifier(loadingRequest)
         let taskID = UUID()
-        lock.withLock {
+        let completion = VideoLoadingRequestCompletion { error in
+            if let error {
+                loadingRequest.finishLoading(with: error as NSError)
+            } else {
+                loadingRequest.finishLoading()
+            }
+        }
+        let accepted = lock.withLock { () -> Bool in
+            guard !isClosed else { return false }
             let task = Task { [weak self] in
                 guard let self else { return }
                 do {
                     try await self.admission.withAdmission { [self] in
                         try await self.serve(dataRequest, request: loadingRequest)
                     }
-                    if !Task.isCancelled { loadingRequest.finishLoading() }
-                } catch is CancellationError {
-                    // A seek cancels the outer task and AVFoundation will re-ask. A closed account gate
-                    // cancels only the admitted child, so finish that stale request deterministically.
-                    if !Task.isCancelled {
-                        loadingRequest.finishLoading(with: CancellationError() as NSError)
-                    }
+                    self.finishRequest(key: key, id: taskID, error: nil)
                 } catch {
-                    if !Task.isCancelled {
-                        loadingRequest.finishLoading(with: error as NSError)
-                    }
-                }
-                self.lock.withLock {
-                    guard self.tasks[key]?.id == taskID else { return }
-                    self.tasks.removeValue(forKey: key)
+                    self.finishRequest(key: key, id: taskID, error: error)
                 }
             }
-            tasks[key] = RequestTask(id: taskID, task: task)
+            tasks[key] = RequestTask(id: taskID, task: task, completion: completion)
+            return true
         }
+        if !accepted { completion.finish(CancellationError()) }
         return true
     }
 
@@ -181,8 +220,9 @@ final class ProtonVideoResourceLoader: NSObject, AVAssetResourceLoaderDelegate, 
         didCancel loadingRequest: AVAssetResourceLoadingRequest
     ) {
         let key = ObjectIdentifier(loadingRequest)
-        let task = lock.withLock { tasks.removeValue(forKey: key)?.task }
-        task?.cancel()
+        let request = lock.withLock { tasks.removeValue(forKey: key) }
+        request?.completion.cancel()
+        request?.task.cancel()
         // The read-ahead stays alive: AVFoundation also cancels for reasons other than a seek (for example
         // a full buffer), and the next served block re-schedules the window without duplicates.
         PhotoDiagnostics.shared.emit(
@@ -190,6 +230,14 @@ final class ProtonVideoResourceLoader: NSObject, AVAssetResourceLoaderDelegate, 
             [
                 "uid": uidKey, "strategy": "range", "cancelled": "true",
             ])
+    }
+
+    private func finishRequest(key: ObjectIdentifier, id: UUID, error: Error?) {
+        let completion = lock.withLock { () -> VideoLoadingRequestCompletion? in
+            guard tasks[key]?.id == id else { return nil }
+            return tasks.removeValue(forKey: key)?.completion
+        }
+        completion?.finish(error)
     }
 
     // MARK: - Serving
@@ -211,14 +259,23 @@ final class ProtonVideoResourceLoader: NSObject, AVAssetResourceLoaderDelegate, 
         var cacheHits = 0
         var cacheMisses = 0
         for slice in slices {
-            try Task.checkCancellation()
-            guard let block = prepared.block(at: slice.blockIndex) else { continue }
-            let (clear, hit) = try await decryptedBlock(block, priority: .immediate, joinsPrefetch: true)
+            try checkOpen()
+            guard let block = prepared.block(at: slice.blockIndex) else {
+                throw StreamingError.missingBlockForSlice(slice.blockIndex)
+            }
+            let (clear, hit) = try await decryptedBlock(block, priority: .immediate)
             if hit { cacheHits += 1 } else { cacheMisses += 1 }
             let from = slice.inBlock.lower
-            let to = min(slice.inBlock.upper, clear.count)
+            let to = slice.inBlock.upper
             guard from < to else { continue }
-            dataRequest.respond(with: clear.subdata(in: from..<to))
+            guard clear.count >= to else {
+                throw StreamingError.decryptedBlockLengthMismatch(
+                    blockIndex: block.index, expected: block.clearSize, actual: clear.count)
+            }
+            try lock.withLock {
+                guard !isClosed, !Task.isCancelled else { throw CancellationError() }
+                dataRequest.respond(with: clear.subdata(in: from..<to))
+            }
             served += to - from
             // Per block, not per request: one open-ended request can span the whole file, and the
             // read-ahead must keep moving while it is served.
@@ -243,46 +300,98 @@ final class ProtonVideoResourceLoader: NSObject, AVAssetResourceLoaderDelegate, 
             ])
     }
 
-    /// Decrypted bytes for a block + whether it came from a cache (in-memory or disk). Network is the
-    /// last resort; fetched encrypted bytes are persisted so reopen / seek-back reuses them.
-    ///
-    /// `joinsPrefetch` makes a demand read wait for an in-flight prefetch of the same block instead of
-    /// downloading it a second time. A prefetch task must pass `false`, or it would wait for itself.
-    private func decryptedBlock(
-        _ block: VideoBlock,
-        priority: ProtonRequestPriority,
-        joinsPrefetch: Bool = false
+    /// Demand and prefetch claim the same encrypted fetch before any cache lookup.
+    func decryptedBlock(
+        _ block: VideoBlock, priority: ProtonRequestPriority
     ) async throws -> (Data, hit: Bool) {
+        if priority == .immediate {
+            return try await source.withDemandPriority { [self] in
+                try await resolvedDecryptedBlock(block, priority: priority)
+            }
+        }
+        return try await resolvedDecryptedBlock(block, priority: priority)
+    }
+
+    private func resolvedDecryptedBlock(
+        _ block: VideoBlock, priority: ProtonRequestPriority
+    ) async throws -> (Data, hit: Bool) {
+        try checkOpen()
         let key = NSNumber(value: block.index)
         if let cached = decryptedCache.object(forKey: key) { return (cached as Data, true) }
-
-        if joinsPrefetch, let prefetch = lock.withLock({ prefetchTasks[block.index]?.task }) {
-            await prefetch.value
-            try Task.checkCancellation()
+        guard block.clearSize > 0 else { return (Data(), false) }
+        let (encrypted, hit) = try await sharedEncryptedBlock(block, priority: priority)
+        // One synchronous block decrypt owns publication. Concurrent range requests reuse its result.
+        return try lock.withLock {
+            guard !isClosed, !Task.isCancelled else { throw CancellationError() }
             if let cached = decryptedCache.object(forKey: key) { return (cached as Data, true) }
-            // A deep warm leaves only encrypted bytes on disk, and a failed prefetch leaves nothing:
-            // both continue with the lookup below.
+            let clear = try crypto.decryptBlock(encrypted, sessionKey: prepared.sessionKey)
+            guard clear.count >= block.clearSize else {
+                throw StreamingError.decryptedBlockLengthMismatch(
+                    blockIndex: block.index, expected: block.clearSize, actual: clear.count)
+            }
+            decryptedCache.setObject(clear as NSData, forKey: key)
+            return (clear, hit)
         }
+    }
 
-        var hit = true
-        let encrypted: Data
-        let lookup = await cache.lookupAsync(uid: prepared.uid, block: block.index)
-        if let disk = lookup.encrypted {
-            encrypted = disk
-        } else {
-            hit = false
-            encrypted = try await source.encryptedBlockData(block, priority: priority)
-            _ = await cache.storeAsync(
-                uid: prepared.uid,
-                block: block.index,
-                encrypted: encrypted,
-                ticket: lookup.ticket,
-                ownerGeneration: ownerGeneration
-            )
+    private func sharedEncryptedBlock(
+        _ block: VideoBlock, priority: ProtonRequestPriority, canRetryPrefetch: Bool = true
+    ) async throws -> (Data, Bool) {
+        try checkOpen()
+        let fetch = try lock.withLock { () throws -> EncryptedFetch in
+            guard !isClosed else { throw CancellationError() }
+            if let existing = encryptedFetches[block.index] { return existing }
+            let id = UUID()
+            let completion = VideoPrefetchCompletion()
+            let handle = ProtonRequestGovernor.PriorityHandle(priority: priority)
+            let task = Task { [weak self] () throws -> (Data, Bool) in
+                defer { completion.finish() }
+                guard let self else { throw CancellationError() }
+                defer {
+                    self.lock.withLock {
+                        if self.encryptedFetches[block.index]?.id == id {
+                            self.encryptedFetches.removeValue(forKey: block.index)
+                        }
+                    }
+                }
+                return try await self.admission.withAdmission { [self] in
+                    try await self.fetchEncryptedBlock(block, priority: priority, priorityHandle: handle)
+                }
+            }
+            let created = EncryptedFetch(
+                id: id, task: task, completion: completion, priorityHandle: handle,
+                startedAsPrefetch: priority != .immediate)
+            encryptedFetches[block.index] = created
+            return created
         }
-        let clear = try crypto.decryptBlock(encrypted, sessionKey: prepared.sessionKey)
-        decryptedCache.setObject(clear as NSData, forKey: key)
-        return (clear, hit)
+        if priority == .immediate { await source.promoteDemand(fetch.priorityHandle) }
+        do {
+            try await fetch.completion.wait()
+            try checkOpen()
+            return try await fetch.task.value
+        } catch {
+            try checkOpen()
+            guard priority == .immediate, fetch.startedAsPrefetch, canRetryPrefetch else { throw error }
+            // Failed speculative work may be retried once by demand, inside the same upload suspension.
+            return try await sharedEncryptedBlock(block, priority: priority, canRetryPrefetch: false)
+        }
+    }
+
+    private func fetchEncryptedBlock(
+        _ block: VideoBlock, priority: ProtonRequestPriority,
+        priorityHandle: ProtonRequestGovernor.PriorityHandle
+    ) async throws -> (Data, Bool) {
+        let lookup = await cache.lookupAsync(uid: prepared.uid, block: block.index)
+        try checkOpen()
+        if let disk = lookup.encrypted { return (disk, true) }
+        let encrypted = try await source.encryptedBlockData(
+            block, priority: priority, priorityHandle: priorityHandle)
+        try checkOpen()
+        _ = await cache.storeAsync(
+            uid: prepared.uid, block: block.index, encrypted: encrypted, ticket: lookup.ticket,
+            ownerGeneration: ownerGeneration, publicationOwner: publicationOwner)
+        try checkOpen()
+        return (encrypted, false)
     }
 
     /// Starts warming the blocks immediately after the bytes AVFoundation just consumed. This matters
@@ -294,7 +403,7 @@ final class ProtonVideoResourceLoader: NSObject, AVAssetResourceLoaderDelegate, 
     /// repeat at the same `clearOffset` is skipped wholesale (a seek changes the offset and re-schedules).
     private func scheduleForwardPrefetch(afterClearOffset clearOffset: Int, reason: String) {
         let advanced = lock.withLock { () -> Bool in
-            guard clearOffset != lastForwardPrefetchOffset else { return false }
+            guard !isClosed, clearOffset != lastForwardPrefetchOffset else { return false }
             lastForwardPrefetchOffset = clearOffset
             return true
         }
@@ -329,13 +438,13 @@ final class ProtonVideoResourceLoader: NSObject, AVAssetResourceLoaderDelegate, 
         let key = NSNumber(value: block.index)
         guard decryptedCache.object(forKey: key) == nil else { return }
         let scheduled = lock.withLock { () -> Bool in
-            guard prefetchTasks[block.index] == nil else { return false }
+            guard !isClosed, prefetchTasks[block.index] == nil else { return false }
             let taskID = UUID()
             let task = Task { [weak self] in
                 guard let self else { return }
                 do {
                     try await self.admission.withAdmission { [self] in
-                        try await self.warmEncryptedBlock(block)
+                        _ = try await self.sharedEncryptedBlock(block, priority: .foregroundPrefetch)
                     }
                 } catch is CancellationError {
                 } catch {
@@ -357,20 +466,6 @@ final class ProtonVideoResourceLoader: NSObject, AVAssetResourceLoaderDelegate, 
         if scheduled { PhotoDiagnostics.shared.increment("perf.videoDeepWarmScheduled") }
     }
 
-    /// Stores the block's encrypted bytes for a later serve. A block already on disk costs nothing.
-    private func warmEncryptedBlock(_ block: VideoBlock) async throws {
-        let lookup = await cache.lookupAsync(uid: prepared.uid, block: block.index)
-        guard lookup.encrypted == nil else { return }
-        let encrypted = try await source.encryptedBlockData(block, priority: .foregroundPrefetch)
-        _ = await cache.storeAsync(
-            uid: prepared.uid,
-            block: block.index,
-            encrypted: encrypted,
-            ticket: lookup.ticket,
-            ownerGeneration: ownerGeneration
-        )
-    }
-
     private func schedulePrefetch(
         _ block: VideoBlock,
         reason: String,
@@ -383,7 +478,7 @@ final class ProtonVideoResourceLoader: NSObject, AVAssetResourceLoaderDelegate, 
         }
 
         let scheduled = lock.withLock { () -> Bool in
-            guard prefetchTasks[block.index] == nil else { return false }
+            guard !isClosed, prefetchTasks[block.index] == nil else { return false }
             let taskID = UUID()
             let task = Task { [weak self] in
                 guard let self else { return }

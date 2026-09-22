@@ -599,9 +599,14 @@ public final class PhotoViewerModel {
         }
         video.setResolving()
         logViewer(item, strategy: "resolving", kind: nil)
+        let preparationActivity = LibraryRuntimeState.shared.beginActivity(.videoPlayback)
+        defer { preparationActivity.end() }
         do {
             let stream = try await streamer.makeStreamingAsset(for: item.uid)
-            guard !Task.isCancelled, self.isDisplaying(item), self.sessionIsCurrent() else { return }
+            guard !Task.isCancelled, self.isDisplaying(item), self.sessionIsCurrent() else {
+                stream.close()
+                return
+            }
             isLoadingOriginal = false
             logViewer(item, strategy: "range", kind: .video)
             video.playStreaming(asset: stream.asset, retaining: stream, uid: item.uid)

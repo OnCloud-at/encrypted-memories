@@ -22,6 +22,91 @@ import Testing
         }
     }
 
+    private final class PreemptionProbe: MLVectorScorer, @unchecked Sendable {
+        private let lock = NSLock()
+        private var blocks = 0
+        var scoredBlocks: Int { lock.withLock { blocks } }
+        func score(block: MLVectorBlock, query: ContiguousArray<Float32>, into scores: inout [Float32]) {
+            ReferenceDotProductScorer().score(block: block, query: query, into: &scores)
+            lock.withLock { blocks += 1 }
+        }
+    }
+
+    @Test func preemptedSearchStopsAtTheNextBlockAndNeverReturnsPartialResults() async throws {
+        let store = InMemoryMLIndexStore()
+        store.upsert(
+            (0..<8).map {
+                MLEmbeddingRecord(uid: uid("\($0)"), descriptor: descriptor, vector: [1, 0, 0])
+            })
+        let probe = PreemptionProbe()
+        let engine = MLSemanticSearchEngine(
+            store: store, encoder: Encoder(vector: [1, 0, 0]), scorer: probe, queryBlockRowLimit: 2
+        )
+        await #expect(throws: CancellationError.self) {
+            try await engine.search(
+                MLSearchQuery(descriptor: descriptor, queryText: "fixture", limit: 8),
+                shouldContinue: { probe.scoredBlocks == 0 }
+            )
+        }
+        #expect(probe.scoredBlocks == 1)
+        let resumed = try await engine.search(MLSearchQuery(descriptor: descriptor, queryText: "fixture", limit: 8))
+        #expect(resumed.results.count == 8)
+    }
+
+    private final class ReadCountingCipher: MLVectorCipher, @unchecked Sendable {
+        private let lock = NSLock()
+        private var count = 0
+        var reads: Int { lock.withLock { count } }
+        func seal(_ plaintext: Data, context: MLVectorCipherContext) throws -> Data {
+            try TestMLVectorCipher().seal(plaintext, context: context)
+        }
+        func open(_ ciphertext: Data, context: MLVectorCipherContext) throws -> Data {
+            lock.withLock { count += 1 }
+            return try TestMLVectorCipher().open(ciphertext, context: context)
+        }
+    }
+
+    private actor CountingPromptEncoder: MLTextQueryEncoder {
+        private(set) var count = 0
+        func encode(text: String, descriptor: MLModelDescriptor) async throws -> ContiguousArray<Float32> {
+            count += 1
+            return text == "query-50" ? [0, 4, 0] : [4, 0, 0]
+        }
+    }
+
+    @Test func batchedSuggestionsMatchIndependentQueriesIncludingTiesAndLimits() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let cipher = ReadCountingCipher()
+        let encoder = CountingPromptEncoder()
+        let store = try #require(
+            SQLiteMLIndexStore(url: directory.appendingPathComponent("index.sqlite"), cipher: cipher))
+        defer { store.close() }
+        store.upsert(
+            (0..<601).map {
+                MLEmbeddingRecord(
+                    uid: uid("item-\($0)"), descriptor: descriptor,
+                    vector: $0 % 3 == 0 ? [0, 1, 0] : [1, 0, 0])
+            })
+        let engine = MLSemanticSearchEngine(store: store, encoder: encoder, scorer: ReferenceDotProductScorer())
+        let queries = [0, 6, 50, 400].map {
+            MLSearchQuery(descriptor: descriptor, queryText: "query-\($0)", limit: $0)
+        }
+        var expected: [[MLSearchResult]] = []
+        for query in queries { expected.append(try await engine.search(query).results) }
+        let priorReads = cipher.reads
+        let actual = try await engine.searchBatch(queries)
+        #expect(actual.map(\.results) == expected)
+        #expect(actual.map(\.queryText) == queries.map(\.queryText))
+        #expect(cipher.reads - priorReads == 601, "each encrypted row is read once for the whole batch")
+        let encoded = await encoder.count
+        _ = try await engine.searchBatch(queries)
+        #expect(await encoder.count == encoded)
+        await engine.purgeCachedBlocks()
+        _ = try await engine.searchBatch(queries)
+        #expect(await encoder.count == encoded + queries.count)
+    }
+
     private struct DualEncoder: MLAssetEmbedder, MLTextQueryEncoder {
         func embed(uid: PhotoUID, descriptor: MLModelDescriptor) async -> MLEmbeddingOutcome {
             .embedded(uid.nodeID == "tree" ? [1, 0, 0] : [0, 1, 0])
@@ -128,9 +213,9 @@ import Testing
         func forEachVectorBlock(
             for descriptor: MLModelDescriptor,
             maximumRows: Int,
-            _ body: (MLVectorBlock) -> Void
-        ) {
-            body(vectorBlock(for: descriptor))
+            _ body: (MLVectorBlock) throws -> Void
+        ) throws {
+            try body(vectorBlock(for: descriptor))
         }
         func remove(uid: PhotoUID, descriptor: MLModelDescriptor) { backing.remove(uid: uid, descriptor: descriptor) }
         func remove(uids: [PhotoUID], descriptor: MLModelDescriptor) {

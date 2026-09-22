@@ -23,6 +23,7 @@ struct MobileSearchRecentEntry: Identifiable, Equatable {
 struct MobileSearchLandingContent {
     var recents: [MobileSearchRecentEntry] = []
     var discovery: SmartSearchDiscoveryModel?
+    var isUpdatingSuggestions = false
     var onSelectRecent: (MobileSearchRecentEntry) -> Void = { _ in }
     var onSelectSuggestion: (TimelineSearchSuggestion) -> Void = { _ in }
     var onClearHistory: () -> Void = {}
@@ -118,10 +119,15 @@ struct MobileSearchLandingScreen: View {
 
     @ViewBuilder private var forYouSection: some View {
         let suggestions = displayedForYou
-        let isLoading = discovery?.isCurrent(content: discoveryContent) != true
+        let isLoading = content.isUpdatingSuggestions && discovery?.hasComputed != true
         if isLoading || !suggestions.isEmpty {
             VStack(alignment: .leading, spacing: 10) {
                 sectionTitle(L10n.string("search.for_you"))
+                if content.isUpdatingSuggestions, !isLoading {
+                    Text(L10n.string("search.suggestions_loading"))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
                 VStack(spacing: 0) {
                     if isLoading {
                         // One sweep over the whole placeholder block, as a single continuous band.
