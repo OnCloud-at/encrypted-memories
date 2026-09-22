@@ -870,7 +870,7 @@ struct MainView: View {
 
     private func showMapCluster(uids: [PhotoUID], coordinate: CLLocationCoordinate2D) {
         let orderedUIDs = timelineModel.allLibraryUIDs(matching: Set(uids))
-        let pager = PhotoLocationClusterPager(uids: orderedUIDs)
+        let pager = PhotoLocationClusterPager(uids: Array(orderedUIDs.reversed()))
         guard let firstPage = pager.page(at: 0), !firstPage.uids.isEmpty else { return }
         selectionMode = false
         selectedUIDs = []

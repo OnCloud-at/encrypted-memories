@@ -50,7 +50,9 @@ public struct TimelineSearchProjection: Sendable {
         let projection = TimelineContentProjection(sections: filtered)
         self.sections = projection.sections
         snapshot = projection.snapshot
-        if key.refinement.isActive, TimelineSearchQuery(key.query).isEmpty, key.requiredUIDs == nil {
+        if key.refinement.isActive || !TimelineSearchQuery(key.query).isEmpty || key.requiredUIDs != nil
+            || (key.context.activeFilter != nil && key.context.activeFilter != .all)
+        {
             presentationItems = Array(projection.snapshot.items.reversed())
         } else {
             presentationItems = projection.snapshot.items

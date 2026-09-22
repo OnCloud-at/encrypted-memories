@@ -9,6 +9,40 @@ import TimelineCore
 
 @MainActor
 @Suite struct TimelineVisibleContentTests {
+    @Test func mapPresentationAndLibraryHaveOppositeOrderWithoutChangingCanonicalItems() async {
+        let old = photo("old", month: 1)
+        let new = photo("new", month: 2)
+        let model = TimelineViewModel(
+            repository: VisibleContentRepository(timelines: [[section([old, new])]]),
+            feed: makeVisibleContentFeed())
+        await model.load()
+        #expect(model.presentationItems.map(\.uid) == [old.uid, new.uid])
+        await model.showTransientItems([old, new], sectionID: "cluster")
+        #expect(model.allItems.map(\.uid) == [old.uid, new.uid])
+        #expect(model.presentationItems.map(\.uid) == [new.uid, old.uid])
+        await model.select(.all)
+        #expect(model.presentationItems.map(\.uid) == [old.uid, new.uid])
+    }
+
+    @Test(arguments: [
+        PhotoFilter.tag(.favorites), .tag(.videos), .tag(.motionPhotos), .trash,
+        .album(id: "album", title: "Album"), .sharedAlbum(volumeID: "volume", nodeID: "node", title: "Shared"),
+    ])
+    func collectionsKeepNewestFirstEvenWhenTheyContainTheWholeLibrary(filter: PhotoFilter) async {
+        let old = photo("old", month: 1)
+        let new = photo("new", month: 2)
+        let sections = [section([old, new])]
+        let model = TimelineViewModel(
+            repository: VisibleContentRepository(timelines: [sections]), feed: makeVisibleContentFeed(),
+            library: VisibleContentLibrary(timelines: [filter: [sections]]))
+        await model.load()
+        await model.select(filter)
+        #expect(model.presentationItems.map(\.uid) == [new.uid, old.uid])
+        #expect(model.allItems.map(\.uid) == [old.uid, new.uid])
+        await model.select(.all)
+        #expect(model.presentationItems.map(\.uid) == [old.uid, new.uid])
+    }
+
     @Test func favoriteContextInvalidatesCachedSearchResult() async {
         let item = photo("favorite-candidate", month: 1)
         let sections = [section([item])]

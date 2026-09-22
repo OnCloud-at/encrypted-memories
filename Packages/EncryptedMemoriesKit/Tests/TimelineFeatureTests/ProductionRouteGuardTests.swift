@@ -2847,6 +2847,24 @@ struct ProductionRouteGuardTests {
             "the timeline surface must extend under Liquid Glass while its trailing inset protects the newest row")
     }
 
+    @Test func collectionGridsAndViewersConsumeTheSameNewestFirstPresentation() throws {
+        func read(_ path: String) throws -> String {
+            try String(contentsOf: Self.repoRoot.appendingPathComponent(path), encoding: .utf8)
+        }
+        let desktop = try read("Packages/EncryptedMemoriesKit/Sources/TimelineFeature/TimelineView.swift")
+        #expect(desktop.contains("items: items)]"))
+        #expect(desktop.contains("?.presentationItems ?? model.presentationItems"))
+        let album = try read("iOSApp/MobileAlbumsScreen.swift")
+        #expect(album.components(separatedBy: "items: snapshotReconciler.presentationItems").count == 3)
+        #expect(album.contains("index: snapshot.count - 1 - index"))
+        for path in ["App/Views/MainView.swift", "iOSApp/MobileMapScreen.swift"] {
+            #expect(try read(path).contains("PhotoLocationClusterPager(uids: Array(orderedUIDs.reversed()))"))
+        }
+        let cluster = try read("iOSApp/MobileMapClusterSeriesScreen.swift")
+        #expect(cluster.contains("Array(model.selectedItems(Set(currentPage.uids)).reversed())"))
+        #expect(cluster.contains("scrollToTopSignal: pageIndex"))
+    }
+
     @Test func mobileLibraryRefinementsOwnTheirViewportEdges() throws {
         let mobileTimeline = try String(
             contentsOf: Self.repoRoot.appendingPathComponent("iOSApp/MobileTimelineScreen.swift"),

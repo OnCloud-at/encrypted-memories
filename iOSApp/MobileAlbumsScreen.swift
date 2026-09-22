@@ -412,7 +412,7 @@ private struct MobileFilterGridScreen: View {
                 }
             } else if let feed = model.thumbnailFeed {
                 UIKitTimelineGrid(
-                    items: snapshot.items,
+                    items: snapshotReconciler.presentationItems,
                     thumbnailFeed: feed,
                     fillOrder: .topLeading,
                     selectionMode: selection.isSelecting,
@@ -635,8 +635,8 @@ private struct MobileFilterGridScreen: View {
     private func open(_ item: PhotoItem) {
         guard let index = snapshot.index(of: item.uid) else { return }  // O(1)
         viewerRouter.presentation = MobileViewerPresentation(
-            index: index,
-            items: snapshot.items,
+            index: snapshot.count - 1 - index,
+            items: snapshotReconciler.presentationItems,
             context: ViewerCollectionContext(filter: filter)
         )
     }

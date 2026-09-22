@@ -20,6 +20,7 @@ import Testing
         let projection = TimelineSearchProjection(key: key, sections: sections)
 
         #expect(projection.snapshot.items.map(\.uid) == [favorite.uid, semantic.uid])
+        #expect(projection.presentationItems.map(\.uid) == [semantic.uid, favorite.uid])
         #expect(projection.sections.flatMap(\.items) == projection.snapshot.items)
     }
 
@@ -36,6 +37,18 @@ import Testing
         let projection = TimelineSearchProjection(key: key, sections: [section([a, b])])
 
         #expect(projection.snapshot.items.map(\.uid) == [a.uid, b.uid])
+        #expect(projection.presentationItems.map(\.uid) == [a.uid, b.uid])
+    }
+
+    @Test func structuredSuggestionUsesNewestFirstWithoutChangingCanonicalSnapshot() {
+        let old = item("old", seconds: 1)
+        let new = item("new", seconds: 2)
+        let key = TimelineSearchProjectionKey(
+            sourceRevision: 1, query: "", context: TimelineSearchContext(), semanticMatches: nil,
+            requiredUIDs: [old.uid, new.uid])
+        let projection = TimelineSearchProjection(key: key, sections: [section([old, new])])
+        #expect(projection.presentationItems.map(\.uid) == [new.uid, old.uid])
+        #expect(projection.snapshot.index(of: old.uid) == 0)
     }
 
     @Test func coordinatorDropsSupersededLargeLibraryResult() async throws {

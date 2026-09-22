@@ -73,7 +73,7 @@ struct MobileMapScreen: View {
                         onSelectPhoto: openPhoto,
                         onSelectCluster: { uids, coordinate in
                             let orderedUIDs = model.selectedUIDs(Set(uids))
-                            let pager = PhotoLocationClusterPager(uids: orderedUIDs)
+                            let pager = PhotoLocationClusterPager(uids: Array(orderedUIDs.reversed()))
                             guard pager.totalCount > 0 else { return }
                             clusterPresentation = MobileMapClusterPresentation(pager: pager, coordinate: coordinate)
                         }
