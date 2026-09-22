@@ -53,7 +53,8 @@ runs:
           esac
         done < <(git ls-files)
         digest="$(shasum -a 256 "$key_material" | awk '{print $1}')"
-        xcode_version="$(xcodebuild -version | awk '/^Xcode / { print $2; exit }')"
+        xcode_version_output="$(xcodebuild -version)"
+        xcode_version="$(awk '/^Xcode / { print $2; exit }' <<< "$xcode_version_output")"
         [[ -n "$xcode_version" ]] || release_fail toolchain \
           "xcodebuild -version did not report an Xcode version." \
           "Use the configured xcode-27 runner with a working Xcode installation."
