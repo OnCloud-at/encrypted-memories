@@ -83,8 +83,10 @@ public struct MLSearchConceptEvidence: Equatable, Sendable {
 public enum MLSearchConceptDiscovery {
     public typealias Search = @Sendable (_ prompt: String, _ limit: Int) async throws -> [PhotoUID]
 
-    public static func minimumHits(coveredAssetCount: Int) -> Int {
-        max(6, Int((Double(coveredAssetCount) * 0.004).rounded(.up)))
+    public static func minimumHits(coveredAssetCount: Int, limit: Int = 400) -> Int {
+        // Search returns at most `limit` matches. Keep qualification attainable even for
+        // very large libraries, without increasing the amount of work per query.
+        max(6, min(max(0, limit), Int((Double(coveredAssetCount) * 0.004).rounded(.up))))
     }
 
     /// Runs every internal sensitive prompt. The gate fails closed: any failed or cancelled query throws, and
@@ -99,6 +101,12 @@ public enum MLSearchConceptDiscovery {
         return sensitive
     }
 
+    public struct Evaluation: Sendable {
+        public let evidence: [MLSearchConceptEvidence]
+        /// Empty successful results are complete; failed or cancelled queries are not.
+        public let isComplete: Bool
+    }
+
     /// Evaluates the curated concepts. `sensitiveUIDs` must come from a successful `sensitiveUIDs(search:)`;
     /// those items never count towards a concept. A failed concept query skips only that concept.
     public static func evaluate(
@@ -109,17 +117,39 @@ public enum MLSearchConceptDiscovery {
         maximumOverlap: Double = 0.8,
         search: Search
     ) async -> [MLSearchConceptEvidence] {
-        let threshold = minimumHits(coveredAssetCount: coveredAssetCount)
+        await evaluateWithCompletion(
+            concepts: concepts, coveredAssetCount: coveredAssetCount, sensitiveUIDs: sensitiveUIDs,
+            limit: limit, maximumOverlap: maximumOverlap, search: search
+        ).evidence
+    }
+
+    public static func evaluateWithCompletion(
+        concepts: [MLSearchConcept] = MLSearchConceptCatalog.curated,
+        coveredAssetCount: Int,
+        sensitiveUIDs: Set<PhotoUID>,
+        limit: Int = 400,
+        maximumOverlap: Double = 0.8,
+        search: Search
+    ) async -> Evaluation {
+        guard limit >= 6 else { return Evaluation(evidence: [], isComplete: true) }
+        var isComplete = true
+        let threshold = minimumHits(coveredAssetCount: coveredAssetCount, limit: limit)
         var candidates: [MLSearchConceptEvidence] = []
         for concept in concepts {
-            guard !Task.isCancelled else { return [] }
-            guard let uids = try? await search(concept.prompt, limit) else { continue }
+            guard !Task.isCancelled else { return Evaluation(evidence: [], isComplete: false) }
+            let uids: [PhotoUID]
+            do {
+                uids = try await search(concept.prompt, limit)
+            } catch {
+                isComplete = false
+                continue
+            }
             let ranked = uids.filter { !sensitiveUIDs.contains($0) }
             if ranked.count >= threshold {
                 candidates.append(MLSearchConceptEvidence(concept: concept, rankedUIDs: ranked))
             }
         }
-        guard !Task.isCancelled else { return [] }
+        guard !Task.isCancelled else { return Evaluation(evidence: [], isComplete: false) }
 
         var accepted: [MLSearchConceptEvidence] = []
         var acceptedSets: [Set<PhotoUID>] = []
@@ -132,6 +162,6 @@ public enum MLSearchConceptDiscovery {
             accepted.append(candidate)
             acceptedSets.append(hits)
         }
-        return accepted
+        return Evaluation(evidence: accepted, isComplete: isComplete)
     }
 }
