@@ -1,5 +1,5 @@
 diff --git a/Package.swift b/Package.swift
-index 533470e..8ff4c48 100644
+index 7f1ecc7..3afc325 100644
 --- a/Package.swift
 +++ b/Package.swift
 @@ -3,0 +4 @@
@@ -117,18 +117,18 @@ index f8ba40e..220a08a 100644
 +        await freeTask().value
 +    }
 diff --git a/Sources/Client/EncryptedMemoriesClient/EncryptedMemoriesClient.swift b/Sources/Client/EncryptedMemoriesClient/EncryptedMemoriesClient.swift
-index 1680d0c..6f3fe32 100644
+index 1fe2159..ada05f1 100644
 --- a/Sources/Client/EncryptedMemoriesClient/EncryptedMemoriesClient.swift
 +++ b/Sources/Client/EncryptedMemoriesClient/EncryptedMemoriesClient.swift
 @@ -52,0 +53,2 @@ public actor EncryptedMemoriesClient: Sendable, ProtonSDKClient {
 +    private var shutdownTask: Task<Void, Never>?
 +    private var didShutDown = false
-@@ -134 +136,3 @@ public actor EncryptedMemoriesClient: Sendable, ProtonSDKClient {
+@@ -131 +133,3 @@ public actor EncryptedMemoriesClient: Sendable, ProtonSDKClient {
 -        Self.freeEncryptedMemoriesClient(Int64(clientHandle), logger)
 +        let handle = Int64(clientHandle)
 +        let logger = logger
 +        Task { await Self.freeEncryptedMemoriesClient(handle, logger) }
-@@ -137,4 +141,18 @@ public actor EncryptedMemoriesClient: Sendable, ProtonSDKClient {
+@@ -134,4 +138,18 @@ public actor EncryptedMemoriesClient: Sendable, ProtonSDKClient {
 -    private static func freeEncryptedMemoriesClient(_ clientHandle: Int64, _ logger: Logger?) {
 -        Task {
 -            let freeRequest = Proton_Drive_Sdk_DrivePhotosClientFreeRequest.with {
@@ -151,7 +151,7 @@ index 1680d0c..6f3fe32 100644
 +        let task: Task<Void, Never> = Task {
 +            for source in tokenSources {
 +                try? await source.cancel()
-@@ -142,8 +160,2 @@ public actor EncryptedMemoriesClient: Sendable, ProtonSDKClient {
+@@ -139,8 +157,2 @@ public actor EncryptedMemoriesClient: Sendable, ProtonSDKClient {
 -            do {
 -                try await SDKRequestHandler.send(freeRequest, logger: logger) as Void
 -            } catch {
@@ -162,7 +162,7 @@ index 1680d0c..6f3fe32 100644
 -                )
 +            for source in tokenSources {
 +                await source.freeAndWait()
-@@ -150,0 +163,19 @@ public actor EncryptedMemoriesClient: Sendable, ProtonSDKClient {
+@@ -147,0 +160,19 @@ public actor EncryptedMemoriesClient: Sendable, ProtonSDKClient {
 +            await Self.freeEncryptedMemoriesClient(handle, logger)
 +        }
 +        shutdownTask = task
@@ -182,24 +182,69 @@ index 1680d0c..6f3fe32 100644
 +                "Proton_Drive_Sdk_DrivePhotosClientFreeRequest failed: \(error)",
 +                category: "EncryptedMemoriesClient.freeEncryptedMemoriesClient"
 +            )
-@@ -412,0 +444 @@ extension EncryptedMemoriesClient {
+@@ -409,0 +441 @@ extension EncryptedMemoriesClient {
 +        overrideExistingDraft: Bool = false,
-@@ -428,0 +461 @@ extension EncryptedMemoriesClient {
+@@ -425,0 +458 @@ extension EncryptedMemoriesClient {
 +            overrideExistingDraft: overrideExistingDraft,
-@@ -443,0 +477 @@ extension EncryptedMemoriesClient {
+@@ -440,0 +474 @@ extension EncryptedMemoriesClient {
 +        try operation.claimStart()
-@@ -463,0 +498 @@ extension EncryptedMemoriesClient {
+@@ -460,0 +495 @@ extension EncryptedMemoriesClient {
 +        overrideExistingDraft: Bool = false,
-@@ -486,0 +522 @@ extension EncryptedMemoriesClient {
+@@ -483,0 +519 @@ extension EncryptedMemoriesClient {
 +            overrideExistingDraft: overrideExistingDraft,
+diff --git a/Sources/Client/EncryptedMemoriesClient/cAlbumItemEnumerationCallback.swift b/Sources/Client/EncryptedMemoriesClient/cAlbumItemEnumerationCallback.swift
+index 2b70c64..2574ebc 100644
+--- a/Sources/Client/EncryptedMemoriesClient/cAlbumItemEnumerationCallback.swift
++++ b/Sources/Client/EncryptedMemoriesClient/cAlbumItemEnumerationCallback.swift
+@@ -16 +16,3 @@ let cAlbumItemEnumerationCallback: CCallback = { stateHandle, byteArray in
+-    typealias BoxType = BoxedCompletionBlock<Int, WeakReference<AlbumItemEnumerationCallbackWrapper>>
++    // `enumerateAlbum` awaits `Void`, so SDKRequestHandler registers this exact result type.
++    // A mismatched generic makes the registry's checked cast reject every yielded item.
++    typealias BoxType = BoxedCompletionBlock<Void, WeakReference<AlbumItemEnumerationCallbackWrapper>>
+diff --git a/Sources/Client/EncryptedMemoriesClient/cNodeResultEnumerationCallback.swift b/Sources/Client/EncryptedMemoriesClient/cNodeResultEnumerationCallback.swift
+index 2ba97dc..adab1e6 100644
+--- a/Sources/Client/EncryptedMemoriesClient/cNodeResultEnumerationCallback.swift
++++ b/Sources/Client/EncryptedMemoriesClient/cNodeResultEnumerationCallback.swift
+@@ -16 +16,3 @@ let cNodeResultEnumerationCallback: CCallback = { stateHandle, byteArray in
+-    typealias BoxType = BoxedCompletionBlock<Int, WeakReference<NodeResultEnumerationCallbackWrapper>>
++    // `updatePhotos` awaits `Void`, so SDKRequestHandler registers this exact result type.
++    // A mismatched generic makes the registry's checked cast reject every yielded item.
++    typealias BoxType = BoxedCompletionBlock<Void, WeakReference<NodeResultEnumerationCallbackWrapper>>
+diff --git a/Sources/Client/EncryptedMemoriesClient/cTimelineItemEnumerationCallback.swift b/Sources/Client/EncryptedMemoriesClient/cTimelineItemEnumerationCallback.swift
+index 642f9ea..dd6502a 100644
+--- a/Sources/Client/EncryptedMemoriesClient/cTimelineItemEnumerationCallback.swift
++++ b/Sources/Client/EncryptedMemoriesClient/cTimelineItemEnumerationCallback.swift
+@@ -16 +16,3 @@ let cTimelineItemEnumerationCallback: CCallback = { stateHandle, byteArray in
+-    typealias BoxType = BoxedCompletionBlock<Int, WeakReference<TimelineItemEnumerationCallbackWrapper>>
++    // `enumerateTimeline` awaits `Void`, so SDKRequestHandler registers this exact result type.
++    // A mismatched generic makes the registry's checked cast reject every yielded item.
++    typealias BoxType = BoxedCompletionBlock<Void, WeakReference<TimelineItemEnumerationCallbackWrapper>>
 diff --git a/Sources/Client/ProtonDriveClient/ProtonDriveClient.swift b/Sources/Client/ProtonDriveClient/ProtonDriveClient.swift
-index a67a327..6a82c68 100644
+index ff58245..ed17d5b 100644
 --- a/Sources/Client/ProtonDriveClient/ProtonDriveClient.swift
 +++ b/Sources/Client/ProtonDriveClient/ProtonDriveClient.swift
-@@ -352,0 +353 @@ extension ProtonDriveClient {
+@@ -349,0 +350 @@ extension ProtonDriveClient {
 +        try operation.claimStart()
-@@ -384,0 +386 @@ extension ProtonDriveClient {
+@@ -381,0 +383 @@ extension ProtonDriveClient {
 +        try operation.claimStart()
+diff --git a/Sources/Client/ProtonDriveClient/cDeviceEnumerationCallback.swift b/Sources/Client/ProtonDriveClient/cDeviceEnumerationCallback.swift
+index b09e7c0..862e2ac 100644
+--- a/Sources/Client/ProtonDriveClient/cDeviceEnumerationCallback.swift
++++ b/Sources/Client/ProtonDriveClient/cDeviceEnumerationCallback.swift
+@@ -16 +16,3 @@ let cDeviceEnumerationCallback: CCallback = { stateHandle, byteArray in
+-    typealias BoxType = BoxedCompletionBlock<Int, WeakReference<DeviceEnumerationCallbackWrapper>>
++    // `enumerateDevices` awaits `Void`, so SDKRequestHandler registers this exact result type.
++    // A mismatched generic makes the registry's checked cast reject every yielded item.
++    typealias BoxType = BoxedCompletionBlock<Void, WeakReference<DeviceEnumerationCallbackWrapper>>
+diff --git a/Sources/Client/ProtonDriveClient/cNodeUidEnumerationCallback.swift b/Sources/Client/ProtonDriveClient/cNodeUidEnumerationCallback.swift
+index df2c12f..06e9333 100644
+--- a/Sources/Client/ProtonDriveClient/cNodeUidEnumerationCallback.swift
++++ b/Sources/Client/ProtonDriveClient/cNodeUidEnumerationCallback.swift
+@@ -17 +17,3 @@ let cNodeUidEnumerationCallback: CCallback = { stateHandle, byteArray in
+-    typealias BoxType = BoxedCompletionBlock<Int, WeakReference<NodeUidEnumerationCallbackWrapper>>
++    // every node-UID enumeration awaits `Void`, so SDKRequestHandler registers this exact result type.
++    // A mismatched generic makes the registry's checked cast reject every yielded item.
++    typealias BoxType = BoxedCompletionBlock<Void, WeakReference<NodeUidEnumerationCallbackWrapper>>
 diff --git a/Sources/FileOperations/Downloads/DownloadThumbnailsManager.swift b/Sources/FileOperations/Downloads/DownloadThumbnailsManager.swift
 index 367242f..f6b161f 100644
 --- a/Sources/FileOperations/Downloads/DownloadThumbnailsManager.swift
@@ -318,25 +363,21 @@ index 367242f..f6b161f 100644
 +        activeDownloads[cancellationToken] = activeDownload
 +        return activeDownload
 diff --git a/Sources/FileOperations/Downloads/cThumbnailEnumerationCallback.swift b/Sources/FileOperations/Downloads/cThumbnailEnumerationCallback.swift
-index 5f1da98..54a66ab 100644
+index 091683f..54a66ab 100644
 --- a/Sources/FileOperations/Downloads/cThumbnailEnumerationCallback.swift
 +++ b/Sources/FileOperations/Downloads/cThumbnailEnumerationCallback.swift
-@@ -16 +16,4 @@ let cThumbnailEnumerationCallback: CCallback = { statePointer, byteArray in
+@@ -15,2 +15,5 @@ final class ThumbnailEnumerationCallbackWrapper: Sendable {
+-let cThumbnailEnumerationCallback: CCallback = { stateHandle, byteArray in
 -    typealias BoxType = BoxedCompletionBlock<Int, WeakReference<ThumbnailEnumerationCallbackWrapper>>
++let cThumbnailEnumerationCallback: CCallback = { statePointer, byteArray in
 +    // `downloadPhotoThumbnails` awaits `Void`, so SDKRequestHandler registers this exact result type.
 +    // A mismatched generic makes the registry's checked cast reject every streamed thumbnail.
 +    typealias BoxType = BoxedCompletionBlock<Void, WeakReference<ThumbnailEnumerationCallbackWrapper>>
 +    guard let box = CallbackHandleRegistry.shared.get(statePointer, as: BoxType.self) else { return }
-@@ -20,8 +23 @@ let cThumbnailEnumerationCallback: CCallback = { statePointer, byteArray in
--    guard let stateRawPointer = UnsafeRawPointer(bitPattern: statePointer) else {
--        let message = "cProgressCallback.statePointer is nil"
--        assertionFailure(message)
--        // there is no way we can inform the SDK back about the issue
+@@ -20,3 +22,0 @@ let cThumbnailEnumerationCallback: CCallback = { stateHandle, byteArray in
+-    guard let box: BoxType = CallbackHandleRegistry.shared.get(stateHandle) else {
 -        return
 -    }
--    let stateTypedPointer = Unmanaged<BoxType>.fromOpaque(stateRawPointer)
--    let weakWrapper: WeakReference<ThumbnailEnumerationCallbackWrapper> = stateTypedPointer.takeUnretainedValue().state
-+    let weakWrapper: WeakReference<ThumbnailEnumerationCallbackWrapper> = box.state
 diff --git a/Sources/FileOperations/Uploads/PhotoUploadsManager.swift b/Sources/FileOperations/Uploads/PhotoUploadsManager.swift
 index 81cd6ad..7b3f27d 100644
 --- a/Sources/FileOperations/Uploads/PhotoUploadsManager.swift
@@ -808,7 +849,7 @@ index 0000000..825b19a
 +    }
 +}
 diff --git a/Sources/FileOperations/Uploads/UploadOperation.swift b/Sources/FileOperations/Uploads/UploadOperation.swift
-index 0816fcd..cb2198c 100644
+index 134a46e..c7fc881 100644
 --- a/Sources/FileOperations/Uploads/UploadOperation.swift
 +++ b/Sources/FileOperations/Uploads/UploadOperation.swift
 @@ -18,0 +19 @@ public final class UploadOperation: Sendable {
@@ -1122,47 +1163,19 @@ index e9fb939..320a2a8 100644
 @@ -232,0 +315 @@ extension UploadsManager {
 +        return operation
 diff --git a/Sources/Plumbing/BoxedContinuation.swift b/Sources/Plumbing/BoxedContinuation.swift
-index c660a66..b7e2393 100644
+index c1f6f71..a7743d1 100644
 --- a/Sources/Plumbing/BoxedContinuation.swift
 +++ b/Sources/Plumbing/BoxedContinuation.swift
-@@ -0,0 +1,2 @@
-+import Foundation
-+
-@@ -16 +18 @@ extension Resumable where ReturnType == Void {
--final class BoxedCompletionBlock<ResultType, StateType>: RegistryTracking, Resumable {
-+final class BoxedCompletionBlock<ResultType, StateType>: RegistryTracking, RegistryCancellable, Resumable {
-@@ -18,0 +21 @@ final class BoxedCompletionBlock<ResultType, StateType>: RegistryTracking, Resum
-+    private let lock = NSLock()
-@@ -29,4 +32 @@ final class BoxedCompletionBlock<ResultType, StateType>: RegistryTracking, Resum
--        guard let completionBlock else {
--            assertionFailure("Attempt at calling continuation twice, programmer's error, must fix")
--            return
--        }
-+        guard let completionBlock = takeCompletionBlock() else { return }
-@@ -34 +33,0 @@ final class BoxedCompletionBlock<ResultType, StateType>: RegistryTracking, Resum
--        self.completionBlock = nil
-@@ -38,4 +37 @@ final class BoxedCompletionBlock<ResultType, StateType>: RegistryTracking, Resum
--        guard let completionBlock else {
--            assertionFailure("Attempt at calling continuation twice, programmer's error, must fix")
--            return
--        }
-+        guard let completionBlock = takeCompletionBlock() else { return }
-@@ -43 +39,12 @@ final class BoxedCompletionBlock<ResultType, StateType>: RegistryTracking, Resum
--        self.completionBlock = nil
-+    }
-+
+@@ -18 +18 @@ extension Resumable where ReturnType == Void {
+-final class BoxedCompletionBlock<ResultType, StateType>: Resumable {
++final class BoxedCompletionBlock<ResultType, StateType>: RegistryCancellable, Resumable {
+@@ -29,0 +30,4 @@ final class BoxedCompletionBlock<ResultType, StateType>: Resumable {
 +    func cancel() {
 +        resume(throwing: CancellationError())
 +    }
 +
-+    private func takeCompletionBlock() -> CompletionBlock? {
-+        lock.lock()
-+        defer { lock.unlock() }
-+        let block = completionBlock
-+        completionBlock = nil
-+        return block
 diff --git a/Sources/Plumbing/SDKRequestHandler.swift b/Sources/Plumbing/SDKRequestHandler.swift
-index 155e460..4a5eaa5 100644
+index f6f8a9d..89771c5 100644
 --- a/Sources/Plumbing/SDKRequestHandler.swift
 +++ b/Sources/Plumbing/SDKRequestHandler.swift
 @@ -7,0 +8,31 @@ enum SDKRequestHandler {
@@ -1197,7 +1210,7 @@ index 155e460..4a5eaa5 100644
 +        }
 +    }
 +
-@@ -71,0 +103,34 @@ enum SDKRequestHandler {
+@@ -71,0 +103,33 @@ enum SDKRequestHandler {
 +    /// Async request whose Swift continuation is released when its task is cancelled.
 +    /// The underlying operation still owns its native cancellation token separately.
 +    static func sendCancellable<T: Message, U: Sendable, V>(
@@ -1215,8 +1228,7 @@ index 155e460..4a5eaa5 100644
 +                    state: state,
 +                    logger: logger,
 +                    scope: scope,
-+                    owner: owner,
-+                    registryBacked: true
++                    owner: owner
 +                ) { (result: Result<U, Error>) in
 +                    switch result {
 +                    case .success(let response):
@@ -1232,52 +1244,21 @@ index 155e460..4a5eaa5 100644
 +        }
 +    }
 +
-@@ -72,0 +138 @@ enum SDKRequestHandler {
+@@ -72,0 +137 @@ enum SDKRequestHandler {
 +    @discardableResult
-@@ -78,0 +145 @@ enum SDKRequestHandler {
-+        registryBacked: Bool = false,
-@@ -80 +147 @@ enum SDKRequestHandler {
+@@ -80 +145 @@ enum SDKRequestHandler {
 -    ) {
 +    ) -> RegistryHandle? {
-@@ -96,4 +163,17 @@ enum SDKRequestHandler {
--            let pointer = Unmanaged.passRetained(boxedState)
--            boxedState.registryHandleId = CallbackHandleRegistry.shared.register(boxedState, scope: scope, owner: owner)
--            let bindingsHandle = Int(rawPointer: pointer.toOpaque())
--            proton_drive_sdk_handle_request(requestArray, bindingsHandle, sdkResponseCallbackWithState)
-+            let registryHandle = CallbackHandleRegistry.shared.register(boxedState, scope: scope, owner: owner)
-+            boxedState.registryHandleId = registryHandle
-+            if registryBacked {
-+                proton_drive_sdk_handle_request(
-+                    requestArray,
-+                    registryHandle,
-+                    sdkResponseCallbackWithRegistryHandle
-+                )
-+            } else {
-+                let pointer = Unmanaged.passRetained(boxedState)
-+                proton_drive_sdk_handle_request(
-+                    requestArray,
-+                    Int(rawPointer: pointer.toOpaque()),
-+                    sdkResponseCallbackWithState
-+                )
-+            }
-+            return registryHandle
-@@ -101,0 +182 @@ enum SDKRequestHandler {
+@@ -98,0 +164 @@ enum SDKRequestHandler {
++            return registryId
+@@ -100,0 +167 @@ enum SDKRequestHandler {
 +            return nil
-@@ -105,0 +187,8 @@ enum SDKRequestHandler {
-+/// Cancellable requests pass a registry ID instead of a retained raw address. Cancellation removes
-+/// the entry, so a late native completion safely becomes a no-op without leaking or dereferencing freed memory.
-+let sdkResponseCallbackWithRegistryHandle: CCallback = { handle, responseArray in
-+    guard let rawBox = CallbackHandleRegistry.shared.remove(handle) else { return }
-+    let temporaryPointer = Unmanaged.passRetained(rawBox).toOpaque()
-+    sdkResponseCallbackWithState(Int(rawPointer: temporaryPointer), responseArray)
-+}
-+
 diff --git a/Tests/CallbackHandleRegistryTests.swift b/Tests/CallbackHandleRegistryTests.swift
 new file mode 100644
-index 0000000..835952e
+index 0000000..44e283b
 --- /dev/null
 +++ b/Tests/CallbackHandleRegistryTests.swift
-@@ -0,0 +1,92 @@
+@@ -0,0 +1,89 @@
 +import Foundation
 +import Testing
 +@testable import ProtonDriveSDK
@@ -1288,7 +1269,6 @@ index 0000000..835952e
 +        let recorder = CompletionRecorder()
 +        let box = BoxedCompletionBlock<Void, Void>({ recorder.record($0) }, state: ())
 +        let handle = CallbackHandleRegistry.shared.register(box)
-+        box.registryHandleId = handle
 +
 +        CallbackHandleRegistry.shared.cancel(handle)
 +        CallbackHandleRegistry.shared.cancel(handle)
@@ -1304,7 +1284,6 @@ index 0000000..835952e
 +        let recorder = CompletionRecorder()
 +        let box = BoxedCompletionBlock<Void, Void>({ recorder.record($0) }, state: ())
 +        let handle = CallbackHandleRegistry.shared.register(box)
-+        box.registryHandleId = handle
 +
 +        await withTaskGroup(of: Void.self) { group in
 +            group.addTask { CallbackHandleRegistry.shared.cancel(handle) }
@@ -1322,7 +1301,6 @@ index 0000000..835952e
 +        let recorder = CompletionRecorder()
 +        let box = BoxedCompletionBlock<Void, Void>({ recorder.record($0) }, state: ())
 +        let handle = CallbackHandleRegistry.shared.register(box)
-+        box.registryHandleId = handle
 +        let cancellation = SDKRequestHandler.RequestCancellation()
 +
 +        cancellation.cancel()
@@ -1369,6 +1347,131 @@ index 0000000..835952e
 +            return error is CancellationError
 +        }
 +    }
++}
+diff --git a/Tests/EnumerationCallbackTests.swift b/Tests/EnumerationCallbackTests.swift
+new file mode 100644
+index 0000000..438abdc
+--- /dev/null
++++ b/Tests/EnumerationCallbackTests.swift
+@@ -0,0 +1,119 @@
++import CProtonDriveSDK
++import Foundation
++import SwiftProtobuf
++import Testing
++@testable import ProtonDriveSDK
++
++/// Every streamed enumeration awaits `Void` from `SDKRequestHandler.send`, so the registry holds a
++/// `BoxedCompletionBlock<Void, WeakReference<Wrapper>>` for each of these callbacks. Upstream 0.28+
++/// looks the box up with a checked cast; a callback declared with any other result type silently drops
++/// every yielded item.
++@Suite("Enumeration callbacks resolve Void request boxes")
++struct EnumerationCallbackTests {
++    @Test func timelineItemIsDeliveredFromVoidRequestBox() throws {
++        let recorder = ResultRecorder<PhotoTimelineItem>()
++        let wrapper = TimelineItemEnumerationCallbackWrapper(callback: recorder.record)
++        let handle = register(wrapper)
++        defer { CallbackHandleRegistry.shared.remove(handle) }
++
++        var item = Proton_Drive_Sdk_PhotosTimelineItem()
++        item.nodeUid = "volume~node-1"
++        item.captureTime = Google_Protobuf_Timestamp(seconds: 1_700_000_000)
++        try withBytes(of: item) { cTimelineItemEnumerationCallback(handle, $0) }
++
++        let delivered = try #require(recorder.value)
++        #expect(delivered.nodeUid.nodeID == "node-1")
++        #expect(delivered.captureTime == 1_700_000_000)
++    }
++
++    @Test func albumItemIsDeliveredFromVoidRequestBox() throws {
++        let recorder = ResultRecorder<AlbumItem>()
++        let wrapper = AlbumItemEnumerationCallbackWrapper(callback: recorder.record)
++        let handle = register(wrapper)
++        defer { CallbackHandleRegistry.shared.remove(handle) }
++
++        var item = Proton_Drive_Sdk_AlbumItem()
++        item.nodeUid = "volume~album-photo"
++        item.captureTime = Google_Protobuf_Timestamp(seconds: 42)
++        try withBytes(of: item) { cAlbumItemEnumerationCallback(handle, $0) }
++
++        let delivered = try #require(recorder.value)
++        #expect(delivered.nodeUid.nodeID == "album-photo")
++        #expect(delivered.captureTime == 42)
++    }
++
++    @Test func nodeResultIsDeliveredFromVoidRequestBox() throws {
++        let recorder = ResultRecorder<NodeResult>()
++        let wrapper = NodeResultEnumerationCallbackWrapper(callback: recorder.record)
++        let handle = register(wrapper)
++        defer { CallbackHandleRegistry.shared.remove(handle) }
++
++        var pair = Proton_Drive_Sdk_NodeResultPair()
++        pair.nodeUid = "volume~updated"
++        try withBytes(of: pair) { cNodeResultEnumerationCallback(handle, $0) }
++
++        let delivered = try #require(recorder.value)
++        #expect(delivered.nodeUid.nodeID == "updated")
++        #expect(delivered.error == nil)
++    }
++
++    @Test func nodeUidIsDeliveredFromVoidRequestBox() throws {
++        let recorder = ResultRecorder<SDKNodeUid>()
++        let wrapper = NodeUidEnumerationCallbackWrapper(callback: recorder.record)
++        let handle = register(wrapper)
++        defer { CallbackHandleRegistry.shared.remove(handle) }
++
++        var uid = Google_Protobuf_StringValue()
++        uid.value = "volume~shared"
++        try withBytes(of: uid) { cNodeUidEnumerationCallback(handle, $0) }
++
++        let delivered = try #require(recorder.value)
++        #expect(delivered.volumeID == "volume")
++        #expect(delivered.nodeID == "shared")
++    }
++
++    @Test func deviceIsDeliveredFromVoidRequestBox() throws {
++        let recorder = ResultRecorder<Device>()
++        let wrapper = DeviceEnumerationCallbackWrapper(callback: recorder.record)
++        let handle = register(wrapper)
++        defer { CallbackHandleRegistry.shared.remove(handle) }
++
++        var device = Proton_Drive_Sdk_Device()
++        device.uid = "device-7"
++        device.type = .macos
++        device.name = Proton_Drive_Sdk_StringResult.with { $0.value = "Studio" }
++        device.rootFolderUid = "volume~root"
++        device.creationTime = Google_Protobuf_Timestamp(seconds: 7)
++        device.shareID = "share"
++        try withBytes(of: device) { cDeviceEnumerationCallback(handle, $0) }
++
++        let delivered = try #require(recorder.value)
++        #expect(delivered.uid.deviceID == "device-7")
++        #expect(delivered.rootFolderUid.nodeID == "root")
++    }
++
++    /// Mirrors `SDKRequestHandler.send` for `let _: Void = try await send(...)`: the completion result
++    /// type is `Void` and the state is the weak wrapper reference.
++    private func register<Wrapper: AnyObject>(_ wrapper: Wrapper) -> RegistryHandle {
++        let box = BoxedCompletionBlock<Void, WeakReference<Wrapper>>(nil, state: WeakReference(value: wrapper))
++        return CallbackHandleRegistry.shared.register(box)
++    }
++
++    private func withBytes(of message: some Message, _ body: (ByteArray) -> Void) throws {
++        let bytes = ByteArray(data: try message.serializedData())
++        defer { bytes.deallocate() }
++        body(bytes)
++    }
++}
++
++private final class ResultRecorder<Value: Sendable>: @unchecked Sendable {
++    private let lock = NSLock()
++    private var storedValue: Value?
++
++    func record(_ result: Result<Value, any Error>) {
++        guard case let .success(value) = result else { return }
++        lock.withLock { storedValue = value }
++    }
++
++    var value: Value? { lock.withLock { storedValue } }
 +}
 diff --git a/Tests/PhotoRequestPackagingTests.swift b/Tests/PhotoRequestPackagingTests.swift
 new file mode 100644
