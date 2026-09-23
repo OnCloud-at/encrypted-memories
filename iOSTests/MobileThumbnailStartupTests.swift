@@ -1,0 +1,188 @@
+import Foundation
+import MediaByteCache
+import MediaCacheUIKitAdapter
+import PhotosCore
+import Testing
+import UIKit
+
+@testable import EncryptedMemoriesMobile
+
+@MainActor @Suite struct MobileThumbnailStartupTests {
+    @Test func metadataChangeDoesNotRestartCompletedStartupCrawl() async throws {
+        let fixture = try await MobileSignedInFixture(itemsPerSection: 1)
+        defer { fixture.removeCache() }
+        let model = MobileLibraryModel()
+        fixture.install(into: model)
+
+        model.startIsolatedThumbnailPrefetchForTests()
+        #expect(model.isBackgroundLoading)
+        #expect(await waitUntil { !model.isBackgroundLoading })
+
+        let updated = fixture.sections.map { section in
+            TimelineSection(
+                id: section.id,
+                date: section.date,
+                title: section.title,
+                items: section.items.map {
+                    PhotoItem(
+                        uid: $0.uid,
+                        captureTime: $0.captureTime.addingTimeInterval(1),
+                        mediaType: $0.mediaType)
+                })
+        }
+        model.replaceIsolatedThumbnailInventoryForTests(updated)
+
+        #expect(!model.isBackgroundLoading)
+        await fixture.feed.stopPrefetch()
+    }
+
+    @Test func initiallyEmptyInventoryStartsCrawlWhenContentArrives() async throws {
+        let fixture = try await MobileSignedInFixture(itemsPerSection: 1)
+        defer { fixture.removeCache() }
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let uid = PhotoUID(volumeID: "thumbnail-owner", nodeID: "arriving")
+        let loader = ThumbnailLoaderProbe(data: [uid: try imageData(color: .orange)])
+        let cache = ThumbnailCache(rootDirectory: root)
+        let feed = UIKitThumbnailFeed(cache: cache, loader: loader, concurrency: 1, batch: 1)
+        let model = MobileLibraryModel()
+        fixture.install(
+            into: model, backend: fixture.backend, sections: [],
+            thumbnailFeed: feed, thumbnailCache: cache)
+
+        model.startIsolatedThumbnailPrefetchForTests()
+        #expect(!model.isBackgroundLoading)
+
+        model.replaceIsolatedThumbnailInventoryForTests([section(items: [item(uid)])])
+        #expect(model.isBackgroundLoading)
+        #expect(await waitUntil { !model.isBackgroundLoading })
+        #expect(await loader.requests(for: uid) > 0)
+        #expect(await feed.image(for: uid) != nil)
+        await feed.stopPrefetch()
+    }
+
+    @Test func newPhotoUsesTheIncrementalCoordinatorAndSurvivesCacheClear() async throws {
+        let fixture = try await MobileSignedInFixture(itemsPerSection: 1)
+        defer { fixture.removeCache() }
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let old = PhotoUID(volumeID: "thumbnail-owner", nodeID: "old")
+        let added = PhotoUID(volumeID: "thumbnail-owner", nodeID: "added")
+        let loader = ThumbnailLoaderProbe(data: [
+            old: try imageData(color: .blue),
+            added: try imageData(color: .green),
+        ])
+        let cache = ThumbnailCache(rootDirectory: root)
+        let feed = UIKitThumbnailFeed(cache: cache, loader: loader, concurrency: 1, batch: 1)
+        let initial = [section(items: [item(old)])]
+        let model = MobileLibraryModel()
+        fixture.install(
+            into: model, backend: fixture.backend, sections: initial,
+            thumbnailFeed: feed, thumbnailCache: cache)
+
+        model.startIsolatedThumbnailPrefetchForTests()
+        #expect(await waitUntil { !model.isBackgroundLoading })
+        let initialCalls = await loader.callCount
+
+        model.replaceIsolatedThumbnailInventoryForTests([section(items: [item(old), item(added)])])
+        #expect(
+            await waitUntil {
+                await loader.requests(for: added) > 0 && !model.isBackgroundLoading
+            })
+        #expect(await loader.callCount > initialCalls)
+        #expect(await feed.image(for: added) != nil)
+        let addedCallsBeforeClear = await loader.requests(for: added)
+
+        await model.clearCache()
+        try await feed.waitForPrefetchToFinish()
+
+        // Decoded images survive a disk-cache clear. Inspect downloads before another image request
+        // can hide a stale crawl inventory by fetching the new asset on demand.
+        #expect(await loader.requests(for: added) > addedCallsBeforeClear)
+        await feed.stopPrefetch()
+    }
+
+    @Test func explicitCacheClearRestartsTheOwnedCrawl() async throws {
+        let fixture = try await MobileSignedInFixture(itemsPerSection: 1)
+        defer { fixture.removeCache() }
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let uid = PhotoUID(volumeID: "thumbnail-owner", nodeID: "cached")
+        let loader = ThumbnailLoaderProbe(data: [uid: try imageData(color: .purple)])
+        let cache = ThumbnailCache(rootDirectory: root)
+        let feed = UIKitThumbnailFeed(cache: cache, loader: loader, concurrency: 1, batch: 1)
+        let model = MobileLibraryModel()
+        fixture.install(
+            into: model, backend: fixture.backend, sections: [section(items: [item(uid)])],
+            thumbnailFeed: feed, thumbnailCache: cache)
+
+        model.startIsolatedThumbnailPrefetchForTests()
+        #expect(await waitUntil { !model.isBackgroundLoading })
+        let callsBeforeClear = await loader.callCount
+
+        await model.clearCache()
+        try await feed.waitForPrefetchToFinish()
+
+        #expect(await loader.callCount > callsBeforeClear)
+        #expect(await feed.image(for: uid) != nil)
+        await feed.stopPrefetch()
+    }
+
+    private func waitUntil(
+        timeout: Duration = .seconds(5),
+        _ predicate: @MainActor @escaping () async -> Bool
+    ) async -> Bool {
+        let deadline = ContinuousClock.now + timeout
+        while ContinuousClock.now < deadline {
+            if await predicate() { return true }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        return await predicate()
+    }
+
+    private func section(items: [PhotoItem]) -> TimelineSection {
+        TimelineSection(id: "thumbnail-owner", date: Date(), title: "Fixture", items: items)
+    }
+
+    private func item(_ uid: PhotoUID) -> PhotoItem {
+        PhotoItem(uid: uid, captureTime: Date(), mediaType: "image/png")
+    }
+
+    private func imageData(color: UIColor) throws -> Data {
+        let image = UIGraphicsImageRenderer(size: CGSize(width: 64, height: 64)).image { context in
+            color.setFill()
+            context.fill(CGRect(x: 0, y: 0, width: 64, height: 64))
+        }
+        return try #require(image.pngData())
+    }
+}
+
+private actor ThumbnailLoaderProbe: ThumbnailBatchLoader {
+    private let data: [PhotoUID: Data]
+    private var calls = 0
+    private var requested: [PhotoUID: Int] = [:]
+
+    init(data: [PhotoUID: Data]) {
+        self.data = data
+    }
+
+    func loadThumbnails(
+        for uids: [PhotoUID],
+        onLoaded: @Sendable @escaping (PhotoUID, Data) -> Void
+    ) async -> ThumbnailBatchLoadResult {
+        calls += 1
+        var errors: [PhotoUID: String] = [:]
+        for uid in uids {
+            requested[uid, default: 0] += 1
+            if let bytes = data[uid] {
+                onLoaded(uid, bytes)
+            } else {
+                errors[uid] = "missing fixture thumbnail"
+            }
+        }
+        return ThumbnailBatchLoadResult(itemErrors: errors)
+    }
+
+    var callCount: Int { calls }
+    func requests(for uid: PhotoUID) -> Int { requested[uid, default: 0] }
+}

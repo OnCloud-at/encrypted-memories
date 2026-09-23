@@ -344,11 +344,15 @@ import Testing
 
     private final class TrackingSession: MLSmartSearchSession, @unchecked Sendable {
         let descriptor: MLModelDescriptor
+        private let indexFails: Bool
         private let lock = NSLock()
         private var indexes = 0
         private var shutdowns = 0
 
-        init(descriptor: MLModelDescriptor) { self.descriptor = descriptor }
+        init(descriptor: MLModelDescriptor, indexFails: Bool = false) {
+            self.descriptor = descriptor
+            self.indexFails = indexFails
+        }
 
         func index(_ assets: [PhotoUID], observer: MLIndexPassObserver) async -> MLIndexPassOutcome {
             lock.withLock { indexes += 1 }
@@ -356,7 +360,9 @@ import Testing
                 report: MLIndexBatchReport(),
                 ranToCompletion: false,
                 newPermanentFailures: [],
-                progress: MLIndexProgress(phase: .idle, descriptor: descriptor)
+                progress: MLIndexProgress(
+                    phase: indexFails ? .failed(message: "fixture storage failure") : .idle,
+                    descriptor: descriptor)
             )
         }
 
@@ -1960,6 +1966,74 @@ import Testing
         #expect(failed)
         #expect(harness.provider.builtCount == 0)
         #expect(!FileManager.default.fileExists(atPath: harness.layout.modelDirectory(for: entryA.id).path))
+    }
+
+    @Test func completedIndexBecomesReadyAfterSelectionPublicationResumes() async throws {
+        let payload = Data("model-a-bytes".utf8)
+        let (entry, url) = downloadableEntry(id: "model-a", payload: payload)
+        let assets = (0..<5).map { uid("asset-\($0)") }
+        let harness = try makeHarness(
+            catalog: MLModelCatalog(entries: [entry]), payloads: [url: payload], assets: assets)
+        defer { try? FileManager.default.removeItem(at: harness.layout.rootDirectory) }
+        let gate = OneShotEmbeddingBarrier()
+        await gate.arm()
+        await harness.lifecycle.setSelectionCompletionGate { await gate.waitIfArmed() }
+
+        await harness.lifecycle.start()
+        await harness.lifecycle.setEnabled(true)
+        let selection = Task { await harness.lifecycle.select(entry.id) }
+        await gate.waitUntilBlocked()
+        #expect(
+            await waitUntil {
+                let snapshot = await harness.lifecycle.currentSnapshot()
+                if case .ready(let progress) = snapshot.indexingState {
+                    return progress.totalWorkUnits == assets.count
+                        && progress.settledWorkUnits == assets.count
+                }
+                return false
+            })
+        #expect(await harness.lifecycle.semanticIndexedAssetCount() == assets.count)
+
+        await gate.release()
+        await selection.value
+        #expect(await waitForCompleteIndex(harness, total: assets.count))
+        await harness.lifecycle.shutdown()
+    }
+
+    @Test func selectionCompletionPreservesIndexFailureBackoff() async throws {
+        let payload = Data("model-a-bytes".utf8)
+        let (entry, url) = downloadableEntry(id: "model-a", payload: payload)
+        let harness = try makeHarness(
+            catalog: MLModelCatalog(entries: [entry]), payloads: [url: payload],
+            assets: [uid("asset")], retryDelay: .seconds(30))
+        defer { try? FileManager.default.removeItem(at: harness.layout.rootDirectory) }
+        let session = TrackingSession(descriptor: entry.descriptor, indexFails: true)
+        harness.provider.sessionOverride = { _ in session }
+        let gate = OneShotEmbeddingBarrier()
+        await gate.arm()
+        await harness.lifecycle.setSelectionCompletionGate { await gate.waitIfArmed() }
+
+        await harness.lifecycle.start()
+        await harness.lifecycle.setEnabled(true)
+        let selection = Task { await harness.lifecycle.select(entry.id) }
+        await gate.waitUntilBlocked()
+        #expect(
+            await waitUntil {
+                if case .failed = await harness.lifecycle.currentSnapshot().indexingState {
+                    return true
+                }
+                return false
+            })
+        #expect(session.indexCount == 1)
+
+        await gate.release()
+        await selection.value
+        let retriedEarly = await waitUntil(timeout: .milliseconds(250)) {
+            session.indexCount > 1
+        }
+        #expect(!retriedEarly)
+        #expect(session.indexCount == 1)
+        await harness.lifecycle.shutdown()
     }
 
     @Test func sameSelectionDoesNotReindex() async throws {

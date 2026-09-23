@@ -604,7 +604,15 @@ final class MobileLibraryModel {
     func clearCache() async {
         guard let cache = thumbnailCache else { return }
         if let feed = thumbnailFeed {
-            await feed.clearCacheAndRestartPrefetch()
+            // Incremental arrivals do not restart the startup crawl. An explicit clear must still
+            // rebuild the current inventory, including photos added since that crawl began.
+            let crawlItems = items
+            let token = loadToken
+            let uids = await Task.detached(priority: .utility) {
+                ThumbnailCrawlOrder.newestToOldestFromChronological(crawlItems)
+            }.value
+            guard !Task.isCancelled, token == loadToken, thumbnailFeed === feed else { return }
+            await feed.clearCacheAndRestartPrefetch(currentUIDs: uids)
         } else {
             await cache.clear()
         }
@@ -805,7 +813,10 @@ final class MobileLibraryModel {
     }
 
     private func scheduleThumbnailPrefetch(using feed: UIKitThumbnailFeed) {
-        prefetchStartTask?.cancel()
+        // Metadata corrections must not restart the whole-library crawl. Later new identities use the
+        // existing update coordinator. An empty first inventory does not consume this generation's start.
+        // Teardown and a replacement load clear this owner; completion deliberately retains it.
+        guard !items.isEmpty, prefetchStartTask == nil else { return }
         let crawlItems = items
         let token = loadToken
         isThumbnailPrefetchLoading = !crawlItems.isEmpty
@@ -1487,14 +1498,12 @@ final class MobileLibraryModel {
                         loadGeneration == self.loadToken,
                         self.session == session
                     else { return }
-                    let appliedCachedItems = try await applyItems(cached.sections, cached: true)
+                    try await applyItems(cached.sections, cached: true)
                     guard !Task.isCancelled,
                         loadGeneration == self.loadToken,
                         self.session == session
                     else { return }
-                    if appliedCachedItems {
-                        scheduleThumbnailPrefetch(using: feed)
-                    }
+                    scheduleThumbnailPrefetch(using: feed)
                     cacheValidation = await TimelineCacheValidationPolicy.validate(
                         snapshot: cached,
                         repository: backend
@@ -1527,14 +1536,12 @@ final class MobileLibraryModel {
                     self.session == session
                 else { return }
                 let previousUIDs = items.map(\.uid)
-                let changed = try await applyItems(refreshed.sections, cached: false, authoritative: true)
+                try await applyItems(refreshed.sections, cached: false, authoritative: true)
                 guard !Task.isCancelled,
                     loadGeneration == self.loadToken,
                     self.session == session
                 else { return }
-                if changed {
-                    scheduleThumbnailPrefetch(using: feed)
-                }
+                scheduleThumbnailPrefetch(using: feed)
                 if hadCachedInventory {
                     reconcileNewAssetThumbnails(previousUIDs: previousUIDs, using: feed)
                 }
@@ -1755,12 +1762,10 @@ final class MobileLibraryModel {
             try Task.checkCancellation()
             try requireCurrentMutation(refreshLease)
             let previousUIDs = items.map(\.uid)
-            let changed = try await applyItems(refreshed, cached: false, authoritative: true)
+            try await applyItems(refreshed, cached: false, authoritative: true)
             try requireCurrentMutation(refreshLease)
             if let thumbnailFeed {
-                if changed {
-                    scheduleThumbnailPrefetch(using: thumbnailFeed)
-                }
+                scheduleThumbnailPrefetch(using: thumbnailFeed)
                 reconcileNewAssetThumbnails(previousUIDs: previousUIDs, using: thumbnailFeed)
             }
             // The same opaque server event token covers album mutations. Reuse this central foreground
@@ -1804,7 +1809,8 @@ final class MobileLibraryModel {
             store: SessionKeychainStore,
             backend: any PhotosBackend,
             sections: [TimelineSection],
-            thumbnailFeed: UIKitThumbnailFeed
+            thumbnailFeed: UIKitThumbnailFeed,
+            thumbnailCache: ThumbnailCache? = nil
         ) {
             let projection = TimelineContentProjection(sections: sections)
             self.store = store
@@ -1812,12 +1818,30 @@ final class MobileLibraryModel {
             configuredUID = session.uid
             self.backend = backend
             self.thumbnailFeed = thumbnailFeed
+            self.thumbnailCache = thumbnailCache
             snapshot = projection.snapshot
             self.sections = projection.sections
             favoriteUIDs = []
             favoriteFilterAvailability = .available
             timelineRevision &+= 1
             loadState = .contentReady(count: projection.snapshot.items.count)
+        }
+
+        /// Drives the production startup and new-identity paths without opening a real account backend.
+        func replaceIsolatedThumbnailInventoryForTests(_ sections: [TimelineSection]) {
+            let previousUIDs = items.map(\.uid)
+            let projection = TimelineContentProjection(sections: sections)
+            snapshot = projection.snapshot
+            self.sections = projection.sections
+            timelineRevision &+= 1
+            guard let thumbnailFeed else { return }
+            scheduleThumbnailPrefetch(using: thumbnailFeed)
+            reconcileNewAssetThumbnails(previousUIDs: previousUIDs, using: thumbnailFeed)
+        }
+
+        func startIsolatedThumbnailPrefetchForTests() {
+            guard let thumbnailFeed else { return }
+            scheduleThumbnailPrefetch(using: thumbnailFeed)
         }
     }
 #endif

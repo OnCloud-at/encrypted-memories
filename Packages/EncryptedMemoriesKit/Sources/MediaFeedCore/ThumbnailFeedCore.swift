@@ -1419,8 +1419,9 @@ public actor ThumbnailFeedCore {
     /// Clears the encrypted thumbnail tier and its coverage state as one feed operation, then restarts the
     /// current library crawl. Stopping first prevents an old worker or checkpoint from repopulating stale
     /// coverage after the cache directory has been removed.
-    public func clearCacheAndRestartPrefetch() async {
-        let current = sequential
+    /// Hosts that add photos through incremental demand can supply the latest crawl inventory.
+    public func clearCacheAndRestartPrefetch(currentUIDs: [PhotoUID]? = nil) async {
+        let current = currentUIDs ?? sequential
         let shouldRestart = prefetchEnabled && !current.isEmpty
         stopPrefetch()
         await cache.clear()

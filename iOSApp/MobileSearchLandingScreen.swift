@@ -264,13 +264,18 @@ private struct MobileSearchSubtitleLabelStyle: LabelStyle {
 }
 
 /// A square preview from the authenticated thumbnail cache, with a symbol while it loads or when no item exists.
-private struct MobileSearchThumbnail: View {
+struct MobileSearchThumbnail: View {
     let uid: PhotoUID?
     let size: CGFloat
     let cornerRadius: CGFloat
     let placeholderSymbol: String
     let thumbnailFeed: UIKitThumbnailFeed?
     @State private var image: UIImage?
+
+    private struct LoadIdentity: Equatable {
+        let uid: PhotoUID?
+        let feed: ObjectIdentifier?
+    }
 
     var body: some View {
         ZStack {
@@ -288,14 +293,16 @@ private struct MobileSearchThumbnail: View {
         .frame(width: size, height: size)
         .clipShape(.rect(cornerRadius: cornerRadius))
         .accessibilityHidden(true)
-        .task(id: uid) {
+        .task(id: LoadIdentity(uid: uid, feed: thumbnailFeed.map { ObjectIdentifier($0) })) {
             guard let uid, let thumbnailFeed else {
                 image = nil
                 return
             }
             image = thumbnailFeed.memoryImage(for: uid)
             if image == nil {
-                image = await thumbnailFeed.image(for: uid)
+                let loaded = await thumbnailFeed.image(for: uid)
+                guard !Task.isCancelled else { return }
+                image = loaded
             }
         }
     }

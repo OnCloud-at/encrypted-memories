@@ -587,7 +587,20 @@ public actor MLSmartSearchLifecycle {
             }
         }
         switchInProgress = true
-        defer { switchInProgress = false }
+        defer {
+            switchInProgress = false
+            // A fast index can finish while selection still owns the visible phase. Once that
+            // owner retires, let the existing loop publish its durable coverage without reindexing.
+            if !isShutDown, persistent.isEnabled, persistent.pendingOperation == nil,
+                activationGeneration == selectionGeneration, case .ready = indexingState,
+                lastCoverage.isComplete, semanticIndexedLibraryGeneration == libraryGeneration
+            {
+                switch phase {
+                case .waiting, .indexing, .ready: kick()
+                default: break  // Preserve failures and phases owned by another operation.
+                }
+            }
+        }
 
         // Make the target installable without disturbing the current installation. A hosted target
         // is ready only when its exact signed revision is installed.
@@ -674,6 +687,9 @@ public actor MLSmartSearchLifecycle {
             activationGeneration == selectionGeneration
         else { return }
         await activateSelectedModel(intent: .userInitiated)
+        #if DEBUG
+            await selectionCompletionGate?()
+        #endif
     }
 
     /// Retry after a retryable failure (download, model load, storage). A storage failure may
@@ -747,6 +763,13 @@ public actor MLSmartSearchLifecycle {
 
         /// Test seam: runs when a Visual Search removal has published `.deleting`, before teardown.
         private var visualRemovalContinuationGate: (@Sendable () async -> Void)?
+        /// Test seam: holds selection ownership after activation while the index may finish.
+        private var selectionCompletionGate: (@Sendable () async -> Void)?
+
+        func setSelectionCompletionGate(_ gate: (@Sendable () async -> Void)?) {
+            selectionCompletionGate = gate
+        }
+
         func setVisualRemovalContinuationGate(_ gate: (@Sendable () async -> Void)?) {
             visualRemovalContinuationGate = gate
         }

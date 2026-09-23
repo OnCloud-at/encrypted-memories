@@ -178,9 +178,9 @@
             await core.stopPrefetchAndWait()
         }
 
-        public func clearCacheAndRestartPrefetch() async {
+        public func clearCacheAndRestartPrefetch(currentUIDs: [PhotoUID]? = nil) async {
             imageWrappers.invalidateAll()
-            await core.clearCacheAndRestartPrefetch()
+            await core.clearCacheAndRestartPrefetch(currentUIDs: currentUIDs)
         }
 
         public func setPrefetchEnabled(_ enabled: Bool) async {
