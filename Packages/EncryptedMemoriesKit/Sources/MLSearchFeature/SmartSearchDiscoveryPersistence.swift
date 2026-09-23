@@ -12,8 +12,36 @@ struct SmartSearchDiscoveryPersistence: Codable, Sendable {
     let fingerprint: Data
     let snapshot: SmartSearchDiscoveryModel.PersistedSnapshot
     let evidence: MLSearchBatchResults?
+    /// Separates inventory changes from dates, favorites and place metadata. Missing values cannot
+    /// authorize evidence reuse for different content, but an exact full fingerprint remains sufficient.
+    var assetFingerprint: Data?
 
-    var hasCompleteEvidence: Bool {
+    /// Playback learns durations into SQLite although server timeline rows omit them.
+    /// Discovery never reads duration, so that enrichment cannot change suggestion identity.
+    static func suggestionItem(_ item: PhotoItem) -> PhotoItem {
+        guard item.durationSeconds != nil else { return item }
+        return PhotoItem(
+            uid: item.uid, captureTime: item.captureTime, mediaType: item.mediaType,
+            isLivePhoto: item.isLivePhoto, relatedVideoID: item.relatedVideoID,
+            tags: item.tags, burstMemberIDs: item.burstMemberIDs)
+    }
+
+    static func assetFingerprint(sections: [TimelineSection]) throws -> Data {
+        let items: [PhotoItem] = sections.flatMap(\.items)
+        let uids: [PhotoUID] = items.map(\.uid).sorted { lhs, rhs in
+            lhs.volumeID == rhs.volumeID ? lhs.nodeID < rhs.nodeID : lhs.volumeID < rhs.volumeID
+        }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = .sortedKeys
+        return Data(SHA256.hash(data: try encoder.encode(uids)))
+    }
+
+    func hasCompleteEvidence(requiresVisualEvidence: Bool) -> Bool {
+        // The sensitive gate applies only when visual search is enabled. Metadata-only rows are valid
+        // without an embedding scan; the encrypted envelope and model key bind that policy.
+        if !requiresVisualEvidence {
+            return !snapshot.candidates.contains { $0.kind == .concept }
+        }
         guard let evidence else {
             return !snapshot.candidates.contains { !$0.representativeUIDs.isEmpty || $0.kind == .concept }
         }
@@ -48,7 +76,8 @@ struct SmartSearchDiscoveryPersistence: Codable, Sendable {
         encoder.outputFormatting = .sortedKeys
         let data = try encoder.encode(
             Content(
-                items: sections.flatMap(\.items), favorites: favorites.sorted(by: precedes),
+                items: sections.flatMap(\.items).map(suggestionItem).sorted { precedes($0.uid, $1.uid) },
+                favorites: favorites.sorted(by: precedes),
                 coordinates: coordinates.sorted { precedes($0.uid, $1.uid) }, day: calendar.startOfDay(for: now),
                 calendar: String(describing: calendar.identifier), timeZone: calendar.timeZone.identifier,
                 locale: locale.identifier + "|" + Locale.preferredLanguages.joined(separator: "|")))

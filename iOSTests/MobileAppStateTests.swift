@@ -54,6 +54,21 @@ private actor MobileRetryCompletionLatch {
     func isCompleted() -> Bool { completed }
 }
 
+private actor MobileFavoriteRecoveryProbe {
+    private(set) var calls = 0
+    let retry = MobileRetryLifecycleLatch()
+    let members: Set<PhotoUID>
+
+    init(members: Set<PhotoUID>) { self.members = members }
+
+    func load() async throws -> Set<PhotoUID> {
+        calls += 1
+        if calls == 1 { throw MobileFixtureError.unavailable }
+        await retry.block("favorites")
+        return members
+    }
+}
+
 @MainActor
 private final class MobileScopeRecoveryTestState {
     var events: [String] = []
@@ -872,6 +887,99 @@ private func waitUntil(
 
         #expect(model.favoriteFilterAvailability == .loading)
         #expect(model.favoriteUIDs.isEmpty)
+    }
+
+    @Test(arguments: [false, true])
+    func unavailableFavoritesRecoverThroughCoalescedLibraryRefresh(knownEmpty: Bool) async throws {
+        let fixture = try await MobileSignedInFixture(itemsPerSection: 1)
+        defer { fixture.removeCache() }
+        let model = MobileLibraryModel()
+        let authoritative: Set<PhotoUID> = knownEmpty ? [] : [fixture.items[0].uid]
+        let newerFavorite = fixture.items[1].uid
+        let probe = MobileFavoriteRecoveryProbe(members: authoritative)
+        defer { Task { await probe.retry.release("favorites") } }
+        fixture.install(
+            into: model,
+            backend: MobileFixtureBackend(
+                sections: fixture.sections, thumbnails: fixture.backend.thumbnails,
+                favoriteLoader: { try await probe.load() }),
+            sections: fixture.sections, thumbnailFeed: fixture.feed, thumbnailCache: fixture.cache)
+
+        // This is the production entry used after connectivity and successful timeline refreshes.
+        // It must work without a secondary-source runtime and without restarting the account.
+        model.refreshLibrarySources()
+        try await waitUntil { await MainActor.run { model.favoriteFilterAvailability == .unavailable } }
+        #expect(await probe.calls == 1)
+        #expect(!model.allowsSuggestionCacheRestore)
+
+        model.refreshLibrarySources()
+        model.refreshLibrarySources()
+        try await waitUntil { await probe.retry.hasEntered("favorites") }
+        #expect(await probe.calls == 2)
+        #expect(model.favoriteFilterAvailability == .loading)
+        #expect(!model.allowsSuggestionCacheRestore)
+        let mutationSucceeded = await model.toggleFavorite([newerFavorite])
+        #expect(mutationSucceeded)
+        model.refreshLibrarySources()
+        await probe.retry.release("favorites")
+
+        try await waitUntil { await MainActor.run { model.allowsSuggestionCacheRestore } }
+        #expect(model.favoriteUIDs == authoritative.union([newerFavorite]))
+        #expect(model.favoriteFilterAvailability == .available)
+        #expect(await probe.calls == 2)
+        model.refreshLibrarySources()
+        #expect(model.favoriteFilterAvailability == .available)
+        #expect(await probe.calls == 2, "known favorites must not cause another server read on every refresh")
+    }
+
+    @Test(arguments: ["success", "failureBeforeRead", "failureAfterRead"])
+    func favoriteMutationStartedBeforeRetrySurvivesStaleRead(outcome: String) async throws {
+        let fixture = try await MobileSignedInFixture(itemsPerSection: 1)
+        defer { fixture.removeCache() }
+        let model = MobileLibraryModel()
+        let favorite = fixture.items[0].uid
+        let probe = MobileFavoriteRecoveryProbe(members: [])
+        defer {
+            Task {
+                await probe.retry.release("favorites")
+                await probe.retry.release("write")
+            }
+        }
+        fixture.install(
+            into: model,
+            backend: MobileFixtureBackend(
+                sections: fixture.sections, thumbnails: fixture.backend.thumbnails,
+                favoriteLoader: { try await probe.load() },
+                favoriteWriter: { _, _ in
+                    await probe.retry.block("write")
+                    if outcome != "success" { throw MobileFixtureError.unavailable }
+                }),
+            sections: fixture.sections, thumbnailFeed: fixture.feed, thumbnailCache: fixture.cache)
+        model.refreshLibrarySources()
+        try await waitUntil { await MainActor.run { model.favoriteFilterAvailability == .unavailable } }
+
+        let mutation = Task { await model.toggleFavorite([favorite]) }
+        try await waitUntil { await probe.retry.hasEntered("write") }
+        #expect(model.favoriteUIDs.contains(favorite))
+        model.refreshLibrarySources()
+        try await waitUntil { await probe.retry.hasEntered("favorites") }
+
+        if outcome == "failureBeforeRead" {
+            await probe.retry.release("write")
+            #expect(await mutation.value == false)
+        }
+        await probe.retry.release("favorites")
+        try await waitUntil { await MainActor.run { model.allowsSuggestionCacheRestore } }
+        #expect(model.favoriteUIDs.contains(favorite) == (outcome != "failureBeforeRead"))
+        if outcome != "failureBeforeRead" {
+            await probe.retry.release("write")
+            #expect(await mutation.value == (outcome == "success"))
+        }
+        #expect(model.favoriteUIDs.contains(favorite) == (outcome == "success"))
+        #expect(model.favoriteMutationsInFlight.isEmpty)
+        model.refreshLibrarySources()
+        #expect(model.favoriteFilterAvailability == .available)
+        #expect(await probe.calls == 2)
     }
 
     @Test func bulkFavoriteKeepsSelectionAndSurfacesFailure() async throws {

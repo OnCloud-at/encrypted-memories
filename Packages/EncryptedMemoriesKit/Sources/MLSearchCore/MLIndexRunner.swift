@@ -513,7 +513,12 @@ public actor MLIndexRunner {
                 return MLDerivedPipelinePassOutcome(reason: stopReason, progress: progress)
             }
             if deferredWorkSeen {
-                return MLDerivedPipelinePassOutcome(reason: .retryPending, progress: progress)
+                // Nonresident sources must not stall older queued assets behind their retry slot.
+                let hasUntouchedWork = progress.pending > progress.retryPending
+                return MLDerivedPipelinePassOutcome(
+                    reason: hasUntouchedWork ? .workQuantumCompleted : .retryPending,
+                    progress: progress
+                )
             }
             if let remaining = remainingAnalysisPlans {
                 remainingAnalysisPlans = remaining - plans.count
@@ -602,6 +607,15 @@ public actor MLIndexRunner {
         configuration: Configuration,
         now: Date
     ) -> MLPipelineStageResult {
+        if case .deferred(let reason, let requestedRetry) = result.outcome {
+            return MLPipelineStageResult(
+                workItem: item,
+                outcome: .deferred(
+                    reason: reason,
+                    retryAfter: requestedRetry ?? now.addingTimeInterval(configuration.retryDelay)
+                )
+            )
+        }
         guard case .retryableFailure(let reason, let requestedRetry) = result.outcome else {
             return result
         }

@@ -339,7 +339,7 @@ import TimelineCore
 
     @MainActor @Test func failedVisualQueriesRemainRetryableAfterMetadataSettles() async {
         struct QueryFailure: Error {}
-        let model = SmartSearchDiscoveryModel(refreshPolicy: .oncePerSession) { _, _ in nil }
+        let model = SmartSearchDiscoveryModel(refreshPolicy: .background) { _, _ in nil }
         let ready = snapshot(enabled: true, visual: true, indexing: .ready(progress()))
         await model.refresh(
             sections: [TimelineSection(id: "all", date: Self.start, title: "", items: Self.items())],
@@ -347,7 +347,7 @@ import TimelineCore
             snapshot: ready, indexedAssetCount: { 20 }, search: { _, _ in throw QueryFailure() }
         )
         #expect(model.hasComputed)
-        #expect(model.needsVisualCompletion(ready))
+        #expect(!model.lastRefreshCompleted)
         #expect(!model.showsVisualSuggestionsPendingNote(ready))
         #expect(model.forYou.allSatisfy { $0.representativeUIDs.isEmpty })
 
@@ -356,7 +356,7 @@ import TimelineCore
             timelineRevision: 1, favoriteUIDs: Self.favorites(), coordinates: [],
             snapshot: ready, indexedAssetCount: { 20 }, search: { _, _ in [] }
         )
-        #expect(!model.needsVisualCompletion(ready))
+        #expect(model.lastRefreshCompleted)
         #expect(!model.showsVisualSuggestionsPendingNote(ready))
     }
 
@@ -459,64 +459,6 @@ import TimelineCore
 
     // MARK: Fixtures
 
-    /// Twenty items of one summer day: eight favorites and five videos, enough for a favorites row, a season
-    /// row and media chips without any machine learning.
-    /// Once per session: after the first complete refresh, library changes neither recompute the suggestions nor
-    /// hide them, so the loading placeholder cannot come back until the next launch.
-    @MainActor @Test func aCompleteSessionRefreshIsFinalUntilTheNextLaunch() async throws {
-        let model = SmartSearchDiscoveryModel(refreshPolicy: .oncePerSession) { _, _ in nil }
-        let one = await refresh(model, revision: 1)
-        let rows = model.forYou(content: one, snapshot: nil)
-        #expect(!rows.isEmpty)
-        #expect(model.isSessionComplete)
-
-        // Background loading changes the library: nothing is recomputed and the same rows stay current.
-        let two = await refresh(model, revision: 2, favorites: [], itemCount: 24)
-        #expect(model.isCurrent(content: two))
-        #expect(model.forYou(content: two, snapshot: nil) == rows)
-        let first = try #require(rows.first)
-        #expect(model.commitDecision(for: first.query, content: two, snapshot: nil) == .structured(first))
-        #expect(model.rebind(first, content: two, snapshot: nil) == .keep(first))
-    }
-
-    /// Before the session is complete, a later refresh replaces the rows without clearing them first, so the
-    /// placeholder appears only until the very first publish.
-    @MainActor @Test func aSessionRefreshNeverClearsPublishedRows() async throws {
-        let model = SmartSearchDiscoveryModel(refreshPolicy: .oncePerSession) { _, _ in nil }
-        let two = Self.content(2, favorites: Self.favorites())
-        #expect(!model.isCurrent(content: two))
-
-        let one = await refresh(model, revision: 1)
-        #expect(!model.forYou(content: one, snapshot: nil).isEmpty)
-        // A refresh that stops before its first publish leaves the published rows visible.
-        let interrupted = Task { @MainActor in _ = await refresh(model, revision: 2) }
-        interrupted.cancel()
-        await interrupted.value
-        #expect(model.isCurrent(content: two))
-        #expect(!model.forYou(content: two, snapshot: nil).isEmpty)
-    }
-
-    /// The one exception to a complete session: once visual search is on and its index is finished, visual
-    /// concepts may be computed one more time. Until then a short note explains that they follow the indexing.
-    @MainActor @Test func visualSearchStillYieldsSuggestionsAfterTheIndexingFinishes() async {
-        let model = SmartSearchDiscoveryModel(refreshPolicy: .oncePerSession) { _, _ in nil }
-        await refresh(model, revision: 1)
-        #expect(model.isSessionComplete)
-
-        let off = snapshot(enabled: true, visual: false)
-        let indexing = snapshot(enabled: true, visual: true, indexing: .indexing(progress()))
-        let ready = snapshot(enabled: true, visual: true, indexing: .ready(progress()))
-        #expect(!model.showsVisualSuggestionsPendingNote(off))
-        #expect(model.showsVisualSuggestionsPendingNote(indexing))
-        #expect(!model.needsVisualCompletion(indexing))
-        #expect(!model.showsVisualSuggestionsPendingNote(ready))
-        #expect(model.needsVisualCompletion(ready))
-        #expect(model.visualCompletionKey(indexing) != model.visualCompletionKey(ready))
-
-        let continuous = SmartSearchDiscoveryModel { _, _ in nil }
-        #expect(!continuous.needsVisualCompletion(ready))
-    }
-
     @MainActor @discardableResult private func refresh(
         _ model: SmartSearchDiscoveryModel,
         revision: UInt64,
@@ -575,11 +517,18 @@ import TimelineCore
     private func snapshot(
         enabled: Bool, visual: Bool, indexing: MLSmartSearchIndexingState
     ) -> MLSmartSearchSnapshot {
-        MLSmartSearchSnapshot(
+        let phase: MLSmartSearchPhase
+        switch indexing {
+        case .ready(let progress):
+            phase = .ready(
+                .init(total: progress.totalWorkUnits, indexed: progress.settledWorkUnits, permanentlyUnindexable: 0))
+        default: phase = .disabled
+        }
+        return MLSmartSearchSnapshot(
             isEnabled: enabled,
             isVisualSearchEnabled: visual,
             selectedModelID: nil,
-            phase: .disabled,
+            phase: phase,
             installedModelBytes: 0,
             availableModels: [],
             isSearchAvailable: enabled,

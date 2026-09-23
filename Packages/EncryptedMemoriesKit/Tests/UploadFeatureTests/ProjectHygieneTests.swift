@@ -875,7 +875,7 @@ final class ProjectHygieneTests: XCTestCase {
         )
 
         XCTAssertTrue(
-            mobileApp.contains("MobileAdaptiveTabShell(selection: $selection)")
+            mobileApp.contains("MobileAdaptiveTabShell(selection: $selection, searchText: $searchText)")
                 && mobileApp.contains(".tabViewStyle(.sidebarAdaptable)"),
             "iPhone and iPad must share one native adaptive tab hierarchy: a bottom tab bar in compact windows, "
                 + "the system top tab bar with its sidebar toggle in regular windows"
@@ -946,6 +946,59 @@ final class ProjectHygieneTests: XCTestCase {
             iPad detail must not add a manual sidebar toggle on top of NavigationSplitView's built-in
             control. Rely on the single native control.
             """
+        )
+    }
+
+    func testSuggestionRestoreUsesLocalInventoryWithoutWaitingForServerOrThumbnails() throws {
+        let mobile = try String(
+            contentsOf: repoRoot.appendingPathComponent("iOSApp/MobileLibraryModel.swift"), encoding: .utf8)
+        let restore = try sourceBlock(
+            from: "var allowsSuggestionCacheRestore: Bool", to: "/// Indicates that explicit sign-out", in: mobile)
+        XCTAssertFalse(restore.contains("initialLibraryLoadSettled"))
+        XCTAssertFalse(restore.contains("hasSettled"))
+        XCTAssertTrue(restore.contains("loadState.knownCount != nil"))
+        XCTAssertTrue(restore.contains("favoriteLoadSettled"))
+        XCTAssertFalse(mobile.contains("@ObservationIgnored private var favoriteLoadSettled"))
+        let desktop = try String(
+            contentsOf: repoRoot.appendingPathComponent("App/Views/MainView.swift"), encoding: .utf8)
+        XCTAssertTrue(desktop.contains("cacheContentIsSettled: suggestionCacheContentReady"))
+        XCTAssertTrue(desktop.contains("cacheContentSettled:\\(suggestionCacheContentReady)"))
+    }
+
+    func testSuggestionHostsDoNotTreatFailedFavoritesAsKnownEmpty() throws {
+        let mobile = try String(
+            contentsOf: repoRoot.appendingPathComponent("iOSApp/MobileLibraryModel.swift"), encoding: .utf8)
+        let restore = try sourceBlock(
+            from: "var allowsSuggestionCacheRestore: Bool", to: "/// Indicates that explicit sign-out", in: mobile)
+        XCTAssertTrue(restore.contains("favoriteFilterAvailability == .available"))
+        let desktop = try String(
+            contentsOf: repoRoot.appendingPathComponent("App/Views/MainView.swift"), encoding: .utf8)
+        let load = try sourceBlock(from: "private func loadAlbums()", to: "// MARK: - Upload", in: desktop)
+        XCTAssertTrue(load.contains("favoritesLoaded = newFavorites != nil"))
+        XCTAssertFalse(load.contains("favoritesLoaded = true"))
+    }
+
+    func testEmptySearchTabDoesNotClaimInteractiveSearchResources() throws {
+        let mobileApp = try String(
+            contentsOf: repoRoot.appendingPathComponent("iOSApp/EncryptedMemoriesMobileApp.swift"),
+            encoding: .utf8
+        )
+        let mainTabView = try sourceBlock(
+            from: "private struct MobileMainTabView: View",
+            to: "private struct MobileAdaptiveTabShell: View",
+            in: mobileApp
+        )
+        XCTAssertTrue(
+            mainTabView.contains("!searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty"),
+            "the empty search landing must not pause ML indexing or suggestion generation"
+        )
+        XCTAssertTrue(
+            mainTabView.contains(".onChange(of: searchText)"),
+            "typing and clearing a query must update interactive resource priority"
+        )
+        XCTAssertTrue(
+            mainTabView.contains("MobileAdaptiveTabShell(selection: $selection, searchText: $searchText)"),
+            "the resource owner must observe the same search text as the native search field"
         )
     }
 

@@ -238,17 +238,23 @@ public actor MLSmartSearchLifecycle {
             PhotoDiagnostics.shared.increment("ml.suggestions.cacheReadFailed")
             data = nil
         }
-        return MLSearchSuggestionCacheAccess(data: data) { [weak self] payload in
-            guard let self else { throw CancellationError() }
-            try await self.saveSuggestionCache(payload, identity: identity, generation: generation)
-        }
+        return MLSearchSuggestionCacheAccess(
+            data: data,
+            isCurrent: { [weak self] in
+                await self?.suggestionCacheLeaseIsCurrent(identity: identity, generation: generation) == true
+            },
+            save: { [weak self] payload in
+                guard let self else { throw CancellationError() }
+                try await self.saveSuggestionCache(payload, identity: identity, generation: generation)
+            }
+        )
     }
 
     private func suggestionCacheIdentity() -> MLSearchSuggestionCacheIdentity? {
-        guard !isShutDown, !Task.isCancelled, persistent.isEnabled, persistent.pendingOperation == nil else {
+        guard started, !isShutDown, !Task.isCancelled, !stateLoadFailed, persistent.pendingOperation == nil else {
             return nil
         }
-        guard persistent.isVisualSearchEnabled else {
+        guard persistent.isEnabled && persistent.isVisualSearchEnabled else {
             return MLSearchSuggestionCacheIdentity(
                 descriptor: nil, modelRevision: nil, indexGeneration: nil, visualSearchEnabled: false)
         }
@@ -256,17 +262,23 @@ public actor MLSmartSearchLifecycle {
             let store = deps.storeProvider.openStore()
         else { return nil }
         let generation = store.generation(for: activeModel.entry.descriptor)
-        guard generation > 0 else { return nil }
         return MLSearchSuggestionCacheIdentity(
             descriptor: activeModel.entry.descriptor, modelRevision: activeModel.record.revision,
             indexGeneration: generation, visualSearchEnabled: true)
+    }
+
+    private func suggestionCacheLeaseIsCurrent(
+        identity: MLSearchSuggestionCacheIdentity, generation: UInt64
+    ) -> Bool {
+        generation == sessionGeneration && identity == suggestionCacheIdentity()
     }
 
     private func saveSuggestionCache(
         _ data: Data, identity: MLSearchSuggestionCacheIdentity, generation: UInt64
     ) throws {
         try Task.checkCancellation()
-        guard generation == sessionGeneration, identity == suggestionCacheIdentity(), let cache = deps.suggestionCache
+        guard suggestionCacheLeaseIsCurrent(identity: identity, generation: generation),
+            let cache = deps.suggestionCache
         else { throw MLSmartSearchQueryError.staleEpoch }
         try cache.save(data, identity: identity)
     }
@@ -954,7 +966,9 @@ public actor MLSmartSearchLifecycle {
         else { throw MLSmartSearchQueryError.unavailable }
         let generation = sessionGeneration
         let initialInventory = await deps.assetsProvider()
-        guard generation == sessionGeneration, !isShutDown else { throw MLSmartSearchQueryError.staleEpoch }
+        guard generation == sessionGeneration, !isShutDown, initialInventory.isAuthoritative else {
+            throw MLSmartSearchQueryError.staleEpoch
+        }
         let prompts = MLSearchConceptCatalog.suggestionPrompts
         let results = try await deps.resourceCoordinator.withHeavyPermit(
             LibraryWorkRequest(workload: .mlInference, intent: .automatic, memoryClass: .small)
@@ -963,7 +977,7 @@ public actor MLSmartSearchLifecycle {
         }
         let inventory = await deps.assetsProvider()
         guard generation == sessionGeneration, !isShutDown,
-            inventory.sourceEpoch == initialInventory.sourceEpoch
+            inventory == initialInventory
         else { throw MLSmartSearchQueryError.staleEpoch }
         // Result candidates are bounded by prompts × limit. Do not allocate another whole-library set.
         var removedUIDs = Set(results.results.flatMap { $0.results.map(\.uid) })
@@ -2101,7 +2115,8 @@ public actor MLSmartSearchLifecycle {
                 unavailableUIDs.count,
                 max(semanticUnavailable, nativeUnavailable)
             ),
-            unavailableAssetReasons: unavailableReasons
+            unavailableAssetReasons: unavailableReasons,
+            deferredWorkUnits: nativeSearch == nil ? 0 : (lastNativeProgress?.retryPending ?? 0)
         )
     }
 

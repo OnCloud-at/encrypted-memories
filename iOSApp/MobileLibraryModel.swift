@@ -201,6 +201,12 @@ final class MobileLibraryModel {
     var allowsAutomaticSuggestionRefresh: Bool {
         initialLibraryLoadSettled && loadState.hasSettled && !isBackgroundLoading && !isRefreshingLibrary
     }
+    /// A complete local inventory can restore its matching suggestions before server validation or thumbnails.
+    /// Source recovery still retires the account-owned scheduler before admitting replacement content.
+    var allowsSuggestionCacheRestore: Bool {
+        favoriteLoadSettled && favoriteFilterAvailability == .available
+            && loadState.knownCount != nil && !isRecoveringScope && !isSigningOut
+    }
     /// Indicates that explicit sign-out is closing account owners and deleting account data.
     /// Transient session replacement does not set this flag.
     private(set) var isSigningOut = false
@@ -280,7 +286,7 @@ final class MobileLibraryModel {
     /// Mutations newer than the in-flight authoritative favorite read. The loader merges this journal before
     /// publishing, so a slow response cannot erase a newer heart tap.
     @ObservationIgnored private var favoriteLoadOverrides: [PhotoUID: Bool] = [:]
-    @ObservationIgnored private var favoriteLoadSettled = false
+    private var favoriteLoadSettled = false
     /// Generation token used to reject off-main snapshot results from superseded loads or teardown.
     private var loadToken = 0
     private let libraryChangeMonitor = LibraryChangeMonitor()
@@ -808,8 +814,49 @@ final class MobileLibraryModel {
     /// Coalesces source discovery with any active refresh. Callers use this after connectivity or
     /// catalog change signals and do not delay the primary timeline refresh on secondary metadata.
     func refreshLibrarySources() {
+        loadFavoritesIfNeeded()
         guard let sourceAnalysisRuntime else { return }
         Task { await sourceAnalysisRuntime.refresh() }
+    }
+
+    /// Unknown favorites can recover through existing refresh signals without reloading the account.
+    /// The task owner coalesces startup and refresh calls; known membership needs no further server read.
+    private func loadFavoritesIfNeeded() {
+        guard favoriteLoadTask == nil,
+            !favoriteLoadSettled || favoriteFilterAvailability == .unavailable,
+            !isSigningOut, !isRecoveringScope,
+            let backend, let session
+        else { return }
+        let loadGeneration = loadToken
+        // A mutation can start after a failed read settled but before this retry.
+        for uid in favoriteMutationsInFlight {
+            favoriteLoadOverrides[uid] = favoriteUIDs.contains(uid)
+        }
+        favoriteLoadSettled = false
+        favoriteFilterAvailability = .loading
+        favoriteLoadTask = Task { [weak self, backend] in
+            let loaded: Set<PhotoUID>?
+            do {
+                loaded = try await backend.favoriteUIDs()
+            } catch {
+                loaded = nil
+            }
+            guard let self,
+                !Task.isCancelled,
+                loadGeneration == self.loadToken,
+                self.session == session
+            else { return }
+            if let loaded {
+                self.favoriteUIDs = FavoriteMutationPolicy.reconciling(
+                    authoritative: loaded,
+                    newerTargets: self.favoriteLoadOverrides
+                )
+            }
+            self.favoriteLoadTask = nil
+            self.favoriteFilterAvailability = loaded == nil ? .unavailable : .available
+            self.favoriteLoadOverrides.removeAll(keepingCapacity: false)
+            self.favoriteLoadSettled = true
+        }
     }
 
     /// Called when the grid first draws a fully populated frame to lift the loading UI.
@@ -871,7 +918,6 @@ final class MobileLibraryModel {
         let accountUID = cacheContext.accountUID
         let previousStarter = locationCrawlStartTask
         previousStarter?.cancel()
-        let locationKey = cacheContext.encryptionKey
 
         // Reuse the latest off-actor projection when available. The fallback covers tests or an early Map open.
         let initialItems = items
@@ -895,32 +941,20 @@ final class MobileLibraryModel {
                 loadGeneration == self.loadToken,
                 self.session?.uid == accountUID
             else { return }
-            // Await the previous crawl before replacing the store lease. Delayed persistence could otherwise
-            // race the new account generation.
+            // Startup already restored the account's location cache. Map entry only resumes its crawl.
             await crawl.cancel()
             guard !Task.isCancelled,
                 crawlGeneration == self.locationCrawlGeneration,
                 loadGeneration == self.loadToken,
                 self.session?.uid == accountUID
             else { return }
-            let sessionLease = store.configure(accountUID: accountUID, key: locationKey)
-            let locationLoad = Task.detached(priority: .utility) {
-                store.loadSnapshot()
-            }
+            guard let sessionLease = store.captureSessionLease() else { return }
             let initialInventory = await inventoryTask.value
             guard !Task.isCancelled,
                 crawlGeneration == self.locationCrawlGeneration,
                 loadGeneration == self.loadToken,
                 self.session?.uid == accountUID
             else { return }
-            let snapshot = await locationLoad.value
-            guard !Task.isCancelled,
-                store.isCurrentSessionLease(sessionLease),
-                crawlGeneration == self.locationCrawlGeneration,
-                loadGeneration == self.loadToken,
-                self.session?.uid == accountUID
-            else { return }
-            self.locationIndex.replaceAll(snapshot)  // Decrypted data stays off the UI actor.
             // Give thumbnail crawling a head start, then yield to visible demand. Do not use
             // `hasPendingThumbnailWork()` because it includes whole-library fill and can starve map indexing.
             do {
@@ -929,11 +963,7 @@ final class MobileLibraryModel {
                 return
             }
             guard !Task.isCancelled,
-                crawlGeneration == self.locationCrawlGeneration,
-                loadGeneration == self.loadToken,
-                self.session?.uid == accountUID
-            else { return }
-            guard !Task.isCancelled,
+                store.isCurrentSessionLease(sessionLease),
                 crawlGeneration == self.locationCrawlGeneration,
                 loadGeneration == self.loadToken,
                 self.session?.uid == accountUID
@@ -1395,6 +1425,19 @@ final class MobileLibraryModel {
             guard let self else { return }
             var hadCachedInventory = false
             do {
+                // Suggestions validate locations as part of their content identity. Restore the existing
+                // encrypted store before publishing settled inventory, even if Map is never opened.
+                // This reads local data only; it does not start the GPS crawl or geocoding.
+                let locationStore = self.locationStore
+                let locationLease = locationStore.configure(
+                    accountUID: cacheContext.accountUID, key: cacheContext.encryptionKey)
+                let savedLocations = await Task.detached(priority: .utility) {
+                    locationStore.loadSnapshot()
+                }.value
+                guard !Task.isCancelled, loadGeneration == self.loadToken, self.session == session,
+                    locationStore.isCurrentSessionLease(locationLease)
+                else { return }
+                self.locationIndex.replaceAll(savedLocations)
                 let client = try await ProtonDriveBackendFactory.makeFacade(
                     session: session,
                     store: store,
@@ -1468,28 +1511,7 @@ final class MobileLibraryModel {
                 if self.isRecoveringScope {
                     self.isRecoveringScope = false
                 }
-                self.favoriteLoadTask = Task { [weak self, backend] in
-                    let loaded: Set<PhotoUID>?
-                    do {
-                        loaded = try await backend.favoriteUIDs()
-                    } catch {
-                        loaded = nil
-                    }
-                    guard let self,
-                        !Task.isCancelled,
-                        loadGeneration == self.loadToken,
-                        self.session == session
-                    else { return }
-                    if let loaded {
-                        self.favoriteUIDs = FavoriteMutationPolicy.reconciling(
-                            authoritative: loaded,
-                            newerTargets: self.favoriteLoadOverrides
-                        )
-                    }
-                    self.favoriteFilterAvailability = loaded == nil ? .unavailable : .available
-                    self.favoriteLoadOverrides.removeAll(keepingCapacity: false)
-                    self.favoriteLoadSettled = true
-                }
+                self.loadFavoritesIfNeeded()
                 // The live feed's RAM tiers (UIImage wrappers + decoded core) respond to pressure tiers.
                 UIKitMemoryPressureCoordinator.shared.attachFeed(feed)
                 self.configureSourceAnalysis(client: client, feed: feed)

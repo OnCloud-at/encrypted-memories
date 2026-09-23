@@ -67,6 +67,8 @@ public enum MLSmartSearchPhase: Sendable, Equatable {
 public struct MLSmartSearchAggregateProgress: Sendable, Equatable {
     public let totalWorkUnits: Int
     public let settledWorkUnits: Int
+    /// Unfinished native work with a scheduled retry, not work in the initial indexing queue.
+    public let deferredWorkUnits: Int
     public let permanentlyUnavailableAssets: Int
     public let unavailableAssetReasons: [MLPipelineFailureReason: Int]
 
@@ -74,10 +76,12 @@ public struct MLSmartSearchAggregateProgress: Sendable, Equatable {
         totalWorkUnits: Int,
         settledWorkUnits: Int,
         permanentlyUnavailableAssets: Int,
-        unavailableAssetReasons: [MLPipelineFailureReason: Int] = [:]
+        unavailableAssetReasons: [MLPipelineFailureReason: Int] = [:],
+        deferredWorkUnits: Int = 0
     ) {
         self.totalWorkUnits = max(0, totalWorkUnits)
         self.settledWorkUnits = min(max(0, settledWorkUnits), max(0, totalWorkUnits))
+        self.deferredWorkUnits = min(max(0, deferredWorkUnits), self.totalWorkUnits - self.settledWorkUnits)
         self.permanentlyUnavailableAssets = max(0, permanentlyUnavailableAssets)
         self.unavailableAssetReasons = unavailableAssetReasons.filter { $0.value > 0 }
     }
@@ -145,6 +149,54 @@ public struct MLSmartSearchSnapshot: Sendable, Equatable {
         isSearchAvailable: false,
         indexingState: .idle
     )
+
+    /// Semantic coverage is independent of native OCR/document retries.
+    public var isVisualIndexComplete: Bool {
+        guard isEnabled, isVisualSearchEnabled else { return false }
+        switch phase {
+        case .ready(let coverage), .waiting(let coverage): return coverage.isComplete
+        case .indexing(let progress):
+            return progress.indexed + progress.alreadyIndexed + progress.permanentFailure >= progress.totalAssets
+        default: return false
+        }
+    }
+
+    /// Automatic suggestions yield to initial indexing and active retry quanta, not an idle retry timer.
+    /// Hosts additionally supply library/thumbnail readiness; the shared resource permit remains authoritative.
+    public var permitsAutomaticSuggestionGeneration: Bool {
+        guard isEnabled else { return true }
+        guard !isVisualSearchEnabled || isVisualIndexComplete else { return false }
+        switch indexingState {
+        case .ready(let progress): return progress.isComplete
+        case .waiting(let progress):
+            return progress.totalWorkUnits > 0
+                && progress.settledWorkUnits + progress.deferredWorkUnits == progress.totalWorkUnits
+        default: return false
+        }
+    }
+
+    /// Local metadata can remain useful when a model needs user action or an index has failed.
+    /// This never authorizes inference, geocoding, or persistence of a partial collection.
+    public var permitsAutomaticSuggestionMetadata: Bool {
+        guard isEnabled else { return true }
+        switch indexingState {
+        case .indexing: return false
+        case .waiting(let progress):
+            guard progress.settledWorkUnits + progress.deferredWorkUnits == progress.totalWorkUnits else {
+                return false
+            }
+        case .ready(let progress):
+            guard progress.isComplete else { return false }
+        case .idle, .failed: break
+        }
+        switch phase {
+        case .selectingModel, .notInstalled, .downloading, .failed: return true
+        case .disabled, .ready, .waiting, .indexing:
+            if case .failed = indexingState { return true }
+            return false
+        default: return false
+        }
+    }
 }
 
 /// Journal marker for multi-step operations that must complete across a crash.

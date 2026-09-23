@@ -22,9 +22,15 @@ public final class SmartSearchDiscoveryScheduler {
         let visualKey: String
         let cacheKey: String
         let libraryIsSettled: Bool
+        let cacheContentIsSettled: Bool
         let indexedAssetCount: @Sendable () async -> Int
         let searchEvidence: (@Sendable () async throws -> MLSearchBatchResults)?
         let cacheAccess: (@Sendable () async -> MLSearchSuggestionCacheAccess?)?
+
+        /// A metadata-only pass must not consume the later full-curation wakeup.
+        var generationKey: String {
+            snapshot?.permitsAutomaticSuggestionGeneration == false ? contentKey + "|metadata" : contentKey
+        }
     }
 
     @ObservationIgnored private let runtimeState: LibraryRuntimeState
@@ -66,20 +72,22 @@ public final class SmartSearchDiscoveryScheduler {
 
     public static func revisionKey(
         timelineRevision: UInt64, favoriteUIDs: Set<PhotoUID>, coordinateCount: Int,
-        smartSearch: MLSmartSearchController?
+        smartSearch: MLSmartSearchController?, coordinateRevision: Int = 0
     ) -> String {
         revisionKey(
             timelineRevision: timelineRevision, favoriteUIDs: favoriteUIDs, coordinateCount: coordinateCount,
-            smartSearch: smartSearch, snapshot: smartSearch?.snapshot)
+            smartSearch: smartSearch, snapshot: smartSearch?.snapshot, coordinateRevision: coordinateRevision)
     }
 
     private static func revisionKey(
         timelineRevision: UInt64, favoriteUIDs: Set<PhotoUID>, coordinateCount: Int,
-        smartSearch: MLSmartSearchController?, snapshot: MLSmartSearchSnapshot?
+        smartSearch: MLSmartSearchController?, snapshot: MLSmartSearchSnapshot?, coordinateRevision: Int
     ) -> String {
         contentKey(
             timelineRevision: timelineRevision, favoriteUIDs: favoriteUIDs, coordinateCount: coordinateCount,
-            smartSearch: smartSearch, snapshot: snapshot) + "|recovery:\(coverageState(snapshot).progressBucket)"
+            smartSearch: smartSearch, snapshot: snapshot, coordinateRevision: coordinateRevision)
+            + "|generationReady:\(permitsAutomaticGeneration(snapshot))"
+            + "|fullGenerationReady:\(snapshot?.permitsAutomaticSuggestionGeneration ?? true)"
             + "|cacheAuthority:\(cacheAuthorityKey(snapshot))"
     }
 
@@ -94,13 +102,13 @@ public final class SmartSearchDiscoveryScheduler {
 
     private static func contentKey(
         timelineRevision: UInt64, favoriteUIDs: Set<PhotoUID>, coordinateCount: Int,
-        smartSearch: MLSmartSearchController?, snapshot: MLSmartSearchSnapshot?
+        smartSearch: MLSmartSearchController?, snapshot: MLSmartSearchSnapshot?, coordinateRevision: Int
     ) -> String {
         let visualKey = visualEvidenceKey(
             timelineRevision: timelineRevision, snapshot: snapshot)
         let day = Calendar.current.ordinality(of: .day, in: .era, for: Date()) ?? 0
         return [
-            visualKey, "\(favoriteUIDs.hashValue)", "\(coordinateCount)", "\(day)",
+            visualKey, "\(favoriteUIDs.hashValue)", "\(coordinateCount):\(coordinateRevision)", "\(day)",
             "\(snapshot?.isEnabled == true)", "\(snapshot?.isVisualSearchEnabled == true)",
             smartSearch.map { "\(ObjectIdentifier($0))" } ?? "-",
         ].joined(separator: "|")
@@ -108,7 +116,8 @@ public final class SmartSearchDiscoveryScheduler {
 
     public func update(
         sections: [TimelineSection], timelineRevision: UInt64, favoriteUIDs: Set<PhotoUID>,
-        coordinates: [PhotoCoordinate], smartSearch: MLSmartSearchController?, libraryIsSettled: Bool = true
+        coordinates: [PhotoCoordinate], smartSearch: MLSmartSearchController?, libraryIsSettled: Bool = true,
+        cacheContentIsSettled: Bool = true, coordinateRevision: Int = 0
     ) {
         let lifecycle = smartSearch?.lifecycleActor
         let searchEvidence: (@Sendable () async throws -> MLSearchBatchResults)?
@@ -125,7 +134,8 @@ public final class SmartSearchDiscoveryScheduler {
             coordinates: coordinates, smartSearch: smartSearch, snapshot: smartSearch?.snapshot,
             indexedAssetCount: { await lifecycle?.semanticIndexedAssetCount() ?? 0 },
             searchEvidence: searchEvidence, libraryIsSettled: libraryIsSettled,
-            cacheAccess: cacheAccess)
+            cacheContentIsSettled: cacheContentIsSettled,
+            cacheAccess: cacheAccess, coordinateRevision: coordinateRevision)
     }
 
     func update(
@@ -133,7 +143,9 @@ public final class SmartSearchDiscoveryScheduler {
         coordinates: [PhotoCoordinate], smartSearch: MLSmartSearchController? = nil,
         snapshot: MLSmartSearchSnapshot?, indexedAssetCount: @escaping @Sendable () async -> Int,
         searchEvidence: (@Sendable () async throws -> MLSearchBatchResults)?, libraryIsSettled: Bool = true,
-        cacheAccess: (@Sendable () async -> MLSearchSuggestionCacheAccess?)? = nil
+        cacheContentIsSettled: Bool = true,
+        cacheAccess: (@Sendable () async -> MLSearchSuggestionCacheAccess?)? = nil,
+        coordinateRevision: Int = 0
     ) {
         if let input, input.controller !== smartSearch { reset() }
         let visualKey = Self.visualEvidenceKey(
@@ -141,21 +153,27 @@ public final class SmartSearchDiscoveryScheduler {
         let key =
             Self.revisionKey(
                 timelineRevision: timelineRevision, favoriteUIDs: favoriteUIDs,
-                coordinateCount: coordinates.count, smartSearch: smartSearch, snapshot: snapshot
-            ) + "|librarySettled:\(libraryIsSettled)"
+                coordinateCount: coordinates.count, smartSearch: smartSearch, snapshot: snapshot,
+                coordinateRevision: coordinateRevision
+            ) + "|librarySettled:\(libraryIsSettled)|cacheContentSettled:\(cacheContentIsSettled)"
         guard input?.key != key else { return }
         let contentKey = Self.contentKey(
             timelineRevision: timelineRevision, favoriteUIDs: favoriteUIDs, coordinateCount: coordinates.count,
-            smartSearch: smartSearch, snapshot: snapshot)
+            smartSearch: smartSearch, snapshot: snapshot, coordinateRevision: coordinateRevision)
         let cacheKey = contentKey + "|cacheAuthority:\(Self.cacheAuthorityKey(snapshot))"
         // A replacement inventory must stop the superseded scan, not queue another full pass behind it.
-        if input?.contentKey != contentKey || !libraryIsSettled { task?.cancel() }
+        if input?.contentKey != contentKey || !libraryIsSettled || !cacheContentIsSettled
+            || !Self.permitsAutomaticGeneration(snapshot)
+            || input?.snapshot?.permitsAutomaticSuggestionGeneration != snapshot?.permitsAutomaticSuggestionGeneration
+        {
+            task?.cancel()
+        }
         if input?.contentKey != contentKey {
             pendingPersistenceKey = nil
             failedPersistenceKey = nil
             persistenceWriteFailures = 0
         }
-        if input?.cacheKey != cacheKey || !libraryIsSettled {
+        if input?.cacheKey != cacheKey || !cacheContentIsSettled {
             cacheGeneration &+= 1
             cacheTask?.cancel()
             cacheTask = nil
@@ -166,11 +184,45 @@ public final class SmartSearchDiscoveryScheduler {
         if !SmartSearchDiscoveryModel.visualConceptsAvailable(snapshot) || evidenceKey != visualKey {
             discardEvidence()
         }
-        eligible = libraryIsSettled && Self.permitsRefresh(runtimeState.snapshot())
+        if let previous = input, discovery.hasComputed {
+            if Self.persistedModelKey(previous.snapshot) != Self.persistedModelKey(snapshot) {
+                let replacement = SmartSearchDiscoveryModel(refreshPolicy: .background, placeName: placeName)
+                replacement.reusePlaceNames(from: discovery)
+                discovery = replacement
+            } else {
+                var affectedUIDs = Set<PhotoUID>()
+                if previous.revision != timelineRevision {
+                    let current = Dictionary(
+                        sections.flatMap(\.items).map { ($0.uid, SmartSearchDiscoveryPersistence.suggestionItem($0)) },
+                        uniquingKeysWith: { first, _ in first })
+                    for section in previous.sections {
+                        for item in section.items
+                        where current[item.uid] != SmartSearchDiscoveryPersistence.suggestionItem(item) {
+                            affectedUIDs.insert(item.uid)
+                        }
+                    }
+                }
+                discovery.invalidateRows(
+                    affectedUIDs: affectedUIDs, favoritesChanged: previous.favorites != favoriteUIDs,
+                    locationsChanged: previous.coordinates != coordinates)
+            }
+        }
+        eligible =
+            libraryIsSettled && cacheContentIsSettled && Self.permitsAutomaticGeneration(snapshot)
+            && Self.permitsRefresh(runtimeState.snapshot())
+        PhotoDiagnostics.shared.emitDebug(
+            "SearchSuggestions",
+            [
+                "event": "input", "generationAllowed": "\(Self.permitsAutomaticGeneration(snapshot))",
+                "librarySettled": "\(libraryIsSettled)", "cacheContentSettled": "\(cacheContentIsSettled)",
+                "eligible": "\(eligible)", "items": "\(sections.reduce(0) { $0 + $1.items.count })",
+                "coordinates": "\(coordinates.count)",
+            ])
         input = Input(
             sections: sections, revision: timelineRevision, favorites: favoriteUIDs,
             coordinates: coordinates, controller: smartSearch, snapshot: snapshot, key: key,
             contentKey: contentKey, visualKey: visualKey, cacheKey: cacheKey, libraryIsSettled: libraryIsSettled,
+            cacheContentIsSettled: cacheContentIsSettled,
             indexedAssetCount: indexedAssetCount, searchEvidence: searchEvidence, cacheAccess: cacheAccess)
         failedKey = nil
         retryCount = 0
@@ -187,31 +239,15 @@ public final class SmartSearchDiscoveryScheduler {
         schedule(after: debounce)
     }
 
-    /// Native indexing can remain pending after the semantic model has finished.
-    /// Progress only rearms exhausted failures; healthy partial evidence stays cached until completion.
     private static func visualEvidenceKey(timelineRevision: UInt64, snapshot: MLSmartSearchSnapshot?) -> String {
         SmartSearchDiscoveryModel.visualEvidenceKey(
-            timelineRevision: timelineRevision, snapshot: snapshot, indexingKey: coverageState(snapshot).stage)
+            timelineRevision: timelineRevision, snapshot: snapshot,
+            indexingKey: snapshot?.isVisualIndexComplete == true ? "complete" : "pending")
     }
 
-    private static func coverageState(_ snapshot: MLSmartSearchSnapshot?) -> (stage: String, progressBucket: Int) {
-        let indexed: Int
-        let total: Int
-        let complete: Bool
-        switch snapshot?.phase {
-        case .ready(let coverage), .waiting(let coverage):
-            indexed = coverage.indexed
-            total = coverage.total
-            complete = coverage.isComplete
-        case .indexing(let progress):
-            indexed = progress.indexed + progress.alreadyIndexed
-            total = progress.totalAssets
-            complete = indexed + progress.permanentFailure >= total && progress.transientFailure == 0
-        default:
-            return ("empty", 0)
-        }
-        let stage = indexed == 0 ? "empty" : (complete ? "complete" : "partial")
-        return (stage, total > 0 ? min(10, Int(Double(indexed) / Double(total) * 10)) : 0)
+    private static func permitsAutomaticGeneration(_ snapshot: MLSmartSearchSnapshot?) -> Bool {
+        guard let snapshot else { return true }
+        return snapshot.permitsAutomaticSuggestionGeneration || snapshot.permitsAutomaticSuggestionMetadata
     }
 
     /// Called by account/scope teardown before its controllers and stores are retired.
@@ -264,7 +300,10 @@ public final class SmartSearchDiscoveryScheduler {
         } else {
             prepareCacheIfNeeded()
         }
-        eligible = input?.libraryIsSettled == true && Self.permitsRefresh(snapshot)
+        eligible =
+            input?.libraryIsSettled == true && input?.cacheContentIsSettled == true
+            && Self.permitsAutomaticGeneration(input?.snapshot)
+            && Self.permitsRefresh(snapshot)
         if !eligible {
             task?.cancel()
         } else if !wasEligible {
@@ -282,21 +321,28 @@ public final class SmartSearchDiscoveryScheduler {
     }
 
     private static func persistedModelKey(_ input: Input) -> String {
-        "\(input.snapshot?.isEnabled == true)|\(input.snapshot?.isVisualSearchEnabled == true)|"
+        persistedModelKey(input.snapshot)
+    }
+
+    private static func persistedModelKey(_ snapshot: MLSmartSearchSnapshot?) -> String {
+        "\(snapshot?.isEnabled == true)|\(snapshot?.isVisualSearchEnabled == true)|"
             + SmartSearchDiscoveryModel.visualEvidenceKey(
-                timelineRevision: 0, snapshot: input.snapshot, indexingKey: "persisted")
+                timelineRevision: 0, snapshot: snapshot, indexingKey: "persisted")
     }
 
     private struct PreparedCache: Sendable {
-        let fingerprint: Data
+        let fingerprint: Data?
         let saved: SmartSearchDiscoveryPersistence?
         let snapshot: SmartSearchDiscoveryModel.PersistedSnapshot?
         let exact: Bool
+        let reusesEvidence: Bool
     }
 
     /// Hydrate saved rows even while Search is active. This performs no inference or geocoding.
     private func prepareCacheIfNeeded() {
-        guard cacheTask == nil, let input, input.libraryIsSettled, preparedCacheKey != input.cacheKey else { return }
+        guard cacheTask == nil, let input, input.cacheContentIsSettled, preparedCacheKey != input.cacheKey else {
+            return
+        }
         guard let load = input.cacheAccess, input.sections.contains(where: { !$0.items.isEmpty }) else {
             preparedCacheKey = input.cacheKey
             return
@@ -307,32 +353,64 @@ public final class SmartSearchDiscoveryScheduler {
         let modelKey = Self.persistedModelKey(input)
         cacheTask = Task(priority: .utility) { [weak self] in
             let started = ContinuousClock.now
-            let access = await load()
-            let prepared = await SmartSearchDiscoveryModel.background {
+            var access = await load()
+            let data = access?.data
+            var prepared = await SmartSearchDiscoveryModel.background {
                 Result { () throws -> PreparedCache in
                     try Task.checkCancellation()
-                    let fingerprint = try SmartSearchDiscoveryPersistence.fingerprint(
-                        sections: input.sections, favorites: input.favorites, coordinates: input.coordinates)
                     var saved: SmartSearchDiscoveryPersistence?
-                    if let data = access?.data {
+                    if let data {
                         do {
                             let decoded = try PropertyListDecoder().decode(
                                 SmartSearchDiscoveryPersistence.self, from: data)
+                            let evidenceComplete = decoded.hasCompleteEvidence(
+                                requiresVisualEvidence: SmartSearchDiscoveryModel.visualConceptsAvailable(
+                                    input.snapshot))
                             if decoded.version == SmartSearchDiscoveryPersistence.version, decoded.modelKey == modelKey,
-                                decoded.hasCompleteEvidence
+                                evidenceComplete
                             {
                                 saved = decoded
+                            } else {
+                                PhotoDiagnostics.shared.emitDebug(
+                                    "SearchSuggestions",
+                                    [
+                                        "cache": "payloadRejected",
+                                        "versionMatches":
+                                            "\(decoded.version == SmartSearchDiscoveryPersistence.version)",
+                                        "modelMatches": "\(decoded.modelKey == modelKey)",
+                                        "evidenceComplete": "\(evidenceComplete)",
+                                    ])
                             }
                         } catch {
                             PhotoDiagnostics.shared.increment("ml.suggestions.snapshotDecodeFailed")
                         }
                     }
+                    guard let saved else {
+                        return PreparedCache(
+                            fingerprint: nil, saved: nil, snapshot: nil, exact: false, reusesEvidence: false)
+                    }
+                    let fingerprint = try SmartSearchDiscoveryPersistence.fingerprint(
+                        sections: input.sections, favorites: input.favorites, coordinates: input.coordinates)
                     try Task.checkCancellation()
-                    let exact = saved?.fingerprint == fingerprint
+                    let exact = saved.fingerprint == fingerprint
+                    let reusesEvidence: Bool
+                    if exact {
+                        reusesEvidence = true
+                    } else {
+                        reusesEvidence =
+                            saved.assetFingerprint
+                            == (try SmartSearchDiscoveryPersistence.assetFingerprint(sections: input.sections))
+                    }
                     return PreparedCache(
                         fingerprint: fingerprint, saved: saved,
-                        snapshot: exact ? saved?.snapshot : nil, exact: exact)
+                        snapshot: exact ? saved.snapshot : nil, exact: exact, reusesEvidence: reusesEvidence)
                 }
+            }
+            if let lease = access, !(await lease.isCurrent()) {
+                // Decoding can outlive a model/index reset. Retire the read result as well as its writer.
+                prepared = .success(
+                    PreparedCache(fingerprint: nil, saved: nil, snapshot: nil, exact: false, reusesEvidence: false))
+                access = await load()
             }
             guard let self, owner == self.cacheGeneration, !Task.isCancelled,
                 self.input?.cacheKey == input.cacheKey
@@ -340,7 +418,9 @@ public final class SmartSearchDiscoveryScheduler {
             self.cacheTask = nil
             self.preparedCacheKey = input.cacheKey
             // Do not retain a second copy of the serialized payload alongside the decoded rows.
-            self.cacheAccess = access.map { MLSearchSuggestionCacheAccess(data: nil, save: $0.save) }
+            self.cacheAccess = access.map {
+                MLSearchSuggestionCacheAccess(data: nil, isCurrent: $0.isCurrent, save: $0.save)
+            }
             if access != nil {
                 self.failedPersistenceKey = nil
                 self.persistenceWriteFailures = 0
@@ -355,6 +435,12 @@ public final class SmartSearchDiscoveryScheduler {
                         : prepared.saved == nil ? "incompatible" : prepared.exact ? "restored" : "contentChanged"
                 Self.recordPersistence(action: "restore", result: outcome, started: started)
                 self.contentFingerprint = prepared.fingerprint
+                PhotoDiagnostics.shared.emitDebug(
+                    "SearchSuggestions",
+                    [
+                        "cache": "prepared", "lease": "\(access != nil)", "payload": "\(prepared.saved != nil)",
+                        "exactContent": "\(prepared.exact)",
+                    ])
                 if let saved = prepared.saved {
                     self.discovery.restorePlaceNames(from: saved.snapshot)
                     if let snapshot = prepared.snapshot {
@@ -365,12 +451,13 @@ public final class SmartSearchDiscoveryScheduler {
                             isExactContent: prepared.exact)
                     }
                     let runtime = self.runtimeState.snapshot()
-                    if runtime.memoryPressure == .normal, runtime.memoryHeadroom < .constrained {
+                    if prepared.reusesEvidence, runtime.memoryPressure == .normal, runtime.memoryHeadroom < .constrained
+                    {
                         self.evidence = saved.evidence
                         self.evidenceKey = saved.evidence == nil ? nil : input.visualKey
                     }
                     if prepared.exact { self.completedKey = input.contentKey }
-                    PhotoDiagnostics.shared.increment("ml.suggestions.snapshotRestored")
+                    if prepared.exact { PhotoDiagnostics.shared.increment("ml.suggestions.snapshotRestored") }
                 }
             case .failure(let error):
                 Self.recordPersistence(action: "restore", result: "failed", started: started)
@@ -394,7 +481,13 @@ public final class SmartSearchDiscoveryScheduler {
             version: SmartSearchDiscoveryPersistence.version, modelKey: Self.persistedModelKey(input),
             fingerprint: fingerprint, snapshot: snapshot,
             evidence: evidenceKey == input.visualKey ? evidence : nil)
-        let encoded = await SmartSearchDiscoveryModel.background { Result { try saved.encoded() } }
+        let encoded = await SmartSearchDiscoveryModel.background {
+            Result {
+                var saved = saved
+                saved.assetFingerprint = try SmartSearchDiscoveryPersistence.assetFingerprint(sections: input.sections)
+                return try saved.encoded()
+            }
+        }
         guard !Task.isCancelled, self.input?.contentKey == input.contentKey else { return false }
         do {
             try await access.save(encoded.get())
@@ -403,6 +496,8 @@ public final class SmartSearchDiscoveryScheduler {
             failedPersistenceKey = nil
             persistenceWriteFailures = 0
             Self.recordPersistence(action: "save", result: "saved", started: started)
+            PhotoDiagnostics.shared.emitDebug(
+                "SearchSuggestions", ["cache": "saved", "rows": "\(snapshot.candidates.count)"])
             return true
         } catch is CancellationError {
             return false
@@ -442,7 +537,9 @@ public final class SmartSearchDiscoveryScheduler {
     }
 
     private func schedule(after delay: Duration) {
-        guard task == nil, eligible, let input, completedKey != input.contentKey, failedKey != input.key else { return }
+        guard task == nil, eligible, let input, completedKey != input.contentKey,
+            completedKey != input.generationKey, failedKey != input.key
+        else { return }
         guard failedPersistenceKey != input.cacheKey else { return }
         guard input.cacheAccess == nil || preparedCacheKey == input.cacheKey else { return }
         let generation = generation
@@ -467,7 +564,7 @@ public final class SmartSearchDiscoveryScheduler {
                 return
             }
             if succeeded {
-                self.completedKey = current.contentKey
+                self.completedKey = current.generationKey
             } else if current.key != self.input?.key {
                 self.schedule(after: self.debounce)
             } else {
@@ -491,8 +588,37 @@ public final class SmartSearchDiscoveryScheduler {
     }
 
     private func refresh(_ input: Input) async -> Bool {
+        guard input.cacheContentIsSettled else { return false }
         if pendingPersistenceKey == input.contentKey {
             return await persistCompletedSuggestions(input)
+        }
+        guard Self.permitsAutomaticGeneration(input.snapshot), input.libraryIsSettled else { return false }
+        if input.snapshot?.permitsAutomaticSuggestionGeneration == false {
+            // Keep existing valid rows. An unavailable model only needs this cheap path for an empty landing.
+            if discovery.forYou.isEmpty && discovery.chips.isEmpty {
+                await discovery.refresh(
+                    sections: input.sections, timelineRevision: input.revision, favoriteUIDs: input.favorites,
+                    coordinates: [], snapshot: input.snapshot, indexedAssetCount: { 0 }, search: nil,
+                    includeVisualConcepts: false, metadataOnly: true)
+            }
+            return !Task.isCancelled && self.input?.key == input.key
+        }
+        if input.cacheAccess != nil, contentFingerprint == nil {
+            let prepared = await SmartSearchDiscoveryModel.background {
+                Result {
+                    try SmartSearchDiscoveryPersistence.fingerprint(
+                        sections: input.sections, favorites: input.favorites, coordinates: input.coordinates)
+                }
+            }
+            guard !Task.isCancelled, self.input?.contentKey == input.contentKey else { return false }
+            do {
+                contentFingerprint = try prepared.get()
+            } catch is CancellationError {
+                return false
+            } catch {
+                PhotoDiagnostics.shared.increment("ml.suggestions.snapshotPreparationFailed")
+                return false
+            }
         }
         let previous = discovery
         // Build later updates privately. Entering Search during cancellation keeps the published rows usable.
@@ -515,6 +641,7 @@ public final class SmartSearchDiscoveryScheduler {
         else {
             if !SmartSearchDiscoveryModel.visualConceptsAvailable(input.snapshot)
                 || !previous.forYou.contains(where: { $0.kind == .concept })
+                || previous.computedContent != model.computedContent
             {
                 discovery = model
                 // Metadata-only startup is not a completed visual presentation to persist.
@@ -524,6 +651,7 @@ public final class SmartSearchDiscoveryScheduler {
         }
         if evidenceKey != input.visualKey {
             do {
+                PhotoDiagnostics.shared.emitDebug("SearchSuggestions", ["event": "evidenceScanStarted"])
                 let fresh = try await searchEvidence()
                 guard !Task.isCancelled, self.input?.visualKey == input.visualKey,
                     SmartSearchDiscoveryModel.visualConceptsAvailable(self.input?.snapshot),
@@ -531,6 +659,8 @@ public final class SmartSearchDiscoveryScheduler {
                 else { return false }
                 evidence = fresh
                 evidenceKey = input.visualKey
+                PhotoDiagnostics.shared.emitDebug(
+                    "SearchSuggestions", ["event": "evidenceScanCompleted", "assets": "\(fresh.scannedUIDs.count)"])
             } catch is CancellationError {
                 return false
             } catch {

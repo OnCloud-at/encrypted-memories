@@ -72,7 +72,6 @@ struct MainView: View {
     @State private var searchDebounceTask: Task<Void, Never>?
     @State private var searchHistory = TimelineSearchHistory()
     private var searchDiscovery: SmartSearchDiscoveryModel { model.searchSuggestions.discovery }
-    @State private var searchPresented = false
     @State private var searchActivity: LibraryRuntimeActivityRegistration?
     /// The structured suggestion that owned `committedSearchText` when it was committed.
     @State private var committedSuggestion: TimelineSearchSuggestion?
@@ -130,6 +129,7 @@ struct MainView: View {
     @State private var dragOutFailureMessage: String?
     // Favorites (read from server so iOS favorites show up; toggle writes back).
     @State private var favorites: Set<PhotoUID> = []
+    @State private var favoritesLoaded = false
     @State private var favoriteMutationsInFlight: Set<PhotoUID> = []
     @State private var uploadRefreshTask: Task<Void, Never>?
     @State private var uploadRefreshGeneration: UInt64 = 0
@@ -647,10 +647,6 @@ struct MainView: View {
                 SmartSearchSuggestionItem(id: $0.id, title: $0.title, query: $0.query)
             },
             isUpdatingSuggestions: model.searchSuggestions.isRefreshing,
-            onPresentationChange: { presented in
-                searchPresented = presented
-                updateSearchActivity()
-            },
             onClearRecentSearches: clearSearchHistory
         )
         .onSubmit(of: .search) { recordSearchHistory(searchText) }
@@ -1220,7 +1216,11 @@ struct MainView: View {
         async let owned: Void = albumActions.refresh()
         async let shared: Void = albumActions.refreshSharedAlbums()
         async let fetchedFavorites = try? backend.favoriteUIDs()
-        let (_, _, newFavorites) = await (owned, shared, fetchedFavorites)
+        let newFavorites = await fetchedFavorites
+        guard !Task.isCancelled, loadGeneration == albumLoadGeneration else { return }
+        if let newFavorites { favorites = newFavorites }
+        favoritesLoaded = newFavorites != nil
+        let (_, _) = await (owned, shared)
         guard !Task.isCancelled, loadGeneration == albumLoadGeneration else { return }
         if albumActions.loadErrorMessage == nil {
             albums = albumActions.albums
@@ -1232,9 +1232,6 @@ struct MainView: View {
             // Preserve the last authoritative catalog during a transient/offline failure. Replacing
             // it with [] made real albums disappear and presented a false empty state until relaunch.
             albumCatalogFailed = true
-        }
-        if let newFavorites {
-            favorites = newFavorites
         }
     }
 
@@ -1826,13 +1823,16 @@ struct MainView: View {
                     timelineRevision: UInt64(truncatingIfNeeded: timelineModel.contentRevision),
                     favoriteUIDs: favorites,
                     coordinates: OfflineLibraryManager.shared.locationIndex.coordinates,
-                    smartSearch: model.smartSearch
+                    smartSearch: model.smartSearch,
+                    libraryIsSettled: librarySettled && !backgroundLibraryActivityActive,
+                    cacheContentIsSettled: suggestionCacheContentReady,
+                    coordinateRevision: OfflineLibraryManager.shared.locationIndex.revision
                 )
             }
     }
 
     private func updateSearchActivity() {
-        if searchPresented || !isSearchTextEmpty {
+        if !isSearchTextEmpty {
             if searchActivity?.isActive != true { searchActivity = LibraryRuntimeState.shared.beginActivity(.search) }
         } else {
             searchActivity?.end()
@@ -1844,8 +1844,13 @@ struct MainView: View {
         SmartSearchDiscoveryScheduler.revisionKey(
             timelineRevision: UInt64(truncatingIfNeeded: timelineModel.contentRevision),
             favoriteUIDs: favorites, coordinateCount: OfflineLibraryManager.shared.locationIndex.coordinates.count,
-            smartSearch: model.smartSearch
-        )
+            smartSearch: model.smartSearch, coordinateRevision: OfflineLibraryManager.shared.locationIndex.revision
+        ) + "|librarySettled:\(librarySettled)|thumbnailWork:\(backgroundLibraryActivityActive)"
+            + "|cacheContentSettled:\(suggestionCacheContentReady)"
+    }
+
+    private var suggestionCacheContentReady: Bool {
+        favoritesLoaded && timelineModel.initialLibraryLoadState.knownCount != nil
     }
 
     private var isSearchTextEmpty: Bool {
