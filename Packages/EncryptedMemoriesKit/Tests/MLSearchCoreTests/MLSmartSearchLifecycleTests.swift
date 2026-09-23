@@ -381,15 +381,18 @@ import Testing
         let descriptor: MLModelDescriptor
         private let permanentlyUnavailable: Set<PhotoUID>
         private let suppressionRead: BlockingSuppressionRead?
+        private let duringBatch: @Sendable () -> Void
 
         init(
             descriptor: MLModelDescriptor,
             permanentlyUnavailable: Set<PhotoUID> = [],
-            suppressionRead: BlockingSuppressionRead? = nil
+            suppressionRead: BlockingSuppressionRead? = nil,
+            duringBatch: @escaping @Sendable () -> Void = {}
         ) {
             self.descriptor = descriptor
             self.permanentlyUnavailable = permanentlyUnavailable
             self.suppressionRead = suppressionRead
+            self.duringBatch = duringBatch
         }
 
         func index(_ assets: [PhotoUID], observer: MLIndexPassObserver) async -> MLIndexPassOutcome {
@@ -426,6 +429,15 @@ import Testing
             MLSearchResults(descriptor: descriptor, queryText: text, results: [])
         }
 
+        func searchBatch(
+            _ texts: [String], limit: Int, shouldContinue: @escaping @Sendable () -> Bool
+        ) async throws -> MLSearchBatchResults {
+            duringBatch()
+            return MLSearchBatchResults(
+                results: texts.map { MLSearchResults(descriptor: descriptor, queryText: $0, results: []) },
+                scannedUIDs: MLScannedUIDMembership([]))
+        }
+
         func releaseMemory() async {}
         func shutdown() async {}
     }
@@ -449,6 +461,7 @@ import Testing
         init(_ uids: [PhotoUID]) { inventory = .authoritative(uids) }
         var current: MLAssetInventorySnapshot { lock.withLock { inventory } }
         func set(_ new: [PhotoUID]) { lock.withLock { inventory = .authoritative(new) } }
+        func setSnapshot(_ new: MLAssetInventorySnapshot) { lock.withLock { inventory = new } }
         func setHydrating(_ visible: [PhotoUID]) {
             lock.withLock {
                 inventory = MLAssetInventorySnapshot(
@@ -472,6 +485,7 @@ import Testing
         private let results: [PhotoUID]
         private let permanentlyUnavailable: Set<PhotoUID>
         private let suppressionRead: BlockingSuppressionRead?
+        private let deferredCount: Int
         private var indexedAssets: [MLPipelineAssetRevision] = []
         private var indexes = 0
         private var shutdowns = 0
@@ -480,9 +494,11 @@ import Testing
             results: [PhotoUID],
             initiallyIndexed: [PhotoUID] = [],
             permanentlyUnavailable: Set<PhotoUID> = [],
-            suppressionRead: BlockingSuppressionRead? = nil
+            suppressionRead: BlockingSuppressionRead? = nil,
+            deferredCount: Int = 0
         ) {
             self.results = results
+            self.deferredCount = deferredCount
             self.permanentlyUnavailable = permanentlyUnavailable
             self.suppressionRead = suppressionRead
             indexedAssets = initiallyIndexed.compactMap {
@@ -580,13 +596,13 @@ import Testing
             }
             let permanentFailure = permanentlyUnavailable.intersection(Set(assets.map(\.uid))).count
             let outcome = MLDerivedPipelinePassOutcome(
-                reason: .drained,
+                reason: deferredCount > 0 ? .retryPending : .drained,
                 progress: MLDerivedPipelineProgress(
                     total: visibleCount,
-                    completed: max(0, visibleCount - permanentFailure),
+                    completed: max(0, visibleCount - permanentFailure - deferredCount),
                     skipped: 0,
                     permanentFailure: permanentFailure,
-                    retryPending: 0,
+                    retryPending: deferredCount,
                     unavailableAssets: permanentFailure,
                     generation: 1
                 )
@@ -779,6 +795,48 @@ import Testing
         await harness.lifecycle.shutdown()
     }
 
+    @Test func disabledSearchCanPersistMetadataSuggestions() async throws {
+        let harness = try makeHarness(
+            catalog: .init(entries: []), payloads: [:], assets: [], suggestionCacheEnabled: true)
+        defer { try? FileManager.default.removeItem(at: harness.layout.rootDirectory) }
+        await harness.lifecycle.start()
+        let lease = try #require(await harness.lifecycle.suggestionCacheAccess())
+        let payload = Data("metadata-suggestions".utf8)
+        try await lease.save(payload)
+        #expect(await harness.lifecycle.suggestionCacheAccess()?.data == payload)
+        await harness.lifecycle.shutdown()
+        do {
+            try await lease.save(payload)
+            Issue.record("shutdown must retire metadata cache writes too")
+        } catch MLSmartSearchQueryError.staleEpoch {}
+    }
+
+    @Test func nativeDeferredRetriesDoNotBlockCompletedSemanticSuggestions() async throws {
+        let payload = Data("model".utf8)
+        let (entry, url) = downloadableEntry(id: "deferred-native", payload: payload)
+        let assets = [uid("a"), uid("b"), uid("c")]
+        let harness = try makeHarness(
+            catalog: .init(entries: [entry]), payloads: [url: payload], assets: assets,
+            nativeSearch: RecordingNativeSearch(results: [], deferredCount: 1))
+        defer { try? FileManager.default.removeItem(at: harness.layout.rootDirectory) }
+        await harness.lifecycle.start()
+        await harness.lifecycle.setEnabled(true)
+        await harness.lifecycle.select(entry.id)
+        #expect(
+            await waitUntil {
+                await harness.lifecycle.currentSnapshot().permitsAutomaticSuggestionGeneration
+            })
+        let snapshot = await harness.lifecycle.currentSnapshot()
+        #expect(snapshot.isVisualIndexComplete)
+        if case .waiting(let progress) = snapshot.indexingState {
+            #expect(progress.deferredWorkUnits == 1)
+            #expect(!progress.isComplete, "a deferred retry is not falsely reported as indexed")
+        } else {
+            Issue.record("deferred native work must remain waiting")
+        }
+        await harness.lifecycle.shutdown()
+    }
+
     @Test(arguments: ["shutdown", "purge", "visualDisable", "modelSwitch", "indexChange"])
     func suggestionCacheLeaseCannotOutliveItsState(_ retirement: String) async throws {
         let payload = Data("model".utf8)
@@ -797,6 +855,7 @@ import Testing
         try #require(await harness.lifecycle.semanticIndexedAssetCount() == 1)
         let lease = try #require(await harness.lifecycle.suggestionCacheAccess())
         let original = Data("completed-cache".utf8)
+        #expect(await lease.isCurrent())
         try await lease.save(original)
         #expect(await harness.lifecycle.suggestionCacheAccess()?.data == original)
         switch retirement {
@@ -810,6 +869,7 @@ import Testing
             ])
         }
         do {
+            #expect(await !lease.isCurrent(), "retired read authority must not restore a stale snapshot")
             try await lease.save(Data("stale".utf8))
             Issue.record("retired cache lease wrote after \(retirement)")
         } catch MLSmartSearchQueryError.staleEpoch {}
@@ -818,6 +878,39 @@ import Testing
                 !FileManager.default.fileExists(
                     atPath: harness.layout.rootDirectory.appendingPathComponent("suggestions-v1.enc").path))
         }
+        await harness.lifecycle.shutdown()
+    }
+
+    @Test(arguments: [false, true]) func changedInventoryRevisionRejectsInFlightSuggestionEvidence(
+        hydrating: Bool
+    ) async throws {
+        let payload = Data("model".utf8)
+        let (entry, url) = downloadableEntry(id: "batch-revision", payload: payload)
+        let initial = uid("initial")
+        let added = uid("added")
+        let harness = try makeHarness(catalog: .init(entries: [entry]), payloads: [url: payload], assets: [initial])
+        defer { try? FileManager.default.removeItem(at: harness.layout.rootDirectory) }
+        let assets = harness.assets
+        assets.setSnapshot(.init(uids: [initial], isAuthoritative: true, sourceRevision: 1))
+        harness.provider.sessionOverride = { model in
+            FixedSemanticSession(descriptor: model.entry.descriptor) {
+                if !hydrating {
+                    assets.setSnapshot(.init(uids: [initial, added], isAuthoritative: true, sourceRevision: 2))
+                }
+            }
+        }
+        await harness.lifecycle.start()
+        await harness.lifecycle.setEnabled(true)
+        await harness.lifecycle.select(entry.id)
+        for _ in 0..<200 where await harness.lifecycle.semanticIndexedAssetCount() == 0 {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        try #require(await harness.lifecycle.semanticIndexedAssetCount() == 1)
+        if hydrating { assets.beginHydration() }
+        do {
+            _ = try await harness.lifecycle.searchSuggestionEvidence()
+            Issue.record("A scan of the prior source revision must not become evidence for new inventory")
+        } catch MLSmartSearchQueryError.staleEpoch {}
         await harness.lifecycle.shutdown()
     }
 

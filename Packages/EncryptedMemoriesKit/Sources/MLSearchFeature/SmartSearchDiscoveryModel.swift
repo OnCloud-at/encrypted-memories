@@ -47,25 +47,20 @@ public enum SmartSearchSuggestionRebindResult: Equatable {
 /// 2. Metadata families (dates, trips, seasons, favorites, media types), published immediately.
 /// 3. Curated visual concepts, published before network-backed place names.
 /// 4. Places from the existing location index, named by the host-provided resolver.
-/// Gate and concept evidence are cached per library revision, model and coarse indexing progress, so a
-/// cancelled refresh (for example when the user starts typing) resumes cheaply.
+/// Gate and concept evidence are cached per library revision and model, so a cancelled refresh (for example
+/// when the user starts typing) resumes cheaply.
 @MainActor
 @Observable
 public final class SmartSearchDiscoveryModel {
     public typealias PlaceNameResolver = @Sendable (_ latitude: Double, _ longitude: Double) async -> String?
 
-    /// When suggestions are recomputed.
+    /// How published rows behave while a replacement refresh runs.
     public enum RefreshPolicy: Sendable {
         /// Every library, favorites or availability change recomputes them. Published sets always match the
         /// current content.
         case continuous
         /// Refresh while idle, preserving the last published rows until replacement metadata is ready.
         case background
-        /// They are computed once per app session: the first published rows stay on screen, and after the first
-        /// complete refresh nothing is recomputed until the next launch. Library changes never bring the loading
-        /// placeholder back. An applied suggestion keeps its session result set, intersected with the current
-        /// items, and visual concepts still disappear at once when visual search turns off.
-        case oncePerSession
     }
 
     /// Raw published rows. Hosts display `forYou(content:snapshot:)` and `chips(content:snapshot:)`, which
@@ -95,8 +90,7 @@ public final class SmartSearchDiscoveryModel {
 
     @ObservationIgnored private let placeName: PlaceNameResolver
     @ObservationIgnored private let refreshPolicy: RefreshPolicy
-    /// Whether this session computed visual concepts with a finished visual index. Until then, turning visual
-    /// search on or finishing the indexing allows one more refresh, the only exception to `.oncePerSession`.
+    /// Whether this model computed visual concepts with a finished visual index.
     private var visualConceptsCompletedWhenReady = false
     /// Only the current refresh may publish after an asynchronous boundary.
     @ObservationIgnored private var refreshGeneration: UInt64 = 0
@@ -143,6 +137,23 @@ public final class SmartSearchDiscoveryModel {
         placeNames = previous.placeNames
     }
 
+    /// Retain only still-valid finished rows while resource gates defer their replacement.
+    /// No new representative can enter through this path; changed rows wait for the normal safety gate.
+    func invalidateRows(affectedUIDs: Set<PhotoUID>, favoritesChanged: Bool, locationsChanged: Bool) {
+        let previousCount = candidates.count
+        candidates.removeAll { row in
+            (row.matchingUIDs.map { !$0.isDisjoint(with: affectedUIDs) } ?? false)
+                || (favoritesChanged && row.kind == .favorites)
+                || (locationsChanged && (row.kind == .place || row.kind == .placeSeason))
+        }
+        guard candidates.count != previousCount else { return }
+        let validIDs = Set(candidates.map(\.id))
+        forYou.removeAll { !validIDs.contains($0.id) }
+        chips.removeAll { !validIDs.contains($0.id) }
+        lastRefreshCompleted = false
+        settledGeneration &+= 1
+    }
+
     func restorePlaceNames(from snapshot: PersistedSnapshot) {
         placeNames = snapshot.placeNamesLocale == Self.placeNamesLocale ? snapshot.placeNames : [:]
     }
@@ -170,22 +181,9 @@ public final class SmartSearchDiscoveryModel {
         settledGeneration &+= 1
     }
 
-    /// Whether this session's suggestions are final: a complete refresh ran once under `.oncePerSession`.
-    public var isSessionComplete: Bool {
-        refreshPolicy == .oncePerSession && settledContent != nil
-    }
-
     /// Whether the visual index can answer for the whole library.
     public nonisolated static func visualIndexReady(_ snapshot: MLSmartSearchSnapshot?) -> Bool {
-        guard visualConceptsAvailable(snapshot), case .ready = snapshot?.indexingState else { return false }
-        return true
-    }
-
-    /// The one exception to a complete `.oncePerSession`: visual search is on and its index is finished, but this
-    /// session has no visual concepts from a finished index yet. Turning visual search on then still yields
-    /// suggestions for photo content, after the indexing.
-    public func needsVisualCompletion(_ snapshot: MLSmartSearchSnapshot?) -> Bool {
-        refreshPolicy == .oncePerSession && Self.visualIndexReady(snapshot) && !visualConceptsCompletedWhenReady
+        snapshot?.isVisualIndexComplete == true
     }
 
     /// Whether to show the short note that suggestions for photo content appear after the indexing. It is read at
@@ -196,14 +194,7 @@ public final class SmartSearchDiscoveryModel {
         return !visualConceptsCompletedWhenReady && !Self.visualIndexReady(snapshot)
     }
 
-    /// Changes whenever the visual completion exception could apply. Hosts add it to their refresh key, because
-    /// after the first publish library changes no longer restart the refresh.
-    public func visualCompletionKey(_ snapshot: MLSmartSearchSnapshot?) -> String {
-        "\(Self.visualConceptsAvailable(snapshot))|\(Self.visualIndexReady(snapshot))|\(visualConceptsCompletedWhenReady)"
-    }
-
-    /// The content that published rows are checked against. Under `.oncePerSession`, published rows stay valid
-    /// for the whole session, so later library changes neither hide them nor show the placeholder again.
+    /// Background refreshes keep the last published rows visible until their replacement is ready.
     private func effective(_ content: SmartSearchContentIdentity) -> SmartSearchContentIdentity {
         guard refreshPolicy != .continuous, hasComputed, let computedContent else { return content }
         return computedContent
@@ -456,13 +447,10 @@ public final class SmartSearchDiscoveryModel {
         let visualAvailable = Self.visualConceptsAvailable(snapshot)
         let content = SmartSearchContentIdentity(timelineRevision: timelineRevision, favoriteUIDs: favoriteUIDs)
         showsSmartSearchHint = snapshot?.isEnabled != true
-        // A complete session refresh is final until the next launch: no compute for a UI feature.
-        guard !isSessionComplete || needsVisualCompletion(snapshot) else { return }
         lastRefreshCompleted = false
         refreshGeneration &+= 1
         let generation = refreshGeneration
         let refreshIndexingReady = Self.visualIndexReady(snapshot)
-        // Under `.oncePerSession` the first published rows stay on screen while a later refresh replaces them.
         let keepsRows = refreshPolicy != .continuous && hasComputed
         if keepsRows {
             // The next publish replaces the rows at once; nothing is cleared, so no placeholder appears.

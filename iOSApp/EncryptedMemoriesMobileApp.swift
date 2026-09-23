@@ -255,6 +255,7 @@ private struct MobileMainTabView: View {
     @Environment(MobileSceneContext.self) private var sceneContext
     @State private var selection: MobileTab = .photos
     @Environment(\.scenePhase) private var scenePhase
+    @State private var searchText = ""
     @State private var searchActivity: LibraryRuntimeActivityRegistration?
     @State private var networkMonitor = NetworkMonitor.shared
     @Namespace private var libraryActivityTransition
@@ -270,12 +271,16 @@ private struct MobileMainTabView: View {
     private var suggestionsRevision: String {
         SmartSearchDiscoveryScheduler.revisionKey(
             timelineRevision: libraryModel.timelineRevision, favoriteUIDs: libraryModel.favoriteUIDs,
-            coordinateCount: libraryModel.locationIndex.coordinates.count, smartSearch: libraryModel.smartSearch
+            coordinateCount: libraryModel.locationIndex.coordinates.count, smartSearch: libraryModel.smartSearch,
+            coordinateRevision: libraryModel.locationIndex.revision
         ) + "|librarySettled:\(libraryModel.allowsAutomaticSuggestionRefresh)"
+            + "|cacheContentSettled:\(libraryModel.allowsSuggestionCacheRestore)"
     }
 
     private func updateSearchActivity() {
-        if selection == .search, scenePhase == .active {
+        if selection == .search, scenePhase == .active,
+            !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        {
             if searchActivity?.isActive != true { searchActivity = LibraryRuntimeState.shared.beginActivity(.search) }
         } else {
             searchActivity?.end()
@@ -295,7 +300,7 @@ private struct MobileMainTabView: View {
 
     var body: some View {
         @Bindable var sceneContext = sceneContext
-        MobileAdaptiveTabShell(selection: $selection)
+        MobileAdaptiveTabShell(selection: $selection, searchText: $searchText)
             .environment(viewerRouter)
             .task(id: suggestionsRevision) {
                 updateSearchActivity()
@@ -303,11 +308,14 @@ private struct MobileMainTabView: View {
                     sections: libraryModel.sections, timelineRevision: libraryModel.timelineRevision,
                     favoriteUIDs: libraryModel.favoriteUIDs, coordinates: libraryModel.locationIndex.coordinates,
                     smartSearch: libraryModel.smartSearch,
-                    libraryIsSettled: libraryModel.allowsAutomaticSuggestionRefresh
+                    libraryIsSettled: libraryModel.allowsAutomaticSuggestionRefresh,
+                    cacheContentIsSettled: libraryModel.allowsSuggestionCacheRestore,
+                    coordinateRevision: libraryModel.locationIndex.revision
                 )
             }
             .onChange(of: selection, initial: true) { _, _ in updateSearchActivity() }
             .onChange(of: scenePhase) { _, _ in updateSearchActivity() }
+            .onChange(of: searchText) { _, _ in updateSearchActivity() }
             .onDisappear {
                 searchActivity?.end()
                 searchActivity = nil
@@ -363,9 +371,9 @@ private struct MobileMainTabView: View {
 
 private struct MobileAdaptiveTabShell: View {
     @Binding var selection: MobileTab
+    @Binding var searchText: String
     /// Bumped when the already-active Photos tab is retapped, so the timeline scrolls to the newest photos.
     @State private var photosScrollSignal = 0
-    @State private var searchText = ""
     @State private var searchScope: MLSearchScope = .all
 
     /// A custom selection binding makes an already-active Photos-tab retap observable. The route and grid

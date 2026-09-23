@@ -1497,10 +1497,21 @@ struct ProductionRouteGuardTests {
             to: "func restartLocationCrawlIfNeeded()"
         )
         let joinedCrawl = try #require(crawlStart.range(of: "await crawl.cancel()"))
-        let configuredStore = try #require(crawlStart.range(of: "store.configure(accountUID:"))
+        let capturedLease = try #require(crawlStart.range(of: "store.captureSessionLease()"))
         #expect(
-            joinedCrawl.upperBound <= configuredStore.lowerBound,
-            "iOS must join the previous crawl before replacing the encrypted store lease")
+            joinedCrawl.upperBound <= capturedLease.lowerBound,
+            "iOS must join the previous crawl before reusing the startup-owned store lease")
+        #expect(!crawlStart.contains("store.configure(accountUID:"))
+        #expect(crawlStart.contains("store.isCurrentSessionLease(sessionLease)"))
+        let startup = try Self.body(of: mobile, from: "private func start(", to: "private func applyItems(")
+        let configuredStore = try #require(startup.range(of: "locationStore.configure("))
+        let restoredLocations = try #require(startup.range(of: "self.locationIndex.replaceAll(savedLocations)"))
+        let appliedInventory = try #require(startup.range(of: "try await applyItems(cached.sections"))
+        #expect(configuredStore.upperBound <= restoredLocations.lowerBound)
+        #expect(restoredLocations.upperBound <= appliedInventory.lowerBound)
+        #expect(startup.contains("locationStore.isCurrentSessionLease(locationLease)"))
+        let transition = try Self.body(of: mobile, from: "transitionTask = Task", to: "self.start(session:")
+        #expect(transition.contains("await teardownTask.value"), "replacement startup must join prior account owners")
         #expect(
             crawlStart.contains("locationCrawlInventoryRevision = max("),
             "the running crawl must acknowledge each refreshed inventory revision")
@@ -2098,9 +2109,13 @@ struct ProductionRouteGuardTests {
             smartSearchToolbar.contains("isPresented = false"),
             "clearing the query must dismiss Apple's scope presentation instead of leaving stale filters")
         #expect(
-            smartSearchToolbar.contains(
-                ".onChange(of: isPresented) { _, presented in onPresentationChange(presented) }"),
-            "search presentation must report resource demand without changing the selected scope")
+            !smartSearchToolbar.contains("onPresentationChange"),
+            "opening empty Search must not claim interactive demand or stop automatic indexing")
+        let searchActivity = try Self.body(
+            of: mainView, from: "private func updateSearchActivity()", to: "private var searchDiscoveryTaskKey")
+        #expect(searchActivity.contains("if !isSearchTextEmpty"))
+        #expect(searchActivity.contains("beginActivity(.search)"))
+        #expect(searchActivity.contains("searchActivity?.end()"))
         #expect(
             !smartSearchToolbar.contains(".dismiss(clearText: true)"),
             "unavailable Smart Search must not reject ordinary lexical library queries")

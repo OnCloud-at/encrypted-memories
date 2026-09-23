@@ -4,10 +4,15 @@ import PhotosCore
 /// A lifecycle-owned read and write lease. Hosts cannot write after its account or model retires.
 public struct MLSearchSuggestionCacheAccess: Sendable {
     public let data: Data?
+    public let isCurrent: @Sendable () async -> Bool
     public let save: @Sendable (Data) async throws -> Void
 
-    public init(data: Data?, save: @escaping @Sendable (Data) async throws -> Void) {
+    public init(
+        data: Data?, isCurrent: @escaping @Sendable () async -> Bool,
+        save: @escaping @Sendable (Data) async throws -> Void
+    ) {
         self.data = data
+        self.isCurrent = isCurrent
         self.save = save
     }
 }
@@ -61,7 +66,12 @@ public struct MLSearchSuggestionCache: Sendable {
         let plaintext = try cipher.open(sealed, context: context)
         let envelope = try PropertyListDecoder().decode(Envelope.self, from: plaintext)
         guard envelope.version == 1 else { throw CacheError.incompatibleVersion }
-        guard envelope.identity == identity else { return nil }
+        guard envelope.identity == identity else {
+            PhotoDiagnostics.shared.emitDebug("SearchSuggestions", ["cache": "identityMismatch"])
+            return nil
+        }
+        PhotoDiagnostics.shared.emitDebug(
+            "SearchSuggestions", ["cache": "loaded", "bytes": "\(envelope.payload.count)"])
         return envelope.payload
     }
 

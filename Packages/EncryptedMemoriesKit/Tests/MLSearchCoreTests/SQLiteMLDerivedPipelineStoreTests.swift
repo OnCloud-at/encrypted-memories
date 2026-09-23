@@ -471,6 +471,50 @@ import Testing
         #expect(work[3].asset.uid == secondAsset.uid)
     }
 
+    @Test func deferredSourceDoesNotBlockLaterSQLiteWork() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("SQLiteMLDerivedPipelineStoreTests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try openStore(
+            url: root.appendingPathComponent(SQLiteMLDerivedPipelineStore.databaseFileName),
+            cipher: TestDerivedCipher(key: 0x67)
+        )
+        let artifact = try makeArtifact(stage: "ocr", revision: "revision3")
+        let key = try makeKey(account: "account", artifacts: [artifact])
+        let first = try MLPipelineAssetRevision(
+            uid: PhotoUID(volumeID: "volume", nodeID: "first"), sourceRevision: "source-v1"
+        )
+        let second = try MLPipelineAssetRevision(
+            uid: PhotoUID(volumeID: "volume", nodeID: "second"), sourceRevision: "source-v1"
+        )
+        #expect(store.enqueue([first, second], for: key))
+        let executor = SQLiteRecordingExecutor { plan in
+            plan.workItems.map {
+                .init(
+                    workItem: $0,
+                    outcome: plan.asset.uid == first.uid
+                        ? .deferred(reason: .sourceNotResident, retryAfter: nil)
+                        : .completedEmpty
+                )
+            }
+        }
+        let clock = Date(timeIntervalSince1970: 100)
+        let firstPass = await MLIndexRunner.runDerivedPass(
+            key: key, store: store, executor: executor,
+            configuration: .init(chunkSize: 1, retryDelay: 120), maximumAnalysisPlans: 1,
+            now: { clock }
+        )
+        #expect(firstPass.reason == .workQuantumCompleted)
+        #expect(try store.nextWorkBatch(for: key, limit: 1, now: clock).first?.asset.uid == second.uid)
+
+        let secondPass = await MLIndexRunner.runDerivedPass(
+            key: key, store: store, executor: executor,
+            configuration: .init(chunkSize: 1, retryDelay: 120), maximumAnalysisPlans: 1,
+            now: { clock }
+        )
+        #expect(secondPass.progress.completed == 1)
+    }
+
     @Test func retrySelectionIsBoundedByDueTimeBeforeAssetGrouping() throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("SQLiteMLDerivedPipelineStoreTests-\(UUID().uuidString)")

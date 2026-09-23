@@ -213,6 +213,47 @@ import Testing
         #expect(try store.nextWorkBatch(for: key, limit: 1, now: .distantFuture).first?.attempts == 0)
     }
 
+    @Test func deferredFirstAssetDoesNotStarvePendingAssets() async throws {
+        let store = InMemoryMLDerivedPipelineStore()
+        let artifact = try artifact(pipeline: .nativeSearch, stage: "ocr", revision: "revision3")
+        let key = try executionKey(pipeline: .nativeSearch, artifacts: [artifact])
+        #expect(store.enqueue([try asset("1"), try asset("2")], for: key))
+        let executor = RecordingExecutor { plan in
+            plan.workItems.map {
+                .init(
+                    workItem: $0,
+                    outcome: plan.asset.uid == uid("1")
+                        ? .deferred(reason: .sourceNotResident, retryAfter: nil)
+                        : .completedEmpty
+                )
+            }
+        }
+        let clock = Date(timeIntervalSince1970: 100)
+        let first = await MLIndexRunner.runDerivedPass(
+            key: key,
+            store: store,
+            executor: executor,
+            configuration: .init(chunkSize: 1, retryDelay: 120),
+            maximumAnalysisPlans: 1,
+            now: { clock }
+        )
+
+        #expect(first.reason == .workQuantumCompleted)
+        #expect(first.progress.retryPending == 1)
+        #expect(first.progress.pending == 2)
+        #expect(try store.nextWorkBatch(for: key, limit: 1, now: clock).first?.asset.uid == uid("2"))
+
+        let second = await MLIndexRunner.runDerivedPass(
+            key: key,
+            store: store,
+            executor: executor,
+            configuration: .init(chunkSize: 1, retryDelay: 120),
+            maximumAnalysisPlans: 1,
+            now: { clock }
+        )
+        #expect(second.progress.completed == 1)
+    }
+
     @Test func searchRequiresEveryNormalizedTokenAndKeepsAccountsIsolated() async throws {
         let store = InMemoryMLDerivedPipelineStore()
         let artifact = try artifact(pipeline: .nativeSearch, stage: "ocr", revision: "revision3")

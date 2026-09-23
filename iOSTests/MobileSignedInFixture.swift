@@ -119,6 +119,8 @@ enum MobileFixtureError: Error {
 struct MobileFixtureBackend: PhotosBackend {
     let sections: [TimelineSection]
     let thumbnails: [PhotoUID: Data]
+    var favoriteLoader: (@Sendable () async throws -> Set<PhotoUID>)? = nil
+    var favoriteWriter: (@Sendable ([PhotoUID], Bool) async throws -> Void)? = nil
 
     func loadTimeline() async throws -> [TimelineSection] { sections }
     func timeline(filter: PhotoFilter) async throws -> [TimelineSection] { sections }
@@ -167,8 +169,12 @@ struct MobileFixtureBackend: PhotosBackend {
         PhotoMetadata(filename: "\(uid.nodeID).jpg", mimeType: "image/jpeg", pixelWidth: 160, pixelHeight: 160)
     }
     func burstGroup(containing uid: PhotoUID) async throws -> [PhotoItem] { [] }
-    func favoriteUIDs() async throws -> Set<PhotoUID> { [] }
-    func setFavorites(_ uids: [PhotoUID], _ favorite: Bool) async throws {}
+    func favoriteUIDs() async throws -> Set<PhotoUID> {
+        try await favoriteLoader?() ?? []
+    }
+    func setFavorites(_ uids: [PhotoUID], _ favorite: Bool) async throws {
+        try await favoriteWriter?(uids, favorite)
+    }
     func trash(_ uids: [PhotoUID]) async throws {}
     func restore(_ uids: [PhotoUID]) async throws {}
     func emptyTrash() async throws {}
