@@ -161,11 +161,39 @@ public protocol MLSmartSearchSession: Sendable {
     ) async -> MLIndexPassOutcome
     func permanentlyUnavailableAssetUIDs(_ assets: [PhotoUID]) async throws -> Set<PhotoUID>
     func search(_ text: String, limit: Int) async throws -> MLSearchResults
+    func search(
+        _ text: String, limit: Int, shouldContinue: @escaping @Sendable () -> Bool
+    ) async throws -> MLSearchResults
+    func searchBatch(
+        _ texts: [String], limit: Int, shouldContinue: @escaping @Sendable () -> Bool
+    ) async throws -> MLSearchBatchResults
     func releaseMemory() async
     func shutdown() async
 }
 
 public extension MLSmartSearchSession {
+    func searchBatch(
+        _ texts: [String], limit: Int, shouldContinue: @escaping @Sendable () -> Bool
+    ) async throws -> MLSearchBatchResults {
+        var results: [MLSearchResults] = []
+        for text in texts {
+            results.append(try await search(text, limit: limit, shouldContinue: shouldContinue))
+        }
+        // A fallback session cannot establish shared scan membership. Fail closed for previews.
+        return MLSearchBatchResults(results: results, scannedUIDs: [])
+    }
+
+    func search(
+        _ text: String, limit: Int, shouldContinue: @escaping @Sendable () -> Bool
+    ) async throws -> MLSearchResults {
+        try Task.checkCancellation()
+        guard shouldContinue() else { throw CancellationError() }
+        let results = try await search(text, limit: limit)
+        try Task.checkCancellation()
+        guard shouldContinue() else { throw CancellationError() }
+        return results
+    }
+
     func indexQuantum(
         _ assets: [PhotoUID],
         maximumAssets: Int,

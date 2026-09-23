@@ -9,8 +9,21 @@ final class MetalGridAccessibilityProvider {
     private weak var host: NSView?
     private weak var coordinator: MetalGridCoordinator?
     var items: [PhotoItem] = []
-    var selected: Set<PhotoUID> = []
+    var selected: Set<PhotoUID> = [] {
+        didSet {
+            guard selected != oldValue, let host else { return }
+            // Preserve the focused element while updating the value that VoiceOver reads after a press.
+            for case let element as MetalGridA11yElement in host.accessibilityChildren() ?? [] {
+                guard let uid = element.uid else { continue }
+                element.setAccessibilitySelected(selected.contains(uid))
+            }
+            NSAccessibility.post(element: host, notification: .selectedChildrenChanged)
+        }
+    }
     var onOpen: ((PhotoUID) -> Void)?
+    /// Programmatic activation (VoiceOver press) that respects the current selection mode. Preferred
+    /// over `onOpen` when set; the closure reports whether the activation succeeded.
+    var onActivate: ((PhotoUID) -> Bool)?
 
     init(host: NSView, coordinator: MetalGridCoordinator) {
         self.host = host
@@ -67,6 +80,7 @@ final class MetalGridAccessibilityProvider {
             element.setAccessibilityFrame(screen)
             element.setAccessibilitySelected(selected.contains(item.uid))
             element.uid = item.uid
+            element.onActivate = onActivate
             element.onOpen = onOpen
             elements.append(element)
         }
@@ -89,14 +103,21 @@ final class MetalGridAccessibilityProvider {
     }
 }
 
-/// An accessibility element whose press action opens the viewer for its photo.
+/// An accessibility element whose press action activates its photo. `onActivate` routes through the
+/// current selection mode (toggle in selection mode, open the viewer otherwise); `onOpen` is the legacy
+/// direct-open fallback.
 final class MetalGridA11yElement: NSAccessibilityElement {
     var uid: PhotoUID?
+    var onActivate: ((PhotoUID) -> Bool)?
     var onOpen: ((PhotoUID) -> Void)?
 
     override func accessibilityPerformPress() -> Bool {
         guard let uid else { return false }
-        onOpen?(uid)
+        if let onActivate {
+            return onActivate(uid)
+        }
+        guard let onOpen else { return false }
+        onOpen(uid)
         return true
     }
 }

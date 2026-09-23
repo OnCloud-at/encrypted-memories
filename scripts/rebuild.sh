@@ -128,9 +128,9 @@ fi
 
 IOS_DEVICE_ID="$(
     xcrun devicectl list devices \
-        --filter "Name = '$IOS_DEVICE_NAME' AND State BEGINSWITH 'available'" \
+        --filter "Name = '$IOS_DEVICE_NAME' AND (State BEGINSWITH 'available' OR State = 'connected') AND Reality = 'physical'" \
         --columns Identifier --hide-default-columns --hide-headers --timeout 5 2>/dev/null \
-        | awk '$1 ~ /^[[:xdigit:]-]{36}$/ { print $1; exit }' || true
+        | awk '$1 ~ /^[[:xdigit:]]{8}-[[:xdigit:]]{16}$/ || $1 ~ /^[[:xdigit:]-]{36}$/ { print $1; exit }' || true
 )"
 
 if [[ -z "$IOS_DEVICE_ID" ]]; then

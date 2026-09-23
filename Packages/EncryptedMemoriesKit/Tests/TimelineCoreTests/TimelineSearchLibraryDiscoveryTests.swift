@@ -29,7 +29,7 @@ import Testing
         #expect(unfiltered.flatMap(\.items).count == 3)
     }
 
-    @Test func suggestionProjectionKeepsSearchOrderInsteadOfTheRefinementReversal() {
+    @Test func suggestionProjectionUsesNewestFirstAndPreservesCanonicalSnapshot() {
         let older = item("older", date(2024, 5, 1))
         let newer = item("newer", date(2024, 5, 2))
         let sections = [TimelineSection(id: "s", date: older.captureTime, title: "", items: [older, newer])]
@@ -44,8 +44,8 @@ import Testing
 
         let projection = TimelineSearchProjection(key: key, sections: sections)
 
-        #expect(projection.presentationItems.map(\.uid) == projection.snapshot.items.map(\.uid))
-        #expect(projection.snapshot.items.count == 2)
+        #expect(projection.presentationItems.map(\.uid) == [newer.uid, older.uid])
+        #expect(projection.snapshot.items.map(\.uid) == [older.uid, newer.uid])
     }
 
     @Test func aSuggestionOwnsOnlyItsUnchangedTitle() {

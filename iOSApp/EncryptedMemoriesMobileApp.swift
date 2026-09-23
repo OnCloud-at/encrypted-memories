@@ -254,6 +254,8 @@ private struct MobileMainTabView: View {
     @Environment(MobileLibraryModel.self) private var libraryModel
     @Environment(MobileSceneContext.self) private var sceneContext
     @State private var selection: MobileTab = .photos
+    @Environment(\.scenePhase) private var scenePhase
+    @State private var searchActivity: LibraryRuntimeActivityRegistration?
     @State private var networkMonitor = NetworkMonitor.shared
     @Namespace private var libraryActivityTransition
     /// Viewer presentation lives above the adaptive shell so a live iPad resize cannot dismiss open media.
@@ -263,6 +265,22 @@ private struct MobileMainTabView: View {
     private var showsLibraryLoadingCover: Bool {
         guard libraryModel.loadState.isLoading else { return false }
         return networkMonitor.isOnline || !libraryModel.items.isEmpty
+    }
+
+    private var suggestionsRevision: String {
+        SmartSearchDiscoveryScheduler.revisionKey(
+            timelineRevision: libraryModel.timelineRevision, favoriteUIDs: libraryModel.favoriteUIDs,
+            coordinateCount: libraryModel.locationIndex.coordinates.count, smartSearch: libraryModel.smartSearch
+        ) + "|librarySettled:\(libraryModel.allowsAutomaticSuggestionRefresh)"
+    }
+
+    private func updateSearchActivity() {
+        if selection == .search, scenePhase == .active {
+            if searchActivity?.isActive != true { searchActivity = LibraryRuntimeState.shared.beginActivity(.search) }
+        } else {
+            searchActivity?.end()
+            searchActivity = nil
+        }
     }
 
     private var loadingActivityMessage: String {
@@ -279,6 +297,21 @@ private struct MobileMainTabView: View {
         @Bindable var sceneContext = sceneContext
         MobileAdaptiveTabShell(selection: $selection)
             .environment(viewerRouter)
+            .task(id: suggestionsRevision) {
+                updateSearchActivity()
+                libraryModel.searchSuggestions.update(
+                    sections: libraryModel.sections, timelineRevision: libraryModel.timelineRevision,
+                    favoriteUIDs: libraryModel.favoriteUIDs, coordinates: libraryModel.locationIndex.coordinates,
+                    smartSearch: libraryModel.smartSearch,
+                    libraryIsSettled: libraryModel.allowsAutomaticSuggestionRefresh
+                )
+            }
+            .onChange(of: selection, initial: true) { _, _ in updateSearchActivity() }
+            .onChange(of: scenePhase) { _, _ in updateSearchActivity() }
+            .onDisappear {
+                searchActivity?.end()
+                searchActivity = nil
+            }
             .overlay {
                 MobileLibraryLoadingView(
                     isPresented: showsLibraryLoadingCover,
@@ -402,10 +435,7 @@ private struct MobileSearchTabScreen: View {
     @State private var historySuggestions: [String: TimelineSearchSuggestion] = [:]
     @State private var recentRepresentatives: [String: PhotoUID] = [:]
     @State private var activeSuggestion: TimelineSearchSuggestion?
-    /// Suggestions are computed once per app session: a UI feature must not spend compute on every library change.
-    @State private var discovery = SmartSearchDiscoveryModel(refreshPolicy: .oncePerSession) { latitude, longitude in
-        await NativePlaceNameResolver.shared.cityName(latitude: latitude, longitude: longitude)
-    }
+    private var discovery: SmartSearchDiscoveryModel { libraryModel.searchSuggestions.discovery }
 
     var body: some View {
         MobileTimelineScreen(
@@ -416,6 +446,7 @@ private struct MobileSearchTabScreen: View {
             searchLanding: MobileSearchLandingContent(
                 recents: recents,
                 discovery: discovery,
+                isUpdatingSuggestions: libraryModel.searchSuggestions.isRefreshing,
                 onSelectRecent: selectRecent,
                 onSelectSuggestion: select,
                 onClearHistory: clearHistory
@@ -441,20 +472,7 @@ private struct MobileSearchTabScreen: View {
         .onChange(of: discoveryContent) { _, _ in rebindActiveSuggestion() }
         .onChange(of: libraryModel.smartSearch?.snapshot) { _, _ in rebindActiveSuggestion() }
         .onChange(of: discovery.settledGeneration) { _, _ in rebindActiveSuggestion() }
-        .task(id: discoveryTaskKey) {
-            // Discovery runs while its landing is visible, and to keep a selected suggestion current. Typing or
-            // leaving the tab cancels it, so its background ML queries never compete with an interactive search.
-            // While results show, the visual stages run only for a selected visual concept.
-            guard isLandingVisible || needsActiveSuggestionRefresh else { return }
-            await discovery.refresh(
-                sections: libraryModel.sections,
-                timelineRevision: libraryModel.timelineRevision,
-                favoriteUIDs: libraryModel.favoriteUIDs,
-                coordinates: libraryModel.locationIndex.coordinates,
-                smartSearch: libraryModel.smartSearch,
-                includeVisualConcepts: isLandingVisible || activeSuggestion?.kind == .concept
-            )
-        }
+        .onChange(of: ObjectIdentifier(discovery)) { _, _ in rebindActiveSuggestion() }
         .task(id: recentRepresentativesRevision) {
             let sections = libraryModel.sections
             let typedQueries = history.queries.prefix(6).filter { historySuggestions[$0] == nil }
@@ -550,13 +568,6 @@ private struct MobileSearchTabScreen: View {
         }
     }
 
-    /// A selected suggestion needs a refresh until the suggestions are settled for the current library content.
-    /// A visual concept also follows the indexing progress.
-    private var needsActiveSuggestionRefresh: Bool {
-        guard isActive, let activeSuggestion else { return false }
-        return activeSuggestion.kind == .concept || !discovery.isSettled(content: discoveryContent)
-    }
-
     private func select(_ suggestion: TimelineSearchSuggestion) {
         if suggestion.matchingUIDs != nil {
             activeSuggestion = suggestion
@@ -597,30 +608,6 @@ private struct MobileSearchTabScreen: View {
         history.clear()
         historySuggestions = [:]
         recentRepresentatives = [:]
-    }
-
-    private var isLandingVisible: Bool {
-        isActive && searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-    }
-
-    private var discoveryTaskKey: String {
-        let revision = SmartSearchDiscoveryModel.revisionKey(
-            timelineRevision: libraryModel.timelineRevision,
-            favoriteCount: libraryModel.favoriteUIDs.count,
-            coordinateCount: libraryModel.locationIndex.coordinates.count,
-            snapshot: libraryModel.smartSearch?.snapshot
-        )
-        let visual = isLandingVisible || activeSuggestion?.kind == .concept
-        // After the first published rows, library changes no longer restart the session's refresh, so a sync
-        // cannot keep cancelling it before it completes.
-        let contentKey = discovery.hasComputed ? "session" : "\(discoveryContent.favoritesHash)|\(revision)"
-        return [
-            "\(isLandingVisible)",
-            "\(needsActiveSuggestionRefresh)",
-            "\(visual)",
-            contentKey,
-            discovery.visualCompletionKey(libraryModel.smartSearch?.snapshot),
-        ].joined(separator: "|")
     }
 
     private var recentRepresentativesRevision: String {

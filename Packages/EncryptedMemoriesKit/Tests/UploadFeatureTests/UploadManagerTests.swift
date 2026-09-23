@@ -143,6 +143,21 @@ final class UploadManagerTests: XCTestCase {
         XCTAssertEqual(snap.map(\.displayName), ["a.jpg", "b.jpg", "c.jpg", "d.jpg"])
     }
 
+    func testActiveManualUploadOwnsTransferDemandUntilItFinishes() async throws {
+        let (directory, urls) = try jpegs(["active"])
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let state = LibraryRuntimeState()
+        let uploader = ShutdownControlledUploader()
+        let manager = UploadManager(uploader: uploader, maxConcurrent: 1, runtimeState: state)
+        await manager.enqueueFiles(urls, destination: .library)
+        await uploader.uploadStarted.wait()
+        XCTAssertEqual(state.snapshot().activeUserTransferCount, 1)
+        await uploader.uploadRelease.signal()
+        _ = await waitForAllTerminal(manager)
+        await manager.shutdown()
+        XCTAssertEqual(state.snapshot().activeUserTransferCount, 0)
+    }
+
     func testEnqueueFolderStreamsSupportedMediaInDeterministicQueueOrder() async throws {
         let fileManager = FileManager.default
         let root = fileManager.temporaryDirectory

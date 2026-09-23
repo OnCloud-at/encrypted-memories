@@ -58,7 +58,9 @@ import UIKit
     }
 
     @Test func sceneContextResolvesItsOwnWindowAndPresenter() async throws {
-        let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let scene = try #require(
+            UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+                .first { $0.activationState == .foregroundActive })
         let previousKeyWindow = scene.windows.first(where: \.isKeyWindow)
         let firstContext = MobileSceneContext()
         let secondContext = MobileSceneContext()
@@ -77,7 +79,12 @@ import UIKit
             secondWindow.rootViewController = nil
             previousKeyWindow?.makeKey()
         }
-        try await Task.sleep(for: .milliseconds(300))
+        let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while firstContext.window !== firstWindow || secondContext.window !== secondWindow,
+            ContinuousClock.now < deadline
+        {
+            try await Task.sleep(for: .milliseconds(50))
+        }
 
         #expect(firstContext.window === firstWindow)
         #expect(secondContext.window === secondWindow)

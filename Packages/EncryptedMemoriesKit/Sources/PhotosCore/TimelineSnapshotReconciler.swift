@@ -12,7 +12,12 @@ public final class TimelineSnapshotReconciler {
         fileprivate let revision: UInt64
     }
 
-    public private(set) var snapshot: TimelineSnapshot
+    public private(set) var snapshot: TimelineSnapshot {
+        didSet { presentationItems = Array(snapshot.items.reversed()) }
+    }
+    /// Collection grids and their viewers share one newest-first array per publication.
+    /// The canonical snapshot and its mutation indices remain chronological.
+    public private(set) var presentationItems: [PhotoItem]
     @ObservationIgnored public private(set) var epoch = UUID()
     @ObservationIgnored private var revision: UInt64 = 0
     @ObservationIgnored private var loadGeneration: UInt64 = 0
@@ -31,6 +36,7 @@ public final class TimelineSnapshotReconciler {
         transform: @escaping @Sendable (TimelineSnapshot, Set<PhotoUID>) async -> TimelineSnapshot
     ) {
         self.snapshot = snapshot
+        presentationItems = Array(snapshot.items.reversed())
         self.transform = transform
     }
 

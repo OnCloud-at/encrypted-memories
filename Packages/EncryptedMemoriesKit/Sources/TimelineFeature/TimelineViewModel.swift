@@ -68,7 +68,12 @@ public final class TimelineViewModel {
     @ObservationIgnored private var initialAuthoritativeAddedUIDs: [PhotoUID] = []
     /// Flat, chronological items of the currently active route (whole library for `.all`, else the
     /// filtered tag/album/trash set) - backs selection and the upload-found lookup, not viewer paging.
-    public private(set) var allItems: [PhotoItem] = []
+    public private(set) var allItems: [PhotoItem] = [] {
+        didSet { presentationItems = filter == .all ? allItems : Array(allItems.reversed()) }
+    }
+    /// Reuse one display array across grid, viewer and chrome updates. Only collections reverse it;
+    /// the full library retains its chronological order and bottom-trailing anchor.
+    public private(set) var presentationItems: [PhotoItem] = []
     /// Stable identity snapshot of the whole `.all` library. Filter and map routes must never be
     /// interpreted as asset deletion by consumers such as Smart Search.
     public private(set) var wholeLibraryUIDs: [PhotoUID] = []
@@ -93,7 +98,13 @@ public final class TimelineViewModel {
     public let feed: ThumbnailFeed
 
     /// The active filter/album. `.all` is the whole library (fast SDK path); others use direct REST.
-    public private(set) var filter: PhotoFilter = .all
+    public private(set) var filter: PhotoFilter = .all {
+        didSet {
+            if (filter == .all) != (oldValue == .all) {
+                presentationItems = filter == .all ? allItems : Array(allItems.reversed())
+            }
+        }
+    }
 
     public init(repository: PhotosRepository, feed: ThumbnailFeed, library: PhotoLibraryProvider? = nil) {
         self.repository = repository

@@ -6,6 +6,19 @@ import Testing
 @MainActor
 @Suite("Collection snapshot reconciliation")
 struct TimelineSnapshotReconcilerTests {
+    @Test func collectionPresentationStaysNewestFirstAcrossLoadRemovalAndReset() async {
+        let owner = TimelineSnapshotReconciler(snapshot: snapshot(["a", "b", "c"]))
+        #expect(owner.presentationItems.map(\.uid.nodeID) == ["c", "b", "a"])
+        #expect(owner.snapshot.index(of: uid("b")) == 1)
+        #expect(await owner.remove([uid("b")], within: owner.epoch))
+        #expect(owner.presentationItems.map(\.uid.nodeID) == ["c", "a"])
+        let load = owner.beginLoad()
+        #expect(owner.publishLoaded(snapshot(["a", "b", "c", "d"]), token: load))
+        #expect(owner.presentationItems.map(\.uid.nodeID) == ["d", "c", "b", "a"])
+        owner.reset()
+        #expect(owner.presentationItems.isEmpty)
+    }
+
     @Test(arguments: [false, true])
     func concurrentRemovalsRebaseInEitherCompletionOrder(reverse: Bool) async {
         let gate = SnapshotTransformGate(blockedCalls: 2)

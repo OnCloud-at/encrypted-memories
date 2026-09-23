@@ -50,7 +50,9 @@ public struct TimelineSearchProjection: Sendable {
         let projection = TimelineContentProjection(sections: filtered)
         self.sections = projection.sections
         snapshot = projection.snapshot
-        if key.refinement.isActive, TimelineSearchQuery(key.query).isEmpty, key.requiredUIDs == nil {
+        if key.refinement.isActive || !TimelineSearchQuery(key.query).isEmpty || key.requiredUIDs != nil
+            || (key.context.activeFilter != nil && key.context.activeFilter != .all)
+        {
             presentationItems = Array(projection.snapshot.items.reversed())
         } else {
             presentationItems = projection.snapshot.items
@@ -68,6 +70,15 @@ public actor TimelineSearchProjectionCoordinator {
 
     public init() {}
 
+    #if DEBUG
+        private var beforeProjection: (@Sendable () async -> Void)?
+
+        /// Deterministic overlap seam; release builds retain the normal projection path only.
+        init(beforeProjection: @escaping @Sendable () async -> Void) {
+            self.beforeProjection = beforeProjection
+        }
+    #endif
+
     deinit {
         pendingTask?.cancel()
     }
@@ -81,8 +92,14 @@ public actor TimelineSearchProjectionCoordinator {
         generation &+= 1
         let requestGeneration = generation
         pendingTask?.cancel()
+        #if DEBUG
+            let beforeProjection = beforeProjection
+        #endif
         let task = Task.detached(priority: .userInitiated) {
-            TimelineSearchProjection(key: key, sections: sections, revision: requestGeneration)
+            #if DEBUG
+                await beforeProjection?()
+            #endif
+            return TimelineSearchProjection(key: key, sections: sections, revision: requestGeneration)
         }
         pendingTask = task
         let projection = await withTaskCancellationHandler {

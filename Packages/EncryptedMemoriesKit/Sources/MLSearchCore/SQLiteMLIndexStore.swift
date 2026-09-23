@@ -632,7 +632,7 @@ public final class SQLiteMLIndexStore: MLIndexStore, @unchecked Sendable {
     public func forEachVectorBlock(
         for descriptor: MLModelDescriptor,
         maximumRows: Int,
-        _ body: (MLVectorBlock) -> Void
+        _ body: (MLVectorBlock) throws -> Void
     ) throws {
         guard maximumRows > 0 else { return }
         var lastUID: PhotoUID?
@@ -719,7 +719,7 @@ public final class SQLiteMLIndexStore: MLIndexStore, @unchecked Sendable {
 
             // Scoring can take much longer than the SQLite read. Keep it outside the store lock so bounded
             // indexing writes and progress reads remain responsive between deterministic keyset pages.
-            if !page.block.isEmpty { body(page.block) }
+            if !page.block.isEmpty { try body(page.block) }
             if Task.isCancelled { return }
             guard page.rowCount > 0, let pageLastUID = page.lastUID else { return }
             lastUID = pageLastUID

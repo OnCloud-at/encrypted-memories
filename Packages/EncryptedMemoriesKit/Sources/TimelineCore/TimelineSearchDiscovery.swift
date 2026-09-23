@@ -42,7 +42,7 @@ public struct TimelineSearchHistory: Codable, Equatable, Sendable {
     }
 }
 
-public enum TimelineSearchSuggestionKind: String, Hashable, Sendable {
+public enum TimelineSearchSuggestionKind: String, Hashable, Sendable, Codable {
     case date
     case onThisDay
     case trip
@@ -59,7 +59,7 @@ public enum TimelineSearchSuggestionKind: String, Hashable, Sendable {
 /// A suggestion with `matchingUIDs` is structured: its result set was resolved when the suggestion was built
 /// (for example a place, an anniversary or an ML concept) and cannot be expressed as lexical query text.
 /// A suggestion without it runs `query` through the ordinary lexical and semantic search.
-public struct TimelineSearchSuggestion: Identifiable, Equatable, Sendable {
+public struct TimelineSearchSuggestion: Identifiable, Equatable, Sendable, Codable {
     public let id: String
     public let query: String
     public let title: String

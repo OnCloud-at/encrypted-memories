@@ -142,7 +142,9 @@ public enum AppleSmartSearchBootstrap {
                 allowsDeveloperModels: allowsDeveloperModels,
                 featureAvailability: featureAvailability(),
                 indexingCapacityProfile: indexingCapacityProfile,
-                releaseDerivedResources: { await imageSource.releaseMemory() }
+                releaseDerivedResources: { await imageSource.releaseMemory() },
+                suggestionCache: MLSearchSuggestionCache(
+                    layout: layout, accountIdentifier: accountUID, cipher: derivedCipher)
             ),
             initiallyAllowsIndexingExecution: !CoreMLComputePolicy.requiresCPUOnly
         )

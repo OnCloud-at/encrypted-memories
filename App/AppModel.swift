@@ -4,6 +4,8 @@ import LibrarySourceRuntime
 import MLSearchAppleAdapter
 import MLSearchBackgroundAppleAdapter
 import MLSearchCore
+import MLSearchFeature
+import MapFeature
 import MediaByteCache
 import MediaFeedCore
 import PhotoLibraryBackupAdapter
@@ -56,6 +58,9 @@ final class AppModel {
         backgroundHost: AppleSmartSearchBackgroundCoordinator.shared
     )
     var smartSearch: MLSmartSearchController? { smartSearchSession.controller }
+    let searchSuggestions = SmartSearchDiscoveryScheduler { latitude, longitude in
+        await NativePlaceNameResolver.shared.cityName(latitude: latitude, longitude: longitude)
+    }
     private var smartSearchAssets: MLAssetUniverse { smartSearchSession.assets }
     @ObservationIgnored private var sourceAnalysisRuntime: LibrarySourceAnalysisRuntime?
     @ObservationIgnored private var sourceAnalysisStartupTask: Task<Void, Never>?
@@ -224,6 +229,7 @@ final class AppModel {
         backendTask?.cancel()
         backendTask = nil
         backend = .idle
+        searchSuggestions.reset()
         let smartSearchShutdown = smartSearchSession.stop()
         let sourceAnalysisShutdown = stopSourceAnalysis()
         backupController = nil
@@ -322,6 +328,7 @@ final class AppModel {
         let folderBackup = backupController
         let photoBackup = photoBackupController
         let albumSync = albumSyncController
+        searchSuggestions.reset()
         let smartSearchShutdown = smartSearchSession.stop()
         let sourceAnalysisShutdown = stopSourceAnalysis()
         let policy = ProtonDriveBackendPolicy.standard(
@@ -512,6 +519,7 @@ final class AppModel {
         LibraryRuntimeState.shared.beginNewGeneration()
         backendTask?.cancel()
         libraryReady = false
+        searchSuggestions.reset()
         smartSearchSession.stop()
         stopSourceAnalysis()
         // Install the per-account encrypted-cache key derived from the restored session before the grid

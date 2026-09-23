@@ -17,6 +17,9 @@ final class MobileGridSelectionController {
     var isTrashing = false
     var showTrashConfirm = false
     var actionError: MobileSelectionError?
+    private var exportTask: Task<Void, Never>?
+
+    isolated deinit { exportTask?.cancel() }
 
     var isBusy: Bool { isExporting || isFavoriting || isTrashing }
 
@@ -69,15 +72,24 @@ final class MobileGridSelectionController {
     ) {
         guard !items.isEmpty, !isBusy else { return }
         isExporting = true
-        Task {
+        exportTask = Task { [weak self] in
             let result = await MobileMediaExporter.exportOriginals(items, backend: backend)
-            isExporting = false
+            guard let self else {
+                MobileMediaExporter.cleanup(result.urls)
+                return
+            }
+            self.exportTask = nil
+            self.isExporting = false
+            guard !Task.isCancelled else {
+                MobileMediaExporter.cleanup(result.urls)
+                return
+            }
             if result.urls.isEmpty {
-                actionError = MobileSelectionError(message: failureMessage)
+                self.actionError = MobileSelectionError(message: failureMessage)
             } else if result.failed > 0 {
-                partialShare = MobilePartialShare(urls: result.urls, failed: result.failed)
+                self.partialShare = MobilePartialShare(urls: result.urls, failed: result.failed)
             } else {
-                sharePayload = MobileSharePayload(urls: result.urls)
+                self.sharePayload = MobileSharePayload(urls: result.urls)
             }
         }
     }
@@ -121,11 +133,21 @@ struct MobileSharePayload: Identifiable {
     let id = UUID()
     let urls: [URL]
     let completionURL: URL?
+    let fileOwnership: MobileShareFileOwnership
 
-    init(urls: [URL], completionURL: URL? = nil) {
+    init(urls: [URL], completionURL: URL? = nil, fileOwnership: MobileShareFileOwnership? = nil) {
         self.urls = urls
         self.completionURL = completionURL
+        self.fileOwnership = fileOwnership ?? MobileShareFileOwnership(urls: urls)
     }
+}
+
+/// Payload copies retain their files until the last presentation owner releases them.
+/// Explicit completion cleanup remains idempotent; this also covers an owner that disappears before presentation.
+final class MobileShareFileOwnership {
+    private let urls: [URL]
+    init(urls: [URL]) { self.urls = urls }
+    deinit { MobileMediaExporter.cleanup(urls) }
 }
 
 /// A localized, user-facing failure for a selection action, surfaced honestly via an alert.
@@ -140,6 +162,13 @@ struct MobilePartialShare: Identifiable {
     let id = UUID()
     let urls: [URL]
     let failed: Int
+    let fileOwnership: MobileShareFileOwnership
+
+    init(urls: [URL], failed: Int) {
+        self.urls = urls
+        self.failed = failed
+        fileOwnership = MobileShareFileOwnership(urls: urls)
+    }
 }
 
 /// Native binary confirmations shared by every mobile grid selection surface. A confirmation dialog
@@ -164,7 +193,7 @@ private struct MobileSelectionAlertsModifier: ViewModifier {
                 presenting: selection.partialShare
             ) { info in
                 Button(String(localized: "selection.share_partial_proceed")) {
-                    selection.sharePayload = MobileSharePayload(urls: info.urls)
+                    selection.sharePayload = MobileSharePayload(urls: info.urls, fileOwnership: info.fileOwnership)
                 }
                 Button(L10n.string("action.cancel"), role: .cancel) {
                     MobileMediaExporter.cleanup(info.urls)
@@ -243,37 +272,67 @@ extension View {
 /// file; no selected photo/video is materialized as `Data`. Items whose download fails are skipped (the share
 /// proceeds with whatever succeeded); if none succeed the caller surfaces the failure honestly.
 enum MobileMediaExporter {
-    /// The dedicated temp subfolder for share exports, cleared before each run so stale files never pile up.
-    private static var exportDirectory: URL {
+    /// Cold-launch purge owns this shared root. Each active export owns a UUID child.
+    private static var exportRoot: URL {
         FileManager.default.temporaryDirectory.appendingPathComponent("ShareExports", isDirectory: true)
     }
 
-    /// Share-sheet completion owns the plaintext lifetime. Cleanup is idempotent because both the
-    /// activity completion callback and representable dismantle may run for the same payload.
+    private static func makeExportDirectory() -> URL {
+        exportRoot.appendingPathComponent(UUID().uuidString, isDirectory: true)
+    }
+
+    /// Share completion deletes only its own files. It never removes the shared root or another job.
     static func cleanup(_ urls: [URL]) {
-        let directory = exportDirectory.standardizedFileURL
-        for url in urls where url.standardizedFileURL.deletingLastPathComponent() == directory {
-            try? FileManager.default.removeItem(at: url)
+        let root = exportRoot.standardizedFileURL
+        let resolvedRoot = root.resolvingSymlinksInPath()
+        var parents = Set<URL>()
+        for url in urls {
+            let file = url.standardizedFileURL
+            let parent = file.deletingLastPathComponent()
+            let resolvedParent = parent.resolvingSymlinksInPath()
+            let isLegacyFile = parent == root && resolvedParent == resolvedRoot
+            let isOwnedChild =
+                parent.deletingLastPathComponent() == root
+                && UUID(uuidString: parent.lastPathComponent) != nil
+                && resolvedParent.deletingLastPathComponent() == resolvedRoot
+                && resolvedParent.lastPathComponent == parent.lastPathComponent
+            guard isLegacyFile || isOwnedChild else { continue }
+            try? FileManager.default.removeItem(at: file)
+            if isOwnedChild { parents.insert(parent) }
         }
-        if (try? FileManager.default.contentsOfDirectory(atPath: directory.path).isEmpty) == true {
-            try? FileManager.default.removeItem(at: directory)
+        for parent in parents {
+            if (try? FileManager.default.contentsOfDirectory(atPath: parent.path).isEmpty) == true {
+                try? FileManager.default.removeItem(at: parent)
+            }
         }
     }
 
-    /// Writes only the scrubbed Core support report. It shares the canonical transient directory so
-    /// completion, dismantle, and cold-launch purge all retain one idempotent cleanup contract.
+    /// Support reports receive the same per-job ownership as original-media exports.
     static func exportSupportReport(_ data: Data) async -> URL? {
-        let directory = exportDirectory
-        return await Task.detached(priority: .utility) {
+        let directory = makeExportDirectory()
+        let worker = Task.detached(priority: .utility) { () -> URL? in
             do {
+                try Task.checkCancellation()
                 try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
                 let url = directory.appendingPathComponent("Encrypted-Memories-Support.json")
                 try data.write(to: url, options: [.atomic, .completeFileProtectionUnlessOpen])
+                try Task.checkCancellation()
                 return url
             } catch {
+                try? FileManager.default.removeItem(at: directory)
                 return nil
             }
-        }.value
+        }
+        let result = await withTaskCancellationHandler {
+            await worker.value
+        } onCancel: {
+            worker.cancel()
+        }
+        if Task.isCancelled {
+            if let result { cleanup([result]) }
+            return nil
+        }
+        return result
     }
 
     /// The result of an export run: successfully written URLs and the count of downloads that failed.
@@ -284,13 +343,16 @@ enum MobileMediaExporter {
 
     static func exportOriginals(
         _ items: [PhotoItem],
-        backend: any OriginalFileProvider & PhotoMetadataProvider
+        backend: any OriginalFileProvider & PhotoMetadataProvider,
+        runtimeState: LibraryRuntimeState = .shared
     ) async -> ExportResult {
         guard !items.isEmpty else { return ExportResult(urls: [], failed: 0) }
-        let directory = exportDirectory
+        guard !Task.isCancelled else { return ExportResult(urls: [], failed: items.count) }
+        let activity = runtimeState.beginActivity(.userTransfer)
+        defer { activity.end() }
+        let directory = makeExportDirectory()
         let directoryReady = await Task.detached(priority: .utility) {
             let files = FileManager.default
-            try? files.removeItem(at: directory)
             do {
                 try files.createDirectory(at: directory, withIntermediateDirectories: true)
                 return true
@@ -311,7 +373,7 @@ enum MobileMediaExporter {
         // Bounded task group: at most `maxConcurrent` downloads in flight so a big video selection can't spike RAM.
         await withTaskGroup(of: URL?.self) { group in
             func addNext() {
-                guard index < items.count else { return }
+                guard index < items.count, !Task.isCancelled else { return }
                 let item = items[index]
                 index += 1
                 group.addTask { await export(item, backend: backend, names: names, into: directory) }
@@ -322,7 +384,12 @@ enum MobileMediaExporter {
                 addNext()
             }
         }
-        if exported.isEmpty { cleanup([]) }
+        if Task.isCancelled {
+            cleanup(exported)
+            try? FileManager.default.removeItem(at: directory)
+            return ExportResult(urls: [], failed: items.count)
+        }
+        if exported.isEmpty { try? FileManager.default.removeItem(at: directory) }
         return ExportResult(urls: exported, failed: failed)
     }
 
@@ -335,6 +402,7 @@ enum MobileMediaExporter {
         let staging = directory.appendingPathComponent(".\(UUID().uuidString).download")
         defer { try? FileManager.default.removeItem(at: staging) }
         do {
+            try Task.checkCancellation()
             try await backend.writeOriginal(for: item.uid, to: staging)
             try Task.checkCancellation()
             // The decrypted Proton filename is authoritative. Preserve it when available, and use the
@@ -350,6 +418,7 @@ enum MobileMediaExporter {
                 metadataFilename: meta?.filename, fallbackBase: fallbackBase(for: item), ext: ext
             )
             let url = directory.appendingPathComponent(await names.unique(desired))
+            try Task.checkCancellation()
             try FileManager.default.moveItem(at: staging, to: url)
             return url
         } catch {
@@ -499,6 +568,7 @@ struct MobileActivityPresenter: UIViewControllerRepresentable {
         }
 
         func dismantle(presenter: HostController) {
+            let retainedPayloads = [activePayload, pendingPayload].compactMap { $0 }
             let urls = (activePayload?.urls ?? []) + (pendingPayload?.urls ?? [])
             pendingPayload = nil
             activePayload = nil
@@ -511,7 +581,7 @@ struct MobileActivityPresenter: UIViewControllerRepresentable {
             activeController = nil
             controller.completionWithItemsHandler = nil
             presenter.dismiss(animated: false) {
-                MobileMediaExporter.cleanup(urls)
+                withExtendedLifetime(retainedPayloads) { MobileMediaExporter.cleanup(urls) }
             }
         }
 

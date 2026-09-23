@@ -22,6 +22,7 @@ import UIKit
         keyPassword: "fixture-key")
     let sections: [TimelineSection]
     let backend: MobileFixtureBackend
+    let cache: ThumbnailCache
     let feed: UIKitThumbnailFeed
     var items: [PhotoItem] { sections.flatMap(\.items) }
 
@@ -60,7 +61,7 @@ import UIKit
         }
         self.sections = sections
         backend = MobileFixtureBackend(sections: sections, thumbnails: thumbnails)
-        let cache = ThumbnailCache(rootDirectory: cacheDirectory)
+        cache = ThumbnailCache(rootDirectory: cacheDirectory)
         feed = UIKitThumbnailFeed(cache: cache, loader: backend)
         for (uid, data) in thumbnails {
             await cache.store(data, for: uid)
@@ -82,7 +83,19 @@ import UIKit
     func install(into model: MobileLibraryModel) {
         model.installIsolatedLibrary(
             session: session, store: runtime.sessionModel.sessionStore, backend: backend, sections: sections,
-            thumbnailFeed: feed)
+            thumbnailFeed: feed, thumbnailCache: cache)
+    }
+
+    func install(
+        into model: MobileLibraryModel,
+        backend: any PhotosBackend,
+        sections: [TimelineSection],
+        thumbnailFeed: UIKitThumbnailFeed,
+        thumbnailCache: ThumbnailCache
+    ) {
+        model.installIsolatedLibrary(
+            session: session, store: runtime.sessionModel.sessionStore, backend: backend, sections: sections,
+            thumbnailFeed: thumbnailFeed, thumbnailCache: thumbnailCache)
     }
 
     /// Clears fixture state through the session observer without requesting another persistent-data purge.

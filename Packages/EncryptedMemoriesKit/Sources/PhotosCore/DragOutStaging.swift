@@ -20,6 +20,7 @@ public actor DragOutStager {
     private let stagingDirectory: URL
     private let safetyMarginBytes: Int64
     private let maxConcurrentWrites: Int
+    private let runtimeState: LibraryRuntimeState
 
     private enum JobState {
         case pending
@@ -46,12 +47,14 @@ public actor DragOutStager {
         fileProvider: any OriginalFileProvider,
         stagingDirectory: URL,
         safetyMarginBytes: Int64 = 128 * 1024 * 1024,
-        maxConcurrentWrites: Int = 2
+        maxConcurrentWrites: Int = 2,
+        runtimeState: LibraryRuntimeState = .shared
     ) {
         self.fileProvider = fileProvider
         self.stagingDirectory = stagingDirectory
         self.safetyMarginBytes = safetyMarginBytes
         self.maxConcurrentWrites = max(1, maxConcurrentWrites)
+        self.runtimeState = runtimeState
     }
 
     // MARK: - Public API
@@ -209,6 +212,8 @@ public actor DragOutStager {
     }
 
     private func runJob(uid: PhotoUID, destination: URL) async {
+        let activity = runtimeState.beginActivity(.userTransfer)
+        defer { activity.end() }
         do {
             let relay = progressRelay
             try await fileProvider.writeOriginal(for: uid, to: destination) { fraction in

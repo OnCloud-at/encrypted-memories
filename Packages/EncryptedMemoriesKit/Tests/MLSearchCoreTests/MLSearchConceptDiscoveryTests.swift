@@ -75,10 +75,49 @@ import Testing
         #expect(evidence.map(\.concept.id) == ["nature"])
     }
 
+    @Test func aFailedConceptDoesNotProveDiscoveryIsComplete() async {
+        struct QueryFailure: Error {}
+        let result = await MLSearchConceptDiscovery.evaluateWithCompletion(
+            concepts: [dog, nature], coveredAssetCount: 10, sensitiveUIDs: []
+        ) { prompt, _ in
+            if prompt == dog.prompt { throw QueryFailure() }
+            return uids("n", 0..<6)
+        }
+        #expect(result.evidence.map(\.concept.id) == ["nature"])
+        #expect(!result.isComplete)
+
+        let empty = await MLSearchConceptDiscovery.evaluateWithCompletion(
+            concepts: [dog], coveredAssetCount: 10, sensitiveUIDs: []
+        ) { _, _ in [] }
+        #expect(empty.evidence.isEmpty)
+        #expect(empty.isComplete)
+    }
+
     @Test func thresholdScalesWithCoverageAndNeverDropsBelowSix() {
         #expect(MLSearchConceptDiscovery.minimumHits(coveredAssetCount: 0) == 6)
         #expect(MLSearchConceptDiscovery.minimumHits(coveredAssetCount: 1_000) == 6)
         #expect(MLSearchConceptDiscovery.minimumHits(coveredAssetCount: 50_000) == 200)
+    }
+
+    @Test(arguments: [100_000, 100_001, 150_000, Int.max])
+    func largeLibrariesCanQualifyWithinTheSearchLimit(covered: Int) async {
+        let hits = uids("n", 0..<400)
+        let evidence = await MLSearchConceptDiscovery.evaluate(
+            concepts: [nature], coveredAssetCount: covered, sensitiveUIDs: []
+        ) { _, limit in Array(hits.prefix(limit)) }
+
+        #expect(evidence.map(\.concept.id) == ["nature"])
+        #expect(evidence.first?.rankedUIDs.count == 400)
+    }
+
+    @Test(arguments: [0, 5, 6, 100])
+    func customLimitsKeepTheMinimumEvidenceFloor(limit: Int) async {
+        let hits = uids("n", 0..<limit)
+        let evidence = await MLSearchConceptDiscovery.evaluate(
+            concepts: [nature], coveredAssetCount: 150_000, sensitiveUIDs: [], limit: limit
+        ) { _, _ in hits }
+
+        #expect(evidence.isEmpty == (limit < 6))
     }
 
     @Test func everyCuratedConceptHasAReviewedTitleAndAUniqueID() {

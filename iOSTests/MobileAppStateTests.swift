@@ -911,7 +911,7 @@ private func waitUntil(
         let fileManager = FileManager.default
         let shareDirectory = fileManager.temporaryDirectory
             .appendingPathComponent("ShareExports", isDirectory: true)
-        try? fileManager.removeItem(at: shareDirectory)
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
         try fileManager.createDirectory(at: shareDirectory, withIntermediateDirectories: true)
         let owned = shareDirectory.appendingPathComponent("IMG_0001.HEIC")
         let outside = fileManager.temporaryDirectory
@@ -931,7 +931,7 @@ private func waitUntil(
         let fileManager = FileManager.default
         let shareDirectory = fileManager.temporaryDirectory
             .appendingPathComponent("ShareExports", isDirectory: true)
-        try? fileManager.removeItem(at: shareDirectory)
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
         try fileManager.createDirectory(at: shareDirectory, withIntermediateDirectories: true)
         let urls = ["IMG_0001.HEIC", "IMG_0002.HEIC"].map {
             shareDirectory.appendingPathComponent($0)

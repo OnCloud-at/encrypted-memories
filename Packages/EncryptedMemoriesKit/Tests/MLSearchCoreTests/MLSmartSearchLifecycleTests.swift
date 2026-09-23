@@ -344,11 +344,15 @@ import Testing
 
     private final class TrackingSession: MLSmartSearchSession, @unchecked Sendable {
         let descriptor: MLModelDescriptor
+        private let indexFails: Bool
         private let lock = NSLock()
         private var indexes = 0
         private var shutdowns = 0
 
-        init(descriptor: MLModelDescriptor) { self.descriptor = descriptor }
+        init(descriptor: MLModelDescriptor, indexFails: Bool = false) {
+            self.descriptor = descriptor
+            self.indexFails = indexFails
+        }
 
         func index(_ assets: [PhotoUID], observer: MLIndexPassObserver) async -> MLIndexPassOutcome {
             lock.withLock { indexes += 1 }
@@ -356,7 +360,9 @@ import Testing
                 report: MLIndexBatchReport(),
                 ranToCompletion: false,
                 newPermanentFailures: [],
-                progress: MLIndexProgress(phase: .idle, descriptor: descriptor)
+                progress: MLIndexProgress(
+                    phase: indexFails ? .failed(message: "fixture storage failure") : .idle,
+                    descriptor: descriptor)
             )
         }
 
@@ -739,6 +745,82 @@ import Testing
         let resourceCoordinator: LibraryResourceCoordinator
     }
 
+    private struct SuggestionCipher: MLDerivedDataCipher {
+        private let key = SymmetricKey(data: Data(repeating: 42, count: 32))
+        func seal(_ plaintext: Data, context: MLDerivedDataCipherContext) throws -> Data {
+            try #require(
+                AES.GCM.seal(plaintext, using: key, authenticating: Data(context.accountIdentifier.utf8)).combined)
+        }
+        func open(_ ciphertext: Data, context: MLDerivedDataCipherContext) throws -> Data {
+            try AES.GCM.open(
+                AES.GCM.SealedBox(combined: ciphertext), using: key,
+                authenticating: Data(context.accountIdentifier.utf8))
+        }
+        func tokenDigest(normalizedToken: String, accountIdentifier: String, artifactNamespace: String) throws -> Data {
+            Data(HMAC<SHA256>.authenticationCode(for: Data(normalizedToken.utf8), using: key))
+        }
+    }
+
+    @Test func suggestionCacheWaitsForVerifiedActiveModel() async throws {
+        let payload = Data("model".utf8)
+        let (entry, url) = downloadableEntry(id: "cache-model", payload: payload)
+        let harness = try makeHarness(
+            catalog: .init(entries: [entry]), payloads: [url: payload], assets: [uid("a")],
+            suggestionCacheEnabled: true)
+        defer { try? FileManager.default.removeItem(at: harness.layout.rootDirectory) }
+        await harness.lifecycle.start()
+        await harness.lifecycle.setEnabled(true)
+        harness.provider.blockNextSessionLoad()
+        let activation = Task { await harness.lifecycle.select(entry.id) }
+        #expect(await waitUntil { harness.provider.sessionLoadStarted })
+        #expect(await harness.lifecycle.suggestionCacheAccess() == nil)
+        harness.provider.releaseBlockedSessionLoad()
+        await activation.value
+        await harness.lifecycle.shutdown()
+    }
+
+    @Test(arguments: ["shutdown", "purge", "visualDisable", "modelSwitch", "indexChange"])
+    func suggestionCacheLeaseCannotOutliveItsState(_ retirement: String) async throws {
+        let payload = Data("model".utf8)
+        let (entry, url) = downloadableEntry(id: "cache-a", payload: payload)
+        let (other, otherURL) = downloadableEntry(id: "cache-b", payload: payload)
+        let harness = try makeHarness(
+            catalog: .init(entries: [entry, other]), payloads: [url: payload, otherURL: payload], assets: [uid("a")],
+            suggestionCacheEnabled: true)
+        defer { try? FileManager.default.removeItem(at: harness.layout.rootDirectory) }
+        await harness.lifecycle.start()
+        await harness.lifecycle.setEnabled(true)
+        await harness.lifecycle.select(entry.id)
+        for _ in 0..<200 where await harness.lifecycle.semanticIndexedAssetCount() == 0 {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        try #require(await harness.lifecycle.semanticIndexedAssetCount() == 1)
+        let lease = try #require(await harness.lifecycle.suggestionCacheAccess())
+        let original = Data("completed-cache".utf8)
+        try await lease.save(original)
+        #expect(await harness.lifecycle.suggestionCacheAccess()?.data == original)
+        switch retirement {
+        case "shutdown": await harness.lifecycle.shutdown()
+        case "purge": await harness.lifecycle.setEnabled(false)
+        case "visualDisable": await harness.lifecycle.setVisualSearchEnabled(false)
+        case "modelSwitch": await harness.lifecycle.select(other.id)
+        default:
+            harness.storeProvider.store.upsert([
+                MLEmbeddingRecord(uid: uid("new"), descriptor: entry.descriptor, vector: [1, 0, 0, 0])
+            ])
+        }
+        do {
+            try await lease.save(Data("stale".utf8))
+            Issue.record("retired cache lease wrote after \(retirement)")
+        } catch MLSmartSearchQueryError.staleEpoch {}
+        if ["purge", "visualDisable", "modelSwitch"].contains(retirement) {
+            #expect(
+                !FileManager.default.fileExists(
+                    atPath: harness.layout.rootDirectory.appendingPathComponent("suggestions-v1.enc").path))
+        }
+        await harness.lifecycle.shutdown()
+    }
+
     private func makeHarness(
         catalog: MLModelCatalog,
         payloads: [URL: Data],
@@ -758,7 +840,8 @@ import Testing
         resourceCoordinator: LibraryResourceCoordinator? = nil,
         featureAvailability: AppFeatureAvailability = .available,
         indexingCapacityProfile: MLIndexingCapacityProfile = .constrained,
-        catalogRefreshInterval: Duration = .seconds(15 * 60)
+        catalogRefreshInterval: Duration = .seconds(15 * 60),
+        suggestionCacheEnabled: Bool = false
     ) throws -> Harness {
         let rootDir =
             root
@@ -799,7 +882,10 @@ import Testing
                 resourceCoordinator: resourceCoordinator,
                 allowsDeveloperModels: allowsDeveloperModels,
                 featureAvailability: featureAvailability,
-                indexingCapacityProfile: indexingCapacityProfile
+                indexingCapacityProfile: indexingCapacityProfile,
+                suggestionCache: suggestionCacheEnabled
+                    ? MLSearchSuggestionCache(layout: layout, accountIdentifier: "fixture", cipher: SuggestionCipher())
+                    : nil
             ),
             configuration: .init(
                 indexRetryDelay: retryDelay,
@@ -1880,6 +1966,74 @@ import Testing
         #expect(failed)
         #expect(harness.provider.builtCount == 0)
         #expect(!FileManager.default.fileExists(atPath: harness.layout.modelDirectory(for: entryA.id).path))
+    }
+
+    @Test func completedIndexBecomesReadyAfterSelectionPublicationResumes() async throws {
+        let payload = Data("model-a-bytes".utf8)
+        let (entry, url) = downloadableEntry(id: "model-a", payload: payload)
+        let assets = (0..<5).map { uid("asset-\($0)") }
+        let harness = try makeHarness(
+            catalog: MLModelCatalog(entries: [entry]), payloads: [url: payload], assets: assets)
+        defer { try? FileManager.default.removeItem(at: harness.layout.rootDirectory) }
+        let gate = OneShotEmbeddingBarrier()
+        await gate.arm()
+        await harness.lifecycle.setSelectionCompletionGate { await gate.waitIfArmed() }
+
+        await harness.lifecycle.start()
+        await harness.lifecycle.setEnabled(true)
+        let selection = Task { await harness.lifecycle.select(entry.id) }
+        await gate.waitUntilBlocked()
+        #expect(
+            await waitUntil {
+                let snapshot = await harness.lifecycle.currentSnapshot()
+                if case .ready(let progress) = snapshot.indexingState {
+                    return progress.totalWorkUnits == assets.count
+                        && progress.settledWorkUnits == assets.count
+                }
+                return false
+            })
+        #expect(await harness.lifecycle.semanticIndexedAssetCount() == assets.count)
+
+        await gate.release()
+        await selection.value
+        #expect(await waitForCompleteIndex(harness, total: assets.count))
+        await harness.lifecycle.shutdown()
+    }
+
+    @Test func selectionCompletionPreservesIndexFailureBackoff() async throws {
+        let payload = Data("model-a-bytes".utf8)
+        let (entry, url) = downloadableEntry(id: "model-a", payload: payload)
+        let harness = try makeHarness(
+            catalog: MLModelCatalog(entries: [entry]), payloads: [url: payload],
+            assets: [uid("asset")], retryDelay: .seconds(30))
+        defer { try? FileManager.default.removeItem(at: harness.layout.rootDirectory) }
+        let session = TrackingSession(descriptor: entry.descriptor, indexFails: true)
+        harness.provider.sessionOverride = { _ in session }
+        let gate = OneShotEmbeddingBarrier()
+        await gate.arm()
+        await harness.lifecycle.setSelectionCompletionGate { await gate.waitIfArmed() }
+
+        await harness.lifecycle.start()
+        await harness.lifecycle.setEnabled(true)
+        let selection = Task { await harness.lifecycle.select(entry.id) }
+        await gate.waitUntilBlocked()
+        #expect(
+            await waitUntil {
+                if case .failed = await harness.lifecycle.currentSnapshot().indexingState {
+                    return true
+                }
+                return false
+            })
+        #expect(session.indexCount == 1)
+
+        await gate.release()
+        await selection.value
+        let retriedEarly = await waitUntil(timeout: .milliseconds(250)) {
+            session.indexCount > 1
+        }
+        #expect(!retriedEarly)
+        #expect(session.indexCount == 1)
+        await harness.lifecycle.shutdown()
     }
 
     @Test func sameSelectionDoesNotReindex() async throws {

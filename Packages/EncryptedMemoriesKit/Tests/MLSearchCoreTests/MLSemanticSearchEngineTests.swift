@@ -22,6 +22,125 @@ import Testing
         }
     }
 
+    private final class PreemptionProbe: MLVectorScorer, @unchecked Sendable {
+        private let lock = NSLock()
+        private var blocks = 0
+        var scoredBlocks: Int { lock.withLock { blocks } }
+        func score(block: MLVectorBlock, query: ContiguousArray<Float32>, into scores: inout [Float32]) {
+            ReferenceDotProductScorer().score(block: block, query: query, into: &scores)
+            lock.withLock { blocks += 1 }
+        }
+    }
+
+    @Test func preemptedSearchStopsAtTheNextBlockAndNeverReturnsPartialResults() async throws {
+        let store = InMemoryMLIndexStore()
+        store.upsert(
+            (0..<8).map {
+                MLEmbeddingRecord(uid: uid("\($0)"), descriptor: descriptor, vector: [1, 0, 0])
+            })
+        let probe = PreemptionProbe()
+        let engine = MLSemanticSearchEngine(
+            store: store, encoder: Encoder(vector: [1, 0, 0]), scorer: probe, queryBlockRowLimit: 2
+        )
+        await #expect(throws: CancellationError.self) {
+            try await engine.search(
+                MLSearchQuery(descriptor: descriptor, queryText: "fixture", limit: 8),
+                shouldContinue: { probe.scoredBlocks == 0 }
+            )
+        }
+        #expect(probe.scoredBlocks == 1)
+        let resumed = try await engine.search(MLSearchQuery(descriptor: descriptor, queryText: "fixture", limit: 8))
+        #expect(resumed.results.count == 8)
+    }
+
+    private final class ReadCountingCipher: MLVectorCipher, @unchecked Sendable {
+        private let lock = NSLock()
+        private var count = 0
+        var reads: Int { lock.withLock { count } }
+        func seal(_ plaintext: Data, context: MLVectorCipherContext) throws -> Data {
+            try TestMLVectorCipher().seal(plaintext, context: context)
+        }
+        func open(_ ciphertext: Data, context: MLVectorCipherContext) throws -> Data {
+            lock.withLock { count += 1 }
+            return try TestMLVectorCipher().open(ciphertext, context: context)
+        }
+    }
+
+    private actor CountingPromptEncoder: MLTextQueryEncoder {
+        private(set) var count = 0
+        func encode(text: String, descriptor: MLModelDescriptor) async throws -> ContiguousArray<Float32> {
+            count += 1
+            return text == "query-50" ? [0, 4, 0] : [4, 0, 0]
+        }
+    }
+
+    @Test func batchedSuggestionsMatchIndependentQueriesIncludingTiesAndLimits() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let cipher = ReadCountingCipher()
+        let encoder = CountingPromptEncoder()
+        let store = try #require(
+            SQLiteMLIndexStore(url: directory.appendingPathComponent("index.sqlite"), cipher: cipher))
+        defer { store.close() }
+        store.upsert(
+            (0..<601).map {
+                MLEmbeddingRecord(
+                    uid: uid("item-\($0)"), descriptor: descriptor,
+                    vector: $0 % 3 == 0 ? [0, 1, 0] : [1, 0, 0])
+            })
+        let engine = MLSemanticSearchEngine(store: store, encoder: encoder, scorer: ReferenceDotProductScorer())
+        let queries = [0, 6, 50, 400].map {
+            MLSearchQuery(descriptor: descriptor, queryText: "query-\($0)", limit: $0)
+        }
+        var expected: [[MLSearchResult]] = []
+        for query in queries { expected.append(try await engine.search(query).results) }
+        let priorReads = cipher.reads
+        let actual = try await engine.searchBatch(queries)
+        #expect(actual.results.map(\.results) == expected)
+        #expect(actual.results.map(\.queryText) == queries.map(\.queryText))
+        #expect(cipher.reads - priorReads == 601, "each encrypted row is read once for the whole batch")
+        #expect(actual.scannedUIDs.isEmpty, "a skipped prompt cannot authorize previews")
+        let checked = try await engine.searchBatch(Array(queries.dropFirst()))
+        #expect(checked.scannedUIDs.count == 601)
+        #expect((0..<601).allSatisfy { checked.scannedUIDs.contains(uid("item-\($0)")) })
+        let encoded = await encoder.count
+        _ = try await engine.searchBatch(queries)
+        #expect(await encoder.count == encoded)
+        await engine.purgeCachedBlocks()
+        _ = try await engine.searchBatch(queries)
+        #expect(await encoder.count == encoded + queries.count)
+    }
+
+    @Test func scanMembershipPreservesExactUIDEqualityAndSnapshotIsolation() {
+        let original =
+            (0..<1_031).map {
+                PhotoUID(volumeID: "volume-\($0 % 7)", nodeID: "node-\($0)")
+            } + [
+                PhotoUID(volumeID: "é", nodeID: "🌿"),
+                PhotoUID(volumeID: "e\u{301}", nodeID: "🌿"),
+                PhotoUID(volumeID: "", nodeID: ""),
+            ]
+        let reference = Set(original)
+        var membership = MLScannedUIDMembership()
+        for start in stride(from: 0, to: original.count, by: 256) {
+            membership.formUnion(original[start..<min(original.count, start + 256)])
+        }
+        #expect(membership.count == reference.count)
+        let probes = original + original.map { PhotoUID(volumeID: $0.volumeID + "-other", nodeID: $0.nodeID) }
+        for candidate in probes { #expect(membership.contains(candidate) == reference.contains(candidate)) }
+
+        let completed = membership
+        let later = PhotoUID(volumeID: "volume-0", nodeID: "indexed-after-batch")
+        membership.formUnion([later])
+        #expect(!completed.contains(later), "later indexing cannot authorize an unchecked preview")
+        let current = Array(original.prefix(300)) + [later]
+        let restricted = completed.intersection(current)
+        let expected = reference.intersection(current)
+        #expect(restricted.count == expected.count)
+        for candidate in probes + [later] { #expect(restricted.contains(candidate) == expected.contains(candidate)) }
+        #expect(MLScannedUIDMembership().intersection(original).isEmpty)
+    }
+
     private struct DualEncoder: MLAssetEmbedder, MLTextQueryEncoder {
         func embed(uid: PhotoUID, descriptor: MLModelDescriptor) async -> MLEmbeddingOutcome {
             .embedded(uid.nodeID == "tree" ? [1, 0, 0] : [0, 1, 0])
@@ -128,9 +247,9 @@ import Testing
         func forEachVectorBlock(
             for descriptor: MLModelDescriptor,
             maximumRows: Int,
-            _ body: (MLVectorBlock) -> Void
-        ) {
-            body(vectorBlock(for: descriptor))
+            _ body: (MLVectorBlock) throws -> Void
+        ) throws {
+            try body(vectorBlock(for: descriptor))
         }
         func remove(uid: PhotoUID, descriptor: MLModelDescriptor) { backing.remove(uid: uid, descriptor: descriptor) }
         func remove(uids: [PhotoUID], descriptor: MLModelDescriptor) {
@@ -254,6 +373,24 @@ import Testing
         #expect(try await engine.search(MLSearchQuery(descriptor: descriptor, queryText: "first")).count == 1)
         #expect(try await engine.search(MLSearchQuery(descriptor: descriptor, queryText: "second")).count == 1)
         #expect(store.blockLoads == 2)
+    }
+
+    @Test func batchCoverageExcludesRowsRemovedDuringSelfHealing() async throws {
+        let invalid = uid("invalid")
+        let valid = uid("valid")
+        let store = SelfHealingStore(invalidUID: invalid)
+        _ = store.upsert([
+            MLEmbeddingRecord(uid: valid, descriptor: descriptor, vector: [1, 0, 0]),
+            MLEmbeddingRecord(uid: invalid, descriptor: descriptor, vector: [0, 1, 0]),
+        ])
+        let engine = MLSemanticSearchEngine(
+            store: store, encoder: Encoder(vector: [1, 0, 0]), scorer: ReferenceDotProductScorer())
+        let result = try await engine.searchBatch([MLSearchQuery(descriptor: descriptor, queryText: "fixture")])
+        #expect(result.scannedUIDs.count == 1)
+        #expect(result.scannedUIDs.contains(valid))
+        #expect(!result.scannedUIDs.contains(invalid))
+        #expect(result.results.first?.results.map(\.uid) == [valid])
+        #expect(store.blockLoads == 1)
     }
 
     @Test func streamingKeepsRankingAndTieOrderAcrossBoundedBlocks() async throws {

@@ -124,19 +124,22 @@ public struct LibraryActivityBannerOverlay: View {
     private let state: LibraryActivityBannerState
     private let bottomPadding: CGFloat
     private let leadingObstructionInset: CGFloat
+    private let isActiveSurface: Bool
 
     public init(
         isPresented: Bool,
         message: String,
         state: LibraryActivityBannerState = .working,
         bottomPadding: CGFloat = 20,
-        leadingObstructionInset: CGFloat = 0
+        leadingObstructionInset: CGFloat = 0,
+        isActiveSurface: Bool = true
     ) {
         self.isPresented = isPresented
         self.message = message
         self.state = state
         self.bottomPadding = bottomPadding
         self.leadingObstructionInset = max(0, leadingObstructionInset)
+        self.isActiveSurface = isActiveSurface
     }
 
     public var body: some View {
@@ -158,7 +161,7 @@ public struct LibraryActivityBannerOverlay: View {
 
     @ViewBuilder private var transitionBanner: some View {
         let banner = LibraryActivityBanner(message: message, state: state)
-        if !reduceMotion, let transitionNamespace {
+        if !reduceMotion, isActiveSurface, let transitionNamespace {
             banner.matchedGeometryEffect(
                 id: LibraryActivityTransitionID.banner,
                 in: transitionNamespace,

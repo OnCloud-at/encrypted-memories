@@ -22,7 +22,7 @@ public struct MLSearchQuery: Sendable, Equatable {
 }
 
 /// A single ranked result from a semantic search.
-public struct MLSearchResult: Sendable, Equatable {
+public struct MLSearchResult: Sendable, Equatable, Codable {
     public let uid: PhotoUID
     public let score: Float
 
@@ -33,7 +33,7 @@ public struct MLSearchResult: Sendable, Equatable {
 }
 
 /// A collection of ranked results.
-public struct MLSearchResults: Sendable, Equatable {
+public struct MLSearchResults: Sendable, Equatable, Codable {
     public let descriptor: MLModelDescriptor
     public let queryText: String
     public let results: [MLSearchResult]
@@ -59,6 +59,53 @@ public struct MLSearchResults: Sendable, Equatable {
             results: Array(results.prefix(n)),
             durationMs: durationMs
         )
+    }
+}
+
+/// Exact scan membership. Store each volume once instead of retaining its string for every decoded row.
+/// Memory still scales with checked node IDs; no fingerprint or probabilistic match can authorize a preview.
+public struct MLScannedUIDMembership: Sendable, ExpressibleByArrayLiteral, Codable {
+    private var nodesByVolume: [String: Set<String>] = [:]
+
+    public init() {}
+
+    public init(_ uids: some Sequence<PhotoUID>) {
+        formUnion(uids)
+    }
+
+    public init(arrayLiteral elements: PhotoUID...) {
+        self.init(elements)
+    }
+
+    public var count: Int { nodesByVolume.values.reduce(0) { $0 + $1.count } }
+    public var isEmpty: Bool { nodesByVolume.isEmpty }
+
+    public func contains(_ uid: PhotoUID) -> Bool {
+        nodesByVolume[uid.volumeID]?.contains(uid.nodeID) == true
+    }
+
+    mutating func formUnion(_ uids: some Sequence<PhotoUID>) {
+        for uid in uids { nodesByVolume[uid.volumeID, default: []].insert(uid.nodeID) }
+    }
+
+    func intersection(_ uids: some Sequence<PhotoUID>) -> Self {
+        var result = Self()
+        for uid in uids where contains(uid) {
+            result.nodesByVolume[uid.volumeID, default: []].insert(uid.nodeID)
+        }
+        return result
+    }
+}
+
+/// A completed shared scan, including every valid row checked by all batch prompts.
+/// Membership must come from the scan itself, not from a separate index-count snapshot.
+public struct MLSearchBatchResults: Sendable, Codable {
+    public let results: [MLSearchResults]
+    public let scannedUIDs: MLScannedUIDMembership
+
+    public init(results: [MLSearchResults], scannedUIDs: MLScannedUIDMembership) {
+        self.results = results
+        self.scannedUIDs = scannedUIDs
     }
 }
 

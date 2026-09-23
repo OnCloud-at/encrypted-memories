@@ -45,8 +45,8 @@ public enum SmartSearchSuggestionRebindResult: Equatable {
 /// 1. The sensitive gate, when visual search can answer. It fails closed: if it cannot complete, no suggestion
 ///    carries a preview and no visual concept is offered.
 /// 2. Metadata families (dates, trips, seasons, favorites, media types), published immediately.
-/// 3. Places from the existing location index, named by the host-provided resolver.
-/// 4. Curated visual concepts.
+/// 3. Curated visual concepts, published before network-backed place names.
+/// 4. Places from the existing location index, named by the host-provided resolver.
 /// Gate and concept evidence are cached per library revision, model and coarse indexing progress, so a
 /// cancelled refresh (for example when the user starts typing) resumes cheaply.
 @MainActor
@@ -59,6 +59,8 @@ public final class SmartSearchDiscoveryModel {
         /// Every library, favorites or availability change recomputes them. Published sets always match the
         /// current content.
         case continuous
+        /// Refresh while idle, preserving the last published rows until replacement metadata is ready.
+        case background
         /// They are computed once per app session: the first published rows stay on screen, and after the first
         /// complete refresh nothing is recomputed until the next launch. Library changes never bring the loading
         /// placeholder back. An applied suggestion keeps its session result set, intersected with the current
@@ -96,8 +98,9 @@ public final class SmartSearchDiscoveryModel {
     /// Whether this session computed visual concepts with a finished visual index. Until then, turning visual
     /// search on or finishing the indexing allows one more refresh, the only exception to `.oncePerSession`.
     private var visualConceptsCompletedWhenReady = false
-    /// Indexing state of the refresh in progress, read when it settles.
-    @ObservationIgnored private var refreshIndexingReady = false
+    /// Only the current refresh may publish after an asynchronous boundary.
+    @ObservationIgnored private var refreshGeneration: UInt64 = 0
+    @ObservationIgnored private(set) var lastRefreshCompleted = false
     @ObservationIgnored private var metadata = TimelineSearchDiscoveryResult()
     @ObservationIgnored private var places: [TimelineSearchSuggestion] = []
     @ObservationIgnored private var concepts: [TimelineSearchSuggestion] = []
@@ -110,6 +113,61 @@ public final class SmartSearchDiscoveryModel {
     public init(refreshPolicy: RefreshPolicy = .continuous, placeName: @escaping PlaceNameResolver) {
         self.refreshPolicy = refreshPolicy
         self.placeName = placeName
+    }
+
+    struct PersistedSnapshot: Codable, Sendable {
+        let candidates: [TimelineSearchSuggestion]
+        let forYouIDs: [String]
+        let chipIDs: [String]
+        let showsSmartSearchHint: Bool
+        let visualAvailability: Bool?
+        let visualCompletedWhenReady: Bool
+        let placeNames: [String: String]
+        let placeNamesLocale: String
+    }
+
+    func persistedSnapshot() -> PersistedSnapshot? {
+        guard lastRefreshCompleted else { return nil }
+        return PersistedSnapshot(
+            candidates: candidates, forYouIDs: forYou.map(\.id), chipIDs: chips.map(\.id),
+            showsSmartSearchHint: showsSmartSearchHint, visualAvailability: settledVisualAvailability,
+            visualCompletedWhenReady: visualConceptsCompletedWhenReady,
+            placeNames: placeNames, placeNamesLocale: Self.placeNamesLocale)
+    }
+
+    private static var placeNamesLocale: String {
+        Locale.current.identifier + "|" + Locale.preferredLanguages.joined(separator: "|")
+    }
+
+    func reusePlaceNames(from previous: SmartSearchDiscoveryModel) {
+        placeNames = previous.placeNames
+    }
+
+    func restorePlaceNames(from snapshot: PersistedSnapshot) {
+        placeNames = snapshot.placeNamesLocale == Self.placeNamesLocale ? snapshot.placeNames : [:]
+    }
+
+    func restore(
+        _ snapshot: PersistedSnapshot, content: SmartSearchContentIdentity,
+        isExactContent: Bool
+    ) {
+        var seen = Set<String>()
+        candidates = snapshot.candidates.filter {
+            seen.insert($0.id).inserted && $0.matchingUIDs?.isEmpty == false
+        }
+        let byID = Dictionary(uniqueKeysWithValues: candidates.map { ($0.id, $0) })
+        forYou = snapshot.forYouIDs.compactMap { byID[$0] }
+        chips = snapshot.chipIDs.compactMap { byID[$0] }
+        lastPublished = candidates
+        restorePlaceNames(from: snapshot)
+        showsSmartSearchHint = snapshot.showsSmartSearchHint
+        computedContent = content
+        hasComputed = true
+        settledContent = isExactContent ? content : nil
+        settledVisualAvailability = isExactContent ? snapshot.visualAvailability : nil
+        visualConceptsCompletedWhenReady = isExactContent && snapshot.visualCompletedWhenReady
+        lastRefreshCompleted = isExactContent
+        settledGeneration &+= 1
     }
 
     /// Whether this session's suggestions are final: a complete refresh ran once under `.oncePerSession`.
@@ -134,7 +192,8 @@ public final class SmartSearchDiscoveryModel {
     /// render time, so it follows a visual search toggle at once without a refresh.
     public func showsVisualSuggestionsPendingNote(_ snapshot: MLSmartSearchSnapshot?) -> Bool {
         guard Self.visualConceptsAvailable(snapshot) else { return false }
-        return !Self.visualIndexReady(snapshot) || !visualConceptsCompletedWhenReady
+        // Restored completed suggestions do not become pending while runtime coverage hydrates.
+        return !visualConceptsCompletedWhenReady && !Self.visualIndexReady(snapshot)
     }
 
     /// Changes whenever the visual completion exception could apply. Hosts add it to their refresh key, because
@@ -146,7 +205,7 @@ public final class SmartSearchDiscoveryModel {
     /// The content that published rows are checked against. Under `.oncePerSession`, published rows stay valid
     /// for the whole session, so later library changes neither hide them nor show the placeholder again.
     private func effective(_ content: SmartSearchContentIdentity) -> SmartSearchContentIdentity {
-        guard refreshPolicy == .oncePerSession, hasComputed, let computedContent else { return content }
+        guard refreshPolicy != .continuous, hasComputed, let computedContent else { return content }
         return computedContent
     }
 
@@ -364,16 +423,47 @@ public final class SmartSearchDiscoveryModel {
         smartSearch: MLSmartSearchController?,
         includeVisualConcepts: Bool = true
     ) async {
-        let snapshot = smartSearch?.snapshot
         let lifecycle = smartSearch?.lifecycleActor
+        let search: MLSearchConceptDiscovery.Search?
+        if let lifecycle {
+            search = { prompt, limit in
+                try await lifecycle.search(prompt, limit: limit, intent: .automatic).results.map(\.uid)
+            }
+        } else {
+            search = nil
+        }
+        await refresh(
+            sections: sections, timelineRevision: timelineRevision, favoriteUIDs: favoriteUIDs,
+            coordinates: coordinates, snapshot: smartSearch?.snapshot,
+            indexedAssetCount: { await lifecycle?.semanticIndexedAssetCount() ?? 0 },
+            search: search, includeVisualConcepts: includeVisualConcepts
+        )
+    }
+
+    func refresh(
+        sections: [TimelineSection],
+        timelineRevision: UInt64,
+        favoriteUIDs: Set<PhotoUID>,
+        coordinates: [PhotoCoordinate],
+        snapshot: MLSmartSearchSnapshot?,
+        indexedAssetCount: @Sendable () async -> Int,
+        search: MLSearchConceptDiscovery.Search?,
+        includeVisualConcepts: Bool = true,
+        metadataOnly: Bool = false,
+        allowsRepresentative: (@Sendable (PhotoUID) -> Bool)? = nil,
+        previewsDidPublish: (@MainActor () -> Void)? = nil
+    ) async {
         let visualAvailable = Self.visualConceptsAvailable(snapshot)
         let content = SmartSearchContentIdentity(timelineRevision: timelineRevision, favoriteUIDs: favoriteUIDs)
         showsSmartSearchHint = snapshot?.isEnabled != true
         // A complete session refresh is final until the next launch: no compute for a UI feature.
         guard !isSessionComplete || needsVisualCompletion(snapshot) else { return }
-        refreshIndexingReady = Self.visualIndexReady(snapshot)
+        lastRefreshCompleted = false
+        refreshGeneration &+= 1
+        let generation = refreshGeneration
+        let refreshIndexingReady = Self.visualIndexReady(snapshot)
         // Under `.oncePerSession` the first published rows stay on screen while a later refresh replaces them.
-        let keepsRows = refreshPolicy == .oncePerSession && hasComputed
+        let keepsRows = refreshPolicy != .continuous && hasComputed
         if keepsRows {
             // The next publish replaces the rows at once; nothing is cleared, so no placeholder appears.
         } else if computedContent?.timelineRevision != timelineRevision {
@@ -397,140 +487,186 @@ public final class SmartSearchDiscoveryModel {
             settledContent = nil
             settledVisualAvailability = nil
         }
+        if refreshPolicy == .background, visualAvailable, !includeVisualConcepts {
+            settledVisualAvailability = nil
+        }
         if !visualAvailable {
             clearVisualEvidence()
         }
 
         // Stage 1: the sensitive gate must finish before any preview is chosen.
         var covered = 0
-        var gatePassed = true
-        if Self.visualConceptsAvailable(snapshot), let lifecycle {
-            covered = await lifecycle.semanticIndexedAssetCount()
-            guard !Task.isCancelled else { return }
+        var gatePassed = !visualAvailable
+        if Self.visualConceptsAvailable(snapshot), let search {
+            covered = await indexedAssetCount()
+            guard !Task.isCancelled, generation == refreshGeneration else { return }
             if covered == 0 {
                 clearVisualEvidence()
             } else {
+                gatePassed = true
                 let key = evidenceKey(timelineRevision: timelineRevision, snapshot: snapshot)
                 if gateKey != key, !includeVisualConcepts {
                     // The gate needs inference, which this refresh skips. Fail closed: no previews.
                     gatePassed = false
                 } else if gateKey != key {
                     do {
-                        sensitiveUIDs = try await MLSearchConceptDiscovery.sensitiveUIDs { prompt, limit in
-                            try await lifecycle.search(prompt, limit: limit, intent: .automatic).results.map(\.uid)
-                        }
+                        let sensitive = try await MLSearchConceptDiscovery.sensitiveUIDs(search: search)
+                        guard !Task.isCancelled, generation == refreshGeneration else { return }
+                        sensitiveUIDs = sensitive
                         gateKey = key
                     } catch {
-                        guard !Task.isCancelled else { return }
+                        guard !Task.isCancelled, generation == refreshGeneration else { return }
+                        PhotoDiagnostics.shared.increment("ml.suggestions.sensitiveGateFailed")
                         gatePassed = false
                         clearVisualEvidence()
                     }
                 }
             }
         }
+        if !gatePassed {
+            clearVisualEvidence()
+            places = []
+        }
         let context = TimelineSearchDiscoveryContext(
             favoriteUIDs: favoriteUIDs,
             excludedRepresentativeUIDs: sensitiveUIDs,
+            allowsRepresentative: visualAvailable ? allowsRepresentative : nil,
             suppressesRepresentatives: !gatePassed
         )
 
         // Stage 2: metadata. It needs no network and no further ML.
-        metadata = await Task.detached(priority: .utility) {
+        let newMetadata = await Self.background {
             TimelineSearchDiscovery.librarySuggestions(sections: sections, context: context)
-        }.value
-        guard !Task.isCancelled else { return }
+        }
+        guard !Task.isCancelled, generation == refreshGeneration else { return }
+        if computedContent != content {
+            places = []
+            concepts = []
+        }
+        metadata = newMetadata
         publish(content: content)
+        previewsDidPublish?()
 
-        // Stage 3: places. Only centroids of photo clusters are named.
-        let itemsByUID = await Task.detached(priority: .utility) {
+        // The scheduler's first publication must not wait for network-backed place names before its gate.
+        if metadataOnly {
+            settle(
+                content: content, visualAvailable: visualAvailable, ranVisualStages: false,
+                indexingReady: refreshIndexingReady)
+            return
+        }
+
+        // Prepare the local lookup once for concepts and places.
+        let itemsByUID: [PhotoUID: PhotoItem] = await Self.background {
             var index: [PhotoUID: PhotoItem] = [:]
             for section in sections {
+                guard !Task.isCancelled else { return [:] }
                 for item in section.items { index[item.uid] = item }
             }
             return index
-        }.value
-        guard !Task.isCancelled else { return }
-        let candidates = await Task.detached(priority: .utility) {
+        }
+        guard !Task.isCancelled, generation == refreshGeneration else { return }
+        // Stage 3: publish checked visual concepts before any network-backed place names.
+        var visualStagesComplete = gatePassed
+        if includeVisualConcepts {
+            if gatePassed, covered > 0, let search {
+                let key = evidenceKey(timelineRevision: timelineRevision, snapshot: snapshot)
+                if conceptKey != key {
+                    let sensitive = sensitiveUIDs
+                    let evaluation = await MLSearchConceptDiscovery.evaluateWithCompletion(
+                        coveredAssetCount: covered,
+                        sensitiveUIDs: sensitive,
+                        search: search
+                    )
+                    guard !Task.isCancelled, generation == refreshGeneration else { return }
+                    conceptEvidence = evaluation.evidence
+                    visualStagesComplete = evaluation.isComplete
+                    conceptKey = evaluation.isComplete ? key : nil
+                }
+                let evidence = conceptEvidence
+                let newConcepts = await Self.background {
+                    evidence.map { entry in
+                        let matches = entry.rankedUIDs.compactMap { itemsByUID[$0] }
+                        // The best-ranked matches make the most convincing previews.
+                        let previews = TimelineSearchDiscovery.representatives(
+                            for: Array(matches.prefix(12)),
+                            context: context
+                        )
+                        return TimelineSearchSuggestion(
+                            id: "concept:\(entry.concept.id)",
+                            query: entry.concept.title,
+                            title: entry.concept.title,
+                            subtitle: TimelineSearchDiscovery.countText(matches.count),
+                            systemImage: entry.concept.systemImage,
+                            kind: .concept,
+                            matchingUIDs: Set(matches.map(\.uid)),
+                            representativeUIDs: previews
+                        )
+                    }
+                }
+                guard !Task.isCancelled, generation == refreshGeneration else { return }
+                concepts = newConcepts
+                publish(content: content)
+                previewsDidPublish?()
+            } else {
+                concepts = []
+                conceptEvidence = []
+                conceptKey = nil
+                publish(content: content)
+            }
+        }
+
+        // Stage 4: only centroids of photo clusters are named.
+        let candidates = await Self.background {
             TimelineSearchDiscovery.placeCandidates(coordinates: coordinates)
-        }.value
+        }
+        guard !Task.isCancelled, generation == refreshGeneration else { return }
         for candidate in candidates where placeNames[candidate.id] == nil {
-            guard !Task.isCancelled else { return }
+            guard !Task.isCancelled, generation == refreshGeneration else { return }
             if let name = await placeName(candidate.latitude, candidate.longitude) {
+                guard !Task.isCancelled, generation == refreshGeneration else { return }
                 placeNames[candidate.id] = name
             }
         }
-        guard !Task.isCancelled else { return }
+        guard !Task.isCancelled, generation == refreshGeneration else { return }
         let names = placeNames
-        places = await Task.detached(priority: .utility) {
+        let newPlaces = await Self.background {
             TimelineSearchDiscovery.placeSuggestions(
                 candidates: candidates,
                 names: names,
                 itemsByUID: itemsByUID,
                 context: context
             )
-        }.value
-        guard !Task.isCancelled else { return }
+        }
+        guard !Task.isCancelled, generation == refreshGeneration else { return }
+        places = newPlaces
         publish(content: content)
+        settle(
+            content: content, visualAvailable: visualAvailable,
+            ranVisualStages: includeVisualConcepts && visualStagesComplete, indexingReady: refreshIndexingReady
+        )
+    }
 
-        // Stage 4: curated visual concepts, only behind a passed gate. A host that only keeps a selected
-        // metadata or place suggestion current skips it, so no background inference runs while results show.
-        guard includeVisualConcepts else {
-            settle(content: content, visualAvailable: visualAvailable, ranVisualStages: false)
-            return
+    /// A cancelled host also cancels its utility worker. Results still require the refresh generation check.
+    nonisolated static func background<Value: Sendable>(
+        _ operation: @escaping @Sendable () -> Value
+    ) async -> Value {
+        let task = Task.detached(priority: .utility, operation: operation)
+        return await withTaskCancellationHandler {
+            await task.value
+        } onCancel: {
+            task.cancel()
         }
-        guard gatePassed, covered > 0, let lifecycle else {
-            concepts = []
-            conceptEvidence = []
-            conceptKey = nil
-            publish(content: content)
-            settle(content: content, visualAvailable: visualAvailable, ranVisualStages: true)
-            return
-        }
-        let key = evidenceKey(timelineRevision: timelineRevision, snapshot: snapshot)
-        if conceptKey != key {
-            let sensitive = sensitiveUIDs
-            let evidence = await MLSearchConceptDiscovery.evaluate(
-                coveredAssetCount: covered,
-                sensitiveUIDs: sensitive
-            ) { prompt, limit in
-                try await lifecycle.search(prompt, limit: limit, intent: .automatic).results.map(\.uid)
-            }
-            guard !Task.isCancelled else { return }
-            conceptEvidence = evidence
-            conceptKey = key
-        }
-        let evidence = conceptEvidence
-        concepts = await Task.detached(priority: .utility) {
-            evidence.map { entry in
-                let matches = entry.rankedUIDs.compactMap { itemsByUID[$0] }
-                // The best-ranked matches make the most convincing previews.
-                let previews = TimelineSearchDiscovery.representatives(
-                    for: Array(matches.prefix(12)),
-                    context: context
-                )
-                return TimelineSearchSuggestion(
-                    id: "concept:\(entry.concept.id)",
-                    query: entry.concept.title,
-                    title: entry.concept.title,
-                    subtitle: TimelineSearchDiscovery.countText(matches.count),
-                    systemImage: entry.concept.systemImage,
-                    kind: .concept,
-                    matchingUIDs: Set(matches.map(\.uid)),
-                    representativeUIDs: previews
-                )
-            }
-        }.value
-        guard !Task.isCancelled else { return }
-        publish(content: content)
-        settle(content: content, visualAvailable: visualAvailable, ranVisualStages: true)
     }
 
     /// Marks the refresh as complete. A refresh that skipped the visual stages keeps the availability of an
     /// earlier complete refresh for the same content.
-    private func settle(content: SmartSearchContentIdentity, visualAvailable: Bool, ranVisualStages: Bool) {
+    private func settle(
+        content: SmartSearchContentIdentity, visualAvailable: Bool, ranVisualStages: Bool, indexingReady: Bool
+    ) {
+        lastRefreshCompleted = !visualAvailable || ranVisualStages
         if ranVisualStages {
             settledVisualAvailability = visualAvailable
-            if visualAvailable && refreshIndexingReady {
+            if visualAvailable && indexingReady {
                 visualConceptsCompletedWhenReady = true
             }
         }
@@ -547,10 +683,18 @@ public final class SmartSearchDiscoveryModel {
     }
 
     private func evidenceKey(timelineRevision: UInt64, snapshot: MLSmartSearchSnapshot?) -> String {
-        [
+        Self.visualEvidenceKey(timelineRevision: timelineRevision, snapshot: snapshot)
+    }
+
+    static func visualEvidenceKey(
+        timelineRevision: UInt64, snapshot: MLSmartSearchSnapshot?, indexingKey: String? = nil
+    ) -> String {
+        let selected = snapshot?.availableModels.first { $0.id == snapshot?.selectedModelID }
+        return [
             "\(timelineRevision)",
             snapshot?.selectedModelID.map { "\($0)" } ?? "-",
-            Self.indexingBucket(snapshot),
+            selected.map { "\($0.descriptor.displayName)|\($0.downloadPlan?.revision ?? "local")" } ?? "-",
+            indexingKey ?? indexingBucket(snapshot),
         ].joined(separator: "|")
     }
 

@@ -48,6 +48,8 @@ public struct LibraryRuntimeSnapshot: Sendable, Equatable {
     public var hasVisibleMediaDemand: Bool
     public var hasActiveUserInteraction: Bool
     public var activeUserTransferCount: Int
+    public var activeVideoPlaybackCount: Int
+    public var activeSearchCount: Int
     public var generation: UInt64
     public var monotonicUptimeNanoseconds: UInt64
 
@@ -62,6 +64,8 @@ public struct LibraryRuntimeSnapshot: Sendable, Equatable {
         hasVisibleMediaDemand: Bool = false,
         hasActiveUserInteraction: Bool = false,
         activeUserTransferCount: Int = 0,
+        activeVideoPlaybackCount: Int = 0,
+        activeSearchCount: Int = 0,
         generation: UInt64 = 0,
         monotonicUptimeNanoseconds: UInt64 = DispatchTime.now().uptimeNanoseconds
     ) {
@@ -75,6 +79,8 @@ public struct LibraryRuntimeSnapshot: Sendable, Equatable {
         self.hasVisibleMediaDemand = hasVisibleMediaDemand
         self.hasActiveUserInteraction = hasActiveUserInteraction
         self.activeUserTransferCount = max(0, activeUserTransferCount)
+        self.activeVideoPlaybackCount = max(0, activeVideoPlaybackCount)
+        self.activeSearchCount = max(0, activeSearchCount)
         self.generation = generation
         self.monotonicUptimeNanoseconds = monotonicUptimeNanoseconds
     }
@@ -89,6 +95,7 @@ public final class LibraryRuntimeState: @unchecked Sendable {
 
     private let lock = NSLock()
     private var current: LibraryRuntimeSnapshot
+    private var activities: [UUID: LibraryRuntimeActivity] = [:]
     private var continuations: [UUID: AsyncStream<LibraryRuntimeSnapshot>.Continuation] = [:]
 
     public init(initial: LibraryRuntimeSnapshot = .initial) {
@@ -127,6 +134,7 @@ public final class LibraryRuntimeState: @unchecked Sendable {
     ) -> LibraryRuntimeSnapshot {
         let result: (LibraryRuntimeSnapshot, [AsyncStream<LibraryRuntimeSnapshot>.Continuation]) = lock.withLock {
             let old = current
+            activities.removeAll()
             let generation = old.generation &+ 1
             current =
                 preservingSystemSignals
@@ -147,6 +155,38 @@ public final class LibraryRuntimeState: @unchecked Sendable {
         return result.0
     }
 
+    /// An owner holds this registration only while it actively needs foreground resources.
+    /// Independent windows and jobs cannot clear each other's demand. A generation reset retires all owners.
+    public func beginActivity(_ activity: LibraryRuntimeActivity) -> LibraryRuntimeActivityRegistration {
+        let id = UUID()
+        update { snapshot in
+            activities[id] = activity
+            Self.adjust(activity, in: &snapshot, by: 1)
+        }
+        return LibraryRuntimeActivityRegistration(
+            isActive: { [weak self] in
+                guard let self else { return false }
+                return self.lock.withLock { self.activities[id] != nil }
+            },
+            finish: { [weak self] in
+                guard let self else { return }
+                self.update { snapshot in
+                    guard let activity = self.activities.removeValue(forKey: id) else { return }
+                    Self.adjust(activity, in: &snapshot, by: -1)
+                }
+            })
+    }
+
+    private static func adjust(
+        _ activity: LibraryRuntimeActivity, in snapshot: inout LibraryRuntimeSnapshot, by delta: Int
+    ) {
+        switch activity {
+        case .videoPlayback: snapshot.activeVideoPlaybackCount = max(0, snapshot.activeVideoPlaybackCount + delta)
+        case .userTransfer: snapshot.activeUserTransferCount = max(0, snapshot.activeUserTransferCount + delta)
+        case .search: snapshot.activeSearchCount = max(0, snapshot.activeSearchCount + delta)
+        }
+    }
+
     public func updates() -> AsyncStream<LibraryRuntimeSnapshot> {
         let id = UUID()
         return AsyncStream(bufferingPolicy: .bufferingNewest(1)) { continuation in
@@ -160,4 +200,35 @@ public final class LibraryRuntimeState: @unchecked Sendable {
             }
         }
     }
+}
+
+public enum LibraryRuntimeActivity: Sendable {
+    case videoPlayback
+    case userTransfer
+    case search
+}
+
+public final class LibraryRuntimeActivityRegistration: @unchecked Sendable {
+    private let lock = NSLock()
+    private var finish: (@Sendable () -> Void)?
+    private let checkActive: @Sendable () -> Bool
+
+    fileprivate init(isActive: @escaping @Sendable () -> Bool, finish: @escaping @Sendable () -> Void) {
+        checkActive = isActive
+        self.finish = finish
+    }
+
+    /// A persistent view can renew its demand after an account generation resets the process state.
+    public var isActive: Bool { checkActive() }
+
+    public func end() {
+        let action = lock.withLock {
+            let action = finish
+            finish = nil
+            return action
+        }
+        action?()
+    }
+
+    deinit { end() }
 }

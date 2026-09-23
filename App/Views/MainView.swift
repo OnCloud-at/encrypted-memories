@@ -71,11 +71,9 @@ struct MainView: View {
     @State private var searchScope: MLSearchScope = .all
     @State private var searchDebounceTask: Task<Void, Never>?
     @State private var searchHistory = TimelineSearchHistory()
-    /// Suggestions are computed once per app session: a UI feature must not spend compute on every library change.
-    @State private var searchDiscovery = SmartSearchDiscoveryModel(refreshPolicy: .oncePerSession) {
-        latitude, longitude in
-        await NativePlaceNameResolver.shared.cityName(latitude: latitude, longitude: longitude)
-    }
+    private var searchDiscovery: SmartSearchDiscoveryModel { model.searchSuggestions.discovery }
+    @State private var searchPresented = false
+    @State private var searchActivity: LibraryRuntimeActivityRegistration?
     /// The structured suggestion that owned `committedSearchText` when it was committed.
     @State private var committedSuggestion: TimelineSearchSuggestion?
     /// A search text that may be a suggestion title, held until a current refresh decides how to run it.
@@ -356,7 +354,6 @@ struct MainView: View {
                 TimelineView(
                     model: mapClusterModel,
                     level: $level,
-                    gridProfile: TimelineGridProfiles.secondaryCollectionProfile,
                     gridFillOrder: .topLeading,
                     initialViewportPlacement: .oldest,
                     proxy: mapClusterGridProxy,
@@ -649,6 +646,11 @@ struct MainView: View {
             ).map {
                 SmartSearchSuggestionItem(id: $0.id, title: $0.title, query: $0.query)
             },
+            isUpdatingSuggestions: model.searchSuggestions.isRefreshing,
+            onPresentationChange: { presented in
+                searchPresented = presented
+                updateSearchActivity()
+            },
             onClearRecentSearches: clearSearchHistory
         )
         .onSubmit(of: .search) { recordSearchHistory(searchText) }
@@ -868,7 +870,7 @@ struct MainView: View {
 
     private func showMapCluster(uids: [PhotoUID], coordinate: CLLocationCoordinate2D) {
         let orderedUIDs = timelineModel.allLibraryUIDs(matching: Set(uids))
-        let pager = PhotoLocationClusterPager(uids: orderedUIDs)
+        let pager = PhotoLocationClusterPager(uids: Array(orderedUIDs.reversed()))
         guard let firstPage = pager.page(at: 0), !firstPage.uids.isEmpty else { return }
         selectionMode = false
         selectedUIDs = []
@@ -1804,43 +1806,46 @@ struct MainView: View {
                 rebindCommittedSuggestion()
                 resolvePendingSuggestionText()
             }
+            .onChange(of: ObjectIdentifier(searchDiscovery)) { _, _ in
+                rebindCommittedSuggestion()
+                resolvePendingSuggestionText()
+            }
             // The first publish already decides a deferred title that no place or visual concept owned.
             .onChange(of: searchDiscovery.isCurrent(content: searchDiscoveryContent)) { _, _ in
                 resolvePendingSuggestionText()
             }
+            .onChange(of: searchText) { _, _ in updateSearchActivity() }
+            .onDisappear {
+                searchActivity?.end()
+                searchActivity = nil
+            }
             .task(id: searchDiscoveryTaskKey) {
-                // Suggestions are refreshed while the search field is empty, to keep a committed suggestion
-                // current, and to decide a deferred suggestion title. Typing cancels the refresh, so its
-                // background ML queries never compete with an interactive search.
-                guard isSearchTextEmpty || needsSuggestionRefresh else { return }
-                await searchDiscovery.refresh(
+                updateSearchActivity()
+                model.searchSuggestions.update(
                     sections: currentTimelineSections,
                     timelineRevision: UInt64(truncatingIfNeeded: timelineModel.contentRevision),
                     favoriteUIDs: favorites,
                     coordinates: OfflineLibraryManager.shared.locationIndex.coordinates,
-                    smartSearch: model.smartSearch,
-                    includeVisualConcepts: searchDiscoveryIncludesVisualConcepts
+                    smartSearch: model.smartSearch
                 )
             }
     }
 
+    private func updateSearchActivity() {
+        if searchPresented || !isSearchTextEmpty {
+            if searchActivity?.isActive != true { searchActivity = LibraryRuntimeState.shared.beginActivity(.search) }
+        } else {
+            searchActivity?.end()
+            searchActivity = nil
+        }
+    }
+
     private var searchDiscoveryTaskKey: String {
-        let revision = SmartSearchDiscoveryModel.revisionKey(
+        SmartSearchDiscoveryScheduler.revisionKey(
             timelineRevision: UInt64(truncatingIfNeeded: timelineModel.contentRevision),
-            favoriteCount: favorites.count,
-            coordinateCount: OfflineLibraryManager.shared.locationIndex.coordinates.count,
-            snapshot: model.smartSearch?.snapshot
+            favoriteUIDs: favorites, coordinateCount: OfflineLibraryManager.shared.locationIndex.coordinates.count,
+            smartSearch: model.smartSearch
         )
-        // After the first published rows, library changes no longer restart the session's refresh.
-        let contentKey =
-            searchDiscovery.hasComputed ? "session" : "\(searchDiscoveryContent.favoritesHash)|\(revision)"
-        return [
-            "\(isSearchTextEmpty)",
-            "\(needsSuggestionRefresh)",
-            "\(searchDiscoveryIncludesVisualConcepts)",
-            contentKey,
-            searchDiscovery.visualCompletionKey(model.smartSearch?.snapshot),
-        ].joined(separator: "|")
     }
 
     private var isSearchTextEmpty: Bool {
@@ -1859,24 +1864,6 @@ struct MainView: View {
         guard let committedSuggestion, committedSuggestion.owns(searchText: normalizedCommittedSearchText)
         else { return nil }
         return committedSuggestion
-    }
-
-    /// A deferred suggestion title needs a refresh, and a committed suggestion needs one until the suggestions
-    /// are settled for the current library content. A visual concept also follows the indexing progress.
-    private var needsSuggestionRefresh: Bool {
-        if pendingSuggestionText != nil { return true }
-        guard let active = activeCommittedSuggestion else { return false }
-        return active.kind == .concept || !searchDiscovery.isSettled(content: searchDiscoveryContent)
-    }
-
-    /// While results show, the visual stages run only for a visual concept, committed or deferred.
-    private var searchDiscoveryIncludesVisualConcepts: Bool {
-        isSearchTextEmpty || pendingSuggestionIsConcept || activeCommittedSuggestion?.kind == .concept
-    }
-
-    private var pendingSuggestionIsConcept: Bool {
-        guard let pendingSuggestionText else { return false }
-        return searchDiscovery.publishedKind(owning: pendingSuggestionText) == .concept
     }
 
     /// Resolved result set of the committed suggestion while the committed text still shows its title. While the
@@ -2472,6 +2459,8 @@ struct MainView: View {
         }
 
         // The transfer starts after destination selection, so progress can now become visible.
+        let activity = LibraryRuntimeState.shared.beginActivity(.userTransfer)
+        defer { activity.end() }
         exportFraction = 0
         withAnimation(.smooth(duration: 0.35)) { isExporting = true }
         defer {

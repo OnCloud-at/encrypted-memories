@@ -23,6 +23,7 @@ struct MobileSearchRecentEntry: Identifiable, Equatable {
 struct MobileSearchLandingContent {
     var recents: [MobileSearchRecentEntry] = []
     var discovery: SmartSearchDiscoveryModel?
+    var isUpdatingSuggestions = false
     var onSelectRecent: (MobileSearchRecentEntry) -> Void = { _ in }
     var onSelectSuggestion: (TimelineSearchSuggestion) -> Void = { _ in }
     var onClearHistory: () -> Void = {}
@@ -118,10 +119,15 @@ struct MobileSearchLandingScreen: View {
 
     @ViewBuilder private var forYouSection: some View {
         let suggestions = displayedForYou
-        let isLoading = discovery?.isCurrent(content: discoveryContent) != true
+        let isLoading = content.isUpdatingSuggestions && discovery?.hasComputed != true
         if isLoading || !suggestions.isEmpty {
             VStack(alignment: .leading, spacing: 10) {
                 sectionTitle(L10n.string("search.for_you"))
+                if content.isUpdatingSuggestions, !isLoading {
+                    Text(L10n.string("search.suggestions_loading"))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
                 VStack(spacing: 0) {
                     if isLoading {
                         // One sweep over the whole placeholder block, as a single continuous band.
@@ -258,13 +264,18 @@ private struct MobileSearchSubtitleLabelStyle: LabelStyle {
 }
 
 /// A square preview from the authenticated thumbnail cache, with a symbol while it loads or when no item exists.
-private struct MobileSearchThumbnail: View {
+struct MobileSearchThumbnail: View {
     let uid: PhotoUID?
     let size: CGFloat
     let cornerRadius: CGFloat
     let placeholderSymbol: String
     let thumbnailFeed: UIKitThumbnailFeed?
     @State private var image: UIImage?
+
+    private struct LoadIdentity: Equatable {
+        let uid: PhotoUID?
+        let feed: ObjectIdentifier?
+    }
 
     var body: some View {
         ZStack {
@@ -282,14 +293,16 @@ private struct MobileSearchThumbnail: View {
         .frame(width: size, height: size)
         .clipShape(.rect(cornerRadius: cornerRadius))
         .accessibilityHidden(true)
-        .task(id: uid) {
+        .task(id: LoadIdentity(uid: uid, feed: thumbnailFeed.map { ObjectIdentifier($0) })) {
             guard let uid, let thumbnailFeed else {
                 image = nil
                 return
             }
             image = thumbnailFeed.memoryImage(for: uid)
             if image == nil {
-                image = await thumbnailFeed.image(for: uid)
+                let loaded = await thumbnailFeed.image(for: uid)
+                guard !Task.isCancelled else { return }
+                image = loaded
             }
         }
     }

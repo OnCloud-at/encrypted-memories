@@ -43,7 +43,7 @@ struct MobileMapClusterSeriesScreen: View {
             .task { await resolvePlaceName() }
             .task(id: "\(model.timelineRevision)-\(pageIndex)") {
                 guard let currentPage else { return }
-                clusterItems = model.selectedItems(Set(currentPage.uids))
+                clusterItems = Array(model.selectedItems(Set(currentPage.uids)).reversed())
             }
             .mobileSharePresentation(selection: selection)
             .mobileSelectionAlerts(selection: selection) { performTrash() }
@@ -114,12 +114,12 @@ struct MobileMapClusterSeriesScreen: View {
                 UIKitTimelineGrid(
                     items: clusterItems,
                     thumbnailFeed: feed,
-                    gridProfile: TimelineGridProfiles.secondaryCollectionProfile,
                     fillOrder: .topLeading,
                     initialViewportPlacement: .oldest,
                     selectionMode: selection.isSelecting,
                     selectedUIDs: selection.selected,
                     isActive: true,
+                    scrollToTopSignal: pageIndex,
                     onOpenPhoto: open,
                     onToggleSelection: selection.toggle,
                     onSelectionChanged: selection.replace(with:),

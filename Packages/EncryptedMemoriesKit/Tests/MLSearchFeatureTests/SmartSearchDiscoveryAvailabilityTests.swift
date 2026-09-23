@@ -309,6 +309,57 @@ import TimelineCore
         #expect(model.commitDecision(for: "Klosterneuburg", content: two, snapshot: nil) != .text)
     }
 
+    @MainActor @Test func aSupersededRefreshCannotPublishOverTheCurrentLibrary() async {
+        let (entered, didEnter) = AsyncStream<Void>.makeStream()
+        let (release, doRelease) = AsyncStream<Void>.makeStream()
+        let model = SmartSearchDiscoveryModel { _, _ in
+            didEnter.yield()
+            for await _ in release { break }
+            return "Old place"
+        }
+        let coordinates = Self.items().prefix(12).map {
+            PhotoCoordinate(uid: $0.uid, latitude: 48.2082, longitude: 16.3738, date: $0.captureTime)
+        }
+        let old = Task { @MainActor in
+            await refresh(model, revision: 1, coordinates: coordinates)
+        }
+        for await _ in entered { break }
+        let current = await refresh(model, revision: 2, favorites: [], itemCount: 24)
+        let generation = model.settledGeneration
+        let rows = model.forYou
+
+        doRelease.yield()
+        await old.value
+
+        #expect(model.computedContent == current)
+        #expect(model.settledContent == current)
+        #expect(model.settledGeneration == generation)
+        #expect(model.forYou == rows)
+    }
+
+    @MainActor @Test func failedVisualQueriesRemainRetryableAfterMetadataSettles() async {
+        struct QueryFailure: Error {}
+        let model = SmartSearchDiscoveryModel(refreshPolicy: .oncePerSession) { _, _ in nil }
+        let ready = snapshot(enabled: true, visual: true, indexing: .ready(progress()))
+        await model.refresh(
+            sections: [TimelineSection(id: "all", date: Self.start, title: "", items: Self.items())],
+            timelineRevision: 1, favoriteUIDs: Self.favorites(), coordinates: [],
+            snapshot: ready, indexedAssetCount: { 20 }, search: { _, _ in throw QueryFailure() }
+        )
+        #expect(model.hasComputed)
+        #expect(model.needsVisualCompletion(ready))
+        #expect(!model.showsVisualSuggestionsPendingNote(ready))
+        #expect(model.forYou.allSatisfy { $0.representativeUIDs.isEmpty })
+
+        await model.refresh(
+            sections: [TimelineSection(id: "all", date: Self.start, title: "", items: Self.items())],
+            timelineRevision: 1, favoriteUIDs: Self.favorites(), coordinates: [],
+            snapshot: ready, indexedAssetCount: { 20 }, search: { _, _ in [] }
+        )
+        #expect(!model.needsVisualCompletion(ready))
+        #expect(!model.showsVisualSuggestionsPendingNote(ready))
+    }
+
     /// `forYou` keeps at most three rows of one kind. A valid suggestion that is ranked out of the rows is still
     /// resolved: its title commits it, and a selected one is kept after a refresh at the same content.
     @MainActor @Test func aSuggestionRankedOutOfTheRowsIsStillResolved() async throws {
@@ -458,7 +509,7 @@ import TimelineCore
         #expect(!model.showsVisualSuggestionsPendingNote(off))
         #expect(model.showsVisualSuggestionsPendingNote(indexing))
         #expect(!model.needsVisualCompletion(indexing))
-        #expect(model.showsVisualSuggestionsPendingNote(ready))
+        #expect(!model.showsVisualSuggestionsPendingNote(ready))
         #expect(model.needsVisualCompletion(ready))
         #expect(model.visualCompletionKey(indexing) != model.visualCompletionKey(ready))
 

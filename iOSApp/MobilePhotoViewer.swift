@@ -1,6 +1,7 @@
 import AVFoundation
 import AVKit
 import AlbumCore
+import Combine
 import DesignSystemCore
 import MapUIKitAdapter
 import MediaByteCache
@@ -1499,10 +1500,26 @@ private struct MobileVideoPage: View {
     /// buffering. Keep that intent separate from the visible "currently progressing" state.
     @State private var playbackIntendsToPlay = false
     @State private var playbackIsBuffering = false
+    @State private var playbackGeneration: UInt64 = 0
+    @State private var playbackAttachment: VideoPlaybackAttachmentIdentity?
+    @State private var playbackSourceIdentity: ObjectIdentifier?
+    @State private var playbackSourceRevision: UInt64?
+    @State private var playbackActivity: LibraryRuntimeActivityRegistration?
+
+    private var sourceIdentity: ObjectIdentifier? {
+        guard let facade = libraryModel.facade else { return nil }
+        return ObjectIdentifier(facade)
+    }
 
     var body: some View {
         ZStack {
-            if let player {
+            if failed {
+                ContentUnavailableView(
+                    L10n.string("viewer.playback_failed"),
+                    systemImage: "exclamationmark.triangle"
+                )
+                .foregroundStyle(.white)
+            } else if let player {
                 MobileNativeVideoPlayer(
                     player: player,
                     poster: poster,
@@ -1535,12 +1552,6 @@ private struct MobileVideoPage: View {
                     )
                     .transition(.opacity)
                 }
-            } else if failed {
-                ContentUnavailableView(
-                    L10n.string("viewer.playback_failed"),
-                    systemImage: "exclamationmark.triangle"
-                )
-                .foregroundStyle(.white)
             } else {
                 // AVKit is not mounted yet, so this is the only loading indicator. Once `player` is assigned,
                 // the entire preparation layer leaves and can no longer cover native buffering or controls.
@@ -1562,10 +1573,17 @@ private struct MobileVideoPage: View {
         } action: {
             viewportHeight = $0
         }
-        .task(id: LoadToken(uid: item.uid, current: isCurrent)) { await prepare() }
-        .task(id: player.map(ObjectIdentifier.init)) {
-            guard let player else { return }
-            await observePlayback(player)
+        .task(
+            id: LoadToken(
+                uid: item.uid,
+                current: isCurrent,
+                sourceRevision: libraryModel.scopePresentationRevision,
+                sourceIdentity: sourceIdentity
+            )
+        ) { await prepare() }
+        .task(id: playbackAttachment?.generation) {
+            guard let player, let generation = playbackAttachment?.generation else { return }
+            await observePlayback(player, generation: generation)
         }
         .onChange(of: isCurrent) { _, current in
             if current {
@@ -1575,6 +1593,14 @@ private struct MobileVideoPage: View {
                 playbackIntendsToPlay = false
                 player?.pause()
             }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .AVPlayerItemFailedToPlayToEndTime)) {
+            [playbackGeneration] note in
+            handleFailureNotification(note, generation: playbackGeneration)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .AVPlayerItemDidPlayToEndTime)) {
+            [playbackGeneration] note in
+            handleEndNotification(note, generation: playbackGeneration)
         }
         .onAppear {
             if MobileViewerLog.isEnabled {
@@ -1595,21 +1621,47 @@ private struct MobileVideoPage: View {
     private struct LoadToken: Equatable {
         let uid: PhotoUID
         let current: Bool
+        let sourceRevision: UInt64
+        let sourceIdentity: ObjectIdentifier?
     }
 
     @MainActor
-    private func observePlayback(_ observedPlayer: AVPlayer) async {
-        while !Task.isCancelled, player === observedPlayer {
+    private func observePlayback(_ observedPlayer: AVPlayer, generation: UInt64) async {
+        guard let observedItem = observedPlayer.currentItem else { return }
+        var didReportDuration = false
+        while !Task.isCancelled,
+            isCurrentAttachment(generation: generation, player: observedPlayer, item: observedItem)
+        {
             let time = observedPlayer.currentTime().seconds
             if time.isFinite { playbackTime = max(0, time) }
-            let duration = observedPlayer.currentItem?.duration.seconds ?? 0
+            let duration = observedItem.duration.seconds
             if duration.isFinite, duration > 0 { playbackDuration = duration }
+
+            if !didReportDuration, duration.isFinite, duration > 0 {
+                VideoPlaybackTuning.reportDuration(of: observedItem, to: streamingAsset)
+                didReportDuration = true
+            }
+
+            if observedItem.status == .failed {
+                failPlayback(
+                    observedItem.error.map(VideoPlaybackError.classify)
+                        ?? .playerItemFailed(detail: nil),
+                    generation: generation,
+                    player: observedPlayer,
+                    item: observedItem
+                )
+                return
+            }
+
             playbackIsPlaying = MobileVideoPlaybackIntent.isActivelyPlaying(observedPlayer.timeControlStatus)
             playbackIsBuffering = MobileVideoPlaybackIntent.isBuffering(observedPlayer.timeControlStatus)
-            if MobileVideoPlaybackIntent.reachedEnd(current: playbackTime, duration: playbackDuration),
-                observedPlayer.timeControlStatus == .paused
-            {
+            switch observedPlayer.timeControlStatus {
+            case .playing, .waitingToPlayAtSpecifiedRate:
+                playbackIntendsToPlay = true
+            case .paused:
                 playbackIntendsToPlay = false
+            @unknown default:
+                break
             }
             try? await Task.sleep(for: .milliseconds(150))
         }
@@ -1712,24 +1764,49 @@ private struct MobileVideoPage: View {
         if poster == nil {
             poster = libraryModel.thumbnailFeed?.memoryImage(for: item.uid)
         }
+        let requestedSourceIdentity = sourceIdentity
+        let requestedSourceRevision = libraryModel.scopePresentationRevision
+        if player != nil,
+            playbackSourceIdentity != requestedSourceIdentity
+                || playbackSourceRevision != requestedSourceRevision
+        {
+            teardown()
+        }
         guard isCurrent, player == nil, let backend = libraryModel.backend else { return }
+        playbackGeneration &+= 1
+        let generation = playbackGeneration
         failed = false
+        let activity = LibraryRuntimeState.shared.beginActivity(.videoPlayback)
+        defer {
+            if playbackActivity !== activity { activity.end() }
+        }
         if MobileViewerLog.isEnabled {
             MobileViewerLog.logger.notice(
                 "[ViewerPerf] video prepare start uid=\(MobileViewerLog.short(item.uid), privacy: .public)")
         }
         do {
             let streaming = try await backend.makeStreamingAsset(for: item.uid)
-            guard !Task.isCancelled else { return }  // A cancelled page must not attach a player.
+            guard !Task.isCancelled, isCurrent,
+                generation == playbackGeneration,
+                requestedSourceIdentity == sourceIdentity,
+                requestedSourceRevision == libraryModel.scopePresentationRevision
+            else {
+                streaming.close()
+                return
+            }
             let playerItem = AVPlayerItem(asset: streaming.asset)
             let newPlayer = AVPlayer(playerItem: playerItem)
-            // Same buffering policy as the macOS viewer: AVFoundation decides when playback may start,
-            // and the forward window keeps the block loader ahead of it.
             VideoPlaybackTuning.configure(player: newPlayer, item: playerItem, isStreaming: true)
+            let attachment = VideoPlaybackAttachmentIdentity(
+                generation: generation,
+                player: newPlayer,
+                item: playerItem
+            )
             streamingAsset = streaming  // retain the resource loader for the player's lifetime
-            // The loader sizes its read-ahead from the clip's bitrate; a 4K clip needs a wider window than
-            // a 1080p clip for the same seconds of playback.
-            Task { await VideoPlaybackTuning.reportDuration(of: streaming) }
+            playbackActivity = activity
+            playbackAttachment = attachment
+            playbackSourceIdentity = requestedSourceIdentity
+            playbackSourceRevision = requestedSourceRevision
             player = newPlayer
             if isCurrent {
                 playbackIntendsToPlay = true
@@ -1738,18 +1815,93 @@ private struct MobileVideoPage: View {
         } catch is CancellationError {
             return
         } catch {
-            guard !Task.isCancelled, isCurrent else { return }
+            guard !Task.isCancelled, isCurrent,
+                generation == playbackGeneration,
+                requestedSourceIdentity == sourceIdentity,
+                requestedSourceRevision == libraryModel.scopePresentationRevision
+            else { return }
             failed = true
         }
     }
 
     private func teardown() {
+        playbackGeneration &+= 1
+        playbackAttachment = nil
+        playbackSourceIdentity = nil
+        playbackSourceRevision = nil
         player?.pause()
         player?.replaceCurrentItem(with: nil)
         player = nil
+        streamingAsset?.close()
         streamingAsset = nil
+        playbackActivity?.end()
+        playbackActivity = nil
         playbackTime = 0
         playbackDuration = 0
+        playbackIsPlaying = false
+        playbackIntendsToPlay = false
+        playbackIsBuffering = false
+    }
+
+    private func isCurrentAttachment(
+        generation: UInt64,
+        player observedPlayer: AVPlayer,
+        item observedItem: AVPlayerItem
+    ) -> Bool {
+        guard generation == playbackGeneration,
+            let playbackAttachment,
+            player === observedPlayer,
+            observedPlayer.currentItem === observedItem
+        else { return false }
+        return playbackAttachment.matches(
+            generation: generation,
+            player: observedPlayer,
+            item: observedItem
+        )
+    }
+
+    private func handleFailureNotification(_ note: Notification, generation: UInt64) {
+        guard let observedPlayer = player,
+            let observedItem = note.object as? AVPlayerItem,
+            isCurrentAttachment(generation: generation, player: observedPlayer, item: observedItem)
+        else { return }
+        let error =
+            (note.userInfo?[AVPlayerItemFailedToPlayToEndTimeErrorKey] as? Error)
+            .map(VideoPlaybackError.classify)
+            ?? .playerItemFailed(detail: "failedToPlayToEnd")
+        failPlayback(error, generation: generation, player: observedPlayer, item: observedItem)
+    }
+
+    private func handleEndNotification(_ note: Notification, generation: UInt64) {
+        guard let observedPlayer = player,
+            let observedItem = note.object as? AVPlayerItem,
+            isCurrentAttachment(generation: generation, player: observedPlayer, item: observedItem)
+        else { return }
+        playbackTime = max(playbackTime, playbackDuration)
+        playbackIsPlaying = false
+        playbackIntendsToPlay = false
+        playbackIsBuffering = false
+    }
+
+    private func failPlayback(
+        _: VideoPlaybackError,
+        generation: UInt64,
+        player observedPlayer: AVPlayer,
+        item observedItem: AVPlayerItem
+    ) {
+        guard isCurrentAttachment(generation: generation, player: observedPlayer, item: observedItem) else { return }
+        failed = true
+        playbackGeneration &+= 1
+        playbackAttachment = nil
+        playbackSourceIdentity = nil
+        playbackSourceRevision = nil
+        observedPlayer.pause()
+        observedPlayer.replaceCurrentItem(with: nil)
+        player = nil
+        streamingAsset?.close()
+        streamingAsset = nil
+        playbackActivity?.end()
+        playbackActivity = nil
         playbackIsPlaying = false
         playbackIntendsToPlay = false
         playbackIsBuffering = false

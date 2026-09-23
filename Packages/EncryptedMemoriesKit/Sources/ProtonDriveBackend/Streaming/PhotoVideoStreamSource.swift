@@ -3,10 +3,26 @@ import PhotosCore
 import ProtonCoreCryptoGoInterface
 import UniformTypeIdentifiers
 
-enum StreamingError: Error {
+enum StreamingError: Error, Equatable {
     case noRevision
     case noXAttr
     case revisionPaginationNoProgress
+    /// The revision's block list and the XAttr `BlockSizes` disagree on the block count.
+    case blockCountMismatch(blockCount: Int, blockSizesCount: Int)
+    /// An XAttr block size is negative.
+    case negativeBlockSize(Int)
+    /// Summing the XAttr block sizes overflowed `Int`.
+    case blockSizeSumOverflow
+    /// XAttr declares a positive size but the revision lists no blocks.
+    case declaredSizeWithoutBlocks(Int)
+    /// The summed cleartext block sizes disagree with the declared XAttr size.
+    case blockSumSizeMismatch(declared: Int, summed: Int)
+    /// A decrypted block has fewer bytes than its validated cleartext size.
+    case decryptedBlockLengthMismatch(blockIndex: Int, expected: Int, actual: Int)
+    /// A requested byte range maps to a block index that the prepared block map does not contain.
+    case missingBlockForSlice(Int)
+    /// Fewer cleartext bytes were produced than the validated total.
+    case incompleteStream(streamed: Int, expected: Int)
 }
 
 /// One block's fetch info + its position in the *cleartext* file (from XAttr block sizes), so the
@@ -91,13 +107,18 @@ actor PhotoVideoStreamSource {
         onProgress(0)
         for block in prepared.blocks {
             try Task.checkCancellation()
+            guard block.clearSize > 0 else { continue }
             let encrypted = try await encryptedBlockData(block, priority: .immediate)
             let clear = try crypto.decryptBlock(encrypted, sessionKey: prepared.sessionKey)
+            guard clear.count >= block.clearSize else {
+                throw StreamingError.decryptedBlockLengthMismatch(
+                    blockIndex: block.index, expected: block.clearSize, actual: clear.count)
+            }
             out.append(clear.prefix(block.clearSize))
             onProgress(min(1, Double(out.count) / Double(total)))
         }
-        if out.count > prepared.totalSize {
-            out.removeSubrange(prepared.totalSize..<out.count)
+        guard out.count == prepared.totalSize else {
+            throw StreamingError.incompleteStream(streamed: out.count, expected: prepared.totalSize)
         }
         onProgress(1)
         return out
@@ -116,14 +137,19 @@ actor PhotoVideoStreamSource {
         onProgress(0)
         for block in prepared.blocks {
             try Task.checkCancellation()
+            guard block.clearSize > 0 else { continue }
             let encrypted = try await encryptedBlockData(block, priority: .immediate)
             let clear = try crypto.decryptBlock(encrypted, sessionKey: prepared.sessionKey)
-            let acceptedCount = max(0, min(block.clearSize, prepared.totalSize - streamed))
-            let chunk = acceptedCount == clear.count ? clear : Data(clear.prefix(acceptedCount))
-            guard !chunk.isEmpty else { continue }
-            try await onChunk(chunk)
-            streamed += chunk.count
+            guard clear.count >= block.clearSize else {
+                throw StreamingError.decryptedBlockLengthMismatch(
+                    blockIndex: block.index, expected: block.clearSize, actual: clear.count)
+            }
+            try await onChunk(Data(clear.prefix(block.clearSize)))
+            streamed += block.clearSize
             onProgress(min(1, Double(streamed) / Double(total)))
+        }
+        guard streamed == prepared.totalSize else {
+            throw StreamingError.incompleteStream(streamed: streamed, expected: prepared.totalSize)
         }
         onProgress(1)
     }
@@ -141,12 +167,81 @@ actor PhotoVideoStreamSource {
         let xattrData = try crypto.decryptXAttr(xattrArmored, node: nodeKey)
         let xattr = try JSONDecoder().decode(XAttrBody.self, from: xattrData)
 
+        let (blocks, total) = try Self.validatedVideoBlocks(
+            blockInfos: blockInfos,
+            blockSizes: xattr.common.blockSizes,
+            declaredSize: xattr.common.size
+        )
+        let uti = UTType(mimeType: link.mimeType ?? "") ?? .data
+        return PreparedVideo(
+            uid: uid, totalSize: total, contentTypeUTI: uti.identifier,
+            blocks: blocks, sessionKey: sessionKey)
+    }
+
+    /// Validates the block layout and builds the cleared-position block map. A video must never
+    /// reach playback with a corrupt layout: mismatched block counts, negative sizes, a positive
+    /// declared size with no blocks, or a summed size that disagrees with the declared size are all
+    /// typed failures at this seam, before any byte is fetched or decrypted.
+    ///
+    /// Legacy fallback: when XAttr declares no size (0 or negative), the total falls back to the
+    /// summed block sizes, matching the original behavior for older uploads.
+    nonisolated static func validatedVideoBlocks(
+        blockInfos: [BlockInfo],
+        blockSizes: [Int],
+        declaredSize: Int
+    ) throws -> (blocks: [VideoBlock], totalSize: Int) {
+        // Proton's legacy web writer appends a zero remainder even for exact chunk multiples.
+        // Extra zero entries describe no bytes; missing sizes or extra nonzero entries are invalid.
+        guard blockInfos.count <= blockSizes.count,
+            blockSizes.dropFirst(blockInfos.count).allSatisfy({ $0 == 0 })
+        else {
+            throw StreamingError.blockCountMismatch(
+                blockCount: blockInfos.count, blockSizesCount: blockSizes.count)
+        }
+        for size in blockSizes where size < 0 {
+            throw StreamingError.negativeBlockSize(size)
+        }
+
+        var sum = 0
+        var overflowed = false
+        for size in blockSizes {
+            let (partial, didOverflow) = sum.addingReportingOverflow(size)
+            if didOverflow {
+                overflowed = true
+                break
+            }
+            sum = partial
+        }
+        if overflowed { throw StreamingError.blockSizeSumOverflow }
+
+        if blockInfos.isEmpty {
+            if declaredSize > 0 {
+                throw StreamingError.declaredSizeWithoutBlocks(declaredSize)
+            }
+            return (blocks: [], totalSize: 0)
+        }
+
+        let total: Int
+        if declaredSize > 0 {
+            guard declaredSize == sum else {
+                throw StreamingError.blockSumSizeMismatch(declared: declaredSize, summed: sum)
+            }
+            total = declaredSize
+        } else {
+            total = sum  // legacy fallback: no declared size, use the summed block sizes
+        }
+
         var blocks: [VideoBlock] = []
+        blocks.reserveCapacity(blockInfos.count)
         var offset = 0
-        for info in blockInfos.sorted(by: { $0.index < $1.index }) {
-            let clearSize =
-                xattr.common.blockSizes.indices.contains(info.index - 1)
-                ? xattr.common.blockSizes[info.index - 1] : 0
+        let sortedInfos = blockInfos.sorted(by: { $0.index < $1.index })
+        for (position, info) in sortedInfos.enumerated() {
+            // Contiguous 1-based positions are guaranteed by revision pagination; refuse anything else.
+            guard info.index == position + 1 else {
+                throw StreamingError.blockCountMismatch(
+                    blockCount: blockInfos.count, blockSizesCount: blockSizes.count)
+            }
+            let clearSize = blockSizes[position]
             let bare = info.bareURL
             blocks.append(
                 VideoBlock(
@@ -156,20 +251,16 @@ actor PhotoVideoStreamSource {
                     clearOffset: offset,
                     clearSize: clearSize
                 ))
-            offset += clearSize
+            offset = offset + clearSize
         }
-        // Prefer the authoritative total from XAttr; fall back to the summed block sizes.
-        let total = xattr.common.size > 0 ? xattr.common.size : offset
-        let uti = UTType(mimeType: link.mimeType ?? "") ?? .data
-        return PreparedVideo(
-            uid: uid, totalSize: total, contentTypeUTI: uti.identifier,
-            blocks: blocks, sessionKey: sessionKey)
+        return (blocks: blocks, totalSize: total)
     }
 
     /// Encrypted bytes for one block - called by the resource loader on demand.
     func encryptedBlockData(
         _ block: VideoBlock,
-        priority: ProtonRequestPriority = .immediate
+        priority: ProtonRequestPriority = .immediate,
+        priorityHandle: ProtonRequestGovernor.PriorityHandle? = nil
     ) async throws -> Data {
         if priority == .immediate {
             return try await session.requestGovernor.withPriorityScope(
@@ -179,10 +270,25 @@ actor PhotoVideoStreamSource {
                 promoting: [],
                 suspending: [.storageUpload]
             ) {
-                try await session.fetchBlock(url: block.url, token: block.token, priority: priority)
+                try await session.fetchBlock(
+                    url: block.url, token: block.token, priority: priority, priorityHandle: priorityHandle)
             }
         }
-        return try await session.fetchBlock(url: block.url, token: block.token, priority: priority)
+        return try await session.fetchBlock(
+            url: block.url, token: block.token, priority: priority, priorityHandle: priorityHandle)
+    }
+
+    /// Keep upload admission suspended through joining, cache verification and any failed-prefetch retry.
+    func withDemandPriority<T: Sendable>(
+        _ operation: @Sendable () async throws -> T
+    ) async throws -> T {
+        try await session.requestGovernor.withPriorityScope(
+            .immediate, promoting: [], suspending: [.storageUpload]
+        ) { try await operation() }
+    }
+
+    func promoteDemand(_ priorityHandle: ProtonRequestGovernor.PriorityHandle) async {
+        await session.requestGovernor.promote(priorityHandle, to: .immediate)
     }
 
     /// Fully downloads the clip's encrypted blocks into the shared range cache (no plaintext written anywhere),

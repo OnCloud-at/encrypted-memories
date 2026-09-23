@@ -137,7 +137,6 @@ private struct PlayerView: NSViewRepresentable {
         view.onPinchDismissEnded = onPinchDismissEnded
         view.onPageSwipe = onPageSwipe
         view.attachPoster(poster)
-        player.play()
         return view
     }
 

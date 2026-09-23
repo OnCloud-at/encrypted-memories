@@ -263,6 +263,65 @@ extension DriveSessionStubSuite {
             #expect(StubURLProtocol.requests().count == 1, "no fetch_metadata call for an empty trash")
         }
 
+        @Test func listTrashInvalidPageSizeZeroThrowsWithoutNetwork() async throws {
+            StubURLProtocol.reset()
+            await #expect(throws: DrivePaginationError.self) {
+                try await makeSession().listTrash(volumeID: "vol1", pageSize: 0)
+            }
+            #expect(StubURLProtocol.requests().isEmpty, "no network call for invalid pageSize")
+        }
+
+        @Test func listTrashRepeatedFullPageThrowsTypedError() async throws {
+            // Two identical full pages contribute zero new (shareID, linkID) identities: typed error.
+            StubURLProtocol.reset()
+            StubURLProtocol.routeSequence(
+                "GET /drive/volumes/vol1/trash",
+                responses: [
+                    (status: 200, json: #"{"Code":1000,"Trash":[{"ShareID":"s1","LinkIDs":["a","b"]}]}"#),
+                    (status: 200, json: #"{"Code":1000,"Trash":[{"ShareID":"s1","LinkIDs":["a","b"]}]}"#),
+                    // Safety valve: with the fix the call throws on page 2; without it, this terminates the loop.
+                    (status: 200, json: #"{"Code":1000,"Trash":[]}"#),
+                ]
+            )
+
+            await #expect(throws: DrivePaginationError.trashPageWithoutNewIDs(1)) {
+                try await makeSession().listTrash(volumeID: "vol1", pageSize: 2)
+            }
+            #expect(StubURLProtocol.requests().count == 2, "fails on the second page, after the first")
+        }
+
+        @Test func listTrashOverlappingFullPageWithNewIDsSucceedsAndDedupes() async throws {
+            // A full page that overlaps the previous page but adds new identities must succeed. The
+            // metadata resolution must receive each identity exactly once, in first-seen order.
+            StubURLProtocol.reset()
+            StubURLProtocol.routeSequence(
+                "GET /drive/volumes/vol1/trash",
+                responses: [
+                    (status: 200, json: #"{"Code":1000,"Trash":[{"ShareID":"s1","LinkIDs":["a","b"]}]}"#),
+                    (status: 200, json: #"{"Code":1000,"Trash":[{"ShareID":"s1","LinkIDs":["b","c"]}]}"#),
+                    (status: 200, json: #"{"Code":1000,"Trash":[]}"#),
+                ]
+            )
+            StubURLProtocol.route(
+                "POST /drive/shares/s1/links/fetch_metadata",
+                json: #"""
+                    {"Code":1000,"Links":[
+                        {"LinkID":"a","Type":2,"CreateTime":1700000000},
+                        {"LinkID":"b","Type":2,"CreateTime":1700000001},
+                        {"LinkID":"c","Type":2,"CreateTime":1700000002}
+                    ]}
+                    """#)
+
+            let links = try await makeSession().listTrash(volumeID: "vol1", pageSize: 2)
+
+            #expect(links.count == 3)
+            #expect(links.map(\.linkID) == ["a", "b", "c"])
+
+            let metadataRequest = try #require(
+                StubURLProtocol.requests().first { $0.path == "/drive/shares/s1/links/fetch_metadata" })
+            #expect(try linkIDs(inBodyOf: metadataRequest) == ["a", "b", "c"], "deduped, first-seen order")
+        }
+
         @Test func trashLinkDecodeToleratesSparseEntries() throws {
             // Per-item sparseness must not fail the whole listing.
             let json = #"{"Links":[{"LinkID":"only-id"},{"Type":2},{}]}"#

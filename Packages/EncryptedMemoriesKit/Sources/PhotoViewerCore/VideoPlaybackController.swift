@@ -22,10 +22,8 @@ public typealias VideoPlaybackDiagnosticSink = @MainActor @Sendable (VideoPlayba
 /// playback wiring - the model only decides *which* source to play; this decides *how it's going*.
 ///
 /// The one rule it enforces (the reason it exists): the UI never gets stuck. Every attached player is
-/// guarded by a watchdog - if it doesn't reach `.playing` within the deadline it fails or asks the
-/// model to fall back to a full download (the native equivalent of Proton Drive Web's
-/// `FIRST_BLOCK_TIMEOUT`). Mid-stream stalls surface as `.buffering` (a real reason), not a frozen
-/// frame, and `failedToPlayToEndTime` maps to a readable error.
+/// guarded by a startup watchdog until it actually reaches `.playing`. Mid-stream stalls surface as
+/// `.buffering`, and `failedToPlayToEndTime` maps to a readable error.
 @MainActor
 @Observable
 public final class VideoPlaybackController {
@@ -39,17 +37,27 @@ public final class VideoPlaybackController {
     private var observations: [NSKeyValueObservation] = []
     private var notificationTokens: [NSObjectProtocol] = []
     private var watchdog: Task<Void, Never>?
+    private var watchdogGeneration: UInt64 = 0
     private var currentUID: PhotoUID?
     private var isStreaming = false
-    private var didReachPlaying = false
+    private var hasStartedPlayback = false
+    private var attachmentGeneration: UInt64 = 0
+    private var attachmentIdentity: VideoPlaybackAttachmentIdentity?
+    private var playbackActivity: LibraryRuntimeActivityRegistration?
+    private let runtimeState: LibraryRuntimeState
 
-    /// Seconds to wait for first playback before declaring the attempt stuck. Matches the web client's
-    /// 30 s first-block timeout.
-    private let firstFrameDeadline: TimeInterval
+    /// Seconds to wait for initial playback before declaring the attempt stuck. The public label remains
+    /// source-compatible with existing callers even though the timer measures startup, not display readiness.
+    private let startupDeadline: TimeInterval
     private let diagnostics: VideoPlaybackDiagnosticSink?
 
-    public init(firstFrameDeadline: TimeInterval = 30, diagnostics: VideoPlaybackDiagnosticSink? = nil) {
-        self.firstFrameDeadline = firstFrameDeadline
+    public init(
+        firstFrameDeadline: TimeInterval = 30,
+        runtimeState: LibraryRuntimeState = .shared,
+        diagnostics: VideoPlaybackDiagnosticSink? = nil
+    ) {
+        startupDeadline = firstFrameDeadline
+        self.runtimeState = runtimeState
         self.diagnostics = diagnostics
     }
 
@@ -67,10 +75,11 @@ public final class VideoPlaybackController {
 
     // MARK: - Playback entry points
 
-    /// Plays a range-streamed asset. Starts in `.buffering` (bytes arrive on demand) and is guarded by
-    /// the watchdog; on first `.readyToPlay` it flips to `.playing`.
+    /// Plays a range-streamed asset. Starts in `.buffering` and remains under the startup watchdog until
+    /// `AVPlayer.timeControlStatus` proves that playback actually started.
     public func playStreaming(asset: AVURLAsset, retaining: AnyObject, uid: PhotoUID) {
         teardown()
+        playbackActivity = runtimeState.beginActivity(.videoPlayback)
         currentUID = uid
         isStreaming = true
         streamingAsset = retaining
@@ -88,47 +97,63 @@ public final class VideoPlaybackController {
     // MARK: - Attach + observe
 
     private func attach(_ item: AVPlayerItem, uid: PhotoUID, initial: VideoViewerState) {
-        didReachPlaying = false
+        hasStartedPlayback = false
         let player = AVPlayer(playerItem: item)
         VideoPlaybackTuning.configure(player: player, item: item, isStreaming: isStreaming)
+        attachmentGeneration &+= 1
+        let identity = VideoPlaybackAttachmentIdentity(
+            generation: attachmentGeneration,
+            player: player,
+            item: item
+        )
+        attachmentIdentity = identity
         self.player = player
         transition(initial)
         logPlayer(item: item, player: player)
 
         let box = Weak(self)
 
-        // AVPlayerItem.status - the primary readiness signal.
         observations.append(
             item.observe(\.status, options: [.new, .initial]) { observed, _ in
                 let raw = observed.status.rawValue
-                let err = observed.error
-                Task { @MainActor in box.value?.onStatus(raw, error: err, uid: uid) }
+                let error = observed.error
+                Task { @MainActor in
+                    box.value?.onStatus(raw, error: error, uid: uid, identity: identity)
+                }
             })
-        // Buffer health - surfaces a real "buffering" reason instead of a frozen frame.
         observations.append(
             item.observe(\.isPlaybackBufferEmpty, options: [.new]) { observed, _ in
                 let empty = observed.isPlaybackBufferEmpty
-                Task { @MainActor in box.value?.onBufferEmpty(empty, uid: uid) }
+                Task { @MainActor in
+                    box.value?.onBufferEmpty(empty, uid: uid, identity: identity)
+                }
             })
         observations.append(
             item.observe(\.isPlaybackLikelyToKeepUp, options: [.new]) { observed, _ in
                 let likely = observed.isPlaybackLikelyToKeepUp
-                Task { @MainActor in box.value?.onLikelyToKeepUp(likely, uid: uid) }
+                Task { @MainActor in
+                    box.value?.onLikelyToKeepUp(likely, uid: uid, identity: identity)
+                }
             })
         observations.append(
             item.observe(\.loadedTimeRanges, options: [.new]) { observed, _ in
-                let ranges = observed.loadedTimeRanges.map { $0.timeRangeValue }
-                Task { @MainActor in box.value?.onLoadedRanges(ranges, uid: uid) }
+                let ranges = observed.loadedTimeRanges.map(\.timeRangeValue)
+                Task { @MainActor in
+                    box.value?.onLoadedRanges(ranges, uid: uid, identity: identity)
+                }
             })
-        // The loader sizes its read-ahead from the clip's bitrate, which needs the duration.
         observations.append(
             item.observe(\.duration, options: [.new, .initial]) { observed, _ in
-                Task { @MainActor in box.value?.onDurationKnown(of: observed, uid: uid) }
+                Task { @MainActor in
+                    box.value?.onDurationKnown(of: observed, uid: uid, identity: identity)
+                }
             })
         observations.append(
             player.observe(\.timeControlStatus, options: [.new]) { observed, _ in
                 let raw = observed.timeControlStatus.rawValue
-                Task { @MainActor in box.value?.onTimeControl(raw, uid: uid) }
+                Task { @MainActor in
+                    box.value?.onTimeControl(raw, uid: uid, identity: identity)
+                }
             })
 
         let center = NotificationCenter.default
@@ -136,138 +161,214 @@ public final class VideoPlaybackController {
             center.addObserver(
                 forName: .AVPlayerItemFailedToPlayToEndTime, object: item, queue: .main
             ) { note in
-                let err = note.userInfo?[AVPlayerItemFailedToPlayToEndTimeErrorKey] as? NSError
-                Task { @MainActor in box.value?.onFailedToPlayToEnd(err, uid: uid) }
+                let error = note.userInfo?[AVPlayerItemFailedToPlayToEndTimeErrorKey] as? NSError
+                Task { @MainActor in
+                    box.value?.onFailedToPlayToEnd(error, uid: uid, identity: identity)
+                }
             })
         notificationTokens.append(
             center.addObserver(
                 forName: .AVPlayerItemPlaybackStalled, object: item, queue: .main
             ) { _ in
-                Task { @MainActor in box.value?.onStalled(uid: uid) }
+                Task { @MainActor in
+                    box.value?.onStalled(uid: uid, identity: identity)
+                }
+            })
+        notificationTokens.append(
+            center.addObserver(
+                forName: .AVPlayerItemDidPlayToEndTime, object: item, queue: .main
+            ) { _ in
+                Task { @MainActor in
+                    box.value?.onEnded(uid: uid, identity: identity)
+                }
             })
 
-        startWatchdog(uid: uid)
+        startWatchdogIfNeeded(uid: uid, identity: identity)
         player.play()
     }
 
     // MARK: - Observation handlers
 
-    private func onDurationKnown(of item: AVPlayerItem, uid: PhotoUID) {
-        guard uid == currentUID, isStreaming else { return }
+    private func onDurationKnown(
+        of item: AVPlayerItem,
+        uid: PhotoUID,
+        identity: VideoPlaybackAttachmentIdentity
+    ) {
+        guard isCurrent(uid: uid, identity: identity), isStreaming else { return }
         VideoPlaybackTuning.reportDuration(of: item, to: streamingAsset as? StreamingVideoAsset)
     }
 
-    private func onStatus(_ raw: Int, error: Error?, uid: PhotoUID) {
-        guard uid == currentUID, let player else { return }
+    private func onStatus(
+        _ raw: Int,
+        error: Error?,
+        uid: PhotoUID,
+        identity: VideoPlaybackAttachmentIdentity
+    ) {
+        guard isCurrent(uid: uid, identity: identity), let player else { return }
         logPlayer(item: player.currentItem, player: player, error: error)
         guard
             let next = VideoPlayerItemStatus(rawValue: raw)?
                 .nextState(error: error.map(VideoPlaybackError.classify))
         else { return }
         switch next {
-        case .playing:
-            markPlaying()
-        case .failed(let e):
-            handleFailure(e, uid: uid)
+        case .ready:
+            if player.timeControlStatus != .playing { transition(.ready) }
+        case .failed(let playbackError):
+            handleFailure(playbackError, uid: uid, identity: identity)
         default:
             break
         }
     }
 
-    private func onBufferEmpty(_ empty: Bool, uid: PhotoUID) {
-        guard uid == currentUID, let player else { return }
-        logPlayer(item: player.currentItem, player: player)  // buffering is driven by timeControlStatus
-    }
-
-    private func onLikelyToKeepUp(_ likely: Bool, uid: PhotoUID) {
-        guard uid == currentUID else { return }
-        // Secondary readiness path: some assets flip likelyToKeepUp before status==readyToPlay.
-        if likely, !didReachPlaying { markPlaying() }
-    }
-
-    private func onLoadedRanges(_ ranges: [CMTimeRange], uid: PhotoUID) {
-        guard uid == currentUID, let player else { return }
+    private func onBufferEmpty(
+        _: Bool,
+        uid: PhotoUID,
+        identity: VideoPlaybackAttachmentIdentity
+    ) {
+        guard isCurrent(uid: uid, identity: identity), let player else { return }
         logPlayer(item: player.currentItem, player: player)
     }
 
-    /// After the first frame, `timeControlStatus` is the authoritative "is it actually moving?"
-    /// signal - `.waitingToPlayAtSpecifiedRate` is a real stall (show buffering), `.playing` resumes,
-    /// `.paused` is the user's own pause (clear any overlay; never a spinner). Before the first frame
-    /// it's ignored so the status/likelyToKeepUp handoff isn't disturbed.
-    private func onTimeControl(_ raw: Int, uid: PhotoUID) {
-        guard uid == currentUID, let player else { return }
+    private func onLikelyToKeepUp(
+        _: Bool,
+        uid: PhotoUID,
+        identity: VideoPlaybackAttachmentIdentity
+    ) {
+        guard isCurrent(uid: uid, identity: identity), let player else { return }
         logPlayer(item: player.currentItem, player: player)
-        guard didReachPlaying else { return }
+    }
+
+    private func onLoadedRanges(
+        _: [CMTimeRange],
+        uid: PhotoUID,
+        identity: VideoPlaybackAttachmentIdentity
+    ) {
+        guard isCurrent(uid: uid, identity: identity), let player else { return }
+        logPlayer(item: player.currentItem, player: player)
+    }
+
+    /// `timeControlStatus` is authoritative for native play, pause, replay, and waiting. This handler only
+    /// mirrors the native state. It never issues play or pause commands.
+    private func onTimeControl(
+        _: Int,
+        uid: PhotoUID,
+        identity: VideoPlaybackAttachmentIdentity
+    ) {
+        guard isCurrent(uid: uid, identity: identity), let player else { return }
+        logPlayer(item: player.currentItem, player: player)
         switch player.timeControlStatus {
         case .waitingToPlayAtSpecifiedRate:
             transition(.buffering(nil))
+            startWatchdogIfNeeded(uid: uid, identity: identity)
         case .playing:
+            hasStartedPlayback = true
+            cancelWatchdog()
             transition(.playing)
         case .paused:
-            if state.isBusy { transition(.playing) }  // user paused: hide overlay, native UI shows it
+            cancelWatchdog()
+            if state.isBusy { transition(.ready) }
         @unknown default:
             break
         }
     }
 
-    private func onFailedToPlayToEnd(_ error: NSError?, uid: PhotoUID) {
-        guard uid == currentUID else { return }
+    private func onFailedToPlayToEnd(
+        _ error: NSError?,
+        uid: PhotoUID,
+        identity: VideoPlaybackAttachmentIdentity
+    ) {
+        guard isCurrent(uid: uid, identity: identity) else { return }
         handleFailure(
-            error.map(VideoPlaybackError.classify) ?? .playerItemFailed(detail: "failedToPlayToEnd"), uid: uid)
+            error.map(VideoPlaybackError.classify) ?? .playerItemFailed(detail: "failedToPlayToEnd"),
+            uid: uid,
+            identity: identity
+        )
     }
 
-    private func onStalled(uid: PhotoUID) {
-        guard uid == currentUID, let player else { return }
+    private func onStalled(uid: PhotoUID, identity: VideoPlaybackAttachmentIdentity) {
+        guard isCurrent(uid: uid, identity: identity), let player else { return }
         logPlayer(item: player.currentItem, player: player)
+        if player.timeControlStatus == .waitingToPlayAtSpecifiedRate {
+            transition(.buffering(nil))
+        }
     }
 
-    private func markPlaying() {
-        didReachPlaying = true
-        watchdog?.cancel()
-        watchdog = nil
-        transition(.playing)
-        player?.play()
-        if let player { logPlayer(item: player.currentItem, player: player) }
+    private func onEnded(uid: PhotoUID, identity: VideoPlaybackAttachmentIdentity) {
+        guard isCurrent(uid: uid, identity: identity) else { return }
+        cancelWatchdog()
+        transition(.ready)
+    }
+
+    private func isCurrent(uid: PhotoUID, identity: VideoPlaybackAttachmentIdentity) -> Bool {
+        guard uid == currentUID,
+            identity.generation == attachmentGeneration,
+            attachmentIdentity == identity,
+            let player,
+            let item = player.currentItem
+        else { return false }
+        return identity.matches(generation: identity.generation, player: player, item: item)
     }
 
     /// A player-level failure is surfaced directly. We deliberately do not fall back to a full local video
     /// download: that would require a decrypted plaintext temp file, violating the app-wide local E2EE rule.
-    private func handleFailure(_ error: VideoPlaybackError, uid: PhotoUID) {
+    private func handleFailure(
+        _ error: VideoPlaybackError,
+        uid: PhotoUID,
+        identity: VideoPlaybackAttachmentIdentity
+    ) {
+        guard isCurrent(uid: uid, identity: identity) else { return }
         teardownKeepingState()
         transition(.failed(error))
     }
 
     // MARK: - Watchdog
 
-    private func startWatchdog(uid: PhotoUID) {
-        watchdog?.cancel()
-        let deadline = firstFrameDeadline
+    private func startWatchdogIfNeeded(uid: PhotoUID, identity: VideoPlaybackAttachmentIdentity) {
+        guard watchdog == nil, !hasStartedPlayback else { return }
+        let deadline = startupDeadline
+        watchdogGeneration &+= 1
+        let generation = watchdogGeneration
         watchdog = Task { @MainActor [weak self] in
             try? await Task.sleep(for: .seconds(deadline))
             guard let self, !Task.isCancelled else { return }
-            guard self.currentUID == uid, !self.didReachPlaying else { return }
+            guard self.watchdogGeneration == generation else { return }
+            self.watchdog = nil
+            guard self.isCurrent(uid: uid, identity: identity), !self.hasStartedPlayback,
+                self.player?.timeControlStatus != .paused
+            else { return }
             self.emitDiagnostics([
                 "uid": self.key(uid), "event": "watchdogTimeout", "deadline": "\(Int(deadline))s",
             ])
-            self.handleFailure(.timedOut, uid: uid)
+            self.handleFailure(.timedOut, uid: uid, identity: identity)
         }
+    }
+
+    private func cancelWatchdog() {
+        watchdogGeneration &+= 1
+        watchdog?.cancel()
+        watchdog = nil
     }
 
     // MARK: - Teardown
 
     /// Full teardown: stops the player, removes observers, clears state owner.
     public func teardown() {
-        watchdog?.cancel()
-        watchdog = nil
+        attachmentGeneration &+= 1
+        attachmentIdentity = nil
+        cancelWatchdog()
         observations.forEach { $0.invalidate() }
         observations.removeAll()
         notificationTokens.forEach { NotificationCenter.default.removeObserver($0) }
         notificationTokens.removeAll()
         player?.pause()
+        player?.replaceCurrentItem(with: nil)
         player = nil
+        (streamingAsset as? StreamingVideoAsset)?.close()
         streamingAsset = nil
+        playbackActivity?.end()
+        playbackActivity = nil
         currentUID = nil
-        didReachPlaying = false
+        hasStartedPlayback = false
         isStreaming = false
     }
 
@@ -300,7 +401,7 @@ public final class VideoPlaybackController {
     private func logPlayer(item: AVPlayerItem?, player: AVPlayer, error: Error? = nil) {
         guard let item else { return }
         let loaded = item.loadedTimeRanges
-            .map { $0.timeRangeValue }
+            .map(\.timeRangeValue)
             .map {
                 "\(String(format: "%.1f", $0.start.seconds))-\(String(format: "%.1f", ($0.start + $0.duration).seconds))"
             }

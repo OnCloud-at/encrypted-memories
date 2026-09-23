@@ -6,6 +6,7 @@ public protocol MLTextQueryEncoder: Sendable {
 }
 
 public enum MLSemanticSearchError: Error, Equatable {
+    case incompatibleBatch
     case emptyQuery
     case invalidQueryEmbedding
     case queryDimensionMismatch(expected: Int, actual: Int)
@@ -25,6 +26,11 @@ public actor MLSemanticSearchEngine {
     /// The bound applies to every library size; top-k memory still follows the requested limit.
     public static let defaultQueryBlockRowLimit = 2_048
     private let queryBlockRowLimit: Int
+    private struct PromptKey: Hashable {
+        let descriptor: MLModelDescriptor
+        let text: String
+    }
+    private var promptEmbeddings: [PromptKey: ContiguousArray<Float32>] = [:]
 
     public init(
         store: any MLIndexStore,
@@ -40,11 +46,20 @@ public actor MLSemanticSearchEngine {
         self.queryBlockRowLimit = max(1, queryBlockRowLimit)
     }
 
-    public func search(_ query: MLSearchQuery) async throws -> MLSearchResults {
+    public func search(
+        _ query: MLSearchQuery,
+        shouldContinue: @escaping @Sendable () -> Bool = { true }
+    ) async throws -> MLSearchResults {
+        func checkContinuation() throws {
+            try Task.checkCancellation()
+            guard shouldContinue() else { throw CancellationError() }
+        }
+        try checkContinuation()
         let text = query.queryText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { throw MLSemanticSearchError.emptyQuery }
 
         let raw = try await encoder.encode(text: text, descriptor: query.descriptor)
+        try checkContinuation()
         guard raw.count == query.descriptor.embeddingDimension else {
             throw MLSemanticSearchError.queryDimensionMismatch(
                 expected: query.descriptor.embeddingDimension,
@@ -62,6 +77,7 @@ public actor MLSemanticSearchEngine {
                 for: query.descriptor,
                 maximumRows: queryBlockRowLimit
             ) { block in
+                try checkContinuation()
                 let blockResults = scorer.rank(
                     block: block,
                     query: normalized,
@@ -75,7 +91,7 @@ public actor MLSemanticSearchEngine {
                 )
             }
         }
-        try Task.checkCancellation()
+        try checkContinuation()
         let duration = ContinuousClock.now - startedAt
         return MLSearchResults(
             descriptor: query.descriptor,
@@ -84,6 +100,81 @@ public actor MLSemanticSearchEngine {
             durationMs: Double(duration.components.seconds) * 1_000
                 + Double(duration.components.attoseconds) / 1_000_000_000_000_000
         )
+    }
+
+    /// Suggestion prompts share one bounded index read. Scoring and relevance remain identical to single queries.
+    /// Cached prompt vectors are small, model-scoped, bounded, and released with other derived resources.
+    public func searchBatch(
+        _ queries: [MLSearchQuery],
+        shouldContinue: @escaping @Sendable () -> Bool = { true }
+    ) async throws -> MLSearchBatchResults {
+        guard let first = queries.first else { return MLSearchBatchResults(results: [], scannedUIDs: []) }
+        guard queries.count <= 40, queries.allSatisfy({ $0.descriptor == first.descriptor }) else {
+            throw MLSemanticSearchError.incompatibleBatch
+        }
+        func checkContinuation() throws {
+            try Task.checkCancellation()
+            guard shouldContinue() else { throw CancellationError() }
+        }
+        let startedAt = ContinuousClock.now
+        var texts: [String] = []
+        var vectors: [ContiguousArray<Float32>] = []
+        for query in queries {
+            try checkContinuation()
+            let text = query.queryText.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !text.isEmpty else { throw MLSemanticSearchError.emptyQuery }
+            let key = PromptKey(descriptor: query.descriptor, text: text)
+            let vector: ContiguousArray<Float32>
+            if let cached = promptEmbeddings[key] {
+                vector = cached
+            } else {
+                let raw = try await encoder.encode(text: text, descriptor: query.descriptor)
+                try checkContinuation()
+                guard raw.count == query.descriptor.embeddingDimension else {
+                    throw MLSemanticSearchError.queryDimensionMismatch(
+                        expected: query.descriptor.embeddingDimension, actual: raw.count
+                    )
+                }
+                guard let normalized = MLVectorNormalization.normalized(raw) else {
+                    throw MLSemanticSearchError.invalidQueryEmbedding
+                }
+                vector = normalized
+                if promptEmbeddings.count >= 40 { promptEmbeddings.removeAll(keepingCapacity: true) }
+                promptEmbeddings[key] = vector
+            }
+            texts.append(text)
+            vectors.append(vector)
+        }
+        var ranked = Array(repeating: [MLSearchResult](), count: queries.count)
+        var scannedUIDs = MLScannedUIDMembership()
+        if queries.contains(where: { $0.limit > 0 }) {
+            try store.forEachVectorBlock(
+                for: first.descriptor, maximumRows: min(queryBlockRowLimit, 256)
+            ) { block in
+                for index in queries.indices where queries[index].limit > 0 {
+                    try checkContinuation()
+                    let results = scorer.rank(
+                        block: block, query: vectors[index], limit: queries[index].limit, queryText: texts[index]
+                    ).results
+                    ranked[index] = Self.mergeTopResults(ranked[index], results, limit: queries[index].limit)
+                }
+                if queries.allSatisfy({ $0.limit > 0 }) {
+                    scannedUIDs.formUnion(block.uids)
+                }
+            }
+        }
+        try checkContinuation()
+        let duration = ContinuousClock.now - startedAt
+        let durationMs =
+            Double(duration.components.seconds) * 1_000
+            + Double(duration.components.attoseconds) / 1_000_000_000_000_000
+        let results = queries.indices.map { index in
+            MLSearchResults(
+                descriptor: first.descriptor, queryText: texts[index],
+                results: relevancePolicy.relevantResults(from: ranked[index]), durationMs: durationMs
+            )
+        }
+        return MLSearchBatchResults(results: results, scannedUIDs: scannedUIDs)
     }
 
     public func coverage(for descriptor: MLModelDescriptor, allAssets: [PhotoUID]) throws -> MLIndexCoverage {
@@ -103,8 +194,8 @@ public actor MLSemanticSearchEngine {
     }
 
     public func purgeCachedBlocks() {
-        // Query vectors are streamed per search. Keep this API for lifecycle memory-pressure
-        // callers, which also release the active inference model through the adapter.
+        promptEmbeddings.removeAll()
+        // Index vectors are streamed. Lifecycle callers also release the inference model through the adapter.
     }
 
     private static func mergeTopResults(

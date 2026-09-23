@@ -48,6 +48,7 @@ public actor UploadManager: UploadManaging {
     private let requiresDurableSettlement: Bool
     private let maxConcurrent: Int
     private let now: @Sendable () -> Date
+    private let runtimeState: LibraryRuntimeState
 
     // MARK: State
 
@@ -98,9 +99,11 @@ public actor UploadManager: UploadManaging {
         settlementStore: (any UploadManualSettlementStoreProtocol)? = nil,
         requiresDurableSettlement: Bool = false,
         maxConcurrent: Int = 3,
+        runtimeState: LibraryRuntimeState = .shared,
         now: @Sendable @escaping () -> Date = { Date() }
     ) {
         self.uploader = uploader
+        self.runtimeState = runtimeState
         self.albums = albums
         self.identityResolver = identityResolver
         self.settlementStore = settlementStore
@@ -781,6 +784,8 @@ public actor UploadManager: UploadManaging {
 
     private func run(_ id: UploadQueueItemID) async {
         guard let job = jobs[id] else { return }
+        let activity = runtimeState.beginActivity(.userTransfer)
+        defer { activity.end() }
         let request = await makeRequest(for: job)
         // The descriptor mirrors the request snapshot (same name/size/mtime), so manifest rows
         // written here validate against the exact attributes that were uploaded. Hoisted out of

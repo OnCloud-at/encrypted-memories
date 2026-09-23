@@ -65,7 +65,8 @@ public final class AppleSmartSearchWorkGate: @unchecked Sendable {
         let signals = LibraryWorkloadSignals(
             thermalLevel: snapshot.thermalLevel,
             isLowPowerMode: snapshot.isLowPowerMode,
-            hasVisibleMediaDemand: visibleDemand,
+            hasVisibleMediaDemand: visibleDemand || snapshot.activeVideoPlaybackCount > 0
+                || snapshot.activeSearchCount > 0,
             hasActiveUserInitiatedTransfer: snapshot.activeUserTransferCount > 0
         )
         return !governor.budget(for: .backgroundSemanticIndexing, signals: signals).shouldYield

@@ -17,7 +17,7 @@ public enum VideoPlaybackTuning {
     /// Applies the streaming policy. `isStreaming` is false for a fully downloaded local file, where
     /// AVFoundation reads from disk and needs no forward window.
     public static func configure(player: AVPlayer, item: AVPlayerItem, isStreaming: Bool) {
-        // The player waits until its own estimate says playback can continue without stalling.
+        // Preserve native AVFoundation waiting, including AVKit pause, replay, PiP, and interruption behavior.
         player.automaticallyWaitsToMinimizeStalling = true
         if isStreaming {
             item.preferredForwardBufferDuration = streamingForwardBuffer

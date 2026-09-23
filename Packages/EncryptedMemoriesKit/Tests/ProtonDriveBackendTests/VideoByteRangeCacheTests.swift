@@ -6,6 +6,36 @@ import Testing
 
 @Suite("Video byte-range cache generations")
 struct VideoByteRangeCacheTests {
+    @Test func closedPlayerCannotPublishQueuedBytesOrInvalidateAnotherPlayer() async {
+        let fixture = makeCache()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let cache = fixture.cache
+        let photo = uid("closed-player")
+        let owner = VideoCacheWriteOwner()
+        let other = VideoCacheWriteOwner()
+        let generation = cache.captureOwnerGeneration()
+        let lookup = cache.lookup(uid: photo, block: 1)
+        let queue = DispatchQueue(label: "tests.video-cache.queued-write")
+        queue.suspend()
+        let stored = await withCheckedContinuation { continuation in
+            queue.async {
+                continuation.resume(
+                    returning: cache.store(
+                        uid: photo, block: 1, encrypted: Data([1]), ticket: lookup.ticket,
+                        ownerGeneration: generation, publicationOwner: owner))
+            }
+            owner.close()
+            queue.resume()
+        }
+        #expect(stored == false)
+        #expect(cache.lookup(uid: photo, block: 1).encrypted == nil)
+        #expect(
+            await cache.storeAsync(
+                uid: photo, block: 1, encrypted: Data([2]), ticket: lookup.ticket,
+                ownerGeneration: generation, publicationOwner: other))
+        #expect(cache.lookup(uid: photo, block: 1).encrypted == Data([2]))
+    }
+
     private func makeCache(budgetBytes: Int = 1024 * 1024) -> (cache: VideoByteRangeCache, root: URL) {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent(

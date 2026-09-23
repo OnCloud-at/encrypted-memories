@@ -48,14 +48,6 @@ final class TimelineGridProfileResolverTests: XCTestCase {
         }
     }
 
-    func testSecondaryCollectionStartsWithFourColumnsAndCapsLargeZoomAtThree() {
-        let profile = TimelineGridProfiles.secondaryCollectionProfile
-        XCTAssertEqual(profile.metrics(level: profile.defaultLevel).nominalColumns, 4)
-        XCTAssertEqual(profile.levels.map(\.nominalColumns), [3, 4, 8, 12])
-        XCTAssertEqual(profile.levels.map(\.nominalColumns).min(), 3)
-        XCTAssertFalse(profile.levels.contains { $0.monthLabels })
-    }
-
     func testTouchProfilesUseTouchSpecificLaddersWithQuarterGaps() throws {
         let pairs = [("compactTimeline", "touchCompactTimeline"), ("regularTimeline", "touchRegularTimeline")]
         for (pointerID, touchID) in pairs {

@@ -172,7 +172,11 @@ struct MetalProductionGridView: NSViewRepresentable {
 
         let a11y = MetalGridAccessibilityProvider(host: host, coordinator: host.coordinator)
         a11y.items = allItems
-        a11y.onOpen = interaction.onOpen
+        // VoiceOver press activates the cell through the interaction controller so it honours the
+        // current selection mode (toggle vs. open), including mode changes after elements were built.
+        a11y.onActivate = { [weak interaction] uid in
+            interaction?.activate(uid: uid) ?? false
+        }
         coord.a11y = a11y
 
         host.onViewportChanged = { [weak coord] in

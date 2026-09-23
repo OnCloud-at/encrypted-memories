@@ -5,6 +5,8 @@ import LibrarySourceRuntime
 import MLSearchAppleAdapter
 import MLSearchBackgroundAppleAdapter
 import MLSearchCore
+import MLSearchFeature
+import MapUIKitAdapter
 import MediaByteCache
 import MediaCacheCore
 import MediaCacheUIKitAdapter
@@ -195,6 +197,10 @@ final class MobileLibraryModel {
     var isBackgroundLoading: Bool { isThumbnailPrefetchLoading || isNewAssetThumbnailLoading }
     private var isThumbnailPrefetchLoading = false
     private var isNewAssetThumbnailLoading = false
+    /// Automatic suggestion scans must wait for the library's startup and thumbnail work.
+    var allowsAutomaticSuggestionRefresh: Bool {
+        initialLibraryLoadSettled && loadState.hasSettled && !isBackgroundLoading && !isRefreshingLibrary
+    }
     /// Indicates that explicit sign-out is closing account owners and deleting account data.
     /// Transient session replacement does not set this flag.
     private(set) var isSigningOut = false
@@ -224,6 +230,9 @@ final class MobileLibraryModel {
         backgroundHost: AppleSmartSearchBackgroundCoordinator.shared
     )
     var smartSearch: MLSmartSearchController? { smartSearchSession.controller }
+    let searchSuggestions = SmartSearchDiscoveryScheduler { latitude, longitude in
+        await NativePlaceNameResolver.shared.cityName(latitude: latitude, longitude: longitude)
+    }
 
     /// Encrypted GPS index shared with the Map tab. The per-account key protects it at rest.
     let locationIndex = PhotoLocationIndex()
@@ -595,6 +604,19 @@ final class MobileLibraryModel {
     func clearCache() async {
         guard let cache = thumbnailCache else { return }
         if let feed = thumbnailFeed {
+            let token = loadToken
+            if let runtime = sourceAnalysisRuntime {
+                // Visible publication precedes async source admission. Join that boundary before clearing;
+                // the bound feed owns the authorized crawl order, including photos from additional sources.
+                let admission = await synchronizePrimarySourceInventory(items, authority: primaryInventoryAuthority)
+                guard sourceAnalysisRuntime === runtime else { return }
+                // A newer host generation may win while the existing runtime drains its pending inventory.
+                guard admission == .accepted || admission == .superseded else {
+                    DebugLog.log("thumbnail cache clear skipped: source inventory was not admitted")
+                    return
+                }
+            }
+            guard !Task.isCancelled, token == loadToken, thumbnailFeed === feed else { return }
             await feed.clearCacheAndRestartPrefetch()
         } else {
             await cache.clear()
@@ -796,7 +818,10 @@ final class MobileLibraryModel {
     }
 
     private func scheduleThumbnailPrefetch(using feed: UIKitThumbnailFeed) {
-        prefetchStartTask?.cancel()
+        // Metadata corrections must not restart the whole-library crawl. Later new identities use the
+        // existing update coordinator. An empty first inventory does not consume this generation's start.
+        // Teardown and a replacement load clear this owner; completion deliberately retains it.
+        guard !items.isEmpty, prefetchStartTask == nil else { return }
         let crawlItems = items
         let token = loadToken
         isThumbnailPrefetchLoading = !crawlItems.isEmpty
@@ -967,6 +992,7 @@ final class MobileLibraryModel {
     /// Builds the account-scoped Smart Search lifecycle. MLSearchCore owns lifecycle decisions.
     private func configureSmartSearch(session: ProtonSession, client: ProtonClientFacade, feed: UIKitThumbnailFeed) {
         guard AppleSmartSearchBootstrap.featureAvailability() == .available else {
+            searchSuggestions.reset()
             smartSearchSession.stop()
             return
         }
@@ -1056,6 +1082,7 @@ final class MobileLibraryModel {
         let activeChangeMonitor = libraryChangeMonitor
         let activeLocationCrawl = locationCrawl
         let activeLocationCrawlStarter = locationCrawlStartTask
+        searchSuggestions.reset()
         let smartSearchShutdown = smartSearchSession.stop()
         let sourceAnalysisShutdown = stopSourceAnalysis()
 
@@ -1196,6 +1223,7 @@ final class MobileLibraryModel {
         favoriteMutationsInFlight = []
         timelineRevision &+= 1
         thumbnailFeed = nil
+        searchSuggestions.reset()
         let smartSearchShutdown = smartSearchSession.stop()
         let sourceAnalysisShutdown = stopSourceAnalysis()
         thumbnailCache = nil
@@ -1334,6 +1362,7 @@ final class MobileLibraryModel {
             timelineRevision &+= 1
         }
         thumbnailFeed = nil
+        searchSuggestions.reset()
         smartSearchSession.stop()
         stopSourceAnalysis()
         loadState = .preparingInventory
@@ -1474,14 +1503,12 @@ final class MobileLibraryModel {
                         loadGeneration == self.loadToken,
                         self.session == session
                     else { return }
-                    let appliedCachedItems = try await applyItems(cached.sections, cached: true)
+                    try await applyItems(cached.sections, cached: true)
                     guard !Task.isCancelled,
                         loadGeneration == self.loadToken,
                         self.session == session
                     else { return }
-                    if appliedCachedItems {
-                        scheduleThumbnailPrefetch(using: feed)
-                    }
+                    scheduleThumbnailPrefetch(using: feed)
                     cacheValidation = await TimelineCacheValidationPolicy.validate(
                         snapshot: cached,
                         repository: backend
@@ -1514,14 +1541,12 @@ final class MobileLibraryModel {
                     self.session == session
                 else { return }
                 let previousUIDs = items.map(\.uid)
-                let changed = try await applyItems(refreshed.sections, cached: false, authoritative: true)
+                try await applyItems(refreshed.sections, cached: false, authoritative: true)
                 guard !Task.isCancelled,
                     loadGeneration == self.loadToken,
                     self.session == session
                 else { return }
-                if changed {
-                    scheduleThumbnailPrefetch(using: feed)
-                }
+                scheduleThumbnailPrefetch(using: feed)
                 if hadCachedInventory {
                     reconcileNewAssetThumbnails(previousUIDs: previousUIDs, using: feed)
                 }
@@ -1742,12 +1767,10 @@ final class MobileLibraryModel {
             try Task.checkCancellation()
             try requireCurrentMutation(refreshLease)
             let previousUIDs = items.map(\.uid)
-            let changed = try await applyItems(refreshed, cached: false, authoritative: true)
+            try await applyItems(refreshed, cached: false, authoritative: true)
             try requireCurrentMutation(refreshLease)
             if let thumbnailFeed {
-                if changed {
-                    scheduleThumbnailPrefetch(using: thumbnailFeed)
-                }
+                scheduleThumbnailPrefetch(using: thumbnailFeed)
                 reconcileNewAssetThumbnails(previousUIDs: previousUIDs, using: thumbnailFeed)
             }
             // The same opaque server event token covers album mutations. Reuse this central foreground
@@ -1791,7 +1814,8 @@ final class MobileLibraryModel {
             store: SessionKeychainStore,
             backend: any PhotosBackend,
             sections: [TimelineSection],
-            thumbnailFeed: UIKitThumbnailFeed
+            thumbnailFeed: UIKitThumbnailFeed,
+            thumbnailCache: ThumbnailCache? = nil
         ) {
             let projection = TimelineContentProjection(sections: sections)
             self.store = store
@@ -1799,12 +1823,36 @@ final class MobileLibraryModel {
             configuredUID = session.uid
             self.backend = backend
             self.thumbnailFeed = thumbnailFeed
+            self.thumbnailCache = thumbnailCache
             snapshot = projection.snapshot
             self.sections = projection.sections
             favoriteUIDs = []
             favoriteFilterAvailability = .available
             timelineRevision &+= 1
             loadState = .contentReady(count: projection.snapshot.items.count)
+        }
+
+        /// Installs the real source runtime for bound-feed lifecycle regression tests.
+        func installIsolatedSourceAnalysisForTests(_ runtime: LibrarySourceAnalysisRuntime) {
+            sourceAnalysisRuntime = runtime
+            primaryInventoryAuthority = .authoritative
+        }
+
+        /// Drives the production startup and new-identity paths without opening a real account backend.
+        func replaceIsolatedThumbnailInventoryForTests(_ sections: [TimelineSection]) {
+            let previousUIDs = items.map(\.uid)
+            let projection = TimelineContentProjection(sections: sections)
+            snapshot = projection.snapshot
+            self.sections = projection.sections
+            timelineRevision &+= 1
+            guard let thumbnailFeed else { return }
+            scheduleThumbnailPrefetch(using: thumbnailFeed)
+            reconcileNewAssetThumbnails(previousUIDs: previousUIDs, using: thumbnailFeed)
+        }
+
+        func startIsolatedThumbnailPrefetchForTests() {
+            guard let thumbnailFeed else { return }
+            scheduleThumbnailPrefetch(using: thumbnailFeed)
         }
     }
 #endif

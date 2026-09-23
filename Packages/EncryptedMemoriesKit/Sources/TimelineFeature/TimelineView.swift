@@ -252,13 +252,19 @@ public struct TimelineView: View {
     }
 
     private var displayedSections: [TimelineSection] {
+        if gridFillOrder == .topLeading {
+            let items = displayedItems
+            guard let first = items.first else { return [] }
+            // The Metal data source and viewer must consume the same cached presentation order.
+            return [TimelineSection(id: "grid-presentation", date: first.captureTime, title: "", items: items)]
+        }
         guard hasSearchQuery else { return model.currentSections }
         return (resolvedSearchProjection ?? searchProjection)?.sections ?? model.currentSections
     }
 
     private var displayedItems: [PhotoItem] {
-        guard hasSearchQuery else { return model.allItems }
-        return (resolvedSearchProjection ?? searchProjection)?.snapshot.items ?? model.allItems
+        guard hasSearchQuery else { return model.presentationItems }
+        return (resolvedSearchProjection ?? searchProjection)?.presentationItems ?? model.presentationItems
     }
 
     private var isSearchResultPending: Bool {
