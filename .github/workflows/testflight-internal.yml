@@ -320,6 +320,7 @@ jobs:
           chmod 600 "$certificate_archive"
 
       - name: Import certificates with pinned community action
+        id: import-certificates
         if: steps.build.outputs.exists != 'true'
         continue-on-error: true
         uses: Apple-Actions/import-codesign-certs@5142e029c445c10ffc7149d172e540235a065466 # v7.0.0
@@ -332,6 +333,7 @@ jobs:
         if: steps.build.outputs.exists != 'true'
         env:
           APPLE_SIGNING_CERTIFICATES_PASSWORD: ${{ secrets.APPLE_SIGNING_CERTIFICATES_PASSWORD }}
+          IMPORT_OUTCOME: ${{ steps.import-certificates.outcome }}
         run: |
           set -euo pipefail
           # The helper is absent before checkout and in release tags older than the helper.
@@ -344,8 +346,9 @@ jobs:
           [[ -n "${APPLE_SIGNING_CERTIFICATES_PASSWORD:-}" ]] || release_fail configuration \
             "Secret APPLE_SIGNING_CERTIFICATES_PASSWORD was empty." \
             "Export the certificate archive again and update APPLE_SIGNING_CERTIFICATES_PASSWORD."
-          certificate_archive="$RUNNER_TEMP/apple-signing-certificates.p12"
-          if ! openssl pkcs12 -in "$certificate_archive" -passin "pass:$APPLE_SIGNING_CERTIFICATES_PASSWORD" -noout >/dev/null 2>&1; then
+          # Judge the keychain import itself. OpenSSL 3 rejects the legacy encryption of Keychain-exported
+          # archives that `security import` accepts, so a second parser reported valid credentials as wrong.
+          if [[ "$IMPORT_OUTCOME" != "success" ]]; then
             release_fail credentials \
               "The P12 archive could not be imported with APPLE_SIGNING_CERTIFICATES_PASSWORD." \
               "Export the certificate again and update APPLE_SIGNING_CERTIFICATES_P12_BASE64 and APPLE_SIGNING_CERTIFICATES_PASSWORD."
