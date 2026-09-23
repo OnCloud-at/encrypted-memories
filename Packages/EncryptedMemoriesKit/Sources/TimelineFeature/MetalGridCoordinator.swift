@@ -855,19 +855,16 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
 
     // MARK: - Live resize / sidebar presentation
     //
-    // During a live window resize the grid must not re-resolve its lattice every tick, because that reflows tiles
-    // while the user drags the window edge. On gesture begin we snapshot the settled render slots once (generous
-    // overscan above), then each frame scales/slides those slots to the current viewport. The slot geometry is
-    // stable, but thumbnail streaming is intentionally still live: missing cells can decode, upload, fade in, and
-    // wake the display link during the drag instead of waiting for mouse-up.
+    // Window-width changes retain the current level's fixed columns and phase. Resolve only visible rows with
+    // canonical gaps and the release camera, including rows exposed beyond the initial snapshot. Height-only
+    // changes slide that snapshot. Thumbnail streaming remains live throughout either presentation.
 
     private(set) var presentationResizeActive = false
     /// Leading obstruction inset (sidebar overlap) + layout width captured at gesture start: the scale anchors the
     /// content's left edge at `inset` and scales by `currentLayoutWidth / startLayoutWidth`.
     private var presentationStartInset: CGFloat = 0
     private var presentationStartLayoutWidth: CGFloat = 1
-    /// The settled render slots snapshotted once at gesture start (+ their display mode). Each frame these are
-    /// presented uniformly scaled as one coherent surface and never re-resolved.
+    /// Settled slots captured at gesture start for height-only and sidebar presentation.
     private var presentationSnapshotSlots: [GridRenderSlot] = []
     private var presentationSnapshotDisplayMode: TileContentDisplayMode = .aspectFitInsideSquare
     /// Item pinned to the viewport bottom during a sidebar transition, or -1 when no item was captured.
@@ -1254,7 +1251,8 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
         )
     }
 
-    /// Pure geometry for the live window-resize presentation. Applies one uniform scale and slide to captured slots.
+    /// Keep item rows and columns while using the same fixed gaps and bounded camera as mouse-up.
+    /// Height-only dragging retains its existing counter-scroll presentation.
     func resizePresentationSlots(viewportSize: CGSize) -> [GridRenderSlot] {
         let viewportHeight = viewportSize.height
         let inset = presentationStartInset
@@ -1262,6 +1260,20 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
         // scales to fill width−inset and the standard outer margin vanishes during the drag (photos stick to the
         // right edge), then snaps back when the settled grid (which has the margin) renders on release.
         let curLayoutW = max(1, viewportSize.width - inset - gridHorizontalMargin(forLevel: level))
+        if abs(curLayoutW - presentationStartLayoutWidth) > 0.5 {
+            let scrollY = windowResizeReleaseScrollY()
+            // A fixed-column plan preserves placement and covers rows newly exposed by a large shrink.
+            // Query only the viewport plus bounded overscan; never resolve each captured item separately.
+            let plan = engine.framePlan(
+                level: level, viewportSize: CGSize(width: curLayoutW, height: viewportHeight),
+                scrollOffset: CGPoint(x: 0, y: scrollY),
+                overscan: max(budget.overscanFraction, 1.5) * viewportHeight, columnPhase: currentPhase())
+            return plan.visibleSlots.map { slot in
+                GridRenderSlot(
+                    index: slot.index, column: slot.column, row: slot.row,
+                    rect: slot.viewportRect.offsetBy(dx: inset, dy: 0))
+            }
+        }
         let k = curLayoutW / max(1, presentationStartLayoutWidth)
         let dy = presentationVerticalShift  // VERTICAL counter-scroll (pure-vertical only); tiles keep their size
         let anchorY = presentationResizeBottomPinned ? viewportHeight : viewportHeight / 2
