@@ -604,15 +604,20 @@ final class MobileLibraryModel {
     func clearCache() async {
         guard let cache = thumbnailCache else { return }
         if let feed = thumbnailFeed {
-            // Incremental arrivals do not restart the startup crawl. An explicit clear must still
-            // rebuild the current inventory, including photos added since that crawl began.
-            let crawlItems = items
             let token = loadToken
-            let uids = await Task.detached(priority: .utility) {
-                ThumbnailCrawlOrder.newestToOldestFromChronological(crawlItems)
-            }.value
+            if let runtime = sourceAnalysisRuntime {
+                // Visible publication precedes async source admission. Join that boundary before clearing;
+                // the bound feed owns the authorized crawl order, including photos from additional sources.
+                let admission = await synchronizePrimarySourceInventory(items, authority: primaryInventoryAuthority)
+                guard sourceAnalysisRuntime === runtime else { return }
+                // A newer host generation may win while the existing runtime drains its pending inventory.
+                guard admission == .accepted || admission == .superseded else {
+                    DebugLog.log("thumbnail cache clear skipped: source inventory was not admitted")
+                    return
+                }
+            }
             guard !Task.isCancelled, token == loadToken, thumbnailFeed === feed else { return }
-            await feed.clearCacheAndRestartPrefetch(currentUIDs: uids)
+            await feed.clearCacheAndRestartPrefetch()
         } else {
             await cache.clear()
         }
@@ -1825,6 +1830,12 @@ final class MobileLibraryModel {
             favoriteFilterAvailability = .available
             timelineRevision &+= 1
             loadState = .contentReady(count: projection.snapshot.items.count)
+        }
+
+        /// Installs the real source runtime for bound-feed lifecycle regression tests.
+        func installIsolatedSourceAnalysisForTests(_ runtime: LibrarySourceAnalysisRuntime) {
+            sourceAnalysisRuntime = runtime
+            primaryInventoryAuthority = .authoritative
         }
 
         /// Drives the production startup and new-identity paths without opening a real account backend.

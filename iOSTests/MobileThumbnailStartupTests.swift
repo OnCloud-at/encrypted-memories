@@ -1,4 +1,8 @@
+import AlbumCore
+import CryptoKit
 import Foundation
+import LibrarySourceRuntime
+import MLSearchCore
 import MediaByteCache
 import MediaCacheUIKitAdapter
 import PhotosCore
@@ -6,6 +10,7 @@ import Testing
 import UIKit
 
 @testable import EncryptedMemoriesMobile
+@testable import ProtonDriveBackend
 
 @MainActor @Suite struct MobileThumbnailStartupTests {
     @Test func metadataChangeDoesNotRestartCompletedStartupCrawl() async throws {
@@ -61,7 +66,7 @@ import UIKit
         await feed.stopPrefetch()
     }
 
-    @Test func newPhotoUsesTheIncrementalCoordinatorAndSurvivesCacheClear() async throws {
+    @Test func newPhotoUsesTheIncrementalCoordinator() async throws {
         let fixture = try await MobileSignedInFixture(itemsPerSection: 1)
         defer { fixture.removeCache() }
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
@@ -91,15 +96,47 @@ import UIKit
             })
         #expect(await loader.callCount > initialCalls)
         #expect(await feed.image(for: added) != nil)
-        let addedCallsBeforeClear = await loader.requests(for: added)
+        await feed.stopPrefetch()
+    }
 
+    @Test func sourceBoundCacheClearAdmitsTheVisibleInventoryBeforeRestarting() async throws {
+        let fixture = try await MobileSignedInFixture(itemsPerSection: 1)
+        defer { fixture.removeCache() }
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let removed = PhotoUID(volumeID: "thumbnail-owner", nodeID: "removed")
+        let added = PhotoUID(volumeID: "thumbnail-owner", nodeID: "restored")
+        let loader = ThumbnailLoaderProbe(data: [
+            removed: try imageData(color: .blue), added: try imageData(color: .green),
+        ])
+        let coordinator = LibrarySourceCoordinator(remote: loader, thumbnailLoader: loader, inventoryStore: nil)
+        await coordinator.prepare()
+        let cache = ThumbnailCache(rootDirectory: root)
+        cache.configure(accountUID: "fixture-account", key: SymmetricKey(size: .bits256))
+        let feed = UIKitThumbnailFeed(cache: cache, loader: coordinator, concurrency: 1, batch: 1)
+        let runtime = LibrarySourceAnalysisRuntime(
+            coordinator: coordinator, feed: feed.feedCore, assets: MLAssetUniverse(),
+            initiallyActive: false, onAssetsChanged: {})
+        #expect(
+            await runtime.start(primaryItems: [item(removed)], authority: .authoritative, generation: 0) == .accepted)
+        try await feed.waitForPrefetchToFinish()
+        let removedCalls = await loader.requests(for: removed)
+        #expect(removedCalls > 0)
+
+        let model = MobileLibraryModel()
+        // Reproduce the production interval after visible publication but before its async source update.
+        fixture.install(
+            into: model, backend: fixture.backend, sections: [section(items: [item(added)])],
+            thumbnailFeed: feed, thumbnailCache: cache)
+        model.installIsolatedSourceAnalysisForTests(runtime)
         await model.clearCache()
         try await feed.waitForPrefetchToFinish()
 
-        // Decoded images survive a disk-cache clear. Inspect downloads before another image request
-        // can hide a stale crawl inventory by fetching the new asset on demand.
-        #expect(await loader.requests(for: added) > addedCallsBeforeClear)
-        await feed.stopPrefetch()
+        #expect(await loader.requests(for: added) > 0)
+        #expect(await loader.requests(for: removed) == removedCalls)
+        #expect(cache.hasUsableDiskData(added))
+        #expect(!cache.hasUsableDiskData(removed))
+        await runtime.shutdown()
     }
 
     @Test func explicitCacheClearRestartsTheOwnedCrawl() async throws {
@@ -157,7 +194,7 @@ import UIKit
     }
 }
 
-private actor ThumbnailLoaderProbe: ThumbnailBatchLoader {
+private actor ThumbnailLoaderProbe: ThumbnailBatchLoader, LibrarySourceRemoteBackend {
     private let data: [PhotoUID: Data]
     private var calls = 0
     private var requested: [PhotoUID: Int] = [:]
@@ -185,4 +222,6 @@ private actor ThumbnailLoaderProbe: ThumbnailBatchLoader {
 
     var callCount: Int { calls }
     func requests(for uid: PhotoUID) -> Int { requested[uid, default: 0] }
+    func librarySourceLocators() async throws -> [AlbumNodeIdentifier] { [] }
+    func librarySourceItems(for _: AlbumNodeIdentifier) async throws -> [LibrarySourceItem] { [] }
 }

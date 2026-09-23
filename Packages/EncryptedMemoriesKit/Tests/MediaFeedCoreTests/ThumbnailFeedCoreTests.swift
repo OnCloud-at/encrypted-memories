@@ -2125,6 +2125,37 @@ struct ThumbnailFeedCoreTests {
         await feed.stopPrefetch()
     }
 
+    @Test(arguments: [true, false], [true, false])
+    func liveCacheClearUsesBoundInventoryWhenPrimaryInventoryIsEmpty(
+        includedInLibrary: Bool,
+        prefetchEnabled: Bool
+    ) async throws {
+        let uid = Self.uid("bound-clear")
+        let cache = Self.cache("bound-clear")
+        let loader = RecordingLoader(payloads: [uid: Self.pngData(width: 8, height: 8)])
+        let feed = ThumbnailFeedCore(cache: cache, loader: loader, configuration: Self.configuration())
+        let graph = LibrarySourceGraph()
+        let change = Self.visibleScope(in: graph, uids: [uid], includedInLibrary: includedInLibrary)
+        #expect(await feed.bindDerivedDataEpoch(graph.runtimeEpoch))
+        _ = await feed.reconcile(
+            selected: change.selectedScope,
+            analysis: change.analysisScope,
+            retention: change.thumbnailRetentionScope
+        )
+        try await feed.waitForPrefetchToFinish()
+        #expect(await loader.requestCount() == 1)
+        #expect(cache.hasUsableDiskData(uid))
+
+        await feed.setPrefetchEnabled(prefetchEnabled)
+        // The host's primary timeline can be empty; the admitted source scopes still own the crawl.
+        await feed.clearCacheAndRestartPrefetch()
+        try await feed.waitForPrefetchToFinish()
+
+        #expect(await loader.requestCount() == (prefetchEnabled ? 2 : 1))
+        #expect(cache.hasUsableDiskData(uid) == prefetchEnabled)
+        await feed.stopPrefetchAndWait()
+    }
+
     @Test func implausibleCoverageCheckpointFallsBackToDiskVerification() async throws {
         let present = Self.uid("implausible-present")
         let missing = Self.uid("implausible-missing")
