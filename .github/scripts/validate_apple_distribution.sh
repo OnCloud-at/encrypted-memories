@@ -173,7 +173,9 @@ validate_app_signing() {
           -c "Print :Entitlements:keychain-access-groups:$profile_group_index" \
           "$profile_plist" 2>/dev/null
       )"; do
-        [[ "$signed_keychain_group" != "$profile_group" ]] || keychain_group_allowed=true
+        # A profile grants keychain groups as patterns such as `TEAMID.*`, so match the profile entry as a glob.
+        # shellcheck disable=SC2053
+        [[ "$signed_keychain_group" != $profile_group ]] || keychain_group_allowed=true
         profile_group_index="$((profile_group_index + 1))"
       done
       [[ "$keychain_group_allowed" == "true" ]] || release_fail signing \
