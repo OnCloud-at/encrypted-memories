@@ -110,6 +110,7 @@ cp "$ROOT/BuildSupport/Package.resolved" "$SDK_DIR/Package.resolved"
 echo "Clearing local Xcode module caches that may reference the previous SDK..."
 source "$ROOT/scripts/build-paths.sh"
 rm -rf "$ENCRYPTED_MEMORIES_BUILD_ROOT/DD.noindex" \
+       "$ENCRYPTED_MEMORIES_BUILD_ROOT/DD.device.noindex" \
        "$ENCRYPTED_MEMORIES_BUILD_ROOT/DD.ios.noindex" \
        "$ENCRYPTED_MEMORIES_BUILD_ROOT/DD.tests.ios.noindex" \
        "$ENCRYPTED_MEMORIES_BUILD_ROOT/core-gate-dd.noindex" \
