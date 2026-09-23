@@ -194,6 +194,122 @@ import TimelineCore
         #expect(scheduler.discovery.chips.isEmpty)
     }
 
+    /// Invalidated rows are hidden at once, but only the replacement refresh proves that a selected suggestion is
+    /// gone. Until then both hosts must keep it; `.drop` cleared the iOS query and re-ran the macOS title as text.
+    @Test(arguments: ["favorites", "deletion"]) func invalidatedSelectionWaitsForItsReplacement(
+        change: String
+    ) async throws {
+        let start = Date(timeIntervalSince1970: 1_718_413_200)
+        let items = (0..<20).map {
+            PhotoItem(
+                uid: PhotoUID(volumeID: "v", nodeID: "item-\($0)"),
+                captureTime: start.addingTimeInterval(Double($0) * 600), mediaType: "image/jpeg")
+        }
+        let favorites = Set(items.prefix(8).map(\.uid))
+        let runtime = LibraryRuntimeState()
+        let scheduler = SmartSearchDiscoveryScheduler(runtimeState: runtime, debounce: .zero) { _, _ in nil }
+        defer { scheduler.reset() }
+        scheduler.update(
+            sections: [TimelineSection(id: "all", date: start, title: "", items: items)], timelineRevision: 1,
+            favoriteUIDs: favorites, coordinates: [], smartSearch: nil)
+        for _ in 0..<200 where scheduler.discovery.settledContent == nil {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        let before = SmartSearchContentIdentity(timelineRevision: 1, favoriteUIDs: favorites)
+        let selected = try #require(
+            scheduler.discovery.displayableSuggestions(content: before, snapshot: nil).first {
+                $0.kind == .favorites && $0.matchingUIDs == favorites
+            })
+
+        // The user keeps the selected results open, so the replacement refresh waits.
+        let search = runtime.beginActivity(.search)
+        let removed = items[0].uid
+        let remaining = change == "deletion" ? Array(items.dropFirst()) : items
+        let revision: UInt64 = change == "deletion" ? 2 : 1
+        let changedFavorites = favorites.subtracting([removed])
+        scheduler.update(
+            sections: [TimelineSection(id: "all", date: start, title: "", items: remaining)],
+            timelineRevision: revision, favoriteUIDs: changedFavorites, coordinates: [], smartSearch: nil)
+        let after = SmartSearchContentIdentity(timelineRevision: revision, favoriteUIDs: changedFavorites)
+        #expect(
+            !scheduler.discovery.displayableSuggestions(content: after, snapshot: nil).contains {
+                $0.id == selected.id
+            }, "the invalidated row stays hidden")
+        #expect(scheduler.discovery.rebind(selected, content: after, snapshot: nil) == .pending)
+
+        search.end()
+        for _ in 0..<200 where scheduler.discovery.settledContent != after {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        guard case .keep(let fresh) = scheduler.discovery.rebind(selected, content: after, snapshot: nil) else {
+            Issue.record("the selected suggestion must rebind to its replacement")
+            return
+        }
+        #expect(fresh.matchingUIDs == changedFavorites)
+    }
+
+    /// A metadata-only pass keeps its remaining rows and never replaces invalidated ones, so the selection must
+    /// not wait for a refresh that cannot come. This also holds when the model fails after the invalidation.
+    @Test(arguments: [false, true]) func unavailableModelDropsAnInvalidatedSelection(
+        failsAfterInvalidation: Bool
+    ) async throws {
+        let start = Date(timeIntervalSince1970: 1_718_413_200)
+        let items = (0..<20).map {
+            PhotoItem(
+                uid: PhotoUID(volumeID: "v", nodeID: "item-\($0)"),
+                captureTime: start.addingTimeInterval(Double($0) * 600),
+                mediaType: $0 % 4 == 0 ? "video/mp4" : "image/jpeg")
+        }
+        let favorites = Set(items.prefix(8).map(\.uid))
+        let missingModel = MLSmartSearchSnapshot(
+            isEnabled: true, isVisualSearchEnabled: true, selectedModelID: nil,
+            phase: .notInstalled(downloadable: false), installedModelBytes: 0, availableModels: [],
+            isSearchAvailable: false, indexingState: .idle)
+        let complete = visualSnapshot(settled: 20, ready: true)
+        try #require(!missingModel.permitsAutomaticSuggestionGeneration)
+        try #require(missingModel.permitsAutomaticSuggestionMetadata)
+        try #require(complete.permitsAutomaticSuggestionGeneration)
+        let runtime = LibraryRuntimeState()
+        let scheduler = SmartSearchDiscoveryScheduler(runtimeState: runtime, debounce: .zero) { _, _ in nil }
+        defer { scheduler.reset() }
+        func apply(favorites: Set<PhotoUID>, snapshot: MLSmartSearchSnapshot) {
+            scheduler.update(
+                sections: [TimelineSection(id: "all", date: start, title: "", items: items)], timelineRevision: 1,
+                favoriteUIDs: favorites, coordinates: [], snapshot: snapshot, indexedAssetCount: { 0 },
+                searchEvidence: nil)
+        }
+        let initial = failsAfterInvalidation ? complete : missingModel
+        apply(favorites: favorites, snapshot: initial)
+        for _ in 0..<200 where scheduler.discovery.settledContent == nil || scheduler.isRefreshing {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        let before = SmartSearchContentIdentity(timelineRevision: 1, favoriteUIDs: favorites)
+        let selected = try #require(
+            scheduler.discovery.displayableSuggestions(content: before, snapshot: initial).first {
+                $0.kind == .favorites
+            })
+
+        let changedFavorites = favorites.subtracting([items[0].uid])
+        let after = SmartSearchContentIdentity(timelineRevision: 1, favoriteUIDs: changedFavorites)
+        if failsAfterInvalidation {
+            // The selection waits for a full refresh, but the model fails before that refresh can run.
+            let search = runtime.beginActivity(.search)
+            apply(favorites: changedFavorites, snapshot: complete)
+            #expect(scheduler.discovery.rebind(selected, content: after, snapshot: complete) == .pending)
+            apply(favorites: changedFavorites, snapshot: missingModel)
+            search.end()
+        } else {
+            apply(favorites: changedFavorites, snapshot: missingModel)
+        }
+        for _ in 0..<200 where scheduler.discovery.settledContent == nil || scheduler.isRefreshing {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        try #require(
+            !scheduler.discovery.displayableSuggestions(content: after, snapshot: missingModel).isEmpty,
+            "the metadata-only pass keeps the remaining valid rows")
+        #expect(scheduler.discovery.rebind(selected, content: after, snapshot: missingModel) == .drop)
+    }
+
     @Test func emptyLibraryRemovesPreviouslyPublishedConcepts() async throws {
         let probe = EvidenceProbe()
         let items = (0..<8).map {
