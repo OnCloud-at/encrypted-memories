@@ -600,6 +600,9 @@ public final class SmartSearchDiscoveryScheduler {
                     sections: input.sections, timelineRevision: input.revision, favoriteUIDs: input.favorites,
                     coordinates: [], snapshot: input.snapshot, indexedAssetCount: { 0 }, search: nil,
                     includeVisualConcepts: false, metadataOnly: true)
+            } else {
+                // This pass never replaces invalidated rows. The kept rows are final, so a selection stops waiting.
+                discovery.settleRetainedRows()
             }
             return !Task.isCancelled && self.input?.key == input.key
         }

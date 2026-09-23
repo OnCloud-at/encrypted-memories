@@ -73,6 +73,8 @@ public final class SmartSearchDiscoveryModel {
     /// Library content of the last refresh that ran every stage to its end. Rows are published stage by stage,
     /// so only a settled refresh proves that a suggestion no longer exists.
     public private(set) var settledContent: SmartSearchContentIdentity?
+    /// The settled content that an invalidation withdrew. Only a metadata-only pass restores it.
+    @ObservationIgnored private var settledBeforeInvalidation: SmartSearchContentIdentity?
     /// Increases each time a refresh settles. Hosts re-check a selected suggestion when it changes.
     public private(set) var settledGeneration = 0
     /// Visual search availability the settled refresh ran with; nil when it skipped the visual stages.
@@ -151,6 +153,18 @@ public final class SmartSearchDiscoveryModel {
         forYou.removeAll { !validIDs.contains($0.id) }
         chips.removeAll { !validIDs.contains($0.id) }
         lastRefreshCompleted = false
+        // Hiding a row does not prove that its suggestion is gone. Selections wait for the replacement refresh.
+        if let settledContent { settledBeforeInvalidation = settledContent }
+        settledContent = nil
+        settledGeneration &+= 1
+    }
+
+    /// A metadata-only pass keeps the remaining rows and never replaces invalidated ones. Make them final again,
+    /// so a selection whose row was removed stops waiting.
+    func settleRetainedRows() {
+        guard settledContent == nil, let settled = settledBeforeInvalidation else { return }
+        settledContent = settled
+        settledBeforeInvalidation = nil
         settledGeneration &+= 1
     }
 
@@ -175,6 +189,7 @@ public final class SmartSearchDiscoveryModel {
         computedContent = content
         hasComputed = true
         settledContent = isExactContent ? content : nil
+        settledBeforeInvalidation = nil
         settledVisualAvailability = isExactContent ? snapshot.visualAvailability : nil
         visualConceptsCompletedWhenReady = isExactContent && snapshot.visualCompletedWhenReady
         lastRefreshCompleted = isExactContent
@@ -448,6 +463,7 @@ public final class SmartSearchDiscoveryModel {
         let content = SmartSearchContentIdentity(timelineRevision: timelineRevision, favoriteUIDs: favoriteUIDs)
         showsSmartSearchHint = snapshot?.isEnabled != true
         lastRefreshCompleted = false
+        settledBeforeInvalidation = nil
         refreshGeneration &+= 1
         let generation = refreshGeneration
         let refreshIndexingReady = Self.visualIndexReady(snapshot)
