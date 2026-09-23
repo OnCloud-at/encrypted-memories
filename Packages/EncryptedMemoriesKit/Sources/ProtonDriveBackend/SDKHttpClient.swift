@@ -8,11 +8,17 @@ final class SDKHttpClient: HttpClientProtocol, @unchecked Sendable {
     private let urlSession: URLSession
     private let requestGovernor: ProtonRequestGovernor
 
-    init(driveSession: DriveSession, requestGovernor: ProtonRequestGovernor) {
+    init(
+        driveSession: DriveSession,
+        requestGovernor: ProtonRequestGovernor,
+        urlProtocolClasses: [AnyClass]? = nil
+    ) {
         self.driveSession = driveSession
         self.requestGovernor = requestGovernor
         let cfg = URLSessionConfiguration.default
         cfg.requestCachePolicy = .reloadIgnoringLocalCacheData
+        // Test seam: lets unit tests intercept requests with a URLProtocol stub (never set in production).
+        if let urlProtocolClasses { cfg.protocolClasses = urlProtocolClasses }
         self.urlSession = URLSession(configuration: cfg)
     }
 
@@ -107,6 +113,45 @@ final class SDKHttpClient: HttpClientProtocol, @unchecked Sendable {
         }
     }
 
+    // MARK: Small upload (absolute url, buffered)
+
+    /// Sends one complete multipart upload to the Drive API. SDK 0.29.0 buffers a small file from byte
+    /// zero and hands us the opaque multipart body plus its metadata JSON as a side channel. The body
+    /// goes out unchanged with session auth; `metadata` may contain plaintext, so it is neither logged
+    /// nor reconstructed from `content`. The SDK forbids resending after a timeout, lost connection or
+    /// server error: only the explicit refresh after a 401 may issue a second request.
+    func requestSmallUpload(
+        method: String,
+        url: String,
+        content: Data,
+        metadata: Data,
+        headers: [(String, [String])]
+    ) async -> Result<HttpClientResponse, NSError> {
+        let requestURL = Self.driveURL(url, makeURL: driveSession.makeURL)
+        guard Self.isTrustedDriveAPIURL(requestURL, baseURL: driveSession.config.baseURL) else {
+            return .failure(Self.invalidURL("Refusing small upload outside trusted Proton API host"))
+        }
+        var req = URLRequest(url: requestURL)
+        req.httpMethod = method
+        applyAuthAndHeaders(&req, headers: headers)
+        req.httpBody = content
+        Self.applyDriveAcceptHeader(&req)
+
+        // Redirects are refused: following one would replay the authenticated body against a
+        // Location the trusted-host check above never saw. The 3xx status reaches the SDK unchanged.
+        let result = await perform(
+            req, scope: .api, retryOn401: true, retryOn429: false, taskDelegate: RedirectRefusingTaskDelegate.shared)
+        switch result {
+        case .success(let resp) where resp.statusCode >= 400:
+            DebugLog.log("smallUpload \(method) -> \(resp.statusCode)")
+        case .failure(let err):
+            DebugLog.log("smallUpload \(method) -> ERR \(err.code)")
+        default:
+            break
+        }
+        return result
+    }
+
     // MARK: Storage download (absolute url, streamed)
 
     func requestDownloadFromStorage(
@@ -163,7 +208,8 @@ final class SDKHttpClient: HttpClientProtocol, @unchecked Sendable {
         _ request: URLRequest,
         scope: ProtonRequestScope,
         retryOn401: Bool,
-        retryOn429: Bool
+        retryOn429: Bool,
+        taskDelegate: URLSessionTaskDelegate? = nil
     ) async -> Result<HttpClientResponse, NSError> {
         let permit: ProtonRequestGovernor.Permit
         do {
@@ -172,7 +218,7 @@ final class SDKHttpClient: HttpClientProtocol, @unchecked Sendable {
             return .failure(error as NSError)
         }
         do {
-            let (data, response) = try await urlSession.data(for: request)
+            let (data, response) = try await urlSession.data(for: request, delegate: taskDelegate)
             guard let http = response as? HTTPURLResponse else {
                 await requestGovernor.finish(permit, statusCode: nil)
                 return .failure(NSError(domain: "EncryptedMemories.SDKHttpClient", code: -1))
@@ -188,7 +234,8 @@ final class SDKHttpClient: HttpClientProtocol, @unchecked Sendable {
                         request,
                         scope: scope,
                         retryOn401: retryOn401,
-                        retryOn429: false
+                        retryOn429: false,
+                        taskDelegate: taskDelegate
                     )
                 }
             }
@@ -199,7 +246,8 @@ final class SDKHttpClient: HttpClientProtocol, @unchecked Sendable {
                     retry,
                     scope: scope,
                     retryOn401: false,
-                    retryOn429: retryOn429
+                    retryOn429: retryOn429,
+                    taskDelegate: taskDelegate
                 )
             }
             return .success(
@@ -220,11 +268,16 @@ final class SDKHttpClient: HttpClientProtocol, @unchecked Sendable {
     }
 
     static func applyDriveJSONHeaders(_ request: inout URLRequest, hasContent: Bool) {
-        if request.value(forHTTPHeaderField: "Accept") == nil {
-            request.setValue("application/vnd.protonmail.v1+json", forHTTPHeaderField: "Accept")
-        }
+        applyDriveAcceptHeader(&request)
         if hasContent, request.value(forHTTPHeaderField: "Content-Type") == nil {
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        }
+    }
+
+    /// Drive API responses are JSON even for multipart uploads; the SDK-provided Content-Type stays as is.
+    static func applyDriveAcceptHeader(_ request: inout URLRequest) {
+        if request.value(forHTTPHeaderField: "Accept") == nil {
+            request.setValue("application/vnd.protonmail.v1+json", forHTTPHeaderField: "Accept")
         }
     }
 
@@ -285,6 +338,21 @@ final class SDKHttpClient: HttpClientProtocol, @unchecked Sendable {
             guard let k = key as? String else { return nil }
             return (k, ["\(value)"])
         }
+    }
+}
+
+/// Declines every HTTP redirect so an authenticated request body is never replayed to a host that
+/// the caller's trust check did not validate. `URLSession` then delivers the 3xx response as is.
+private final class RedirectRefusingTaskDelegate: NSObject, URLSessionTaskDelegate, Sendable {
+    static let shared = RedirectRefusingTaskDelegate()
+
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest
+    ) async -> URLRequest? {
+        nil
     }
 }
 

@@ -2105,14 +2105,60 @@ final class ProjectHygieneTests: XCTestCase {
         XCTAssertTrue(manager.contains("SDKRequestHandler.sendCancellable("))
         XCTAssertTrue(manager.contains("requestCancellation: activeDownload.requestCancellation"))
         XCTAssertTrue(handler.contains("CallbackHandleRegistry.shared.cancel(handle)"))
-        XCTAssertTrue(handler.contains("registryBacked: true"))
-        XCTAssertTrue(handler.contains("sdkResponseCallbackWithRegistryHandle"))
+        XCTAssertTrue(
+            handler.contains("CallbackHandleRegistry.shared.resolveResponse(stateHandle)"),
+            "SDK 0.29.0 resolves every response through the registry; the raw-pointer adapter is gone")
+        XCTAssertFalse(handler.contains("registryBacked"), "the 0.27 dual-path adapter must not return")
+        XCTAssertFalse(handler.contains("Unmanaged"), "no request may pass a retained raw address to native code")
         XCTAssertTrue(boxedContinuation.contains("RegistryCancellable"))
         XCTAssertTrue(boxedContinuation.contains("CancellationError()"))
         XCTAssertTrue(thumbnailCallback.contains("CallbackHandleRegistry.shared.get"))
         XCTAssertFalse(
             thumbnailCallback.contains("Unmanaged"),
             "late thumbnail callbacks must use registry IDs, never retained raw pointers")
+
+        // Every streamed enumeration awaits `Void`, so its yield callback must look up that exact box
+        // type. Upstream 0.28+ ships five of these with `Int`, which makes the checked registry cast
+        // drop every yielded timeline item, album item, node result, node UID, and device.
+        let voidEnumerationCallbacks = [
+            "FileOperations/Downloads/cThumbnailEnumerationCallback.swift",
+            "Client/ProtonDriveClient/cDriveEventEnumerationCallback.swift",
+            "Client/ProtonDriveClient/cNodeUidEnumerationCallback.swift",
+            "Client/ProtonDriveClient/cDeviceEnumerationCallback.swift",
+            "Client/EncryptedMemoriesClient/cTimelineItemEnumerationCallback.swift",
+            "Client/EncryptedMemoriesClient/cAlbumItemEnumerationCallback.swift",
+            "Client/EncryptedMemoriesClient/cNodeResultEnumerationCallback.swift",
+        ]
+        for callback in voidEnumerationCallbacks {
+            let source = try String(contentsOf: sdkRoot.appendingPathComponent(callback), encoding: .utf8)
+            XCTAssertTrue(
+                source.contains("BoxedCompletionBlock<Void,"),
+                "\(callback) must resolve the Void request box registered by SDKRequestHandler")
+            XCTAssertFalse(
+                source.contains("BoxedCompletionBlock<Int,"),
+                "\(callback) uses an Int box; the registry cast rejects it and every yield is lost")
+        }
+        // Controller-producing requests await an `Int` handle, so their progress, stream and SHA-1
+        // callbacks must keep the Int box; the duplicate lookup awaits `[String]`.
+        let intCallbacks = [
+            "Plumbing/ProgressCallbackWrapper.swift",
+            "Plumbing/StreamCallbackWrapper.swift",
+            "FileOperations/Uploads/UploadOperation.swift",
+        ]
+        for callback in intCallbacks {
+            let source = try String(contentsOf: sdkRoot.appendingPathComponent(callback), encoding: .utf8)
+            XCTAssertTrue(
+                source.contains("BoxedCompletionBlock<Int,"),
+                "\(callback) must keep the Int box registered for controller-handle requests")
+            XCTAssertFalse(source.contains("BoxedCompletionBlock<Void,"))
+        }
+        let sha1Callback = try String(
+            contentsOf: sdkRoot.appendingPathComponent(
+                "Client/EncryptedMemoriesClient/cGenerateSha1CallbackForFindDuplicates.swift"),
+            encoding: .utf8)
+        XCTAssertTrue(
+            sha1Callback.contains("BoxedCompletionBlock<[String],"),
+            "findDuplicates awaits [String]; its SHA-1 callback must resolve that box")
         XCTAssertTrue(
             cancellationSource.contains("freeGate.task"),
             "native cancellation-token free must remain one-shot and awaitable")
