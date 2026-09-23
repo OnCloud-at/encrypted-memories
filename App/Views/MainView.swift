@@ -2004,6 +2004,8 @@ struct MainView: View {
                 .padding(.horizontal, 12)
                 .contentTransition(.interpolate)
                 .accessibilityAddTraits(.isHeader)
+                // Refresh the native title's measurement and accessibility label when its text changes.
+                .id(title)
         }
         .hidden(viewerModel != nil)
         .sharedBackgroundVisibility(.visible)

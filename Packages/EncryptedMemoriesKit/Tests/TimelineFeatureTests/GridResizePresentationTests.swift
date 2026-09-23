@@ -27,10 +27,8 @@ private final class PresentationTestDataSource: MetalGridDataSource {
 }
 
 // Live window-resize presentation layer. During a live window edge drag the grid keeps stable geometry: the
-// settled slots are snapshotted once on begin, then each frame is uniformly scaled to the new width (square tiles
-// preserved) about the stationary left edge + viewport centre. It must not per-tick engine-resolve the lattice
-// because that reflows tiles, but it must still stream current thumbnails through the normal visible-first path
-// so placeholders can fill while the mouse is still down. The clip is frozen and re-centred once on release.
+// captured items keep their rows and columns. Width changes use canonical fixed gaps and the bounded release
+// camera before mouse-up. Thumbnail streaming stays live. Height-only dragging retains its counter-scroll.
 @Suite struct GridResizePresentationTests {
     private let eps: CGFloat = 0.001
     private func repoRoot() -> URL {
@@ -86,7 +84,7 @@ private final class PresentationTestDataSource: MetalGridDataSource {
     }
 
     @Test(.enabled(if: MTLCreateSystemDefaultDevice() != nil)) @MainActor
-    func executableWindowResizePresentationScalesSnapshotAndSettlesCleanly() throws {
+    func executableWindowResizePresentationMatchesCanonicalLayoutAndSettlesCleanly() throws {
         let (coordinator, view, clip) = try #require(makeCoordinator())
         _ = clip  // coordinator holds clipView weakly; keep the test clip alive for the lifecycle.
         coordinator.beginPresentationResize()
@@ -106,8 +104,10 @@ private final class PresentationTestDataSource: MetalGridDataSource {
             Issue.record("no common presentation slot")
             return
         }
-        let k: CGFloat = (900 - 24) / (1200 - 24)  // standard 12pt left + right margin at normal levels
-        let expected = MetalGridCoordinator.presentationScaledRect(source, scale: k, insetX: 12, anchorY: 400)
+        #expect(narrowed.width < source.width)
+        let content = try #require(coordinator.cellContentRect(forFlatIndex: sampleIndex))
+        let expected = content.offsetBy(
+            dx: coordinator.leadingObstructionInset, dy: -coordinator.windowResizeReleaseScrollY())
         #expect(abs(narrowed.minX - expected.minX) < 0.001)
         #expect(abs(narrowed.minY - expected.minY) < 0.001)
         #expect(abs(narrowed.width - expected.width) < 0.001)
@@ -118,6 +118,84 @@ private final class PresentationTestDataSource: MetalGridDataSource {
             "fixed-column resize should not arm a release reflow morph")
         coordinator.endPresentationResize()
         #expect(!coordinator.presentationResizeActive)
+    }
+
+    @Test(.enabled(if: MTLCreateSystemDefaultDevice() != nil)) @MainActor
+    func horizontalResizeMatchesSettledGeometryBeforeMouseUp() throws {
+        for count in [8, 2000, 50000] {
+            for scrollFraction: CGFloat in [0, 0.5, 1] {
+                let (coordinator, view, clip) = try #require(makeCoordinator(scrollY: 0, count: count))
+                defer { withExtendedLifetime(clip) {} }
+                coordinator.topBarInset = 52
+                clip.bounds.origin.y = max(0, coordinator.contentSize().height - view.bounds.height) * scrollFraction
+                coordinator.beginPresentationResize()
+                for width: CGFloat in [900, 1500] {
+                    view.frame.size.width = width
+                    let liveSlots = coordinator.resizePresentationSlots(viewportSize: view.bounds.size)
+                    #expect(!liveSlots.isEmpty)
+                    let releaseY = coordinator.windowResizeReleaseScrollY()
+                    for slot in liveSlots where slot.rect.maxY >= 0 && slot.rect.minY <= view.bounds.height {
+                        let contentRect = try #require(coordinator.cellContentRect(forFlatIndex: slot.index))
+                        let settled = contentRect.offsetBy(dx: coordinator.leadingObstructionInset, dy: -releaseY)
+                        #expect(abs(slot.rect.minX - settled.minX) < 0.01)
+                        #expect(
+                            abs(slot.rect.minY - settled.minY) < 0.01,
+                            "Live resize must use the same bounded camera as release, without a temporary empty band")
+                        #expect(abs(slot.rect.width - settled.width) < 0.01)
+                    }
+                }
+                coordinator.endPresentationResize()
+            }
+        }
+    }
+
+    @Test(.enabled(if: MTLCreateSystemDefaultDevice() != nil)) @MainActor
+    func extremeWidthShrinkCoversEveryNewlyVisibleRow() throws {
+        for order: GridFillOrder in [.newestBottomTrailing, .topLeading] {
+            for fraction: CGFloat in [0, 0.5, 1] {
+                let (coordinator, view, clip) = try #require(makeCoordinator(width: 2400, scrollY: 0, count: 50000))
+                defer { withExtendedLifetime(clip) {} }
+                coordinator.setFillOrder(order)
+                coordinator.topBarInset = 52
+                coordinator.sidebarObstructionInset = 280
+                clip.bounds.origin.y = max(0, coordinator.contentSize().height - view.bounds.height) * fraction
+                coordinator.beginPresentationResize()
+                let original = coordinator.resizePresentationSlots(viewportSize: view.bounds.size)
+                let originalByIndex = Dictionary(uniqueKeysWithValues: original.map { ($0.index, $0) })
+                for size in [
+                    CGSize(width: 720, height: 800), CGSize(width: 960, height: 1000),
+                    CGSize(width: 2400, height: 800),
+                ] {
+                    view.frame.size = size
+                    let slots = coordinator.resizePresentationSlots(viewportSize: size)
+                    let presented = Set(slots.map(\.index))
+                    // Returning to the original width uses the host's height-only release branch.
+                    let releaseY =
+                        size.width == 2400
+                        ? coordinator.presentationStartScrollY : coordinator.windowResizeReleaseScrollY()
+                    clip.bounds.origin.y = releaseY
+                    let visible = coordinator.visibleCells()
+                    #expect(!visible.isEmpty)
+                    #expect(
+                        visible.allSatisfy { presented.contains($0.flatIndex) },
+                        "Extreme shrink and corner drags must cover every newly visible row")
+                    #expect(slots.count < 2000, "Resize work must remain bounded by the viewport, not library size")
+                    for slot in slots {
+                        if let start = originalByIndex[slot.index] {
+                            #expect(
+                                slot.row == start.row && slot.column == start.column,
+                                "Resizing must preserve each photo's row and column")
+                        }
+                        let content = try #require(coordinator.cellContentRect(forFlatIndex: slot.index))
+                        let settled = content.offsetBy(dx: coordinator.leadingObstructionInset, dy: -releaseY)
+                        #expect(abs(slot.rect.minY - settled.minY) < 0.01)
+                        #expect(abs(slot.rect.minX - settled.minX) < 0.01)
+                        #expect(abs(slot.rect.width - settled.width) < 0.01)
+                    }
+                }
+                coordinator.endPresentationResize()
+            }
+        }
     }
 
     @Test(.enabled(if: MTLCreateSystemDefaultDevice() != nil)) @MainActor
@@ -244,10 +322,9 @@ private final class PresentationTestDataSource: MetalGridDataSource {
             "the content right edge must map to the new content width (fills, no gutter)")
     }
 
-    // The presentation scales the gesture-start snapshot each tick; it does not re-resolve the engine per frame
-    // (that would reflow). drawPresentationResize maps the snapshot slots through presentationScaledRect, then
-    // streams/renders those slots through the shared visible-first path - never `engine.framePlan` for the render.
-    @Test func presentationScalesSnapshotNotPerFrameResolve() {
+    // Width resizing queries canonical visible rows; height-only resizing retains the captured snapshot.
+    // Both paths stream and render through the shared visible-first path.
+    @Test func presentationKeepsLiveThumbnailsAndCanonicalWidthGeometry() {
         let coord = src("MetalGridCoordinator.swift")
         let drawBody = funcBody(coord, "func drawPresentationResize")
         let slotBody = funcBody(coord, "func resizePresentationSlots")
@@ -271,10 +348,10 @@ private final class PresentationTestDataSource: MetalGridDataSource {
             "live resize must not use a frozen offscreen snapshot canvas")
         #expect(
             slotBody.contains("presentationSnapshotSlots") && slotBody.contains("presentationScaledRect"),
-            "the render must SCALE the captured snapshot geometry, not re-resolve per tick")
+            "height-only resizing must retain the captured geometry")
         #expect(
-            !drawBody.contains("engine.framePlan") && !slotBody.contains("engine.framePlan"),
-            "drawPresentationResize must NOT re-resolve the layout per tick (that reflows)")
+            slotBody.contains("engine.framePlan") && slotBody.contains("columnPhase: currentPhase()"),
+            "width resizing must cover newly visible rows with the unchanged level and column phase")
         #expect(coord.contains("if presentationResizeActive {") && coord.contains("drawPresentationResize(to: target"))
     }
 
@@ -377,15 +454,8 @@ private final class PresentationTestDataSource: MetalGridDataSource {
     // (bottom-anchored vs centre-anchored). Begin captures both anchors + the flag.
     @Test func resizeAnchorIsAdaptiveBottomOrCentre() {
         let coord = src("MetalGridCoordinator.swift")
-        guard let dr = coord.range(of: "func resizePresentationSlots") else {
-            Issue.record("resizePresentationSlots missing")
-            return
-        }
-        let db = String(
-            coord[
-                dr
-                    .lowerBound..<(coord.index(dr.lowerBound, offsetBy: 1600, limitedBy: coord.endIndex)
-                    ?? coord.endIndex)])
+        let db = funcBody(coord, "func resizePresentationSlots")
+        #expect(!db.isEmpty)
         #expect(
             db.containsCodeFragmentIgnoringWhitespace(
                 "presentationResizeBottomPinned ? viewportHeight : viewportHeight / 2"
@@ -517,15 +587,8 @@ private final class PresentationTestDataSource: MetalGridDataSource {
     // synchronously; the heightChanged path does not rebase on every tick.
     @Test func verticalDragSlidesTheSnapshotNoFallback() {
         let coord = src("MetalGridCoordinator.swift")
-        guard let range = coord.range(of: "func resizePresentationSlots") else {
-            Issue.record("resizePresentationSlots missing")
-            return
-        }
-        let body = String(
-            coord[
-                range
-                    .lowerBound..<(coord.index(range.lowerBound, offsetBy: 1400, limitedBy: coord.endIndex)
-                    ?? coord.endIndex)])
+        let body = funcBody(coord, "func resizePresentationSlots")
+        #expect(!body.isEmpty)
         #expect(
             body.contains("presentationVerticalShift")
                 && body.containsCodeFragmentIgnoringWhitespace("offsetBy(dx: 0, dy: dy)"),
