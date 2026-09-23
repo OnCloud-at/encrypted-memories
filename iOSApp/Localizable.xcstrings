@@ -449,13 +449,13 @@
         "de": {
           "stringUnit": {
             "state": "translated",
-            "value": "Papierkorb"
+            "value": "Zuletzt gelöscht"
           }
         },
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Trash"
+            "value": "Recently Deleted"
           }
         }
       }
