@@ -2,6 +2,11 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<key>BGTaskSchedulerPermittedIdentifiers</key>
+	<array>
+		<string>at.oncloud.encryptedmemories.photo-backup.processing</string>
+		<string>at.oncloud.encryptedmemories.smart-search.processing</string>
+	</array>
 	<key>CADisableMinimumFrameDurationOnPhone</key>
 	<true/>
 	<key>CFBundleDevelopmentRegion</key>
@@ -26,19 +31,14 @@
 	<string>$(ENCRYPTED_MEMORIES_BUILD_COMMIT)</string>
 	<key>EncryptedMemoriesProtonChannel</key>
 	<string>$(ENCRYPTED_MEMORIES_PROTON_CHANNEL)</string>
-	<key>LSApplicationCategoryType</key>
-	<string>public.app-category.photography</string>
 	<key>ITSAppUsesNonExemptEncryption</key>
 	<false/>
-	<key>NSPhotoLibraryUsageDescription</key>
-	<string>Encrypted Memories backs up the photos and videos in your library to Proton Drive, end-to-end encrypted. Access is requested only when you turn backup on.</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.photography</string>
 	<key>NSMotionUsageDescription</key>
 	<string>Motion data lets the celebration drift with the way you hold your device.</string>
-	<key>BGTaskSchedulerPermittedIdentifiers</key>
-	<array>
-		<string>at.oncloud.encryptedmemories.photo-backup.processing</string>
-		<string>at.oncloud.encryptedmemories.smart-search.processing</string>
-	</array>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>Encrypted Memories backs up the photos and videos in your library to Proton Drive, end-to-end encrypted. Access is requested only when you turn backup on.</string>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>
