@@ -194,6 +194,39 @@ final class ProjectHygieneTests: XCTestCase {
         XCTAssertEqual(rebuild.components(separatedBy: "IOS_BUNDLE_ID=").count - 1, 1)
     }
 
+    /// An SDK update must clear every derived-data directory that a build script writes. Otherwise the
+    /// next build links products compiled against the previous SDK. `rebuild.sh` gained its iOS device
+    /// directory without the updater learning about it; this guard keeps both lists in step.
+    func testSDKUpdaterClearsEveryScriptDerivedDataDirectory() throws {
+        let scriptsDirectory = repoRoot.appendingPathComponent("scripts")
+        let updater = try String(
+            contentsOf: scriptsDirectory.appendingPathComponent("update-proton-sdk.sh"),
+            encoding: .utf8
+        )
+        let scripts = try FileManager.default.contentsOfDirectory(
+            at: scriptsDirectory,
+            includingPropertiesForKeys: nil
+        ).filter { $0.pathExtension == "sh" }
+
+        var derivedDataDirectories = Set<String>()
+        for script in scripts {
+            let source = try String(contentsOf: script, encoding: .utf8)
+            for match in source.matches(of: #/BUILD_ROOT/([A-Za-z0-9._-]+\.noindex)/#) {
+                let name = String(match.output.1)
+                if name.lowercased().contains("dd") { derivedDataDirectories.insert(name) }
+            }
+        }
+
+        XCTAssertTrue(
+            derivedDataDirectories.contains("DD.device.noindex"),
+            "the guard must observe the device build directory used by rebuild.sh")
+        for name in derivedDataDirectories.sorted() {
+            XCTAssertTrue(
+                updater.contains("$ENCRYPTED_MEMORIES_BUILD_ROOT/\(name)"),
+                "update-proton-sdk.sh must clear \(name); it holds products built against the previous SDK")
+        }
+    }
+
     func testAppleDistributionBuildsOnceAndPromotesExistingBuilds() throws {
         let buildPaths = try String(
             contentsOf: repoRoot.appendingPathComponent("scripts/build-paths.sh"),
