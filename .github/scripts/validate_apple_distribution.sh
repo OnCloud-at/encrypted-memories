@@ -122,8 +122,11 @@ validate_app_signing() {
 
   run_checked "$label provisioning profile decode" "Renew the profile and export the app again." \
     security cms -D -i "$checked_profile" > "$profile_plist"
+  # codesign reports `Executable=...` on stderr, which run_checked merges into its output. Let codesign
+  # write the XML itself; it does not replace an existing file, so remove any earlier one first.
+  rm -f "$entitlements_plist"
   run_checked "$label entitlements extraction" "Re-sign and export the app with valid entitlements." \
-    codesign --display --entitlements :- "$checked_app" > "$entitlements_plist"
+    codesign --display --entitlements "$entitlements_plist" --xml "$checked_app" >/dev/null
   run_checked "$label plist syntax" "Regenerate the archive and export options." \
     plutil -lint "$profile_plist" "$entitlements_plist" >/dev/null
 
