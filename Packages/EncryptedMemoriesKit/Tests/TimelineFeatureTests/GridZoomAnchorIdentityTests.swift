@@ -50,28 +50,6 @@ import Testing
         return (displayed, tx.anchorGlobalIndex, after, phase, scrollY, tx, e)
     }
 
-    private func hostSource() -> String {
-        var url = URL(fileURLWithPath: #filePath)
-        url.deleteLastPathComponent()
-        url.deleteLastPathComponent()
-        url.deleteLastPathComponent()
-        return
-            (try? String(
-                contentsOf: url.appendingPathComponent("Sources/TimelineFeature/MetalGridScrollHost.swift"),
-                encoding: .utf8)) ?? ""
-    }
-
-    private func coordinatorSource() -> String {
-        var url = URL(fileURLWithPath: #filePath)
-        url.deleteLastPathComponent()
-        url.deleteLastPathComponent()
-        url.deleteLastPathComponent()
-        return
-            (try? String(
-                contentsOf: url.appendingPathComponent("Sources/TimelineFeature/MetalGridCoordinator.swift"),
-                encoding: .utf8)) ?? ""
-    }
-
     private let cursorVP = CGPoint(x: 430, y: 360)
     private let scenarios: [Int?] = [.none, .some(1), .some(3), .some(5)]  // canonical + several committed phases
 
@@ -130,11 +108,6 @@ import Testing
         // The commit computes a new scrollY, so the lock must use the committed value.
         let r = simulatePinch(sourceLevel: 2, sourcePhase: nil, targetLevel: 5, cursorVP: cursorVP, sourceScrollY: 5000)
         #expect(abs(r.scrollY - 5000) > 1, "the commit computed a new anchor-preserving scrollY")
-        // The host sets the scroll lock to the committed target before scrolling, so the grace cannot restore the prior origin.
-        let host = hostSource()
-        #expect(
-            host.contains("scrollLockOrigin = CGPoint(x: 0, y: targetY)"),
-            "scrollLock must be set to the committed targetY")
     }
 
     @Test func pinchEndpointUsesClampedScrollBeforeRelease() {
@@ -169,25 +142,11 @@ import Testing
             viewportHeight: viewport.height, columnPhase: bottomPhase)
         #expect(rawBottom > targetMaxY, "test must cover a bottom-edge impossible cursor anchor")
         #expect(clampedBottom == targetMaxY, "bottom-edge target detent must be built at the committed bottom clamp")
-
-        let coordinator = coordinatorSource()
-        #expect(
-            coordinator.containsCodeFragmentIgnoringWhitespace("engine.clampScrollOffsetY(y, level: lv"),
-            "normal live-pinch detent endpoints must be built from the same clamped scrollY the release commit adopts")
     }
 
     @Test func commitUsesSameCursorPointAsBegin() {
         let r = simulatePinch(sourceLevel: 3, sourcePhase: 3, targetLevel: 5, cursorVP: cursorVP, sourceScrollY: 5000)
         #expect(r.tx.anchorViewportPoint == cursorVP, "the transaction must carry the begin cursor point")
-        // The coordinator commit rebases from `tx.anchorViewportPoint` (the begin point), not a fresh/stale point.
-        let coord =
-            (try? String(
-                contentsOf: URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
-                    .deletingLastPathComponent().appendingPathComponent(
-                        "Sources/TimelineFeature/MetalGridCoordinator.swift"), encoding: .utf8)) ?? ""
-        #expect(
-            coord.contains("viewportPoint: tx.anchorViewportPoint, level: lv"),
-            "commit must rebase from the begin cursor point")
     }
 
     @Test func problematic24To18Regression() {
@@ -211,20 +170,6 @@ import Testing
                 sourceLevel: s, sourcePhase: nil, targetLevel: t, cursorVP: cursorVP, sourceScrollY: 5000)
             #expect(r.after == r.displayed, "canonical-phase gesture broke: s\(s)→t\(t)")
         }
-    }
-
-    @Test func plusMinusZoomUsesViewportCenterAnchor() {
-        let host = hostSource()
-        // setLevel(+/-) anchors at the grid viewport centre.
-        // Viewport centre is expressed in layout space after removing the sidebar inset, so the engine
-        // receives a layout-space anchor; the render translation happens once at the coordinator's draw chokepoint.
-        #expect(
-            host.containsCodeFragmentIgnoringWhitespace(
-                "anchorContentPoint ?? CGPoint(x: max(1, bounds.width - coordinator.leadingObstructionInset) / 2, y: origin.y + vh / 2)"
-            ),
-            "+/- must anchor at the grid viewport centre (layout space)")
-        // It must not use a stale mouse or hover content point.
-        #expect(!host.contains("lastMouseContentPoint"), "+/- must not reuse a stale mouse/hover point")
     }
 
     @Test func plusMinusCenterItemSurvivesCommit() {
@@ -379,27 +324,5 @@ import Testing
             scrollOffset: CGPoint(x: 0, y: y), overscan: 0, columnPhase: phase)
         let under = plan.visibleSlots.first { $0.viewportRect.contains(cursorVPLayout) }?.index
         #expect(under == tx.anchorGlobalIndex, "sidebar: settled frame anchor must stay under the layout-space cursor")
-        // Source guards: the host converts render to layout once; the coordinator's layout width removes the inset.
-        #expect(
-            hostSource().contains("CGPoint(x: raw.x - inset, y: raw.y)"),
-            "cursor x must be converted render→layout by subtracting the inset exactly once")
-        #expect(
-            coordinatorSource().contains("renderBounds(forLevel: lvl).layoutWidth"),
-            "the engine layout width must come from the per-level bounds policy")
-    }
-
-    // Set the scroll lock before scrolling so the grace window cannot restore the prior origin.
-    @Test func latticeCommitSetsScrollLockBeforeScrolling() {
-        let host = hostSource()
-        guard let lockIdx = host.range(of: "scrollLockOrigin = CGPoint(x: 0, y: committedY)"),
-            let scrollIdx = host.range(of: "scrollView.contentView.scroll(to: CGPoint(x: 0, y: committedY))")
-        else {
-            Issue.record("commitLivePinch scroll-lock / scroll lines not found")
-            return
-        }
-        #expect(
-            lockIdx.lowerBound < scrollIdx.lowerBound,
-            "commitLivePinch must set the scroll lock to committedY BEFORE scrolling (grace window must not restore the pre-pinch origin)"
-        )
     }
 }

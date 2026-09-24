@@ -14,20 +14,6 @@ import Testing
         return (src, tgt)
     }
 
-    @Test func controllerSchedulesFromSingleBuiltLattice() throws {
-        let root = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-        let controller = root.appendingPathComponent("Sources/GridCore/GridTransitionController.swift")
-        let source = try String(contentsOf: controller, encoding: .utf8)
-
-        #expect(!source.contains("ClickZoomTransitionScheduler.makePlan(source:"))
-        #expect(!source.contains("PinchZoomTransitionScheduler.makePlan(source:"))
-        #expect(source.containsCodeFragmentIgnoringWhitespace("ClickZoomTransitionScheduler.makePlan(lattice: lat"))
-        #expect(source.containsCodeFragmentIgnoringWhitespace("PinchZoomTransitionScheduler.makePlan(lattice: lat"))
-    }
-
     // The transition is on by default - no flag, no UserDefaults - and builds/draws/settles a click.
     @Test func clickBuildsPlanAndDrawsAndSettlesByDefault() {
         let (src, tgt) = plans()

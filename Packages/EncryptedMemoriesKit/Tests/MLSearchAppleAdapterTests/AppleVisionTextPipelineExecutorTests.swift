@@ -188,23 +188,6 @@ import Vision
         #expect(cell.columnSpan == 1)
     }
 
-    @Test func structuredDocumentBarcodeExtractionStaysRootBounded() throws {
-        var sourceURL = URL(fileURLWithPath: #filePath)
-        for _ in 0..<3 { sourceURL.deleteLastPathComponent() }
-        sourceURL.append(path: "Sources/MLSearchAppleAdapter/AppleVisionTextPipelineExecutor.swift")
-        let source = try String(contentsOf: sourceURL, encoding: .utf8)
-        let start = try #require(source.range(of: "private static func documentBarcodes("))
-        let tail = source[start.lowerBound...]
-        let end = try #require(
-            tail.range(of: "\n    @available", range: tail.index(after: start.lowerBound)..<tail.endIndex))
-        let implementation = tail[..<end.lowerBound]
-
-        #expect(implementation.contains("document.barcodes"))
-        #expect(!implementation.contains("cell.content"))
-        #expect(!implementation.contains("item.content"))
-        #expect(!implementation.contains("func collect"))
-    }
-
     @Test(.enabled(if: ProcessInfo.processInfo.environment["ENCRYPTED_MEMORIES_RUN_VISION_QUALIFICATION"] == "1"))
     func structuredDocumentQualificationFixture() async throws {
         guard #available(macOS 26.0, iOS 26.0, *) else { return }

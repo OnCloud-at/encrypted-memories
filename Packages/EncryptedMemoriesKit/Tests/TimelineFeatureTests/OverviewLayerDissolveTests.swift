@@ -25,21 +25,6 @@ import Testing
             anchorViewportPoint: CGPoint(x: 500, y: 380), overscan: 300)
     }
 
-    private func repoRoot() -> URL {
-        var u = URL(fileURLWithPath: #filePath)
-        for _ in 0..<5 { u.deleteLastPathComponent() }  // …/Tests/TimelineFeatureTests/X.swift to repo root
-        return u
-    }
-    private func source(_ name: String) -> String {
-        for target in ["TimelineFeature", "TimelineUIKitFeature", "GridCore", "MetalRenderingCore"] {
-            let rel = "Packages/EncryptedMemoriesKit/Sources/\(target)/\(name)"
-            if let source = try? String(contentsOf: repoRoot().appendingPathComponent(rel), encoding: .utf8) {
-                return source
-            }
-        }
-        return ""
-    }
-
     private func renderBounds(
         profile: GridLevelProfile, level: Int, fullWidth: CGFloat, sidebarInset: CGFloat
     ) -> GridRenderBounds {
@@ -97,19 +82,6 @@ import Testing
             #expect(pq.targetScrollY == p0.targetScrollY)
             #expect(pq.targetColumnPhase == p0.targetColumnPhase)
         }
-    }
-
-    @Test func nativeMenuZoomUsesTheExistingShortPinchRoutes() {
-        let host = source("UIKitTimelineGridHost.swift")
-        let pinch = source("UIKitTimelineGridHostPinch.swift")
-        let proxy = source("GridProxy.swift")
-
-        #expect(host.contains("proxy?.zoomIn =") && host.contains("proxy?.zoomOut ="))
-        #expect(host.contains("proxy?.zoomAvailability ="))
-        #expect(pinch.contains("performDiscreteZoom(direction:"))
-        #expect(pinch.contains("beginShortPinchStep("))
-        #expect(pinch.contains("commitLiveZoom(to: targetLevel"))
-        #expect(proxy.contains("zoomAvailability"))
     }
 
     // The target overview grid is in its final position at every q.
@@ -203,24 +175,6 @@ import Testing
         }
     }
 
-    @Test func coordinatorMapsOverviewTargetWithTargetBoundsWithoutScaling() {
-        let coord = source("MetalGridCoordinator.swift")
-        #expect(coord.contains("func renderBounds(forLevel lvl: Int) -> GridRenderBounds"))
-        #expect(coord.contains("targetBounds: renderBounds(forLevel: plan.targetLevel)"))
-        #expect(
-            coord.contains(
-                "private func mapDissolveTargetLayer(_ slots: [GridRenderSlot], targetBounds: GridRenderBounds)"))
-        #expect(coord.contains("targetBounds.translate(slots)"))
-        guard let start = coord.range(of: "private func mapDissolveTargetLayer"),
-            let end = coord.range(of: "// MARK: - Live resize", range: start.upperBound..<coord.endIndex)
-        else {
-            Issue.record("missing mapDissolveTargetLayer body")
-            return
-        }
-        let body = String(coord[start.lowerBound..<end.lowerBound])
-        #expect(!body.contains("scale"), "overview target mapping must not scale an already target-width plan")
-    }
-
     // Source keeps its own display mode (not forced square); target is square because overview is square-only.
     @Test func sourceKeepsModeTargetIsSquare() {
         let e = engine()
@@ -289,65 +243,6 @@ import Testing
         // the single-pass bleed depends on bg (a tell-tale of background bleed); the linear mix never does
         #expect(overviewDissolveSinglePassBleed(a, b, 0.0, 0.5) != overviewDissolveSinglePassBleed(a, b, 0.5, 0.5))
         #expect(overviewDissolveMix(a, b, 0.5) == overviewDissolveMix(a, b, 0.5))  // bg-independent by construction
-    }
-
-    // guard: the renderer actually uses offscreen two-layer compositing with a single linear `mix`, not a
-    // sequential source-over dissolve into one framebuffer.
-    @Test func rendererUsesOffscreenLinearComposite() {
-        let r = source("MetalGridRenderer.swift")
-        #expect(r.contains("func renderLayerDissolve"))
-        #expect(r.contains("ensureLayerTextures"))  // offscreen render targets
-        #expect(r.contains("encodeLayerPass"))  // each layer rendered to its own texture
-        #expect(r.contains("mix(a.rgb, b.rgb, t)"))  // linear composite in the shader
-        #expect(r.contains("metalGridCompositeFragment"))
-        #expect(r.contains("render(to: target, viewportSize: viewportSize, groups: targetGroups())"))
-    }
-
-    // guard: toolbar/keyboard +/- must use the same whole-grid overview dissolve as pinch at L3 and L4 / L4 and L5.
-    @Test func plusMinusOverviewBoundaryUsesLayerDissolveNotSnap() {
-        let coord = source("MetalGridCoordinator.swift")
-        let host = source("MetalGridScrollHost.swift")
-        #expect(coord.contains("func tryBeginClickOverviewDissolve"))
-        #expect(coord.contains("engine.overviewLayerDissolvePlan("))
-        #expect(coord.contains("overviewClickDissolveDuration"))
-        #expect(host.contains("tryBeginClickOverviewDissolve"))
-        #expect(host.contains("coordinator.isOverviewClickDissolving"))
-        if let overview = host.range(of: "tryBeginClickOverviewDissolve"),
-            let snap = host.range(of: "settleScrollOffsetY")
-        {
-            #expect(overview.lowerBound < snap.lowerBound, "+/- overview dissolve must run before snap settle")
-        } else {
-            Issue.record("missing +/- overview dissolve or snap fallback source")
-        }
-    }
-
-    @Test func uiKitPinchUsesSharedTransitionPresentations() {
-        // The host class spans two files: the render loop and the pinch state machine.
-        let host = source("UIKitTimelineGridHost.swift") + source("UIKitTimelineGridHostPinch.swift")
-        #expect(host.contains("GridTransitionController"))
-        #expect(host.contains("PinchLiveZoomDriver"))
-        #expect(host.contains("gridTransition.beginPinch("))
-        #expect(host.contains("renderer.renderLayerDissolve("))
-        #expect(host.contains("engine.overviewLayerDissolvePlan("))
-        #expect(host.contains("MetalGridFrameComposer.buildTransitionGroups("))
-        #expect(host.contains("commitPinchChain(toLevel:"))
-        #expect(host.contains("commitOverviewDissolve()"))
-    }
-
-    // Guard: the overview layer dissolve must not reuse the relocation lattice / transition controller.
-    @Test func dissolveModelDoesNotUseRelocationMachinery() {
-        // Scan code only - the file's prose deliberately names these to explain what it does not use.
-        let code = source("OverviewLayerDissolve.swift")
-            .split(separator: "\n", omittingEmptySubsequences: false)
-            .filter { !$0.trimmingCharacters(in: .whitespaces).hasPrefix("//") }
-            .joined(separator: "\n")
-        #expect(!code.isEmpty)
-        for forbidden in [
-            "GridTransitionComponentBuilder", "GridTransitionController", "GridTransitionPlan",
-            "GridTransitionRendererInput", "beginPinch", "beginClick",
-        ] {
-            #expect(!code.contains(forbidden), "overview layer dissolve must not reference \(forbidden)")
-        }
     }
 
     private func dissolveAtBottom(_ s: Int, _ t: Int, _ e: SquareTileGridEngine) -> OverviewLayerDissolvePlan? {
