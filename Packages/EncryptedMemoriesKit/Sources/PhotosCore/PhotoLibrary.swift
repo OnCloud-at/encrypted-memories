@@ -139,7 +139,7 @@ public struct FavoriteMutationError: LocalizedError, Sendable, Equatable {
     }
 }
 
-/// Read + write of the favorites tag. Reads retain the Photos tag listing because SDK 0.29.0 does
+/// Read + write of the favorites tag. Reads retain the Photos tag listing because SDK 0.29.1 does
 /// not expose complete timeline tags; writes use one SDK `updatePhotos` batch and validate every
 /// per-node result.
 public protocol FavoritesProvider: Sendable {
@@ -153,6 +153,33 @@ public extension FavoritesProvider {
     }
 }
 
+/// Result of one "Save to Library" request. Every requested photo is either saved or failed.
+public struct PhotoLibrarySaveResult: Sendable, Equatable {
+    public let saved: Set<PhotoUID>
+    public let failed: Set<PhotoUID>
+
+    public init(saved: Set<PhotoUID>, failed: Set<PhotoUID>) {
+        self.saved = saved
+        self.failed = failed
+    }
+
+    /// Localized outcome for the banner or alert that follows the request.
+    public var message: String {
+        if failed.isEmpty {
+            return saved.count == 1
+                ? L10n.string("library.save_to_library_done_one")
+                : L10n.string("library.save_to_library_done_many \(saved.count)")
+        }
+        return L10n.string("library.save_to_library_partial \(failed.count) \(saved.count + failed.count)")
+    }
+}
+
+/// Copies photos from another account's shared album into the signed-in account's own photo library.
+/// The backend also copies Live Photo and burst companions and reports one outcome per requested photo.
+public protocol PhotoLibrarySaving: Sendable {
+    func saveToLibrary(_ uids: [PhotoUID]) async throws -> PhotoLibrarySaveResult
+}
+
 /// Move photos to / restore from the Proton trash.
 public protocol TrashProvider: Sendable {
     func trash(_ uids: [PhotoUID]) async throws
@@ -162,7 +189,7 @@ public protocol TrashProvider: Sendable {
 
 /// Optional backend capability: load a filtered/album timeline. Album catalog reads live in
 /// AlbumCore's SDK-backed repository; tag/album contents retain the direct Photos endpoints because
-/// SDK 0.29.0 omits Tags and RelatedPhotos needed for Live Photos and bursts.
+/// SDK 0.29.1 omits Tags and RelatedPhotos needed for Live Photos and bursts.
 public protocol PhotoLibraryProvider: Sendable {
     func timeline(filter: PhotoFilter) async throws -> [TimelineSection]
 }

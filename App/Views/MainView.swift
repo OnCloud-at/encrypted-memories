@@ -114,6 +114,7 @@ struct MainView: View {
     @State private var confirmEmptyTrash = false
     @State private var isTrashMutating = false
     @State private var isEmptyingTrash = false
+    @State private var isSavingToLibrary = false
     @State private var confirmDeleteAlbum = false
     @State private var isDeletingAlbum = false
     @State private var albumDeleteFailureMessage: String?
@@ -1919,27 +1920,44 @@ struct MainView: View {
                     .disabled(!viewerModel.canDownloadCurrentSelection)
                 }
 
-                Button {
-                    mutateFavorites([viewerModel.current.uid])
-                } label: {
-                    Label(
-                        favorites.contains(viewerModel.current.uid) ? "toolbar.remove_favorite" : "toolbar.favorite",
-                        systemImage: favorites.contains(viewerModel.current.uid) ? "heart.fill" : "heart"
+                if viewerMutationAction == .saveToLibrary {
+                    saveToLibraryButton(uids: [viewerModel.current.uid])
+                } else {
+                    Button {
+                        mutateFavorites([viewerModel.current.uid])
+                    } label: {
+                        Label(
+                            favorites.contains(viewerModel.current.uid)
+                                ? "toolbar.remove_favorite" : "toolbar.favorite",
+                            systemImage: favorites.contains(viewerModel.current.uid) ? "heart.fill" : "heart"
+                        )
+                        .labelStyle(.iconOnly)
+                    }
+                    .help(
+                        favorites.contains(viewerModel.current.uid) ? "toolbar.remove_favorite" : "toolbar.favorite"
                     )
-                    .labelStyle(.iconOnly)
+                    .accessibilityLabel(
+                        favorites.contains(viewerModel.current.uid) ? "toolbar.remove_favorite" : "toolbar.favorite")
                 }
-                .help(favorites.contains(viewerModel.current.uid) ? "toolbar.remove_favorite" : "toolbar.favorite")
-                .accessibilityLabel(
-                    favorites.contains(viewerModel.current.uid) ? "toolbar.remove_favorite" : "toolbar.favorite")
 
                 Menu {
-                    if viewerMutationAction == .restore {
+                    switch viewerMutationAction {
+                    case .restore:
                         Button {
                             performViewerMutation(viewerModel.current)
                         } label: {
                             Label("toolbar.restore_from_trash", systemImage: "arrow.uturn.backward")
                         }
-                    } else {
+                    case .saveToLibrary:
+                        Button {
+                            performViewerMutation(viewerModel.current)
+                        } label: {
+                            Label(
+                                L10n.string("library.save_to_library"),
+                                systemImage: PhotoContextMenuAction.saveToLibrary.systemImage)
+                        }
+                        .disabled(isSavingToLibrary)
+                    case .moveToTrash:
                         Button(role: .destructive) {
                             performViewerMutation(viewerModel.current)
                         } label: {
@@ -2056,6 +2074,12 @@ struct MainView: View {
                     .accessibilityLabel("toolbar.set_album_cover")
                 }
             }
+        } else if selection.isReadOnly {
+            // Shared albums live on another account's volume: download and Save to Library only.
+            ToolbarItemGroup(placement: .secondaryAction) {
+                downloadActionItem
+                saveToLibraryButton(uids: selectedUIDs)
+            }
         } else {
             ToolbarItemGroup(placement: .secondaryAction) {
                 downloadActionItem
@@ -2128,6 +2152,47 @@ struct MainView: View {
             requestTrash([item], closeViewer: true)
         case .restore:
             restorePhotos([item], closeViewer: true)
+        case .saveToLibrary:
+            saveToLibrary([item.uid])
+        }
+    }
+
+    /// Copies photos from a shared album into the own library. The shared originals stay unchanged.
+    private func saveToLibraryButton(uids: Set<PhotoUID>) -> some View {
+        Button {
+            saveToLibrary(Array(uids))
+        } label: {
+            if isSavingToLibrary {
+                ProgressView().controlSize(.small)
+            } else {
+                Label(
+                    L10n.string("library.save_to_library"),
+                    systemImage: PhotoContextMenuAction.saveToLibrary.systemImage
+                )
+                .labelStyle(.iconOnly)
+            }
+        }
+        .disabled(uids.isEmpty || isSavingToLibrary)
+        .help(L10n.string("library.save_to_library"))
+        .accessibilityLabel(L10n.string("library.save_to_library"))
+    }
+
+    /// Reuses the view's single title-and-message alert: the body modifier chain has no room for another alert.
+    private func saveToLibrary(_ uids: [PhotoUID]) {
+        guard !uids.isEmpty, !isSavingToLibrary else { return }
+        isSavingToLibrary = true
+        Task { @MainActor in
+            defer { isSavingToLibrary = false }
+            do {
+                let result = try await backend.saveToLibrary(uids)
+                exportFailureTitle = L10n.string("library.save_to_library")
+                exportFailureMessage = result.message
+                if !result.saved.isEmpty { refreshLibraryManually() }
+            } catch {
+                DebugLog.log("save to library failed: \(error)")
+                exportFailureTitle = L10n.string("library.save_to_library_failed")
+                exportFailureMessage = error.localizedDescription
+            }
         }
     }
 

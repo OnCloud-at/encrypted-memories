@@ -14,6 +14,7 @@ public typealias PhotosBackend = PhotosRepository
     & BurstGroupProvider
     & PhotoLibraryProvider
     & FavoritesProvider
+    & PhotoLibrarySaving
     & TrashProvider
     & LibraryStatsProvider
     & PhotoDimensionRecording

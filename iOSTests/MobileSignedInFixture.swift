@@ -175,6 +175,9 @@ struct MobileFixtureBackend: PhotosBackend {
     func setFavorites(_ uids: [PhotoUID], _ favorite: Bool) async throws {
         try await favoriteWriter?(uids, favorite)
     }
+    func saveToLibrary(_ uids: [PhotoUID]) async throws -> PhotoLibrarySaveResult {
+        PhotoLibrarySaveResult(saved: Set(uids), failed: [])
+    }
     func trash(_ uids: [PhotoUID]) async throws {}
     func restore(_ uids: [PhotoUID]) async throws {}
     func emptyTrash() async throws {}

@@ -756,6 +756,20 @@ final class MobileLibraryModel {
         sourceAnalysis.enqueueLifecycle { await $0.setActive(active) }
     }
 
+    /// Copies shared photos into the account's own library and refreshes it so the copies appear. Returns `nil`
+    /// when the request failed as a whole; a partial result names the photos that were not saved.
+    func saveToLibrary(_ uids: [PhotoUID]) async -> PhotoLibrarySaveResult? {
+        guard let backend else { return nil }
+        do {
+            let result = try await backend.saveToLibrary(uids)
+            if !result.saved.isEmpty { refreshAfterLocalUpload() }
+            return result
+        } catch {
+            DebugLog.log("save to library failed: \(error)")
+            return nil
+        }
+    }
+
     /// Local upload completion is authoritative enough to refresh immediately; repeated signals coalesce.
     func refreshAfterLocalUpload() {
         guard let recoverySession = session, let refreshLease = currentMutationLease() else { return }
