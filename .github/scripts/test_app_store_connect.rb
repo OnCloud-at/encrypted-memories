@@ -1686,7 +1686,8 @@ class AppStoreConnectTest < Minitest::Test
   end
 
   def test_stable_release_refuses_ambiguous_review_history_before_mutating_either_platform
-    %w[IN_REVIEW COMPLETE].each do |state|
+    # Two open attempts, undated completed attempts, or completed attempts with the same date stay ambiguous.
+    [["IN_REVIEW", nil], ["COMPLETE", nil], ["COMPLETE", "2026-09-18T09:14:40Z"]].each do |state, date|
       versions = {
         "IOS" => [app_store_version(platform: "IOS", version: "1.0.1", state: "IN_REVIEW")],
         "MAC_OS" => [app_store_version(platform: "MAC_OS", version: "1.0.3", state: "WAITING_FOR_REVIEW")]
@@ -1694,6 +1695,7 @@ class AppStoreConnectTest < Minitest::Test
       submissions = (0..1).map do |index|
         item = review_submission(platform: "IOS", version_id: "version-IOS-1.0.1", state: state)
         item["id"] = "review-IOS-#{index}"
+        item["attributes"]["submittedDate"] = date if date
         item
       end
       client = FakeAppStoreConnectClient.new(app_store_versions: versions, review_submissions: submissions)
@@ -2220,6 +2222,44 @@ class AppStoreConnectTest < Minitest::Test
       method == :patch && body.dig(:data, :attributes, :canceled) == true
     end
     assert_equal 2, cancellation_count
+  end
+
+  def test_approved_release_with_resubmission_history_cancels_its_latest_completed_review
+    [false, true].each do |newest_first|
+      versions = AppStoreConnect::PLATFORMS.to_h do |platform|
+        [platform, [app_store_version(platform: platform, version: "1.0.3", state: "PENDING_DEVELOPER_RELEASE")]]
+      end
+      older = review_submission(platform: "IOS", version_id: "version-IOS-1.0.3", state: "COMPLETE")
+      older["id"] = "earlier-review-IOS"
+      older["attributes"]["submittedDate"] = "2026-09-18T06:59:02Z"
+      newer = review_submission(platform: "IOS", version_id: "version-IOS-1.0.3", state: "COMPLETE")
+      newer["id"] = "approved-review-IOS"
+      newer["attributes"]["submittedDate"] = "2026-09-18T09:14:40Z"
+      mac = review_submission(platform: "MAC_OS", version_id: "version-MAC_OS-1.0.3", state: "COMPLETE")
+      mac["attributes"]["submittedDate"] = "2026-09-18T09:15:03Z"
+      ios_history = newest_first ? [newer, older] : [older, newer]
+      client = FakeAppStoreConnectClient.new(app_store_versions: versions, review_submissions: ios_history + [mac])
+      manager = AppStoreConnect::ReleaseManager.new(
+        client: client, app_id: "6805117080", output_path: nil, summary_path: nil,
+        sleeper: ->(_seconds) {}, monotonic_clock: -> { 0 }
+      )
+
+      manager.prepare_app_store(
+        version: "1.0.4", build_number: "714", submit: true, create_versions: true, automatic_release: true
+      )
+
+      cancellations = client.calls.filter_map do |method, path, body|
+        path if method == :patch && body.dig(:data, :attributes, :canceled) == true
+      end
+      assert_equal ["/v1/reviewSubmissions/approved-review-IOS", "/v1/reviewSubmissions/old-review-MAC_OS"].sort,
+                   cancellations.sort
+      AppStoreConnect::PLATFORMS.each do |platform|
+        assert client.calls.any? { |method, path, body|
+          method == :patch && path == "/v1/appStoreVersions/version-#{platform}-1.0.3" &&
+            body.dig(:data, :attributes, :versionString) == "1.0.4"
+        }, "#{platform} must reuse its approved version record for 1.0.4"
+      end
+    end
   end
 
   def test_release_refuses_to_replace_a_newer_reviewed_version
