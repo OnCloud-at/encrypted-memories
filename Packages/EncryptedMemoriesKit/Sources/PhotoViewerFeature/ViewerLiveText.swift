@@ -17,11 +17,15 @@ enum ViewerLiveText {
         guard ImageAnalyzer.isSupported else { return nil }
         // A fresh configuration per request: the value is not Sendable, so it cannot live in shared state.
         let configuration = ImageAnalyzer.Configuration([.text, .machineReadableCode])
-        guard
-            let analysis = try? await analyzer.analyze(image, orientation: .up, configuration: configuration),
-            analysis.hasResults(for: [.text, .machineReadableCode])
-        else { return nil }
-        return analysis
+        do {
+            let analysis = try await analyzer.analyze(image, orientation: .up, configuration: configuration)
+            return analysis.hasResults(for: [.text, .machineReadableCode]) ? analysis : nil
+        } catch {
+            if !(error is CancellationError) {
+                PhotoDiagnostics.shared.emitDebug("LiveText", ["result": "analysisFailed"])
+            }
+            return nil
+        }
     }
 }
 

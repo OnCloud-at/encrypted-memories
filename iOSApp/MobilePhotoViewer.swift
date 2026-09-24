@@ -1103,10 +1103,10 @@ struct MobileImagePage: View {
         }
     }
 
-    /// Recognizes text in the displayed still of the current page. A sharper image replaces the analysis; a grid
-    /// thumbnail is too small for useful text and is skipped.
+    /// Recognizes text in the displayed still of the current page. A sharper image replaces the analysis; the grid
+    /// thumbnail shown while the display image loads is skipped.
     private func analyzeLiveText() async {
-        guard isCurrent, let image, MobileLiveText.isUsable(image) else {
+        guard isCurrent, let image, displayedCap > 0 else {
             liveTextAnalysis = nil
             onLiveTextAvailable(item.uid, false)
             return
@@ -2454,12 +2454,12 @@ struct MobileZoomableImage: UIViewRepresentable {
             imageView.isUserInteractionEnabled = true
         }
 
-        /// True when `gesture` is on highlighted text or a highlighted code.
+        /// True when `gesture` is on highlighted text, a highlighted code, or another highlighted item.
         private func liveTextOwns(_ gesture: UIGestureRecognizer) -> Bool {
             guard let interaction = liveTextInteraction, let imageView, interaction.analysis != nil,
                 interaction.selectableItemsHighlighted
             else { return false }
-            return interaction.analysisHasText(at: gesture.location(in: imageView))
+            return interaction.hasInteractiveItem(at: gesture.location(in: imageView))
         }
 
         func interaction(

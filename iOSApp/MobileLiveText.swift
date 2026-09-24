@@ -10,15 +10,8 @@ enum MobileLiveText {
     /// Symbol of the viewer action that shows or hides the recognized text.
     static let systemImage = "text.viewfinder"
 
-    /// Grid thumbnails are too small for reliable text; the viewer analyzes its sharper display image instead.
-    static let minimumLongestPixelSide: CGFloat = 1_024
-
     private static let analyzer = ImageAnalyzer()
     private static let configuration = ImageAnalyzer.Configuration([.text, .machineReadableCode])
-
-    static func isUsable(_ image: UIImage) -> Bool {
-        max(image.size.width, image.size.height) * image.scale >= minimumLongestPixelSide
-    }
 
     /// Analyzes one displayed still. Returns `nil` when the device has no Live Text support, the analysis fails,
     /// or the image contains neither text nor a code.
