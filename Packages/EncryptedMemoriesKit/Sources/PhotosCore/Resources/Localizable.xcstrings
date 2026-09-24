@@ -37,6 +37,18 @@
         "en": { "stringUnit": { "state": "translated", "value": "Couldn’t save to your library" } }
       }
     },
+    "viewer.live_text_show": {
+      "localizations": {
+        "de": { "stringUnit": { "state": "translated", "value": "Text anzeigen" } },
+        "en": { "stringUnit": { "state": "translated", "value": "Show Text" } }
+      }
+    },
+    "viewer.live_text_hide": {
+      "localizations": {
+        "de": { "stringUnit": { "state": "translated", "value": "Text ausblenden" } },
+        "en": { "stringUnit": { "state": "translated", "value": "Hide Text" } }
+      }
+    },
     "contextmenu.share": {
       "localizations": {
         "de": { "stringUnit": { "state": "translated", "value": "Teilen" } },

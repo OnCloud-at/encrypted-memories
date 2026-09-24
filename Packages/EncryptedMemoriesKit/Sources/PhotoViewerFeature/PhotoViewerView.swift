@@ -355,7 +355,9 @@ public struct PhotoViewerView: View {
                     onZoomChanged: { zoom in
                         guard zoom > 1.01 else { return }
                         model.requestOriginal(maxPixelSize: ViewerImageLoadPolicy.maxZoomedPixelSize)
-                    })
+                    },
+                    liveTextAnalysis: model.liveTextAnalysis,
+                    liveTextHighlighted: model.liveTextHighlighted)
                 // Framed to the displayed photo rect (magnification/pan-transformed), so a zoomed-in Live Photo
                 // plays its motion at the same zoom/position as the still - never an unzoomed clip on top.
                 if model.current.isLivePhoto, let motion = model.motionPlayer {
@@ -380,6 +382,12 @@ public struct PhotoViewerView: View {
             // Apple). Kept small per the Live Photo feel.
             .scaleEffect(model.isMotionPlaying ? mediaTransition.liveMotionScale : 1.0)
             .animation(mediaTransition.scaleAnimation, value: model.isMotionPlaying)
+            // On-device Live Text follows the displayed image; a sharper image replaces the analysis.
+            .task(
+                id: ViewerLiveTextTaskID(uid: model.current.uid, image: ObjectIdentifier(image), isSharp: model.isSharp)
+            ) {
+                await model.refreshLiveText()
+            }
         }
     }
 

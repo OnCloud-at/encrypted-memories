@@ -6,6 +6,7 @@ import MediaByteCache
 import MediaCache
 import PhotoViewerCore
 import PhotosCore
+import VisionKit
 
 /// Drives the full-screen viewer with progressive quality: grid thumbnail, bounded preview, then original.
 ///
@@ -23,6 +24,11 @@ public final class PhotoViewerModel {
     public private(set) var image: NSImage?
     /// True once a bounded original representation is shown - drives the crossfade reveal from the interim image.
     public private(set) var isSharp = false
+    /// On-device Live Text of the displayed sharp still. `nil` while the photo loads or has no text.
+    public private(set) var liveTextAnalysis: ImageAnalysis?
+    /// Highlights the recognized text. Every photo starts unhighlighted.
+    public var liveTextHighlighted = false
+    public var hasLiveText: Bool { liveTextAnalysis != nil }
     /// Owns the AVPlayer + the video state machine (streaming, watchdog, stall/buffer handling). The
     /// model decides *which* source to play; the controller decides *how it's going*.
     public let video: VideoPlaybackController
@@ -454,6 +460,20 @@ public final class PhotoViewerModel {
         )
     }
 
+    /// Recognizes text in the displayed still once the sharp image is shown. The view restarts it whenever the
+    /// displayed image changes; a result for a photo that is no longer shown is dropped.
+    public func refreshLiveText() async {
+        guard isSharp, player == nil, let image else {
+            liveTextAnalysis = nil
+            return
+        }
+        let uid = current.uid
+        let analysis = await ViewerLiveText.analyze(image)
+        guard !Task.isCancelled, current.uid == uid, self.image === image else { return }
+        liveTextAnalysis = analysis
+        if analysis == nil { liveTextHighlighted = false }
+    }
+
     private func loadCurrent() {
         burstTask?.cancel()
         burstSelection.reset()
@@ -469,6 +489,8 @@ public final class PhotoViewerModel {
     private func loadDisplayedItem(_ item: PhotoItem) {
         originalLoadGeneration &+= 1
         loadTask?.cancel()
+        liveTextAnalysis = nil
+        liveTextHighlighted = false
         video.reset()
         motion.teardown()
         originalProgress = 0

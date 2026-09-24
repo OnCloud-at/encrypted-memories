@@ -12,6 +12,7 @@ import PhotoViewerUIKitAdapter
 import PhotosCore
 import SwiftUI
 import UIKit
+import VisionKit
 
 /// Native full-screen photo/video viewer. Paging + chrome live here (pure presentation); the media decoding,
 /// titles, video-playback and pinch-to-close semantics come from shared `PhotoViewerCore` and the shared
@@ -36,6 +37,9 @@ struct MobilePhotoViewer: View {
     @State private var showFavoriteError = false
     @State private var isSavingToLibrary = false
     @State private var saveToLibraryMessage: String?
+    /// The page whose displayed still has recognized text, and whether that text is highlighted.
+    @State private var liveTextUID: PhotoUID?
+    @State private var liveTextHighlighted = false
     @State private var favoriteTask: Task<Void, Never>?
     @State private var favoriteRequestGeneration: UInt64 = 0
     @State private var restoreTask: Task<Void, Never>?
@@ -125,6 +129,15 @@ struct MobilePhotoViewer: View {
                         resolvedMediaKind: resolvedMediaKinds[item.uid],
                         libraryModel: libraryModel,
                         imageStore: imageStore,
+                        liveTextHighlighted: isCurrent && liveTextHighlighted,
+                        onLiveTextAvailable: { uid, available in
+                            if available {
+                                liveTextUID = uid
+                            } else if liveTextUID == uid {
+                                liveTextUID = nil
+                                liveTextHighlighted = false
+                            }
+                        },
                         onToggleChrome: {
                             withAnimation(
                                 MobileViewerMotionPolicy.animation(
@@ -234,6 +247,7 @@ struct MobilePhotoViewer: View {
         }
         .onChange(of: currentBaseItem?.uid) { _, _ in
             cancelViewerMutationPresentation()
+            liveTextHighlighted = false
         }
         .onDisappear {
             cancelViewerMutationPresentation()
@@ -474,6 +488,17 @@ struct MobilePhotoViewer: View {
             Label(String(localized: "viewer.share_action"), systemImage: "square.and.arrow.up")
         }
         .disabled(currentBaseItem == nil || selection.isBusy)
+
+        if currentBaseItem?.uid != nil, liveTextUID == currentBaseItem?.uid {
+            Button {
+                liveTextHighlighted.toggle()
+            } label: {
+                Label(
+                    liveTextHighlighted ? L10n.string("viewer.live_text_hide") : L10n.string("viewer.live_text_show"),
+                    systemImage: MobileLiveText.systemImage
+                )
+            }
+        }
 
         Divider()
 
@@ -878,6 +903,8 @@ private struct MobileViewerPage: View {
     let resolvedMediaKind: MediaKind?
     let libraryModel: MobileLibraryModel
     let imageStore: UIKitViewerImageStore
+    let liveTextHighlighted: Bool
+    let onLiveTextAvailable: (PhotoUID, Bool) -> Void
     let onToggleChrome: () -> Void
     let onCloseRequested: () -> Void
 
@@ -897,6 +924,8 @@ private struct MobileViewerPage: View {
                 isCurrent: isCurrent,
                 imageStore: imageStore,
                 streamer: libraryModel.backend,
+                liveTextHighlighted: liveTextHighlighted,
+                onLiveTextAvailable: onLiveTextAvailable,
                 onToggleChrome: onToggleChrome,
                 onCloseRequested: onCloseRequested
             )
@@ -915,6 +944,8 @@ struct MobileImagePage: View {
     let imageStore: UIKitViewerImageStore
     /// The shared streamer used to preload the current Live Photo's encrypted motion clip.
     let streamer: (any VideoStreamProvider)?
+    var liveTextHighlighted = false
+    var onLiveTextAvailable: (PhotoUID, Bool) -> Void = { _, _ in }
     let onToggleChrome: () -> Void
     let onCloseRequested: () -> Void
 
@@ -939,6 +970,8 @@ struct MobileImagePage: View {
     @State private var didFullResolutionStillFail = false
     /// Shared Live Photo motion controller for the current page.
     @State private var motion = LivePhotoMotionController()
+    /// On-device Live Text of the displayed still, for the current page only.
+    @State private var liveTextAnalysis: ImageAnalysis?
     /// Actual page viewport, including iPad split-view and future resizable form factors. A global
     /// screen bound over-decodes small windows and becomes wrong after a live resize.
     @State private var viewportSize: CGSize = .zero
@@ -959,7 +992,9 @@ struct MobileImagePage: View {
                         } : nil,
                     onMotionStop: item.isLivePhoto ? { motion.stop() } : nil,
                     onPhotoFrameChanged: { photoFrame = $0 },
-                    onZoomSettled: { loadZoomedDecodeIfNeeded(zoom: $0) }
+                    onZoomSettled: { loadZoomedDecodeIfNeeded(zoom: $0) },
+                    liveTextAnalysis: isCurrent ? liveTextAnalysis : nil,
+                    liveTextHighlighted: isCurrent && liveTextHighlighted
                 )
             } else if livePhotoReadiness == .notApplicable {
                 ProgressView().tint(.white)
@@ -1045,6 +1080,9 @@ struct MobileImagePage: View {
         .task(id: MobileLivePhotoMotionTaskID(item: item, isCurrent: isCurrent)) {
             prepareOrStopMotion()
         }
+        .task(id: MobileLiveTextTaskID(uid: item.uid, isCurrent: isCurrent, image: image.map(ObjectIdentifier.init))) {
+            await analyzeLiveText()
+        }
         .onChange(of: isCurrent) { _, current in
             if !current { cancelZoomDecode() }
         }
@@ -1063,6 +1101,20 @@ struct MobileImagePage: View {
             }
             motion.teardown()
         }
+    }
+
+    /// Recognizes text in the displayed still of the current page. A sharper image replaces the analysis; a grid
+    /// thumbnail is too small for useful text and is skipped.
+    private func analyzeLiveText() async {
+        guard isCurrent, let image, MobileLiveText.isUsable(image) else {
+            liveTextAnalysis = nil
+            onLiveTextAvailable(item.uid, false)
+            return
+        }
+        let analysis = await MobileLiveText.analyze(image)
+        guard !Task.isCancelled, isCurrent else { return }
+        liveTextAnalysis = analysis
+        onLiveTextAvailable(item.uid, analysis != nil)
     }
 
     /// Preloads only the current page. The task identity excludes viewport changes, so resizing cannot restart it.
@@ -2008,6 +2060,11 @@ struct MobileZoomableImage: UIViewRepresentable {
     /// Fired when a zoom gesture or animation settles, with the final zoom scale. The page uses it to swap in a
     /// sharper decode sized for that zoom (never during the gesture, so the interaction stays fluid).
     var onZoomSettled: ((CGFloat) -> Void)? = nil
+    /// On-device Live Text for the displayed still. `nil` removes text interaction from the photo.
+    var liveTextAnalysis: ImageAnalysis? = nil
+    /// Highlights the recognized text and makes it selectable. A Live Photo needs this, because its long press
+    /// plays the motion; a still also selects text with a long press directly on the text.
+    var liveTextHighlighted = false
 
     func makeUIView(context: Context) -> UIScrollView {
         let scrollView = MobileViewerZoomScrollView()
@@ -2040,7 +2097,7 @@ struct MobileZoomableImage: UIViewRepresentable {
         scrollView.addGestureRecognizer(doubleTap)
 
         let singleTap = UITapGestureRecognizer(
-            target: context.coordinator, action: #selector(Coordinator.handleSingleTap))
+            target: context.coordinator, action: #selector(Coordinator.handleSingleTap(_:)))
         singleTap.numberOfTapsRequired = 1
         singleTap.require(toFail: doubleTap)
         scrollView.addGestureRecognizer(singleTap)
@@ -2071,6 +2128,7 @@ struct MobileZoomableImage: UIViewRepresentable {
             longPress.minimumPressDuration = 0.3
             longPress.delegate = context.coordinator
             scrollView.addGestureRecognizer(longPress)
+            context.coordinator.motionPress = longPress
         }
 
         return scrollView
@@ -2084,6 +2142,11 @@ struct MobileZoomableImage: UIViewRepresentable {
         context.coordinator.onPhotoFrameChanged = onPhotoFrameChanged
         context.coordinator.onZoomSettled = onZoomSettled
         context.coordinator.reduceMotion = reduceMotion
+        context.coordinator.updateLiveText(
+            analysis: liveTextAnalysis,
+            highlighted: liveTextHighlighted,
+            requiresHighlight: onMotionStart != nil
+        )
         if context.coordinator.imageView?.image !== image {
             context.coordinator.imageView?.image = image
             // Geometry must be current before SwiftUI presents the replacement image. Reporting the new
@@ -2106,7 +2169,9 @@ struct MobileZoomableImage: UIViewRepresentable {
         )
     }
 
-    final class Coordinator: NSObject, UIScrollViewDelegate, UIGestureRecognizerDelegate {
+    final class Coordinator: NSObject, UIScrollViewDelegate, UIGestureRecognizerDelegate,
+        ImageAnalysisInteractionDelegate
+    {
         var imageView: UIImageView?
         weak var scrollView: UIScrollView?
         var onSingleTap: () -> Void
@@ -2122,6 +2187,9 @@ struct MobileZoomableImage: UIViewRepresentable {
         private var dismissPinchActive = false
         private var pinchStartCentroid: CGPoint = .zero
         weak var dismissPan: UIPanGestureRecognizer?
+        weak var motionPress: UILongPressGestureRecognizer?
+        private var liveTextInteraction: ImageAnalysisInteraction?
+        private var liveTextRequiresHighlight = false
         private var dismissPanActive = false
         private var motionActive = false
         private var updatingZoomGeometry = false
@@ -2237,6 +2305,7 @@ struct MobileZoomableImage: UIViewRepresentable {
             lastZoomViewport = viewport
             lastZoomMediaSize = image.size
             updatingZoomGeometry = false
+            liveTextInteraction?.setContentsRectNeedsUpdate()
             if reportChanges { reportPhotoFrame() }
         }
 
@@ -2289,6 +2358,10 @@ struct MobileZoomableImage: UIViewRepresentable {
         /// horizontal drag then falls through to the page TabView's paging swipe, and a zoomed image keeps its
         /// scroll-view pan. Every other recognizer begins normally.
         func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
+            // While text is highlighted, a press on text selects it instead of playing the Live Photo.
+            if gestureRecognizer === motionPress {
+                return !liveTextOwns(gestureRecognizer)
+            }
             guard gestureRecognizer === dismissPan, let scrollView else { return true }
             let isZoomedIn = scrollView.zoomScale > scrollView.minimumZoomScale + 0.01
             guard !isZoomedIn else { return false }
@@ -2344,7 +2417,62 @@ struct MobileZoomableImage: UIViewRepresentable {
             }
         }
 
-        @objc func handleSingleTap() { onSingleTap() }
+        @objc func handleSingleTap(_ gesture: UITapGestureRecognizer) {
+            // A tap that clears a text selection or opens a highlighted item belongs to Live Text, not to the chrome.
+            if let interaction = liveTextInteraction, interaction.hasActiveTextSelection || liveTextOwns(gesture) {
+                return
+            }
+            onSingleTap()
+        }
+
+        // MARK: Live Text
+
+        func updateLiveText(analysis: ImageAnalysis?, highlighted: Bool, requiresHighlight: Bool) {
+            guard let imageView else { return }
+            liveTextRequiresHighlight = requiresHighlight
+            guard let analysis else {
+                liveTextInteraction?.selectableItemsHighlighted = false
+                liveTextInteraction?.analysis = nil
+                imageView.isUserInteractionEnabled = false
+                return
+            }
+            let interaction: ImageAnalysisInteraction
+            if let existing = liveTextInteraction {
+                interaction = existing
+            } else {
+                interaction = ImageAnalysisInteraction(self)
+                interaction.preferredInteractionTypes = .automaticTextOnly
+                // The viewer toolbar owns the Show Text action; the system button would scale with the zoom.
+                interaction.isSupplementaryInterfaceHidden = true
+                imageView.addInteraction(interaction)
+                liveTextInteraction = interaction
+            }
+            if interaction.analysis !== analysis { interaction.analysis = analysis }
+            if interaction.selectableItemsHighlighted != highlighted {
+                interaction.selectableItemsHighlighted = highlighted
+            }
+            imageView.isUserInteractionEnabled = true
+        }
+
+        /// True when `gesture` is on highlighted text or a highlighted code.
+        private func liveTextOwns(_ gesture: UIGestureRecognizer) -> Bool {
+            guard let interaction = liveTextInteraction, let imageView, interaction.analysis != nil,
+                interaction.selectableItemsHighlighted
+            else { return false }
+            return interaction.analysisHasText(at: gesture.location(in: imageView))
+        }
+
+        func interaction(
+            _ interaction: ImageAnalysisInteraction,
+            shouldBeginAt point: CGPoint,
+            for interactionType: ImageAnalysisInteraction.InteractionTypes
+        ) -> Bool {
+            if interaction.selectableItemsHighlighted { return true }
+            // Unhighlighted text only starts a selection on a still. Taps, double taps, and a Live Photo's long press
+            // keep their viewer meaning.
+            guard !liveTextRequiresHighlight, interactionType.contains(.textSelection) else { return false }
+            return interaction.analysisHasText(at: point)
+        }
 
         @objc func handleDoubleTap(_ gesture: UITapGestureRecognizer) {
             guard let scrollView = gesture.view as? UIScrollView else { return }

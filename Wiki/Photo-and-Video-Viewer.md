@@ -16,6 +16,15 @@ The Viewer opens photos, videos, Live Photos, and burst media without leaving th
 
 Album changes are available from Library selection, not from the Viewer.
 
+## Live Text
+
+When a photo contains text or a QR or bar code, you can select and copy the text directly in the Viewer. Phone numbers, links, addresses, and dates become actions you can use.
+
+- **iPhone and iPad:** touch and hold the text to select it. On a Live Photo, touching and holding plays the motion, so choose **Show Text** in the more-actions menu first. **Show Text** also highlights all recognized text and codes on any photo.
+- **Mac:** drag across the text to select it. **Show Text** in the more-actions menu highlights the recognized text and codes.
+
+Text recognition runs on your device. The app requests only text and codes; Visual Look Up and subject lifting stay off, so no image content leaves your device for recognition. Live Text needs a device that supports it.
+
 ## Platform controls
 
 - **iPhone and iPad:** Swipe between pages and use native touch, pinch, drag, and long-press gestures. Viewer actions use top and bottom chrome.
