@@ -183,6 +183,7 @@ public actor MLSmartSearchLifecycle {
     private var acceptedIndexProgressSettled = 0
     private var observers: [UUID: AsyncStream<MLSmartSearchSnapshot>.Continuation] = [:]
     private var kickWaiters: [UUID: CheckedContinuation<Void, Never>] = [:]
+    private var kickTimeoutTasks: [UUID: Task<Void, Never>] = [:]
     /// Monotonic wake token. A library or condition change that arrives during a pass must be
     /// observed before the indexing loop parks after that pass.
     private var kickGeneration: UInt64 = 0
@@ -2188,11 +2189,7 @@ public actor MLSmartSearchLifecycle {
 
     private func kick() {
         kickGeneration &+= 1
-        let waiters = kickWaiters
-        kickWaiters = [:]
-        for waiter in waiters.values {
-            waiter.resume()
-        }
+        for id in Array(kickWaiters.keys) { resumeKickWaiter(id) }
     }
 
     private func waitForKick(timeout: Duration?, since observedGeneration: UInt64) async {
@@ -2213,8 +2210,8 @@ public actor MLSmartSearchLifecycle {
                 }
                 kickWaiters[id] = continuation
                 if let timeout {
-                    Task { [weak self] in
-                        try? await Task.sleep(for: timeout)
+                    kickTimeoutTasks[id] = Task { [weak self] in
+                        do { try await Task.sleep(for: timeout) } catch { return }
                         await self?.resumeKickWaiter(id)
                     }
                 }
@@ -2225,6 +2222,7 @@ public actor MLSmartSearchLifecycle {
     }
 
     private func resumeKickWaiter(_ id: UUID) {
+        kickTimeoutTasks.removeValue(forKey: id)?.cancel()
         guard let waiter = kickWaiters.removeValue(forKey: id) else { return }
         waiter.resume()
     }
@@ -2567,7 +2565,15 @@ public actor MLSmartSearchLifecycle {
 
         catalogRefreshInProgress = true
         defer { catalogRefreshInProgress = false }
-        guard let refreshed = try? await deps.catalogProvider.catalog() else { return }
+        let refreshed: MLModelCatalog
+        do {
+            refreshed = try await deps.catalogProvider.catalog()
+        } catch {
+            PhotoDiagnostics.shared.emit(
+                "MLCatalogRefresh", ["errorKind": error is CancellationError ? "cancelled" : "provider"],
+                throttleSeconds: 60)
+            return
+        }
         guard !isShutDown, persistent.isEnabled else { return }
         lastCatalogRefreshAt = now
         let previousCatalog = catalog

@@ -631,6 +631,12 @@ public final class PhotoDiagnostics: @unchecked Sendable {
             allowedFields = ["diagnosticPayloads", "metricPayloads"]
         case "SearchSuggestions":
             allowedFields = ["action", "result", "durationMs"]
+        case "DeviceIdentityKeychain":
+            allowedFields = ["operation", "status"]
+        case "MLCatalogRefresh":
+            allowedFields = ["errorKind"]
+        case "MetalGridRenderer":
+            allowedFields = ["compositePipeline"]
         default:
             return nil
         }

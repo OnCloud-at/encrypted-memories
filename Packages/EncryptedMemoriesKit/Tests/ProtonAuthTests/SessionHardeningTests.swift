@@ -65,6 +65,18 @@ struct SessionHardeningTests {
         #expect(store.loadOrCreate() == first)
     }
 
+    @Test func deviceIdentityReturnsEphemeralUUIDWhenKeychainFails() {
+        let store = DeviceIdentityKeychainStore(
+            service: "at.oncloud.encryptedmemories.device.tests", account: "installation",
+            keychain: FailingAppleKeychainStore()
+        )
+        let first = store.loadOrCreate()
+        let second = store.loadOrCreate()
+        #expect(UUID(uuidString: first) != nil)
+        #expect(UUID(uuidString: second) != nil)
+        #expect(first != second)
+    }
+
     @Test func fullPurgeCompletesMarkerOnlyAfterFilesAndKeychainSucceed() throws {
         let suite = "auth-purge-test-\(UUID().uuidString)"
         let defaults = try #require(UserDefaults(suiteName: suite))
@@ -257,6 +269,24 @@ private struct NonPersistingAppleKeychainStore: AppleKeychainStoring {
     func dataOrInsert(_ data: Data, for item: AppleKeychainItem) throws -> Data { data }
     func removeData(for item: AppleKeychainItem) throws {}
     func removeAllData(service: String) throws {}
+}
+
+private struct FailingAppleKeychainStore: AppleKeychainStoring {
+    func data(for item: AppleKeychainItem) throws -> Data? {
+        throw AppleSecurityError(operation: .read, status: errSecNotAvailable)
+    }
+    func setData(_ data: Data, for item: AppleKeychainItem) throws {
+        throw AppleSecurityError(operation: .add, status: errSecNotAvailable)
+    }
+    func dataOrInsert(_ data: Data, for item: AppleKeychainItem) throws -> Data {
+        throw AppleSecurityError(operation: .add, status: errSecNotAvailable)
+    }
+    func removeData(for item: AppleKeychainItem) throws {
+        throw AppleSecurityError(operation: .delete, status: errSecNotAvailable)
+    }
+    func removeAllData(service: String) throws {
+        throw AppleSecurityError(operation: .delete, status: errSecNotAvailable)
+    }
 }
 
 private final class MemoryAppleKeychainStore: AppleKeychainStoring, @unchecked Sendable {
