@@ -388,6 +388,107 @@ import Testing
         #expect(transport.starts == [0, payload.count / 2])
     }
 
+    private final class ScriptedCapacity: @unchecked Sendable {
+        private let lock = NSLock()
+        private var values: [Int64]
+
+        /// Returns the values in order and then repeats the last one.
+        init(_ values: [Int64]) { self.values = values }
+
+        func next(_ url: URL) -> Int64? {
+            lock.withLock { values.count > 1 ? values.removeFirst() : values.first }
+        }
+    }
+
+    @Test func downloadThatDoesNotFitFailsBeforeAnyTransfer() async throws {
+        let root = try makeRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let layout = MLModelInstallLayout(rootDirectory: root)
+        let payload = Data(repeating: 1, count: 1_000)
+        let url = URL(string: "https://example.test/space.bin")!
+        let testEntry = entry(id: "model-space", plan: plan(files: [("weights.bin", payload, url)]))
+        let transport = ScriptedTransport(payloads: [url: payload])
+        let required = Int64(payload.count) + MLModelInstaller.storageReserveBytes
+        let installer = MLModelInstaller(
+            layout: layout, transport: transport, availableCapacity: { _ in required - 1 })
+
+        await #expect(
+            throws: MLModelInstallError.insufficientStorage(requiredBytes: required, availableBytes: required - 1)
+        ) {
+            _ = try await installer.install(testEntry) { _ in }
+        }
+        #expect(transport.downloadCount(url) == 0)
+
+        // The same download runs once the space is there.
+        let roomy = MLModelInstaller(layout: layout, transport: transport, availableCapacity: { _ in required })
+        _ = try await roomy.install(testEntry) { _ in }
+        #expect(transport.downloadCount(url) == 1)
+    }
+
+    @Test func fullDiskDuringTransferReportsInsufficientStorage() async throws {
+        final class FullDiskTransport: MLModelArtifactTransport, @unchecked Sendable {
+            func download(
+                from url: URL,
+                to destination: URL,
+                expectedByteCount: Int64,
+                progress: @escaping @Sendable (Int64, Int64?) async -> Void
+            ) async throws {
+                throw CocoaError(.fileWriteOutOfSpace)
+            }
+        }
+        let root = try makeRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let layout = MLModelInstallLayout(rootDirectory: root)
+        let payload = Data(repeating: 1, count: 1_000)
+        let url = URL(string: "https://example.test/full.bin")!
+        let testEntry = entry(id: "model-full", plan: plan(files: [("weights.bin", payload, url)]))
+        let required = Int64(payload.count) + MLModelInstaller.storageReserveBytes
+        // Enough space when the download starts; another app fills the disk during the transfer.
+        let capacity = ScriptedCapacity([required, 10])
+        let installer = MLModelInstaller(
+            layout: layout, transport: FullDiskTransport(), availableCapacity: { capacity.next($0) })
+
+        await #expect(throws: MLModelInstallError.insufficientStorage(requiredBytes: required, availableBytes: 10)) {
+            _ = try await installer.install(testEntry) { _ in }
+        }
+    }
+
+    @Test func transferFailureWithFreeSpaceKeepsItsOwnError() async throws {
+        let root = try makeRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let layout = MLModelInstallLayout(rootDirectory: root)
+        let payload = Data("bytes".utf8)
+        let url = URL(string: "https://example.test/network.bin")!
+        let testEntry = entry(id: "model-network", plan: plan(files: [("weights.bin", payload, url)]))
+        let transport = ScriptedTransport(payloads: [url: payload], failFirst: [url: 1])
+        let installer = MLModelInstaller(layout: layout, transport: transport, availableCapacity: { _ in .max })
+
+        await #expect(throws: URLError.self) {
+            _ = try await installer.install(testEntry) { _ in }
+        }
+    }
+
+    @Test func resumedBytesNeedNoNewSpace() async throws {
+        let root = try makeRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let layout = MLModelInstallLayout(rootDirectory: root)
+        let payload = Data(repeating: 7, count: 1_000)
+        let url = URL(string: "https://example.test/resumed.bin")!
+        let testEntry = entry(id: "model-resumed", plan: plan(files: [("weights.bin", payload, url)]))
+        let partial = layout.stagingDirectory(for: testEntry.id, revision: "rev1")
+            .appendingPathComponent("Model.mlmodelc/weights.bin.partial")
+        try FileManager.default.createDirectory(
+            at: partial.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try payload.prefix(600).write(to: partial)
+        let required = Int64(400) + MLModelInstaller.storageReserveBytes
+        let installer = MLModelInstaller(
+            layout: layout, transport: ScriptedTransport(payloads: [url: payload]),
+            availableCapacity: { _ in required })
+
+        let record = try await installer.install(testEntry) { _ in }
+        #expect(record.installedByteCount == Int64(payload.count))
+    }
+
     @Test func concurrentInstallsShareOneDownload() async throws {
         let root = try makeRoot()
         defer { try? FileManager.default.removeItem(at: root) }

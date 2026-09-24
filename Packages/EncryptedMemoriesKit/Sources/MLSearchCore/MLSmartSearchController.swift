@@ -30,13 +30,10 @@ public final class MLSmartSearchController {
     public private(set) var presentation = MLSmartSearchPresentation(snapshot: .disabled)
     public private(set) var modelPresentation = MLSmartSearchModelPresentation(snapshot: .disabled)
     public private(set) var availableSearchScopes: [MLSearchScope] = [.all]
-    public private(set) var storageBreakdown: MLSmartSearchStorageBreakdown = .empty
 
     @ObservationIgnored private let lifecycle: MLSmartSearchLifecycle
     @ObservationIgnored private let artifactAccess: MLScopedArtifactAccess
     @ObservationIgnored private var observationTask: Task<Void, Never>?
-    @ObservationIgnored private var storageTask: Task<Void, Never>?
-    @ObservationIgnored private var lastStorageMarker: StorageRefreshMarker?
 
     public init(lifecycle: MLSmartSearchLifecycle, artifactAccess: MLScopedArtifactAccess = .securityScoped) {
         self.lifecycle = lifecycle
@@ -52,14 +49,12 @@ public final class MLSmartSearchController {
                 self.apply(snapshot)
                 let scopes = await lifecycle.availableSearchScopes()
                 self.availableSearchScopes = scopes.isEmpty ? [.all] : scopes
-                self.refreshStorageIfSettled(snapshot)
             }
         }
     }
 
     deinit {
         observationTask?.cancel()
-        storageTask?.cancel()
     }
 
     private func apply(_ snapshot: MLSmartSearchSnapshot) {
@@ -71,16 +66,18 @@ public final class MLSmartSearchController {
 
     // MARK: - Intents (fire-and-forget into the lifecycle actor)
 
-    public func setEnabled(_ enabled: Bool) {
-        Task { await lifecycle.setEnabled(enabled) }
+    /// Loads the model list while Smart Search is off, so the person can choose before anything starts.
+    public func loadModelChoices() {
+        Task { await lifecycle.loadModelChoices() }
+    }
+
+    /// Turns Smart Search on with the chosen model, or switches to it when Smart Search is on.
+    public func enable(with id: MLModelID) {
+        Task { await lifecycle.enable(with: id) }
     }
 
     public func select(_ id: MLModelID) {
         Task { await lifecycle.select(id) }
-    }
-
-    public func setVisualSearchEnabled(_ enabled: Bool) {
-        Task { await lifecycle.setVisualSearchEnabled(enabled) }
     }
 
     public func retry() {
@@ -111,50 +108,8 @@ public final class MLSmartSearchController {
         Task { await lifecycle.noteConditionsChanged() }
     }
 
-    public func refreshStorageBreakdown() {
-        storageTask?.cancel()
-        storageTask = Task { [weak self, lifecycle] in
-            let breakdown = await lifecycle.storageBreakdown()
-            guard !Task.isCancelled else { return }
-            self?.storageBreakdown = breakdown
-        }
-    }
-
     /// The underlying lifecycle, for query coordination and host memory-pressure wiring.
     public nonisolated var lifecycleActor: MLSmartSearchLifecycle { lifecycle }
-
-    private func refreshStorageIfSettled(_ snapshot: MLSmartSearchSnapshot) {
-        guard let marker = StorageRefreshMarker(snapshot: snapshot), marker != lastStorageMarker else { return }
-        lastStorageMarker = marker
-        refreshStorageBreakdown()
-    }
-
-    private struct StorageRefreshMarker: Equatable {
-        enum State: Equatable { case disabled, noModel, ready, failed }
-
-        let state: State
-        let visualSearchEnabled: Bool
-        let installedModelBytes: Int64
-
-        init?(snapshot: MLSmartSearchSnapshot) {
-            let state: State
-            if !snapshot.isEnabled {
-                state = .disabled
-            } else if case .ready = snapshot.indexingState {
-                state = .ready
-            } else {
-                switch snapshot.phase {
-                case .notInstalled, .selectingModel: state = .noModel
-                case .ready: state = .ready
-                case .failed: state = .failed
-                default: return nil
-                }
-            }
-            self.state = state
-            self.visualSearchEnabled = snapshot.isVisualSearchEnabled
-            self.installedModelBytes = snapshot.installedModelBytes
-        }
-    }
 }
 
 /// Debounced, epoch-safe query pipeline for the shared timeline search field.

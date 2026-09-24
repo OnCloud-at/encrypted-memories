@@ -39,7 +39,7 @@ Unsupported hardware receives a localized in-app explanation before the main lib
 | Folder backup | Mac only | Requires access to a user-selected folder. |
 | Album sync | Yes | Requires Photos permission and selected local albums. |
 | OCR and document-text indexing | Usually | Apple Vision support is checked at runtime. The visible Text scope appears only when its local index is available. |
-| Optional Visual Search model | Model-dependent | Core ML can use CPU, GPU, or Neural Engine. A compatible signed catalog model must be available. |
+| Smart Search model | Model-dependent | Core ML can use CPU, GPU, or Neural Engine. A compatible signed catalog model and enough free space for its download must be available. |
 | Neural Engine | No | It is not a requirement for the app or generic Apple Vision search requests. |
 
 Encrypted Memories does not use VisionKit’s live Data Scanner as an app requirement. Apple documents a Neural Engine requirement for that separate component, not for Apple Vision as a whole.

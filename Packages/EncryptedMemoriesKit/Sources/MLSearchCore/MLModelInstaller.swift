@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import PhotosCore
 
 /// Byte transport for one artifact download. Implementations (URLSession in the Apple adapter,
 /// scripted fakes in tests) write the complete artifact to `destination`, reporting progress as
@@ -26,6 +27,8 @@ public enum MLModelInstallError: Error, Equatable {
     /// The entry's weight license forbids redistribution or product use; downloading it into
     /// a user installation is technically blocked, whatever the catalog data says elsewhere.
     case licenseProhibitsDistribution
+    /// The volume has less free space than the remaining download plus a reserve for the system.
+    case insufficientStorage(requiredBytes: Int64, availableBytes: Int64)
     case cancelled
 }
 
@@ -157,6 +160,7 @@ public actor MLModelInstaller {
     private let layout: MLModelInstallLayout
     private let transport: any MLModelArtifactTransport
     private let now: @Sendable () -> Date
+    private let availableCapacity: @Sendable (URL) -> Int64?
     private var inFlight: [InstallDestinationKey: InFlightInstall] = [:]
     private var modelFenceOwners: [MLModelID: Int] = [:]
     private var allInstallFenceOwners = 0
@@ -168,14 +172,20 @@ public actor MLModelInstaller {
             [(minimum: Int, modelID: MLModelID?, continuation: CheckedContinuation<Void, Never>)] = []
     #endif
 
+    /// Free space the installer leaves untouched, so the system, the photo cache and the search index
+    /// keep room to work after a model download.
+    public static let storageReserveBytes: Int64 = 256 * 1024 * 1024
+
     public init(
         layout: MLModelInstallLayout,
         transport: any MLModelArtifactTransport,
-        now: @escaping @Sendable () -> Date = { Date() }
+        now: @escaping @Sendable () -> Date = { Date() },
+        availableCapacity: @escaping @Sendable (URL) -> Int64? = DeviceStorage.availableCapacity(at:)
     ) {
         self.layout = layout
         self.transport = transport
         self.now = now
+        self.availableCapacity = availableCapacity
     }
 
     /// The verified installation for `entry` at `revision`, or `nil` when none exists.
@@ -271,6 +281,7 @@ public actor MLModelInstaller {
             let layout = self.layout
             let transport = self.transport
             let now = self.now
+            let availableCapacity = self.availableCapacity
             let install = InFlightInstall(
                 requestKey: requestKey,
                 task: Task {
@@ -280,6 +291,7 @@ public actor MLModelInstaller {
                         layout: layout,
                         transport: transport,
                         now: now,
+                        availableCapacity: availableCapacity,
                         onProgress: onProgress
                     )
                 })
@@ -345,8 +357,7 @@ public actor MLModelInstaller {
         )
     }
 
-    /// Remove every installed and partial revision of `entry` (used after model switches and
-    /// when optional visual search is disabled).
+    /// Remove every installed and partial revision of `entry` (used after model switches).
     /// Awaits any in-flight install of the same entry first, so a racing installer task can
     /// never recreate files after the removal.
     public func uninstall(_ entry: MLModelCatalogEntry) async {
@@ -507,6 +518,7 @@ public actor MLModelInstaller {
         layout: MLModelInstallLayout,
         transport: any MLModelArtifactTransport,
         now: @Sendable () -> Date,
+        availableCapacity: @Sendable (URL) -> Int64?,
         onProgress: @escaping @Sendable (MLModelTransferProgress) async -> Void
     ) async throws -> MLModelInstallRecord {
         let fm = FileManager.default
@@ -521,6 +533,23 @@ public actor MLModelInstaller {
         var completedBytes: Int64 = 0
         let staging = layout.stagingDirectory(for: entry.id, revision: plan.revision)
         try fm.createDirectory(at: staging, withIntermediateDirectories: true)
+        // Resumed bytes already occupy the disk; only the rest of the transfer needs new space.
+        let remainingBytes = plan.items.reduce(Int64(0)) { total, item in
+            let destination = staging.appendingPathComponent(item.artifact.relativePath)
+            let present = max(
+                (try? fileSize(of: destination)) ?? 0,
+                (try? fileSize(of: destination.appendingPathExtension("partial"))) ?? 0
+            )
+            return total + max(0, item.artifact.byteCount - present)
+        }
+        let requiredBytes = remainingBytes + storageReserveBytes
+        func insufficientStorage() -> MLModelInstallError? {
+            guard let available = availableCapacity(staging), available < requiredBytes else { return nil }
+            return .insufficientStorage(requiredBytes: requiredBytes, availableBytes: available)
+        }
+        if remainingBytes > 0, let failure = insufficientStorage() {
+            throw failure
+        }
         for item in plan.items {
             try Task.checkCancellation()
             let destination = staging.appendingPathComponent(item.artifact.relativePath)
@@ -548,6 +577,10 @@ public actor MLModelInstaller {
                         }
                     } catch is CancellationError {
                         throw MLModelInstallError.cancelled
+                    } catch {
+                        // A full disk surfaces through several URLSession and POSIX error shapes.
+                        // Measure again instead of guessing from the error.
+                        throw insufficientStorage() ?? error
                     }
                     if let failure = verifyFile(at: partial, against: item.artifact) {
                         // A completed but invalid transfer must not poison future resumes.

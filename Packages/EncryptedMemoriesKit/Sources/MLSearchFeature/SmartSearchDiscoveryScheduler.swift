@@ -109,7 +109,7 @@ public final class SmartSearchDiscoveryScheduler {
         let day = Calendar.current.ordinality(of: .day, in: .era, for: Date()) ?? 0
         return [
             visualKey, "\(favoriteUIDs.hashValue)", "\(coordinateCount):\(coordinateRevision)", "\(day)",
-            "\(snapshot?.isEnabled == true)", "\(snapshot?.isVisualSearchEnabled == true)",
+            "\(snapshot?.isEnabled == true)",
             smartSearch.map { "\(ObjectIdentifier($0))" } ?? "-",
         ].joined(separator: "|")
     }
@@ -325,7 +325,7 @@ public final class SmartSearchDiscoveryScheduler {
     }
 
     private static func persistedModelKey(_ snapshot: MLSmartSearchSnapshot?) -> String {
-        "\(snapshot?.isEnabled == true)|\(snapshot?.isVisualSearchEnabled == true)|"
+        "\(snapshot?.isEnabled == true)|"
             + SmartSearchDiscoveryModel.visualEvidenceKey(
                 timelineRevision: 0, snapshot: snapshot, indexingKey: "persisted")
     }

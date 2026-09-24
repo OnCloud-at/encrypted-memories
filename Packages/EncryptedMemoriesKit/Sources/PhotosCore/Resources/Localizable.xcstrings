@@ -1000,62 +1000,6 @@
         "de": { "stringUnit": { "state": "translated", "value": "Modellgröße" } }
       }
     },
-    "mlsearch.storage_title %@": {
-      "extractionState": "manual",
-      "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "Local %@ storage" } },
-        "de": { "stringUnit": { "state": "translated", "value": "Lokaler Speicher für %@" } }
-      }
-    },
-    "mlsearch.storage_refresh": {
-      "extractionState": "manual",
-      "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "Refresh storage usage" } },
-        "de": { "stringUnit": { "state": "translated", "value": "Speichernutzung aktualisieren" } }
-      }
-    },
-    "mlsearch.storage_vision": {
-      "extractionState": "manual",
-      "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "Apple Vision index" } },
-        "de": { "stringUnit": { "state": "translated", "value": "Apple-Vision-Index" } }
-      }
-    },
-    "mlsearch.storage_vectors": {
-      "extractionState": "manual",
-      "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "Semantic vector index" } },
-        "de": { "stringUnit": { "state": "translated", "value": "Semantischer Vektorindex" } }
-      }
-    },
-    "mlsearch.storage_models": {
-      "extractionState": "manual",
-      "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "Installed visual models" } },
-        "de": { "stringUnit": { "state": "translated", "value": "Installierte visuelle Modelle" } }
-      }
-    },
-    "mlsearch.storage_partial": {
-      "extractionState": "manual",
-      "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "Partial model downloads" } },
-        "de": { "stringUnit": { "state": "translated", "value": "Teilweise Modelldownloads" } }
-      }
-    },
-    "mlsearch.storage_other": {
-      "extractionState": "manual",
-      "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "Other ML data" } },
-        "de": { "stringUnit": { "state": "translated", "value": "Sonstige ML-Daten" } }
-      }
-    },
-    "mlsearch.storage_total": {
-      "extractionState": "manual",
-      "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "Total" } },
-        "de": { "stringUnit": { "state": "translated", "value": "Gesamt" } }
-      }
-    },
     "mlsearch.disable_confirm_title %@": {
       "extractionState": "manual",
       "comment": "Confirmation title when turning Smart Search off.",
@@ -1080,44 +1024,20 @@
         "de": { "stringUnit": { "state": "translated", "value": "Ausschalten und löschen" } }
       }
     },
-    "mlsearch.visual_disable_confirm_title": {
-      "extractionState": "manual",
-      "comment": "Confirmation title when turning only the optional visual model search off.",
-      "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "Turn off visual search?" } },
-        "de": { "stringUnit": { "state": "translated", "value": "Visuelle Suche ausschalten?" } }
-      }
-    },
-    "mlsearch.visual_disable_confirm_message": {
-      "extractionState": "manual",
-      "comment": "Explains the scoped data removal when visual search is disabled.",
-      "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "The visual model and its search index will be removed from this device. Text, document and barcode search remain available." } },
-        "de": { "stringUnit": { "state": "translated", "value": "Das visuelle Modell und sein Suchindex werden von diesem Gerät entfernt. Die Suche nach Text, Dokumenten und Barcodes bleibt verfügbar." } }
-      }
-    },
-    "mlsearch.visual_disable_confirm_action": {
-      "extractionState": "manual",
-      "comment": "Destructive confirm button for disabling only visual model search.",
-      "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "Turn off and remove" } },
-        "de": { "stringUnit": { "state": "translated", "value": "Ausschalten und entfernen" } }
-      }
-    },
     "mlsearch.switch_confirm_title": {
       "extractionState": "manual",
       "comment": "Confirmation title when changing Smart Search quality.",
       "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "Change search quality?" } },
-        "de": { "stringUnit": { "state": "translated", "value": "Suchqualität ändern?" } }
+        "en": { "stringUnit": { "state": "translated", "value": "Switch Search Model?" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Suchmodell wechseln?" } }
       }
     },
     "mlsearch.switch_confirm_message": {
       "extractionState": "manual",
       "comment": "Confirmation body when changing Smart Search quality.",
       "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "The local search index will be deleted and rebuilt for the new quality setting." } },
-        "de": { "stringUnit": { "state": "translated", "value": "Der lokale Suchindex wird gelöscht und für die neue Qualitätseinstellung neu aufgebaut." } }
+        "en": { "stringUnit": { "state": "translated", "value": "The new model downloads, then your library is indexed again. The current model stays active until then." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Das neue Modell wird geladen, danach wird die Mediathek neu indexiert. Bis dahin bleibt das aktuelle Modell aktiv." } }
       }
     },
     "mlsearch.switch_confirm_action": {
@@ -1190,14 +1110,6 @@
       "localizations": {
         "en": { "stringUnit": { "state": "translated", "value": "Preparing model" } },
         "de": { "stringUnit": { "state": "translated", "value": "Modell wird vorbereitet" } }
-      }
-    },
-    "mlsearch.status_preparing_index": {
-      "extractionState": "manual",
-      "comment": "Smart Search status while the zero-download native index is starting and no optional visual model is selected.",
-      "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "Preparing indexing" } },
-        "de": { "stringUnit": { "state": "translated", "value": "Indexierung wird vorbereitet" } }
       }
     },
     "mlsearch.status_indexing": {
@@ -1296,6 +1208,45 @@
         "de": { "stringUnit": { "state": "translated", "value": "Modell konnte nicht geladen werden" } }
       }
     },
+    "mlsearch.model_recommended": {
+      "extractionState": "manual",
+      "comment": "Badge next to the search model that suits the device language.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Recommended" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Empfohlen" } }
+      }
+    },
+    "mlsearch.model_row": {
+      "extractionState": "manual",
+      "comment": "Settings row that shows and switches the active search model.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Search Model" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Suchmodell" } }
+      }
+    },
+    "mlsearch.unsupported_device": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Not available on this device." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Auf diesem Gerät nicht verfügbar." } }
+      }
+    },
+    "mlsearch.status_failed_space": {
+      "extractionState": "manual",
+      "comment": "Smart Search status when the model download does not fit on the device.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Not enough storage" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Nicht genug Speicherplatz" } }
+      }
+    },
+    "mlsearch.space_required %@": {
+      "extractionState": "manual",
+      "comment": "Detail under the storage failure; the argument is a file size.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "%@ of free space is needed." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Benötigt werden %@ freier Speicher." } }
+      }
+    },
     "mlsearch.status_failed_storage": {
       "extractionState": "manual",
       "comment": "Smart Search error: the local index database is unavailable.",
@@ -1379,22 +1330,6 @@
         "de": { "stringUnit": { "state": "translated", "value": "%@ verarbeitet Mediathekinhalte und Suchanfragen ausschließlich auf diesem Gerät." } }
       }
     },
-    "mlsearch.native_search_intro": {
-      "extractionState": "manual",
-      "comment": "Explains the zero-download native search enabled by the main Smart Search switch.",
-      "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "Your library is analyzed automatically on this device. Text, codes and additional image features are captured locally; no model download is required." } },
-        "de": { "stringUnit": { "state": "translated", "value": "Deine Mediathek wird automatisch auf diesem Gerät analysiert. Text, Codes und weitere Bildmerkmale werden lokal erfasst; ein Modell-Download ist dafür nicht erforderlich." } }
-      }
-    },
-    "mlsearch.visual_search_intro": {
-      "extractionState": "manual",
-      "comment": "Explains the independently optional downloadable visual search feature.",
-      "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "Optional. Adds natural-language search for objects, scenes and image content using a downloadable model." } },
-        "de": { "stringUnit": { "state": "translated", "value": "Optional. Ergänzt die Suche nach Objekten, Szenen und Bildinhalten mit einem herunterladbaren Modell." } }
-      }
-    },
     "mlsearch.developer_model_note": {
       "extractionState": "manual",
       "comment": "Warning under developer-only models in the model picker.",
@@ -1423,16 +1358,8 @@
       "extractionState": "manual",
       "comment": "Short explanation shown before the Smart Search quality choices.",
       "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "Choose the visual search quality. Changing it rebuilds only the visual index." } },
-        "de": { "stringUnit": { "state": "translated", "value": "Wähle die Qualität der visuellen Suche. Ein Wechsel erstellt nur den visuellen Index neu." } }
-      }
-    },
-    "mlsearch.semantic_section_title": {
-      "extractionState": "manual",
-      "comment": "Heading for the optional semantic image-search model in Smart Search settings.",
-      "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "Visual search" } },
-        "de": { "stringUnit": { "state": "translated", "value": "Visuelle Suche" } }
+        "en": { "stringUnit": { "state": "translated", "value": "Choose a search model. Your library is then indexed on this device." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Wähle ein Suchmodell. Danach wird deine Mediathek auf diesem Gerät indexiert." } }
       }
     },
     "mlsearch.status_failed_catalog": {

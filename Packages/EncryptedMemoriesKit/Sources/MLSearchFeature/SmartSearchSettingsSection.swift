@@ -3,32 +3,41 @@ import MLSearchCore
 import PhotosCore
 import SwiftUI
 
-enum SmartSearchVisualSearchEnableAction: Equatable {
-    case showInlineModelChoices
-    case enableSelectedModel
+/// What the Smart Search section shows below its switch.
+enum SmartSearchSettingsContent: Equatable {
+    case off
+    /// The device cannot run Smart Search. The switch stays off and disabled.
+    case unsupported
+    /// Smart Search starts only after the person taps a model.
+    case modelChoice
+    case status
 }
 
-enum SmartSearchVisualSearchPresentationPolicy {
-    static func isToggleOn(
-        isEnabled: Bool,
-        hasSelectedModel: Bool,
-        isChoosingInitialModel: Bool
-    ) -> Bool {
-        isChoosingInitialModel || (isEnabled && hasSelectedModel)
+enum SmartSearchSettingsPolicy {
+    /// The switch looks on while the person chooses a model, before anything is stored.
+    static func isToggleOn(isEnabled: Bool, isChoosingModel: Bool) -> Bool {
+        isEnabled || isChoosingModel
     }
 
-    static func enableAction(hasSelectedModel: Bool) -> SmartSearchVisualSearchEnableAction {
-        hasSelectedModel ? .enableSelectedModel : .showInlineModelChoices
+    static func content(
+        isSupported: Bool,
+        isEnabled: Bool,
+        hasSelectedModel: Bool,
+        isChoosingModel: Bool
+    ) -> SmartSearchSettingsContent {
+        // Enabled Smart Search stays manageable, so it can always be turned off.
+        if isEnabled { return hasSelectedModel ? .status : .modelChoice }
+        guard isSupported else { return .unsupported }
+        return isChoosingModel ? .modelChoice : .off
     }
 }
 
 /// Shared Smart Search settings for macOS, iOS and iPadOS.
 public struct SmartSearchSettingsSection: View {
     private let controller: MLSmartSearchController
+    @State private var isChoosingModel = false
     @State private var pendingModelSwitch: MLModelCatalogEntry?
     @State private var confirmingDisable = false
-    @State private var confirmingVisualSearchDisable = false
-    @State private var isChoosingInitialVisualSearchModel = false
     @State private var pickingDeveloperArtifact = false
     @State private var developerInstallTarget: MLModelID?
 
@@ -37,51 +46,43 @@ public struct SmartSearchSettingsSection: View {
     }
 
     public var body: some View {
-        let hasSelectableModel = !controller.snapshot.availableModels.isEmpty
+        let snapshot = controller.snapshot
+        let content = SmartSearchSettingsPolicy.content(
+            isSupported: snapshot.isSupported,
+            isEnabled: snapshot.isEnabled,
+            hasSelectedModel: snapshot.selectedModelID != nil,
+            isChoosingModel: isChoosingModel
+        )
         Section {
             Toggle(isOn: enabledBinding) {
                 Text(MLSmartSearchPresentation.productName)
             }
+            // Removal must commit before Smart Search can be turned on again.
+            .disabled(content == .unsupported || snapshot.phase == .deleting)
             .accessibilityIdentifier("smartsearch.toggle")
 
-            if controller.snapshot.isEnabled {
-                Text(L10n.string("mlsearch.native_search_intro"))
+            switch content {
+            case .off:
+                EmptyView()
+            case .unsupported:
+                Text(L10n.string("mlsearch.unsupported_device"))
                     .font(.footnote)
                     .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+            case .modelChoice:
+                modelChoices
+            case .status:
                 statusRows
-                storageRows
-
-                Toggle(isOn: visualSearchBinding) {
-                    Text(L10n.string("mlsearch.semantic_section_title"))
-                }
-                // Removal must commit before Visual Search can be turned on again.
-                .disabled(controller.snapshot.phase == .deleting)
-                .accessibilityIdentifier("smartsearch.visual.toggle")
-
-                Text(L10n.string("mlsearch.visual_search_intro"))
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-
-                if isChoosingInitialVisualSearchModel || controller.snapshot.isVisualSearchEnabled {
-                    if hasSelectableModel {
-                        modelChoices
-                    }
-                    modelStatusRows
-                }
+                modelStatusRows
+                modelPicker
             }
         } footer: {
             Text(MLSmartSearchPresentation.privacyStatement)
                 .font(.footnote)
                 .foregroundStyle(.secondary)
         }
-        .animation(.easeInOut(duration: 0.2), value: controller.snapshot.isVisualSearchEnabled)
-        .animation(.easeInOut(duration: 0.2), value: isChoosingInitialVisualSearchModel)
-        .onChange(of: controller.snapshot.selectedModelID) { _, selectedModelID in
-            if selectedModelID != nil {
-                isChoosingInitialVisualSearchModel = false
-            }
+        .animation(.easeInOut(duration: 0.2), value: content)
+        .onChange(of: snapshot.isEnabled) { _, isEnabled in
+            if isEnabled { isChoosingModel = false }
         }
         .alert(
             L10n.string("mlsearch.disable_confirm_title \(MLSmartSearchPresentation.productName)"),
@@ -93,17 +94,6 @@ public struct SmartSearchSettingsSection: View {
             }
         } message: {
             Text(L10n.string("mlsearch.disable_confirm_message"))
-        }
-        .alert(
-            L10n.string("mlsearch.visual_disable_confirm_title"),
-            isPresented: $confirmingVisualSearchDisable
-        ) {
-            Button(L10n.string("action.cancel"), role: .cancel) {}
-            Button(L10n.string("mlsearch.visual_disable_confirm_action"), role: .destructive) {
-                controller.setVisualSearchEnabled(false)
-            }
-        } message: {
-            Text(L10n.string("mlsearch.visual_disable_confirm_message"))
         }
         .alert(
             L10n.string("mlsearch.switch_confirm_title"),
@@ -136,95 +126,100 @@ public struct SmartSearchSettingsSection: View {
 
     private var enabledBinding: Binding<Bool> {
         Binding(
-            get: { controller.snapshot.isEnabled },
-            set: { enable in
-                if enable {
-                    controller.setEnabled(true)
-                } else {
-                    confirmingDisable = true
-                }
-            }
-        )
-    }
-
-    private var visualSearchBinding: Binding<Bool> {
-        Binding(
             get: {
-                SmartSearchVisualSearchPresentationPolicy.isToggleOn(
-                    isEnabled: controller.snapshot.isVisualSearchEnabled,
-                    hasSelectedModel: controller.snapshot.selectedModelID != nil,
-                    isChoosingInitialModel: isChoosingInitialVisualSearchModel
+                SmartSearchSettingsPolicy.isToggleOn(
+                    isEnabled: controller.snapshot.isEnabled,
+                    isChoosingModel: isChoosingModel
                 )
             },
             set: { enable in
                 if enable {
-                    switch SmartSearchVisualSearchPresentationPolicy.enableAction(
-                        hasSelectedModel: controller.snapshot.selectedModelID != nil
-                    ) {
-                    case .showInlineModelChoices:
-                        isChoosingInitialVisualSearchModel = true
-                    case .enableSelectedModel:
-                        controller.setVisualSearchEnabled(true)
-                    }
-                } else if isChoosingInitialVisualSearchModel {
-                    isChoosingInitialVisualSearchModel = false
+                    isChoosingModel = true
+                    controller.loadModelChoices()
+                } else if controller.snapshot.isEnabled {
+                    confirmingDisable = true
                 } else {
-                    confirmingVisualSearchDisable = true
+                    isChoosingModel = false
                 }
             }
         )
     }
 
+    // MARK: - Model choice
+
+    /// Before Smart Search starts: the recommended model first, one tap starts download and indexing.
     @ViewBuilder
     private var modelChoices: some View {
-        let snapshot = controller.snapshot
+        let models = MLModelRecommendation.ordered(controller.snapshot.availableModels)
+        if models.isEmpty {
+            modelStatusRows
+        } else {
+            Text(L10n.string("mlsearch.model_choice_intro"))
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            ForEach(models) { model in
+                Button {
+                    activate(model)
+                } label: {
+                    modelChoiceLabel(model, isRecommended: model.id == models.first?.id)
+                }
+                .buttonStyle(.plain)
+                .disabled(controller.modelPresentation.isBusy)
+                .accessibilityLabel(Text(L10n.string(dynamicKey: model.localizedMetadata.selectionTitleKey)))
+                .accessibilityValue(Text(L10n.string(dynamicKey: model.localizedMetadata.selectionDescriptionKey)))
+            }
+            modelStatusRows
+        }
+    }
 
-        Text(L10n.string("mlsearch.model_choice_intro"))
-            .font(.footnote)
-            .foregroundStyle(.secondary)
-            .fixedSize(horizontal: false, vertical: true)
-
-        ForEach(snapshot.availableModels) { model in
-            Button {
-                choose(model)
-            } label: {
-                HStack(alignment: .top, spacing: 12) {
-                    Image(
-                        systemName: snapshot.selectedModelID == model.id
-                            ? "checkmark.circle.fill"
-                            : "circle"
-                    )
-                    .foregroundStyle(snapshot.selectedModelID == model.id ? Color.accentColor : Color.secondary)
-                    .frame(width: 20)
-                    .accessibilityHidden(true)
-
-                    VStack(alignment: .leading, spacing: 4) {
-                        HStack(alignment: .firstTextBaseline, spacing: 8) {
-                            Text(L10n.string(dynamicKey: model.localizedMetadata.selectionTitleKey))
-                                .fontWeight(.medium)
-                                .foregroundStyle(.primary)
-                            Spacer(minLength: 8)
-                            if let size = modelDownloadSize(model) {
-                                Text(size)
-                                    .font(.footnote)
-                                    .foregroundStyle(.secondary)
-                                    .monospacedDigit()
-                            }
-                        }
-                        Text(L10n.string(dynamicKey: model.localizedMetadata.selectionDescriptionKey))
+    private func modelChoiceLabel(_ model: MLModelCatalogEntry, isRecommended: Bool) -> some View {
+        HStack(alignment: .top, spacing: 12) {
+            Image(systemName: "circle")
+                .foregroundStyle(.secondary)
+                .frame(width: 20)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Text(L10n.string(dynamicKey: model.localizedMetadata.selectionTitleKey))
+                        .fontWeight(.medium)
+                        .foregroundStyle(.primary)
+                    if isRecommended {
+                        Text(L10n.string("mlsearch.model_recommended"))
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.tint)
+                    }
+                    Spacer(minLength: 8)
+                    if let size = modelDownloadSize(model) {
+                        Text(size)
                             .font(.footnote)
                             .foregroundStyle(.secondary)
-                            .fixedSize(horizontal: false, vertical: true)
+                            .monospacedDigit()
                     }
                 }
-                .contentShape(Rectangle())
+                Text(L10n.string(dynamicKey: model.localizedMetadata.selectionDescriptionKey))
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
-            .buttonStyle(.plain)
-            .disabled(controller.modelPresentation.isBusy)
-            .accessibilityLabel(Text(L10n.string(dynamicKey: model.localizedMetadata.selectionTitleKey)))
-            .accessibilityValue(Text(L10n.string(dynamicKey: model.localizedMetadata.selectionDescriptionKey)))
         }
+        .contentShape(Rectangle())
+    }
 
+    /// While Smart Search runs, the model is one compact row. A switch rebuilds the index and asks first.
+    @ViewBuilder
+    private var modelPicker: some View {
+        let snapshot = controller.snapshot
+        let models = MLModelRecommendation.ordered(snapshot.availableModels)
+        if models.count > 1 {
+            Picker(L10n.string("mlsearch.model_row"), selection: modelSelectionBinding) {
+                ForEach(models) { model in
+                    Text(L10n.string(dynamicKey: model.localizedMetadata.selectionTitleKey))
+                        .tag(Optional(model.id))
+                }
+            }
+            .disabled(controller.modelPresentation.isBusy)
+        }
         if let selected = snapshot.availableModels.first(where: { $0.id == snapshot.selectedModelID }),
             selected.releaseTrack == .developerOnly
         {
@@ -234,10 +229,25 @@ public struct SmartSearchSettingsSection: View {
         }
     }
 
+    private var modelSelectionBinding: Binding<MLModelID?> {
+        Binding(
+            get: { controller.snapshot.selectedModelID },
+            set: { id in
+                guard let id, id != controller.snapshot.selectedModelID,
+                    let model = controller.snapshot.availableModels.first(where: { $0.id == id })
+                else { return }
+                pendingModelSwitch = model
+            }
+        )
+    }
+
+    // MARK: - Status
+
     @ViewBuilder
     private var modelStatusRows: some View {
         let presentation = controller.modelPresentation
-        if let status = presentation.statusText {
+        // The overall status already names a model step when no indexing runs; do not repeat it.
+        if let status = presentation.statusText, status != controller.presentation.statusText {
             VStack(alignment: .leading, spacing: 6) {
                 Text(status)
                     .font(.footnote)
@@ -305,41 +315,6 @@ public struct SmartSearchSettingsSection: View {
         }
     }
 
-    @ViewBuilder
-    private var storageRows: some View {
-        let storage = controller.storageBreakdown
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Text(L10n.string("mlsearch.storage_title \(MLSmartSearchPresentation.productName)"))
-                    .font(.headline)
-                Spacer()
-                Button {
-                    controller.refreshStorageBreakdown()
-                } label: {
-                    Image(systemName: "arrow.clockwise")
-                }
-                .buttonStyle(.borderless)
-                .accessibilityLabel(Text(L10n.string("mlsearch.storage_refresh")))
-            }
-            storageRow("mlsearch.storage_vision", bytes: storage.appleVisionIndexBytes)
-            storageRow("mlsearch.storage_vectors", bytes: storage.semanticVectorIndexBytes)
-            storageRow("mlsearch.storage_models", bytes: storage.installedVisualModelsBytes)
-            storageRow("mlsearch.storage_partial", bytes: storage.partialModelDownloadsBytes)
-            storageRow("mlsearch.storage_other", bytes: storage.otherMLDataBytes)
-            Divider()
-            storageRow("mlsearch.storage_total", bytes: storage.totalBytes)
-        }
-        .accessibilityElement(children: .contain)
-    }
-
-    private func storageRow(_ key: String, bytes: Int64) -> some View {
-        LabeledContent(L10n.string(dynamicKey: key)) {
-            Text(L10n.fileSize(bytes))
-                .foregroundStyle(.secondary)
-                .monospacedDigit()
-        }
-    }
-
     private var statusSymbolName: String {
         if controller.presentation.presentsAsReady { return "checkmark.circle.fill" }
         switch controller.snapshot.indexingState {
@@ -376,28 +351,20 @@ public struct SmartSearchSettingsSection: View {
         }
     }
 
-    private func choose(_ model: MLModelCatalogEntry) {
-        let snapshot = controller.snapshot
-        guard model.id != snapshot.selectedModelID else { return }
-        if snapshot.selectedModelID == nil {
-            activate(model)
-        } else {
-            pendingModelSwitch = model
-        }
-    }
+    // MARK: - Actions
 
+    /// Starts Smart Search with `model`, or switches to it. A developer model without a hosted
+    /// artifact asks for its local folder once Smart Search owns the selection.
     private func activate(_ model: MLModelCatalogEntry) {
+        controller.enable(with: model.id)
         if model.releaseTrack == .developerOnly, !model.isDownloadable {
             developerInstallTarget = model.id
             pickingDeveloperArtifact = true
-        } else {
-            controller.select(model.id)
         }
     }
 
     private func modelDownloadSize(_ model: MLModelCatalogEntry) -> String? {
         guard let bytes = model.downloadPlan?.totalByteCount, bytes > 0 else { return nil }
-        let size = L10n.fileSize(bytes)
-        return size
+        return L10n.fileSize(bytes)
     }
 }

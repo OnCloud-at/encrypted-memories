@@ -59,11 +59,20 @@ public enum MLModelCapability: String, Hashable, Sendable, Codable {
 public struct MLModelLocalizedMetadata: Sendable, Equatable {
     public let selectionTitleKey: String
     public let selectionDescriptionKey: String
+    /// Languages of the searches that the model understands. Drives the recommended choice.
+    public let queryLanguages: MLModelQueryLanguages
 
-    public init(selectionTitleKey: String, selectionDescriptionKey: String) {
+    public init(selectionTitleKey: String, selectionDescriptionKey: String, queryLanguages: MLModelQueryLanguages) {
         self.selectionTitleKey = selectionTitleKey
         self.selectionDescriptionKey = selectionDescriptionKey
+        self.queryLanguages = queryLanguages
     }
+}
+
+/// Languages in which people can type a search that a model understands.
+public enum MLModelQueryLanguages: Sendable, Equatable {
+    case englishOnly
+    case multilingual
 }
 
 /// Optional evidence that one immutable artifact revision passed an external on-device release run.
@@ -282,7 +291,8 @@ public struct MLModelCatalogEntry: Sendable, Equatable, Identifiable {
         releaseTrack: MLModelReleaseTrack,
         localizedMetadata: MLModelLocalizedMetadata = .init(
             selectionTitleKey: "mlsearch.model_generic_title",
-            selectionDescriptionKey: "mlsearch.model_generic_description"
+            selectionDescriptionKey: "mlsearch.model_generic_description",
+            queryLanguages: .englishOnly
         ),
         estimatedInstalledBytes: Int64,
         downloadPlan: MLModelDownloadPlan?,
@@ -426,7 +436,8 @@ extension MLModelCatalogEntry {
         releaseTrack: .production,
         localizedMetadata: .init(
             selectionTitleKey: "mlsearch.model_tinyclip_title",
-            selectionDescriptionKey: "mlsearch.model_tinyclip_description"
+            selectionDescriptionKey: "mlsearch.model_tinyclip_description",
+            queryLanguages: .englishOnly
         ),
         estimatedInstalledBytes: 130_000_000,
         downloadPlan: nil
@@ -455,7 +466,8 @@ extension MLModelCatalogEntry {
         releaseTrack: .production,
         localizedMetadata: .init(
             selectionTitleKey: "mlsearch.model_siglip2_title",
-            selectionDescriptionKey: "mlsearch.model_siglip2_description"
+            selectionDescriptionKey: "mlsearch.model_siglip2_description",
+            queryLanguages: .multilingual
         ),
         estimatedInstalledBytes: 760_000_000,
         downloadPlan: nil

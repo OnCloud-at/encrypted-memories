@@ -133,7 +133,6 @@ public actor MLSmartSearchLifecycle {
 
     private let deps: Dependencies
     private let configuration: Configuration
-    private let storageMeter: MLSmartSearchStorageMeter
     private var catalog: MLModelCatalog
 
     private var persistent = MLSmartSearchPersistentState()
@@ -170,8 +169,6 @@ public actor MLSmartSearchLifecycle {
     /// `true` while a model switch is mid-flight: the still-running old-epoch index loop must
     /// not overwrite switch/download phases.
     private var switchInProgress = false
-    /// Number of `completeVisualSearchDisable` calls currently running (they await teardown).
-    private var visualRemovalsInFlight = 0
     private var indexTask: Task<Void, Never>?
     private var indexTaskID: UUID?
     private var activationTasks: [UUID: Task<Void, Never>] = [:]
@@ -214,7 +211,6 @@ public actor MLSmartSearchLifecycle {
     ) {
         self.deps = dependencies
         self.configuration = configuration
-        self.storageMeter = MLSmartSearchStorageMeter(layout: dependencies.layout)
         self.catalog = dependencies.catalog
         self.indexingExecutionIsAllowed = initiallyAllowsIndexingExecution
         self.nativeParallelismRamp = MLNativeParallelismRamp(
@@ -255,7 +251,7 @@ public actor MLSmartSearchLifecycle {
         guard started, !isShutDown, !Task.isCancelled, !stateLoadFailed, persistent.pendingOperation == nil else {
             return nil
         }
-        guard persistent.isEnabled && persistent.isVisualSearchEnabled else {
+        guard persistent.isEnabled && persistent.selectedModelID != nil else {
             return MLSearchSuggestionCacheIdentity(
                 descriptor: nil, modelRevision: nil, indexGeneration: nil, visualSearchEnabled: false)
         }
@@ -284,10 +280,6 @@ public actor MLSmartSearchLifecycle {
         try cache.save(data, identity: identity)
     }
 
-    public func storageBreakdown() async -> MLSmartSearchStorageBreakdown {
-        await storageMeter.measure()
-    }
-
     /// Snapshot stream; yields the current state immediately, then every transition.
     public func snapshots() -> AsyncStream<MLSmartSearchSnapshot> {
         AsyncStream { continuation in
@@ -313,14 +305,14 @@ public actor MLSmartSearchLifecycle {
 
     private func makeSnapshot() -> MLSmartSearchSnapshot {
         MLSmartSearchSnapshot(
+            isSupported: deps.featureAvailability == .available,
             isEnabled: persistent.isEnabled,
-            isVisualSearchEnabled: persistent.isVisualSearchEnabled,
             selectedModelID: persistent.selectedModelID,
             phase: phase,
             installedModelBytes: activeModel?.record.installedByteCount ?? 0,
             availableModels: catalog.selectableEntries(allowsDeveloperModels: deps.allowsDeveloperModels),
             isSearchAvailable: persistent.isEnabled
-                && ((persistent.isVisualSearchEnabled && session != nil && lastCoverage.indexed > 0)
+                && ((session != nil && lastCoverage.indexed > 0)
                     || (nativeSearch != nil && (lastNativeProgress?.completed ?? 0) > 0)),
             indexingState: indexingState
         )
@@ -350,12 +342,6 @@ public actor MLSmartSearchLifecycle {
             startCatalogRefreshLoopIfNeeded()
         }
         if persistent.isEnabled, !(await refreshCatalog()) {
-            if case .disableVisualSearch(let model) = persistent.pendingOperation {
-                // Removal needs no network. Finish it with the current catalog instead of leaving the
-                // journal pending, which would also block native indexing.
-                _ = await completeVisualSearchDisable(model: model, descriptor: persistent.activatedDescriptor)
-                return
-            }
             await recoverLocallyInstalledSemanticModelAfterCatalogFailure()
             return
         }
@@ -395,13 +381,6 @@ public actor MLSmartSearchLifecycle {
                     descriptor: persistent.activatedDescriptor
                 )
             else { return }
-        case .disableVisualSearch(let model):
-            guard
-                await completeVisualSearchDisable(
-                    model: model,
-                    descriptor: persistent.activatedDescriptor
-                )
-            else { return }
         case nil:
             break
         }
@@ -413,7 +392,7 @@ public actor MLSmartSearchLifecycle {
             return
         }
         await activateNativeSearch()
-        guard persistent.isVisualSearchEnabled, persistent.selectedModelID != nil else {
+        guard persistent.selectedModelID != nil else {
             phase = .selectingModel
             emit()
             startIndexingLoopIfAvailable()
@@ -442,135 +421,81 @@ public actor MLSmartSearchLifecycle {
 
     // MARK: - Intents
 
-    public func setEnabled(_ enabled: Bool) async {
-        guard !isShutDown, deps.featureAvailability == .available,
-            enabled != persistent.isEnabled
+    /// Loads the selectable models while Smart Search is off, so the person can choose one before
+    /// anything is stored or downloaded. A failure stays retryable through `retry()`.
+    public func loadModelChoices() async {
+        guard started, !isShutDown, deps.featureAvailability == .available, !persistent.isEnabled,
+            persistent.pendingOperation == nil, !stateLoadFailed
         else { return }
-        activationGeneration &+= 1
-        if enabled {
-            persistent.isEnabled = true
-            // Persist enablement before starting any download or index work. A failed write
-            // leaves an honest retryable state and cannot create unowned derived data.
-            guard persistState() else { return }
-            startCatalogRefreshLoopIfNeeded()
-            // Publish the durable user intent before capability probes, database setup, or
-            // catalog I/O. Settings must never appear blocked by background initialization.
-            phase = .selectingModel
-            emit()
-            await activateNativeSearch(intent: .userInitiated)
-            guard !isShutDown, persistent.isEnabled else { return }
-            startIndexingLoopIfAvailable()
-            guard await refreshCatalog() else { return }
-            guard !isShutDown, persistent.isEnabled else { return }
-            let selectable = catalog.selectableEntries(allowsDeveloperModels: deps.allowsDeveloperModels)
-            guard !selectable.isEmpty else {
-                phase = .notInstalled(downloadable: false)
-                emit()
-                return
-            }
-            guard let selectedID = persistent.selectedModelID,
-                selectable.contains(where: { $0.id == selectedID })
-            else {
-                persistent.selectedModelID = nil
-                persistent.activatedRevision = nil
-                persistent.activatedDescriptor = nil
-                guard persistState() else { return }
-                phase = .selectingModel
-                emit()
-                return
-            }
-            await activateSelectedModel(intent: .userInitiated)
-        } else {
-            await performPurge()
+        // The built-in catalog has no download plans, so a fresh signed catalog is required once.
+        if let lastCatalogRefreshAt, lastCatalogRefreshAt.duration(to: .now) < configuration.catalogRefreshInterval {
+            return
         }
+        guard await refreshCatalog(), !isShutDown, !persistent.isEnabled else { return }
+        phase = .disabled
+        emit()
     }
 
-    /// Explicit full disable + purge (same as `setEnabled(false)`, exposed for the destructive
-    /// confirmation flow).
+    /// Turns Smart Search on with the chosen model: native analysis starts at once, and the model
+    /// downloads, installs and indexes afterwards. When Smart Search is already on, this switches
+    /// to `id` instead.
+    public func enable(with id: MLModelID) async {
+        guard started, !isShutDown, deps.featureAvailability == .available else { return }
+        guard !persistent.isEnabled else {
+            await select(id)
+            return
+        }
+        guard persistent.pendingOperation == nil, !stateLoadFailed,
+            let target = catalog.entry(for: id), isSelectable(target)
+        else { return }
+        activationGeneration &+= 1
+        blockedRuntimeFailure = nil
+        // One atomic write stores the intent and the model before any download or index work. A
+        // failed write keeps both in memory, publishes a retryable failure and creates no data.
+        persistent.isEnabled = true
+        persistent.selectedModelID = id
+        persistent.activatedRevision = nil
+        persistent.activatedDescriptor = nil
+        guard persistState() else { return }
+        startCatalogRefreshLoopIfNeeded()
+        // Publish the intent before native setup can suspend. Settings must never look idle
+        // while the first download is about to start.
+        phase =
+            target.isDownloadable
+            ? .downloading(MLModelTransferProgress(bytesReceived: 0, totalBytes: target.downloadPlan?.totalByteCount))
+            : .notInstalled(downloadable: false)
+        emit()
+        let generation = activationGeneration
+        await activateNativeSearch(intent: .userInitiated)
+        guard !isShutDown, persistent.isEnabled, activationGeneration == generation else { return }
+        startIndexingLoopIfAvailable()
+        // Download outside an activation, as a model switch does: native indexing keeps running meanwhile.
+        let installed =
+            if let plan = target.downloadPlan {
+                deps.installer.installedRecord(for: target, revision: plan.revision)
+            } else {
+                deps.installer.anyInstalledRecord(for: target)
+            }
+        if installed == nil, target.isDownloadable {
+            guard await downloadAndInstall(target, expectedGeneration: generation) != nil,
+                !isShutDown, persistent.isEnabled, activationGeneration == generation
+            else { return }
+        }
+        await activateSelectedModel(intent: .userInitiated)
+    }
+
+    /// Turns Smart Search off and deletes every model, index and derived artifact on this device.
     public func disableAndPurge() async {
         guard !isShutDown else { return }
         await performPurge()
     }
 
-    /// Independently controls the optional semantic image model. Turning it off removes only
-    /// semantic vectors and model artifacts; Apple Vision text, document and barcode search
-    /// remains enabled and keeps its durable progress.
-    public func setVisualSearchEnabled(_ enabled: Bool) async {
-        guard !isShutDown, persistent.isEnabled,
-            enabled != persistent.isVisualSearchEnabled
-        else { return }
-        if case .disableVisualSearch(let model) = persistent.pendingOperation {
-            // A running removal owns the state. A stalled one (after a failure) is finished first.
-            // Either way the model choice is gone, so the user selects a model again afterwards.
-            guard visualRemovalsInFlight == 0 else { return }
-            _ = await completeVisualSearchDisable(model: model, descriptor: persistent.activatedDescriptor)
-            return
-        }
-        activationGeneration &+= 1
-
-        if enabled {
-            persistent.isVisualSearchEnabled = true
-            guard persistState() else {
-                persistent.isVisualSearchEnabled = false
-                return
-            }
-            phase = .selectingModel
-            emit()
-            if persistent.selectedModelID == nil {
-                startIndexingLoopIfAvailable()
-            } else {
-                await activateSelectedModel(intent: .userInitiated)
-            }
-            return
-        }
-
-        let selectedModel = persistent.selectedModelID
-        persistent.pendingOperation = .disableVisualSearch(model: selectedModel)
-        persistent.isVisualSearchEnabled = false
-        guard persistState() else {
-            persistent.pendingOperation = nil
-            persistent.isVisualSearchEnabled = true
-            return
-        }
-        phase = .deleting
-        emit()
-        _ = await completeVisualSearchDisable(
-            model: selectedModel,
-            descriptor: persistent.activatedDescriptor
-        )
-    }
-
-    /// A journaled Visual Search removal owns the model state until it commits. Its cleanup awaits
-    /// teardown, so a re-enable or selection accepted meanwhile would be overwritten by the final
-    /// removal state. Intents wait for a running removal and finish a stalled one first.
-    private var isRemovingVisualSearch: Bool {
-        if case .disableVisualSearch = persistent.pendingOperation { return true }
-        return false
-    }
-
-    /// True while `operation` is still the journaled operation of enabled Smart Search.
-    private func isCurrentOperation(_ operation: MLSmartSearchPendingOperation) -> Bool {
-        !isShutDown && persistent.isEnabled && persistent.pendingOperation == operation
-    }
-
     /// Select a model. The same selection is a no-op; another model runs the transactional switch,
     /// retires the old epoch, activates the new model, and starts a clean reindex.
     public func select(_ id: MLModelID) async {
-        guard !isShutDown, persistent.isEnabled else { return }
-        if case .disableVisualSearch(let model) = persistent.pendingOperation {
-            // An explicit choice waits for a running removal and finishes a stalled one first.
-            guard visualRemovalsInFlight == 0,
-                await completeVisualSearchDisable(model: model, descriptor: persistent.activatedDescriptor),
-                !isShutDown, persistent.isEnabled
-            else { return }
-        }
-        guard let target = catalog.entry(for: id), isSelectable(target) else { return }
-
-        if id == persistent.selectedModelID {
-            guard !persistent.isVisualSearchEnabled else { return }
-            await setVisualSearchEnabled(true)
-            return
-        }
+        guard !isShutDown, persistent.isEnabled, id != persistent.selectedModelID,
+            let target = catalog.entry(for: id), isSelectable(target)
+        else { return }
 
         // Selecting another model is an explicit new runtime candidate. Do not carry a permanent
         // failure from the previous model epoch into that candidate.
@@ -581,18 +506,16 @@ public actor MLSmartSearchLifecycle {
         let previousSelection = persistent.selectedModelID
         let previousActivatedRevision = persistent.activatedRevision
         let previousActivatedDescriptor = persistent.activatedDescriptor
-        let previousID = persistent.isVisualSearchEnabled ? previousSelection : nil
+        let previousID = previousSelection
         let startsWithoutActiveModel = previousID == nil
         if startsWithoutActiveModel {
-            // Persist an initial optional-model choice before download so a failed transfer is
-            // retryable after relaunch. Existing active models use the switch journal below and
-            // remain serving until their replacement is installed.
-            persistent.isVisualSearchEnabled = true
+            // Persist a choice that replaces a dropped selection before download, so a failed
+            // transfer is retryable after relaunch. Existing selections use the switch journal below
+            // and remain serving until their replacement is installed.
             persistent.selectedModelID = id
             persistent.activatedRevision = nil
             persistent.activatedDescriptor = nil
             guard persistState() else {
-                persistent.isVisualSearchEnabled = false
                 persistent.selectedModelID = previousSelection
                 persistent.activatedRevision = previousActivatedRevision
                 persistent.activatedDescriptor = previousActivatedDescriptor
@@ -660,7 +583,6 @@ public actor MLSmartSearchLifecycle {
         guard persistState() else {
             persistent.pendingOperation = nil
             if startsWithoutActiveModel {
-                persistent.isVisualSearchEnabled = true
                 persistent.selectedModelID = id
                 persistent.activatedRevision = nil
                 persistent.activatedDescriptor = nil
@@ -715,16 +637,15 @@ public actor MLSmartSearchLifecycle {
             await resumePersistentState()
             return
         }
-        guard !isShutDown, persistent.isEnabled || persistent.pendingOperation == .purge,
-            case .failed(let failure) = phase, failure.isRetryable
-        else { return }
+        guard case .failed(let failure) = phase, failure.isRetryable else { return }
+        if !persistent.isEnabled, persistent.pendingOperation == nil {
+            // Off: only the model list can fail, while the person is choosing a model.
+            if failure.kind == .catalog { await loadModelChoices() }
+            return
+        }
+        guard persistent.isEnabled || persistent.pendingOperation == .purge else { return }
         if failure.kind == .catalog {
             guard await refreshCatalog() else { return }
-            if case .disableVisualSearch(let model) = persistent.pendingOperation {
-                guard visualRemovalsInFlight == 0 else { return }
-                _ = await completeVisualSearchDisable(model: model, descriptor: persistent.activatedDescriptor)
-                return
-            }
             if persistent.selectedModelID == nil {
                 phase = .selectingModel
                 emit()
@@ -734,14 +655,19 @@ public actor MLSmartSearchLifecycle {
             }
             return
         }
-        if failure.kind == .storage, persistent.isEnabled, persistent.selectedModelID == nil,
-            persistent.pendingOperation == nil
-        {
+        if failure.kind == .storage, persistent.isEnabled, persistent.pendingOperation == nil {
+            // A failed state write may have interrupted enabling or a model choice. Store the intent
+            // again before any work resumes.
             guard persistState() else { return }
             await activateNativeSearch(intent: .userInitiated)
-            phase = .selectingModel
-            emit()
+            guard persistent.selectedModelID != nil else {
+                phase = .selectingModel
+                emit()
+                startIndexingLoopIfAvailable()
+                return
+            }
             startIndexingLoopIfAvailable()
+            await activateSelectedModel(intent: .userInitiated)
             return
         }
         switch persistent.pendingOperation {
@@ -756,11 +682,6 @@ public actor MLSmartSearchLifecycle {
                 )
             else { return }
             await activateSelectedModel(intent: .userInitiated)
-        case .disableVisualSearch(let model):
-            _ = await completeVisualSearchDisable(
-                model: model,
-                descriptor: persistent.activatedDescriptor
-            )
         case nil:
             await activateSelectedModel(intent: .userInitiated)
         }
@@ -774,17 +695,11 @@ public actor MLSmartSearchLifecycle {
             developerInstallContinuationGate = gate
         }
 
-        /// Test seam: runs when a Visual Search removal has published `.deleting`, before teardown.
-        private var visualRemovalContinuationGate: (@Sendable () async -> Void)?
         /// Test seam: holds selection ownership after activation while the index may finish.
         private var selectionCompletionGate: (@Sendable () async -> Void)?
 
         func setSelectionCompletionGate(_ gate: (@Sendable () async -> Void)?) {
             selectionCompletionGate = gate
-        }
-
-        func setVisualRemovalContinuationGate(_ gate: (@Sendable () async -> Void)?) {
-            visualRemovalContinuationGate = gate
         }
     #endif
 
@@ -795,7 +710,6 @@ public actor MLSmartSearchLifecycle {
         guard !isShutDown,
             deps.allowsDeveloperModels,
             persistent.isEnabled,
-            persistent.isVisualSearchEnabled,
             let entry = catalog.entry(for: id)
         else { return }
         phase = .installing
@@ -810,11 +724,11 @@ public actor MLSmartSearchLifecycle {
         #if DEBUG
             await developerInstallContinuationGate?()
         #endif
-        // The copy runs outside this actor. Turning Visual Search off or purging Smart Search meanwhile
-        // supersedes the install: it must neither re-enable Visual Search nor leave an orphaned model.
-        guard !isShutDown, persistent.isEnabled, persistent.isVisualSearchEnabled, !isRemovingVisualSearch
+        // The copy runs outside this actor. Turning Smart Search off meanwhile supersedes the install:
+        // it must neither re-enable Smart Search nor leave an orphaned model.
+        guard !isShutDown, persistent.isEnabled, persistent.pendingOperation != .purge
         else {
-            // Uninstall is idempotent. A pending removal may already have passed its own uninstall.
+            // Uninstall is idempotent. A running purge may already have passed its own delete.
             if case .success = installResult, !isShutDown {
                 await deps.installer.uninstall(entry)
             }
@@ -863,7 +777,7 @@ public actor MLSmartSearchLifecycle {
         if indexingExecutionIsAllowed {
             if persistent.isEnabled, activationTasks.isEmpty,
                 phase == .preparingModel || (session == nil && nativeSearch == nil)
-                    || (persistent.isVisualSearchEnabled && persistent.selectedModelID != nil && session == nil)
+                    || (persistent.selectedModelID != nil && session == nil)
             {
                 _ = beginActivation { [self] in await prepareSelectedModel() }
             } else {
@@ -925,9 +839,7 @@ public actor MLSmartSearchLifecycle {
         limit: Int = 50,
         intent: LibraryWorkIntent = .interactive
     ) async throws -> MLSearchResults {
-        guard !isShutDown, persistent.isEnabled, persistent.isVisualSearchEnabled,
-            let session, lastCoverage.indexed > 0
-        else {
+        guard !isShutDown, persistent.isEnabled, let session, lastCoverage.indexed > 0 else {
             throw MLSmartSearchQueryError.unavailable
         }
         let generation = sessionGeneration
@@ -962,9 +874,9 @@ public actor MLSmartSearchLifecycle {
     /// All reviewed suggestion prompts share one automatic, preemptible scan of the active index.
     /// The complete result is required before the sensitive gate can authorize any previews.
     public func searchSuggestionEvidence() async throws -> MLSearchBatchResults {
-        guard !isShutDown, persistent.isEnabled, persistent.isVisualSearchEnabled,
-            let session, lastCoverage.indexed > 0
-        else { throw MLSmartSearchQueryError.unavailable }
+        guard !isShutDown, persistent.isEnabled, let session, lastCoverage.indexed > 0 else {
+            throw MLSmartSearchQueryError.unavailable
+        }
         let generation = sessionGeneration
         let initialInventory = await deps.assetsProvider()
         guard generation == sessionGeneration, !isShutDown, initialInventory.isAuthoritative else {
@@ -992,15 +904,15 @@ public actor MLSmartSearchLifecycle {
             scannedUIDs: results.scannedUIDs.intersection(inventory.uids))
     }
 
-    /// Number of assets the active visual model can answer for; 0 when visual search is off or not ready.
+    /// Number of assets the active model can answer for; 0 when Smart Search is off or not ready.
     public func semanticIndexedAssetCount() -> Int {
-        guard !isShutDown, persistent.isEnabled, persistent.isVisualSearchEnabled, session != nil else { return 0 }
+        guard !isShutDown, persistent.isEnabled, session != nil else { return 0 }
         return lastCoverage.indexed
     }
 
     public func availableSearchScopes() async -> [MLSearchScope] {
         var backends = deps.advertisedNativeSearchBackends
-        if persistent.isVisualSearchEnabled, session != nil, lastCoverage.indexed > 0 {
+        if persistent.isEnabled, session != nil, lastCoverage.indexed > 0 {
             backends.insert(.semantic)
         }
         if let nativeSearch {
@@ -1030,9 +942,7 @@ public actor MLSmartSearchLifecycle {
         var nativeUIDs: [PhotoUID] = []
         var hasBackend = false
 
-        if semanticRequested, persistent.isVisualSearchEnabled,
-            session != nil, lastCoverage.indexed > 0
-        {
+        if semanticRequested, session != nil, lastCoverage.indexed > 0 {
             hasBackend = true
             semanticUIDs = try await search(text, limit: limit).results.map(\.uid)
         }
@@ -1176,7 +1086,6 @@ public actor MLSmartSearchLifecycle {
     private func isCurrent(_ token: ActivationToken) -> Bool {
         guard !isShutDown, !Task.isCancelled,
             persistent.isEnabled,
-            persistent.isVisualSearchEnabled,
             persistent.selectedModelID == token.entry.id,
             activationGeneration == token.generation,
             catalog.entry(for: token.entry.id) == token.entry
@@ -1198,8 +1107,7 @@ public actor MLSmartSearchLifecycle {
         }
 
         let token: ActivationToken? =
-            if persistent.isVisualSearchEnabled,
-                let selectedID = persistent.selectedModelID,
+            if let selectedID = persistent.selectedModelID,
                 let entry = catalog.entry(for: selectedID),
                 isSelectable(entry)
             {
@@ -1463,7 +1371,12 @@ public actor MLSmartSearchLifecycle {
             }
             let kind: MLSmartSearchFailure.Kind
             var isRetryable = true
+            var requiredBytes: Int64?
             switch error {
+            case .insufficientStorage(let required, _):
+                // Retry measures again after the person frees space.
+                kind = .insufficientStorage
+                requiredBytes = required
             case .checksumMismatch, .sizeMismatch, .unsafeArtifactPath:
                 kind = .verification
             case .artifactMissing, .ambiguousModelArtifact, .installRecordUnreadable, .notDownloadable:
@@ -1482,7 +1395,8 @@ public actor MLSmartSearchLifecycle {
                     MLSmartSearchFailure(
                         kind: kind,
                         isRetryable: isRetryable,
-                        debugDescription: String(describing: error)
+                        debugDescription: String(describing: error),
+                        requiredBytes: requiredBytes
                     ))
                 : .ready(lastCoverage)
             emit()
@@ -2090,7 +2004,7 @@ public actor MLSmartSearchLifecycle {
     }
 
     private func aggregateProgress() -> MLSmartSearchAggregateProgress {
-        let semanticIsActive = persistent.isVisualSearchEnabled && session != nil
+        let semanticIsActive = persistent.selectedModelID != nil && session != nil
         let semanticTotal = semanticIsActive ? lastCoverage.total : 0
         let semanticSettled =
             !semanticIsActive
@@ -2333,7 +2247,6 @@ public actor MLSmartSearchLifecycle {
             return false
         }
         persistent.selectedModelID = to
-        persistent.isVisualSearchEnabled = true
         persistent.activatedRevision = nil
         persistent.activatedDescriptor = nil
         persistent.pendingOperation = nil
@@ -2344,98 +2257,6 @@ public actor MLSmartSearchLifecycle {
             return false
         }
         return true
-    }
-
-    /// Crash-recoverable cleanup for the optional visual backend. It forgets the model choice and
-    /// removes every catalog model, partial download, semantic vector epoch and the runtime session.
-    /// Native derived artifacts live in a separate store and survive. Only one removal runs at a time.
-    @discardableResult
-    private func completeVisualSearchDisable(
-        model: MLModelID?,
-        descriptor: MLModelDescriptor?
-    ) async -> Bool {
-        let removal = MLSmartSearchPendingOperation.disableVisualSearch(model: model)
-        // A second completion would stop indexing after the first one committed and restarted it.
-        guard visualRemovalsInFlight == 0 else { return false }
-        visualRemovalsInFlight += 1
-        defer { visualRemovalsInFlight -= 1 }
-        if phase != .deleting {
-            // A stalled journal is finishing: hide Retry and disable the toggle while it runs.
-            phase = .deleting
-            if case .failed = indexingState {
-                indexingState = .waiting(aggregateProgress())
-            }
-            emit()
-        }
-        #if DEBUG
-            await visualRemovalContinuationGate?()
-        #endif
-        await stopActivations()
-        await stopIndexing()
-        await teardownSession()
-        // A full purge may replace this journal while teardown awaits. The purge then owns every
-        // file and the state; this stale removal must not touch the store or rewrite the journal.
-        guard isCurrentOperation(removal) else { return false }
-
-        // Visual Search off means no semantic model or vector epoch may remain. Remove every catalog
-        // model, not only the journaled one: a removal that interrupts a model switch or a download
-        // would otherwise leave the other model's files, partial download or vectors behind.
-        if model != nil || descriptor != nil {
-            var descriptors = catalog.entries.map(\.descriptor)
-            if let descriptor, !descriptors.contains(descriptor) {
-                descriptors.append(descriptor)
-            }
-            guard let store = deps.storeProvider.openStore(),
-                descriptors.allSatisfy({ store.removeAll(for: $0) })
-            else {
-                failVisualRemoval("visual index cleanup failed")
-                return false
-            }
-        }
-        for entry in catalog.entries {
-            await deps.installer.uninstall(entry)
-            guard isCurrentOperation(removal) else { return false }
-        }
-        do {
-            try deps.suggestionCache?.remove()
-        } catch {
-            failVisualRemoval("suggestion cache cleanup failed")
-            return false
-        }
-
-        // "Turn Off and Remove" also forgets the model choice. Re-enabling Visual Search must ask
-        // for a model again instead of silently downloading the removed one.
-        persistent.isVisualSearchEnabled = false
-        persistent.selectedModelID = nil
-        persistent.activatedRevision = nil
-        persistent.activatedDescriptor = nil
-        persistent.pendingOperation = nil
-        guard persistState() else {
-            persistent.pendingOperation = removal
-            persistent.selectedModelID = model
-            persistent.activatedDescriptor = descriptor
-            if case .failed(let failure) = phase {
-                indexingState = .failed(failure)
-                emit()
-            }
-            return false
-        }
-
-        phase = .selectingModel
-        let aggregate = aggregateProgress()
-        indexingState = aggregate.isComplete ? .ready(aggregate) : .indexing(aggregate)
-        emit()
-        startIndexingLoopIfAvailable()
-        return true
-    }
-
-    /// Settings shows native indexing status ahead of the phase. Publish a removal failure in both, so
-    /// its Retry action stays visible while native search is active.
-    private func failVisualRemoval(_ debugDescription: String) {
-        let failure = MLSmartSearchFailure(kind: .storage, isRetryable: true, debugDescription: debugDescription)
-        phase = .failed(failure)
-        indexingState = .failed(failure)
-        emit()
     }
 
     /// Full disable: stop everything, close every handle, delete every Smart Search artifact,
@@ -2512,7 +2333,6 @@ public actor MLSmartSearchLifecycle {
     private func recoverLocallyInstalledSemanticModelAfterCatalogFailure() async {
         guard !isShutDown,
             persistent.isEnabled,
-            persistent.isVisualSearchEnabled,
             let selectedID = persistent.selectedModelID,
             let entry = catalog.entry(for: selectedID),
             isSelectable(entry)
@@ -2585,23 +2405,8 @@ public actor MLSmartSearchLifecycle {
                 false
             }
         if previousCatalog != refreshed || recoveredFromCatalogFailure { emit() }
-        if case .disableVisualSearch(let model) = persistent.pendingOperation {
-            // A running removal owns the phase. A stalled one, for example after an offline start or a
-            // storage failure, is finished now instead of being hidden behind selectingModel.
-            if visualRemovalsInFlight == 0 {
-                _ = await completeVisualSearchDisable(model: model, descriptor: persistent.activatedDescriptor)
-            }
-            return
-        }
 
         if persistent.selectedModelID == nil {
-            phase = .selectingModel
-            emit()
-            startIndexingLoopIfAvailable()
-            return
-        }
-
-        if !persistent.isVisualSearchEnabled {
             phase = .selectingModel
             emit()
             startIndexingLoopIfAvailable()

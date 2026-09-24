@@ -29,7 +29,7 @@ Smart Search exposes only scopes that Apple Vision reports as supported and that
 
 ## Search suggestions do not appear
 
-Suggestions appear after the library and its thumbnails finish loading. The app builds them only while it is idle, so leave the search field empty and keep the app in the foreground. Photo-content suggestions also need Visual Search and a finished index; until then, Search shows a short note. A large library can need several minutes for the first build. Later restarts show the saved suggestions at once.
+Suggestions appear after the library and its thumbnails finish loading. The app builds them only while it is idle, so leave the search field empty and keep the app in the foreground. Photo-content suggestions also need the search model and a finished index; until then, Search shows a short note. A large library can need several minutes for the first build. Later restarts show the saved suggestions at once.
 
 ## Cached media is unavailable offline
 

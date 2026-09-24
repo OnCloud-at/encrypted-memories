@@ -68,8 +68,8 @@ public struct MLSmartSearchPresentation: Sendable, Equatable {
             case .loadingCatalog:
                 status = L10n.string("mlsearch.status_loading_catalog")
             case .selectingModel:
-                // Native Vision starts independently; selecting a semantic model is optional.
-                status = L10n.string("mlsearch.status_preparing_index")
+                // Native Vision keeps indexing, but Smart Search needs a model to be complete.
+                status = L10n.string("mlsearch.status_select_model")
             case .notInstalled(let downloadable):
                 status =
                     downloadable
@@ -123,6 +123,7 @@ public struct MLSmartSearchPresentation: Sendable, Equatable {
                 status = L10n.string("mlsearch.status_deleting")
             case .failed(let failure):
                 status = Self.failureStatus(failure)
+                detail = Self.failureDetail(failure)
                 retry = failure.isRetryable
             }
         }
@@ -216,11 +217,19 @@ public struct MLSmartSearchPresentation: Sendable, Equatable {
         case .installation: L10n.string("mlsearch.status_failed_installation")
         case .modelLoad: L10n.string("mlsearch.status_failed_model")
         case .storage: L10n.string("mlsearch.status_failed_storage")
+        case .insufficientStorage: L10n.string("mlsearch.status_failed_space")
         }
+    }
+
+    fileprivate static func failureDetail(_ failure: MLSmartSearchFailure) -> String? {
+        guard failure.kind == .insufficientStorage, let required = failure.requiredBytes, required > 0 else {
+            return nil
+        }
+        return L10n.string("mlsearch.space_required \(L10n.fileSize(required))")
     }
 }
 
-/// Optional semantic-model status. Native analysis remains usable when this reports a model error.
+/// Model download and activation status. Native analysis remains usable when this reports a model error.
 public struct MLSmartSearchModelPresentation: Sendable, Equatable {
     public let statusText: String?
     public let detailText: String?
@@ -260,6 +269,7 @@ public struct MLSmartSearchModelPresentation: Sendable, Equatable {
             status = L10n.string("mlsearch.status_switching")
         case .failed(let failure) where failure.kind != .storage:
             status = MLSmartSearchPresentation.failureStatus(failure)
+            detail = MLSmartSearchPresentation.failureDetail(failure)
             canRetry = failure.isRetryable
         case .disabled, .selectingModel, .indexing, .waiting, .ready, .deleting, .failed:
             break

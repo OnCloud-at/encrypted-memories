@@ -526,8 +526,7 @@ import TimelineCore
         }
         return MLSmartSearchSnapshot(
             isEnabled: enabled,
-            isVisualSearchEnabled: visual,
-            selectedModelID: nil,
+            selectedModelID: visual ? MLModelID("visual-model") : nil,
             phase: phase,
             installedModelBytes: 0,
             availableModels: [],
@@ -539,8 +538,7 @@ import TimelineCore
     private func snapshot(enabled: Bool, visual: Bool) -> MLSmartSearchSnapshot {
         MLSmartSearchSnapshot(
             isEnabled: enabled,
-            isVisualSearchEnabled: visual,
-            selectedModelID: nil,
+            selectedModelID: visual ? MLModelID("visual-model") : nil,
             phase: .disabled,
             installedModelBytes: 0,
             availableModels: [],
