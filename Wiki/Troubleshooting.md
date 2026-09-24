@@ -27,6 +27,10 @@ Large libraries can show usable media before all thumbnails, map locations, and 
 
 Smart Search exposes only scopes that Apple Vision reports as supported and that have an available index. Check indexing status in Settings. A Neural Engine is not a general requirement.
 
+## Search suggestions do not appear
+
+Suggestions appear after the library and its thumbnails finish loading. The app builds them only while it is idle, so leave the search field empty and keep the app in the foreground. Photo-content suggestions also need Visual Search and a finished index; until then, Search shows a short note. A large library can need several minutes for the first build. Later restarts show the saved suggestions at once.
+
 ## Cached media is unavailable offline
 
 Only media already present in the configured encrypted cache can open offline. Reconnect and open or cache the media before the next offline period.

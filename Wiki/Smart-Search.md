@@ -11,9 +11,27 @@ The app shows **Text** only when its local Apple Vision index is available. Init
 
 Visual Search is a separate optional model feature for descriptive queries. Its availability depends on a compatible signed model in the current model catalog. Document, barcode, and similar-image pipelines are not separate user-selectable scopes in the current app.
 
+## Search suggestions
+
+When the search field is empty, Search suggests entries from your own library:
+
+- Places and places in a season, for example a city in summer.
+- Trips, seasons, and photos from this day in earlier years.
+- Favorites from a year.
+- Media types, for example Videos or Live Photos.
+- Photo content, for example beaches or dogs. This requires Visual Search and a finished index.
+
+Select a suggestion to show exactly the photos that belong to it. The app builds suggestions on the device while it is idle. It pauses this work during an active search, video playback, exports that you start, Low Power Mode, and high device temperature. The first build can take several minutes for a large library. After a restart, the app shows the saved suggestions at once if the library did not change.
+
+Suggestion previews never show photos that the sensitive-content check did not confirm.
+
+- **iPhone and iPad:** The Search tab shows **For You** rows with previews and your **Recent** searches.
+- **Mac:** Suggestions appear in the menu of the search field.
+
 ## Privacy
 
 - Photos and search queries are not sent to a separate search service.
+- Place suggestions get their names from Apple MapKit. For this, the app sends only the rounded center of a group of photos, precise to about 1 km. See [[Settings, Cache, and Privacy|Settings-Cache-and-Privacy]].
 - Model artifacts and encrypted indexes remain on the device.
 - Signing out removes account-scoped local search data.
 
