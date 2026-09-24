@@ -16,4 +16,4 @@ Only media with usable location information appears. An empty Map does not mean 
 - **iPhone and iPad:** Open the **Map** tab and tap a marker or cluster.
 - **Mac:** Select **Map** in the sidebar. The map stays beside the native sidebar and opens media in the shared viewer.
 
-The local location index is account-scoped and encrypted at rest. Apple MapKit provides the native map surface.
+The local location index is account-scoped and encrypted at rest. Apple MapKit provides the native map surface and the place names. To resolve a place name, the app sends the location coordinates to Apple.

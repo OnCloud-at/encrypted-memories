@@ -20,6 +20,7 @@ The app can rebuild derived thumbnails and search indexes from the remote librar
 - Credentials use the platform Keychain with device-only accessibility.
 - Local photo and search data is encrypted at rest.
 - Search queries are not sent to a separate search service.
+- Place names in the viewer, on the Map, and in search suggestions come from Apple MapKit. The app sends location coordinates to Apple for this. For search suggestions, it sends only the rounded center of a group of photos, precise to about 1 km. These requests contain no photos, file names, or search text.
 - Release builds do not write file debug logs. Runtime-gated unified logging is disabled unless explicitly enabled for a local investigation.
 - Support reports must be reviewed before sharing. Never attach passwords, API keys, private links, or photo content to GitHub.
 
