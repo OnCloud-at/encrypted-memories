@@ -23,6 +23,8 @@ public struct LabsSettingsSection: View {
                 } description: {
                     Text(L10n.string("labs.empty_message"))
                 }
+                // A macOS grouped form does not give the view the full row, which leaves it off-center.
+                .frame(maxWidth: .infinity)
             } else {
                 ForEach(features) { feature in
                     LabFeatureToggle(feature: feature)
