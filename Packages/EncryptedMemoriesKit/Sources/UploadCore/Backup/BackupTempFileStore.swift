@@ -59,10 +59,7 @@ public final class BackupTempFileStore: @unchecked Sendable {
             directory: directory,
             maximumBytes: maximumBytes,
             minimumFreeBytes: minimumFreeBytes,
-            availableCapacity: { url in
-                let values = try? url.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
-                return values?.volumeAvailableCapacityForImportantUsage
-            },
+            availableCapacity: DeviceStorage.availableCapacity(at:),
             now: { Date() }
         )
     }

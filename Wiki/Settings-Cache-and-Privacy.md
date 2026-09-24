@@ -20,6 +20,8 @@ Encrypted Memories keeps encrypted thumbnails, previews, originals, metadata, an
 
 The app can rebuild derived thumbnails and search indexes from the remote library. This can temporarily increase network and background activity.
 
+When the device is almost full, the app stops saving new offline copies of originals, previews, and videos. When hardly any space is left, it also deletes these copies and pauses background work that writes a lot, such as indexing. Grid thumbnails stay. Settings shows a short note while this applies. Everything resumes on its own once there is space again.
+
 ## Privacy boundaries
 
 - Proton authentication happens through the browser flow.

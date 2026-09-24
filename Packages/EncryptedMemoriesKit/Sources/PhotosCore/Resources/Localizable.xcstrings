@@ -91,6 +91,13 @@
         "en": { "stringUnit": { "state": "translated", "value": "Restore" } }
       }
     },
+    "settings.storage_pressure": {
+      "extractionState": "manual",
+      "localizations": {
+        "de": { "stringUnit": { "state": "translated", "value": "Wenig Speicher auf diesem Gerät. Offline-Kopien werden vorerst nicht gespeichert." } },
+        "en": { "stringUnit": { "state": "translated", "value": "Storage is almost full. Offline copies are paused for now." } }
+      }
+    },
     "dragout.error.title": {
       "extractionState": "manual",
       "localizations": {

@@ -21,6 +21,8 @@ public final class VideoByteRangeCache: @unchecked Sendable {
     private let fm = FileManager.default
     /// Shared fence used by detached range fetches that can return after `clearAll()`.
     private let writerGeneration = CacheWriterGeneration()
+    private let runtimeState: LibraryRuntimeState
+    private var storageTask: Task<Void, Never>?
     private var sizeOnDisk: Int?
 
     struct Lookup: Sendable {
@@ -30,15 +32,27 @@ public final class VideoByteRangeCache: @unchecked Sendable {
 
     init(
         budgetBytes: Int = 512 * 1024 * 1024,
-        rootDirectory: URL? = nil
+        rootDirectory: URL? = nil,
+        runtimeState: LibraryRuntimeState = .shared
     ) {
         self.budgetBytes = budgetBytes
+        self.runtimeState = runtimeState
         let caches = fm.urls(for: .cachesDirectory, in: .userDomainMask)[0]
         self.root =
             rootDirectory
             ?? caches.appendingPathComponent("EncryptedMemories/video-blocks", isDirectory: true)
         // Reads do not require the directory. The first store or clear creates it on the I/O queue.
+        storageTask = Task { [weak self, runtimeState] in
+            var wasCritical = false
+            for await snapshot in runtimeState.updates() {
+                let critical = snapshot.storagePressure == .critical
+                if critical, !wasCritical { await self?.clearForStoragePressureAsync() }
+                wasCritical = critical
+            }
+        }
     }
+
+    deinit { storageTask?.cancel() }
 
     /// Stable, filesystem-safe directory name for a uid (SHA-256 hex of the volume~node pair).
     private func dir(for uid: PhotoUID) -> URL {
@@ -96,11 +110,15 @@ public final class VideoByteRangeCache: @unchecked Sendable {
         // A fresh post-clear lookup must not let an old owner write. Equality also rejects a stale miss
         // ticket when a caller mixes requests from different generations.
         guard ticket == ownerGeneration else { return false }
+        guard runtimeState.snapshot().storagePressure.permitsDiskWrite(for: .video) else { return false }
         let d = dir(for: uid)
         // Keep the generation fence across the complete write and budget pass. This establishes the one
         // lock order used by this cache: generation first, then cache. clearAll uses the same order.
         return writerGeneration.performIfCurrent(ownerGeneration) {
             lock.withLock { () -> Bool in
+                guard runtimeState.snapshot().storagePressure.permitsDiskWrite(for: .video) else {
+                    return false
+                }
                 try? fm.createDirectory(at: d, withIntermediateDirectories: true)
                 let url = d.appendingPathComponent("\(block).blk")
                 let previousTotal = sizeOnDiskLocked()
@@ -167,6 +185,24 @@ public final class VideoByteRangeCache: @unchecked Sendable {
         await withCheckedContinuation { continuation in
             ioQueue.async {
                 self.clearAll()
+                continuation.resume()
+            }
+        }
+    }
+
+    private func clearForStoragePressureAsync() async {
+        await withCheckedContinuation { continuation in
+            ioQueue.async {
+                // Keep the owner generation so an open player can cache new blocks after recovery.
+                let generation = self.writerGeneration.capture()
+                _ = self.writerGeneration.performIfCurrent(generation) {
+                    self.lock.withLock {
+                        guard self.runtimeState.snapshot().storagePressure == .critical else { return }
+                        try? self.fm.removeItem(at: self.root)
+                        try? self.fm.createDirectory(at: self.root, withIntermediateDirectories: true)
+                        self.sizeOnDisk = nil
+                    }
+                }
                 continuation.resume()
             }
         }

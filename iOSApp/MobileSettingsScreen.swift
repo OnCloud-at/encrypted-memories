@@ -19,6 +19,7 @@ struct MobileSettingsScreen: View {
     @State private var account = AccountInfo.shared
 
     @State private var cacheSize: Int64 = 0
+    @State private var storagePressure: LibraryStoragePressure = .normal
     @State private var isClearingCache = false
     @State private var confirmSignOut = false
     @State private var confirmClearCache = false
@@ -42,6 +43,7 @@ struct MobileSettingsScreen: View {
                 brandFooter
             }
             .mobileNavigationTitle(String(localized: "tab.settings"))
+            .observesStoragePressure($storagePressure)
             .toolbar {
                 if showsDismissButton {
                     ToolbarItem(placement: .confirmationAction) {
@@ -206,7 +208,7 @@ struct MobileSettingsScreen: View {
 
     /// On-disk encrypted thumbnail-cache size and clear action.
     @ViewBuilder private var cacheSection: some View {
-        Section(String(localized: "settings.section_cache")) {
+        Section {
             LabeledContent(String(localized: "settings.cache_size")) {
                 Text(L10n.fileSize(cacheSize))
                     .monospacedDigit()
@@ -222,6 +224,12 @@ struct MobileSettingsScreen: View {
                 }
             }
             .disabled(isClearingCache)
+        } header: {
+            Text(String(localized: "settings.section_cache"))
+        } footer: {
+            if storagePressure != .normal {
+                Text(L10n.string("settings.storage_pressure"))
+            }
         }
     }
 

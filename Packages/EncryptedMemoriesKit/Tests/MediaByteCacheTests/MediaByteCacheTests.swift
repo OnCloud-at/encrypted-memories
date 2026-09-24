@@ -55,6 +55,51 @@ struct MediaByteCacheTests {
         PhotoUID(volumeID: "vol-1", nodeID: id)
     }
 
+    @Test func storagePressurePausesOptionalWritesAndEvictsThemAtCritical() async throws {
+        let root = uniqueRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runtime = LibraryRuntimeState()
+        let thumbnail = ThumbnailCache(
+            namespace: "thumb", derivative: "thumbnail", rootDirectory: root, runtimeState: runtime)
+        let preview = ThumbnailCache(
+            namespace: "preview", derivative: "preview", rootDirectory: root, runtimeState: runtime)
+        let original = ThumbnailCache(
+            namespace: "original", derivative: "original", rootDirectory: root, runtimeState: runtime)
+        let photo = uid("pressure")
+        for cache in [thumbnail, preview, original] {
+            cache.configure(accountUID: "acct-A", key: byteCacheTestKey)
+            #expect(cache.storeToDisk(png(), for: photo, ifCurrent: cache.captureWriterGeneration()) == .stored)
+        }
+
+        runtime.update { $0.storagePressure = .low }
+        #expect(
+            thumbnail.storeToDisk(png(), for: uid("low"), ifCurrent: thumbnail.captureWriterGeneration()) == .stored)
+        for cache in [preview, original] {
+            #expect(
+                cache.storeToDisk(png(), for: uid("low"), ifCurrent: cache.captureWriterGeneration()) == .storagePaused)
+            #expect(cache.diskData(for: photo) == png())
+        }
+
+        runtime.update { $0.storagePressure = .critical }
+        #expect(
+            thumbnail.storeToDisk(png(), for: uid("critical"), ifCurrent: thumbnail.captureWriterGeneration())
+                == .storagePaused)
+        for _ in 0..<100 where preview.diskFileCount() != 0 || original.diskFileCount() != 0 {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(preview.diskFileCount() == 0)
+        #expect(original.diskFileCount() == 0)
+        #expect(thumbnail.diskData(for: photo) == png())
+        await thumbnail.store(png(), for: uid("ram"))
+        #expect(await thumbnail.data(for: uid("ram")) == png())
+        #expect(thumbnail.diskData(for: uid("ram")) == nil)
+
+        runtime.update { $0.storagePressure = .normal }
+        #expect(
+            original.storeToDisk(png(), for: uid("recovered"), ifCurrent: original.captureWriterGeneration()) == .stored
+        )
+    }
+
     private func sourceGraph(
         retaining uids: [PhotoUID],
         authoritative: Bool

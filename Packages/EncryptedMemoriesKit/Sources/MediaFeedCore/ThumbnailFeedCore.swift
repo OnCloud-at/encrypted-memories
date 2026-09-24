@@ -581,7 +581,8 @@ public actor ThumbnailFeedCore {
         }
         let maxPixels = configuration.targetPixels
         let decoded: DecodedThumbnail? = await decodeExecutor.perform(priority: .visibleNow) {
-            guard cache.storeToDisk(data, for: uid, ifCurrent: generation) == .stored else { return nil }
+            let stored = cache.storeToDisk(data, for: uid, ifCurrent: generation)
+            guard stored == .stored || stored == .storagePaused else { return nil }
             return ThumbnailImageDecoder.downsample(data, maxPixelSize: maxPixels)
         }
         guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(generation),
@@ -1220,9 +1221,12 @@ public actor ThumbnailFeedCore {
             return nil
         }
         let maxPixels = configuration.targetPixels
-        let image: DecodedThumbnail? = await decodeExecutor.perform(priority: .visibleNow) { () -> DecodedThumbnail? in
-            guard cache.storeToDisk(data, for: uid, ifCurrent: writerGeneration) == .stored else { return nil }
-            return ThumbnailImageDecoder.downsample(data, maxPixelSize: maxPixels)
+        let (image, stored): (DecodedThumbnail?, ThumbnailCacheStoreResult) = await decodeExecutor.perform(
+            priority: .visibleNow
+        ) {
+            let stored = cache.storeToDisk(data, for: uid, ifCurrent: writerGeneration)
+            guard stored == .stored || stored == .storagePaused else { return (nil, stored) }
+            return (ThumbnailImageDecoder.downsample(data, maxPixelSize: maxPixels), stored)
         }
         guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(writerGeneration),
             thumbnailReadAuthorization.isAllowed(uid)
@@ -1230,7 +1234,7 @@ public actor ThumbnailFeedCore {
             decoded.removeAll()
             return nil
         }
-        diskPresence.set(uid, present: true)
+        if stored == .stored { diskPresence.set(uid, present: true) }
         cacheArrivalWake.call()
         guard let image else {
             diagnostics.increment("thumb.diskDecodeFailed")
@@ -2116,7 +2120,9 @@ public actor ThumbnailFeedCore {
 
         let now = clock()
         let backingOff = crawlBackoffUntil.map { now < $0 } ?? false
-        guard !prefetchPaused, prefetchEnabled, !recentVisibleDemand(now: now), !backingOff else {
+        // With almost no free space the cache cannot keep what the crawl downloads; visible photos still load.
+        let storageIsCritical = LibraryRuntimeState.shared.snapshot().storagePressure == .critical
+        guard !prefetchPaused, prefetchEnabled, !recentVisibleDemand(now: now), !backingOff, !storageIsCritical else {
             let batch = await finishDiskProbeBatch(
                 candidates,
                 priority: batchPriority,

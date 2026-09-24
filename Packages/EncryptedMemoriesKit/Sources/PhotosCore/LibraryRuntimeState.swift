@@ -42,6 +42,7 @@ public struct LibraryRuntimeSnapshot: Sendable, Equatable {
     /// Cache footprint, including proactive background reduction. This is not a pressure signal.
     public var memoryBudgetTier: MemoryBudgetTier
     public var memoryHeadroom: LibraryMemoryHeadroom
+    public var storagePressure: LibraryStoragePressure
     public var isLowPowerMode: Bool
     public var network: LibraryNetworkState
     public var executionOpportunity: LibraryExecutionOpportunity
@@ -58,6 +59,7 @@ public struct LibraryRuntimeSnapshot: Sendable, Equatable {
         memoryPressure: MemoryConditions.Pressure = .normal,
         memoryBudgetTier: MemoryBudgetTier = .normal,
         memoryHeadroom: LibraryMemoryHeadroom = .unknown,
+        storagePressure: LibraryStoragePressure = .normal,
         isLowPowerMode: Bool = false,
         network: LibraryNetworkState = LibraryNetworkState(),
         executionOpportunity: LibraryExecutionOpportunity = .foregroundActive,
@@ -73,6 +75,7 @@ public struct LibraryRuntimeSnapshot: Sendable, Equatable {
         self.memoryPressure = memoryPressure
         self.memoryBudgetTier = memoryBudgetTier
         self.memoryHeadroom = memoryHeadroom
+        self.storagePressure = storagePressure
         self.isLowPowerMode = isLowPowerMode
         self.network = network
         self.executionOpportunity = executionOpportunity
@@ -143,6 +146,7 @@ public final class LibraryRuntimeState: @unchecked Sendable {
                     memoryPressure: old.memoryPressure,
                     memoryBudgetTier: old.memoryBudgetTier,
                     memoryHeadroom: old.memoryHeadroom,
+                    storagePressure: old.storagePressure,
                     isLowPowerMode: old.isLowPowerMode,
                     network: old.network,
                     executionOpportunity: old.executionOpportunity,

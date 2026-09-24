@@ -370,6 +370,7 @@ private struct LibrarySettingsTab: View {
     @State private var deleting = false
     @State private var cacheSize: Int64 = 0
     @State private var originalsSize: Int64 = 0
+    @State private var storagePressure: LibraryStoragePressure = .normal
 
     var body: some View {
         Form {
@@ -438,9 +439,14 @@ private struct LibrarySettingsTab: View {
                     .fixedSize(horizontal: false, vertical: true)
             } header: {
                 Text("settings.storage_section")
+            } footer: {
+                if storagePressure != .normal {
+                    Text(L10n.string("settings.storage_pressure"))
+                }
             }
         }
         .formStyle(.grouped)
+        .observesStoragePressure($storagePressure)
         .task {
             await refreshSize()
             while !Task.isCancelled {
