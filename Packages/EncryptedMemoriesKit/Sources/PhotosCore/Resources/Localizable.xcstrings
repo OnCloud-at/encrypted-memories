@@ -4558,8 +4558,8 @@
     "settings.albumsync_picker_title": {
       "extractionState": "manual",
       "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "Choose albums to sync" } },
-        "de": { "stringUnit": { "state": "translated", "value": "Alben für Sync auswählen" } }
+        "en": { "stringUnit": { "state": "translated", "value": "Choose Albums" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Alben auswählen" } }
       }
     },
     "settings.albumsync_remove": {
