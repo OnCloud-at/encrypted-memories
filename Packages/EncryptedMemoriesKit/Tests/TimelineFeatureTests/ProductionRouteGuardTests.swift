@@ -566,7 +566,11 @@ struct ProductionRouteGuardTests {
             encoding: .utf8)
         #expect(mainView.contains("await model.recoverBackendAfterScopeAccessLoss()"))
         #expect(mainView.contains("timelineModel.initialLoadFailureReason == .scopeAccessLost"))
-        #expect(mainView.contains("result.failureReason == .scopeAccessLost { return .terminal }"))
+        let macRefresh = try String(
+            contentsOf: Self.repoRoot.appendingPathComponent("App/MacLibraryRefreshController.swift"),
+            encoding: .utf8)
+        #expect(macRefresh.contains("result.failureReason == .scopeAccessLost { return .terminal }"))
+        #expect(macRefresh.contains("await host.model.recoverBackendAfterScopeAccessLoss()"))
 
         let mobile = try String(
             contentsOf: Self.repoRoot.appendingPathComponent("iOSApp/MobileLibraryModel.swift"),
@@ -2149,7 +2153,9 @@ struct ProductionRouteGuardTests {
                 in: mainView
             ).contains("model.refreshLibrarySources()"),
             "connectivity recovery must retry additional library-source discovery")
-        #expect(mainView.contains("Label(\"sidebar.map\""), "Map must be localized on macOS")
+        let macSidebar = try String(
+            contentsOf: Self.repoRoot.appendingPathComponent("App/Views/MacLibrarySidebar.swift"), encoding: .utf8)
+        #expect(macSidebar.contains("Label(\"sidebar.map\""), "Map must be localized on macOS")
         #expect(
             !mainView.contains("try? await facade.albums.setAlbumCover"),
             "album-cover failures must remain visible instead of being discarded")
@@ -2244,7 +2250,7 @@ struct ProductionRouteGuardTests {
         #expect(!mainView.contains("gridToolbarGlassFade"), "old hand-painted toolbar gradient must not return")
         #expect(!mainView.contains("SidebarResizeHandle"), "the custom sidebar resize handle must not return")
         #expect(
-            mainView.contains("SettingsLink"),
+            macSidebar.contains("SettingsLink"),
             "macOS settings must remain discoverable from the visible sidebar")
 
         let settingsView = try String(
@@ -2314,14 +2320,21 @@ struct ProductionRouteGuardTests {
             encoding: .utf8
         )
 
+        // LibrarySourceAnalysisSessionTests prove the generation fence itself; both hosts must route every
+        // startup and later primary-inventory update through that one shared owner.
         #expect(
-            appModel.components(separatedBy: "generation: primaryGeneration").count - 1 >= 2,
+            appModel.contains("sourceAnalysis.startPrimaryInventory(")
+                && appModel.contains("sourceAnalysis.replacePrimaryInventory("),
             "macOS startup and later primary-inventory updates must share the monotonic generation fence"
         )
         #expect(
-            mobileLibrary.contains("generation: primaryGeneration"),
+            mobileLibrary.contains("sourceAnalysis.synchronizePrimaryInventory(")
+                && mobileLibrary.contains("sourceAnalysis.replacePrimaryInventory("),
             "iOS and iPadOS primary-inventory updates must use the same generation fence"
         )
+        for host in [appModel, mobileLibrary] {
+            #expect(!host.contains("sourcePrimaryInventoryGeneration"), "hosts must not keep a second generation")
+        }
 
         let mobileSourceConfiguration = sourceBlock(
             from: "private func configureSourceAnalysis(",
@@ -2353,12 +2366,16 @@ struct ProductionRouteGuardTests {
         )
         #expect(macConnectivityRecovery.contains("model.refreshLibrarySources()"))
 
+        let macRefreshController = try String(
+            contentsOf: Self.repoRoot.appendingPathComponent("App/MacLibraryRefreshController.swift"),
+            encoding: .utf8)
         let macRemoteRefresh = sourceBlock(
-            from: "@MainActor private func performRemoteLibraryRefresh()",
-            to: "private func scheduleLibraryRefreshAfterBackupUpload()",
-            in: mainView
+            from: "func performRemoteLibraryRefresh(host: Host)",
+            to: "func cancelBackupUploadRefresh()",
+            in: macRefreshController
         )
-        #expect(macRemoteRefresh.contains("model.refreshLibrarySources()"))
+        #expect(macRemoteRefresh.contains("host.model.refreshLibrarySources()"))
+        #expect(mainView.contains("libraryRefresh.performRemoteLibraryRefresh(host: refreshHost)"))
 
         #expect(
             mobileApp.contains("libraryModel.refreshLibrarySources()"),
@@ -2400,8 +2417,10 @@ struct ProductionRouteGuardTests {
     @Test func albumsSidebarAndEmptyRoutesStayExplicit() throws {
         let mainView = try String(
             contentsOf: Self.repoRoot.appendingPathComponent("App/Views/MainView.swift"), encoding: .utf8)
+        let sidebarFile = try String(
+            contentsOf: Self.repoRoot.appendingPathComponent("App/Views/MacLibrarySidebar.swift"), encoding: .utf8)
         let sidebar = try Self.body(
-            of: mainView, from: "private struct SidebarView: View", to: ".scrollContentBackground(.hidden)")
+            of: sidebarFile, from: "struct SidebarView: View", to: ".scrollContentBackground(.hidden)")
         #expect(
             sidebar.contains("Section(\"sidebar.albums\")"),
             "the Albums section must stay visible even before the account has albums")
@@ -2421,7 +2440,7 @@ struct ProductionRouteGuardTests {
             sidebar.contains(".buttonStyle(.plain)"),
             "SettingsLink's default macOS button chrome adds a gray capsule and extra indentation")
         #expect(
-            !mainView.contains(".safeAreaInset(edge: .bottom"),
+            !mainView.contains(".safeAreaInset(edge: .bottom") && !sidebarFile.contains(".safeAreaInset(edge: .bottom"),
             "an overlaid settings footer can cover the final sidebar routes in short windows")
 
         let appStrings = try String(
