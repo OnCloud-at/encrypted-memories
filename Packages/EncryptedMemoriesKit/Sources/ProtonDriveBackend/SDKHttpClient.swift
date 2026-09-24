@@ -115,7 +115,7 @@ final class SDKHttpClient: HttpClientProtocol, @unchecked Sendable {
 
     // MARK: Small upload (absolute url, buffered)
 
-    /// Sends one complete multipart upload to the Drive API. SDK 0.29.0 buffers a small file from byte
+    /// Sends one complete multipart upload to the Drive API. SDK 0.29.1 buffers a small file from byte
     /// zero and hands us the opaque multipart body plus its metadata JSON as a side channel. The body
     /// goes out unchanged with session auth; `metadata` may contain plaintext, so it is neither logged
     /// nor reconstructed from `content`. The SDK forbids resending after a timeout, lost connection or

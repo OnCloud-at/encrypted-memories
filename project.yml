@@ -35,7 +35,7 @@ packages:
     path: Packages/EncryptedMemoriesKit
   ProtonCore:
     url: https://github.com/ProtonMail/protoncore_ios.git
-    # Proton Drive SDK 0.29.0 no longer pins ProtonCore; the app pins this version for ProtonAuth and crypto.
+    # Proton Drive SDK 0.29.1 does not pin ProtonCore; the app pins this version for ProtonAuth and crypto.
     exactVersion: 37.3.0
 
 fileGroups:

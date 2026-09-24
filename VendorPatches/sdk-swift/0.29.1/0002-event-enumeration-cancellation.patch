@@ -1,17 +1,17 @@
 diff --git a/Sources/Client/EncryptedMemoriesClient/EncryptedMemoriesClient.swift b/Sources/Client/EncryptedMemoriesClient/EncryptedMemoriesClient.swift
-index ada05f1..876a35a 100644
+index 458a790..6a9a9a4 100644
 --- a/Sources/Client/EncryptedMemoriesClient/EncryptedMemoriesClient.swift
 +++ b/Sources/Client/EncryptedMemoriesClient/EncryptedMemoriesClient.swift
-@@ -52,0 +53 @@ public actor EncryptedMemoriesClient: Sendable, ProtonSDKClient {
+@@ -54,0 +55 @@ public actor EncryptedMemoriesClient: Sendable, ProtonSDKClient {
 +    private var activeEventEnumerations: [OperationIdentifier: EventEnumerationCancellationState] = [:]
-@@ -151,0 +153,2 @@ public actor EncryptedMemoriesClient: Sendable, ProtonSDKClient {
+@@ -153,0 +155,2 @@ public actor EncryptedMemoriesClient: Sendable, ProtonSDKClient {
 +        let eventEnumerations = Array(activeEventEnumerations.values)
 +        activeEventEnumerations.removeAll(keepingCapacity: false)
-@@ -159,0 +163,3 @@ public actor EncryptedMemoriesClient: Sendable, ProtonSDKClient {
+@@ -161,0 +165,3 @@ public actor EncryptedMemoriesClient: Sendable, ProtonSDKClient {
 +            for enumeration in eventEnumerations {
 +                await enumeration.cancelAndRelease()
 +            }
-@@ -203,0 +210,16 @@ public actor EncryptedMemoriesClient: Sendable, ProtonSDKClient {
+@@ -205,0 +212,16 @@ public actor EncryptedMemoriesClient: Sendable, ProtonSDKClient {
 +
 +    private func releaseEventEnumeration(
 +        identifier: OperationIdentifier,
@@ -28,7 +28,7 @@ index ada05f1..876a35a 100644
 +            await state.completeAndRelease()
 +        }
 +    }
-@@ -789,4 +811,4 @@ extension EncryptedMemoriesClient {
+@@ -821,4 +843,4 @@ extension EncryptedMemoriesClient {
 -        let cancellationTokenSource = try await createCancellationTokenSource(.enumerateEvents(cancellationToken), logger)
 -        defer {
 -            freeCancellationTokenSourceIfNeeded(identifier: .enumerateEvents(cancellationToken))
@@ -37,7 +37,7 @@ index ada05f1..876a35a 100644
 +        let cancellationTokenSource = try await CancellationTokenSource(logger: logger)
 +        let cancellationState = EventEnumerationCancellationState(tokenSource: cancellationTokenSource)
 +        activeEventEnumerations[identifier] = cancellationState
-@@ -805,7 +827,29 @@ extension EncryptedMemoriesClient {
+@@ -837,7 +859,29 @@ extension EncryptedMemoriesClient {
 -        let _: Void = try await SDKRequestHandler.send(
 -            request,
 -            state: WeakReference(value: callbackState),
@@ -74,7 +74,7 @@ index ada05f1..876a35a 100644
 +            )
 +            throw error
 +        }
-@@ -815 +859,7 @@ extension EncryptedMemoriesClient {
+@@ -847 +891,7 @@ extension EncryptedMemoriesClient {
 -        try await cancelOperation(identifier: .enumerateEvents(cancellationToken))
 +        let identifier = OperationIdentifier.enumerateEvents(cancellationToken)
 +        guard let state = activeEventEnumerations.removeValue(forKey: identifier) else {
@@ -231,22 +231,6 @@ index ed17d5b..21066ed 100644
 +            )
 +        }
 +        await state.cancelAndRelease()
-diff --git a/Sources/Client/ProtonDriveClient/cDriveEventEnumerationCallback.swift b/Sources/Client/ProtonDriveClient/cDriveEventEnumerationCallback.swift
-index 997d0b5..7209304 100644
---- a/Sources/Client/ProtonDriveClient/cDriveEventEnumerationCallback.swift
-+++ b/Sources/Client/ProtonDriveClient/cDriveEventEnumerationCallback.swift
-@@ -16,6 +16,5 @@ final class DriveEventEnumerationCallbackWrapper: Sendable {
--let cDriveEventEnumerationCallback: CCallback = { stateHandle, byteArray in
--    typealias BoxType = BoxedCompletionBlock<Int, WeakReference<DriveEventEnumerationCallbackWrapper>>
--
--    guard let box: BoxType = CallbackHandleRegistry.shared.get(stateHandle) else {
--        return
--    }
-+let cDriveEventEnumerationCallback: CCallback = { statePointer, byteArray in
-+    // Event enumeration awaits `Void`, so the yield callback must use that exact box type. The
-+    // registry lookup also makes a yield after task cancellation a safe no-op.
-+    typealias BoxType = BoxedCompletionBlock<Void, WeakReference<DriveEventEnumerationCallbackWrapper>>
-+    guard let box = CallbackHandleRegistry.shared.get(statePointer, as: BoxType.self) else { return }
 diff --git a/Tests/DriveEventEnumerationCallbackTests.swift b/Tests/DriveEventEnumerationCallbackTests.swift
 new file mode 100644
 index 0000000..e799e98

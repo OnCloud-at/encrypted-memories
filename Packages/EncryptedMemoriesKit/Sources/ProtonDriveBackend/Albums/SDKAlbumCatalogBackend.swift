@@ -250,7 +250,7 @@ actor SDKSharedAlbumSnapshotCache {
     }
 }
 
-/// SDK 0.29.0 catalog/sharing/membership adapter. Enumerations publish only after their native
+/// SDK 0.29.1 catalog/sharing/membership adapter. Enumerations publish only after their native
 /// callback stream completes, and node hydration uses a bounded task group so a large catalog
 /// cannot create one unbounded task per album.
 struct SDKAlbumCatalogBackend: AlbumCatalogBackend {

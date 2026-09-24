@@ -2193,7 +2193,7 @@ final class ProjectHygieneTests: XCTestCase {
         XCTAssertTrue(handler.contains("CallbackHandleRegistry.shared.cancel(handle)"))
         XCTAssertTrue(
             handler.contains("CallbackHandleRegistry.shared.resolveResponse(stateHandle)"),
-            "SDK 0.29.0 resolves every response through the registry; the raw-pointer adapter is gone")
+            "SDK 0.29.1 resolves every response through the registry; the raw-pointer adapter is gone")
         XCTAssertFalse(handler.contains("registryBacked"), "the 0.27 dual-path adapter must not return")
         XCTAssertFalse(handler.contains("Unmanaged"), "no request may pass a retained raw address to native code")
         XCTAssertTrue(boxedContinuation.contains("RegistryCancellable"))
@@ -2204,8 +2204,9 @@ final class ProjectHygieneTests: XCTestCase {
             "late thumbnail callbacks must use registry IDs, never retained raw pointers")
 
         // Every streamed enumeration awaits `Void`, so its yield callback must look up that exact box
-        // type. Upstream 0.28+ ships five of these with `Int`, which makes the checked registry cast
-        // drop every yielded timeline item, album item, node result, node UID, and device.
+        // type. Upstream 0.28 through 0.29.0 shipped five of these with `Int`, which made the checked registry
+        // cast drop every yielded timeline item, album item, node result, node UID, and device. 0.29.1 fixes
+        // them upstream; this guard keeps a later SDK from reintroducing the mismatch.
         let voidEnumerationCallbacks = [
             "FileOperations/Downloads/cThumbnailEnumerationCallback.swift",
             "Client/ProtonDriveClient/cDriveEventEnumerationCallback.swift",
