@@ -17,6 +17,11 @@ concurrency:
 jobs:
   remind:
     name: Check LLM API key expiry
+    # Repo-global LLM kill switch: runs only when the LLM_ENABLED repository
+    # variable is "1" or "true" (GitHub compares case-insensitively, so "True"
+    # also enables it). Missing, "0", "false", or any other value skips this
+    # job neutrally without failing.
+    if: ${{ vars.LLM_ENABLED == '1' || vars.LLM_ENABLED == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:

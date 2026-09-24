@@ -22,7 +22,7 @@ concurrency:
 jobs:
   review:
     name: Review changed code
-    if: github.event.pull_request.state == 'open' && github.event.pull_request.draft == false
+    if: ${{ github.event.pull_request.state == 'open' && github.event.pull_request.draft == false && (vars.LLM_ENABLED == '1' || vars.LLM_ENABLED == 'true') }}
     runs-on: ubuntu-24.04
     # Advisory: never add this job to branch protection or required workflows.
     continue-on-error: true
