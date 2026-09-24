@@ -25,8 +25,10 @@ struct MobileCollectionsScreen: View {
         var revision: Int
     }
 
-    /// Server-backed smart filters. Titles and icons come from the localized `PhotoTag` values.
-    private let smartCategories: [PhotoTag] = [.favorites, .videos, .livePhotos]
+    /// Server-backed smart filters in the same set and order as the Mac sidebar. Titles and icons come from the
+    /// localized `PhotoTag` values.
+    static let smartCategories: [PhotoTag] = PhotoTag.allCases
+    private var smartCategories: [PhotoTag] { Self.smartCategories }
 
     var body: some View {
         NavigationStack {

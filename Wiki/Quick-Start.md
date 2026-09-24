@@ -30,7 +30,7 @@ The layout differs, but the library, albums, viewer, map, backup, cache, and sea
 ## 4. Browse and protect your library
 
 - Open [[Library|Library]] to browse photos and videos.
-- Use [[Collections|Collections]] for Favorites, Videos, Live Photos, albums, and Recently Deleted.
+- Use [[Collections|Collections]] for Favorites, media types such as Videos, Live Photos, or Screenshots, albums, and Recently Deleted.
 - Enable [[Backup and Photo Library Sync|Backup-and-Album-Sync]] if you want to back up the Apple Photos library.
 - Use [[Album Sync|Album-Sync]] if you want to mirror selected Apple Photos albums.
 - Open [[Smart Search|Smart-Search]] to build a private on-device search index.
