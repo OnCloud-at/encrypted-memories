@@ -76,6 +76,13 @@ _LONG_TOKEN_RE = re.compile(
 _UUID_RE = re.compile(
     r"(?i)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 )
+# Provider wording for an input that does not fit the model context window. Lumo reports
+# "maximum context length is 131072"; OpenAI-compatible providers use similar phrases.
+_CONTEXT_LIMIT_RE = re.compile(
+    r"(?i)context[ _-]?(?:length|window|limit)|maximum context|too many (?:input )?tokens|"
+    r"(?:prompt|input) is too long|reduce the length"
+)
+MAX_LLM_ERROR_BODY_BYTES = 8 * 1024
 
 
 class RequestFailure(RuntimeError):
@@ -101,6 +108,29 @@ class LLMResponseLimitError(LLMStreamError):
 
 class LLMTimeBudgetError(LLMStreamRetryableError):
     """The provider did not complete one bounded request before its deadline."""
+
+
+class LLMContextLimitError(LLMStreamError):
+    """The provider rejected the request because its input exceeds the model context window.
+
+    The same request fails again, so it is never retried. A caller can send a smaller request instead.
+    """
+
+
+def _is_context_limit_rejection(error: HTTPError) -> bool:
+    """Classify an HTTP rejection without keeping or exposing the provider text."""
+
+    if error.code == 413:
+        return True
+    if error.code not in {400, 422}:
+        return False
+    try:
+        body = error.read(MAX_LLM_ERROR_BODY_BYTES)
+    except Exception:
+        return False
+    if not isinstance(body, bytes):
+        return False
+    return _CONTEXT_LIMIT_RE.search(body.decode("utf-8", errors="replace")) is not None
 
 
 class RejectAuthenticatedRedirects(HTTPRedirectHandler):
@@ -194,6 +224,8 @@ def read_llm_stream_content(
         if not isinstance(event, dict):
             raise LLMStreamError("LLM API returned an invalid SSE event")
         if "error" in event or "Error" in event:
+            if _CONTEXT_LIMIT_RE.search(json.dumps(event, ensure_ascii=False)):
+                raise LLMContextLimitError("LLM API rejected the request as exceeding its context limit")
             raise LLMStreamRetryableError("LLM API returned an error event")
         choices = event.get("choices")
         if choices is None:
@@ -371,6 +403,8 @@ def request_llm_content(
             ) as response:
                 return read_llm_stream_content(response, deadline=deadline, on_activity=on_activity)
         except HTTPError as error:
+            if _is_context_limit_rejection(error):
+                raise LLMContextLimitError("LLM API rejected the request as exceeding its context limit") from None
             if error.code not in {429, 500, 502, 503, 504} or attempt == LLM_API_ATTEMPTS - 1:
                 raise RequestFailure("LLM API", error.code, urlsplit(url).path) from None
             retry_after = error.headers.get("Retry-After", "")
@@ -393,6 +427,7 @@ def _llm_validation_retry_payload(
     *,
     discarded_content: str,
     validation_error: RuntimeError,
+    max_request_bytes: int = MAX_LLM_REQUEST_BYTES,
 ) -> dict[str, Any]:
     retry_payload = dict(payload)
     messages = payload.get("messages")
@@ -426,18 +461,18 @@ def _llm_validation_retry_payload(
     )
     retry_payload["messages"] = retry_messages
     encoded_retry = json.dumps(retry_payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    if len(encoded_retry) > MAX_LLM_REQUEST_BYTES:
+    if len(encoded_retry) > max_request_bytes:
         retry_messages.pop(-2)
         encoded_retry = json.dumps(
             retry_payload,
             ensure_ascii=False,
             separators=(",", ":"),
         ).encode("utf-8")
-    if len(encoded_retry) > MAX_LLM_REQUEST_BYTES:
+    if len(encoded_retry) > max_request_bytes:
         retry_messages.pop()
     if len(
         json.dumps(retry_payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    ) > MAX_LLM_REQUEST_BYTES:
+    ) > max_request_bytes:
         return payload
     return retry_payload
 
@@ -451,8 +486,12 @@ def request_validated_llm_result(
     total_seconds: float = MAX_LLM_TOTAL_SECONDS,
     socket_seconds: float = MAX_LLM_SOCKET_SECONDS,
     on_activity: Callable[[str], None] | None = None,
+    max_request_bytes: int = MAX_LLM_REQUEST_BYTES,
 ) -> ValidatedResult:
-    """Request, validate, and once regenerate an invalid complete model result."""
+    """Request, validate, and once regenerate an invalid complete model result.
+
+    The regeneration request stays within `max_request_bytes`; it drops the discarded candidate first.
+    """
 
     if not math.isfinite(total_seconds) or total_seconds <= 0:
         raise ValueError("LLM time budget must be finite and positive")
@@ -476,6 +515,7 @@ def request_validated_llm_result(
                 payload,
                 discarded_content=content,
                 validation_error=error,
+                max_request_bytes=max_request_bytes,
             )
     raise AssertionError("LLM validation retry loop ended unexpectedly")
 

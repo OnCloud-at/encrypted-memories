@@ -13,7 +13,8 @@ class EvidenceValidationError(RuntimeError):
     """A claimed finding failed client validation and must be regenerated."""
 
 
-def verify_findings(review, payload, files, snapshot, repo, *, token, api_url, request, fetch, redact):
+def verify_findings(review, payload, files, snapshot, repo, *, token, api_url, request, fetch, redact,
+                    max_request_bytes=MAX_LLM_REQUEST_BYTES):
     # Legacy callers used testing_gaps for optional notes. New parsed reviews keep
     # those notes in review_notes and reserve testing_gaps for real limitations.
     has_explicit_notes = "review_notes" in review
@@ -110,9 +111,10 @@ def verify_findings(review, payload, files, snapshot, repo, *, token, api_url, r
     verification_input = {"candidates": contexts,
                           "patches": {item["file_id"]: patches[item["file_id"]] for item in candidates}}
     # Share each patch once. Reduce source windows before giving up on a large request.
+    # `max_request_bytes` bounds the verification request like the review request that produced the candidates.
     while True:
         verification["messages"][1]["content"] = json.dumps(verification_input, ensure_ascii=False)
-        if len(json.dumps(verification, ensure_ascii=False).encode()) <= MAX_LLM_REQUEST_BYTES:
+        if len(json.dumps(verification, ensure_ascii=False).encode()) <= max_request_bytes:
             break
         reduced = False
         for context in contexts.values():
@@ -126,7 +128,7 @@ def verify_findings(review, payload, files, snapshot, repo, *, token, api_url, r
                     reduced = True
         if not reduced:
             break
-    if len(json.dumps(verification, ensure_ascii=False).encode()) > MAX_LLM_REQUEST_BYTES:
+    if len(json.dumps(verification, ensure_ascii=False).encode()) > max_request_bytes:
         return {"summary": "Candidate verification exceeded the context limit.", "findings": [],
                 "testing_gaps": ["Candidate findings could not be verified within the context limit."],
                 "review_notes": review_notes}

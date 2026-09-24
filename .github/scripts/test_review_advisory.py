@@ -23,7 +23,8 @@ from test_review_pull_request import changed_file, pull_request, valid_review
 class EvidenceTests(unittest.TestCase):
     def verify(self, *, unavailable=False, retry_quote=False, testing_gaps=None, review_notes=None, **overrides):
         files = [changed_file()]
-        payload, _, _, paths = review.llm_payload(pull_request(), files, model="test", reasoning_effort=None)
+        plan = review.plan_review(pull_request(), files, model="test", reasoning_effort=None)
+        payload, _, paths = review.batch_request(plan, plan.batches[0])
         candidate = {"severity": "blocking", "file_id": "file-001", "path": paths["file-001"],
                      "line": 1, "title": "Lost item", "detail": "An item is lost."}
         decision = {"id": "0", "decision": "confirmed", "severity": "high", "category": "data_loss",
