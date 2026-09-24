@@ -525,6 +525,10 @@ public actor LibraryResourceCoordinator {
 
     public func metrics() -> LibraryResourceCoordinatorMetrics { collectedMetrics }
 
+    var waitingPermitCount: Int { waiters.count }
+
+    var observedGeneration: UInt64 { observedSnapshot.generation }
+
     public func budget(for request: LibraryWorkRequest) -> LibraryWorkBudget {
         policy.budget(
             for: request,
