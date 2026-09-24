@@ -55,29 +55,4 @@ import Testing
         ramp.note(.resourceYield)
         #expect(ramp.currentParallelism == 2)
     }
-
-    @Test func schedulingPoliciesContainNoDeviceOrProcessorMarketingNames() throws {
-        var packageRoot = URL(fileURLWithPath: #filePath)
-        for _ in 0..<3 { packageRoot.deleteLastPathComponent() }
-        let sourcePaths = [
-            "Sources/MLSearchCore/MLIndexingCapacityProfile.swift",
-            "Sources/MLSearchCore/MLNativeAnalysisCapabilities.swift",
-            "Sources/MLSearchCore/MLSmartSearchLifecycle.swift",
-            "Sources/PhotosCore/LibraryResourceCoordinator.swift",
-        ]
-        let forbidden = [
-            "macbook", "mac mini", "mac pro", "apple silicon", "intel",
-            "\"m1\"", "\"m2\"", "\"m3\"", "\"m4\"",
-        ]
-
-        for path in sourcePaths {
-            let source = try String(
-                contentsOf: packageRoot.appendingPathComponent(path),
-                encoding: .utf8
-            ).lowercased()
-            for token in forbidden {
-                #expect(!source.contains(token), "Scheduling policy \(path) contains \(token)")
-            }
-        }
-    }
 }

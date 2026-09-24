@@ -4,23 +4,6 @@ import Testing
 @testable import MLSearchCore
 
 @Suite struct MLRuntimeFailureTaxonomyTests {
-    private func repoRoot() -> URL {
-        var url = URL(fileURLWithPath: #filePath)
-        for _ in 0..<5 { url.deleteLastPathComponent() }
-        return url
-    }
-
-    @Test func lifecycleUsesCoreRuntimeFailureDisposition() throws {
-        let lifecycle = try String(
-            contentsOf: repoRoot().appendingPathComponent(
-                "Packages/EncryptedMemoriesKit/Sources/MLSearchCore/MLSmartSearchLifecycle.swift"
-            ),
-            encoding: .utf8
-        )
-        #expect(lifecycle.contains("catch let failure as MLRuntimeFailure"))
-        #expect(lifecycle.contains("isRetryable: failure.isRetryable"))
-    }
-
     @Test func permanentCategoriesCannotRetry() {
         let categories: [MLRuntimeFailureCategory] = [
             .missingModel,

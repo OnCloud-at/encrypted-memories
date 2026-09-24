@@ -82,10 +82,6 @@ import Testing
         let contentPoint = CGPoint(x: target.slotRect.midX, y: target.slotRect.midY)
         let t = e.beginZoomTransaction(cursorContentPoint: contentPoint, viewportPoint: cursor, level: 3, width: width)!
         #expect(t.anchorGlobalIndex == target.index, "transaction must anchor on the cursor item")
-        // Host wiring: pinch passes the cursor item, not the top-visible item.
-        let host = hostSource()
-        #expect(host.contains("beginZoomTransaction") || host.contains("cursorContentPoint(for: event)"))
-        #expect(!host.contains("anchorAtViewportTop()"), "live zoom must not use the top-viewport anchor")
     }
 
     @Test func gapCursorResolvesNearestFocusRowItem() {
@@ -114,12 +110,6 @@ import Testing
             }
             prev = fr
         }
-    }
-
-    @Test func noStatelessContinuousRewrapInProduction() {
-        let coord = coordinatorSource()
-        #expect(coord.contains("GridZoomTransaction"), "live zoom must use the transaction")
-        #expect(!coord.contains("engine.zoomFramePlan("), "production must not re-resolve a stateless plan per frame")
     }
 
     @Test func largerZoomLevelExists() {
@@ -162,21 +152,5 @@ import Testing
         #expect(
             empty.beginZoomTransaction(cursorContentPoint: cursor, viewportPoint: vp, level: 3, width: width) == nil,
             "empty library must capture no transaction")
-    }
-
-    private func sourcesDir() -> URL {
-        var url = URL(fileURLWithPath: #filePath)
-        url.deleteLastPathComponent()
-        url.deleteLastPathComponent()
-        url.deleteLastPathComponent()
-        return url.appendingPathComponent("Sources/TimelineFeature")
-    }
-    private func hostSource() -> String {
-        (try? String(contentsOf: sourcesDir().appendingPathComponent("MetalGridScrollHost.swift"), encoding: .utf8))
-            ?? ""
-    }
-    private func coordinatorSource() -> String {
-        (try? String(contentsOf: sourcesDir().appendingPathComponent("MetalGridCoordinator.swift"), encoding: .utf8))
-            ?? ""
     }
 }

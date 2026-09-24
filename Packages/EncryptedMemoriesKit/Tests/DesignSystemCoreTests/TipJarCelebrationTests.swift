@@ -70,26 +70,4 @@ struct TipJarCelebrationTests {
             )
         )
     }
-
-    @Test("StoreKit view completion starts the celebration")
-    func storeKitViewCompletionStartsCelebration() throws {
-        var sourceURL = URL(fileURLWithPath: #filePath)
-        for _ in 0..<5 { sourceURL.deleteLastPathComponent() }
-        sourceURL.appendPathComponent(
-            "Packages/EncryptedMemoriesKit/Sources/DesignSystemCore/TipJarView.swift"
-        )
-        let source = try String(contentsOf: sourceURL, encoding: .utf8)
-
-        #expect(source.contains(".onInAppPurchaseCompletion"))
-        #expect(source.contains("case .success(let purchaseResult) = result"))
-        #expect(source.contains("case .success(let verificationResult) = purchaseResult"))
-        #expect(source.contains("case .verified(let transaction) = verificationResult"))
-        #expect(source.contains("TipJarCelebrationCoordinator.shared.celebrate()"))
-
-        let transactionProcessorSource =
-            source.components(
-                separatedBy: "public actor TipJarTransactionProcessor"
-            ).last ?? ""
-        #expect(!transactionProcessorSource.contains("TipJarCelebrationCoordinator.shared.celebrate()"))
-    }
 }

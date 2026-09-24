@@ -18,6 +18,7 @@ Thank you for helping improve Encrypted Memories. Keep each pull request focused
 - Do not duplicate business logic across platform targets.
 - Prefer a smaller implementation when it preserves behavior and makes regressions less likely.
 - Add or update tests for every changed contract and regression.
+- Test behavior through the code under test. Do not add tests that search source files for code text; they break on renames and stay green when the behavior breaks. Module import rules in `CoreArchitectureGateTests` and build-configuration checks in `ProjectHygieneTests` are the exceptions.
 - Treat `project.yml` as the project source. Do not commit the generated Xcode project.
 - Update the pinned SDK patch set when a Proton SDK change modifies vendored code.
 

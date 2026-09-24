@@ -12,16 +12,6 @@ import Testing
     private let eps: CGFloat = 1.0
     private func engine() -> SquareTileGridEngine { SquareTileGridEngine.testRegular(sectionCounts: [3000]) }
 
-    // .../Tests/TimelineFeatureTests/<this>.swift to up 3 to EncryptedMemoriesKit
-    private func source(_ name: String) -> String {
-        var url = URL(fileURLWithPath: #filePath)
-        url.deleteLastPathComponent()
-        url.deleteLastPathComponent()
-        url.deleteLastPathComponent()
-        return (try? String(contentsOf: url.appendingPathComponent("Sources/TimelineFeature/\(name)"), encoding: .utf8))
-            ?? ""
-    }
-
     /// Viewport-Y of the cursor item after a cursor-anchored change to `toLevel`.
     private func cursorItemViewportY(
         _ e: SquareTileGridEngine, fromLevel: Int, scrollY: CGFloat,
@@ -81,11 +71,6 @@ import Testing
             levelChangeFrom: 2, to: 4, width: width,
             cursorContentPoint: CGPoint(x: width / 2, y: scrollY + 2), sourceScrollOriginY: scrollY)!
         #expect(abs(cursorOffset - topOffset) > 30, "cursor anchor must differ from a top anchor")
-        // The host's pinch passes the cursor point, setLevel rebases via the engine (not the top item).
-        let host = source("MetalGridScrollHost.swift")
-        #expect(host.contains("cursorContentPoint(for: event)"), "pinch must anchor on the cursor")
-        #expect(host.contains("settleScrollOffsetY"), "setLevel must rebase on the explicit anchor")
-        #expect(!host.contains("anchorAtViewportTop"), "live zoom / +- must not use the top-viewport anchor")
     }
 
     @Test func setLevelCanAnchorToExplicitItem() {

@@ -111,19 +111,6 @@ final class ViewerFullImageDecoderTests: XCTestCase {
         }
     }
 
-    func testStreamedDecoderKeepsBlockingWorkOffSwiftDetachedTasks() throws {
-        let sourceURL = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .appendingPathComponent("Sources/PhotoViewerCore/ViewerFullImageDecoder.swift")
-        let source = try String(contentsOf: sourceURL, encoding: .utf8)
-
-        XCTAssertFalse(source.contains("Task.detached"))
-        XCTAssertTrue(source.contains("streamingDecodeQueue.async"))
-        XCTAssertTrue(source.contains("onChunk: { try await queue.append($0) }"))
-    }
-
     private func pngData(width: Int, height: Int, usesNoise: Bool = false) throws -> Data {
         let colorSpace = CGColorSpaceCreateDeviceRGB()
         var pixels = [UInt8](repeating: 0, count: width * height * 4)

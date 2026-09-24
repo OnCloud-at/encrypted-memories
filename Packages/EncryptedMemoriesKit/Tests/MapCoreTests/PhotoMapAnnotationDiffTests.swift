@@ -29,16 +29,6 @@ private func cell(
 }
 
 @Suite struct PhotoMapAnnotationDiffTests {
-    private var repoRoot: URL {
-        var url = URL(fileURLWithPath: #filePath)
-        for _ in 0..<5 { url.deleteLastPathComponent() }
-        return url
-    }
-
-    private func source(_ relativePath: String) throws -> String {
-        try String(contentsOf: repoRoot.appendingPathComponent(relativePath), encoding: .utf8)
-    }
-
     @Test func growingMembershipReplacesSameHeroCell() {
         let old = cell(["a", "b"], hero: "b")
         let updated = cell(["a", "b"] + (0..<4_998).map { "p\($0)" }, hero: "b")
@@ -102,67 +92,5 @@ private func cell(
 
         #expect(diff.sourceCellIDByAddedCellID.isEmpty)
         #expect(diff.destinationCellIDByRemovedCellID.isEmpty)
-    }
-
-    @Test func nativeHostsDoNotRegroupOrDeclutterFinalCoreCells() throws {
-        let viewPaths = [
-            "Packages/EncryptedMemoriesKit/Sources/MapFeature/PhotoAnnotationViews.swift",
-            "Packages/EncryptedMemoriesKit/Sources/MapUIKitAdapter/UIKitPhotoAnnotationViews.swift",
-        ]
-        for path in viewPaths {
-            let text = try source(path)
-            #expect(text.contains("clusteringIdentifier = nil"))
-            #expect(text.contains("displayPriority = .required"))
-            #expect(!text.contains("clusteringIdentifier = \"photo\""))
-            #expect(!text.contains("displayPriority = .defaultLow"))
-        }
-
-        let hostPaths = [
-            "Packages/EncryptedMemoriesKit/Sources/MapFeature/LibraryMapView.swift",
-            "Packages/EncryptedMemoriesKit/Sources/MapUIKitAdapter/UIKitLibraryMapHostView.swift",
-        ]
-        for path in hostPaths {
-            #expect(
-                try source(path).contains("isPitchEnabled = false"),
-                "the degree-based Core grid requires an unpitched native map")
-        }
-
-        let roots = [
-            repoRoot.appendingPathComponent("Packages/EncryptedMemoriesKit/Sources/MapFeature"),
-            repoRoot.appendingPathComponent("Packages/EncryptedMemoriesKit/Sources/MapUIKitAdapter"),
-        ]
-        let forbidden = [
-            "MKClusterAnnotation",
-            "MKMapViewDefaultClusterAnnotationViewReuseIdentifier",
-            "clusteringIdentifier = \"photo\"",
-            "displayPriority = .defaultLow",
-        ]
-        var scanned = 0
-        for root in roots {
-            guard
-                let enumerator = FileManager.default.enumerator(
-                    at: root,
-                    includingPropertiesForKeys: nil
-                )
-            else { continue }
-            for case let file as URL in enumerator where file.pathExtension == "swift" {
-                scanned += 1
-                let text = try String(contentsOf: file, encoding: .utf8)
-                for token in forbidden {
-                    #expect(!text.contains(token), "final Core cells must not regain '\(token)' in \(file.path)")
-                }
-            }
-        }
-        #expect(scanned > 0)
-    }
-
-    @Test func macOSCountBadgeDoesNotInterceptMapAnnotationClicks() throws {
-        let text = try source("Packages/EncryptedMemoriesKit/Sources/MapFeature/PhotoAnnotationViews.swift")
-        #expect(text.contains("private final class NonHitTestingTextField: NSTextField"))
-        #expect(text.contains("override func hitTest(_ point: NSPoint) -> NSView? { nil }"))
-        #expect(text.contains("private let countLabel = NonHitTestingTextField(labelWithString: \"\")"))
-        #expect(
-            !text.contains("private let countLabel = NSTextField(labelWithString: \"\")"),
-            "a decorative AppKit text field otherwise wins hit-testing over the MapKit annotation")
     }
 }

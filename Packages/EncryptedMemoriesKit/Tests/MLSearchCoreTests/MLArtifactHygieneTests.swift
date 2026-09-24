@@ -47,18 +47,4 @@ import Testing
             violations.isEmpty,
             "Model weights/compiled artifacts found in the source tree:\n\(violations.joined(separator: "\n"))")
     }
-
-    @Test func sigLIP2ConversionRecipeMatchesCatalogAndProducesCanonicalDistribution() throws {
-        var repoRoot = URL(fileURLWithPath: #filePath)
-        for _ in 0..<5 { repoRoot.deleteLastPathComponent() }
-        let scriptURL = repoRoot.appendingPathComponent("Tools/MLModels/SigLIP2/convert_siglip2.py")
-        let script = try String(contentsOf: scriptURL, encoding: .utf8)
-        let entry = MLModelCatalogEntry.sigLIP2Base256
-
-        #expect(script.contains("REVISION = \"\(entry.sourceRevision ?? "")\""))
-        #expect(script.contains("coremlcompiler"))
-        #expect(script.contains("image_coreml_torch_cosine"))
-        #expect(script.contains("artifact-manifest.json"))
-        #expect(!script.contains("/Users/"))
-    }
 }

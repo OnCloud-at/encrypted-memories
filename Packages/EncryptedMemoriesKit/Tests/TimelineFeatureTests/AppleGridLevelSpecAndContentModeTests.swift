@@ -22,21 +22,6 @@ import TimelineCore
         inner.minX >= outer.minX - eps && inner.minY >= outer.minY - eps && inner.maxX <= outer.maxX + eps
             && inner.maxY <= outer.maxY + eps
     }
-    private func repoRoot() -> URL {
-        var u = URL(fileURLWithPath: #filePath)
-        for _ in 0..<5 { u.deleteLastPathComponent() }  // …/Tests/TimelineFeatureTests/X.swift to repo root
-        return u
-    }
-    private func readSource(_ rel: String) -> String {
-        (try? String(contentsOf: repoRoot().appendingPathComponent(rel), encoding: .utf8)) ?? ""
-    }
-    private func source(_ name: String) -> String {
-        for target in ["TimelineFeature", "GridCore", "MetalGridComposeCore"] {
-            let source = readSource("Packages/EncryptedMemoriesKit/Sources/\(target)/\(name)")
-            if !source.isEmpty { return source }
-        }
-        return ""
-    }
 
     // Density levels use the documented slot metrics.
     @Test func sixAppleGridLevelsExist() {
@@ -221,9 +206,6 @@ import TimelineCore
         let h1 = e.hitTest(contentPoint: p, level: 2, width: width)?.index
         let h2 = e.hitTest(contentPoint: p, level: 2, width: width)?.index
         #expect(h1 == h2)
-        #expect(
-            !source("SquareTileGridEngine.swift").contains("displayMode"), "engine geometry must not take a displayMode"
-        )
     }
 
     // Visible slots are independent of content mode.
@@ -315,24 +297,6 @@ import TimelineCore
         #expect(e.effectiveContentMode(preferred: preferred, level: 2) == .aspectFitInsideSquare)  // back to restored
     }
 
-    private func mainViewSource() -> String { readSource("App/Views/MainView.swift") }
-
-    // The toggle has a native toolbar label.
-    @Test func toolbarAspectToggleExists() {
-        let mv = mainViewSource()
-        #expect(mv.contains("aspectSquareToggleButton"), "MainView must add the aspect/square toolbar button")
-        #expect(
-            mv.contains("gridProxy.setContentMode") || mv.contains("AspectSquareToggleModel"),
-            "button must drive the content mode")
-        let proxy = source("GridProxy.swift")
-        #expect(
-            proxy.contains("setContentMode") && proxy.contains("toggleContentMode")
-                && proxy.contains("contentModeState"))
-        #expect(proxy.contains("final class GridProxy<ItemID"), "GridProxy must stay generic in GridCore")
-        #expect(
-            !proxy.contains("PhotoItem"), "GridProxy must not require full timeline items for content-mode commands")
-    }
-
     // Toolbar symbols use the supported fallback path.
     @MainActor @Test func toolbarAspectToggleUsesNativeSymbolOrVectorFallback() {
         for mode in TileContentDisplayMode.allCases {
@@ -350,56 +314,6 @@ import TimelineCore
         let a = AspectSquareToggleModel.accessibilityLabel(for: .squareFillCrop)
         let b = AspectSquareToggleModel.accessibilityLabel(for: .aspectFitInsideSquare)
         #expect(!a.isEmpty && !b.isEmpty && a != b, "each state needs a distinct, non-empty a11y label")
-        #expect(mainViewSource().contains(".accessibilityLabel("), "the toolbar button must set an accessibility label")
-    }
-
-    // Toolbar icons use SF Symbols or CoreGraphics vectors.
-    @Test func toolbarAspectToggleDoesNotUseExternalRasterAsset() {
-        let model = source("AspectSquareToggleModel.swift")
-        #expect(model.contains("systemSymbolName"), "must use SF Symbols")
-        #expect(!model.contains("NSImage(named:") && !model.contains("NSImage(contentsOf"), "no bundled/raster image")
-        #expect(!model.lowercased().contains(".png") && !model.lowercased().contains(".jpg"))
-        let mv = mainViewSource()
-        // The toggle button label must not reference an asset-catalog image literal or an Apple Photos icon.
-        #expect(
-            !mv.contains("Image(\"") || !mv.contains("PhotosAppIcon"), "no asset-catalog/raster icon for the toggle")
-    }
-
-    // Production level metrics match the shared specification.
-    @Test func noAspectRowOuterLayout() {
-        for f in [
-            "SquareTileGridEngine.swift", "GridZoomTransaction.swift", "MetalGridCoordinator.swift",
-            "TileContentFitter.swift",
-        ] {
-            let s = source(f)
-            #expect(!s.contains("AspectRowLayout"), "\(f) must not introduce AspectRowLayout")
-        }
-    }
-
-    // Production fitting uses the shared content fitter.
-    @Test func noJustifiedLayoutProductionReference() {
-        for f in [
-            "SquareTileGridEngine.swift", "MetalGridCoordinator.swift", "MetalProductionGridView.swift",
-            "GridZoomTransaction.swift",
-        ] {
-            #expect(
-                !source(f).contains("JustifiedCollectionLayout"), "\(f) must not reference JustifiedCollectionLayout")
-        }
-    }
-
-    // The renderer composes the square slot with content fitting and does not derive outer geometry from aspect.
-    // The settled composition now lives in the universal MetalGridFrameComposer (shared by the macOS + iOS hosts).
-    @Test func rendererDoesNotComputeAspectGeometry() {
-        let c = source("MetalGridFrameComposer.swift")
-        #expect(c.contains("let cell = s.rect"), "the composer must take the square slot from the engine")
-        #expect(
-            c.contains("TileContentFitter.fit(slotRect: cell"),
-            "media aspect enters ONLY via the fitter, on the square cell")
-        #expect(c.contains("rect: fit.contentRect"), "the image quad must use the fitter's in-slot content rect")
-        // mediaPixelSize is used solely as the fitter's input, never to size the outer cell.
-        #expect(
-            !c.contains("cell.width * ") && !c.contains("aspect * cell"),
-            "no aspect-scaled outer cell math in the composer")
     }
 
     // Production geometry remains inside the slot.
@@ -412,9 +326,6 @@ import TimelineCore
                 #expect(abs(s.viewportRect.width - s.viewportRect.height) < eps, "slot not square at L\(level)")
             }
         }
-        #expect(
-            source("MetalGridCoordinator.swift").contains("engine.framePlan")
-                || source("MetalGridCoordinator.swift").contains("framePlan("))
     }
 
     // Content geometry comes only from TileContentFitter and stays inside the slot.
@@ -427,14 +338,6 @@ import TimelineCore
                 )
             }
         }
-        #expect(source("TileContentFitter.swift").contains("contentRect"))
-    }
-
-    private func itemUnderCursor(
-        _ e: SquareTileGridEngine, vp: CGPoint, level: Int, phase: Int?, scrollY: CGFloat
-    ) -> Int? {
-        e.hitTest(contentPoint: CGPoint(x: vp.x, y: vp.y + scrollY), level: level, width: width, columnPhase: phase)?
-            .index
     }
 
     // A trackpad pinch keeps the item under the cursor through commit.
@@ -492,25 +395,6 @@ import TimelineCore
             )!.flatIndex
             #expect(
                 after == a.flatIndex, "+/- lost the viewport-centre item (phase \(String(describing: sourcePhase)))")
-        }
-    }
-
-    // Changing content mode does not change committed phase, scroll, or level.
-    @Test func toggleDoesNotBreakCommittedPhase() {
-        let e = engine()
-        // The engine's phased plan is identical regardless of any content mode (mode is never an input).
-        let p1 = e.framePlan(
-            level: 2, viewportSize: viewport, scrollOffset: CGPoint(x: 0, y: 3333), overscan: 0, columnPhase: 4)
-        let p2 = e.framePlan(
-            level: 2, viewportSize: viewport, scrollOffset: CGPoint(x: 0, y: 3333), overscan: 0, columnPhase: 4)
-        #expect(p1.visibleSlots == p2.visibleSlots)
-        // The coordinator's mode setters must not mutate committedPhase / level / scroll.
-        let c = source("MetalGridCoordinator.swift")
-        if let range = c.range(of: "func setPreferredNormalLevelContentMode") {
-            let body = String(
-                c[range.lowerBound..<(c.index(range.lowerBound, offsetBy: 320, limitedBy: c.endIndex) ?? c.endIndex)])
-            #expect(!body.contains("committedPhase ="), "setting content mode must not write committedPhase")
-            #expect(!body.contains("level ="), "setting content mode must not change the level")
         }
     }
 }

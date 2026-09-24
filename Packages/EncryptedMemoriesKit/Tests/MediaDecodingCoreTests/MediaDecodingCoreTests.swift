@@ -163,14 +163,4 @@ struct MediaCacheDecoderBoundaryTests {
         for _ in 0..<3 { url.deleteLastPathComponent() }
         return url
     }
-
-    @Test func thumbnailFeedDoesNotOwnImageIODecodeImplementation() throws {
-        let feedURL = packageRoot.appendingPathComponent("Sources/MediaCacheAppKitAdapter/ThumbnailFeed.swift")
-        let source = try String(contentsOf: feedURL, encoding: .utf8)
-
-        #expect(!source.contains("import ImageIO"))
-        #expect(!source.contains("CGImageSourceCreate"))
-        #expect(!source.contains("kCGImageSource"))
-        #expect(!source.contains("CreateThumbnailAtIndex"))
-    }
 }

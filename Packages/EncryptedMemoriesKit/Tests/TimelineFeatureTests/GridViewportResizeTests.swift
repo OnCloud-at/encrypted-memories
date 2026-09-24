@@ -43,20 +43,6 @@ import Testing
                 scrollOffset: CGPoint(x: 0, y: scrollY), overscan: 0, columnPhase: phase
             ).visibleSlots.map(\.index))
     }
-    private func repoRoot() -> URL {
-        var u = URL(fileURLWithPath: #filePath)
-        for _ in 0..<5 { u.deleteLastPathComponent() }
-        return u
-    }
-    private func src(_ name: String) -> String {
-        for target in ["TimelineFeature", "GridCore"] {
-            let rel = "Packages/EncryptedMemoriesKit/Sources/\(target)/\(name)"
-            if let source = try? String(contentsOf: repoRoot().appendingPathComponent(rel), encoding: .utf8) {
-                return source
-            }
-        }
-        return ""
-    }
 
     // Vertical resize uses the normalized viewport anchor: rebased rather than raw, and strictly between the
     // strict-top (f=0) and strict-bottom (f=1) results - i.e. neither edge is rigidly pinned.
@@ -214,54 +200,6 @@ import Testing
         #expect(
             abs(after - centerBefore) <= newCols,
             "centre item must stay within one row after the sidebar width change (\(after) vs \(centerBefore))")
-        let host = src("MetalGridScrollHost.swift")
-        #expect(host.contains("coordinator.rebaseForViewportChange") && host.contains("rebaseForResize"))
-        #expect(!host.contains("restoreScroll") && !host.contains("oldScrollOrigin"))
-    }
-
-    // Sidebar animation changes layout width even though MTKView renders
-    // full-width under the translucent sidebar. The resize camera must therefore measure and rebase in
-    // layout-space (`full.width - leadingObstructionInset`) and must react to safe-area inset changes directly
-    // instead of waiting for a later AppKit layout/scroll tick.
-    @Test func hostUsesLayoutSpaceFrameForSidebarResize() {
-        let host = src("MetalGridScrollHost.swift")
-        #expect(host.contains("let inset = coordinator.leadingObstructionInset"))
-        #expect(host.contains("full.width - inset"))
-        #expect(host.contains("private func applyLeadingInsetChange(from oldValue: CGFloat)"))
-        #expect(host.contains("coordinator.sidebarObstructionInset = eventLeadingInset"))
-        #expect(host.contains("rebaseForResize(oldFrame: oldFrame, newFrame: newFrame)"))
-        #expect(host.contains("lastViewportScreenFrame = newFrame"))
-    }
-
-    // Runtime host policy holds the stationary vertical edge: bottom-edge drags preserve the top,
-    // top-edge drags preserve the bottom, and width-only/sidebar changes preserve the top. The engine stays
-    // generic; this guard only constrains the production coordinator policy.
-    @Test func coordinatorUsesStationaryEdgeResizeAnchors() {
-        let coord = src("MetalGridCoordinator.swift")
-        guard let range = coord.range(of: "private func resizeAnchorFraction") else {
-            Issue.record("resizeAnchorFraction missing")
-            return
-        }
-        let body = String(
-            coord[
-                range
-                    .lowerBound..<(coord.index(range.lowerBound, offsetBy: 700, limitedBy: coord.endIndex)
-                    ?? coord.endIndex)])
-        #expect(body.contains("delta.movedBottomEdge && !delta.movedTopEdge { return 0 }"))
-        #expect(body.contains("delta.movedTopEdge && !delta.movedBottomEdge { return 1 }"))
-        #expect(body.contains("return 0.5"))
-        #expect(body.contains("return 0"))
-        guard let rebase = coord.range(of: "func rebaseForViewportChange") else {
-            Issue.record("rebaseForViewportChange missing")
-            return
-        }
-        let rebaseBody = String(
-            coord[
-                rebase
-                    .lowerBound..<(coord.index(rebase.lowerBound, offsetBy: 900, limitedBy: coord.endIndex)
-                    ?? coord.endIndex)])
-        #expect(rebaseBody.contains("let anchorFractionY = resizeAnchorFraction(for: delta)"))
-        #expect(!rebaseBody.contains("anchorFractionY: 0.5)   // normalized viewport-centre camera anchor"))
     }
 
     @Test func bottomPinnedResizeStaysBottomPinned() {
@@ -283,44 +221,6 @@ import Testing
         #expect(
             abs(r.newScrollY - max(0, r.newContentSize.height - new.height))
                 > e.resolvedMetrics(level: 2, width: 1200).pitch)
-    }
-
-    @Test func resizeDoesNotStartZoomTransaction() {
-        let resizeSrc = src("GridViewportResizeRebase.swift")
-        #expect(
-            !resizeSrc.contains("beginZoomTransaction") && !resizeSrc.contains("GridZoomCommitBridge.")
-                && !resizeSrc.contains("GridZoomTransaction("))
-        let host = src("MetalGridScrollHost.swift")
-        if let range = host.range(of: "private func rebaseForResize") {
-            let body = String(
-                host[
-                    range
-                        .lowerBound..<(host.index(range.lowerBound, offsetBy: 1100, limitedBy: host.endIndex)
-                        ?? host.endIndex)])
-            #expect(!body.contains("beginZoomTransaction") && !body.contains("beginCommitBridge"))
-        }
-    }
-
-    @Test func firstFrameAfterResizeUsesRebasedScrollY() {
-        let host = src("MetalGridScrollHost.swift")
-        #expect(host.contains("let y = min(max(0, r.newScrollY), maxY)"))
-        guard let resizeStart = host.range(of: "private func rebaseForResize"),
-            let resizeEnd = host.range(
-                of: "    private func applyContentSize",
-                range: resizeStart.upperBound..<host.endIndex
-            )
-        else {
-            Issue.record("rebaseForResize body missing")
-            return
-        }
-        let resizeBody = String(host[resizeStart.lowerBound..<resizeEnd.lowerBound]).filter { !$0.isWhitespace }
-        guard let scrollIdx = resizeBody.range(of: "scrollView.contentView.scroll(to:CGPoint(x:0,y:y))"),
-            let applyIdx = resizeBody.range(of: "applyContentSize(coordinator.contentSize())")
-        else {
-            Issue.record("resize apply/scroll missing")
-            return
-        }
-        #expect(applyIdx.lowerBound < scrollIdx.lowerBound)
     }
 
     @Test func resizeVisibleNeighborhoodOverlap() {
@@ -350,28 +250,6 @@ import Testing
             #expect(abs((row[i].viewportRect.minX - row[i - 1].viewportRect.minX) - m.pitch) < eps)
             #expect(abs((row[i].viewportRect.minX - row[i - 1].viewportRect.maxX) - m.gap) < eps)
         }
-    }
-
-    // A manual window resize detaches the bottom pin so the rebase
-    // runs even on a freshly-opened (bottom-pinned) grid. Guard the host wiring + the rebase-bypass condition.
-    @Test func liveWindowResizeDetachesBottomPinSoRebaseRuns() {
-        let host = src("MetalGridScrollHost.swift")
-        #expect(
-            host.contains("NSWindow.willStartLiveResizeNotification") && host.contains("windowWillLiveResize"),
-            "host must observe window live-resize to detach the bottom-pin")
-        // windowWillLiveResize still clears stickToBottom (now also arms the live-resize presentation).
-        if let r = host.range(of: "func windowWillLiveResize()") {
-            let body = String(
-                host[
-                    r.lowerBound..<(host.index(r.lowerBound, offsetBy: 220, limitedBy: host.endIndex) ?? host.endIndex)]
-            )
-            #expect(
-                body.contains("stickToBottom = false"), "a live window resize must clear stickToBottom (like a scroll)")
-        } else {
-            Issue.record("windowWillLiveResize missing")
-        }
-        // The rebase is bypassed while stuck to the bottom; detaching allows it to run.
-        #expect(host.contains("guard !stickToBottom, let r = result else { return }"))
     }
 
     // A continuous sequence of height steps rebases smoothly with the centre held,
