@@ -1,6 +1,42 @@
 {
   "sourceLanguage": "en",
   "strings": {
+    "library.save_to_library": {
+      "localizations": {
+        "de": { "stringUnit": { "state": "translated", "value": "In Mediathek sichern" } },
+        "en": { "stringUnit": { "state": "translated", "value": "Save to Library" } }
+      }
+    },
+    "library.saving_to_library": {
+      "localizations": {
+        "de": { "stringUnit": { "state": "translated", "value": "Wird in deiner Mediathek gesichert …" } },
+        "en": { "stringUnit": { "state": "translated", "value": "Saving to your library…" } }
+      }
+    },
+    "library.save_to_library_done_one": {
+      "localizations": {
+        "de": { "stringUnit": { "state": "translated", "value": "Foto in deiner Mediathek gesichert" } },
+        "en": { "stringUnit": { "state": "translated", "value": "Photo saved to your library" } }
+      }
+    },
+    "library.save_to_library_done_many %lld": {
+      "localizations": {
+        "de": { "stringUnit": { "state": "translated", "value": "%lld Fotos in deiner Mediathek gesichert" } },
+        "en": { "stringUnit": { "state": "translated", "value": "%lld photos saved to your library" } }
+      }
+    },
+    "library.save_to_library_partial %lld %lld": {
+      "localizations": {
+        "de": { "stringUnit": { "state": "translated", "value": "%1$lld von %2$lld Fotos konnten nicht gesichert werden" } },
+        "en": { "stringUnit": { "state": "translated", "value": "%1$lld of %2$lld photos couldn’t be saved" } }
+      }
+    },
+    "library.save_to_library_failed": {
+      "localizations": {
+        "de": { "stringUnit": { "state": "translated", "value": "Sichern in deiner Mediathek fehlgeschlagen" } },
+        "en": { "stringUnit": { "state": "translated", "value": "Couldn’t save to your library" } }
+      }
+    },
     "contextmenu.share": {
       "localizations": {
         "de": { "stringUnit": { "state": "translated", "value": "Teilen" } },

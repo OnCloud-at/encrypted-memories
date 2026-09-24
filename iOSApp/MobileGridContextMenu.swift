@@ -14,6 +14,8 @@ import SwiftUI
     var albumItems: Items?
     var trashItems: Items?
     var error: String?
+    /// Outcome of a completed Save to Library request.
+    var notice: String?
     private(set) var isBusy = false
 
     func actions(
@@ -21,6 +23,10 @@ import SwiftUI
         context: ViewerCollectionContext = .library, albumID: String? = nil
     ) -> [PhotoContextMenuAction] {
         let uids = Set(items.map(\.uid))
+        if context == .sharedAlbum {
+            return PhotoContextMenuPolicy.sharedAlbumActions(
+                itemCount: items.count, canSave: model.backend != nil && !isBusy)
+        }
         return PhotoContextMenuPolicy.actions(
             itemCount: items.count, isTrash: context == .trash,
             canMutate: model.backend != nil && !isBusy,
@@ -57,6 +63,13 @@ import SwiftUI
         case .restore:
             mutate(failure: String(localized: "trash.restore_failed_message"), removed: uids, onRemoved: onRemoved) {
                 try await model.restoreItems(items)
+            }
+        case .saveToLibrary:
+            isBusy = true
+            Task {
+                defer { isBusy = false }
+                let result = await model.saveToLibrary(items.map(\.uid))
+                notice = result?.message ?? L10n.string("library.save_to_library_failed")
             }
         case .removeFromAlbum:
             guard let albumID else { return }
@@ -131,6 +144,14 @@ private struct MobileGridContextMenuPresentation: ViewModifier {
                 )
             ) {
                 Button(L10n.string("action.ok"), role: .cancel) { controller.error = nil }
+            }
+            .alert(
+                controller.notice ?? "",
+                isPresented: Binding(
+                    get: { controller.notice != nil }, set: { if !$0 { controller.notice = nil } }
+                )
+            ) {
+                Button(L10n.string("action.ok"), role: .cancel) { controller.notice = nil }
             }
     }
 }

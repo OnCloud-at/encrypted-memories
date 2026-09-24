@@ -83,6 +83,12 @@ final class SDKEnumerationCollector<Element: Sendable>: @unchecked Sendable {
         }
     }
 
+    /// Everything received so far and the first callback failure, without throwing. Callers use it when elements
+    /// that arrived before a failure still describe completed work.
+    func snapshot() -> (elements: [Element], failure: (any Error)?) {
+        lock.withLock { (elements, firstError) }
+    }
+
     func collected() throws -> [Element] {
         try lock.withLock {
             if let firstError {

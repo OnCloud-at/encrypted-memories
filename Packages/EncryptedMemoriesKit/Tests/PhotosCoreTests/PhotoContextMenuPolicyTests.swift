@@ -29,4 +29,13 @@ import Testing
                 allFavorited: false, canAddToAlbum: false, canRemoveFromAlbum: true)
                 == [.copy, .share, .removeFromAlbum, .trash])
     }
+
+    @Test func sharedAlbumMenuOffersOnlySaveToLibraryAndInformation() {
+        #expect(
+            PhotoContextMenuPolicy.sharedAlbumActions(itemCount: 1, canSave: true) == [.saveToLibrary, .information])
+        #expect(PhotoContextMenuPolicy.sharedAlbumActions(itemCount: 3, canSave: true) == [.saveToLibrary])
+        #expect(PhotoContextMenuPolicy.sharedAlbumActions(itemCount: 1, canSave: false) == [.information])
+        #expect(PhotoContextMenuPolicy.sharedAlbumActions(itemCount: 0, canSave: true).isEmpty)
+        #expect(!PhotoContextMenuAction.saveToLibrary.title.contains("library.save_to_library"))
+    }
 }

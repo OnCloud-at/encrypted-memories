@@ -16,7 +16,7 @@ private typealias LibraryPhotoTag = PhotosCore.PhotoTag
 actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailProvider, ThumbnailBatchLoader,
     PriorityThumbnailBatchLoader, FullMediaProvider, OriginalByteStreamProvider, OriginalFileProvider,
     VideoStreamProvider, PhotoMetadataProvider, BurstGroupProvider, PhotoLibraryProvider, FavoritesProvider,
-    TrashProvider, LibraryStatsProvider
+    PhotoLibrarySaving, TrashProvider, LibraryStatsProvider
 {
     private let photosClient: EncryptedMemoriesClient
     private let uploadClientUID: String
@@ -127,7 +127,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         )
         self.uploadManifestURL = libraryDirectory.appendingPathComponent(UploadIdentityManifestStore.databaseFileName)
         self.uploadManifestPolicy = policy.libraryDatabasePolicy
-        // Keep the optional native SDK cache in memory. SDK 0.29.0 only frees the managed client handle;
+        // Keep the optional native SDK cache in memory. SDK 0.29.1 only frees the managed client handle;
         // it does not deterministically dispose its SQLite repository. A persistent native cache can therefore
         // still own WAL files after shutdown and makes the required same-process sign-out purge unsafe.
         // The app-owned encrypted account cache and timeline store provide offline and warm-launch persistence.
@@ -1099,7 +1099,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         )
     }
 
-    /// Sets an album's cover to an already-uploaded photo (direct REST; SDK 0.29.0 has no album-write API).
+    /// Sets an album's cover to an already-uploaded photo (direct REST; SDK 0.29.1 has no album-write API).
     /// The photo's `nodeID` is its Drive link id.
     func setAlbumCover(albumID: String, photoUID: PhotoUID) async throws {
         try await withOpenSession { bridge in
@@ -1225,6 +1225,14 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     func setFavorites(_ uids: [PhotoUID], _ favorite: Bool) async throws {
         try await withOpenSession { bridge in
             try await SDKFavoriteWriter(client: bridge.photosClient).setFavorites(uids, favorite: favorite)
+        }
+    }
+
+    // MARK: - PhotoLibrarySaving
+
+    func saveToLibrary(_ uids: [PhotoUID]) async throws -> PhotoLibrarySaveResult {
+        try await withOpenSession { bridge in
+            try await SDKPhotoLibrarySaver(client: bridge.photosClient).save(uids)
         }
     }
 

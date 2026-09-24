@@ -17,5 +17,14 @@ final class ViewerMutationPolicyTests: XCTestCase {
         XCTAssertEqual(ViewerCollectionContext(filter: .album(id: "a", title: "Album")), .library)
         XCTAssertEqual(ViewerCollectionContext(filter: .map), .library)
         XCTAssertEqual(ViewerCollectionContext(filter: .trash), .trash)
+        XCTAssertEqual(
+            ViewerCollectionContext(filter: .sharedAlbum(volumeID: "v", nodeID: "n", title: "Shared")), .sharedAlbum)
+    }
+
+    func testSharedAlbumItemsSaveToTheLibraryAndNeverFavorite() {
+        XCTAssertEqual(ViewerMutationPolicy.action(for: .sharedAlbum), .saveToLibrary)
+        XCTAssertFalse(ViewerCollectionContext.sharedAlbum.allowsFavorites)
+        XCTAssertTrue(ViewerCollectionContext.library.allowsFavorites)
+        XCTAssertTrue(ViewerCollectionContext.trash.allowsFavorites)
     }
 }

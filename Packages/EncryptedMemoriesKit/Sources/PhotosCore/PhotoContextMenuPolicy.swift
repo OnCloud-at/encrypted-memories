@@ -2,7 +2,7 @@ import Foundation
 
 /// Existing photo operations offered by a grid context menu, independent of its native renderer.
 public enum PhotoContextMenuAction: String, CaseIterable, Sendable {
-    case copy, share, favorite, unfavorite, addToAlbum, information, removeFromAlbum, trash, restore
+    case copy, share, favorite, unfavorite, addToAlbum, information, removeFromAlbum, trash, restore, saveToLibrary
 
     public var title: String {
         let key: String =
@@ -16,6 +16,7 @@ public enum PhotoContextMenuAction: String, CaseIterable, Sendable {
             case .removeFromAlbum: "albums.remove_photos_action"
             case .trash: "contextmenu.trash"
             case .restore: "contextmenu.restore"
+            case .saveToLibrary: "library.save_to_library"
             }
         return L10n.string(dynamicKey: key)
     }
@@ -31,13 +32,14 @@ public enum PhotoContextMenuAction: String, CaseIterable, Sendable {
         case .removeFromAlbum: "rectangle.stack.badge.minus"
         case .trash: "trash"
         case .restore: "arrow.uturn.backward"
+        case .saveToLibrary: "photo.badge.plus"
         }
     }
 
     public var group: Int {
         switch self {
         case .copy: 0
-        case .share, .favorite, .unfavorite: 1
+        case .share, .favorite, .unfavorite, .saveToLibrary: 1
         case .addToAlbum, .information, .removeFromAlbum: 2
         case .trash, .restore: 3
         }
@@ -58,6 +60,16 @@ public enum PhotoContextMenuPolicy {
         }
         if itemCount == 1 { actions.append(.information) }
         if canMutate { actions.append(isTrash ? .restore : .trash) }
+        return actions
+    }
+
+    /// Actions for photos in an album another account shares. The photos stay read-only; saving copies them
+    /// into the account's own library.
+    public static func sharedAlbumActions(itemCount: Int, canSave: Bool) -> [PhotoContextMenuAction] {
+        guard itemCount > 0 else { return [] }
+        var actions: [PhotoContextMenuAction] = []
+        if canSave { actions.append(.saveToLibrary) }
+        if itemCount == 1 { actions.append(.information) }
         return actions
     }
 }

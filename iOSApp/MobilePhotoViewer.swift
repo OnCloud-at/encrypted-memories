@@ -34,6 +34,8 @@ struct MobilePhotoViewer: View {
     @State private var isRestoring = false
     @State private var showRestoreError = false
     @State private var showFavoriteError = false
+    @State private var isSavingToLibrary = false
+    @State private var saveToLibraryMessage: String?
     @State private var favoriteTask: Task<Void, Never>?
     @State private var favoriteRequestGeneration: UInt64 = 0
     @State private var restoreTask: Task<Void, Never>?
@@ -221,6 +223,15 @@ struct MobilePhotoViewer: View {
         } message: {
             Text(String(localized: "viewer.favorite_failed_message"))
         }
+        .alert(
+            saveToLibraryMessage ?? "",
+            isPresented: Binding(
+                get: { saveToLibraryMessage != nil },
+                set: { if !$0 { saveToLibraryMessage = nil } }
+            )
+        ) {
+            Button(L10n.string("action.ok"), role: .cancel) { saveToLibraryMessage = nil }
+        }
         .onChange(of: currentBaseItem?.uid) { _, _ in
             cancelViewerMutationPresentation()
         }
@@ -272,7 +283,8 @@ struct MobilePhotoViewer: View {
             .mobileVisibilityPriority(.high)
         ToolbarSpacer(.flexible, placement: .bottomBar)
         ToolbarItemGroup(placement: .bottomBar) {
-            viewerFavoriteButton
+            // Shared photos cannot carry the account's favorite tag; the context is fixed for the presentation.
+            if context.allowsFavorites { viewerFavoriteButton }
             viewerInfoButton
         }
         // Favorite and Info are the first to leave a compressed bar; the overflow menu keeps their titles.
@@ -415,21 +427,36 @@ struct MobilePhotoViewer: View {
         .accessibilityLabel(String(localized: "viewer.info_action"))
     }
 
-    /// Move to Trash in the library, Restore in Recently Deleted: one slot, the shared mutation policy.
+    /// Move to Trash in the library, Restore in Recently Deleted, Save to Library in a shared album: one slot,
+    /// the shared mutation policy.
     private var viewerMutationButton: some View {
-        let title =
-            viewerMutationAction == .restore
-            ? String(localized: "viewer.restore_action")
-            : String(localized: "viewer.move_to_trash_action")
-        return Button(role: viewerMutationAction == .restore ? nil : .destructive, action: requestViewerMutation) {
-            if isRestoring || selection.isTrashing {
+        let action = viewerMutationAction
+        let title = viewerMutationTitle(action)
+        return Button(role: action == .moveToTrash ? .destructive : nil, action: requestViewerMutation) {
+            if isRestoring || isSavingToLibrary || selection.isTrashing {
                 ProgressView()
             } else {
-                Label(title, systemImage: viewerMutationAction == .restore ? "arrow.uturn.backward" : "trash")
+                Label(title, systemImage: viewerMutationSystemImage(action))
             }
         }
-        .disabled(currentBaseItem == nil || isRestoring || selection.isBusy)
+        .disabled(currentBaseItem == nil || isRestoring || isSavingToLibrary || selection.isBusy)
         .accessibilityLabel(title)
+    }
+
+    private func viewerMutationTitle(_ action: ViewerMutationAction) -> String {
+        switch action {
+        case .moveToTrash: String(localized: "viewer.move_to_trash_action")
+        case .restore: String(localized: "viewer.restore_action")
+        case .saveToLibrary: L10n.string("library.save_to_library")
+        }
+    }
+
+    private func viewerMutationSystemImage(_ action: ViewerMutationAction) -> String {
+        switch action {
+        case .moveToTrash: "trash"
+        case .restore: "arrow.uturn.backward"
+        case .saveToLibrary: PhotoContextMenuAction.saveToLibrary.systemImage
+        }
     }
 
     @ViewBuilder
@@ -450,14 +477,17 @@ struct MobilePhotoViewer: View {
 
         Divider()
 
-        if viewerMutationAction == .restore {
+        switch viewerMutationAction {
+        case .restore, .saveToLibrary:
             Button {
                 requestViewerMutation()
             } label: {
-                Label(String(localized: "viewer.restore_action"), systemImage: "arrow.uturn.backward")
+                Label(
+                    viewerMutationTitle(viewerMutationAction),
+                    systemImage: viewerMutationSystemImage(viewerMutationAction))
             }
-            .disabled(currentBaseItem == nil || isRestoring || selection.isBusy)
-        } else {
+            .disabled(currentBaseItem == nil || isRestoring || isSavingToLibrary || selection.isBusy)
+        case .moveToTrash:
             Button(role: .destructive) {
                 requestViewerMutation()
             } label: {
@@ -553,6 +583,19 @@ struct MobilePhotoViewer: View {
             selection.showTrashConfirm = true
         case .restore:
             restore(item)
+        case .saveToLibrary:
+            saveToLibrary(item)
+        }
+    }
+
+    /// Copies the shared photo into the own library. The result message confirms the copy or names the failure.
+    private func saveToLibrary(_ item: PhotoItem) {
+        guard !isSavingToLibrary else { return }
+        isSavingToLibrary = true
+        Task { @MainActor in
+            let result = await libraryModel.saveToLibrary([item.uid])
+            isSavingToLibrary = false
+            saveToLibraryMessage = result?.message ?? L10n.string("library.save_to_library_failed")
         }
     }
 

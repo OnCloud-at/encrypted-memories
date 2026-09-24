@@ -425,21 +425,18 @@ private struct MobileFilterGridScreen: View {
                         actionErrorTitle = L10n.string("dragout.error.title")
                         actionError = $0.localizedMessage
                     },
-                    contextMenuActions: filter.isReadOnly
-                        ? nil
-                        : {
-                            contextMenu.actions(
-                                for: $0, model: model,
-                                context: ViewerCollectionContext(filter: filter), albumID: albumID)
-                        },
-                    onContextMenuAction: filter.isReadOnly
-                        ? nil
-                        : { action, items in
-                            contextMenu.perform(
-                                action, items: items, model: model, router: viewerRouter,
-                                context: ViewerCollectionContext(filter: filter), albumID: albumID,
-                                onRemoved: removeContextItems)
-                        }
+                    // Shared albums offer only reading actions and Save to Library; the shared policy decides.
+                    contextMenuActions: {
+                        contextMenu.actions(
+                            for: $0, model: model,
+                            context: ViewerCollectionContext(filter: filter), albumID: albumID)
+                    },
+                    onContextMenuAction: { action, items in
+                        contextMenu.perform(
+                            action, items: items, model: model, router: viewerRouter,
+                            context: ViewerCollectionContext(filter: filter), albumID: albumID,
+                            onRemoved: removeContextItems)
+                    }
                 )
                 .ignoresSafeArea(edges: .bottom)
             }
