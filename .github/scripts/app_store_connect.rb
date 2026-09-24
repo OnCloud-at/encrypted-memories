@@ -1735,16 +1735,18 @@ module AppStoreConnect
           review_submission_version_id(submission) == app_store_version.fetch("id")
         end
         # Apple retains completed review attempts for a version that was submitted again.
-        # Prefer its active attempt, but never guess between multiple active or completed attempts.
+        # Prefer its active attempt. Without one, the most recently submitted attempt produced the
+        # version's current review result: an approved version cannot be submitted again.
         active = matching.reject { |submission| submission.dig("attributes", "state") == "COMPLETE" }
-        matching = active unless active.empty?
+        matching = active.empty? ? latest_completed_review_submission(matching) : active
         if matching.empty?
           raise Error,
                 "Missing #{platform} review submission for App Store version #{existing_version}"
         end
         if matching.length > 1
           raise Error,
-                "Apple returned multiple #{platform} review submissions for App Store version #{existing_version}"
+                "Apple returned multiple #{platform} review submissions for App Store version #{existing_version}: " \
+                "#{submission_list(matching)}"
         end
 
         submission = matching.fetch(0)
@@ -1929,12 +1931,30 @@ module AppStoreConnect
     def review_submissions(platform:, states: nil)
       query = {
         "filter[platform]" => platform,
-        "fields[reviewSubmissions]" => "platform,state,appStoreVersionForReview",
+        "fields[reviewSubmissions]" => "platform,state,submittedDate,appStoreVersionForReview",
         "include" => "appStoreVersionForReview",
         "limit" => "200"
       }
       query["filter[state]"] = states.join(",") if states
       @client.collection("/v1/apps/#{@app_id}/reviewSubmissions", query: query)
+    end
+
+    # Returns the uniquely newest completed submission. Missing or equal submission dates stay ambiguous,
+    # so the caller refuses to cancel instead of choosing an arbitrary attempt.
+    def latest_completed_review_submission(submissions)
+      return submissions if submissions.length < 2
+
+      dated = submissions.map do |submission|
+        date = submission.dig("attributes", "submittedDate")
+        [submission, date && Time.iso8601(date)]
+      rescue ArgumentError
+        [submission, nil]
+      end
+      return submissions if dated.any? { |_submission, date| date.nil? }
+
+      newest = dated.map(&:last).max
+      latest = dated.select { |_submission, date| date == newest }.map(&:first)
+      latest.length == 1 ? latest : submissions
     end
 
     def review_submission_version_id(submission)
