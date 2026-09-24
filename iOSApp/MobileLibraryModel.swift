@@ -300,10 +300,8 @@ final class MobileLibraryModel {
     @ObservationIgnored private var primaryInventoryAuthority: SourceInventoryAuthority = .hydrating
     @ObservationIgnored private var pendingTimelineRemovals = Set<PhotoUID>()
     @ObservationIgnored private var timelineMutationGeneration = 0
-    @ObservationIgnored private var sourceAnalysisRuntime: LibrarySourceAnalysisRuntime?
-    @ObservationIgnored private var sourceAnalysisActivityTask: Task<Void, Never>?
-    @ObservationIgnored private var sourceAnalysisShutdownTask: Task<Void, Never>?
-    @ObservationIgnored private var sourcePrimaryInventoryGeneration: UInt64 = 0
+    @ObservationIgnored private let sourceAnalysis = LibrarySourceAnalysisSession()
+    private var sourceAnalysisRuntime: LibrarySourceAnalysisRuntime? { sourceAnalysis.runtime }
     /// Coalesces repeated retry taps into one ordered transient retirement and one replacement load.
     @ObservationIgnored private var retryTask: Task<Void, Never>?
     /// Coalesces terminal Drive scope recovery. This path keeps authentication but purges all lost-scope data.
@@ -491,61 +489,44 @@ final class MobileLibraryModel {
     @discardableResult
     func toggleFavorite(_ selection: Set<PhotoUID>) async -> Bool {
         guard let backend, let activeSession = session else { return false }
-        guard favoriteMutationsInFlight.isDisjoint(with: selection) else { return true }
         let mutationGeneration = loadToken
-        guard let target = FavoriteMutationPolicy.target(for: selection, current: favoriteUIDs) else { return true }
-        let requested = FavoriteMutationPolicy.requestedUIDs(
-            selection: selection,
-            current: favoriteUIDs,
-            target: target
-        )
-        guard !requested.isEmpty else { return true }
+        guard
+            let mutation = FavoriteMutationPolicy.request(
+                selection: selection,
+                current: favoriteUIDs,
+                inFlight: favoriteMutationsInFlight
+            )
+        else { return true }
+        let requested = mutation.requested
         if !favoriteLoadSettled {
             for requestedUID in requested {
-                favoriteLoadOverrides[requestedUID] = target
+                favoriteLoadOverrides[requestedUID] = mutation.target
             }
         }
         favoriteMutationsInFlight.formUnion(requested)
-        favoriteUIDs = FavoriteMutationPolicy.optimisticState(
-            current: favoriteUIDs,
-            requested: requested,
-            target: target
-        )
+        favoriteUIDs = mutation.optimisticState
         defer {
             if mutationGeneration == loadToken, session == activeSession {
                 favoriteMutationsInFlight.subtract(requested)
             }
         }
         do {
-            try await backend.setFavorites(Array(requested), target)
-            guard mutationGeneration == loadToken, session == activeSession else { return true }
+            try await backend.setFavorites(Array(requested), mutation.target)
             return true
-        } catch let partial as FavoriteMutationError {
-            guard mutationGeneration == loadToken, session == activeSession else { return true }
-            if !favoriteLoadSettled {
-                for failedUID in partial.failed {
-                    favoriteLoadOverrides.removeValue(forKey: failedUID)
-                }
-            }
-            favoriteUIDs = FavoriteMutationPolicy.rollbackState(
-                current: favoriteUIDs,
-                failed: partial.failed,
-                target: target
-            )
-            return partial.failed.isDisjoint(with: requested)
         } catch {
             guard mutationGeneration == loadToken, session == activeSession else { return true }
+            let failed = FavoriteMutationPolicy.failedUIDs(after: error, requested: requested)
             if !favoriteLoadSettled {
-                for failedUID in requested {
+                for failedUID in failed {
                     favoriteLoadOverrides.removeValue(forKey: failedUID)
                 }
             }
             favoriteUIDs = FavoriteMutationPolicy.rollbackState(
                 current: favoriteUIDs,
-                failed: requested,
-                target: target
+                failed: failed,
+                target: mutation.target
             )
-            return false
+            return failed.isDisjoint(with: requested)
         }
     }
 
@@ -772,15 +753,7 @@ final class MobileLibraryModel {
         } else {
             Task { await libraryChangeMonitor.stop() }
         }
-        if let sourceAnalysisRuntime {
-            let previous = sourceAnalysisActivityTask
-            let task = Task {
-                await previous?.value
-                guard !Task.isCancelled else { return }
-                await sourceAnalysisRuntime.setActive(active)
-            }
-            sourceAnalysisActivityTask = task
-        }
+        sourceAnalysis.enqueueLifecycle { await $0.setActive(active) }
     }
 
     /// Local upload completion is authoritative enough to refresh immediately; repeated signals coalesce.
@@ -1052,7 +1025,7 @@ final class MobileLibraryModel {
                 }
             }
         )
-        sourceAnalysisRuntime = runtime
+        sourceAnalysis.install(runtime)
     }
 
     /// Installs the source-aware byte route before the same primary inventory is exposed to the grid. Otherwise
@@ -1062,37 +1035,13 @@ final class MobileLibraryModel {
         _ items: [PhotoItem],
         authority: SourceInventoryAuthority
     ) async -> PrimaryInventoryAdmission {
-        guard let runtime = sourceAnalysisRuntime else { return .unavailable }
-        sourcePrimaryInventoryGeneration &+= 1
-        let primaryGeneration = sourcePrimaryInventoryGeneration
-        let previousShutdown = sourceAnalysisShutdownTask
-
-        await previousShutdown?.value
-        guard !Task.isCancelled, sourceAnalysisRuntime === runtime else { return .unavailable }
-        return await runtime.start(
-            primaryItems: items,
-            authority: authority,
-            generation: primaryGeneration
-        )
+        await sourceAnalysis.synchronizePrimaryInventory(items, authority: authority)
     }
 
     @discardableResult
     private func stopSourceAnalysis() -> Task<Void, Never>? {
         smartSearchAssets.invalidateSourceSession()
-        let runtime = sourceAnalysisRuntime
-        sourceAnalysisRuntime = nil
-        let activity = sourceAnalysisActivityTask
-        sourceAnalysisActivityTask = nil
-        guard runtime != nil || activity != nil else { return sourceAnalysisShutdownTask }
-        activity?.cancel()
-        let previous = sourceAnalysisShutdownTask
-        let task = Task {
-            await previous?.value
-            await activity?.value
-            await runtime?.shutdown()
-        }
-        sourceAnalysisShutdownTask = task
-        return task
+        return sourceAnalysis.stop()
     }
 
     /// Retires transient retry owners without deleting account data. Every replacement load waits for this
@@ -1702,23 +1651,13 @@ final class MobileLibraryModel {
         {
             primaryInventoryAuthority = authority
         }
-        guard let sourceAnalysisRuntime else { return }
-        let primaryInventoryAuthority = self.primaryInventoryAuthority
-        sourcePrimaryInventoryGeneration &+= 1
-        let primaryGeneration = sourcePrimaryInventoryGeneration
-        Task { [weak self] in
-            let admission = await sourceAnalysisRuntime.replacePrimaryInventory(
-                items,
-                authority: primaryInventoryAuthority,
-                generation: primaryGeneration
-            )
-            guard let self, self.sourceAnalysisRuntime === sourceAnalysisRuntime,
-                self.sourcePrimaryInventoryGeneration == primaryGeneration
-            else { return }
-            if admission == .rejected || admission == .unavailable {
-                self.apply(.contentLoadFailed(message: L10n.string("error.load_library_title")))
+        sourceAnalysis.replacePrimaryInventory(
+            items,
+            authority: primaryInventoryAuthority,
+            onFailure: { [weak self] in
+                self?.apply(.contentLoadFailed(message: L10n.string("error.load_library_title")))
             }
-        }
+        )
     }
 
     private func startLibraryChangeMonitorIfPossible(
@@ -1856,7 +1795,7 @@ final class MobileLibraryModel {
 
         /// Installs the real source runtime for bound-feed lifecycle regression tests.
         func installIsolatedSourceAnalysisForTests(_ runtime: LibrarySourceAnalysisRuntime) {
-            sourceAnalysisRuntime = runtime
+            sourceAnalysis.install(runtime)
             primaryInventoryAuthority = .authoritative
         }
 

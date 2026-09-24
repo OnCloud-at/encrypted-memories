@@ -372,8 +372,11 @@ final class LibraryResourceCoordinatorTests: XCTestCase {
             try await coordinator.withHeavyPermit(request) { _ in XCTFail("stale session work ran") }
         }
 
-        state.beginNewGeneration()
-        try await Task.sleep(for: .milliseconds(5))
+        let queued = await waitUntilYielding { await coordinator.waitingPermitCount == 1 }
+        XCTAssertTrue(queued, "stale permit was not queued")
+        let generation = state.beginNewGeneration().generation
+        let observed = await waitUntilYielding { await coordinator.observedGeneration == generation }
+        XCTAssertTrue(observed, "coordinator did not observe the new generation")
         await gate.open()
         try await holder.value
         do {
@@ -381,6 +384,18 @@ final class LibraryResourceCoordinatorTests: XCTestCase {
             XCTFail("expected stale work cancellation")
         } catch is CancellationError {}
     }
+}
+
+private func waitUntilYielding(
+    timeout: Duration = .seconds(2),
+    _ predicate: @escaping @Sendable () async -> Bool
+) async -> Bool {
+    let deadline = ContinuousClock.now + timeout
+    while ContinuousClock.now < deadline {
+        if await predicate() { return true }
+        await Task.yield()
+    }
+    return await predicate()
 }
 
 private actor AsyncGate {

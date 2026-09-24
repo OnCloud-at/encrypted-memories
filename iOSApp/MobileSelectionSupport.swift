@@ -409,13 +409,8 @@ enum MobileMediaExporter {
             // generated fallback if metadata lookup fails.
             let meta = try? await backend.metadata(for: item.uid)
             // Derive a missing extension from the bounded header, then use the link MIME as a secondary signal.
-            let header = try fileHeader(staging)
-            let ext = OriginalFileNaming.resolvedExtension(
-                filename: meta?.filename, mimeType: meta?.mimeType, header: header,
-                fallbackMediaType: item.mediaType, isVideo: item.isVideo
-            )
-            let desired = OriginalFileNaming.exportFilename(
-                metadataFilename: meta?.filename, fallbackBase: fallbackBase(for: item), ext: ext
+            let desired = try OriginalExportWriter.exportFilename(
+                forDownloadedOriginal: staging, item: item, metadata: meta, fallbackBase: fallbackBase(for: item)
             )
             let url = directory.appendingPathComponent(await names.unique(desired))
             try Task.checkCancellation()
@@ -424,12 +419,6 @@ enum MobileMediaExporter {
         } catch {
             return nil
         }
-    }
-
-    private static func fileHeader(_ url: URL) throws -> Data {
-        let handle = try FileHandle(forReadingFrom: url)
-        defer { try? handle.close() }
-        return try handle.read(upToCount: 64) ?? Data()
     }
 
     /// Generates a fallback base name when Proton metadata has no filename. The timestamp and node suffix

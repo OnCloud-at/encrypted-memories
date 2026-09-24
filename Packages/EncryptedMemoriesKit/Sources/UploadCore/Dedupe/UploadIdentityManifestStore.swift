@@ -1452,7 +1452,7 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
 
     // MARK: Column/bind helpers
 
-    private let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)  // SQLITE_TRANSIENT
+    private let transient = SQLiteStoreSchemaGate.transientDestructor  // SQLITE_TRANSIENT
 
     private func bindText(_ stmt: OpaquePointer?, _ index: Int32, _ value: String) {
         sqlite3_bind_text(stmt, index, value, -1, transient)

@@ -6,9 +6,9 @@
 </p>
 
 <p align="center">
-  <img src="site/assets/library.webp" alt="Encrypted Memories on macOS" width="31%">
-  <img src="site/assets/iphone-library.webp" alt="Encrypted Memories on iPhone" width="31%">
-  <img src="site/assets/ipad-library-device.webp" alt="Encrypted Memories on iPad" width="31%">
+  <img src="Branding/readme/mac-library.png" alt="Encrypted Memories library on macOS" width="31%">
+  <img src="Branding/readme/iphone-library.png" alt="Encrypted Memories library on iPhone" width="31%">
+  <img src="Branding/readme/ipad-library.png" alt="Encrypted Memories library on iPad" width="31%">
 </p>
 
 <p align="center">

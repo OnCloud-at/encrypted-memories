@@ -67,6 +67,43 @@ final class FavoriteMutationPolicyTests: XCTestCase {
         XCTAssertEqual(reconciled, [b, c])
     }
 
+    func testRequestPlansOnlyChangingIdentitiesAndTheirOptimisticState() throws {
+        let request = try XCTUnwrap(
+            FavoriteMutationPolicy.request(selection: [a, b, c], current: [a], inFlight: [])
+        )
+
+        XCTAssertEqual(request.requested, [b, c])
+        XCTAssertTrue(request.target)
+        XCTAssertEqual(request.optimisticState, [a, b, c])
+    }
+
+    func testRequestUnfavoritesAWhollyFavoriteSelection() throws {
+        let request = try XCTUnwrap(
+            FavoriteMutationPolicy.request(selection: [a, b], current: [a, b, c], inFlight: [])
+        )
+
+        XCTAssertEqual(request.requested, [a, b])
+        XCTAssertFalse(request.target)
+        XCTAssertEqual(request.optimisticState, [c])
+    }
+
+    func testRequestRejectsOverlapWithAMutationInFlight() {
+        XCTAssertNil(FavoriteMutationPolicy.request(selection: [a, b], current: [], inFlight: [b]))
+        XCTAssertNotNil(FavoriteMutationPolicy.request(selection: [a], current: [], inFlight: [b]))
+    }
+
+    func testRequestRejectsAnEmptySelection() {
+        XCTAssertNil(FavoriteMutationPolicy.request(selection: [], current: [a], inFlight: []))
+    }
+
+    func testPartialFailureRollsBackItsReportedIdentitiesAndOtherErrorsRollBackEverything() {
+        let partial = FavoriteMutationError(succeeded: [a], failed: [b], diagnosticMessage: "partial")
+        XCTAssertEqual(FavoriteMutationPolicy.failedUIDs(after: partial, requested: [a, b]), [b])
+
+        struct Transport: Error {}
+        XCTAssertEqual(FavoriteMutationPolicy.failedUIDs(after: Transport(), requested: [a, b]), [a, b])
+    }
+
     func testDelayedAuthoritativeReadPreservesNewerMutationTargets() {
         let reconciled = FavoriteMutationPolicy.reconciling(
             authoritative: [a, c],

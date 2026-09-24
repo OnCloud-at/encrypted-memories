@@ -340,7 +340,7 @@ public final class AlbumSyncMappingStore: @unchecked Sendable {
 
     // MARK: Row mapping
 
-    private static let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+    private static let transient = SQLiteStoreSchemaGate.transientDestructor
 
     private static func rowToMapping(_ stmt: OpaquePointer?) -> AlbumSyncMapping? {
         guard let local = sqlite3_column_text(stmt, 0).map({ String(cString: $0) }),
