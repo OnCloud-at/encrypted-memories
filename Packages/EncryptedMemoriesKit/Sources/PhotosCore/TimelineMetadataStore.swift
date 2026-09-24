@@ -176,7 +176,7 @@ public struct TimelineSaveResult: Sendable, Equatable {
 public final class TimelineMetadataStore {
     private var db: OpaquePointer?
     private let policy: LibraryDatabasePolicy
-    private let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)  // SQLITE_TRANSIENT
+    private let transient = SQLiteStoreSchemaGate.transientDestructor  // SQLITE_TRANSIENT
 
     /// Feature schema versions this build understands. Any mismatch preserves the store and rejects opening it.
     private static let supportedFeatureVersions: [String: Int] = [
@@ -272,48 +272,13 @@ public final class TimelineMetadataStore {
             CREATE TABLE IF NOT EXISTS store_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
             """
 
-        let compatibility = SQLiteStoreSchemaGate.compatibility(
+        return SQLiteStoreSchemaGate.openCurrentStore(
             at: url,
             schemaSQL: schema,
-            busyTimeoutMs: policy.busyTimeoutMs,
-            versionIsCurrent: verifyFeatureVersions
+            policy: policy,
+            verifyVersion: verifyFeatureVersions,
+            stampVersion: stampFeatureVersions
         )
-        guard compatibility == .empty || compatibility == .current else { return nil }
-        var handle: OpaquePointer?
-        let flags =
-            SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX
-            | (compatibility == .empty ? SQLITE_OPEN_CREATE : 0)
-        guard sqlite3_open_v2(url.path, &handle, flags, nil) == SQLITE_OK else {
-            sqlite3_close(handle)
-            return nil
-        }
-        sqlite3_busy_timeout(handle, Int32(clamping: policy.busyTimeoutMs))
-        switch compatibility {
-        case .empty:
-            SQLiteStoreSchemaGate.configureConnection(handle, policy: policy)
-            guard
-                SQLiteStoreSchemaGate.initializeCurrentSchema(
-                    handle,
-                    schemaSQL: schema,
-                    stamp: { stampFeatureVersions(handle) }
-                )
-            else {
-                sqlite3_close(handle)
-                return nil
-            }
-        case .current:
-            guard verifyFeatureVersions(handle),
-                SQLiteStoreSchemaGate.matchesCurrentSchema(handle, schemaSQL: schema)
-            else {
-                sqlite3_close(handle)
-                return nil
-            }
-            SQLiteStoreSchemaGate.configureConnection(handle, policy: policy)
-        case .incompatible, .unavailable:
-            sqlite3_close(handle)
-            return nil
-        }
-        return handle
     }
 
     /// Existing feature rows must exactly match this build. Missing or unknown markers fail closed.
@@ -347,7 +312,7 @@ public final class TimelineMetadataStore {
         defer { sqlite3_finalize(upsert) }
         for (feature, version) in supportedFeatureVersions {
             sqlite3_reset(upsert)
-            sqlite3_bind_text(upsert, 1, feature, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+            sqlite3_bind_text(upsert, 1, feature, -1, SQLiteStoreSchemaGate.transientDestructor)
             sqlite3_bind_int(upsert, 2, Int32(version))
             guard sqlite3_step(upsert) == SQLITE_DONE else { return false }
         }

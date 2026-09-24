@@ -257,6 +257,9 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
                 policy: texturePolicy
             ) as MetalGridTextureCache<PhotoUID>?
         else { return nil }
+        if renderer.compositePipelineUnavailable {
+            PhotoDiagnostics.shared.emit("MetalGridRenderer", ["compositePipeline": "unavailable"])
+        }
         self.renderer = renderer
         self.cache = cache
         self.dataSource = dataSource

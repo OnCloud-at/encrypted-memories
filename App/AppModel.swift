@@ -62,10 +62,7 @@ final class AppModel {
         await NativePlaceNameResolver.shared.cityName(latitude: latitude, longitude: longitude)
     }
     private var smartSearchAssets: MLAssetUniverse { smartSearchSession.assets }
-    @ObservationIgnored private var sourceAnalysisRuntime: LibrarySourceAnalysisRuntime?
-    @ObservationIgnored private var sourceAnalysisStartupTask: Task<Void, Never>?
-    @ObservationIgnored private var sourceAnalysisShutdownTask: Task<Void, Never>?
-    @ObservationIgnored private var sourcePrimaryInventoryGeneration: UInt64 = 0
+    @ObservationIgnored private let sourceAnalysis = LibrarySourceAnalysisSession()
     @ObservationIgnored private var onPrimaryInventoryFailure: (@MainActor () -> Void)?
     @ObservationIgnored private let signOutBarrier = AccountSignOutBarrier()
     /// Retains the idempotent purge after a failure. The durable marker independently recreates this claim
@@ -409,21 +406,8 @@ final class AppModel {
     @discardableResult
     private func stopSourceAnalysis() -> Task<Void, Never>? {
         smartSearchAssets.invalidateSourceSession()
-        let runtime = sourceAnalysisRuntime
-        sourceAnalysisRuntime = nil
         onPrimaryInventoryFailure = nil
-        let startup = sourceAnalysisStartupTask
-        sourceAnalysisStartupTask = nil
-        guard runtime != nil || startup != nil else { return sourceAnalysisShutdownTask }
-        startup?.cancel()
-        let previous = sourceAnalysisShutdownTask
-        let task = Task {
-            await previous?.value
-            await startup?.value
-            await runtime?.shutdown()
-        }
-        sourceAnalysisShutdownTask = task
-        return task
+        return sourceAnalysis.stop()
     }
 
     /// Creates the account-scoped Smart Search lifecycle after the feed and timeline are available.
@@ -436,41 +420,31 @@ final class AppModel {
     ) {
         guard let session = authController.currentSession, let facade else { return }
         self.onPrimaryInventoryFailure = onPrimaryInventoryFailure
-        sourcePrimaryInventoryGeneration &+= 1
-        let primaryGeneration = sourcePrimaryInventoryGeneration
-        if sourceAnalysisRuntime == nil {
-            let runtime = LibrarySourceAnalysisRuntime(
-                coordinator: facade.librarySources,
-                feed: feedCore,
-                assets: smartSearchAssets,
-                onAssetsChanged: { [weak self] in
-                    Task { @MainActor [weak self] in
-                        guard let self else { return }
-                        self.sourceAnalysisRevision &+= 1
-                        self.smartSearch?.noteLibraryChanged()
+        if sourceAnalysis.runtime == nil {
+            sourceAnalysis.install(
+                LibrarySourceAnalysisRuntime(
+                    coordinator: facade.librarySources,
+                    feed: feedCore,
+                    assets: smartSearchAssets,
+                    onAssetsChanged: { [weak self] in
+                        Task { @MainActor [weak self] in
+                            guard let self else { return }
+                            self.sourceAnalysisRevision &+= 1
+                            self.smartSearch?.noteLibraryChanged()
+                        }
                     }
-                }
+                ))
+            sourceAnalysis.startPrimaryInventory(
+                primaryItems,
+                authority: primaryAuthority,
+                onFailure: { [weak self] in self?.onPrimaryInventoryFailure?() }
             )
-            sourceAnalysisRuntime = runtime
-            let previousShutdown = sourceAnalysisShutdownTask
-            sourceAnalysisStartupTask = Task {
-                await previousShutdown?.value
-                let admission = await runtime.start(
-                    primaryItems: primaryItems,
-                    authority: primaryAuthority,
-                    generation: primaryGeneration
-                )
-                self.handlePrimaryAdmission(admission, runtime: runtime, generation: primaryGeneration)
-            }
-        } else if let sourceAnalysisRuntime {
-            Task {
-                let admission = await sourceAnalysisRuntime.replacePrimaryInventory(
-                    primaryItems,
-                    authority: primaryAuthority,
-                    generation: primaryGeneration
-                )
-                self.handlePrimaryAdmission(admission, runtime: sourceAnalysisRuntime, generation: primaryGeneration)
-            }
+        } else {
+            sourceAnalysis.replacePrimaryInventory(
+                primaryItems,
+                authority: primaryAuthority,
+                onFailure: { [weak self] in self?.onPrimaryInventoryFailure?() }
+            )
         }
 
         // macOS configures once per MainView life; the session keeps the first lifecycle.
@@ -488,31 +462,16 @@ final class AppModel {
         _ items: [PhotoItem],
         authority: SourceInventoryAuthority
     ) {
-        guard let sourceAnalysisRuntime else { return }
-        sourcePrimaryInventoryGeneration &+= 1
-        let primaryGeneration = sourcePrimaryInventoryGeneration
-        Task {
-            let admission = await sourceAnalysisRuntime.replacePrimaryInventory(
-                items,
-                authority: authority,
-                generation: primaryGeneration
-            )
-            self.handlePrimaryAdmission(admission, runtime: sourceAnalysisRuntime, generation: primaryGeneration)
-        }
-    }
-
-    private func handlePrimaryAdmission(
-        _ admission: PrimaryInventoryAdmission,
-        runtime: LibrarySourceAnalysisRuntime,
-        generation: UInt64
-    ) {
-        guard sourceAnalysisRuntime === runtime, sourcePrimaryInventoryGeneration == generation else { return }
-        if admission == .rejected || admission == .unavailable { onPrimaryInventoryFailure?() }
+        sourceAnalysis.replacePrimaryInventory(
+            items,
+            authority: authority,
+            onFailure: { [weak self] in self?.onPrimaryInventoryFailure?() }
+        )
     }
 
     func refreshLibrarySources() {
-        guard let sourceAnalysisRuntime else { return }
-        Task { await sourceAnalysisRuntime.refresh() }
+        guard let runtime = sourceAnalysis.runtime else { return }
+        Task { await runtime.refresh() }
     }
 
     private func prepareBackend(_ session: ProtonSession) {

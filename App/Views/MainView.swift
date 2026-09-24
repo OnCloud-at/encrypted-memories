@@ -132,14 +132,8 @@ struct MainView: View {
     @State private var favorites: Set<PhotoUID> = []
     @State private var favoritesLoaded = false
     @State private var favoriteMutationsInFlight: Set<PhotoUID> = []
-    @State private var uploadRefreshTask: Task<Void, Never>?
-    @State private var uploadRefreshGeneration: UInt64 = 0
-    @State private var backupUploadRefreshCoordinator = TimelineUploadRefreshCoordinator()
-    @State private var uploadRefreshMessage: String?
-    @State private var uploadRefreshBusy = false
-    /// Whether the current banner message represents success (drives the icon/colour). Tracked
-    /// explicitly so the banner never compares against localized message text.
-    @State private var uploadRefreshSuccess = false
+    /// Refresh routes and the library activity banner state.
+    @State private var libraryRefresh = MacLibraryRefreshController()
     private let libraryChangeMonitor = LibraryChangeMonitor()
     private let feed: ThumbnailFeed
     private let temporalCoverImageLoader: TimelineTemporalCoverImageLoader
@@ -239,7 +233,7 @@ struct MainView: View {
             .task(id: temporalProjectionRequestID) {
                 await rebuildTemporalProjection()
             }
-            .onChange(of: uploadRefreshBusy) { _, _ in evaluateVeilLift() }
+            .onChange(of: libraryRefresh.isBusy) { _, _ in evaluateVeilLift() }
             .onChange(of: selection) { oldValue, newValue in
                 selectionMode = false
                 selectedUIDs.removeAll()
@@ -574,8 +568,7 @@ struct MainView: View {
         searchDebounceTask = nil
         clearPendingSuggestionText()
         cancelVeilTasks()
-        let backupRefresh = backupUploadRefreshCoordinator
-        Task { await backupRefresh.cancel() }
+        libraryRefresh.cancelBackupUploadRefresh()
         let changeMonitor = libraryChangeMonitor
         Task { await changeMonitor.stop() }
     }
@@ -783,7 +776,7 @@ struct MainView: View {
             isOnline: networkMonitor.isOnline,
             didRecentlyRestoreConnection: networkMonitor.didRecentlyRestoreConnection
         )
-        let hasUploadMessage = uploadRefreshMessage != nil
+        let hasUploadMessage = libraryRefresh.message != nil
         let backgroundVisible = backgroundLibraryActivityActive && viewerModel == nil && selection.hasTimeline
         let connectivityVisible = connectivityState != .hidden
         let message: String
@@ -796,10 +789,10 @@ struct MainView: View {
             message = L10n.string("library.title_online_restored")
             visualState = .success
         case .hidden:
-            message = uploadRefreshMessage ?? "\(L10n.string("library.title_activity")) …"
+            message = libraryRefresh.message ?? "\(L10n.string("library.title_activity")) …"
             visualState =
                 hasUploadMessage
-                ? (uploadRefreshBusy ? .working : (uploadRefreshSuccess ? .success : .failure))
+                ? (libraryRefresh.isBusy ? .working : (libraryRefresh.succeeded ? .success : .failure))
                 : .working
         }
         return LibraryActivityBannerOverlay(
@@ -1045,7 +1038,7 @@ struct MainView: View {
     /// waiting for network validation, while cached empty remains covered until Proton confirms it.
     private var librarySettled: Bool {
         guard timelineModel.initialLibraryLoadState.hasSettled else { return false }
-        guard !uploadRefreshBusy else { return false }
+        guard !libraryRefresh.isBusy else { return false }
         if case .loading = timelineModel.state { return false }
         return true
     }
@@ -1273,15 +1266,17 @@ struct MainView: View {
         uploadCoordinator.chooseDestination(folder: folder)
     }
 
+    private var refreshHost: MacLibraryRefreshController.Host {
+        MacLibraryRefreshController.Host(
+            timelineModel: timelineModel,
+            model: model,
+            loadAlbums: { await loadAlbums() },
+            scrollToItem: { gridProxy.scrollToItem?($0) }
+        )
+    }
+
     private func scheduleUploadRefresh(_ event: UploadCompletedEvent) {
-        uploadRefreshGeneration &+= 1
-        let generation = uploadRefreshGeneration
-        uploadRefreshTask?.cancel()
-        uploadRefreshTask = Task { @MainActor in
-            await runUploadRefresh(event, generation: generation)
-            guard generation == uploadRefreshGeneration else { return }
-            uploadRefreshTask = nil
-        }
+        libraryRefresh.scheduleUploadRefresh(event, host: refreshHost)
     }
 
     private func startLibraryChangeMonitor() async {
@@ -1292,7 +1287,8 @@ struct MainView: View {
             await model.recoverBackendAfterScopeAccessLoss()
             return
         }
-        reconcileNewAssetThumbnails(timelineModel.takeInitialAuthoritativeAddedUIDs())
+        libraryRefresh.reconcileNewAssetThumbnails(
+            timelineModel.takeInitialAuthoritativeAddedUIDs(), host: refreshHost)
         guard let provider = backend as? any LibraryChangeTokenProvider else { return }
         await libraryChangeMonitor.start(
             provider: provider,
@@ -1300,171 +1296,20 @@ struct MainView: View {
             onTerminal: { [model] _ in
                 await model.recoverBackendAfterScopeAccessLoss()
             },
-            onChange: { await performRemoteLibraryRefresh() }
+            onChange: { await libraryRefresh.performRemoteLibraryRefresh(host: refreshHost) }
         )
-    }
-
-    @MainActor private func performRemoteLibraryRefresh() async -> LibraryChangeRefreshOutcome {
-        guard uploadRefreshTask == nil, !uploadRefreshBusy else { return .retry }
-        // The five-second token-driven comparison is routine synchronization, not user-facing progress. Keep the
-        // gate for refresh serialization, but show the shared bottom banner only if the refreshed projection
-        // actually schedules thumbnail or GPS work (observed by `backgroundLibraryActivityActive`).
-        uploadRefreshBusy = true
-        defer { uploadRefreshBusy = false }
-        let result = await timelineModel.refreshLibrary()
-        if result.failureReason == .scopeAccessLost { return .terminal }
-        OfflineLibraryManager.shared.liveAssetCount = timelineModel.allItems.count
-        await loadAlbums()
-        model.refreshLibrarySources()
-        reconcileNewAssetThumbnails(result.addedUIDs)
-        return result.errorMessage == nil ? .refreshed : .retry
     }
 
     private func scheduleLibraryRefreshAfterBackupUpload() {
-        uploadRefreshBusy = true
-        uploadRefreshSuccess = false
-        uploadRefreshMessage = String(localized: "library.refreshing")
-        Task {
-            await backupUploadRefreshCoordinator.request(
-                refresh: { attempt in
-                    await performBackupUploadRefreshAttempt(attempt: attempt)
-                },
-                observer: { state in
-                    await applyBackupUploadRefresh(state)
-                }
-            )
-        }
-    }
-
-    @MainActor private func performBackupUploadRefreshAttempt(attempt: Int) async -> TimelineRefreshFailureReason? {
-        let result = await timelineModel.refreshLibrary()
-        if await recoverBackendAfterScopeAccessLoss(ifNeeded: result) { return .cancelled }
-        OfflineLibraryManager.shared.liveAssetCount = timelineModel.allItems.count
-        reconcileNewAssetThumbnails(result.addedUIDs)
-        logUploadRefresh(uploadedNode: "backup", attempt: attempt, result: result)
-        return result.failureReason
-    }
-
-    @MainActor private func applyBackupUploadRefresh(_ state: TimelineUploadRefreshAttempt) {
-        switch state.decision {
-        case .succeeded:
-            uploadRefreshBusy = false
-            uploadRefreshSuccess = true
-            uploadRefreshMessage = String(localized: "library.refreshed")
-            clearUploadRefreshMessage(after: .seconds(2))
-        case .retry:
-            uploadRefreshMessage = String(localized: "upload.waiting_for_refresh")
-        case .notYetVisible:
-            uploadRefreshBusy = false
-            uploadRefreshMessage = String(localized: "upload.not_yet_indexed")
-        case .failed:
-            uploadRefreshBusy = false
-            uploadRefreshMessage = String(localized: "library.refresh_failed")
-            clearUploadRefreshMessage(after: .seconds(2))
-        case .cancelled:
-            uploadRefreshBusy = false
-            uploadRefreshMessage = nil
-        }
-    }
-
-    @MainActor private func runUploadRefresh(_ event: UploadCompletedEvent, generation: UInt64) async {
-        uploadRefreshBusy = true
-        uploadRefreshSuccess = false
-        uploadRefreshMessage = String(localized: "upload.refreshing_after_upload")
-        let schedule = TimelineRefreshRetrySchedule.uploadDefault.delays
-        for (attempt, delay) in schedule.enumerated() {
-            guard generation == uploadRefreshGeneration, !Task.isCancelled else { return }
-            if delay > .zero {
-                uploadRefreshMessage = String(localized: "upload.waiting_for_refresh")
-                try? await Task.sleep(for: delay)
-            }
-            let result = await timelineModel.refreshAfterUpload(uploadedUID: event.uploadedUID)
-            guard generation == uploadRefreshGeneration, !Task.isCancelled else { return }
-            if await recoverBackendAfterScopeAccessLoss(ifNeeded: result) { return }
-            OfflineLibraryManager.shared.liveAssetCount = timelineModel.allItems.count
-            reconcileNewAssetThumbnails(result.addedUIDs)
-            if event.destination.usesAlbum {
-                await loadAlbums()
-            }
-            logUploadRefresh(upload: event, attempt: attempt, result: result)
-            if let found = result.foundItem {
-                uploadRefreshBusy = false
-                uploadRefreshSuccess = true
-                uploadRefreshMessage = String(localized: "upload.uploaded")
-                gridProxy.scrollToItem?(found.uid)
-                clearUploadRefreshMessage(after: .seconds(2))
-                return
-            }
-        }
-        uploadRefreshBusy = false
-        uploadRefreshSuccess = false
-        uploadRefreshMessage = String(localized: "upload.not_yet_indexed")
+        libraryRefresh.scheduleBackupUploadRefresh(host: refreshHost)
     }
 
     private func refreshLibraryManually() {
-        Task { await performManualLibraryRefresh() }
-    }
-
-    @MainActor private func performManualLibraryRefresh() async {
-        guard !uploadRefreshBusy else { return }
-        uploadRefreshBusy = true
-        uploadRefreshSuccess = false
-        uploadRefreshMessage = String(localized: "library.refreshing")
-        let result = await timelineModel.refreshLibrary()
-        if await recoverBackendAfterScopeAccessLoss(ifNeeded: result) { return }
-        OfflineLibraryManager.shared.liveAssetCount = timelineModel.allItems.count
-        await loadAlbums()
-        reconcileNewAssetThumbnails(result.addedUIDs)
-        logUploadRefresh(uploadedNode: "-", attempt: 0, result: result)
-        uploadRefreshBusy = false
-        uploadRefreshSuccess = result.errorMessage == nil
-        uploadRefreshMessage =
-            result.errorMessage == nil
-            ? String(localized: "library.refreshed") : String(localized: "library.refresh_failed")
-        clearUploadRefreshMessage(after: .seconds(2))
-    }
-
-    @MainActor private func recoverBackendAfterScopeAccessLoss(
-        ifNeeded result: TimelineRefreshResult
-    ) async -> Bool {
-        guard result.failureReason == .scopeAccessLost else { return false }
-        uploadRefreshBusy = false
-        uploadRefreshSuccess = false
-        uploadRefreshMessage = nil
-        await model.recoverBackendAfterScopeAccessLoss()
-        return true
-    }
-
-    private func clearUploadRefreshMessage(after delay: Duration) {
-        Task { @MainActor in
-            try? await Task.sleep(for: delay)
-            guard !uploadRefreshBusy else { return }
-            uploadRefreshMessage = nil
-        }
-    }
-
-    @MainActor private func reconcileNewAssetThumbnails(_ addedUIDs: [PhotoUID]) {
-        OfflineLibraryManager.shared.reconcileNewAssetThumbnails(
-            currentUIDs: timelineModel.wholeLibraryUIDs,
-            addedUIDs: addedUIDs
-        )
+        libraryRefresh.refreshManually(host: refreshHost)
     }
 
     private func logUploadUI(action: String, trigger: UploadUITrigger) {
         let line = "[UploadUI] action=\(action) trigger=\(trigger.rawValue)"
-        DebugLog.log(line)
-    }
-
-    private func logUploadRefresh(upload: UploadCompletedEvent, attempt: Int, result: TimelineRefreshResult) {
-        logUploadRefresh(uploadedNode: upload.uploadedUID.nodeID, attempt: attempt, result: result)
-    }
-
-    private func logUploadRefresh(uploadedNode: String, attempt: Int, result: TimelineRefreshResult) {
-        let line = """
-            [UploadRefresh] uploadedNode=\(uploadedNode) attempt=\(attempt) found=\(result.found) \
-            timelineCountBefore=\(result.timelineCountBefore) timelineCountAfter=\(result.timelineCountAfter) \
-            filter=\(result.filterDescription) elapsedMs=\(Int(result.elapsedMs)) error=\(result.errorMessage ?? "-")
-            """
         DebugLog.log(line)
     }
 
@@ -1514,29 +1359,25 @@ struct MainView: View {
     /// Applies an optimistic favorite mutation for `selection`, rejecting a call that overlaps any
     /// mutation already in flight so a stale rollback cannot clobber a newer optimistic state.
     private func mutateFavorites(_ selection: Set<PhotoUID>) {
-        guard favoriteMutationsInFlight.isDisjoint(with: selection) else { return }
-        guard let target = FavoriteMutationPolicy.target(for: selection, current: favorites) else { return }
-        let requested = FavoriteMutationPolicy.requestedUIDs(
-            selection: selection,
-            current: favorites,
-            target: target
-        )
-        guard !requested.isEmpty else { return }
-        favoriteMutationsInFlight.formUnion(requested)
-        favorites = FavoriteMutationPolicy.optimisticState(
-            current: favorites,
-            requested: requested,
-            target: target
-        )
+        guard
+            let mutation = FavoriteMutationPolicy.request(
+                selection: selection,
+                current: favorites,
+                inFlight: favoriteMutationsInFlight
+            )
+        else { return }
+        favoriteMutationsInFlight.formUnion(mutation.requested)
+        favorites = mutation.optimisticState
         Task {
             do {
-                try await backend.setFavorites(Array(requested), target)
-            } catch let partial as FavoriteMutationError {
-                rollbackFavoriteMutation(partial.failed, target: target)
+                try await backend.setFavorites(Array(mutation.requested), mutation.target)
             } catch {
-                rollbackFavoriteMutation(requested, target: target)
+                rollbackFavoriteMutation(
+                    FavoriteMutationPolicy.failedUIDs(after: error, requested: mutation.requested),
+                    target: mutation.target
+                )
             }
-            favoriteMutationsInFlight.subtract(requested)
+            favoriteMutationsInFlight.subtract(mutation.requested)
         }
     }
 
@@ -2542,14 +2383,16 @@ struct MainView: View {
 
         do {
             if single {
-                try await Self.writeSingleExport(item: items[0], dest: dest, backend: backend, onProgress: onProgress)
+                try await OriginalExportWriter.writeSingle(
+                    item: items[0], to: dest, provider: backend, onProgress: onProgress)
             } else {
-                try await Self.writeZipExport(items: items, dest: dest, backend: backend, onProgress: onProgress)
+                try await OriginalExportWriter.writeArchive(
+                    items: items, to: dest, provider: backend, onProgress: onProgress)
             }
             NSWorkspace.shared.activateFileViewerSelecting([dest])
         } catch is CancellationError {
             // User cancelled from the ring popover; the worker's `defer` already discarded any partial output.
-        } catch ExportError.lowDisk {
+        } catch OriginalExportWriter.Failure.lowDisk {
             exportFailureTitle = String(localized: "export.low_disk_title")
             exportFailureMessage = String(localized: "export.low_disk_message")
         } catch {
@@ -2557,100 +2400,6 @@ struct MainView: View {
             exportFailureTitle = String(localized: "export.failed_title")
             exportFailureMessage = String(localized: "export.failed_message \(error.localizedDescription)")
         }
-    }
-
-    /// Off-main single-file export: stage on the destination volume, then atomically install the completed file.
-    nonisolated private static func writeSingleExport(
-        item: PhotoItem, dest: URL, backend: any PhotosBackend,
-        onProgress: @escaping @Sendable (Double) -> Void
-    ) async throws {
-        let stagingDirectory = try exportReplacementDirectory(for: dest)
-        defer { try? FileManager.default.removeItem(at: stagingDirectory) }
-        let stagedFile = stagingDirectory.appendingPathComponent(dest.lastPathComponent, isDirectory: false)
-        try await backend.writeOriginal(for: item.uid, to: stagedFile, onProgress: onProgress)
-        try installCompletedExport(stagedFile, at: dest)
-    }
-
-    /// Streams an archive off the main actor and removes partial output on every unsuccessful exit.
-    nonisolated private static func writeZipExport(
-        items: [PhotoItem], dest: URL, backend: any PhotosBackend,
-        onProgress: @escaping @Sendable (Double) -> Void
-    ) async throws {
-        let total = Double(items.count)
-        let stagingDirectory = try exportReplacementDirectory(for: dest)
-        defer { try? FileManager.default.removeItem(at: stagingDirectory) }
-        let stagedArchive = stagingDirectory.appendingPathComponent(dest.lastPathComponent, isDirectory: false)
-        let safetyMargin: Int64 = 256 * 1024 * 1024  // headroom (incl. the central directory)
-        let writer = try ZipStreamWriter(url: stagedArchive)
-        var success = false
-        defer { if !success { writer.abort() } }
-        var used = Set<String>()
-        for (i, item) in items.enumerated() {
-            try Task.checkCancellation()
-            let meta = try? await backend.metadata(for: item.uid)
-            if let rawSize = meta?.fileSize, rawSize > 0, rawSize <= Int(Int64.max / 2),
-                let free = freeBytes(at: stagingDirectory), free < Int64(rawSize) * 2 + safetyMargin
-            {
-                throw ExportError.lowDisk
-            }
-            // The SDK currently downloads photos to a seekable file. Keep that bounded sidecar beside the staged
-            // archive, stream it once into the ZIP, and erase it immediately.
-            let sidecar = stagingDirectory.appendingPathComponent(
-                ".encrypted-memories-export-\(UUID().uuidString).partial")
-            defer { try? FileManager.default.removeItem(at: sidecar) }
-            try await backend.writeOriginal(
-                for: item.uid,
-                to: sidecar,
-                onProgress: { p in onProgress((Double(i) + p * 0.85) / total) }
-            )
-            try Task.checkCancellation()
-            let size = Int64(try sidecar.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0)
-            if let free = freeBytes(at: stagingDirectory), free < size + safetyMargin { throw ExportError.lowDisk }
-            let header = try fileHeader(sidecar)
-            let ext = OriginalFileNaming.resolvedExtension(
-                filename: meta?.filename,
-                mimeType: meta?.mimeType,
-                header: header,
-                fallbackMediaType: item.mediaType,
-                isVideo: item.isVideo
-            )
-            let base = OriginalFileNaming.exportFilename(
-                metadataFilename: meta?.filename,
-                fallbackBase: String(item.uid.nodeID.prefix(8)),
-                ext: ext
-            )
-            try writer.addFile(name: uniqueName(base, used: &used), fileURL: sidecar)
-            onProgress(Double(i + 1) / total)
-        }
-        try writer.finish()
-        try installCompletedExport(stagedArchive, at: dest)
-        success = true
-    }
-
-    /// `NSSavePanel` authorizes the selected file, but not UUID-named siblings. Foundation's replacement
-    /// directory is the sandbox-safe location Apple provides for atomic-save staging on the destination volume.
-    nonisolated private static func exportReplacementDirectory(for destination: URL) throws -> URL {
-        try FileManager.default.url(
-            for: .itemReplacementDirectory,
-            in: .userDomainMask,
-            appropriateFor: destination,
-            create: true
-        )
-    }
-
-    nonisolated private static func installCompletedExport(_ stagedFile: URL, at destination: URL) throws {
-        let fileManager = FileManager.default
-        if fileManager.fileExists(atPath: destination.path) {
-            _ = try fileManager.replaceItemAt(destination, withItemAt: stagedFile)
-        } else {
-            try fileManager.moveItem(at: stagedFile, to: destination)
-        }
-    }
-
-    nonisolated private static func fileHeader(_ url: URL) throws -> Data {
-        let handle = try FileHandle(forReadingFrom: url)
-        defer { try? handle.close() }
-        return try handle.read(upToCount: 64) ?? Data()
     }
 
     private func chooseZipDestination(suggestedName: String? = nil) -> URL? {
@@ -2661,13 +2410,6 @@ struct MainView: View {
         guard panel.runModal() == .OK else { return nil }
         return panel.url
     }
-
-    nonisolated private static func freeBytes(at dir: URL) -> Int64? {
-        (try? dir.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]))?
-            .volumeAvailableCapacityForImportantUsage
-    }
-
-    private enum ExportError: Error { case lowDisk }
 
     private func chooseSingleDestination(suggestedName: String) -> URL? {
         let panel = NSSavePanel()
@@ -2689,272 +2431,6 @@ struct MainView: View {
             filename: metadata?.filename, mimeType: metadata?.mimeType, header: nil,
             fallbackMediaType: item.mediaType, isVideo: item.isVideo
         )
-    }
-
-    nonisolated private static func uniqueName(_ name: String, used: inout Set<String>) -> String {
-        guard used.contains(name) else {
-            used.insert(name)
-            return name
-        }
-        let url = URL(fileURLWithPath: name)
-        let stem = url.deletingPathExtension().lastPathComponent
-        let ext = url.pathExtension
-        var i = 2
-        while true {
-            let candidate = ext.isEmpty ? "\(stem) \(i)" : "\(stem) \(i).\(ext)"
-            if !used.contains(candidate) {
-                used.insert(candidate)
-                return candidate
-            }
-            i += 1
-        }
-    }
-}
-
-/// Collapsible left sidebar - a native macOS sidebar `List` (Liquid-Glass vibrant material, native
-/// selection): Proton smart filters (tags) on top, user albums below.
-private struct SidebarView: View {
-    let albums: [AlbumSummary]
-    let isLoadingAlbums: Bool
-    let albumCatalogFailed: Bool
-    let sharedAlbums: [SharedAlbumSummary]
-    let sharedAlbumPresentation: (SharedAlbumSummary) -> SharedAlbumPresentation
-    let isLoadingSharedAlbums: Bool
-    let sharedAlbumCatalogFailed: Bool
-    let canLeaveSharedAlbum: Bool
-    let thumbnailFeed: ThumbnailFeed
-    let sourceAnalysisRevision: UInt64
-    @Binding var selection: PhotoFilter
-    let onRetryAlbums: () -> Void
-    let onRetrySharedAlbums: () -> Void
-    let onLeaveSharedAlbum: (SharedAlbumSummary) -> Void
-    @State private var pendingSharedAlbumLeave: SharedAlbumSummary?
-
-    var body: some View {
-        List(selection: Binding(get: { selection }, set: { if let v = $0 { selection = v } })) {
-            Section {
-                Label("sidebar.all_photos", systemImage: "photo.on.rectangle.angled")
-                    .tag(PhotoFilter.all)
-                ForEach(PhotoTag.allCases, id: \.self) { tag in
-                    Label(tag.title, systemImage: tag.systemImage)
-                        .tag(PhotoFilter.tag(tag))
-                }
-                Label("sidebar.map", systemImage: "map")
-                    .tag(PhotoFilter.map)
-            }
-            Section("sidebar.albums") {
-                if isLoadingAlbums, albums.isEmpty {
-                    Label("sidebar.albums_loading", systemImage: "arrow.trianglehead.2.clockwise.rotate.90")
-                        .foregroundStyle(.secondary)
-                        .disabled(true)
-                } else if albumCatalogFailed, albums.isEmpty {
-                    Button(action: onRetryAlbums) {
-                        Label("sidebar.albums_failed", systemImage: "arrow.clockwise")
-                    }
-                    .buttonStyle(.plain)
-                } else if albums.isEmpty {
-                    Label("sidebar.no_albums", systemImage: "tray")
-                        .foregroundStyle(.secondary)
-                        .disabled(true)
-                }
-                if albumCatalogFailed, !albums.isEmpty {
-                    Button(action: onRetryAlbums) {
-                        Label("sidebar.albums_failed", systemImage: "arrow.clockwise")
-                    }
-                    .buttonStyle(.plain)
-                }
-                ForEach(albums) { album in
-                    OwnedAlbumSidebarRow(
-                        album: album,
-                        thumbnailFeed: thumbnailFeed,
-                        sourceAnalysisRevision: sourceAnalysisRevision
-                    )
-                    .tag(PhotoFilter.album(id: album.id, title: album.title))
-                }
-            }
-            Section(L10n.string("collections.section_shared_with_me")) {
-                if isLoadingSharedAlbums, sharedAlbums.isEmpty {
-                    Label(
-                        L10n.string("collections.loading_shared_albums"),
-                        systemImage: "arrow.trianglehead.2.clockwise.rotate.90"
-                    )
-                    .foregroundStyle(.secondary)
-                    .disabled(true)
-                } else if sharedAlbumCatalogFailed, sharedAlbums.isEmpty {
-                    Button(action: onRetrySharedAlbums) {
-                        Label(L10n.string("albums.shared_load_failed"), systemImage: "arrow.clockwise")
-                    }
-                    .buttonStyle(.plain)
-                } else if sharedAlbums.isEmpty {
-                    Label(L10n.string("collections.empty_shared_albums"), systemImage: "person.2.crop.square.stack")
-                        .foregroundStyle(.secondary)
-                        .disabled(true)
-                }
-                ForEach(sharedAlbums) { album in
-                    SharedAlbumSidebarRow(
-                        album: album,
-                        presentation: sharedAlbumPresentation(album),
-                        thumbnailFeed: thumbnailFeed,
-                        sourceAnalysisRevision: sourceAnalysisRevision
-                    )
-                    .tag(
-                        PhotoFilter.sharedAlbum(
-                            volumeID: album.node.volumeID,
-                            nodeID: album.node.nodeID,
-                            title: album.title
-                        )
-                    )
-                    .contextMenu {
-                        if canLeaveSharedAlbum {
-                            Button(L10n.string("albums.leave_shared_action"), role: .destructive) {
-                                pendingSharedAlbumLeave = album
-                            }
-                        }
-                    }
-                }
-            }
-            Section {
-                Label("sidebar.recently_deleted", systemImage: "trash")
-                    .tag(PhotoFilter.trash)
-            }
-            Section {
-                Divider()
-                SettingsLink {
-                    Label("sidebar.settings", systemImage: "gearshape")
-                }
-                .buttonStyle(.plain)
-                .help("sidebar.settings")
-                .accessibilityLabel("sidebar.settings")
-            }
-        }
-        .listStyle(.sidebar)
-        .scrollContentBackground(.hidden)  // let the within-window glass (and the grid behind it) show through
-        .confirmationDialog(
-            L10n.string("albums.leave_shared_title"),
-            isPresented: Binding(
-                get: { pendingSharedAlbumLeave != nil },
-                set: { if !$0 { pendingSharedAlbumLeave = nil } }
-            ),
-            titleVisibility: .visible
-        ) {
-            Button(L10n.string("albums.leave_shared_action"), role: .destructive) {
-                guard let album = pendingSharedAlbumLeave else { return }
-                onLeaveSharedAlbum(album)
-                pendingSharedAlbumLeave = nil
-            }
-            Button(L10n.string("action.cancel"), role: .cancel) {
-                pendingSharedAlbumLeave = nil
-            }
-        } message: {
-            Text(L10n.string("albums.leave_shared_message"))
-        }
-    }
-}
-
-/// Sidebar cover thumbnail shared by owned and shared album rows. Falls back to a symbol until the
-/// thumbnail feed has the cover in memory or on disk.
-private struct AlbumSidebarCover: View {
-    let coverUID: PhotoUID?
-    let fallbackSystemImage: String
-    let thumbnailFeed: ThumbnailFeed
-    let sourceAnalysisRevision: UInt64
-    @State private var coverImage: NSImage?
-    @State private var loadedCoverUID: PhotoUID?
-
-    private struct CoverLoadKey: Equatable {
-        let uid: PhotoUID?
-        let analysisRevision: UInt64
-    }
-
-    var body: some View {
-        ZStack {
-            RoundedRectangle(cornerRadius: 6)
-                .fill(.quaternary)
-            if let coverImage {
-                Image(nsImage: coverImage)
-                    .resizable()
-                    .scaledToFill()
-            } else {
-                Image(systemName: fallbackSystemImage)
-                    .foregroundStyle(.secondary)
-            }
-        }
-        .frame(width: 32, height: 32)
-        .clipShape(RoundedRectangle(cornerRadius: 6))
-        .task(id: CoverLoadKey(uid: coverUID, analysisRevision: sourceAnalysisRevision)) {
-            if loadedCoverUID != coverUID {
-                coverImage = nil
-                loadedCoverUID = coverUID
-            }
-            guard coverImage == nil else { return }
-            guard let coverUID else { return }
-            coverImage = thumbnailFeed.memoryImage(for: coverUID)
-            if coverImage == nil {
-                coverImage = await thumbnailFeed.analysisImage(for: coverUID)
-            }
-        }
-    }
-}
-
-private struct OwnedAlbumSidebarRow: View {
-    let album: AlbumSummary
-    let thumbnailFeed: ThumbnailFeed
-    let sourceAnalysisRevision: UInt64
-
-    var body: some View {
-        HStack(spacing: 8) {
-            AlbumSidebarCover(
-                coverUID: album.coverPhotoUID,
-                fallbackSystemImage: "rectangle.stack",
-                thumbnailFeed: thumbnailFeed,
-                sourceAnalysisRevision: sourceAnalysisRevision
-            )
-            Text(album.title)
-                .lineLimit(1)
-        }
-    }
-}
-
-private struct SharedAlbumSidebarRow: View {
-    let album: SharedAlbumSummary
-    let presentation: SharedAlbumPresentation
-    let thumbnailFeed: ThumbnailFeed
-    let sourceAnalysisRevision: UInt64
-
-    /// The row stays compact; the read-only reason lives in the tooltip and accessibility hint.
-    private var helpText: String {
-        [presentation.detailLine, presentation.invitationDetail, presentation.writeRestrictionReason]
-            .compactMap { $0 }
-            .joined(separator: "\n")
-    }
-
-    var body: some View {
-        HStack(spacing: 8) {
-            AlbumSidebarCover(
-                coverUID: album.coverPhotoUID,
-                fallbackSystemImage: "person.2.crop.square.stack",
-                thumbnailFeed: thumbnailFeed,
-                sourceAnalysisRevision: sourceAnalysisRevision
-            )
-            VStack(alignment: .leading, spacing: 1) {
-                Text(album.title)
-                    .lineLimit(1)
-                Text(presentation.detailLine)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                if let invitation = presentation.invitationDetail {
-                    Text(invitation)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                }
-            }
-        }
-        .help(helpText)
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel(presentation.accessibilityLabel)
-        .accessibilityHint(presentation.accessibilityHint ?? "")
     }
 }
 

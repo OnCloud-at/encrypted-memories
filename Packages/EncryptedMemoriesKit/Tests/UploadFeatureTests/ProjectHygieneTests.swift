@@ -1364,9 +1364,11 @@ final class ProjectHygieneTests: XCTestCase {
         let mainView = try String(
             contentsOf: repoRoot.appendingPathComponent("App/Views/MainView.swift"), encoding: .utf8)
         XCTAssertTrue(mainView.contains(".task(id: model.albumCatalogRevision) { await loadAlbums() }"))
-        XCTAssertTrue(mainView.contains("@MainActor private func performRemoteLibraryRefresh()"))
+        let macRefresh = try String(
+            contentsOf: repoRoot.appendingPathComponent("App/MacLibraryRefreshController.swift"), encoding: .utf8)
+        XCTAssertTrue(macRefresh.contains("func performRemoteLibraryRefresh(host: Host)"))
         XCTAssertTrue(
-            mainView.contains("await loadAlbums()"),
+            macRefresh.contains("await host.loadAlbums()") && mainView.contains("loadAlbums: { await loadAlbums() }"),
             "the shared remote-library poll must refresh the macOS album catalog too")
 
         let mobileModel = try String(

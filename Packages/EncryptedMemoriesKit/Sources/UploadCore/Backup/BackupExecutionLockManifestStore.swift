@@ -269,48 +269,13 @@ public final class BackupExecutionLockManifestStore: BackupExecutionLockStore, @
             );
             """
 
-        let compatibility = SQLiteStoreSchemaGate.compatibility(
+        return SQLiteStoreSchemaGate.openCurrentStore(
             at: url,
             schemaSQL: schema,
-            busyTimeoutMs: policy.busyTimeoutMs,
-            versionIsCurrent: verifyVersion
+            policy: policy,
+            verifyVersion: verifyVersion,
+            stampVersion: stampVersion
         )
-        guard compatibility == .empty || compatibility == .current else { return nil }
-        var handle: OpaquePointer?
-        let flags =
-            SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX
-            | (compatibility == .empty ? SQLITE_OPEN_CREATE : 0)
-        guard sqlite3_open_v2(url.path, &handle, flags, nil) == SQLITE_OK else {
-            sqlite3_close(handle)
-            return nil
-        }
-        sqlite3_busy_timeout(handle, Int32(clamping: policy.busyTimeoutMs))
-        switch compatibility {
-        case .empty:
-            SQLiteStoreSchemaGate.configureConnection(handle, policy: policy)
-            guard
-                SQLiteStoreSchemaGate.initializeCurrentSchema(
-                    handle,
-                    schemaSQL: schema,
-                    stamp: { stampVersion(handle) }
-                )
-            else {
-                sqlite3_close(handle)
-                return nil
-            }
-        case .current:
-            guard verifyVersion(handle),
-                SQLiteStoreSchemaGate.matchesCurrentSchema(handle, schemaSQL: schema)
-            else {
-                sqlite3_close(handle)
-                return nil
-            }
-            SQLiteStoreSchemaGate.configureConnection(handle, policy: policy)
-        case .incompatible, .unavailable:
-            sqlite3_close(handle)
-            return nil
-        }
-        return handle
     }
 
     private static func verifyVersion(_ handle: OpaquePointer?) -> Bool {
@@ -353,7 +318,7 @@ public final class BackupExecutionLockManifestStore: BackupExecutionLockStore, @
 
     // MARK: - Bind/column helpers
 
-    private let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+    private let transient = SQLiteStoreSchemaGate.transientDestructor
 
     private func bindText(_ stmt: OpaquePointer?, _ index: Int32, _ value: String) {
         sqlite3_bind_text(stmt, index, value, -1, transient)

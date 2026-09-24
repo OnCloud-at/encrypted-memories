@@ -55,6 +55,12 @@ struct ZipStreamWriterTests {
         let mac = try String(
             contentsOf: repo.appendingPathComponent("App/Views/MainView.swift"), encoding: .utf8
         )
+        let sharedWriter = try String(
+            contentsOf: repo.appendingPathComponent(
+                "Packages/EncryptedMemoriesKit/Sources/PhotosCore/OriginalExportWriter.swift"
+            ),
+            encoding: .utf8
+        )
         let backend = try String(
             contentsOf: repo.appendingPathComponent(
                 "Packages/EncryptedMemoriesKit/Sources/ProtonDriveBackend/DriveSDKBridge.swift"
@@ -64,11 +70,13 @@ struct ZipStreamWriterTests {
 
         #expect(mobile.contains("backend.writeOriginal(for: item.uid, to: staging)"))
         #expect(!mobile.contains("provider.originalData(for: item.uid)"))
-        #expect(mac.contains("for: .itemReplacementDirectory"))
-        #expect(mac.contains("appropriateFor: destination"))
+        // The sandbox Powerbox contract cannot run in a package test: stage beside the chosen destination and
+        // keep the security-scoped grant for the whole export. OriginalExportWriterTests cover the writes.
+        #expect(sharedWriter.contains("for: .itemReplacementDirectory"))
+        #expect(sharedWriter.contains("appropriateFor: destination"))
         #expect(mac.contains("dest.startAccessingSecurityScopedResource()"))
-        #expect(mac.contains("backend.writeOriginal(for: item.uid, to: stagedFile"))
-        #expect(mac.contains("writer.addFile(name: uniqueName(base, used: &used), fileURL: sidecar)"))
+        #expect(mac.contains("OriginalExportWriter.writeSingle("))
+        #expect(mac.contains("OriginalExportWriter.writeArchive("))
         #expect(!mac.contains("destDir.appendingPathComponent(\".encryptedmemories-export-"))
         #expect(backend.contains("original file completed with verification warning"))
         #expect(!backend.contains("if let verificationIssue { throw verificationIssue }"))

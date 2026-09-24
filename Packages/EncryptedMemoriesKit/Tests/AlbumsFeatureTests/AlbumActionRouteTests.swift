@@ -45,7 +45,7 @@ final class AlbumActionRouteTests: XCTestCase {
     }
 
     func testSharedAlbumRowsUseTheSharedPresentationAndNeverEvaluateRoles() throws {
-        for path in ["App/Views/MainView.swift", "iOSApp/MobileAlbumsScreen.swift"] {
+        for path in ["App/Views/MacLibrarySidebar.swift", "iOSApp/MobileAlbumsScreen.swift"] {
             let view = try source(path)
             XCTAssertTrue(view.contains("presentation.detailLine"), "\(path) must show the shared role line")
             XCTAssertTrue(
@@ -59,13 +59,22 @@ final class AlbumActionRouteTests: XCTestCase {
             }
             XCTAssertFalse(view.contains("import ProtonDriveSDK"), "\(path) must not import SDK types")
         }
+        let mac = try source("App/Views/MainView.swift")
+        for forbidden in [
+            "SharedAlbumPermissions.resolve", "album.role", "invitation?.role", "canWriteSharedAlbums",
+            "SharedAlbumRole", "import ProtonDriveSDK",
+        ] {
+            XCTAssertFalse(mac.contains(forbidden), "MainView must not evaluate shared roles (\(forbidden))")
+        }
         let core = try source("Packages/EncryptedMemoriesKit/Sources/AlbumCore/AlbumModels.swift")
         XCTAssertFalse(core.contains("import ProtonDriveSDK"))
     }
 
     func testSharedAlbumsOpenAsReadOnlyRoutesOnEveryPlatform() throws {
+        let macSidebar = try source("App/Views/MacLibrarySidebar.swift")
+        XCTAssertTrue(
+            macSidebar.contains("PhotoFilter.sharedAlbum("), "macOS sidebar rows must select the shared route")
         let mac = try source("App/Views/MainView.swift")
-        XCTAssertTrue(mac.contains("PhotoFilter.sharedAlbum("), "macOS sidebar rows must select the shared route")
         XCTAssertTrue(mac.contains("!selection.isReadOnly"), "macOS mutation toolbar must hide on read-only routes")
 
         let mobile = try source("iOSApp/MobileAlbumsScreen.swift")

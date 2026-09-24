@@ -101,7 +101,7 @@ public final class LibrarySourceInventoryStore: @unchecked Sendable {
     private let indexKey: SymmetricKey
     private let policy: LibraryDatabasePolicy
     private let queue: DispatchQueue
-    private let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+    private let transient = SQLiteStoreSchemaGate.transientDestructor
     private let ownerID = UUID()
 
     private var db: OpaquePointer?

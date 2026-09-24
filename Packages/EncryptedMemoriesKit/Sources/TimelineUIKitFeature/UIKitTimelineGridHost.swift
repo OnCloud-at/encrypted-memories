@@ -841,6 +841,9 @@
             guard isMetal3Capable else { return }
             self.device = device
             renderer = MetalGridRenderer(device: device, clearColor: Self.gridClearColor)
+            if renderer?.compositePipelineUnavailable == true {
+                PhotoDiagnostics.shared.emit("MetalGridRenderer", ["compositePipeline": "unavailable"])
+            }
             metalView.configure(device: device)
             refreshTextureCacheIfNeeded()
         }

@@ -15,6 +15,9 @@ package final class MetalGridRenderer {
     private let clearColor: MTLClearColor
     /// Two-texture linear-mix pipeline for overview dissolves. Nil when shader setup fails.
     private let compositePipeline: MTLRenderPipelineState?
+    /// `true` when the dissolve composite pipeline could not be built. Dissolves then draw the target layer
+    /// directly; the platform adapter reports this through its diagnostics.
+    package let compositePipelineUnavailable: Bool
     /// Offscreen source and target render targets used by `renderLayerDissolve`.
     private var layerA: MTLTexture?
     private var layerB: MTLTexture?
@@ -76,6 +79,7 @@ package final class MetalGridRenderer {
             self.pipeline = try device.makeRenderPipelineState(descriptor: descriptor)
 
             // Composite pipeline: opaque (no blending) fullscreen linear mix of two layer textures.
+            let composite: MTLRenderPipelineState?
             if let cv = library.makeFunction(name: "metalGridCompositeVertex"),
                 let cf = library.makeFunction(name: "metalGridCompositeFragment")
             {
@@ -84,10 +88,12 @@ package final class MetalGridRenderer {
                 cd.fragmentFunction = cf
                 cd.colorAttachments[0].pixelFormat = .bgra8Unorm
                 cd.colorAttachments[0].isBlendingEnabled = false
-                self.compositePipeline = try? device.makeRenderPipelineState(descriptor: cd)
+                composite = try? device.makeRenderPipelineState(descriptor: cd)
             } else {
-                self.compositePipeline = nil
+                composite = nil
             }
+            self.compositePipeline = composite
+            self.compositePipelineUnavailable = composite == nil
 
             let sd = MTLSamplerDescriptor()
             sd.minFilter = .linear
