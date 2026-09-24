@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import VisionKit
 
 /// AppKit owns native event details. Core owns the direction lock, threshold, and one-page-per-gesture contract.
 enum AppKitViewerPageSwipeAdapter {
@@ -66,6 +67,10 @@ struct ZoomableImageView: NSViewRepresentable {
     var onPhotoFrameChanged: ((CGRect) -> Void)? = nil
     /// Requests a bounded sharp representation once the native zoom exceeds fit scale.
     var onZoomChanged: ((CGFloat) -> Void)? = nil
+    /// On-device Live Text for the displayed still. `nil` removes text interaction from the photo.
+    var liveTextAnalysis: ImageAnalysis? = nil
+    /// Highlights the recognized text and its detected items.
+    var liveTextHighlighted = false
 
     func makeNSView(context: Context) -> NSScrollView {
         let scrollView = ZoomScrollView()
@@ -97,6 +102,7 @@ struct ZoomableImageView: NSViewRepresentable {
         context.coordinator.imageView = imageView
         context.coordinator.itemIdentity = itemIdentity
         context.coordinator.isSharp = isSharp
+        context.coordinator.updateLiveText(analysis: liveTextAnalysis, highlighted: liveTextHighlighted)
         scrollView.needsLayout = true
         return scrollView
     }
@@ -133,6 +139,7 @@ struct ZoomableImageView: NSViewRepresentable {
         }
         context.coordinator.itemIdentity = itemIdentity
         context.coordinator.isSharp = isSharp
+        context.coordinator.updateLiveText(analysis: liveTextAnalysis, highlighted: liveTextHighlighted)
     }
 
     func makeCoordinator() -> Coordinator { Coordinator() }
@@ -141,6 +148,33 @@ struct ZoomableImageView: NSViewRepresentable {
         weak var imageView: NSImageView?
         var itemIdentity: String?
         var isSharp = false
+        private var liveTextOverlay: ImageAnalysisOverlayView?
+
+        /// Places the Live Text overlay inside the image view, so it follows magnification and pan, and tracks the
+        /// image view's fitted image rect. Without an analysis the overlay is removed and no event reaches it.
+        @MainActor func updateLiveText(analysis: ImageAnalysis?, highlighted: Bool) {
+            guard let imageView else { return }
+            guard let analysis else {
+                liveTextOverlay?.removeFromSuperview()
+                liveTextOverlay = nil
+                return
+            }
+            let overlay: ImageAnalysisOverlayView
+            if let existing = liveTextOverlay {
+                overlay = existing
+            } else {
+                overlay = ImageAnalysisOverlayView(frame: imageView.bounds)
+                overlay.autoresizingMask = [.width, .height]
+                overlay.preferredInteractionTypes = .automaticTextOnly
+                // The viewer toolbar owns the Show Text action; the system button would scale with the zoom.
+                overlay.isSupplementaryInterfaceHidden = true
+                overlay.trackingImageView = imageView
+                imageView.addSubview(overlay)
+                liveTextOverlay = overlay
+            }
+            if overlay.analysis !== analysis { overlay.analysis = analysis }
+            if overlay.selectableItemsHighlighted != highlighted { overlay.selectableItemsHighlighted = highlighted }
+        }
     }
 }
 

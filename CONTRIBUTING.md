@@ -64,9 +64,22 @@ Code links point to the reviewed commit; they do not create unresolved review th
 - Green: no actionable findings in the reviewed changes.
 - Yellow: actionable notices without a serious finding.
 - Red: serious findings survived evidence verification; this remains advice.
-- Grey: review unavailable or incomplete because required source or context was missing. Partial findings also carry a coverage note.
+- Grey: review unavailable or incomplete. Unreviewed patch lines, files without a textual patch, model-reported testing gaps, or evidence verification gaps remain. Partial findings also carry a coverage note.
 
 The comment shows at most three findings. Expand the details for evidence and coverage limitations.
+
+The review sends the cumulative pull request diff in bounded batches.
+Each request, validation retry, and evidence verification stays at or below 100,000 UTF-8 bytes.
+With 8,000 reserved output tokens, this stays below the 131,072-token window measured for Lumo Lite and Max.
+A file stays whole when it fits into one request.
+A larger file is split at hunk boundaries. A larger hunk is split at line boundaries with an exact `(continued)` hunk header.
+Each batch also receives a list of all changed files and short summaries of earlier batches as cross-file context.
+If the provider still rejects a batch as too large, the review splits that batch at most twice.
+The comment counts text coverage per GitHub patch line, including files beyond the file limit.
+For each file, it names the failed, rejected, timed-out, or unstarted batch that left lines unreviewed. It lists up to 40 of these gaps.
+Files without a textual patch, such as images, appear in a separate list. The automation does not inspect image or binary content.
+Model-reported testing gaps and evidence verification gaps appear in two more lists.
+The workflow runs the reviewer from the default branch. A reviewer change takes effect only after it is merged.
 A second model pass challenges candidate findings using the patch and redacted source windows
 from the exact head and base commits. It checks the trigger, impact, counterevidence, and source quotation.
 Missing tests, style preferences, and speculative risks do not justify a serious finding.
@@ -81,12 +94,13 @@ All model passes and retries share a thirty-minute analysis budget.
 The workflow reserves additional time for source reads and comment publication.
 The issue-triage workflow keeps its existing shorter timeout policy.
 
-Review coverage is bounded: 80 files, 96,000 patch characters, and 3,000 patch lines.
+Review coverage is bounded: 80 files, 8 review batches, and 12 review requests, including context splits.
+A patch line longer than 24,000 characters is truncated and counts as a coverage gap.
 Source reads accept text files up to 200,000 bytes and select windows around candidate lines.
 Large inputs can reduce these windows. Omitted patches, unavailable source, and specific missing context produce coverage limitations.
 Dismissed suspicions, low-confidence candidates, existing issues, and optional test improvements do not count as coverage gaps.
 The model reports optional test improvements as review notes, so they do not change the review status.
-Invalid evidence triggers regeneration; repeated validation failure makes the review unavailable.
+Invalid evidence triggers regeneration. Repeated validation failure leaves the lines of that batch as a text coverage gap.
 Logs report decision counts without candidate text. An uncertain decision must identify its missing context.
 The reviewer does not execute PR code or search the entire repository for callers and tests.
 The trusted default-branch script reads PR source as data, including for fork PRs.

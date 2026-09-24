@@ -1941,6 +1941,18 @@ struct MainView: View {
                 }
 
                 Menu {
+                    if viewerModel.hasLiveText {
+                        Button {
+                            viewerModel.liveTextHighlighted.toggle()
+                        } label: {
+                            Label(
+                                viewerModel.liveTextHighlighted
+                                    ? L10n.string("viewer.live_text_hide") : L10n.string("viewer.live_text_show"),
+                                systemImage: "text.viewfinder"
+                            )
+                        }
+                        Divider()
+                    }
                     switch viewerMutationAction {
                     case .restore:
                         Button {
