@@ -22,7 +22,7 @@ public final class SQLiteMLIndexStore: MLIndexStore, @unchecked Sendable {
 
     private var db: OpaquePointer?
     private let lock = NSLock()
-    private let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+    private let transient = SQLiteStoreSchemaGate.transientDestructor
     private let cipher: any MLVectorCipher
 
     public init?(url: URL, policy: LibraryDatabasePolicy = .conservative, cipher: any MLVectorCipher) {

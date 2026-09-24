@@ -23,7 +23,7 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
     private let journalSizeLimitBytes: Int
     private let walCheckpointRowThreshold: Int
     private let lock = NSLock()
-    private let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+    private let transient = SQLiteStoreSchemaGate.transientDestructor
     private var db: OpaquePointer?
     private var walRowsSinceCheckpoint = 0
 

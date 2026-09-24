@@ -22,6 +22,66 @@ public enum SQLiteStoreSchemaCompatibility: Sendable, Equatable {
 /// produced by this build's schema SQL. This keeps schema changes explicit and prevents markerless or
 /// future files from being modified while an older build tries to open them.
 public enum SQLiteStoreSchemaGate {
+    /// `SQLITE_TRANSIENT`: SQLite copies bound text and blobs before the bind call returns.
+    public static var transientDestructor: sqlite3_destructor_type {
+        unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+    }
+
+    /// Opens an operational store only when the file is empty or already matches this build's exact schema.
+    ///
+    /// The file is inspected read-only first. An empty store is created, configured, and stamped; a current store
+    /// is verified and configured. Every other state closes the connection and returns `nil` without writing.
+    public static func openCurrentStore(
+        at url: URL,
+        schemaSQL: String,
+        policy: LibraryDatabasePolicy,
+        verifyVersion: (OpaquePointer?) -> Bool,
+        stampVersion: (OpaquePointer?) -> Bool
+    ) -> OpaquePointer? {
+        let compatibility = compatibility(
+            at: url,
+            schemaSQL: schemaSQL,
+            busyTimeoutMs: policy.busyTimeoutMs,
+            versionIsCurrent: verifyVersion
+        )
+        guard compatibility == .empty || compatibility == .current else { return nil }
+        var opened: OpaquePointer?
+        let flags =
+            SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX
+            | (compatibility == .empty ? SQLITE_OPEN_CREATE : 0)
+        guard sqlite3_open_v2(url.path, &opened, flags, nil) == SQLITE_OK, let handle = opened else {
+            sqlite3_close(opened)
+            return nil
+        }
+        sqlite3_busy_timeout(handle, Int32(clamping: policy.busyTimeoutMs))
+        switch compatibility {
+        case .empty:
+            configureConnection(handle, policy: policy)
+            guard
+                initializeCurrentSchema(
+                    handle,
+                    schemaSQL: schemaSQL,
+                    stamp: { stampVersion(handle) }
+                )
+            else {
+                sqlite3_close(handle)
+                return nil
+            }
+        case .current:
+            guard verifyVersion(handle),
+                matchesCurrentSchema(handle, schemaSQL: schemaSQL)
+            else {
+                sqlite3_close(handle)
+                return nil
+            }
+            configureConnection(handle, policy: policy)
+        case .incompatible, .unavailable:
+            sqlite3_close(handle)
+            return nil
+        }
+        return handle
+    }
+
     /// Inspects an existing database through a read-only connection. Missing files are empty stores.
     /// The caller can therefore reject a populated incompatible file before any read-write open,
     /// WAL recovery, persistent pragma, schema DDL, or version stamp can modify it.
