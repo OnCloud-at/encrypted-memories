@@ -32,7 +32,8 @@ struct SettingsView: View {
                 .padding(.vertical, 7)
         }
         .navigationTitle("sidebar.settings")
-        .frame(width: 520, height: 520)
+        // German tab titles need at least 530 pt; a narrower window hides a tab behind the overflow menu.
+        .frame(width: 560, height: 520)
         .task {
             await refreshAccountInfo()
             while !Task.isCancelled {
@@ -88,6 +89,10 @@ struct SettingsView: View {
                         )
                     })
             }
+            tabs.append(
+                .init(id: .labs, title: L10n.string("labs.title"), systemImage: "flask") {
+                    LabsSettingsTab()
+                })
             tabs.append(
                 .init(
                     id: .diagnostics, title: String(localized: "settings.diagnostics_tab"), systemImage: "internaldrive"
@@ -182,7 +187,7 @@ private struct BackupSettingsTab: View {
                     Section {
                         BackupStatusSummaryRow(status: manualStatus)
                     } header: {
-                        Text("settings.backup_uploads_section")
+                        Text(L10n.string("settings.backup_uploads_section"))
                     }
                 }
             }
@@ -1110,6 +1115,17 @@ private struct BackupStatusSummaryRow: View {
 
     private var showsStatusHeader: Bool {
         status.isActive || total > 0 || status.needsAttentionCount > 0
+    }
+}
+
+// MARK: - Labs
+
+private struct LabsSettingsTab: View {
+    var body: some View {
+        Form {
+            LabsSettingsSection()
+        }
+        .formStyle(.grouped)
     }
 }
 

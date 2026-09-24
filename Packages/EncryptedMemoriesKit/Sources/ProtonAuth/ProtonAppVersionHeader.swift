@@ -1,4 +1,5 @@
 import Foundation
+import PhotosCore
 
 /// Builds the `x-pm-appversion` value that Proton requires from third-party Drive clients:
 /// `external-drive-{name}@{major.minor.patch}-{channel}+{build metadata}`.
@@ -8,7 +9,7 @@ import Foundation
 public enum ProtonAppVersionHeader {
     public static let clientName = "encryptedmemories"
     /// Info.plist key filled from the `ENCRYPTED_MEMORIES_PROTON_CHANNEL` build setting.
-    public static let channelInfoKey = "EncryptedMemoriesProtonChannel"
+    public static let channelInfoKey = AppBuildInfo.releaseChannelInfoKey
     /// Info.plist key filled from the `ENCRYPTED_MEMORIES_BUILD_COMMIT` build setting.
     public static let buildCommitInfoKey = "EncryptedMemoriesBuildCommit"
 

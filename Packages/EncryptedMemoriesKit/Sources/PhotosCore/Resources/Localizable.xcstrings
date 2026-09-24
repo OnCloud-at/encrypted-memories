@@ -475,6 +475,99 @@
         "de": { "stringUnit": { "state": "translated", "value": "Die Hintergrundsicherung konnte nicht geplant werden. Encrypted Memories versucht es erneut; lasse die App geöffnet, um jetzt fortzufahren." } }
       }
     },
+    "settings.backup_uploads_section": {
+      "extractionState": "manual",
+      "comment": "Backup section for the manual upload queue's pre-upload check.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Uploads" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Uploads" } }
+      }
+    },
+    "labs.title": {
+      "extractionState": "manual",
+      "comment": "Settings entry and title for features that people can try before release.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Labs" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Labs" } }
+      }
+    },
+    "labs.intro": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Try new features here before they’re finished. They may still change or go away." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Hier kannst du neue Funktionen ausprobieren, bevor sie fertig sind. Sie können sich noch ändern oder wieder verschwinden." } }
+      }
+    },
+    "labs.empty_title": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Nothing to Try Right Now" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Gerade nichts zum Ausprobieren" } }
+      }
+    },
+    "labs.empty_message": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "New features show up here when they’re ready. Check back soon." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Neue Funktionen erscheinen hier, sobald sie bereit sind. Schau bald wieder vorbei." } }
+      }
+    },
+    "settings.summary_on": {
+      "extractionState": "manual",
+      "comment": "Short trailing value of a settings row.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "On" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Ein" } }
+      }
+    },
+    "settings.summary_off": {
+      "extractionState": "manual",
+      "comment": "Short trailing value of a settings row.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Off" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Aus" } }
+      }
+    },
+    "settings.summary_unavailable": {
+      "extractionState": "manual",
+      "comment": "Short trailing value of a settings row.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Unavailable" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Nicht verfügbar" } }
+      }
+    },
+    "backup.summary_backing_up": {
+      "extractionState": "manual",
+      "comment": "Trailing value of the Backup settings row while a pass runs.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Backing Up" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Wird gesichert" } }
+      }
+    },
+    "backup.summary_paused": {
+      "extractionState": "manual",
+      "comment": "Trailing value of the Backup settings row.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Paused" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Pausiert" } }
+      }
+    },
+    "backup.summary_waiting": {
+      "extractionState": "manual",
+      "comment": "Trailing value of the Backup settings row while backup waits to continue.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Waiting" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Wartet" } }
+      }
+    },
+    "backup.summary_incomplete": {
+      "extractionState": "manual",
+      "comment": "Trailing value of the Backup settings row when files could not be backed up.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Incomplete" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Unvollständig" } }
+      }
+    },
     "backup.phase_attention": {
       "extractionState": "manual",
       "localizations": {
@@ -4799,8 +4892,8 @@
       "extractionState": "manual",
       "comment": "Shown BEFORE the system permission prompt - states plainly what enabling will do.",
       "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "Backs up your photos and videos to Proton Drive, encrypted. Your originals stay untouched, and nothing is ever deleted from your library. Photos that can be matched exactly are not uploaded again. If older remote photos lack the required metadata, backup continues with a warning. Turning this on needs access to your photos." } },
-        "de": { "stringUnit": { "state": "translated", "value": "Sichert deine Fotos und Videos verschlüsselt in Proton Drive. Deine Originale bleiben unverändert, und es wird nie etwas aus deiner Mediathek gelöscht. Exakt erkennbare Fotos werden nicht noch mal hochgeladen. Fehlen bei älteren Remote-Fotos die nötigen Metadaten, läuft das Backup mit einer Warnung weiter. Zum Aktivieren braucht die App Zugriff auf deine Fotos." } }
+        "en": { "stringUnit": { "state": "translated", "value": "Backs up your photos and videos to Proton Drive, encrypted. Your library stays untouched, and photos that are already backed up aren’t uploaded again." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Sichert deine Fotos und Videos verschlüsselt in Proton Drive. Deine Mediathek bleibt unverändert, und bereits gesicherte Fotos werden nicht noch mal hochgeladen." } }
       }
     },
     "settings.bug_report_action": {

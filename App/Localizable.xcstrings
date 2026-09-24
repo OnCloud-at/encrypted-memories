@@ -32,14 +32,6 @@
         "de": { "stringUnit": { "state": "translated", "value": "Foto-Mediathek" } }
       }
     },
-    "settings.backup_uploads_section": {
-      "extractionState": "manual",
-      "comment": "Backup tab section for the manual upload queue's pre-upload check.",
-      "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "Uploads" } },
-        "de": { "stringUnit": { "state": "translated", "value": "Uploads" } }
-      }
-    },
     "settings.backup_tab": {
       "extractionState": "manual",
       "localizations": {

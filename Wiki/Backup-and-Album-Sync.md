@@ -4,7 +4,7 @@ Encrypted Memories uses one shared backup engine across Mac, iPhone, and iPad. T
 
 ## Apple Photos library backup
 
-1. Open Settings.
+1. Open Settings, then **Backup**. On a Mac, open the Backup tab.
 2. Enable Photos backup.
 3. Grant full or limited Photos access.
 4. Keep the app open for the first large pass when practical.
@@ -16,7 +16,7 @@ On iPhone and iPad, background processing is scheduled with the operating system
 
 ## Limited Photos access
 
-When iOS or iPadOS grants limited access, only selected library items can be backed up. Use **Manage Selection** in Settings to change the allowed set.
+When iOS or iPadOS grants limited access, only selected library items can be backed up. Use **Manage Selection** on the Backup page to change the allowed set.
 
 ## Mac folder backup
 
