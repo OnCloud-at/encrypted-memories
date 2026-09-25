@@ -37,7 +37,10 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         try? FileManager.default.removeItem(at: directory)
     }
 
-    private func makeCoordinator() -> PendingBackupCoordinator {
+    private func makeCoordinator(
+        checkmarkDuration: Duration = .seconds(60),
+        uncheckedAdmissionLimit: Int = 64
+    ) -> PendingBackupCoordinator {
         PendingBackupCoordinator(
             store: store,
             queues: [.photoLibraryAsset: queue],
@@ -47,7 +50,9 @@ final class PendingBackupCoordinatorTests: XCTestCase {
             configuration: .init(
                 membershipInterval: .zero,
                 progressInterval: .milliseconds(1),
-                doneLinger: .milliseconds(20)
+                doneLinger: .milliseconds(20),
+                checkmarkDuration: checkmarkDuration,
+                uncheckedAdmissionLimit: uncheckedAdmissionLimit
             ),
             now: { [date] in date }
         )
@@ -108,11 +113,43 @@ final class PendingBackupCoordinatorTests: XCTestCase {
 
     // MARK: - Admission
 
-    func testUncheckedPhotoWaitsForTheDuplicateCheck() async throws {
+    func testFewNewPhotosShowAtOnceBeforeTheirCheck() async throws {
+        enqueue("a", state: .discovered)
+        enqueue("b", state: .discovered, captureOffset: 1)
+        enqueue("c", state: .checking, captureOffset: 2)
+        await coordinator.start()
+        let snapshot = await coordinator.currentSnapshot()
+        XCTAssertEqual(tileIDs(snapshot), ["a", "b", "c"], "a few new photos show together, each with an empty ring")
+        XCTAssertTrue(snapshot.tiles.allSatisfy { $0.badge == .waiting })
+    }
+
+    func testLargeScanShowsPhotosOnlyAfterTheirCheck() async throws {
+        await coordinator.close()
+        coordinator = makeCoordinator(uncheckedAdmissionLimit: 1)
+        enqueue("shown", state: .discovered)
+        await coordinator.start()
+        await waitForSnapshot("a small scan shows at once") { $0.tiles.count == 1 }
+
+        // A large scan (a first backup, or a second device of an iCloud library) waits for each check, so copies
+        // of photos already in Proton never flood the grid. The tile that already showed stays.
+        for id in ["x", "y", "z"] { enqueue(id, state: .discovered, captureOffset: 5) }
+        try await Task.sleep(for: .milliseconds(100))
+        let large = await coordinator.currentSnapshot()
+        XCTAssertEqual(tileIDs(large), ["shown"])
+
+        recorder.recordUploadEvidence(source: source("x"), revision: revision)
+        await waitForSnapshot("evidence admits a checked photo") {
+            Set($0.tiles.map(\.key.identifier)) == ["shown", "x"]
+        }
+    }
+
+    func testUncheckedPhotoShowsOnceItsCheckPassed() async throws {
+        await coordinator.close()
+        coordinator = makeCoordinator(uncheckedAdmissionLimit: 0)
         enqueue("fresh", state: .discovered)
         await coordinator.start()
         let initial = await coordinator.currentSnapshot()
-        XCTAssertTrue(initial.tiles.isEmpty, "an unchecked photo can be a copy of a photo already in Proton")
+        XCTAssertTrue(initial.tiles.isEmpty, "an unchecked photo of a large scan can be a copy of a Proton photo")
 
         recorder.recordUploadEvidence(source: source("fresh"), revision: revision)
         let snapshot = await waitForSnapshot("evidence admits the tile") { $0.tiles.count == 1 }
@@ -193,6 +230,36 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         await coordinator.noteRemotePresence([key("done")])
         await waitForSnapshot("the tile retires after the checkmark lingered") { $0.tiles.isEmpty }
         XCTAssertTrue(store.unacknowledgedHandoffs().isEmpty)
+    }
+
+    func testSettledRowKeepsItsTileBeforeTheHandoffEventArrives() async throws {
+        enqueue("done", state: .uploading)
+        await coordinator.start()
+        await waitForSnapshot("uploading") { $0.tiles.count == 1 }
+        // The runner writes the handoff first; its event travels on another stream than the queue change.
+        let remote = PhotoUID(volumeID: "vol", nodeID: "link-done")
+        XCTAssertEqual(
+            store.recordHandoff(
+                PendingHandoff(key: key("done"), revision: revision, remote: remote, kind: .uploaded, createdAt: date)),
+            .recorded)
+        setState("done", .completed)
+
+        let settled = await waitForSnapshot("the tile keeps its place") { $0.tiles.first?.isSettled == true }
+        XCTAssertEqual(tileIDs(settled), ["done"], "a settled row must never hide its tile for a moment")
+        XCTAssertEqual(settled.tiles.first?.handoff, remote)
+    }
+
+    func testCheckmarkShowsOnlyBriefly() async throws {
+        await coordinator.close()
+        coordinator = makeCoordinator(checkmarkDuration: .milliseconds(30))
+        enqueue("done", state: .uploading)
+        await coordinator.start()
+        recorder.recordHandoff(
+            source: source("done"), revision: revision, remote: PhotoUID(volumeID: "vol", nodeID: "l"), kind: .uploaded)
+        setState("done", .completed)
+        await waitForSnapshot("the checkmark shows") { $0.tiles.first?.badge == .done }
+        let later = await waitForSnapshot("then the tile shows no badge") { $0.tiles.first?.badge == .backedUp }
+        XCTAssertEqual(tileIDs(later), ["done"], "the tile stays until its Proton photo takes over")
     }
 
     func testUnlistedHandoffSurvivesARestart() async throws {

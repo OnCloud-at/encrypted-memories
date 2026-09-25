@@ -9,8 +9,10 @@ public enum PendingUploadBadge: Sendable, Equatable {
     case uploading(step: Int)
     /// A failure that needs the person; the reason stays in the Backup settings.
     case attention
-    /// Backed up; the checkmark shows until the tile hands over and briefly after.
+    /// Backed up; the checkmark shows for a moment.
     case done
+    /// Backed up, and the checkmark has shown: no badge.
+    case backedUp
 }
 
 /// One local photo in the grid, the trash list or the excluded list.

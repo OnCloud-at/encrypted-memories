@@ -722,6 +722,36 @@ struct ThumbnailFeedCoreTests {
         #expect(await feed.cachedDecoded(for: local) == nil)
     }
 
+    @Test func handoverShowsThePendingImageBeforeTheScopeListsTheProtonPhoto() async throws {
+        let local = PhotoUID(localPending: .photoLibrary, identifier: "asset-7")
+        let remote = Self.uid("fresh-upload")
+        let feed = ThumbnailFeedCore(
+            cache: Self.cache("adopt-before-scope"),
+            loader: PriorityRecordingLoader(payload: Self.pngData(width: 24, height: 24)),
+            configuration: Self.configuration()
+        )
+        // The source scope lists the library but not the photo that just uploaded.
+        let graph = LibrarySourceGraph()
+        let change = Self.visibleScope(in: graph, uids: [Self.uid("older")])
+        #expect(await feed.bindDerivedDataEpoch(graph.runtimeEpoch))
+        _ = await feed.reconcile(
+            selected: change.selectedScope, analysis: change.analysisScope,
+            retention: change.thumbnailRetentionScope)
+        await feed.setLocalThumbnailLoader(StubLocalThumbnails(image: Self.decodedThumb(16, 16)))
+        await feed.setLocalAuthorization([local])
+        _ = await feed.decoded(for: local)
+
+        await feed.setLocalAuthorization([], adoptions: [(local, remote)])
+        #expect(feed.memoryDecoded(for: remote) != nil, "the handed-over tile must not turn black")
+
+        // Once the scope lists the photo, the image stays and needs no exception any more.
+        let listed = Self.visibleScope(in: graph, uids: [Self.uid("older"), remote])
+        _ = await feed.reconcile(
+            selected: listed.selectedScope, analysis: listed.analysisScope,
+            retention: listed.thumbnailRetentionScope)
+        #expect(feed.memoryDecoded(for: remote) != nil)
+    }
+
     @Test func protonPhotoAdoptsThePendingImage() async throws {
         let local = PhotoUID(localPending: .photoLibrary, identifier: "asset-2")
         let remote = Self.uid("adopted")

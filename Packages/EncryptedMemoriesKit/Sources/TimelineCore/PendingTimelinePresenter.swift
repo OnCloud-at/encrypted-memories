@@ -410,7 +410,8 @@ public final class PendingTimelinePresenter {
         var badges: [PhotoUID: GridUploadBadge] = [:]
         badges.reserveCapacity(snapshot.tiles.count)
         for tile in snapshot.tiles {
-            badges[gridUIDs[tile.item.uid] ?? tile.item.uid] = gridBadge(tile.badge)
+            guard let badge = gridBadge(tile.badge) else { continue }
+            badges[gridUIDs[tile.item.uid] ?? tile.item.uid] = badge
         }
         return badges
     }
@@ -425,12 +426,14 @@ public final class PendingTimelinePresenter {
         return progress
     }
 
-    private nonisolated static func gridBadge(_ badge: PendingUploadBadge) -> GridUploadBadge {
+    /// Nil once the checkmark has shown: a backed-up photo looks like any other photo.
+    private nonisolated static func gridBadge(_ badge: PendingUploadBadge) -> GridUploadBadge? {
         switch badge {
         case .waiting: .waiting
         case .uploading(let step): .uploading(step: step)
         case .attention: .attention
         case .done: .done
+        case .backedUp: nil
         }
     }
 }

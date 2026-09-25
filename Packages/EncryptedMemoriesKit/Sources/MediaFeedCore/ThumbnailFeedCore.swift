@@ -261,6 +261,12 @@ public actor ThumbnailFeedCore {
         DerivedDataResourceAuthorization<ThumbnailRetentionDerivedDataScopeKind>()
     /// Local pending photos are not in any source scope; the host authorizes them explicitly.
     private nonisolated let localAuthorization = LocalThumbnailAuthorization()
+    /// Proton photos that took over a pending tile. The grid lists them as soon as the timeline does, but the
+    /// source scope follows asynchronously; until it covers them, the handed-over image keeps them readable, so
+    /// the tile never turns black at the handover.
+    private nonisolated let adoptedAuthorization = LocalThumbnailAuthorization()
+    private static let maxAdoptedWithoutScope = 1_024
+    private static let maxLocalPreload = 24
     private var localLoader: (any LocalThumbnailLoading)?
     /// Queued local demand in request order. A newer viewport replaces it; warm passes append.
     private var localDemand: [(uid: PhotoUID, pixels: Int)] = []
@@ -1586,6 +1592,8 @@ public actor ThumbnailFeedCore {
         // boundary. That owner consumes only the newest queued revision, so an older continuation can never
         // overwrite a newer feed state after one of the awaits below.
         thumbnailReadAuthorization.apply(retentionScope)
+        // Handed-over photos the scope now covers need no exception any more.
+        adoptedAuthorization.subtract(retentionScope.uids)
         let incomingRequest = SourceReconciliationRequest(
             selectedScope: selectedScope,
             analysisScope: analysisScope,
@@ -1669,7 +1677,8 @@ public actor ThumbnailFeedCore {
 
             // Join first, then remove only plaintext which lost thumbnail access. The source and cache
             // fences already reject a cancellation-ignoring loader, so retained tiles stay immediately usable.
-            decoded.retainOnly(request.retentionScope.uids.union(localAuthorization.snapshot))
+            decoded.retainOnly(
+                request.retentionScope.uids.union(localAuthorization.snapshot).union(adoptedAuthorization.snapshot))
             checkpointPresent.removeAll(keepingCapacity: true)
             checkpointHints.removeAll(keepingCapacity: true)
             pendingCheckpointUpdates.removeAll(keepingCapacity: true)
@@ -2796,7 +2805,9 @@ public actor ThumbnailFeedCore {
     // MARK: - Local pending photos
 
     private nonisolated func readAllowed(_ uid: PhotoUID) -> Bool {
-        uid.isLocalPending ? localAuthorization.isAllowed(uid) : thumbnailReadAuthorization.isAllowed(uid)
+        uid.isLocalPending
+            ? localAuthorization.isAllowed(uid)
+            : thumbnailReadAuthorization.isAllowed(uid) || adoptedAuthorization.isAllowed(uid)
     }
 
     /// Installs the device loader for local pending photos.
@@ -2823,6 +2834,9 @@ public actor ThumbnailFeedCore {
         unfetchable.subtract(change.removed)
         let replay = change.added.compactMap { uid in deniedLocalDemand.removeValue(forKey: uid).map { (uid, $0) } }
         if !replay.isEmpty { submitLocalDemand(replay, replacing: false) }
+        // A photo that just joined the grid starts loading now, before its first frame asks for it.
+        let preload = change.added.prefix(Self.maxLocalPreload).map { ($0, Int(configuration.targetPixels)) }
+        if !preload.isEmpty { submitLocalDemand(preload, replacing: false) }
     }
 
     /// Drops the image of a local photo whose content changed (a new revision), so the next request reloads it.
@@ -2841,6 +2855,9 @@ public actor ThumbnailFeedCore {
         guard local.isLocalPending, !remote.isLocalPending, decoded.image(for: remote) == nil,
             let image = decoded.image(for: local)
         else { return false }
+        if !thumbnailReadAuthorization.isAllowed(remote) {
+            adoptedAuthorization.insert(remote, limit: Self.maxAdoptedWithoutScope)
+        }
         guard storeDecoded(image, for: remote, decodePixelCap: Int(configuration.targetPixels)) != nil else {
             return false
         }

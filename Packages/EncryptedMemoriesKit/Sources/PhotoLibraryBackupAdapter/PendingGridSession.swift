@@ -6,6 +6,7 @@ import Observation
 import PhotosCore
 import TimelineCore
 import UploadCore
+import os
 
 /// One account's pending grid, shared by iOS, iPadOS and macOS: the pending store, the coordinator that
 /// follows the backup queue, and the presenter that merges pending photos into the timeline.
@@ -16,6 +17,7 @@ import UploadCore
 @MainActor
 public final class PendingGridSession {
     public let presenter = PendingTimelinePresenter()
+    private static let logger = Logger(subsystem: "at.oncloud.encryptedmemories", category: "PendingGrid")
     /// The latest coordinator snapshot, including the trash and excluded lists.
     public private(set) var pendingSnapshot = PendingBackupSnapshot.empty
     /// Called after `pendingSnapshot` changed.
@@ -89,6 +91,11 @@ public final class PendingGridSession {
         }
         presenter.onFeedUpdate = { [weak self] localUIDs, adoptions, revised in
             guard let self else { return }
+            if !adoptions.isEmpty || !revised.isEmpty || localUIDs.count != self.gridLocalUIDs.count {
+                Self.logger.notice(
+                    "[PendingGrid] local=\(localUIDs.count, privacy: .public) handovers=\(adoptions.count, privacy: .public) revised=\(revised.count, privacy: .public)"
+                )
+            }
             // Before the presentation reaches the grid, so its next upload reads the new content.
             if !revised.isEmpty { self.feed?.invalidateLocal(revised) }
             self.gridLocalUIDs = localUIDs

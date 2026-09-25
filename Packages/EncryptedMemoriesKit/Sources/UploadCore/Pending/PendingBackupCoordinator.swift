@@ -15,8 +15,14 @@ public actor PendingBackupCoordinator {
         public var membershipInterval: Duration
         /// Minimum distance between two progress-only publications.
         public var progressInterval: Duration
-        /// How long a checkmark stays after the Proton photo took over the tile.
+        /// How long a retired tile's state lingers after the Proton photo took over the tile.
         public var doneLinger: Duration
+        /// How long the checkmark shows once a photo is backed up; the tile then shows no badge.
+        public var checkmarkDuration: Duration
+        /// Up to this many unchecked photos show at once, before their duplicate check. A larger scan (a first
+        /// backup, or a second device of an iCloud library) shows photos only after their check, so copies of
+        /// photos that are already in Proton never flood the grid.
+        public var uncheckedAdmissionLimit: Int
         /// "Zuletzt gelöscht" keeps deleted pending photos as long as the Proton trash keeps photos.
         public var trashRetention: TimeInterval
         public var acknowledgedHandoffRetention: TimeInterval
@@ -25,12 +31,16 @@ public actor PendingBackupCoordinator {
             membershipInterval: Duration = .seconds(1),
             progressInterval: Duration = .milliseconds(250),
             doneLinger: Duration = .seconds(2),
+            checkmarkDuration: Duration = .seconds(1),
+            uncheckedAdmissionLimit: Int = 64,
             trashRetention: TimeInterval = 30 * 24 * 60 * 60,
             acknowledgedHandoffRetention: TimeInterval = 7 * 24 * 60 * 60
         ) {
             self.membershipInterval = membershipInterval
             self.progressInterval = progressInterval
             self.doneLinger = doneLinger
+            self.checkmarkDuration = checkmarkDuration
+            self.uncheckedAdmissionLimit = uncheckedAdmissionLimit
             self.trashRetention = trashRetention
             self.acknowledgedHandoffRetention = acknowledgedHandoffRetention
         }
@@ -62,6 +72,14 @@ public actor PendingBackupCoordinator {
     private var retiring: [PendingSourceKey: UploadBackupRevision] = [:]
     private var actions: [PendingAction] = []
     private var excludedAccessible = Set<PendingSourceKey>()
+    /// Whether unchecked photos may show now; see `Configuration.uncheckedAdmissionLimit`.
+    private var admitsUnchecked = false
+    /// Unchecked photos that showed; they keep their tile until their check finishes, even if a large scan
+    /// starts meanwhile.
+    private var admittedUnchecked = Set<PendingSourceKey>()
+    /// Settled revisions whose checkmark showed and ended.
+    private var checkmarkShown: [PendingSourceKey: UploadBackupRevision] = [:]
+    private var checkmarkEnded: [PendingSourceKey: UploadBackupRevision] = [:]
 
     // Presentation, maintained incrementally.
     private var tilesByKey: [PendingSourceKey: PendingTile] = [:]
@@ -306,12 +324,20 @@ public actor PendingBackupCoordinator {
         guard !closed, let queue = queues[kind] else { return }
         switch change {
         case .all:
-            let previous = Set(rows.keys.filter { $0.kind == kind })
-            for key in previous { rows[key] = nil }
+            let previousRows = rows.filter { $0.key.kind == kind }
+            for key in previousRows.keys { rows[key] = nil }
             for row in queue.unsettledRows() where row.source.kind == kind { absorb(row) }
             let current = Set(rows.keys.filter { $0.kind == kind })
-            reloadRows(for: Set(handoffs.keys.filter { $0.kind == kind }).subtracting(current))
-            dirty.formUnion(previous.union(current))
+            let gone = Set(previousRows.keys).subtracting(current)
+            // A row that was still active settled or left: it takes the per-source path, so its durable handoff
+            // keeps the tile. Rows that had settled before only drop their state; there can be many of them.
+            let wasActive = gone.filter { key in
+                guard let state = previousRows[key]?.state else { return false }
+                return state != .completed && state != .alreadyBackedUp
+            }
+            for key in gone.subtracting(wasActive) where handoffs[key] == nil { dropSourceState(key) }
+            reloadRows(for: Set(handoffs.keys.filter { $0.kind == kind }).subtracting(current).union(wasActive))
+            dirty.formUnion(Set(previousRows.keys).union(current))
         case .sources(let grouped):
             let identifiers = grouped[kind] ?? []
             let keys = Set(identifiers.map { PendingSourceKey(kind: kind, identifier: $0) })
@@ -376,14 +402,33 @@ public actor PendingBackupCoordinator {
             guard let queue = queues[kind] else { continue }
             for key in kindKeys { rows[key] = nil }
             for row in queue.rows(kind: kind, identifiers: Set(kindKeys.map(\.identifier))) { absorb(row) }
-            for key in kindKeys where rows[key] == nil && handoffs[key] == nil {
-                // The source left the queue (local deletion or exclusion): its live state is gone too.
-                liveProgress[key] = nil
-                metadata[key] = nil
-                metadataRevision[key] = nil
-                inaccessible.remove(key)
-            }
+            rememberDurableHandoffs(for: kindKeys)
+            for key in kindKeys where rows[key] == nil && handoffs[key] == nil { dropSourceState(key) }
         }
+    }
+
+    /// The source left the queue (local deletion or exclusion): its live state is gone too.
+    private func dropSourceState(_ key: PendingSourceKey) {
+        liveProgress[key] = nil
+        admittedUnchecked.remove(key)
+        checkmarkShown[key] = nil
+        checkmarkEnded[key] = nil
+        metadata[key] = nil
+        metadataRevision[key] = nil
+        inaccessible.remove(key)
+    }
+
+    /// The runner writes a handoff to the store before the queue settles its row, but the coordinator hears
+    /// about the queue change and the handoff event on separate streams. A settled or vanished row whose
+    /// handoff event has not arrived yet would hide the tile until it does; the durable handoff keeps it.
+    private func rememberDurableHandoffs(for keys: [PendingSourceKey]) {
+        let settled = keys.filter { key in
+            guard let row = rows[key] else { return handoffs[key] == nil }
+            guard row.state == .completed || row.state == .alreadyBackedUp else { return false }
+            return handoffs[key]?.revision != row.revision
+        }
+        guard !settled.isEmpty else { return }
+        for handoff in store.latestHandoffs(for: settled).values { remember(handoff) }
     }
 
     private func reloadSourceStates(_ keys: [PendingSourceKey]) {
@@ -400,6 +445,9 @@ public actor PendingBackupCoordinator {
             evidence[key]?.remove(revision)
             if evidence[key]?.isEmpty == true { evidence[key] = nil }
             if liveProgress[key]?.revision == revision { liveProgress[key] = nil }
+            if checkmarkShown[key] == revision { checkmarkShown[key] = nil }
+            if checkmarkEnded[key] == revision { checkmarkEnded[key] = nil }
+            admittedUnchecked.remove(key)
             dirty.insert(key)
         }
         _ = store.removeEvidence(items)
@@ -420,11 +468,42 @@ public actor PendingBackupCoordinator {
         }
     }
 
+    /// The duplicate check has not decided yet.
+    private static func isUnchecked(_ state: UploadBackupSyncQueueState) -> Bool {
+        switch state {
+        case .discovered, .checking, .hashing, .duplicateChecking: true
+        default: false
+        }
+    }
+
+    /// A few new photos (a normal day's shots) show at once with an empty ring; a large scan waits for checks.
+    /// Counts every unchecked photo, shown ones included, so a scan that arrives in many small steps cannot
+    /// slip past the limit.
+    private func updateUncheckedAdmission() {
+        var unchecked = 0
+        var waiting: [PendingSourceKey] = []
+        for (key, row) in rows
+        where Self.isUnchecked(row.state) && evidence[key]?.contains(row.revision) != true
+            && !inaccessible.contains(key) && !isHiddenByChoice(key)
+        {
+            unchecked += 1
+            if !admittedUnchecked.contains(key) { waiting.append(key) }
+        }
+        let admits = unchecked <= configuration.uncheckedAdmissionLimit
+        guard admits != admitsUnchecked else { return }
+        admitsUnchecked = admits
+        if admits { dirty.formUnion(waiting) }
+    }
+
+    /// Excluded by the person, or saved to Apple Photos from Proton by this app.
+    private func isHiddenByChoice(_ key: PendingSourceKey) -> Bool {
+        sourceStates[key]?.desired == .excluded
+            || (key.kind == .photoLibraryAsset && savedFromApp.contains(key.identifier))
+    }
+
     /// Whether the source can show at all, before metadata is known.
     private func isCandidate(_ key: PendingSourceKey) -> Bool {
-        guard sourceStates[key]?.desired != .excluded,
-            !(key.kind == .photoLibraryAsset && savedFromApp.contains(key.identifier))
-        else { return false }
+        guard !isHiddenByChoice(key) else { return false }
         // A recovered commit can remove its queue row before the Proton photo is listed; the durable
         // handoff alone keeps the tile until then.
         guard let row = rows[key] else { return handoffs[key] != nil }
@@ -436,7 +515,12 @@ public actor PendingBackupCoordinator {
             return false
         default:
             if Self.needsEvidence(row.state) {
-                return handoff != nil || evidence[key]?.contains(row.revision) == true
+                if handoff != nil || evidence[key]?.contains(row.revision) == true { return true }
+                // A tile that showed stays, also through a retry or a pause.
+                if admittedUnchecked.contains(key) { return true }
+                guard admitsUnchecked, Self.isUnchecked(row.state) else { return false }
+                admittedUnchecked.insert(key)
+                return true
             }
             return true
         }
@@ -452,7 +536,7 @@ public actor PendingBackupCoordinator {
                 revision: handoff.revision,
                 handoff: handoff.remote,
                 isSettled: true,
-                badge: .done,
+                badge: settledBadge(key, revision: handoff.revision),
                 displayName: metadata.displayName
             )
         }
@@ -460,7 +544,7 @@ public actor PendingBackupCoordinator {
         let settled = row.state == .completed || row.state == .alreadyBackedUp
         let badge: PendingUploadBadge =
             switch row.state {
-            case .completed, .alreadyBackedUp: .done
+            case .completed, .alreadyBackedUp: settledBadge(key, revision: row.revision)
             case .failedPermanent: .attention
             default: .waiting
             }
@@ -473,6 +557,27 @@ public actor PendingBackupCoordinator {
             badge: badge,
             displayName: metadata.displayName
         )
+    }
+
+    /// The checkmark shows for `checkmarkDuration` after the backup finished, then the tile shows no badge.
+    private func settledBadge(_ key: PendingSourceKey, revision: UploadBackupRevision) -> PendingUploadBadge {
+        if checkmarkEnded[key] == revision { return .backedUp }
+        if checkmarkShown[key] != revision {
+            checkmarkShown[key] = revision
+            let duration = configuration.checkmarkDuration
+            Task { [weak self, sleep] in
+                try? await sleep(duration)
+                await self?.endCheckmark(key, revision: revision)
+            }
+        }
+        return .done
+    }
+
+    private func endCheckmark(_ key: PendingSourceKey, revision: UploadBackupRevision) {
+        guard !closed, checkmarkShown[key] == revision else { return }
+        checkmarkEnded[key] = revision
+        dirty.insert(key)
+        scheduleMembershipPublish()
     }
 
     private static func item(for key: PendingSourceKey, metadata: PendingPresentationMetadata) -> PhotoItem {
@@ -488,6 +593,8 @@ public actor PendingBackupCoordinator {
 
     /// Fetches metadata for candidates that do not have it yet, in one batch.
     private func refreshMetadata() async {
+        // Admission decides which sources need metadata at all.
+        updateUncheckedAdmission()
         let missing = dirty.filter { metadata[$0] == nil && !inaccessible.contains($0) && isCandidate($0) }
         guard !missing.isEmpty else { return }
         let requested = Dictionary(uniqueKeysWithValues: missing.map { ($0, currentRevision($0)) })
@@ -524,6 +631,7 @@ public actor PendingBackupCoordinator {
 
     /// Applies dirty keys to the ordered tile list with binary search, so one event costs O(log n) plus a move.
     private func applyDirty() -> Bool {
+        updateUncheckedAdmission()
         guard !dirty.isEmpty else { return false }
         var changed = false
         for key in dirty {
