@@ -1,5 +1,6 @@
 import DesignSystemCore
 import Foundation
+import MediaCacheUIKitAdapter
 import PhotoLibraryBackupAdapter
 import Photos
 import PhotosCore
@@ -12,12 +13,21 @@ import UploadFeature
 /// Backup settings for iOS and iPadOS. The shared `PhotoLibraryBackupController` owns every state and
 /// action; this screen is layout only.
 struct MobileBackupScreen: View {
+    @Environment(MobileLibraryModel.self) private var libraryModel
     let controller: PhotoLibraryBackupController
     let uploadCoordinator: UploadCoordinator?
 
     var body: some View {
         List {
             MobilePhotoBackupSections(controller: controller)
+            if !libraryModel.excludedPendingTiles.isEmpty {
+                PendingExcludedPhotosSection(
+                    tiles: libraryModel.excludedPendingTiles,
+                    thumbnail: PhotoKitLocalThumbnailLoader(request: PhotoKitPlatformImages.request).listThumbnail(for:)
+                ) { tile in
+                    try? await libraryModel.restoreItems([tile.item])
+                }
+            }
             if let uploadCoordinator {
                 MobileManualUploadCheckSection(
                     status: BackupStatus(manualUploadCheck: uploadCoordinator.preparationStatus)

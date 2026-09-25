@@ -1,5 +1,6 @@
 import Foundation
 import Observation
+import PhotoLibraryBackupAdapter
 import PhotosCore
 import ProtonDriveBackend
 import UploadCore
@@ -26,8 +27,17 @@ final class FolderBackupController {
     private(set) var lastMessage: String?
 
     /// False when the account's dedupe manifest or sync stores could not open - backup is then
-    /// disabled entirely instead of running without duplicate protection.
-    var isAvailable: Bool { runner != nil }
+    /// disabled entirely instead of running without duplicate protection. The pending store is required too:
+    /// without it, a file deleted before upload could upload after all.
+    var isAvailable: Bool {
+        runner != nil && (!requiresPendingStore || pendingStore?.isOperational() == true)
+    }
+
+    /// Watched folders the pending grid may read; kept accessible while they are registered.
+    let pendingAccess = PendingFolderAccess()
+    @ObservationIgnored private let pendingStore: PendingBackupManifestStore?
+    @ObservationIgnored private let requiresPendingStore: Bool
+    @ObservationIgnored private var accessedFolders: [BackupFolder.ID: URL] = [:]
 
     private let engine: UploadBackupSyncEngine?
     private let runner: BackupSyncRunner?
@@ -50,7 +60,15 @@ final class FolderBackupController {
 
     private static let foldersDefaultsKey = "backup.folderBookmarks.v1"
 
-    init(facade: ProtonClientFacade) {
+    /// `pendingRecorder` is the photo backup's recorder, so one event stream serves the pending grid.
+    init(
+        facade: ProtonClientFacade,
+        pendingStore: PendingBackupManifestStore? = nil,
+        pendingRecorder: PendingBackupEventRecorder? = nil,
+        requiresPendingStore: Bool = false
+    ) {
+        self.pendingStore = pendingStore
+        self.requiresPendingStore = requiresPendingStore
         let directory = facade.accountDataDirectory
         let policy = facade.accountDatabasePolicy
         let queueStore = UploadBackupSyncQueueManifestStore(
@@ -71,7 +89,8 @@ final class FolderBackupController {
             engine = UploadBackupSyncEngine(
                 preflight: preflight,
                 queue: queueStore,
-                remoteProofResolver: identityResolver
+                remoteProofResolver: identityResolver,
+                exclusions: pendingStore
             )
             runner = BackupSyncRunner(
                 queue: queueStore,
@@ -95,7 +114,8 @@ final class FolderBackupController {
                         isNetworkConstrained: snapshot.network.isConstrained,
                         isNetworkExpensive: snapshot.network.isExpensive
                     )
-                }
+                },
+                events: pendingRecorder
             )
         } else {
             engine = nil
@@ -164,6 +184,7 @@ final class FolderBackupController {
             folders.append(folder)
             folders.sort { $0.displayPath.localizedCaseInsensitiveCompare($1.displayPath) == .orderedAscending }
             persistFolders()
+            refreshFolderAccess()
         } catch {
             lastMessage = error.localizedDescription
         }
@@ -172,6 +193,7 @@ final class FolderBackupController {
     func removeFolder(_ id: BackupFolder.ID) {
         folders.removeAll { $0.id == id }
         persistFolders()
+        refreshFolderAccess()
         reconcileQueueWithRegisteredFolders()
         refreshFromQueue()
     }
@@ -193,6 +215,65 @@ final class FolderBackupController {
             return BackupFolder(id: UUID(), bookmark: bookmark, displayPath: url.path, needsRenewal: stale)
         }
         .sorted { $0.displayPath.localizedCaseInsensitiveCompare($1.displayPath) == .orderedAscending }
+        refreshFolderAccess()
+    }
+
+    /// Keeps every registered folder readable, for pending thumbnails, the viewer and export.
+    private func refreshFolderAccess() {
+        let registered = Set(folders.filter { !$0.needsRenewal }.map(\.id))
+        for (id, url) in accessedFolders where !registered.contains(id) {
+            url.stopAccessingSecurityScopedResource()
+            accessedFolders[id] = nil
+        }
+        for folder in folders where registered.contains(folder.id) && accessedFolders[folder.id] == nil {
+            var stale = false
+            guard
+                let url = try? URL(
+                    resolvingBookmarkData: folder.bookmark,
+                    options: [.withSecurityScope, .withoutUI],
+                    relativeTo: nil,
+                    bookmarkDataIsStale: &stale
+                ), url.startAccessingSecurityScopedResource()
+            else { continue }
+            accessedFolders[folder.id] = url
+        }
+        pendingAccess.setRoots(Array(accessedFolders.values))
+    }
+
+    // MARK: - Pending grid
+
+    /// The folder backup as a source of the pending grid.
+    var pendingFileSource: PendingFileSource? {
+        guard let queueStore, pendingStore != nil else { return nil }
+        return PendingFileSource(
+            queue: queueStore,
+            metadata: PendingFolderMetadataProvider(access: pendingAccess),
+            removeFromBackup: { [weak self] paths in await self?.removeFromBackup(paths: paths) ?? false },
+            returnToBackup: { [weak self] paths in await self?.returnToBackup(paths: paths) ?? false }
+        )
+    }
+
+    /// Removes excluded files from queued and in-flight work; a rescan never offers them again.
+    private func removeFromBackup(paths: [String]) async -> Bool {
+        guard let runner, queueStore?.isOperational() == true else { return false }
+        _ = await runner.removeSources(kind: .fileURL, identifiers: paths)
+        return queueStore?.isOperational() == true
+    }
+
+    /// Enqueues restored files again and starts a pass. Files that are gone need nothing and count as done.
+    private func returnToBackup(paths: [String]) async -> Bool {
+        guard let engine else { return false }
+        let candidates = paths.compactMap { path in
+            pendingAccess.fileURL(forPath: path).flatMap { try? FolderBackupCatalog.candidate(for: $0) }
+        }
+        do {
+            _ = try await engine.enqueueBatch(candidates)
+        } catch {
+            return false
+        }
+        refreshFromQueue()
+        if !candidates.isEmpty { syncNow() }
+        return true
     }
 
     private func persistFolders() {
@@ -212,7 +293,7 @@ final class FolderBackupController {
     // MARK: - Sync lifecycle
 
     func syncNow() {
-        guard !isShuttingDown, !isSyncing, runnerStopTask == nil, let engine, let runner else { return }
+        guard !isShuttingDown, !isSyncing, runnerStopTask == nil, isAvailable, let engine, let runner else { return }
         reconcileQueueWithRegisteredFolders()
         let runID = UUID()
         activeRunID = runID
@@ -315,6 +396,9 @@ final class FolderBackupController {
         await statusProjector?.stop()
         queueStore?.close()
         stateStore?.close()
+        for url in accessedFolders.values { url.stopAccessingSecurityScopedResource() }
+        accessedFolders.removeAll()
+        pendingAccess.setRoots([])
     }
 
     private func markFolderNeedsRenewal(_ id: BackupFolder.ID) {
@@ -322,6 +406,8 @@ final class FolderBackupController {
             folders[index].needsRenewal = true
             persistFolders()
         }
+        // A folder that must be picked again is no longer readable for the pending grid either.
+        refreshFolderAccess()
     }
 
     private func reportFolderEnumerationError(

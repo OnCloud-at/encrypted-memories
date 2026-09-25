@@ -1,8 +1,11 @@
 import CoreGraphics
+import GridCore
 
 package enum MetalGridGlyphContent: Equatable, Hashable, Sendable {
     case symbol(String)
     case text(String)
+    /// Drawn by the shared `MetalGridUploadBadgeImage`, so iOS and macOS show the same badge.
+    case uploadBadge(GridUploadBadgeGlyph)
 }
 
 package struct MetalGridGlyphRequest: Equatable, Hashable, Sendable {
@@ -24,6 +27,15 @@ package struct MetalGridGlyphRequest: Equatable, Hashable, Sendable {
         self.color = color
     }
 
+    package init(uploadBadge: GridUploadBadgeGlyph, pixelSize: Int = 64) {
+        self.content = .uploadBadge(uploadBadge)
+        self.pixelSize = pixelSize
+        self.aspectRatio = 1
+        self.textStyle = .system
+        self.weight = .bold
+        self.color = .white
+    }
+
     package init(
         text: String,
         pixelSize: Int = 60,
@@ -42,7 +54,7 @@ package struct MetalGridGlyphRequest: Equatable, Hashable, Sendable {
 
     package var canvasPixelWidth: Int {
         switch content {
-        case .symbol:
+        case .symbol, .uploadBadge:
             pixelSize
         case .text:
             max(1, Int((Double(pixelSize) * aspectRatio).rounded()))

@@ -391,7 +391,9 @@ public final class PhotoViewerModel {
     }
     private static func cacheKey(_ uid: PhotoUID) -> NSString { "\(uid.volumeID)~\(uid.nodeID)" as NSString }
 
+    /// A pending photo can change in Apple Photos before it uploads, so it always reloads from the device.
     private static func cacheFullImage(_ image: NSImage, pixelSize: Int, for uid: PhotoUID) {
+        guard !uid.isLocalPending else { return }
         fullImageCache.setObject(
             CachedSharpImage(image: image, pixelSize: pixelSize),
             forKey: cacheKey(uid),
@@ -565,6 +567,8 @@ public final class PhotoViewerModel {
     /// and persists it. Keeps the viewer browseable offline and avoids re-downloading previews.
     private func loadPreviewImage(_ uid: PhotoUID) async -> NSImage? {
         guard sessionIsCurrent() else { return nil }
+        // Photos that are not in Proton yet open from Apple Photos and stay out of the Proton caches.
+        let previewCache = uid.isLocalPending ? nil : self.previewCache
         let previewGeneration = previewCache?.captureWriterGeneration()
         if let cache = previewCache {
             guard let previewGeneration else { return nil }
@@ -684,7 +688,8 @@ public final class PhotoViewerModel {
         let progressAdmission = ViewerProgressAdmission()
         defer { progressAdmission.close() }
         let ref = WeakViewerRef(self)
-        let originalWriterGeneration = originalsCache?.captureWriterGeneration()
+        // Without a writer generation, a local pending original neither reads nor fills the originals cache.
+        let originalWriterGeneration = item.uid.isLocalPending ? nil : originalsCache?.captureWriterGeneration()
         do {
             let full: NSImage?
             let data: Data?

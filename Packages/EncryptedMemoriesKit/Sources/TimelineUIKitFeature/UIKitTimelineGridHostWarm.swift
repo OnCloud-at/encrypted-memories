@@ -106,6 +106,11 @@
             guard let thumbnailFeed else { return }
             let unique = uniqueUIDs(uids)
             guard !unique.isEmpty else {
+                // The viewport needs nothing more; loads it asked for earlier may stop.
+                if !lastWarmIDs.isEmpty {
+                    let feedCore = thumbnailFeed.feedCore
+                    Task { await feedCore.clearLocalVisibleDemand() }
+                }
                 lastWarmIDs = []
                 warmNeedsRepass = false
                 return

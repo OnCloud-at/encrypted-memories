@@ -463,13 +463,14 @@ struct MobileTimelineScreen: View {
     }
 
     private var selectedAllFavorited: Bool {
-        !selection.selected.isEmpty && selection.selected.allSatisfy(model.favoriteUIDs.contains)
+        let favorites = model.displayedFavoriteUIDs
+        return !selection.selected.isEmpty && selection.selected.allSatisfy(favorites.contains)
     }
 
     /// The grid keeps the last authoritative projection mounted while a newer query resolves. The expensive
     /// filter/flatten work runs once in TimelineCore, never synchronously from `body`.
     private var visibleItems: [PhotoItem] {
-        guard hasProjectionCriteria else { return model.items }
+        guard hasProjectionCriteria else { return model.gridItems }
         return (resolvedSearchProjection ?? searchProjection)?.presentationItems ?? model.items
     }
 
@@ -481,9 +482,9 @@ struct MobileTimelineScreen: View {
     /// content replacement from selection, toolbar and presentation updates without scanning every photo UID.
     private var visibleContentRevision: UInt64 {
         if hasProjectionCriteria, let projection = resolvedSearchProjection ?? searchProjection {
-            return projection.revision &* 2 &+ 1
+            return projection.revision &* 4 &+ 1
         }
-        return model.timelineRevision &* 2
+        return model.gridRevision
     }
 
     private var showsSearchLanding: Bool {
@@ -506,6 +507,7 @@ struct MobileTimelineScreen: View {
                     displayMode: displayMode,
                     selectionMode: selection.isSelecting,
                     selectedUIDs: selection.selected,
+                    uploadBadges: hasProjectionCriteria ? .empty : model.pendingPresentation.uploadBadges,
                     isActive: isActive && !showsSearchLanding,
                     scrollToLatestSignal: scrollToLatestSignal,
                     scrollToTopSignal: refinementTopPlacementSignal,
@@ -518,7 +520,7 @@ struct MobileTimelineScreen: View {
                     onOpenPhoto: open,
                     onToggleSelection: selection.toggle,
                     onSelectionChanged: selection.replace(with:),
-                    dragOutProvider: model.backend,
+                    dragOutProvider: model.backend == nil ? nil : model.viewerMedia,
                     onDragOutFailed: { selection.actionError = MobileSelectionError(message: $0.localizedMessage) },
                     contextMenuActions: { contextMenu.actions(for: $0, model: model) },
                     onContextMenuAction: { action, items in
@@ -569,7 +571,7 @@ struct MobileTimelineScreen: View {
                     && (model.loadState.isLoading || model.loadState.failure != nil)
                 {
                     OfflineContentUnavailableView()
-                } else if model.loadState.isEmpty {
+                } else if model.loadState.isEmpty && !model.showsPendingPhotos {
                     MobileEmptyLibraryView()
                 } else if let failure = model.loadState.failure {
                     MobileLibraryErrorView(message: failure.message, retryable: failure.retryable) {
@@ -601,9 +603,9 @@ struct MobileTimelineScreen: View {
 
     private func open(_ item: PhotoItem) {
         if !hasProjectionCriteria {
-            guard let index = model.index(of: item.uid) else { return }  // O(1), not an O(n) firstIndex scan
+            guard let index = model.gridIndex(of: item.uid) else { return }  // O(1), not an O(n) firstIndex scan
             viewerRouter.presentation = MobileViewerPresentation(
-                index: index, items: model.items, context: ViewerCollectionContext(filter: .all)
+                index: index, items: model.gridItems, context: ViewerCollectionContext(filter: .all)
             )
         } else {
             // While searching, the viewer pages through the filtered result set to match macOS.
@@ -773,9 +775,10 @@ struct MobileTimelineScreen: View {
     }
 
     private func startShare() {
-        guard let backend = model.backend else { return }
+        guard model.backend != nil else { return }
         let chosen = model.selectedItems(selection.selected)  // O(k log k), not an O(n) filter
-        selection.startShare(items: chosen, backend: backend)
+        // Pending photos share from Apple Photos, every other photo from Proton.
+        selection.startShare(items: chosen, backend: model.viewerMedia)
     }
 
     private func toggleSelectedFavorites() {

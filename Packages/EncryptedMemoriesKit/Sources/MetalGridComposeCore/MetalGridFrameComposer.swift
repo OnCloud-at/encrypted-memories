@@ -92,6 +92,9 @@ package enum MetalGridFrameComposer {
                 revealIDs: Set(visibleIDs)
             ) { provideImage($0) }
         }
+        // A pending photo's new revision replaces its texture in place, also while scrolling.
+        let staleVisible = visibleIDs.filter { cache.isStale($0) }
+        if !staleVisible.isEmpty { cache.replaceStaleResident(staleVisible) { provideImage($0) } }
         // Settled only: after fresh uploads spend their share of the budget, grow any visible texture still
         // below the current cap (carried over from a denser level) to full crispness, in place.
         if allowUpgrade {
@@ -108,6 +111,7 @@ package enum MetalGridFrameComposer {
         for uid in priority where !cache.isResident(uid) && !cache.isInFlight(uid) && !hasImage(uid) && canRetry(uid) {
             appendWarm(uid)
         }
+        for uid in staleVisible where cache.isStale(uid) && !hasImage(uid) && canRetry(uid) { appendWarm(uid) }
         var pendingVisibleQualityUpgrade = cache.pendingUpgradesThisFrame
         if allowUpgrade {
             for uid in upgradeCandidates where cache.residentTextureNeedsMeaningfulUpgrade(uid) {
@@ -371,14 +375,28 @@ package enum MetalGridFrameComposer {
             decorations.selectionMode || decorations.favorites.contains(uid)
             ? badge + pad
             : 0
+        let overlay = decorations.overlay(uid)
         let overlayLayouts =
             hasThumbnail
             ? GridThumbnailOverlayPolicy.layouts(
-                for: decorations.overlay(uid),
+                for: overlay,
                 in: displayed,
                 bottomTrailingInset: bottomTrailingInset
             )
             : []
+        // A photo on its way to Proton shows its upload state top-trailing; selection mode owns the corners.
+        let badgeFrame =
+            decorations.uploadBadgeFrame.map { $0(uid, overlay.uploadBadge) }
+            ?? overlay.uploadBadge.map { GridUploadBadgeFrame(glyph: GridUploadBadgeGlyph($0)) }
+        if let badgeFrame, badgeFrame.alpha > 0, !decorations.selectionMode,
+            let texture = cache.uploadBadgeTexture(badgeFrame.glyph)
+        {
+            let side = badge * badgeFrame.scale
+            let center = CGPoint(x: displayed.maxX - pad - badge / 2, y: displayed.minY + pad + badge / 2)
+            let rect = CGRect(x: center.x - side / 2, y: center.y - side / 2, width: side, height: side)
+            metadataGlyphs.append(MetalGridQuad(rect: rect, radius: 0, alpha: drawAlpha * badgeFrame.alpha))
+            metadataGlyphTextures.append(texture)
+        }
         for layout in overlayLayouts {
             let glyphColor: MetalGridGlyphColor
             let backgroundColor: SIMD4<Float>
@@ -465,6 +483,8 @@ package struct MetalGridDecorations<ID: Hashable> {
     package var selected: Set<ID>
     package var favorites: Set<ID>
     package var overlay: @MainActor (ID) -> GridThumbnailOverlay
+    /// The animated upload badge for a photo and the badge the backup reports; nil draws the badge as is.
+    package var uploadBadgeFrame: (@MainActor (ID, GridUploadBadge?) -> GridUploadBadgeFrame?)?
 
     package init(
         accent: SIMD4<Float>,
@@ -472,7 +492,8 @@ package struct MetalGridDecorations<ID: Hashable> {
         selectionMode: Bool,
         selected: Set<ID>,
         favorites: Set<ID>,
-        overlay: @escaping @MainActor (ID) -> GridThumbnailOverlay
+        overlay: @escaping @MainActor (ID) -> GridThumbnailOverlay,
+        uploadBadgeFrame: (@MainActor (ID, GridUploadBadge?) -> GridUploadBadgeFrame?)? = nil
     ) {
         self.accent = accent
         self.accentGlyphColor = accentGlyphColor
@@ -480,6 +501,7 @@ package struct MetalGridDecorations<ID: Hashable> {
         self.selected = selected
         self.favorites = favorites
         self.overlay = overlay
+        self.uploadBadgeFrame = uploadBadgeFrame
     }
 }
 

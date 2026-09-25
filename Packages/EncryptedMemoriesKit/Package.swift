@@ -209,11 +209,14 @@ let package = Package(
             name: "MediaCache", dependencies: ["MediaCacheCore", "MediaCacheAppKitAdapter"],
             swiftSettings: disableDynamicActorIsolation),
         .target(
-            name: "TimelineCore", dependencies: ["PhotosCore", "GridCore", "MediaFeedCore", "MediaLocationCore"],
+            name: "TimelineCore",
+            dependencies: ["PhotosCore", "GridCore", "MediaFeedCore", "MediaLocationCore", "UploadCore"],
             resources: [.process("Resources")], swiftSettings: disableDynamicActorIsolation),
         .testTarget(
             name: "TimelineCoreTests",
-            dependencies: ["TimelineCore", "PhotosCore", "MediaFeedCore", "MediaLocationCore"],
+            dependencies: [
+                "TimelineCore", "PhotosCore", "MediaFeedCore", "MediaLocationCore", "UploadCore", "GridCore",
+            ],
             swiftSettings: disableDynamicActorIsolation),
         .target(
             name: "TimelineUIKitAdapter", dependencies: ["GridCore", "TimelineCore", "MetalRenderingCore"],
@@ -276,7 +279,11 @@ let package = Package(
         .target(name: "UploadCore", dependencies: ["PhotosCore"]),
         .target(name: "UploadFeature", dependencies: ["UploadCore", "PhotosCore"]),
         // PhotoLibraryBackupAdapter is the package boundary for PhotoKit.
-        .target(name: "PhotoLibraryBackupAdapter", dependencies: ["UploadCore", "PhotosCore", "AlbumSyncCore"]),
+        .target(
+            name: "PhotoLibraryBackupAdapter",
+            dependencies: [
+                "UploadCore", "PhotosCore", "AlbumSyncCore", "MediaFeedCore", "MediaDecodingCore", "TimelineCore",
+            ]),
         .testTarget(
             name: "UploadFeatureTests", dependencies: ["UploadCore", "PhotosCore", "PhotoLibraryBackupAdapter"]),
         .target(

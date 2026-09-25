@@ -45,6 +45,12 @@ final class DecodedThumbnailCache: @unchecked Sendable {
     }
 
     /// Checks membership without changing the eviction order.
+    func decodePixelCap(for uid: PhotoUID) -> Int? {
+        lock.lock()
+        defer { lock.unlock() }
+        return map[uid]?.decodePixelCap
+    }
+
     func contains(_ uid: PhotoUID) -> Bool {
         lock.lock()
         defer { lock.unlock() }

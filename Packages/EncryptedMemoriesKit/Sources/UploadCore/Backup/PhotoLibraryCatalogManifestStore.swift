@@ -57,6 +57,43 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
         lock.withLock { readEntry(localIdentifier) }
     }
 
+    /// Present (not removed) entries for many identifiers with one prepared statement. Missing or removed
+    /// identifiers are absent from the result.
+    public func presentEntries(for localIdentifiers: [String]) -> [String: PhotoLibraryCatalogEntry] {
+        guard !localIdentifiers.isEmpty else { return [:] }
+        return lock.withLock {
+            var stmt: OpaquePointer?
+            guard
+                requireOperational(
+                    sqlite3_prepare_v2(
+                        db,
+                        """
+                        SELECT cloud_id, creation_date, modification_date, pixel_width, pixel_height, duration_seconds,
+                               media_kind, is_live_photo, resources_json, content_fingerprint, metadata_revision,
+                               first_seen_at, last_seen_at, is_removed, removed_at
+                        FROM photo_catalog WHERE local_id=? AND is_removed=0;
+                        """,
+                        -1, &stmt, nil
+                    ) == SQLITE_OK)
+            else { return [:] }
+            defer { sqlite3_finalize(stmt) }
+            var result: [String: PhotoLibraryCatalogEntry] = [:]
+            result.reserveCapacity(localIdentifiers.count)
+            for identifier in localIdentifiers {
+                sqlite3_reset(stmt)
+                sqlite3_clear_bindings(stmt)
+                bindText(stmt, 1, identifier)
+                let step = sqlite3_step(stmt)
+                if step == SQLITE_DONE { continue }
+                guard requireOperational(step == SQLITE_ROW),
+                    let entry = decodeEntry(stmt, localIdentifier: identifier, valueOffset: 0)
+                else { return [:] }
+                result[identifier] = entry
+            }
+            return result
+        }
+    }
+
     public func presentEntries(afterLocalIdentifier: String?, limit: Int) -> [PhotoLibraryCatalogEntry] {
         let clampedLimit = max(1, limit)
         return lock.withLock {

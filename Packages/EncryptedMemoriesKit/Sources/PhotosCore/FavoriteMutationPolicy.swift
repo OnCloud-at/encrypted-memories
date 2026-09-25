@@ -15,13 +15,15 @@ public struct FavoriteMutationRequest: Sendable, Equatable {
 public enum FavoriteMutationPolicy {
     /// Plans a toggle for `selection`. Returns `nil` when the selection overlaps a mutation in flight, is empty,
     /// or needs no change, so a stale rollback can never overwrite a newer optimistic state.
+    /// `target` overrides the toggle direction, for the Proton part of a selection that also holds local photos.
     public static func request(
         selection: Set<PhotoUID>,
         current: Set<PhotoUID>,
-        inFlight: Set<PhotoUID>
+        inFlight: Set<PhotoUID>,
+        target forcedTarget: Bool? = nil
     ) -> FavoriteMutationRequest? {
         guard inFlight.isDisjoint(with: selection) else { return nil }
-        guard let target = target(for: selection, current: current) else { return nil }
+        guard let target = forcedTarget ?? target(for: selection, current: current) else { return nil }
         let requested = requestedUIDs(selection: selection, current: current, target: target)
         guard !requested.isEmpty else { return nil }
         return FavoriteMutationRequest(

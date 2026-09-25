@@ -235,6 +235,39 @@ final class AlbumsRepositoryTests: XCTestCase {
         XCTAssertEqual(backend.added.first?.uids, photos)
     }
 
+    func testPendingPhotosGoToTheBackupAndNeverToProton() async throws {
+        let backend = FakeAlbumBackend(
+            capabilities: .init(canList: true, canCreate: true, canAddPhotos: true, canSetCover: false)
+        )
+        let repo = repository(backend)
+        let local = PhotoUID(localPending: .photoLibrary, identifier: "asset")
+        let recorded = RecordedPendingAlbumAdds()
+        await repo.setPendingAlbumAdds { uids, albumID in
+            await recorded.append(uids, albumID)
+            return true
+        }
+
+        try await repo.addPhotos([uid("1"), local], to: "album-9")
+
+        XCTAssertEqual(backend.added.map(\.uids), [[uid("1")]])
+        let adds = await recorded.adds
+        XCTAssertEqual(adds.map(\.uids), [[local]])
+        XCTAssertEqual(adds.map(\.album), ["album-9"])
+    }
+
+    func testPendingPhotosFailWithoutABackupRecorder() async {
+        let backend = FakeAlbumBackend(
+            capabilities: .init(canList: true, canCreate: true, canAddPhotos: true, canSetCover: false)
+        )
+        let repo = repository(backend)
+        do {
+            try await repo.addPhotos([PhotoUID(localPending: .photoLibrary, identifier: "asset")], to: "album-9")
+            XCTFail("a local photo needs the backup")
+        } catch {
+            XCTAssertTrue(backend.added.isEmpty)
+        }
+    }
+
     func testCreateAndAddReportsCreatedAlbumWhenMembershipFails() async {
         let backend = FakeAlbumBackend(
             capabilities: .init(canList: true, canCreate: true, canAddPhotos: true, canSetCover: false)
@@ -327,4 +360,9 @@ private actor SharedLeaveRecorder {
     func record(_ album: AlbumNodeIdentifier) {
         values.append(album)
     }
+}
+
+private actor RecordedPendingAlbumAdds {
+    private(set) var adds: [(uids: [PhotoUID], album: AlbumID)] = []
+    func append(_ uids: [PhotoUID], _ album: AlbumID) { adds.append((uids, album)) }
 }

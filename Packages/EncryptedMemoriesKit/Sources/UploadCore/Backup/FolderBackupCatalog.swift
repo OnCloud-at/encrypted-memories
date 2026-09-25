@@ -28,7 +28,7 @@ public struct FolderBackupCatalog: UploadBackupAssetCatalog {
     }
 
     /// Creates one candidate from one file and reports attribute failures to the caller.
-    static func candidate(for url: URL) throws -> UploadBackupAssetCandidate {
+    public static func candidate(for url: URL) throws -> UploadBackupAssetCandidate {
         let attributes: [FileAttributeKey: Any]
         do {
             attributes = try FileManager.default.attributesOfItem(atPath: url.path)

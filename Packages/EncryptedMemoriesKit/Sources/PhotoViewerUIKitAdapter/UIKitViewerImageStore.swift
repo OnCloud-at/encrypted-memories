@@ -39,6 +39,8 @@
         #endif
 
         private let thumbnailProvider: (PhotoUID) -> UIImage?
+        /// The grid thumbnail from the feed's disk tier, for a photo whose RAM decode was evicted.
+        private let cachedThumbnailProvider: (@MainActor (PhotoUID) async -> UIImage?)?
         private let media: (any FullMediaProvider)?
         /// Optional host-provided override for the original-bytes fallback. The host owns encrypted-original
         /// caching; when nil, the store uses `media.originalData`.
@@ -50,10 +52,12 @@
 
         public init(
             thumbnailProvider: @escaping (PhotoUID) -> UIImage?,
+            cachedThumbnailProvider: (@MainActor (PhotoUID) async -> UIImage?)? = nil,
             media: (any FullMediaProvider)?,
             originalDataOverride: (@Sendable (PhotoUID) async throws -> Data)? = nil
         ) {
             self.thumbnailProvider = thumbnailProvider
+            self.cachedThumbnailProvider = cachedThumbnailProvider
             self.media = media
             self.originalDataOverride = originalDataOverride
         }
@@ -61,6 +65,13 @@
         /// The instant grid thumbnail (already decoded in the feed's RAM tier), or nil.
         public func thumbnail(for uid: PhotoUID) -> DisplayImage? {
             thumbnailProvider(uid).map { DisplayImage(image: $0, source: "thumbnail") }
+        }
+
+        /// The grid thumbnail from disk when RAM no longer holds it. Never touches the network, so the viewer
+        /// shows the photo at once instead of black until its preview arrives.
+        public func cachedThumbnail(for uid: PhotoUID) async -> DisplayImage? {
+            guard let cachedThumbnailProvider else { return nil }
+            return await cachedThumbnailProvider(uid).map { DisplayImage(image: $0, source: "thumbnail") }
         }
 
         /// Governor-driven memory-pressure response. `scale` lowers the display cache's cost ceiling; `purge`

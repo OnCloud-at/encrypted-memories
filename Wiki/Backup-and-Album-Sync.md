@@ -14,6 +14,13 @@ The queue is durable. It includes streamed hashing, duplicate detection, retry s
 
 On iPhone and iPad, background processing is scheduled with the operating system. iOS decides when background work runs, so backup is not guaranteed to be continuous after the app closes.
 
+## Excluded from Backup
+
+Deleting a photo in the app before it was backed up takes it out of the backup for good on this device.
+Later backup passes never offer it again, and Apple Photos keeps it. The Backup settings list these photos
+under **Excluded from Backup**; choose **Back Up Again** to put one back into the backup. Exclusions are
+stored per device.
+
 ## Limited Photos access
 
 When iOS or iPadOS grants limited access, only selected library items can be backed up. Use **Manage Selection** on the Backup page to change the allowed set.

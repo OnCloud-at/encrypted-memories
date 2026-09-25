@@ -1,5 +1,6 @@
 import AlbumCore
 import AlbumsFeature
+import DesignSystemCore
 import Foundation
 import LibrarySourceRuntime
 import MLSearchAppleAdapter
@@ -175,7 +176,9 @@ final class MobileLibraryModel {
     private(set) var loadState: LibraryLoadState = .initial
     /// Immutable timeline snapshot prepared off the main actor. Its index provides O(1) and O(k) lookups
     /// for viewer, share, and trash actions without scanning the library.
-    private(set) var snapshot = TimelineSnapshot()
+    private(set) var snapshot = TimelineSnapshot() {
+        didSet { pendingGrid?.setRemote(snapshot) }
+    }
     /// Changes only when a new canonical snapshot is published. Secondary grids use it to refresh their one
     /// indexed projection without recomputing it for unrelated SwiftUI state changes.
     private(set) var timelineRevision: UInt64 = 0
@@ -226,6 +229,47 @@ final class MobileLibraryModel {
     private(set) var albumActions: AlbumActionCoordinator?
     /// Account-scoped Photos-library backup controller shared with macOS.
     private(set) var photoBackup: PhotoLibraryBackupController?
+    /// Local photos on their way to Proton, merged into the whole-library grid (shared with macOS).
+    private(set) var pendingGrid: PendingGridSession?
+    @ObservationIgnored private var pendingStore: PendingBackupManifestStore?
+    @ObservationIgnored private var lastFavoriteIntents: [PhotoUID: Bool] = [:]
+    /// The grid's view of the library: Proton photos plus pending local photos.
+    private(set) var pendingPresentation = PendingTimelinePresentation.empty
+    /// Local photos in "Zuletzt gelöscht", shown with the Proton trash.
+    private(set) var pendingTrash = PendingTrashPresentation.empty
+    /// Photos deleted before upload, for the Backup settings list.
+    private(set) var excludedPendingTiles: [PendingTile] = []
+    /// Changes when pending favorite intents change, so favorite displays refresh.
+    private(set) var pendingFavoriteRevision: UInt64 = 0
+    /// Offers to undo the last delete of pending photos.
+    var undoNotice: UndoNoticeContent?
+    /// Favorites as the app shows them, including the intents of pending photos.
+    var displayedFavoriteUIDs: Set<PhotoUID> {
+        _ = pendingFavoriteRevision
+        return pendingGrid?.displayedFavorites(favoriteUIDs) ?? favoriteUIDs
+    }
+    /// Viewer media: pending photos from Apple Photos, every other photo from Proton.
+    var viewerMedia: LocalPendingMediaRouter {
+        LocalPendingMediaRouter(remote: backend, remoteVideo: backend, imageRequest: PhotoKitPlatformImages.request)
+    }
+    /// True while the grid shows pending photos. It waits for the Proton timeline, so a slow first load never
+    /// shows only local photos.
+    var showsPendingPhotos: Bool {
+        !pendingPresentation.isCanonical && !pendingPresentation.items.isEmpty
+            && (!items.isEmpty || loadState.isEmpty)
+    }
+    /// Items of the whole-library grid and viewer. Every remote-only consumer keeps using `items`.
+    var gridItems: [PhotoItem] { showsPendingPhotos ? pendingPresentation.items : items }
+    /// Content identity of `gridItems`: multiples of 4 for the Proton timeline, 4n + 2 with pending photos.
+    /// Search projections use 4n + 1, so the three sources never share a value.
+    var gridRevision: UInt64 {
+        showsPendingPhotos ? pendingPresentation.membershipRevision &* 4 &+ 2 : timelineRevision &* 4
+    }
+
+    /// Position of `uid` in `gridItems`. O(1).
+    func gridIndex(of uid: PhotoUID) -> Int? {
+        showsPendingPhotos ? pendingPresentation.snapshot.index(of: uid) : snapshot.index(of: uid)
+    }
     /// Account-scoped local-album sync controller shared with macOS.
     private(set) var albumSync: AlbumSyncController?
     /// Bumped by the shared album-sync controller after remote album mutations so Collections can
@@ -308,6 +352,62 @@ final class MobileLibraryModel {
     @ObservationIgnored private let scopeRecoveryCoordinator = MobileScopeRecoveryCoordinator()
     @ObservationIgnored private var nextScopeRecoveryID: UInt64 = 0
 
+    // MARK: - Pending grid
+
+    private func configurePendingGrid(
+        store: PendingBackupManifestStore?,
+        photoBackup: PhotoLibraryBackupController,
+        client: ProtonClientFacade,
+        feed: UIKitThumbnailFeed
+    ) {
+        pendingStore = store
+        guard let store,
+            let session = PendingGridSession(
+                store: store,
+                photoBackup: photoBackup,
+                remote: ProtonPendingRemoteEffects(facade: client)
+            )
+        else { return }
+        session.presenter.onChange = { [weak self] presentation in
+            self?.pendingPresentation = presentation
+        }
+        session.onListsChange = { [weak self, weak session] in
+            guard let self, let session else { return }
+            pendingTrash = session.trash
+            excludedPendingTiles = session.excludedTiles
+        }
+        session.onPendingChange = { [weak self] snapshot in
+            guard let self, snapshot.favoriteIntents != lastFavoriteIntents else { return }
+            lastFavoriteIntents = snapshot.favoriteIntents
+            pendingFavoriteRevision &+= 1
+        }
+        let albums = client.albums
+        Task { [weak session] in
+            await albums.setPendingAlbumAdds { [weak session] uids, albumID in
+                await session?.addToAlbum(uids, albumID: albumID) ?? false
+            }
+        }
+        session.attachFeed(feed.feedCore, imageRequest: PhotoKitPlatformImages.request)
+        pendingGrid = session
+        session.setRemote(snapshot)
+        session.start()
+    }
+
+    /// Detaches the pending grid from the model. The caller closes the session before the backup controller
+    /// shuts down, and the store after it.
+    private func retirePendingGrid() -> (session: PendingGridSession?, store: PendingBackupManifestStore?) {
+        let retired = (pendingGrid, pendingStore)
+        pendingGrid = nil
+        pendingStore = nil
+        pendingPresentation = .empty
+        pendingTrash = .empty
+        excludedPendingTiles = []
+        undoNotice = nil
+        lastFavoriteIntents = [:]
+        pendingFavoriteRevision &+= 1
+        return retired
+    }
+
     func configure(session: ProtonSession?, store: SessionKeychainStore) {
         guard let session else {
             self.store = store
@@ -345,9 +445,27 @@ final class MobileLibraryModel {
 
     /// Moves items to Trash through the shared backend. The move is recoverable, not permanent.
     /// On success, the items leave the visible library. Errors propagate to the caller.
+    ///
+    /// Photos that are not backed up yet leave the backup instead; the local photo stays in Apple Photos. An
+    /// undo notice offers to take that back.
     func trashItems(_ uids: Set<PhotoUID>) async throws {
         guard let backend, !uids.isEmpty else { return }
-        try await removeFromVisibleLibrary(uids) { try await backend.trash(Array(uids)) }
+        let split = LocalPendingSplit(uids)
+        if !split.local.isEmpty {
+            guard let pendingGrid, await pendingGrid.delete(split.local) else { throw CancellationError() }
+            offerUndo(forDeleted: split.local)
+        }
+        guard !split.remote.isEmpty else { return }
+        try await removeFromVisibleLibrary(Set(split.remote)) { try await backend.trash(split.remote) }
+    }
+
+    private func offerUndo(forDeleted uids: [PhotoUID]) {
+        undoNotice = UndoNoticeContent(
+            message: L10n.string("pending.delete_notice"), systemImage: "icloud.slash"
+        ) { [weak self] in
+            guard let pendingGrid = self?.pendingGrid else { return }
+            Task { await pendingGrid.restore(uids) }
+        }
     }
 
     /// True when "Keep Only Favorites" may run for the series: uploads work, and every photo of the series
@@ -450,6 +568,12 @@ final class MobileLibraryModel {
     }
 
     func restoreItems(_ items: [PhotoItem]) async throws {
+        let local = items.filter(\.uid.isLocalPending)
+        if !local.isEmpty {
+            // A photo deleted before upload goes back into the backup queue.
+            guard let pendingGrid, await pendingGrid.restore(local.map(\.uid)) else { throw CancellationError() }
+        }
+        let items = items.filter { !$0.uid.isLocalPending }
         guard let backend, let mutationLease = currentMutationLease(), !items.isEmpty else { return }
         try Task.checkCancellation()
         let locationStoreLease = locationStore.captureSessionLease()
@@ -489,14 +613,25 @@ final class MobileLibraryModel {
     @discardableResult
     func toggleFavorite(_ selection: Set<PhotoUID>) async -> Bool {
         guard let backend, let activeSession = session else { return false }
+        let split = LocalPendingSplit(selection)
+        // One direction for the whole selection, pending photos included; the backup applies their part later.
+        guard let target = FavoriteMutationPolicy.target(for: selection, current: displayedFavoriteUIDs) else {
+            return true
+        }
+        var localSucceeded = true
+        if !split.local.isEmpty {
+            localSucceeded = await pendingGrid?.setFavorite(split.local, favorite: target) ?? false
+        }
+        let selection = Set(split.remote)
         let mutationGeneration = loadToken
         guard
             let mutation = FavoriteMutationPolicy.request(
                 selection: selection,
                 current: favoriteUIDs,
-                inFlight: favoriteMutationsInFlight
+                inFlight: favoriteMutationsInFlight,
+                target: target
             )
-        else { return true }
+        else { return localSucceeded }
         let requested = mutation.requested
         if !favoriteLoadSettled {
             for requestedUID in requested {
@@ -512,7 +647,7 @@ final class MobileLibraryModel {
         }
         do {
             try await backend.setFavorites(Array(requested), mutation.target)
-            return true
+            return localSucceeded
         } catch {
             guard mutationGeneration == loadToken, session == activeSession else { return true }
             let failed = FavoriteMutationPolicy.failedUIDs(after: error, requested: requested)
@@ -526,7 +661,7 @@ final class MobileLibraryModel {
                 failed: failed,
                 target: mutation.target
             )
-            return failed.isDisjoint(with: requested)
+            return localSucceeded && failed.isDisjoint(with: requested)
         }
     }
 
@@ -546,9 +681,16 @@ final class MobileLibraryModel {
         }
     }
 
-    func emptyTrash() async throws {
+    /// Empties the Proton trash. Photos deleted before upload only leave the list: they stay excluded from the
+    /// backup and stay in Apple Photos.
+    func emptyTrash(includesProtonTrash: Bool = true) async throws {
         guard let backend else { return }
-        try await backend.emptyTrash()
+        if let pendingGrid, !pendingTrash.isEmpty {
+            guard await pendingGrid.removeFromTrashList(pendingTrash.items.map(\.uid)) else {
+                throw CancellationError()
+            }
+        }
+        if includesProtonTrash { try await backend.emptyTrash() }
     }
 
     /// Deletes only the album container through the shared AlbumCore facade. The backend deliberately uses
@@ -574,11 +716,14 @@ final class MobileLibraryModel {
     func index(of uid: PhotoUID) -> Int? { snapshot.index(of: uid) }
 
     /// Returns selected items in timeline order through the snapshot index.
-    func selectedItems(_ uids: Set<PhotoUID>) -> [PhotoItem] { snapshot.items(withUIDs: uids) }
+    func selectedItems(_ uids: Set<PhotoUID>) -> [PhotoItem] { gridSnapshot.items(withUIDs: uids) }
 
     /// ID-only server actions retain every selected identity even if a concurrent timeline refresh replaced
     /// the projection between the tap and presentation of the destination sheet.
-    func selectedUIDs(_ uids: Set<PhotoUID>) -> [PhotoUID] { snapshot.orderedUIDs(including: uids) }
+    func selectedUIDs(_ uids: Set<PhotoUID>) -> [PhotoUID] { gridSnapshot.orderedUIDs(including: uids) }
+
+    /// The whole-library grid's snapshot: it also holds pending photos, so selections of them resolve.
+    private var gridSnapshot: TimelineSnapshot { showsPendingPhotos ? pendingPresentation.snapshot : snapshot }
 
     /// Returns the encrypted thumbnail-cache size without blocking the main actor on file I/O.
     func cacheDiskSizeBytes() async -> Int64 {
@@ -1068,6 +1213,7 @@ final class MobileLibraryModel {
         let activePrefetchStartTask = prefetchStartTask
         let activeFavoriteLoadTask = favoriteLoadTask
         let activePhotoBackup = photoBackup
+        let activePendingGrid = retirePendingGrid()
         let activeAlbumSync = albumSync
         let activeThumbnailFeed = thumbnailFeed
         let activeRefreshCoalescer = libraryRefreshCoalescer
@@ -1137,7 +1283,9 @@ final class MobileLibraryModel {
                     await activeLocationCrawl.cancel()
                 },
                 photoBackup: {
+                    await activePendingGrid.session?.close()
                     await activePhotoBackup?.shutdown()
+                    activePendingGrid.store?.close()
                 },
                 albumSync: {
                     await activeAlbumSync?.shutdown()
@@ -1165,6 +1313,7 @@ final class MobileLibraryModel {
         pendingSignOutPurgeClaim = purgeClaim
         signOutCleanupFailed = false
         let activePhotoBackup = photoBackup
+        let activePendingGrid = retirePendingGrid()
         let activeAlbumSync = albumSync
         let activeThumbnailFeed = thumbnailFeed
         let activeOriginalsCache = originalsCache
@@ -1253,7 +1402,10 @@ final class MobileLibraryModel {
                 activeLocationIndex.updateScanProgress(PhotoLocationScanProgress())
             },
             AccountTeardownOwner(id: "shared.photo-backup", stage: .photoBackup) {
+                await activePendingGrid.session?.close()
                 await activePhotoBackup?.shutdown()
+                // The purge deletes the account directory; the pending store must be closed first.
+                activePendingGrid.store?.close()
             },
             AccountTeardownOwner(id: "shared.album-sync", stage: .albumSync) {
                 await activeAlbumSync?.shutdown()
@@ -1344,6 +1496,7 @@ final class MobileLibraryModel {
         facade = nil
         albumActions = nil
         photoBackup = nil
+        _ = retirePendingGrid()
         albumSync = nil
         pendingTimelineRemovals.removeAll(keepingCapacity: false)
         timelineMutationGeneration &+= 1
@@ -1423,6 +1576,10 @@ final class MobileLibraryModel {
                     dimensions: PhotoDimensionCoalescer(store: backend),
                     targetPixels: 288
                 )
+                let pendingStore = PendingGridSession.openStore(
+                    accountDataDirectory: client.accountDataDirectory,
+                    policy: client.accountDatabasePolicy
+                )
                 let photoBackup = PhotoLibraryBackupController(
                     configuration: .init(
                         accountDataDirectory: client.accountDataDirectory,
@@ -1430,7 +1587,9 @@ final class MobileLibraryModel {
                     ),
                     identityResolver: client.uploadIdentityResolver,
                     uploader: client.photoUploader,
-                    tagAdder: client.photoTagAdder
+                    tagAdder: client.photoTagAdder,
+                    pendingStore: pendingStore,
+                    requiresPendingStore: true
                 )
                 let albumSync = AlbumSyncController(
                     configuration: .init(
@@ -1454,6 +1613,7 @@ final class MobileLibraryModel {
                     self.session == session
                 else {
                     await photoBackup.shutdown()
+                    pendingStore?.close()
                     await albumSync.shutdown()
                     await client.shutdown()
                     return
@@ -1471,6 +1631,7 @@ final class MobileLibraryModel {
                 self.albumSync = albumSync
                 self.backend = backend
                 self.thumbnailFeed = feed
+                self.configurePendingGrid(store: pendingStore, photoBackup: photoBackup, client: client, feed: feed)
                 if self.isRecoveringScope {
                     self.isRecoveringScope = false
                 }

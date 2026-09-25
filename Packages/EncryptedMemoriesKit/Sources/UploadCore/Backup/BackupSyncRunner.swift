@@ -44,6 +44,8 @@ public actor BackupSyncRunner {
         public var uploadStallPollInterval: TimeInterval
         public var retry: BackupRetryPolicy
         public var throttle: BackupThrottlePolicy
+        /// How long a source the platform still prepares waits before the next try.
+        public var sourceNotReadyDelay: TimeInterval
 
         public init(
             batchSize: Int = 32,
@@ -52,7 +54,8 @@ public actor BackupSyncRunner {
             uploadStallTimeout: TimeInterval = 180,
             uploadStallPollInterval: TimeInterval = 5,
             retry: BackupRetryPolicy = BackupRetryPolicy(),
-            throttle: BackupThrottlePolicy = BackupThrottlePolicy()
+            throttle: BackupThrottlePolicy = BackupThrottlePolicy(),
+            sourceNotReadyDelay: TimeInterval = 30
         ) {
             self.batchSize = max(1, batchSize)
             self.staleActiveGrace = max(0, staleActiveGrace)
@@ -61,6 +64,7 @@ public actor BackupSyncRunner {
             self.uploadStallPollInterval = max(0.01, min(uploadStallPollInterval, uploadStallTimeout))
             self.retry = retry
             self.throttle = throttle
+            self.sourceNotReadyDelay = max(0, sourceNotReadyDelay)
         }
     }
 
@@ -115,8 +119,12 @@ public actor BackupSyncRunner {
     /// primary-to-secondary handoffs cannot make continued-processing progress go backwards.
     private struct ActiveExecution {
         let generation: UUID
+        let source: UploadSourceIdentity
+        let revision: UploadBackupRevision
         var preparationFraction: Double
         var uploadFraction: Double
+        /// The last ring step sent to `events`, so a source reports at most 21 progress events.
+        var reportedStep: Int?
     }
     private var activeExecutions: [String: ActiveExecution] = [:]
     /// A remote-index refresh happens before any queue item can be claimed. It contributes less than
@@ -126,6 +134,9 @@ public actor BackupSyncRunner {
 
     private var progress = BackupSyncProgress()
     private var onProgress: (@Sendable (BackupSyncProgress) -> Void)?
+    /// Durable per-source events for the pending grid: duplicate-check evidence, handoffs, exclusion and
+    /// ring progress.
+    private let events: (any BackupItemEventSink)?
 
     public init(
         queue: any UploadBackupSyncQueueStore,
@@ -138,9 +149,11 @@ public actor BackupSyncRunner {
         configuration: Configuration = Configuration(),
         throttleInputs: @Sendable @escaping () -> BackupThrottleInputs = { .unconstrained },
         clock: any BackupSchedulerClock = BackupContinuousClock(),
+        events: (any BackupItemEventSink)? = nil,
         now: @Sendable @escaping () -> Date = { Date() }
     ) {
         self.queue = queue
+        self.events = events
         self.preflight = preflight
         self.resolver = resolver
         self.identityResolver = identityResolver
@@ -198,11 +211,17 @@ public actor BackupSyncRunner {
     /// failed backup row and no completion callback can resurrect it.
     @discardableResult
     public func removePhotoLibraryAssets(_ identifiers: [String]) async -> Int {
+        await removeSources(kind: .photoLibraryAsset, identifiers: identifiers)
+    }
+
+    /// Removes sources from durable and in-flight work, for a local deletion or an exclusion from backup.
+    @discardableResult
+    public func removeSources(kind: UploadSourceIdentity.Kind, identifiers: [String]) async -> Int {
         let identifiers = Array(Set(identifiers))
         guard !identifiers.isEmpty else { return 0 }
         let sourceKeys = Set(
             identifiers.map {
-                Self.sourceKey(kind: .photoLibraryAsset, identifier: $0)
+                Self.sourceKey(kind: kind, identifier: $0)
             })
         removedSources.formUnion(sourceKeys)
 
@@ -213,7 +232,7 @@ public actor BackupSyncRunner {
         // Make the local deletion authoritative before awaiting native cancellation. The actor can
         // re-enter while a join is suspended; leaving the row until afterwards lets the active drain
         // return one stale item even though this removal already tombstoned every completion callback.
-        let removed = queue.removeSources(kind: .photoLibraryAsset, identifiers: identifiers)
+        let removed = queue.removeSources(kind: kind, identifiers: identifiers)
         refreshProgressFromQueue()
         emitProgress()
         await withTaskGroup(of: Void.self) { group in
@@ -387,9 +406,17 @@ public actor BackupSyncRunner {
                 continue
             }
 
+            // Two revisions of one photo (a preliminary camera version and the finished one) run one after the
+            // other: both read the current file, and the second then finds it backed up instead of uploading
+            // the same bytes at the same time.
+            let bySource = Dictionary(grouping: wave) {
+                Self.sourceKey(kind: $0.source.kind, identifier: $0.source.identifier)
+            }
             await withTaskGroup(of: Void.self) { group in
-                for entry in wave {
-                    group.addTask { await self.process(entry, workIntent: workIntent) }
+                for entries in bySource.values {
+                    group.addTask {
+                        for entry in entries { await self.process(entry, workIntent: workIntent) }
+                    }
                 }
             }
             wavesSincePrime += 1
@@ -535,6 +562,8 @@ public actor BackupSyncRunner {
         let executionGeneration = UUID()
         activeExecutions[key] = ActiveExecution(
             generation: executionGeneration,
+            source: entry.source,
+            revision: entry.revision,
             preparationFraction: 0,
             uploadFraction: 0
         )
@@ -611,7 +640,21 @@ public actor BackupSyncRunner {
         do {
             scopedOutcome = try await identityResolver.withUploadDecision(
                 resolved.descriptor.withWorkIntent(workIntent),
-                onRemoteCommit: { [queue, now] identity, receipt in
+                onRemoteCommit: { [queue, now, events] identity, receipt in
+                    // Durable before anything else: the grid can swap the pending tile for this photo even if
+                    // the app ends before local settlement, and an exclusion that raced the commit is honored.
+                    // A failed write stops settlement like a failed receipt write; the next pass resolves the
+                    // committed photo as a duplicate instead of uploading it again.
+                    if resolved.descriptor.source == entry.source,
+                        events?.recordHandoff(
+                            source: entry.source,
+                            revision: entry.revision,
+                            remote: PhotoUID(volumeID: receipt.remoteVolumeID, nodeID: receipt.remoteLinkID),
+                            kind: .uploaded
+                        ) == .failed
+                    {
+                        throw UploadError.backend("Pending handoff could not be persisted")
+                    }
                     let reconciliation = UploadRemoteCommitReconciliation(
                         source: resolved.descriptor.source,
                         identity: identity,
@@ -639,6 +682,8 @@ public actor BackupSyncRunner {
                     if await self.stopWasRequested() { throw CancellationError() }
                     switch preflightResult.decision {
                     case .upload, .uploadReplacingDraft:
+                        guard await self.admitsTransfer(for: entry.source) else { throw CancellationError() }
+                        await self.recordUploadEvidence(entry)
                         return try await self.performPrimaryUpload(
                             entry,
                             from: persistedState,
@@ -688,6 +733,9 @@ public actor BackupSyncRunner {
             case .uploadMissingSecondaries(let primaryLinkID, _):
                 // This entry IS the primary and the policy proved it active remotely; only paired
                 // secondaries would need bytes.
+                guard recordDeduplicatedHandoff(entry, remoteLinkID: primaryLinkID, from: persistedState) else {
+                    return
+                }
                 await settleCompound(
                     entry, from: persistedState, resolved: resolved,
                     primaryUID: PhotoUID(volumeID: "", nodeID: primaryLinkID),
@@ -701,6 +749,11 @@ public actor BackupSyncRunner {
                     // The primary is proven remote. Secondaries (a Live Photo's paired video) may
                     // still be missing - settle them before any "backed up" claim. The link-only
                     // reference resolves to the photos volume at the transport layer.
+                    if let remoteLinkID,
+                        !recordDeduplicatedHandoff(entry, remoteLinkID: remoteLinkID, from: persistedState)
+                    {
+                        return
+                    }
                     await settleCompound(
                         entry, from: persistedState, resolved: resolved,
                         primaryUID: remoteLinkID.map { PhotoUID(volumeID: "", nodeID: $0) },
@@ -783,6 +836,49 @@ public actor BackupSyncRunner {
 
     private func stopWasRequested() -> Bool { stopRequested }
 
+    /// Checked right before every resource transfer, primary and secondary. A source that the person
+    /// excluded is removed like a local deletion. An unknown answer ends the pass without removing anything,
+    /// so no photo uploads while its exclusion cannot be read.
+    private func admitsTransfer(for source: UploadSourceIdentity) async -> Bool {
+        guard !removedSources.contains(Self.sourceKey(kind: source.kind, identifier: source.identifier)) else {
+            return false
+        }
+        guard let events else { return true }
+        switch events.isExcluded(source: source) {
+        case false?:
+            return true
+        case true?:
+            await removeSources(kind: source.kind, identifiers: [source.identifier])
+            return false
+        case nil:
+            stopRequested = true
+            return false
+        }
+    }
+
+    private func recordUploadEvidence(_ entry: UploadBackupSyncQueueEntry) {
+        events?.recordUploadEvidence(source: entry.source, revision: entry.revision)
+    }
+
+    /// Link-only duplicate results resolve to the photos volume; the grid fills in its volume ID. A failed
+    /// write keeps the row retryable, so the mapping and any deferred action are never stranded.
+    private func recordDeduplicatedHandoff(
+        _ entry: UploadBackupSyncQueueEntry,
+        remoteLinkID: String,
+        from state: UploadBackupSyncQueueState
+    ) -> Bool {
+        guard
+            events?.recordHandoff(
+                source: entry.source,
+                revision: entry.revision,
+                remote: PhotoUID(volumeID: "", nodeID: remoteLinkID),
+                kind: .deduplicated
+            ) == .failed
+        else { return true }
+        retryOrPark(entry, from: state, error: UploadError.backend("Pending handoff could not be persisted"))
+        return false
+    }
+
     private func performPrimaryUpload(
         _ entry: UploadBackupSyncQueueEntry,
         from state: UploadBackupSyncQueueState,
@@ -810,6 +906,8 @@ public actor BackupSyncRunner {
         {
             throw CancellationError()
         }
+        // Materialization can take a while; an exclusion saved meanwhile must still stop the transfer.
+        guard await admitsTransfer(for: entry.source) else { throw CancellationError() }
         let key = Self.key(entry)
         guard transition(entry, from: state, to: .uploading) != nil else {
             throw UploadError.backend("Backup queue could not enter uploading state")
@@ -857,6 +955,26 @@ public actor BackupSyncRunner {
         resolved: BackupResolvedResource,
         workIntent: LibraryWorkIntent
     ) async {
+        if reconciliation.source == entry.source,
+            events?.recordHandoff(
+                source: entry.source,
+                revision: entry.revision,
+                remote: PhotoUID(
+                    volumeID: reconciliation.receipt.remoteVolumeID,
+                    nodeID: reconciliation.receipt.remoteLinkID
+                ),
+                kind: .uploaded
+            ) == .failed
+        {
+            // Keep the receipt: the handoff must be durable before the row can settle.
+            parkRemoteReconciliation(
+                entry,
+                reconciliation: reconciliation,
+                from: state,
+                message: "Pending handoff could not be persisted."
+            )
+            return
+        }
         let descriptor: UploadResourceDescriptor?
         if resolved.descriptor.source == reconciliation.source {
             descriptor = resolved.descriptor
@@ -1314,6 +1432,7 @@ public actor BackupSyncRunner {
         completedSecondaries: Int,
         totalResourceCount: Int
     ) async throws -> PhotoUID {
+        guard await admitsTransfer(for: descriptor.source) else { throw CancellationError() }
         let token = UUID()
         let tokenKey = "\(entryKey)#\(descriptor.source.resource.rawValue)"
         inFlightTokens[tokenKey] = token
@@ -1439,6 +1558,27 @@ public actor BackupSyncRunner {
         if sourceWasRemoved(entry) { return }
         if case UploadError.fileMissing = error {
             discardMissingSource(entry, from: oldState)
+            return
+        }
+        // Not a failure: the camera still processes the photo. Uploading now would send its preliminary
+        // version and then the finished one again. Wait without counting an attempt; the finished photo
+        // usually arrives sooner as a new revision.
+        if case UploadError.sourceNotReady = error {
+            let eligibleAt = now().addingTimeInterval(configuration.sourceNotReadyDelay)
+            guard
+                queue.updateState(
+                    source: entry.source, revision: entry.revision,
+                    state: .discovered,
+                    attempts: entry.attempts,
+                    lastError: nil,
+                    updatedAt: eligibleAt
+                )
+            else {
+                stopRequested = true
+                return
+            }
+            adjustProgress(from: oldState, to: .discovered)
+            emitProgress()
             return
         }
         let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
@@ -1948,7 +2088,10 @@ public actor BackupSyncRunner {
 
     private func endActiveExecution(key: String, generation: UUID? = nil, publish: Bool = true) {
         if let generation, activeExecutions[key]?.generation != generation { return }
-        guard activeExecutions.removeValue(forKey: key) != nil else { return }
+        guard let ended = activeExecutions.removeValue(forKey: key) else { return }
+        if ended.reportedStep != nil {
+            events?.reportProgress(source: ended.source, revision: ended.revision, step: nil)
+        }
         publishActiveExecutionProgress(emit: publish)
     }
 
@@ -1959,11 +2102,8 @@ public actor BackupSyncRunner {
     }
 
     private func publishActiveExecutionProgress(emit: Bool = true) {
-        let activeFractions = activeExecutions.values.map { execution in
-            let preparation = execution.preparationFraction
-            let upload = execution.uploadFraction
-            return min(0.999, preparation + (0.999 - preparation) * upload)
-        }
+        reportItemProgress()
+        let activeFractions = activeExecutions.values.map(Self.fraction)
         var itemEquivalents = activeFractions.reduce(0, +)
         if remoteIndexExecutionFraction > 0 {
             if let handoff = activeFractions.max() {
@@ -1978,6 +2118,23 @@ public actor BackupSyncRunner {
         guard itemEquivalents != progress.activeExecutionItemEquivalents else { return }
         progress.activeExecutionItemEquivalents = itemEquivalents
         if emit { emitProgress() }
+    }
+
+    private static func fraction(_ execution: ActiveExecution) -> Double {
+        let preparation = execution.preparationFraction
+        let upload = execution.uploadFraction
+        return min(0.999, preparation + (0.999 - preparation) * upload)
+    }
+
+    /// Sends each active source's ring step when it changes.
+    private func reportItemProgress() {
+        guard let events else { return }
+        for (key, execution) in activeExecutions {
+            let step = BackupProgressStep.step(for: Self.fraction(execution))
+            guard step != execution.reportedStep else { continue }
+            activeExecutions[key]?.reportedStep = step
+            events.reportProgress(source: execution.source, revision: execution.revision, step: step)
+        }
     }
 
     private static func key(_ entry: UploadBackupSyncQueueEntry) -> String {

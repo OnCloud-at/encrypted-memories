@@ -59,6 +59,9 @@ final class ScriptedBackupResolver: BackupResourceResolving, @unchecked Sendable
         /// Throw `BackupTempFileError.diskBudgetExceeded` for the first `times` resolves, then
         /// behave like `.standard`. Models a device low on space while a pass runs.
         case diskPressure(times: Int)
+        /// Throw `UploadError.sourceNotReady` for the first `times` resolves, then behave like `.standard`.
+        /// Models a new photo the camera still processes.
+        case notReady(times: Int)
     }
 
     private let lock = NSLock()
@@ -77,6 +80,18 @@ final class ScriptedBackupResolver: BackupResourceResolving, @unchecked Sendable
     private var capturedPreparationHandlers: [String: BackupResourcePreparationHandler] = [:]
     private var mismatchOnceIdentifiers: Set<String> = []
     private var materializeCounts: [String: Int] = [:]
+    private var slowIdentifiers: Set<String> = []
+    private var activeResolves: [String: Int] = [:]
+    private var peakResolves: [String: Int] = [:]
+
+    /// Holds each resolve of `identifier` briefly, so overlapping resolves of one source would show.
+    func setSlowResolve(for identifier: String) {
+        _ = lock.withLock { slowIdentifiers.insert(identifier) }
+    }
+
+    func peakConcurrentResolves(for identifier: String) -> Int {
+        lock.withLock { peakResolves[identifier] ?? 0 }
+    }
 
     func setSecondaries(_ names: [String], for identifier: String) {
         lock.withLock { secondaryNames[identifier] = names }
@@ -124,6 +139,7 @@ final class ScriptedBackupResolver: BackupResourceResolving, @unchecked Sendable
             behaviors[identifier] = behavior
             if case .transientFailure(let times) = behavior { remainingFailures[identifier] = times }
             if case .diskPressure(let times) = behavior { remainingFailures[identifier] = times }
+            if case .notReady(let times) = behavior { remainingFailures[identifier] = times }
         }
     }
 
@@ -137,6 +153,13 @@ final class ScriptedBackupResolver: BackupResourceResolving, @unchecked Sendable
 
     func resolve(_ entry: UploadBackupSyncQueueEntry) async throws -> BackupResolvedResource? {
         let id = entry.source.identifier
+        let isSlow = lock.withLock {
+            activeResolves[id, default: 0] += 1
+            peakResolves[id] = max(peakResolves[id] ?? 0, activeResolves[id] ?? 0)
+            return slowIdentifiers.contains(id)
+        }
+        defer { lock.withLock { activeResolves[id, default: 1] -= 1 } }
+        if isSlow { try? await Task.sleep(for: .milliseconds(30)) }
         let behavior: Behavior = lock.withLock {
             _resolveCounts[id, default: 0] += 1
             return behaviors[id] ?? .standard
@@ -158,6 +181,8 @@ final class ScriptedBackupResolver: BackupResourceResolving, @unchecked Sendable
             if consumeFailure() { throw UploadError.backend("transient resolve failure for \(id)") }
         case .diskPressure:
             if consumeFailure() { throw BackupTempFileStore.BackupTempFileError.diskBudgetExceeded }
+        case .notReady:
+            if consumeFailure() { throw UploadError.sourceNotReady(id) }
         case .standard:
             break
         }
@@ -859,6 +884,37 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertEqual(resolver.resolveCount(for: entry.source.identifier), 8, "7 pressure failures, then success")
     }
 
+    func testPhotoTheCameraStillProcessesWaitsWithoutFailing() async throws {
+        let entry = seedEntry("processing.heic")
+        resolver.set(.notReady(times: 5), for: entry.source.identifier)
+
+        let runner = makeRunner()
+        let progress = await runner.runUntilDrained()
+
+        XCTAssertEqual(state(of: entry), .completed, "a photo in camera processing must never park as failed")
+        XCTAssertEqual(uploader.requests.count, 1, "only the finished photo uploads")
+        XCTAssertEqual(progress.failed, 0)
+        XCTAssertEqual(resolver.resolveCount(for: entry.source.identifier), 6)
+        XCTAssertEqual(clock.sleeps.count, 5)
+        XCTAssertEqual(try XCTUnwrap(clock.sleeps.first), 30, accuracy: 0.001)
+    }
+
+    func testTwoRevisionsOfOnePhotoNeverRunAtTheSameTime() async throws {
+        // The camera's preliminary version and the finished photo can both be due in one wave.
+        let preliminary = seedEntry("same.heic")
+        let finished = seedEntry("same.heic", revisionOffset: 1_000_000)
+        resolver.setSlowResolve(for: preliminary.source.identifier)
+
+        let runner = makeRunner()
+        let progress = await runner.runUntilDrained()
+
+        XCTAssertEqual(resolver.peakConcurrentResolves(for: preliminary.source.identifier), 1)
+        XCTAssertEqual(resolver.resolveCount(for: preliminary.source.identifier), 2)
+        XCTAssertEqual(uploader.requests.count, 1, "the second revision finds the photo backed up")
+        XCTAssertEqual(progress.failed, 0)
+        XCTAssertNotEqual(state(of: finished), .failed)
+    }
+
     func testPersistedRetryDelaySurvivesRunnerRecreation() async throws {
         let entry = seedEntry("resume-after-backoff.jpg", ageSeconds: -30)
 
@@ -1017,6 +1073,7 @@ final class BackupSyncRunnerTests: XCTestCase {
         uploadStallTimeout: TimeInterval = 180,
         uploadStallPollInterval: TimeInterval = 5,
         resourceCoordinator: LibraryResourceCoordinator = .shared,
+        events: (any BackupItemEventSink)? = nil,
         throttleInputs: @Sendable @escaping () -> BackupThrottleInputs = { .unconstrained }
     ) -> BackupSyncRunner {
         BackupSyncRunner(
@@ -1035,6 +1092,7 @@ final class BackupSyncRunnerTests: XCTestCase {
             ),
             throttleInputs: throttleInputs,
             clock: clock,
+            events: events,
             now: { [clock] in clock!.now }
         )
     }
@@ -2343,5 +2401,151 @@ final class BackupSyncRunnerTests: XCTestCase {
         let record = stateStore.record(for: entry.source, revision: UploadBackupRevision(date: newModified))
         XCTAssertEqual(record?.isComplete, true, "backed-up proof must be recorded for the revision that was uploaded")
         XCTAssertEqual(uploader.requests.count, 1)
+    }
+}
+
+/// Records runner events for the pending grid, with the queue state at the moment of each handoff.
+private final class SpyBackupItemEvents: BackupItemEventSink, @unchecked Sendable {
+    enum Event: Equatable {
+        case evidence(String)
+        case handoff(String, PhotoUID, PendingHandoffKind, queueState: UploadBackupSyncQueueState?)
+        case progress(String, Int?)
+    }
+
+    private let lock = NSLock()
+    private var recorded: [Event] = []
+    private let queue: UploadBackupSyncQueueManifestStore
+    var excluded: Set<String> = []
+    var exclusionsUnknown = false
+    var handoffOutcome = PendingHandoffOutcome.recorded
+
+    init(queue: UploadBackupSyncQueueManifestStore) {
+        self.queue = queue
+    }
+
+    var events: [Event] { lock.withLock { recorded } }
+
+    func recordUploadEvidence(source: UploadSourceIdentity, revision: UploadBackupRevision) {
+        lock.withLock { recorded.append(.evidence(source.identifier)) }
+    }
+
+    func recordHandoff(
+        source: UploadSourceIdentity,
+        revision: UploadBackupRevision,
+        remote: PhotoUID,
+        kind: PendingHandoffKind
+    ) -> PendingHandoffOutcome {
+        let state = queue.entry(for: source, revision: revision)?.state
+        lock.withLock { recorded.append(.handoff(source.identifier, remote, kind, queueState: state)) }
+        return handoffOutcome
+    }
+
+    func isExcluded(source: UploadSourceIdentity) -> Bool? {
+        lock.withLock { exclusionsUnknown ? nil : excluded.contains(source.identifier) }
+    }
+
+    func reportProgress(source: UploadSourceIdentity, revision: UploadBackupRevision, step: Int?) {
+        lock.withLock { recorded.append(.progress(source.identifier, step)) }
+    }
+}
+
+extension BackupSyncRunnerTests {
+    func testUploadRecordsEvidenceThenHandoffBeforeTheRowSettles() async throws {
+        let entry = seedEntry("fresh.jpg")
+        let events = SpyBackupItemEvents(queue: queueStore)
+
+        _ = await makeRunner(events: events).runUntilDrained()
+
+        XCTAssertEqual(state(of: entry), .completed)
+        let recorded = events.events.filter {
+            if case .progress = $0 { return false }
+            return true
+        }
+        XCTAssertEqual(recorded.count, 2)
+        XCTAssertEqual(recorded.first, .evidence(entry.source.identifier))
+        guard case .handoff(let id, let remote, let kind, let queueState) = recorded.last else {
+            return XCTFail("expected a handoff after the evidence")
+        }
+        XCTAssertEqual(id, entry.source.identifier)
+        XCTAssertEqual(remote, testUID("fresh.jpg"))
+        XCTAssertEqual(kind, .uploaded)
+        XCTAssertNotEqual(queueState, .completed, "the handoff must be durable before the row settles")
+    }
+
+    func testActiveDuplicateRecordsDeduplicatedHandoffWithoutEvidence() async throws {
+        let entry = seedEntry("dup.jpg")
+        let hashes = expectedHashes(id: "dup.jpg")
+        checker.remoteItemsByNameHash[hashes.nameHash] = [
+            RemotePhotoDuplicate(
+                nameHash: hashes.nameHash, contentHash: hashes.contentHash, linkState: .active, linkID: "remote-1"
+            )
+        ]
+        let events = SpyBackupItemEvents(queue: queueStore)
+
+        _ = await makeRunner(events: events).runUntilDrained()
+
+        XCTAssertEqual(state(of: entry), .alreadyBackedUp)
+        XCTAssertFalse(events.events.contains(.evidence(entry.source.identifier)))
+        XCTAssertTrue(
+            events.events.contains {
+                if case .handoff(_, let remote, .deduplicated, _) = $0 {
+                    return remote == PhotoUID(volumeID: "", nodeID: "remote-1")
+                }
+                return false
+            })
+    }
+
+    func testExcludedSourceStopsBeforeBytesMoveAndLeavesNoRow() async throws {
+        let entry = seedEntry("excluded.jpg")
+        let events = SpyBackupItemEvents(queue: queueStore)
+        events.excluded = [entry.source.identifier]
+
+        let progress = await makeRunner(events: events).runUntilDrained()
+
+        XCTAssertTrue(uploader.requests.isEmpty, "an excluded photo must never upload")
+        XCTAssertNil(state(of: entry), "an exclusion removes the row like a local deletion")
+        XCTAssertEqual(progress.total, 0)
+        XCTAssertEqual(progress.failed, 0)
+        XCTAssertFalse(events.events.contains(.evidence(entry.source.identifier)))
+    }
+
+    func testUnknownExclusionsPauseWithoutRemovingWork() async throws {
+        let entry = seedEntry("unknown.jpg")
+        let events = SpyBackupItemEvents(queue: queueStore)
+        events.exclusionsUnknown = true
+
+        _ = await makeRunner(events: events).runUntilDrained()
+
+        XCTAssertTrue(uploader.requests.isEmpty, "no photo may upload while its exclusion cannot be read")
+        XCTAssertNotNil(state(of: entry), "an unknown answer must never remove work")
+        XCTAssertNotEqual(state(of: entry), .completed)
+    }
+
+    func testFailedHandoffKeepsTheRowFromSettling() async throws {
+        let entry = seedEntry("unsaved.jpg")
+        let events = SpyBackupItemEvents(queue: queueStore)
+        events.handoffOutcome = .failed
+
+        _ = await makeRunner(events: events).runUntilDrained()
+
+        XCTAssertNotEqual(state(of: entry), .completed, "the grid needs the handoff before the row settles")
+    }
+
+    func testProgressStepsRiseAndEndWhenTheSourceSettles() async throws {
+        let progressingUploader = MockUploader(workDuration: .milliseconds(1), deliverProgress: true)
+        let entry = seedEntry("progress.jpg")
+        let events = SpyBackupItemEvents(queue: queueStore)
+
+        _ = await makeRunner(uploader: progressingUploader, events: events).runUntilDrained()
+
+        let steps = events.events.compactMap { event -> Int?? in
+            if case .progress(entry.source.identifier, let step) = event { return step }
+            return nil
+        }
+        XCTAssertEqual(steps.last, .some(nil), "the progress ends when the source settles")
+        let values = steps.compactMap { $0 }
+        XCTAssertFalse(values.isEmpty)
+        XCTAssertEqual(values, values.sorted(), "progress never moves backwards")
+        XCTAssertTrue(values.allSatisfy { (0...BackupProgressStep.count).contains($0) })
     }
 }

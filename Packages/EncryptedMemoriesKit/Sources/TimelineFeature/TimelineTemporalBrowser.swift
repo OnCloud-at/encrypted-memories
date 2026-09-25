@@ -36,12 +36,7 @@ public struct TimelineTemporalBrowser: View {
         Group {
             switch projection.status {
             case .loading:
-                VStack(spacing: 12) {
-                    ProgressView()
-                    Text(L10n.string("library.curation_loading"))
-                        .foregroundStyle(.secondary)
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                GridLoadingMark(caption: L10n.string("library.curation_loading"))
             case .empty:
                 ContentUnavailableView(
                     L10n.string("library.view_all_photos"),

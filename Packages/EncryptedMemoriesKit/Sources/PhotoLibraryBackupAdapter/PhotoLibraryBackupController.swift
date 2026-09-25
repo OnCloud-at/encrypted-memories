@@ -107,6 +107,8 @@ public final class PhotoLibraryBackupController {
             && lockStore != nil
             && queueStore?.isOperational() == true
             && catalogStore?.isOperational() == true
+            // Without readable exclusions a deleted pending photo could upload.
+            && (requiresPendingStore ? pendingStore?.isOperational() == true : pendingStore?.isOperational() != false)
     }
 
     /// Identity of the currently active orchestration pass. Platform expiration handlers use this
@@ -115,6 +117,10 @@ public final class PhotoLibraryBackupController {
 
     private let engine: UploadBackupSyncEngine?
     private let runner: BackupSyncRunner?
+    /// Durable runner events for the pending grid. Nil without a pending store.
+    public let pendingRecorder: PendingBackupEventRecorder?
+    private let pendingStore: PendingBackupManifestStore?
+    private let requiresPendingStore: Bool
     private let queueStore: UploadBackupSyncQueueManifestStore?
     private let stateStore: UploadBackupStateManifestStore?
     private let catalogStore: PhotoLibraryCatalogManifestStore?
@@ -181,9 +187,15 @@ public final class PhotoLibraryBackupController {
         configuration: Configuration,
         identityResolver: (any UploadIdentityResolving)?,
         uploader: any PhotoUploading,
-        tagAdder: (any PhotoTagAdding)? = nil
+        tagAdder: (any PhotoTagAdding)? = nil,
+        pendingStore: PendingBackupManifestStore? = nil,
+        requiresPendingStore: Bool = false
     ) {
         let directory = configuration.accountDataDirectory
+        let pendingRecorder = pendingStore.map { PendingBackupEventRecorder(store: $0) }
+        self.pendingRecorder = pendingRecorder
+        self.pendingStore = pendingStore
+        self.requiresPendingStore = requiresPendingStore
         defaults = configuration.defaults
         let retryPolicy = BackupRetryPolicy()
         self.retryPolicy = retryPolicy
@@ -225,7 +237,8 @@ public final class PhotoLibraryBackupController {
             engine = UploadBackupSyncEngine(
                 preflight: preflight,
                 queue: queueStore,
-                remoteProofResolver: identityResolver
+                remoteProofResolver: identityResolver,
+                exclusions: pendingStore
             )
             runner = BackupSyncRunner(
                 queue: queueStore,
@@ -240,7 +253,8 @@ public final class PhotoLibraryBackupController {
                 uploader: uploader,
                 tagAdder: tagAdder,
                 configuration: .init(retry: retryPolicy),
-                throttleInputs: { AppleBackupRuntimeSignals.current() }
+                throttleInputs: { AppleBackupRuntimeSignals.current() },
+                events: pendingRecorder
             )
         } else {
             engine = nil
@@ -273,6 +287,41 @@ public final class PhotoLibraryBackupController {
                 self?.resumeEnabledBackupAfterLaunch()
             }
         }
+    }
+
+    // MARK: - Pending grid
+
+    /// The backup queue as the pending grid observes it.
+    public var pendingQueue: (any UploadBackupSyncQueueObserving)? { queueStore }
+
+    /// Pending-tile metadata from the catalog.
+    public var pendingMetadataProvider: PhotoLibraryPendingMetadataProvider? {
+        catalogStore.map(PhotoLibraryPendingMetadataProvider.init(catalog:))
+    }
+
+    /// Removes excluded photos from queued and in-flight work, like a deletion in Apple Photos.
+    public func removeFromBackup(identifiers: [String]) async -> Bool {
+        guard let runner, queueStore?.isOperational() == true else { return false }
+        _ = await runner.removeSources(kind: .photoLibraryAsset, identifiers: identifiers)
+        return queueStore?.isOperational() == true
+    }
+
+    /// Enqueues restored photos again from the catalog, without PhotoKit, and starts a pass when backup
+    /// is on. Photos no longer in the library need nothing and count as done.
+    public func returnToBackup(identifiers: [String]) async -> Bool {
+        guard let engine, let catalogStore, catalogStore.isOperational() else { return false }
+        let candidates = catalogStore.presentEntries(for: identifiers).values.compactMap {
+            PhotoBackupAssetPlanner.candidate(for: PhotoLibraryCatalogMapper.info(for: $0))
+        }
+        guard catalogStore.isOperational() else { return false }
+        do {
+            _ = try await engine.enqueueBatch(candidates)
+        } catch {
+            return false
+        }
+        refreshFromQueue()
+        if isEnabled, !isUserPaused, !candidates.isEmpty { syncNow() }
+        return true
     }
 
     // MARK: - Enable / disable (explicit consent only)

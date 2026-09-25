@@ -116,10 +116,12 @@ final class CoreArchitectureGateTests: XCTestCase {
         ),
         CoreTargetRule(
             name: "TimelineCore",
+            // UploadCore: photos that the backup has not uploaded yet are part of the timeline (pending grid).
             allowedImports: [
                 "CoreGraphics", "Foundation", "GridCore", "MediaFeedCore", "MediaLocationCore", "PhotosCore",
+                "UploadCore",
             ],
-            expectedDependencies: ["GridCore", "MediaFeedCore", "MediaLocationCore", "PhotosCore"],
+            expectedDependencies: ["GridCore", "MediaFeedCore", "MediaLocationCore", "PhotosCore", "UploadCore"],
             extraForbiddenTokens: []
         ),
         CoreTargetRule(

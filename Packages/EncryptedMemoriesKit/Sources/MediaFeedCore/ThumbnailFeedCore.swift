@@ -259,6 +259,32 @@ public actor ThumbnailFeedCore {
     /// alone refused a series filmstrip even though its bytes are retained on disk.
     private nonisolated let thumbnailReadAuthorization =
         DerivedDataResourceAuthorization<ThumbnailRetentionDerivedDataScopeKind>()
+    /// Local pending photos are not in any source scope; the host authorizes them explicitly.
+    private nonisolated let localAuthorization = LocalThumbnailAuthorization()
+    /// Proton photos that took over a pending tile. The grid lists them as soon as the timeline does, but the
+    /// source scope follows asynchronously; until it covers them, the handed-over image keeps them readable, so
+    /// the tile never turns black at the handover.
+    private nonisolated let adoptedAuthorization = LocalThumbnailAuthorization()
+    private static let maxAdoptedWithoutScope = 1_024
+    private static let maxLocalPreload = 24
+    private var localLoader: (any LocalThumbnailLoading)?
+    /// Queued local demand in request order. A newer viewport replaces it; warm passes append.
+    private var localDemand: [(uid: PhotoUID, pixels: Int)] = []
+    /// Device loads that run now. Each publishes on its own, so one slow iCloud download never holds back
+    /// the others. `pinned` loads have a caller that waits for them; a viewport change never cancels those.
+    private var localLoads: [PhotoUID: (id: UUID, pinned: Bool, task: Task<Void, Never>)] = [:]
+    private static let maxLocalLoads = 4
+    /// Local photos requested before the host authorized them. They load as soon as authorization arrives, so
+    /// a grid that published its presentation first never keeps blank tiles.
+    private var deniedLocalDemand: [PhotoUID: Int] = [:]
+    private static let maxDeniedLocalDemand = 2_048
+    /// Failed local loads (offline iCloud, a deleted asset). The photo shows a placeholder and is tried again
+    /// after 30 s, doubling to at most 10 min, and only when a grid asks for it again.
+    private var localFailedAttempts: [PhotoUID: Int] = [:]
+    private var localRetryAt: [PhotoUID: ContinuousClock.Instant] = [:]
+    private var localRetryTask: (due: ContinuousClock.Instant, task: Task<Void, Never>)?
+    /// Advances when the feed stops, so a waiting direct caller never starts a load after teardown.
+    private var localGeneration: UInt64 = 0
     private nonisolated let configuration: ThumbnailFeedCoreConfiguration
     private nonisolated let coverageStore: (any ThumbnailCoverageCheckpointStore)?
     private nonisolated let diagnostics: PhotoDiagnostics
@@ -500,7 +526,7 @@ public actor ThumbnailFeedCore {
     }
 
     public func cachedDecoded(for uid: PhotoUID) async -> DecodedThumbnail? {
-        guard thumbnailReadAuthorization.isAllowed(uid) else { return nil }
+        guard readAllowed(uid) else { return nil }
         guard ownerLeaseIsCurrent() else {
             decoded.removeAll()
             return nil
@@ -509,6 +535,8 @@ public actor ThumbnailFeedCore {
             diagnostics.increment("thumb.ramDecodedHit")
             return cached
         }
+        // Local pending photos live in memory only.
+        guard !uid.isLocalPending else { return nil }
         diagnostics.increment("thumb.ramDecodeMiss")
         diagnostics.recordDiskReadDuringPinch()
         let cache = self.cache
@@ -518,12 +546,11 @@ public actor ThumbnailFeedCore {
             guard let data = cache.diskData(for: uid) else { return (false, nil) }
             return (true, ThumbnailImageDecoder.downsample(data, maxPixelSize: maxPixels))
         }
-        guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(generation),
-            thumbnailReadAuthorization.isAllowed(uid)
-        else {
+        guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(generation) else {
             decoded.removeAll()
             return nil
         }
+        guard readAllowed(uid) else { return nil }
         if result.0 {
             diskPresence.set(uid, present: true)
             diagnostics.increment("thumb.diskCacheHit")
@@ -553,7 +580,7 @@ public actor ThumbnailFeedCore {
     /// Source-aware direct decode for an explicitly visible analysis-only surface, such as an additional
     /// collection cover. It never publishes into the main grid's decoded LRU.
     public func analysisDecoded(for uid: PhotoUID) async -> DecodedThumbnail? {
-        guard ownerLeaseIsCurrent(), thumbnailReadAuthorization.isAllowed(uid) else { return nil }
+        guard ownerLeaseIsCurrent(), readAllowed(uid) else { return nil }
         if case .decoded(let cached) = await backgroundThumbnailDecodeResult(for: uid) {
             return cached
         }
@@ -573,7 +600,7 @@ public actor ThumbnailFeedCore {
             }
         }
         guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(generation),
-            thumbnailReadAuthorization.isAllowed(uid)
+            readAllowed(uid)
         else { return nil }
         guard let data = buffer.value else {
             if result.itemErrors[uid] != nil { unfetchable.insert(uid) }
@@ -586,7 +613,7 @@ public actor ThumbnailFeedCore {
             return ThumbnailImageDecoder.downsample(data, maxPixelSize: maxPixels)
         }
         guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(generation),
-            thumbnailReadAuthorization.isAllowed(uid)
+            readAllowed(uid)
         else { return nil }
         return decoded
     }
@@ -597,7 +624,7 @@ public actor ThumbnailFeedCore {
         let generation = cache.captureWriterGeneration()
         let isCurrent: @Sendable () -> Bool = { [self] in
             ownerLeaseIsCurrent() && cache.isCurrentWriterGeneration(generation)
-                && thumbnailReadAuthorization.isAllowed(uid)
+                && readAllowed(uid)
         }
         return isCurrent() ? isCurrent : nil
     }
@@ -606,22 +633,20 @@ public actor ThumbnailFeedCore {
     /// that may still arrive from bytes that are present but cannot be decoded.
     public nonisolated func backgroundThumbnailDecodeResult(for uid: PhotoUID) async -> BackgroundThumbnailDecodeResult
     {
-        guard thumbnailReadAuthorization.isAllowed(uid) else { return .missing }
+        guard readAllowed(uid) else { return .missing }
         let cache = self.cache
         let generation = cache.captureWriterGeneration()
-        guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(generation),
-            thumbnailReadAuthorization.isAllowed(uid)
-        else {
+        guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(generation) else {
             decoded.removeAll()
             return .missing
         }
+        guard readAllowed(uid) else { return .missing }
         if let image = decoded.image(for: uid) {
-            guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(generation),
-                thumbnailReadAuthorization.isAllowed(uid)
-            else {
+            guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(generation) else {
                 decoded.removeAll()
                 return .missing
             }
+            guard readAllowed(uid) else { return .missing }
             return .decoded(image)
         }
 
@@ -630,64 +655,58 @@ public actor ThumbnailFeedCore {
             guard let data = cache.diskData(for: uid) else { return (false, nil) }
             return (true, ThumbnailImageDecoder.downsample(data, maxPixelSize: maxPixels))
         }.value
-        guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(generation),
-            thumbnailReadAuthorization.isAllowed(uid)
-        else {
+        guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(generation) else {
             decoded.removeAll()
             return .missing
         }
+        guard readAllowed(uid) else { return .missing }
         guard result.dataPresent else {
-            guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(generation),
-                thumbnailReadAuthorization.isAllowed(uid)
-            else {
+            guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(generation) else {
                 decoded.removeAll()
                 return .missing
             }
+            guard readAllowed(uid) else { return .missing }
             diskPresence.set(uid, present: false)
-            guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(generation),
-                thumbnailReadAuthorization.isAllowed(uid)
-            else {
+            guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(generation) else {
                 decoded.removeAll()
                 return .missing
             }
+            guard readAllowed(uid) else { return .missing }
             return .missing
         }
-        guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(generation),
-            thumbnailReadAuthorization.isAllowed(uid)
-        else {
+        guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(generation) else {
             decoded.removeAll()
             return .missing
         }
+        guard readAllowed(uid) else { return .missing }
         diskPresence.set(uid, present: true)
-        guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(generation),
-            thumbnailReadAuthorization.isAllowed(uid)
-        else {
+        guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(generation) else {
             decoded.removeAll()
             return .missing
         }
+        guard readAllowed(uid) else { return .missing }
         guard let image = result.image else {
-            guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(generation),
-                thumbnailReadAuthorization.isAllowed(uid)
-            else {
+            guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(generation) else {
                 decoded.removeAll()
                 return .missing
             }
+            guard readAllowed(uid) else { return .missing }
             return .undecodable
         }
-        guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(generation),
-            thumbnailReadAuthorization.isAllowed(uid)
-        else {
+        guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(generation) else {
             decoded.removeAll()
             return .missing
         }
+        guard readAllowed(uid) else { return .missing }
         return .decoded(image)
     }
 
     public nonisolated func memoryDecoded(for uid: PhotoUID) -> DecodedThumbnail? {
-        guard ownerLeaseIsCurrent(), thumbnailReadAuthorization.isAllowed(uid) else {
+        guard ownerLeaseIsCurrent() else {
             decoded.removeAll()
             return nil
         }
+        guard readAllowed(uid) else { return nil }
         return decoded.image(for: uid)
     }
 
@@ -696,7 +715,7 @@ public actor ThumbnailFeedCore {
     /// ordinary missing-tile path) or already adequate, so a settled render loop that keys retry work on
     /// this can never spin on a source-limited image.
     public nonisolated func decodedNeedsSharperSource(_ uid: PhotoUID, forPixels pixels: Int) -> Bool {
-        guard ownerLeaseIsCurrent(), thumbnailReadAuthorization.isAllowed(uid) else { return false }
+        guard ownerLeaseIsCurrent(), readAllowed(uid) else { return false }
         return decoded.needsSharperDecode(for: uid, requestedPixels: pixels)
     }
 
@@ -712,13 +731,13 @@ public actor ThumbnailFeedCore {
     }
 
     public nonisolated func isKnownUnfetchable(_ uid: PhotoUID) -> Bool {
-        thumbnailReadAuthorization.isAllowed(uid) && unfetchable.contains(uid)
+        readAllowed(uid) && unfetchable.contains(uid)
     }
 
     public func cacheState(
         for request: ThumbnailRequest, gpuTextureResident: Bool = false
     ) async -> ThumbnailCacheTierState {
-        guard ownerLeaseIsCurrent(), thumbnailReadAuthorization.isAllowed(request.uid) else {
+        guard ownerLeaseIsCurrent(), readAllowed(request.uid) else {
             return ThumbnailCacheTierState(
                 knownInTimeline: true,
                 diskThumbnail: false,
@@ -753,7 +772,8 @@ public actor ThumbnailFeedCore {
     /// because a first-time cache validation performs a real file read and AES-GCM open.
     @discardableResult
     public func requestPriority(_ uid: PhotoUID, priority requestedPriority: ThumbnailPriority = .visibleNow) -> Bool {
-        guard thumbnailReadAuthorization.isAllowed(uid) else { return false }
+        // Local pending photos load through visible and warm demand only, never through the network queue.
+        guard !uid.isLocalPending, readAllowed(uid) else { return false }
         if requestedPriority != .idleLibraryCrawl { lastDemand.set(clock()) }
         if let index = priorityReservations.firstIndex(where: { $0.uid == uid }) {
             if requestedPriority < priorityReservations[index].priority {
@@ -786,6 +806,7 @@ public actor ThumbnailFeedCore {
     @discardableResult
     public func replaceVisiblePriorityDemand(_ orderedUIDs: [PhotoUID]) -> Int {
         lastDemand.set(clock())
+        let orderedUIDs = orderedUIDs.filter { !$0.isLocalPending }
         visiblePriorityDemand = orderedUIDs
         guard !sourceReconciliationInFlight else { return 0 }
         return applyVisiblePriorityDemand(orderedUIDs)
@@ -875,23 +896,45 @@ public actor ThumbnailFeedCore {
 
     private func drainVisibleDiskDemandInbox() {
         while let submission = visibleDiskDemandInbox.takeLatestOrFinish() {
-            applyVisibleDiskDecodeDemand(submission.requests, generation: submission.generation)
+            applyVisibleDiskDecodeDemand(
+                submission.requests, generation: submission.generation, isReplay: submission.isReplay)
         }
     }
 
+    /// A replay re-applies only Proton demand: local loads wake their hosts, which submit fresh demand, so a
+    /// suspended grid's local viewport never restarts from a replay.
     private func applyVisibleDiskDecodeDemand(
         _ requests: [ThumbnailRequest],
-        generation: UInt64
+        generation: UInt64,
+        isReplay: Bool = false
     ) {
-        guard !sourceReconciliationInFlight, ownerLeaseIsCurrent() else { return }
+        guard !sourceReconciliationInFlight, ownerLeaseIsCurrent() else {
+            // The completion replay skips local demand; the host's next identical viewport must get through.
+            if !isReplay { visibleDiskDemandInbox.invalidate() }
+            return
+        }
         var seen = Set<PhotoUID>()
+        var localDemand: [(uid: PhotoUID, pixels: Int)] = []
+        var deniedLocal: [PhotoUID: Int] = [:]
         let jobs = requests.compactMap { request -> LatestVisibleDecodeDemand.Job? in
-            guard thumbnailReadAuthorization.isAllowed(request.uid) else { return nil }
+            guard readAllowed(request.uid) else {
+                if request.uid.isLocalPending { deniedLocal[request.uid] = Int(visibleDecodePixels(for: request)) }
+                return nil
+            }
             guard seen.insert(request.uid).inserted else { return nil }
             let pixels = visibleDecodePixels(for: request)
             guard !decoded.hasAdequateEntry(for: request.uid, requestedPixels: Int(pixels)) else { return nil }
+            // Local pending photos never touch the encrypted disk tier or its coverage checkpoint.
+            if request.uid.isLocalPending {
+                localDemand.append((request.uid, Int(pixels)))
+                return nil
+            }
             return LatestVisibleDecodeDemand.Job(
                 uid: request.uid, maxPixels: pixels, isUpgrade: decoded.contains(request.uid))
+        }
+        if !isReplay {
+            deniedLocalDemand = deniedLocal
+            submitLocalDemand(localDemand, replacing: true)
         }
         guard visibleDiskDemand.replace(with: jobs, generation: generation) else {
             return
@@ -953,7 +996,7 @@ public actor ThumbnailFeedCore {
                 visibleDiskDemand.complete(job)
                 continue
             }
-            guard thumbnailReadAuthorization.isAllowed(job.uid) else {
+            guard readAllowed(job.uid) else {
                 decoded.remove(job.uid)
                 visibleDiskDemand.complete(job)
                 continue
@@ -974,7 +1017,7 @@ public actor ThumbnailFeedCore {
             decoded.removeAll()
             return
         }
-        guard thumbnailReadAuthorization.isAllowed(tile.uid) else {
+        guard readAllowed(tile.uid) else {
             decoded.remove(tile.uid)
             return
         }
@@ -1012,9 +1055,10 @@ public actor ThumbnailFeedCore {
     ) async -> WarmDecodedResult {
         let targets = Array(
             requests.lazy
-                .filter { self.thumbnailReadAuthorization.isAllowed($0.uid) }
+                .filter { self.readAllowed($0.uid) }
                 .prefix(max(0, limit))
         )
+        noteDeniedLocalDemand(requests.prefix(max(0, limit)))
         lastDemand.set(clock())
         var alreadyDecoded = 0
         var decodedFromDisk = 0
@@ -1043,6 +1087,7 @@ public actor ThumbnailFeedCore {
         }
         var needDecode: [(uid: PhotoUID, pixels: CGFloat, isUpgrade: Bool)] = []
         needDecode.reserveCapacity(targets.count)
+        var localDemand: [(uid: PhotoUID, pixels: Int)] = []
         for request in targets {
             // Size-aware skip: "already decoded" only counts when the cached entry's decode cap is adequate
             // for this request (shared `ThumbnailDecodeUpgradePolicy` hysteresis). A materially larger ask
@@ -1052,9 +1097,17 @@ public actor ThumbnailFeedCore {
             if decoded.hasAdequateEntry(for: request.uid, requestedPixels: Int(pixels)) {
                 diagnostics.increment("thumb.ramDecodedHit")
                 alreadyDecoded += 1
+            } else if request.uid.isLocalPending {
+                localDemand.append((request.uid, Int(pixels)))
             } else {
                 needDecode.append((request.uid, pixels, decoded.contains(request.uid)))
             }
+        }
+        // Device loads may wait for iCloud; they never hold back the Proton decodes of this pass. The visible
+        // pass owns the local queue, like the visible disk demand.
+        if requestedPriority == .visibleNow || !localDemand.isEmpty {
+            submitLocalDemand(localDemand, replacing: requestedPriority == .visibleNow)
+            queuedNetwork += localDemand.count
         }
         if !needDecode.isEmpty {
             let cache = self.cache
@@ -1090,7 +1143,7 @@ public actor ThumbnailFeedCore {
                     }
                     if let tile {
                         guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(decodeGeneration),
-                            thumbnailReadAuthorization.isAllowed(tile.uid)
+                            readAllowed(tile.uid)
                         else {
                             group.cancelAll()
                             continue
@@ -1159,10 +1212,13 @@ public actor ThumbnailFeedCore {
     }
 
     public func decoded(for uid: PhotoUID) async -> DecodedThumbnail? {
-        guard ownerLeaseIsCurrent(), thumbnailReadAuthorization.isAllowed(uid) else {
+        guard ownerLeaseIsCurrent() else {
             decoded.removeAll()
             return nil
         }
+        guard readAllowed(uid) else { return nil }
+        // Local photos never touch the disk tier or share a Proton flight; see `loadLocalDirect`.
+        if uid.isLocalPending { return await loadLocalDirect(uid) }
         if let image = await cachedDecoded(for: uid) { return image }
         // Visible tiles re-request on every appearance; once the backend has said "no thumbnail"
         // for this crawl, don't burn a network round-trip per visibility.
@@ -1188,8 +1244,40 @@ public actor ThumbnailFeedCore {
         return result
     }
 
+    /// Loads a local photo for a direct caller (the viewer's first frame). It runs in the caller's task, so the
+    /// caller's cancellation stops a download it started.
+    private func loadLocalDirect(_ uid: PhotoUID) async -> DecodedThumbnail? {
+        let pixels = Int(configuration.targetPixels)
+        let generation = localGeneration
+        // Every await can change the running load: a cancelled one may finish and a queued viewport
+        // request may start a replacement. Re-check after each wait, join the current load and pin it,
+        // and stop when the feed stops. Bounded, so a load that keeps being replaced cannot spin.
+        for _ in 0..<4 {
+            guard decoded.image(for: uid) == nil, !Task.isCancelled, localGeneration == generation else { break }
+            if let load = localLoads[uid] {
+                // Joining does not pin: if a suspension cancels this load, the next pass starts one this
+                // caller owns, and the caller's own cancellation stops it.
+                await load.task.value
+            } else if localLoads.count < Self.maxLocalLoads, shouldLoadLocal(uid, pixels: pixels),
+                let localLoader
+            {
+                // Direct callers share the load limit, and their own cancellation (a viewer paging on)
+                // stops the download.
+                let load = startLocalLoad(uid, pixels: pixels, loader: localLoader, pinned: true)
+                await withTaskCancellationHandler {
+                    await load.value
+                } onCancel: {
+                    load.cancel()
+                }
+            } else {
+                break
+            }
+        }
+        return decoded.image(for: uid)
+    }
+
     private func loadDirectDecoded(for uid: PhotoUID) async -> DecodedThumbnail? {
-        guard thumbnailReadAuthorization.isAllowed(uid) else { return nil }
+        guard readAllowed(uid) else { return nil }
         let box = ByteBox()
         let cache = self.cache
         let writerGeneration = cache.captureWriterGeneration()
@@ -1205,12 +1293,11 @@ public actor ThumbnailFeedCore {
                 if loadedUID == uid { box.set(data) }
             }
         }
-        guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(writerGeneration),
-            thumbnailReadAuthorization.isAllowed(uid)
-        else {
+        guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(writerGeneration) else {
             decoded.removeAll()
             return nil
         }
+        guard readAllowed(uid) else { return nil }
         guard let data = box.value else {
             if let reason = result.itemErrors[uid] {
                 unfetchable.insert(uid)
@@ -1228,12 +1315,11 @@ public actor ThumbnailFeedCore {
             guard stored == .stored || stored == .storagePaused else { return (nil, stored) }
             return (ThumbnailImageDecoder.downsample(data, maxPixelSize: maxPixels), stored)
         }
-        guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(writerGeneration),
-            thumbnailReadAuthorization.isAllowed(uid)
-        else {
+        guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(writerGeneration) else {
             decoded.removeAll()
             return nil
         }
+        guard readAllowed(uid) else { return nil }
         if stored == .stored { diskPresence.set(uid, present: true) }
         cacheArrivalWake.call()
         guard let image else {
@@ -1283,7 +1369,7 @@ public actor ThumbnailFeedCore {
         if let requiredSourceRevision {
             guard lastAnalysisScope?.revision == requiredSourceRevision else { return }
         }
-        let uids = uids.filter { thumbnailReadAuthorization.isAllowed($0) }
+        let uids = uids.filter { readAllowed($0) }
         prefetchReportingUIDs = reportingUIDs
         flushCheckpointUpdates()
         restorePriorityReservationsForRestart()
@@ -1373,6 +1459,20 @@ public actor ThumbnailFeedCore {
             task.cancel()
             retiredVisibleDiskWorkerTasks.append(task)
         }
+        localGeneration &+= 1
+        // A replay skips local demand, so the host's next identical viewport must restart these loads.
+        if !localLoads.isEmpty || !localDemand.isEmpty { visibleDiskDemandInbox.invalidate() }
+        localDemand.removeAll()
+        deniedLocalDemand.removeAll()
+        for load in localLoads.values {
+            load.task.cancel()
+            retiredVisibleDiskWorkerTasks.append(load.task)
+        }
+        localLoads.removeAll()
+        localRetryTask?.task.cancel()
+        localRetryTask = nil
+        localRetryAt.removeAll()
+        localFailedAttempts.removeAll()
         visibleDiskWorkerTasks.removeAll(keepingCapacity: false)
     }
 
@@ -1482,6 +1582,8 @@ public actor ThumbnailFeedCore {
         // boundary. That owner consumes only the newest queued revision, so an older continuation can never
         // overwrite a newer feed state after one of the awaits below.
         thumbnailReadAuthorization.apply(retentionScope)
+        // Handed-over photos the scope now covers need no exception any more.
+        adoptedAuthorization.subtract(retentionScope.uids)
         let incomingRequest = SourceReconciliationRequest(
             selectedScope: selectedScope,
             analysisScope: analysisScope,
@@ -1565,7 +1667,8 @@ public actor ThumbnailFeedCore {
 
             // Join first, then remove only plaintext which lost thumbnail access. The source and cache
             // fences already reject a cancellation-ignoring loader, so retained tiles stay immediately usable.
-            decoded.retainOnly(request.retentionScope.uids)
+            decoded.retainOnly(
+                request.retentionScope.uids.union(localAuthorization.snapshot).union(adoptedAuthorization.snapshot))
             checkpointPresent.removeAll(keepingCapacity: true)
             checkpointHints.removeAll(keepingCapacity: true)
             pendingCheckpointUpdates.removeAll(keepingCapacity: true)
@@ -1803,7 +1906,15 @@ public actor ThumbnailFeedCore {
             guard ownerLeaseIsCurrent() else { return }
             let work = await takeBatch()
             guard ownerLeaseIsCurrent() else { return }
-            let chunk = work.uids
+            // Local pending photos load from the device on their own queue; an iCloud wait never holds back
+            // Proton downloads or counts against the network pacing.
+            let localChunk = work.uids.filter(\.isLocalPending)
+            if !localChunk.isEmpty {
+                submitLocalDemand(localChunk.map { ($0, Int(configuration.targetPixels)) }, replacing: false)
+                releasePriorityReservations(for: localChunk, generation: generation)
+                if localChunk.count == work.uids.count { continue }
+            }
+            let chunk = localChunk.isEmpty ? work.uids : work.uids.filter { !$0.isLocalPending }
             if chunk.isEmpty {
                 if priority.isEmpty && sequentialIndex >= sequential.count {
                     if diskProbeBatchesInFlight > 0 {
@@ -2667,18 +2778,279 @@ public actor ThumbnailFeedCore {
         for uid: PhotoUID,
         decodePixelCap: Int
     ) -> DecodedThumbnail? {
-        guard ownerLeaseIsCurrent(), thumbnailReadAuthorization.isAllowed(uid) else { return nil }
+        guard ownerLeaseIsCurrent(), readAllowed(uid) else { return nil }
         let becameCurrent = decoded.set(image, for: uid, decodePixelCap: decodePixelCap)
         guard ownerLeaseIsCurrent() else {
             decoded.removeAll()
             return nil
         }
-        guard thumbnailReadAuthorization.isAllowed(uid) else {
+        guard readAllowed(uid) else {
             decoded.remove(uid)
             return nil
         }
         if becameCurrent { onDecoded(uid, image) }
         return decoded.image(for: uid)
+    }
+
+    // MARK: - Local pending photos
+
+    private nonisolated func readAllowed(_ uid: PhotoUID) -> Bool {
+        uid.isLocalPending
+            ? localAuthorization.isAllowed(uid)
+            : thumbnailReadAuthorization.isAllowed(uid) || adoptedAuthorization.isAllowed(uid)
+    }
+
+    /// Installs the device loader for local pending photos.
+    public func setLocalThumbnailLoader(_ loader: (any LocalThumbnailLoading)?) {
+        localLoader = loader
+    }
+
+    /// Replaces the set of local pending photos the feed may show. Images of photos that left the set are
+    /// dropped at once; photos that joined get a fresh load attempt. `adoptions` first hand decoded images
+    /// to the Proton photos that replaced pending tiles, before their local images are dropped.
+    public func setLocalAuthorization(
+        _ uids: Set<PhotoUID>,
+        adoptions: [(local: PhotoUID, remote: PhotoUID)] = []
+    ) {
+        var fromDevice: [(local: PhotoUID, remote: PhotoUID)] = []
+        for adoption in adoptions where !adoptDecoded(from: adoption.local, to: adoption.remote) {
+            // RAM no longer holds the pending image: read it from the device again instead of leaving the tile
+            // black until the Proton thumbnail downloads.
+            if !adoption.remote.isLocalPending, decoded.image(for: adoption.remote) == nil {
+                fromDevice.append(adoption)
+            }
+        }
+        if !fromDevice.isEmpty, let localLoader {
+            Task { await self.adoptFromDevice(fromDevice, loader: localLoader) }
+        }
+        let change = localAuthorization.replace(with: uids.filter(\.isLocalPending))
+        for uid in change.removed {
+            decoded.remove(uid)
+            localFailedAttempts[uid] = nil
+            localRetryAt[uid] = nil
+            if let load = localLoads[uid], !load.pinned { load.task.cancel() }
+        }
+        unfetchable.subtract(change.added)
+        unfetchable.subtract(change.removed)
+        let replay = change.added.compactMap { uid in deniedLocalDemand.removeValue(forKey: uid).map { (uid, $0) } }
+        if !replay.isEmpty { submitLocalDemand(replay, replacing: false) }
+        // A photo that just joined the grid starts loading now, before its first frame asks for it.
+        let preload = change.added.prefix(Self.maxLocalPreload).map { ($0, Int(configuration.targetPixels)) }
+        if !preload.isEmpty { submitLocalDemand(preload, replacing: false) }
+    }
+
+    /// The handover image read from the device, for a Proton photo whose pending image left RAM.
+    private func adoptFromDevice(
+        _ adoptions: [(local: PhotoUID, remote: PhotoUID)],
+        loader: any LocalThumbnailLoading
+    ) async {
+        let pixels = Int(configuration.targetPixels)
+        let images = await loader.thumbnails(for: adoptions.map(\.local), maxPixelSize: CGFloat(pixels))
+        guard ownerLeaseIsCurrent() else { return }
+        var stored = false
+        for adoption in adoptions {
+            // The Proton thumbnail may have arrived meanwhile; it wins.
+            guard let image = images[adoption.local], decoded.image(for: adoption.remote) == nil else { continue }
+            if !thumbnailReadAuthorization.isAllowed(adoption.remote) {
+                adoptedAuthorization.insert(adoption.remote, limit: Self.maxAdoptedWithoutScope)
+            }
+            if storeDecoded(image, for: adoption.remote, decodePixelCap: pixels) != nil { stored = true }
+        }
+        // The grid may rest after the handover; wake it so the tile uploads the image.
+        if stored { wakeHostsForLocalArrival() }
+    }
+
+    /// Loads new images for local photos whose content changed (a new revision) and keeps the old image until
+    /// then, so a tile never turns black. Returns the photos whose image was replaced; the host then lets its
+    /// grids upload the new image.
+    public func refreshLocal(_ uids: [PhotoUID]) async -> [PhotoUID] {
+        guard let localLoader else { return [] }
+        let targets = uids.filter { $0.isLocalPending && localAuthorization.isAllowed($0) }
+        guard !targets.isEmpty else { return [] }
+        for uid in targets {
+            // A photo that failed while the camera still processed it may load now.
+            unfetchable.remove(uid)
+            localFailedAttempts[uid] = nil
+            localRetryAt[uid] = nil
+        }
+        // The same size as the image it replaces, so a sharper tile never gets a softer one.
+        let pixels = targets.reduce(Int(configuration.targetPixels)) { max($0, decoded.decodePixelCap(for: $1) ?? 0) }
+        let images = await localLoader.thumbnails(for: targets, maxPixelSize: CGFloat(pixels))
+        guard ownerLeaseIsCurrent() else { return [] }
+        var refreshed: [PhotoUID] = []
+        for uid in targets where localAuthorization.isAllowed(uid) {
+            guard let image = images[uid], storeDecoded(image, for: uid, decodePixelCap: pixels) != nil else {
+                continue
+            }
+            refreshed.append(uid)
+        }
+        if !refreshed.isEmpty { wakeHostsForLocalArrival() }
+        return refreshed
+    }
+
+    /// Hands the decoded image of a pending photo to the Proton photo that replaced it, so the tile never
+    /// blanks while the remote thumbnail loads. The remote identity must already be authorized.
+    @discardableResult
+    public func adoptDecoded(from local: PhotoUID, to remote: PhotoUID) -> Bool {
+        guard local.isLocalPending, !remote.isLocalPending, decoded.image(for: remote) == nil,
+            let image = decoded.image(for: local)
+        else { return false }
+        if !thumbnailReadAuthorization.isAllowed(remote) {
+            adoptedAuthorization.insert(remote, limit: Self.maxAdoptedWithoutScope)
+        }
+        guard storeDecoded(image, for: remote, decodePixelCap: Int(configuration.targetPixels)) != nil else {
+            return false
+        }
+        notifyHostOfAvailableImageIfVisible()
+        return true
+    }
+
+    /// The host's viewport needs no more thumbnails: queued local loads drop; running ones finish.
+    public func clearLocalVisibleDemand() {
+        deniedLocalDemand.removeAll()
+        submitLocalDemand([], replacing: true)
+    }
+
+    /// A grid left the screen: queued local loads drop and running ones stop, unless a caller waits for them.
+    /// Hosts that still show pending photos get a wake and ask again.
+    public func endLocalVisibleDemand() {
+        localDemand.removeAll()
+        deniedLocalDemand.removeAll()
+        var cancelled = false
+        for load in localLoads.values where !load.pinned && !load.task.isCancelled {
+            load.task.cancel()
+            cancelled = true
+        }
+        if cancelled { wakeHostsForLocalArrival() }
+    }
+
+    /// A newer viewport replaces the queue. Running loads (at most `maxLocalLoads`) always finish: several
+    /// grids share this feed, and cancelling on every replace would let one grid stop another grid's
+    /// downloads without a wake.
+    private func submitLocalDemand(_ demand: [(uid: PhotoUID, pixels: Int)], replacing: Bool) {
+        if replacing {
+            localDemand = demand
+        } else {
+            let queued = Set(localDemand.map(\.uid))
+            localDemand.append(contentsOf: demand.filter { !queued.contains($0.uid) })
+        }
+        pumpLocalLoads()
+    }
+
+    private func pumpLocalLoads() {
+        guard ownerLeaseIsCurrent() else { return }
+        guard let localLoader else {
+            for request in localDemand where localAuthorization.isAllowed(request.uid) {
+                unfetchable.insert(request.uid)
+            }
+            localDemand.removeAll()
+            return
+        }
+        // Demand behind a running load stays queued: if that load was cancelled, the photo starts again once
+        // it finishes, so a quick scroll away and back never leaves a blank tile.
+        var remaining: [(uid: PhotoUID, pixels: Int)] = []
+        for request in localDemand {
+            if localLoads[request.uid] != nil {
+                remaining.append(request)
+            } else if localLoads.count < Self.maxLocalLoads {
+                guard shouldLoadLocal(request.uid, pixels: request.pixels) else { continue }
+                startLocalLoad(request.uid, pixels: request.pixels, loader: localLoader, pinned: false)
+            } else {
+                remaining.append(request)
+            }
+        }
+        localDemand = remaining
+    }
+
+    private func shouldLoadLocal(_ uid: PhotoUID, pixels: Int) -> Bool {
+        localAuthorization.isAllowed(uid) && !unfetchable.contains(uid) && localLoads[uid] == nil
+            && !decoded.hasAdequateEntry(for: uid, requestedPixels: max(1, pixels))
+    }
+
+    /// Loads one local photo at `pixels`. The attempted size becomes the decode cap, so a smaller device
+    /// source never keeps a visible tile asking for an upgrade.
+    @discardableResult
+    private func startLocalLoad(
+        _ uid: PhotoUID,
+        pixels: Int,
+        loader: any LocalThumbnailLoading,
+        pinned: Bool
+    ) -> Task<Void, Never> {
+        let id = UUID()
+        let pixels = max(1, pixels)
+        let task = Task { [weak self] in
+            let image = await loader.thumbnails(for: [uid], maxPixelSize: CGFloat(pixels))[uid]
+            let cancelled = Task.isCancelled
+            await self?.finishLocalLoad(uid, id: id, pixels: pixels, image: image, cancelled: cancelled)
+        }
+        localLoads[uid] = (id, pinned, task)
+        return task
+    }
+
+    private func finishLocalLoad(_ uid: PhotoUID, id: UUID, pixels: Int, image: DecodedThumbnail?, cancelled: Bool) {
+        guard localLoads[uid]?.id == id else { return }
+        localLoads[uid] = nil
+        defer { pumpLocalLoads() }
+        guard !cancelled, ownerLeaseIsCurrent(), localAuthorization.isAllowed(uid) else { return }
+        guard let image else {
+            noteLocalFailure(uid)
+            return
+        }
+        localFailedAttempts[uid] = nil
+        guard storeDecoded(image, for: uid, decodePixelCap: pixels) != nil else { return }
+        cacheArrivalWake.call()
+        // An iCloud download can outlast the host wake window; the grid must still learn about the image.
+        wakeHostsForLocalArrival()
+    }
+
+    private func wakeHostsForLocalArrival() {
+        visibleDiskDemandInbox.invalidate()
+        imagesAvailableWake.call()
+    }
+
+    private func noteLocalFailure(_ uid: PhotoUID) {
+        let attempts = (localFailedAttempts[uid] ?? 0) + 1
+        localFailedAttempts[uid] = attempts
+        let delay = min(600, 30 << min(attempts - 1, 5))
+        localRetryAt[uid] = .now + .seconds(delay)
+        unfetchable.insert(uid)
+        scheduleLocalRetry()
+    }
+
+    private func scheduleLocalRetry() {
+        guard let due = localRetryAt.values.min() else { return }
+        if let scheduled = localRetryTask {
+            guard due < scheduled.due else { return }
+            scheduled.task.cancel()
+        }
+        let task = Task { [weak self] in
+            try? await Task.sleep(until: due, clock: .continuous)
+            guard !Task.isCancelled else { return }
+            await self?.releaseDueLocalRetries()
+        }
+        localRetryTask = (due, task)
+    }
+
+    /// Lets failed local photos load again once their delay passed. Visible grids ask for them on the wake.
+    private func releaseDueLocalRetries() {
+        localRetryTask = nil
+        let now = ContinuousClock.now
+        let due = localRetryAt.filter { $0.value <= now }.map(\.key)
+        for uid in due {
+            localRetryAt[uid] = nil
+            unfetchable.remove(uid)
+        }
+        // The first retry comes after the host wake window can close; wake directly so an idle grid asks for
+        // its visible tiles again. At most once per retry deadline.
+        if !due.isEmpty { wakeHostsForLocalArrival() }
+        scheduleLocalRetry()
+    }
+
+    private func noteDeniedLocalDemand(_ requests: ArraySlice<ThumbnailRequest>) {
+        for request in requests where request.uid.isLocalPending && !readAllowed(request.uid) {
+            if deniedLocalDemand.count >= Self.maxDeniedLocalDemand { deniedLocalDemand.removeAll() }
+            deniedLocalDemand[request.uid] = Int(effectiveDecodePixels(for: request))
+        }
     }
 
     /// Publishes a batch arrival that could not reach the disk cache because the device is nearly full.
@@ -2867,6 +3239,8 @@ final class LatestVisibleDecodeDemandInbox: @unchecked Sendable {
     struct Submission: Sendable, Equatable {
         let requests: [ThumbnailRequest]
         let generation: UInt64
+        /// A replay after a Proton arrival, not a fresh viewport from a host.
+        var isReplay = false
     }
 
     private let lock = NSLock()
@@ -2891,7 +3265,9 @@ final class LatestVisibleDecodeDemandInbox: @unchecked Sendable {
     func replay() -> Bool {
         lock.withLock {
             guard let retainedRequests, !retainedRequests.isEmpty else { return false }
-            return enqueue(retainedRequests)
+            // A fresh viewport that is not drained yet carries the same requests and also its local demand.
+            if let latest, !latest.isReplay { return false }
+            return enqueue(retainedRequests, isReplay: true)
         }
     }
 
@@ -2908,10 +3284,11 @@ final class LatestVisibleDecodeDemandInbox: @unchecked Sendable {
         lock.withLock { needsResubmission = true }
     }
 
-    private func enqueue(_ requests: [ThumbnailRequest]) -> Bool {
-        needsResubmission = false
+    private func enqueue(_ requests: [ThumbnailRequest], isReplay: Bool = false) -> Bool {
+        // A replay skips local demand, so the host's next identical viewport must still get through.
+        if !isReplay { needsResubmission = false }
         nextGeneration &+= 1
-        latest = Submission(requests: requests, generation: nextGeneration)
+        latest = Submission(requests: requests, generation: nextGeneration, isReplay: isReplay)
         guard !drainScheduled else { return false }
         drainScheduled = true
         return true
@@ -3085,6 +3462,14 @@ private final class UnfetchableThumbnailBox: @unchecked Sendable {
 
     func formUnion<S: Sequence>(_ sequence: S) where S.Element == PhotoUID {
         lock.withLock { ids.formUnion(sequence) }
+    }
+
+    func subtract<S: Sequence>(_ sequence: S) where S.Element == PhotoUID {
+        lock.withLock { ids.subtract(sequence) }
+    }
+
+    func remove(_ uid: PhotoUID) {
+        _ = lock.withLock { ids.remove(uid) }
     }
 
     func removeAll() {

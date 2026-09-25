@@ -83,27 +83,33 @@ struct MobilePhotoViewer: View {
         _index = State(initialValue: min(max(startIndex, 0), max(items.count - 1, 0)))
         _titleMetadataCoordinator = State(
             initialValue: ViewerTitleMetadataCoordinator(
-                metadataProvider: libraryModel.backend,
+                metadataProvider: libraryModel.backend == nil ? nil : libraryModel.viewerMedia,
                 placeNameResolver: NativePlaceNameResolver.shared
             ))
         let feed = libraryModel.thumbnailFeed
         // Seed/reuse the E2EE originals cache via the shared helper, injected as a closure so the viewer
         // adapter stays decoupled from the cache layer. When the viewer decrypts an original (a no-preview
         // item), it lands in the encrypted cache and later opens / shares reuse it before the network.
+        // Pending photos that are not in Proton yet open from Apple Photos; everything else from Proton.
+        let media = libraryModel.viewerMedia
         let originalFetch: (@Sendable (PhotoUID) async throws -> Data)?
         if let backend = libraryModel.backend, let originals = libraryModel.originalsCache {
             let provider = EncryptedOriginalProvider(
                 media: backend, cache: originals,
                 policy: .persisting(capBytes: libraryModel.originalsCacheCapBytes)
             )
-            originalFetch = { try await provider.originalData(for: $0) }
+            originalFetch = { uid in
+                if uid.isLocalPending { return try await media.originalData(for: uid) { _ in } }
+                return try await provider.originalData(for: uid)
+            }
         } else {
             originalFetch = nil
         }
         _imageStore = State(
             initialValue: UIKitViewerImageStore(
                 thumbnailProvider: { feed?.memoryImage(for: $0) },
-                media: libraryModel.backend,
+                cachedThumbnailProvider: { await feed?.cachedImage(for: $0) },
+                media: media,
                 originalDataOverride: originalFetch))
     }
 
@@ -167,8 +173,13 @@ struct MobilePhotoViewer: View {
             // The filmstrip is bottom safe-area content, the Photos-app contract: the media refits when the chrome
             // toggles, and the native bottom bar stacks below the strip.
             .safeAreaInset(edge: .bottom, spacing: 0) { viewerBottomAccessory }
-            .navigationTitle(viewerTitle.line1)
-            .navigationSubtitle(viewerTitle.line2)
+            .overlay {
+                UndoNoticeOverlay(
+                    notice: Binding(get: { libraryModel.undoNotice }, set: { libraryModel.undoNotice = $0 }))
+            }
+            // The principal item draws both lines. A blank title string would render as quotation marks while
+            // a known location resolves, so the reserved line is hidden by opacity instead, as on the Mac.
+            .navigationTitle(viewerTitle.reservesLocationLine ? viewerTitle.line2 : viewerTitle.line1)
             .toolbarTitleDisplayMode(.inline)
             .toolbar { viewerToolbar }
             // The media background is always black; the bars keep light glyphs and titles over it.
@@ -291,6 +302,7 @@ struct MobilePhotoViewer: View {
     /// Regular iPad windows move the bottom bar items into the navigation bar; iPhone Duo moves both bars to
     /// the vertical edge. Photos and videos share this one toolbar, so paging never inserts or removes items.
     @ToolbarContentBuilder private var viewerToolbar: some ToolbarContent {
+        ToolbarItem(placement: .principal) { viewerTitleView }
         viewerCloseItem
         viewerMoreActions
         ToolbarItem(placement: .bottomBar) { viewerShareButton }
@@ -344,6 +356,21 @@ struct MobilePhotoViewer: View {
             }
             .mobileVisibilityPriority(.low)
         }
+    }
+
+    private var viewerTitleView: some View {
+        let title = viewerTitle
+        return VStack(spacing: 1) {
+            Text(verbatim: title.line1)
+                .font(.headline)
+                .opacity(title.reservesLocationLine ? 0 : 1)
+            Text(verbatim: title.line2)
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+        }
+        .lineLimit(1)
+        .multilineTextAlignment(.center)
+        .accessibilityElement(children: .combine)
     }
 
     /// The Apple-Photos-style two-line bar title: location or date first, date/time and position second. While a
@@ -411,7 +438,7 @@ struct MobilePhotoViewer: View {
 
     private var viewerFavoriteButton: some View {
         let uid = currentBaseItem?.uid
-        let favorite = uid.map { libraryModel.favoriteUIDs.contains($0) } ?? false
+        let favorite = uid.map { libraryModel.displayedFavoriteUIDs.contains($0) } ?? false
         let busy = uid.map { libraryModel.favoriteMutationsInFlight.contains($0) } ?? false
         let title =
             favorite
@@ -592,10 +619,10 @@ struct MobilePhotoViewer: View {
     }
 
     private func shareCurrentItem() {
-        guard let item = currentBaseItem, let backend = libraryModel.backend else { return }
+        guard let item = currentBaseItem, libraryModel.backend != nil else { return }
         let items = burstBelongsToCurrentPage ? burstSelection.exportItems(current: item) : [item]
         selection.startShare(
-            items: items, backend: backend,
+            items: items, backend: libraryModel.viewerMedia,
             failureMessage: String(localized: "viewer.share_failed")
         )
     }
@@ -1144,12 +1171,16 @@ struct MobileImagePage: View {
     }
 
     private func load(maxPixelSize cap: Int) async {
-        // Install the immediate grid thumbnail when no image is mounted.
-        if image == nil, let thumb = imageStore.thumbnail(for: item.uid) {
-            _ = installIfNotLowerQuality(thumb)
-            if MobileViewerLog.isEnabled {
-                MobileViewerLog.logger.notice(
-                    "[ViewerPerf] display uid=\(MobileViewerLog.short(item.uid), privacy: .public) tier=thumbnail")
+        // Install the immediate grid thumbnail when no image is mounted: from RAM, else from the feed's disk tier.
+        if image == nil {
+            var thumb = imageStore.thumbnail(for: item.uid)
+            if thumb == nil { thumb = await imageStore.cachedThumbnail(for: item.uid) }
+            if let thumb, !Task.isCancelled, image == nil {
+                _ = installIfNotLowerQuality(thumb)
+                if MobileViewerLog.isEnabled {
+                    MobileViewerLog.logger.notice(
+                        "[ViewerPerf] display uid=\(MobileViewerLog.short(item.uid), privacy: .public) tier=thumbnail")
+                }
             }
         }
         // Load a screen-bounded preview for the current page only.
@@ -1880,7 +1911,10 @@ private struct MobileVideoPage: View {
                 "[ViewerPerf] video prepare start uid=\(MobileViewerLog.short(item.uid), privacy: .public)")
         }
         do {
-            let streaming = try await backend.makeStreamingAsset(for: item.uid)
+            let streaming =
+                item.uid.isLocalPending
+                ? try await libraryModel.viewerMedia.makeStreamingAsset(for: item.uid)
+                : try await backend.makeStreamingAsset(for: item.uid)
             guard !Task.isCancelled, isCurrent,
                 generation == playbackGeneration,
                 requestedSourceIdentity == sourceIdentity,
@@ -2142,11 +2176,7 @@ struct MobileZoomableImage: UIViewRepresentable {
         context.coordinator.onPhotoFrameChanged = onPhotoFrameChanged
         context.coordinator.onZoomSettled = onZoomSettled
         context.coordinator.reduceMotion = reduceMotion
-        context.coordinator.updateLiveText(
-            analysis: liveTextAnalysis,
-            highlighted: liveTextHighlighted,
-            requiresHighlight: onMotionStart != nil
-        )
+        context.coordinator.updateLiveText(analysis: liveTextAnalysis, highlighted: liveTextHighlighted)
         if context.coordinator.imageView?.image !== image {
             context.coordinator.imageView?.image = image
             // Geometry must be current before SwiftUI presents the replacement image. Reporting the new
@@ -2189,7 +2219,6 @@ struct MobileZoomableImage: UIViewRepresentable {
         weak var dismissPan: UIPanGestureRecognizer?
         weak var motionPress: UILongPressGestureRecognizer?
         private var liveTextInteraction: ImageAnalysisInteraction?
-        private var liveTextRequiresHighlight = false
         private var dismissPanActive = false
         private var motionActive = false
         private var updatingZoomGeometry = false
@@ -2358,9 +2387,9 @@ struct MobileZoomableImage: UIViewRepresentable {
         /// horizontal drag then falls through to the page TabView's paging swipe, and a zoomed image keeps its
         /// scroll-view pan. Every other recognizer begins normally.
         func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
-            // While text is highlighted, a press on text selects it instead of playing the Live Photo.
+            // A press on recognized text selects it, as in Photos; a press anywhere else plays the Live Photo.
             if gestureRecognizer === motionPress {
-                return !liveTextOwns(gestureRecognizer)
+                return !liveTextOwns(gestureRecognizer) && !isOnText(gestureRecognizer)
             }
             guard gestureRecognizer === dismissPan, let scrollView else { return true }
             let isZoomedIn = scrollView.zoomScale > scrollView.minimumZoomScale + 0.01
@@ -2427,9 +2456,8 @@ struct MobileZoomableImage: UIViewRepresentable {
 
         // MARK: Live Text
 
-        func updateLiveText(analysis: ImageAnalysis?, highlighted: Bool, requiresHighlight: Bool) {
+        func updateLiveText(analysis: ImageAnalysis?, highlighted: Bool) {
             guard let imageView else { return }
-            liveTextRequiresHighlight = requiresHighlight
             guard let analysis else {
                 liveTextInteraction?.selectableItemsHighlighted = false
                 liveTextInteraction?.analysis = nil
@@ -2462,15 +2490,24 @@ struct MobileZoomableImage: UIViewRepresentable {
             return interaction.hasInteractiveItem(at: gesture.location(in: imageView))
         }
 
+        /// True when `gesture` starts on recognized text, highlighted or not. The analysis knows every text
+        /// region up front, so a Live Photo's press on text can leave the selection to Live Text.
+        private func isOnText(_ gesture: UIGestureRecognizer) -> Bool {
+            guard let interaction = liveTextInteraction, let imageView, interaction.analysis != nil else {
+                return false
+            }
+            return interaction.analysisHasText(at: gesture.location(in: imageView))
+        }
+
         func interaction(
             _ interaction: ImageAnalysisInteraction,
             shouldBeginAt point: CGPoint,
             for interactionType: ImageAnalysisInteraction.InteractionTypes
         ) -> Bool {
             if interaction.selectableItemsHighlighted { return true }
-            // Unhighlighted text only starts a selection on a still. Taps, double taps, and a Live Photo's long press
-            // keep their viewer meaning.
-            guard !liveTextRequiresHighlight, interactionType.contains(.textSelection) else { return false }
+            // Unhighlighted, only a press on text starts a selection, on stills and Live Photos alike. Taps and
+            // double taps keep their viewer meaning, and a press beside the text plays the Live Photo.
+            guard interactionType.contains(.textSelection) else { return false }
             return interaction.analysisHasText(at: point)
         }
 

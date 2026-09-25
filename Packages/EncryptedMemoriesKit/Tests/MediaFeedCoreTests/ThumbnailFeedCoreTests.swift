@@ -166,6 +166,21 @@ private let feedCacheTestKey = SymmetricKey(size: .bits256)
     #expect(inbox.takeLatestOrFinish() == .init(requests: replacement, generation: 2))
 }
 
+@Test func latestVisibleDecodeDemandInboxReplayNeverSwallowsAFreshViewport() {
+    let inbox = LatestVisibleDecodeDemandInbox()
+    let viewport = [ThumbnailRequest(uid: PhotoUID(localPending: .photoLibrary, identifier: "asset"))]
+    #expect(inbox.submit(requests: viewport))
+    #expect(!inbox.replay(), "an undrained fresh viewport already carries its local demand")
+    #expect(inbox.takeLatestOrFinish()?.isReplay == false)
+    #expect(inbox.takeLatestOrFinish() == nil)
+
+    inbox.invalidate()
+    #expect(inbox.replay())
+    #expect(inbox.takeLatestOrFinish()?.isReplay == true)
+    #expect(inbox.takeLatestOrFinish() == nil)
+    #expect(inbox.submit(requests: viewport), "a replay skips local demand, so the same viewport still gets through")
+}
+
 @Test func latestVisibleDecodeDemandInboxRetainsOnlyLatestIntentForReplay() {
     let inbox = LatestVisibleDecodeDemandInbox()
     let first = [ThumbnailRequest(uid: PhotoUID(volumeID: "vol", nodeID: "first"))]
@@ -386,6 +401,74 @@ private actor PerUIDControlledLateLoader: ThumbnailBatchLoader {
     func finishedBatches() -> Int { finishedBatchCount }
 }
 
+private struct StubLocalThumbnails: LocalThumbnailLoading {
+    let image: DecodedThumbnail
+    var sizes: LocalRequestSizes?
+
+    func thumbnails(for uids: [PhotoUID], maxPixelSize: CGFloat) async -> [PhotoUID: DecodedThumbnail] {
+        await sizes?.record(maxPixelSize)
+        return Dictionary(uniqueKeysWithValues: uids.map { ($0, image) })
+    }
+}
+
+/// Answers once the test opens the gate.
+private struct GatedLocalThumbnails: LocalThumbnailLoading {
+    let image: DecodedThumbnail
+    let gate: LocalGate
+
+    func thumbnails(for uids: [PhotoUID], maxPixelSize: CGFloat) async -> [PhotoUID: DecodedThumbnail] {
+        await gate.wait()
+        return Dictionary(uniqueKeysWithValues: uids.map { ($0, image) })
+    }
+}
+
+private actor LocalGate {
+    private var isOpen = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+    private(set) var waiting = 0
+
+    func wait() async {
+        guard !isOpen else { return }
+        waiting += 1
+        await withCheckedContinuation { waiters.append($0) }
+    }
+
+    func open() {
+        isOpen = true
+        waiters.forEach { $0.resume() }
+        waiters.removeAll()
+    }
+}
+
+/// Never answers for `slow` until the request is cancelled; answers every other photo at once.
+private struct SlowLocalThumbnails: LocalThumbnailLoading {
+    let image: DecodedThumbnail
+    let slow: PhotoUID
+    let cancellations: LocalCancellations
+
+    func thumbnails(for uids: [PhotoUID], maxPixelSize: CGFloat) async -> [PhotoUID: DecodedThumbnail] {
+        if uids.contains(slow) {
+            await cancellations.recordStart()
+            try? await Task.sleep(for: .seconds(30))
+            if Task.isCancelled { await cancellations.record() }
+            return [:]
+        }
+        return Dictionary(uniqueKeysWithValues: uids.map { ($0, image) })
+    }
+}
+
+private actor LocalCancellations {
+    private(set) var count = 0
+    private(set) var starts = 0
+    func record() { count += 1 }
+    func recordStart() { starts += 1 }
+}
+
+private actor LocalRequestSizes {
+    private(set) var values: [CGFloat] = []
+    func record(_ size: CGFloat) { values.append(size) }
+}
+
 private actor PriorityRecordingLoader: PriorityThumbnailBatchLoader {
     private let payload: Data
     private var priorities: [ThumbnailPriority] = []
@@ -555,6 +638,226 @@ struct ThumbnailFeedCoreTests {
         #expect(warm.queuedNetwork == 1)
         try await Self.waitUntil { await feed.cachedDecoded(for: uid) != nil }
         #expect(await loader.recordedPriorities == [.visibleNow])
+    }
+
+    @Test func localPendingPhotosLoadFromTheDeviceOnly() async throws {
+        let local = PhotoUID(localPending: .photoLibrary, identifier: "asset-1")
+        let remoteLoader = PriorityRecordingLoader(payload: Self.pngData(width: 24, height: 24))
+        let localLoader = StubLocalThumbnails(image: Self.decodedThumb(16, 16))
+        let feed = ThumbnailFeedCore(
+            cache: Self.cache("local-pending"),
+            loader: remoteLoader,
+            configuration: Self.configuration(downloadConcurrencyLimit: 1, batchSize: 4)
+        )
+        await feed.setLocalThumbnailLoader(localLoader)
+
+        _ = await feed.warmVisibleDecoded([ThumbnailRequest(uid: local)], limit: 1)
+        try await Task.sleep(for: .milliseconds(50))
+        #expect(await feed.cachedDecoded(for: local) == nil, "an unauthorized local photo never loads")
+
+        await feed.setLocalAuthorization([local])
+        _ = await feed.warmVisibleDecoded([ThumbnailRequest(uid: local)], limit: 1)
+        try await Self.waitUntil { await feed.cachedDecoded(for: local) != nil }
+        #expect(await remoteLoader.recordedPriorities.isEmpty, "Proton never sees a local identity")
+
+        await feed.setLocalAuthorization([])
+        #expect(await feed.cachedDecoded(for: local) == nil, "leaving the pending set drops the image")
+    }
+
+    @Test func largerLocalRequestLoadsOnceAtTheNewSize() async throws {
+        let local = PhotoUID(localPending: .photoLibrary, identifier: "asset-3")
+        let sizes = LocalRequestSizes()
+        let feed = ThumbnailFeedCore(
+            cache: Self.cache("local-upgrade"),
+            loader: PriorityRecordingLoader(payload: Self.pngData(width: 24, height: 24)),
+            configuration: Self.configuration()
+        )
+        await feed.setLocalThumbnailLoader(StubLocalThumbnails(image: Self.decodedThumb(16, 16), sizes: sizes))
+        await feed.setLocalAuthorization([local])
+        _ = await feed.decoded(for: local)
+        #expect(feed.decodedNeedsSharperSource(local, forPixels: 64))
+
+        _ = await feed.warmVisibleDecoded([ThumbnailRequest(uid: local, pixelSize: 64)], limit: 1)
+        try await Self.waitUntil { !feed.decodedNeedsSharperSource(local, forPixels: 64) }
+        #expect(await sizes.values == [16, 64], "a smaller device source must not keep the tile asking again")
+        _ = await feed.warmVisibleDecoded([ThumbnailRequest(uid: local, pixelSize: 64)], limit: 1)
+        #expect(await sizes.values == [16, 64])
+    }
+
+    @Test func slowLocalLoadNeitherBlocksOthersNorOutlivesItsGrid() async throws {
+        let slow = PhotoUID(localPending: .photoLibrary, identifier: "slow")
+        let fast = PhotoUID(localPending: .photoLibrary, identifier: "fast")
+        let cancellations = LocalCancellations()
+        let feed = ThumbnailFeedCore(
+            cache: Self.cache("local-slow"),
+            loader: PriorityRecordingLoader(payload: Self.pngData(width: 24, height: 24)),
+            configuration: Self.configuration()
+        )
+        await feed.setLocalThumbnailLoader(
+            SlowLocalThumbnails(image: Self.decodedThumb(16, 16), slow: slow, cancellations: cancellations))
+        await feed.setLocalAuthorization([slow, fast])
+
+        feed.submitVisibleDiskDecodeDemand([ThumbnailRequest(uid: slow), ThumbnailRequest(uid: fast)])
+        try await Self.waitUntil { feed.memoryDecoded(for: fast) != nil }
+
+        // Another viewport replaces the queue but lets the running download finish.
+        feed.submitVisibleDiskDecodeDemand([ThumbnailRequest(uid: fast)])
+        try await Task.sleep(for: .milliseconds(100))
+        #expect(await cancellations.count == 0)
+
+        // The grid leaves the screen: its download stops, and a cancelled load is no failure.
+        await feed.endLocalVisibleDemand()
+        try await Self.waitUntil { await cancellations.count == 1 }
+        #expect(!feed.isKnownUnfetchable(slow))
+
+        // Returning while the cancelled load still finishes starts it again.
+        feed.submitVisibleDiskDecodeDemand([ThumbnailRequest(uid: slow)])
+        try await Self.waitUntil { await cancellations.starts == 2 }
+        await feed.endLocalVisibleDemand()
+        feed.submitVisibleDiskDecodeDemand([ThumbnailRequest(uid: slow)])
+        try await Self.waitUntil { await cancellations.starts == 3 }
+    }
+
+    @Test func localDemandBeforeAuthorizationLoadsOnceAuthorized() async throws {
+        let local = PhotoUID(localPending: .photoLibrary, identifier: "asset-5")
+        let feed = ThumbnailFeedCore(
+            cache: Self.cache("local-replay"),
+            loader: PriorityRecordingLoader(payload: Self.pngData(width: 24, height: 24)),
+            configuration: Self.configuration()
+        )
+        await feed.setLocalThumbnailLoader(StubLocalThumbnails(image: Self.decodedThumb(16, 16)))
+        feed.submitVisibleDiskDecodeDemand([ThumbnailRequest(uid: local, pixelSize: 16)])
+        try await Task.sleep(for: .milliseconds(50))
+        #expect(feed.memoryDecoded(for: local) == nil)
+
+        await feed.setLocalAuthorization([local])
+        try await Self.waitUntil { feed.memoryDecoded(for: local) != nil }
+    }
+
+    @Test func handoverAdoptsBeforeTheLocalImageIsDropped() async throws {
+        let local = PhotoUID(localPending: .photoLibrary, identifier: "asset-4")
+        let remote = Self.uid("handover")
+        let feed = ThumbnailFeedCore(
+            cache: Self.cache("handover"),
+            loader: PriorityRecordingLoader(payload: Self.pngData(width: 24, height: 24)),
+            configuration: Self.configuration()
+        )
+        await feed.setLocalThumbnailLoader(StubLocalThumbnails(image: Self.decodedThumb(16, 16)))
+        await feed.setLocalAuthorization([local])
+        _ = await feed.decoded(for: local)
+
+        await feed.setLocalAuthorization([], adoptions: [(local, remote)])
+        #expect(await feed.cachedDecoded(for: remote) != nil)
+        #expect(await feed.cachedDecoded(for: local) == nil)
+    }
+
+    @Test func handoverShowsThePendingImageBeforeTheScopeListsTheProtonPhoto() async throws {
+        let local = PhotoUID(localPending: .photoLibrary, identifier: "asset-7")
+        let remote = Self.uid("fresh-upload")
+        let feed = ThumbnailFeedCore(
+            cache: Self.cache("adopt-before-scope"),
+            loader: PriorityRecordingLoader(payload: Self.pngData(width: 24, height: 24)),
+            configuration: Self.configuration()
+        )
+        // The source scope lists the library but not the photo that just uploaded.
+        let graph = LibrarySourceGraph()
+        let change = Self.visibleScope(in: graph, uids: [Self.uid("older")])
+        #expect(await feed.bindDerivedDataEpoch(graph.runtimeEpoch))
+        _ = await feed.reconcile(
+            selected: change.selectedScope, analysis: change.analysisScope,
+            retention: change.thumbnailRetentionScope)
+        await feed.setLocalThumbnailLoader(StubLocalThumbnails(image: Self.decodedThumb(16, 16)))
+        await feed.setLocalAuthorization([local])
+        _ = await feed.decoded(for: local)
+
+        await feed.setLocalAuthorization([], adoptions: [(local, remote)])
+        #expect(feed.memoryDecoded(for: remote) != nil, "the handed-over tile must not turn black")
+
+        // Once the scope lists the photo, the image stays and needs no exception any more.
+        let listed = Self.visibleScope(in: graph, uids: [Self.uid("older"), remote])
+        _ = await feed.reconcile(
+            selected: listed.selectedScope, analysis: listed.analysisScope,
+            retention: listed.thumbnailRetentionScope)
+        #expect(feed.memoryDecoded(for: remote) != nil)
+    }
+
+    @Test func readingAnUnauthorizedPhotoKeepsEveryOtherImage() async throws {
+        let shown = PhotoUID(localPending: .photoLibrary, identifier: "asset-9")
+        let notYetAuthorized = PhotoUID(localPending: .photoLibrary, identifier: "asset-10")
+        let feed = ThumbnailFeedCore(
+            cache: Self.cache("unauthorized-read"),
+            loader: PriorityRecordingLoader(payload: Self.pngData(width: 24, height: 24)),
+            configuration: Self.configuration()
+        )
+        await feed.setLocalThumbnailLoader(StubLocalThumbnails(image: Self.decodedThumb(16, 16)))
+        await feed.setLocalAuthorization([shown])
+        _ = await feed.decoded(for: shown)
+
+        // The grid lists a new photo a moment before its authorization arrives, and a new Proton photo before the
+        // source scope covers it. Such a read misses; it must not empty the RAM tier the viewer opens from.
+        #expect(feed.memoryDecoded(for: notYetAuthorized) == nil)
+        #expect(feed.memoryDecoded(for: Self.uid("unlisted")) == nil)
+        #expect(await feed.decoded(for: notYetAuthorized) == nil)
+        #expect(feed.memoryDecoded(for: shown) != nil)
+    }
+
+    @Test func revisedLocalPhotoKeepsItsImageUntilTheNewOneLoads() async throws {
+        let local = PhotoUID(localPending: .photoLibrary, identifier: "asset-8")
+        let feed = ThumbnailFeedCore(
+            cache: Self.cache("local-refresh"),
+            loader: PriorityRecordingLoader(payload: Self.pngData(width: 24, height: 24)),
+            configuration: Self.configuration()
+        )
+        await feed.setLocalThumbnailLoader(StubLocalThumbnails(image: Self.decodedThumb(16, 16)))
+        await feed.setLocalAuthorization([local])
+        _ = await feed.decoded(for: local)
+
+        // The camera finished processing: a new revision loads while the quick image stays on screen.
+        let gate = LocalGate()
+        await feed.setLocalThumbnailLoader(GatedLocalThumbnails(image: Self.decodedThumb(32, 32), gate: gate))
+        let refresh = Task { await feed.refreshLocal([local]) }
+        try await Self.waitUntil { await gate.waiting == 1 }
+        #expect(feed.memoryDecoded(for: local)?.image.width == 16, "the tile must not turn black while it reloads")
+
+        await gate.open()
+        #expect(await refresh.value == [local])
+        #expect(feed.memoryDecoded(for: local)?.image.width == 32)
+        #expect(await feed.refreshLocal([Self.uid("remote")]).isEmpty, "only local photos refresh")
+    }
+
+    @Test func handoverReadsThePendingImageFromTheDeviceWhenRAMLostIt() async throws {
+        let local = PhotoUID(localPending: .photoLibrary, identifier: "asset-11")
+        let remote = Self.uid("uploaded-evicted")
+        let feed = ThumbnailFeedCore(
+            cache: Self.cache("handover-device"),
+            loader: PriorityRecordingLoader(payload: Self.pngData(width: 24, height: 24)),
+            configuration: Self.configuration()
+        )
+        // Authorized before a device loader exists, so the pending image never reaches RAM (as after an
+        // eviction) when its Proton photo takes over.
+        await feed.setLocalAuthorization([local])
+        #expect(feed.memoryDecoded(for: local) == nil)
+        await feed.setLocalThumbnailLoader(StubLocalThumbnails(image: Self.decodedThumb(16, 16)))
+        await feed.setLocalAuthorization([], adoptions: [(local, remote)])
+        try await Self.waitUntil { feed.memoryDecoded(for: remote) != nil }
+        #expect(feed.memoryDecoded(for: local) == nil)
+    }
+
+    @Test func protonPhotoAdoptsThePendingImage() async throws {
+        let local = PhotoUID(localPending: .photoLibrary, identifier: "asset-2")
+        let remote = Self.uid("adopted")
+        let feed = ThumbnailFeedCore(
+            cache: Self.cache("adopt"),
+            loader: PriorityRecordingLoader(payload: Self.pngData(width: 24, height: 24)),
+            configuration: Self.configuration()
+        )
+        await feed.setLocalThumbnailLoader(StubLocalThumbnails(image: Self.decodedThumb(16, 16)))
+        await feed.setLocalAuthorization([local])
+        _ = await feed.decoded(for: local)
+
+        let adopted = await feed.adoptDecoded(from: local, to: remote)
+        #expect(adopted)
+        #expect(await feed.cachedDecoded(for: remote) != nil)
     }
 
     @Test func equalPriorityQueueKeepsNearToFarOrder() async throws {

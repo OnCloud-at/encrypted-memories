@@ -49,6 +49,54 @@
         "en": { "stringUnit": { "state": "translated", "value": "Hide Text" } }
       }
     },
+    "loading.content": {
+      "localizations": {
+        "de": { "stringUnit": { "state": "translated", "value": "Wird geladen …" } },
+        "en": { "stringUnit": { "state": "translated", "value": "Loading …" } }
+      }
+    },
+    "action.undo": {
+      "localizations": {
+        "de": { "stringUnit": { "state": "translated", "value": "Widerrufen" } },
+        "en": { "stringUnit": { "state": "translated", "value": "Undo" } }
+      }
+    },
+    "pending.delete_notice": {
+      "localizations": {
+        "de": { "stringUnit": { "state": "translated", "value": "Aus dem Backup entfernt" } },
+        "en": { "stringUnit": { "state": "translated", "value": "Removed from backup" } }
+      }
+    },
+    "backup.excluded_title": {
+      "localizations": {
+        "de": { "stringUnit": { "state": "translated", "value": "Vom Backup ausgenommen" } },
+        "en": { "stringUnit": { "state": "translated", "value": "Excluded from Backup" } }
+      }
+    },
+    "backup.excluded_footer": {
+      "localizations": {
+        "de": { "stringUnit": { "state": "translated", "value": "Fotos, die du vor der Sicherung gelöscht hast. Sie bleiben in Apple Fotos." } },
+        "en": { "stringUnit": { "state": "translated", "value": "Photos you deleted before they were backed up. They stay in Apple Photos." } }
+      }
+    },
+    "backup.excluded_include": {
+      "localizations": {
+        "de": { "stringUnit": { "state": "translated", "value": "Wieder sichern" } },
+        "en": { "stringUnit": { "state": "translated", "value": "Back Up Again" } }
+      }
+    },
+    "backup.excluded_empty": {
+      "localizations": {
+        "de": { "stringUnit": { "state": "translated", "value": "Keine ausgenommenen Fotos" } },
+        "en": { "stringUnit": { "state": "translated", "value": "No excluded photos" } }
+      }
+    },
+    "viewer.local_media_unavailable": {
+      "localizations": {
+        "de": { "stringUnit": { "state": "translated", "value": "Dieses Foto ist auf diesem Gerät gerade nicht verfügbar." } },
+        "en": { "stringUnit": { "state": "translated", "value": "This photo isn’t available on this device right now." } }
+      }
+    },
     "contextmenu.share": {
       "localizations": {
         "de": { "stringUnit": { "state": "translated", "value": "Teilen" } },
@@ -3355,6 +3403,12 @@
             "value": "„%@“ konnte nicht gefunden werden."
           }
         }
+      }
+    },
+    "error.upload_source_not_ready %@": {
+      "localizations": {
+        "de": { "stringUnit": { "state": "translated", "value": "„%@“ wird noch von der Kamera bearbeitet." } },
+        "en": { "stringUnit": { "state": "translated", "value": "“%@” is still being processed by the camera." } }
       }
     },
     "error.upload_permission_denied %@": {

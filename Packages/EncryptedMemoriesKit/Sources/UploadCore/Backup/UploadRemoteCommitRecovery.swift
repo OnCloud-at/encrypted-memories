@@ -1,4 +1,5 @@
 import Foundation
+import PhotosCore
 
 /// Replays only durable local manifest settlement for uploads that already committed remotely.
 /// It deliberately has no uploader or normal dedupe-decision dependency, so recovery cannot send
@@ -9,15 +10,18 @@ public struct UploadRemoteCommitRecovery: Sendable {
     private let queue: any UploadBackupSyncQueueStore
     private let resolver: any BackupResourceResolving
     private let identityResolver: any UploadIdentityResolving
+    private let events: (any BackupItemEventSink)?
 
     public init(
         queue: any UploadBackupSyncQueueStore,
         resolver: any BackupResourceResolving,
-        identityResolver: any UploadIdentityResolving
+        identityResolver: any UploadIdentityResolving,
+        events: (any BackupItemEventSink)? = nil
     ) {
         self.queue = queue
         self.resolver = resolver
         self.identityResolver = identityResolver
+        self.events = events
     }
 
     /// Returns only after a complete scan found no remaining receipt. Each receipt is removed only
@@ -155,6 +159,20 @@ public struct UploadRemoteCommitRecovery: Sendable {
         reconciliation: UploadRemoteCommitReconciliation,
         entry: UploadBackupSyncQueueEntry
     ) async throws {
+        // The pending grid needs the handoff before the receipt disappears; a failed write keeps the receipt.
+        if reconciliation.source == entry.source,
+            events?.recordHandoff(
+                source: entry.source,
+                revision: entry.revision,
+                remote: PhotoUID(
+                    volumeID: reconciliation.receipt.remoteVolumeID,
+                    nodeID: reconciliation.receipt.remoteLinkID
+                ),
+                kind: .uploaded
+            ) == .failed
+        {
+            throw UploadRemoteCommitRecoveryError.storeUnavailable
+        }
         try await identityResolver.recordUploaded(
             descriptor,
             identity: reconciliation.identity,

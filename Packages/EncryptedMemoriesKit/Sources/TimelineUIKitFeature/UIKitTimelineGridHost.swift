@@ -34,6 +34,8 @@
         private let displayMode: TileContentDisplayMode
         private let selectionMode: Bool
         private let selectedUIDs: Set<PhotoUID>
+        /// Upload badges of pending photos and "Nicht gesichert" badges in the trash.
+        private let uploadBadges: PendingUploadBadges
         /// Whether this grid's surface is the active one (its tab is selected). When false the host stops its
         /// display link and cancels ahead-warm so a hidden grid never competes with menus/transitions on screen;
         /// defaults to true so a grid that is always visible (e.g. a pushed collection detail) behaves as before.
@@ -74,6 +76,7 @@
             displayMode: TileContentDisplayMode = .squareFillCrop,
             selectionMode: Bool = false,
             selectedUIDs: Set<PhotoUID> = [],
+            uploadBadges: PendingUploadBadges = .empty,
             isActive: Bool = true,
             scrollToLatestSignal: Int = 0,
             scrollToTopSignal: Int = 0,
@@ -102,6 +105,7 @@
             self.displayMode = displayMode
             self.selectionMode = selectionMode
             self.selectedUIDs = selectedUIDs
+            self.uploadBadges = uploadBadges
             self.isActive = isActive
             self.scrollToLatestSignal = scrollToLatestSignal
             self.scrollToTopSignal = scrollToTopSignal
@@ -165,7 +169,8 @@
                 level: level, gridProfile: gridProfile,
                 fillOrder: fillOrder,
                 initialViewportPlacement: initialViewportPlacement, displayMode: displayMode,
-                selectionMode: selectionMode, selectedUIDs: selectedUIDs)
+                selectionMode: selectionMode, selectedUIDs: selectedUIDs,
+                uploadBadges: uploadBadges)
             view.setActive(isActive)
             wireProxy(proxy, to: view)
             return view
@@ -192,7 +197,8 @@
                 level: level, gridProfile: gridProfile,
                 fillOrder: fillOrder,
                 initialViewportPlacement: initialViewportPlacement, displayMode: displayMode,
-                selectionMode: selectionMode, selectedUIDs: selectedUIDs)
+                selectionMode: selectionMode, selectedUIDs: selectedUIDs,
+                uploadBadges: uploadBadges)
             if shouldDissolveContent {
                 uiView.completeContentReplacementTransition(prefersReducedMotion: prefersReducedMotion)
             }
@@ -249,6 +255,10 @@
         private var device: MTLDevice?
         var renderer: MetalGridRenderer?
         var textureCache: MetalGridTextureCache<PhotoUID>?
+        /// Local photos edited in Apple Photos; their resident textures upload again.
+        private var pendingContentEpochs = PendingContentEpochTracker()
+        private var pendingHandovers = PendingHandoverTracker()
+        private let uploadBadgeAnimator = GridUploadBadgeAnimator<PhotoUID>()
         var texturePolicy: UIKitMetalGridTexturePolicy?
         private var texturePressureRegistration: MemoryPressureRegistration?
         var thumbnailFeed: UIKitThumbnailFeed?
@@ -500,10 +510,22 @@
             initialViewportPlacement: TimelineInitialViewportPlacement = .automatic,
             displayMode: TileContentDisplayMode = .squareFillCrop,
             selectionMode: Bool = false,
-            selectedUIDs: Set<PhotoUID> = []
+            selectedUIDs: Set<PhotoUID> = [],
+            uploadBadges: PendingUploadBadges = .empty
         ) {
             self.selectionMode = selectionMode
             self.selectedUIDs = selectedUIDs
+            // Upload badges change with progress; they never rebuild the item overlays.
+            thumbnailOverlayResolver.updateUploadBadges(uploadBadges)
+            for handover in pendingHandovers.newHandovers(in: uploadBadges.handovers) {
+                textureCache?.adoptTexture(from: handover.local, to: handover.remote)
+                uploadBadgeAnimator.adopt(from: handover.local, to: handover.remote)
+            }
+            let revisedContent = pendingContentEpochs.changes(in: uploadBadges.contentEpochs)
+            if !revisedContent.isEmpty {
+                textureCache?.markStale(revisedContent)
+                requestRender()
+            }
             swipeSelection.updateEnabled()
             let feedChanged = wiredFeed !== thumbnailFeed
             let contentChanged: Bool
@@ -725,6 +747,10 @@
             warmTask?.cancel()
             aheadWarmTask?.cancel()
             aheadWarmInFlight = false
+            // Local pending photos download from iCloud outside the warm task; stop the former viewport's loads.
+            if let feedCore = thumbnailFeed?.feedCore {
+                Task { await feedCore.endLocalVisibleDemand() }
+            }
             cancelLiveZoomState()
             swipeSelection.cancel()
             scrollInputActive = false
@@ -1438,7 +1464,9 @@
                 cache: textureCache, cpuPreparationMs: cpuPreparationMs,
                 drawableWaitMs: drawableWaitMs, frameBoundaryWaitMs: renderer.lastFrameBoundaryWaitMs,
                 rendererEncodeMs: renderer.lastEncodeMs, gpuMs: renderer.lastCompletedGpuMs)
-            let activeReveal = textureCache.hasActiveThumbnailReveal(in: uids, now: now)
+            let activeReveal =
+                textureCache.hasActiveThumbnailReveal(in: uids, now: now)
+                || uploadBadgeAnimator.isAnimating(uids, now: now)
             return .drawn(hasPendingWork: pinchSettling || warmInFlight || ramReadyMissing > 0 || activeReveal)
         }
 
@@ -1465,7 +1493,9 @@
             streamTransitionTextures(uids: uids, slotSidePoints: slotSide, textureCache: textureCache)
             let sourceResidentAfter = residentSlotCount(sourceSlots, textureCache: textureCache)
             let targetResidentAfter = residentSlotCount(targetSlots, textureCache: textureCache)
-            let activeReveal = textureCache.hasActiveThumbnailReveal(in: uids, now: now)
+            let activeReveal =
+                textureCache.hasActiveThumbnailReveal(in: uids, now: now)
+                || uploadBadgeAnimator.isAnimating(uids, now: now)
             textureCache.evictToBudget()
             let sourceGroups = MetalGridFrameComposer.buildGroups(
                 slots: MetalGridFrameComposer.viewportDrawSlots(sourceSlots, viewportSize: viewportSize),
@@ -1652,6 +1682,7 @@
                 forcePendingWork
                 || warmInFlight
                 || textureCache.hasActiveThumbnailReveal(in: ids.visible, now: now)
+                || uploadBadgeAnimator.isAnimating(ids.visible, now: now)
                 || ((uploadPending || streamResult.pendingVisibleQualityUpgrade) && canMakeProgress)
             perf.noteDraw(
                 visible: ids.visible.count, missing: missingVisible.count,
@@ -1758,6 +1789,8 @@
 
         private func productionDecorations() -> MetalGridDecorations<PhotoUID> {
             let accent = SIMD4<Float>(Float(0x6D) / 255, Float(0x4A) / 255, Float(0xFF) / 255, 1)
+            // One time for the whole frame, so every badge of the frame animates in step.
+            let frameTime = CACurrentMediaTime()
             return MetalGridDecorations(
                 accent: accent,
                 accentGlyphColor: MetalGridGlyphColor(
@@ -1767,7 +1800,10 @@
                 // just thumbnails + media overlays.
                 selected: selectionMode ? selectedUIDs : [],
                 favorites: [],
-                overlay: { [thumbnailOverlayResolver] uid in thumbnailOverlayResolver.overlay(for: uid) }
+                overlay: { [thumbnailOverlayResolver] uid in thumbnailOverlayResolver.overlay(for: uid) },
+                uploadBadgeFrame: { [uploadBadgeAnimator] uid, badge in
+                    uploadBadgeAnimator.frame(for: uid, target: badge, now: frameTime)
+                }
             )
         }
     }

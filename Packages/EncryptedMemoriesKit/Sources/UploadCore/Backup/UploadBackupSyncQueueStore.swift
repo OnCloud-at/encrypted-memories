@@ -13,6 +13,8 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
     private var db: OpaquePointer?
     private var operationFailed = false
     private let lock = NSLock()
+    private let observerLock = NSLock()
+    private var changeObserver: (@Sendable (UploadBackupSyncQueueChange) -> Void)?
 
     public init?(url: URL, policy: LibraryDatabasePolicy = .conservative) {
         try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -52,7 +54,7 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
     }
 
     @discardableResult
-    public func upsert(_ entry: UploadBackupSyncQueueEntry) -> Bool {
+    private func upsertUnobserved(_ entry: UploadBackupSyncQueueEntry) -> Bool {
         lock.withLock {
             var stmt: OpaquePointer?
             guard requireOperational(sqlite3_prepare_v2(db, Self.upsertSQL, -1, &stmt, nil) == SQLITE_OK) else {
@@ -65,7 +67,7 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
     }
 
     @discardableResult
-    public func upsertBatch(_ entries: [UploadBackupSyncQueueEntry]) -> Bool {
+    private func upsertBatchUnobserved(_ entries: [UploadBackupSyncQueueEntry]) -> Bool {
         guard !entries.isEmpty else { return true }
         return lock.withLock {
             var stmt: OpaquePointer?
@@ -288,7 +290,7 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
         }
     }
 
-    public func claimRunnable(limit: Int, claimedAt: Date) -> [UploadBackupSyncQueueEntry] {
+    private func claimRunnableUnobserved(limit: Int, claimedAt: Date) -> [UploadBackupSyncQueueEntry] {
         let clampedLimit = max(1, limit)
         return lock.withLock {
             guard requireOperational(sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK) else {
@@ -438,7 +440,7 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
     }
 
     @discardableResult
-    public func requeueStaleActive(before cutoff: Date, updatedAt: Date) -> Int {
+    private func requeueStaleActiveUnobserved(before cutoff: Date, updatedAt: Date) -> Int {
         lock.withLock {
             var stmt: OpaquePointer?
             guard
@@ -477,7 +479,7 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
     /// the user explicitly asks to back up again (or re-enables backup), so a manual "back up now"
     /// actually retries the items behind a "needs attention" state instead of being a no-op.
     @discardableResult
-    public func requeueFailed(updatedAt: Date) -> Int {
+    private func requeueFailedUnobserved(updatedAt: Date) -> Int {
         lock.withLock {
             var stmt: OpaquePointer?
             guard
@@ -502,7 +504,7 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
     /// Atomic manual retry: failed work receives a fresh retry budget, while draft/network-backed-off
     /// work keeps its attempt history but becomes due now. Successful and non-retryable rows never move.
     @discardableResult
-    public func makeRetryableWorkEligible(updatedAt: Date) -> Int {
+    private func makeRetryableWorkEligibleUnobserved(updatedAt: Date) -> Int {
         lock.withLock {
             var stmt: OpaquePointer?
             guard
@@ -534,7 +536,7 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
     }
 
     @discardableResult
-    public func updateState(
+    private func updateStateUnobserved(
         source: UploadSourceIdentity,
         revision: UploadBackupRevision,
         state: UploadBackupSyncQueueState,
@@ -583,7 +585,7 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
     }
 
     @discardableResult
-    public func markNeedsRemoteReconciliation(
+    private func markNeedsRemoteReconciliationUnobserved(
         source: UploadSourceIdentity,
         revision: UploadBackupRevision,
         reconciliation: UploadRemoteCommitReconciliation,
@@ -624,7 +626,7 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
     }
 
     @discardableResult
-    public func remove(source: UploadSourceIdentity, revision: UploadBackupRevision) -> Bool {
+    private func removeUnobserved(source: UploadSourceIdentity, revision: UploadBackupRevision) -> Bool {
         lock.withLock {
             var stmt: OpaquePointer?
             guard
@@ -649,7 +651,7 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
     }
 
     @discardableResult
-    public func removeSources(kind: UploadSourceIdentity.Kind, identifiers: [String]) -> Int {
+    private func removeSourcesUnobserved(kind: UploadSourceIdentity.Kind, identifiers: [String]) -> Int {
         let identifiers = Array(Set(identifiers))
         guard !identifiers.isEmpty else { return 0 }
         return lock.withLock {
@@ -691,7 +693,7 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
     /// Removes folder-backup rows that no longer belong to any registered folder root.
     /// Photo-library rows use a different source kind and are never affected.
     @discardableResult
-    public func removeFileSources(outsideRootPaths rootPaths: [String]) -> Int {
+    private func removeFileSourcesUnobserved(outsideRootPaths rootPaths: [String]) -> Int {
         let roots = Array(
             Set(
                 rootPaths.map {
@@ -1054,6 +1056,115 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
         }
     }
 
+    // MARK: - Observed writes
+
+    @discardableResult
+    public func upsert(_ entry: UploadBackupSyncQueueEntry) -> Bool {
+        let result = upsertUnobserved(entry)
+        if result { notify(UploadBackupSyncQueueChange(sources: [entry.source])) }
+        return result
+    }
+
+    @discardableResult
+    public func upsertBatch(_ entries: [UploadBackupSyncQueueEntry]) -> Bool {
+        let result = upsertBatchUnobserved(entries)
+        if result, !entries.isEmpty { notify(UploadBackupSyncQueueChange(sources: entries.map(\.source))) }
+        return result
+    }
+
+    public func claimRunnable(limit: Int, claimedAt: Date) -> [UploadBackupSyncQueueEntry] {
+        let claimed = claimRunnableUnobserved(limit: limit, claimedAt: claimedAt)
+        if !claimed.isEmpty { notify(UploadBackupSyncQueueChange(sources: claimed.map(\.source))) }
+        return claimed
+    }
+
+    @discardableResult
+    public func requeueStaleActive(before cutoff: Date, updatedAt: Date) -> Int {
+        let changed = requeueStaleActiveUnobserved(before: cutoff, updatedAt: updatedAt)
+        if changed > 0 { notify(.all) }
+        return changed
+    }
+
+    @discardableResult
+    public func requeueFailed(updatedAt: Date) -> Int {
+        let changed = requeueFailedUnobserved(updatedAt: updatedAt)
+        if changed > 0 { notify(.all) }
+        return changed
+    }
+
+    @discardableResult
+    public func makeRetryableWorkEligible(updatedAt: Date) -> Int {
+        let changed = makeRetryableWorkEligibleUnobserved(updatedAt: updatedAt)
+        if changed > 0 { notify(.all) }
+        return changed
+    }
+
+    @discardableResult
+    public func updateState(
+        source: UploadSourceIdentity,
+        revision: UploadBackupRevision,
+        state: UploadBackupSyncQueueState,
+        attempts: Int?,
+        lastError: String?,
+        updatedAt: Date
+    ) -> Bool {
+        let result = updateStateUnobserved(
+            source: source,
+            revision: revision,
+            state: state,
+            attempts: attempts,
+            lastError: lastError,
+            updatedAt: updatedAt
+        )
+        if result { notify(UploadBackupSyncQueueChange(sources: [source])) }
+        return result
+    }
+
+    @discardableResult
+    public func markNeedsRemoteReconciliation(
+        source: UploadSourceIdentity,
+        revision: UploadBackupRevision,
+        reconciliation: UploadRemoteCommitReconciliation,
+        lastError: String?,
+        updatedAt: Date
+    ) -> Bool {
+        let result = markNeedsRemoteReconciliationUnobserved(
+            source: source,
+            revision: revision,
+            reconciliation: reconciliation,
+            lastError: lastError,
+            updatedAt: updatedAt
+        )
+        if result { notify(UploadBackupSyncQueueChange(sources: [source])) }
+        return result
+    }
+
+    @discardableResult
+    public func remove(source: UploadSourceIdentity, revision: UploadBackupRevision) -> Bool {
+        let result = removeUnobserved(source: source, revision: revision)
+        if result { notify(UploadBackupSyncQueueChange(sources: [source])) }
+        return result
+    }
+
+    @discardableResult
+    public func removeSources(kind: UploadSourceIdentity.Kind, identifiers: [String]) -> Int {
+        let removed = removeSourcesUnobserved(kind: kind, identifiers: identifiers)
+        if removed > 0 { notify(.sources([kind: Set(identifiers)])) }
+        return removed
+    }
+
+    @discardableResult
+    public func removeFileSources(outsideRootPaths rootPaths: [String]) -> Int {
+        let removed = removeFileSourcesUnobserved(outsideRootPaths: rootPaths)
+        if removed > 0 { notify(.all) }
+        return removed
+    }
+
+    private func notify(_ change: UploadBackupSyncQueueChange) {
+        let observer = observerLock.withLock { changeObserver }
+        observer?(change)
+    }
+
     private let transient = SQLiteStoreSchemaGate.transientDestructor
 
     private func bindText(_ stmt: OpaquePointer?, _ index: Int32, _ value: String) {
@@ -1107,5 +1218,75 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
     private func requireOperational(_ condition: Bool) -> Bool {
         if !condition { operationFailed = true }
         return condition
+    }
+}
+
+extension UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueObserving {
+    public func setChangeObserver(_ observer: (@Sendable (UploadBackupSyncQueueChange) -> Void)?) {
+        observerLock.withLock { changeObserver = observer }
+    }
+
+    public func unsettledRows() -> [UploadBackupQueueRowState] {
+        rowStates(
+            where: """
+                state NOT IN ('alreadyBackedUp', 'completed', 'skippedRemoteDeletion', 'sourceMissing',
+                              'dismissedFailure')
+                """,
+            bind: nil
+        )
+    }
+
+    public func rows(kind: UploadSourceIdentity.Kind, identifiers: Set<String>) -> [UploadBackupQueueRowState] {
+        var result: [UploadBackupQueueRowState] = []
+        for identifier in identifiers {
+            result += rowStates(where: "source_kind=? AND source_id=?") { stmt in
+                self.bindText(stmt, 1, kind.rawValue)
+                self.bindText(stmt, 2, identifier)
+            }
+        }
+        return result
+    }
+
+    private func rowStates(
+        where condition: String,
+        bind: ((OpaquePointer?) -> Void)?
+    ) -> [UploadBackupQueueRowState] {
+        lock.withLock {
+            var stmt: OpaquePointer?
+            guard
+                requireOperational(
+                    sqlite3_prepare_v2(
+                        db,
+                        """
+                        SELECT source_kind, source_id, resource, revision_us, state, original_filename, updated_at
+                        FROM backup_sync_queue WHERE \(condition);
+                        """,
+                        -1, &stmt, nil
+                    ) == SQLITE_OK)
+            else { return [] }
+            defer { sqlite3_finalize(stmt) }
+            bind?(stmt)
+            var result: [UploadBackupQueueRowState] = []
+            var step = sqlite3_step(stmt)
+            while step == SQLITE_ROW {
+                if let source = sourceFromColumns(stmt, kindColumn: 0, idColumn: 1, resourceColumn: 2),
+                    let state = columnText(stmt, 4).flatMap(UploadBackupSyncQueueState.init(rawValue:))
+                {
+                    result.append(
+                        UploadBackupQueueRowState(
+                            source: source,
+                            revision: UploadBackupRevision(rawValue: sqlite3_column_int64(stmt, 3)),
+                            state: state,
+                            originalFilename: columnText(stmt, 5) ?? "",
+                            updatedAt: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 6))
+                        ))
+                } else {
+                    operationFailed = true
+                }
+                step = sqlite3_step(stmt)
+            }
+            if step != SQLITE_DONE { operationFailed = true }
+            return result
+        }
     }
 }

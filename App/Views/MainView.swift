@@ -11,6 +11,7 @@ import MapFeature
 import MediaByteCache
 import MediaCache
 import MediaLocationCore
+import PhotoLibraryBackupAdapter
 import PhotoViewerFeature
 import PhotosCore
 import ProtonDriveBackend
@@ -23,6 +24,7 @@ import UploadFeature
 
 struct MainView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.undoManager) private var undoManager
 
     let model: AppModel
     let facade: ProtonClientFacade
@@ -132,6 +134,8 @@ struct MainView: View {
     @State private var favorites: Set<PhotoUID> = []
     @State private var favoritesLoaded = false
     @State private var favoriteMutationsInFlight: Set<PhotoUID> = []
+    /// Offers to undo the last delete of photos that were not backed up yet.
+    @State private var undoNotice: UndoNoticeContent?
     /// Refresh routes and the library activity banner state.
     @State private var libraryRefresh = MacLibraryRefreshController()
     private let libraryChangeMonitor = LibraryChangeMonitor()
@@ -215,6 +219,7 @@ struct MainView: View {
             .task(id: model.albumCatalogRevision) { await loadAlbums() }
             .onAppear {
                 attachOfflineManager()
+                attachPendingGrid()
                 AppMemoryPressureCoordinator.shared.attachFeed(timelineModel.feed)
                 gridProxy.onContentReady = { revision in
                     renderedLibraryRevision = revision
@@ -264,7 +269,11 @@ struct MainView: View {
                 routeScrollGeneration += 1
                 Task { await timelineModel.select(newValue) }
             }
+            .onChange(of: model.pendingTrash.localUIDs) { _, _ in
+                timelineModel.setPendingTrash(model.pendingTrash)
+            }
             .onChange(of: timelineModel.wholeLibraryContentRevision) { _, _ in
+                model.pendingGrid?.setRemote(timelineModel.wholeLibraryTimeline)
                 let items = timelineModel.wholeLibraryItemsForViewer
                 OfflineLibraryManager.shared.liveAssetCount = items.count
                 // Kick off the low-priority GPS crawl (once) so the Map's location index fills in behind the
@@ -400,6 +409,9 @@ struct MainView: View {
             if let zoom { zoomOverlay(zoom) }
 
             uploadRefreshBanner
+
+            UndoNoticeOverlay(
+                notice: $undoNotice, bottomPadding: 64, leadingObstructionInset: leadingObstructionInset)
         }
         .background(
             // Reads the real top safe-area inset (= native toolbar height) so the zoom transition and the
@@ -605,9 +617,9 @@ struct MainView: View {
                     selectionMode: selectionMode,
                     media: backend,
                     metadataProvider: backend,
-                    favoriteUIDs: favorites,
+                    favoriteUIDs: displayedFavorites,
                     isOffline: !networkMonitor.isOnline,
-                    dragOutProvider: backend,
+                    dragOutProvider: media,
                     onDragOutFailed: { dragOutFailureMessage = $0.localizedMessage },
                     onSelectionChange: { selectedUIDs = $0 },
                     onOpen: { item, items in openPhoto(item, items, proxy: nil) }
@@ -987,9 +999,11 @@ struct MainView: View {
     private func makeViewer(_ item: PhotoItem, _ items: [PhotoItem]) -> PhotoViewerModel {
         let index = items.firstIndex(of: item) ?? 0
         let offline = OfflineLibraryManager.shared
+        // Pending photos that are not in Proton yet open from Apple Photos; everything else from Proton.
+        let media = self.media
         return PhotoViewerModel(
-            items: items, index: index, feed: feed, media: backend,
-            streamer: backend, metadataProvider: backend,
+            items: items, index: index, feed: feed, media: media,
+            streamer: media, metadataProvider: media,
             albumMembershipProvider: facade.albums,
             placeNameResolver: NativePlaceNameResolver.shared,
             knownLocationUIDs: Set(offline.locationIndex.coordinates.map(\.uid)),
@@ -998,6 +1012,54 @@ struct MainView: View {
             originalsCache: offline.originalsCache,
             cacheOriginals: offline.offlineEnabled,
             originalsCapBytes: offline.originalsCapBytes)
+    }
+
+    /// Shows local photos on their way to Proton in the whole-library grid.
+    private func attachPendingGrid() {
+        guard let session = model.pendingGrid else { return }
+        session.attachFeed(
+            timelineModel.feed.feedCore, imageRequest: PhotoKitPlatformImages.request, fileThumbnails: folderMedia)
+        session.presenter.onChange = { [timelineModel] presentation in
+            timelineModel.setPendingPresentation(presentation)
+        }
+        timelineModel.setPendingPresentation(session.presenter.current)
+        timelineModel.setPendingTrash(model.pendingTrash)
+        session.setRemote(timelineModel.wholeLibraryTimeline)
+    }
+
+    /// Favorites as the app shows them: Proton favorites plus the intents of pending photos.
+    private var displayedFavorites: Set<PhotoUID> {
+        _ = model.pendingFavoriteRevision
+        return model.pendingGrid?.displayedFavorites(favorites) ?? favorites
+    }
+
+    /// Pending files of the watched backup folders.
+    private var folderMedia: PendingFolderMedia? {
+        model.backupController.map { PendingFolderMedia(access: $0.pendingAccess) }
+    }
+
+    /// Viewer, export and drag-out media: pending photos from Apple Photos, every other photo from Proton.
+    private var media: LocalPendingMediaRouter {
+        LocalPendingMediaRouter(
+            remote: backend, remoteVideo: backend, imageRequest: PhotoKitPlatformImages.request, files: folderMedia)
+    }
+
+    /// Takes photos that are not backed up yet out of the backup; they stay in Apple Photos. The deletion can
+    /// be undone from the notice and with Edit > Undo.
+    private func excludeFromBackup(_ uids: [PhotoUID]) async -> Bool {
+        guard let session = model.pendingGrid, await session.delete(uids) else { return false }
+        let undo: @MainActor () -> Void = { [weak session] in
+            guard let session else { return }
+            Task { await session.restore(uids) }
+        }
+        undoManager?.registerUndo(withTarget: model) { _ in undo() }
+        undoManager?.setActionName(L10n.string("pending.delete_notice"))
+        undoNotice = UndoNoticeContent(message: L10n.string("pending.delete_notice"), systemImage: "icloud.slash") {
+            [undoManager] in
+            undoManager?.removeAllActions(withTarget: model)
+            undo()
+        }
+        return true
     }
 
     /// Registers this window's thumbnail feed with the shared offline-cache manager, so the Settings
@@ -1359,11 +1421,18 @@ struct MainView: View {
     /// Applies an optimistic favorite mutation for `selection`, rejecting a call that overlaps any
     /// mutation already in flight so a stale rollback cannot clobber a newer optimistic state.
     private func mutateFavorites(_ selection: Set<PhotoUID>) {
+        // One direction for the whole selection; the backup applies it to pending photos after their upload.
+        guard let target = FavoriteMutationPolicy.target(for: selection, current: displayedFavorites) else { return }
+        let split = LocalPendingSplit(selection)
+        if !split.local.isEmpty, let session = model.pendingGrid {
+            Task { await session.setFavorite(split.local, favorite: target) }
+        }
         guard
             let mutation = FavoriteMutationPolicy.request(
-                selection: selection,
+                selection: Set(split.remote),
                 current: favorites,
-                inFlight: favoriteMutationsInFlight
+                inFlight: favoriteMutationsInFlight,
+                target: target
             )
         else { return }
         favoriteMutationsInFlight.formUnion(mutation.requested)
@@ -1383,7 +1452,8 @@ struct MainView: View {
 
     /// Indicates whether every selected photo is a favorite.
     private var selectedAllFavorited: Bool {
-        !selectedUIDs.isEmpty && selectedUIDs.allSatisfy { favorites.contains($0) }
+        let favorites = displayedFavorites
+        return !selectedUIDs.isEmpty && selectedUIDs.allSatisfy { favorites.contains($0) }
     }
 
     private func rollbackFavoriteMutation(_ failed: Set<PhotoUID>, target: Bool) {
@@ -1454,11 +1524,25 @@ struct MainView: View {
     }
 
     private func trashPhotos(_ items: [PhotoItem], closeViewer: Bool) {
+        guard !items.isEmpty, !isTrashMutating else { return }
+        let local = items.filter(\.uid.isLocalPending).map(\.uid)
+        let items = items.filter { !$0.uid.isLocalPending }
         let uids = items.map(\.uid)
-        guard !uids.isEmpty, !isTrashMutating else { return }
         isTrashMutating = true
         Task {
             defer { isTrashMutating = false }
+            if !local.isEmpty {
+                guard await excludeFromBackup(local) else {
+                    trashActionFailureMessage = String(localized: "alert.trash_failed_message")
+                    return
+                }
+                if uids.isEmpty {
+                    selectionMode = false
+                    selectedUIDs = []
+                    if closeViewer { closePhoto() }
+                    return
+                }
+            }
             do {
                 try await backend.trash(uids)
                 await timelineModel.commitTrash(items)
@@ -1480,11 +1564,26 @@ struct MainView: View {
     }
 
     private func restorePhotos(_ items: [PhotoItem], closeViewer: Bool = false) {
+        guard !items.isEmpty, !isTrashMutating else { return }
+        let local = items.filter(\.uid.isLocalPending).map(\.uid)
+        let items = items.filter { !$0.uid.isLocalPending }
         let uids = items.map(\.uid)
-        guard !uids.isEmpty, !isTrashMutating else { return }
         isTrashMutating = true
         Task {
             defer { isTrashMutating = false }
+            if !local.isEmpty {
+                // A photo deleted before upload goes back into the backup queue.
+                guard await model.pendingGrid?.restore(local) == true else {
+                    trashActionFailureMessage = String(localized: "alert.restore_failed_message")
+                    return
+                }
+                if uids.isEmpty {
+                    selectionMode = false
+                    selectedUIDs = []
+                    if closeViewer { closePhoto() }
+                    return
+                }
+            }
             do {
                 try await backend.restore(uids)
                 await timelineModel.commitRestore(items)
@@ -1506,10 +1605,21 @@ struct MainView: View {
 
     private func emptyTrash() {
         let uids = Set(timelineModel.allItems.map(\.uid))
-        guard selection == .trash, !uids.isEmpty, !isEmptyingTrash else { return }
+        let pending = timelineModel.pendingTrash.items.map(\.uid)
+        guard selection == .trash, !uids.isEmpty || !pending.isEmpty, !isEmptyingTrash else { return }
         isEmptyingTrash = true
         Task {
             defer { isEmptyingTrash = false }
+            // Photos deleted before upload only leave the list; they stay excluded and stay in Apple Photos.
+            if !pending.isEmpty, await model.pendingGrid?.removeFromTrashList(pending) != true {
+                trashActionFailureMessage = L10n.string("trash.empty_failed_message")
+                return
+            }
+            guard !uids.isEmpty else {
+                selectedUIDs = []
+                selectionMode = false
+                return
+            }
             do {
                 try await backend.emptyTrash()
                 timelineModel.commitEmptyTrash(uids)
@@ -1530,10 +1640,7 @@ struct MainView: View {
         // The retained Core snapshot answers the whole-library selection without scanning every item on each
         // action. Filtered routes keep their active-route ordering and membership because their items can include
         // trash or album-only identities that are not present in the whole-library snapshot.
-        if timelineModel.filter == .all {
-            return timelineModel.allLibraryItems(matching: selectedUIDs)
-        }
-        return timelineModel.allItems.filter { selectedUIDs.contains($0.uid) }
+        return timelineModel.gridItems(matching: selectedUIDs)
     }
 
     private func scheduleSearchCommit(_ value: String) {
@@ -2100,7 +2207,7 @@ struct MainView: View {
                 } label: {
                     Label(L10n.string("trash.empty_button"), systemImage: "trash.slash").labelStyle(.iconOnly)
                 }
-                .disabled(timelineModel.allItems.isEmpty || isEmptyingTrash || isTrashMutating)
+                .disabled(timelineModel.gridItems.isEmpty || isEmptyingTrash || isTrashMutating)
                 .help(L10n.string("trash.empty_button"))
                 .accessibilityLabel(L10n.string("trash.empty_button"))
             }
@@ -2356,7 +2463,8 @@ struct MainView: View {
 
     /// Coordinates destination selection and UI state; transfer and file work remain off the main actor.
     @MainActor private func performExport(_ items: [PhotoItem], zipSuggestedName: String?) async {
-        let backend = self.backend
+        // Pending photos export from Apple Photos, every other photo from Proton.
+        let backend = self.media
         // Captures self only to push 0…1 onto the @State ring; the closure itself runs on the main actor.
         let onProgress: @Sendable (Double) -> Void = { p in Task { @MainActor in self.exportFraction = p } }
 

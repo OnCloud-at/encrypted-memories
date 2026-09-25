@@ -17,6 +17,8 @@ package final class MetalGridTextureCache<ID: Hashable & Sendable> {
     /// Start time for a real texture that replaced a visible placeholder. This is tied to the actual GPU
     /// residency transition, not to a platform view callback, so every Metal grid gets the same reveal.
     private var thumbnailRevealStartedAt: [ID: Double] = [:]
+    /// Resident textures whose photo has a newer image; see `markStale`.
+    private var staleTextures = Set<ID>()
     package private(set) var placeholderTexture: MTLTexture
 
     /// Rolling per-frame accounting (reset each `beginFrame`).
@@ -327,10 +329,59 @@ package final class MetalGridTextureCache<ID: Hashable & Sendable> {
         }
         for id in evicted {
             textures.removeValue(forKey: id)
+            staleTextures.remove(id)
             thumbnailRevealStartedAt.removeValue(forKey: id)
         }
         evictionsThisFrame = evicted.count
         evictMsThisFrame += Self.elapsedMilliseconds(since: start)
+    }
+
+    /// Marks the textures of photos whose content changed (a new revision of a pending photo). They keep
+    /// drawing until `replaceStaleResident` uploads the new image, so the tile never flashes the placeholder.
+    package func markStale(_ ids: [ID]) {
+        for id in ids where textures[id] != nil { staleTextures.insert(id) }
+    }
+
+    package func isStale(_ id: ID) -> Bool { staleTextures.contains(id) }
+
+    /// A pending photo became its Proton photo: the Proton identity draws the same texture at once, with no
+    /// upload and no fade. The texture is shared; residency counts it for both until the pending one is evicted.
+    package func adoptTexture(from source: ID, to target: ID) {
+        guard textures[target] == nil, !lru.isInFlight(target), let texture = textures[source] else { return }
+        textures[target] = texture
+        lru.completeUpload(target, cost: texture.width * texture.height * 4)
+        if staleTextures.contains(source) { staleTextures.insert(target) }
+    }
+
+    /// Replaces stale visible textures in place, within the frame's upload budget. A texture whose new image is
+    /// not in memory yet keeps drawing until it is.
+    package func replaceStaleResident(_ ids: [ID], provideImage: (ID) -> CGImage?) {
+        for id in ids where staleTextures.contains(id) {
+            guard uploadsThisFrame < budget.maxUploadsPerFrame, !uploadTimeBudgetExhausted else {
+                pendingUpgradesThisFrame = true
+                return
+            }
+            guard let current = residentMetrics(for: id) else {
+                staleTextures.remove(id)
+                continue
+            }
+            guard let image = provideImage(id) else { continue }
+            let size = uploadPixelSize(for: image, cap: effectiveMaxTexturePixels)
+            let newBytes = size.width * size.height * 4
+            if uploadsThisFrame > 0, uploadBytesThisFrame + newBytes > budget.maxUploadBytesPerFrame {
+                pendingUpgradesThisFrame = true
+                return
+            }
+            guard lru.canReplaceResident(id, oldCost: current.bytes, newCost: newBytes) else { continue }
+            let start = ContinuousClock.now
+            guard let texture = makeTexture(from: image, width: size.width, height: size.height) else { continue }
+            uploadMsThisFrame += Self.elapsedMilliseconds(since: start)
+            textures[id] = texture
+            staleTextures.remove(id)
+            uploadBytesThisFrame += newBytes
+            uploadsThisFrame += 1
+            lru.completeUpload(id, cost: newBytes)
+        }
     }
 
     /// Governor-driven memory-pressure response: set the resident ceiling scale (`1.0` = full budget,
@@ -477,6 +528,11 @@ package final class MetalGridTextureCache<ID: Hashable & Sendable> {
             color: color
         )
         return glyphTexture(for: request)
+    }
+
+    /// A cached upload badge texture. About 80 small glyphs (fill and checkmark steps) stay resident.
+    package func uploadBadgeTexture(_ glyph: GridUploadBadgeGlyph) -> MTLTexture? {
+        glyphTexture(for: MetalGridGlyphRequest(uploadBadge: glyph))
     }
 
     private func glyphTexture(for request: MetalGridGlyphRequest) -> MTLTexture? {

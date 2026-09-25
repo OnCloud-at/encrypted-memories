@@ -31,7 +31,7 @@ import SwiftUI
             itemCount: items.count, isTrash: context == .trash,
             canMutate: model.backend != nil && !isBusy,
             canFavorite: model.favoriteMutationsInFlight.isDisjoint(with: uids),
-            allFavorited: uids.isSubset(of: model.favoriteUIDs),
+            allFavorited: uids.isSubset(of: model.displayedFavoriteUIDs),
             canAddToAlbum: model.albumActions?.canAddPhotos == true,
             canRemoveFromAlbum: albumID != nil)
     }

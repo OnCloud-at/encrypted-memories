@@ -54,6 +54,20 @@ public struct TimelineSnapshot: Sendable {
         self.init(items: result.items, indexByUID: result.indexByUID)
     }
 
+    /// Builds a presentation snapshot whose order the caller owns. The pending grid keeps a photo in the
+    /// position of its local tile after upload, which can differ from `TimelineOrder` within one second, so
+    /// this initializer never re-sorts. Duplicate uids keep their first occurrence.
+    public init(trustingOrderOf items: [PhotoItem]) {
+        var unique: [PhotoItem] = []
+        unique.reserveCapacity(items.count)
+        var map = [PhotoUID: Int](minimumCapacity: items.count)
+        for item in items where map[item.uid] == nil {
+            map[item.uid] = unique.count
+            unique.append(item)
+        }
+        self.init(items: unique, indexByUID: map)
+    }
+
     private init(items: [PhotoItem], indexByUID: [PhotoUID: Int]) {
         self.items = items
         self.indexByUID = indexByUID
