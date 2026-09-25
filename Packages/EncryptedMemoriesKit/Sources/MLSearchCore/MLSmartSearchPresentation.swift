@@ -14,6 +14,9 @@ public struct MLSmartSearchPresentation: Sendable, Equatable {
     public let indexedCount: Int
     public let totalCount: Int
     public let modelSizeText: String?
+    /// Media that could not be analyzed. They stay in the library; settings keep this behind an info button so a
+    /// finished index still reads as ready.
+    public let unavailableNote: String?
     public let canRetry: Bool
     public let isBusy: Bool
     /// Lets the shared settings view use completed-state iconography without re-deriving policy.
@@ -26,6 +29,7 @@ public struct MLSmartSearchPresentation: Sendable, Equatable {
         var total = 0
         var retry = false
         var ready = false
+        var unavailable: String?
 
         let aggregateStatus: String?
         if snapshot.isEnabled {
@@ -49,7 +53,10 @@ public struct MLSmartSearchPresentation: Sendable, Equatable {
                 indexed = progress.settledWorkUnits
                 total = progress.totalWorkUnits
                 ready = true
-                detail = Self.unavailableDetail(progress)
+                unavailable = Self.unavailableNote(
+                    count: progress.permanentlyUnavailableAssets,
+                    reasons: Array(progress.unavailableAssetReasons.keys)
+                )
             case .failed(let failure):
                 aggregateStatus = Self.failureStatus(failure)
                 retry = failure.isRetryable
@@ -106,17 +113,19 @@ public struct MLSmartSearchPresentation: Sendable, Equatable {
                     status = L10n.string("mlsearch.status_waiting")
                 }
                 if total > 0, detail == nil {
-                    detail = Self.coverageDetail(coverage)
+                    detail = L10n.string("mlsearch.indexed_count \(coverage.indexed) \(coverage.total)")
                     fraction = coverage.accountedFraction
                 }
+                unavailable = Self.unavailableNote(count: coverage.permanentlyUnindexable, reasons: [])
             case .ready(let coverage):
                 indexed = coverage.indexed
                 total = coverage.total
                 status = Self.readyStatus
                 ready = true
                 if total > 0 {
-                    detail = Self.readyCoverageDetail(coverage)
+                    detail = L10n.string("mlsearch.ready_count \(coverage.indexed)")
                 }
+                unavailable = Self.unavailableNote(count: coverage.permanentlyUnindexable, reasons: [])
             case .switchingModel:
                 status = L10n.string("mlsearch.status_switching")
             case .deleting:
@@ -142,6 +151,7 @@ public struct MLSmartSearchPresentation: Sendable, Equatable {
             modelBytes > 0
             ? L10n.fileSize(modelBytes)
             : nil
+        self.unavailableNote = unavailable
         self.canRetry = retry
         self.isBusy =
             snapshot.phase.isBusy
@@ -171,33 +181,15 @@ public struct MLSmartSearchPresentation: Sendable, Equatable {
         L10n.string("mlsearch.status_ready \(productName)")
     }
 
-    private static func coverageDetail(_ coverage: MLIndexCoverage) -> String {
-        if coverage.permanentlyUnindexable > 0 {
-            return L10n.string(
-                "mlsearch.indexed_with_failures \(coverage.indexed) \(coverage.total) \(coverage.permanentlyUnindexable)"
-            )
-        }
-        return L10n.string("mlsearch.indexed_count \(coverage.indexed) \(coverage.total)")
-    }
-
-    private static func readyCoverageDetail(_ coverage: MLIndexCoverage) -> String {
-        if coverage.permanentlyUnindexable > 0 {
-            return L10n.string(
-                "mlsearch.ready_with_unavailable \(coverage.indexed) \(coverage.permanentlyUnindexable)"
-            )
-        }
-        return L10n.string("mlsearch.ready_count \(coverage.indexed)")
-    }
-
     private static func aggregateDetail(_ progress: MLSmartSearchAggregateProgress) -> String? {
         guard let fraction = progress.fraction else { return nil }
         return L10n.string("mlsearch.work_progress_percent \(Int((fraction * 100).rounded()))")
     }
 
-    private static func unavailableDetail(_ progress: MLSmartSearchAggregateProgress) -> String? {
-        guard progress.permanentlyUnavailableAssets > 0 else { return nil }
-        let count = L10n.string("mlsearch.work_unavailable \(progress.permanentlyUnavailableAssets)")
-        let reasons = progress.unavailableAssetReasons.keys.sorted { $0.rawValue < $1.rawValue }.map {
+    private static func unavailableNote(count: Int, reasons: [MLPipelineFailureReason]) -> String? {
+        guard count > 0 else { return nil }
+        let note = L10n.string("mlsearch.unavailable_note \(count)")
+        let names = reasons.sorted { $0.rawValue < $1.rawValue }.map {
             switch $0 {
             case .sourceCorrupt: L10n.string("mlsearch.failure_source_corrupt")
             case .invalidArtifactContract: L10n.string("mlsearch.failure_invalid_artifact")
@@ -206,7 +198,8 @@ public struct MLSmartSearchPresentation: Sendable, Equatable {
             case .retryLimitReached: L10n.string("mlsearch.failure_retry_limit")
             }
         }
-        return reasons.isEmpty ? count : "\(count) · \(reasons.joined(separator: ", "))"
+        guard !names.isEmpty else { return note }
+        return note + "\n\n" + L10n.string("mlsearch.unavailable_reasons \(names.joined(separator: ", "))")
     }
 
     fileprivate static func failureStatus(_ failure: MLSmartSearchFailure) -> String {

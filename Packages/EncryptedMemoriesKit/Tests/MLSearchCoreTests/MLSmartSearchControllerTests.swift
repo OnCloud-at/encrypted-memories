@@ -111,6 +111,40 @@ import Testing
         #expect(presentation.totalCount == 300)
     }
 
+    @Test func finishedIndexStaysCalmAndKeepsUnanalyzedMediaBehindTheInfo() {
+        let progress = MLSmartSearchAggregateProgress(
+            totalWorkUnits: 100, settledWorkUnits: 100, permanentlyUnavailableAssets: 8,
+            unavailableAssetReasons: [.analysisFailed: 8])
+        let presentation = MLSmartSearchPresentation(
+            snapshot: MLSmartSearchSnapshot(
+                isEnabled: true,
+                selectedModelID: MLModelID("model"),
+                phase: .ready(.init(total: 100, indexed: 92, permanentlyUnindexable: 8)),
+                installedModelBytes: 0,
+                availableModels: [],
+                isSearchAvailable: true,
+                indexingState: .ready(progress)
+            ))
+
+        #expect(presentation.presentsAsReady)
+        #expect(presentation.detailText == nil)
+        #expect(!presentation.canRetry)
+        let note = try? #require(presentation.unavailableNote)
+        #expect(note?.hasPrefix(L10n.string("mlsearch.unavailable_note \(8)")) == true)
+        #expect(note?.contains(L10n.string("mlsearch.failure_analysis")) == true)
+    }
+
+    @Test func completeIndexHasNoInfo() {
+        let progress = MLSmartSearchAggregateProgress(
+            totalWorkUnits: 10, settledWorkUnits: 10, permanentlyUnavailableAssets: 0)
+        let presentation = MLSmartSearchPresentation(
+            snapshot: MLSmartSearchSnapshot(
+                isEnabled: true, selectedModelID: MLModelID("model"),
+                phase: .ready(.init(total: 10, indexed: 10, permanentlyUnindexable: 0)),
+                installedModelBytes: 0, availableModels: [], isSearchAvailable: true, indexingState: .ready(progress)))
+        #expect(presentation.unavailableNote == nil)
+    }
+
     @Test func modelThatDoesNotFitNamesTheSpaceItNeeds() {
         let required: Int64 = 1_000_000_000
         let snapshot = MLSmartSearchSnapshot(

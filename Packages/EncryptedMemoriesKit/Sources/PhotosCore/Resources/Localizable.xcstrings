@@ -1152,14 +1152,6 @@
         "de": { "stringUnit": { "state": "translated", "value": "%lld Fotos und Videos sind durchsuchbar." } }
       }
     },
-    "mlsearch.ready_with_unavailable %lld %lld": {
-      "extractionState": "manual",
-      "comment": "Ready search detail. First number: searchable photos. Second: photos that cannot be processed.",
-      "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "%lld photos and videos are searchable. %lld could not be added." } },
-        "de": { "stringUnit": { "state": "translated", "value": "%lld Fotos und Videos sind durchsuchbar. %lld konnten nicht hinzugefügt werden." } }
-      }
-    },
     "mlsearch.status_switching": {
       "extractionState": "manual",
       "comment": "Smart Search status: switching to another model.",
@@ -1247,6 +1239,44 @@
         "de": { "stringUnit": { "state": "translated", "value": "Benötigt werden %@ freier Speicher." } }
       }
     },
+    "mlsearch.unavailable_title": {
+      "extractionState": "manual",
+      "comment": "Title of the info alert about media that Smart Search could not analyze.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Not Searchable" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Nicht durchsuchbar" } }
+      }
+    },
+    "mlsearch.unavailable_note %lld": {
+      "extractionState": "manual",
+      "comment": "Info alert text for media that Smart Search could not analyze.",
+      "localizations": {
+        "en": {
+          "variations": {
+            "plural": {
+              "one": { "stringUnit": { "state": "translated", "value": "%lld photo or video couldn't be analyzed. It stays in your library but can't be found by its content." } },
+              "other": { "stringUnit": { "state": "translated", "value": "%lld photos or videos couldn't be analyzed. They stay in your library but can't be found by their content." } }
+            }
+          }
+        },
+        "de": {
+          "variations": {
+            "plural": {
+              "one": { "stringUnit": { "state": "translated", "value": "%lld Foto oder Video ließ sich nicht analysieren. Es bleibt in deiner Mediathek, wird aber nicht über seinen Inhalt gefunden." } },
+              "other": { "stringUnit": { "state": "translated", "value": "%lld Fotos oder Videos ließen sich nicht analysieren. Sie bleiben in deiner Mediathek, werden aber nicht über ihren Inhalt gefunden." } }
+            }
+          }
+        }
+      }
+    },
+    "mlsearch.unavailable_reasons %@": {
+      "extractionState": "manual",
+      "comment": "Second paragraph of the info alert; the argument lists the analysis failure reasons.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Reason: %@" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Grund: %@" } }
+      }
+    },
     "mlsearch.status_failed_storage": {
       "extractionState": "manual",
       "comment": "Smart Search error: the local index database is unavailable.",
@@ -1261,14 +1291,6 @@
       "localizations": {
         "en": { "stringUnit": { "state": "translated", "value": "%lld%% complete" } },
         "de": { "stringUnit": { "state": "translated", "value": "%lld%% abgeschlossen" } }
-      }
-    },
-    "mlsearch.work_unavailable %lld": {
-      "extractionState": "manual",
-      "comment": "Aggregate Smart Search completion detail grouped by unique media assets, never artifact work units.",
-      "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "%lld media unavailable" } },
-        "de": { "stringUnit": { "state": "translated", "value": "%lld Medien nicht verfügbar" } }
       }
     },
     "mlsearch.failure_source_corrupt": {
@@ -1312,14 +1334,6 @@
       "localizations": {
         "en": { "stringUnit": { "state": "translated", "value": "%lld of %lld photos and videos prepared" } },
         "de": { "stringUnit": { "state": "translated", "value": "%lld von %lld Fotos und Videos vorbereitet" } }
-      }
-    },
-    "mlsearch.indexed_with_failures %lld %lld %lld": {
-      "extractionState": "manual",
-      "comment": "Index coverage detail. Values: searchable photos, total photos, photos that could not be indexed.",
-      "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "%lld of %lld photos searchable; %lld could not be indexed" } },
-        "de": { "stringUnit": { "state": "translated", "value": "%lld von %lld Fotos durchsuchbar; %lld konnten nicht indexiert werden" } }
       }
     },
     "mlsearch.privacy_note %@": {

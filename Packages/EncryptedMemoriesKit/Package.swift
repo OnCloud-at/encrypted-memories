@@ -308,7 +308,7 @@ let package = Package(
             name: "MLSearchBackgroundAppleAdapter", dependencies: ["MLSearchCore", "PhotosCore"],
             swiftSettings: disableDynamicActorIsolation),
         .target(
-            name: "MLSearchFeature", dependencies: ["MLSearchCore", "PhotosCore", "TimelineCore"],
+            name: "MLSearchFeature", dependencies: ["MLSearchCore", "PhotosCore", "TimelineCore", "DesignSystemCore"],
             swiftSettings: disableDynamicActorIsolation),
         .testTarget(
             name: "MLSearchFeatureTests",

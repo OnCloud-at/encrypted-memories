@@ -619,7 +619,7 @@ private struct PhotoLibraryBackupSection: View {
                             }
                         }
                         if let skipped = display.localizedRemoteDeletionDetail {
-                            BackupRemoteDeletionInfoButton(message: skipped)
+                            InfoButton(title: L10n.string("backup.remote_deletions_info_title"), message: skipped)
                                 .transition(.opacity.combined(with: .move(edge: .top)))
                         }
                     }

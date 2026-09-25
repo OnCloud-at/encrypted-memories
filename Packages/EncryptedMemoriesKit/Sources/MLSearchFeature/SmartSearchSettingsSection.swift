@@ -1,3 +1,4 @@
+import DesignSystemCore
 import Foundation
 import MLSearchCore
 import PhotosCore
@@ -277,6 +278,23 @@ public struct SmartSearchSettingsSection: View {
     private var statusRows: some View {
         let presentation = controller.presentation
 
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            statusSummary(presentation)
+            if let note = presentation.unavailableNote {
+                InfoButton(title: L10n.string("mlsearch.unavailable_title"), message: note)
+            }
+        }
+
+        if presentation.canRetry {
+            Button {
+                controller.retry()
+            } label: {
+                Label(L10n.string("action.retry"), systemImage: "arrow.clockwise")
+            }
+        }
+    }
+
+    private func statusSummary(_ presentation: MLSmartSearchPresentation) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(alignment: .firstTextBaseline, spacing: 10) {
                 Image(systemName: statusSymbolName)
@@ -305,14 +323,6 @@ public struct SmartSearchSettingsSection: View {
         .accessibilityElement(children: .combine)
         .accessibilityLabel(Text(presentation.statusText))
         .accessibilityValue(Text(presentation.detailText ?? ""))
-
-        if presentation.canRetry {
-            Button {
-                controller.retry()
-            } label: {
-                Label(L10n.string("action.retry"), systemImage: "arrow.clockwise")
-            }
-        }
     }
 
     private var statusSymbolName: String {
