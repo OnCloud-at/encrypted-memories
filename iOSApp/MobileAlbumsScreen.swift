@@ -392,7 +392,7 @@ private struct MobileFilterGridScreen: View {
     @ViewBuilder private var gridContent: some View {
         switch phase {
         case .loading:
-            ProgressView().controlSize(.large).tint(ProtonColor.primary)
+            GridLoadingMark()
         case .failed(let message):
             ContentUnavailableView {
                 Label(String(localized: "albums.detail_load_failed"), systemImage: "exclamationmark.icloud")

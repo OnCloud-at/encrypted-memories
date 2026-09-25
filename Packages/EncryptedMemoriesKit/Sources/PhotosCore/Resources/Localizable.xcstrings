@@ -49,6 +49,12 @@
         "en": { "stringUnit": { "state": "translated", "value": "Hide Text" } }
       }
     },
+    "loading.content": {
+      "localizations": {
+        "de": { "stringUnit": { "state": "translated", "value": "Wird geladen …" } },
+        "en": { "stringUnit": { "state": "translated", "value": "Loading …" } }
+      }
+    },
     "contextmenu.share": {
       "localizations": {
         "de": { "stringUnit": { "state": "translated", "value": "Teilen" } },

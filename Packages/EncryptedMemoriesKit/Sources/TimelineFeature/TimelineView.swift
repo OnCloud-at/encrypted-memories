@@ -102,9 +102,7 @@ public struct TimelineView: View {
                     OfflineContentUnavailableView()
                         .padding(.leading, leadingInset)
                 } else {
-                    LoadingMark()
-                        .frame(width: 64, height: 64)
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    GridLoadingMark()
                         .padding(.leading, leadingInset)
                 }
             case .empty:
