@@ -517,7 +517,7 @@
             thumbnailOverlayResolver.updateUploadBadges(uploadBadges)
             let revisedContent = pendingContentEpochs.changes(in: uploadBadges.contentEpochs)
             if !revisedContent.isEmpty {
-                textureCache?.invalidate(revisedContent)
+                textureCache?.markStale(revisedContent)
                 requestRender()
             }
             swipeSelection.updateEnabled()

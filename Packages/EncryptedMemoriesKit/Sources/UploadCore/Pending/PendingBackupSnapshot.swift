@@ -3,7 +3,7 @@ import PhotosCore
 
 /// The upload state a pending tile shows.
 public enum PendingUploadBadge: Sendable, Equatable {
-    /// Waiting, checking, retrying or paused: the ring track only.
+    /// Waiting, checking, retrying or paused: the empty circle.
     case waiting
     /// Bytes are moving: `step` of `BackupProgressStep.count`.
     case uploading(step: Int)
@@ -56,7 +56,7 @@ public struct PendingBackupSnapshot: Sendable, Equatable {
     public let progressRevision: UInt64
     /// Grid tiles in `TimelineOrder`.
     public let tiles: [PendingTile]
-    /// Ring steps of the few sources whose bytes move right now, keyed by local UID.
+    /// Progress steps of the few sources whose bytes move right now, keyed by local UID.
     public let progress: [PhotoUID: Int]
     /// Deleted pending photos listed in "Zuletzt gelöscht", newest deletion first.
     public let trashTiles: [PendingTile]

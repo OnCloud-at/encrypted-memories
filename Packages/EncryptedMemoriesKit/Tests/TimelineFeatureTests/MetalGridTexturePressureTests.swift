@@ -37,6 +37,33 @@ import Testing
     }
 
     @Test(.enabled(if: MTLCreateSystemDefaultDevice() != nil))
+    func changedPhotoKeepsItsTextureUntilTheNewImageUploads() throws {
+        let cache = try #require(makeCache())
+        let image = try #require(makeImage())
+        let photo = uid("revised")
+        cache.beginFrame(pinned: [photo])
+        cache.uploadVisible(wanted: [photo]) { _ in image }
+        let old = cache.texture(for: photo)
+
+        // A new revision: the tile keeps drawing its texture, never the placeholder.
+        cache.markStale([photo])
+        #expect(cache.isResident(photo) && cache.isStale(photo))
+        #expect(cache.texture(for: photo) === old)
+
+        // The new image is not in memory yet: the old texture stays.
+        cache.beginFrame(pinned: [photo])
+        cache.replaceStaleResident([photo]) { _ in nil }
+        #expect(cache.texture(for: photo) === old && cache.isStale(photo))
+
+        let newer = try #require(makeImage(side: 32))
+        cache.beginFrame(pinned: [photo])
+        cache.replaceStaleResident([photo]) { _ in newer }
+        #expect(cache.texture(for: photo) !== old)
+        #expect(cache.isResident(photo) && !cache.isStale(photo))
+        #expect(cache.thumbnailRevealOpacity(for: photo, now: 0) == 1, "a replaced texture does not fade in again")
+    }
+
+    @Test(.enabled(if: MTLCreateSystemDefaultDevice() != nil))
     func pressureScaleShedsOffscreenResidencyButNeverTheVisiblePinnedSet() throws {
         let cache = try #require(makeCache())
         let image = try #require(makeImage())

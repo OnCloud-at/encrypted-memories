@@ -19,7 +19,7 @@ package struct GridThumbnailOverlay: Equatable, Sendable {
     package static let empty = GridThumbnailOverlay()
 }
 
-/// Upload state shown on a pending tile: an empty ring while waiting, a filling ring while bytes move, a
+/// Upload state shown on a pending tile: an empty circle while waiting, a circle that fills while bytes move, a
 /// checkmark once backed up, and an exclamation mark for a failure that needs the person.
 package enum GridUploadBadge: Equatable, Hashable, Sendable {
     package static let progressSteps = 20

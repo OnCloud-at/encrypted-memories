@@ -1,8 +1,9 @@
 import CoreGraphics
 import GridCore
 
-/// Draws upload badges with CoreGraphics only, for every platform alike. A dark translucent disc keeps the
-/// white ring legible on bright photos; the checkmark uses a white disc, like other system badges.
+/// Draws upload badges with CoreGraphics only, for every platform alike. A dark translucent disc with a white
+/// outline keeps the badge legible on bright photos. Progress fills the disc with white like a pie until it is
+/// solid; the checkmark then shows on that white disc.
 package enum MetalGridUploadBadgeImage {
     /// The SF Symbol a platform rasterizer renders for `badge`, when the badge carries one.
     package static func symbolName(for badge: GridUploadBadge) -> String? { badge.symbolName }
@@ -26,13 +27,11 @@ package enum MetalGridUploadBadgeImage {
         context.setShouldAntialias(true)
         switch badge {
         case .waiting:
-            drawDisc(context, disc)
-            drawRing(context, in: disc, fraction: 0)
+            drawPie(context, in: disc, fraction: 0)
         case .uploading(let step):
-            drawDisc(context, disc)
             let fraction =
                 Double(min(max(step, 0), GridUploadBadge.progressSteps)) / Double(GridUploadBadge.progressSteps)
-            drawRing(context, in: disc, fraction: fraction)
+            drawPie(context, in: disc, fraction: fraction)
         case .done:
             context.setFillColor(CGColor(red: 1, green: 1, blue: 1, alpha: 0.96))
             context.fillEllipse(in: disc)
@@ -60,22 +59,24 @@ package enum MetalGridUploadBadgeImage {
         context.fillEllipse(in: rect)
     }
 
-    private static func drawRing(_ context: CGContext, in disc: CGRect, fraction: Double) {
-        let lineWidth = disc.width * 0.11
-        let ringRect = disc.insetBy(dx: disc.width * 0.2, dy: disc.width * 0.2)
-        let center = CGPoint(x: ringRect.midX, y: ringRect.midY)
-        let radius = ringRect.width / 2
+    private static func drawPie(_ context: CGContext, in disc: CGRect, fraction: Double) {
+        drawDisc(context, disc)
+        let lineWidth = disc.width * 0.07
+        let white = CGColor(red: 1, green: 1, blue: 1, alpha: 1)
+        if fraction > 0 {
+            let center = CGPoint(x: disc.midX, y: disc.midY)
+            // CoreGraphics has a bottom-left origin: start at 12 o'clock and fill clockwise.
+            let start = CGFloat.pi / 2
+            let end = start - CGFloat(min(1, fraction)) * 2 * .pi
+            context.setFillColor(white)
+            context.move(to: center)
+            context.addArc(center: center, radius: disc.width / 2, startAngle: start, endAngle: end, clockwise: true)
+            context.closePath()
+            context.fillPath()
+        }
+        context.setStrokeColor(white)
         context.setLineWidth(lineWidth)
-        context.setLineCap(.round)
-        context.setStrokeColor(CGColor(red: 1, green: 1, blue: 1, alpha: 0.42))
-        context.strokeEllipse(in: ringRect)
-        guard fraction > 0 else { return }
-        // CoreGraphics has a bottom-left origin: start at 12 o'clock and fill clockwise.
-        let start = CGFloat.pi / 2
-        let end = start - CGFloat(min(1, fraction)) * 2 * .pi
-        context.setStrokeColor(CGColor(red: 1, green: 1, blue: 1, alpha: 1))
-        context.addArc(center: center, radius: radius, startAngle: start, endAngle: end, clockwise: true)
-        context.strokePath()
+        context.strokeEllipse(in: disc.insetBy(dx: lineWidth / 2, dy: lineWidth / 2))
     }
 
     private static func drawCheckmark(_ context: CGContext, in disc: CGRect) {

@@ -386,7 +386,7 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
         dataSource.updateUploadBadges(badges)
         let changed = contentEpochs.changes(in: badges.contentEpochs)
         if !changed.isEmpty {
-            cache.invalidate(changed)
+            cache.markStale(changed)
             requestRedraw()
         }
     }

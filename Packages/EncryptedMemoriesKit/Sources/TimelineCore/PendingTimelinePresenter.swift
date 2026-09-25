@@ -9,7 +9,7 @@ public struct PendingUploadBadges: Sendable, Equatable {
     /// Identity of this value; hosts compare it instead of the maps.
     private let id: UUID
     package let base: [PhotoUID: GridUploadBadge]
-    /// Ring steps of the few photos whose bytes move now, keyed by grid UID.
+    /// Progress steps of the few photos whose bytes move now, keyed by grid UID.
     package let progress: [PhotoUID: Int]
     /// Local photos whose content changed in Apple Photos during this session, with a growing epoch per
     /// change. The map is cumulative, so a grid that skips a presentation still sees every change and
@@ -438,7 +438,7 @@ public final class PendingTimelinePresenter {
         return badges
     }
 
-    /// Ring steps keyed by grid UID. O(uploads in flight).
+    /// Progress steps keyed by grid UID. O(uploads in flight).
     private nonisolated static func progress(
         of snapshot: PendingBackupSnapshot,
         gridUIDs: [PhotoUID: PhotoUID]

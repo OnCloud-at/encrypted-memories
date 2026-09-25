@@ -92,6 +92,9 @@ package enum MetalGridFrameComposer {
                 revealIDs: Set(visibleIDs)
             ) { provideImage($0) }
         }
+        // A pending photo's new revision replaces its texture in place, also while scrolling.
+        let staleVisible = visibleIDs.filter { cache.isStale($0) }
+        if !staleVisible.isEmpty { cache.replaceStaleResident(staleVisible) { provideImage($0) } }
         // Settled only: after fresh uploads spend their share of the budget, grow any visible texture still
         // below the current cap (carried over from a denser level) to full crispness, in place.
         if allowUpgrade {
@@ -108,6 +111,7 @@ package enum MetalGridFrameComposer {
         for uid in priority where !cache.isResident(uid) && !cache.isInFlight(uid) && !hasImage(uid) && canRetry(uid) {
             appendWarm(uid)
         }
+        for uid in staleVisible where cache.isStale(uid) && !hasImage(uid) && canRetry(uid) { appendWarm(uid) }
         var pendingVisibleQualityUpgrade = cache.pendingUpgradesThisFrame
         if allowUpgrade {
             for uid in upgradeCandidates where cache.residentTextureNeedsMeaningfulUpgrade(uid) {

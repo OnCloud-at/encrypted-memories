@@ -213,7 +213,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         XCTAssertEqual(during.badge(for: tile), .uploading(step: 7))
 
         recorder.reportProgress(source: source("up"), revision: revision, step: nil)
-        await waitForSnapshot("the ring ends") { $0.progress.isEmpty }
+        await waitForSnapshot("the progress ends") { $0.progress.isEmpty }
     }
 
     func testSettledSourceRetiresOnlyAfterItsProtonPhotoIsListed() async throws {

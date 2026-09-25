@@ -17,6 +17,8 @@ package final class MetalGridTextureCache<ID: Hashable & Sendable> {
     /// Start time for a real texture that replaced a visible placeholder. This is tied to the actual GPU
     /// residency transition, not to a platform view callback, so every Metal grid gets the same reveal.
     private var thumbnailRevealStartedAt: [ID: Double] = [:]
+    /// Resident textures whose photo has a newer image; see `markStale`.
+    private var staleTextures = Set<ID>()
     package private(set) var placeholderTexture: MTLTexture
 
     /// Rolling per-frame accounting (reset each `beginFrame`).
@@ -327,19 +329,49 @@ package final class MetalGridTextureCache<ID: Hashable & Sendable> {
         }
         for id in evicted {
             textures.removeValue(forKey: id)
+            staleTextures.remove(id)
             thumbnailRevealStartedAt.removeValue(forKey: id)
         }
         evictionsThisFrame = evicted.count
         evictMsThisFrame += Self.elapsedMilliseconds(since: start)
     }
 
-    /// Drops the textures of photos whose content changed; they upload again when next visible.
-    package func invalidate(_ ids: [ID]) {
-        guard !ids.isEmpty else { return }
-        lru.invalidate(ids)
-        for id in ids {
-            textures.removeValue(forKey: id)
-            thumbnailRevealStartedAt.removeValue(forKey: id)
+    /// Marks the textures of photos whose content changed (a new revision of a pending photo). They keep
+    /// drawing until `replaceStaleResident` uploads the new image, so the tile never flashes the placeholder.
+    package func markStale(_ ids: [ID]) {
+        for id in ids where textures[id] != nil { staleTextures.insert(id) }
+    }
+
+    package func isStale(_ id: ID) -> Bool { staleTextures.contains(id) }
+
+    /// Replaces stale visible textures in place, within the frame's upload budget. A texture whose new image is
+    /// not in memory yet keeps drawing until it is.
+    package func replaceStaleResident(_ ids: [ID], provideImage: (ID) -> CGImage?) {
+        for id in ids where staleTextures.contains(id) {
+            guard uploadsThisFrame < budget.maxUploadsPerFrame, !uploadTimeBudgetExhausted else {
+                pendingUpgradesThisFrame = true
+                return
+            }
+            guard let current = residentMetrics(for: id) else {
+                staleTextures.remove(id)
+                continue
+            }
+            guard let image = provideImage(id) else { continue }
+            let size = uploadPixelSize(for: image, cap: effectiveMaxTexturePixels)
+            let newBytes = size.width * size.height * 4
+            if uploadsThisFrame > 0, uploadBytesThisFrame + newBytes > budget.maxUploadBytesPerFrame {
+                pendingUpgradesThisFrame = true
+                return
+            }
+            guard lru.canReplaceResident(id, oldCost: current.bytes, newCost: newBytes) else { continue }
+            let start = ContinuousClock.now
+            guard let texture = makeTexture(from: image, width: size.width, height: size.height) else { continue }
+            uploadMsThisFrame += Self.elapsedMilliseconds(since: start)
+            textures[id] = texture
+            staleTextures.remove(id)
+            uploadBytesThisFrame += newBytes
+            uploadsThisFrame += 1
+            lru.completeUpload(id, cost: newBytes)
         }
     }
 
@@ -489,7 +521,7 @@ package final class MetalGridTextureCache<ID: Hashable & Sendable> {
         return glyphTexture(for: request)
     }
 
-    /// A cached upload badge texture: 21 ring steps plus waiting, done and attention stay resident.
+    /// A cached upload badge texture: 21 progress steps plus waiting, done and attention stay resident.
     package func uploadBadgeTexture(_ badge: GridUploadBadge) -> MTLTexture? {
         glyphTexture(for: MetalGridGlyphRequest(uploadBadge: badge))
     }

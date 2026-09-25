@@ -122,20 +122,6 @@ package struct GridTextureResidencyPolicy<ID: Hashable & Sendable>: Equatable {
         lastUsed[id] = tick
     }
 
-    /// Drops resident textures whose content changed, so a later frame uploads them again.
-    package mutating func invalidate(_ ids: [ID]) {
-        for id in ids where resident.remove(id) != nil {
-            if let previous = cost.removeValue(forKey: id) {
-                residentCost -= previous
-                if pinned.contains(id) {
-                    pinnedResidentCost -= previous
-                    pinnedResidentCount -= 1
-                }
-            }
-            lastUsed.removeValue(forKey: id)
-        }
-    }
-
     /// A texture upload failed or was abandoned; clear the in-flight flag so it can be retried.
     package mutating func abandonUpload(_ id: ID) {
         inFlight.remove(id)

@@ -118,7 +118,7 @@ import UploadCore
 
         #expect(after.items.map(\.uid) == [uploaded, remotes[0].uid], "the Proton photo takes the tile's place")
         #expect(after.localUIDs.isEmpty)
-        #expect(after.uploadBadges[uploaded] == .uploading(step: 10), "a still-uploading source keeps its ring")
+        #expect(after.uploadBadges[uploaded] == .uploading(step: 10), "a still-uploading source keeps its progress")
         #expect(presence == [PendingSourceKey(kind: .photoLibraryAsset, identifier: "p")])
     }
 

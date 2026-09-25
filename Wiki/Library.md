@@ -14,8 +14,8 @@ The Library is the primary chronological photo and video timeline.
 ## Photos that are still backing up
 
 While backup runs, photos that are not uploaded yet already appear in the Library, in their place by
-capture date. A ring in the corner fills while the photo uploads, then a checkmark shows, and the tile
-turns into the uploaded photo in the same place. On a Mac, files in watched backup folders appear the
+capture date. A circle in the corner fills with white while the photo uploads, a checkmark shows for a
+moment, and the tile turns into the uploaded photo in the same place. On a Mac, files in watched backup folders appear the
 same way.
 
 These photos load from Apple Photos or the folder on this device; nothing is sent to Proton before the

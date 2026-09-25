@@ -2486,7 +2486,7 @@ extension BackupSyncRunnerTests {
             if case .progress(entry.source.identifier, let step) = event { return step }
             return nil
         }
-        XCTAssertEqual(steps.last, .some(nil), "the ring ends when the source settles")
+        XCTAssertEqual(steps.last, .some(nil), "the progress ends when the source settles")
         let values = steps.compactMap { $0 }
         XCTAssertFalse(values.isEmpty)
         XCTAssertEqual(values, values.sorted(), "progress never moves backwards")
