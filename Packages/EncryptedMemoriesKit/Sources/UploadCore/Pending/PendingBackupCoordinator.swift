@@ -77,9 +77,9 @@ public actor PendingBackupCoordinator {
     private var excludedAccessible = Set<PendingSourceKey>()
     /// Whether unchecked photos may show now; see `Configuration.uncheckedAdmissionLimit`.
     private var admitsUnchecked = false
-    /// Unchecked photos that showed; they keep their tile until their check finishes, even if a large scan
-    /// starts meanwhile.
-    private var admittedUnchecked = Set<PendingSourceKey>()
+    /// Sources whose tile showed. They keep it through a retry, a pause, or a new revision whose check has not
+    /// finished, also when a large scan starts meanwhile.
+    private var shownSources = Set<PendingSourceKey>()
     /// Settled revisions whose checkmark showed and ended.
     private var checkmarkShown: [PendingSourceKey: UploadBackupRevision] = [:]
     private var checkmarkEnded: [PendingSourceKey: UploadBackupRevision] = [:]
@@ -429,7 +429,7 @@ public actor PendingBackupCoordinator {
     /// The source left the queue (local deletion or exclusion): its live state is gone too.
     private func dropSourceState(_ key: PendingSourceKey) {
         liveProgress[key] = nil
-        admittedUnchecked.remove(key)
+        shownSources.remove(key)
         checkmarkShown[key] = nil
         checkmarkEnded[key] = nil
         metadata[key] = nil
@@ -467,7 +467,7 @@ public actor PendingBackupCoordinator {
             if liveProgress[key]?.revision == revision { liveProgress[key] = nil }
             if checkmarkShown[key] == revision { checkmarkShown[key] = nil }
             if checkmarkEnded[key] == revision { checkmarkEnded[key] = nil }
-            admittedUnchecked.remove(key)
+            shownSources.remove(key)
             dirty.insert(key)
         }
         _ = store.removeEvidence(items)
@@ -507,7 +507,7 @@ public actor PendingBackupCoordinator {
             && !inaccessible.contains(key) && !isHiddenByChoice(key)
         {
             unchecked += 1
-            if !admittedUnchecked.contains(key) { waiting.append(key) }
+            if !shownSources.contains(key) { waiting.append(key) }
         }
         let admits = unchecked <= configuration.uncheckedAdmissionLimit
         guard admits != admitsUnchecked else { return }
@@ -530,18 +530,18 @@ public actor PendingBackupCoordinator {
         let handoff = handoffs[key].flatMap { $0.revision == row.revision ? $0 : nil }
         switch row.state {
         case .completed, .alreadyBackedUp:
-            return handoff != nil
+            guard handoff != nil else { return false }
+            shownSources.insert(key)
+            return true
         case .skippedRemoteDeletion, .sourceMissing, .dismissedFailure:
             return false
         default:
-            if Self.needsEvidence(row.state) {
-                if handoff != nil || evidence[key]?.contains(row.revision) == true { return true }
-                // A tile that showed stays, also through a retry or a pause.
-                if admittedUnchecked.contains(key) { return true }
+            if Self.needsEvidence(row.state), handoff == nil, evidence[key]?.contains(row.revision) != true,
+                !shownSources.contains(key)
+            {
                 guard admitsUnchecked, Self.isUnchecked(row.state) else { return false }
-                admittedUnchecked.insert(key)
-                return true
             }
+            shownSources.insert(key)
             return true
         }
     }

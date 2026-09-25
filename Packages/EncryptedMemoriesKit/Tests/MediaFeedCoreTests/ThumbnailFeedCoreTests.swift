@@ -825,6 +825,24 @@ struct ThumbnailFeedCoreTests {
         #expect(await feed.refreshLocal([Self.uid("remote")]).isEmpty, "only local photos refresh")
     }
 
+    @Test func handoverReadsThePendingImageFromTheDeviceWhenRAMLostIt() async throws {
+        let local = PhotoUID(localPending: .photoLibrary, identifier: "asset-11")
+        let remote = Self.uid("uploaded-evicted")
+        let feed = ThumbnailFeedCore(
+            cache: Self.cache("handover-device"),
+            loader: PriorityRecordingLoader(payload: Self.pngData(width: 24, height: 24)),
+            configuration: Self.configuration()
+        )
+        // Authorized before a device loader exists, so the pending image never reaches RAM (as after an
+        // eviction) when its Proton photo takes over.
+        await feed.setLocalAuthorization([local])
+        #expect(feed.memoryDecoded(for: local) == nil)
+        await feed.setLocalThumbnailLoader(StubLocalThumbnails(image: Self.decodedThumb(16, 16)))
+        await feed.setLocalAuthorization([], adoptions: [(local, remote)])
+        try await Self.waitUntil { feed.memoryDecoded(for: remote) != nil }
+        #expect(feed.memoryDecoded(for: local) == nil)
+    }
+
     @Test func protonPhotoAdoptsThePendingImage() async throws {
         let local = PhotoUID(localPending: .photoLibrary, identifier: "asset-2")
         let remote = Self.uid("adopted")

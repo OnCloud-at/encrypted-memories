@@ -80,6 +80,18 @@ final class ScriptedBackupResolver: BackupResourceResolving, @unchecked Sendable
     private var capturedPreparationHandlers: [String: BackupResourcePreparationHandler] = [:]
     private var mismatchOnceIdentifiers: Set<String> = []
     private var materializeCounts: [String: Int] = [:]
+    private var slowIdentifiers: Set<String> = []
+    private var activeResolves: [String: Int] = [:]
+    private var peakResolves: [String: Int] = [:]
+
+    /// Holds each resolve of `identifier` briefly, so overlapping resolves of one source would show.
+    func setSlowResolve(for identifier: String) {
+        _ = lock.withLock { slowIdentifiers.insert(identifier) }
+    }
+
+    func peakConcurrentResolves(for identifier: String) -> Int {
+        lock.withLock { peakResolves[identifier] ?? 0 }
+    }
 
     func setSecondaries(_ names: [String], for identifier: String) {
         lock.withLock { secondaryNames[identifier] = names }
@@ -141,6 +153,13 @@ final class ScriptedBackupResolver: BackupResourceResolving, @unchecked Sendable
 
     func resolve(_ entry: UploadBackupSyncQueueEntry) async throws -> BackupResolvedResource? {
         let id = entry.source.identifier
+        let isSlow = lock.withLock {
+            activeResolves[id, default: 0] += 1
+            peakResolves[id] = max(peakResolves[id] ?? 0, activeResolves[id] ?? 0)
+            return slowIdentifiers.contains(id)
+        }
+        defer { lock.withLock { activeResolves[id, default: 1] -= 1 } }
+        if isSlow { try? await Task.sleep(for: .milliseconds(30)) }
         let behavior: Behavior = lock.withLock {
             _resolveCounts[id, default: 0] += 1
             return behaviors[id] ?? .standard
@@ -878,6 +897,22 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertEqual(resolver.resolveCount(for: entry.source.identifier), 6)
         XCTAssertEqual(clock.sleeps.count, 5)
         XCTAssertEqual(try XCTUnwrap(clock.sleeps.first), 30, accuracy: 0.001)
+    }
+
+    func testTwoRevisionsOfOnePhotoNeverRunAtTheSameTime() async throws {
+        // The camera's preliminary version and the finished photo can both be due in one wave.
+        let preliminary = seedEntry("same.heic")
+        let finished = seedEntry("same.heic", revisionOffset: 1_000_000)
+        resolver.setSlowResolve(for: preliminary.source.identifier)
+
+        let runner = makeRunner()
+        let progress = await runner.runUntilDrained()
+
+        XCTAssertEqual(resolver.peakConcurrentResolves(for: preliminary.source.identifier), 1)
+        XCTAssertEqual(resolver.resolveCount(for: preliminary.source.identifier), 2)
+        XCTAssertEqual(uploader.requests.count, 1, "the second revision finds the photo backed up")
+        XCTAssertEqual(progress.failed, 0)
+        XCTAssertNotEqual(state(of: finished), .failed)
     }
 
     func testPersistedRetryDelaySurvivesRunnerRecreation() async throws {

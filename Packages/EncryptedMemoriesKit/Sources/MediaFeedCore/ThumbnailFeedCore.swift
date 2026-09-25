@@ -2812,7 +2812,17 @@ public actor ThumbnailFeedCore {
         _ uids: Set<PhotoUID>,
         adoptions: [(local: PhotoUID, remote: PhotoUID)] = []
     ) {
-        for adoption in adoptions { adoptDecoded(from: adoption.local, to: adoption.remote) }
+        var fromDevice: [(local: PhotoUID, remote: PhotoUID)] = []
+        for adoption in adoptions where !adoptDecoded(from: adoption.local, to: adoption.remote) {
+            // RAM no longer holds the pending image: read it from the device again instead of leaving the tile
+            // black until the Proton thumbnail downloads.
+            if !adoption.remote.isLocalPending, decoded.image(for: adoption.remote) == nil {
+                fromDevice.append(adoption)
+            }
+        }
+        if !fromDevice.isEmpty, let localLoader {
+            Task { await self.adoptFromDevice(fromDevice, loader: localLoader) }
+        }
         let change = localAuthorization.replace(with: uids.filter(\.isLocalPending))
         for uid in change.removed {
             decoded.remove(uid)
@@ -2827,6 +2837,27 @@ public actor ThumbnailFeedCore {
         // A photo that just joined the grid starts loading now, before its first frame asks for it.
         let preload = change.added.prefix(Self.maxLocalPreload).map { ($0, Int(configuration.targetPixels)) }
         if !preload.isEmpty { submitLocalDemand(preload, replacing: false) }
+    }
+
+    /// The handover image read from the device, for a Proton photo whose pending image left RAM.
+    private func adoptFromDevice(
+        _ adoptions: [(local: PhotoUID, remote: PhotoUID)],
+        loader: any LocalThumbnailLoading
+    ) async {
+        let pixels = Int(configuration.targetPixels)
+        let images = await loader.thumbnails(for: adoptions.map(\.local), maxPixelSize: CGFloat(pixels))
+        guard ownerLeaseIsCurrent() else { return }
+        var stored = false
+        for adoption in adoptions {
+            // The Proton thumbnail may have arrived meanwhile; it wins.
+            guard let image = images[adoption.local], decoded.image(for: adoption.remote) == nil else { continue }
+            if !thumbnailReadAuthorization.isAllowed(adoption.remote) {
+                adoptedAuthorization.insert(adoption.remote, limit: Self.maxAdoptedWithoutScope)
+            }
+            if storeDecoded(image, for: adoption.remote, decodePixelCap: pixels) != nil { stored = true }
+        }
+        // The grid may rest after the handover; wake it so the tile uploads the image.
+        if stored { wakeHostsForLocalArrival() }
     }
 
     /// Loads new images for local photos whose content changed (a new revision) and keeps the old image until

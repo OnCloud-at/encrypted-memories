@@ -117,8 +117,14 @@ package final class GridUploadBadgeAnimator<ID: Hashable> {
 
     private let timing: Timing
     private var states: [ID: State] = [:]
-    private var lastSeen: [ID: Double] = [:]
-    private var lastForget: Double = 0
+    /// The drawn frame in which each photo last asked for its badge. Frames, not wall time: the host draws
+    /// nothing while the grid rests, and a rest must not make the visible badges start over.
+    private var lastSeen: [ID: UInt64] = [:]
+    private var drawnFrame: UInt64 = 0
+    private var frameTime: Double = -.infinity
+    private var lastForgetFrame: UInt64 = 0
+    /// About five seconds of continuous drawing.
+    private static var forgetAfterFrames: UInt64 { 600 }
 
     package init(timing: Timing = Timing()) {
         self.timing = timing
@@ -127,11 +133,15 @@ package final class GridUploadBadgeAnimator<ID: Hashable> {
     /// The badge to draw for `id` at `now`, given the badge the backup reports now (nil for none).
     package func frame(for id: ID, target: GridUploadBadge?, now: Double) -> GridUploadBadgeFrame? {
         guard target != nil || states[id] != nil else { return nil }
-        lastSeen[id] = now
-        // Photos that left the screen long ago lose their state; a revisit starts from the current badge.
-        if lastSeen.count > 256, now - lastForget > 5 {
-            lastForget = now
-            forget(unseenSince: now - 10)
+        if now != frameTime {
+            frameTime = now
+            drawnFrame &+= 1
+        }
+        lastSeen[id] = drawnFrame
+        // Photos not drawn for a while lose their state; a revisit starts from the current badge.
+        if lastSeen.count > 256, drawnFrame &- lastForgetFrame > Self.forgetAfterFrames {
+            lastForgetFrame = drawnFrame
+            forgetUnseen(frames: Self.forgetAfterFrames)
         }
         var state = states[id]
         let frame = advance(&state, target: target, now: now)
@@ -164,8 +174,9 @@ package final class GridUploadBadgeAnimator<ID: Hashable> {
         lastSeen[target] = lastSeen.removeValue(forKey: source)
     }
 
-    /// Forgets photos not drawn since `cutoff`, bounding the state to what the grid shows.
-    package func forget(unseenSince cutoff: Double) {
+    /// Forgets photos not drawn in the last `frames` drawn frames, bounding the state to what the grid shows.
+    package func forgetUnseen(frames: UInt64) {
+        let cutoff = drawnFrame > frames ? drawnFrame - frames : 0
         let stale = lastSeen.filter { $0.value < cutoff }.map(\.key)
         for id in stale {
             lastSeen[id] = nil

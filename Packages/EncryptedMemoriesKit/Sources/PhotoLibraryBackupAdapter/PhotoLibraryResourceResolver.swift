@@ -2,16 +2,18 @@ import Foundation
 import Photos
 import PhotosCore
 import UploadCore
+import os
 
 /// Resolves a PhotoKit queue entry in two stages. It first streams each original only to compute its
 /// identity (O(chunk) memory, no temp file). Core materializes verbatim bytes into the bounded temp
 /// store only if dedupe returns `.upload`. HEIC stays HEIC and MOV stays MOV; `PHImageManager` is
 /// never used.
 public struct PhotoLibraryResourceResolver: BackupResourceResolving {
-    /// A new photo whose only image is the camera's preliminary version (deferred photo processing, the
-    /// `.photoProxy` resource) waits this long for the finished one. After that the preliminary version is
+    /// A new photo the camera still processes (deferred photo processing: a `.photoProxy` resource, alone or
+    /// next to a preliminary image) waits this long for the finished one. After that the preliminary version is
     /// backed up, so a photo whose processing never finishes still gets a copy.
-    static let processingWaitWindow: TimeInterval = 3600
+    static let processingWaitWindow: TimeInterval = 600
+    private static let logger = Logger(subsystem: "at.oncloud.encryptedmemories", category: "Backup")
 
     private let tempStore: BackupTempFileStore
     private let cloudIdentifierProvider: @Sendable (String) -> String?
@@ -41,17 +43,22 @@ public struct PhotoLibraryResourceResolver: BackupResourceResolving {
         }
 
         let info = PhotoKitAssetMapper.info(for: asset)
+        // The camera still processes the photo while its resources list a proxy, whether it is the only image
+        // or listed next to a preliminary one. Checked before planning, which never picks the proxy as primary.
+        let age = asset.creationDate.map { Date().timeIntervalSince($0) } ?? .infinity
+        if age < Self.processingWaitWindow {
+            // Resource roles only, for checking deferred camera processing on a device; no names or identifiers.
+            let roles = info.resources.map(\.role.rawValue).sorted().joined(separator: ",")
+            Self.logger.notice("[Backup] new photo ageS=\(Int(age), privacy: .public) roles=\(roles, privacy: .public)")
+        }
+        if info.resources.contains(where: { $0.role == .photoProxy }), age < Self.processingWaitWindow {
+            throw UploadError.sourceNotReady(entry.originalFilename)
+        }
         guard let plan = PhotoBackupAssetPlanner.exportPlan(for: info),
             let candidate = PhotoBackupAssetPlanner.candidate(for: info),
             let primaryResource = PhotoKitAssetMapper.resource(for: plan.primary.role, of: asset)
         else {
             return nil
-        }
-        if plan.primary.role == .photoProxy,
-            let created = asset.creationDate,
-            Date().timeIntervalSince(created) < Self.processingWaitWindow
-        {
-            throw UploadError.sourceNotReady(plan.primary.uploadFilename)
         }
 
         // Stable descriptor dates: capture time drives the remote timeline; the descriptor's

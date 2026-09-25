@@ -1789,6 +1789,8 @@
 
         private func productionDecorations() -> MetalGridDecorations<PhotoUID> {
             let accent = SIMD4<Float>(Float(0x6D) / 255, Float(0x4A) / 255, Float(0xFF) / 255, 1)
+            // One time for the whole frame, so every badge of the frame animates in step.
+            let frameTime = CACurrentMediaTime()
             return MetalGridDecorations(
                 accent: accent,
                 accentGlyphColor: MetalGridGlyphColor(
@@ -1800,7 +1802,7 @@
                 favorites: [],
                 overlay: { [thumbnailOverlayResolver] uid in thumbnailOverlayResolver.overlay(for: uid) },
                 uploadBadgeFrame: { [uploadBadgeAnimator] uid, badge in
-                    uploadBadgeAnimator.frame(for: uid, target: badge, now: CACurrentMediaTime())
+                    uploadBadgeAnimator.frame(for: uid, target: badge, now: frameTime)
                 }
             )
         }

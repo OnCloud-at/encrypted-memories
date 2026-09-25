@@ -2125,6 +2125,8 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
 
     private func productionDecorations() -> MetalGridDecorations<PhotoUID>? {
         guard decorationsEnabled else { return nil }
+        // One time for the whole frame, so every badge of the frame animates in step.
+        let frameTime = CACurrentMediaTime()
         return MetalGridDecorations(
             accent: Self.colorVector(.controlAccentColor),
             accentGlyphColor: MetalGridGlyphColor(.controlAccentColor),
@@ -2133,7 +2135,7 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
             favorites: favoriteUIDs,
             overlay: { [dataSource] uid in dataSource.thumbnailOverlay(for: uid) },
             uploadBadgeFrame: { [uploadBadgeAnimator] uid, badge in
-                uploadBadgeAnimator.frame(for: uid, target: badge, now: CACurrentMediaTime())
+                uploadBadgeAnimator.frame(for: uid, target: badge, now: frameTime)
             }
         )
     }

@@ -97,6 +97,18 @@ import Testing
         #expect(abs(backAlpha - fadingAlpha) < 0.1, "no jump back to full opacity")
     }
 
+    @Test func restingGridKeepsItsBadgesWhenDrawingResumes() {
+        let animator = GridUploadBadgeAnimator<Int>()
+        let ids = Array(0..<300)
+        for id in ids { _ = animator.frame(for: id, target: .waiting, now: 0) }
+        for id in ids { _ = animator.frame(for: id, target: .waiting, now: 1) }
+        // The grid rests for a minute without drawing, then scrolls.
+        for id in ids {
+            let frame = animator.frame(for: id, target: .waiting, now: 61)
+            #expect(frame?.alpha == 1, "a visible badge must not fade in again after a rest")
+        }
+    }
+
     @Test func handoverKeepsTheAnimation() {
         let animator = GridUploadBadgeAnimator<Int>()
         _ = animator.frame(for: 1, target: .uploading(step: 20), now: 0)

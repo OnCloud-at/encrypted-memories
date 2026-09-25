@@ -406,9 +406,17 @@ public actor BackupSyncRunner {
                 continue
             }
 
+            // Two revisions of one photo (a preliminary camera version and the finished one) run one after the
+            // other: both read the current file, and the second then finds it backed up instead of uploading
+            // the same bytes at the same time.
+            let bySource = Dictionary(grouping: wave) {
+                Self.sourceKey(kind: $0.source.kind, identifier: $0.source.identifier)
+            }
             await withTaskGroup(of: Void.self) { group in
-                for entry in wave {
-                    group.addTask { await self.process(entry, workIntent: workIntent) }
+                for entries in bySource.values {
+                    group.addTask {
+                        for entry in entries { await self.process(entry, workIntent: workIntent) }
+                    }
                 }
             }
             wavesSincePrime += 1

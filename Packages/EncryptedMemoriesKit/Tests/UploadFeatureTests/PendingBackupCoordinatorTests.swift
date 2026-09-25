@@ -143,6 +143,30 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         }
     }
 
+    func testCheckedTileStaysThroughANewRevisionDuringALargeScan() async throws {
+        await coordinator.close()
+        coordinator = makeCoordinator(uncheckedAdmissionLimit: 0)
+        enqueue("p", state: .queuedForUpload)
+        recorder.recordUploadEvidence(source: source("p"), revision: revision)
+        await coordinator.start()
+        await waitForSnapshot("the checked photo shows") { $0.tiles.count == 1 }
+
+        // The camera finished the photo: its new revision is not checked yet.
+        XCTAssertTrue(
+            queue.upsert(
+                UploadBackupSyncQueueEntry(
+                    source: source("p"), revision: UploadBackupRevision(rawValue: 10), originalFilename: "p.heic",
+                    state: .discovered, updatedAt: date)))
+        await waitForSnapshot("the tile follows the new revision") {
+            $0.tiles.first?.revision == UploadBackupRevision(rawValue: 10)
+        }
+        for _ in 0..<20 {
+            let snapshot = await coordinator.currentSnapshot()
+            XCTAssertEqual(tileIDs(snapshot), ["p"], "a tile that showed must not leave for an unchecked revision")
+            try await Task.sleep(for: .milliseconds(5))
+        }
+    }
+
     func testUncheckedPhotoShowsOnceItsCheckPassed() async throws {
         await coordinator.close()
         coordinator = makeCoordinator(uncheckedAdmissionLimit: 0)
