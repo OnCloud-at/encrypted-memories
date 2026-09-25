@@ -22,6 +22,8 @@ Large libraries can show usable media before all thumbnails, map locations, and 
 - Resume a paused backup.
 - Open the failed-items view and retry recoverable items.
 - On iPhone and iPad, remember that the operating system schedules background work.
+- A photo you deleted in the app before its upload is excluded on purpose. Find it under **Excluded from
+  Backup** in the Backup settings and choose **Back Up Again**.
 
 ## A search scope is missing
 

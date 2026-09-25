@@ -8,6 +8,11 @@ You can:
 - Restore selected items to the library.
 - Permanently delete items after confirmation when the backend permits it.
 
+Photos you deleted before they were backed up appear here too, marked with a crossed-out cloud: they exist
+only on this device. **Restore** puts them back into the backup. **Empty Trash** only removes them from the
+list; they stay excluded from the backup and stay in Apple Photos or their folder. You can still bring them
+back later under **Excluded from Backup** in the Backup settings.
+
 Removing an item from an album is not the same as moving it to Recently Deleted. Album removal keeps the item in the main library.
 
 - **iPhone and iPad:** Open **Collections → Recently Deleted**.
