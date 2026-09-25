@@ -91,6 +91,41 @@ struct ProtonRequestGovernorTests {
         #expect(snapshot.concurrencyLimit == 3)
     }
 
+    @Test func quietTimeRecoversFromARateLimitWithoutManySuccesses() async throws {
+        let clock = TestClock()
+        let governor = ProtonRequestGovernor(
+            configuration: Self.configuration(initial: 4, maximum: 6, recoveryInterval: 5),
+            now: { clock.now }
+        )
+        // Four requests run at once and all hit the limit; the cooldown admits nothing new meanwhile.
+        var permits: [ProtonRequestGovernor.Permit] = []
+        for _ in 0..<4 { permits.append(try await governor.acquire(scope: .api)) }
+        for permit in permits { await governor.finish(permit, statusCode: 429, retryAfter: 0.001) }
+        var snapshot = await governor.snapshot().api
+        #expect(snapshot.concurrencyLimit == 1)
+        #expect(snapshot.admissionInterval == 2, "several 429s pace the scope at the 2 s ceiling")
+
+        // One request every few seconds never reaches the success window; time alone must recover.
+        clock.now = clock.now.addingTimeInterval(5)
+        snapshot = await governor.snapshot().api
+        #expect(snapshot.admissionInterval == 1)
+        #expect(snapshot.concurrencyLimit == 2)
+
+        clock.now = clock.now.addingTimeInterval(60)
+        snapshot = await governor.snapshot().api
+        #expect(snapshot.admissionInterval == 0)
+        #expect(snapshot.concurrencyLimit == 4)
+
+        // A viewer request after the quiet time starts at once.
+        let permit = try await governor.acquire(scope: .api, priority: .immediate)
+        await governor.finish(permit, statusCode: 200)
+
+        // A new 429 paces the scope again.
+        let limited = try await governor.acquire(scope: .api)
+        await governor.finish(limited, statusCode: 429, retryAfter: 0.001)
+        #expect(await governor.snapshot().api.admissionInterval > 0)
+    }
+
     @Test func cancellingQueuedRequestDoesNotLeakAWaiter() async throws {
         let governor = ProtonRequestGovernor(configuration: Self.configuration(initial: 1, maximum: 1))
         let first = try await governor.acquire(scope: .api)
@@ -457,7 +492,8 @@ struct ProtonRequestGovernorTests {
         initial: Int,
         maximum: Int,
         successWindow: Int = 32,
-        priorityLifetime: TimeInterval = 60
+        priorityLifetime: TimeInterval = 60,
+        recoveryInterval: TimeInterval = 5
     ) -> ProtonRequestGovernor.Configuration {
         let scope = ProtonRequestGovernor.Configuration.Scope(
             initialConcurrency: initial,
@@ -469,7 +505,8 @@ struct ProtonRequestGovernorTests {
             storageUpload: scope,
             successWindowForIncrease: successWindow,
             starvationPromotionInterval: 10,
-            priorityScopeLifetime: priorityLifetime
+            priorityScopeLifetime: priorityLifetime,
+            rateLimitRecoveryInterval: recoveryInterval
         )
     }
 

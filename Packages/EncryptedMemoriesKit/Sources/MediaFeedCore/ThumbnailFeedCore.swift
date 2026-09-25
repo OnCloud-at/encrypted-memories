@@ -546,12 +546,11 @@ public actor ThumbnailFeedCore {
             guard let data = cache.diskData(for: uid) else { return (false, nil) }
             return (true, ThumbnailImageDecoder.downsample(data, maxPixelSize: maxPixels))
         }
-        guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(generation),
-            readAllowed(uid)
-        else {
+        guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(generation) else {
             decoded.removeAll()
             return nil
         }
+        guard readAllowed(uid) else { return nil }
         if result.0 {
             diskPresence.set(uid, present: true)
             diagnostics.increment("thumb.diskCacheHit")
@@ -637,19 +636,17 @@ public actor ThumbnailFeedCore {
         guard readAllowed(uid) else { return .missing }
         let cache = self.cache
         let generation = cache.captureWriterGeneration()
-        guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(generation),
-            readAllowed(uid)
-        else {
+        guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(generation) else {
             decoded.removeAll()
             return .missing
         }
+        guard readAllowed(uid) else { return .missing }
         if let image = decoded.image(for: uid) {
-            guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(generation),
-                readAllowed(uid)
-            else {
+            guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(generation) else {
                 decoded.removeAll()
                 return .missing
             }
+            guard readAllowed(uid) else { return .missing }
             return .decoded(image)
         }
 
@@ -658,64 +655,58 @@ public actor ThumbnailFeedCore {
             guard let data = cache.diskData(for: uid) else { return (false, nil) }
             return (true, ThumbnailImageDecoder.downsample(data, maxPixelSize: maxPixels))
         }.value
-        guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(generation),
-            readAllowed(uid)
-        else {
+        guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(generation) else {
             decoded.removeAll()
             return .missing
         }
+        guard readAllowed(uid) else { return .missing }
         guard result.dataPresent else {
-            guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(generation),
-                readAllowed(uid)
-            else {
+            guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(generation) else {
                 decoded.removeAll()
                 return .missing
             }
+            guard readAllowed(uid) else { return .missing }
             diskPresence.set(uid, present: false)
-            guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(generation),
-                readAllowed(uid)
-            else {
+            guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(generation) else {
                 decoded.removeAll()
                 return .missing
             }
+            guard readAllowed(uid) else { return .missing }
             return .missing
         }
-        guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(generation),
-            readAllowed(uid)
-        else {
+        guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(generation) else {
             decoded.removeAll()
             return .missing
         }
+        guard readAllowed(uid) else { return .missing }
         diskPresence.set(uid, present: true)
-        guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(generation),
-            readAllowed(uid)
-        else {
+        guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(generation) else {
             decoded.removeAll()
             return .missing
         }
+        guard readAllowed(uid) else { return .missing }
         guard let image = result.image else {
-            guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(generation),
-                readAllowed(uid)
-            else {
+            guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(generation) else {
                 decoded.removeAll()
                 return .missing
             }
+            guard readAllowed(uid) else { return .missing }
             return .undecodable
         }
-        guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(generation),
-            readAllowed(uid)
-        else {
+        guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(generation) else {
             decoded.removeAll()
             return .missing
         }
+        guard readAllowed(uid) else { return .missing }
         return .decoded(image)
     }
 
     public nonisolated func memoryDecoded(for uid: PhotoUID) -> DecodedThumbnail? {
-        guard ownerLeaseIsCurrent(), readAllowed(uid) else {
+        guard ownerLeaseIsCurrent() else {
             decoded.removeAll()
             return nil
         }
+        guard readAllowed(uid) else { return nil }
         return decoded.image(for: uid)
     }
 
@@ -1221,10 +1212,11 @@ public actor ThumbnailFeedCore {
     }
 
     public func decoded(for uid: PhotoUID) async -> DecodedThumbnail? {
-        guard ownerLeaseIsCurrent(), readAllowed(uid) else {
+        guard ownerLeaseIsCurrent() else {
             decoded.removeAll()
             return nil
         }
+        guard readAllowed(uid) else { return nil }
         // Local photos never touch the disk tier or share a Proton flight; see `loadLocalDirect`.
         if uid.isLocalPending { return await loadLocalDirect(uid) }
         if let image = await cachedDecoded(for: uid) { return image }
@@ -1301,12 +1293,11 @@ public actor ThumbnailFeedCore {
                 if loadedUID == uid { box.set(data) }
             }
         }
-        guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(writerGeneration),
-            readAllowed(uid)
-        else {
+        guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(writerGeneration) else {
             decoded.removeAll()
             return nil
         }
+        guard readAllowed(uid) else { return nil }
         guard let data = box.value else {
             if let reason = result.itemErrors[uid] {
                 unfetchable.insert(uid)
@@ -1324,12 +1315,11 @@ public actor ThumbnailFeedCore {
             guard stored == .stored || stored == .storagePaused else { return (nil, stored) }
             return (ThumbnailImageDecoder.downsample(data, maxPixelSize: maxPixels), stored)
         }
-        guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(writerGeneration),
-            readAllowed(uid)
-        else {
+        guard ownerLeaseIsCurrent(), cache.isCurrentWriterGeneration(writerGeneration) else {
             decoded.removeAll()
             return nil
         }
+        guard readAllowed(uid) else { return nil }
         if stored == .stored { diskPresence.set(uid, present: true) }
         cacheArrivalWake.call()
         guard let image else {

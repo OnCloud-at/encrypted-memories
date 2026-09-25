@@ -108,6 +108,7 @@ struct MobilePhotoViewer: View {
         _imageStore = State(
             initialValue: UIKitViewerImageStore(
                 thumbnailProvider: { feed?.memoryImage(for: $0) },
+                cachedThumbnailProvider: { await feed?.cachedImage(for: $0) },
                 media: media,
                 originalDataOverride: originalFetch))
     }
@@ -1170,12 +1171,16 @@ struct MobileImagePage: View {
     }
 
     private func load(maxPixelSize cap: Int) async {
-        // Install the immediate grid thumbnail when no image is mounted.
-        if image == nil, let thumb = imageStore.thumbnail(for: item.uid) {
-            _ = installIfNotLowerQuality(thumb)
-            if MobileViewerLog.isEnabled {
-                MobileViewerLog.logger.notice(
-                    "[ViewerPerf] display uid=\(MobileViewerLog.short(item.uid), privacy: .public) tier=thumbnail")
+        // Install the immediate grid thumbnail when no image is mounted: from RAM, else from the feed's disk tier.
+        if image == nil {
+            var thumb = imageStore.thumbnail(for: item.uid)
+            if thumb == nil { thumb = await imageStore.cachedThumbnail(for: item.uid) }
+            if let thumb, !Task.isCancelled, image == nil {
+                _ = installIfNotLowerQuality(thumb)
+                if MobileViewerLog.isEnabled {
+                    MobileViewerLog.logger.notice(
+                        "[ViewerPerf] display uid=\(MobileViewerLog.short(item.uid), privacy: .public) tier=thumbnail")
+                }
             }
         }
         // Load a screen-bounded preview for the current page only.

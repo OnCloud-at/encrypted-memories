@@ -781,6 +781,26 @@ struct ThumbnailFeedCoreTests {
         #expect(feed.memoryDecoded(for: remote) != nil)
     }
 
+    @Test func readingAnUnauthorizedPhotoKeepsEveryOtherImage() async throws {
+        let shown = PhotoUID(localPending: .photoLibrary, identifier: "asset-9")
+        let notYetAuthorized = PhotoUID(localPending: .photoLibrary, identifier: "asset-10")
+        let feed = ThumbnailFeedCore(
+            cache: Self.cache("unauthorized-read"),
+            loader: PriorityRecordingLoader(payload: Self.pngData(width: 24, height: 24)),
+            configuration: Self.configuration()
+        )
+        await feed.setLocalThumbnailLoader(StubLocalThumbnails(image: Self.decodedThumb(16, 16)))
+        await feed.setLocalAuthorization([shown])
+        _ = await feed.decoded(for: shown)
+
+        // The grid lists a new photo a moment before its authorization arrives, and a new Proton photo before the
+        // source scope covers it. Such a read misses; it must not empty the RAM tier the viewer opens from.
+        #expect(feed.memoryDecoded(for: notYetAuthorized) == nil)
+        #expect(feed.memoryDecoded(for: Self.uid("unlisted")) == nil)
+        #expect(await feed.decoded(for: notYetAuthorized) == nil)
+        #expect(feed.memoryDecoded(for: shown) != nil)
+    }
+
     @Test func revisedLocalPhotoKeepsItsImageUntilTheNewOneLoads() async throws {
         let local = PhotoUID(localPending: .photoLibrary, identifier: "asset-8")
         let feed = ThumbnailFeedCore(

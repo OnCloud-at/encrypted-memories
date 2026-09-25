@@ -91,6 +91,10 @@ actor ProtonRequestGovernor {
         let successWindowForIncrease: Int
         let starvationPromotionInterval: TimeInterval
         let priorityScopeLifetime: TimeInterval
+        /// Without a new 429, each interval of this length halves the admission interval and adds one
+        /// concurrent request, up to the initial concurrency. A quiet app sends too few requests to reach
+        /// `successWindowForIncrease`, so success-based recovery alone kept a 2 s pacing for minutes.
+        var rateLimitRecoveryInterval: TimeInterval = 5
 
         static let production = Configuration(
             api: Scope(initialConcurrency: 4, maximumConcurrency: 8),
@@ -135,9 +139,13 @@ actor ProtonRequestGovernor {
         var rateLimited: [Date] = []
         var sustainableRateBeforeLastLimit = 0
         var successfulRequestsPerSecondBeforeLastLimit: Double = 0
+        let initialConcurrency: Int
+        /// The last 429 or time-based recovery step; distant past once the scope has fully recovered.
+        var lastRecoveryAt = Date.distantPast
 
         init(configuration: Configuration.Scope) {
             concurrencyLimit = max(1, configuration.initialConcurrency)
+            initialConcurrency = concurrencyLimit
             maximumConcurrency = max(concurrencyLimit, configuration.maximumConcurrency)
         }
     }
@@ -303,6 +311,7 @@ actor ProtonRequestGovernor {
             state.cooldownUntil = max(state.cooldownUntil, timestamp.addingTimeInterval(cooldown))
             let observedInterval = 1 / max(0.1, state.successfulRequestsPerSecondBeforeLastLimit * 0.8)
             state.admissionInterval = max(0.025, min(2, max(state.admissionInterval * 2, observedInterval)))
+            state.lastRecoveryAt = timestamp
             DebugLog.log(
                 "[RequestGovernor] 429 scope=\(permit.scope) cooldownMs=\(Int(cooldown * 1_000)) "
                     + "limit=\(state.concurrencyLimit) intervalMs=\(Int(state.admissionInterval * 1_000)) "
@@ -347,6 +356,7 @@ actor ProtonRequestGovernor {
             )
         }
         Self.prune(&state, now: timestamp)
+        recover(&state, now: timestamp)
         states[scope] = state
         return .init(
             inFlight: state.inFlight,
@@ -373,9 +383,31 @@ actor ProtonRequestGovernor {
         drain(scope)
     }
 
+    /// Time-based half of the recovery after a 429; see `Configuration.rateLimitRecoveryInterval`.
+    private func recover(_ state: inout ScopeState, now timestamp: Date) {
+        guard state.lastRecoveryAt != .distantPast, configuration.rateLimitRecoveryInterval > 0 else { return }
+        let steps = Int(timestamp.timeIntervalSince(state.lastRecoveryAt) / configuration.rateLimitRecoveryInterval)
+        guard steps > 0 else { return }
+        for _ in 0..<min(steps, 16) {
+            state.admissionInterval *= 0.5
+            if state.admissionInterval < 0.01 { state.admissionInterval = 0 }
+            if state.concurrencyLimit < state.initialConcurrency { state.concurrencyLimit += 1 }
+        }
+        if let lastAdmitted = state.admitted.last {
+            state.nextAdmission = min(state.nextAdmission, lastAdmitted.addingTimeInterval(state.admissionInterval))
+        }
+        if state.admissionInterval == 0, state.concurrencyLimit >= state.initialConcurrency {
+            state.lastRecoveryAt = .distantPast
+        } else {
+            state.lastRecoveryAt = state.lastRecoveryAt.addingTimeInterval(
+                Double(steps) * configuration.rateLimitRecoveryInterval)
+        }
+    }
+
     private func drain(_ scope: ProtonRequestScope) {
         guard var state = states[scope] else { return }
         let timestamp = now()
+        recover(&state, now: timestamp)
 
         while state.inFlight < state.concurrencyLimit, !state.waiters.isEmpty {
             guard !isAdmissionSuspended(scope) else {
