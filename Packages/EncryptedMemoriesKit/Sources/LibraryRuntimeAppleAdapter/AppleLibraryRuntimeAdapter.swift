@@ -24,6 +24,7 @@ public final class AppleLibraryRuntimeAdapter {
     private var memoryPressureSource: DispatchSourceMemoryPressure?
     private var notificationTokens: [NSObjectProtocol] = []
     private var warningDecayTask: Task<Void, Never>?
+    private var storageTask: Task<Void, Never>?
     private var installed = false
     private var dispatchPressure: MemoryConditions.Pressure = .normal
     private var memoryWarningLatched = false
@@ -54,12 +55,50 @@ public final class AppleLibraryRuntimeAdapter {
         installMemoryPressureSource()
         installProcessNotifications()
         publishMemoryConditions()
+        if runtimeState.snapshot().executionOpportunity == .foregroundActive {
+            startStoragePolling()
+        } else {
+            storageTask = Task { await sampleStorageCapacity() }
+        }
     }
 
     /// Platform lifecycle adapters provide opportunity; Core remains framework-free.
     public func setExecutionOpportunity(_ opportunity: LibraryExecutionOpportunity) {
+        let previous = runtimeState.snapshot().executionOpportunity
         runtimeState.update { $0.executionOpportunity = opportunity }
         publishMemoryConditions()
+        if opportunity == .foregroundActive, previous != .foregroundActive {
+            startStoragePolling()
+        } else if opportunity != .foregroundActive {
+            storageTask?.cancel()
+            storageTask = nil
+        }
+    }
+
+    private func startStoragePolling() {
+        storageTask?.cancel()
+        storageTask = Task { [weak self] in
+            while !Task.isCancelled {
+                await self?.sampleStorageCapacity()
+                do {
+                    try await Task.sleep(for: .seconds(60))
+                } catch {
+                    return
+                }
+            }
+        }
+    }
+
+    private func sampleStorageCapacity() async {
+        let home = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
+        let available = await Task.detached(priority: .utility) {
+            DeviceStorage.availableCapacity(at: home)
+        }.value
+        guard !Task.isCancelled else { return }
+        runtimeState.update {
+            $0.storagePressure = LibraryStoragePressure.next(
+                after: $0.storagePressure, availableBytes: available)
+        }
     }
 
     private func installNetworkMonitor() {

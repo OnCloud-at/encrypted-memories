@@ -221,12 +221,13 @@ private struct MobileAlbumPickerSheet: View {
                     )
                 } else {
                     List(filteredAlbums) { album in
+                        let isSelected = draft.contains(album.id)
                         Button {
                             toggle(album.id)
                         } label: {
-                            HStack {
-                                Image(systemName: draft.contains(album.id) ? "checkmark.circle.fill" : "circle")
-                                    .foregroundStyle(draft.contains(album.id) ? Color.accentColor : Color.secondary)
+                            HStack(spacing: 12) {
+                                Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
+                                    .foregroundStyle(isSelected ? Color.accentColor : Color.secondary)
                                     .imageScale(.large)
                                 VStack(alignment: .leading, spacing: 2) {
                                     Text(album.title)
@@ -236,8 +237,13 @@ private struct MobileAlbumPickerSheet: View {
                                         .font(.footnote.monospacedDigit())
                                         .foregroundStyle(.secondary)
                                 }
+                                Spacer(minLength: 0)
                             }
+                            // The whole row toggles; the plain style keeps the text out of the tint color.
+                            .contentShape(Rectangle())
                         }
+                        .buttonStyle(.plain)
+                        .accessibilityAddTraits(isSelected ? .isSelected : [])
                     }
                     .listStyle(.insetGrouped)
                 }
@@ -255,14 +261,18 @@ private struct MobileAlbumPickerSheet: View {
                         dismiss()
                     }
                     .fontWeight(.semibold)
+                    .disabled(!didLoad || draft == controller.selectedAlbumIDs)
                 }
                 .mobileVisibilityPriority(.high)
-                ToolbarItem(placement: .status) {
-                    Text(L10n.string("settings.albumsync_picker_selected \(draft.count)"))
-                        .font(.footnote.monospacedDigit())
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                        .fixedSize()  // the .status pill constrains width; keep the full text ("3 Alben"), not "3 Al…"
+                if !draft.isEmpty {
+                    ToolbarItem(placement: .status) {
+                        // The .status pill constrains width; keep the full text ("3 Alben"), not "3 Al…".
+                        Text(L10n.string("settings.albumsync_picker_selected \(draft.count)"))
+                            .font(.footnote.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .fixedSize()
+                    }
                 }
             }
         }

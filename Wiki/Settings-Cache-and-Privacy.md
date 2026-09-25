@@ -2,17 +2,25 @@
 
 ## iPhone and iPad
 
-Open the **Photos** tab and select the account button. The Settings screen contains account and storage information, backup, album sync, cache controls, Smart Search, optional tips, support-report export, build information, and sign out.
+Open the **Photos** tab and select the account button. Settings shows your account and storage, optional tips, and the **Features** Smart Search, Backup, and Album Sync. Each feature opens its own page. Its row shows the current state, for example **On**, **Paused**, or **3 albums**. Below follow **Labs**, the cache controls, support-report export, build information, and sign out.
 
 ## Mac
 
-Open **Encrypted Memories → Settings…**. Native tabs separate Account, Support, Library, Smart Search, Backup, and Cache diagnostics.
+Open **Encrypted Memories → Settings…**. Native tabs separate Account, Support, Library, Smart Search, Backup, Labs, and Cache diagnostics.
+
+## Labs
+
+Labs is the place to try new features before they are finished. Each feature has its own switch and stays off until you turn it on. Labs features can still change or go away. Some appear only in TestFlight builds. When nothing is ready to try, Labs says so.
+
+Signing out turns every Labs feature off.
 
 ## Cache controls
 
 Encrypted Memories keeps encrypted thumbnails, previews, originals, metadata, and derived indexes in account-scoped local storage. Clearing a cache removes local copies; it does not delete remote Proton Drive photos.
 
 The app can rebuild derived thumbnails and search indexes from the remote library. This can temporarily increase network and background activity.
+
+When the device is almost full, the app stops saving new offline copies of originals, previews, and videos. When hardly any space is left, it also deletes these copies and pauses background work that writes a lot, such as indexing. Grid thumbnails stay. Settings shows a short note while this applies. Everything resumes on its own once there is space again.
 
 ## Privacy boundaries
 

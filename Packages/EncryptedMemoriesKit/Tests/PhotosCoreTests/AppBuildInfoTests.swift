@@ -18,4 +18,15 @@ final class AppBuildInfoTests: XCTestCase {
         XCTAssertTrue(summary.contains("1.2.3"))
         XCTAssertTrue(summary.contains("683"))
     }
+
+    func testOnlyBetaAndDevelopmentChannelsArePrereleaseBuilds() {
+        XCTAssertTrue(AppBuildInfo(version: nil, build: nil, releaseChannel: "beta").isPrerelease)
+        XCTAssertTrue(AppBuildInfo(version: nil, build: nil, releaseChannel: " Alpha\n").isPrerelease)
+        XCTAssertFalse(AppBuildInfo(version: nil, build: nil, releaseChannel: "stable").isPrerelease)
+        // A missing or unknown channel never unlocks prerelease features.
+        XCTAssertFalse(AppBuildInfo(version: nil, build: nil).isPrerelease)
+        XCTAssertFalse(AppBuildInfo(version: nil, build: nil, releaseChannel: "").isPrerelease)
+        XCTAssertFalse(
+            AppBuildInfo(version: nil, build: nil, releaseChannel: "$(ENCRYPTED_MEMORIES_PROTON_CHANNEL)").isPrerelease)
+    }
 }

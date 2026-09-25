@@ -32,7 +32,8 @@ struct SettingsView: View {
                 .padding(.vertical, 7)
         }
         .navigationTitle("sidebar.settings")
-        .frame(width: 520, height: 520)
+        // German tab titles need at least 530 pt; a narrower window hides a tab behind the overflow menu.
+        .frame(width: 560, height: 520)
         .task {
             await refreshAccountInfo()
             while !Task.isCancelled {
@@ -88,6 +89,10 @@ struct SettingsView: View {
                         )
                     })
             }
+            tabs.append(
+                .init(id: .labs, title: L10n.string("labs.title"), systemImage: "flask") {
+                    LabsSettingsTab()
+                })
             tabs.append(
                 .init(
                     id: .diagnostics, title: String(localized: "settings.diagnostics_tab"), systemImage: "internaldrive"
@@ -182,7 +187,7 @@ private struct BackupSettingsTab: View {
                     Section {
                         BackupStatusSummaryRow(status: manualStatus)
                     } header: {
-                        Text("settings.backup_uploads_section")
+                        Text(L10n.string("settings.backup_uploads_section"))
                     }
                 }
             }
@@ -365,6 +370,7 @@ private struct LibrarySettingsTab: View {
     @State private var deleting = false
     @State private var cacheSize: Int64 = 0
     @State private var originalsSize: Int64 = 0
+    @State private var storagePressure: LibraryStoragePressure = .normal
 
     var body: some View {
         Form {
@@ -433,9 +439,14 @@ private struct LibrarySettingsTab: View {
                     .fixedSize(horizontal: false, vertical: true)
             } header: {
                 Text("settings.storage_section")
+            } footer: {
+                if storagePressure != .normal {
+                    Text(L10n.string("settings.storage_pressure"))
+                }
             }
         }
         .formStyle(.grouped)
+        .observesStoragePressure($storagePressure)
         .task {
             await refreshSize()
             while !Task.isCancelled {
@@ -1110,6 +1121,17 @@ private struct BackupStatusSummaryRow: View {
 
     private var showsStatusHeader: Bool {
         status.isActive || total > 0 || status.needsAttentionCount > 0
+    }
+}
+
+// MARK: - Labs
+
+private struct LabsSettingsTab: View {
+    var body: some View {
+        Form {
+            LabsSettingsSection()
+        }
+        .formStyle(.grouped)
     }
 }
 

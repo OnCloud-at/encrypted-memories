@@ -79,7 +79,7 @@ public actor DragOutStager {
                 break
             }
         }
-        let free = Self.freeDiskBytes(at: stagingDirectory)
+        let free = DeviceStorage.availableCapacity(at: stagingDirectory) ?? 0
         let decision = DragOutPolicy.preflight(
             totalKnownBytes: totalKnownBytes,
             freeDiskBytes: free,
@@ -283,11 +283,6 @@ public actor DragOutStager {
         for file in files where file.pathExtension == "download" {
             try? FileManager.default.removeItem(at: file)
         }
-    }
-
-    private static func freeDiskBytes(at url: URL) -> Int64 {
-        let values = try? url.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
-        return Int64(values?.volumeAvailableCapacityForImportantUsage ?? 0)
     }
 
     private static func desiredFilename(for uid: PhotoUID, provider: any OriginalFileProvider) async -> String {

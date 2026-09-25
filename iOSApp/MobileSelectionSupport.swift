@@ -85,9 +85,11 @@ final class MobileGridSelectionController {
                 return
             }
             if result.urls.isEmpty {
-                self.actionError = MobileSelectionError(message: failureMessage)
+                self.actionError = MobileSelectionError(
+                    message: result.ranOutOfSpace ? String(localized: "selection.share_failed_space") : failureMessage)
             } else if result.failed > 0 {
-                self.partialShare = MobilePartialShare(urls: result.urls, failed: result.failed)
+                self.partialShare = MobilePartialShare(
+                    urls: result.urls, failed: result.failed, ranOutOfSpace: result.ranOutOfSpace)
             } else {
                 self.sharePayload = MobileSharePayload(urls: result.urls)
             }
@@ -162,11 +164,13 @@ struct MobilePartialShare: Identifiable {
     let id = UUID()
     let urls: [URL]
     let failed: Int
+    let ranOutOfSpace: Bool
     let fileOwnership: MobileShareFileOwnership
 
-    init(urls: [URL], failed: Int) {
+    init(urls: [URL], failed: Int, ranOutOfSpace: Bool = false) {
         self.urls = urls
         self.failed = failed
+        self.ranOutOfSpace = ranOutOfSpace
         fileOwnership = MobileShareFileOwnership(urls: urls)
     }
 }
@@ -199,7 +203,10 @@ private struct MobileSelectionAlertsModifier: ViewModifier {
                     MobileMediaExporter.cleanup(info.urls)
                 }
             } message: { info in
-                Text(String(localized: "selection.share_partial_message \(info.failed)"))
+                Text(
+                    info.ranOutOfSpace
+                        ? String(localized: "selection.share_partial_space \(info.failed)")
+                        : String(localized: "selection.share_partial_message \(info.failed)"))
             }
             .alert(
                 trashTitle,
@@ -335,16 +342,19 @@ enum MobileMediaExporter {
         return result
     }
 
-    /// The result of an export run: successfully written URLs and the count of downloads that failed.
+    /// The result of an export run: successfully written URLs, the count of items left out, and whether
+    /// the device ran short of space.
     struct ExportResult {
         let urls: [URL]
         let failed: Int
+        var ranOutOfSpace = false
     }
 
     static func exportOriginals(
         _ items: [PhotoItem],
         backend: any OriginalFileProvider & PhotoMetadataProvider,
-        runtimeState: LibraryRuntimeState = .shared
+        runtimeState: LibraryRuntimeState = .shared,
+        availableCapacity: (URL) -> Int64? = DeviceStorage.availableCapacity(at:)
     ) async -> ExportResult {
         guard !items.isEmpty else { return ExportResult(urls: [], failed: 0) }
         guard !Task.isCancelled else { return ExportResult(urls: [], failed: items.count) }
@@ -368,19 +378,33 @@ enum MobileMediaExporter {
 
         let maxConcurrent = 2
         var exported: [URL] = []
-        var failed = 0
         var index = 0
+        var ranOutOfSpace = false
+        // Original sizes are unknown up front, so each next item needs the reserve free before it starts. The rest
+        // of the selection is then reported as a space failure instead of filling the device.
+        func hasRoomForNextItem() -> Bool {
+            (availableCapacity(directory) ?? .max) >= exportReserveBytes
+        }
         // Bounded task group: at most `maxConcurrent` downloads in flight so a big video selection can't spike RAM.
-        await withTaskGroup(of: URL?.self) { group in
+        await withTaskGroup(of: ItemExport.self) { group in
             func addNext() {
-                guard index < items.count, !Task.isCancelled else { return }
+                guard index < items.count, !Task.isCancelled, !ranOutOfSpace else { return }
+                guard hasRoomForNextItem() else {
+                    ranOutOfSpace = true
+                    return
+                }
                 let item = items[index]
                 index += 1
                 group.addTask { await export(item, backend: backend, names: names, into: directory) }
             }
             for _ in 0..<min(maxConcurrent, items.count) { addNext() }
-            for await url in group {
-                if let url { exported.append(url) } else { failed += 1 }
+            for await outcome in group {
+                switch outcome {
+                case .exported(let url): exported.append(url)
+                // A full device fails every later item too. Stop instead of retrying into the same wall.
+                case .outOfSpace: ranOutOfSpace = true
+                case .failed: break
+                }
                 addNext()
             }
         }
@@ -390,7 +414,16 @@ enum MobileMediaExporter {
             return ExportResult(urls: [], failed: items.count)
         }
         if exported.isEmpty { try? FileManager.default.removeItem(at: directory) }
-        return ExportResult(urls: exported, failed: failed)
+        return ExportResult(urls: exported, failed: items.count - exported.count, ranOutOfSpace: ranOutOfSpace)
+    }
+
+    /// Free space an export leaves untouched, matching the drag-out staging reserve.
+    private static let exportReserveBytes: Int64 = 128 * 1024 * 1024
+
+    private enum ItemExport: Sendable {
+        case exported(URL)
+        case outOfSpace
+        case failed
     }
 
     private static func export(
@@ -398,7 +431,7 @@ enum MobileMediaExporter {
         backend: any OriginalFileProvider & PhotoMetadataProvider,
         names: ExportNames,
         into directory: URL
-    ) async -> URL? {
+    ) async -> ItemExport {
         let staging = directory.appendingPathComponent(".\(UUID().uuidString).download")
         defer { try? FileManager.default.removeItem(at: staging) }
         do {
@@ -415,9 +448,9 @@ enum MobileMediaExporter {
             let url = directory.appendingPathComponent(await names.unique(desired))
             try Task.checkCancellation()
             try FileManager.default.moveItem(at: staging, to: url)
-            return url
+            return .exported(url)
         } catch {
-            return nil
+            return DeviceStorage.isOutOfSpace(error) ? .outOfSpace : .failed
         }
     }
 

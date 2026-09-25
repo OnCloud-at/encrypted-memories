@@ -541,6 +541,22 @@ struct ThumbnailFeedCoreTests {
         #expect(await loader.recordedPriorities == [.visibleNow, .visibleNow])
     }
 
+    @Test func visibleArrivalsStayInMemoryWhenTheDeviceIsNearlyFull() async throws {
+        let uid = Self.uid("visible-storage-critical")
+        let loader = PriorityRecordingLoader(payload: Self.pngData(width: 24, height: 24))
+        let nearlyFull = LibraryRuntimeState(initial: LibraryRuntimeSnapshot(storagePressure: .critical))
+        let feed = ThumbnailFeedCore(
+            cache: Self.cache("visible-storage-critical", runtimeState: nearlyFull),
+            loader: loader,
+            configuration: Self.configuration(downloadConcurrencyLimit: 1, batchSize: 1)
+        )
+
+        let warm = await feed.warmVisibleDecoded([ThumbnailRequest(uid: uid)], limit: 1)
+        #expect(warm.queuedNetwork == 1)
+        try await Self.waitUntil { await feed.cachedDecoded(for: uid) != nil }
+        #expect(await loader.recordedPriorities == [.visibleNow])
+    }
+
     @Test func equalPriorityQueueKeepsNearToFarOrder() async throws {
         let blocker = Self.uid("fifo-blocker")
         let near = Self.uid("fifo-near")
@@ -2614,13 +2630,14 @@ struct ThumbnailFeedCoreTests {
         )
     }
 
-    private static func cache(_ prefix: String) -> ThumbnailCache {
+    private static func cache(_ prefix: String, runtimeState: LibraryRuntimeState = .shared) -> ThumbnailCache {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("EncryptedMemoriesKit-feed-core-\(prefix)-\(UUID().uuidString)", isDirectory: true)
         try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         let cache = ThumbnailCache(
             namespace: "feed-core-\(prefix)-\(UUID().uuidString)",
-            rootDirectory: root
+            rootDirectory: root,
+            runtimeState: runtimeState
         )
         cache.configure(accountUID: "acct-A", key: feedCacheTestKey)
         return cache

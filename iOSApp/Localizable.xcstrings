@@ -18,23 +18,6 @@
         }
       }
     },
-    "settings.albumsync_row": {
-      "extractionState": "manual",
-      "localizations": {
-        "de": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Alben mit Proton Drive synchronisieren"
-          }
-        },
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Sync albums to Proton Drive"
-          }
-        }
-      }
-    },
     "settings.albumsync_title": {
       "extractionState": "manual",
       "localizations": {
@@ -176,8 +159,44 @@
     "settings.section_features": {
       "extractionState": "manual",
       "localizations": {
-        "de": { "stringUnit": { "state": "translated", "value": "Features" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Funktionen" } },
         "en": { "stringUnit": { "state": "translated", "value": "Features" } }
+      }
+    },
+    "settings.albumsync_summary %lld": {
+      "extractionState": "manual",
+      "comment": "Trailing value of the album sync settings row: number of synced albums.",
+      "localizations": {
+        "en": {
+          "variations": {
+            "plural": {
+              "one": { "stringUnit": { "state": "translated", "value": "%lld album" } },
+              "other": { "stringUnit": { "state": "translated", "value": "%lld albums" } }
+            }
+          }
+        },
+        "de": {
+          "variations": {
+            "plural": {
+              "one": { "stringUnit": { "state": "translated", "value": "%lld Album" } },
+              "other": { "stringUnit": { "state": "translated", "value": "%lld Alben" } }
+            }
+          }
+        }
+      }
+    },
+    "selection.share_failed_space": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "There isn't enough free space to prepare the selection for sharing." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Es ist nicht genug freier Speicher da, um die Auswahl zum Teilen vorzubereiten." } }
+      }
+    },
+    "selection.share_partial_space %lld": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "There isn't enough free space for %lld item(s); they will be left out." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Für %lld Objekt(e) ist nicht genug freier Speicher da; sie werden ausgelassen." } }
       }
     },
     "action.try_again": {

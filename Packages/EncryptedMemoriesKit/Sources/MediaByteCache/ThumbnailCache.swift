@@ -26,6 +26,7 @@ public enum ThumbnailCacheStoreResult: Sendable, Equatable {
     case stored
     case stale
     case ioFailure
+    case storagePaused
 }
 
 /// Two-tier thumbnail cache: in-memory (NSCache) backed by an encrypted on-disk store. Keeps decoded
@@ -46,6 +47,9 @@ public actor ThumbnailCache {
     private nonisolated let coverageCheckpointDir: URL
     private nonisolated let namespace: String
     private nonisolated let derivative: String
+    private nonisolated let storageKind: LibraryDiskCacheKind
+    private nonisolated let runtimeState: LibraryRuntimeState
+    private nonisolated(unsafe) var storageTask: Task<Void, Never>?
     private nonisolated let crypto: CryptoBox
     /// Fence for loaders and detached writers that can outlive a destructive clear or session change.
     private nonisolated let writerGeneration = CacheWriterGeneration()
@@ -66,13 +70,15 @@ public actor ThumbnailCache {
     public init(
         namespace: String = "thumbnails",
         derivative: String? = nil,
-        rootDirectory: URL? = nil
+        rootDirectory: URL? = nil,
+        runtimeState: LibraryRuntimeState = .shared
     ) {
         self.init(
             namespace: namespace,
             derivative: derivative,
             configuration: ThumbnailCacheConfiguration(),
-            rootDirectory: rootDirectory
+            rootDirectory: rootDirectory,
+            runtimeState: runtimeState
         )
     }
 
@@ -80,12 +86,20 @@ public actor ThumbnailCache {
         namespace: String = "thumbnails",
         derivative: String? = nil,
         configuration: ThumbnailCacheConfiguration = ThumbnailCacheConfiguration(),
-        rootDirectory: URL? = nil
+        rootDirectory: URL? = nil,
+        runtimeState: LibraryRuntimeState = .shared
     ) {
         let root = rootDirectory ?? Self.defaultRootDirectory()
         let resolvedDerivative = derivative ?? Self.defaultDerivative(for: namespace)
         self.namespace = namespace
         self.derivative = resolvedDerivative
+        self.storageKind =
+            switch resolvedDerivative {
+            case "preview": .preview
+            case "original": .original
+            default: .thumbnail
+            }
+        self.runtimeState = runtimeState
         self.directory = root.appendingPathComponent("\(namespace).enc", isDirectory: true)
         self.coverageCheckpointDir = root.appendingPathComponent("\(namespace).coverage", isDirectory: true)
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -112,7 +126,19 @@ public actor ThumbnailCache {
                 self?.enforceByteCap(automaticDiskCapBytes)
             }
         }
+        if storageKind.evictsOnCritical {
+            storageTask = Task { [weak self, runtimeState] in
+                var wasCritical = false
+                for await snapshot in runtimeState.updates() {
+                    let critical = snapshot.storagePressure == .critical
+                    if critical, !wasCritical { await self?.clearForStoragePressure() }
+                    wasCritical = critical
+                }
+            }
+        }
     }
+
+    deinit { storageTask?.cancel() }
 
     /// Governor-driven memory-pressure response for the in-process plaintext RAM tier. `scale` lowers
     /// the NSCache cost limit; `purge` drops the tier now. `nonisolated` + thread-safe NSCache, so the
@@ -339,6 +365,9 @@ public actor ThumbnailCache {
         ifCurrent generation: CacheWriterGeneration.Token
     ) -> ThumbnailCacheStoreResult {
         guard retentionAuthorization.isAllowed(uid) else { return .stale }
+        guard runtimeState.snapshot().storagePressure.permitsDiskWrite(for: storageKind) else {
+            return .storagePaused
+        }
         let (cipher, account) = crypto.snapshot()
         // Never persist plaintext while the cache is locked.
         guard let cipher, let sealed = try? cipher.seal(data, uid: uid) else { return .ioFailure }
@@ -347,6 +376,9 @@ public actor ThumbnailCache {
             writerGeneration.performIfCurrent(generation) {
                 guard retentionAuthorization.isAllowed(uid) else {
                     return ThumbnailCacheStoreResult.stale
+                }
+                guard runtimeState.snapshot().storagePressure.permitsDiskWrite(for: storageKind) else {
+                    return ThumbnailCacheStoreResult.storagePaused
                 }
                 do {
                     try sealed.write(to: directory.appendingPathComponent(name), options: .atomic)
@@ -372,7 +404,8 @@ public actor ThumbnailCache {
     public func store(_ data: Data, for uid: PhotoUID) {
         guard retentionAuthorization.isAllowed(uid) else { return }
         let generation = writerGeneration.capture()
-        guard storeToDisk(data, for: uid, ifCurrent: generation) == .stored else {
+        let result = storeToDisk(data, for: uid, ifCurrent: generation)
+        guard result == .stored || result == .storagePaused else {
             memory.removeObject(forKey: Self.memKey(uid))
             return
         }
@@ -624,6 +657,15 @@ public actor ThumbnailCache {
     public func clear() {
         // Advance before removing files. A late non-cooperative loader can still invoke its callback,
         // but its captured token will fail the write fence instead of recreating stale data.
+        writerGeneration.invalidateAndPerform {
+            memory.removeAllObjects()
+            validated.clearAll()
+            if purgeDirectoryContents() { diskUsage.reset() } else { diskUsage.invalidate() }
+        }
+    }
+
+    private func clearForStoragePressure() {
+        // Revoke in-flight optional writes before removing their encrypted blobs and RAM copies.
         writerGeneration.invalidateAndPerform {
             memory.removeAllObjects()
             validated.clearAll()

@@ -72,7 +72,7 @@ public enum OriginalExportWriter {
         items: [PhotoItem],
         to destination: URL,
         provider: any OriginalFileProvider & PhotoMetadataProvider,
-        freeBytes: (URL) -> Int64? = OriginalExportWriter.volumeFreeBytes(at:),
+        freeBytes: (URL) -> Int64? = DeviceStorage.availableCapacity(at:),
         onProgress: @escaping @Sendable (Double) -> Void
     ) async throws {
         let total = Double(items.count)
@@ -136,11 +136,6 @@ public enum OriginalExportWriter {
         } else {
             try fileManager.moveItem(at: stagedFile, to: destination)
         }
-    }
-
-    public static func volumeFreeBytes(at directory: URL) -> Int64? {
-        (try? directory.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]))?
-            .volumeAvailableCapacityForImportantUsage
     }
 
     /// Returns `name`, or `name 2`, `name 3` and so on before the extension, so archive entries never collide.

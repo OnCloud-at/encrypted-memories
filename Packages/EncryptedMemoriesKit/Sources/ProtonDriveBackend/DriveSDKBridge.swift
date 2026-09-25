@@ -1019,9 +1019,24 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         } catch {
             await requestGovernor.endPriorityScope(priorityScope)
             if Task.isCancelled { throw CancellationError() }
-            throw error
+            throw Self.originalTransferError(from: error)
         }
         await requestGovernor.endPriorityScope(priorityScope)
+    }
+
+    /// Exports stop on a full device through `DeviceStorage.isOutOfSpace`, which cannot read the SDK's own
+    /// error chain. Give that case the platform error and keep every other error unchanged.
+    nonisolated static func originalTransferError(from error: any Error) -> any Error {
+        guard let sdkError = error as? ProtonDriveSDKError else { return error }
+        return originalTransferError(error, fileSystemCode: sdkError.underlyingFileSystemErrorCode)
+    }
+
+    nonisolated static func originalTransferError(
+        _ error: any Error,
+        fileSystemCode: ProtonDriveSDKError.FileSystemErrorCode?
+    ) -> any Error {
+        guard fileSystemCode == .outOfSpace else { return error }
+        return CocoaError(.fileWriteOutOfSpace, userInfo: [NSUnderlyingErrorKey: error])
     }
 
     private func singleThumbnail(_ uid: PhotoUID, type: ThumbnailData.ThumbnailType) async throws -> Data {

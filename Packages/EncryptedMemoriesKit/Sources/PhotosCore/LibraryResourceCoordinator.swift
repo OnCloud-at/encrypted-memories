@@ -8,6 +8,15 @@ public enum LibraryHeavyWorkload: String, Sendable, Equatable {
     case backupHashing
     case cryptoPreparation
     case videoDerivative
+
+    /// Automatic work that fills the disk pauses while storage is critical. Backup is excluded: it checks
+    /// free space itself and tells the person that the device needs storage.
+    public var writesLargeData: Bool {
+        switch self {
+        case .mlIndexing, .videoDerivative: true
+        case .mlModelLoading, .mlInference, .backupHashing, .backupMaterialization, .cryptoPreparation: false
+        }
+    }
 }
 
 public enum LibraryWorkIntent: Int, Sendable, Comparable, Equatable {
@@ -75,6 +84,7 @@ public enum LibraryWorkPolicyReason: String, Sendable, Equatable {
     case lowPowerMode
     case executionSuspended
     case recoveryHysteresis
+    case storagePressure
 }
 
 public struct LibraryWorkBudget: Sendable, Equatable {
@@ -112,6 +122,7 @@ public enum LibraryWorkYieldReason: String, Sendable, Equatable {
     case userInteraction
     case thermalPressure
     case memoryPressure
+    case storagePressure
     case lowPowerMode
     case executionSuspended
     case generationChanged
@@ -217,6 +228,11 @@ public struct LibraryResourcePolicy: Sendable, Equatable {
             || snapshot.memoryHeadroom == .critical
         {
             return result(false, 0, .criticalPressure)
+        }
+        if snapshot.storagePressure == .critical, request.intent < .userInitiated,
+            request.workload.writesLargeData
+        {
+            return result(false, 0, .storagePressure)
         }
         if recoveryIsPending, request.intent < .interactive {
             return result(false, 0, .recoveryHysteresis)
@@ -369,6 +385,11 @@ private final class LibraryWorkLeaseState: @unchecked Sendable {
     private func liveYieldReason(snapshot: LibraryRuntimeSnapshot) -> LibraryWorkYieldReason? {
         if snapshot.generation != budget.snapshotGeneration { return .generationChanged }
         if snapshot.executionOpportunity == .suspended { return .executionSuspended }
+        if snapshot.storagePressure == .critical, request.intent < .userInitiated,
+            request.workload.writesLargeData
+        {
+            return .storagePressure
+        }
         if snapshot.hasActiveUserInteraction { return .userInteraction }
         if snapshot.hasVisibleMediaDemand { return .visibleDemand }
         if snapshot.isLowPowerMode, request.workload == .mlIndexing, request.intent < .userInitiated {
@@ -410,6 +431,7 @@ private final class LibraryWorkLeaseState: @unchecked Sendable {
         case .seriousPressure, .criticalPressure:
             .thermalPressure
         case .lowPowerMode: .lowPowerMode
+        case .storagePressure: .storagePressure
         case .executionSuspended: .executionSuspended
         case .nominal, .fairPressure, .recoveryHysteresis:
             .thermalPressure
@@ -675,7 +697,12 @@ public actor LibraryResourceCoordinator {
         }
 
         recoveryIsPending = true
+        // Storage pressure has its own hysteresis. It applies at once in both directions, so a device that
+        // frees space does not hold backup or user work behind the recovery delay of the other signals.
+        let storageChanged = effectiveSnapshot.storagePressure != snapshot.storagePressure
+        effectiveSnapshot.storagePressure = snapshot.storagePressure
         emitStateTransition(snapshot)
+        if storageChanged { admitNextIfPossible() }
         recoveryTask = Task { [weak self, recoveryDelay, recoverySleep] in
             try? await recoverySleep(recoveryDelay)
             guard !Task.isCancelled else { return }
@@ -699,6 +726,7 @@ public actor LibraryResourceCoordinator {
             String(describing: snapshot.memoryBudgetTier),
             String(describing: snapshot.memoryPressure),
             String(describing: snapshot.memoryHeadroom),
+            String(describing: snapshot.storagePressure),
             "\(snapshot.isLowPowerMode)",
             String(describing: snapshot.executionOpportunity),
             "\(snapshot.network.isReachable)",
@@ -718,6 +746,7 @@ public actor LibraryResourceCoordinator {
                 "lowPower": "\(snapshot.isLowPowerMode)",
                 "memory": String(describing: snapshot.memoryBudgetTier),
                 "memoryPressure": String(describing: snapshot.memoryPressure),
+                "storagePressure": String(describing: snapshot.storagePressure),
                 "networkConstrained": "\(snapshot.network.isConstrained)",
                 "networkExpensive": "\(snapshot.network.isExpensive)",
                 "networkReachable": "\(snapshot.network.isReachable)",

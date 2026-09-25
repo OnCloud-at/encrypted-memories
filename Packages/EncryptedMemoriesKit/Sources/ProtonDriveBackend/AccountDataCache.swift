@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import PhotosCore
 
 /// Encrypted on-disk cache of the account data (`/core/v4/users` + `/core/v4/addresses`) needed to build the
 /// Drive crypto + SDK account client. It exists so the app can cold-start offline: when those two GETs can't be
@@ -51,7 +52,12 @@ enum AccountDataCache {
 
     private static func seal(_ data: Data, to url: URL, using key: SymmetricKey) {
         guard let sealed = try? AES.GCM.seal(data, using: key).combined else { return }
-        try? sealed.write(to: url, options: .atomic)
+        do {
+            try sealed.write(to: url, options: .atomic)
+        } catch {
+            // The cache only speeds up the next launch; a full disk must stay visible in diagnostics.
+            PhotoDiagnostics.shared.increment("account.cacheWriteFailed")
+        }
     }
 
     private static func open(_ url: URL, using key: SymmetricKey) -> Data? {

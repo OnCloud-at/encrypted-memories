@@ -6,6 +6,39 @@ import Testing
 
 @Suite("Video byte-range cache generations")
 struct VideoByteRangeCacheTests {
+    @Test func storagePressurePausesWritesAndEvictsAtCritical() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("EncryptedMemories-video-pressure-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runtime = LibraryRuntimeState()
+        let cache = VideoByteRangeCache(rootDirectory: root, runtimeState: runtime)
+        let photo = uid("pressure")
+        let first = cache.lookup(uid: photo, block: 1)
+        #expect(
+            cache.store(
+                uid: photo, block: 1, encrypted: Data([1]), ticket: first.ticket,
+                ownerGeneration: first.ticket))
+
+        runtime.update { $0.storagePressure = .low }
+        let low = cache.lookup(uid: photo, block: 2)
+        #expect(
+            !cache.store(
+                uid: photo, block: 2, encrypted: Data([2]), ticket: low.ticket,
+                ownerGeneration: low.ticket))
+        #expect(cache.lookup(uid: photo, block: 1).encrypted == Data([1]))
+
+        runtime.update { $0.storagePressure = .critical }
+        for _ in 0..<100 where cache.lookup(uid: photo, block: 1).encrypted != nil {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(cache.lookup(uid: photo, block: 1).encrypted == nil)
+        runtime.update { $0.storagePressure = .normal }
+        let recovered = cache.lookup(uid: photo, block: 3)
+        #expect(
+            cache.store(
+                uid: photo, block: 3, encrypted: Data([3]), ticket: recovered.ticket,
+                ownerGeneration: first.ticket))
+    }
     @Test func closedPlayerCannotPublishQueuedBytesOrInvalidateAnotherPlayer() async {
         let fixture = makeCache()
         defer { try? FileManager.default.removeItem(at: fixture.root) }

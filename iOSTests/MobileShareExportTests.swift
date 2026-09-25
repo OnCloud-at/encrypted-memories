@@ -75,6 +75,41 @@ struct MobileShareExportTests {
         #expect(FileManager.default.fileExists(atPath: support.path))
     }
 
+    @Test func shareStopsBeforeTheDeviceRunsFull() async throws {
+        let backend = ShareExportTestBackend()
+        let full = await MobileMediaExporter.exportOriginals(
+            [item("a"), item("b")], backend: backend, availableCapacity: { _ in 0 })
+        #expect(full.urls.isEmpty)
+        #expect(full.failed == 2)
+        #expect(full.ranOutOfSpace)
+        #expect(await backend.directory(for: "a") == nil, "no download starts without room")
+
+        var remaining: Int64 = 1 << 40
+        let partial = await MobileMediaExporter.exportOriginals(
+            [item("c"), item("d"), item("e")], backend: backend,
+            availableCapacity: { _ in
+                defer { remaining = 0 }
+                return remaining
+            })
+        defer { MobileMediaExporter.cleanup(partial.urls) }
+        #expect(partial.urls.count == 1)
+        #expect(partial.failed == 2)
+        #expect(partial.ranOutOfSpace)
+    }
+
+    @Test func diskFullDuringADownloadStopsTheShare() async throws {
+        let backend = ShareExportTestBackend()
+        let result = await MobileMediaExporter.exportOriginals(
+            [item("full")], backend: backend, availableCapacity: { _ in 1 << 40 })
+        #expect(result.urls.isEmpty)
+        #expect(result.failed == 1)
+        #expect(result.ranOutOfSpace)
+
+        let ordinary = await MobileMediaExporter.exportOriginals(
+            [item("fail")], backend: backend, availableCapacity: { _ in 1 << 40 })
+        #expect(!ordinary.ranOutOfSpace)
+    }
+
     @Test func allFailedOrCancelledShareRemovesOnlyItsOwnDirectory() async throws {
         let support = try #require(await MobileMediaExporter.exportSupportReport(Data("keep".utf8)))
         defer { MobileMediaExporter.cleanup([support]) }
@@ -109,6 +144,7 @@ private actor ShareExportTestBackend: OriginalFileProvider, PhotoMetadataProvide
         directories[uid.nodeID] = destination.deletingLastPathComponent()
         try Data([0xFF, 0xD8, 0xFF, 0xE0]).write(to: destination)
         if uid.nodeID == "fail" { throw CocoaError(.fileWriteUnknown) }
+        if uid.nodeID == "full" { throw CocoaError(.fileWriteOutOfSpace) }
         if uid.nodeID == "blocked" {
             entered = true
             entryWaiters.forEach { $0.resume() }
