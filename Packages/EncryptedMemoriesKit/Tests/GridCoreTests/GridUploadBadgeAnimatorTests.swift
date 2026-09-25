@@ -25,6 +25,32 @@ import Testing
         #expect(!animator.isAnimating([1], now: t))
     }
 
+    @Test func restartedUploadNeverEmptiesTheCircle() {
+        let animator = GridUploadBadgeAnimator<Int>()
+        _ = animator.frame(for: 1, target: .uploading(step: 12), now: 0)
+        var t = 0.0
+        while t < 1 {
+            t += 1.0 / 60
+            _ = animator.frame(for: 1, target: .uploading(step: 12), now: t)
+        }
+        let held = pieStep(animator.frame(for: 1, target: .uploading(step: 12), now: t)) ?? 0
+        // A new version arrived: the upload starts over and reports little progress.
+        for target: GridUploadBadge in [.waiting, .uploading(step: 2), .uploading(step: 8)] {
+            for _ in 0..<30 {
+                t += 1.0 / 60
+                let step = pieStep(animator.frame(for: 1, target: target, now: t)) ?? -1
+                #expect(step >= held, "the circle holds its fill while the new upload catches up")
+            }
+        }
+        #expect(!animator.isAnimating([1], now: t), "a held circle needs no frames")
+        // The new upload passes the old fill and finishes.
+        for _ in 0..<90 {
+            t += 1.0 / 60
+            _ = animator.frame(for: 1, target: .uploading(step: 20), now: t)
+        }
+        #expect(pieStep(animator.frame(for: 1, target: .uploading(step: 20), now: t)) == GridUploadBadgeGlyph.pieSteps)
+    }
+
     @Test func backedUpPhotoFillsThenChecksThenFades() {
         let animator = GridUploadBadgeAnimator<Int>()
         _ = animator.frame(for: 1, target: .uploading(step: 4), now: 0)

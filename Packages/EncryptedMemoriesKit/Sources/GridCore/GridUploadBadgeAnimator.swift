@@ -225,7 +225,9 @@ package final class GridUploadBadgeAnimator<ID: Hashable> {
             }
             if case .leaving = state.phase { resume(&state, now: now) }
             if state.phase == .progress {
-                state.target = fraction
+                // The circle never runs backwards. When a photo's upload starts over (a new version arrived
+                // while it uploaded), the circle holds its fill until the new upload passes it.
+                state.target = max(fraction, state.target)
                 state.completes = false
             }
         }
