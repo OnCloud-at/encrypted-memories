@@ -2176,11 +2176,7 @@ struct MobileZoomableImage: UIViewRepresentable {
         context.coordinator.onPhotoFrameChanged = onPhotoFrameChanged
         context.coordinator.onZoomSettled = onZoomSettled
         context.coordinator.reduceMotion = reduceMotion
-        context.coordinator.updateLiveText(
-            analysis: liveTextAnalysis,
-            highlighted: liveTextHighlighted,
-            requiresHighlight: onMotionStart != nil
-        )
+        context.coordinator.updateLiveText(analysis: liveTextAnalysis, highlighted: liveTextHighlighted)
         if context.coordinator.imageView?.image !== image {
             context.coordinator.imageView?.image = image
             // Geometry must be current before SwiftUI presents the replacement image. Reporting the new
@@ -2223,7 +2219,6 @@ struct MobileZoomableImage: UIViewRepresentable {
         weak var dismissPan: UIPanGestureRecognizer?
         weak var motionPress: UILongPressGestureRecognizer?
         private var liveTextInteraction: ImageAnalysisInteraction?
-        private var liveTextRequiresHighlight = false
         private var dismissPanActive = false
         private var motionActive = false
         private var updatingZoomGeometry = false
@@ -2392,9 +2387,9 @@ struct MobileZoomableImage: UIViewRepresentable {
         /// horizontal drag then falls through to the page TabView's paging swipe, and a zoomed image keeps its
         /// scroll-view pan. Every other recognizer begins normally.
         func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
-            // While text is highlighted, a press on text selects it instead of playing the Live Photo.
+            // A press on recognized text selects it, as in Photos; a press anywhere else plays the Live Photo.
             if gestureRecognizer === motionPress {
-                return !liveTextOwns(gestureRecognizer)
+                return !liveTextOwns(gestureRecognizer) && !isOnText(gestureRecognizer)
             }
             guard gestureRecognizer === dismissPan, let scrollView else { return true }
             let isZoomedIn = scrollView.zoomScale > scrollView.minimumZoomScale + 0.01
@@ -2461,9 +2456,8 @@ struct MobileZoomableImage: UIViewRepresentable {
 
         // MARK: Live Text
 
-        func updateLiveText(analysis: ImageAnalysis?, highlighted: Bool, requiresHighlight: Bool) {
+        func updateLiveText(analysis: ImageAnalysis?, highlighted: Bool) {
             guard let imageView else { return }
-            liveTextRequiresHighlight = requiresHighlight
             guard let analysis else {
                 liveTextInteraction?.selectableItemsHighlighted = false
                 liveTextInteraction?.analysis = nil
@@ -2496,15 +2490,24 @@ struct MobileZoomableImage: UIViewRepresentable {
             return interaction.hasInteractiveItem(at: gesture.location(in: imageView))
         }
 
+        /// True when `gesture` starts on recognized text, highlighted or not. The analysis knows every text
+        /// region up front, so a Live Photo's press on text can leave the selection to Live Text.
+        private func isOnText(_ gesture: UIGestureRecognizer) -> Bool {
+            guard let interaction = liveTextInteraction, let imageView, interaction.analysis != nil else {
+                return false
+            }
+            return interaction.analysisHasText(at: gesture.location(in: imageView))
+        }
+
         func interaction(
             _ interaction: ImageAnalysisInteraction,
             shouldBeginAt point: CGPoint,
             for interactionType: ImageAnalysisInteraction.InteractionTypes
         ) -> Bool {
             if interaction.selectableItemsHighlighted { return true }
-            // Unhighlighted text only starts a selection on a still. Taps, double taps, and a Live Photo's long press
-            // keep their viewer meaning.
-            guard !liveTextRequiresHighlight, interactionType.contains(.textSelection) else { return false }
+            // Unhighlighted, only a press on text starts a selection, on stills and Live Photos alike. Taps and
+            // double taps keep their viewer meaning, and a press beside the text plays the Live Photo.
+            guard interactionType.contains(.textSelection) else { return false }
             return interaction.analysisHasText(at: point)
         }
 
