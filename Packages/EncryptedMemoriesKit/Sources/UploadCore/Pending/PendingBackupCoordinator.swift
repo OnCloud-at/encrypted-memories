@@ -1,0 +1,853 @@
+import Foundation
+import PhotosCore
+
+/// Owns the pending grid for one account: which local photos show while they wait for backup, their upload
+/// badges, deletes and restores of pending photos, and deferred favorite and album actions.
+///
+/// The backup queue stays the source of truth. The coordinator follows it through change notifications
+/// and keeps its own model incremental, so a first backup of 60,000 photos never rebuilds or re-sorts the
+/// whole list per event. A source shows only with duplicate-check evidence: with iCloud Photos on several
+/// devices, a photo that another device already uploaded arrives here as a new local asset, and only the
+/// check can tell. Desired states in the pending store drive every side effect through one reconciler.
+public actor PendingBackupCoordinator {
+    public struct Configuration: Sendable {
+        /// Minimum distance between two membership publications. Each one makes hosts merge the timeline.
+        public var membershipInterval: Duration
+        /// Minimum distance between two progress-only publications.
+        public var progressInterval: Duration
+        /// How long a checkmark stays after the Proton photo took over the tile.
+        public var doneLinger: Duration
+        /// "Zuletzt gelöscht" keeps deleted pending photos as long as the Proton trash keeps photos.
+        public var trashRetention: TimeInterval
+        public var acknowledgedHandoffRetention: TimeInterval
+
+        public init(
+            membershipInterval: Duration = .seconds(1),
+            progressInterval: Duration = .milliseconds(250),
+            doneLinger: Duration = .seconds(2),
+            trashRetention: TimeInterval = 30 * 24 * 60 * 60,
+            acknowledgedHandoffRetention: TimeInterval = 7 * 24 * 60 * 60
+        ) {
+            self.membershipInterval = membershipInterval
+            self.progressInterval = progressInterval
+            self.doneLinger = doneLinger
+            self.trashRetention = trashRetention
+            self.acknowledgedHandoffRetention = acknowledgedHandoffRetention
+        }
+    }
+
+    public nonisolated let snapshots: AsyncStream<PendingBackupSnapshot>
+    private let snapshotContinuation: AsyncStream<PendingBackupSnapshot>.Continuation
+
+    private let store: PendingBackupManifestStore
+    private let queues: [UploadSourceIdentity.Kind: any UploadBackupSyncQueueObserving]
+    private let metadataProvider: any PendingSourceMetadataProviding
+    private let effects: any PendingBackupEffects
+    private let recorder: PendingBackupEventRecorder?
+    private let configuration: Configuration
+    private let now: @Sendable () -> Date
+    private let sleep: @Sendable (Duration) async throws -> Void
+
+    // Model, all keyed by source.
+    private var rows: [PendingSourceKey: UploadBackupQueueRowState] = [:]
+    private var evidence: [PendingSourceKey: Set<UploadBackupRevision>] = [:]
+    private var handoffs: [PendingSourceKey: PendingHandoff] = [:]
+    private var sourceStates: [PendingSourceKey: PendingSourceState] = [:]
+    private var savedFromApp = Set<String>()
+    private var metadata: [PendingSourceKey: PendingPresentationMetadata] = [:]
+    /// The revision each cached metadata entry belongs to; a new revision can change the capture time.
+    private var metadataRevision: [PendingSourceKey: UploadBackupRevision] = [:]
+    private var inaccessible = Set<PendingSourceKey>()
+    private var liveProgress: [PendingSourceKey: (revision: UploadBackupRevision, step: Int)] = [:]
+    private var retiring: [PendingSourceKey: UploadBackupRevision] = [:]
+    private var actions: [PendingAction] = []
+    private var excludedAccessible = Set<PendingSourceKey>()
+
+    // Presentation, maintained incrementally.
+    private var tilesByKey: [PendingSourceKey: PendingTile] = [:]
+    private var orderedTiles: [PendingTile] = []
+    private var dirty = Set<PendingSourceKey>()
+    private var listsDirty = true
+    private var snapshot = PendingBackupSnapshot.empty
+    private var membershipRevision: UInt64 = 0
+    private var progressRevision: UInt64 = 0
+
+    private var started = false
+    private var closed = false
+    private var tasks: [Task<Void, Never>] = []
+    private var membershipPublishTask: Task<Void, Never>?
+    private var progressPublishTask: Task<Void, Never>?
+    private var lastMembershipPublish: ContinuousClock.Instant?
+    private var reconcileRunning = false
+    private var reconcileAgain = false
+    private var reconcileTimer: Task<Void, Never>?
+    private var actionsRunning = false
+    private var actionsAgain = false
+    private var actionTimer: Task<Void, Never>?
+
+    public init(
+        store: PendingBackupManifestStore,
+        queues: [UploadSourceIdentity.Kind: any UploadBackupSyncQueueObserving],
+        metadataProvider: any PendingSourceMetadataProviding,
+        effects: any PendingBackupEffects,
+        recorder: PendingBackupEventRecorder?,
+        configuration: Configuration = Configuration(),
+        now: @Sendable @escaping () -> Date = { Date() },
+        sleep: @Sendable @escaping (Duration) async throws -> Void = { try await Task.sleep(for: $0) }
+    ) {
+        self.store = store
+        self.queues = queues
+        self.metadataProvider = metadataProvider
+        self.effects = effects
+        self.recorder = recorder
+        self.configuration = configuration
+        self.now = now
+        self.sleep = sleep
+        (snapshots, snapshotContinuation) = AsyncStream.makeStream(
+            of: PendingBackupSnapshot.self,
+            bufferingPolicy: .bufferingNewest(1)
+        )
+    }
+
+    public func currentSnapshot() -> PendingBackupSnapshot { snapshot }
+
+    // MARK: - Lifecycle
+
+    /// Loads the durable state, subscribes to the queues and the runner, publishes the first snapshot and
+    /// resumes any due effect.
+    public func start() async {
+        guard !started, !closed else { return }
+        started = true
+        guard store.isOperational() else { return }
+        let handoffCutoff = now().addingTimeInterval(-configuration.acknowledgedHandoffRetention)
+        _ = store.pruneAcknowledgedHandoffs(olderThan: handoffCutoff)
+        evidence = store.evidenceRevisions()
+        for handoff in store.unacknowledgedHandoffs() { remember(handoff) }
+        sourceStates = Dictionary(uniqueKeysWithValues: store.sourceStates().map { ($0.key, $0) })
+        savedFromApp = store.savedFromAppIdentifiers()
+        actions = store.actions()
+
+        for (kind, queue) in queues {
+            let (changes, continuation) = AsyncStream.makeStream(
+                of: UploadBackupSyncQueueChange.self,
+                bufferingPolicy: .unbounded
+            )
+            queue.setChangeObserver { continuation.yield($0) }
+            tasks.append(
+                Task { [weak self] in
+                    for await change in changes {
+                        await self?.handle(change, kind: kind)
+                    }
+                })
+            for row in queue.unsettledRows() where row.source.kind == kind { absorb(row) }
+        }
+        // Settled rows are not part of the unsettled read; unacknowledged handoffs still need their rows.
+        reloadRows(for: Set(handoffs.keys).subtracting(rows.keys))
+        if let recorder {
+            tasks.append(
+                Task { [weak self] in
+                    for await event in recorder.events {
+                        await self?.handle(event)
+                    }
+                })
+        }
+        dirty.formUnion(rows.keys)
+        dirty.formUnion(handoffs.keys)
+        await refreshMetadata()
+        await refreshExcludedAccessibility()
+        publishMembership(force: true)
+        await reconcile()
+        await runDueActions()
+    }
+
+    public func close() {
+        guard !closed else { return }
+        closed = true
+        for queue in queues.values { queue.setChangeObserver(nil) }
+        tasks.forEach { $0.cancel() }
+        tasks.removeAll()
+        membershipPublishTask?.cancel()
+        progressPublishTask?.cancel()
+        reconcileTimer?.cancel()
+        actionTimer?.cancel()
+        snapshotContinuation.finish()
+    }
+
+    // MARK: - Person actions
+
+    /// Deletes pending photos: they leave the grid and the backup, and appear in "Zuletzt gelöscht".
+    /// A photo whose upload already committed goes to the Proton trash instead. Returns false when the
+    /// decision could not be stored.
+    @discardableResult
+    public func exclude(_ uids: [PhotoUID]) async -> Bool {
+        guard !closed else { return false }
+        let keys = uids.compactMap(PendingSourceKey.init(localUID:))
+        guard !keys.isEmpty else { return true }
+        let requests = keys.map { key in
+            let revision = tilesByKey[key]?.revision ?? rows[key]?.revision
+            return PendingExclusionRequest(
+                key: key,
+                presentation: metadata[key],
+                remote: handoffs[key].flatMap { $0.revision == revision ? $0.remote : nil },
+                revision: revision
+            )
+        }
+        guard let states = store.exclude(requests, at: now()) else { return false }
+        for state in states { sourceStates[state.key] = state }
+        dirty.formUnion(keys)
+        excludedAccessible.formUnion(keys.filter { metadata[$0] != nil })
+        listsDirty = true
+        publishMembership(force: true)
+        await reconcile()
+        return true
+    }
+
+    /// Restores deleted or excluded pending photos: they return to the backup and to the grid. A Proton
+    /// photo that a delete moved to the Proton trash comes back as well.
+    @discardableResult
+    public func restore(_ uids: [PhotoUID]) async -> Bool {
+        guard !closed else { return false }
+        let keys = uids.compactMap(PendingSourceKey.init(localUID:))
+        guard !keys.isEmpty else { return true }
+        guard let states = store.include(keys, at: now()) else { return false }
+        for state in states { sourceStates[state.key] = state }
+        dirty.formUnion(keys)
+        listsDirty = true
+        publishMembership(force: true)
+        await reconcile()
+        return true
+    }
+
+    /// Restores the sources behind Proton photos that the person restored from the Proton trash, when a
+    /// pending delete had moved them there.
+    public func restoreSources(ofRemote uids: [PhotoUID]) async {
+        let keys = store.handoffs(forRemoteLinkIDs: uids.map(\.nodeID))
+            .map(\.key)
+            .filter { sourceStates[$0]?.desired == .excluded }
+        guard !keys.isEmpty else { return }
+        await restore(keys.map(\.localUID))
+    }
+
+    /// "Endgültig löschen" / "Papierkorb leeren": the entries leave "Zuletzt gelöscht", the photos stay
+    /// excluded from backup.
+    @discardableResult
+    public func removeFromTrashList(_ uids: [PhotoUID]) -> Bool {
+        guard !closed else { return false }
+        let keys = uids.compactMap(PendingSourceKey.init(localUID:))
+        guard store.unlistFromTrash(keys, at: now()) else { return false }
+        reloadSourceStates(keys)
+        listsDirty = true
+        publishMembership(force: true)
+        return true
+    }
+
+    /// Stores the desired favorite state of pending photos. The app applies it after upload.
+    @discardableResult
+    public func setFavorite(_ uids: [PhotoUID], favorite: Bool) async -> Bool {
+        guard !closed else { return false }
+        let keys = uids.compactMap(PendingSourceKey.init(localUID:))
+        let date = now()
+        guard keys.allSatisfy({ store.setFavoriteIntent($0, favorite: favorite, at: date) }) else { return false }
+        actions = store.actions()
+        listsDirty = true
+        publishMembership(force: true)
+        await runDueActions()
+        return true
+    }
+
+    /// Adds pending photos to an album after upload.
+    @discardableResult
+    public func addToAlbum(_ uids: [PhotoUID], albumID: String) async -> Bool {
+        guard !closed else { return false }
+        let keys = uids.compactMap(PendingSourceKey.init(localUID:))
+        let date = now()
+        guard keys.allSatisfy({ store.addAlbumIntent($0, albumID: albumID, at: date) }) else { return false }
+        actions = store.actions()
+        await runDueActions()
+        return true
+    }
+
+    /// The photo was saved to Apple Photos by this app from Proton; it never shows as pending.
+    public func recordSavedFromApp(localIdentifier: String, remote: PhotoUID) {
+        guard !closed, store.recordSavedFromApp(localIdentifier: localIdentifier, remote: remote, at: now()) else {
+            return
+        }
+        savedFromApp.insert(localIdentifier)
+        let key = PendingSourceKey(kind: .photoLibraryAsset, identifier: localIdentifier)
+        dirty.insert(key)
+        scheduleMembershipPublish()
+    }
+
+    /// Called by the host after each timeline merge with the sources whose Proton photo is now listed.
+    /// Settled sources retire after the checkmark lingered; deferred actions run for all of them.
+    public func noteRemotePresence(_ keys: Set<PendingSourceKey>) async {
+        guard !keys.isEmpty, !closed else { return }
+        var acknowledged: [(PendingSourceKey, UploadBackupRevision)] = []
+        for key in keys {
+            guard let tile = tilesByKey[key], tile.isSettled, let revision = tile.revision,
+                retiring[key] != revision
+            else { continue }
+            retiring[key] = revision
+            acknowledged.append((key, revision))
+        }
+        if !acknowledged.isEmpty, store.acknowledgeHandoffs(acknowledged) {
+            let linger = configuration.doneLinger
+            Task { [weak self, sleep] in
+                try? await sleep(linger)
+                await self?.retire(acknowledged)
+            }
+        }
+        await runDueActions()
+    }
+
+    // MARK: - Queue and runner events
+
+    private func handle(_ change: UploadBackupSyncQueueChange, kind: UploadSourceIdentity.Kind) async {
+        guard !closed, let queue = queues[kind] else { return }
+        switch change {
+        case .all:
+            let previous = Set(rows.keys.filter { $0.kind == kind })
+            for key in previous { rows[key] = nil }
+            for row in queue.unsettledRows() where row.source.kind == kind { absorb(row) }
+            let current = Set(rows.keys.filter { $0.kind == kind })
+            reloadRows(for: Set(handoffs.keys.filter { $0.kind == kind }).subtracting(current))
+            dirty.formUnion(previous.union(current))
+        case .sources(let grouped):
+            let identifiers = grouped[kind] ?? []
+            let keys = Set(identifiers.map { PendingSourceKey(kind: kind, identifier: $0) })
+            reloadRows(for: keys)
+            dirty.formUnion(keys)
+        }
+        await refreshMetadata()
+        scheduleMembershipPublish()
+    }
+
+    private func handle(_ event: PendingRuntimeEvent) async {
+        guard !closed else { return }
+        switch event {
+        case .evidence(let key, let revision):
+            evidence[key, default: []].insert(revision)
+            dirty.insert(key)
+            await refreshMetadata()
+            scheduleMembershipPublish()
+        case .handoff(let handoff, let outcome):
+            remember(handoff)
+            dirty.insert(handoff.key)
+            if outcome == .excludedRemoteNeedsTrash {
+                reloadSourceStates([handoff.key])
+                await reconcile()
+            }
+            await refreshMetadata()
+            scheduleMembershipPublish()
+            await runDueActions()
+        case .progress(let key, let revision, let step):
+            if let step {
+                guard liveProgress[key]?.step != step || liveProgress[key]?.revision != revision else { return }
+                liveProgress[key] = (revision, step)
+            } else {
+                guard liveProgress.removeValue(forKey: key) != nil else { return }
+            }
+            scheduleProgressPublish()
+        }
+    }
+
+    private func remember(_ handoff: PendingHandoff) {
+        guard !handoff.acknowledged else { return }
+        if let existing = handoffs[handoff.key], existing.revision > handoff.revision { return }
+        handoffs[handoff.key] = handoff
+    }
+
+    private func absorb(_ row: UploadBackupQueueRowState) {
+        let key = PendingSourceKey(row.source)
+        // A compound has one row per source; with several revisions, the newest owns the tile.
+        if let existing = rows[key], existing.revision > row.revision { return }
+        rows[key] = row
+        if let cached = metadataRevision[key], cached != row.revision {
+            // An edit can change the capture time and the media type.
+            metadata[key] = nil
+            metadataRevision[key] = nil
+            inaccessible.remove(key)
+        }
+    }
+
+    private func reloadRows(for keys: Set<PendingSourceKey>) {
+        let grouped = Dictionary(grouping: keys, by: \.kind)
+        for (kind, kindKeys) in grouped {
+            guard let queue = queues[kind] else { continue }
+            for key in kindKeys { rows[key] = nil }
+            for row in queue.rows(kind: kind, identifiers: Set(kindKeys.map(\.identifier))) { absorb(row) }
+            for key in kindKeys where rows[key] == nil && handoffs[key] == nil {
+                // The source left the queue (local deletion or exclusion): its live state is gone too.
+                liveProgress[key] = nil
+                metadata[key] = nil
+                metadataRevision[key] = nil
+                inaccessible.remove(key)
+            }
+        }
+    }
+
+    private func reloadSourceStates(_ keys: [PendingSourceKey]) {
+        for key in keys { sourceStates[key] = store.sourceState(for: key) }
+        dirty.formUnion(keys)
+    }
+
+    /// Retires exactly the acknowledged revisions; a newer revision of the same source keeps its state.
+    private func retire(_ items: [(PendingSourceKey, UploadBackupRevision)]) {
+        guard !closed else { return }
+        for (key, revision) in items {
+            if retiring[key] == revision { retiring[key] = nil }
+            if handoffs[key]?.revision == revision { handoffs[key] = nil }
+            evidence[key]?.remove(revision)
+            if evidence[key]?.isEmpty == true { evidence[key] = nil }
+            if liveProgress[key]?.revision == revision { liveProgress[key] = nil }
+            dirty.insert(key)
+        }
+        _ = store.removeEvidence(items)
+        scheduleMembershipPublish()
+    }
+
+    // MARK: - Tiles
+
+    /// Pre-check states can hide a photo that already exists in Proton, so they need evidence.
+    private static func needsEvidence(_ state: UploadBackupSyncQueueState) -> Bool {
+        switch state {
+        case .discovered, .checking, .hashing, .duplicateChecking, .failed, .paused, .blockedByDraft,
+            .failedPermanent:
+            true
+        case .queuedForUpload, .uploading, .finalizing, .needsRemoteReconciliation, .completed, .alreadyBackedUp,
+            .skippedRemoteDeletion, .sourceMissing, .dismissedFailure:
+            false
+        }
+    }
+
+    /// Whether the source can show at all, before metadata is known.
+    private func isCandidate(_ key: PendingSourceKey) -> Bool {
+        guard sourceStates[key]?.desired != .excluded,
+            !(key.kind == .photoLibraryAsset && savedFromApp.contains(key.identifier))
+        else { return false }
+        // A recovered commit can remove its queue row before the Proton photo is listed; the durable
+        // handoff alone keeps the tile until then.
+        guard let row = rows[key] else { return handoffs[key] != nil }
+        let handoff = handoffs[key].flatMap { $0.revision == row.revision ? $0 : nil }
+        switch row.state {
+        case .completed, .alreadyBackedUp:
+            return handoff != nil
+        case .skippedRemoteDeletion, .sourceMissing, .dismissedFailure:
+            return false
+        default:
+            if Self.needsEvidence(row.state) {
+                return handoff != nil || evidence[key]?.contains(row.revision) == true
+            }
+            return true
+        }
+    }
+
+    private func tile(for key: PendingSourceKey) -> PendingTile? {
+        guard isCandidate(key), let metadata = metadata[key] else { return nil }
+        guard let row = rows[key] else {
+            guard let handoff = handoffs[key] else { return nil }
+            return PendingTile(
+                key: key,
+                item: Self.item(for: key, metadata: metadata),
+                revision: handoff.revision,
+                handoff: handoff.remote,
+                isSettled: true,
+                badge: .done,
+                displayName: metadata.displayName
+            )
+        }
+        let handoff = handoffs[key].flatMap { $0.revision == row.revision ? $0.remote : nil }
+        let settled = row.state == .completed || row.state == .alreadyBackedUp
+        let badge: PendingUploadBadge =
+            switch row.state {
+            case .completed, .alreadyBackedUp: .done
+            case .failedPermanent: .attention
+            default: .waiting
+            }
+        return PendingTile(
+            key: key,
+            item: Self.item(for: key, metadata: metadata),
+            revision: row.revision,
+            handoff: handoff,
+            isSettled: settled,
+            badge: badge,
+            displayName: metadata.displayName
+        )
+    }
+
+    private static func item(for key: PendingSourceKey, metadata: PendingPresentationMetadata) -> PhotoItem {
+        let seconds = metadata.captureTime.timeIntervalSince1970
+        return PhotoItem(
+            uid: key.localUID,
+            captureTime: Date(timeIntervalSince1970: seconds.isFinite ? seconds.rounded(.down) : 0),
+            mediaType: metadata.mediaType,
+            isLivePhoto: metadata.isLivePhoto,
+            durationSeconds: metadata.durationSeconds
+        )
+    }
+
+    /// Fetches metadata for candidates that do not have it yet, in one batch.
+    private func refreshMetadata() async {
+        let missing = dirty.filter { metadata[$0] == nil && !inaccessible.contains($0) && isCandidate($0) }
+        guard !missing.isEmpty else { return }
+        let requested = Dictionary(uniqueKeysWithValues: missing.map { ($0, currentRevision($0)) })
+        let fetched = await metadataProvider.metadata(for: Array(missing))
+        guard !closed else { return }
+        for key in missing {
+            // The source may have left or changed revision while the fetch ran; its next event refetches.
+            guard metadata[key] == nil, isCandidate(key), currentRevision(key) == requested[key] else { continue }
+            if let value = fetched[key] {
+                metadata[key] = value
+                metadataRevision[key] = requested[key] ?? nil
+            } else {
+                inaccessible.insert(key)
+            }
+        }
+        // A publication during the fetch may have consumed these keys before their metadata existed.
+        dirty.formUnion(missing)
+    }
+
+    private func currentRevision(_ key: PendingSourceKey) -> UploadBackupRevision? {
+        rows[key]?.revision ?? handoffs[key]?.revision
+    }
+
+    private func refreshExcludedAccessibility() async {
+        let excluded = sourceStates.values.filter { $0.desired == .excluded }.map(\.key)
+        guard !excluded.isEmpty else {
+            excludedAccessible = []
+            return
+        }
+        let accessible = await metadataProvider.metadata(for: excluded)
+        excludedAccessible = Set(accessible.keys)
+        listsDirty = true
+    }
+
+    /// Applies dirty keys to the ordered tile list with binary search, so one event costs O(log n) plus a move.
+    private func applyDirty() -> Bool {
+        guard !dirty.isEmpty else { return false }
+        var changed = false
+        for key in dirty {
+            let old = tilesByKey[key]
+            let new = tile(for: key)
+            guard old != new else { continue }
+            changed = true
+            if let old, let index = position(of: old) { orderedTiles.remove(at: index) }
+            if let new { orderedTiles.insert(new, at: insertionIndex(for: new.item)) }
+            tilesByKey[key] = new
+        }
+        dirty.removeAll(keepingCapacity: true)
+        return changed
+    }
+
+    private func insertionIndex(for item: PhotoItem) -> Int {
+        var low = 0
+        var high = orderedTiles.count
+        while low < high {
+            let mid = (low + high) / 2
+            if TimelineOrder.areInIncreasingOrder(orderedTiles[mid].item, item) {
+                low = mid + 1
+            } else {
+                high = mid
+            }
+        }
+        return low
+    }
+
+    private func position(of tile: PendingTile) -> Int? {
+        let index = insertionIndex(for: tile.item)
+        guard index < orderedTiles.count, orderedTiles[index].item.uid == tile.item.uid else { return nil }
+        return index
+    }
+
+    // MARK: - Publishing
+
+    private func scheduleMembershipPublish() {
+        guard membershipPublishTask == nil, !closed else { return }
+        let interval = configuration.membershipInterval
+        let elapsed = lastMembershipPublish.map { ContinuousClock.now - $0 } ?? interval
+        let delay = elapsed >= interval ? Duration.zero : interval - elapsed
+        membershipPublishTask = Task { [weak self, sleep] in
+            if delay > .zero { try? await sleep(delay) }
+            await self?.membershipTimerFired()
+        }
+    }
+
+    private func membershipTimerFired() {
+        membershipPublishTask = nil
+        publishMembership(force: false)
+    }
+
+    private func publishMembership(force: Bool) {
+        guard !closed else { return }
+        let tilesChanged = applyDirty()
+        guard tilesChanged || listsDirty || force else { return }
+        if tilesChanged || listsDirty { membershipRevision &+= 1 }
+        listsDirty = false
+        lastMembershipPublish = ContinuousClock.now
+        publish()
+    }
+
+    private func scheduleProgressPublish() {
+        guard progressPublishTask == nil, !closed else { return }
+        let interval = configuration.progressInterval
+        progressPublishTask = Task { [weak self, sleep] in
+            try? await sleep(interval)
+            await self?.progressTimerFired()
+        }
+    }
+
+    private func progressTimerFired() {
+        progressPublishTask = nil
+        progressRevision &+= 1
+        publish()
+    }
+
+    private func publish() {
+        guard store.isOperational() else {
+            snapshot = .empty
+            snapshotContinuation.yield(snapshot)
+            return
+        }
+        var progress: [PhotoUID: Int] = [:]
+        for (key, live) in liveProgress where tilesByKey[key]?.revision == live.revision {
+            progress[key.localUID] = live.step
+        }
+        let lists = excludedLists()
+        var favorites: [PhotoUID: Bool] = [:]
+        for action in actions where action.kind == .favorite && !action.failed {
+            favorites[action.key.localUID] = action.desired
+        }
+        snapshot = PendingBackupSnapshot(
+            membershipRevision: membershipRevision,
+            progressRevision: progressRevision,
+            tiles: orderedTiles,
+            progress: progress,
+            trashTiles: lists.trash,
+            excludedTiles: lists.excluded,
+            favoriteIntents: favorites
+        )
+        snapshotContinuation.yield(snapshot)
+    }
+
+    private func excludedLists() -> (trash: [PendingTile], excluded: [PendingTile]) {
+        let retentionStart = now().addingTimeInterval(-configuration.trashRetention)
+        var trash: [(Date, PendingTile)] = []
+        var excluded: [(Date, PendingTile)] = []
+        for state in sourceStates.values where state.desired == .excluded && excludedAccessible.contains(state.key) {
+            guard let presentation = state.presentation else { continue }
+            let tile = PendingTile(
+                key: state.key,
+                item: Self.item(for: state.key, metadata: presentation),
+                revision: nil,
+                handoff: nil,
+                isSettled: false,
+                badge: .waiting,
+                displayName: presentation.displayName
+            )
+            let excludedAt = state.excludedAt ?? .distantPast
+            excluded.append((excludedAt, tile))
+            if state.listedInTrash, excludedAt >= retentionStart { trash.append((excludedAt, tile)) }
+        }
+        let newestFirst: ((Date, PendingTile), (Date, PendingTile)) -> Bool = {
+            $0.0 == $1.0 ? $0.1.key < $1.1.key : $0.0 > $1.0
+        }
+        return (trash.sorted(by: newestFirst).map(\.1), excluded.sorted(by: newestFirst).map(\.1))
+    }
+
+    // MARK: - Reconciler
+
+    /// Performs every due effect. Runs one pass at a time; a request during a pass runs another pass.
+    ///
+    /// Order matters. A restore brings the Proton photo back before the source returns to the backup, so
+    /// the duplicate check never mistakes the trashed photo for a deliberate remote deletion. A delete
+    /// removes queue work before it trashes, so nothing uploads in between.
+    private func reconcile() async {
+        guard !closed else { return }
+        guard !reconcileRunning else {
+            reconcileAgain = true
+            return
+        }
+        reconcileRunning = true
+        defer { reconcileRunning = false }
+        repeat {
+            reconcileAgain = false
+            await performRemote(
+                .remoteRestore,
+                store.dueSourceStates(by: now()).filter {
+                    $0.needsRemoteRestore && $0.desired == .included && $0.remote != nil
+                })
+            guard !closed else { return }
+            await performQueueSync(
+                store.dueSourceStates(by: now()).filter {
+                    $0.needsQueueSync && ($0.desired == .excluded || !$0.needsRemoteRestore)
+                })
+            guard !closed else { return }
+            await performRemote(
+                .remoteTrash,
+                store.dueSourceStates(by: now()).filter {
+                    $0.needsRemoteTrash && $0.desired == .excluded && $0.remote != nil
+                })
+            guard !closed else { return }
+            // A restore can make deferred actions eligible again. Inside the loop, so a request that arrives
+            // while an action awaits the network still runs another pass.
+            await runDueActions()
+        } while reconcileAgain && !closed
+        scheduleReconcileTimer()
+    }
+
+    private func performQueueSync(_ states: [PendingSourceState]) async {
+        guard !states.isEmpty else { return }
+        let date = now()
+        let excluded = states.filter { $0.desired == .excluded }
+        for (kind, group) in Dictionary(grouping: excluded, by: \.key.kind) {
+            let ok = await effects.removeFromBackup(kind: kind, identifiers: group.map(\.key.identifier))
+            guard !closed else { return }
+            finish(.queueSync, group, succeeded: ok, at: date)
+        }
+        let included = states.filter { $0.desired == .included }
+        if !included.isEmpty {
+            let ok = await effects.returnToBackup(included.map(\.key))
+            guard !closed else { return }
+            finish(.queueSync, included, succeeded: ok, at: date)
+        }
+    }
+
+    private func performRemote(_ effect: PendingSourceEffect, _ states: [PendingSourceState]) async {
+        guard !states.isEmpty else { return }
+        let date = now()
+        let volume = await effects.photosVolumeID()
+        guard !closed else { return }
+        guard let volume else {
+            for state in states { _ = store.deferEffects(for: state.key, at: date) }
+            reloadSourceStates(states.map(\.key))
+            return
+        }
+        // Marked right before dispatch, and only while the state still wants this effect for the same
+        // generation: a decision taken during the volume lookup wins. Until a confirmed completion, new
+        // decisions treat the request as possibly done.
+        guard let marked = store.beginRemoteOperation(effect, for: states) else { return }
+        let dispatched = states.filter { marked.contains($0.key) }
+        guard !dispatched.isEmpty else {
+            reloadSourceStates(states.map(\.key))
+            return
+        }
+        let uids = dispatched.compactMap { Self.normalized($0.remote, volume: volume) }
+        let result: PendingEffectResult =
+            switch effect {
+            case .remoteTrash: await effects.trashRemote(uids)
+            case .remoteRestore: await effects.restoreRemote(uids)
+            case .queueSync: .done
+            }
+        guard !closed else { return }
+        // A photo that can no longer be trashed or restored (deleted permanently) needs no further attempt.
+        finish(effect, dispatched, succeeded: result != .retry, at: date)
+    }
+
+    private func finish(_ effect: PendingSourceEffect, _ states: [PendingSourceState], succeeded: Bool, at date: Date) {
+        for state in states {
+            if succeeded {
+                _ = store.completeEffect(effect, for: state.key, generation: state.generation, at: date)
+            } else {
+                _ = store.deferEffects(for: state.key, at: date)
+            }
+        }
+        reloadSourceStates(states.map(\.key))
+        listsDirty = true
+        scheduleMembershipPublish()
+    }
+
+    private func scheduleReconcileTimer() {
+        reconcileTimer?.cancel()
+        reconcileTimer = nil
+        guard !closed, let next = store.nextEffectDate() else { return }
+        let seconds = max(1, next.timeIntervalSince(now()))
+        reconcileTimer = Task { [weak self, sleep] in
+            try? await sleep(.seconds(seconds))
+            guard !Task.isCancelled else { return }
+            await self?.reconcile()
+        }
+    }
+
+    private static func normalized(_ uid: PhotoUID?, volume: String) -> PhotoUID? {
+        guard let uid else { return nil }
+        return uid.volumeID.isEmpty ? PhotoUID(volumeID: volume, nodeID: uid.nodeID) : uid
+    }
+
+    // MARK: - Deferred actions
+
+    /// Applies due favorite and album actions of sources whose Proton photo exists. Independent of the
+    /// grid: an action also runs after its tile retired or after a relaunch, and retries on its own timer.
+    private func runDueActions() async {
+        guard !closed else { return }
+        guard !actionsRunning else {
+            actionsAgain = true
+            return
+        }
+        actionsRunning = true
+        defer { actionsRunning = false }
+        repeat {
+            actionsAgain = false
+            let latest = store.latestHandoffs(for: Array(Set(store.dueActions(by: now()).map(\.key))))
+            // Actions of sources without a Proton photo wait for their handoff event, not for a timer.
+            let due = store.dueActions(by: now()).filter { latest[$0.key] != nil && actionIsEligible($0.key) }
+            guard !due.isEmpty else { break }
+            let volume = await effects.photosVolumeID()
+            guard !closed else { return }
+            guard let volume else {
+                for action in due { _ = store.retryAction(action, at: now()) }
+                break
+            }
+            for action in due {
+                guard !closed else { return }
+                // A delete or restore can land during any await above; recheck right before dispatch.
+                guard actionIsEligible(action.key),
+                    let remote = Self.normalized(latest[action.key]?.remote, volume: volume)
+                else { continue }
+                let result: PendingEffectResult =
+                    switch action.kind {
+                    case .favorite: await effects.setFavorite(remote, favorite: action.desired)
+                    case .addToAlbum: await effects.addToAlbum(remote, albumID: action.albumID)
+                    }
+                guard !closed else { return }
+                switch result {
+                case .done: _ = store.completeAction(action)
+                case .retry: _ = store.retryAction(action, at: now())
+                case .permanentFailure:
+                    _ = store.failAction(action)
+                    PhotoDiagnostics.shared.increment("pending.actionFailed")
+                }
+            }
+            actions = store.actions()
+            listsDirty = true
+            scheduleMembershipPublish()
+        } while actionsAgain && !closed
+        scheduleActionTimer()
+    }
+
+    /// Wakes for the earliest retry among actions whose Proton photo is known. Actions still waiting for an
+    /// upload never pull the timer forward; their handoff event starts them.
+    /// Actions wait while the source is excluded or its Proton photo still has to come back from the trash.
+    private func actionIsEligible(_ key: PendingSourceKey) -> Bool {
+        guard let state = sourceStates[key] else { return true }
+        return state.desired == .included && !state.needsRemoteRestore
+    }
+
+    private func scheduleActionTimer() {
+        actionTimer?.cancel()
+        actionTimer = nil
+        guard !closed else { return }
+        let pending = store.actions().filter { !$0.failed }
+        guard !pending.isEmpty else { return }
+        let withRemote = store.latestHandoffs(for: Array(Set(pending.map(\.key))))
+        guard
+            let next = pending.filter({ withRemote[$0.key] != nil && actionIsEligible($0.key) })
+                .map(\.nextAttemptAt).min()
+        else { return }
+        let seconds = max(1, next.timeIntervalSince(now()))
+        actionTimer = Task { [weak self, sleep] in
+            try? await sleep(.seconds(seconds))
+            guard !Task.isCancelled else { return }
+            await self?.runDueActions()
+        }
+    }
+}

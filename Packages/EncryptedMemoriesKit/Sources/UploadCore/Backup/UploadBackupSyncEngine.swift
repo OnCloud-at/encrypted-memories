@@ -63,17 +63,20 @@ public actor UploadBackupSyncEngine: UploadBackupCandidateEnqueueing {
     private let preflight: UploadBackupPreflightIndex
     private let queue: any UploadBackupSyncQueueStore
     private let remoteProofResolver: (any UploadIdentityResolving)?
+    private let exclusions: (any UploadBackupExclusionFiltering)?
     private let now: @Sendable () -> Date
 
     public init(
         preflight: UploadBackupPreflightIndex,
         queue: any UploadBackupSyncQueueStore,
         remoteProofResolver: (any UploadIdentityResolving)? = nil,
+        exclusions: (any UploadBackupExclusionFiltering)? = nil,
         now: @Sendable @escaping () -> Date = { Date() }
     ) {
         self.preflight = preflight
         self.queue = queue
         self.remoteProofResolver = remoteProofResolver
+        self.exclusions = exclusions
         self.now = now
     }
 
@@ -119,6 +122,8 @@ public actor UploadBackupSyncEngine: UploadBackupCandidateEnqueueing {
     }
 
     public func enqueueBatch(_ candidates: [UploadBackupAssetCandidate]) async throws -> UploadBackupSyncScanResult {
+        // A photo the person deleted before upload stays out of the backup, also when a rescan offers it again.
+        let candidates = try withoutExcludedSources(candidates)
         guard !candidates.isEmpty else { return UploadBackupSyncScanResult() }
         var decisions = try await preflight.classifyBatch(candidates.map(\.snapshot))
         try Task.checkCancellation()
@@ -206,6 +211,23 @@ public actor UploadBackupSyncEngine: UploadBackupCandidateEnqueueing {
             state = .checking
         }
         return (delta, entry(for: candidate, state: state))
+    }
+
+    private func withoutExcludedSources(
+        _ candidates: [UploadBackupAssetCandidate]
+    ) throws -> [UploadBackupAssetCandidate] {
+        guard let exclusions, !candidates.isEmpty else { return candidates }
+        var excluded: [UploadSourceIdentity.Kind: Set<String>] = [:]
+        for kind in Set(candidates.map(\.snapshot.source.kind)) {
+            let identifiers = candidates.filter { $0.snapshot.source.kind == kind }.map(\.snapshot.source.identifier)
+            guard let kindExclusions = exclusions.excludedIdentifiers(kind: kind, among: identifiers) else {
+                throw UploadError.backend("Backup exclusions are unavailable")
+            }
+            excluded[kind] = kindExclusions
+        }
+        return candidates.filter { candidate in
+            excluded[candidate.snapshot.source.kind]?.contains(candidate.snapshot.source.identifier) != true
+        }
     }
 
     public func markCompleted(_ candidate: UploadBackupAssetCandidate) async throws {
