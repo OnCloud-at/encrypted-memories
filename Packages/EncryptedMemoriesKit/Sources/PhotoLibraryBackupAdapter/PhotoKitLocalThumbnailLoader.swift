@@ -10,11 +10,20 @@ import PhotosCore
 /// iCloud-optimized library still shows its photos.
 public struct PhotoKitLocalThumbnailLoader: LocalThumbnailLoading {
     private static let maxConcurrentRequests = 4
+    /// How long a quick, lower-quality version of a new photo may wait for the final one. The camera still
+    /// processes a new photo for a while and has only the quick version; its new revision brings the final one.
+    private static let degradedGrace: TimeInterval = 0.3
+    /// Photos taken this recently may still be in camera processing. Older ones wait for their final version,
+    /// so an iCloud photo never keeps a blurry tile.
+    private static let freshWindow: TimeInterval = 3600
 
     private let request: PhotoKitImageRequest
+    private let onMissing: (@Sendable ([PhotoUID]) -> Void)?
 
-    public init(request: @escaping PhotoKitImageRequest) {
+    /// `onMissing` hears about photos that no longer exist in Apple Photos (deleted before their upload).
+    public init(request: @escaping PhotoKitImageRequest, onMissing: (@Sendable ([PhotoUID]) -> Void)? = nil) {
         self.request = request
+        self.onMissing = onMissing
     }
 
     /// A small thumbnail for a list row, such as the excluded photos in the Backup settings.
@@ -34,6 +43,11 @@ public struct PhotoKitLocalThumbnailLoader: LocalThumbnailLoading {
             result.enumerateObjects { asset, _, _ in assets.append(asset) }
             return assets
         }.value
+        if let onMissing, assets.count < identifiers.count {
+            let found = Set(assets.map(\.localIdentifier))
+            let missing = identifiers.filter { !found.contains($0) }
+            onMissing(missing.map { PhotoUID(localPending: .photoLibrary, identifier: $0) })
+        }
         let side = max(1, maxPixelSize)
         return await withTaskGroup(of: (PhotoUID, DecodedThumbnail?).self) { group in
             var result: [PhotoUID: DecodedThumbnail] = [:]
@@ -60,14 +74,60 @@ public struct PhotoKitLocalThumbnailLoader: LocalThumbnailLoading {
         for asset: PHAsset, side: CGFloat, request: PhotoKitImageRequest
     ) async -> DecodedThumbnail? {
         let options = PHImageRequestOptions()
-        options.deliveryMode = .highQualityFormat
         options.resizeMode = .fast
         options.isNetworkAccessAllowed = true
         options.isSynchronous = false
+        let size = CGSize(width: side, height: side)
+        let isFresh = asset.creationDate.map { Date().timeIntervalSince($0) < freshWindow } ?? false
+        guard isFresh else {
+            options.deliveryMode = .highQualityFormat
+            return await PhotoKitRequest.perform { finish in
+                // `.highQualityFormat` calls back exactly once.
+                request(asset, size, .aspectFill, options) { image, _ in
+                    finish(image.map(DecodedThumbnail.init(image:)))
+                }
+            }
+        }
+        // The quick version shows at once; the final one replaces it when it follows within the grace time.
+        options.deliveryMode = .opportunistic
+        let quick = QuickVersion()
         return await PhotoKitRequest.perform { finish in
-            // `.highQualityFormat` calls back exactly once.
-            request(asset, CGSize(width: side, height: side), .aspectFill, options) { image in
-                finish(image.map(DecodedThumbnail.init(image:)))
+            let id = request(asset, size, .aspectFill, options) { image, isDegraded in
+                guard isDegraded else {
+                    finish((image ?? quick.image).map(DecodedThumbnail.init(image:)))
+                    return
+                }
+                guard let image, quick.keep(image) else { return }
+                DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + degradedGrace) {
+                    finish(quick.image.map(DecodedThumbnail.init(image:)))
+                    // The final version waits for the camera; the revision loads it. Keeps at most four requests.
+                    quick.requestID.map(PHImageManager.default().cancelImageRequest)
+                }
+            }
+            quick.requestID = id
+            return id
+        }
+    }
+
+    /// The first lower-quality version of one request.
+    private final class QuickVersion: @unchecked Sendable {
+        private let lock = NSLock()
+        private var stored: CGImage?
+        private var storedID: PHImageRequestID?
+
+        var image: CGImage? { lock.withLock { stored } }
+
+        var requestID: PHImageRequestID? {
+            get { lock.withLock { storedID } }
+            set { lock.withLock { storedID = newValue } }
+        }
+
+        /// True for the first version only.
+        func keep(_ image: CGImage) -> Bool {
+            lock.withLock {
+                guard stored == nil else { return false }
+                stored = image
+                return true
             }
         }
     }

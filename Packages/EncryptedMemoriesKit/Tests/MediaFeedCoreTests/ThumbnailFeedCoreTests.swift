@@ -411,6 +411,35 @@ private struct StubLocalThumbnails: LocalThumbnailLoading {
     }
 }
 
+/// Answers once the test opens the gate.
+private struct GatedLocalThumbnails: LocalThumbnailLoading {
+    let image: DecodedThumbnail
+    let gate: LocalGate
+
+    func thumbnails(for uids: [PhotoUID], maxPixelSize: CGFloat) async -> [PhotoUID: DecodedThumbnail] {
+        await gate.wait()
+        return Dictionary(uniqueKeysWithValues: uids.map { ($0, image) })
+    }
+}
+
+private actor LocalGate {
+    private var isOpen = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+    private(set) var waiting = 0
+
+    func wait() async {
+        guard !isOpen else { return }
+        waiting += 1
+        await withCheckedContinuation { waiters.append($0) }
+    }
+
+    func open() {
+        isOpen = true
+        waiters.forEach { $0.resume() }
+        waiters.removeAll()
+    }
+}
+
 /// Never answers for `slow` until the request is cancelled; answers every other photo at once.
 private struct SlowLocalThumbnails: LocalThumbnailLoading {
     let image: DecodedThumbnail
@@ -750,6 +779,30 @@ struct ThumbnailFeedCoreTests {
             selected: listed.selectedScope, analysis: listed.analysisScope,
             retention: listed.thumbnailRetentionScope)
         #expect(feed.memoryDecoded(for: remote) != nil)
+    }
+
+    @Test func revisedLocalPhotoKeepsItsImageUntilTheNewOneLoads() async throws {
+        let local = PhotoUID(localPending: .photoLibrary, identifier: "asset-8")
+        let feed = ThumbnailFeedCore(
+            cache: Self.cache("local-refresh"),
+            loader: PriorityRecordingLoader(payload: Self.pngData(width: 24, height: 24)),
+            configuration: Self.configuration()
+        )
+        await feed.setLocalThumbnailLoader(StubLocalThumbnails(image: Self.decodedThumb(16, 16)))
+        await feed.setLocalAuthorization([local])
+        _ = await feed.decoded(for: local)
+
+        // The camera finished processing: a new revision loads while the quick image stays on screen.
+        let gate = LocalGate()
+        await feed.setLocalThumbnailLoader(GatedLocalThumbnails(image: Self.decodedThumb(32, 32), gate: gate))
+        let refresh = Task { await feed.refreshLocal([local]) }
+        try await Self.waitUntil { await gate.waiting == 1 }
+        #expect(feed.memoryDecoded(for: local)?.image.width == 16, "the tile must not turn black while it reloads")
+
+        await gate.open()
+        #expect(await refresh.value == [local])
+        #expect(feed.memoryDecoded(for: local)?.image.width == 32)
+        #expect(await feed.refreshLocal([Self.uid("remote")]).isEmpty, "only local photos refresh")
     }
 
     @Test func protonPhotoAdoptsThePendingImage() async throws {

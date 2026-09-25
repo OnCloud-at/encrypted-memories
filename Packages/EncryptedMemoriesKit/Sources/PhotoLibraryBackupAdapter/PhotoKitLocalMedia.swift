@@ -28,7 +28,8 @@ public struct PhotoKitLocalMedia: Sendable {
         options.resizeMode = .exact
         options.isNetworkAccessAllowed = true
         let data: Data? = await PhotoKitRequest.perform { [request] finish in
-            request(asset, CGSize(width: maxPixelSize, height: maxPixelSize), .aspectFit, options) { image in
+            // `.highQualityFormat` answers once, never degraded.
+            request(asset, CGSize(width: maxPixelSize, height: maxPixelSize), .aspectFit, options) { image, _ in
                 finish(image.flatMap(Self.jpegData(from:)))
             }
         }

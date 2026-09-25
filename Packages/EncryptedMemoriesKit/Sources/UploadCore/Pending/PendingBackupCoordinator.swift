@@ -318,6 +318,21 @@ public actor PendingBackupCoordinator {
         await runDueActions()
     }
 
+    /// The platform found these local photos gone (deleted in Apple Photos before their upload). Their tiles
+    /// leave the grid like any inaccessible source; an upload that still finishes shows as a Proton photo.
+    public func noteSourcesMissing(_ uids: [PhotoUID]) {
+        guard !closed else { return }
+        let keys = uids.compactMap(PendingSourceKey.init(localUID:)).filter { tilesByKey[$0] != nil }
+        guard !keys.isEmpty else { return }
+        for key in keys {
+            metadata[key] = nil
+            metadataRevision[key] = nil
+            inaccessible.insert(key)
+            dirty.insert(key)
+        }
+        scheduleMembershipPublish()
+    }
+
     // MARK: - Queue and runner events
 
     private func handle(_ change: UploadBackupSyncQueueChange, kind: UploadSourceIdentity.Kind) async {

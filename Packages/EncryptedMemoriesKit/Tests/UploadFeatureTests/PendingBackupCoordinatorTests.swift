@@ -262,6 +262,19 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         XCTAssertEqual(tileIDs(later), ["done"], "the tile stays until its Proton photo takes over")
     }
 
+    func testPhotoDeletedInApplePhotosLeavesTheGrid() async throws {
+        enqueue("gone", state: .queuedForUpload)
+        enqueue("kept", state: .queuedForUpload)
+        await coordinator.start()
+        await waitForSnapshot("both show") { $0.tiles.count == 2 }
+
+        await coordinator.noteSourcesMissing([
+            PhotoUID(localPending: .photoLibrary, identifier: "gone"), PhotoUID(volumeID: "vol", nodeID: "remote"),
+        ])
+        let snapshot = await waitForSnapshot("the deleted photo leaves") { $0.tiles.count == 1 }
+        XCTAssertEqual(tileIDs(snapshot), ["kept"])
+    }
+
     func testUnlistedHandoffSurvivesARestart() async throws {
         enqueue("done", state: .uploading)
         await coordinator.start()

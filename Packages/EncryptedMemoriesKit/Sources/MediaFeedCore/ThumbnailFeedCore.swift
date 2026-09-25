@@ -2839,13 +2839,32 @@ public actor ThumbnailFeedCore {
         if !preload.isEmpty { submitLocalDemand(preload, replacing: false) }
     }
 
-    /// Drops the image of a local photo whose content changed (a new revision), so the next request reloads it.
-    /// Synchronous, so the grid never uploads the old image again after it learns about the change.
-    public nonisolated func invalidateLocal(_ uids: [PhotoUID]) {
-        for uid in uids where uid.isLocalPending {
-            decoded.remove(uid)
+    /// Loads new images for local photos whose content changed (a new revision) and keeps the old image until
+    /// then, so a tile never turns black. Returns the photos whose image was replaced; the host then lets its
+    /// grids upload the new image.
+    public func refreshLocal(_ uids: [PhotoUID]) async -> [PhotoUID] {
+        guard let localLoader else { return [] }
+        let targets = uids.filter { $0.isLocalPending && localAuthorization.isAllowed($0) }
+        guard !targets.isEmpty else { return [] }
+        for uid in targets {
+            // A photo that failed while the camera still processed it may load now.
             unfetchable.remove(uid)
+            localFailedAttempts[uid] = nil
+            localRetryAt[uid] = nil
         }
+        // The same size as the image it replaces, so a sharper tile never gets a softer one.
+        let pixels = targets.reduce(Int(configuration.targetPixels)) { max($0, decoded.decodePixelCap(for: $1) ?? 0) }
+        let images = await localLoader.thumbnails(for: targets, maxPixelSize: CGFloat(pixels))
+        guard ownerLeaseIsCurrent() else { return [] }
+        var refreshed: [PhotoUID] = []
+        for uid in targets where localAuthorization.isAllowed(uid) {
+            guard let image = images[uid], storeDecoded(image, for: uid, decodePixelCap: pixels) != nil else {
+                continue
+            }
+            refreshed.append(uid)
+        }
+        if !refreshed.isEmpty { wakeHostsForLocalArrival() }
+        return refreshed
     }
 
     /// Hands the decoded image of a pending photo to the Proton photo that replaced it, so the tile never

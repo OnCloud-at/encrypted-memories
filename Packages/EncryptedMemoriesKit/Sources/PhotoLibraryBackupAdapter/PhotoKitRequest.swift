@@ -60,7 +60,8 @@ enum PhotoKitRequest {
     }
 }
 
-/// PhotoKit's image request, answered as a `CGImage`. PhotoKit hands out images as the platform image type, so
+/// PhotoKit's image request, answered as a `CGImage` with PhotoKit's "degraded" flag (a quick, lower-quality
+/// version that a better one may follow). PhotoKit hands out images as the platform image type, so
 /// the platform media adapters implement it once (`PhotoKitPlatformImages.request` in MediaCacheUIKitAdapter and
 /// MediaCacheAppKitAdapter) and hosts pass it in. This adapter stays free of UI frameworks.
 public typealias PhotoKitImageRequest =
@@ -69,5 +70,5 @@ public typealias PhotoKitImageRequest =
         _ targetSize: CGSize,
         _ contentMode: PHImageContentMode,
         _ options: PHImageRequestOptions,
-        _ resultHandler: @escaping @Sendable (CGImage?) -> Void
+        _ resultHandler: @escaping @Sendable (_ image: CGImage?, _ isDegraded: Bool) -> Void
     ) -> PHImageRequestID

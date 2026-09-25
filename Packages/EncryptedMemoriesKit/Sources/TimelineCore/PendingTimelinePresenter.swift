@@ -222,10 +222,8 @@ public final class PendingTimelinePresenter {
             anchors = anchors.filter { result.snapshot.index(of: $0.key) != nil }
         }
         tileRevisions = result.revisions
-        for uid in result.revised {
-            contentEpoch &+= 1
-            contentEpochs[uid] = contentEpoch
-        }
+        // A revised photo keeps its current image; `noteContentRefreshed` bumps its epoch once the new
+        // image is loaded, so the tile never shows black in between.
         if !contentEpochs.isEmpty { contentEpochs = contentEpochs.filter { result.localUIDs.contains($0.key) } }
         revision &+= 1
         if result.snapshot != presentation.snapshot { membershipRevision &+= 1 }
@@ -244,6 +242,30 @@ public final class PendingTimelinePresenter {
         onFeedUpdate?(result.localUIDs, result.adoptions, result.revised)
         if !result.presentKeys.isEmpty { onRemotePresence?(result.presentKeys) }
         presentLocal = result.presentLocal
+        onChange?(presentation)
+    }
+
+    /// The feed holds new images for these revised photos; grids upload them in place of the old textures.
+    public func noteContentRefreshed(_ uids: [PhotoUID]) {
+        let shown = uids.filter { presentation.localUIDs.contains($0) }
+        guard !shown.isEmpty else { return }
+        for uid in shown {
+            contentEpoch &+= 1
+            contentEpochs[uid] = contentEpoch
+        }
+        let badges = PendingUploadBadges(
+            base: presentation.uploadBadges.base, progress: presentation.uploadBadges.progress,
+            contentEpochs: contentEpochs)
+        revision &+= 1
+        presentation = PendingTimelinePresentation(
+            revision: revision,
+            membershipRevision: membershipRevision,
+            snapshot: presentation.snapshot,
+            localUIDs: presentation.localUIDs,
+            favoriteIntents: presentation.favoriteIntents,
+            uploadBadges: badges,
+            isCanonical: presentation.isCanonical
+        )
         onChange?(presentation)
     }
 

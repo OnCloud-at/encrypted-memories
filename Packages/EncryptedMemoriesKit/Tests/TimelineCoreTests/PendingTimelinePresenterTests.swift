@@ -61,7 +61,7 @@ import UploadCore
         #expect(PendingTrashPresentation.empty.merged(intoNewestFirst: [newest]).map(\.uid) == [newest.uid])
     }
 
-    @Test func editedLocalPhotoGetsANewContentEpoch() async {
+    @Test func editedLocalPhotoGetsANewContentEpochOnceItsImageLoaded() async {
         let presenter = PendingTimelinePresenter()
         var revisedUIDs: [PhotoUID] = []
         presenter.onFeedUpdate = { _, _, revised in revisedUIDs += revised }
@@ -77,9 +77,13 @@ import UploadCore
         let after = await settle(presenter)
 
         #expect(revisedUIDs == [original.item.uid])
+        #expect(after.uploadBadges.contentEpochs.isEmpty, "the tile keeps its image until the new one loaded")
+
+        presenter.noteContentRefreshed([original.item.uid, tile("gone", second: 0).item.uid])
         var tracker = PendingContentEpochTracker()
-        #expect(tracker.changes(in: after.uploadBadges.contentEpochs) == [original.item.uid])
-        #expect(tracker.changes(in: after.uploadBadges.contentEpochs).isEmpty, "one change invalidates once")
+        #expect(tracker.changes(in: presenter.current.uploadBadges.contentEpochs) == [original.item.uid])
+        #expect(
+            tracker.changes(in: presenter.current.uploadBadges.contentEpochs).isEmpty, "one change invalidates once")
     }
 
     @Test func pendingPhotosSortIntoTheTimeline() async {

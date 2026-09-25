@@ -96,8 +96,15 @@ public final class PendingGridSession {
                     "[PendingGrid] local=\(localUIDs.count, privacy: .public) handovers=\(adoptions.count, privacy: .public) revised=\(revised.count, privacy: .public)"
                 )
             }
-            // Before the presentation reaches the grid, so its next upload reads the new content.
-            if !revised.isEmpty { self.feed?.invalidateLocal(revised) }
+            // The tile keeps its image while the new one loads; the grid swaps textures once it is there. This
+            // runs beside the authorization chain, so a slow iCloud load never delays new tiles.
+            if !revised.isEmpty, let feed = self.feed {
+                let presenter = self.presenter
+                Task {
+                    let refreshed = await feed.refreshLocal(revised)
+                    presenter.noteContentRefreshed(refreshed)
+                }
+            }
             self.gridLocalUIDs = localUIDs
             self.publishFeedAuthorization(adoptions: adoptions)
         }
@@ -111,6 +118,11 @@ public final class PendingGridSession {
         imageRequest: @escaping PhotoKitImageRequest,
         fileThumbnails: (any LocalThumbnailLoading)? = nil
     ) {
+        // A photo deleted in Apple Photos before its upload leaves the grid instead of staying black.
+        let coordinator = self.coordinator
+        let onMissing: @Sendable ([PhotoUID]) -> Void = { uids in
+            Task { await coordinator.noteSourcesMissing(uids) }
+        }
         guard feed !== self.feed else { return }
         let previous = self.feed
         self.feed = feed
@@ -118,7 +130,9 @@ public final class PendingGridSession {
         enqueueFeedUpdate {
             if let previous { await Self.detach(previous) }
             await feed.setLocalThumbnailLoader(
-                LocalThumbnailRouter(photos: PhotoKitLocalThumbnailLoader(request: imageRequest), files: fileThumbnails)
+                LocalThumbnailRouter(
+                    photos: PhotoKitLocalThumbnailLoader(request: imageRequest, onMissing: onMissing),
+                    files: fileThumbnails)
             )
             await feed.setLocalAuthorization(authorized)
         }
