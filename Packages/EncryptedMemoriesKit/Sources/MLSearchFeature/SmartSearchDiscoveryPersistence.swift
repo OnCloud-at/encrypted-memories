@@ -37,7 +37,7 @@ struct SmartSearchDiscoveryPersistence: Codable, Sendable {
     }
 
     func hasCompleteEvidence(requiresVisualEvidence: Bool) -> Bool {
-        // The sensitive gate applies only when visual search is enabled. Metadata-only rows are valid
+        // The sensitive gate applies only when a model can answer. Metadata-only rows are valid
         // without an embedding scan; the encrypted envelope and model key bind that policy.
         if !requiresVisualEvidence {
             return !snapshot.candidates.contains { $0.kind == .concept }

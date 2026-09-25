@@ -2,6 +2,17 @@
 
 Smart Search builds an encrypted, on-device index for private discovery across the photo library.
 
+## Turn on Smart Search
+
+1. In Settings, turn on **Smart Search**.
+2. Choose a search model. The model that suits your device language is marked **Recommended**: **Fast and efficient** for English, **Accurate and multilingual** for other languages.
+
+Smart Search starts only after you choose a model. The app then downloads the model and indexes your library on this device. Text search already works while the model downloads. You can switch the model later; the library is then indexed again.
+
+When the device has too little free space for the model, Smart Search shows how much space it needs. Free up space and select **Retry**.
+
+Turning Smart Search off deletes the model and the search index from this device.
+
 ## Current search scopes
 
 - **All:** Combines available search sources.
@@ -9,7 +20,7 @@ Smart Search builds an encrypted, on-device index for private discovery across t
 
 The app shows **Text** only when its local Apple Vision index is available. Initial indexing can take time and can pause when foreground library work has priority.
 
-Visual Search is a separate optional model feature for descriptive queries. Its availability depends on a compatible signed model in the current model catalog. Document, barcode, and similar-image pipelines are not separate user-selectable scopes in the current app.
+Descriptive searches, for example beaches or dogs, use the chosen search model. The models come from a signed model catalog. Document, barcode, and similar-image pipelines are not separate user-selectable scopes in the current app.
 
 ## Search suggestions
 
@@ -19,7 +30,7 @@ When the search field is empty, Search suggests entries from your own library:
 - Trips, seasons, and photos from this day in earlier years.
 - Favorites from a year.
 - Media types, for example Videos or Live Photos.
-- Photo content, for example beaches or dogs. This requires Visual Search and a finished index.
+- Photo content, for example beaches or dogs. This needs the search model and a finished index.
 
 Select a suggestion to show exactly the photos that belong to it. The app builds suggestions on the device while it is idle. It pauses this work during an active search, video playback, exports that you start, Low Power Mode, and high device temperature. The first build can take several minutes for a large library. After a restart, the app shows the saved suggestions at once if the library did not change.
 

@@ -4,54 +4,45 @@ import Testing
 
 @Suite
 struct SmartSearchSettingsPresentationPolicyTests {
-    @Test func oldEnabledStateWithoutModelDisplaysAsOff() {
-        #expect(
-            SmartSearchVisualSearchPresentationPolicy.isToggleOn(
-                isEnabled: true,
-                hasSelectedModel: false,
-                isChoosingInitialModel: false
-            ) == false
-        )
+    @Test func switchLooksOnWhileTheModelIsChosenBeforeAnythingIsStored() {
+        #expect(SmartSearchSettingsPolicy.isToggleOn(isEnabled: false, isChoosingModel: true))
+        #expect(SmartSearchSettingsPolicy.isToggleOn(isEnabled: true, isChoosingModel: false))
+        #expect(!SmartSearchSettingsPolicy.isToggleOn(isEnabled: false, isChoosingModel: false))
     }
 
-    @Test func toggleDisplaysAsOnOnlyWithAnEnabledSelectedModel() {
-        #expect(
-            SmartSearchVisualSearchPresentationPolicy.isToggleOn(
-                isEnabled: true,
-                hasSelectedModel: true,
-                isChoosingInitialModel: false
-            )
-        )
-        #expect(
-            SmartSearchVisualSearchPresentationPolicy.isToggleOn(
-                isEnabled: false,
-                hasSelectedModel: true,
-                isChoosingInitialModel: false
-            ) == false
-        )
+    @Test func turningOnShowsTheModelChoiceFirst() {
+        #expect(content(isEnabled: false, isChoosingModel: false) == .off)
+        #expect(content(isEnabled: false, isChoosingModel: true) == .modelChoice)
     }
 
-    @Test func initialInlineModelChoiceKeepsToggleVisuallyOnUntilSelection() {
-        #expect(
-            SmartSearchVisualSearchPresentationPolicy.isToggleOn(
-                isEnabled: false,
-                hasSelectedModel: false,
-                isChoosingInitialModel: true
-            )
-        )
+    @Test func runningSmartSearchShowsItsStatus() {
+        #expect(content(isEnabled: true, hasSelectedModel: true) == .status)
     }
 
-    @Test func firstVisualSearchEnableShowsExistingInlineModelChoices() {
-        #expect(
-            SmartSearchVisualSearchPresentationPolicy.enableAction(hasSelectedModel: false)
-                == .showInlineModelChoices
-        )
+    @Test func enabledSmartSearchWithoutAModelAsksForOne() {
+        // For example after the catalog dropped the selected model.
+        #expect(content(isEnabled: true, hasSelectedModel: false) == .modelChoice)
     }
 
-    @Test func visualSearchReenableUsesExistingModelSelection() {
-        #expect(
-            SmartSearchVisualSearchPresentationPolicy.enableAction(hasSelectedModel: true)
-                == .enableSelectedModel
+    @Test func unsupportedDeviceCannotStartSmartSearch() {
+        #expect(content(isSupported: false, isEnabled: false, isChoosingModel: true) == .unsupported)
+    }
+
+    @Test func enabledSmartSearchStaysManageableWhenSupportEnds() {
+        #expect(content(isSupported: false, isEnabled: true, hasSelectedModel: true) == .status)
+    }
+
+    private func content(
+        isSupported: Bool = true,
+        isEnabled: Bool,
+        hasSelectedModel: Bool = false,
+        isChoosingModel: Bool = false
+    ) -> SmartSearchSettingsContent {
+        SmartSearchSettingsPolicy.content(
+            isSupported: isSupported,
+            isEnabled: isEnabled,
+            hasSelectedModel: hasSelectedModel,
+            isChoosingModel: isChoosingModel
         )
     }
 }

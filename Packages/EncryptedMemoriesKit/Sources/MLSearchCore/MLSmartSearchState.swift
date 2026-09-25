@@ -9,17 +9,22 @@ public struct MLSmartSearchFailure: Sendable, Equatable {
         case installation
         case modelLoad
         case storage
+        /// The device has too little free space for the model download.
+        case insufficientStorage
     }
 
     public let kind: Kind
     public let isRetryable: Bool
     /// Diagnostic detail for logs; UI copy comes from the presentation layer per `kind`.
     public let debugDescription: String
+    /// Free space the failed step needs, including its reserve, when the failure is about space.
+    public let requiredBytes: Int64?
 
-    public init(kind: Kind, isRetryable: Bool, debugDescription: String) {
+    public init(kind: Kind, isRetryable: Bool, debugDescription: String, requiredBytes: Int64? = nil) {
         self.kind = kind
         self.isRetryable = isRetryable
         self.debugDescription = debugDescription
+        self.requiredBytes = requiredBytes
     }
 }
 
@@ -104,10 +109,12 @@ public enum MLSmartSearchIndexingState: Sendable, Equatable {
 
 /// Full state snapshot emitted to hosts after every transition.
 public struct MLSmartSearchSnapshot: Sendable, Equatable {
+    /// `false` when this device or product tier cannot run Smart Search; it then cannot be turned on.
+    public let isSupported: Bool
+    /// Smart Search runs native Apple Vision analysis and the selected semantic model together.
     public let isEnabled: Bool
-    /// Optional semantic image search. Native text, document and barcode analysis remains
-    /// controlled by `isEnabled` and does not depend on this setting.
-    public let isVisualSearchEnabled: Bool
+    /// The semantic model. `nil` while enabled only when the selection must be made again, for
+    /// example after the catalog dropped the selected model.
     public let selectedModelID: MLModelID?
     public let phase: MLSmartSearchPhase
     /// Installed size of the active model in bytes (0 when nothing is installed).
@@ -120,8 +127,8 @@ public struct MLSmartSearchSnapshot: Sendable, Equatable {
     public let indexingState: MLSmartSearchIndexingState
 
     public init(
+        isSupported: Bool = true,
         isEnabled: Bool,
-        isVisualSearchEnabled: Bool,
         selectedModelID: MLModelID?,
         phase: MLSmartSearchPhase,
         installedModelBytes: Int64,
@@ -129,8 +136,8 @@ public struct MLSmartSearchSnapshot: Sendable, Equatable {
         isSearchAvailable: Bool,
         indexingState: MLSmartSearchIndexingState = .idle
     ) {
+        self.isSupported = isSupported
         self.isEnabled = isEnabled
-        self.isVisualSearchEnabled = isVisualSearchEnabled
         self.selectedModelID = selectedModelID
         self.phase = phase
         self.installedModelBytes = installedModelBytes
@@ -141,7 +148,6 @@ public struct MLSmartSearchSnapshot: Sendable, Equatable {
 
     public static let disabled = MLSmartSearchSnapshot(
         isEnabled: false,
-        isVisualSearchEnabled: false,
         selectedModelID: nil,
         phase: .disabled,
         installedModelBytes: 0,
@@ -152,7 +158,7 @@ public struct MLSmartSearchSnapshot: Sendable, Equatable {
 
     /// Semantic coverage is independent of native OCR/document retries.
     public var isVisualIndexComplete: Bool {
-        guard isEnabled, isVisualSearchEnabled else { return false }
+        guard isEnabled, selectedModelID != nil else { return false }
         switch phase {
         case .ready(let coverage), .waiting(let coverage): return coverage.isComplete
         case .indexing(let progress):
@@ -165,7 +171,7 @@ public struct MLSmartSearchSnapshot: Sendable, Equatable {
     /// Hosts additionally supply library/thumbnail readiness; the shared resource permit remains authoritative.
     public var permitsAutomaticSuggestionGeneration: Bool {
         guard isEnabled else { return true }
-        guard !isVisualSearchEnabled || isVisualIndexComplete else { return false }
+        guard selectedModelID == nil || isVisualIndexComplete else { return false }
         switch indexingState {
         case .ready(let progress): return progress.isComplete
         case .waiting(let progress):
@@ -206,15 +212,11 @@ public enum MLSmartSearchPendingOperation: Sendable, Equatable, Codable {
     /// Model switch committed: the previous epoch's vectors and artifacts must be gone before
     /// the new model activates.
     case switchModel(from: MLModelID?, to: MLModelID)
-    /// Visual search was disabled: its vectors and model artifacts must be removed while
-    /// native analysis and its derived store remain available.
-    case disableVisualSearch(model: MLModelID?)
 }
 
 /// Minimal persisted lifecycle state (crash recovery only; everything else is derived).
 public struct MLSmartSearchPersistentState: Sendable, Equatable, Codable {
     public var isEnabled: Bool
-    public var isVisualSearchEnabled: Bool
     public var selectedModelID: MLModelID?
     /// Revision of the activated installation, so relaunches load exactly what was verified.
     public var activatedRevision: String?
@@ -225,14 +227,12 @@ public struct MLSmartSearchPersistentState: Sendable, Equatable, Codable {
 
     public init(
         isEnabled: Bool = false,
-        isVisualSearchEnabled: Bool = false,
         selectedModelID: MLModelID? = nil,
         activatedRevision: String? = nil,
         activatedDescriptor: MLModelDescriptor? = nil,
         pendingOperation: MLSmartSearchPendingOperation? = nil
     ) {
         self.isEnabled = isEnabled
-        self.isVisualSearchEnabled = isVisualSearchEnabled
         self.selectedModelID = selectedModelID
         self.activatedRevision = activatedRevision
         self.activatedDescriptor = activatedDescriptor

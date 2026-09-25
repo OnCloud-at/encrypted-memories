@@ -202,7 +202,7 @@ public final class SmartSearchDiscoveryModel {
     }
 
     /// Whether to show the short note that suggestions for photo content appear after the indexing. It is read at
-    /// render time, so it follows a visual search toggle at once without a refresh.
+    /// render time, so it follows Smart Search and its model at once without a refresh.
     public func showsVisualSuggestionsPendingNote(_ snapshot: MLSmartSearchSnapshot?) -> Bool {
         guard Self.visualConceptsAvailable(snapshot) else { return false }
         // Restored completed suggestions do not become pending while runtime coverage hydrates.
@@ -215,9 +215,9 @@ public final class SmartSearchDiscoveryModel {
         return computedContent
     }
 
-    /// Visual concept suggestions can work only while Smart Search and visual search are both on.
+    /// Visual concept suggestions need Smart Search with a selected model.
     public nonisolated static func visualConceptsAvailable(_ snapshot: MLSmartSearchSnapshot?) -> Bool {
-        snapshot?.isEnabled == true && snapshot?.isVisualSearchEnabled == true
+        snapshot?.isEnabled == true && snapshot?.selectedModelID != nil
     }
 
     /// Whether a published suggestion may be shown for the current state. A suggestion from other library
@@ -404,7 +404,6 @@ public final class SmartSearchDiscoveryModel {
             "\(favoriteCount)",
             "\(coordinateCount / 250)",
             "\(snapshot?.isEnabled == true)",
-            "\(snapshot?.isVisualSearchEnabled == true)",
             snapshot?.selectedModelID.map { "\($0)" } ?? "-",
             indexingBucket(snapshot),
             "\(day)",

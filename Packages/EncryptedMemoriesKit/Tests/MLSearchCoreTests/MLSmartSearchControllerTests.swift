@@ -11,7 +11,6 @@ import Testing
         let presentation = MLSmartSearchPresentation(
             snapshot: MLSmartSearchSnapshot(
                 isEnabled: true,
-                isVisualSearchEnabled: false,
                 selectedModelID: nil,
                 phase: .waiting(coverage),
                 installedModelBytes: 0,
@@ -31,7 +30,6 @@ import Testing
         let presentation = MLSmartSearchPresentation(
             snapshot: MLSmartSearchSnapshot(
                 isEnabled: true,
-                isVisualSearchEnabled: false,
                 selectedModelID: nil,
                 phase: .ready(MLIndexCoverage(total: 10, indexed: 9, permanentlyUnindexable: 1)),
                 installedModelBytes: 0,
@@ -52,7 +50,6 @@ import Testing
         let presentation = MLSmartSearchPresentation(
             snapshot: MLSmartSearchSnapshot(
                 isEnabled: true,
-                isVisualSearchEnabled: false,
                 selectedModelID: nil,
                 phase: .waiting(MLIndexCoverage(total: 20_891, indexed: 20_888, permanentlyUnindexable: 0)),
                 installedModelBytes: 0,
@@ -75,7 +72,6 @@ import Testing
         let presentation = MLSmartSearchPresentation(
             snapshot: MLSmartSearchSnapshot(
                 isEnabled: true,
-                isVisualSearchEnabled: false,
                 selectedModelID: nil,
                 phase: .downloading(MLModelTransferProgress(bytesReceived: 25, totalBytes: 100)),
                 installedModelBytes: 0,
@@ -97,7 +93,6 @@ import Testing
         let presentation = MLSmartSearchPresentation(
             snapshot: MLSmartSearchSnapshot(
                 isEnabled: true,
-                isVisualSearchEnabled: false,
                 selectedModelID: nil,
                 phase: .selectingModel,
                 installedModelBytes: 0,
@@ -116,11 +111,66 @@ import Testing
         #expect(presentation.totalCount == 300)
     }
 
-    @Test func optionalModelSelectionNeverPresentsAsARequirement() {
+    @Test func finishedIndexStaysCalmAndKeepsUnanalyzedMediaBehindTheInfo() {
+        let progress = MLSmartSearchAggregateProgress(
+            totalWorkUnits: 100, settledWorkUnits: 100, permanentlyUnavailableAssets: 8,
+            unavailableAssetReasons: [.analysisFailed: 8])
         let presentation = MLSmartSearchPresentation(
             snapshot: MLSmartSearchSnapshot(
                 isEnabled: true,
-                isVisualSearchEnabled: false,
+                selectedModelID: MLModelID("model"),
+                phase: .ready(.init(total: 100, indexed: 92, permanentlyUnindexable: 8)),
+                installedModelBytes: 0,
+                availableModels: [],
+                isSearchAvailable: true,
+                indexingState: .ready(progress)
+            ))
+
+        #expect(presentation.presentsAsReady)
+        #expect(presentation.detailText == nil)
+        #expect(!presentation.canRetry)
+        let note = try? #require(presentation.unavailableNote)
+        #expect(note?.hasPrefix(L10n.string("mlsearch.unavailable_note \(8)")) == true)
+        #expect(note?.contains(L10n.string("mlsearch.failure_analysis")) == true)
+    }
+
+    @Test func completeIndexHasNoInfo() {
+        let progress = MLSmartSearchAggregateProgress(
+            totalWorkUnits: 10, settledWorkUnits: 10, permanentlyUnavailableAssets: 0)
+        let presentation = MLSmartSearchPresentation(
+            snapshot: MLSmartSearchSnapshot(
+                isEnabled: true, selectedModelID: MLModelID("model"),
+                phase: .ready(.init(total: 10, indexed: 10, permanentlyUnindexable: 0)),
+                installedModelBytes: 0, availableModels: [], isSearchAvailable: true, indexingState: .ready(progress)))
+        #expect(presentation.unavailableNote == nil)
+    }
+
+    @Test func modelThatDoesNotFitNamesTheSpaceItNeeds() {
+        let required: Int64 = 1_000_000_000
+        let snapshot = MLSmartSearchSnapshot(
+            isEnabled: true,
+            selectedModelID: MLModelID("model"),
+            phase: .failed(
+                MLSmartSearchFailure(
+                    kind: .insufficientStorage, isRetryable: true, debugDescription: "", requiredBytes: required)),
+            installedModelBytes: 0,
+            availableModels: [],
+            isSearchAvailable: true,
+            indexingState: .idle
+        )
+        let model = MLSmartSearchModelPresentation(snapshot: snapshot)
+        #expect(model.statusText == L10n.string("mlsearch.status_failed_space"))
+        #expect(model.detailText == L10n.string("mlsearch.space_required \(L10n.fileSize(required))"))
+        #expect(model.canRetry)
+        let overall = MLSmartSearchPresentation(snapshot: snapshot)
+        #expect(overall.statusText == model.statusText)
+        #expect(overall.canRetry)
+    }
+
+    @Test func enabledSearchWithoutAModelAsksForOne() {
+        let presentation = MLSmartSearchPresentation(
+            snapshot: MLSmartSearchSnapshot(
+                isEnabled: true,
                 selectedModelID: nil,
                 phase: .selectingModel,
                 installedModelBytes: 0,
@@ -129,8 +179,7 @@ import Testing
                 indexingState: .idle
             ))
 
-        #expect(presentation.statusText == L10n.string("mlsearch.status_preparing_index"))
-        #expect(presentation.statusText != L10n.string("mlsearch.status_select_model"))
+        #expect(presentation.statusText == L10n.string("mlsearch.status_select_model"))
     }
 }
 
@@ -333,10 +382,6 @@ import Testing
         #expect(controller.presentation.statusText != L10n.string("mlsearch.status_disabled"))
         #expect(controller.availableSearchScopes == [.all, .text])
 
-        controller.setEnabled(true)
-        try await Task.sleep(for: .milliseconds(50))
-        #expect(controller.snapshot.isEnabled)
-
         await factory.release()
         await lifecycle.shutdown()
     }
@@ -420,8 +465,7 @@ import Testing
         )
         await lifecycle.start()
         let controller = MLSmartSearchController(lifecycle: lifecycle, artifactAccess: access)
-        await lifecycle.setEnabled(true)
-        await lifecycle.setVisualSearchEnabled(true)
+        await lifecycle.enable(with: entry.id)
 
         controller.installDeveloperModel(from: artifact, for: entry.id)
 
@@ -460,7 +504,6 @@ import Testing
 
         let state = MLSmartSearchPersistentState(
             isEnabled: true,
-            isVisualSearchEnabled: true,
             selectedModelID: MLModelID("model-a"),
             activatedRevision: "rev1",
             activatedDescriptor: MLModelDescriptor(
@@ -486,7 +529,6 @@ import Testing
         try store.save(
             MLSmartSearchPersistentState(
                 isEnabled: true,
-                isVisualSearchEnabled: true,
                 selectedModelID: MLModelID("model-a"),
                 activatedRevision: "rev1"
             ))
@@ -510,13 +552,12 @@ import Testing
         try store.save(
             MLSmartSearchPersistentState(
                 isEnabled: true,
-                isVisualSearchEnabled: true,
                 selectedModelID: MLModelID("model-a")
             ))
 
         let encoded = try Data(contentsOf: layout.stateFileURL)
         var object = try #require(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
-        object["isVisualSearchEnabled"] = nil
+        object["isEnabled"] = nil
         try JSONSerialization.data(withJSONObject: object).write(to: layout.stateFileURL, options: .atomic)
 
         #expect(throws: (any Error).self) {

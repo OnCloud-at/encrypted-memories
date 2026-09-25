@@ -104,7 +104,8 @@ public struct MLModelCompatibilityRegistry: Sendable, Equatable {
             ),
             localizedMetadata: .init(
                 selectionTitleKey: "mlsearch.model_tinyclip_title",
-                selectionDescriptionKey: "mlsearch.model_tinyclip_description"
+                selectionDescriptionKey: "mlsearch.model_tinyclip_description",
+                queryLanguages: .englishOnly
             ),
             estimatedInstalledBytes: 130_000_000
         ),
@@ -128,7 +129,8 @@ public struct MLModelCompatibilityRegistry: Sendable, Equatable {
             ),
             localizedMetadata: .init(
                 selectionTitleKey: "mlsearch.model_siglip2_title",
-                selectionDescriptionKey: "mlsearch.model_siglip2_description"
+                selectionDescriptionKey: "mlsearch.model_siglip2_description",
+                queryLanguages: .multilingual
             ),
             estimatedInstalledBytes: 760_000_000
         ),

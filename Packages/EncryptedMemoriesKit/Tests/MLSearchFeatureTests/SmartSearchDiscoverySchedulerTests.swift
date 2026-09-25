@@ -29,7 +29,8 @@ import TimelineCore
         default: phase = complete.phase
         }
         let blocked = MLSmartSearchSnapshot(
-            isEnabled: true, isVisualSearchEnabled: state != "nativeOnlyFailure", selectedModelID: nil, phase: phase,
+            isEnabled: true, selectedModelID: state != "nativeOnlyFailure" ? MLModelID("visual-model") : nil,
+            phase: phase,
             installedModelBytes: 0, availableModels: [], isSearchAvailable: false,
             indexingState: state.hasPrefix("native") ? .failed(failure) : .idle)
         let probe = EvidenceProbe()
@@ -60,7 +61,7 @@ import TimelineCore
         }
         try #require(!scheduler.discovery.forYou.isEmpty, "a blocked model must not hide local metadata forever")
         #expect(scheduler.discovery.forYou.allSatisfy { $0.kind != .concept })
-        if blocked.isVisualSearchEnabled {
+        if blocked.selectedModelID != nil {
             #expect(scheduler.discovery.forYou.allSatisfy { $0.representativeUIDs.isEmpty })
         }
         #expect(await probe.calls == 0, "metadata fallback must not scan embeddings")
@@ -85,7 +86,7 @@ import TimelineCore
             sections: [TimelineSection(id: "all", date: Date(), title: "", items: [item])],
             timelineRevision: 1, favoriteUIDs: [item.uid], coordinates: [],
             snapshot: MLSmartSearchSnapshot(
-                isEnabled: true, isVisualSearchEnabled: true, selectedModelID: nil,
+                isEnabled: true, selectedModelID: MLModelID("visual-model"),
                 phase: .notInstalled(downloadable: false), installedModelBytes: 0, availableModels: [],
                 isSearchAvailable: false,
                 indexingState: .indexing(
@@ -262,7 +263,7 @@ import TimelineCore
         }
         let favorites = Set(items.prefix(8).map(\.uid))
         let missingModel = MLSmartSearchSnapshot(
-            isEnabled: true, isVisualSearchEnabled: true, selectedModelID: nil,
+            isEnabled: true, selectedModelID: MLModelID("visual-model"),
             phase: .notInstalled(downloadable: false), installedModelBytes: 0, availableModels: [],
             isSearchAvailable: false, indexingState: .idle)
         let complete = visualSnapshot(settled: 20, ready: true)
@@ -504,7 +505,7 @@ import TimelineCore
         scheduler.update(
             sections: [], timelineRevision: 1, favoriteUIDs: [], coordinates: [],
             snapshot: MLSmartSearchSnapshot(
-                isEnabled: true, isVisualSearchEnabled: true, selectedModelID: nil, phase: .waiting(coverage),
+                isEnabled: true, selectedModelID: MLModelID("visual-model"), phase: .waiting(coverage),
                 installedModelBytes: 0, availableModels: [], isSearchAvailable: true, indexingState: .waiting(progress)),
             indexedAssetCount: { 100 },
             searchEvidence: { await probe.query(sensitive: PhotoUID(volumeID: "v", nodeID: "sensitive")) })
@@ -514,7 +515,7 @@ import TimelineCore
         scheduler.update(
             sections: [], timelineRevision: 1, favoriteUIDs: [], coordinates: [],
             snapshot: MLSmartSearchSnapshot(
-                isEnabled: true, isVisualSearchEnabled: true, selectedModelID: nil, phase: .waiting(coverage),
+                isEnabled: true, selectedModelID: MLModelID("visual-model"), phase: .waiting(coverage),
                 installedModelBytes: 0, availableModels: [], isSearchAvailable: true, indexingState: .indexing(progress)
             ),
             indexedAssetCount: { 100 },
@@ -704,7 +705,7 @@ import TimelineCore
         let ready = visualSnapshot(settled: 8, ready: true)
         func apply(_ scheduler: SmartSearchDiscoveryScheduler, phase: MLSmartSearchPhase, cacheReady: Bool) {
             let snapshot = MLSmartSearchSnapshot(
-                isEnabled: ready.isEnabled, isVisualSearchEnabled: ready.isVisualSearchEnabled,
+                isEnabled: ready.isEnabled,
                 selectedModelID: ready.selectedModelID, phase: phase,
                 installedModelBytes: ready.installedModelBytes, availableModels: ready.availableModels,
                 isSearchAvailable: false, indexingState: cacheReady ? ready.indexingState : .idle)
@@ -990,7 +991,7 @@ import TimelineCore
         let probe = EvidenceProbe()
         func update(semanticComplete: Bool, aggregateReady: Bool) {
             let snapshot = MLSmartSearchSnapshot(
-                isEnabled: true, isVisualSearchEnabled: true, selectedModelID: nil,
+                isEnabled: true, selectedModelID: MLModelID("visual-model"),
                 phase: semanticComplete
                     ? .ready(MLIndexCoverage(total: 100, indexed: 100, permanentlyUnindexable: 0))
                     : .waiting(MLIndexCoverage(total: 100, indexed: 40, permanentlyUnindexable: 0)),
@@ -1024,7 +1025,7 @@ import TimelineCore
             totalWorkUnits: total, settledWorkUnits: settled, permanentlyUnavailableAssets: 0)
         let coverage = MLIndexCoverage(total: total, indexed: settled, permanentlyUnindexable: 0)
         return MLSmartSearchSnapshot(
-            isEnabled: true, isVisualSearchEnabled: true, selectedModelID: nil,
+            isEnabled: true, selectedModelID: MLModelID("visual-model"),
             phase: ready ? .ready(coverage) : .waiting(coverage),
             installedModelBytes: 0, availableModels: [], isSearchAvailable: true,
             indexingState: ready ? .ready(progress) : .waiting(progress))
