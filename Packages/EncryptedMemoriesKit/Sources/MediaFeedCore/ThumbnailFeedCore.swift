@@ -1870,7 +1870,11 @@ public actor ThumbnailFeedCore {
                 writeExecutor: decodeExecutor,
                 writePermits: decodePermits,
                 priority: work.priority,
-                seconds: configuration.downloadTimeoutSeconds
+                seconds: configuration.downloadTimeoutSeconds,
+                decodePixelSize: configuration.targetPixels,
+                publishMemoryOnly: { [weak self] uid, image in
+                    await self?.publishMemoryOnlyArrival(image, for: uid, writerGeneration: writerGeneration) ?? false
+                }
             )
             activeDownloaders = max(0, activeDownloaders - 1)
             releasePriorityReservations(for: chunk, generation: generation)
@@ -1890,7 +1894,7 @@ public actor ThumbnailFeedCore {
             let reportedDelivered = snapshot.delivered.filter(isReportedForPrefetch)
             prefetchCompleted += reportedDelivered.count
             prefetchDownloadCompleted += reportedDelivered.count
-            recordCheckpointPresent(Array(snapshot.delivered), writerGeneration: writerGeneration)
+            recordCheckpointPresent(Array(snapshot.storedOnDisk), writerGeneration: writerGeneration)
             let undelivered = chunk.filter { !snapshot.delivered.contains($0) }
             let reportedUndelivered = undelivered.filter(isReportedForPrefetch)
             prefetchFailed += reportedUndelivered.count
@@ -1957,6 +1961,8 @@ public actor ThumbnailFeedCore {
 
     private struct BatchSnapshot: Sendable {
         let delivered: Set<PhotoUID>
+        /// The delivered subset that reached the disk cache. The rest is held in memory only.
+        let storedOnDisk: Set<PhotoUID>
         let resolution: BatchResolution
         let lateLoader: Task<ThumbnailBatchLoadResult, Never>?
     }
@@ -1992,41 +1998,44 @@ public actor ThumbnailFeedCore {
         writeExecutor: ThumbnailDecodeWorkExecutor,
         writePermits: DecodePermitPool,
         priority: ThumbnailPriority,
-        seconds: Double
+        seconds: Double,
+        decodePixelSize: CGFloat,
+        publishMemoryOnly: @escaping @Sendable (PhotoUID, DecodedThumbnail) async -> Bool
     ) async -> BatchSnapshot {
         let delivered = UIDSetBox()
+        let storedOnDisk = UIDSetBox()
         let writes = ThumbnailWriteTaskGroup()
+        let onLoaded: @Sendable (PhotoUID, Data) -> Void = { uid, data in
+            writes.submit {
+                guard cache.isCurrentSessionLease(sessionLease) else { return }
+                guard await writePermits.acquire(priority: priority) else { return }
+                let (stored, memoryOnly) = await writeExecutor.perform(priority: priority) {
+                    let stored = cache.storeToDisk(data, for: uid, ifCurrent: writerGeneration)
+                    // A nearly full device keeps thumbnails in memory only. Decode now, or the downloaded bytes
+                    // are lost and the tile stays blank while the same thumbnail is requested again.
+                    guard stored == .storagePaused else { return (stored, nil as DecodedThumbnail?) }
+                    return (stored, ThumbnailImageDecoder.downsample(data, maxPixelSize: decodePixelSize))
+                }
+                await writePermits.release()
+                guard cache.isCurrentSessionLease(sessionLease) else { return }
+                switch stored {
+                case .stored:
+                    diskPresence.set(uid, present: true)
+                    storedOnDisk.insert(uid)
+                    delivered.insert(uid)
+                case .storagePaused:
+                    guard let memoryOnly, await publishMemoryOnly(uid, memoryOnly) else { return }
+                    delivered.insert(uid)
+                case .stale, .ioFailure:
+                    return
+                }
+            }
+        }
         let loaderTask = Task {
             if let priorityLoader = loader as? any PriorityThumbnailBatchLoader {
-                await priorityLoader.loadThumbnails(for: chunk, priority: priority) { uid, data in
-                    writes.submit {
-                        guard cache.isCurrentSessionLease(sessionLease) else { return }
-                        guard await writePermits.acquire(priority: priority) else { return }
-                        let stored = await writeExecutor.perform(priority: priority) {
-                            cache.storeToDisk(data, for: uid, ifCurrent: writerGeneration)
-                        }
-                        await writePermits.release()
-                        guard stored == .stored else { return }
-                        guard cache.isCurrentSessionLease(sessionLease) else { return }
-                        diskPresence.set(uid, present: true)
-                        delivered.insert(uid)
-                    }
-                }
+                await priorityLoader.loadThumbnails(for: chunk, priority: priority, onLoaded: onLoaded)
             } else {
-                await loader.loadThumbnails(for: chunk) { uid, data in
-                    writes.submit {
-                        guard cache.isCurrentSessionLease(sessionLease) else { return }
-                        guard await writePermits.acquire(priority: priority) else { return }
-                        let stored = await writeExecutor.perform(priority: priority) {
-                            cache.storeToDisk(data, for: uid, ifCurrent: writerGeneration)
-                        }
-                        await writePermits.release()
-                        guard stored == .stored else { return }
-                        guard cache.isCurrentSessionLease(sessionLease) else { return }
-                        diskPresence.set(uid, present: true)
-                        delivered.insert(uid)
-                    }
-                }
+                await loader.loadThumbnails(for: chunk, onLoaded: onLoaded)
             }
         }
         let completionTask = Task {
@@ -2066,7 +2075,12 @@ public actor ThumbnailFeedCore {
         } else {
             lateLoader = nil
         }
-        return BatchSnapshot(delivered: delivered.snapshot, resolution: resolution, lateLoader: lateLoader)
+        return BatchSnapshot(
+            delivered: delivered.snapshot,
+            storedOnDisk: storedOnDisk.snapshot,
+            resolution: resolution,
+            lateLoader: lateLoader
+        )
     }
 
     private func timedOutLoaderFinished(taskID: UUID, itemCount: Int) {
@@ -2665,6 +2679,19 @@ public actor ThumbnailFeedCore {
         }
         if becameCurrent { onDecoded(uid, image) }
         return decoded.image(for: uid)
+    }
+
+    /// Publishes a batch arrival that could not reach the disk cache because the device is nearly full.
+    private func publishMemoryOnlyArrival(
+        _ image: DecodedThumbnail,
+        for uid: PhotoUID,
+        writerGeneration: CacheWriterGeneration.Token
+    ) -> Bool {
+        guard cache.isCurrentWriterGeneration(writerGeneration),
+            storeDecoded(image, for: uid, decodePixelCap: Int(configuration.targetPixels)) != nil
+        else { return false }
+        notifyHostOfAvailableImageIfVisible()
+        return true
     }
 
     /// A completed disk decode is immediately useful to the Metal grid. This wake intentionally happens at each

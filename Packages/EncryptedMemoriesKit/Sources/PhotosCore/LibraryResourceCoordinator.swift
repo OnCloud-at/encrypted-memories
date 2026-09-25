@@ -697,7 +697,12 @@ public actor LibraryResourceCoordinator {
         }
 
         recoveryIsPending = true
+        // Storage pressure has its own hysteresis. It applies at once in both directions, so a device that
+        // frees space does not hold backup or user work behind the recovery delay of the other signals.
+        let storageChanged = effectiveSnapshot.storagePressure != snapshot.storagePressure
+        effectiveSnapshot.storagePressure = snapshot.storagePressure
         emitStateTransition(snapshot)
+        if storageChanged { admitNextIfPossible() }
         recoveryTask = Task { [weak self, recoveryDelay, recoverySleep] in
             try? await recoverySleep(recoveryDelay)
             guard !Task.isCancelled else { return }
@@ -775,7 +780,6 @@ public actor LibraryResourceCoordinator {
             snapshot.thermalLevel == .critical ? 4 : snapshot.thermalLevel.rawValue,
             memoryRank,
             headroomRank,
-            snapshot.storagePressure == .critical ? 3 : 0,
             snapshot.executionOpportunity == .suspended ? 4 : 0
         )
     }

@@ -43,6 +43,16 @@ final class LibraryStoragePressureTests: XCTestCase {
             ).isAdmitted)
     }
 
+    func testOutOfSpaceErrorsAreRecognizedWhenWrapped() {
+        XCTAssertTrue(DeviceStorage.isOutOfSpace(CocoaError(.fileWriteOutOfSpace)))
+        XCTAssertTrue(DeviceStorage.isOutOfSpace(POSIXError(.ENOSPC)))
+        let diskFull = NSError(domain: NSPOSIXErrorDomain, code: Int(ENOSPC))
+        let wrapped = NSError(domain: "Transfer", code: 1, userInfo: [NSUnderlyingErrorKey: diskFull])
+        XCTAssertTrue(DeviceStorage.isOutOfSpace(wrapped))
+        XCTAssertFalse(DeviceStorage.isOutOfSpace(CocoaError(.fileWriteUnknown)))
+        XCTAssertFalse(DeviceStorage.isOutOfSpace(URLError(.timedOut)))
+    }
+
     func testGenerationResetKeepsObservedPressure() {
         let state = LibraryRuntimeState(initial: LibraryRuntimeSnapshot(storagePressure: .critical))
         XCTAssertEqual(state.beginNewGeneration().storagePressure, .critical)

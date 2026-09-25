@@ -1,4 +1,5 @@
 import Foundation
+import PhotosCore
 import ProtonDriveSDK
 import Testing
 import UploadCore
@@ -151,6 +152,15 @@ struct SDKUploadFileSystemErrorPolicyTests {
         let mapped = DriveSDKBridge.uploadFileSystemError(.outOfSpace, filename: "video.mov")
 
         #expect(mapped as? BackupTempFileStore.BackupTempFileError == .diskBudgetExceeded)
+    }
+
+    @Test func fullDeviceDuringAnOriginalDownloadReadsAsOutOfSpace() {
+        let sdkFailure = URLError(.cannotWriteToFile)
+        let full = DriveSDKBridge.originalTransferError(sdkFailure, fileSystemCode: .outOfSpace)
+        #expect(DeviceStorage.isOutOfSpace(full))
+        let denied = DriveSDKBridge.originalTransferError(sdkFailure, fileSystemCode: .permissionDenied)
+        #expect(!DeviceStorage.isOutOfSpace(denied))
+        #expect(!DeviceStorage.isOutOfSpace(DriveSDKBridge.originalTransferError(from: sdkFailure)))
     }
 
     @Test func unknownFileSystemCodeKeepsGenericFallbackAvailable() {

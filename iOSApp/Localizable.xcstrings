@@ -185,6 +185,20 @@
         }
       }
     },
+    "selection.share_failed_space": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "There isn't enough free space to prepare the selection for sharing." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Es ist nicht genug freier Speicher da, um die Auswahl zum Teilen vorzubereiten." } }
+      }
+    },
+    "selection.share_partial_space %lld": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "There isn't enough free space for %lld item(s); they will be left out." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Für %lld Objekt(e) ist nicht genug freier Speicher da; sie werden ausgelassen." } }
+      }
+    },
     "action.try_again": {
       "extractionState": "manual",
       "localizations": {

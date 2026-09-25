@@ -312,6 +312,20 @@ final class LibraryResourceCoordinatorTests: XCTestCase {
         XCTAssertTrue(recovered)
     }
 
+    func testFreedStorageSkipsTheRecoveryDelay() async {
+        let state = LibraryRuntimeState(initial: LibraryRuntimeSnapshot(storagePressure: .critical))
+        let coordinator = LibraryResourceCoordinator(runtimeState: state, recoveryDelay: .seconds(30))
+        await coordinator.startObserving()
+        let request = LibraryWorkRequest(workload: .mlIndexing, intent: .automatic)
+        let paused = await coordinator.budget(for: request)
+        XCTAssertEqual(paused.reason, .storagePressure)
+
+        // Storage levels already have their own hysteresis. Freed space must not wait another 30 seconds.
+        state.update { $0.storagePressure = .low }
+        let admitted = await waitUntilAsync { await coordinator.budget(for: request).isAdmitted }
+        XCTAssertTrue(admitted)
+    }
+
     func testCacheBudgetRecoveryDoesNotDelayForegroundWork() async {
         let state = LibraryRuntimeState(
             initial: LibraryRuntimeSnapshot(memoryBudgetTier: .reduced, executionOpportunity: .backgroundPermitted)

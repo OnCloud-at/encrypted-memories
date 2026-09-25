@@ -7,6 +7,19 @@ public enum DeviceStorage {
         (try? url.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]))?
             .volumeAvailableCapacityForImportantUsage
     }
+
+    /// True when a write failed because the volume is full, also when the error wraps the file-system error.
+    public static func isOutOfSpace(_ error: any Error) -> Bool {
+        if let cocoa = error as? CocoaError, cocoa.code == .fileWriteOutOfSpace { return true }
+        if let posix = error as? POSIXError, posix.code == .ENOSPC || posix.code == .EDQUOT { return true }
+        let nsError = error as NSError
+        if nsError.domain == NSPOSIXErrorDomain, nsError.code == Int(ENOSPC) || nsError.code == Int(EDQUOT) {
+            return true
+        }
+        if nsError.domain == NSCocoaErrorDomain, nsError.code == NSFileWriteOutOfSpaceError { return true }
+        guard let underlying = nsError.userInfo[NSUnderlyingErrorKey] as? any Error else { return false }
+        return isOutOfSpace(underlying)
+    }
 }
 
 /// How full the device is. Optional caches stop growing at `low`; at `critical` they are cleared and
