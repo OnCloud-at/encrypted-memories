@@ -1032,12 +1032,15 @@ final class MetalGridScrollHost: NSView {
             updateFeedInteractionState()
             streamingTick?.invalidate()
             streamingTick = nil
+            coordinator.retireLocalDemand()
         }
     }
 
     @objc private func windowVisibilityChanged() {
+        let wasActive = framePump.isActive
         framePump.setActive(window?.occlusionState.contains(.visible) == true)
         if framePump.isActive { requestFrame() }
+        if wasActive, !framePump.isActive { coordinator.retireLocalDemand() }
         updateDisplayLinkIdleState()
     }
 

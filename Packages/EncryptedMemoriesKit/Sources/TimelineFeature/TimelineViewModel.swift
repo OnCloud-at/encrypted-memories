@@ -1,4 +1,5 @@
 import Foundation
+import GridCore
 import MediaCache
 import PhotosCore
 import TimelineCore
@@ -86,11 +87,56 @@ public final class TimelineViewModel {
     public private(set) var wholeLibraryInventoryAuthorityRevision: UInt64 = 0
     /// Revision of the identity/order that actually drives Metal grid presentation. Metadata enrichment can
     /// update `contentRevision` without rebuilding an unchanged whole-library grid.
+    /// With pending photos the whole-library grid uses 4n + 2, so it never shares a value with the Proton
+    /// timeline (4n) or a filtered route (4n + 1).
     public var gridSourceRevision: UInt64 {
         switch filter {
-        case .all: wholeLibraryRevision &* 2
-        default: contentRevision &* 2 &+ 1
+        case .all where showsPendingPhotos: pendingPresentation.membershipRevision &* 4 &+ 2
+        case .all: wholeLibraryRevision &* 4
+        default: contentRevision &* 4 &+ 1
         }
+    }
+
+    /// Local photos on their way to Proton, merged into the whole-library grid by the shared presenter. The
+    /// Proton timeline stays in `allItems` and the whole-library snapshot for every remote-only consumer
+    /// (search, Map, Smart Search, trash and export).
+    public private(set) var pendingPresentation = PendingTimelinePresentation.empty
+
+    public func setPendingPresentation(_ presentation: PendingTimelinePresentation) {
+        pendingPresentation = presentation
+    }
+
+    /// True while the whole-library grid shows pending photos. It waits for the Proton timeline, so a slow
+    /// first load never shows only local photos.
+    public var showsPendingPhotos: Bool {
+        filter == .all && !pendingPresentation.isCanonical && allRouteSnapshot != nil
+            && !pendingPresentation.items.isEmpty
+    }
+
+    /// The route state the grid shows. A library without Proton photos still shows its pending photos.
+    public var gridState: State {
+        guard showsPendingPhotos else { return state }
+        switch state {
+        case .loaded, .empty: return .loaded(pendingSections)
+        case .loading, .failed: return state
+        }
+    }
+
+    /// Sections of the grid; see `gridState`.
+    public var gridSections: [TimelineSection] { showsPendingPhotos ? pendingSections : currentSections }
+
+    /// Grid and viewer items; see `gridState`.
+    public var gridItems: [PhotoItem] { showsPendingPhotos ? pendingPresentation.items : presentationItems }
+
+    /// Upload badges of the whole-library grid.
+    var pendingUploadBadges: PendingUploadBadges {
+        filter == .all ? pendingPresentation.uploadBadges : .empty
+    }
+
+    private var pendingSections: [TimelineSection] {
+        let items = pendingPresentation.items
+        guard let first = items.first else { return [] }
+        return [TimelineSection(id: "pending-presentation", date: first.captureTime, title: "", items: items)]
     }
 
     private let repository: PhotosRepository
@@ -308,6 +354,9 @@ public final class TimelineViewModel {
         guard allRouteSnapshot != nil else { return allItems.first { $0.uid == uid } }
         return wholeLibrarySnapshot.item(for: uid)
     }
+
+    /// The canonical whole-library Proton timeline, for the pending presenter.
+    public var wholeLibraryTimeline: TimelineSnapshot { wholeLibrarySnapshot }
 
     /// Viewer paging for Map taps should use the whole-library snapshot when available, not whichever filtered
     /// timeline happened to be underneath the Map overlay.

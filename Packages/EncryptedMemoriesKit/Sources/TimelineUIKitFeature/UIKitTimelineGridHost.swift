@@ -34,6 +34,8 @@
         private let displayMode: TileContentDisplayMode
         private let selectionMode: Bool
         private let selectedUIDs: Set<PhotoUID>
+        /// Upload badges of pending photos; nil for grids without pending photos.
+        private let pendingPresentation: PendingTimelinePresentation?
         /// Whether this grid's surface is the active one (its tab is selected). When false the host stops its
         /// display link and cancels ahead-warm so a hidden grid never competes with menus/transitions on screen;
         /// defaults to true so a grid that is always visible (e.g. a pushed collection detail) behaves as before.
@@ -74,6 +76,7 @@
             displayMode: TileContentDisplayMode = .squareFillCrop,
             selectionMode: Bool = false,
             selectedUIDs: Set<PhotoUID> = [],
+            pendingPresentation: PendingTimelinePresentation? = nil,
             isActive: Bool = true,
             scrollToLatestSignal: Int = 0,
             scrollToTopSignal: Int = 0,
@@ -102,6 +105,7 @@
             self.displayMode = displayMode
             self.selectionMode = selectionMode
             self.selectedUIDs = selectedUIDs
+            self.pendingPresentation = pendingPresentation
             self.isActive = isActive
             self.scrollToLatestSignal = scrollToLatestSignal
             self.scrollToTopSignal = scrollToTopSignal
@@ -165,7 +169,8 @@
                 level: level, gridProfile: gridProfile,
                 fillOrder: fillOrder,
                 initialViewportPlacement: initialViewportPlacement, displayMode: displayMode,
-                selectionMode: selectionMode, selectedUIDs: selectedUIDs)
+                selectionMode: selectionMode, selectedUIDs: selectedUIDs,
+                pendingPresentation: pendingPresentation)
             view.setActive(isActive)
             wireProxy(proxy, to: view)
             return view
@@ -192,7 +197,8 @@
                 level: level, gridProfile: gridProfile,
                 fillOrder: fillOrder,
                 initialViewportPlacement: initialViewportPlacement, displayMode: displayMode,
-                selectionMode: selectionMode, selectedUIDs: selectedUIDs)
+                selectionMode: selectionMode, selectedUIDs: selectedUIDs,
+                pendingPresentation: pendingPresentation)
             if shouldDissolveContent {
                 uiView.completeContentReplacementTransition(prefersReducedMotion: prefersReducedMotion)
             }
@@ -249,6 +255,8 @@
         private var device: MTLDevice?
         var renderer: MetalGridRenderer?
         var textureCache: MetalGridTextureCache<PhotoUID>?
+        /// Local photos edited in Apple Photos; their resident textures upload again.
+        private var pendingContentEpochs = PendingContentEpochTracker()
         var texturePolicy: UIKitMetalGridTexturePolicy?
         private var texturePressureRegistration: MemoryPressureRegistration?
         var thumbnailFeed: UIKitThumbnailFeed?
@@ -500,10 +508,19 @@
             initialViewportPlacement: TimelineInitialViewportPlacement = .automatic,
             displayMode: TileContentDisplayMode = .squareFillCrop,
             selectionMode: Bool = false,
-            selectedUIDs: Set<PhotoUID> = []
+            selectedUIDs: Set<PhotoUID> = [],
+            pendingPresentation: PendingTimelinePresentation? = nil
         ) {
             self.selectionMode = selectionMode
             self.selectedUIDs = selectedUIDs
+            // Upload badges change with progress; they never rebuild the item overlays.
+            let uploadBadges = pendingPresentation?.uploadBadges ?? .empty
+            thumbnailOverlayResolver.updateUploadBadges(uploadBadges)
+            let revisedContent = pendingContentEpochs.changes(in: uploadBadges.contentEpochs)
+            if !revisedContent.isEmpty {
+                textureCache?.invalidate(revisedContent)
+                requestRender()
+            }
             swipeSelection.updateEnabled()
             let feedChanged = wiredFeed !== thumbnailFeed
             let contentChanged: Bool
@@ -725,6 +742,10 @@
             warmTask?.cancel()
             aheadWarmTask?.cancel()
             aheadWarmInFlight = false
+            // Local pending photos download from iCloud outside the warm task; stop the former viewport's loads.
+            if let feedCore = thumbnailFeed?.feedCore {
+                Task { await feedCore.endLocalVisibleDemand() }
+            }
             cancelLiveZoomState()
             swipeSelection.cancel()
             scrollInputActive = false

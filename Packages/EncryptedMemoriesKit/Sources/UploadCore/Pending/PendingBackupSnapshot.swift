@@ -120,3 +120,11 @@ public protocol PendingBackupEffects: Sendable {
     func setFavorite(_ uid: PhotoUID, favorite: Bool) async -> PendingEffectResult
     func addToAlbum(_ uid: PhotoUID, albumID: String) async -> PendingEffectResult
 }
+
+/// The Proton side of pending decisions, implemented by the backend. Each call reports whether to retry.
+public protocol PendingRemoteEffects: Sendable {
+    func trash(_ uids: [PhotoUID]) async -> PendingEffectResult
+    func restore(_ uids: [PhotoUID]) async -> PendingEffectResult
+    func setFavorite(_ uid: PhotoUID, favorite: Bool) async -> PendingEffectResult
+    func addToAlbum(_ uid: PhotoUID, albumID: String) async -> PendingEffectResult
+}

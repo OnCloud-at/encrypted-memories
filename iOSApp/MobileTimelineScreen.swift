@@ -469,7 +469,7 @@ struct MobileTimelineScreen: View {
     /// The grid keeps the last authoritative projection mounted while a newer query resolves. The expensive
     /// filter/flatten work runs once in TimelineCore, never synchronously from `body`.
     private var visibleItems: [PhotoItem] {
-        guard hasProjectionCriteria else { return model.items }
+        guard hasProjectionCriteria else { return model.gridItems }
         return (resolvedSearchProjection ?? searchProjection)?.presentationItems ?? model.items
     }
 
@@ -481,9 +481,9 @@ struct MobileTimelineScreen: View {
     /// content replacement from selection, toolbar and presentation updates without scanning every photo UID.
     private var visibleContentRevision: UInt64 {
         if hasProjectionCriteria, let projection = resolvedSearchProjection ?? searchProjection {
-            return projection.revision &* 2 &+ 1
+            return projection.revision &* 4 &+ 1
         }
-        return model.timelineRevision &* 2
+        return model.gridRevision
     }
 
     private var showsSearchLanding: Bool {
@@ -506,6 +506,7 @@ struct MobileTimelineScreen: View {
                     displayMode: displayMode,
                     selectionMode: selection.isSelecting,
                     selectedUIDs: selection.selected,
+                    pendingPresentation: hasProjectionCriteria ? nil : model.pendingPresentation,
                     isActive: isActive && !showsSearchLanding,
                     scrollToLatestSignal: scrollToLatestSignal,
                     scrollToTopSignal: refinementTopPlacementSignal,
@@ -569,7 +570,7 @@ struct MobileTimelineScreen: View {
                     && (model.loadState.isLoading || model.loadState.failure != nil)
                 {
                     OfflineContentUnavailableView()
-                } else if model.loadState.isEmpty {
+                } else if model.loadState.isEmpty && !model.showsPendingPhotos {
                     MobileEmptyLibraryView()
                 } else if let failure = model.loadState.failure {
                     MobileLibraryErrorView(message: failure.message, retryable: failure.retryable) {
@@ -601,9 +602,9 @@ struct MobileTimelineScreen: View {
 
     private func open(_ item: PhotoItem) {
         if !hasProjectionCriteria {
-            guard let index = model.index(of: item.uid) else { return }  // O(1), not an O(n) firstIndex scan
+            guard let index = model.gridIndex(of: item.uid) else { return }  // O(1), not an O(n) firstIndex scan
             viewerRouter.presentation = MobileViewerPresentation(
-                index: index, items: model.items, context: ViewerCollectionContext(filter: .all)
+                index: index, items: model.gridItems, context: ViewerCollectionContext(filter: .all)
             )
         } else {
             // While searching, the viewer pages through the filtered result set to match macOS.

@@ -175,7 +175,9 @@ final class MobileLibraryModel {
     private(set) var loadState: LibraryLoadState = .initial
     /// Immutable timeline snapshot prepared off the main actor. Its index provides O(1) and O(k) lookups
     /// for viewer, share, and trash actions without scanning the library.
-    private(set) var snapshot = TimelineSnapshot()
+    private(set) var snapshot = TimelineSnapshot() {
+        didSet { pendingGrid?.setRemote(snapshot) }
+    }
     /// Changes only when a new canonical snapshot is published. Secondary grids use it to refresh their one
     /// indexed projection without recomputing it for unrelated SwiftUI state changes.
     private(set) var timelineRevision: UInt64 = 0
@@ -226,6 +228,33 @@ final class MobileLibraryModel {
     private(set) var albumActions: AlbumActionCoordinator?
     /// Account-scoped Photos-library backup controller shared with macOS.
     private(set) var photoBackup: PhotoLibraryBackupController?
+    /// Local photos on their way to Proton, merged into the whole-library grid (shared with macOS).
+    private(set) var pendingGrid: PendingGridSession?
+    @ObservationIgnored private var pendingStore: PendingBackupManifestStore?
+    /// The grid's view of the library: Proton photos plus pending local photos.
+    private(set) var pendingPresentation = PendingTimelinePresentation.empty
+    /// Viewer media: pending photos from Apple Photos, every other photo from Proton.
+    var viewerMedia: LocalPendingMediaRouter {
+        LocalPendingMediaRouter(remote: backend, remoteVideo: backend)
+    }
+    /// True while the grid shows pending photos. It waits for the Proton timeline, so a slow first load never
+    /// shows only local photos.
+    var showsPendingPhotos: Bool {
+        !pendingPresentation.isCanonical && !pendingPresentation.items.isEmpty
+            && (!items.isEmpty || loadState.isEmpty)
+    }
+    /// Items of the whole-library grid and viewer. Every remote-only consumer keeps using `items`.
+    var gridItems: [PhotoItem] { showsPendingPhotos ? pendingPresentation.items : items }
+    /// Content identity of `gridItems`: multiples of 4 for the Proton timeline, 4n + 2 with pending photos.
+    /// Search projections use 4n + 1, so the three sources never share a value.
+    var gridRevision: UInt64 {
+        showsPendingPhotos ? pendingPresentation.membershipRevision &* 4 &+ 2 : timelineRevision &* 4
+    }
+
+    /// Position of `uid` in `gridItems`. O(1).
+    func gridIndex(of uid: PhotoUID) -> Int? {
+        showsPendingPhotos ? pendingPresentation.snapshot.index(of: uid) : snapshot.index(of: uid)
+    }
     /// Account-scoped local-album sync controller shared with macOS.
     private(set) var albumSync: AlbumSyncController?
     /// Bumped by the shared album-sync controller after remote album mutations so Collections can
@@ -307,6 +336,41 @@ final class MobileLibraryModel {
     /// Coalesces terminal Drive scope recovery. This path keeps authentication but purges all lost-scope data.
     @ObservationIgnored private let scopeRecoveryCoordinator = MobileScopeRecoveryCoordinator()
     @ObservationIgnored private var nextScopeRecoveryID: UInt64 = 0
+
+    // MARK: - Pending grid
+
+    private func configurePendingGrid(
+        store: PendingBackupManifestStore?,
+        photoBackup: PhotoLibraryBackupController,
+        client: ProtonClientFacade,
+        feed: UIKitThumbnailFeed
+    ) {
+        pendingStore = store
+        guard let store,
+            let session = PendingGridSession(
+                store: store,
+                photoBackup: photoBackup,
+                remote: ProtonPendingRemoteEffects(facade: client)
+            )
+        else { return }
+        session.presenter.onChange = { [weak self] presentation in
+            self?.pendingPresentation = presentation
+        }
+        session.attachFeed(feed.feedCore)
+        pendingGrid = session
+        session.setRemote(snapshot)
+        session.start()
+    }
+
+    /// Detaches the pending grid from the model. The caller closes the session before the backup controller
+    /// shuts down, and the store after it.
+    private func retirePendingGrid() -> (session: PendingGridSession?, store: PendingBackupManifestStore?) {
+        let retired = (pendingGrid, pendingStore)
+        pendingGrid = nil
+        pendingStore = nil
+        pendingPresentation = .empty
+        return retired
+    }
 
     func configure(session: ProtonSession?, store: SessionKeychainStore) {
         guard let session else {
@@ -1068,6 +1132,7 @@ final class MobileLibraryModel {
         let activePrefetchStartTask = prefetchStartTask
         let activeFavoriteLoadTask = favoriteLoadTask
         let activePhotoBackup = photoBackup
+        let activePendingGrid = retirePendingGrid()
         let activeAlbumSync = albumSync
         let activeThumbnailFeed = thumbnailFeed
         let activeRefreshCoalescer = libraryRefreshCoalescer
@@ -1137,7 +1202,9 @@ final class MobileLibraryModel {
                     await activeLocationCrawl.cancel()
                 },
                 photoBackup: {
+                    await activePendingGrid.session?.close()
                     await activePhotoBackup?.shutdown()
+                    activePendingGrid.store?.close()
                 },
                 albumSync: {
                     await activeAlbumSync?.shutdown()
@@ -1165,6 +1232,7 @@ final class MobileLibraryModel {
         pendingSignOutPurgeClaim = purgeClaim
         signOutCleanupFailed = false
         let activePhotoBackup = photoBackup
+        let activePendingGrid = retirePendingGrid()
         let activeAlbumSync = albumSync
         let activeThumbnailFeed = thumbnailFeed
         let activeOriginalsCache = originalsCache
@@ -1253,7 +1321,10 @@ final class MobileLibraryModel {
                 activeLocationIndex.updateScanProgress(PhotoLocationScanProgress())
             },
             AccountTeardownOwner(id: "shared.photo-backup", stage: .photoBackup) {
+                await activePendingGrid.session?.close()
                 await activePhotoBackup?.shutdown()
+                // The purge deletes the account directory; the pending store must be closed first.
+                activePendingGrid.store?.close()
             },
             AccountTeardownOwner(id: "shared.album-sync", stage: .albumSync) {
                 await activeAlbumSync?.shutdown()
@@ -1344,6 +1415,7 @@ final class MobileLibraryModel {
         facade = nil
         albumActions = nil
         photoBackup = nil
+        _ = retirePendingGrid()
         albumSync = nil
         pendingTimelineRemovals.removeAll(keepingCapacity: false)
         timelineMutationGeneration &+= 1
@@ -1423,6 +1495,10 @@ final class MobileLibraryModel {
                     dimensions: PhotoDimensionCoalescer(store: backend),
                     targetPixels: 288
                 )
+                let pendingStore = PendingGridSession.openStore(
+                    accountDataDirectory: client.accountDataDirectory,
+                    policy: client.accountDatabasePolicy
+                )
                 let photoBackup = PhotoLibraryBackupController(
                     configuration: .init(
                         accountDataDirectory: client.accountDataDirectory,
@@ -1430,7 +1506,9 @@ final class MobileLibraryModel {
                     ),
                     identityResolver: client.uploadIdentityResolver,
                     uploader: client.photoUploader,
-                    tagAdder: client.photoTagAdder
+                    tagAdder: client.photoTagAdder,
+                    pendingStore: pendingStore,
+                    requiresPendingStore: true
                 )
                 let albumSync = AlbumSyncController(
                     configuration: .init(
@@ -1454,6 +1532,7 @@ final class MobileLibraryModel {
                     self.session == session
                 else {
                     await photoBackup.shutdown()
+                    pendingStore?.close()
                     await albumSync.shutdown()
                     await client.shutdown()
                     return
@@ -1471,6 +1550,7 @@ final class MobileLibraryModel {
                 self.albumSync = albumSync
                 self.backend = backend
                 self.thumbnailFeed = feed
+                self.configurePendingGrid(store: pendingStore, photoBackup: photoBackup, client: client, feed: feed)
                 if self.isRecoveringScope {
                     self.isRecoveringScope = false
                 }

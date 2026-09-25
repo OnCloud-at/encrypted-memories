@@ -13,6 +13,8 @@ package final class AppKitMetalGridGlyphRasterizer: MetalGridGlyphRasterizing {
             return symbolImage(symbol, request: request)
         case .text(let text):
             return textImage(text, request: request)
+        case .uploadBadge(let badge):
+            return MetalGridUploadBadgeImage.make(badge, pixelSize: request.pixelSize)
         }
     }
 

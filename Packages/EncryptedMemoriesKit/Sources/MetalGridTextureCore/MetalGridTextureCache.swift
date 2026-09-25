@@ -333,6 +333,16 @@ package final class MetalGridTextureCache<ID: Hashable & Sendable> {
         evictMsThisFrame += Self.elapsedMilliseconds(since: start)
     }
 
+    /// Drops the textures of photos whose content changed; they upload again when next visible.
+    package func invalidate(_ ids: [ID]) {
+        guard !ids.isEmpty else { return }
+        lru.invalidate(ids)
+        for id in ids {
+            textures.removeValue(forKey: id)
+            thumbnailRevealStartedAt.removeValue(forKey: id)
+        }
+    }
+
     /// Governor-driven memory-pressure response: set the resident ceiling scale (`1.0` = full budget,
     /// `0.0` = keep only the visible pinned set) and reclaim immediately at the new ceiling. Applies to
     /// future frames too, so residency stays reduced while pressure persists and grows back once the
@@ -477,6 +487,11 @@ package final class MetalGridTextureCache<ID: Hashable & Sendable> {
             color: color
         )
         return glyphTexture(for: request)
+    }
+
+    /// A cached upload badge texture: 21 ring steps plus waiting, done and attention stay resident.
+    package func uploadBadgeTexture(_ badge: GridUploadBadge) -> MTLTexture? {
+        glyphTexture(for: MetalGridGlyphRequest(uploadBadge: badge))
     }
 
     private func glyphTexture(for request: MetalGridGlyphRequest) -> MTLTexture? {

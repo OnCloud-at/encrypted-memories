@@ -108,7 +108,7 @@ public final class PhotoLibraryBackupController {
             && queueStore?.isOperational() == true
             && catalogStore?.isOperational() == true
             // Without readable exclusions a deleted pending photo could upload.
-            && pendingStore?.isOperational() != false
+            && (requiresPendingStore ? pendingStore?.isOperational() == true : pendingStore?.isOperational() != false)
     }
 
     /// Identity of the currently active orchestration pass. Platform expiration handlers use this
@@ -120,6 +120,7 @@ public final class PhotoLibraryBackupController {
     /// Durable runner events for the pending grid. Nil without a pending store.
     public let pendingRecorder: PendingBackupEventRecorder?
     private let pendingStore: PendingBackupManifestStore?
+    private let requiresPendingStore: Bool
     private let queueStore: UploadBackupSyncQueueManifestStore?
     private let stateStore: UploadBackupStateManifestStore?
     private let catalogStore: PhotoLibraryCatalogManifestStore?
@@ -187,12 +188,14 @@ public final class PhotoLibraryBackupController {
         identityResolver: (any UploadIdentityResolving)?,
         uploader: any PhotoUploading,
         tagAdder: (any PhotoTagAdding)? = nil,
-        pendingStore: PendingBackupManifestStore? = nil
+        pendingStore: PendingBackupManifestStore? = nil,
+        requiresPendingStore: Bool = false
     ) {
         let directory = configuration.accountDataDirectory
         let pendingRecorder = pendingStore.map { PendingBackupEventRecorder(store: $0) }
         self.pendingRecorder = pendingRecorder
         self.pendingStore = pendingStore
+        self.requiresPendingStore = requiresPendingStore
         defaults = configuration.defaults
         let retryPolicy = BackupRetryPolicy()
         self.retryPolicy = retryPolicy

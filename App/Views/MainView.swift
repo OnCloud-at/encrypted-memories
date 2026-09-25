@@ -11,6 +11,7 @@ import MapFeature
 import MediaByteCache
 import MediaCache
 import MediaLocationCore
+import PhotoLibraryBackupAdapter
 import PhotoViewerFeature
 import PhotosCore
 import ProtonDriveBackend
@@ -215,6 +216,7 @@ struct MainView: View {
             .task(id: model.albumCatalogRevision) { await loadAlbums() }
             .onAppear {
                 attachOfflineManager()
+                attachPendingGrid()
                 AppMemoryPressureCoordinator.shared.attachFeed(timelineModel.feed)
                 gridProxy.onContentReady = { revision in
                     renderedLibraryRevision = revision
@@ -265,6 +267,7 @@ struct MainView: View {
                 Task { await timelineModel.select(newValue) }
             }
             .onChange(of: timelineModel.wholeLibraryContentRevision) { _, _ in
+                model.pendingGrid?.setRemote(timelineModel.wholeLibraryTimeline)
                 let items = timelineModel.wholeLibraryItemsForViewer
                 OfflineLibraryManager.shared.liveAssetCount = items.count
                 // Kick off the low-priority GPS crawl (once) so the Map's location index fills in behind the
@@ -605,7 +608,7 @@ struct MainView: View {
                     selectionMode: selectionMode,
                     media: backend,
                     metadataProvider: backend,
-                    favoriteUIDs: favorites,
+                    favoriteUIDs: displayedFavorites,
                     isOffline: !networkMonitor.isOnline,
                     dragOutProvider: backend,
                     onDragOutFailed: { dragOutFailureMessage = $0.localizedMessage },
@@ -987,9 +990,11 @@ struct MainView: View {
     private func makeViewer(_ item: PhotoItem, _ items: [PhotoItem]) -> PhotoViewerModel {
         let index = items.firstIndex(of: item) ?? 0
         let offline = OfflineLibraryManager.shared
+        // Pending photos that are not in Proton yet open from Apple Photos; everything else from Proton.
+        let media = LocalPendingMediaRouter(remote: backend, remoteVideo: backend)
         return PhotoViewerModel(
-            items: items, index: index, feed: feed, media: backend,
-            streamer: backend, metadataProvider: backend,
+            items: items, index: index, feed: feed, media: media,
+            streamer: media, metadataProvider: backend,
             albumMembershipProvider: facade.albums,
             placeNameResolver: NativePlaceNameResolver.shared,
             knownLocationUIDs: Set(offline.locationIndex.coordinates.map(\.uid)),
@@ -998,6 +1003,24 @@ struct MainView: View {
             originalsCache: offline.originalsCache,
             cacheOriginals: offline.offlineEnabled,
             originalsCapBytes: offline.originalsCapBytes)
+    }
+
+    /// Shows local photos on their way to Proton in the whole-library grid.
+    private func attachPendingGrid() {
+        guard let session = model.pendingGrid else { return }
+        session.attachFeed(timelineModel.feed.feedCore)
+        session.presenter.onChange = { [timelineModel] presentation in
+            timelineModel.setPendingPresentation(presentation)
+        }
+        timelineModel.setPendingPresentation(session.presenter.current)
+        session.setRemote(timelineModel.wholeLibraryTimeline)
+    }
+
+    /// Favorites as the grid shows them: Proton favorites plus the intents of pending photos.
+    private var displayedFavorites: Set<PhotoUID> {
+        let intents = timelineModel.pendingPresentation.favoriteIntents
+        guard !intents.isEmpty else { return favorites }
+        return favorites.union(intents.lazy.filter(\.value).map(\.key))
     }
 
     /// Registers this window's thumbnail feed with the shared offline-cache manager, so the Settings

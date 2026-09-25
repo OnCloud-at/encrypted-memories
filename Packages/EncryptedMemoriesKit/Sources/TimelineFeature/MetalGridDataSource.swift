@@ -31,6 +31,12 @@ protocol MetalGridDataSource: AnyObject {
     func thumbnailOverlay(for uid: PhotoUID) -> GridThumbnailOverlay
     /// Resolve metadata omitted by the lightweight timeline only for the resident visible window.
     func resolveOverlays(for uids: [PhotoUID])
+    /// Replaces the upload badges of pending photos and of Proton photos that just took over from one.
+    func updateUploadBadges(_ badges: PendingUploadBadges)
+    /// The viewport needs no more thumbnails; loads it asked for earlier may stop.
+    func endVisibleDemand()
+    /// The grid left the screen: its local downloads stop.
+    func retireLocalDemand()
     /// Reports real pointer/gesture interaction of one grid host to shared background scheduling. A mounted
     /// grid or outstanding thumbnail request is not interaction. The owner scopes the report so several
     /// windows over one feed never clear each other's live gesture.
@@ -39,6 +45,9 @@ protocol MetalGridDataSource: AnyObject {
 
 extension MetalGridDataSource {
     func thumbnailOverlay(for uid: PhotoUID) -> GridThumbnailOverlay { .empty }
+    func updateUploadBadges(_ badges: PendingUploadBadges) {}
+    func endVisibleDemand() {}
+    func retireLocalDemand() {}
     func resolveOverlays(for uids: [PhotoUID]) {}
     func canRetryThumbnail(for uid: PhotoUID) -> Bool { true }
     func prefetchWarm(_ uids: [PhotoUID]) {}  // only the real source decodes; test sources opt out
@@ -96,6 +105,19 @@ final class RealMetalGridDataSource: MetalGridDataSource {
 
     func thumbnailOverlay(for uid: PhotoUID) -> GridThumbnailOverlay {
         overlayResolver.overlay(for: uid)
+    }
+
+    func endVisibleDemand() {
+        feed.submitVisibleDiskDecodeDemand([])
+    }
+
+    func retireLocalDemand() {
+        let feedCore = feed.feedCore
+        Task { await feedCore.endLocalVisibleDemand() }
+    }
+
+    func updateUploadBadges(_ badges: PendingUploadBadges) {
+        overlayResolver.updateUploadBadges(badges)
     }
 
     func resolveOverlays(for uids: [PhotoUID]) {

@@ -7,13 +7,28 @@ import CoreGraphics
 package struct GridThumbnailOverlay: Equatable, Sendable {
     package var durationText: String?
     package var showsRAW: Bool
+    /// Backup state of a photo that is still on its way to Proton; drawn in the top-trailing corner.
+    package var uploadBadge: GridUploadBadge?
 
-    package init(durationText: String? = nil, showsRAW: Bool = false) {
+    package init(durationText: String? = nil, showsRAW: Bool = false, uploadBadge: GridUploadBadge? = nil) {
         self.durationText = durationText
         self.showsRAW = showsRAW
+        self.uploadBadge = uploadBadge
     }
 
     package static let empty = GridThumbnailOverlay()
+}
+
+/// Upload state shown on a pending tile: an empty ring while waiting, a filling ring while bytes move, a
+/// checkmark once backed up, and an exclamation mark for a failure that needs the person.
+package enum GridUploadBadge: Equatable, Hashable, Sendable {
+    package static let progressSteps = 20
+
+    case waiting
+    /// `step` of `progressSteps`.
+    case uploading(step: Int)
+    case done
+    case attention
 }
 
 package enum GridThumbnailOverlayLabelKind: Equatable, Sendable {

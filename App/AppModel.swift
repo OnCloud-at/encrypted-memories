@@ -13,6 +13,7 @@ import PhotosCore
 import ProtonAuth
 import ProtonCoreCryptoPatchedGoImplementation
 import ProtonDriveBackend
+import UploadCore
 
 /// Root application state + composition. Owns the session lifecycle and builds the SDK-backed
 /// services once the user is signed in.
@@ -47,6 +48,9 @@ final class AppModel {
     /// macOS folder-backup composition. This type owns folder access and lifecycle; sync semantics stay in core.
     private(set) var backupController: FolderBackupController?
     private(set) var photoBackupController: PhotoLibraryBackupController?
+    /// Local photos on their way to Proton, merged into the whole-library grid (shared with iOS).
+    private(set) var pendingGrid: PendingGridSession?
+    @ObservationIgnored private var pendingStore: PendingBackupManifestStore?
     private(set) var albumSyncController: AlbumSyncController?
     /// Bumped after album sync creates or mutates Proton albums. Views use it only to refresh
     /// visible album lists; sync correctness lives in the shared controller.
@@ -220,6 +224,7 @@ final class AppModel {
         let activeFacade = facade
         let folderBackup = backupController
         let photoBackup = photoBackupController
+        let activePendingGrid = retirePendingGrid()
         let albumSync = albumSyncController
         auth = .signingOut
         let backendShutdown = backendTask
@@ -254,7 +259,10 @@ final class AppModel {
                     await folderBackup?.shutdown()
                 },
                 AccountTeardownOwner(id: "shared.photo-backup", stage: .photoBackup) {
+                    await activePendingGrid.session?.close()
                     await photoBackup?.shutdown()
+                    // The purge deletes the account directory; the pending store must be closed first.
+                    activePendingGrid.store?.close()
                 },
                 AccountTeardownOwner(id: "shared.album-sync", stage: .albumSync) {
                     await albumSync?.shutdown()
@@ -324,6 +332,7 @@ final class AppModel {
         let activeFacade = facade
         let folderBackup = backupController
         let photoBackup = photoBackupController
+        let activePendingGrid = retirePendingGrid()
         let albumSync = albumSyncController
         searchSuggestions.reset()
         let smartSearchShutdown = smartSearchSession.stop()
@@ -360,7 +369,9 @@ final class AppModel {
                     await folderBackup?.shutdown()
                 },
                 AccountTeardownOwner(id: "mac.scope-recovery.photo-backup", stage: .photoBackup) {
+                    await activePendingGrid.session?.close()
                     await photoBackup?.shutdown()
+                    activePendingGrid.store?.close()
                 },
                 AccountTeardownOwner(id: "mac.scope-recovery.album-sync", stage: .albumSync) {
                     await albumSync?.shutdown()
@@ -499,6 +510,10 @@ final class AppModel {
                 }
                 facade = client
                 backupController = FolderBackupController(facade: client)
+                let pendingStore = PendingGridSession.openStore(
+                    accountDataDirectory: client.accountDataDirectory,
+                    policy: client.accountDatabasePolicy
+                )
                 let photoBackup = PhotoLibraryBackupController(
                     configuration: .init(
                         accountDataDirectory: client.accountDataDirectory,
@@ -506,10 +521,13 @@ final class AppModel {
                     ),
                     identityResolver: client.uploadIdentityResolver,
                     uploader: client.photoUploader,
-                    tagAdder: client.photoTagAdder
+                    tagAdder: client.photoTagAdder,
+                    pendingStore: pendingStore,
+                    requiresPendingStore: true
                 )
                 photoBackupController = photoBackup
                 photoBackupScheduler.configure(controller: photoBackup)
+                configurePendingGrid(store: pendingStore, photoBackup: photoBackup, client: client)
                 let albumSync = AlbumSyncController(
                     configuration: .init(
                         accountDataDirectory: client.accountDataDirectory,
@@ -536,6 +554,34 @@ final class AppModel {
                 backend = .failed((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
             }
         }
+    }
+
+    // MARK: - Pending grid
+
+    private func configurePendingGrid(
+        store: PendingBackupManifestStore?,
+        photoBackup: PhotoLibraryBackupController,
+        client: ProtonClientFacade
+    ) {
+        pendingStore = store
+        guard let store,
+            let session = PendingGridSession(
+                store: store,
+                photoBackup: photoBackup,
+                remote: ProtonPendingRemoteEffects(facade: client)
+            )
+        else { return }
+        pendingGrid = session
+        session.start()
+    }
+
+    /// Detaches the pending grid from the model. The caller closes the session before the backup controller
+    /// shuts down, and the store after it.
+    private func retirePendingGrid() -> (session: PendingGridSession?, store: PendingBackupManifestStore?) {
+        let retired = (pendingGrid, pendingStore)
+        pendingGrid = nil
+        pendingStore = nil
+        return retired
     }
 
     private func apply(_ state: ProtonAuthState, prepareBackendOnSignedIn: Bool) {

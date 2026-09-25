@@ -1,4 +1,5 @@
 import Foundation
+import GridCore
 import MediaByteCache
 import MediaCache
 import PhotosCore
@@ -278,7 +279,7 @@ import TimelineCore
         #expect(enrichedModel.wholeLibraryRevision == 1)
         #expect(enrichedModel.wholeLibraryContentRevision == 2)
         #expect(
-            enrichedModel.gridSourceRevision == 2,
+            enrichedModel.gridSourceRevision == 4,
             "same UID order must keep the already-rendered Metal grid generation")
     }
 
@@ -318,6 +319,59 @@ import TimelineCore
         #expect(model.allItems.map(\.uid) == [remote.uid])
         #expect(model.initialLibraryChangeToken == "event-8")
         #expect(await repository.remoteRequestCount == 1)
+    }
+
+    @Test func pendingPhotosShowOnlyInTheWholeLibraryGrid() async {
+        let remote = photo("remote", month: 1)
+        let model = TimelineViewModel(
+            repository: MetadataStartupRepository(cached: [], remote: [section([remote])]),
+            feed: makeVisibleContentFeed())
+        await model.load()
+        let canonicalRevision = model.gridSourceRevision
+        #expect(canonicalRevision % 4 == 0)
+
+        let local = PhotoItem(
+            uid: PhotoUID(localPending: .photoLibrary, identifier: "asset"), captureTime: Self.date(2026, 2, 1),
+            mediaType: "image/jpeg")
+        model.setPendingPresentation(
+            PendingTimelinePresentation(
+                revision: 1, membershipRevision: 1, snapshot: TimelineSnapshot(sections: [section([remote, local])]),
+                localUIDs: [local.uid], favoriteIntents: [:],
+                uploadBadges: PendingUploadBadges(base: [local.uid: .waiting]),
+                isCanonical: false))
+
+        #expect(model.gridItems.map(\.uid) == [remote.uid, local.uid])
+        #expect(model.allItems.map(\.uid) == [remote.uid], "remote-only consumers keep the Proton timeline")
+        #expect(model.gridSourceRevision == 6)
+        #expect(model.pendingUploadBadges[local.uid] == .waiting)
+
+        await model.select(.trash)
+        #expect(!model.showsPendingPhotos)
+        #expect(model.gridSourceRevision % 4 == 1)
+        #expect(model.pendingUploadBadges.isEmpty)
+    }
+
+    @Test func aLibraryWithoutProtonPhotosStillShowsPendingPhotos() async {
+        let model = TimelineViewModel(
+            repository: MetadataStartupRepository(cached: [], remote: []), feed: makeVisibleContentFeed())
+        await model.load()
+        guard case .empty = model.state else {
+            Issue.record("expected an empty Proton library")
+            return
+        }
+        let local = PhotoItem(
+            uid: PhotoUID(localPending: .photoLibrary, identifier: "asset"), captureTime: Self.date(2026, 2, 1),
+            mediaType: "image/jpeg")
+        model.setPendingPresentation(
+            PendingTimelinePresentation(
+                revision: 1, membershipRevision: 1, snapshot: TimelineSnapshot(sections: [section([local])]),
+                localUIDs: [local.uid], favoriteIntents: [:], uploadBadges: .empty, isCanonical: false))
+
+        guard case .loaded(let sections) = model.gridState else {
+            Issue.record("pending photos must show")
+            return
+        }
+        #expect(sections.flatMap(\.items).map(\.uid) == [local.uid])
     }
 
     private func photo(_ id: String, month: Int) -> PhotoItem {

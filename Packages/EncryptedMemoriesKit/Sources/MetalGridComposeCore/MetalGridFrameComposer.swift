@@ -371,14 +371,23 @@ package enum MetalGridFrameComposer {
             decorations.selectionMode || decorations.favorites.contains(uid)
             ? badge + pad
             : 0
+        let overlay = decorations.overlay(uid)
         let overlayLayouts =
             hasThumbnail
             ? GridThumbnailOverlayPolicy.layouts(
-                for: decorations.overlay(uid),
+                for: overlay,
                 in: displayed,
                 bottomTrailingInset: bottomTrailingInset
             )
             : []
+        // A photo on its way to Proton shows its upload state top-trailing; selection mode owns the corners.
+        if let uploadBadge = overlay.uploadBadge, !decorations.selectionMode,
+            let texture = cache.uploadBadgeTexture(uploadBadge)
+        {
+            let topRight = CGRect(x: displayed.maxX - badge - pad, y: displayed.minY + pad, width: badge, height: badge)
+            metadataGlyphs.append(MetalGridQuad(rect: topRight, radius: 0, alpha: drawAlpha))
+            metadataGlyphTextures.append(texture)
+        }
         for layout in overlayLayouts {
             let glyphColor: MetalGridGlyphColor
             let backgroundColor: SIMD4<Float>

@@ -93,7 +93,7 @@ public struct TimelineView: View {
 
     public var body: some View {
         Group {
-            switch model.state {
+            switch model.gridState {
             case .loading:
                 // Route switches (RAW / album / trash …) show the same animated Proton mark as the app's launch
                 // veil - never a black surface, never a stale grid. The leading inset keeps the 64pt mark
@@ -141,6 +141,7 @@ public struct TimelineView: View {
                             selectionMode: selectionMode,
                             onSelectionChange: onSelectionChange,
                             favoriteUIDs: favoriteUIDs,
+                            uploadBadges: hasSearchQuery ? .empty : model.pendingUploadBadges,
                             media: media,
                             metadataProvider: metadataProvider,
                             dragOutProvider: dragOutProvider,
@@ -256,12 +257,12 @@ public struct TimelineView: View {
             // The Metal data source and viewer must consume the same cached presentation order.
             return [TimelineSection(id: "grid-presentation", date: first.captureTime, title: "", items: items)]
         }
-        guard hasSearchQuery else { return model.currentSections }
+        guard hasSearchQuery else { return model.gridSections }
         return (resolvedSearchProjection ?? searchProjection)?.sections ?? model.currentSections
     }
 
     private var displayedItems: [PhotoItem] {
-        guard hasSearchQuery else { return model.presentationItems }
+        guard hasSearchQuery else { return model.gridItems }
         return (resolvedSearchProjection ?? searchProjection)?.presentationItems ?? model.presentationItems
     }
 

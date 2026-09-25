@@ -60,6 +60,8 @@ struct MetalProductionGridView: NSViewRepresentable {
     var selectionMode: Bool = false
     var onSelectionChange: (Set<PhotoUID>) -> Void = { _ in }
     var favoriteUIDs: Set<PhotoUID> = []
+    /// Upload badges of pending photos; badge-only changes never rebuild the data source.
+    var uploadBadges = PendingUploadBadges.empty
     var media: FullMediaProvider?  // Reserved for drag-to-Finder support.
     var metadataProvider: PhotoMetadataProvider?  // Reserved for richer on-demand metadata.
     /// Drag-out (drag-to-Finder): resolves + stages decrypted originals for the dragged set.
@@ -186,6 +188,7 @@ struct MetalProductionGridView: NSViewRepresentable {
 
         host.coordinator.setSelectionMode(selectionMode)
         host.coordinator.setFavorites(favoriteUIDs)
+        host.coordinator.setUploadBadges(uploadBadges)
         wireProxy(host: host, levelBinding: $level, sourceRevision: sourceRevision)
         host.setLevel(level)
         MetalGridRuntime.logResolutionOnce()
@@ -224,6 +227,7 @@ struct MetalProductionGridView: NSViewRepresentable {
         }
         host.coordinator.setSelectionMode(selectionMode)
         host.coordinator.setFavorites(favoriteUIDs)
+        host.coordinator.setUploadBadges(uploadBadges)
         // Honour a genuine external (+/- / keyboard / programmatic) level change, but ignore a stale `level`
         // binding value left over from a host-led pinch commit - re-driving it would re-anchor at the viewport
         // centre and jump a different photo under the cursor. See `LevelBindingReconciler`.

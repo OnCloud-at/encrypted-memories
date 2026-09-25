@@ -90,20 +90,25 @@ struct MobilePhotoViewer: View {
         // Seed/reuse the E2EE originals cache via the shared helper, injected as a closure so the viewer
         // adapter stays decoupled from the cache layer. When the viewer decrypts an original (a no-preview
         // item), it lands in the encrypted cache and later opens / shares reuse it before the network.
+        // Pending photos that are not in Proton yet open from Apple Photos; everything else from Proton.
+        let media = libraryModel.viewerMedia
         let originalFetch: (@Sendable (PhotoUID) async throws -> Data)?
         if let backend = libraryModel.backend, let originals = libraryModel.originalsCache {
             let provider = EncryptedOriginalProvider(
                 media: backend, cache: originals,
                 policy: .persisting(capBytes: libraryModel.originalsCacheCapBytes)
             )
-            originalFetch = { try await provider.originalData(for: $0) }
+            originalFetch = { uid in
+                if uid.isLocalPending { return try await media.originalData(for: uid) { _ in } }
+                return try await provider.originalData(for: uid)
+            }
         } else {
             originalFetch = nil
         }
         _imageStore = State(
             initialValue: UIKitViewerImageStore(
                 thumbnailProvider: { feed?.memoryImage(for: $0) },
-                media: libraryModel.backend,
+                media: media,
                 originalDataOverride: originalFetch))
     }
 
@@ -1897,7 +1902,10 @@ private struct MobileVideoPage: View {
                 "[ViewerPerf] video prepare start uid=\(MobileViewerLog.short(item.uid), privacy: .public)")
         }
         do {
-            let streaming = try await backend.makeStreamingAsset(for: item.uid)
+            let streaming =
+                item.uid.isLocalPending
+                ? try await libraryModel.viewerMedia.makeStreamingAsset(for: item.uid)
+                : try await backend.makeStreamingAsset(for: item.uid)
             guard !Task.isCancelled, isCurrent,
                 generation == playbackGeneration,
                 requestedSourceIdentity == sourceIdentity,

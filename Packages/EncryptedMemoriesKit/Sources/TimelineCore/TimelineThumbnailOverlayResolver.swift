@@ -11,6 +11,9 @@ package final class TimelineThumbnailOverlayResolver {
     package var onChange: (() -> Void)?
 
     private var overlays: [PhotoUID: GridThumbnailOverlay] = [:]
+    /// Upload badges of pending tiles and of Proton photos that just took over from one. Replaced as a whole
+    /// on progress changes, which never touches the O(n) item overlays.
+    private var uploadBadges = PendingUploadBadges.empty
     private var videoUIDs = Set<PhotoUID>()
     private var attempted = Set<PhotoUID>()
     private var latestVisible: [PhotoUID] = []
@@ -55,7 +58,15 @@ package final class TimelineThumbnailOverlayResolver {
     }
 
     package func overlay(for uid: PhotoUID) -> GridThumbnailOverlay {
-        overlays[uid] ?? .empty
+        var overlay = overlays[uid] ?? .empty
+        overlay.uploadBadge = uploadBadges[uid]
+        return overlay
+    }
+
+    package func updateUploadBadges(_ badges: PendingUploadBadges) {
+        guard badges != uploadBadges else { return }
+        uploadBadges = badges
+        onChange?()
     }
 
     /// Debounces changes to the resident viewport without cancelling metadata already in flight.
@@ -65,7 +76,8 @@ package final class TimelineThumbnailOverlayResolver {
     ) {
         var seen = Set<PhotoUID>()
         let unresolved = uids.filter { uid in
-            seen.insert(uid).inserted
+            // Local pending photos are not in Proton; their duration comes from Apple Photos or stays hidden.
+            seen.insert(uid).inserted && !uid.isLocalPending
                 && videoUIDs.contains(uid)
                 && overlays[uid]?.durationText == nil
                 && !attempted.contains(uid)

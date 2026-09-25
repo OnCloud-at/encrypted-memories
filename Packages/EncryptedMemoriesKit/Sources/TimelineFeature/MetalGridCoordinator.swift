@@ -8,6 +8,7 @@ import MetalGridTextureCore
 import MetalKit
 import MetalRenderingCore
 import PhotosCore
+import TimelineCore
 import simd
 
 /// Bridges scroll position + geometry + texture cache + renderer for the Metal grid. It is the
@@ -289,6 +290,7 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
     func setDataSource(_ newSource: MetalGridDataSource) {
         contentReadyReported = false
         dataSource = newSource
+        newSource.updateUploadBadges(uploadBadges)
         rebuildIndex()
         onContentSizeChange?(contentSize())
         requestRedraw()
@@ -353,6 +355,10 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
     var decorationsEnabled = false
     private(set) var selectedUIDs: Set<PhotoUID> = []
     private(set) var favoriteUIDs: Set<PhotoUID> = []
+    private var uploadBadges = PendingUploadBadges.empty
+    private var contentEpochs = PendingContentEpochTracker()
+    /// The last frame asked the feed for thumbnails; the first frame without demand tells the feed once.
+    private var hasVisibleDemand = false
     private(set) var selectionMode = false
     private var indexByUID: [PhotoUID: Int] = [:]
 
@@ -366,6 +372,23 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
         guard uids != favoriteUIDs else { return }
         favoriteUIDs = uids
         requestRedraw()
+    }
+    /// The grid left the screen: local downloads it asked for stop, and the next visible frame asks again.
+    func retireLocalDemand() {
+        hasVisibleDemand = false
+        dataSource.retireLocalDemand()
+    }
+
+    /// The data source redraws when a badge changes.
+    func setUploadBadges(_ badges: PendingUploadBadges) {
+        guard badges != uploadBadges else { return }
+        uploadBadges = badges
+        dataSource.updateUploadBadges(badges)
+        let changed = contentEpochs.changes(in: badges.contentEpochs)
+        if !changed.isEmpty {
+            cache.invalidate(changed)
+            requestRedraw()
+        }
     }
     func setSelectionMode(_ on: Bool) {
         guard on != selectionMode else { return }
@@ -2173,6 +2196,10 @@ extension MetalGridCoordinator {
                 ThumbnailRequest(uid: $0, pixelSize: uploadPixels, cropMode: effectiveDisplayMode.rawValue)
             }
             dataSource.warm(requests)
+            hasVisibleDemand = true
+        } else if hasVisibleDemand {
+            hasVisibleDemand = false
+            dataSource.endVisibleDemand()
         }
         // Duration lives in encrypted metadata, not the timeline enumeration. Ask only for already-resident
         // visible videos; the shared resolver debounces until the viewport is stable, so this never competes
