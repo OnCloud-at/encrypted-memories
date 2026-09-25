@@ -29,11 +29,14 @@ final class FolderBackupController {
     /// False when the account's dedupe manifest or sync stores could not open - backup is then
     /// disabled entirely instead of running without duplicate protection. The pending store is required too:
     /// without it, a file deleted before upload could upload after all.
-    var isAvailable: Bool { runner != nil && (pendingStore == nil || pendingStore?.isOperational() == true) }
+    var isAvailable: Bool {
+        runner != nil && (!requiresPendingStore || pendingStore?.isOperational() == true)
+    }
 
     /// Watched folders the pending grid may read; kept accessible while they are registered.
     let pendingAccess = PendingFolderAccess()
     @ObservationIgnored private let pendingStore: PendingBackupManifestStore?
+    @ObservationIgnored private let requiresPendingStore: Bool
     @ObservationIgnored private var accessedFolders: [BackupFolder.ID: URL] = [:]
 
     private let engine: UploadBackupSyncEngine?
@@ -61,9 +64,11 @@ final class FolderBackupController {
     init(
         facade: ProtonClientFacade,
         pendingStore: PendingBackupManifestStore? = nil,
-        pendingRecorder: PendingBackupEventRecorder? = nil
+        pendingRecorder: PendingBackupEventRecorder? = nil,
+        requiresPendingStore: Bool = false
     ) {
         self.pendingStore = pendingStore
+        self.requiresPendingStore = requiresPendingStore
         let directory = facade.accountDataDirectory
         let policy = facade.accountDatabasePolicy
         let queueStore = UploadBackupSyncQueueManifestStore(
@@ -288,7 +293,7 @@ final class FolderBackupController {
     // MARK: - Sync lifecycle
 
     func syncNow() {
-        guard !isShuttingDown, !isSyncing, runnerStopTask == nil, let engine, let runner else { return }
+        guard !isShuttingDown, !isSyncing, runnerStopTask == nil, isAvailable, let engine, let runner else { return }
         reconcileQueueWithRegisteredFolders()
         let runID = UUID()
         activeRunID = runID
@@ -401,6 +406,8 @@ final class FolderBackupController {
             folders[index].needsRenewal = true
             persistFolders()
         }
+        // A folder that must be picked again is no longer readable for the pending grid either.
+        refreshFolderAccess()
     }
 
     private func reportFolderEnumerationError(

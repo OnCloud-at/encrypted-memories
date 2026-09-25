@@ -536,7 +536,8 @@ final class AppModel {
                 photoBackupScheduler.configure(controller: photoBackup)
                 // Watched folders share the pending store and the photo backup's event stream.
                 let folderBackup = FolderBackupController(
-                    facade: client, pendingStore: pendingStore, pendingRecorder: photoBackup.pendingRecorder)
+                    facade: client, pendingStore: pendingStore, pendingRecorder: photoBackup.pendingRecorder,
+                    requiresPendingStore: true)
                 backupController = folderBackup
                 configurePendingGrid(
                     store: pendingStore, photoBackup: photoBackup, folderBackup: folderBackup, client: client)
