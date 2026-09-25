@@ -34,8 +34,8 @@
         private let displayMode: TileContentDisplayMode
         private let selectionMode: Bool
         private let selectedUIDs: Set<PhotoUID>
-        /// Upload badges of pending photos; nil for grids without pending photos.
-        private let pendingPresentation: PendingTimelinePresentation?
+        /// Upload badges of pending photos and "Nicht gesichert" badges in the trash.
+        private let uploadBadges: PendingUploadBadges
         /// Whether this grid's surface is the active one (its tab is selected). When false the host stops its
         /// display link and cancels ahead-warm so a hidden grid never competes with menus/transitions on screen;
         /// defaults to true so a grid that is always visible (e.g. a pushed collection detail) behaves as before.
@@ -76,7 +76,7 @@
             displayMode: TileContentDisplayMode = .squareFillCrop,
             selectionMode: Bool = false,
             selectedUIDs: Set<PhotoUID> = [],
-            pendingPresentation: PendingTimelinePresentation? = nil,
+            uploadBadges: PendingUploadBadges = .empty,
             isActive: Bool = true,
             scrollToLatestSignal: Int = 0,
             scrollToTopSignal: Int = 0,
@@ -105,7 +105,7 @@
             self.displayMode = displayMode
             self.selectionMode = selectionMode
             self.selectedUIDs = selectedUIDs
-            self.pendingPresentation = pendingPresentation
+            self.uploadBadges = uploadBadges
             self.isActive = isActive
             self.scrollToLatestSignal = scrollToLatestSignal
             self.scrollToTopSignal = scrollToTopSignal
@@ -170,7 +170,7 @@
                 fillOrder: fillOrder,
                 initialViewportPlacement: initialViewportPlacement, displayMode: displayMode,
                 selectionMode: selectionMode, selectedUIDs: selectedUIDs,
-                pendingPresentation: pendingPresentation)
+                uploadBadges: uploadBadges)
             view.setActive(isActive)
             wireProxy(proxy, to: view)
             return view
@@ -198,7 +198,7 @@
                 fillOrder: fillOrder,
                 initialViewportPlacement: initialViewportPlacement, displayMode: displayMode,
                 selectionMode: selectionMode, selectedUIDs: selectedUIDs,
-                pendingPresentation: pendingPresentation)
+                uploadBadges: uploadBadges)
             if shouldDissolveContent {
                 uiView.completeContentReplacementTransition(prefersReducedMotion: prefersReducedMotion)
             }
@@ -509,12 +509,11 @@
             displayMode: TileContentDisplayMode = .squareFillCrop,
             selectionMode: Bool = false,
             selectedUIDs: Set<PhotoUID> = [],
-            pendingPresentation: PendingTimelinePresentation? = nil
+            uploadBadges: PendingUploadBadges = .empty
         ) {
             self.selectionMode = selectionMode
             self.selectedUIDs = selectedUIDs
             // Upload badges change with progress; they never rebuild the item overlays.
-            let uploadBadges = pendingPresentation?.uploadBadges ?? .empty
             thumbnailOverlayResolver.updateUploadBadges(uploadBadges)
             let revisedContent = pendingContentEpochs.changes(in: uploadBadges.contentEpochs)
             if !revisedContent.isEmpty {

@@ -4,7 +4,11 @@ import GridCore
 /// Draws upload badges with CoreGraphics only, for every platform alike. A dark translucent disc keeps the
 /// white ring legible on bright photos; the checkmark uses a white disc, like other system badges.
 package enum MetalGridUploadBadgeImage {
-    package static func make(_ badge: GridUploadBadge, pixelSize: Int) -> CGImage? {
+    /// The SF Symbol a platform rasterizer renders for `badge`, when the badge carries one.
+    package static func symbolName(for badge: GridUploadBadge) -> String? { badge.symbolName }
+
+    /// `symbol` is the host-rendered white `symbolName(for:)`, drawn centered on the disc.
+    package static func make(_ badge: GridUploadBadge, pixelSize: Int, symbol: CGImage? = nil) -> CGImage? {
         guard pixelSize > 0,
             let context = CGContext(
                 data: nil,
@@ -36,6 +40,17 @@ package enum MetalGridUploadBadgeImage {
         case .attention:
             drawDisc(context, disc)
             drawExclamation(context, in: disc)
+        case .notBackedUp:
+            drawDisc(context, disc)
+            if let symbol {
+                let side = disc.width * 0.62
+                let aspect = CGFloat(symbol.width) / CGFloat(max(1, symbol.height))
+                let width = aspect >= 1 ? side : side * aspect
+                let height = aspect >= 1 ? side / aspect : side
+                context.draw(
+                    symbol,
+                    in: CGRect(x: disc.midX - width / 2, y: disc.midY - height / 2, width: width, height: height))
+            }
         }
         return context.makeImage()
     }

@@ -5,7 +5,7 @@ import UploadCore
 
 /// Upload badges of the grid. The base map changes only with membership; progress ticks replace the small
 /// `progress` overlay, so a tick never copies or compares a map with one entry per pending photo.
-package struct PendingUploadBadges: Sendable, Equatable {
+public struct PendingUploadBadges: Sendable, Equatable {
     /// Identity of this value; hosts compare it instead of the maps.
     private let id: UUID
     package let base: [PhotoUID: GridUploadBadge]
@@ -27,7 +27,7 @@ package struct PendingUploadBadges: Sendable, Equatable {
         self.contentEpochs = contentEpochs
     }
 
-    package static let empty = PendingUploadBadges()
+    public static let empty = PendingUploadBadges()
 
     package var isEmpty: Bool { base.isEmpty }
 
@@ -36,7 +36,7 @@ package struct PendingUploadBadges: Sendable, Equatable {
         return progress[uid].map { .uploading(step: $0) } ?? badge
     }
 
-    package static func == (lhs: Self, rhs: Self) -> Bool { lhs.id == rhs.id }
+    public static func == (lhs: Self, rhs: Self) -> Bool { lhs.id == rhs.id }
 }
 
 /// Follows `PendingUploadBadges.contentEpochs` for one grid and reports the photos whose resident texture
@@ -71,7 +71,8 @@ public struct PendingTimelinePresentation: Sendable {
     public let localUIDs: Set<PhotoUID>
     /// Desired favorite states of pending photos, shown before the upload applies them.
     public let favoriteIntents: [PhotoUID: Bool]
-    package let uploadBadges: PendingUploadBadges
+    /// Upload badges for the grid; opaque outside the package.
+    public let uploadBadges: PendingUploadBadges
     /// True when no pending photo shows; hosts can then use their canonical snapshot directly.
     public let isCanonical: Bool
 

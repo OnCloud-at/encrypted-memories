@@ -29,6 +29,13 @@ package enum GridUploadBadge: Equatable, Hashable, Sendable {
     case uploading(step: Int)
     case done
     case attention
+    /// A photo in "Zuletzt gelöscht" that was deleted before it uploaded: it exists only on this device.
+    case notBackedUp
+
+    /// The SF Symbol a host draws on the badge disc, when the badge carries one.
+    package var symbolName: String? {
+        self == .notBackedUp ? "icloud.slash" : nil
+    }
 }
 
 package enum GridThumbnailOverlayLabelKind: Equatable, Sendable {

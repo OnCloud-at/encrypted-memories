@@ -5,19 +5,22 @@ import MediaFeedCore
 import Photos
 import PhotosCore
 
-#if canImport(UIKit)
-    import UIKit
-#elseif canImport(AppKit)
-    import AppKit
-#endif
-
 /// Grid thumbnails of pending Apple Photos assets, straight from PhotoKit. No Proton request and no
 /// encrypted disk copy: PhotoKit already caches its own thumbnails. Network access is allowed so an
 /// iCloud-optimized library still shows its photos.
 public struct PhotoKitLocalThumbnailLoader: LocalThumbnailLoading {
     private static let maxConcurrentRequests = 4
 
-    public init() {}
+    private let request: PhotoKitImageRequest
+
+    public init(request: @escaping PhotoKitImageRequest) {
+        self.request = request
+    }
+
+    /// A small thumbnail for a list row, such as the excluded photos in the Backup settings.
+    public func listThumbnail(for uid: PhotoUID) async -> CGImage? {
+        await thumbnails(for: [uid], maxPixelSize: 120)[uid]?.image
+    }
 
     public func thumbnails(for uids: [PhotoUID], maxPixelSize: CGFloat) async -> [PhotoUID: DecodedThumbnail] {
         let identifiers = uids.compactMap { uid -> String? in
@@ -39,8 +42,8 @@ public struct PhotoKitLocalThumbnailLoader: LocalThumbnailLoading {
                 guard next < assets.count, !Task.isCancelled else { return }
                 let asset = assets[next]
                 next += 1
-                group.addTask {
-                    let image = await Self.image(for: asset, side: side)
+                group.addTask { [request] in
+                    let image = await Self.image(for: asset, side: side, request: request)
                     return (PhotoUID(localPending: .photoLibrary, identifier: asset.localIdentifier), image)
                 }
             }
@@ -53,30 +56,19 @@ public struct PhotoKitLocalThumbnailLoader: LocalThumbnailLoading {
         }
     }
 
-    private static func image(for asset: PHAsset, side: CGFloat) async -> DecodedThumbnail? {
+    private static func image(
+        for asset: PHAsset, side: CGFloat, request: PhotoKitImageRequest
+    ) async -> DecodedThumbnail? {
         let options = PHImageRequestOptions()
         options.deliveryMode = .highQualityFormat
         options.resizeMode = .fast
         options.isNetworkAccessAllowed = true
         options.isSynchronous = false
         return await PhotoKitRequest.perform { finish in
-            PHImageManager.default().requestImage(
-                for: asset,
-                targetSize: CGSize(width: side, height: side),
-                contentMode: .aspectFill,
-                options: options
-            ) { image, _ in
-                // `.highQualityFormat` calls back exactly once.
-                finish(image.flatMap(cgImage(from:)).map(DecodedThumbnail.init(image:)))
+            // `.highQualityFormat` calls back exactly once.
+            request(asset, CGSize(width: side, height: side), .aspectFill, options) { image in
+                finish(image.map(DecodedThumbnail.init(image:)))
             }
         }
     }
-
-    #if canImport(UIKit)
-        private static func cgImage(from image: UIImage) -> CGImage? { image.cgImage }
-    #elseif canImport(AppKit)
-        private static func cgImage(from image: NSImage) -> CGImage? {
-            image.cgImage(forProposedRect: nil, context: nil, hints: nil)
-        }
-    #endif
 }

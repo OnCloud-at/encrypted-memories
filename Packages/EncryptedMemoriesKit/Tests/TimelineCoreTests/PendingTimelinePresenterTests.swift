@@ -50,6 +50,17 @@ import UploadCore
         return presenter.current
     }
 
+    @Test func trashMergesPendingPhotosNewestFirst() {
+        let newest = remote("newest", second: 30)
+        let oldest = remote("oldest", second: 0)
+        let pending = tile("pending", second: 10).item
+        let trash = PendingTrashPresentation(items: [pending])
+
+        #expect(trash.merged(intoNewestFirst: [newest, oldest]).map(\.uid) == [newest.uid, pending.uid, oldest.uid])
+        #expect(trash.badges[pending.uid] == .notBackedUp)
+        #expect(PendingTrashPresentation.empty.merged(intoNewestFirst: [newest]).map(\.uid) == [newest.uid])
+    }
+
     @Test func editedLocalPhotoGetsANewContentEpoch() async {
         let presenter = PendingTimelinePresenter()
         var revisedUIDs: [PhotoUID] = []

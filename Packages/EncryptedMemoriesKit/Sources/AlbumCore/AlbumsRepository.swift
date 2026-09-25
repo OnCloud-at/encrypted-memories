@@ -29,6 +29,9 @@ public actor AlbumsRepository: AlbumManaging {
     private var membershipCache: [PhotoUID: Set<AlbumNodeIdentifier>] = [:]
     private var membershipCacheOrder: [PhotoUID] = []
     private static let membershipCacheLimit = 512
+    /// Records album adds of photos that are still on their way to Proton; the backup applies them after
+    /// the upload. Nil when no pending grid runs, and local photos then cannot be added.
+    private var pendingAlbumAdds: (@Sendable ([PhotoUID], AlbumID) async -> Bool)?
 
     public init(
         catalogBackend: any AlbumCatalogBackend,
@@ -40,6 +43,21 @@ public actor AlbumsRepository: AlbumManaging {
         self.writeBackend = writeBackend
         self.capabilities = capabilities
         self.didLeaveSharedAlbum = didLeaveSharedAlbum
+    }
+
+    public func setPendingAlbumAdds(_ record: (@Sendable ([PhotoUID], AlbumID) async -> Bool)?) {
+        pendingAlbumAdds = record
+    }
+
+    /// Hands local pending photos to the backup, which adds them once they are uploaded.
+    private func recordPendingAlbumAdds(_ photoUIDs: [PhotoUID], to albumID: AlbumID) async throws {
+        guard !photoUIDs.isEmpty else { return }
+        guard let pendingAlbumAdds else {
+            throw AlbumError.unsupported(operation: "Add to album", gap: "no pending grid records local photos")
+        }
+        guard await pendingAlbumAdds(photoUIDs, albumID) else {
+            throw AlbumError.backend("the pending store did not record the album add")
+        }
     }
 
     public func listAlbums() async throws -> [AlbumSummary] {
@@ -104,7 +122,8 @@ public actor AlbumsRepository: AlbumManaging {
             )
         }
         let uniqueUIDs = Self.unique(photoUIDs)
-        let missing = uniqueUIDs.filter { membershipCache[$0] == nil }
+        // Local pending photos are in no Proton album yet.
+        let missing = uniqueUIDs.filter { membershipCache[$0] == nil && !$0.isLocalPending }
         if !missing.isEmpty {
             do {
                 let loaded = try await catalogBackend.albumMemberships(for: missing)
@@ -179,9 +198,13 @@ public actor AlbumsRepository: AlbumManaging {
             throw Self.normalized(error)
         }
         guard !photoUIDs.isEmpty else { return albumID }
+        let split = LocalPendingSplit(photoUIDs)
         do {
-            try await writeBackend.addPhotos(photoUIDs, to: albumID)
-            noteAdded(photoUIDs, to: albumID)
+            if !split.remote.isEmpty {
+                try await writeBackend.addPhotos(split.remote, to: albumID)
+                noteAdded(split.remote, to: albumID)
+            }
+            try await recordPendingAlbumAdds(split.local, to: albumID)
         } catch {
             throw AlbumError.albumCreatedButPhotosNotAdded(
                 albumID: albumID,
@@ -222,9 +245,13 @@ public actor AlbumsRepository: AlbumManaging {
             )
         }
         try rejectSharedAlbumTarget(albumID)
+        let split = LocalPendingSplit(uniqueUIDs)
         do {
-            try await writeBackend.addPhotos(uniqueUIDs, to: albumID)
-            noteAdded(uniqueUIDs, to: albumID)
+            if !split.remote.isEmpty {
+                try await writeBackend.addPhotos(split.remote, to: albumID)
+                noteAdded(split.remote, to: albumID)
+            }
+            try await recordPendingAlbumAdds(split.local, to: albumID)
         } catch {
             throw Self.normalized(error)
         }

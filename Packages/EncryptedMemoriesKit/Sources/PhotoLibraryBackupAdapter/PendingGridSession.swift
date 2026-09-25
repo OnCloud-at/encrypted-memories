@@ -18,6 +18,13 @@ public final class PendingGridSession {
     public private(set) var pendingSnapshot = PendingBackupSnapshot.empty
     /// Called after `pendingSnapshot` changed.
     public var onPendingChange: ((PendingBackupSnapshot) -> Void)?
+    /// Local photos in "Zuletzt gelöscht" while pending photos show; empty otherwise.
+    public private(set) var trash = PendingTrashPresentation.empty
+    /// Excluded photos for the Backup settings list, newest deletion first; empty while pending photos do
+    /// not show.
+    public private(set) var excludedTiles: [PendingTile] = []
+    /// Called after `trash` or `excludedTiles` changed.
+    public var onListsChange: (() -> Void)?
     private var gridLocalUIDs = Set<PhotoUID>()
     /// The local photos the feed may load: the grid, "Zuletzt gelöscht" and the excluded list.
     private var authorizedLocalUIDs = Set<PhotoUID>()
@@ -75,14 +82,15 @@ public final class PendingGridSession {
     }
 
     /// Lets `feed` load thumbnails of local photos from Apple Photos, and keeps its authorization current.
-    public func attachFeed(_ feed: ThumbnailFeedCore) {
+    /// `imageRequest` is the platform's `PhotoKitPlatformImages.request`.
+    public func attachFeed(_ feed: ThumbnailFeedCore, imageRequest: @escaping PhotoKitImageRequest) {
         guard feed !== self.feed else { return }
         let previous = self.feed
         self.feed = feed
         let authorized = authorizedLocalUIDs
         enqueueFeedUpdate {
             if let previous { await Self.detach(previous) }
-            await feed.setLocalThumbnailLoader(PhotoKitLocalThumbnailLoader())
+            await feed.setLocalThumbnailLoader(PhotoKitLocalThumbnailLoader(request: imageRequest))
             await feed.setLocalAuthorization(authorized)
         }
     }
@@ -139,7 +147,10 @@ public final class PendingGridSession {
                 self.pendingSnapshot = snapshot
                 self.presenter.setPending(snapshot, enabled: self.isBackupEnabled)
                 // Progress ticks leave the lists unchanged; only membership changes can change authorization.
-                if membershipChanged { self.publishFeedAuthorization() }
+                if membershipChanged {
+                    self.publishFeedAuthorization()
+                    self.refreshLists()
+                }
                 self.onPendingChange?(snapshot)
             }
         }
@@ -157,10 +168,32 @@ public final class PendingGridSession {
         isBackupEnabled = enabled
         presenter.setPending(pendingSnapshot, enabled: enabled)
         publishFeedAuthorization()
+        refreshLists()
+    }
+
+    private func refreshLists() {
+        let trashItems = isBackupEnabled ? pendingSnapshot.trashTiles.map(\.item) : []
+        let excluded = isBackupEnabled ? pendingSnapshot.excludedTiles : []
+        guard Set(trashItems.map(\.uid)) != trash.localUIDs || excluded != excludedTiles else { return }
+        trash = PendingTrashPresentation(items: trashItems)
+        excludedTiles = excluded
+        onListsChange?()
     }
 
     /// Whether pending photos show now (backup on, available, and allowed to read the Photos library).
     public var isShowingPendingPhotos: Bool { isBackupEnabled }
+
+    /// Favorites as the app shows them: Proton favorites plus the desired states of pending photos, which the
+    /// backup applies after the upload.
+    public func displayedFavorites(_ remote: Set<PhotoUID>) -> Set<PhotoUID> {
+        let intents = pendingSnapshot.favoriteIntents
+        guard !intents.isEmpty else { return remote }
+        var result = remote
+        for (uid, favorite) in intents {
+            if favorite { result.insert(uid) } else { result.remove(uid) }
+        }
+        return result
+    }
 
     // MARK: - Person actions on local photos
 
@@ -198,6 +231,9 @@ public final class PendingGridSession {
         pendingSnapshot = .empty
         gridLocalUIDs = []
         authorizedLocalUIDs = []
+        trash = .empty
+        excludedTiles = []
+        onListsChange?()
         if let feed {
             self.feed = nil
             enqueueFeedUpdate { await Self.detach(feed) }

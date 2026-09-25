@@ -6,6 +6,7 @@ import MediaCacheUIKitAdapter
 import PhotoViewerCore
 import PhotosCore
 import SwiftUI
+import TimelineCore
 import TimelineUIKitFeature
 import UIKit
 
@@ -332,6 +333,12 @@ private struct MobileFilterGridScreen: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var snapshotReconciler = TimelineSnapshotReconciler()
     private var snapshot: TimelineSnapshot { snapshotReconciler.snapshot }
+    /// Photos deleted before upload join "Zuletzt gelöscht" with a "Nicht gesichert" badge.
+    private var pendingTrash: PendingTrashPresentation { filter == .trash ? model.pendingTrash : .empty }
+    private var displayedItems: [PhotoItem] {
+        pendingTrash.merged(intoNewestFirst: snapshotReconciler.presentationItems)
+    }
+    private var isRouteEmpty: Bool { snapshot.isEmpty && pendingTrash.isEmpty }
     @State private var phase: Phase = .loading
     @State private var selection = MobileGridSelectionController()
     @State private var contextMenu = MobileGridContextMenuController()
@@ -405,7 +412,7 @@ private struct MobileFilterGridScreen: View {
                 .buttonStyle(.glassProminent)
             }
         case .loaded:
-            if snapshot.isEmpty {
+            if isRouteEmpty {
                 let copy = filter.emptyStateCopy
                 ContentUnavailableView {
                     Label(copy.title, systemImage: copy.systemImage)
@@ -414,11 +421,12 @@ private struct MobileFilterGridScreen: View {
                 }
             } else if let feed = model.thumbnailFeed {
                 UIKitTimelineGrid(
-                    items: snapshotReconciler.presentationItems,
+                    items: displayedItems,
                     thumbnailFeed: feed,
                     fillOrder: .topLeading,
                     selectionMode: selection.isSelecting,
                     selectedUIDs: selection.selected,
+                    uploadBadges: pendingTrash.badges,
                     onOpenPhoto: open,
                     onToggleSelection: toggleSelectionHandler,
                     onSelectionChanged: filter.isReadOnly ? nil : { selection.replace(with: $0) },
@@ -572,7 +580,7 @@ private struct MobileFilterGridScreen: View {
                 } label: {
                     Label(L10n.string("action.select"), systemImage: "checkmark.circle")
                 }
-                .disabled(snapshot.isEmpty || phase != .loaded || isEmptyingTrash)
+                .disabled(isRouteEmpty || phase != .loaded || isEmptyingTrash)
 
                 Divider()
 
@@ -581,7 +589,7 @@ private struct MobileFilterGridScreen: View {
                 } label: {
                     Label(L10n.string("trash.empty_button"), systemImage: "trash.slash")
                 }
-                .disabled(snapshot.isEmpty || phase != .loaded || isEmptyingTrash)
+                .disabled(isRouteEmpty || phase != .loaded || isEmptyingTrash)
             } label: {
                 Label(L10n.string("albums.more_actions"), systemImage: "ellipsis")
             }
@@ -632,12 +640,24 @@ private struct MobileFilterGridScreen: View {
     }
 
     private func open(_ item: PhotoItem) {
-        guard let index = snapshot.index(of: item.uid) else { return }  // O(1)
+        let items = displayedItems
+        let index: Int?
+        if pendingTrash.isEmpty {
+            index = snapshot.index(of: item.uid).map { snapshot.count - 1 - $0 }  // O(1)
+        } else {
+            index = items.firstIndex { $0.uid == item.uid }
+        }
+        guard let index else { return }
         viewerRouter.presentation = MobileViewerPresentation(
-            index: snapshot.count - 1 - index,
-            items: snapshotReconciler.presentationItems,
+            index: index,
+            items: items,
             context: ViewerCollectionContext(filter: filter)
         )
+    }
+
+    /// Selected photos of this route, including photos deleted before upload.
+    private func routeItems(_ uids: Set<PhotoUID>) -> [PhotoItem] {
+        snapshot.items(withUIDs: uids) + pendingTrash.items.filter { uids.contains($0.uid) }
     }
 
     private func removeContextItems(_ uids: Set<PhotoUID>) {
@@ -700,7 +720,7 @@ private struct MobileFilterGridScreen: View {
     }
 
     @MainActor private func restoreSelected() {
-        let selectedItems = snapshot.items(withUIDs: selection.selected)
+        let selectedItems = routeItems(selection.selected)
         guard !selectedItems.isEmpty, !isRestoring else { return }
         isRestoring = true
         let epoch = snapshotReconciler.epoch
@@ -733,12 +753,13 @@ private struct MobileFilterGridScreen: View {
     }
 
     @MainActor private func emptyTrash() async {
-        guard filter == .trash, !snapshot.isEmpty, !isEmptyingTrash else { return }
+        guard filter == .trash, !isRouteEmpty, !isEmptyingTrash else { return }
         isEmptyingTrash = true
         let epoch = snapshotReconciler.epoch
         defer { isEmptyingTrash = false }
         do {
-            try await model.emptyTrash()
+            // Photos deleted before upload only leave the list; they stay in Apple Photos.
+            try await model.emptyTrash(includesProtonTrash: !snapshot.isEmpty)
             guard epoch == snapshotReconciler.epoch else { return }
             snapshotReconciler.reset()
             phase = .loaded

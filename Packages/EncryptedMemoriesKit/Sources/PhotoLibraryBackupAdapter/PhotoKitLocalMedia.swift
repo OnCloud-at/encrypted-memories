@@ -6,12 +6,6 @@ import Photos
 import PhotosCore
 import UniformTypeIdentifiers
 
-#if canImport(UIKit)
-    import UIKit
-#elseif canImport(AppKit)
-    import AppKit
-#endif
-
 /// Viewer media of pending Apple Photos assets, read from the device. No Proton request is involved.
 public struct PhotoKitLocalMedia: Sendable {
     public enum LocalMediaError: LocalizedError {
@@ -20,7 +14,11 @@ public struct PhotoKitLocalMedia: Sendable {
         public var errorDescription: String? { L10n.string("viewer.local_media_unavailable") }
     }
 
-    public init() {}
+    private let request: PhotoKitImageRequest
+
+    public init(request: @escaping PhotoKitImageRequest) {
+        self.request = request
+    }
 
     /// A screen-sized JPEG rendition, for the viewer's first frame.
     public func preview(for uid: PhotoUID, maxPixelSize: CGFloat) async throws -> Data {
@@ -29,14 +27,9 @@ public struct PhotoKitLocalMedia: Sendable {
         options.deliveryMode = .highQualityFormat
         options.resizeMode = .exact
         options.isNetworkAccessAllowed = true
-        let data: Data? = await PhotoKitRequest.perform { finish in
-            PHImageManager.default().requestImage(
-                for: asset,
-                targetSize: CGSize(width: maxPixelSize, height: maxPixelSize),
-                contentMode: .aspectFit,
-                options: options
-            ) { image, _ in
-                finish(image.flatMap(Self.cgImage(from:)).flatMap(Self.jpegData(from:)))
+        let data: Data? = await PhotoKitRequest.perform { [request] finish in
+            request(asset, CGSize(width: maxPixelSize, height: maxPixelSize), .aspectFit, options) { image in
+                finish(image.flatMap(Self.jpegData(from:)))
             }
         }
         try Task.checkCancellation()
@@ -81,6 +74,59 @@ public struct PhotoKitLocalMedia: Sendable {
         throw LocalMediaError.unavailable
     }
 
+    /// What Apple Photos knows about a pending photo, for the viewer's info panel and export file names.
+    public func metadata(for uid: PhotoUID) async throws -> PhotoMetadata {
+        let asset = try await Self.asset(for: uid)
+        let resource = Self.primaryResource(of: asset)
+        let location = asset.location?.coordinate
+        return PhotoMetadata(
+            filename: resource?.originalFilename,
+            mimeType: resource.flatMap { UTType($0.uniformTypeIdentifier)?.preferredMIMEType },
+            pixelWidth: asset.pixelWidth > 0 ? asset.pixelWidth : nil,
+            pixelHeight: asset.pixelHeight > 0 ? asset.pixelHeight : nil,
+            durationSeconds: asset.mediaType == .video ? asset.duration : nil,
+            modificationTime: asset.modificationDate,
+            latitude: location?.latitude,
+            longitude: location?.longitude
+        )
+    }
+
+    /// Writes the current version of a pending photo's original (with edits, as Apple Photos shows it) to
+    /// `destination`, for sharing, export and drag-out. Large videos stream to disk.
+    public func writeOriginal(
+        for uid: PhotoUID,
+        to destination: URL,
+        onProgress: @escaping @Sendable (Double) -> Void
+    ) async throws {
+        let asset = try await Self.asset(for: uid)
+        guard let resource = Self.currentResource(of: asset) else { throw LocalMediaError.unavailable }
+        let options = PHAssetResourceRequestOptions()
+        options.isNetworkAccessAllowed = true
+        options.progressHandler = { onProgress($0) }
+        try? FileManager.default.removeItem(at: destination)
+        let failure: (any Error)?? = await withCheckedContinuation { continuation in
+            PHAssetResourceManager.default().writeData(for: resource, toFile: destination, options: options) {
+                continuation.resume(returning: .some($0))
+            }
+        }
+        try Task.checkCancellation()
+        if case .some(.some(let error)) = failure { throw error }
+        onProgress(1)
+    }
+
+    private static func primaryResource(of asset: PHAsset) -> PHAssetResource? {
+        let resources = PHAssetResource.assetResources(for: asset)
+        let primary: Set<PHAssetResourceType> = asset.mediaType == .video ? [.video] : [.photo]
+        return resources.first { primary.contains($0.type) } ?? resources.first
+    }
+
+    /// The edited rendition when there is one, else the original.
+    private static func currentResource(of asset: PHAsset) -> PHAssetResource? {
+        let resources = PHAssetResource.assetResources(for: asset)
+        let edited: PHAssetResourceType = asset.mediaType == .video ? .fullSizeVideo : .fullSizePhoto
+        return resources.first { $0.type == edited } ?? primaryResource(of: asset)
+    }
+
     private static func asset(for uid: PhotoUID) async throws -> PHAsset {
         guard uid.localPendingNamespace == .photoLibrary else { throw LocalMediaError.unavailable }
         let identifier = uid.nodeID
@@ -99,30 +145,48 @@ public struct PhotoKitLocalMedia: Sendable {
             destination, image, [kCGImageDestinationLossyCompressionQuality: 0.9] as CFDictionary)
         return CGImageDestinationFinalize(destination) ? data as Data : nil
     }
-
-    #if canImport(UIKit)
-        private static func cgImage(from image: UIImage) -> CGImage? { image.cgImage }
-    #elseif canImport(AppKit)
-        private static func cgImage(from image: NSImage) -> CGImage? {
-            image.cgImage(forProposedRect: nil, context: nil, hints: nil)
-        }
-    #endif
 }
 
 /// Routes viewer media requests: local pending photos go to Apple Photos, every other identity to Proton.
-public struct LocalPendingMediaRouter: FullMediaProvider, VideoStreamProvider, OriginalByteStreamProvider {
+public struct LocalPendingMediaRouter: FullMediaProvider, VideoStreamProvider, OriginalByteStreamProvider,
+    OriginalFileProvider, PhotoMetadataProvider
+{
     private let remote: (any FullMediaProvider)?
     private let remoteVideo: (any VideoStreamProvider)?
-    private let local = PhotoKitLocalMedia()
+    private let local: PhotoKitLocalMedia
     /// The viewer's first-frame size for local previews.
     private let previewPixelSize: CGFloat
 
     public init(
-        remote: (any FullMediaProvider)?, remoteVideo: (any VideoStreamProvider)?, previewPixelSize: CGFloat = 2048
+        remote: (any FullMediaProvider)?, remoteVideo: (any VideoStreamProvider)?,
+        imageRequest: @escaping PhotoKitImageRequest, previewPixelSize: CGFloat = 2048
     ) {
         self.remote = remote
         self.remoteVideo = remoteVideo
+        self.local = PhotoKitLocalMedia(request: imageRequest)
         self.previewPixelSize = previewPixelSize
+    }
+
+    public func metadata(for uid: PhotoUID) async throws -> PhotoMetadata {
+        if uid.isLocalPending { return try await local.metadata(for: uid) }
+        guard let provider = remote as? any PhotoMetadataProvider else {
+            throw PhotoKitLocalMedia.LocalMediaError.unavailable
+        }
+        return try await provider.metadata(for: uid)
+    }
+
+    public func writeOriginal(
+        for uid: PhotoUID,
+        to destination: URL,
+        onProgress: @escaping @Sendable (Double) -> Void
+    ) async throws {
+        if uid.isLocalPending {
+            return try await local.writeOriginal(for: uid, to: destination, onProgress: onProgress)
+        }
+        guard let provider = remote as? any OriginalFileProvider else {
+            throw PhotoKitLocalMedia.LocalMediaError.unavailable
+        }
+        try await provider.writeOriginal(for: uid, to: destination, onProgress: onProgress)
     }
 
     public func preview(for uid: PhotoUID) async throws -> Data {

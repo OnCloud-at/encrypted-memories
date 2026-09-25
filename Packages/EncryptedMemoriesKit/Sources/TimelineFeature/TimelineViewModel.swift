@@ -113,9 +113,21 @@ public final class TimelineViewModel {
             && !pendingPresentation.items.isEmpty
     }
 
-    /// The route state the grid shows. A library without Proton photos still shows its pending photos.
+    /// Local photos deleted before upload, shown in "Zuletzt gelöscht" with the Proton trash.
+    public private(set) var pendingTrash = PendingTrashPresentation.empty
+
+    public func setPendingTrash(_ trash: PendingTrashPresentation) {
+        pendingTrash = trash
+        // The trash grid rebuilds for a new list; other routes do not show it.
+        if filter == .trash { contentRevision &+= 1 }
+    }
+
+    private var showsPendingTrash: Bool { filter == .trash && !pendingTrash.isEmpty }
+
+    /// The route state the grid shows. A library without Proton photos still shows its pending photos, and an
+    /// empty Proton trash still shows photos deleted before upload.
     public var gridState: State {
-        guard showsPendingPhotos else { return state }
+        guard showsPendingPhotos || showsPendingTrash else { return state }
         switch state {
         case .loaded, .empty: return .loaded(pendingSections)
         case .loading, .failed: return state
@@ -123,18 +135,41 @@ public final class TimelineViewModel {
     }
 
     /// Sections of the grid; see `gridState`.
-    public var gridSections: [TimelineSection] { showsPendingPhotos ? pendingSections : currentSections }
+    public var gridSections: [TimelineSection] {
+        showsPendingPhotos || showsPendingTrash ? pendingSections : currentSections
+    }
 
     /// Grid and viewer items; see `gridState`.
-    public var gridItems: [PhotoItem] { showsPendingPhotos ? pendingPresentation.items : presentationItems }
+    public var gridItems: [PhotoItem] {
+        if showsPendingPhotos { return pendingPresentation.items }
+        if showsPendingTrash { return pendingTrash.merged(intoNewestFirst: presentationItems) }
+        return presentationItems
+    }
 
-    /// Upload badges of the whole-library grid.
+    /// The grid items with these identities, pending photos included, for actions on a selection.
+    public func gridItems(matching uids: Set<PhotoUID>) -> [PhotoItem] {
+        switch filter {
+        case .all:
+            return showsPendingPhotos
+                ? pendingPresentation.snapshot.items(withUIDs: uids) : allLibraryItems(matching: uids)
+        case .trash:
+            return allItems.filter { uids.contains($0.uid) } + pendingTrash.items.filter { uids.contains($0.uid) }
+        default:
+            return allItems.filter { uids.contains($0.uid) }
+        }
+    }
+
+    /// Upload badges of the whole-library grid, and "Nicht gesichert" badges in the trash.
     var pendingUploadBadges: PendingUploadBadges {
-        filter == .all ? pendingPresentation.uploadBadges : .empty
+        switch filter {
+        case .all: pendingPresentation.uploadBadges
+        case .trash: pendingTrash.badges
+        default: .empty
+        }
     }
 
     private var pendingSections: [TimelineSection] {
-        let items = pendingPresentation.items
+        let items = gridItems
         guard let first = items.first else { return [] }
         return [TimelineSection(id: "pending-presentation", date: first.captureTime, title: "", items: items)]
     }

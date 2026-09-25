@@ -463,7 +463,8 @@ struct MobileTimelineScreen: View {
     }
 
     private var selectedAllFavorited: Bool {
-        !selection.selected.isEmpty && selection.selected.allSatisfy(model.favoriteUIDs.contains)
+        let favorites = model.displayedFavoriteUIDs
+        return !selection.selected.isEmpty && selection.selected.allSatisfy(favorites.contains)
     }
 
     /// The grid keeps the last authoritative projection mounted while a newer query resolves. The expensive
@@ -506,7 +507,7 @@ struct MobileTimelineScreen: View {
                     displayMode: displayMode,
                     selectionMode: selection.isSelecting,
                     selectedUIDs: selection.selected,
-                    pendingPresentation: hasProjectionCriteria ? nil : model.pendingPresentation,
+                    uploadBadges: hasProjectionCriteria ? .empty : model.pendingPresentation.uploadBadges,
                     isActive: isActive && !showsSearchLanding,
                     scrollToLatestSignal: scrollToLatestSignal,
                     scrollToTopSignal: refinementTopPlacementSignal,
@@ -519,7 +520,7 @@ struct MobileTimelineScreen: View {
                     onOpenPhoto: open,
                     onToggleSelection: selection.toggle,
                     onSelectionChanged: selection.replace(with:),
-                    dragOutProvider: model.backend,
+                    dragOutProvider: model.backend == nil ? nil : model.viewerMedia,
                     onDragOutFailed: { selection.actionError = MobileSelectionError(message: $0.localizedMessage) },
                     contextMenuActions: { contextMenu.actions(for: $0, model: model) },
                     onContextMenuAction: { action, items in
@@ -774,9 +775,10 @@ struct MobileTimelineScreen: View {
     }
 
     private func startShare() {
-        guard let backend = model.backend else { return }
+        guard model.backend != nil else { return }
         let chosen = model.selectedItems(selection.selected)  // O(k log k), not an O(n) filter
-        selection.startShare(items: chosen, backend: backend)
+        // Pending photos share from Apple Photos, every other photo from Proton.
+        selection.startShare(items: chosen, backend: model.viewerMedia)
     }
 
     private func toggleSelectedFavorites() {

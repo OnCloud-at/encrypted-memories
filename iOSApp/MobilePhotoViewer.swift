@@ -83,7 +83,7 @@ struct MobilePhotoViewer: View {
         _index = State(initialValue: min(max(startIndex, 0), max(items.count - 1, 0)))
         _titleMetadataCoordinator = State(
             initialValue: ViewerTitleMetadataCoordinator(
-                metadataProvider: libraryModel.backend,
+                metadataProvider: libraryModel.backend == nil ? nil : libraryModel.viewerMedia,
                 placeNameResolver: NativePlaceNameResolver.shared
             ))
         let feed = libraryModel.thumbnailFeed
@@ -172,6 +172,10 @@ struct MobilePhotoViewer: View {
             // The filmstrip is bottom safe-area content, the Photos-app contract: the media refits when the chrome
             // toggles, and the native bottom bar stacks below the strip.
             .safeAreaInset(edge: .bottom, spacing: 0) { viewerBottomAccessory }
+            .overlay {
+                UndoNoticeOverlay(
+                    notice: Binding(get: { libraryModel.undoNotice }, set: { libraryModel.undoNotice = $0 }))
+            }
             // The principal item draws both lines. A blank title string would render as quotation marks while
             // a known location resolves, so the reserved line is hidden by opacity instead, as on the Mac.
             .navigationTitle(viewerTitle.reservesLocationLine ? viewerTitle.line2 : viewerTitle.line1)
@@ -433,7 +437,7 @@ struct MobilePhotoViewer: View {
 
     private var viewerFavoriteButton: some View {
         let uid = currentBaseItem?.uid
-        let favorite = uid.map { libraryModel.favoriteUIDs.contains($0) } ?? false
+        let favorite = uid.map { libraryModel.displayedFavoriteUIDs.contains($0) } ?? false
         let busy = uid.map { libraryModel.favoriteMutationsInFlight.contains($0) } ?? false
         let title =
             favorite
@@ -614,10 +618,10 @@ struct MobilePhotoViewer: View {
     }
 
     private func shareCurrentItem() {
-        guard let item = currentBaseItem, let backend = libraryModel.backend else { return }
+        guard let item = currentBaseItem, libraryModel.backend != nil else { return }
         let items = burstBelongsToCurrentPage ? burstSelection.exportItems(current: item) : [item]
         selection.startShare(
-            items: items, backend: backend,
+            items: items, backend: libraryModel.viewerMedia,
             failureMessage: String(localized: "viewer.share_failed")
         )
     }

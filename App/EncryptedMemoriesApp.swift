@@ -108,6 +108,7 @@ struct EncryptedMemoriesApp: App {
                         photoBackup: model.photoBackupController,
                         albumSync: model.albumSyncController,
                         smartSearch: model.smartSearch,
+                        appModel: model,
                         refreshAccountInfo: {
                             guard let facade = model.facade else { return }
                             try? await facade.refreshAccountInfo()

@@ -3,6 +3,7 @@ import AppKit
 import DesignSystem
 import DesignSystemCore
 import MLSearchCore
+import MediaCache
 import PhotoLibraryBackupAdapter
 import PhotosCore
 import ProtonDriveBackend
@@ -20,6 +21,8 @@ struct SettingsView: View {
     let photoBackup: PhotoLibraryBackupController?
     let albumSync: AlbumSyncController?
     let smartSearch: MLSmartSearchController?
+    /// The account model, for the photos excluded from backup.
+    let appModel: AppModel
     let refreshAccountInfo: @MainActor () async -> Void
     let signOut: () -> Void
 
@@ -85,7 +88,7 @@ struct SettingsView: View {
                     ) {
                         BackupSettingsTab(
                             backup: backup, photoBackup: photoBackup, albumSync: albumSync,
-                            uploadCoordinator: uploadCoordinator
+                            uploadCoordinator: uploadCoordinator, appModel: appModel
                         )
                     })
             }
@@ -113,6 +116,7 @@ private struct BackupSettingsTab: View {
     let photoBackup: PhotoLibraryBackupController?
     let albumSync: AlbumSyncController?
     let uploadCoordinator: UploadCoordinator?
+    let appModel: AppModel
 
     var body: some View {
         Form {
@@ -121,6 +125,14 @@ private struct BackupSettingsTab: View {
                     PhotoLibraryBackupSection(controller: photoBackup)
                 } header: {
                     Text("settings.photos_backup_section")
+                }
+            }
+            if !appModel.excludedPendingTiles.isEmpty {
+                PendingExcludedPhotosSection(
+                    tiles: appModel.excludedPendingTiles,
+                    thumbnail: PhotoKitLocalThumbnailLoader(request: PhotoKitPlatformImages.request).listThumbnail(for:)
+                ) { tile in
+                    await appModel.pendingGrid?.restore([tile.item.uid])
                 }
             }
             if let albumSync {

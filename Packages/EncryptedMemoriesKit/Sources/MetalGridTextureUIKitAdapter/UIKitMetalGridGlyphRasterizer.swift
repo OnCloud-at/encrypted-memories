@@ -15,7 +15,11 @@
             case .text(let text):
                 return textImage(text, request: request)
             case .uploadBadge(let badge):
-                return MetalGridUploadBadgeImage.make(badge, pixelSize: request.pixelSize)
+                let symbol = MetalGridUploadBadgeImage.symbolName(for: badge).flatMap {
+                    symbolImage(
+                        $0, request: MetalGridGlyphRequest(symbol: $0, pixelSize: request.pixelSize, color: .white))
+                }
+                return MetalGridUploadBadgeImage.make(badge, pixelSize: request.pixelSize, symbol: symbol)
             }
         }
 

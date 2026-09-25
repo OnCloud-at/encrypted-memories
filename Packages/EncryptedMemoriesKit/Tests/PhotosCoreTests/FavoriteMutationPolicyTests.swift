@@ -19,6 +19,15 @@ final class FavoriteMutationPolicyTests: XCTestCase {
         XCTAssertNil(FavoriteMutationPolicy.target(for: [], current: [a]))
     }
 
+    func testForcedTargetKeepsOneDirectionForAMixedSelection() {
+        // The Proton part of a selection that also holds pending photos: all favorites, yet the whole selection
+        // becomes favorite, so nothing changes here instead of unfavoriting.
+        XCTAssertNil(FavoriteMutationPolicy.request(selection: [a], current: [a], inFlight: [], target: true))
+        let request = FavoriteMutationPolicy.request(selection: [a, b], current: [a], inFlight: [], target: true)
+        XCTAssertEqual(request?.requested, [b])
+        XCTAssertEqual(request?.target, true)
+    }
+
     func testMixedSelectionFavoritesOnlyItemsThatNeedChanging() {
         let selection: Set<PhotoUID> = [a, b, c]
         let current: Set<PhotoUID> = [a]

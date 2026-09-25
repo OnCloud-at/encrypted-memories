@@ -59,3 +59,15 @@ enum PhotoKitRequest {
         }
     }
 }
+
+/// PhotoKit's image request, answered as a `CGImage`. PhotoKit hands out images as the platform image type, so
+/// the platform media adapters implement it once (`PhotoKitPlatformImages.request` in MediaCacheUIKitAdapter and
+/// MediaCacheAppKitAdapter) and hosts pass it in. This adapter stays free of UI frameworks.
+public typealias PhotoKitImageRequest =
+    @Sendable (
+        _ asset: PHAsset,
+        _ targetSize: CGSize,
+        _ contentMode: PHImageContentMode,
+        _ options: PHImageRequestOptions,
+        _ resultHandler: @escaping @Sendable (CGImage?) -> Void
+    ) -> PHImageRequestID

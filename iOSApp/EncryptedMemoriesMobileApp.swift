@@ -327,6 +327,13 @@ private struct MobileMainTabView: View {
                     activityState: loadingActivityState
                 )
             }
+            // Above the tab bar, so an undo stays reachable on every tab.
+            .overlay {
+                UndoNoticeOverlay(
+                    notice: Binding(get: { libraryModel.undoNotice }, set: { libraryModel.undoNotice = $0 }),
+                    bottomPadding: 72
+                )
+            }
             .libraryActivityTransition(
                 namespace: libraryActivityTransition,
                 loadingCoverPresented: showsLibraryLoadingCover
