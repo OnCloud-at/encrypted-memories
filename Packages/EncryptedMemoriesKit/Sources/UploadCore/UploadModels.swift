@@ -583,6 +583,9 @@ public enum UploadError: LocalizedError, Equatable {
     case backend(String)
     case albumStep(String)
     case cancelled
+    /// The platform still prepares the source (the camera still processes a new photo). The runner tries
+    /// again shortly without counting an attempt; the finished file usually arrives as a new revision.
+    case sourceNotReady(String)
 
     public var errorDescription: String? {
         switch self {
@@ -594,6 +597,7 @@ public enum UploadError: LocalizedError, Equatable {
         case .backend(let message): message
         case .albumStep(let message): L10n.string("error.upload_album_step \(message)")
         case .cancelled: L10n.string("error.upload_cancelled")
+        case .sourceNotReady(let name): L10n.string("error.upload_source_not_ready \(name)")
         }
     }
 }

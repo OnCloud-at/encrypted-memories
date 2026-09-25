@@ -3405,6 +3405,12 @@
         }
       }
     },
+    "error.upload_source_not_ready %@": {
+      "localizations": {
+        "de": { "stringUnit": { "state": "translated", "value": "„%@“ wird noch von der Kamera bearbeitet." } },
+        "en": { "stringUnit": { "state": "translated", "value": "“%@” is still being processed by the camera." } }
+      }
+    },
     "error.upload_permission_denied %@": {
       "extractionState": "manual",
       "comment": "Permission error. %@ is the file name.",

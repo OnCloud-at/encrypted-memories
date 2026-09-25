@@ -357,6 +357,8 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
     private(set) var favoriteUIDs: Set<PhotoUID> = []
     private var uploadBadges = PendingUploadBadges.empty
     private var contentEpochs = PendingContentEpochTracker()
+    private var handovers = PendingHandoverTracker()
+    private let uploadBadgeAnimator = GridUploadBadgeAnimator<PhotoUID>()
     /// The last frame asked the feed for thumbnails; the first frame without demand tells the feed once.
     private var hasVisibleDemand = false
     private(set) var selectionMode = false
@@ -384,6 +386,10 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
         guard badges != uploadBadges else { return }
         uploadBadges = badges
         dataSource.updateUploadBadges(badges)
+        for handover in handovers.newHandovers(in: badges.handovers) {
+            cache.adoptTexture(from: handover.local, to: handover.remote)
+            uploadBadgeAnimator.adopt(from: handover.local, to: handover.remote)
+        }
         let changed = contentEpochs.changes(in: badges.contentEpochs)
         if !changed.isEmpty {
             cache.markStale(changed)
@@ -1231,7 +1237,7 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
             displayMode: presentationSnapshotDisplayMode
         )
         renderer.render(to: target, viewportSize: viewportSize, groups: groups)
-        let activeReveal = cache.hasActiveThumbnailReveal(in: admission.visible, now: now)
+        let activeReveal = hasActiveAnimation(in: admission.visible, now: now)
         hasPendingVisibleThumbnails =
             activeReveal
             || (!cache.residencySaturatedThisFrame
@@ -1260,7 +1266,7 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
             viewportSize: viewportSize,
             now: now
         )
-        let activeReveal = cache.hasActiveThumbnailReveal(in: visibleUIDs, now: now)
+        let activeReveal = hasActiveAnimation(in: visibleUIDs, now: now)
         hasPendingVisibleThumbnails =
             activeReveal
             || (!cache.residencySaturatedThisFrame
@@ -1458,7 +1464,7 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
         }
         streamTextures(visibleUIDs: visibleUIDs, overscanUIDs: overscanUIDs, now: now)
         _ = renderRealSlots(to: target, slots: slots, flatUIDs: flatUIDs, viewportSize: viewportSize)
-        let activeReveal = cache.hasActiveThumbnailReveal(in: visibleUIDs, now: now)
+        let activeReveal = hasActiveAnimation(in: visibleUIDs, now: now)
         hasPendingVisibleThumbnails =
             activeReveal
             || (!cache.residencySaturatedThisFrame && hasRetryableMissingVisibleTexture(visibleUIDs))
@@ -1864,7 +1870,7 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
         streamTextures(visibleUIDs: uids, overscanUIDs: [], now: now)
         let srcResidentAfter = residentSlotCount(srcSlots, flatUIDs: flatUIDs)
         let tgtResidentAfter = residentSlotCount(tgtSlots, flatUIDs: flatUIDs)
-        let activeReveal = cache.hasActiveThumbnailReveal(in: uids, now: now)
+        let activeReveal = hasActiveAnimation(in: uids, now: now)
         evictTexturesToBudget()
         PhotoPerformanceSignposts.grid.interval("dissolve.layerPass") {
             renderer.renderLayerDissolve(
@@ -1967,7 +1973,7 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
         let realCount = renderRealSlots(
             to: target, slots: Self.viewportDrawSlots(slots, viewportSize: viewportSize),
             flatUIDs: flatUIDs, viewportSize: viewportSize, now: now)
-        let activeReveal = cache.hasActiveThumbnailReveal(in: visibleUIDs, now: now)
+        let activeReveal = hasActiveAnimation(in: visibleUIDs, now: now)
         hasPendingVisibleThumbnails =
             activeReveal
             || (!cache.residencySaturatedThisFrame && hasRetryableMissingVisibleTexture(visibleUIDs))
@@ -2044,7 +2050,7 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
             flatUIDs: flatUIDs, viewportSize: viewportSize, now: now)
         // Keep ticking while visible placeholders or quality upgrades can still complete.
         // Residency saturation waits for a later viewport change.
-        let activeReveal = cache.hasActiveThumbnailReveal(in: visibleUIDs, now: now)
+        let activeReveal = hasActiveAnimation(in: visibleUIDs, now: now)
         hasPendingVisibleThumbnails =
             activeReveal
             || (!cache.residencySaturatedThisFrame
@@ -2112,6 +2118,11 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
         )
     }
 
+    /// A thumbnail fading in or an upload badge moving keeps the grid drawing frames.
+    private func hasActiveAnimation(in uids: [PhotoUID], now: CFTimeInterval) -> Bool {
+        cache.hasActiveThumbnailReveal(in: uids, now: now) || uploadBadgeAnimator.isAnimating(uids, now: now)
+    }
+
     private func productionDecorations() -> MetalGridDecorations<PhotoUID>? {
         guard decorationsEnabled else { return nil }
         return MetalGridDecorations(
@@ -2120,7 +2131,10 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
             selectionMode: selectionMode,
             selected: selectedUIDs,
             favorites: favoriteUIDs,
-            overlay: { [dataSource] uid in dataSource.thumbnailOverlay(for: uid) }
+            overlay: { [dataSource] uid in dataSource.thumbnailOverlay(for: uid) },
+            uploadBadgeFrame: { [uploadBadgeAnimator] uid, badge in
+                uploadBadgeAnimator.frame(for: uid, target: badge, now: CACurrentMediaTime())
+            }
         )
     }
 

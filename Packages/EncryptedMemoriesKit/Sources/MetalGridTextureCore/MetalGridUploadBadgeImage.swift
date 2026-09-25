@@ -3,13 +3,13 @@ import GridCore
 
 /// Draws upload badges with CoreGraphics only, for every platform alike. A dark translucent disc with a white
 /// outline keeps the badge legible on bright photos. Progress fills the disc with white like a pie until it is
-/// solid; the checkmark then shows on that white disc.
+/// solid; the checkmark then draws itself on that white disc. `GridUploadBadgeAnimator` picks the steps.
 package enum MetalGridUploadBadgeImage {
-    /// The SF Symbol a platform rasterizer renders for `badge`, when the badge carries one.
-    package static func symbolName(for badge: GridUploadBadge) -> String? { badge.symbolName }
+    /// The SF Symbol a platform rasterizer renders for `glyph`, when the glyph carries one.
+    package static func symbolName(for glyph: GridUploadBadgeGlyph) -> String? { glyph.symbolName }
 
     /// `symbol` is the host-rendered white `symbolName(for:)`, drawn centered on the disc.
-    package static func make(_ badge: GridUploadBadge, pixelSize: Int, symbol: CGImage? = nil) -> CGImage? {
+    package static func make(_ glyph: GridUploadBadgeGlyph, pixelSize: Int, symbol: CGImage? = nil) -> CGImage? {
         guard pixelSize > 0,
             let context = CGContext(
                 data: nil,
@@ -25,17 +25,16 @@ package enum MetalGridUploadBadgeImage {
         let bounds = CGRect(x: 0, y: 0, width: size, height: size)
         let disc = bounds.insetBy(dx: size * 0.04, dy: size * 0.04)
         context.setShouldAntialias(true)
-        switch badge {
-        case .waiting:
-            drawPie(context, in: disc, fraction: 0)
-        case .uploading(let step):
-            let fraction =
-                Double(min(max(step, 0), GridUploadBadge.progressSteps)) / Double(GridUploadBadge.progressSteps)
-            drawPie(context, in: disc, fraction: fraction)
-        case .done:
-            context.setFillColor(CGColor(red: 1, green: 1, blue: 1, alpha: 0.96))
+        switch glyph {
+        case .pie(let step):
+            let steps = GridUploadBadgeGlyph.pieSteps
+            drawPie(context, in: disc, fraction: Double(min(max(step, 0), steps)) / Double(steps))
+        case .check(let step):
+            // The same white as the full circle, so the checkmark draws onto it without a change of tone.
+            context.setFillColor(CGColor(red: 1, green: 1, blue: 1, alpha: 1))
             context.fillEllipse(in: disc)
-            drawCheckmark(context, in: disc)
+            let steps = GridUploadBadgeGlyph.checkSteps
+            drawCheckmark(context, in: disc, drawn: Double(min(max(step, 0), steps)) / Double(steps))
         case .attention:
             drawDisc(context, disc)
             drawExclamation(context, in: disc)
@@ -79,15 +78,29 @@ package enum MetalGridUploadBadgeImage {
         context.strokeEllipse(in: disc.insetBy(dx: lineWidth / 2, dy: lineWidth / 2))
     }
 
-    private static func drawCheckmark(_ context: CGContext, in disc: CGRect) {
+    /// The checkmark stroke drawn from its start to `drawn` of its length, as a pen would draw it.
+    private static func drawCheckmark(_ context: CGContext, in disc: CGRect, drawn: Double) {
+        guard drawn > 0 else { return }
         let width = disc.width
+        let points = [
+            CGPoint(x: disc.minX + width * 0.29, y: disc.minY + width * 0.51),
+            CGPoint(x: disc.minX + width * 0.44, y: disc.minY + width * 0.35),
+            CGPoint(x: disc.minX + width * 0.72, y: disc.minY + width * 0.66),
+        ]
+        let lengths = zip(points, points.dropFirst()).map { hypot($1.x - $0.x, $1.y - $0.y) }
+        var remaining = CGFloat(min(1, drawn)) * lengths.reduce(0, +)
         context.setStrokeColor(CGColor(red: 0.1, green: 0.1, blue: 0.1, alpha: 1))
         context.setLineWidth(width * 0.11)
         context.setLineCap(.round)
         context.setLineJoin(.round)
-        context.move(to: CGPoint(x: disc.minX + width * 0.29, y: disc.minY + width * 0.51))
-        context.addLine(to: CGPoint(x: disc.minX + width * 0.44, y: disc.minY + width * 0.35))
-        context.addLine(to: CGPoint(x: disc.minX + width * 0.72, y: disc.minY + width * 0.66))
+        context.move(to: points[0])
+        for (index, length) in lengths.enumerated() where remaining > 0 {
+            let from = points[index]
+            let to = points[index + 1]
+            let share = min(1, remaining / max(length, 0.0001))
+            context.addLine(to: CGPoint(x: from.x + (to.x - from.x) * share, y: from.y + (to.y - from.y) * share))
+            remaining -= length
+        }
         context.strokePath()
     }
 

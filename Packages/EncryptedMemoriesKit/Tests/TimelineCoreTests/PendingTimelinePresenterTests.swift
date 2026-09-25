@@ -120,6 +120,13 @@ import UploadCore
         #expect(after.localUIDs.isEmpty)
         #expect(after.uploadBadges[uploaded] == .uploading(step: 10), "a still-uploading source keeps its progress")
         #expect(presence == [PendingSourceKey(kind: .photoLibraryAsset, identifier: "p")])
+
+        // Grids let the Proton photo draw the pending tile's texture, once.
+        let local = before.items[0].uid
+        #expect(after.uploadBadges.handovers == [uploaded: local])
+        var tracker = PendingHandoverTracker()
+        #expect(tracker.newHandovers(in: after.uploadBadges.handovers).map(\.remote) == [uploaded])
+        #expect(tracker.newHandovers(in: after.uploadBadges.handovers).isEmpty)
     }
 
     @Test func linkOnlyHandoffResolvesToThePhotosVolume() async {

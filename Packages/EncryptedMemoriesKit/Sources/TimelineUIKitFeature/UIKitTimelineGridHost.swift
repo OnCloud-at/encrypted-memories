@@ -257,6 +257,8 @@
         var textureCache: MetalGridTextureCache<PhotoUID>?
         /// Local photos edited in Apple Photos; their resident textures upload again.
         private var pendingContentEpochs = PendingContentEpochTracker()
+        private var pendingHandovers = PendingHandoverTracker()
+        private let uploadBadgeAnimator = GridUploadBadgeAnimator<PhotoUID>()
         var texturePolicy: UIKitMetalGridTexturePolicy?
         private var texturePressureRegistration: MemoryPressureRegistration?
         var thumbnailFeed: UIKitThumbnailFeed?
@@ -515,6 +517,10 @@
             self.selectedUIDs = selectedUIDs
             // Upload badges change with progress; they never rebuild the item overlays.
             thumbnailOverlayResolver.updateUploadBadges(uploadBadges)
+            for handover in pendingHandovers.newHandovers(in: uploadBadges.handovers) {
+                textureCache?.adoptTexture(from: handover.local, to: handover.remote)
+                uploadBadgeAnimator.adopt(from: handover.local, to: handover.remote)
+            }
             let revisedContent = pendingContentEpochs.changes(in: uploadBadges.contentEpochs)
             if !revisedContent.isEmpty {
                 textureCache?.markStale(revisedContent)
@@ -1458,7 +1464,9 @@
                 cache: textureCache, cpuPreparationMs: cpuPreparationMs,
                 drawableWaitMs: drawableWaitMs, frameBoundaryWaitMs: renderer.lastFrameBoundaryWaitMs,
                 rendererEncodeMs: renderer.lastEncodeMs, gpuMs: renderer.lastCompletedGpuMs)
-            let activeReveal = textureCache.hasActiveThumbnailReveal(in: uids, now: now)
+            let activeReveal =
+                textureCache.hasActiveThumbnailReveal(in: uids, now: now)
+                || uploadBadgeAnimator.isAnimating(uids, now: now)
             return .drawn(hasPendingWork: pinchSettling || warmInFlight || ramReadyMissing > 0 || activeReveal)
         }
 
@@ -1485,7 +1493,9 @@
             streamTransitionTextures(uids: uids, slotSidePoints: slotSide, textureCache: textureCache)
             let sourceResidentAfter = residentSlotCount(sourceSlots, textureCache: textureCache)
             let targetResidentAfter = residentSlotCount(targetSlots, textureCache: textureCache)
-            let activeReveal = textureCache.hasActiveThumbnailReveal(in: uids, now: now)
+            let activeReveal =
+                textureCache.hasActiveThumbnailReveal(in: uids, now: now)
+                || uploadBadgeAnimator.isAnimating(uids, now: now)
             textureCache.evictToBudget()
             let sourceGroups = MetalGridFrameComposer.buildGroups(
                 slots: MetalGridFrameComposer.viewportDrawSlots(sourceSlots, viewportSize: viewportSize),
@@ -1672,6 +1682,7 @@
                 forcePendingWork
                 || warmInFlight
                 || textureCache.hasActiveThumbnailReveal(in: ids.visible, now: now)
+                || uploadBadgeAnimator.isAnimating(ids.visible, now: now)
                 || ((uploadPending || streamResult.pendingVisibleQualityUpgrade) && canMakeProgress)
             perf.noteDraw(
                 visible: ids.visible.count, missing: missingVisible.count,
@@ -1787,7 +1798,10 @@
                 // just thumbnails + media overlays.
                 selected: selectionMode ? selectedUIDs : [],
                 favorites: [],
-                overlay: { [thumbnailOverlayResolver] uid in thumbnailOverlayResolver.overlay(for: uid) }
+                overlay: { [thumbnailOverlayResolver] uid in thumbnailOverlayResolver.overlay(for: uid) },
+                uploadBadgeFrame: { [uploadBadgeAnimator] uid, badge in
+                    uploadBadgeAnimator.frame(for: uid, target: badge, now: CACurrentMediaTime())
+                }
             )
         }
     }

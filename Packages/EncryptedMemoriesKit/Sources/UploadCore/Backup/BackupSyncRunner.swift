@@ -44,6 +44,8 @@ public actor BackupSyncRunner {
         public var uploadStallPollInterval: TimeInterval
         public var retry: BackupRetryPolicy
         public var throttle: BackupThrottlePolicy
+        /// How long a source the platform still prepares waits before the next try.
+        public var sourceNotReadyDelay: TimeInterval
 
         public init(
             batchSize: Int = 32,
@@ -52,7 +54,8 @@ public actor BackupSyncRunner {
             uploadStallTimeout: TimeInterval = 180,
             uploadStallPollInterval: TimeInterval = 5,
             retry: BackupRetryPolicy = BackupRetryPolicy(),
-            throttle: BackupThrottlePolicy = BackupThrottlePolicy()
+            throttle: BackupThrottlePolicy = BackupThrottlePolicy(),
+            sourceNotReadyDelay: TimeInterval = 30
         ) {
             self.batchSize = max(1, batchSize)
             self.staleActiveGrace = max(0, staleActiveGrace)
@@ -61,6 +64,7 @@ public actor BackupSyncRunner {
             self.uploadStallPollInterval = max(0.01, min(uploadStallPollInterval, uploadStallTimeout))
             self.retry = retry
             self.throttle = throttle
+            self.sourceNotReadyDelay = max(0, sourceNotReadyDelay)
         }
     }
 
@@ -1546,6 +1550,27 @@ public actor BackupSyncRunner {
         if sourceWasRemoved(entry) { return }
         if case UploadError.fileMissing = error {
             discardMissingSource(entry, from: oldState)
+            return
+        }
+        // Not a failure: the camera still processes the photo. Uploading now would send its preliminary
+        // version and then the finished one again. Wait without counting an attempt; the finished photo
+        // usually arrives sooner as a new revision.
+        if case UploadError.sourceNotReady = error {
+            let eligibleAt = now().addingTimeInterval(configuration.sourceNotReadyDelay)
+            guard
+                queue.updateState(
+                    source: entry.source, revision: entry.revision,
+                    state: .discovered,
+                    attempts: entry.attempts,
+                    lastError: nil,
+                    updatedAt: eligibleAt
+                )
+            else {
+                stopRequested = true
+                return
+            }
+            adjustProgress(from: oldState, to: .discovered)
+            emitProgress()
             return
         }
         let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription

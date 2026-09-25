@@ -8,6 +8,11 @@ import UploadCore
 /// store only if dedupe returns `.upload`. HEIC stays HEIC and MOV stays MOV; `PHImageManager` is
 /// never used.
 public struct PhotoLibraryResourceResolver: BackupResourceResolving {
+    /// A new photo whose only image is the camera's preliminary version (deferred photo processing, the
+    /// `.photoProxy` resource) waits this long for the finished one. After that the preliminary version is
+    /// backed up, so a photo whose processing never finishes still gets a copy.
+    static let processingWaitWindow: TimeInterval = 3600
+
     private let tempStore: BackupTempFileStore
     private let cloudIdentifierProvider: @Sendable (String) -> String?
 
@@ -41,6 +46,12 @@ public struct PhotoLibraryResourceResolver: BackupResourceResolving {
             let primaryResource = PhotoKitAssetMapper.resource(for: plan.primary.role, of: asset)
         else {
             return nil
+        }
+        if plan.primary.role == .photoProxy,
+            let created = asset.creationDate,
+            Date().timeIntervalSince(created) < Self.processingWaitWindow
+        {
+            throw UploadError.sourceNotReady(plan.primary.uploadFilename)
         }
 
         // Stable descriptor dates: capture time drives the remote timeline; the descriptor's

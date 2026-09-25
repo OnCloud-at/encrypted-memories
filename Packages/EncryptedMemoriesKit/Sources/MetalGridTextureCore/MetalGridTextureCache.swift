@@ -344,6 +344,15 @@ package final class MetalGridTextureCache<ID: Hashable & Sendable> {
 
     package func isStale(_ id: ID) -> Bool { staleTextures.contains(id) }
 
+    /// A pending photo became its Proton photo: the Proton identity draws the same texture at once, with no
+    /// upload and no fade. The texture is shared; residency counts it for both until the pending one is evicted.
+    package func adoptTexture(from source: ID, to target: ID) {
+        guard textures[target] == nil, !lru.isInFlight(target), let texture = textures[source] else { return }
+        textures[target] = texture
+        lru.completeUpload(target, cost: texture.width * texture.height * 4)
+        if staleTextures.contains(source) { staleTextures.insert(target) }
+    }
+
     /// Replaces stale visible textures in place, within the frame's upload budget. A texture whose new image is
     /// not in memory yet keeps drawing until it is.
     package func replaceStaleResident(_ ids: [ID], provideImage: (ID) -> CGImage?) {
@@ -521,9 +530,9 @@ package final class MetalGridTextureCache<ID: Hashable & Sendable> {
         return glyphTexture(for: request)
     }
 
-    /// A cached upload badge texture: 21 progress steps plus waiting, done and attention stay resident.
-    package func uploadBadgeTexture(_ badge: GridUploadBadge) -> MTLTexture? {
-        glyphTexture(for: MetalGridGlyphRequest(uploadBadge: badge))
+    /// A cached upload badge texture. About 80 small glyphs (fill and checkmark steps) stay resident.
+    package func uploadBadgeTexture(_ glyph: GridUploadBadgeGlyph) -> MTLTexture? {
+        glyphTexture(for: MetalGridGlyphRequest(uploadBadge: glyph))
     }
 
     private func glyphTexture(for request: MetalGridGlyphRequest) -> MTLTexture? {

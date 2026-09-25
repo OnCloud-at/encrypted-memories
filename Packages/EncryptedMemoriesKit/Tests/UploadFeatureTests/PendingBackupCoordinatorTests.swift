@@ -249,6 +249,27 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         XCTAssertEqual(settled.tiles.first?.handoff, remote)
     }
 
+    func testNewRevisionKeepsItsTileWhileItsMetadataLoads() async throws {
+        enqueue("p", state: .uploading)
+        await coordinator.start()
+        await waitForSnapshot("shown") { $0.tiles.count == 1 }
+
+        // The camera finished processing the photo: a new revision arrives before the catalog knows it.
+        metadata.remove(key("p"))
+        let finished = UploadBackupRevision(rawValue: 10)
+        XCTAssertTrue(
+            queue.upsert(
+                UploadBackupSyncQueueEntry(
+                    source: source("p"), revision: finished, originalFilename: "p.heic", state: .discovered,
+                    updatedAt: date)))
+        await waitForSnapshot("the tile follows the new revision") { $0.tiles.first?.revision == finished }
+        for _ in 0..<20 {
+            let snapshot = await coordinator.currentSnapshot()
+            XCTAssertEqual(tileIDs(snapshot), ["p"], "the tile must never leave while its metadata loads")
+            try await Task.sleep(for: .milliseconds(5))
+        }
+    }
+
     func testCheckmarkShowsOnlyBriefly() async throws {
         await coordinator.close()
         coordinator = makeCoordinator(checkmarkDuration: .milliseconds(30))

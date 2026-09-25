@@ -59,6 +59,9 @@ final class ScriptedBackupResolver: BackupResourceResolving, @unchecked Sendable
         /// Throw `BackupTempFileError.diskBudgetExceeded` for the first `times` resolves, then
         /// behave like `.standard`. Models a device low on space while a pass runs.
         case diskPressure(times: Int)
+        /// Throw `UploadError.sourceNotReady` for the first `times` resolves, then behave like `.standard`.
+        /// Models a new photo the camera still processes.
+        case notReady(times: Int)
     }
 
     private let lock = NSLock()
@@ -124,6 +127,7 @@ final class ScriptedBackupResolver: BackupResourceResolving, @unchecked Sendable
             behaviors[identifier] = behavior
             if case .transientFailure(let times) = behavior { remainingFailures[identifier] = times }
             if case .diskPressure(let times) = behavior { remainingFailures[identifier] = times }
+            if case .notReady(let times) = behavior { remainingFailures[identifier] = times }
         }
     }
 
@@ -158,6 +162,8 @@ final class ScriptedBackupResolver: BackupResourceResolving, @unchecked Sendable
             if consumeFailure() { throw UploadError.backend("transient resolve failure for \(id)") }
         case .diskPressure:
             if consumeFailure() { throw BackupTempFileStore.BackupTempFileError.diskBudgetExceeded }
+        case .notReady:
+            if consumeFailure() { throw UploadError.sourceNotReady(id) }
         case .standard:
             break
         }
@@ -857,6 +863,21 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertEqual(uploader.requests.count, 1)
         XCTAssertEqual(progress.failed, 0)
         XCTAssertEqual(resolver.resolveCount(for: entry.source.identifier), 8, "7 pressure failures, then success")
+    }
+
+    func testPhotoTheCameraStillProcessesWaitsWithoutFailing() async throws {
+        let entry = seedEntry("processing.heic")
+        resolver.set(.notReady(times: 5), for: entry.source.identifier)
+
+        let runner = makeRunner()
+        let progress = await runner.runUntilDrained()
+
+        XCTAssertEqual(state(of: entry), .completed, "a photo in camera processing must never park as failed")
+        XCTAssertEqual(uploader.requests.count, 1, "only the finished photo uploads")
+        XCTAssertEqual(progress.failed, 0)
+        XCTAssertEqual(resolver.resolveCount(for: entry.source.identifier), 6)
+        XCTAssertEqual(clock.sleeps.count, 5)
+        XCTAssertEqual(try XCTUnwrap(clock.sleeps.first), 30, accuracy: 0.001)
     }
 
     func testPersistedRetryDelaySurvivesRunnerRecreation() async throws {

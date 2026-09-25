@@ -15,16 +15,21 @@ public struct PendingUploadBadges: Sendable, Equatable {
     /// change. The map is cumulative, so a grid that skips a presentation still sees every change and
     /// uploads the new thumbnail. Sparse: only edited photos.
     package let contentEpochs: [PhotoUID: UInt64]
+    /// Proton photos that took over a pending tile this session -> that tile's local UID. Grids let the
+    /// Proton photo draw the pending tile's texture, so the handover shows no upload and no fade.
+    package let handovers: [PhotoUID: PhotoUID]
 
     package init(
         base: [PhotoUID: GridUploadBadge] = [:],
         progress: [PhotoUID: Int] = [:],
-        contentEpochs: [PhotoUID: UInt64] = [:]
+        contentEpochs: [PhotoUID: UInt64] = [:],
+        handovers: [PhotoUID: PhotoUID] = [:]
     ) {
         id = UUID()
         self.base = base
         self.progress = progress
         self.contentEpochs = contentEpochs
+        self.handovers = handovers
     }
 
     public static let empty = PendingUploadBadges()
@@ -37,6 +42,20 @@ public struct PendingUploadBadges: Sendable, Equatable {
     }
 
     public static func == (lhs: Self, rhs: Self) -> Bool { lhs.id == rhs.id }
+}
+
+/// Follows `PendingUploadBadges.handovers` for one grid and reports each handover once.
+package struct PendingHandoverTracker {
+    private var applied = Set<PhotoUID>()
+
+    package init() {}
+
+    package mutating func newHandovers(in handovers: [PhotoUID: PhotoUID]) -> [(local: PhotoUID, remote: PhotoUID)] {
+        if applied.count > handovers.count { applied.formIntersection(handovers.keys) }
+        var result: [(local: PhotoUID, remote: PhotoUID)] = []
+        for (remote, local) in handovers where applied.insert(remote).inserted { result.append((local, remote)) }
+        return result
+    }
 }
 
 /// Follows `PendingUploadBadges.contentEpochs` for one grid and reports the photos whose resident texture
@@ -236,7 +255,7 @@ public final class PendingTimelinePresenter {
             favoriteIntents: shown.favoriteIntents.filter { result.localUIDs.contains($0.key) },
             uploadBadges: PendingUploadBadges(
                 base: result.baseBadges, progress: Self.progress(of: shown, gridUIDs: result.presentLocal),
-                contentEpochs: contentEpochs),
+                contentEpochs: contentEpochs, handovers: anchors.mapValues(\.uid)),
             isCanonical: result.localUIDs.isEmpty && anchors.isEmpty
         )
         onFeedUpdate?(result.localUIDs, result.adoptions, result.revised)
@@ -255,7 +274,7 @@ public final class PendingTimelinePresenter {
         }
         let badges = PendingUploadBadges(
             base: presentation.uploadBadges.base, progress: presentation.uploadBadges.progress,
-            contentEpochs: contentEpochs)
+            contentEpochs: contentEpochs, handovers: presentation.uploadBadges.handovers)
         revision &+= 1
         presentation = PendingTimelinePresentation(
             revision: revision,
@@ -278,7 +297,7 @@ public final class PendingTimelinePresenter {
         guard progress != presentation.uploadBadges.progress else { return }
         let badges = PendingUploadBadges(
             base: presentation.uploadBadges.base, progress: progress,
-            contentEpochs: presentation.uploadBadges.contentEpochs)
+            contentEpochs: presentation.uploadBadges.contentEpochs, handovers: presentation.uploadBadges.handovers)
         revision &+= 1
         presentation = PendingTimelinePresentation(
             revision: revision,

@@ -37,6 +37,29 @@ import Testing
     }
 
     @Test(.enabled(if: MTLCreateSystemDefaultDevice() != nil))
+    func handedOverPhotoDrawsThePendingTextureAtOnce() throws {
+        let cache = try #require(makeCache())
+        let image = try #require(makeImage())
+        let pending = PhotoUID(localPending: .photoLibrary, identifier: "shot")
+        let uploaded = uid("uploaded")
+        cache.beginFrame(pinned: [pending])
+        cache.uploadVisible(wanted: [pending]) { _ in image }
+
+        cache.adoptTexture(from: pending, to: uploaded)
+        #expect(cache.isResident(uploaded))
+        #expect(cache.texture(for: uploaded) === cache.texture(for: pending))
+        #expect(cache.thumbnailRevealOpacity(for: uploaded, now: 0) == 1, "the handover does not fade in")
+
+        // A Proton photo that already has its own texture keeps it.
+        let own = uid("own")
+        cache.beginFrame(pinned: [own])
+        cache.uploadVisible(wanted: [own]) { _ in image }
+        let ownTexture = cache.texture(for: own)
+        cache.adoptTexture(from: pending, to: own)
+        #expect(cache.texture(for: own) === ownTexture)
+    }
+
+    @Test(.enabled(if: MTLCreateSystemDefaultDevice() != nil))
     func changedPhotoKeepsItsTextureUntilTheNewImageUploads() throws {
         let cache = try #require(makeCache())
         let image = try #require(makeImage())

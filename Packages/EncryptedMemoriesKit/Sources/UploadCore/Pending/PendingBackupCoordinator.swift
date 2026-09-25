@@ -68,6 +68,9 @@ public actor PendingBackupCoordinator {
     /// The revision each cached metadata entry belongs to; a new revision can change the capture time.
     private var metadataRevision: [PendingSourceKey: UploadBackupRevision] = [:]
     private var inaccessible = Set<PendingSourceKey>()
+    /// Sources with a new revision whose metadata is read again. The tile keeps its current metadata until
+    /// then, so it never leaves the grid for a moment (the camera finishing a photo creates a revision).
+    private var staleMetadata = Set<PendingSourceKey>()
     private var liveProgress: [PendingSourceKey: (revision: UploadBackupRevision, step: Int)] = [:]
     private var retiring: [PendingSourceKey: UploadBackupRevision] = [:]
     private var actions: [PendingAction] = []
@@ -327,6 +330,7 @@ public actor PendingBackupCoordinator {
         for key in keys {
             metadata[key] = nil
             metadataRevision[key] = nil
+            staleMetadata.remove(key)
             inaccessible.insert(key)
             dirty.insert(key)
         }
@@ -404,9 +408,9 @@ public actor PendingBackupCoordinator {
         if let existing = rows[key], existing.revision > row.revision { return }
         rows[key] = row
         if let cached = metadataRevision[key], cached != row.revision {
-            // An edit can change the capture time and the media type.
-            metadata[key] = nil
-            metadataRevision[key] = nil
+            // An edit can change the capture time and the media type: read them again, and show the current
+            // ones meanwhile.
+            staleMetadata.insert(key)
             inaccessible.remove(key)
         }
     }
@@ -430,6 +434,7 @@ public actor PendingBackupCoordinator {
         checkmarkEnded[key] = nil
         metadata[key] = nil
         metadataRevision[key] = nil
+        staleMetadata.remove(key)
         inaccessible.remove(key)
     }
 
@@ -610,16 +615,25 @@ public actor PendingBackupCoordinator {
     private func refreshMetadata() async {
         // Admission decides which sources need metadata at all.
         updateUncheckedAdmission()
-        let missing = dirty.filter { metadata[$0] == nil && !inaccessible.contains($0) && isCandidate($0) }
+        let missing = dirty.filter {
+            (metadata[$0] == nil || staleMetadata.contains($0)) && !inaccessible.contains($0) && isCandidate($0)
+        }
         guard !missing.isEmpty else { return }
         let requested = Dictionary(uniqueKeysWithValues: missing.map { ($0, currentRevision($0)) })
         let fetched = await metadataProvider.metadata(for: Array(missing))
         guard !closed else { return }
         for key in missing {
             // The source may have left or changed revision while the fetch ran; its next event refetches.
-            guard metadata[key] == nil, isCandidate(key), currentRevision(key) == requested[key] else { continue }
+            guard metadata[key] == nil || staleMetadata.contains(key), isCandidate(key),
+                currentRevision(key) == requested[key]
+            else { continue }
             if let value = fetched[key] {
                 metadata[key] = value
+                metadataRevision[key] = requested[key] ?? nil
+                staleMetadata.remove(key)
+            } else if staleMetadata.remove(key) != nil {
+                // The catalog does not know the new revision yet; the current metadata stays until the next
+                // revision. A deleted photo leaves through `noteSourcesMissing`.
                 metadataRevision[key] = requested[key] ?? nil
             } else {
                 inaccessible.insert(key)
