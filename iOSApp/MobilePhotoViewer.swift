@@ -167,8 +167,9 @@ struct MobilePhotoViewer: View {
             // The filmstrip is bottom safe-area content, the Photos-app contract: the media refits when the chrome
             // toggles, and the native bottom bar stacks below the strip.
             .safeAreaInset(edge: .bottom, spacing: 0) { viewerBottomAccessory }
-            .navigationTitle(viewerTitle.line1)
-            .navigationSubtitle(viewerTitle.line2)
+            // The principal item draws both lines. A blank title string would render as quotation marks while
+            // a known location resolves, so the reserved line is hidden by opacity instead, as on the Mac.
+            .navigationTitle(viewerTitle.reservesLocationLine ? viewerTitle.line2 : viewerTitle.line1)
             .toolbarTitleDisplayMode(.inline)
             .toolbar { viewerToolbar }
             // The media background is always black; the bars keep light glyphs and titles over it.
@@ -291,6 +292,7 @@ struct MobilePhotoViewer: View {
     /// Regular iPad windows move the bottom bar items into the navigation bar; iPhone Duo moves both bars to
     /// the vertical edge. Photos and videos share this one toolbar, so paging never inserts or removes items.
     @ToolbarContentBuilder private var viewerToolbar: some ToolbarContent {
+        ToolbarItem(placement: .principal) { viewerTitleView }
         viewerCloseItem
         viewerMoreActions
         ToolbarItem(placement: .bottomBar) { viewerShareButton }
@@ -344,6 +346,21 @@ struct MobilePhotoViewer: View {
             }
             .mobileVisibilityPriority(.low)
         }
+    }
+
+    private var viewerTitleView: some View {
+        let title = viewerTitle
+        return VStack(spacing: 1) {
+            Text(verbatim: title.line1)
+                .font(.headline)
+                .opacity(title.reservesLocationLine ? 0 : 1)
+            Text(verbatim: title.line2)
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+        }
+        .lineLimit(1)
+        .multilineTextAlignment(.center)
+        .accessibilityElement(children: .combine)
     }
 
     /// The Apple-Photos-style two-line bar title: location or date first, date/time and position second. While a
