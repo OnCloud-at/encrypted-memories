@@ -148,26 +148,39 @@ public struct PhotoKitLocalMedia: Sendable {
 }
 
 /// Routes viewer media requests: local pending photos go to Apple Photos, every other identity to Proton.
+/// Media of pending files in watched Mac folders, supplied by the app, which owns folder access.
+public typealias LocalFileMedia = FullMediaProvider & VideoStreamProvider & OriginalFileProvider & PhotoMetadataProvider
+
 public struct LocalPendingMediaRouter: FullMediaProvider, VideoStreamProvider, OriginalByteStreamProvider,
     OriginalFileProvider, PhotoMetadataProvider
 {
     private let remote: (any FullMediaProvider)?
     private let remoteVideo: (any VideoStreamProvider)?
     private let local: PhotoKitLocalMedia
+    private let files: (any LocalFileMedia)?
     /// The viewer's first-frame size for local previews.
     private let previewPixelSize: CGFloat
 
     public init(
         remote: (any FullMediaProvider)?, remoteVideo: (any VideoStreamProvider)?,
-        imageRequest: @escaping PhotoKitImageRequest, previewPixelSize: CGFloat = 2048
+        imageRequest: @escaping PhotoKitImageRequest, files: (any LocalFileMedia)? = nil,
+        previewPixelSize: CGFloat = 2048
     ) {
         self.remote = remote
         self.remoteVideo = remoteVideo
         self.local = PhotoKitLocalMedia(request: imageRequest)
+        self.files = files
         self.previewPixelSize = previewPixelSize
     }
 
+    private func fileMedia(for uid: PhotoUID) throws -> (any LocalFileMedia)? {
+        guard uid.localPendingNamespace == .file else { return nil }
+        guard let files else { throw PhotoKitLocalMedia.LocalMediaError.unavailable }
+        return files
+    }
+
     public func metadata(for uid: PhotoUID) async throws -> PhotoMetadata {
+        if let files = try fileMedia(for: uid) { return try await files.metadata(for: uid) }
         if uid.isLocalPending { return try await local.metadata(for: uid) }
         guard let provider = remote as? any PhotoMetadataProvider else {
             throw PhotoKitLocalMedia.LocalMediaError.unavailable
@@ -180,6 +193,9 @@ public struct LocalPendingMediaRouter: FullMediaProvider, VideoStreamProvider, O
         to destination: URL,
         onProgress: @escaping @Sendable (Double) -> Void
     ) async throws {
+        if let files = try fileMedia(for: uid) {
+            return try await files.writeOriginal(for: uid, to: destination, onProgress: onProgress)
+        }
         if uid.isLocalPending {
             return try await local.writeOriginal(for: uid, to: destination, onProgress: onProgress)
         }
@@ -190,12 +206,14 @@ public struct LocalPendingMediaRouter: FullMediaProvider, VideoStreamProvider, O
     }
 
     public func preview(for uid: PhotoUID) async throws -> Data {
+        if let files = try fileMedia(for: uid) { return try await files.preview(for: uid) }
         if uid.isLocalPending { return try await local.preview(for: uid, maxPixelSize: previewPixelSize) }
         guard let remote else { throw PhotoKitLocalMedia.LocalMediaError.unavailable }
         return try await remote.preview(for: uid)
     }
 
     public func originalData(for uid: PhotoUID, onProgress: @escaping @Sendable (Double) -> Void) async throws -> Data {
+        if let files = try fileMedia(for: uid) { return try await files.originalData(for: uid, onProgress: onProgress) }
         if uid.isLocalPending {
             let data = try await local.originalData(for: uid)
             onProgress(1)
@@ -219,6 +237,7 @@ public struct LocalPendingMediaRouter: FullMediaProvider, VideoStreamProvider, O
     }
 
     public func makeStreamingAsset(for uid: PhotoUID) async throws -> StreamingVideoAsset {
+        if let files = try fileMedia(for: uid) { return try await files.makeStreamingAsset(for: uid) }
         if uid.isLocalPending { return try await local.streamingAsset(for: uid) }
         guard let remoteVideo else { throw PhotoKitLocalMedia.LocalMediaError.unavailable }
         return try await remoteVideo.makeStreamingAsset(for: uid)

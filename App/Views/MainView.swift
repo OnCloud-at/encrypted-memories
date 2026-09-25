@@ -1017,7 +1017,8 @@ struct MainView: View {
     /// Shows local photos on their way to Proton in the whole-library grid.
     private func attachPendingGrid() {
         guard let session = model.pendingGrid else { return }
-        session.attachFeed(timelineModel.feed.feedCore, imageRequest: PhotoKitPlatformImages.request)
+        session.attachFeed(
+            timelineModel.feed.feedCore, imageRequest: PhotoKitPlatformImages.request, fileThumbnails: folderMedia)
         session.presenter.onChange = { [timelineModel] presentation in
             timelineModel.setPendingPresentation(presentation)
         }
@@ -1032,9 +1033,15 @@ struct MainView: View {
         return model.pendingGrid?.displayedFavorites(favorites) ?? favorites
     }
 
+    /// Pending files of the watched backup folders.
+    private var folderMedia: PendingFolderMedia? {
+        model.backupController.map { PendingFolderMedia(access: $0.pendingAccess) }
+    }
+
     /// Viewer, export and drag-out media: pending photos from Apple Photos, every other photo from Proton.
     private var media: LocalPendingMediaRouter {
-        LocalPendingMediaRouter(remote: backend, remoteVideo: backend, imageRequest: PhotoKitPlatformImages.request)
+        LocalPendingMediaRouter(
+            remote: backend, remoteVideo: backend, imageRequest: PhotoKitPlatformImages.request, files: folderMedia)
     }
 
     /// Takes photos that are not backed up yet out of the backup; they stay in Apple Photos. The deletion can

@@ -517,7 +517,6 @@ final class AppModel {
                     return
                 }
                 facade = client
-                backupController = FolderBackupController(facade: client)
                 let pendingStore = PendingGridSession.openStore(
                     accountDataDirectory: client.accountDataDirectory,
                     policy: client.accountDatabasePolicy
@@ -535,7 +534,12 @@ final class AppModel {
                 )
                 photoBackupController = photoBackup
                 photoBackupScheduler.configure(controller: photoBackup)
-                configurePendingGrid(store: pendingStore, photoBackup: photoBackup, client: client)
+                // Watched folders share the pending store and the photo backup's event stream.
+                let folderBackup = FolderBackupController(
+                    facade: client, pendingStore: pendingStore, pendingRecorder: photoBackup.pendingRecorder)
+                backupController = folderBackup
+                configurePendingGrid(
+                    store: pendingStore, photoBackup: photoBackup, folderBackup: folderBackup, client: client)
                 let albumSync = AlbumSyncController(
                     configuration: .init(
                         accountDataDirectory: client.accountDataDirectory,
@@ -569,6 +573,7 @@ final class AppModel {
     private func configurePendingGrid(
         store: PendingBackupManifestStore?,
         photoBackup: PhotoLibraryBackupController,
+        folderBackup: FolderBackupController,
         client: ProtonClientFacade
     ) {
         pendingStore = store
@@ -576,7 +581,8 @@ final class AppModel {
             let session = PendingGridSession(
                 store: store,
                 photoBackup: photoBackup,
-                remote: ProtonPendingRemoteEffects(facade: client)
+                remote: ProtonPendingRemoteEffects(facade: client),
+                files: folderBackup.pendingFileSource
             )
         else { return }
         session.onListsChange = { [weak self, weak session] in

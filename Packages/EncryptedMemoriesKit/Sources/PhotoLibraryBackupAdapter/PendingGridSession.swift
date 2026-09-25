@@ -1,4 +1,6 @@
+import CoreGraphics
 import Foundation
+import MediaDecodingCore
 import MediaFeedCore
 import Observation
 import PhotosCore
@@ -38,6 +40,14 @@ public final class PendingGridSession {
     private var snapshotTask: Task<Void, Never>?
     private var isBackupEnabled = false
     private var started = false
+    /// Watched Mac folders feed the session too; their files show even while photo backup is off.
+    private let hasFileSource: Bool
+    /// The snapshot as the grid and lists show it: without Apple Photos tiles while photo backup is off.
+    private var presented = PendingBackupSnapshot.empty
+    private var presentedFileTiles:
+        (revision: UInt64, tiles: [PendingTile], trash: [PendingTile], excluded: [PendingTile])?
+    /// Anything shows: photo backup runs, or watched folders exist.
+    private var showsPending: Bool { isBackupEnabled || hasFileSource }
 
     /// Opens the device-local pending store in the account data directory. Nil when it cannot open; backup
     /// then reports itself unavailable, because deleted pending photos could otherwise upload.
@@ -50,10 +60,12 @@ public final class PendingGridSession {
         )
     }
 
+    /// `files` adds the Mac's watched folders; their backup runner must record into `photoBackup.pendingRecorder`.
     public init?(
         store: PendingBackupManifestStore,
         photoBackup: PhotoLibraryBackupController,
-        remote: any PendingRemoteEffects
+        remote: any PendingRemoteEffects,
+        files: PendingFileSource? = nil
     ) {
         guard let recorder = photoBackup.pendingRecorder,
             let queue = photoBackup.pendingQueue,
@@ -61,11 +73,14 @@ public final class PendingGridSession {
         else { return nil }
         let volume = PhotosVolumeBox()
         self.volume = volume
+        hasFileSource = files != nil
+        var queues: [UploadSourceIdentity.Kind: any UploadBackupSyncQueueObserving] = [.photoLibraryAsset: queue]
+        if let files { queues[.fileURL] = files.queue }
         coordinator = PendingBackupCoordinator(
             store: store,
-            queues: [.photoLibraryAsset: queue],
-            metadataProvider: metadata,
-            effects: SessionEffects(photoBackup: photoBackup, remote: remote, volume: volume),
+            queues: queues,
+            metadataProvider: SessionMetadata(photos: metadata, files: files?.metadata),
+            effects: SessionEffects(photoBackup: photoBackup, files: files, remote: remote, volume: volume),
             recorder: recorder
         )
         self.photoBackup = photoBackup
@@ -83,23 +98,30 @@ public final class PendingGridSession {
 
     /// Lets `feed` load thumbnails of local photos from Apple Photos, and keeps its authorization current.
     /// `imageRequest` is the platform's `PhotoKitPlatformImages.request`.
-    public func attachFeed(_ feed: ThumbnailFeedCore, imageRequest: @escaping PhotoKitImageRequest) {
+    /// `fileThumbnails` loads watched-folder files on the Mac.
+    public func attachFeed(
+        _ feed: ThumbnailFeedCore,
+        imageRequest: @escaping PhotoKitImageRequest,
+        fileThumbnails: (any LocalThumbnailLoading)? = nil
+    ) {
         guard feed !== self.feed else { return }
         let previous = self.feed
         self.feed = feed
         let authorized = authorizedLocalUIDs
         enqueueFeedUpdate {
             if let previous { await Self.detach(previous) }
-            await feed.setLocalThumbnailLoader(PhotoKitLocalThumbnailLoader(request: imageRequest))
+            await feed.setLocalThumbnailLoader(
+                LocalThumbnailRouter(photos: PhotoKitLocalThumbnailLoader(request: imageRequest), files: fileThumbnails)
+            )
             await feed.setLocalAuthorization(authorized)
         }
     }
 
     private func publishFeedAuthorization(adoptions: [(local: PhotoUID, remote: PhotoUID)] = []) {
         var nextAuthorized = gridLocalUIDs
-        if isBackupEnabled {
-            nextAuthorized.formUnion(pendingSnapshot.trashTiles.map(\.item.uid))
-            nextAuthorized.formUnion(pendingSnapshot.excludedTiles.map(\.item.uid))
+        if showsPending {
+            nextAuthorized.formUnion(presented.trashTiles.map(\.item.uid))
+            nextAuthorized.formUnion(presented.excludedTiles.map(\.item.uid))
         }
         let authorized = nextAuthorized
         guard authorized != authorizedLocalUIDs || !adoptions.isEmpty else { return }
@@ -145,7 +167,8 @@ public final class PendingGridSession {
                 guard let self else { return }
                 let membershipChanged = snapshot.membershipRevision != self.pendingSnapshot.membershipRevision
                 self.pendingSnapshot = snapshot
-                self.presenter.setPending(snapshot, enabled: self.isBackupEnabled)
+                self.presented = self.present(snapshot)
+                self.presenter.setPending(self.presented, enabled: self.showsPending)
                 // Progress ticks leave the lists unchanged; only membership changes can change authorization.
                 if membershipChanged {
                     self.publishFeedAuthorization()
@@ -166,14 +189,38 @@ public final class PendingGridSession {
     private func setBackupEnabled(_ enabled: Bool) {
         guard enabled != isBackupEnabled else { return }
         isBackupEnabled = enabled
-        presenter.setPending(pendingSnapshot, enabled: enabled)
+        presented = present(pendingSnapshot)
+        presenter.setPending(presented, enabled: showsPending)
         publishFeedAuthorization()
         refreshLists()
     }
 
+    /// Everything while photo backup runs; only watched-folder files while it is off. The membership revision
+    /// changes with the filter, so the presenter rebuilds when photo backup turns on or off.
+    private func present(_ snapshot: PendingBackupSnapshot) -> PendingBackupSnapshot {
+        guard hasFileSource, !isBackupEnabled else { return snapshot }
+        let isFile: (PendingTile) -> Bool = { $0.key.kind == .fileURL }
+        if presentedFileTiles?.revision != snapshot.membershipRevision {
+            presentedFileTiles = (
+                snapshot.membershipRevision, snapshot.tiles.filter(isFile), snapshot.trashTiles.filter(isFile),
+                snapshot.excludedTiles.filter(isFile)
+            )
+        }
+        let files = presentedFileTiles!
+        return PendingBackupSnapshot(
+            membershipRevision: snapshot.membershipRevision | (1 << 63),
+            progressRevision: snapshot.progressRevision,
+            tiles: files.tiles,
+            progress: snapshot.progress.filter { $0.key.localPendingNamespace == .file },
+            trashTiles: files.trash,
+            excludedTiles: files.excluded,
+            favoriteIntents: snapshot.favoriteIntents.filter { $0.key.localPendingNamespace == .file }
+        )
+    }
+
     private func refreshLists() {
-        let trashItems = isBackupEnabled ? pendingSnapshot.trashTiles.map(\.item) : []
-        let excluded = isBackupEnabled ? pendingSnapshot.excludedTiles : []
+        let trashItems = showsPending ? presented.trashTiles.map(\.item) : []
+        let excluded = showsPending ? presented.excludedTiles : []
         guard Set(trashItems.map(\.uid)) != trash.localUIDs || excluded != excludedTiles else { return }
         trash = PendingTrashPresentation(items: trashItems)
         excludedTiles = excluded
@@ -181,7 +228,7 @@ public final class PendingGridSession {
     }
 
     /// Whether pending photos show now (backup on, available, and allowed to read the Photos library).
-    public var isShowingPendingPhotos: Bool { isBackupEnabled }
+    public var isShowingPendingPhotos: Bool { showsPending }
 
     /// Favorites as the app shows them: Proton favorites plus the desired states of pending photos, which the
     /// backup applies after the upload.
@@ -229,6 +276,8 @@ public final class PendingGridSession {
         await coordinator.close()
         presenter.reset()
         pendingSnapshot = .empty
+        presented = .empty
+        presentedFileTiles = nil
         gridLocalUIDs = []
         authorizedLocalUIDs = []
         trash = .empty
@@ -252,20 +301,81 @@ private final class PhotosVolumeBox: @unchecked Sendable {
     func get() -> String? { lock.withLock { value } }
 }
 
+/// Watched Mac folders as a second backup source of the pending grid. The app owns folder access; the folder
+/// backup runner records into the photo backup's pending recorder, so one event stream serves both.
+public struct PendingFileSource: Sendable {
+    public let queue: any UploadBackupSyncQueueObserving
+    public let metadata: any PendingSourceMetadataProviding
+    /// Removes excluded files (standardized paths) from queued and in-flight backup work.
+    public let removeFromBackup: @Sendable ([String]) async -> Bool
+    /// Enqueues restored files again.
+    public let returnToBackup: @Sendable ([String]) async -> Bool
+
+    public init(
+        queue: any UploadBackupSyncQueueObserving,
+        metadata: any PendingSourceMetadataProviding,
+        removeFromBackup: @escaping @Sendable ([String]) async -> Bool,
+        returnToBackup: @escaping @Sendable ([String]) async -> Bool
+    ) {
+        self.queue = queue
+        self.metadata = metadata
+        self.removeFromBackup = removeFromBackup
+        self.returnToBackup = returnToBackup
+    }
+}
+
+/// Tile metadata from the source that owns each key.
+private struct SessionMetadata: PendingSourceMetadataProviding {
+    let photos: any PendingSourceMetadataProviding
+    let files: (any PendingSourceMetadataProviding)?
+
+    func metadata(for keys: [PendingSourceKey]) async -> [PendingSourceKey: PendingPresentationMetadata] {
+        let photoKeys = keys.filter { $0.kind == .photoLibraryAsset }
+        let fileKeys = keys.filter { $0.kind == .fileURL }
+        var result = photoKeys.isEmpty ? [:] : await photos.metadata(for: photoKeys)
+        if let files, !fileKeys.isEmpty {
+            result.merge(await files.metadata(for: fileKeys)) { current, _ in current }
+        }
+        return result
+    }
+}
+
+/// Thumbnails of local photos from the source that owns each identity.
+private struct LocalThumbnailRouter: LocalThumbnailLoading {
+    let photos: PhotoKitLocalThumbnailLoader
+    let files: (any LocalThumbnailLoading)?
+
+    func thumbnails(for uids: [PhotoUID], maxPixelSize: CGFloat) async -> [PhotoUID: DecodedThumbnail] {
+        let photoUIDs = uids.filter { $0.localPendingNamespace == .photoLibrary }
+        let fileUIDs = uids.filter { $0.localPendingNamespace == .file }
+        var result = photoUIDs.isEmpty ? [:] : await photos.thumbnails(for: photoUIDs, maxPixelSize: maxPixelSize)
+        if let files, !fileUIDs.isEmpty {
+            result.merge(await files.thumbnails(for: fileUIDs, maxPixelSize: maxPixelSize)) { current, _ in current }
+        }
+        return result
+    }
+}
+
 private struct SessionEffects: PendingBackupEffects {
     let photoBackup: PhotoLibraryBackupController
+    let files: PendingFileSource?
     let remote: any PendingRemoteEffects
     let volume: PhotosVolumeBox
 
     func removeFromBackup(kind: UploadSourceIdentity.Kind, identifiers: [String]) async -> Bool {
-        guard kind == .photoLibraryAsset else { return true }
-        return await photoBackup.removeFromBackup(identifiers: identifiers)
+        switch kind {
+        case .photoLibraryAsset: await photoBackup.removeFromBackup(identifiers: identifiers)
+        case .fileURL: await files?.removeFromBackup(identifiers) ?? true
+        }
     }
 
     func returnToBackup(_ keys: [PendingSourceKey]) async -> Bool {
-        let identifiers = keys.filter { $0.kind == .photoLibraryAsset }.map(\.identifier)
-        guard !identifiers.isEmpty else { return true }
-        return await photoBackup.returnToBackup(identifiers: identifiers)
+        let photos = keys.filter { $0.kind == .photoLibraryAsset }.map(\.identifier)
+        let fileKeys = keys.filter { $0.kind == .fileURL }.map(\.identifier)
+        var succeeded = true
+        if !photos.isEmpty { succeeded = await photoBackup.returnToBackup(identifiers: photos) }
+        if !fileKeys.isEmpty, let files { succeeded = await files.returnToBackup(fileKeys) && succeeded }
+        return succeeded
     }
 
     func photosVolumeID() async -> String? { volume.get() }

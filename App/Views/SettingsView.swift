@@ -118,6 +118,18 @@ private struct BackupSettingsTab: View {
     let uploadCoordinator: UploadCoordinator?
     let appModel: AppModel
 
+    /// Apple Photos items through PhotoKit, watched-folder files through QuickLook.
+    private var excludedThumbnail: @Sendable (PhotoUID) async -> CGImage? {
+        let photos = PhotoKitLocalThumbnailLoader(request: PhotoKitPlatformImages.request)
+        let files = appModel.backupController.map { PendingFolderMedia(access: $0.pendingAccess) }
+        return { uid in
+            if uid.localPendingNamespace == .file {
+                return await files?.thumbnails(for: [uid], maxPixelSize: 120)[uid]?.image
+            }
+            return await photos.listThumbnail(for: uid)
+        }
+    }
+
     var body: some View {
         Form {
             if let photoBackup {
@@ -130,7 +142,7 @@ private struct BackupSettingsTab: View {
             if !appModel.excludedPendingTiles.isEmpty {
                 PendingExcludedPhotosSection(
                     tiles: appModel.excludedPendingTiles,
-                    thumbnail: PhotoKitLocalThumbnailLoader(request: PhotoKitPlatformImages.request).listThumbnail(for:)
+                    thumbnail: excludedThumbnail
                 ) { tile in
                     await appModel.pendingGrid?.restore([tile.item.uid])
                 }
