@@ -419,6 +419,7 @@ public actor MLSmartSearchLifecycle {
         guard !isShutDown else { return }
         isShutDown = true
         activationGeneration &+= 1
+        recommendedStartTask?.cancel()
         await stopActivations()
         await stopCatalogRefreshLoop()
         await stopIndexing()
@@ -737,10 +738,15 @@ public actor MLSmartSearchLifecycle {
             // Off: only the model list can fail, while Smart Search switches on or the person chooses a model.
             if failure.kind == .catalog {
                 if pendingRecommendedEnable != nil {
-                    // As the start's own task, so a newer intent can stop it like the first attempt.
+                    // As the start's own task, so a newer intent can stop it like the first attempt. The phase
+                    // leaves the failure before the first suspension, so a second Retry tap starts nothing.
                     let intent = startIntentSequence
-                    recommendedStartTask = Task { await self.startRecommended(intent: intent) }
-                    await recommendedStartTask?.value
+                    recommendedStartTask?.cancel()
+                    phase = .loadingCatalog
+                    emit()
+                    let task = Task { await self.startRecommended(intent: intent) }
+                    recommendedStartTask = task
+                    await task.value
                 } else {
                     await loadModelChoices()
                 }
@@ -2372,6 +2378,7 @@ public actor MLSmartSearchLifecycle {
     /// completes on next start).
     private func performPurge() async {
         activationGeneration &+= 1
+        recommendedStartTask?.cancel()
         pendingRecommendedEnable = nil
         // Journal first: any crash from here on re-runs the purge. If the journal itself
         // cannot be written, the purge does not start silently; the failure phase is honest

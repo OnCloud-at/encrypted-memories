@@ -733,8 +733,10 @@ import Testing
         }
 
         var isHolding: Bool { held != nil }
+        private(set) var requestCount = 0
 
         func catalog() async throws -> MLModelCatalog {
+            requestCount += 1
             guard !script.isEmpty else { return value }
             switch script.removeFirst() {
             case .fail:
@@ -1558,6 +1560,49 @@ import Testing
         #expect(stored.pendingOperation == .switchModel(from: entryA.id, to: entryB.id), "the journal stays intact")
         #expect(stored.selectedModelID == entryB.id)
         #expect(harness.transport.downloadCount == 2, "the choice waits instead of downloading")
+
+        // A developer install waits too, so the failure and its Retry stay visible.
+        let artifact = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ml-dev-artifact-\(UUID().uuidString)", isDirectory: true)
+        let model = artifact.appendingPathComponent("Test.mlmodelc", isDirectory: true)
+        try FileManager.default.createDirectory(at: model, withIntermediateDirectories: true)
+        try Data("weights".utf8).write(to: model.appendingPathComponent("model.bin"))
+        defer { try? FileManager.default.removeItem(at: artifact) }
+        await harness.lifecycle.installDeveloperModel(from: artifact, for: entryC.id)
+        guard case .failed(let failure) = await harness.lifecycle.currentSnapshot().phase else {
+            Issue.record("the failed switch must stay visible")
+            return
+        }
+        #expect(failure.isRetryable)
+        #expect(!FileManager.default.fileExists(atPath: harness.layout.modelDirectory(for: entryC.id).path))
+    }
+
+    @Test func aSecondRetryTapStartsNoSecondSwitchOn() async throws {
+        let payload = Data("model".utf8)
+        let (entry, url) = downloadableEntry(id: "model", payload: payload)
+        let catalogProvider = ScriptedCatalogProvider(MLModelCatalog(entries: [entry]), script: [.fail, .hold, .hold])
+        let harness = try makeHarness(
+            catalog: MLModelCatalog(entries: []),
+            payloads: [url: payload],
+            assets: [uid("asset")],
+            catalogProvider: catalogProvider
+        )
+        defer { try? FileManager.default.removeItem(at: harness.layout.rootDirectory) }
+
+        await harness.lifecycle.start()
+        await harness.lifecycle.enableRecommended(preferredLanguages: ["en"], intent: 1)
+        await harness.lifecycle.awaitRecommendedStart()
+        let first = Task { await harness.lifecycle.retry() }
+        let second = Task { await harness.lifecycle.retry() }
+        #expect(await waitUntil { await catalogProvider.isHolding })
+
+        await harness.lifecycle.cancelRecommendedEnable(intent: 2)
+        await catalogProvider.failHeldRequest()
+        await first.value
+        await second.value
+
+        #expect(await catalogProvider.requestCount == 2, "one list request per Retry, not per tap")
+        #expect(await harness.lifecycle.currentSnapshot().phase == .disabled)
     }
 
     @Test func enablingAgainSwitchesToTheChosenModel() async throws {
