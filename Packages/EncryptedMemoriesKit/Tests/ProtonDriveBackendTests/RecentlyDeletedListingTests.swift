@@ -69,18 +69,31 @@ struct RecentlyDeletedListingTests {
         let unknownToTheLibrary = PhotoUID(volumeID: "volume", nodeID: "not-in-library")
         var identities = RecentlyDeletedIdentities(listing: [listed])
 
+        // A listing that started before the trash request cannot know the new photos and changes nothing.
+        let early = identities.beginListing()
         identities.trashed([trashedHere.uid, unknownToTheLibrary], items: [trashedHere])
         #expect(identities.ordered == [unknownToTheLibrary, trashedHere.uid, listed.uid])
         #expect(identities.listing == [listed, trashedHere], "a relaunch must keep the photo trashed here")
-
-        // A listing that lags behind the trash request must not release the new photos.
-        receive([listed], into: &identities)
-        #expect(identities.ordered == [unknownToTheLibrary, trashedHere.uid, listed.uid])
+        let earlyApplied = identities.received([listed], ticket: early)
+        #expect(!earlyApplied)
         #expect(identities.listing == [listed, trashedHere])
 
+        // The next listing shows both photos.
         receive([listed, trashedHere], into: &identities)
-        #expect(identities.ordered == [unknownToTheLibrary, trashedHere.uid, listed.uid])
+        #expect(identities.ordered == [trashedHere.uid, listed.uid])
         #expect(identities.listing == [listed, trashedHere])
+    }
+
+    @Test func aPhotoTrashedHereAndRestoredElsewhereLeavesWithTheNextListing() {
+        let listed = Self.item("listed", at: 1)
+        let restoredElsewhere = Self.item("restored-elsewhere", at: 5)
+        var identities = RecentlyDeletedIdentities(listing: [listed])
+        identities.trashed([restoredElsewhere.uid], items: [restoredElsewhere])
+
+        receive([listed], into: &identities)
+
+        #expect(identities.ordered == [listed.uid])
+        #expect(identities.listing == [listed], "Recently Deleted must not show a photo that is back in the library")
     }
 
     @Test func restoredPhotosStayRegisteredUntilOneRefreshAfterTheLibraryListsThemAgain() {
