@@ -6,8 +6,9 @@ import os
 
 /// Resolves a PhotoKit queue entry in two stages. It first streams each original only to compute its
 /// identity (O(chunk) memory, no temp file). Core materializes verbatim bytes into the bounded temp
-/// store only if dedupe returns `.upload`. HEIC stays HEIC and MOV stays MOV; `PHImageManager` is
-/// never used.
+/// store only if dedupe returns `.upload`. An original that exists only in iCloud is the exception: its
+/// identity pass downloads it once and stages it, and the upload reuses that file. HEIC stays HEIC and
+/// MOV stays MOV; `PHImageManager` is never used.
 public struct PhotoLibraryResourceResolver: BackupResourceResolving {
     /// A new photo the camera still processes (deferred photo processing: a `.photoProxy` resource, alone or
     /// next to a preliminary image) waits up to this long after its capture for the finished one. The change
@@ -88,7 +89,8 @@ public struct PhotoLibraryResourceResolver: BackupResourceResolving {
         }
         let primaryIdentity = try await readIdentity(
             primaryResource,
-            filename: plan.primary.uploadFilename
+            filename: plan.primary.uploadFilename,
+            tracking: exportedURLs
         ) { fraction in
             identityProgress(0, fraction)
         }
@@ -101,6 +103,7 @@ public struct PhotoLibraryResourceResolver: BackupResourceResolving {
         )
         let primaryRole = plan.primary.role
         let primaryByteCount = primaryIdentity.byteCount
+        let primaryStaged = StagedExport(primaryIdentity.staged)
         let localIdentifier = entry.source.identifier
         let tempStore = self.tempStore
         let primaryMaterializer:
@@ -118,6 +121,7 @@ public struct PhotoLibraryResourceResolver: BackupResourceResolving {
                     resource,
                     uploadFilename: plan.primary.uploadFilename,
                     expectedBytes: primaryByteCount,
+                    staged: primaryStaged,
                     tempStore: tempStore,
                     tracking: exportedURLs,
                     onProgress: {
@@ -164,7 +168,9 @@ public struct PhotoLibraryResourceResolver: BackupResourceResolving {
             guard let resource = PhotoKitAssetMapper.resource(for: role, ordinal: ordinal, of: owner) else {
                 throw UploadError.fileMissing(item.uploadFilename)
             }
-            let identity = try await readIdentity(resource, filename: item.uploadFilename) { fraction in
+            let identity = try await readIdentity(
+                resource, filename: item.uploadFilename, tracking: exportedURLs
+            ) { fraction in
                 identityProgress(secondaryIndex + 1, fraction)
             }
             let source = UploadSourceIdentity(
@@ -177,6 +183,7 @@ public struct PhotoLibraryResourceResolver: BackupResourceResolving {
             let stableDate = isBurstMember ? owner.creationDate ?? captureDate : captureDate
             let filename = item.uploadFilename
             let expectedByteCount = identity.byteCount
+            let staged = StagedExport(identity.staged)
             let materializer: @Sendable (BackupResourcePreparationReporter) async throws -> UploadResourceDescriptor = {
                 progress in
                 guard
@@ -191,6 +198,7 @@ public struct PhotoLibraryResourceResolver: BackupResourceResolving {
                     currentResource,
                     uploadFilename: filename,
                     expectedBytes: expectedByteCount,
+                    staged: staged,
                     tempStore: tempStore,
                     tracking: exportedURLs,
                     onProgress: {
@@ -261,6 +269,24 @@ public struct PhotoLibraryResourceResolver: BackupResourceResolving {
     private struct IdentityResult {
         let byteCount: Int64
         let sha1Digest: Data
+        /// The original in the temp store when the identity pass had to download it from iCloud.
+        let staged: ExportResult?
+    }
+
+    /// Gives the file that the identity pass staged to the first export of the resource, once. A later export of the
+    /// same resource reads the original again.
+    private final class StagedExport: @unchecked Sendable {
+        private let lock = NSLock()
+        private var export: ExportResult?
+
+        init(_ export: ExportResult?) { self.export = export }
+
+        func take() -> ExportResult? {
+            lock.withLock {
+                defer { export = nil }
+                return export
+            }
+        }
     }
 
     private static func identityDescriptor(
@@ -323,57 +349,75 @@ public struct PhotoLibraryResourceResolver: BackupResourceResolving {
         }
     }
 
-    /// Hashes one PhotoKit resource without materializing it. This is the common path for a library
-    /// that is already backed up: original bytes are read once, but no temp I/O is paid.
+    /// Hashes one PhotoKit resource. An original on the device is read without network access and without temp I/O:
+    /// the common path for a library that is already backed up. An original that exists only in iCloud downloads
+    /// once: the same pass hashes it and stages it in the temp store, so its upload does not download it again.
     private func readIdentity(
         _ resource: PHAssetResource,
         filename: String,
+        tracking exported: ExportedURLBox,
         onProgress: @escaping @Sendable (Double) -> Void
     ) async throws -> IdentityResult {
-        let sha1 = UploadSHA1Accumulator()
-        let options = PHAssetResourceRequestOptions()
-        options.isNetworkAccessAllowed = true
         let progressGate = FractionProgressGate(onProgress)
-        let manager = PHAssetResourceManager.default()
-        let liveness = PhotoKitResourceRequestLivenessGuard<PHAssetResourceDataRequestID>(
-            cancelRequest: { manager.cancelDataRequest($0) }
-        )
-        options.progressHandler = {
-            liveness.markActivity()
-            progressGate.publish($0)
-        }
+        let sha1 = UploadSHA1Accumulator()
         final class ReadBox: @unchecked Sendable {
             var bytes: Int64 = 0
         }
         let box = ReadBox()
-        try await liveness.waitForCompletion {
-            manager.requestData(for: resource, options: options) { data in
-                liveness.receiveData {
-                    sha1.update(data)
-                    box.bytes += Int64(data.count)
-                }
-            } completionHandler: { error in
-                liveness.complete(
-                    error: error.map {
-                        Self.normalizedPhotoKitError($0, filename: filename)
-                    }
-                )
+        do {
+            try await Self.requestData(
+                for: resource, networkAccessAllowed: false, progressGate: progressGate
+            ) { data in
+                sha1.update(data)
+                box.bytes += Int64(data.count)
             }
+            progressGate.publish(1)
+            return IdentityResult(byteCount: box.bytes, sha1Digest: sha1.finalizeDigest(), staged: nil)
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            // Not on this device (PhotoKit reports that network access is required). Any other local failure also
+            // gets one networked pass, which reports the definitive error.
+        }
+
+        let sink = PhotoKitStagingSink(tempStore: tempStore, filename: filename)
+        do {
+            try await Self.requestData(
+                for: resource, networkAccessAllowed: true, progressGate: progressGate
+            ) { data in
+                sink.receive(data)
+            }
+        } catch {
+            sink.abandon()
+            throw Self.normalizedPhotoKitError(error, filename: filename)
         }
         progressGate.publish(1)
-        return IdentityResult(byteCount: box.bytes, sha1Digest: sha1.finalizeDigest())
+        let result = sink.finish()
+        Self.logger.notice(
+            "[Backup] original from iCloud staged=\(result.stagedURL != nil, privacy: .public)")
+        let staged = result.stagedURL.map { url in
+            exported.append(url)
+            return ExportResult(url: url, byteCount: result.byteCount, sha1Digest: result.sha1Digest)
+        }
+        return IdentityResult(byteCount: result.byteCount, sha1Digest: result.sha1Digest, staged: staged)
     }
 
-    /// Materializes one resource only after Core selected it for upload. Chunks go straight to the
-    /// temp file and are hashed again so the runner can reject a source that changed after preflight.
+    /// Materializes one resource only after Core selected it for upload. It reuses the file the identity pass
+    /// staged; otherwise chunks go straight to the temp file and are hashed again so the runner can reject a
+    /// source that changed after preflight.
     private static func export(
         _ resource: PHAssetResource,
         uploadFilename: String,
         expectedBytes: Int64,
+        staged: StagedExport,
         tempStore: BackupTempFileStore,
         tracking exported: ExportedURLBox,
         onProgress: @escaping @Sendable (Double) -> Void
     ) async throws -> ExportResult {
+        if let export = staged.take() {
+            onProgress(1)
+            return export
+        }
         let partialURL = try tempStore.reserve(filename: uploadFilename, expectedBytes: expectedBytes)
         do {
             guard FileManager.default.createFile(atPath: partialURL.path, contents: nil) else {
@@ -382,40 +426,26 @@ public struct PhotoLibraryResourceResolver: BackupResourceResolving {
             let handle = try FileHandle(forWritingTo: partialURL)
             defer { try? handle.close() }
             let sha1 = UploadSHA1Accumulator()
-            let options = PHAssetResourceRequestOptions()
-            options.isNetworkAccessAllowed = true
             let progressGate = FractionProgressGate(onProgress)
-            let manager = PHAssetResourceManager.default()
-            let liveness = PhotoKitResourceRequestLivenessGuard<PHAssetResourceDataRequestID>(
-                cancelRequest: { manager.cancelDataRequest($0) }
-            )
-            options.progressHandler = {
-                liveness.markActivity()
-                progressGate.publish($0)
-            }
 
             final class WriteBox: @unchecked Sendable {
                 var bytes: Int64 = 0
             }
             let box = WriteBox()
-            try await liveness.waitForCompletion {
-                manager.requestData(for: resource, options: options) { data in
-                    liveness.receiveData {
-                        try tempStore.recordWrite(to: partialURL, byteCount: data.count)
-                        try handle.write(contentsOf: data)
-                        sha1.update(data)
-                        box.bytes += Int64(data.count)
-                        if expectedBytes > 0 {
-                            progressGate.publish(Double(box.bytes) / Double(expectedBytes))
-                        }
+            do {
+                try await requestData(
+                    for: resource, networkAccessAllowed: true, progressGate: progressGate
+                ) { data in
+                    try tempStore.recordWrite(to: partialURL, byteCount: data.count)
+                    try handle.write(contentsOf: data)
+                    sha1.update(data)
+                    box.bytes += Int64(data.count)
+                    if expectedBytes > 0 {
+                        progressGate.publish(Double(box.bytes) / Double(expectedBytes))
                     }
-                } completionHandler: { error in
-                    liveness.complete(
-                        error: error.map {
-                            normalizedPhotoKitError($0, filename: uploadFilename)
-                        }
-                    )
                 }
+            } catch {
+                throw normalizedPhotoKitError(error, filename: uploadFilename)
             }
             progressGate.publish(1)
 
@@ -426,6 +456,33 @@ public struct PhotoLibraryResourceResolver: BackupResourceResolving {
         } catch {
             tempStore.discard(partialURL)
             throw error
+        }
+    }
+
+    /// Streams one PhotoKit resource into `receive`, which runs under the liveness guard's lock. A throwing `receive`
+    /// ends the request with its error. PhotoKit errors arrive unchanged; callers normalize them.
+    private static func requestData(
+        for resource: PHAssetResource,
+        networkAccessAllowed: Bool,
+        progressGate: FractionProgressGate,
+        receive: @escaping (Data) throws -> Void
+    ) async throws {
+        let options = PHAssetResourceRequestOptions()
+        options.isNetworkAccessAllowed = networkAccessAllowed
+        let manager = PHAssetResourceManager.default()
+        let liveness = PhotoKitResourceRequestLivenessGuard<PHAssetResourceDataRequestID>(
+            cancelRequest: { manager.cancelDataRequest($0) }
+        )
+        options.progressHandler = {
+            liveness.markActivity()
+            progressGate.publish($0)
+        }
+        try await liveness.waitForCompletion {
+            manager.requestData(for: resource, options: options) { data in
+                liveness.receiveData { try receive(data) }
+            } completionHandler: { error in
+                liveness.complete(error: error)
+            }
         }
     }
 
