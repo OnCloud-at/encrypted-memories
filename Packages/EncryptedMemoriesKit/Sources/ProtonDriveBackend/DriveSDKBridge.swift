@@ -61,8 +61,6 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     /// Low-priority trash listing after the library lost photos, so photos trashed elsewhere get their
     /// thumbnails before the route opens. One task per bridge.
     private var trashListingTask: Task<Void, Never>?
-    /// True until a listing applies: once per session, and again after a listing failed or went stale.
-    private var trashListingNeeded = true
     /// Orders identity reports: the coordinator applies only a report newer than the last one it applied, so a
     /// report that an actor hop delayed cannot replace a newer list.
     private var recentlyDeletedReportSequence: UInt64 = 0
@@ -532,7 +530,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                     throw CancellationError()
                 } catch {
                     // A background listing repeats it; no refresh waits for a failing endpoint again.
-                    trashListingNeeded = true
+                    recentlyDeleted.listingFailed()
                     DebugLog.log("trash: listing after a library change failed - \(error)")
                 }
             } else {
@@ -1383,13 +1381,16 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         // A trash, restore, or Empty Trash request finished meanwhile, or a listing that started later was already
         // applied. Both are newer than this listing, so the route shows that state instead.
         let stored = recentlyDeleted.listing
-        guard recentlyDeleted.received(photos, ticket: ticket) else {
+        switch recentlyDeleted.received(photos, ticket: ticket) {
+        case .applied:
+            break
+        case .overtakenByChange:
             // Photos that left the library meanwhile may still lack a listing; a background listing follows.
-            trashListingNeeded = true
             scheduleTrashListing()
             return stored ?? photos
+        case .superseded:
+            return stored ?? photos
         }
-        trashListingNeeded = false
         if let listing = recentlyDeleted.listing, listing != stored {
             DebugLog.log("trash: listing has \(listing.count) items")
             recentlyDeletedStore.save(listing)
@@ -1409,7 +1410,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     /// launch get their thumbnails (the crawl fetches them last), and again after a listing failed or went stale.
     /// A library refresh that lost photos lists the trash itself.
     private func scheduleTrashListing() {
-        guard !isShutDown, trashListingTask == nil, trashListingNeeded else { return }
+        guard !isShutDown, trashListingTask == nil, recentlyDeleted.needsListing else { return }
         trashListingTask = Task(priority: .utility) { [weak self] in
             guard let self else { return }
             await self.listTrashInBackground()

@@ -79,9 +79,9 @@ struct RecentlyDeletedListingStore: Sendable {
 /// The photos whose thumbnails Recently Deleted may read and keep, newest first.
 ///
 /// A listing is the authority, but it can lag behind a change made here. Photos trashed here join the stored
-/// listing at once, so their thumbnails survive a relaunch before the next listing. The first listing that starts
-/// after the trash request settles them: it either shows them or proves that another device moved them on.
-/// Restored photos stay registered until the library lists them again, so their thumbnails never lose their place.
+/// listing at once, so their thumbnails survive a relaunch before a listing shows them. A photo that two listings
+/// after the trash request both lack was restored or deleted elsewhere and leaves. Restored photos stay registered
+/// until the library lists them again, so their thumbnails never lose their place.
 struct RecentlyDeletedIdentities: Sendable, Equatable {
     /// Taken when a listing starts. A listing is stale when a trash change here finished while it ran, or when a
     /// listing that started later was already applied; a stale listing changes nothing.
@@ -90,13 +90,21 @@ struct RecentlyDeletedIdentities: Sendable, Equatable {
         fileprivate let changes: UInt64
     }
 
+    enum ListingOutcome: Sendable, Equatable {
+        case applied
+        /// A trash, restore, or Empty Trash request here finished while the listing ran; another listing is needed.
+        case overtakenByChange
+        /// A listing that started later was already applied.
+        case superseded
+    }
+
     /// The last trash listing that the server returned.
     private var receivedListing: [PhotoItem]?
     /// Photos trashed here that no listing has shown yet, oldest request first, with the items the library knew.
     private var trashedHere: [PhotoUID] = []
     private var trashedHereItems: [PhotoUID: PhotoItem] = [:]
-    /// The listing count when each photo was trashed here; a listing with a later start settles it.
-    private var trashedHereAfterListing: [PhotoUID: UInt64] = [:]
+    /// Listings since the trash request that lacked the photo. The second one proves that it moved on elsewhere.
+    private var trashedHereMisses: [PhotoUID: Int] = [:]
     /// Photos restored here. A library refresh that lists one marks it; the next refresh releases it, because by
     /// then the library that lists it was published.
     private var restoredHere: [PhotoUID] = []
@@ -104,6 +112,9 @@ struct RecentlyDeletedIdentities: Sendable, Equatable {
     private var listingStarts: UInt64 = 0
     private var appliedListingStart: UInt64 = 0
     private var changesHere: UInt64 = 0
+    /// True until a listing applies: once per session, again after a failed or overtaken listing, and while a
+    /// photo trashed here still waits for a listing that shows it.
+    private(set) var needsListing = true
 
     init(listing: [PhotoItem]?) {
         receivedListing = listing
@@ -133,19 +144,33 @@ struct RecentlyDeletedIdentities: Sendable, Equatable {
         return ListingTicket(start: listingStarts, changes: changesHere)
     }
 
-    /// Applies a listing unless it is stale. Returns whether it applied.
-    mutating func received(_ listing: [PhotoItem], ticket: ListingTicket) -> Bool {
-        guard ticket.changes == changesHere, ticket.start > appliedListingStart else { return false }
+    /// Applies a listing unless it is stale.
+    mutating func received(_ listing: [PhotoItem], ticket: ListingTicket) -> ListingOutcome {
+        guard ticket.changes == changesHere else {
+            needsListing = true
+            return .overtakenByChange
+        }
+        guard ticket.start > appliedListingStart else { return .superseded }
         appliedListingStart = ticket.start
         receivedListing = listing
         let listed = Set(listing.map(\.uid))
-        // This listing started after these trash requests finished, so it is the truth for them: listed photos
-        // are in the listing now, missing ones were restored or deleted elsewhere.
-        let settled = Set(trashedHere.filter { ticket.start > (trashedHereAfterListing[$0] ?? 0) })
-        trashedHere.removeAll { listed.contains($0) || settled.contains($0) }
-        trashedHereItems = trashedHereItems.filter { trashedHere.contains($0.key) }
-        trashedHereAfterListing = trashedHereAfterListing.filter { trashedHere.contains($0.key) }
-        return true
+        var kept = Set<PhotoUID>()
+        for uid in trashedHere where !listed.contains(uid) {
+            let misses = (trashedHereMisses[uid] ?? 0) + 1
+            if misses < 2 {
+                trashedHereMisses[uid] = misses
+                kept.insert(uid)
+            }
+        }
+        trashedHere.removeAll { !kept.contains($0) }
+        trashedHereItems = trashedHereItems.filter { kept.contains($0.key) }
+        trashedHereMisses = trashedHereMisses.filter { kept.contains($0.key) }
+        needsListing = !trashedHere.isEmpty
+        return .applied
+    }
+
+    mutating func listingFailed() {
+        needsListing = true
     }
 
     /// `items` holds what the library knew about the moved photos; a photo without one is registered only.
@@ -156,7 +181,7 @@ struct RecentlyDeletedIdentities: Sendable, Equatable {
         restoredListedByLibrary.subtract(moved)
         trashedHere.removeAll { moved.contains($0) }
         trashedHere.append(contentsOf: uids)
-        for uid in uids { trashedHereAfterListing[uid] = listingStarts }
+        trashedHereMisses = trashedHereMisses.filter { !moved.contains($0.key) }
         for item in items where moved.contains(item.uid) { trashedHereItems[item.uid] = item }
     }
 
@@ -166,7 +191,7 @@ struct RecentlyDeletedIdentities: Sendable, Equatable {
         receivedListing?.removeAll { moved.contains($0.uid) }
         trashedHere.removeAll { moved.contains($0) }
         trashedHereItems = trashedHereItems.filter { !moved.contains($0.key) }
-        trashedHereAfterListing = trashedHereAfterListing.filter { !moved.contains($0.key) }
+        trashedHereMisses = trashedHereMisses.filter { !moved.contains($0.key) }
         restoredHere.removeAll { moved.contains($0) }
         restoredListedByLibrary.subtract(moved)
         restoredHere.append(contentsOf: uids)
@@ -178,7 +203,7 @@ struct RecentlyDeletedIdentities: Sendable, Equatable {
         receivedListing = []
         trashedHere = []
         trashedHereItems = [:]
-        trashedHereAfterListing = [:]
+        trashedHereMisses = [:]
     }
 
     /// Called after each library refresh. Releases restored photos that the previous refresh already listed and
