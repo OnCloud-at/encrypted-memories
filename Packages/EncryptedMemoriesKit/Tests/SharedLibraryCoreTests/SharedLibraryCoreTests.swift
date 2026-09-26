@@ -404,3 +404,60 @@ struct SharedLibraryJournalLimitTests {
         #expect(merged.shards.map(\.album.volumeID) == ["v1", "v2"])
     }
 }
+
+@Suite("Shared library scope safety")
+struct SharedLibraryScopeSafetyTests {
+    private func journal(_ json: String) throws -> SharedLibraryJournal {
+        try JSONDecoder().decode(SharedLibraryJournal.self, from: Data(json.utf8))
+    }
+
+    private func settingsChange(since: String) -> String {
+        """
+        {"format":1,"device":"mac","entries":[
+          {"device":"mac","seq":1,"time":1,"change":{"type":"settings","enabled":true,"since":1000}},
+          {"device":"mac","seq":2,"time":2,"change":{"type":"settings","enabled":true,"since":\(since)}}
+        ]}
+        """
+    }
+
+    @Test(arguments: ["null", "1e400", "\"soon\""])
+    func anUnreadableStartDateNeverWidensWhatIsShared(since: String) throws {
+        let decoded = try journal(settingsChange(since: since))
+        #expect(
+            SharedLibraryState.merged([decoded]).settings.scope == .since(Date(timeIntervalSince1970: 1000)),
+            "the damaged change is ignored; the earlier start date stays")
+    }
+
+    @Test func aStartDateBeyondWhatTheJournalCanHoldIsRefused() throws {
+        var mac = SharedLibraryJournal(deviceID: "mac")
+        let farFuture = Date(timeIntervalSince1970: 1e200)
+        let change = SharedLibraryChange.settings(SharedLibrarySettings(isEnabled: true, scope: .since(farFuture)))
+        #expect(throws: SharedLibraryJournalInvalidChangeError()) { try mac.record(change, at: Date()) }
+
+        let bypassed = SharedLibraryJournal(
+            deviceID: "mac",
+            entries: [
+                SharedLibraryJournalEntry(
+                    deviceID: "mac", sequence: 1, recordedAt: Date(timeIntervalSince1970: 1), change: change)
+            ])
+        #expect(throws: (any Error).self) { try JSONEncoder().encode(bypassed) }
+    }
+
+    @Test func aDamagedCounterKeepsTheEntriesButMakesTheJournalReadOnly() throws {
+        var damaged = try journal(
+            """
+            {"format":1,"device":"mac","last":"100","entries":[
+              {"device":"mac","seq":1,"time":1,"change":{"type":"hidden",
+               "photo":{"volumeID":"volume","nodeID":"photo"},"value":true}}
+            ]}
+            """)
+        #expect(!damaged.isAppendable)
+        #expect(SharedLibraryState.merged([damaged]).hidden.count == 1, "its entries still count")
+        #expect(throws: SharedLibraryJournalDamagedError()) {
+            try damaged.record(
+                .hidden(PhotoUID(volumeID: "volume", nodeID: "photo"), isHidden: false), at: Date())
+        }
+        #expect(throws: SharedLibraryJournalDamagedError.self) { try JSONEncoder().encode(damaged) }
+        #expect(damaged.compacted() == damaged)
+    }
+}
