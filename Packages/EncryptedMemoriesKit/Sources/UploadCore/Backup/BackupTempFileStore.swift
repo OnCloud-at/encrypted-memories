@@ -45,7 +45,8 @@ public final class BackupTempFileStore: @unchecked Sendable {
         var writtenBytes: Int64
         let isOversized: Bool
         /// Bytes staged ahead of the duplicate check. All staged files together use at most half of the normal
-        /// pool, so exports of photos selected for upload always keep the other half.
+        /// pool, so exports of photos selected for upload always keep the other half. An iCloud original whose known
+        /// size exceeds that half is not staged this way: it reserves its exact size like its export would.
         var isStaged = false
     }
     private var reservations: [URL: Reservation] = [:]

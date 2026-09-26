@@ -131,6 +131,21 @@ final class PhotoKitStagingSinkTests: XCTestCase {
         tempStore.discard(staged)
     }
 
+    func testOnlyOneOriginalAboveTheStagingShareReservesBesideTheExports() throws {
+        let tempStore = store(maximumBytes: 100)
+        let large = PhotoKitStagingSink(tempStore: tempStore, filename: "4K-1.MOV", expectedBytes: 70)
+        XCTAssertTrue(large.isStaging)
+
+        // Its export would hold the same share; photos still export beside it.
+        let photo = try tempStore.reserve(filename: "IMG_11.HEIC", expectedBytes: 20)
+        XCTAssertFalse(
+            PhotoKitStagingSink(tempStore: tempStore, filename: "4K-2.MOV", expectedBytes: 60).isStaging,
+            "a second large original only hashes")
+        tempStore.discard(photo)
+        large.abandon()
+        XCTAssertEqual(tempStore.usedBytes(), 0)
+    }
+
     func testTheDuplicateCheckStagesExactlyOnlyWhenBothCopiesFit() {
         XCTAssertEqual(
             PhotoLibraryResourceResolver.exactStagingSize(knownSize: 300, tempStore: store(freeBytes: 600)), 300)

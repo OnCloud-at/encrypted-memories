@@ -67,11 +67,12 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
 
     /// Set by a timeline save that removed photos; a trash listing then follows the load.
     private var timelineLostPhotos = false
-    /// Bytes this session uploaded since the account's used storage last changed, so the capacity check sees them
-    /// before the next account refresh. Another used value means a newer refresh that already contains them.
-    private var uploadedBytesSinceQuotaRefresh: Int64 = 0
-    private var quotaBaselineUsedBytes: Int64?
+    /// Bytes this session uploaded, and the part of them that the latest account refresh already contains: the
+    /// uploads recorded before that refresh started. The capacity check subtracts the rest from the account quota.
+    private var uploadedBytes: Int64 = 0
+    private var uploadedBytesInQuota: Int64 = 0
     private var quotaRefresh: Task<Void, Never>?
+    private var quotaRefreshWaiters: [UUID: CheckedContinuation<Void, Never>] = [:]
     private var lastQuotaRefreshAt: ContinuousClock.Instant?
     /// Where the per-account upload-identity manifest lives (next to `library-v1.sqlite`, so the
     /// sign-out purge covers it) and the platform SQLite tuning it opens with. Module-internal:
@@ -191,6 +192,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
             timelineLoadTask?.task.cancel()
             mediaTypeReconciliationTask?.cancel()
             trashListingTask?.cancel()
+            quotaRefresh?.cancel()
         }
         await shutdownGate.run { [weak self] in
             await self?.performShutdown()
@@ -1199,9 +1201,12 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     /// Refreshes the lightweight account snapshot used by Settings (email and Drive quota). The existing
     /// account-data request also updates the encrypted offline cache; it does not rebuild the signed-in client.
     func refreshAccountInfo() async throws {
+        let recordedBefore = uploadedBytes
         try await withOpenSession { bridge in
             _ = try await bridge.driveSession.fetchAccountData()
         }
+        // Uploads recorded during the request stay counted; the response may not contain them yet.
+        uploadedBytesInQuota = max(uploadedBytesInQuota, recordedBefore)
     }
 
     func timeline(filter: PhotoFilter) async throws -> [TimelineSection] {
@@ -1747,8 +1752,8 @@ extension DriveSDKBridge: PhotoUploading {
 
     /// Compares the file with the account's remaining Drive storage: the last account refresh minus what this session
     /// uploaded since. When it does not fit, the account data is refreshed first, at most once a minute, because the
-    /// person may have freed space or upgraded; checks during a refresh wait for it. Without a known quota the upload
-    /// proceeds; Proton then decides.
+    /// person may have freed space or upgraded; checks during a refresh wait for it, and a cancelled check stops
+    /// waiting at once. Without a known quota the upload proceeds; Proton then decides.
     nonisolated func ensureRemoteCapacity(forBytes bytes: Int64, filename: String) async throws {
         guard bytes > 0, let available = await remainingDriveBytes(), bytes > available else { return }
         await refreshQuotaIfDue()
@@ -1765,31 +1770,44 @@ extension DriveSDKBridge: PhotoUploading {
             return (used, maximum)
         }
         guard let quota else { return nil }
-        rebaseUploadedBytes(onUsedBytes: quota.used)
-        return quota.max - quota.used - uploadedBytesSinceQuotaRefresh
+        return quota.max - quota.used - (uploadedBytes - uploadedBytesInQuota)
     }
 
-    private func recordUploadedBytes(_ bytes: Int64) async {
-        let used = await MainActor.run { AccountInfo.shared.driveUsedSpaceBytes }
-        rebaseUploadedBytes(onUsedBytes: used)
-        uploadedBytesSinceQuotaRefresh += max(0, bytes)
-    }
-
-    private func rebaseUploadedBytes(onUsedBytes used: Int64?) {
-        guard used != quotaBaselineUsedBytes else { return }
-        quotaBaselineUsedBytes = used
-        uploadedBytesSinceQuotaRefresh = 0
-    }
-
+    /// Starts one account refresh when none ran in the last minute, then waits for the running refresh. The refresh
+    /// belongs to no single check, so cancelling one check neither cancels it nor keeps that check waiting.
     private func refreshQuotaIfDue() async {
-        if let quotaRefresh { return await quotaRefresh.value }
-        let now = ContinuousClock.now
-        if let lastQuotaRefreshAt, lastQuotaRefreshAt.duration(to: now) < .seconds(60) { return }
-        lastQuotaRefreshAt = now
-        let refresh = Task { _ = try? await self.refreshAccountInfo() }
-        quotaRefresh = refresh
-        await refresh.value
+        if quotaRefresh == nil {
+            let now = ContinuousClock.now
+            if let lastQuotaRefreshAt, lastQuotaRefreshAt.duration(to: now) < .seconds(60) { return }
+            lastQuotaRefreshAt = now
+            quotaRefresh = Task {
+                _ = try? await self.refreshAccountInfo()
+                self.finishQuotaRefresh()
+            }
+        }
+        let waiter = UUID()
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                if quotaRefresh == nil || Task.isCancelled {
+                    continuation.resume()
+                } else {
+                    quotaRefreshWaiters[waiter] = continuation
+                }
+            }
+        } onCancel: {
+            Task { await self.stopWaitingForQuotaRefresh(waiter) }
+        }
+    }
+
+    private func finishQuotaRefresh() {
         quotaRefresh = nil
+        let waiters = quotaRefreshWaiters.values
+        quotaRefreshWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+    }
+
+    private func stopWaitingForQuotaRefresh(_ waiter: UUID) {
+        quotaRefreshWaiters.removeValue(forKey: waiter)?.resume()
     }
 
     /// The universal dedupe pipeline for this account: the SQLite identity manifest (per-account
@@ -1925,7 +1943,7 @@ extension DriveSDKBridge: PhotoUploading {
                 throw error
             }
             await operation.releaseResources()
-            await recordUploadedBytes(request.fileSize)
+            uploadedBytes += max(0, request.fileSize)
             DebugLog.log("[Upload] completed node=\(ids.nodeUid.nodeID.prefix(8))… file=\(request.name)")
             let uid = PhotoUID(volumeID: ids.nodeUid.volumeID, nodeID: ids.nodeUid.nodeID)
             if mainPhotoUid == nil {
