@@ -437,8 +437,9 @@ public actor MLSmartSearchLifecycle {
     /// Loads the selectable models while Smart Search is off, so the person can choose one before
     /// anything is stored or downloaded. A failure stays retryable through `retry()`.
     public func loadModelChoices() async {
+        // A pending switch-on loads the list itself.
         guard started, !isShutDown, deps.featureAvailability == .available, !persistent.isEnabled,
-            persistent.pendingOperation == nil, !stateLoadFailed
+            persistent.pendingOperation == nil, !stateLoadFailed, pendingRecommendedEnable == nil
         else { return }
         // The built-in catalog has no download plans, so a fresh signed catalog is required once.
         if let lastCatalogRefreshAt, lastCatalogRefreshAt.duration(to: .now) < configuration.catalogRefreshInterval {
@@ -503,7 +504,9 @@ public actor MLSmartSearchLifecycle {
             // A failed list stays visible with a retry that resumes this switch-on.
             guard await refreshCatalog() else { return }
         }
-        guard !isShutDown, !persistent.isEnabled, startIntentSequence == intent, pendingRecommendedEnable != nil
+        // A cancelled start belongs to an intent or Retry that replaced it, even when its list request succeeded.
+        guard !isShutDown, !Task.isCancelled, !persistent.isEnabled, startIntentSequence == intent,
+            pendingRecommendedEnable != nil
         else { return }
         pendingRecommendedEnable = nil
         let choices = catalog.selectableEntries(allowsDeveloperModels: deps.allowsDeveloperModels)

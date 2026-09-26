@@ -1593,13 +1593,15 @@ import Testing
         await harness.lifecycle.enableRecommended(preferredLanguages: ["en"], intent: 1)
         await harness.lifecycle.awaitRecommendedStart()
         let first = Task { await harness.lifecycle.retry() }
-        let second = Task { await harness.lifecycle.retry() }
         #expect(await waitUntil { await catalogProvider.isHolding })
+        // The first Retry shows the list loading, so a second tap finds no failure to retry.
+        #expect(await harness.lifecycle.currentSnapshot().phase == .loadingCatalog)
+        await harness.lifecycle.retry()
+        #expect(await catalogProvider.requestCount == 2)
 
         await harness.lifecycle.cancelRecommendedEnable(intent: 2)
         await catalogProvider.failHeldRequest()
         await first.value
-        await second.value
 
         #expect(await catalogProvider.requestCount == 2, "one list request per Retry, not per tap")
         #expect(await harness.lifecycle.currentSnapshot().phase == .disabled)

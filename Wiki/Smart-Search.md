@@ -4,10 +4,9 @@ Smart Search builds an encrypted, on-device index for private discovery across t
 
 ## Turn on Smart Search
 
-1. In Settings, turn on **Smart Search**.
-2. Choose a search model. The model that suits your device language is marked **Recommended**: **Fast and efficient** for English, **Accurate and multilingual** for other languages.
+In Settings, turn on **Smart Search**. It starts at once with the search model that suits your device language: **Fast and efficient** for English, **Accurate and multilingual** for other languages. The app downloads the model and indexes your library on this device. Text search already works while the model downloads.
 
-Smart Search starts only after you choose a model. The app then downloads the model and indexes your library on this device. Text search already works while the model downloads. You can switch the model later; the library is then indexed again.
+You can choose the other model at any time. While the first model still downloads, the choice stops that download and takes the other model without asking. Later, a switch asks first, because the library is then indexed again.
 
 When the device has too little free space for the model, Smart Search shows how much space it needs. Free up space and select **Retry**.
 
