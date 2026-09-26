@@ -331,9 +331,9 @@ public struct SourceSetUpdateLease: Hashable, Sendable {
 
 /// Capability-bound access lease for one resource route.
 ///
-/// A normal inventory refresh keeps this lease valid while the membership remains present. Access loss,
-/// membership removal, or reactivation after access loss invalidates it. A changed backend route must use
-/// a new `SourceID`.
+/// Access loss, membership removal, reactivation after access loss, and every inventory refresh that changes an
+/// item invalidate it. `renewed(_:)` issues the same route again when the graph still authorizes it. A changed
+/// backend route must use a new `SourceID`.
 public struct SourceAccessLease: Hashable, Sendable {
     public let sourceID: SourceID
     public let uid: PhotoUID
@@ -1267,6 +1267,41 @@ public final class LibrarySourceGraph {
             }
         }
         return leases
+    }
+
+    /// The same route as `lease`, issued from the graph as it is now: the same photo, capability, source, and
+    /// relationship owner, or the same Recently Deleted registration. Nil when the graph no longer authorizes that
+    /// route. A delivery fence uses it for a result that arrives after an inventory refresh changed any item.
+    ///
+    /// Renewal authorizes by the current state only. It deliberately accepts a route that was removed and added
+    /// again, or a source reactivated after access loss, while the result was in flight, because the graph
+    /// authorizes that route now. It also returns nil when a source of higher precedence now serves the photo,
+    /// although the original source still lists it; the caller withholds the result and requests it again. Use it
+    /// only for reads whose bytes depend on the photo identity alone, such as thumbnails; a consumer that needs the
+    /// remove-then-readd fence must keep checking `isCurrent(_:)`.
+    public func renewed(_ lease: SourceAccessLease) -> SourceAccessLease? {
+        guard lease.epoch == epoch else { return nil }
+        let includeExcludedSources = !lease.requiresInclusion
+        let renewed: SourceAccessLease?
+        if lease.readsIdentityOutsideInventory {
+            renewed =
+                identityOutsideInventoryAccessLeases(
+                    for: [lease.uid], requiring: lease.capability, includeExcludedSources: includeExcludedSources
+                )[lease.uid]
+        } else if let relationship = lease.relationship {
+            renewed = relatedAccessLease(
+                for: lease.uid,
+                of: lease.membershipUID,
+                relationship: relationship,
+                requiring: lease.capability,
+                includeExcludedSources: includeExcludedSources
+            )
+        } else {
+            renewed = accessLease(
+                for: lease.uid, requiring: lease.capability, includeExcludedSources: includeExcludedSources)
+        }
+        guard let renewed, renewed.sourceID == lease.sourceID else { return nil }
+        return renewed
     }
 
     /// Checks the lease again before publishing a late asynchronous result.

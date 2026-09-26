@@ -57,6 +57,112 @@ final class LibrarySourceGraphTests: XCTestCase {
         )
     }
 
+    func testRenewalAfterAMetadataRefreshKeepsTheRouteAndTheSource() throws {
+        var graph = LibrarySourceGraph()
+        _ = install(firstSource, items: [item("photo", time: 1)], in: &graph)
+        let uid = item("photo", time: 1).uid
+        let lease = try XCTUnwrap(graph.accessLease(for: uid, requiring: .readThumbnail))
+
+        _ = install(firstSource, items: [item("photo", time: 1, tags: [.favorites])], in: &graph)
+
+        XCTAssertFalse(graph.isCurrent(lease), "every changed item invalidates the leases of its source")
+        let renewed = try XCTUnwrap(graph.renewed(lease))
+        XCTAssertEqual(renewed.sourceID, firstSource.id)
+        XCTAssertTrue(graph.isCurrent(renewed))
+    }
+
+    func testRenewalFailsWhenThePhotoLeftOrTheSourceLostAccess() throws {
+        var graph = LibrarySourceGraph()
+        _ = install(firstSource, items: [item("photo", time: 1)], in: &graph)
+        let uid = item("photo", time: 1).uid
+        let lease = try XCTUnwrap(graph.accessLease(for: uid, requiring: .readThumbnail))
+
+        _ = install(firstSource, items: [], in: &graph)
+        XCTAssertNil(graph.renewed(lease))
+
+        _ = install(firstSource, items: [item("photo", time: 1)], in: &graph)
+        let readded = try XCTUnwrap(graph.accessLease(for: uid, requiring: .readThumbnail))
+        _ = graph.removeSource(firstSource.id)
+        XCTAssertNil(graph.renewed(readded))
+    }
+
+    func testRenewalNeverMovesALeaseToAnotherSource() throws {
+        var graph = LibrarySourceGraph()
+        let shared = item("shared", time: 1)
+        _ = install(firstSource, items: [shared], in: &graph)
+        _ = install(secondSource, items: [shared], in: &graph)
+        let lease = try XCTUnwrap(graph.accessLease(for: shared.uid, requiring: .readThumbnail))
+
+        // The source that issued the lease drops the photo; another source still lists it.
+        let otherID = lease.sourceID == firstSource.id ? secondSource : firstSource
+        let issuing = lease.sourceID == firstSource.id ? firstSource : secondSource
+        _ = install(issuing, items: [], in: &graph)
+
+        XCTAssertEqual(graph.accessLease(for: shared.uid, requiring: .readThumbnail)?.sourceID, otherID.id)
+        XCTAssertNil(graph.renewed(lease), "a renewal keeps the route of the original lease")
+    }
+
+    func testRenewalReturnsNothingWhenAHigherSourceNowServesThePhoto() throws {
+        var graph = LibrarySourceGraph()
+        let shared = item("shared", time: 1)
+        _ = install(secondSource, items: [shared], in: &graph)
+        let lease = try XCTUnwrap(graph.accessLease(for: shared.uid, requiring: .readThumbnail))
+        XCTAssertEqual(lease.sourceID, secondSource.id)
+
+        _ = install(firstSource, items: [shared], in: &graph)
+
+        XCTAssertEqual(graph.accessLease(for: shared.uid, requiring: .readThumbnail)?.sourceID, firstSource.id)
+        XCTAssertNil(graph.renewed(lease), "the caller withholds the bytes and requests them again")
+    }
+
+    func testRenewalAuthorizesByTheCurrentStateAfterReactivation() throws {
+        var graph = LibrarySourceGraph()
+        let photo = item("photo", time: 1)
+        _ = install(firstSource, items: [photo], in: &graph)
+        let lease = try XCTUnwrap(graph.accessLease(for: photo.uid, requiring: .readThumbnail))
+
+        _ = graph.removeSource(firstSource.id)
+        XCTAssertEqual(graph.inventory(for: firstSource.id)?.accessState, .accessLost)
+        XCTAssertNil(graph.renewed(lease))
+
+        // Access returns and the source lists the photo again: the graph authorizes the same route now.
+        _ = install(firstSource, items: [photo], in: &graph)
+        XCTAssertNotNil(graph.renewed(lease))
+    }
+
+    func testRenewalOfASeriesMemberRequiresTheSameSeries() throws {
+        var graph = LibrarySourceGraph()
+        let member = item("member", time: 3)
+        _ = install(firstSource, items: [item("key", time: 1, burstMemberIDs: ["key", "member"])], in: &graph)
+        let lease = try XCTUnwrap(
+            graph.burstMemberAccessLeases(for: [member.uid], requiring: .readThumbnail)[member.uid])
+
+        _ = install(
+            firstSource, items: [item("key", time: 1, tags: [.favorites], burstMemberIDs: ["key", "member"])],
+            in: &graph)
+        XCTAssertNotNil(graph.renewed(lease), "a refreshed series still lists its member")
+
+        _ = install(
+            firstSource,
+            items: [
+                item("key", time: 1, burstMemberIDs: ["key"]),
+                item("other", time: 2, burstMemberIDs: ["other", "member"]),
+            ],
+            in: &graph)
+        XCTAssertNotNil(graph.burstMemberAccessLeases(for: [member.uid], requiring: .readThumbnail)[member.uid])
+        XCTAssertNil(graph.renewed(lease), "another series lists the member now; a fresh request must prove it")
+    }
+
+    func testRenewalRejectsALeaseOfAnotherGraph() throws {
+        var first = LibrarySourceGraph()
+        var second = LibrarySourceGraph()
+        _ = install(firstSource, items: [item("photo", time: 1)], in: &first)
+        _ = install(firstSource, items: [item("photo", time: 1)], in: &second)
+        let lease = try XCTUnwrap(first.accessLease(for: item("photo", time: 1).uid, requiring: .readThumbnail))
+
+        XCTAssertNil(second.renewed(lease), "a lease never crosses an account or session")
+    }
+
     func testProjectionDeduplicatesResourceIdentityAndKeepsEveryMembership() throws {
         let duplicate = item("same", time: 10)
         var graph = LibrarySourceGraph()

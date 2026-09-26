@@ -232,19 +232,23 @@ private actor RecordingLoader: ThumbnailBatchLoader {
     private let batchError: String?
     private let failAll: Bool
     private let delayMilliseconds: Int
+    /// Withheld on the first request, as after an authorization change during the download; delivered afterwards.
+    private var withheldOnce: Set<PhotoUID>
 
     init(
         payloads: [PhotoUID: Data] = [:],
         itemErrors: [PhotoUID: String] = [:],
         batchError: String? = nil,
         failAll: Bool = false,
-        delayMilliseconds: Int = 0
+        delayMilliseconds: Int = 0,
+        withheldOnce: Set<PhotoUID> = []
     ) {
         self.payloads = payloads
         self.itemErrors = itemErrors
         self.batchError = batchError
         self.failAll = failAll
         self.delayMilliseconds = delayMilliseconds
+        self.withheldOnce = withheldOnce
     }
 
     func loadThumbnails(
@@ -258,14 +262,17 @@ private actor RecordingLoader: ThumbnailBatchLoader {
         if let batchError { return ThumbnailBatchLoadResult(batchError: batchError) }
         guard !failAll else { return .delivered }  // models a loader that delivers nothing and reports nothing
         var errors: [PhotoUID: String] = [:]
+        var withheld = Set<PhotoUID>()
         for uid in uids {
-            if let data = payloads[uid] {
+            if withheldOnce.remove(uid) != nil {
+                withheld.insert(uid)
+            } else if let data = payloads[uid] {
                 onLoaded(uid, data)
             } else if let reason = itemErrors[uid] {
                 errors[uid] = reason
             }
         }
-        return ThumbnailBatchLoadResult(itemErrors: errors)
+        return ThumbnailBatchLoadResult(itemErrors: errors, withheldUIDs: withheld)
     }
 
     func fetched(_ uid: PhotoUID) -> Bool { order.contains(uid) }
@@ -2900,6 +2907,54 @@ struct ThumbnailFeedCoreTests {
         #expect(await loader.requestCount() == 2)
     }
 
+    @Test func aWithheldThumbnailIsNotQuarantinedAndTheCrawlLoadsItAgain() async throws {
+        // A library large enough that the end-of-crawl coverage pass settles with one photo missing; only the
+        // requeue can fetch that photo again.
+        let uids = (0..<400).map { Self.uid("withheld-\($0)") }
+        let withheld = uids[7]
+        let png = Self.pngData(width: 8, height: 8)
+        let loader = RecordingLoader(
+            payloads: Dictionary(uniqueKeysWithValues: uids.map { ($0, png) }), withheldOnce: [withheld])
+        let cache = Self.cache("withheld")
+        let feed = ThumbnailFeedCore(
+            cache: cache,
+            loader: loader,
+            configuration: Self.configuration(downloadConcurrencyLimit: 2, batchSize: 50)
+        )
+
+        await feed.startPrefetch(uids)
+        try await Self.waitUntil { await loader.requestOrder().filter { $0 == withheld }.count == 2 }
+
+        #expect(await loader.requestOrder().filter { $0 == withheld }.count == 2)
+        let status = await feed.prefetchStatus()
+        #expect(status.failedWithheld == 1)
+        #expect(status.unfetchableCount == 0, "an authorization change during the download is not the photo's fault")
+        #expect(status.failedUnreported == 0, "and no transport problem either")
+        try await Self.waitUntil { cache.diskData(for: withheld) != nil }
+        #expect(cache.diskData(for: withheld) != nil, "the crawl stored it without any visible request")
+    }
+
+    @Test func turningPrefetchOffDropsPendingWithheldRetries() async throws {
+        let uid = Self.uid("withheld-then-off")
+        let loader = RecordingLoader(payloads: [uid: Self.pngData(width: 8, height: 8)], withheldOnce: [uid])
+        let feed = ThumbnailFeedCore(
+            cache: Self.cache("withheld-then-off"),
+            loader: loader,
+            configuration: Self.configuration(downloadConcurrencyLimit: 1, batchSize: 1, crawlBackoffSeconds: 30)
+        )
+
+        await feed.startPrefetch([uid])
+        try await Self.waitUntil { await feed.prefetchStatus().failedWithheld == 1 }
+        // The retry waits behind the crawl backoff and shows in the queue.
+        #expect(await feed.prefetchStatus().currentQueueLength == 1)
+
+        await feed.setPrefetchEnabled(false)
+
+        // Nothing would take the retry now, and a pending retry would keep the workers polling.
+        #expect(await feed.prefetchStatus().currentQueueLength == 0)
+        #expect(await loader.requestCount() == 1)
+    }
+
     @Test func visiblePathDoesNotRefetchBackendRefusedItems() async throws {
         let uid = Self.uid("visible-refused")
         let loader = RecordingLoader(itemErrors: [uid: "Node has no thumbnails"])
@@ -2939,7 +2994,7 @@ struct ThumbnailFeedCoreTests {
         // failed=N must decompose into the classified buckets…
         #expect(
             status.failed == status.failedTimeout + status.failedBatchError + status.failedItemError
-                + status.failedUnreported)
+                + status.failedUnreported + status.failedWithheld)
         #expect(status.failedItemError == 1)
         // …and the human-readable reason must be surfaced.
         #expect(status.lastErrors.joined().contains("decrypt failed"))
