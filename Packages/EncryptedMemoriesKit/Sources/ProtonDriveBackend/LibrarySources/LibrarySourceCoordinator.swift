@@ -184,14 +184,14 @@ public actor LibrarySourceCoordinator: PriorityThumbnailBatchLoader {
         return closed ? .unavailable : .accepted
     }
 
-    /// Registers what a route outside every inventory currently shows, today Recently Deleted.
+    /// Registers the photos in Recently Deleted, newest first; they are outside every inventory.
     ///
     /// A trashed photo left the inventory, so no scope and no lease authorized its thumbnail and each tile
-    /// stayed black. The set authorizes explicit reads only; no crawl fetches it. Leaving the route passes an
-    /// empty set, which releases the retained bytes again.
+    /// stayed black. The list authorizes thumbnail reads and keeps their bytes; the thumbnail crawl fetches
+    /// them after every library photo. A later list without a photo releases its bytes again.
     public func setIdentitiesOutsideInventory(_ uids: [PhotoUID]) async {
         guard !closed else { return }
-        if let change = graph.setIdentitiesOutsideInventory(Set(uids)) { await publish(change) }
+        if let change = graph.setIdentitiesOutsideInventory(uids) { await publish(change) }
     }
 
     /// Applies an already-confirmed remote access loss without waiting for another catalog sweep.

@@ -55,6 +55,15 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     /// Receives the identities of a listing that no source inventory contains, currently the volume trash.
     /// The library source coordinator authorizes their thumbnails; without it every tile stays black.
     private nonisolated let identitiesOutsideInventoryObserver = IdentitiesOutsideInventoryObserver()
+    /// The last Recently Deleted listing on disk, so the route opens offline and its thumbnails survive a launch.
+    private let recentlyDeletedStore: RecentlyDeletedListingStore
+    private var recentlyDeleted: RecentlyDeletedIdentities
+    /// Low-priority trash listing after the library lost photos, so photos trashed elsewhere get their
+    /// thumbnails before the route opens. One task per bridge.
+    private var trashListingTask: Task<Void, Never>?
+    private var hasListedTrash = false
+    /// Set by a timeline save that removed photos; a trash listing then follows the load.
+    private var timelineLostPhotos = false
     /// Where the per-account upload-identity manifest lives (next to `library-v1.sqlite`, so the
     /// sign-out purge covers it) and the platform SQLite tuning it opens with. Module-internal:
     /// the facade derives the account data directory + store policy for the backup sync stores
@@ -126,6 +135,13 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
             policy: policy.libraryDatabasePolicy
         )
         self.uploadManifestURL = libraryDirectory.appendingPathComponent(UploadIdentityManifestStore.databaseFileName)
+        let recentlyDeletedStore = RecentlyDeletedListingStore(
+            directory: libraryDirectory,
+            accountUID: session.uid,
+            keyPassword: session.keyPassword
+        )
+        self.recentlyDeletedStore = recentlyDeletedStore
+        self.recentlyDeleted = RecentlyDeletedIdentities(listing: recentlyDeletedStore.load())
         self.uploadManifestPolicy = policy.libraryDatabasePolicy
         // Keep the optional native SDK cache in memory. SDK 0.29.1 only frees the managed client handle;
         // it does not deterministically dispose its SQLite repository. A persistent native cache can therefore
@@ -165,6 +181,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
             shutdownGate.closeAdmission()
             timelineLoadTask?.task.cancel()
             mediaTypeReconciliationTask?.cancel()
+            trashListingTask?.cancel()
         }
         await shutdownGate.run { [weak self] in
             await self?.performShutdown()
@@ -191,9 +208,13 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         let reconciliationTask = mediaTypeReconciliationTask
         mediaTypeReconciliationTask = nil
         reconciliationTask?.cancel()
+        let trashTask = trashListingTask
+        trashListingTask = nil
+        trashTask?.cancel()
 
         _ = await timelineTask?.result
         await reconciliationTask?.value
+        await trashTask?.value
         timelineStore?.close()
         await photosClient.shutdown()
     }
@@ -493,6 +514,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                 items: reconciliationItems,
                 alreadyClassifiedNodeIDs: Set(mediaTypeEvidence.keys)
             )
+            scheduleTrashListing()
             return TimelineLoadSnapshot(
                 sections: sections,
                 validationToken: monitorToken(remoteToken: commit.monitorBaseline)
@@ -752,6 +774,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     private func writeTimelineCache(_ sections: [TimelineSection], validationToken: String?) -> Bool {
         guard let store = timelineStore else { return false }
         let result = store.save(sections.flatMap(\.items), validationToken: validationToken)
+        if result.succeeded, result.sweptRows > 0 { timelineLostPhotos = true }
         if !result.succeeded {
             DebugLog.log("timeline: cache save failed - validation token not published")
         } else if result.skippedUnchanged {
@@ -1198,24 +1221,17 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                     id: "shared-album", date: items.first?.captureTime ?? .distantPast, title: "", items: items)
             ]
         case .trash:
-            let root = try await resolvePhotosRoot()
-            let links = try await driveSession.listTrash(volumeID: root.volumeID)
-                .filter { $0.type != 1 && $0.type != 3 }  // drop folders + albums; keep files/unknown
-                .filter { $0.mainPhotoLinkID == nil }  // hide Live-Photo paired videos, like the timeline
-            let photos =
-                links
-                .compactMap { l -> PhotoItem? in
-                    guard let id = l.linkID else { return nil }
-                    let isVideo = l.mimeType?.hasPrefix("video/") == true
-                    return PhotoItem(
-                        uid: PhotoUID(volumeID: root.volumeID, nodeID: id),
-                        captureTime: Date(timeIntervalSince1970: l.captureTime),
-                        mediaType: isVideo ? "video/quicktime" : "image/jpeg",
-                        tags: isVideo ? [.videos] : [])
-                }
-                .sorted(by: TimelineOrder.areInIncreasingOrder)
-            // A trashed photo left every inventory, so only this listing proves that the user may read it.
-            await identitiesOutsideInventoryObserver.report(photos.map(\.uid))
+            let photos: [PhotoItem]
+            do {
+                photos = try await listTrash()
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                // When the listing fails, for example offline, Recently Deleted shows the last listing it
+                // received; the thumbnail crawl already put its thumbnails on disk.
+                guard let listing = recentlyDeleted.listing else { throw error }
+                photos = listing
+            }
             return [
                 TimelineSection(id: "trash", date: photos.first?.captureTime ?? .distantPast, title: "", items: photos)
             ]
@@ -1257,6 +1273,9 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         try await withOpenSession { bridge in
             let root = try await bridge.resolvePhotosRoot()
             try await bridge.driveSession.trash(volumeID: root.volumeID, linkIDs: uids.map(\.nodeID))
+            // The next library refresh drops these photos; they keep their thumbnails in Recently Deleted.
+            bridge.recentlyDeleted.trashed(uids)
+            await bridge.reportRecentlyDeleted()
             // Debug-gated end-to-end verification: the moved links must actually surface in the volume trash
             // listing (this is the seam that silently broke before - trash "succeeded" but Recently Deleted
             // stayed empty). Costs one extra listing round-trip, only when the debug log is on.
@@ -1277,6 +1296,9 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         try await withOpenSession { bridge in
             let root = try await bridge.resolvePhotosRoot()
             try await bridge.driveSession.restore(volumeID: root.volumeID, linkIDs: uids.map(\.nodeID))
+            // A listing can drop these photos before the library lists them again; their thumbnails stay.
+            bridge.recentlyDeleted.restored(uids)
+            await bridge.reportRecentlyDeleted()
         }
     }
 
@@ -1288,6 +1310,68 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
             } cancel: { [photosClient = bridge.photosClient] cancellationToken in
                 try? await photosClient.cancelEmptyTrash(cancellationToken: cancellationToken)
             }
+            bridge.recentlyDeleted.emptied()
+            bridge.recentlyDeletedStore.save([])
+            await bridge.reportRecentlyDeleted()
+        }
+    }
+
+    // MARK: - Recently Deleted
+
+    /// The photos of the stored listing, newest first. The account composition registers them before the first
+    /// cache sweep, so their thumbnails survive a launch before the route or a listing runs.
+    func recentlyDeletedIdentities() -> [PhotoUID] {
+        recentlyDeleted.ordered
+    }
+
+    /// Lists the volume trash, stores the listing, and registers its photos for their thumbnails.
+    private func listTrash() async throws -> [PhotoItem] {
+        let root = try await resolvePhotosRoot()
+        let links = try await driveSession.listTrash(volumeID: root.volumeID)
+            .filter { $0.type != 1 && $0.type != 3 }  // drop folders + albums; keep files/unknown
+            .filter { $0.mainPhotoLinkID == nil }  // hide Live-Photo paired videos, like the timeline
+        let photos =
+            links
+            .compactMap { l -> PhotoItem? in
+                guard let id = l.linkID else { return nil }
+                return RecentlyDeletedItem.make(
+                    volumeID: root.volumeID,
+                    nodeID: id,
+                    captureTime: Date(timeIntervalSince1970: l.captureTime),
+                    isVideo: l.mimeType?.hasPrefix("video/") == true)
+            }
+            .sorted(by: TimelineOrder.areInIncreasingOrder)
+        hasListedTrash = true
+        if recentlyDeleted.listing != photos { recentlyDeletedStore.save(photos) }
+        recentlyDeleted.received(photos)
+        // A trashed photo left every inventory, so only this listing proves that the user may read it.
+        await reportRecentlyDeleted()
+        return photos
+    }
+
+    private func reportRecentlyDeleted() async {
+        await identitiesOutsideInventoryObserver.report(recentlyDeleted.ordered)
+    }
+
+    /// Lists the trash once per session and again after the library lost photos, which another device may have
+    /// moved to the trash. It runs at maintenance priority; the thumbnail crawl then fetches the new photos last.
+    private func scheduleTrashListing() {
+        guard !isShutDown, trashListingTask == nil, !hasListedTrash || timelineLostPhotos else { return }
+        timelineLostPhotos = false
+        trashListingTask = Task(priority: .utility) { [weak self] in
+            guard let self else { return }
+            await self.listTrashInBackground()
+        }
+    }
+
+    private func listTrashInBackground() async {
+        defer { trashListingTask = nil }
+        do {
+            _ = try await ProtonRequestContext.$priority.withValue(.maintenance) {
+                try await listTrash()
+            }
+        } catch {
+            DebugLog.log("trash: background listing failed - \(error)")
         }
     }
 

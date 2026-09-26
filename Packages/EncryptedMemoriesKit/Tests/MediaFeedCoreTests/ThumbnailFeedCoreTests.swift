@@ -1819,7 +1819,7 @@ struct ThumbnailFeedCoreTests {
         #expect(change.thumbnailRetentionScope.authorizationOnlyUIDs == [trashed])
         #expect(
             !change.thumbnailRetentionScope.orderedUIDs.contains(trashed),
-            "a background crawl must never fetch a trashed photo")
+            "a trashed photo must stay out of every analysis and relationship order")
         #expect(await feed.bindDerivedDataEpoch(graph.runtimeEpoch))
         _ = await feed.reconcile(
             selected: change.selectedScope, analysis: change.analysisScope,
@@ -1895,6 +1895,43 @@ struct ThumbnailFeedCoreTests {
             let memberRequest = try #require(order.firstIndex(of: member))
             #expect(memberRequest > lastLibraryRequest, "burst members follow every library thumbnail")
         }
+        await feed.stopPrefetchAndWait()
+    }
+
+    @Test func recentlyDeletedThumbnailsAreCrawledAfterEveryLibraryThumbnail() async throws {
+        let library = [Self.uid("trash-crawl-library-1"), Self.uid("trash-crawl-library-2")]
+        let newerTrashed = Self.uid("trash-crawl-newer")
+        let olderTrashed = Self.uid("trash-crawl-older")
+        let cache = Self.cache("trash-crawl")
+        let payload = Self.pngData(width: 8, height: 8)
+        let payloads = Dictionary(
+            uniqueKeysWithValues: (library + [newerTrashed, olderTrashed]).map { ($0, payload) })
+        let loader = RecordingLoader(payloads: payloads)
+        // One worker and single-item batches keep the loader's call order equal to the crawl order.
+        let feed = ThumbnailFeedCore(
+            cache: cache, loader: loader,
+            configuration: Self.configuration(downloadConcurrencyLimit: 1, batchSize: 1))
+        let graph = LibrarySourceGraph()
+        let source = LibrarySource(id: SourceID("trash-crawl"), capabilities: .readThumbnail, isIncluded: true)
+        _ = graph.commitSourceSet([source], using: graph.beginSourceSetRefresh())
+        _ = graph.commit(Self.sourceItems(library), validationToken: nil, using: graph.beginRefresh(source.id)!)
+        // The trash listing registers Recently Deleted newest first; a library photo in it is not duplicated.
+        let change = try #require(graph.setIdentitiesOutsideInventory([newerTrashed, library[0], olderTrashed]))
+        #expect(change.thumbnailRetentionScope.authorizationOnlyOrder == [newerTrashed, olderTrashed])
+        #expect(await feed.bindDerivedDataEpoch(graph.runtimeEpoch))
+
+        _ = await feed.reconcile(
+            selected: change.selectedScope, analysis: change.analysisScope,
+            retention: change.thumbnailRetentionScope)
+        try await Self.waitUntil { [newerTrashed, olderTrashed].allSatisfy { cache.diskData(for: $0) != nil } }
+
+        let order = await loader.requestOrder()
+        let lastLibraryRequest = try #require(library.compactMap { order.firstIndex(of: $0) }.max())
+        let newerRequest = try #require(order.firstIndex(of: newerTrashed))
+        let olderRequest = try #require(order.firstIndex(of: olderTrashed))
+        #expect(newerRequest > lastLibraryRequest, "Recently Deleted follows every library thumbnail")
+        #expect(olderRequest > newerRequest, "Recently Deleted is crawled newest first")
+        #expect(!change.analysisScope.uids.contains(newerTrashed), "no analysis reads a trashed photo")
         await feed.stopPrefetchAndWait()
     }
 

@@ -1,0 +1,107 @@
+import Foundation
+import PhotosCore
+import Testing
+
+@testable import ProtonDriveBackend
+
+@Suite("Recently Deleted listing")
+struct RecentlyDeletedListingTests {
+    private static func item(_ node: String, at seconds: TimeInterval, video: Bool = false) -> PhotoItem {
+        RecentlyDeletedItem.make(
+            volumeID: "volume", nodeID: node, captureTime: Date(timeIntervalSince1970: seconds), isVideo: video)
+    }
+
+    private static func directory() throws -> URL {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("recently-deleted-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        return url
+    }
+
+    @Test func theLastListingOpensAfterALaunch() throws {
+        let directory = try Self.directory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let listing = [Self.item("photo", at: 1), Self.item("video", at: 2, video: true)]
+        RecentlyDeletedListingStore(directory: directory, accountUID: "account", keyPassword: "secret")
+            .save(listing)
+
+        let reopened = RecentlyDeletedListingStore(directory: directory, accountUID: "account", keyPassword: "secret")
+
+        #expect(reopened.load() == listing)
+        let blob = try Data(contentsOf: directory.appendingPathComponent(RecentlyDeletedListingStore.fileName))
+        #expect(blob.range(of: Data("photo".utf8)) == nil, "the listing is encrypted at rest")
+    }
+
+    @Test func anotherAccountOrKeyCannotOpenTheListing() throws {
+        let directory = try Self.directory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        RecentlyDeletedListingStore(directory: directory, accountUID: "account", keyPassword: "secret")
+            .save([Self.item("photo", at: 1)])
+
+        #expect(
+            RecentlyDeletedListingStore(directory: directory, accountUID: "account", keyPassword: "other").load()
+                == nil)
+        #expect(
+            RecentlyDeletedListingStore(directory: directory, accountUID: "other", keyPassword: "secret").load()
+                == nil)
+    }
+
+    @Test func withoutAStoredListingThereIsNothingToShow() throws {
+        let directory = try Self.directory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        #expect(
+            RecentlyDeletedListingStore(directory: directory, accountUID: "account", keyPassword: "secret").load()
+                == nil)
+    }
+
+    @Test func theListingRegistersItsPhotosNewestFirst() {
+        let older = Self.item("older", at: 1)
+        let newer = Self.item("newer", at: 2)
+        let identities = RecentlyDeletedIdentities(listing: [older, newer])
+
+        #expect(identities.ordered == [newer.uid, older.uid])
+    }
+
+    @Test func photosTrashedHereKeepTheirThumbnailsUntilAListingShowsThem() {
+        let listed = Self.item("listed", at: 1)
+        let trashedHere = Self.item("trashed-here", at: 5)
+        var identities = RecentlyDeletedIdentities(listing: [listed])
+
+        identities.trashed([trashedHere.uid])
+        #expect(identities.ordered == [trashedHere.uid, listed.uid])
+
+        // A listing that lags behind the trash request must not release the new photo.
+        identities.received([listed])
+        #expect(identities.ordered == [trashedHere.uid, listed.uid])
+
+        identities.received([listed, trashedHere])
+        #expect(identities.ordered == [trashedHere.uid, listed.uid])
+        #expect(identities.listing == [listed, trashedHere])
+    }
+
+    @Test func restoredPhotosKeepTheirThumbnailsUntilTheLibraryListsThemAgain() {
+        let restored = Self.item("restored", at: 1)
+        var identities = RecentlyDeletedIdentities(listing: [restored])
+
+        identities.restored([restored.uid])
+        identities.received([])
+
+        #expect(identities.ordered == [restored.uid])
+        #expect(identities.listing == [])
+    }
+
+    @Test func emptyingTheTrashReleasesEveryTrashedPhoto() {
+        let listed = Self.item("listed", at: 1)
+        let trashedHere = Self.item("trashed-here", at: 2)
+        let restored = Self.item("restored", at: 3)
+        var identities = RecentlyDeletedIdentities(listing: [listed, restored])
+        identities.trashed([trashedHere.uid])
+        identities.restored([restored.uid])
+
+        identities.emptied()
+
+        #expect(identities.ordered == [restored.uid])
+        #expect(identities.listing == [])
+    }
+}

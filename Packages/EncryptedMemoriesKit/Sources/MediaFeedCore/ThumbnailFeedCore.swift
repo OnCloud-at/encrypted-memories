@@ -1346,8 +1346,9 @@ public actor ThumbnailFeedCore {
         }
     }
 
-    /// Background crawl order: the main library grid first, then thumbnails of additional sources, and last the
-    /// burst members, which only a series filmstrip shows. Visible demand still preempts the whole crawl.
+    /// Background crawl order: the main library grid first, then thumbnails of additional sources, then the
+    /// burst members, which only a series filmstrip shows, and last the photos in Recently Deleted, so that
+    /// route also opens offline. Visible demand still preempts the whole crawl.
     private static func crawlOrder(
         selected: SelectedDerivedDataScope,
         analysis: AnalysisDerivedDataScope,
@@ -1357,6 +1358,7 @@ public actor ThumbnailFeedCore {
         var seen = Set(orderedUIDs)
         orderedUIDs.append(contentsOf: analysis.orderedUIDs.filter { seen.insert($0).inserted })
         orderedUIDs.append(contentsOf: retention.orderedUIDs.filter { seen.insert($0).inserted })
+        orderedUIDs.append(contentsOf: retention.authorizationOnlyOrder.filter { seen.insert($0).inserted })
         return orderedUIDs
     }
 

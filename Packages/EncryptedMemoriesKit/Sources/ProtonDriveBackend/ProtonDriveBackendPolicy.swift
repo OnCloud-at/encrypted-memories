@@ -89,6 +89,8 @@ public enum ProtonDriveBackendFactory {
             inventoryStore: sourceInventoryStore
         )
         await librarySources.prepare()
+        // Before any consumer binds: the first cache sweep keeps the thumbnails of the photos in Recently Deleted.
+        await librarySources.setIdentitiesOutsideInventory(await bridge.recentlyDeletedIdentities())
         SDKCapabilities.current.log()
         // Opening account-scoped SQLite stores is synchronous. Prepare them on a utility executor before the
         // facade's MainActor composition so account activation does not block the UI executor on disk I/O.

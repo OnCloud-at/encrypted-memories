@@ -13,6 +13,9 @@ only on this device. **Restore** puts them back into the backup. **Empty Trash**
 list; they stay excluded from the backup and stay in Apple Photos or their folder. You can still bring them
 back later under **Excluded from Backup** in the Backup settings.
 
+Recently Deleted also opens offline and shows the last list the app received. Thumbnails of trashed photos
+stay on the device while the photos are in the trash; the app loads them after every library thumbnail.
+
 Removing an item from an album is not the same as moving it to Recently Deleted. Album removal keeps the item in the main library.
 
 - **iPhone and iPad:** Open **Collections → Recently Deleted**.
