@@ -8,6 +8,7 @@ public struct AppFeatureID: RawRepresentable, Hashable, Sendable, Codable {
     public static let smartSearch = AppFeatureID(rawValue: "smartSearch")
     public static let peopleRecognition = AppFeatureID(rawValue: "peopleRecognition")
     public static let petRecognition = AppFeatureID(rawValue: "petRecognition")
+    public static let sharedLibrary = AppFeatureID(rawValue: "sharedLibrary")
 }
 
 public struct AppCapabilityID: RawRepresentable, Hashable, Sendable, Codable {

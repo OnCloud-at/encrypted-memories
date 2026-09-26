@@ -115,6 +115,12 @@ final class CoreArchitectureGateTests: XCTestCase {
             extraForbiddenTokens: []
         ),
         CoreTargetRule(
+            name: "SharedLibraryCore",
+            allowedImports: ["AlbumCore", "Foundation", "PhotosCore"],
+            expectedDependencies: ["AlbumCore", "PhotosCore"],
+            extraForbiddenTokens: []
+        ),
+        CoreTargetRule(
             name: "TimelineCore",
             // UploadCore: photos that the backup has not uploaded yet are part of the timeline (pending grid).
             allowedImports: [

@@ -560,6 +560,21 @@
         "de": { "stringUnit": { "state": "translated", "value": "Gerade nichts zum Ausprobieren" } }
       }
     },
+    "labs.shared_library_title": {
+      "extractionState": "manual",
+      "comment": "Labs toggle for sharing the whole photo library with other people.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Shared Library" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Geteilte Mediathek" } }
+      }
+    },
+    "labs.shared_library_summary": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Share your whole library with people you trust." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Teile deine ganze Mediathek mit Menschen, denen du vertraust." } }
+      }
+    },
     "labs.empty_message": {
       "extractionState": "manual",
       "localizations": {
