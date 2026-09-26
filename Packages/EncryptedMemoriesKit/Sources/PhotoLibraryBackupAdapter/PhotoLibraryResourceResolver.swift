@@ -104,6 +104,7 @@ public struct PhotoLibraryResourceResolver: BackupResourceResolving {
         let primaryRole = plan.primary.role
         let primaryByteCount = primaryIdentity.byteCount
         let primaryStaged = StagedExport(primaryIdentity.staged)
+        let modifiedAtResolve = asset.modificationDate
         let localIdentifier = entry.source.identifier
         let tempStore = self.tempStore
         let primaryMaterializer:
@@ -122,6 +123,7 @@ public struct PhotoLibraryResourceResolver: BackupResourceResolving {
                     uploadFilename: plan.primary.uploadFilename,
                     expectedBytes: primaryByteCount,
                     staged: primaryStaged,
+                    sourceUnchanged: currentAsset.modificationDate == modifiedAtResolve,
                     tempStore: tempStore,
                     tracking: exportedURLs,
                     onProgress: {
@@ -184,6 +186,7 @@ public struct PhotoLibraryResourceResolver: BackupResourceResolving {
             let filename = item.uploadFilename
             let expectedByteCount = identity.byteCount
             let staged = StagedExport(identity.staged)
+            let ownerModifiedAtResolve = owner.modificationDate
             let materializer: @Sendable (BackupResourcePreparationReporter) async throws -> UploadResourceDescriptor = {
                 progress in
                 guard
@@ -199,6 +202,7 @@ public struct PhotoLibraryResourceResolver: BackupResourceResolving {
                     uploadFilename: filename,
                     expectedBytes: expectedByteCount,
                     staged: staged,
+                    sourceUnchanged: currentAsset.modificationDate == ownerModifiedAtResolve,
                     tempStore: tempStore,
                     tracking: exportedURLs,
                     onProgress: {
@@ -403,20 +407,25 @@ public struct PhotoLibraryResourceResolver: BackupResourceResolving {
     }
 
     /// Materializes one resource only after Core selected it for upload. It reuses the file the identity pass
-    /// staged; otherwise chunks go straight to the temp file and are hashed again so the runner can reject a
-    /// source that changed after preflight.
+    /// staged while the photo is unchanged; otherwise chunks go straight to the temp file and are hashed again so
+    /// the runner can reject a source that changed after preflight.
     private static func export(
         _ resource: PHAssetResource,
         uploadFilename: String,
         expectedBytes: Int64,
         staged: StagedExport,
+        sourceUnchanged: Bool,
         tempStore: BackupTempFileStore,
         tracking exported: ExportedURLBox,
         onProgress: @escaping @Sendable (Double) -> Void
     ) async throws -> ExportResult {
         if let export = staged.take() {
-            onProgress(1)
-            return export
+            if sourceUnchanged {
+                onProgress(1)
+                return export
+            }
+            // The photo changed after its identity pass: read it again, so the runner compares current bytes.
+            tempStore.discard(export.url)
         }
         let partialURL = try tempStore.reserve(filename: uploadFilename, expectedBytes: expectedBytes)
         do {

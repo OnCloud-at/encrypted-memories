@@ -3,8 +3,9 @@ import UploadCore
 
 /// Receives one original that PhotoKit downloads from iCloud. It hashes every chunk and also stages the bytes in the
 /// temp store, so the upload reuses the file and the original downloads only once. When the temp budget or the disk
-/// refuses a chunk, the sink drops the partial file and only hashes the rest; the upload then exports the original
-/// again, as before.
+/// refuses a chunk, or the original outgrows half of the temp budget, the sink drops the partial file and only
+/// hashes the rest; the upload then exports the original again, as before. The half keeps one large video from
+/// starving the other photos that stage at the same time.
 ///
 /// Not synchronized: the PhotoKit liveness guard serializes `receive`, and `finish`/`abandon` run after the request ended.
 final class PhotoKitStagingSink: @unchecked Sendable {
@@ -16,6 +17,7 @@ final class PhotoKitStagingSink: @unchecked Sendable {
     }
 
     private let tempStore: BackupTempFileStore
+    private let maximumStagedBytes: Int64
     private let sha1 = UploadSHA1Accumulator()
     private var byteCount: Int64 = 0
     private var partialURL: URL?
@@ -23,6 +25,7 @@ final class PhotoKitStagingSink: @unchecked Sendable {
 
     init(tempStore: BackupTempFileStore, filename: String) {
         self.tempStore = tempStore
+        maximumStagedBytes = tempStore.maximumBytes / 2
         // PhotoKit exposes no size before the download, so the reservation starts empty and each chunk is accounted.
         guard let url = try? tempStore.reserve(filename: filename, expectedBytes: 0) else { return }
         guard FileManager.default.createFile(atPath: url.path, contents: nil),
@@ -41,6 +44,10 @@ final class PhotoKitStagingSink: @unchecked Sendable {
         sha1.update(data)
         byteCount += Int64(data.count)
         guard let partialURL, let handle else { return }
+        guard byteCount <= maximumStagedBytes else {
+            dropStaging()
+            return
+        }
         do {
             try tempStore.recordWrite(to: partialURL, byteCount: data.count)
             try handle.write(contentsOf: data)

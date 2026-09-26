@@ -67,6 +67,24 @@ final class PhotoKitStagingSinkTests: XCTestCase {
         XCTAssertTrue(files().isEmpty, "the partial file must not stay behind")
     }
 
+    func testAnOriginalLargerThanHalfTheBudgetIsOnlyHashed() throws {
+        let fits = PhotoKitStagingSink(tempStore: store(maximumBytes: 100), filename: "IMG_6.MOV")
+        [Data(count: 25), Data(count: 25)].forEach(fits.receive)
+        let staged = try XCTUnwrap(fits.finish().stagedURL, "half of the budget may stage")
+        XCTAssertEqual(try Data(contentsOf: staged).count, 50)
+        try FileManager.default.removeItem(at: staged)
+
+        let tooLarge = PhotoKitStagingSink(tempStore: store(maximumBytes: 100), filename: "IMG_7.MOV")
+        let chunks = [Data(count: 30), Data(count: 30)]
+        chunks.forEach(tooLarge.receive)
+        let result = tooLarge.finish()
+
+        XCTAssertNil(result.stagedURL, "one large video must not fill the budget of every other photo")
+        XCTAssertEqual(result.byteCount, 60)
+        XCTAssertEqual(result.sha1Digest, digest(of: chunks))
+        XCTAssertTrue(files().isEmpty)
+    }
+
     func testLowDiskSpaceDropsTheFileButStillHashesEveryByte() {
         let tempStore = store(freeBytes: 4)
         let chunks = [Data("12345".utf8)]
