@@ -169,6 +169,9 @@ public final class PhotoMapAnnotationLoader {
         if let lastViewportSize, lastViewportSize != viewportSize {
             resizeTransitionDeadline = CACurrentMediaTime() + Self.resizeTransitionWindow
         }
+        if lastViewportSize != viewportSize {
+            PhotoMapPrewarmer.rememberViewport(mapView.bounds.size)
+        }
         lastViewportSize = viewportSize
         guard let plan = policy.aggregationPlan(for: viewport, viewportSize: viewportSize),
             lastPlan != plan

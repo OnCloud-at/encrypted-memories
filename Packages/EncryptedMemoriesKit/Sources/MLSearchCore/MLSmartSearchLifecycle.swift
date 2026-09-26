@@ -168,6 +168,10 @@ public actor MLSmartSearchLifecycle {
     /// The preferred languages of a switch-on that waits for the model list; a retry resumes it, and turning
     /// Smart Search off before the list arrives drops it.
     private var pendingRecommendedEnable: [String]?
+    /// Orders switch-on and switch-off intents: hosts number them, and an older one than the last applied one is
+    /// ignored, because separate intent tasks may reach the actor in any order.
+    private var startIntentSequence: UInt64 = 0
+    private var recommendedStartTask: Task<Void, Never>?
     /// The model whose download runs now, so choosing another first model can stop it.
     private var downloadingModelID: MLModelID?
 
@@ -315,6 +319,8 @@ public actor MLSmartSearchLifecycle {
             selectedModelID: persistent.selectedModelID,
             phase: phase,
             installedModelBytes: activeModel?.record.installedByteCount ?? 0,
+            hasActivatedModel: persistent.activatedRevision != nil,
+            isStartPending: pendingRecommendedEnable != nil,
             availableModels: catalog.selectableEntries(allowsDeveloperModels: deps.allowsDeveloperModels),
             isSearchAvailable: persistent.isEnabled
                 && ((session != nil && lastCoverage.indexed > 0)
@@ -443,12 +449,38 @@ public actor MLSmartSearchLifecycle {
 
     /// Turns Smart Search on with the model that suits the device language, without asking first. The model
     /// list loads first when needed. The person can choose another model at once, also while the first one
-    /// downloads.
-    public func enableRecommended(preferredLanguages: [String]) async {
+    /// downloads. Returns at once whether the switch-on was accepted; `isStartPending` shows it until Smart
+    /// Search is on, the model list failed, or no model suits.
+    @discardableResult
+    public func enableRecommended(preferredLanguages: [String], intent: UInt64) -> Bool {
+        guard intent > startIntentSequence else { return false }
+        startIntentSequence = intent
         guard started, !isShutDown, deps.featureAvailability == .available, !persistent.isEnabled,
             persistent.pendingOperation == nil, !stateLoadFailed
-        else { return }
+        else { return false }
         pendingRecommendedEnable = preferredLanguages
+        emit()
+        recommendedStartTask = Task { await self.startRecommended(intent: intent) }
+        return true
+    }
+
+    /// Turning the switch off before Smart Search started drops that start.
+    public func cancelRecommendedEnable(intent: UInt64) {
+        guard intent > startIntentSequence else { return }
+        startIntentSequence = intent
+        guard pendingRecommendedEnable != nil else { return }
+        pendingRecommendedEnable = nil
+        if !persistent.isEnabled { phase = .disabled }
+        emit()
+    }
+
+    /// Waits for a switch-on that `enableRecommended` accepted, including its first model activation.
+    func awaitRecommendedStart() async {
+        await recommendedStartTask?.value
+    }
+
+    private func startRecommended(intent: UInt64) async {
+        guard let preferredLanguages = pendingRecommendedEnable else { return }
         // The built-in catalog has no download plans, so a fresh signed catalog is required once.
         let catalogIsFresh =
             lastCatalogRefreshAt.map { $0.duration(to: .now) < configuration.catalogRefreshInterval } ?? false
@@ -456,7 +488,8 @@ public actor MLSmartSearchLifecycle {
             // A failed list stays visible with a retry that resumes this switch-on.
             guard await refreshCatalog() else { return }
         }
-        guard !isShutDown, !persistent.isEnabled, pendingRecommendedEnable == preferredLanguages else { return }
+        guard !isShutDown, !persistent.isEnabled, startIntentSequence == intent, pendingRecommendedEnable != nil
+        else { return }
         pendingRecommendedEnable = nil
         let choices = catalog.selectableEntries(allowsDeveloperModels: deps.allowsDeveloperModels)
             .filter { $0.releaseTrack == .production }
@@ -469,15 +502,6 @@ public actor MLSmartSearchLifecycle {
             return
         }
         await enable(with: model.id)
-    }
-
-    /// Turning Smart Search off before the model list arrived drops the pending switch-on.
-    public func cancelRecommendedEnable() {
-        guard pendingRecommendedEnable != nil else { return }
-        pendingRecommendedEnable = nil
-        guard !persistent.isEnabled else { return }
-        phase = .disabled
-        emit()
     }
 
     /// Turns Smart Search on with the chosen model: native analysis starts at once, and the model
@@ -557,9 +581,11 @@ public actor MLSmartSearchLifecycle {
         let previousActivatedRevision = persistent.activatedRevision
         let previousActivatedDescriptor = persistent.activatedDescriptor
         let previousID = previousSelection
-        let startsWithoutActiveModel = previousID == nil
+        // A selection that never activated, such as a first model whose download was just stopped, serves nothing:
+        // the choice replaces it right away like a dropped selection.
+        let startsWithoutActiveModel = previousID == nil || previousActivatedRevision == nil
         if startsWithoutActiveModel {
-            // Persist a choice that replaces a dropped selection before download, so a failed
+            // Persist a choice that replaces a dropped or never activated selection before download, so a failed
             // transfer is retryable after relaunch. Existing selections use the switch journal below
             // and remain serving until their replacement is installed.
             persistent.selectedModelID = id
@@ -598,7 +624,7 @@ public actor MLSmartSearchLifecycle {
             }
         if targetRecord == nil {
             guard target.isDownloadable else {
-                if previousID == nil {
+                if startsWithoutActiveModel {
                     phase = .notInstalled(downloadable: false)
                     emit()
                     startIndexingLoopIfAvailable()
@@ -691,8 +717,8 @@ public actor MLSmartSearchLifecycle {
         if !persistent.isEnabled, persistent.pendingOperation == nil {
             // Off: only the model list can fail, while Smart Search switches on or the person chooses a model.
             if failure.kind == .catalog {
-                if let preferredLanguages = pendingRecommendedEnable {
-                    await enableRecommended(preferredLanguages: preferredLanguages)
+                if pendingRecommendedEnable != nil {
+                    await startRecommended(intent: startIntentSequence)
                 } else {
                     await loadModelChoices()
                 }

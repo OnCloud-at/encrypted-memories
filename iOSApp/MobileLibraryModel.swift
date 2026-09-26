@@ -1556,10 +1556,8 @@ final class MobileLibraryModel {
                     locationStore.isCurrentSessionLease(locationLease)
                 else { return }
                 self.locationIndex.replaceAll(savedLocations)
-                self.mapPrewarmer.prewarm(
-                    coordinates: self.locationIndex.coordinates,
-                    viewportSize: UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
-                        .first?.screen.bounds.size ?? .zero)
+                // Map tiles come from Apple, so this runs only where the Map was opened before.
+                self.mapPrewarmer.prewarm(coordinates: self.locationIndex.coordinates)
                 let client = try await ProtonDriveBackendFactory.makeFacade(
                     session: session,
                     store: store,

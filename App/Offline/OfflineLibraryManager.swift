@@ -1,4 +1,3 @@
-import AppKit
 import Foundation
 import MapFeature
 import MediaByteCache
@@ -46,18 +45,6 @@ final class OfflineLibraryManager {
     let locationIndex = PhotoLocationIndex()
     /// Loads the area the map opens at into MapKit's cache, so the map draws at once.
     @ObservationIgnored private let mapPrewarmer = PhotoMapPrewarmer()
-
-    /// The map fills the main window. At launch the window may not exist yet; its saved frame, then the screen, stand in.
-    private static func mapViewportSize() -> CGSize {
-        if let window = NSApp.mainWindow ?? NSApp.windows.first(where: \.isVisible) {
-            return window.contentLayoutRect.size
-        }
-        if let saved = UserDefaults.standard.string(forKey: AppSettingsKey.mainWindowFrame) {
-            let frame = NSRectFromString(saved)
-            if frame.width > 0, frame.height > 0 { return frame.size }
-        }
-        return NSScreen.main?.visibleFrame.size ?? .zero
-    }
     private let locationCrawl = LocationCrawl()
     private var locationCrawlStarted = false
     private var locationCrawlGeneration: UInt64 = 0
@@ -225,7 +212,8 @@ final class OfflineLibraryManager {
                 self.locationStore.isCurrentSessionLease(sessionLease)
             else { return }
             self.locationIndex.replaceAll(snapshot)
-            self.mapPrewarmer.prewarm(coordinates: self.locationIndex.coordinates, viewportSize: Self.mapViewportSize())
+            // Map tiles come from Apple, so this runs only where the Map was opened before.
+            self.mapPrewarmer.prewarm(coordinates: self.locationIndex.coordinates)
             self.locationConfigurationTask = nil
         }
         if originalsCapGate.isClosed { originalsCapGate = JoinedShutdownGate() }

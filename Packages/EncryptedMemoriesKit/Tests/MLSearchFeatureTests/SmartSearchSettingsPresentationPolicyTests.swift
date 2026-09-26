@@ -32,9 +32,9 @@ struct SmartSearchSettingsPresentationPolicyTests {
         #expect(content(isSupported: false, isEnabled: true, hasSelectedModel: true) == .status)
     }
 
-    @Test func onlyReplacingAServingModelAsksFirst() {
-        #expect(SmartSearchSettingsPolicy.asksBeforeSwitching(hasActiveModel: true))
-        #expect(!SmartSearchSettingsPolicy.asksBeforeSwitching(hasActiveModel: false))
+    @Test func onlyReplacingAnActivatedModelAsksFirst() {
+        #expect(SmartSearchSettingsPolicy.asksBeforeSwitching(hasActivatedModel: true))
+        #expect(!SmartSearchSettingsPolicy.asksBeforeSwitching(hasActivatedModel: false))
     }
 
     private func content(

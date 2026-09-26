@@ -1249,13 +1249,17 @@ import Testing
         defer { try? FileManager.default.removeItem(at: harness.layout.rootDirectory) }
 
         await harness.lifecycle.start()
-        await harness.lifecycle.enableRecommended(preferredLanguages: ["en-US"])
+        let accepted = await harness.lifecycle.enableRecommended(preferredLanguages: ["en-US"], intent: 1)
+        #expect(accepted)
+        #expect(await harness.lifecycle.currentSnapshot().isStartPending || harness.transport.downloadCount > 0)
+        await harness.lifecycle.awaitRecommendedStart()
 
         let stored = try #require(try harness.stateStore.load())
         #expect(stored.isEnabled)
         #expect(stored.selectedModelID == smallEntry.id, "English speakers get the smallest model, unasked")
         #expect(await waitForCompleteIndex(harness, total: 1))
         #expect(harness.transport.downloadCount == 1)
+        #expect(!(await harness.lifecycle.currentSnapshot().isStartPending))
     }
 
     @Test func aFailedModelListResumesTheSwitchOnWithRetry() async throws {
@@ -1270,9 +1274,11 @@ import Testing
         defer { try? FileManager.default.removeItem(at: harness.layout.rootDirectory) }
 
         await harness.lifecycle.start()
-        await harness.lifecycle.enableRecommended(preferredLanguages: ["de-AT"])
+        await harness.lifecycle.enableRecommended(preferredLanguages: ["de-AT"], intent: 1)
+        await harness.lifecycle.awaitRecommendedStart()
         let failed = await harness.lifecycle.currentSnapshot()
         #expect(!failed.isEnabled)
+        #expect(failed.isStartPending, "the switch stays on while the model list waits for Retry")
         #expect(MLSmartSearchModelPresentation(snapshot: failed).canRetry)
         #expect(try harness.stateStore.load() == nil)
 
@@ -1294,12 +1300,17 @@ import Testing
         defer { try? FileManager.default.removeItem(at: harness.layout.rootDirectory) }
 
         await harness.lifecycle.start()
-        await harness.lifecycle.enableRecommended(preferredLanguages: ["en"])
-        await harness.lifecycle.cancelRecommendedEnable()
+        await harness.lifecycle.enableRecommended(preferredLanguages: ["en"], intent: 1)
+        await harness.lifecycle.awaitRecommendedStart()
+        await harness.lifecycle.cancelRecommendedEnable(intent: 2)
         await harness.lifecycle.retry()
+        // A switch-on that reaches the actor after the later switch-off is older and changes nothing.
+        let late = await harness.lifecycle.enableRecommended(preferredLanguages: ["en"], intent: 1)
 
+        #expect(!late)
         let snapshot = await harness.lifecycle.currentSnapshot()
         #expect(!snapshot.isEnabled)
+        #expect(!snapshot.isStartPending)
         #expect(snapshot.phase == .disabled)
         #expect(try harness.stateStore.load() == nil)
         #expect(harness.transport.downloadCount == 0)
@@ -1320,22 +1331,63 @@ import Testing
         transport.blockNextDownload()
 
         await harness.lifecycle.start()
-        let enable = Task { await harness.lifecycle.enableRecommended(preferredLanguages: ["en"]) }
+        await harness.lifecycle.enableRecommended(preferredLanguages: ["en"], intent: 1)
         #expect(await waitUntil { transport.isBlocked })
         let downloading = await harness.lifecycle.currentSnapshot()
         #expect(downloading.allowsModelChoice, "the first download must not lock the model choice")
-        #expect(!downloading.hasActiveModel)
+        #expect(!downloading.hasActivatedModel)
 
         await harness.lifecycle.select(largeEntry.id)
-        await enable.value
+        await harness.lifecycle.awaitRecommendedStart()
         #expect(transport.downloadCount == 1, "the first model's download stops; only the choice downloads")
 
         #expect(await waitForCompleteIndex(harness, total: 1))
         let ready = await harness.lifecycle.currentSnapshot()
         #expect(ready.selectedModelID == largeEntry.id)
-        #expect(ready.hasActiveModel)
+        #expect(ready.hasActivatedModel)
         #expect(try harness.stateStore.load()?.selectedModelID == largeEntry.id)
         #expect(!FileManager.default.fileExists(atPath: harness.layout.modelDirectory(for: smallEntry.id).path))
+    }
+
+    @Test func aModelChosenDuringTheFirstDownloadSurvivesAFailedDownloadAndARelaunch() async throws {
+        let small = Data("small".utf8)
+        let large = Data("the-larger-model".utf8)
+        let (smallEntry, smallURL) = downloadableEntry(id: "small", payload: small)
+        let (largeEntry, largeURL) = downloadableEntry(id: "large", payload: large)
+        let catalog = MLModelCatalog(entries: [smallEntry, largeEntry])
+        let first = try makeHarness(
+            catalog: catalog,
+            payloads: [smallURL: small, largeURL: large],
+            assets: [uid("asset")],
+            failFirst: [largeURL: 1]
+        )
+        defer { try? FileManager.default.removeItem(at: first.layout.rootDirectory) }
+        first.transport.blockNextDownload()
+
+        await first.lifecycle.start()
+        await first.lifecycle.enableRecommended(preferredLanguages: ["en"], intent: 1)
+        #expect(await waitUntil { first.transport.isBlocked })
+        await first.lifecycle.select(largeEntry.id)
+        await first.lifecycle.awaitRecommendedStart()
+
+        // The choice's download failed; the choice itself is stored and shown, not the stopped first model.
+        let failed = await first.lifecycle.currentSnapshot()
+        #expect(failed.selectedModelID == largeEntry.id)
+        #expect(try first.stateStore.load()?.selectedModelID == largeEntry.id)
+        await first.lifecycle.shutdown()
+
+        let second = try makeHarness(
+            catalog: catalog,
+            payloads: [smallURL: small, largeURL: large],
+            assets: [uid("asset")],
+            root: first.layout.rootDirectory,
+            stateStoreOverride: first.stateStore,
+            storeProviderOverride: first.storeProvider
+        )
+        await second.lifecycle.start()
+
+        #expect(await waitForCompleteIndex(second, total: 1))
+        #expect(await second.lifecycle.currentSnapshot().selectedModelID == largeEntry.id)
     }
 
     @Test func enablingAgainSwitchesToTheChosenModel() async throws {

@@ -1,3 +1,4 @@
+import Foundation
 import MapKit
 import Testing
 
@@ -28,6 +29,20 @@ struct PhotoMapPrewarmerTests {
         // 1080 map points into 700 - 160 screen points: two map points per screen point.
         #expect(abs(visible.height - 1_400) < 0.001)
         #expect(abs(visible.width - 2_000) < 0.001)
+    }
+
+    @Test func onlyADeviceThatShowedTheMapRemembersASizeToPrewarm() throws {
+        let suite = "PhotoMapPrewarmerTests-\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        #expect(PhotoMapPrewarmer.rememberedViewport(defaults: defaults) == nil, "no Map shown, no tiles requested")
+        PhotoMapPrewarmer.rememberViewport(.zero, defaults: defaults)
+        #expect(PhotoMapPrewarmer.rememberedViewport(defaults: defaults) == nil)
+
+        PhotoMapPrewarmer.rememberViewport(CGSize(width: 393, height: 852), defaults: defaults)
+
+        #expect(PhotoMapPrewarmer.rememberedViewport(defaults: defaults) == CGSize(width: 393, height: 852))
     }
 
     @Test func aViewSmallerThanItsPaddingLoadsNothing() {

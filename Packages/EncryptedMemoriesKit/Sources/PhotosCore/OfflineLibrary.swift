@@ -19,6 +19,9 @@ public enum AppSettingsKey {
     public static let sidebarVisible = "EncryptedMemories.sidebarVisible"
     /// Saved main-window frame string (NSStringFromRect).
     public static let mainWindowFrame = "EncryptedMemories.mainWindowFrame"
+    /// Size of the library map when it was last shown on this device, in points ("width,height"). Its presence
+    /// allows loading the map's opening area at launch; a device whose person never opened the Map loads nothing.
+    public static let libraryMapViewportSize = "EncryptedMemories.libraryMapViewportSize"
     /// Records that macOS showed the Full Disk Access setup before the first folder selection.
     public static let folderBackupFullDiskAccessIntroduced =
         "EncryptedMemories.folderBackupFullDiskAccessIntroduced"

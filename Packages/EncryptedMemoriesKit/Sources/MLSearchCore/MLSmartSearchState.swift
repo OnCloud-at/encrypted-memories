@@ -119,6 +119,11 @@ public struct MLSmartSearchSnapshot: Sendable, Equatable {
     public let phase: MLSmartSearchPhase
     /// Installed size of the active model in bytes (0 when nothing is installed).
     public let installedModelBytes: Int64
+    /// A model was activated and owns an index, even while its session is not loaded, for example after a failed
+    /// model load. Replacing it rebuilds that index.
+    public let hasActivatedModel: Bool
+    /// A switch-on waits for the model list; Smart Search then starts with the recommended model.
+    public let isStartPending: Bool
     /// Selectable catalog entries for this environment.
     public let availableModels: [MLModelCatalogEntry]
     /// `true` once any enabled backend has searchable coverage.
@@ -132,6 +137,8 @@ public struct MLSmartSearchSnapshot: Sendable, Equatable {
         selectedModelID: MLModelID?,
         phase: MLSmartSearchPhase,
         installedModelBytes: Int64,
+        hasActivatedModel: Bool = false,
+        isStartPending: Bool = false,
         availableModels: [MLModelCatalogEntry],
         isSearchAvailable: Bool,
         indexingState: MLSmartSearchIndexingState = .idle
@@ -141,6 +148,8 @@ public struct MLSmartSearchSnapshot: Sendable, Equatable {
         self.selectedModelID = selectedModelID
         self.phase = phase
         self.installedModelBytes = installedModelBytes
+        self.hasActivatedModel = hasActivatedModel
+        self.isStartPending = isStartPending
         self.availableModels = availableModels
         self.isSearchAvailable = isSearchAvailable
         self.indexingState = indexingState
@@ -156,14 +165,11 @@ public struct MLSmartSearchSnapshot: Sendable, Equatable {
         indexingState: .idle
     )
 
-    /// A model serves searches. Until then, choosing another model discards no index.
-    public var hasActiveModel: Bool { installedModelBytes > 0 }
-
     /// The person may choose a model now: whenever no model work runs, and while the first model downloads,
     /// which the choice stops.
     public var allowsModelChoice: Bool {
         guard isEnabled else { return false }
-        if case .downloading = phase, !hasActiveModel { return true }
+        if case .downloading = phase, !hasActivatedModel { return true }
         return !phase.isBusy
     }
 
