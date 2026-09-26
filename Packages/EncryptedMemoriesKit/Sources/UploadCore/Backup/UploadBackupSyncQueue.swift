@@ -25,10 +25,6 @@ public enum UploadBackupSyncQueueState: String, Sendable, Codable, CaseIterable 
     /// Acknowledged non-success. It remains durably not backed up but no longer demands attention.
     case dismissedFailure
     case paused
-    /// The platform still prepares the source (the camera still processes a new photo). The row waits,
-    /// without an attempt and without scheduling a wake-up, until its date or until a newer revision
-    /// of the source arrives; the next regular pass then makes it runnable again.
-    case awaitingSource
 
     public var isTerminalSuccess: Bool {
         self == .alreadyBackedUp || self == .completed || self == .skippedRemoteDeletion
@@ -162,9 +158,6 @@ public struct UploadBackupSyncQueueSummary: Sendable, Equatable {
     public var failed = 0
     public var dismissedFailures = 0
     public var paused = 0
-    /// Rows parked until the platform finishes the source. Not outstanding work: they never schedule a
-    /// wake-up, but the status still reports them as waiting.
-    public var awaitingSource = 0
 
     public init() {}
 
@@ -224,8 +217,6 @@ public struct UploadBackupSyncQueueSummary: Sendable, Equatable {
             dismissedFailures += count
         case .paused:
             paused += count
-        case .awaitingSource:
-            awaitingSource += count
         }
     }
 }

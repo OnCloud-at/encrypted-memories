@@ -480,7 +480,7 @@ public actor PendingBackupCoordinator {
     private static func needsEvidence(_ state: UploadBackupSyncQueueState) -> Bool {
         switch state {
         case .discovered, .checking, .hashing, .duplicateChecking, .failed, .paused, .blockedByDraft,
-            .failedPermanent, .awaitingSource:
+            .failedPermanent:
             true
         case .queuedForUpload, .uploading, .finalizing, .needsRemoteReconciliation, .completed, .alreadyBackedUp,
             .skippedRemoteDeletion, .sourceMissing, .dismissedFailure:
@@ -491,7 +491,7 @@ public actor PendingBackupCoordinator {
     /// The duplicate check has not decided yet.
     private static func isUnchecked(_ state: UploadBackupSyncQueueState) -> Bool {
         switch state {
-        case .discovered, .checking, .hashing, .duplicateChecking, .awaitingSource: true
+        case .discovered, .checking, .hashing, .duplicateChecking: true
         default: false
         }
     }

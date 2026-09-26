@@ -583,9 +583,9 @@ public enum UploadError: LocalizedError, Equatable {
     case backend(String)
     case albumStep(String)
     case cancelled
-    /// The platform still prepares the source (the camera still processes a new photo). The runner parks
-    /// the row until `until` without counting an attempt; the finished file usually arrives sooner as a
-    /// new revision, which the platform's change notification enqueues.
+    /// The platform still prepares the source (the camera still processes a new photo). The runner makes the
+    /// row due at `until` without counting an attempt; the finished file usually arrives sooner as a new
+    /// revision, which the platform's change notification enqueues.
     case sourceNotReady(String, until: Date)
 
     public var errorDescription: String? {

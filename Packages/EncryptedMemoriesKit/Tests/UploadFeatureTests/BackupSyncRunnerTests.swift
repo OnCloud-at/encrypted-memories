@@ -919,45 +919,76 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertEqual(resolver.resolveCount(for: entry.source.identifier), 8, "7 pressure failures, then success")
     }
 
-    func testPhotoTheCameraStillProcessesWaitsWithoutATimer() async throws {
+    func testPhotoTheCameraStillProcessesWaitsForTheEndOfItsWindowWithoutPolling() async throws {
         let entry = seedEntry("processing.heic")
-        resolver.set(.notReady(times: 1, until: clock.now.addingTimeInterval(600)), for: entry.source.identifier)
+        let windowEnd = clock.now.addingTimeInterval(600)
+        resolver.set(.notReady(times: 1, until: windowEnd), for: entry.source.identifier)
 
-        // The first pass parks the photo and ends: no attempt, no failure, and no wait for its date.
+        // The library pass waits for nothing: the photo stays due at the end of the camera window.
         let runner = makeRunner()
-        let parked = await runner.runUntilDrained()
-        XCTAssertEqual(state(of: entry), .awaitingSource)
-        XCTAssertEqual(parked.awaitingSource, 1)
+        let parked = await runner.runUntilDrained(mode: .eligibleOnly)
+        let row = try XCTUnwrap(queueStore.entry(for: entry.source, revision: entry.revision))
+        XCTAssertEqual(row.state, .discovered, "a state that older builds know, never a failure")
+        XCTAssertEqual(row.attempts, 0)
+        XCTAssertEqual(row.updatedAt.timeIntervalSince1970, windowEnd.timeIntervalSince1970, accuracy: 0.001)
         XCTAssertEqual(parked.failed, 0)
-        XCTAssertFalse(parked.hasOutstandingWork, "a parked photo must not keep a pass or a wake-up alive")
-        XCTAssertTrue(clock.sleeps.isEmpty, "no timer polls the camera")
+        XCTAssertTrue(clock.sleeps.isEmpty)
         XCTAssertTrue(uploader.requests.isEmpty)
 
-        // A pass before the date leaves it parked.
+        // A pass before that date does not look at the photo again.
         clock.advance(by: 300)
-        _ = await runner.runUntilDrained()
-        XCTAssertEqual(state(of: entry), .awaitingSource)
+        _ = await runner.runUntilDrained(mode: .eligibleOnly)
         XCTAssertEqual(resolver.resolveCount(for: entry.source.identifier), 1)
 
-        // The next regular pass after the date backs up whatever version exists.
+        // One check at the end of the window backs up whatever version exists.
         clock.advance(by: 301)
-        let done = await runner.runUntilDrained()
+        _ = await runner.runUntilDrained(mode: .eligibleOnly)
         XCTAssertEqual(state(of: entry), .completed)
         XCTAssertEqual(uploader.requests.count, 1)
-        XCTAssertEqual(done.awaitingSource, 0)
+        XCTAssertEqual(resolver.resolveCount(for: entry.source.identifier), 2)
     }
 
-    func testBackUpNowTakesUpAParkedPhoto() async throws {
-        let entry = seedEntry("parked.heic")
+    func testAWaitingBackupSleepsOnceUntilTheCameraWindowEnds() async throws {
+        let entry = seedEntry("processing-wait.heic")
+        resolver.set(.notReady(times: 1, until: clock.now.addingTimeInterval(600)), for: entry.source.identifier)
+
+        let progress = await makeRunner().runUntilDrained()
+
+        XCTAssertEqual(state(of: entry), .completed)
+        XCTAssertEqual(progress.failed, 0)
+        XCTAssertEqual(clock.sleeps.count, 1, "no 30-second polling")
+        XCTAssertEqual(try XCTUnwrap(clock.sleeps.first), 600, accuracy: 0.001)
+    }
+
+    func testBackUpNowChecksAWaitingPhotoAgain() async throws {
+        let entry = seedEntry("waiting.heic")
         resolver.set(.notReady(times: 1, until: clock.now.addingTimeInterval(600)), for: entry.source.identifier)
         let runner = makeRunner()
-        _ = await runner.runUntilDrained()
-        XCTAssertEqual(state(of: entry), .awaitingSource)
+        _ = await runner.runUntilDrained(mode: .eligibleOnly)
+        XCTAssertEqual(resolver.resolveCount(for: entry.source.identifier), 1)
 
-        // "Back up now" makes every retryable row due, parked ones included.
+        // The camera finished without a change notification reaching the app; Back Up Now finds it done.
         queueStore.makeRetryableWorkEligible(updatedAt: clock.now)
-        _ = await runner.runUntilDrained()
+        _ = await runner.runUntilDrained(mode: .eligibleOnly)
+
         XCTAssertEqual(state(of: entry), .completed)
+        XCTAssertEqual(resolver.resolveCount(for: entry.source.identifier), 2)
+    }
+
+    func testTwoRevisionsOfOnePhotoNeverRunAtTheSameTime() async throws {
+        // The camera's preliminary version and the finished photo can both be due in one wave.
+        let preliminary = seedEntry("same.heic")
+        let finished = seedEntry("same.heic", revisionOffset: 1_000_000)
+        resolver.setSlowResolve(for: preliminary.source.identifier)
+
+        let runner = makeRunner()
+        let progress = await runner.runUntilDrained()
+
+        XCTAssertEqual(resolver.peakConcurrentResolves(for: preliminary.source.identifier), 1)
+        XCTAssertEqual(resolver.resolveCount(for: preliminary.source.identifier), 2)
+        XCTAssertEqual(uploader.requests.count, 1, "the second revision finds the photo backed up")
+        XCTAssertEqual(progress.failed, 0)
+        XCTAssertNotEqual(state(of: finished), .failed)
     }
 
     func testPersistedRetryDelaySurvivesRunnerRecreation() async throws {

@@ -159,35 +159,6 @@ final class UploadBackupSyncQueueTests: XCTestCase {
         XCTAssertEqual(store.summary().uploaded, 1)
     }
 
-    func testParkedRowIsNeitherRunnableNorOutstanding() throws {
-        let url = tempDir.appendingPathComponent(UploadBackupSyncQueueManifestStore.databaseFileName)
-        let store = try XCTUnwrap(UploadBackupSyncQueueManifestStore(url: url))
-        let parked = UploadBackupSyncQueueEntry(
-            source: source("camera"),
-            revision: revision(10),
-            originalFilename: "camera.heic",
-            state: .awaitingSource,
-            updatedAt: Date(timeIntervalSince1970: 5)
-        )
-        store.upsert(parked)
-
-        // The camera still processes the photo: nothing claims it, and nothing schedules a wake-up for it.
-        XCTAssertTrue(store.nextRunnable(limit: 10).isEmpty)
-        XCTAssertNil(store.nextRunnableDate())
-        XCTAssertNil(store.earliestRunnableEntry())
-        let summary = store.summary()
-        XCTAssertEqual(summary.awaitingSource, 1)
-        XCTAssertEqual(summary.waiting + summary.active + summary.blocked, 0)
-        XCTAssertTrue(summary.hasWork, "the photo is not backed up yet")
-
-        // A rescan of the same revision keeps it parked.
-        store.upsert(
-            UploadBackupSyncQueueEntry(
-                source: parked.source, revision: parked.revision, originalFilename: "camera.heic",
-                state: .discovered, updatedAt: Date(timeIntervalSince1970: 6)))
-        XCTAssertEqual(store.entry(for: parked.source, revision: parked.revision)?.state, .awaitingSource)
-    }
-
     func testRemoteCommitReconciliationSurvivesReopenAndClaimsWithoutLosingReceipt() throws {
         let url = tempDir.appendingPathComponent(UploadBackupSyncQueueManifestStore.databaseFileName)
         let entry = UploadBackupSyncQueueEntry(

@@ -14,8 +14,8 @@ The queue is durable. It includes streamed hashing, duplicate detection, retry s
 
 A photo that exists only in iCloud ("Optimize Storage") downloads once for its backup. A new photo that the
 camera still processes waits, without repeated checks, until Apple Photos reports the finished photo. If that
-report does not come, the next backup pass at least ten minutes after the shot backs up the version that
-exists. **Back Up Now** takes a waiting photo up at once.
+report does not come, one check ten minutes after the shot backs up the version that exists. **Back Up Now**
+checks a waiting photo again at once.
 
 On iPhone and iPad, background processing is scheduled with the operating system. iOS decides when background work runs, so backup is not guaranteed to be continuous after the app closes.
 

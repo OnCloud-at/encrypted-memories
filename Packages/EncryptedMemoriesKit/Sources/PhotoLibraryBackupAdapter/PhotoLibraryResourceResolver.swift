@@ -12,8 +12,8 @@ import os
 public struct PhotoLibraryResourceResolver: BackupResourceResolving {
     /// A new photo the camera still processes (deferred photo processing: a `.photoProxy` resource, alone or
     /// next to a preliminary image) waits up to this long after its capture for the finished one. The change
-    /// notification for the finished photo triggers its backup; no timer polls. After the window, the next
-    /// regular pass backs up whatever version exists, so a photo whose processing never finishes still gets a copy.
+    /// notification for the finished photo triggers its backup; no timer polls. One check at the end of the
+    /// window backs up whatever version exists, so a photo whose processing never finishes still gets a copy.
     static let processingWaitWindow: TimeInterval = 600
     private static let logger = Logger(subsystem: "at.oncloud.encryptedmemories", category: "Backup")
 

@@ -277,7 +277,6 @@ public actor BackupSyncRunner {
         queue.requeueStaleActive(before: now().addingTimeInterval(-configuration.staleActiveGrace), updatedAt: now())
         guard queue.isOperational() else { return progress }
         await requeueDueBlockedRows()
-        requeueDueAwaitingSourceRows()
         guard queue.isOperational() else { return progress }
 
         progress = BackupSyncProgress(summary: queue.summary(), isRunning: true)
@@ -348,7 +347,6 @@ public actor BackupSyncRunner {
                 break
             }
             await requeueDueBlockedRows()
-            requeueDueAwaitingSourceRows()
             guard queue.isOperational() else {
                 stopRequested = true
                 break
@@ -488,25 +486,6 @@ public actor BackupSyncRunner {
             return max(0.05, persisted.timeIntervalSince(currentTime))
         }
         return nil
-    }
-
-    /// Rows parked while the platform prepared their source become runnable once their date has passed.
-    /// Runs only inside a pass that started for another reason; parked rows never start one themselves.
-    private func requeueDueAwaitingSourceRows() {
-        let currentTime = now()
-        let due = queue.entries(in: .awaitingSource, updatedBefore: currentTime, limit: configuration.batchSize)
-        for entry in due {
-            guard
-                queue.updateState(
-                    source: entry.source, revision: entry.revision,
-                    state: .discovered, attempts: entry.attempts, lastError: nil, updatedAt: currentTime
-                )
-            else {
-                stopRequested = true
-                return
-            }
-            adjustProgress(from: .awaitingSource, to: .discovered)
-        }
     }
 
     /// One due-based re-check for parked draft rows: a row blocked N times re-enters the queue once
@@ -1579,23 +1558,24 @@ public actor BackupSyncRunner {
             return
         }
         // Not a failure: the camera still processes the photo. Uploading now would send its preliminary
-        // version and then the finished one again. Park the row without an attempt and without a timer: the
-        // platform's change notification enqueues the finished photo as a new revision, and a later regular
-        // pass takes the parked row up again once its date has passed.
+        // version and then the finished one again. The row waits, without an attempt, until the end of the
+        // camera's window: the platform's change notification enqueues the finished photo as a new revision
+        // sooner, so no timer re-checks it before that date. A known state keeps older builds able to read it.
         if case UploadError.sourceNotReady(_, let until) = error {
+            let eligibleAt = max(until, now())
             guard
                 queue.updateState(
                     source: entry.source, revision: entry.revision,
-                    state: .awaitingSource,
+                    state: .discovered,
                     attempts: entry.attempts,
                     lastError: nil,
-                    updatedAt: until
+                    updatedAt: eligibleAt
                 )
             else {
                 stopRequested = true
                 return
             }
-            adjustProgress(from: oldState, to: .awaitingSource)
+            adjustProgress(from: oldState, to: .discovered)
             emitProgress()
             return
         }
@@ -1826,8 +1806,6 @@ public actor BackupSyncRunner {
             progress.dismissedFailures += sign
         case .paused:
             progress.paused += sign
-        case .awaitingSource:
-            progress.awaitingSource += sign
         }
     }
 
