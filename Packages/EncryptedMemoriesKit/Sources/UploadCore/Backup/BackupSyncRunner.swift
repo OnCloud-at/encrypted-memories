@@ -44,8 +44,6 @@ public actor BackupSyncRunner {
         public var uploadStallPollInterval: TimeInterval
         public var retry: BackupRetryPolicy
         public var throttle: BackupThrottlePolicy
-        /// How long a source the platform still prepares waits before the next try.
-        public var sourceNotReadyDelay: TimeInterval
 
         public init(
             batchSize: Int = 32,
@@ -54,8 +52,7 @@ public actor BackupSyncRunner {
             uploadStallTimeout: TimeInterval = 180,
             uploadStallPollInterval: TimeInterval = 5,
             retry: BackupRetryPolicy = BackupRetryPolicy(),
-            throttle: BackupThrottlePolicy = BackupThrottlePolicy(),
-            sourceNotReadyDelay: TimeInterval = 30
+            throttle: BackupThrottlePolicy = BackupThrottlePolicy()
         ) {
             self.batchSize = max(1, batchSize)
             self.staleActiveGrace = max(0, staleActiveGrace)
@@ -64,7 +61,6 @@ public actor BackupSyncRunner {
             self.uploadStallPollInterval = max(0.01, min(uploadStallPollInterval, uploadStallTimeout))
             self.retry = retry
             self.throttle = throttle
-            self.sourceNotReadyDelay = max(0, sourceNotReadyDelay)
         }
     }
 
@@ -281,6 +277,7 @@ public actor BackupSyncRunner {
         queue.requeueStaleActive(before: now().addingTimeInterval(-configuration.staleActiveGrace), updatedAt: now())
         guard queue.isOperational() else { return progress }
         await requeueDueBlockedRows()
+        requeueDueAwaitingSourceRows()
         guard queue.isOperational() else { return progress }
 
         progress = BackupSyncProgress(summary: queue.summary(), isRunning: true)
@@ -351,6 +348,7 @@ public actor BackupSyncRunner {
                 break
             }
             await requeueDueBlockedRows()
+            requeueDueAwaitingSourceRows()
             guard queue.isOperational() else {
                 stopRequested = true
                 break
@@ -490,6 +488,25 @@ public actor BackupSyncRunner {
             return max(0.05, persisted.timeIntervalSince(currentTime))
         }
         return nil
+    }
+
+    /// Rows parked while the platform prepared their source become runnable once their date has passed.
+    /// Runs only inside a pass that started for another reason; parked rows never start one themselves.
+    private func requeueDueAwaitingSourceRows() {
+        let currentTime = now()
+        let due = queue.entries(in: .awaitingSource, updatedBefore: currentTime, limit: configuration.batchSize)
+        for entry in due {
+            guard
+                queue.updateState(
+                    source: entry.source, revision: entry.revision,
+                    state: .discovered, attempts: entry.attempts, lastError: nil, updatedAt: currentTime
+                )
+            else {
+                stopRequested = true
+                return
+            }
+            adjustProgress(from: .awaitingSource, to: .discovered)
+        }
     }
 
     /// One due-based re-check for parked draft rows: a row blocked N times re-enters the queue once
@@ -1561,23 +1578,23 @@ public actor BackupSyncRunner {
             return
         }
         // Not a failure: the camera still processes the photo. Uploading now would send its preliminary
-        // version and then the finished one again. Wait without counting an attempt; the finished photo
-        // usually arrives sooner as a new revision.
-        if case UploadError.sourceNotReady = error {
-            let eligibleAt = now().addingTimeInterval(configuration.sourceNotReadyDelay)
+        // version and then the finished one again. Park the row without an attempt and without a timer: the
+        // platform's change notification enqueues the finished photo as a new revision, and a later regular
+        // pass takes the parked row up again once its date has passed.
+        if case UploadError.sourceNotReady(_, let until) = error {
             guard
                 queue.updateState(
                     source: entry.source, revision: entry.revision,
-                    state: .discovered,
+                    state: .awaitingSource,
                     attempts: entry.attempts,
                     lastError: nil,
-                    updatedAt: eligibleAt
+                    updatedAt: until
                 )
             else {
                 stopRequested = true
                 return
             }
-            adjustProgress(from: oldState, to: .discovered)
+            adjustProgress(from: oldState, to: .awaitingSource)
             emitProgress()
             return
         }
@@ -1808,6 +1825,8 @@ public actor BackupSyncRunner {
             progress.dismissedFailures += sign
         case .paused:
             progress.paused += sign
+        case .awaitingSource:
+            progress.awaitingSource += sign
         }
     }
 

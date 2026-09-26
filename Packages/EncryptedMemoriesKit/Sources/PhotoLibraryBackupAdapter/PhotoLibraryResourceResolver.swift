@@ -10,8 +10,9 @@ import os
 /// never used.
 public struct PhotoLibraryResourceResolver: BackupResourceResolving {
     /// A new photo the camera still processes (deferred photo processing: a `.photoProxy` resource, alone or
-    /// next to a preliminary image) waits this long for the finished one. After that the preliminary version is
-    /// backed up, so a photo whose processing never finishes still gets a copy.
+    /// next to a preliminary image) waits up to this long after its capture for the finished one. The change
+    /// notification for the finished photo triggers its backup; no timer polls. After the window, the next
+    /// regular pass backs up whatever version exists, so a photo whose processing never finishes still gets a copy.
     static let processingWaitWindow: TimeInterval = 600
     private static let logger = Logger(subsystem: "at.oncloud.encryptedmemories", category: "Backup")
 
@@ -51,8 +52,11 @@ public struct PhotoLibraryResourceResolver: BackupResourceResolving {
             let roles = info.resources.map(\.role.rawValue).sorted().joined(separator: ",")
             Self.logger.notice("[Backup] new photo ageS=\(Int(age), privacy: .public) roles=\(roles, privacy: .public)")
         }
-        if info.resources.contains(where: { $0.role == .photoProxy }), age < Self.processingWaitWindow {
-            throw UploadError.sourceNotReady(entry.originalFilename)
+        if info.resources.contains(where: { $0.role == .photoProxy }), age < Self.processingWaitWindow,
+            let created = asset.creationDate
+        {
+            throw UploadError.sourceNotReady(
+                entry.originalFilename, until: created.addingTimeInterval(Self.processingWaitWindow))
         }
         guard let plan = PhotoBackupAssetPlanner.exportPlan(for: info),
             let candidate = PhotoBackupAssetPlanner.candidate(for: info),

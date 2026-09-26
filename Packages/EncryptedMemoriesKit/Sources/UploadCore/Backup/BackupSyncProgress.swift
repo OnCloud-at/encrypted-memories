@@ -59,6 +59,8 @@ public struct BackupSyncProgress: Sendable, Equatable {
     /// Permanent failures the user acknowledged. Still not backed up, but no longer attention work.
     public var dismissedFailures = 0
     public var paused = 0
+    /// Photos the platform still prepares (camera processing); shown as waiting, never outstanding work.
+    public var awaitingSource = 0
     /// The file currently being processed, for "wird geprüft: IMG_0042.HEIC" style rows.
     public var currentItemName: String?
     /// True while a runner pass is draining the queue.
@@ -104,6 +106,7 @@ public struct BackupSyncProgress: Sendable, Equatable {
     /// not an error; the UI reports its count separately without an attention state.
     public var needsAttention: Int { failed + sourceMissing }
 
+    /// Excludes `awaitingSource`: a photo the camera still processes never keeps a pass or a wake-up alive.
     public var hasOutstandingWork: Bool {
         waiting + checking + uploading + blocked > 0
     }
@@ -128,6 +131,7 @@ public struct BackupSyncProgress: Sendable, Equatable {
         failed = summary.failed
         dismissedFailures = summary.dismissedFailures
         paused = summary.paused
+        awaitingSource = summary.awaitingSource
         self.currentItemName = currentItemName
         self.isRunning = isRunning
     }

@@ -123,6 +123,13 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         XCTAssertTrue(snapshot.tiles.allSatisfy { $0.badge == .waiting })
     }
 
+    func testPhotoTheCameraStillProcessesShowsWithAnEmptyCircle() async throws {
+        enqueue("fresh", state: .awaitingSource)
+        await coordinator.start()
+        let snapshot = await waitForSnapshot("the parked photo shows") { $0.tiles.count == 1 }
+        XCTAssertEqual(snapshot.tiles.first?.badge, .waiting)
+    }
+
     func testLargeScanShowsPhotosOnlyAfterTheirCheck() async throws {
         await coordinator.close()
         coordinator = makeCoordinator(uncheckedAdmissionLimit: 1)

@@ -59,9 +59,9 @@ final class ScriptedBackupResolver: BackupResourceResolving, @unchecked Sendable
         /// Throw `BackupTempFileError.diskBudgetExceeded` for the first `times` resolves, then
         /// behave like `.standard`. Models a device low on space while a pass runs.
         case diskPressure(times: Int)
-        /// Throw `UploadError.sourceNotReady` for the first `times` resolves, then behave like `.standard`.
-        /// Models a new photo the camera still processes.
-        case notReady(times: Int)
+        /// Throw `UploadError.sourceNotReady(until:)` for the first `times` resolves, then behave like
+        /// `.standard`. Models a new photo the camera still processes.
+        case notReady(times: Int, until: Date)
     }
 
     private let lock = NSLock()
@@ -139,7 +139,7 @@ final class ScriptedBackupResolver: BackupResourceResolving, @unchecked Sendable
             behaviors[identifier] = behavior
             if case .transientFailure(let times) = behavior { remainingFailures[identifier] = times }
             if case .diskPressure(let times) = behavior { remainingFailures[identifier] = times }
-            if case .notReady(let times) = behavior { remainingFailures[identifier] = times }
+            if case .notReady(let times, _) = behavior { remainingFailures[identifier] = times }
         }
     }
 
@@ -181,8 +181,8 @@ final class ScriptedBackupResolver: BackupResourceResolving, @unchecked Sendable
             if consumeFailure() { throw UploadError.backend("transient resolve failure for \(id)") }
         case .diskPressure:
             if consumeFailure() { throw BackupTempFileStore.BackupTempFileError.diskBudgetExceeded }
-        case .notReady:
-            if consumeFailure() { throw UploadError.sourceNotReady(id) }
+        case .notReady(_, let until):
+            if consumeFailure() { throw UploadError.sourceNotReady(id, until: until) }
         case .standard:
             break
         }
@@ -884,35 +884,45 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertEqual(resolver.resolveCount(for: entry.source.identifier), 8, "7 pressure failures, then success")
     }
 
-    func testPhotoTheCameraStillProcessesWaitsWithoutFailing() async throws {
+    func testPhotoTheCameraStillProcessesWaitsWithoutATimer() async throws {
         let entry = seedEntry("processing.heic")
-        resolver.set(.notReady(times: 5), for: entry.source.identifier)
+        resolver.set(.notReady(times: 1, until: clock.now.addingTimeInterval(600)), for: entry.source.identifier)
 
+        // The first pass parks the photo and ends: no attempt, no failure, and no wait for its date.
         let runner = makeRunner()
-        let progress = await runner.runUntilDrained()
+        let parked = await runner.runUntilDrained()
+        XCTAssertEqual(state(of: entry), .awaitingSource)
+        XCTAssertEqual(parked.awaitingSource, 1)
+        XCTAssertEqual(parked.failed, 0)
+        XCTAssertFalse(parked.hasOutstandingWork, "a parked photo must not keep a pass or a wake-up alive")
+        XCTAssertTrue(clock.sleeps.isEmpty, "no timer polls the camera")
+        XCTAssertTrue(uploader.requests.isEmpty)
 
-        XCTAssertEqual(state(of: entry), .completed, "a photo in camera processing must never park as failed")
-        XCTAssertEqual(uploader.requests.count, 1, "only the finished photo uploads")
-        XCTAssertEqual(progress.failed, 0)
-        XCTAssertEqual(resolver.resolveCount(for: entry.source.identifier), 6)
-        XCTAssertEqual(clock.sleeps.count, 5)
-        XCTAssertEqual(try XCTUnwrap(clock.sleeps.first), 30, accuracy: 0.001)
+        // A pass before the date leaves it parked.
+        clock.advance(by: 300)
+        _ = await runner.runUntilDrained()
+        XCTAssertEqual(state(of: entry), .awaitingSource)
+        XCTAssertEqual(resolver.resolveCount(for: entry.source.identifier), 1)
+
+        // The next regular pass after the date backs up whatever version exists.
+        clock.advance(by: 301)
+        let done = await runner.runUntilDrained()
+        XCTAssertEqual(state(of: entry), .completed)
+        XCTAssertEqual(uploader.requests.count, 1)
+        XCTAssertEqual(done.awaitingSource, 0)
     }
 
-    func testTwoRevisionsOfOnePhotoNeverRunAtTheSameTime() async throws {
-        // The camera's preliminary version and the finished photo can both be due in one wave.
-        let preliminary = seedEntry("same.heic")
-        let finished = seedEntry("same.heic", revisionOffset: 1_000_000)
-        resolver.setSlowResolve(for: preliminary.source.identifier)
-
+    func testBackUpNowTakesUpAParkedPhoto() async throws {
+        let entry = seedEntry("parked.heic")
+        resolver.set(.notReady(times: 1, until: clock.now.addingTimeInterval(600)), for: entry.source.identifier)
         let runner = makeRunner()
-        let progress = await runner.runUntilDrained()
+        _ = await runner.runUntilDrained()
+        XCTAssertEqual(state(of: entry), .awaitingSource)
 
-        XCTAssertEqual(resolver.peakConcurrentResolves(for: preliminary.source.identifier), 1)
-        XCTAssertEqual(resolver.resolveCount(for: preliminary.source.identifier), 2)
-        XCTAssertEqual(uploader.requests.count, 1, "the second revision finds the photo backed up")
-        XCTAssertEqual(progress.failed, 0)
-        XCTAssertNotEqual(state(of: finished), .failed)
+        // "Back up now" makes every retryable row due, parked ones included.
+        queueStore.makeRetryableWorkEligible(updatedAt: clock.now)
+        _ = await runner.runUntilDrained()
+        XCTAssertEqual(state(of: entry), .completed)
     }
 
     func testPersistedRetryDelaySurvivesRunnerRecreation() async throws {

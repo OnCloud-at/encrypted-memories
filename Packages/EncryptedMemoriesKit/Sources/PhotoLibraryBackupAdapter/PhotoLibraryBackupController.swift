@@ -413,6 +413,7 @@ public final class PhotoLibraryBackupController {
         guard let queueStore else { return [] }
         let states: [UploadBackupSyncQueueState] = [
             .failed, .failedPermanent, .sourceMissing, .blockedByDraft, .discovered, .queuedForUpload,
+            .awaitingSource,
         ]
         var entries: [UploadBackupSyncQueueEntry] = []
         for state in states where entries.count < limit {
@@ -458,7 +459,8 @@ public final class PhotoLibraryBackupController {
     /// True while at least one failed item can still be retried (i.e. it is not a permanently-gone
     /// local file), so the detail sheet can offer "try again".
     public var hasRetryableFailures: Bool {
-        queueStore?.containsAny(in: [.failed, .blockedByDraft, .discovered, .queuedForUpload]) == true
+        queueStore?.containsAny(in: [.failed, .blockedByDraft, .discovered, .queuedForUpload, .awaitingSource])
+            == true
     }
 
     /// Platform adapters report whether an OS background opportunity was accepted. This changes only

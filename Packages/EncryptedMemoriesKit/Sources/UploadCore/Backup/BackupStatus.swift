@@ -195,7 +195,9 @@ public struct BackupStatus: Sendable, Equatable {
             }
         } else if progress.needsAttention > 0 {
             phase = .needsAttention
-        } else if progress.waiting + progress.checking + progress.uploading + progress.blocked > 0 {
+        } else if progress.waiting + progress.checking + progress.uploading + progress.blocked + progress.awaitingSource
+            > 0
+        {
             phase = .waiting
         } else if progress.total > 0 {
             phase = .completed

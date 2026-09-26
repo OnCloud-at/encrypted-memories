@@ -233,6 +233,7 @@ public actor BackupStatusProjector {
         progress.failed = summary.failed
         progress.dismissedFailures = summary.dismissedFailures
         progress.paused = summary.paused
+        progress.awaitingSource = summary.awaitingSource
         // A Photo Library pass repeatedly invokes short eligible-only runner drains while its scan
         // runs concurrently. The controller's run context is therefore the stable activity truth;
         // Mirroring each micro-drain's terminal callback would flicker between checking and waiting.

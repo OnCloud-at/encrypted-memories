@@ -514,14 +514,14 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
                         """
                         UPDATE backup_sync_queue SET
                           state = CASE
-                            WHEN state IN ('failed', 'blockedByDraft') THEN 'discovered'
+                            WHEN state IN ('failed', 'blockedByDraft', 'awaitingSource') THEN 'discovered'
                             ELSE state
                           END,
                           attempts = CASE WHEN state = 'failed' THEN 0 ELSE attempts END,
                           last_error = NULL,
                           updated_at = ?
                         WHERE state IN (
-                          'failed', 'blockedByDraft', 'discovered', 'queuedForUpload',
+                          'failed', 'blockedByDraft', 'awaitingSource', 'discovered', 'queuedForUpload',
                           'needsRemoteReconciliation'
                         );
                         """,
