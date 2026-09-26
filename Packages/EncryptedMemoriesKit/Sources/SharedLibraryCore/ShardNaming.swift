@@ -11,8 +11,10 @@ public enum ShardNaming {
         "\(prefix) \(index)"
     }
 
-    /// The one-based index when `name` is exactly a shard name, otherwise nil.
+    /// The one-based index when `name` is exactly a shard name, otherwise nil. Names compare in canonical Unicode
+    /// form, so a name stored in another normalization still matches.
     public static func index(ofName name: String) -> Int? {
+        let name = name.precomposedStringWithCanonicalMapping
         guard name.hasPrefix(prefix + " ") else { return nil }
         let digits = name.dropFirst(prefix.count + 1)
         guard !digits.isEmpty, digits.allSatisfy(\.isASCIIDigit), digits.first != "0",

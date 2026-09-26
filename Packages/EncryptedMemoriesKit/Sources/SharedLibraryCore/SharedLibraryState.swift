@@ -51,8 +51,8 @@ public struct SharedLibraryState: Sendable, Equatable {
         var state = SharedLibraryState()
         for entry in winners.values {
             switch entry.change {
-            case .hidden(let photo, true): state.hidden.insert(photo)
-            case .personal(let photo, true): state.personal.insert(photo)
+            case .hidden(let photo, isHidden: true): state.hidden.insert(photo)
+            case .personal(let photo, isPersonal: true): state.personal.insert(photo)
             case .settings(let settings): state.settings = settings
             case .shardCreated(let index, let album): state.shards.append(ShardRecord(index: index, album: album))
             case .hidden, .personal, .shardRetired, .unrecognized: break

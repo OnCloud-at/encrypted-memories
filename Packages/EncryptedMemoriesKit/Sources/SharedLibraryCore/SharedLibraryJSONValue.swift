@@ -1,10 +1,11 @@
 import Foundation
 
 /// A JSON value kept verbatim. A change type that a newer build wrote survives when this build rewrites its journal.
+/// Numbers keep every digit, so large identifiers do not change.
 public enum SharedLibraryJSONValue: Sendable, Equatable, Codable {
     case null
     case bool(Bool)
-    case number(Double)
+    case number(Decimal)
     case string(String)
     case array([SharedLibraryJSONValue])
     case object([String: SharedLibraryJSONValue])
@@ -15,7 +16,7 @@ public enum SharedLibraryJSONValue: Sendable, Equatable, Codable {
             self = .null
         } else if let value = try? container.decode(Bool.self) {
             self = .bool(value)
-        } else if let value = try? container.decode(Double.self) {
+        } else if let value = try? container.decode(Decimal.self) {
             self = .number(value)
         } else if let value = try? container.decode(String.self) {
             self = .string(value)
@@ -51,6 +52,17 @@ public enum SharedLibraryJSONValue: Sendable, Equatable, Codable {
     }
 
     var numberValue: Double? {
-        if case .number(let value) = self, value.isFinite { value } else { nil }
+        // Parsing the decimal text rounds to the nearest Double; NSDecimalNumber.doubleValue does not.
+        guard case .number(let value) = self, let double = Double(value.description), double.isFinite else {
+            return nil
+        }
+        return double
+    }
+
+    /// The value as compact JSON with sorted keys; equal values give equal text.
+    var canonicalText: String {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        return (try? encoder.encode(self)).flatMap { String(data: $0, encoding: .utf8) } ?? ""
     }
 }

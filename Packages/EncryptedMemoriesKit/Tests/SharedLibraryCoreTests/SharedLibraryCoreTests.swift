@@ -77,12 +77,12 @@ struct SharedLibraryJournalTests {
 
     @Test func everyChangeRoundTrips() throws {
         var journal = SharedLibraryJournal(deviceID: "mac")
-        journal.record(.hidden(photo, true), at: date(1))
-        journal.record(.personal(photo, false), at: date(2))
-        journal.record(.settings(SharedLibrarySettings(isEnabled: true, scope: .since(date(50)))), at: date(3))
-        journal.record(.settings(.off), at: date(4))
-        journal.record(.shardCreated(index: 2, album: album), at: date(5))
-        journal.record(.shardRetired(album: album), at: date(6))
+        try journal.record(.hidden(photo, isHidden: true), at: date(1))
+        try journal.record(.personal(photo, isPersonal: false), at: date(2))
+        try journal.record(.settings(SharedLibrarySettings(isEnabled: true, scope: .since(date(50)))), at: date(3))
+        try journal.record(.settings(.off), at: date(4))
+        try journal.record(.shardCreated(index: 2, album: album), at: date(5))
+        try journal.record(.shardRetired(album: album), at: date(6))
 
         #expect(try roundTrip(journal) == journal)
         #expect(journal.entries.map(\.sequence) == [1, 2, 3, 4, 5, 6])
@@ -97,15 +97,17 @@ struct SharedLibraryJournalTests {
             """
         var journal = try JSONDecoder().decode(SharedLibraryJournal.self, from: Data(json.utf8))
         guard case .unrecognized = journal.entries[1].change else {
-            Issue.record("the unknown change must stay unrecognized")
+            try Issue.record("the unknown change must stay unrecognized")
             return
         }
-        journal.record(.personal(photo, true), at: date(3))
+        try journal.record(.personal(photo, isPersonal: true), at: date(3))
         let rewritten = try roundTrip(journal.compacted())
 
         #expect(rewritten.entries.contains { $0.change == journal.entries[1].change }, "kept verbatim")
         let state = SharedLibraryState.merged([rewritten])
         #expect(state.visibility(of: photo) == .hidden)
+        let onlyUnknown = SharedLibraryJournal(deviceID: "mac", entries: [journal.entries[1]])
+        #expect(SharedLibraryState.merged([onlyUnknown]) == SharedLibraryState(), "never applied")
     }
 
     @Test func aDamagedKnownChangeIsIgnoredInsteadOfBreakingTheJournal() throws {
@@ -127,60 +129,192 @@ struct SharedLibraryJournalTests {
         #expect(SharedLibraryState.merged([journal]) == SharedLibraryState())
     }
 
-    @Test func theLatestChangeWinsAcrossDevices() {
+    @Test func theLatestChangeWinsAcrossDevices() throws {
         var mac = SharedLibraryJournal(deviceID: "mac")
         var phone = SharedLibraryJournal(deviceID: "phone")
-        mac.record(.hidden(photo, true), at: date(10))
-        phone.record(.hidden(photo, false), at: date(20))
+        try mac.record(.hidden(photo, isHidden: true), at: date(10))
+        try phone.record(.hidden(photo, isHidden: false), at: date(20))
         #expect(SharedLibraryState.merged([mac, phone]).visibility(of: photo) == .normal)
         #expect(SharedLibraryState.merged([phone, mac]).visibility(of: photo) == .normal, "order of journals")
 
-        mac.record(.hidden(photo, true), at: date(30))
+        try mac.record(.hidden(photo, isHidden: true), at: date(30))
         #expect(SharedLibraryState.merged([mac, phone]).visibility(of: photo) == .hidden)
     }
 
-    @Test func equalTimesResolveTheSameWayOnEveryDevice() {
+    @Test func equalTimesResolveTheSameWayOnEveryDevice() throws {
         var mac = SharedLibraryJournal(deviceID: "mac")
         var phone = SharedLibraryJournal(deviceID: "phone")
-        mac.record(.personal(photo, true), at: date(10))
-        phone.record(.personal(photo, false), at: date(10))
+        try mac.record(.personal(photo, isPersonal: true), at: date(10))
+        try phone.record(.personal(photo, isPersonal: false), at: date(10))
         let merged = SharedLibraryState.merged([mac, phone])
         #expect(merged == SharedLibraryState.merged([phone, mac]))
         #expect(merged.visibility(of: photo) == .normal, "the higher device ID wins a tie")
     }
 
-    @Test func showingAHiddenPhotoAgainRestoresNurFuerMich() {
+    @Test func showingAHiddenPhotoAgainRestoresNurFuerMich() throws {
         var journal = SharedLibraryJournal(deviceID: "mac")
-        journal.record(.personal(photo, true), at: date(1))
-        journal.record(.hidden(photo, true), at: date(2))
+        try journal.record(.personal(photo, isPersonal: true), at: date(1))
+        try journal.record(.hidden(photo, isHidden: true), at: date(2))
         #expect(SharedLibraryState.merged([journal]).visibility(of: photo) == .hidden)
 
-        journal.record(.hidden(photo, false), at: date(3))
+        try journal.record(.hidden(photo, isHidden: false), at: date(3))
         #expect(SharedLibraryState.merged([journal]).visibility(of: photo) == .personal)
     }
 
-    @Test func aRetiredShardLeavesTheStateAndShardsStayInIndexOrder() {
+    @Test func aRetiredShardLeavesTheStateAndShardsStayInIndexOrder() throws {
         let second = AlbumNodeIdentifier(volumeID: "volume", nodeID: "second")
         var journal = SharedLibraryJournal(deviceID: "mac")
-        journal.record(.shardCreated(index: 2, album: second), at: date(1))
-        journal.record(.shardCreated(index: 1, album: album), at: date(2))
+        try journal.record(.shardCreated(index: 2, album: second), at: date(1))
+        try journal.record(.shardCreated(index: 1, album: album), at: date(2))
         #expect(SharedLibraryState.merged([journal]).shards.map(\.index) == [1, 2])
 
-        journal.record(.shardRetired(album: second), at: date(3))
+        try journal.record(.shardRetired(album: second), at: date(3))
         #expect(SharedLibraryState.merged([journal]).shards == [ShardRecord(index: 1, album: album)])
     }
 
-    @Test func compactionKeepsTheMergedStateAndDropsSupersededChanges() {
+    @Test func compactionKeepsTheMergedStateAndDropsSupersededChanges() throws {
         var journal = SharedLibraryJournal(deviceID: "mac")
         for second in 0..<300 {
-            journal.record(.hidden(photo, second.isMultiple(of: 2)), at: date(TimeInterval(second)))
+            try journal.record(.hidden(photo, isHidden: second.isMultiple(of: 2)), at: date(TimeInterval(second)))
         }
-        journal.record(.settings(SharedLibrarySettings(isEnabled: true, scope: .everything)), at: date(400))
+        try journal.record(.settings(SharedLibrarySettings(isEnabled: true, scope: .everything)), at: date(400))
         #expect(journal.needsCompaction)
 
         let compacted = journal.compacted()
         #expect(compacted.entries.count == 2)
         #expect(SharedLibraryState.merged([compacted]) == SharedLibraryState.merged([journal]))
         #expect(!compacted.needsCompaction)
+    }
+}
+
+@Suite("Shared library journal robustness")
+struct SharedLibraryJournalRobustnessTests {
+    private let photo = PhotoUID(volumeID: "volume", nodeID: "photo")
+
+    private func date(_ seconds: TimeInterval) -> Date { Date(timeIntervalSince1970: seconds) }
+
+    private func journal(_ json: String) throws -> SharedLibraryJournal {
+        try JSONDecoder().decode(SharedLibraryJournal.self, from: Data(json.utf8))
+    }
+
+    @Test func anOutOfRangeShardIndexIsIgnoredInsteadOfCrashing() throws {
+        let decoded = try journal(
+            """
+            {"format":1,"device":"mac","entries":[
+              {"device":"mac","seq":1,"time":1,"change":{"type":"shardCreated","index":9223372036854775808,
+               "album":{"volumeID":"v","nodeID":"a"}}},
+              {"device":"mac","seq":2,"time":2,"change":{"type":"shardCreated","index":1.5,
+               "album":{"volumeID":"v","nodeID":"b"}}}
+            ]}
+            """)
+        #expect(SharedLibraryState.merged([decoded]).shards.isEmpty)
+    }
+
+    @Test func aNumberWhereAFlagBelongsIsIgnored() throws {
+        let decoded = try journal(
+            """
+            {"format":1,"device":"mac","entries":[
+              {"device":"mac","seq":1,"time":1,"change":{"type":"hidden",
+               "photo":{"volumeID":"volume","nodeID":"photo"},"value":1}}
+            ]}
+            """)
+        #expect(SharedLibraryState.merged([decoded]).hidden.isEmpty)
+    }
+
+    @Test func aDamagedEntryHidesOnlyItselfAndSurvivesARewrite() throws {
+        var decoded = try journal(
+            """
+            {"format":1,"device":"mac","entries":[
+              {"device":"mac","seq":-1,"time":1,"change":{"type":"hidden",
+               "photo":{"volumeID":"volume","nodeID":"other"},"value":true}},
+              {"device":"mac","seq":2,"time":2,"change":{"type":"personal",
+               "photo":{"volumeID":"volume","nodeID":"photo"},"value":true}}
+            ]}
+            """)
+        #expect(decoded.unreadableEntries.count == 1)
+        #expect(SharedLibraryState.merged([decoded]).visibility(of: photo) == .personal)
+
+        try decoded.record(.hidden(photo, isHidden: true), at: date(3))
+        let rewritten = try JSONDecoder().decode(
+            SharedLibraryJournal.self, from: JSONEncoder().encode(decoded.compacted()))
+        #expect(rewritten.unreadableEntries == decoded.unreadableEntries)
+        #expect(rewritten.entries.map(\.sequence) == [2, 3])
+    }
+
+    @Test func aNewerJournalCannotBeChangedOrWrittenButDoesNotCrash() throws {
+        var newer = try journal(#"{"format":2,"device":"mac","entries":[]}"#)
+        #expect(throws: SharedLibraryJournalReadOnlyError(format: 2)) {
+            try newer.record(.hidden(photo, isHidden: true), at: date(1))
+        }
+        #expect(throws: SharedLibraryJournalReadOnlyError.self) { try JSONEncoder().encode(newer) }
+        #expect(newer.compacted() == newer)
+    }
+
+    @Test func twoJournalsOfOneDeviceMergeTheSameWayInEveryOrder() {
+        let tie = date(10)
+        let a = SharedLibraryJournal(
+            deviceID: "mac",
+            entries: [
+                SharedLibraryJournalEntry(
+                    deviceID: "mac", sequence: 1, recordedAt: tie, change: .hidden(photo, isHidden: true))
+            ])
+        let b = SharedLibraryJournal(
+            deviceID: "mac",
+            entries: [
+                SharedLibraryJournalEntry(
+                    deviceID: "mac", sequence: 1, recordedAt: tie, change: .hidden(photo, isHidden: false))
+            ])
+        #expect(SharedLibraryState.merged([a, b]) == SharedLibraryState.merged([b, a]))
+    }
+
+    @Test func compactingOneDeviceKeepsTheStateThatAllDevicesMerge() throws {
+        var mac = SharedLibraryJournal(deviceID: "mac")
+        var phone = SharedLibraryJournal(deviceID: "phone")
+        try mac.record(.hidden(photo, isHidden: true), at: date(1))
+        try phone.record(.hidden(photo, isHidden: true), at: date(2))
+        try mac.record(.hidden(photo, isHidden: false), at: date(3))
+        try mac.record(.hidden(photo, isHidden: false), at: date(4))
+
+        let before = SharedLibraryState.merged([mac, phone])
+        #expect(before.visibility(of: photo) == .normal, "the later false must beat the other device's true")
+        #expect(SharedLibraryState.merged([mac.compacted(), phone]) == before)
+        #expect(SharedLibraryState.merged([mac.compacted(), phone.compacted()]) == before)
+    }
+
+    @Test func largeNumbersInAChangeFromANewerBuildKeepEveryDigit() throws {
+        let decoded = try journal(
+            """
+            {"format":1,"device":"mac","entries":[
+              {"device":"mac","seq":1,"time":1,"change":{"type":"futureThing","id":9223372036854775807}}
+            ]}
+            """)
+        let text = String(decoding: try JSONEncoder().encode(decoded), as: UTF8.self)
+        #expect(text.contains("9223372036854775807"))
+    }
+
+    @Test func theSequenceKeepsGrowingAfterCompactionWithAClockThatWentBack() throws {
+        var mac = SharedLibraryJournal(deviceID: "mac")
+        try mac.record(.hidden(photo, isHidden: true), at: date(100))
+        try mac.record(.hidden(photo, isHidden: false), at: date(50))
+        var compacted = mac.compacted()
+        #expect(compacted.entries.map(\.sequence) == [1], "the later time wins even with the lower sequence")
+
+        try compacted.record(.personal(photo, isPersonal: true), at: date(60))
+        #expect(compacted.entries.last?.sequence == 3)
+        let reread = try JSONDecoder().decode(SharedLibraryJournal.self, from: JSONEncoder().encode(compacted))
+        #expect(reread.lastSequence == 3)
+    }
+
+    @Test func aShardNameInAnotherUnicodeFormStillMatches() {
+        let decomposed = ShardNaming.name(forIndex: 3).decomposedStringWithCanonicalMapping
+        #expect(ShardNaming.index(ofName: decomposed) == 3)
+    }
+
+    @Test func aStartDateSurvivesTheJournalExactly() throws {
+        var mac = SharedLibraryJournal(deviceID: "mac")
+        let start = Date(timeIntervalSince1970: 1_790_000_000.123_456)
+        try mac.record(.settings(SharedLibrarySettings(isEnabled: true, scope: .since(start))), at: date(1))
+        let reread = try JSONDecoder().decode(SharedLibraryJournal.self, from: JSONEncoder().encode(mac))
+        #expect(SharedLibraryState.merged([reread]).settings.scope == .since(start))
     }
 }

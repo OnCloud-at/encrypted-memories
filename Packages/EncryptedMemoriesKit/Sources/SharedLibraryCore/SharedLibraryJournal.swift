@@ -5,9 +5,9 @@ import PhotosCore
 /// One account-wide change to the shared library.
 public enum SharedLibraryChange: Sendable, Equatable {
     /// The owner hid a photo, or showed it again.
-    case hidden(PhotoUID, Bool)
+    case hidden(PhotoUID, isHidden: Bool)
     /// The owner kept a photo for themselves ("Nur für mich"), or shared it again.
-    case personal(PhotoUID, Bool)
+    case personal(PhotoUID, isPersonal: Bool)
     /// The owner changed the sharing choice.
     case settings(SharedLibrarySettings)
     /// A device created a shard album.
@@ -28,7 +28,7 @@ extension SharedLibraryChange: Codable {
         try json.encode(to: encoder)
     }
 
-    private var json: SharedLibraryJSONValue {
+    var json: SharedLibraryJSONValue {
         switch self {
         case .hidden(let photo, let value):
             .object(["type": .string("hidden"), "photo": Self.json(photo), "value": .bool(value)])
@@ -37,7 +37,7 @@ extension SharedLibraryChange: Codable {
         case .settings(let settings):
             .object(Self.settingsFields(settings))
         case .shardCreated(let index, let album):
-            .object(["type": .string("shardCreated"), "index": .number(Double(index)), "album": Self.json(album)])
+            .object(["type": .string("shardCreated"), "index": .number(Decimal(index)), "album": Self.json(album)])
         case .shardRetired(let album):
             .object(["type": .string("shardRetired"), "album": Self.json(album)])
         case .unrecognized(let raw):
@@ -49,10 +49,10 @@ extension SharedLibraryChange: Codable {
         switch raw["type"]?.stringValue {
         case "hidden":
             guard let photo = photoUID(raw["photo"]), let value = raw["value"]?.boolValue else { return nil }
-            return .hidden(photo, value)
+            return .hidden(photo, isHidden: value)
         case "personal":
             guard let photo = photoUID(raw["photo"]), let value = raw["value"]?.boolValue else { return nil }
-            return .personal(photo, value)
+            return .personal(photo, isPersonal: value)
         case "settings":
             guard let enabled = raw["enabled"]?.boolValue else { return nil }
             switch raw["since"] {
@@ -64,10 +64,10 @@ extension SharedLibraryChange: Codable {
                     SharedLibrarySettings(isEnabled: enabled, scope: .since(Date(timeIntervalSince1970: seconds))))
             }
         case "shardCreated":
-            guard let number = raw["index"]?.numberValue, number >= 1, number <= Double(Int.max),
-                number == number.rounded(), let album = albumIdentifier(raw["album"])
+            guard let number = raw["index"]?.numberValue, let index = Int(exactly: number), index >= 1,
+                let album = albumIdentifier(raw["album"])
             else { return nil }
-            return .shardCreated(index: Int(number), album: album)
+            return .shardCreated(index: index, album: album)
         case "shardRetired":
             guard let album = albumIdentifier(raw["album"]) else { return nil }
             return .shardRetired(album: album)
@@ -80,8 +80,15 @@ extension SharedLibraryChange: Codable {
         var fields: [String: SharedLibraryJSONValue] = [
             "type": .string("settings"), "enabled": .bool(settings.isEnabled),
         ]
-        if case .since(let date) = settings.scope { fields["since"] = .number(date.timeIntervalSince1970) }
+        if case .since(let date) = settings.scope {
+            fields["since"] = .number(Self.decimal(date.timeIntervalSince1970))
+        }
         return fields
+    }
+
+    /// The shortest decimal text that reads back as the same `Double`.
+    private static func decimal(_ value: Double) -> Decimal {
+        Decimal(string: "\(value)", locale: Locale(identifier: "en_US_POSIX")) ?? Decimal(value)
     }
 
     private static func json(_ photo: PhotoUID) -> SharedLibraryJSONValue {
@@ -142,13 +149,19 @@ public struct SharedLibraryJournalEntry: Sendable, Equatable, Codable {
         try container.encode(change, forKey: .change)
     }
 
-    /// Of two changes to the same thing, the later one wins. Equal times fall back to the device and its sequence, so
-    /// every device reaches the same result.
+    /// Of two changes to the same thing, the later one wins. Equal times fall back to the device, its sequence, and
+    /// finally the change itself, so every device reaches the same result in any reading order.
     func supersedes(_ other: SharedLibraryJournalEntry) -> Bool {
         if recordedAt != other.recordedAt { return recordedAt > other.recordedAt }
         if deviceID != other.deviceID { return deviceID > other.deviceID }
-        return sequence > other.sequence
+        if sequence != other.sequence { return sequence > other.sequence }
+        return change.json.canonicalText > other.change.json.canonicalText
     }
+}
+
+/// A journal in a newer format; this build reads it but never changes or writes it.
+public struct SharedLibraryJournalReadOnlyError: Error, Equatable {
+    public let format: Int
 }
 
 /// The changes one device recorded. Each device writes only its own journal, so devices never overwrite each
@@ -159,26 +172,46 @@ public struct SharedLibraryJournal: Sendable, Equatable {
     public let format: Int
     public let deviceID: String
     public private(set) var entries: [SharedLibraryJournalEntry]
+    /// Entries this build could not read, kept verbatim so a rewrite does not lose them. They never count.
+    public private(set) var unreadableEntries: [SharedLibraryJSONValue]
+    /// The highest sequence this device ever used; it only grows, also when compaction drops entries.
+    public private(set) var lastSequence: UInt64
 
     public init(deviceID: String, entries: [SharedLibraryJournalEntry] = []) {
-        format = Self.currentFormat
+        self.init(
+            format: Self.currentFormat, deviceID: deviceID, entries: entries, unreadableEntries: [],
+            lastSequence: entries.map(\.sequence).max() ?? 0)
+    }
+
+    private init(
+        format: Int,
+        deviceID: String,
+        entries: [SharedLibraryJournalEntry],
+        unreadableEntries: [SharedLibraryJSONValue],
+        lastSequence: UInt64
+    ) {
+        self.format = format
         self.deviceID = deviceID
         self.entries = entries
+        self.unreadableEntries = unreadableEntries
+        self.lastSequence = max(lastSequence, entries.map(\.sequence).max() ?? 0)
     }
 
     /// Whether this build can read the journal. A journal from a newer format is neither applied nor rewritten.
     public var isSupported: Bool { format <= Self.currentFormat }
 
-    /// Records `change` as this device's next change.
-    public mutating func record(_ change: SharedLibraryChange, at date: Date) {
-        precondition(isSupported, "A journal in a newer format is read-only")
-        let next = (entries.map(\.sequence).max() ?? 0) + 1
-        entries.append(SharedLibraryJournalEntry(deviceID: deviceID, sequence: next, recordedAt: date, change: change))
+    /// Records `change` as this device's next change. A journal in a newer format stays unchanged.
+    public mutating func record(_ change: SharedLibraryChange, at date: Date) throws {
+        guard isSupported else { throw SharedLibraryJournalReadOnlyError(format: format) }
+        lastSequence += 1
+        entries.append(
+            SharedLibraryJournalEntry(deviceID: deviceID, sequence: lastSequence, recordedAt: date, change: change))
     }
 
-    /// The same journal with only the latest change for each thing, plus every unrecognized change. The merged state
-    /// stays the same.
+    /// The same journal with only the latest change for each thing, plus every unrecognized and unreadable entry.
+    /// The merged state stays the same. A journal in a newer format stays unchanged.
     public func compacted() -> SharedLibraryJournal {
+        guard isSupported else { return self }
         var latest: [SharedLibraryMergeKey: SharedLibraryJournalEntry] = [:]
         var kept: [SharedLibraryJournalEntry] = []
         for entry in entries {
@@ -191,18 +224,13 @@ public struct SharedLibraryJournal: Sendable, Equatable {
         }
         kept.append(contentsOf: latest.values)
         return SharedLibraryJournal(
-            format: format, deviceID: deviceID, entries: kept.sorted { $0.sequence < $1.sequence })
+            format: format, deviceID: deviceID, entries: kept.sorted { $0.sequence < $1.sequence },
+            unreadableEntries: unreadableEntries, lastSequence: lastSequence)
     }
 
     /// Whether the journal holds many superseded changes, so a compacted copy is worth writing.
     public var needsCompaction: Bool {
         entries.count > 256 && entries.count > compacted().entries.count * 2
-    }
-
-    private init(format: Int, deviceID: String, entries: [SharedLibraryJournalEntry]) {
-        self.format = format
-        self.deviceID = deviceID
-        self.entries = entries
     }
 }
 
@@ -211,24 +239,50 @@ extension SharedLibraryJournal: Codable {
         case format
         case deviceID = "device"
         case entries
+        case lastSequence = "last"
     }
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        format = try container.decode(Int.self, forKey: .format)
-        deviceID = try container.decode(String.self, forKey: .deviceID)
-        // A newer format may change the entry layout; its entries stay unread.
-        entries =
-            format <= Self.currentFormat
-            ? try container.decode([SharedLibraryJournalEntry].self, forKey: .entries) : []
+        let format = try container.decode(Int.self, forKey: .format)
+        let deviceID = try container.decode(String.self, forKey: .deviceID)
+        guard format <= Self.currentFormat else {
+            // A newer format may change the entry layout; its entries stay unread.
+            self.init(format: format, deviceID: deviceID, entries: [], unreadableEntries: [], lastSequence: 0)
+            return
+        }
+        // Each entry is read on its own, so one damaged entry does not hide the others.
+        var entries: [SharedLibraryJournalEntry] = []
+        var unreadable: [SharedLibraryJSONValue] = []
+        let encoder = JSONEncoder()
+        let decoder = JSONDecoder()
+        for raw in try container.decode([SharedLibraryJSONValue].self, forKey: .entries) {
+            if let data = try? encoder.encode(raw),
+                let entry = try? decoder.decode(SharedLibraryJournalEntry.self, from: data),
+                entry.deviceID == deviceID
+            {
+                entries.append(entry)
+            } else {
+                unreadable.append(raw)
+            }
+        }
+        let last = try container.decodeIfPresent(UInt64.self, forKey: .lastSequence) ?? 0
+        self.init(
+            format: format, deviceID: deviceID, entries: entries, unreadableEntries: unreadable, lastSequence: last)
     }
 
     public func encode(to encoder: Encoder) throws {
-        precondition(isSupported, "A journal in a newer format is read-only")
+        guard isSupported else { throw SharedLibraryJournalReadOnlyError(format: format) }
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(format, forKey: .format)
         try container.encode(deviceID, forKey: .deviceID)
-        try container.encode(entries, forKey: .entries)
+        var raw: [SharedLibraryJSONValue] = []
+        let entryEncoder = JSONEncoder()
+        for entry in entries {
+            raw.append(try JSONDecoder().decode(SharedLibraryJSONValue.self, from: entryEncoder.encode(entry)))
+        }
+        try container.encode(raw + unreadableEntries, forKey: .entries)
+        try container.encode(lastSequence, forKey: .lastSequence)
     }
 }
 
