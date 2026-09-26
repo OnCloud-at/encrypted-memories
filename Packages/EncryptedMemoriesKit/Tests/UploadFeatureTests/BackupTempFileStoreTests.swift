@@ -68,6 +68,8 @@ final class BackupTempFileStoreTests: XCTestCase {
                 error as? BackupTempFileStore.BackupTempFileError, .needsFreeSpace(requiredBytes: 20_500),
                 "the message names the free space the file needs")
         }
+        XCTAssertTrue(store.hasFreeSpace(forAdditionalBytes: 9_000))
+        XCTAssertFalse(store.hasFreeSpace(forAdditionalBytes: 20_000))
     }
 
     func testSweepClearsPartialsAndCommittedFiles() throws {

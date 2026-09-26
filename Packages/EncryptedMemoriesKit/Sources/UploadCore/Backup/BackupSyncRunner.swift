@@ -401,6 +401,9 @@ public actor BackupSyncRunner {
                     break
                 }
                 if mode == .eligibleOnly { break }
+                // Only an item waiting for Proton storage waits longer than any regular retry. A one-shot drain the
+                // user waits for ends then instead of sleeping for hours.
+                if wait > longestRegularRetryWait { break }
                 do {
                     try await clock.sleep(for: wait)
                 } catch {
@@ -484,6 +487,12 @@ public actor BackupSyncRunner {
         // moves rows to `checking`. Never filter after claiming: a discarded claim has no worker
         // and would remain falsely active until crash recovery.
         return queue.claimRunnable(limit: claimLimit, claimedAt: now())
+    }
+
+    /// The longest wait of a runnable retry other than a full Proton account: the retry policy's cap, its
+    /// 30-second minimum after low disk space, and the recheck of a photo the camera still processes.
+    private var longestRegularRetryWait: TimeInterval {
+        max(configuration.retry.maxDelay, 30, configuration.oneShotSourceRecheckInterval)
     }
 
     /// The wait until the next persisted retry becomes eligible, or nil when none is pending.
@@ -891,9 +900,12 @@ public actor BackupSyncRunner {
         workIntent: LibraryWorkIntent,
         preparationProgress: @escaping BackupResourcePreparationHandler
     ) async throws -> UploadDecisionOperationResult<PrimaryScopedOutcome> {
-        // Before the original is copied: a file that cannot fit into the account is neither copied nor sent.
-        try await uploader.ensureRemoteCapacity(
-            forBytes: resolved.descriptor.fileSize, filename: resolved.descriptor.filename)
+        // Before the original is copied: a file that cannot fit into the account is neither copied nor sent. Replacing
+        // a draft is left to Proton, because the draft's own blocks may be what fills the account.
+        if preflightResult.decision != .uploadReplacingDraft {
+            try await uploader.ensureRemoteCapacity(
+                forBytes: resolved.descriptor.fileSize, filename: resolved.descriptor.filename)
+        }
         let descriptor: UploadResourceDescriptor
         if resolved.hasDeferredMaterialization {
             descriptor = try await resourceCoordinator.withHeavyPermit(
@@ -1309,8 +1321,10 @@ public actor BackupSyncRunner {
                         case .skip(.inconsistentRemoteState, _), .uploadMissingSecondaries:
                             return .noUpload(.inconsistent)
                         case .upload, .uploadReplacingDraft:
-                            try await self.uploader.ensureRemoteCapacity(
-                                forBytes: secondary.descriptor.fileSize, filename: secondary.descriptor.filename)
+                            if result.decision != .uploadReplacingDraft {
+                                try await self.uploader.ensureRemoteCapacity(
+                                    forBytes: secondary.descriptor.fileSize, filename: secondary.descriptor.filename)
+                            }
                             let uploadDescriptor: UploadResourceDescriptor
                             if secondary.hasDeferredMaterialization {
                                 uploadDescriptor = try await self.resourceCoordinator.withHeavyPermit(

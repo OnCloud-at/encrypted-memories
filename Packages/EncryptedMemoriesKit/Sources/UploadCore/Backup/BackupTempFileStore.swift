@@ -140,8 +140,13 @@ public final class BackupTempFileStore: @unchecked Sendable {
         }
     }
 
+    /// Whether the volume has room for `bytes` more on top of the reserved free space and the unwritten reservations.
+    public func hasFreeSpace(forAdditionalBytes bytes: Int64) -> Bool {
+        (try? ensureFreeSpace(forAdditionalBytes: bytes)) != nil
+    }
+
     /// Throws `needsFreeSpace` unless the volume has room for `bytes` more on top of the reserved free space. Callers
-    /// check before a large download or copy, so a file that cannot fit fails at once with the space it needs.
+    /// check before a large copy for upload, so a file that cannot fit fails at once with the space it needs.
     public func ensureFreeSpace(forAdditionalBytes bytes: Int64) throws {
         try lock.withLock {
             let required = addingClamped(minimumFreeBytes, addingClamped(max(0, bytes), reservedUnwrittenBytesLocked()))

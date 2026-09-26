@@ -107,7 +107,7 @@ final class PhotoKitStagingSinkTests: XCTestCase {
         let tempStore = store(maximumBytes: 100)
         let chunks = [Data(count: 120), Data(count: 120)]
         let sink = PhotoKitStagingSink(tempStore: tempStore, filename: "PRORES.MOV", expectedBytes: 240)
-        XCTAssertTrue(sink.isStaging, "a known size above half the budget still stages, exclusively")
+        XCTAssertTrue(sink.isStaging, "a known size above the whole budget still stages, exclusively")
         chunks.forEach(sink.receive)
 
         let result = sink.finish()
@@ -118,6 +118,15 @@ final class PhotoKitStagingSinkTests: XCTestCase {
         // While it holds the large-file slot, nothing else stages beside it.
         XCTAssertFalse(PhotoKitStagingSink(tempStore: tempStore, filename: "OTHER.HEIC").isStaging)
         tempStore.discard(staged)
+    }
+
+    func testAKnownSizeWithinTheBudgetStagesInChunks() {
+        let tempStore = store(maximumBytes: 100)
+        let sink = PhotoKitStagingSink(tempStore: tempStore, filename: "SHORT.MOV", expectedBytes: 80)
+        sink.receive(Data(count: 60))
+
+        XCTAssertFalse(sink.isStaging, "within the budget, the size gives no exclusive slot; half the budget applies")
+        XCTAssertEqual(sink.finish().byteCount, 60)
     }
 
     func testALargeOriginalThatGrowsBeyondItsKnownSizeIsOnlyHashed() {

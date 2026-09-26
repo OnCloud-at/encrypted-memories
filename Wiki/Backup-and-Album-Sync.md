@@ -17,6 +17,12 @@ camera still processes waits, without repeated checks, until Apple Photos report
 report does not come, one check ten minutes after the shot backs up the version that exists. **Back Up Now**
 checks a waiting photo again at once.
 
+Large videos, for example ProRes recordings of many gigabytes, also download from iCloud only once when the device
+has room for the copy in Apple Photos and the backup copy. If the device does not have room for the backup copy,
+the backup status names the free space the video needs, and the backup tries again later. A file that does not fit
+into the remaining Proton storage waits and does not use the device's storage for a copy. The backup status shows
+this, smaller photos continue, and the waiting file is checked again every six hours or with **Back Up Now**.
+
 On iPhone and iPad, background processing is scheduled with the operating system. iOS decides when background work runs, so backup is not guaranteed to be continuous after the app closes.
 
 ## Excluded from Backup

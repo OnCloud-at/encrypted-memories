@@ -67,6 +67,10 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
 
     /// Set by a timeline save that removed photos; a trash listing then follows the load.
     private var timelineLostPhotos = false
+    /// Bytes this session uploaded since the account quota was last read, so the capacity check sees them before the
+    /// next account refresh.
+    private var uploadedBytesSinceQuotaRefresh: Int64 = 0
+    private var lastQuotaRefreshAt: ContinuousClock.Instant?
     /// Where the per-account upload-identity manifest lives (next to `library-v1.sqlite`, so the
     /// sign-out purge covers it) and the platform SQLite tuning it opens with. Module-internal:
     /// the facade derives the account data directory + store policy for the backup sync stores
@@ -1739,22 +1743,36 @@ extension DriveSDKBridge: PhotoUploading {
         .sdkUploader
     }
 
-    /// Compares the file with the account's remaining Drive storage from the last account refresh. When it does not
-    /// fit, the account data is refreshed once first, because the person may have freed space or upgraded since.
-    /// Without a known quota the upload proceeds; Proton then decides.
+    /// Compares the file with the account's remaining Drive storage: the last account refresh minus what this session
+    /// uploaded since. When it does not fit, the account data is refreshed first, at most once a minute, because the
+    /// person may have freed space or upgraded. Without a known quota the upload proceeds; Proton then decides.
     nonisolated func ensureRemoteCapacity(forBytes bytes: Int64, filename: String) async throws {
-        guard bytes > 0, let available = await Self.remainingDriveBytes(), bytes > available else { return }
-        try? await refreshAccountInfo()
-        guard let refreshed = await Self.remainingDriveBytes(), bytes > refreshed else { return }
+        guard bytes > 0, let available = await remainingDriveBytes(), bytes > available else { return }
+        await refreshQuotaIfDue()
+        guard let refreshed = await remainingDriveBytes(), bytes > refreshed else { return }
         DebugLog.log("[Upload] storage full file=\(filename) needs=\(bytes) left=\(refreshed)")
         throw UploadError.accountStorageFull(filename, requiredBytes: bytes, availableBytes: max(0, refreshed))
     }
 
-    @MainActor private static func remainingDriveBytes() -> Int64? {
-        guard let used = AccountInfo.shared.driveUsedSpaceBytes, let maximum = AccountInfo.shared.driveMaxSpaceBytes,
-            maximum > 0
-        else { return nil }
-        return maximum - used
+    private func remainingDriveBytes() async -> Int64? {
+        let quota = await MainActor.run { () -> (used: Int64, max: Int64)? in
+            guard let used = AccountInfo.shared.driveUsedSpaceBytes,
+                let maximum = AccountInfo.shared.driveMaxSpaceBytes, maximum > 0
+            else { return nil }
+            return (used, maximum)
+        }
+        guard let quota else { return nil }
+        return quota.max - quota.used - uploadedBytesSinceQuotaRefresh
+    }
+
+    private func refreshQuotaIfDue() async {
+        let now = ContinuousClock.now
+        if let lastQuotaRefreshAt, lastQuotaRefreshAt.duration(to: now) < .seconds(60) { return }
+        lastQuotaRefreshAt = now
+        let counted = uploadedBytesSinceQuotaRefresh
+        guard (try? await refreshAccountInfo()) != nil else { return }
+        // Uploads that finished during the refresh stay counted; the server may not include them yet.
+        uploadedBytesSinceQuotaRefresh -= counted
     }
 
     /// The universal dedupe pipeline for this account: the SQLite identity manifest (per-account
@@ -1890,6 +1908,7 @@ extension DriveSDKBridge: PhotoUploading {
                 throw error
             }
             await operation.releaseResources()
+            uploadedBytesSinceQuotaRefresh += max(0, request.fileSize)
             DebugLog.log("[Upload] completed node=\(ids.nodeUid.nodeID.prefix(8))… file=\(request.name)")
             let uid = PhotoUID(volumeID: ids.nodeUid.volumeID, nodeID: ids.nodeUid.nodeID)
             if mainPhotoUid == nil {

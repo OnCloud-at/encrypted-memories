@@ -384,13 +384,13 @@ public struct PhotoLibraryResourceResolver: BackupResourceResolving {
             // gets one networked pass, which reports the definitive error.
         }
 
-        // Photos keeps its own copy of an original it downloads, and the upload needs a second one. With the size
-        // known before the download, a file that cannot fit fails at once instead of after gigabytes.
+        // Photos keeps its own copy of an original it downloads, and staging for the upload writes a second one. A
+        // large original of known size is staged exactly only when both fit; otherwise it is only hashed now. The
+        // duplicate check never waits for space: a photo already in Proton needs no copy at all.
         let knownSize = Self.knownSize(of: resource)
-        if let knownSize {
-            try tempStore.ensureFreeSpace(forAdditionalBytes: knownSize * 2)
-        }
-        let sink = PhotoKitStagingSink(tempStore: tempStore, filename: filename, expectedBytes: knownSize)
+        let stagesExactly = knownSize.map { tempStore.hasFreeSpace(forAdditionalBytes: $0 * 2) } ?? false
+        let sink = PhotoKitStagingSink(
+            tempStore: tempStore, filename: filename, expectedBytes: stagesExactly ? knownSize : nil)
         do {
             try await Self.requestData(
                 for: resource, networkAccessAllowed: true, progressGate: progressGate
@@ -404,7 +404,8 @@ public struct PhotoLibraryResourceResolver: BackupResourceResolving {
         progressGate.publish(1)
         let result = sink.finish()
         Self.logger.notice(
-            "[Backup] original from iCloud staged=\(result.stagedURL != nil, privacy: .public)")
+            "[Backup] original from iCloud staged=\(result.stagedURL != nil, privacy: .public) sizeKnown=\(knownSize != nil, privacy: .public) exact=\(stagesExactly, privacy: .public)"
+        )
         let staged = result.stagedURL.map { url in
             exported.append(url)
             return ExportResult(url: url, byteCount: result.byteCount, sha1Digest: result.sha1Digest)
