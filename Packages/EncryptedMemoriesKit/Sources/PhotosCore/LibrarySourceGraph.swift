@@ -1284,9 +1284,10 @@ public final class LibrarySourceGraph {
         let includeExcludedSources = !lease.requiresInclusion
         let renewed: SourceAccessLease?
         if lease.readsIdentityOutsideInventory {
-            renewed = identityOutsideInventoryAccessLeases(
-                for: [lease.uid], requiring: lease.capability, includeExcludedSources: includeExcludedSources
-            )[lease.uid]
+            renewed =
+                identityOutsideInventoryAccessLeases(
+                    for: [lease.uid], requiring: lease.capability, includeExcludedSources: includeExcludedSources
+                )[lease.uid]
         } else if let relationship = lease.relationship {
             renewed = relatedAccessLease(
                 for: lease.uid,

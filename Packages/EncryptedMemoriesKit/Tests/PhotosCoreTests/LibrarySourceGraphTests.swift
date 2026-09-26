@@ -144,7 +144,10 @@ final class LibrarySourceGraphTests: XCTestCase {
 
         _ = install(
             firstSource,
-            items: [item("key", time: 1, burstMemberIDs: ["key"]), item("other", time: 2, burstMemberIDs: ["other", "member"])],
+            items: [
+                item("key", time: 1, burstMemberIDs: ["key"]),
+                item("other", time: 2, burstMemberIDs: ["other", "member"]),
+            ],
             in: &graph)
         XCTAssertNotNil(graph.burstMemberAccessLeases(for: [member.uid], requiring: .readThumbnail)[member.uid])
         XCTAssertNil(graph.renewed(lease), "another series lists the member now; a fresh request must prove it")
