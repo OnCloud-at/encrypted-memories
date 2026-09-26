@@ -35,6 +35,15 @@ The package uses feature modules and shared cores. A feature module owns reusabl
 
 GitHub runs repository hygiene, Swift style, package tests, iOS app tests, and both platform builds. A maintainer reviews the result before merge.
 
+## Own your pull request
+
+You own your pull request until a maintainer merges or closes it. A review can take time, and a fix that is not urgent can wait for a later release.
+
+- Keep your branch current with `main` while the pull request waits.
+- Rebase onto `main` when `main` moves on, and resolve every conflict yourself.
+- Run the local gates again after a rebase, then push the updated branch.
+- Answer review comments and push the requested changes.
+
 ## Local verification
 
 Run focused tests while you work. Run these gates before requesting review:
