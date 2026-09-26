@@ -321,6 +321,7 @@ public actor MLSmartSearchLifecycle {
             installedModelBytes: activeModel?.record.installedByteCount ?? 0,
             hasActivatedModel: persistent.activatedRevision != nil,
             isStartPending: pendingRecommendedEnable != nil,
+            startIntent: startIntentSequence,
             availableModels: catalog.selectableEntries(allowsDeveloperModels: deps.allowsDeveloperModels),
             isSearchAvailable: persistent.isEnabled
                 && ((session != nil && lastCoverage.indexed > 0)
@@ -455,9 +456,14 @@ public actor MLSmartSearchLifecycle {
     public func enableRecommended(preferredLanguages: [String], intent: UInt64) -> Bool {
         guard intent > startIntentSequence else { return false }
         startIntentSequence = intent
+        stopWaitingRecommendedStart()
         guard started, !isShutDown, deps.featureAvailability == .available, !persistent.isEnabled,
             persistent.pendingOperation == nil, !stateLoadFailed
-        else { return false }
+        else {
+            // The snapshot carries the applied intent, so the host stops showing the refused switch-on.
+            emit()
+            return false
+        }
         pendingRecommendedEnable = preferredLanguages
         emit()
         recommendedStartTask = Task { await self.startRecommended(intent: intent) }
@@ -468,10 +474,18 @@ public actor MLSmartSearchLifecycle {
     public func cancelRecommendedEnable(intent: UInt64) {
         guard intent > startIntentSequence else { return }
         startIntentSequence = intent
-        guard pendingRecommendedEnable != nil else { return }
+        let wasPending = pendingRecommendedEnable != nil
+        stopWaitingRecommendedStart()
         pendingRecommendedEnable = nil
-        if !persistent.isEnabled { phase = .disabled }
+        if wasPending, !persistent.isEnabled { phase = .disabled }
         emit()
+    }
+
+    /// A newer intent stops a switch-on that still waits for the model list, so its late failure cannot
+    /// overwrite a newer state. A start past the list owns a download and keeps running.
+    private func stopWaitingRecommendedStart() {
+        guard pendingRecommendedEnable != nil else { return }
+        recommendedStartTask?.cancel()
     }
 
     /// Waits for a switch-on that `enableRecommended` accepted, including its first model activation.
@@ -561,7 +575,8 @@ public actor MLSmartSearchLifecycle {
     /// Select a model. The same selection is a no-op; another model runs the transactional switch,
     /// retires the old epoch, activates the new model, and starts a clean reindex.
     public func select(_ id: MLModelID) async {
-        guard !isShutDown, persistent.isEnabled, id != persistent.selectedModelID,
+        // A journaled switch whose cleanup failed must finish first (Retry); a choice now would overwrite it.
+        guard !isShutDown, persistent.isEnabled, persistent.pendingOperation == nil, id != persistent.selectedModelID,
             let target = catalog.entry(for: id), isSelectable(target)
         else { return }
 
@@ -625,6 +640,10 @@ public actor MLSmartSearchLifecycle {
         if targetRecord == nil {
             guard target.isDownloadable else {
                 if startsWithoutActiveModel {
+                    // The replaced selection never activated: no index to remove, only its files.
+                    if let previousID, previousID != id, let previousEntry = catalog.entry(for: previousID) {
+                        await deps.installer.uninstall(previousEntry)
+                    }
                     phase = .notInstalled(downloadable: false)
                     emit()
                     startIndexingLoopIfAvailable()
@@ -2447,7 +2466,8 @@ public actor MLSmartSearchLifecycle {
             lastCatalogRefreshAt = .now
             return true
         } catch {
-            guard !isShutDown else { return false }
+            // A cancelled request belongs to an intent that a newer one replaced; it reports nothing.
+            guard !isShutDown, !Task.isCancelled else { return false }
             phase = .failed(
                 MLSmartSearchFailure(
                     kind: .catalog,

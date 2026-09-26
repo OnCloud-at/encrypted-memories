@@ -131,9 +131,9 @@ public struct SmartSearchSettingsSection: View {
         }
     }
 
-    /// The lifecycle owns a pending switch-on; the controller covers the moment before it arrives there.
+    /// The lifecycle owns a pending switch-on; the controller shows the person's latest tap until it arrives there.
     private var isStarting: Bool {
-        controller.snapshot.isStartPending || controller.isStartRequested
+        controller.startSwitch.isStarting(controller.snapshot)
     }
 
     private var enabledBinding: Binding<Bool> {

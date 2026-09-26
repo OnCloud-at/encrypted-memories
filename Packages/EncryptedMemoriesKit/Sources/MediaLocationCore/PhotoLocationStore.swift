@@ -268,8 +268,10 @@ public final class PhotoLocationStore: @unchecked Sendable {
         }
     }
 
-    /// Sign-out / master reset: erase the exact encrypted location files and forget the key.
+    /// Sign-out / master reset: erase the exact encrypted location files and forget the key. The next account
+    /// prewarms map tiles only after it opened the Map itself.
     public func clear() {
+        UserDefaults.standard.removeObject(forKey: AppSettingsKey.libraryMapViewportSize)
         lock.withLock {
             sessionGeneration &+= 1
             nextWriteGeneration = 0

@@ -117,6 +117,8 @@ public enum ProtonDriveBackendFactory {
 
     public static func purgeLocalAccountData(uid: String, policy: ProtonDriveBackendPolicy) {
         AccountDataCache.clear(uid: uid, in: policy.sdkCacheDirectory)
+        // The next account prewarms map tiles only after it opened the Map itself.
+        UserDefaults.standard.removeObject(forKey: AppSettingsKey.libraryMapViewportSize)
         DriveSDKBridge.purgeMetadata(uid: uid, policy: policy)
         VideoByteRangeCache.shared.clearAll()
     }

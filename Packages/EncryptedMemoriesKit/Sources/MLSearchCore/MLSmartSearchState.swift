@@ -124,6 +124,9 @@ public struct MLSmartSearchSnapshot: Sendable, Equatable {
     public let hasActivatedModel: Bool
     /// A switch-on waits for the model list; Smart Search then starts with the recommended model.
     public let isStartPending: Bool
+    /// The last switch-on or switch-off intent the lifecycle applied. Hosts keep showing the person's newer intent
+    /// until a snapshot with that number arrives.
+    public let startIntent: UInt64
     /// Selectable catalog entries for this environment.
     public let availableModels: [MLModelCatalogEntry]
     /// `true` once any enabled backend has searchable coverage.
@@ -139,6 +142,7 @@ public struct MLSmartSearchSnapshot: Sendable, Equatable {
         installedModelBytes: Int64,
         hasActivatedModel: Bool = false,
         isStartPending: Bool = false,
+        startIntent: UInt64 = 0,
         availableModels: [MLModelCatalogEntry],
         isSearchAvailable: Bool,
         indexingState: MLSmartSearchIndexingState = .idle
@@ -150,6 +154,7 @@ public struct MLSmartSearchSnapshot: Sendable, Equatable {
         self.installedModelBytes = installedModelBytes
         self.hasActivatedModel = hasActivatedModel
         self.isStartPending = isStartPending
+        self.startIntent = startIntent
         self.availableModels = availableModels
         self.isSearchAvailable = isSearchAvailable
         self.indexingState = indexingState
@@ -292,5 +297,36 @@ public struct FileMLSmartSearchStateStore: MLSmartSearchStateStore {
 
     public func clear() {
         try? FileManager.default.removeItem(at: fileURL)
+    }
+}
+
+/// The Smart Search switch between a tap and the lifecycle's answer. The person's latest intent shows until a
+/// snapshot proves that the lifecycle applied it, so an older snapshot can neither flip the switch back nor let it
+/// flicker off.
+public struct MLSmartSearchStartSwitch: Sendable, Equatable {
+    private var override: Bool?
+    private var lastIntent: UInt64 = 0
+
+    public init() {}
+
+    /// Records a tap and returns its intent number for the lifecycle.
+    public mutating func request(on: Bool) -> UInt64 {
+        lastIntent &+= 1
+        override = on
+        return lastIntent
+    }
+
+    public mutating func apply(_ snapshot: MLSmartSearchSnapshot) {
+        if snapshot.startIntent >= lastIntent { override = nil }
+    }
+
+    /// The lifecycle refused the switch-on outright.
+    public mutating func refused(_ intent: UInt64) {
+        if intent == lastIntent { override = nil }
+    }
+
+    /// Smart Search is on its way: the person switched it on and it is not enabled yet.
+    public func isStarting(_ snapshot: MLSmartSearchSnapshot) -> Bool {
+        !snapshot.isEnabled && (override ?? snapshot.isStartPending)
     }
 }

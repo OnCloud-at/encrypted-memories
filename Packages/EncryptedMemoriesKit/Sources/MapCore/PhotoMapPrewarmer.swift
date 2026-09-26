@@ -28,7 +28,7 @@ public final class PhotoMapPrewarmer {
 
     /// Called by the map loader whenever the map's size changes.
     nonisolated static func rememberViewport(_ size: CGSize, defaults: UserDefaults = .standard) {
-        guard size.width > 0, size.height > 0 else { return }
+        guard size.width > 0, size.height > 0, rememberedViewport(defaults: defaults) != size else { return }
         defaults.set("\(Double(size.width)),\(Double(size.height))", forKey: AppSettingsKey.libraryMapViewportSize)
     }
 

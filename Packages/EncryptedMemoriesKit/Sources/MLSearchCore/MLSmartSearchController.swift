@@ -30,15 +30,12 @@ public final class MLSmartSearchController {
     public private(set) var presentation = MLSmartSearchPresentation(snapshot: .disabled)
     public private(set) var modelPresentation = MLSmartSearchModelPresentation(snapshot: .disabled)
     public private(set) var availableSearchScopes: [MLSearchScope] = [.all]
-    /// A switch-on that the lifecycle has not taken up yet. The switch shows on at once instead of flickering off
-    /// until the lifecycle's snapshot arrives.
-    public private(set) var isStartRequested = false
+    /// The switch between a tap and the lifecycle's answer; it shows the tap at once and never an older state.
+    public private(set) var startSwitch = MLSmartSearchStartSwitch()
 
     @ObservationIgnored private let lifecycle: MLSmartSearchLifecycle
     @ObservationIgnored private let artifactAccess: MLScopedArtifactAccess
     @ObservationIgnored private var observationTask: Task<Void, Never>?
-    /// Numbers switch-on and switch-off intents in the order the person gave them.
-    @ObservationIgnored private var startIntents: UInt64 = 0
 
     public init(lifecycle: MLSmartSearchLifecycle, artifactAccess: MLScopedArtifactAccess = .securityScoped) {
         self.lifecycle = lifecycle
@@ -63,8 +60,7 @@ public final class MLSmartSearchController {
     }
 
     private func apply(_ snapshot: MLSmartSearchSnapshot) {
-        // From here the snapshot shows the switch-on itself.
-        if snapshot.isStartPending || snapshot.isEnabled { isStartRequested = false }
+        startSwitch.apply(snapshot)
         guard snapshot != self.snapshot else { return }
         self.snapshot = snapshot
         self.presentation = MLSmartSearchPresentation(snapshot: snapshot)
@@ -75,21 +71,16 @@ public final class MLSmartSearchController {
 
     /// Turns Smart Search on with the model that suits the device language; it downloads without asking.
     public func enableRecommended(preferredLanguages: [String] = Locale.preferredLanguages) {
-        startIntents &+= 1
-        let intent = startIntents
-        isStartRequested = true
+        let intent = startSwitch.request(on: true)
         Task { [weak self, lifecycle] in
             let accepted = await lifecycle.enableRecommended(preferredLanguages: preferredLanguages, intent: intent)
-            guard !accepted, let self, self.startIntents == intent else { return }
-            self.isStartRequested = false
+            if !accepted { self?.startSwitch.refused(intent) }
         }
     }
 
     /// Turning the switch off again before Smart Search started drops that start.
     public func cancelRecommendedEnable() {
-        startIntents &+= 1
-        let intent = startIntents
-        isStartRequested = false
+        let intent = startSwitch.request(on: false)
         Task { [lifecycle] in await lifecycle.cancelRecommendedEnable(intent: intent) }
     }
 

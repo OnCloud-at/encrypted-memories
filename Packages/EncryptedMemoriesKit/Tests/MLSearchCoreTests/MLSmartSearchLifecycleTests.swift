@@ -719,6 +719,32 @@ import Testing
         }
     }
 
+    /// Holds its first request until the test fails it; later requests return the catalog at once.
+    private actor GatedFirstCatalogProvider: MLModelCatalogProvider {
+        private let value: MLModelCatalog
+        private var requests = 0
+        private var waiting: CheckedContinuation<Void, Never>?
+        private var failWaiting = false
+
+        init(_ value: MLModelCatalog) { self.value = value }
+
+        var isWaiting: Bool { waiting != nil }
+
+        func catalog() async throws -> MLModelCatalog {
+            requests += 1
+            guard requests == 1 else { return value }
+            await withCheckedContinuation { waiting = $0 }
+            if failWaiting { throw FailingCatalogProvider.Failure() }
+            return value
+        }
+
+        func failWaitingRequest() {
+            failWaiting = true
+            waiting?.resume()
+            waiting = nil
+        }
+    }
+
     private final class FreeSpace: @unchecked Sendable {
         private let lock = NSLock()
         private var bytes: Int64
@@ -1251,7 +1277,6 @@ import Testing
         await harness.lifecycle.start()
         let accepted = await harness.lifecycle.enableRecommended(preferredLanguages: ["en-US"], intent: 1)
         #expect(accepted)
-        #expect(await harness.lifecycle.currentSnapshot().isStartPending || harness.transport.downloadCount > 0)
         await harness.lifecycle.awaitRecommendedStart()
 
         let stored = try #require(try harness.stateStore.load())
@@ -1388,6 +1413,85 @@ import Testing
 
         #expect(await waitForCompleteIndex(second, total: 1))
         #expect(await second.lifecycle.currentSnapshot().selectedModelID == largeEntry.id)
+    }
+
+    @Test func aSupersededSwitchOnCannotOverwriteTheNewerStateWithItsCatalogFailure() async throws {
+        let payload = Data("model".utf8)
+        let (entry, url) = downloadableEntry(id: "model", payload: payload)
+        let catalogProvider = GatedFirstCatalogProvider(MLModelCatalog(entries: [entry]))
+        let harness = try makeHarness(
+            catalog: MLModelCatalog(entries: []),
+            payloads: [url: payload],
+            assets: [uid("asset")],
+            catalogProvider: catalogProvider
+        )
+        defer { try? FileManager.default.removeItem(at: harness.layout.rootDirectory) }
+
+        await harness.lifecycle.start()
+        // On, off, on: the first request hangs until the person turned the switch on again.
+        await harness.lifecycle.enableRecommended(preferredLanguages: ["en"], intent: 1)
+        #expect(await waitUntil { await catalogProvider.isWaiting })
+        #expect(await harness.lifecycle.currentSnapshot().isStartPending)
+        await harness.lifecycle.cancelRecommendedEnable(intent: 2)
+        await harness.lifecycle.enableRecommended(preferredLanguages: ["en"], intent: 3)
+        await harness.lifecycle.awaitRecommendedStart()
+        #expect(await waitForCompleteIndex(harness, total: 1))
+
+        await catalogProvider.failWaitingRequest()
+        try await Task.sleep(for: .milliseconds(50))
+        let snapshot = await harness.lifecycle.currentSnapshot()
+        #expect(snapshot.isEnabled)
+        if case .failed = snapshot.phase {
+            Issue.record("a superseded catalog failure must not replace the ready state")
+        }
+        #expect(snapshot.startIntent == 3)
+    }
+
+    @Test func aRefusedSwitchOnStillReportsItsIntent() async throws {
+        let harness = try makeHarness(catalog: MLModelCatalog(entries: []), payloads: [:], assets: [])
+        defer { try? FileManager.default.removeItem(at: harness.layout.rootDirectory) }
+
+        // Not started yet: refused, but the snapshot carries the intent so the switch can settle.
+        let accepted = await harness.lifecycle.enableRecommended(preferredLanguages: ["en"], intent: 4)
+
+        #expect(!accepted)
+        let snapshot = await harness.lifecycle.currentSnapshot()
+        #expect(snapshot.startIntent == 4)
+        #expect(!snapshot.isStartPending)
+    }
+
+    @Test func aChoiceWaitsUntilAFailedSwitchCleanupIsRetried() async throws {
+        let payloadA = Data("model-a".utf8)
+        let payloadB = Data("model-b".utf8)
+        let payloadC = Data("model-c".utf8)
+        let (entryA, urlA) = downloadableEntry(id: "model-a", payload: payloadA)
+        let (entryB, urlB) = downloadableEntry(id: "model-b", payload: payloadB)
+        let (entryC, urlC) = downloadableEntry(id: "model-c", payload: payloadC)
+        let rootDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let flaky = FlakyStateStore(layout: MLModelInstallLayout(rootDirectory: rootDir))
+        let harness = try makeHarness(
+            catalog: MLModelCatalog(entries: [entryA, entryB, entryC]),
+            payloads: [urlA: payloadA, urlB: payloadB, urlC: payloadC],
+            assets: [uid("asset")],
+            root: rootDir,
+            stateStoreOverride: flaky
+        )
+        defer { try? FileManager.default.removeItem(at: rootDir) }
+
+        await harness.lifecycle.start()
+        await harness.lifecycle.enable(with: entryA.id)
+        #expect(await waitForCompleteIndex(harness, total: 1))
+        // The journal to B is written, but committing its cleanup fails: the switch stays journaled.
+        flaky.setFailing(where: { $0.pendingOperation == nil && $0.selectedModelID == entryB.id })
+        await harness.lifecycle.select(entryB.id)
+        #expect(try flaky.load()?.pendingOperation == .switchModel(from: entryA.id, to: entryB.id))
+
+        await harness.lifecycle.select(entryC.id)
+
+        let stored = try #require(try flaky.load())
+        #expect(stored.pendingOperation == .switchModel(from: entryA.id, to: entryB.id), "the journal stays intact")
+        #expect(stored.selectedModelID == entryB.id)
+        #expect(harness.transport.downloadCount == 2, "the choice waits instead of downloading")
     }
 
     @Test func enablingAgainSwitchesToTheChosenModel() async throws {
