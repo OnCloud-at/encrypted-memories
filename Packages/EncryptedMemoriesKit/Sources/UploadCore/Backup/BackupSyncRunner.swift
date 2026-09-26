@@ -629,13 +629,14 @@ public actor BackupSyncRunner {
             return
         }
 
+        // A resolve can already hold temp files, such as an iCloud original its identity pass staged.
+        resourceCleanup = resolved?.cleanup
         if sourceWasRemoved(entry) { return }
 
         guard let resolved else {
             discardMissingSource(entry, from: persistedState)
             return
         }
-        resourceCleanup = resolved.cleanup
         resourcePressureStreak = 0  // A successful export indicates available volume space.
         if stopRequested {
             revert(entry, from: persistedState)

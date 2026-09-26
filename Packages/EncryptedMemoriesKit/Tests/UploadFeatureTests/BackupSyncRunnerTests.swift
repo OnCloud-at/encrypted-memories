@@ -321,6 +321,41 @@ final class ScriptedBackupResolver: BackupResourceResolving, @unchecked Sendable
     }
 }
 
+/// Removes its source while the runner still waits for the resolve, like a deletion during an iCloud download.
+final class SourceRemovedDuringResolveResolver: BackupResourceResolving, @unchecked Sendable {
+    private let inner: ScriptedBackupResolver
+    private let lock = NSLock()
+    private var cleanups = 0
+    private var _onResolve: (@Sendable (UploadBackupSyncQueueEntry) async -> Void)?
+
+    init(inner: ScriptedBackupResolver) { self.inner = inner }
+
+    var onResolve: (@Sendable (UploadBackupSyncQueueEntry) async -> Void)? {
+        get { lock.withLock { _onResolve } }
+        set { lock.withLock { _onResolve = newValue } }
+    }
+
+    var cleanupCount: Int { lock.withLock { cleanups } }
+
+    func resolve(_ entry: UploadBackupSyncQueueEntry) async throws -> BackupResolvedResource? {
+        await onResolve?(entry)
+        guard let resolved = try await inner.resolve(entry) else { return nil }
+        return BackupResolvedResource(
+            candidate: resolved.candidate,
+            descriptor: resolved.descriptor,
+            mediaType: resolved.mediaType,
+            additionalMetadata: resolved.additionalMetadata,
+            captureDate: resolved.captureDate,
+            secondaries: resolved.secondaries,
+            cleanup: { [weak self] in self?.recordCleanup() }
+        )
+    }
+
+    private func recordCleanup() {
+        lock.withLock { cleanups += 1 }
+    }
+}
+
 /// Shared ordered event log for cross-component ordering assertions.
 final class BackupEventLog: @unchecked Sendable {
     private let lock = NSLock()
@@ -1475,6 +1510,21 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertEqual(progress.total, 0)
         XCTAssertEqual(progress.failed, 0)
         XCTAssertEqual(progress.sourceMissing, 0)
+    }
+
+    func testPhotoDeletedDuringItsIdentityPassReleasesItsTempFiles() async throws {
+        let entry = seedEntry("deleted-during-download.heic")
+        let removing = SourceRemovedDuringResolveResolver(inner: resolver)
+        let runner = makeRunner(resolver: removing)
+        removing.onResolve = { entry in
+            _ = await runner.removeSources(kind: entry.source.kind, identifiers: [entry.source.identifier])
+        }
+
+        _ = await runner.runUntilDrained()
+
+        XCTAssertEqual(removing.cleanupCount, 1, "a staged iCloud original must not outlive a deleted photo")
+        XCTAssertNil(queueStore.entry(for: entry.source, revision: entry.revision))
+        XCTAssertTrue(uploader.requests.isEmpty)
     }
 
     func testDraftBlocksWithBackoffAndNeverCountsAsBackedUp() async throws {
