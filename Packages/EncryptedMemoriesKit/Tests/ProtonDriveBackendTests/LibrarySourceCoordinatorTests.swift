@@ -156,6 +156,60 @@ struct LibrarySourceCoordinatorTests {
         await coordinator.shutdown()
     }
 
+    @Test func aThumbnailThatArrivesAfterItsPhotoWasRefreshedIsStillDelivered() async throws {
+        let uid = PhotoUID(volumeID: "primary-volume", nodeID: "photo")
+        let backend = ControlledLibrarySourceBackend(blockThumbnailLoads: true)
+        let coordinator = LibrarySourceCoordinator(remote: backend, thumbnailLoader: backend, inventoryStore: nil)
+        await coordinator.prepare()
+        let captured = Date(timeIntervalSince1970: 1)
+        await coordinator.replacePrimaryInventory(
+            [PhotoItem(uid: uid, captureTime: captured, mediaType: "image/jpeg")], authority: .authoritative)
+        let delivered = ThumbnailDeliveryRecorder()
+        let load = Task {
+            await coordinator.loadThumbnails(for: [uid], priority: .visibleNow) { uid, data in
+                delivered.store(data, for: uid)
+            }
+        }
+        while await !backend.isThumbnailLoadWaiting() { await Task.yield() }
+
+        // After sign-in the library keeps refreshing photos it already lists, for example their tags. The photo
+        // stays in the library, so its thumbnail must not be refused and then never requested again.
+        await coordinator.replacePrimaryInventory(
+            [PhotoItem(uid: uid, captureTime: captured, mediaType: "image/jpeg", tags: [.favorites])],
+            authority: .authoritative)
+        await backend.releaseThumbnailLoad()
+        let result = await load.value
+
+        #expect(delivered.data(for: uid) != nil)
+        #expect(result.itemErrors[uid] == nil)
+        await coordinator.shutdown()
+    }
+
+    @Test func aThumbnailThatArrivesAfterItsPhotoLeftTheLibraryIsRefused() async throws {
+        let uid = PhotoUID(volumeID: "primary-volume", nodeID: "photo")
+        let backend = ControlledLibrarySourceBackend(blockThumbnailLoads: true)
+        let coordinator = LibrarySourceCoordinator(remote: backend, thumbnailLoader: backend, inventoryStore: nil)
+        await coordinator.prepare()
+        await coordinator.replacePrimaryInventory(
+            [PhotoItem(uid: uid, captureTime: Date(timeIntervalSince1970: 1), mediaType: "image/jpeg")],
+            authority: .authoritative)
+        let delivered = ThumbnailDeliveryRecorder()
+        let load = Task {
+            await coordinator.loadThumbnails(for: [uid], priority: .visibleNow) { uid, data in
+                delivered.store(data, for: uid)
+            }
+        }
+        while await !backend.isThumbnailLoadWaiting() { await Task.yield() }
+
+        await coordinator.replacePrimaryInventory([], authority: .authoritative)
+        await backend.releaseThumbnailLoad()
+        let result = await load.value
+
+        #expect(delivered.data(for: uid) == nil)
+        #expect(result.itemErrors[uid] == "source authorization changed")
+        await coordinator.shutdown()
+    }
+
     @Test(arguments: [false, true])
     func thumbnailsStreamBeforeTheBatchEndsAndLateBytesRemainFenced(closeRuntime: Bool) async throws {
         let firstUID = PhotoUID(volumeID: "remote-volume", nodeID: "first")

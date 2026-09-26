@@ -476,29 +476,10 @@ public actor LibrarySourceCoordinator: PriorityThumbnailBatchLoader {
         onLoaded: @Sendable @escaping (PhotoUID, Data) -> Void
     ) async -> ThumbnailBatchLoadResult {
         guard !closed else { return ThumbnailBatchLoadResult(batchError: "source runtime closed") }
-        var leases: [PhotoUID: SourceAccessLease] = [:]
+        let leases = thumbnailAccessLeases(for: Set(uids))
         var denied: [PhotoUID: String] = [:]
-        var unleased = Set<PhotoUID>()
-        for uid in Set(uids) {
-            if let lease = graph.accessLease(for: uid, requiring: .readThumbnail) {
-                leases[uid] = lease
-            } else {
-                unleased.insert(uid)
-            }
-        }
-        // A series filmstrip requests burst members, which are authorized through the item that lists them.
-        let burstLeases = graph.burstMemberAccessLeases(for: unleased, requiring: .readThumbnail)
-        // Recently Deleted requests photos that left every inventory; their route registered them.
-        let outsideInventoryLeases = graph.identityOutsideInventoryAccessLeases(
-            for: unleased.subtracting(burstLeases.keys),
-            requiring: .readThumbnail
-        )
-        for uid in unleased {
-            if let lease = burstLeases[uid] ?? outsideInventoryLeases[uid] {
-                leases[uid] = lease
-            } else {
-                denied[uid] = "source unavailable"
-            }
+        for uid in Set(uids) where leases[uid] == nil {
+            denied[uid] = "source unavailable"
         }
         var requested = Set<PhotoUID>()
         let authorized = uids.filter { leases[$0] != nil && requested.insert($0).inserted }
@@ -518,7 +499,7 @@ public actor LibrarySourceCoordinator: PriorityThumbnailBatchLoader {
         // not hold already-available thumbnails behind the completion of the entire network batch.
         for await (uid, data) in stream {
             if Task.isCancelled { break }
-            guard let lease = leases[uid], graph.isCurrent(lease), !closed else {
+            guard let lease = leases[uid], !closed, isStillAuthorized(uid, by: lease) else {
                 itemErrors[uid] = "source authorization changed"
                 continue
             }
@@ -533,6 +514,39 @@ public actor LibrarySourceCoordinator: PriorityThumbnailBatchLoader {
         return ThumbnailBatchLoadResult(
             batchError: Task.isCancelled ? "cancelled" : result.batchError, itemErrors: itemErrors
         )
+    }
+
+    /// Thumbnail leases: library items through their source, burst members through the item that lists them, and
+    /// photos in Recently Deleted, which left every inventory, through the listing that registered them.
+    private func thumbnailAccessLeases(for uids: Set<PhotoUID>) -> [PhotoUID: SourceAccessLease] {
+        var leases: [PhotoUID: SourceAccessLease] = [:]
+        var unleased = Set<PhotoUID>()
+        for uid in uids {
+            if let lease = graph.accessLease(for: uid, requiring: .readThumbnail) {
+                leases[uid] = lease
+            } else {
+                unleased.insert(uid)
+            }
+        }
+        let burstLeases = graph.burstMemberAccessLeases(for: unleased, requiring: .readThumbnail)
+        let outsideInventoryLeases = graph.identityOutsideInventoryAccessLeases(
+            for: unleased.subtracting(burstLeases.keys),
+            requiring: .readThumbnail
+        )
+        for uid in unleased {
+            if let lease = burstLeases[uid] ?? outsideInventoryLeases[uid] { leases[uid] = lease }
+        }
+        return leases
+    }
+
+    /// Checks a late thumbnail against the graph as it is now. Every inventory refresh that changes an item, even
+    /// only its tags, renews the lease generation of the whole source, and after sign-in such refreshes follow each
+    /// other. Bytes of a photo that the same source still authorizes are delivered; a photo that left the source,
+    /// or a source that lost access, keeps them fenced.
+    private func isStillAuthorized(_ uid: PhotoUID, by lease: SourceAccessLease) -> Bool {
+        if graph.isCurrent(lease) { return true }
+        guard let renewed = thumbnailAccessLeases(for: [uid])[uid] else { return false }
+        return renewed.sourceID == lease.sourceID
     }
 
     private static func streamThumbnails(
