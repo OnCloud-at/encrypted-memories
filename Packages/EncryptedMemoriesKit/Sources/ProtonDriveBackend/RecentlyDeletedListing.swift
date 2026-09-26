@@ -78,49 +78,83 @@ struct RecentlyDeletedListingStore: Sendable {
 
 /// The photos whose thumbnails Recently Deleted may read and keep, newest first.
 ///
-/// A listing is the authority, but it can lag behind a change made here: photos trashed here must keep their
-/// thumbnails before the next listing shows them, and restored photos must keep theirs until the library lists
-/// them again. Both stay registered for the session; the stored listing alone seeds the next launch.
+/// A listing is the authority, but it can lag behind a change made here. Photos trashed here join the stored
+/// listing at once, so their thumbnails survive a relaunch before the next listing shows them. Restored photos
+/// stay registered until the library lists them again, so their thumbnails never lose their place in between.
 struct RecentlyDeletedIdentities: Sendable, Equatable {
-    private(set) var listing: [PhotoItem]?
+    /// The last trash listing that the server returned.
+    private var receivedListing: [PhotoItem]?
+    /// Photos trashed here that no listing has shown yet, oldest request first, with the items the library knew.
     private var trashedHere: [PhotoUID] = []
+    private var trashedHereItems: [PhotoUID: PhotoItem] = [:]
+    /// Photos restored here. A library refresh that lists one marks it; the next refresh releases it, because by
+    /// then the library that lists it was published.
     private var restoredHere: [PhotoUID] = []
+    private var restoredListedByLibrary: Set<PhotoUID> = []
 
     init(listing: [PhotoItem]?) {
-        self.listing = listing
+        receivedListing = listing
+    }
+
+    /// What Recently Deleted shows and stores: the last listing and the photos trashed here that it lacks.
+    var listing: [PhotoItem]? {
+        let pending = trashedHere.compactMap { trashedHereItems[$0] }
+        guard receivedListing != nil || !pending.isEmpty else { return nil }
+        var seen = Set<PhotoUID>()
+        return ((receivedListing ?? []) + pending)
+            .filter { seen.insert($0.uid).inserted }
+            .sorted(by: TimelineOrder.areInIncreasingOrder)
     }
 
     /// Registered identities: photos trashed here first, then the listing newest first, then restored photos.
     var ordered: [PhotoUID] {
         var seen = Set<PhotoUID>()
-        let listed = (listing ?? []).sorted(by: TimelineOrder.areInIncreasingOrder).reversed().map(\.uid)
+        let listed = (listing ?? []).reversed().map(\.uid)
         return (trashedHere.reversed() + listed + restoredHere).filter { seen.insert($0).inserted }
     }
 
+    var hasRestoredPhotos: Bool { !restoredHere.isEmpty }
+
     mutating func received(_ listing: [PhotoItem]) {
-        self.listing = listing
+        receivedListing = listing
         let listed = Set(listing.map(\.uid))
         trashedHere.removeAll { listed.contains($0) }
+        trashedHereItems = trashedHereItems.filter { !listed.contains($0.key) }
     }
 
-    mutating func trashed(_ uids: [PhotoUID]) {
+    /// `items` holds what the library knew about the moved photos; a photo without one is registered only.
+    mutating func trashed(_ uids: [PhotoUID], items: [PhotoItem]) {
         let moved = Set(uids)
         restoredHere.removeAll { moved.contains($0) }
+        restoredListedByLibrary.subtract(moved)
         trashedHere.removeAll { moved.contains($0) }
         trashedHere.append(contentsOf: uids)
+        for item in items where moved.contains(item.uid) { trashedHereItems[item.uid] = item }
     }
 
     mutating func restored(_ uids: [PhotoUID]) {
         let moved = Set(uids)
-        listing?.removeAll { moved.contains($0.uid) }
+        receivedListing?.removeAll { moved.contains($0.uid) }
         trashedHere.removeAll { moved.contains($0) }
+        trashedHereItems = trashedHereItems.filter { !moved.contains($0.key) }
         restoredHere.removeAll { moved.contains($0) }
+        restoredListedByLibrary.subtract(moved)
         restoredHere.append(contentsOf: uids)
     }
 
     /// The trash is empty now; restored photos keep their thumbnails until the library lists them again.
     mutating func emptied() {
-        listing = []
+        receivedListing = []
         trashedHere = []
+        trashedHereItems = [:]
+    }
+
+    /// Called after each library refresh. Releases restored photos that the previous refresh already listed and
+    /// marks the ones this refresh lists. Returns whether a photo was released.
+    mutating func libraryRefreshed(lists isListed: (PhotoUID) -> Bool) -> Bool {
+        let released = restoredHere.filter { restoredListedByLibrary.contains($0) }
+        restoredHere.removeAll { restoredListedByLibrary.contains($0) }
+        restoredListedByLibrary = Set(restoredHere.filter(isListed))
+        return !released.isEmpty
     }
 }

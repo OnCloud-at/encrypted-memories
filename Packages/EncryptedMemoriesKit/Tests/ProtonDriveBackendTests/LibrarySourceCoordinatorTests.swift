@@ -89,7 +89,7 @@ struct LibrarySourceCoordinatorTests {
         }
         #expect(refused.itemErrors[trashedUID] == "source unavailable")
 
-        await coordinator.setIdentitiesOutsideInventory([trashedUID])
+        await coordinator.setIdentitiesOutsideInventory([trashedUID], sequence: 1)
         let result = await coordinator.loadThumbnails(for: [trashedUID], priority: .visibleNow) { uid, data in
             delivered.store(data, for: uid)
         }
@@ -97,9 +97,29 @@ struct LibrarySourceCoordinatorTests {
         #expect(delivered.data(for: trashedUID) != nil, "a Recently Deleted tile must load its thumbnail")
         #expect(result.itemErrors[trashedUID] == nil)
 
-        await coordinator.setIdentitiesOutsideInventory([])
+        await coordinator.setIdentitiesOutsideInventory([], sequence: 2)
         let withdrawn = await coordinator.loadThumbnails(for: [trashedUID], priority: .visibleNow) { _, _ in }
         #expect(withdrawn.itemErrors[trashedUID] == "source unavailable")
+        await coordinator.shutdown()
+    }
+
+    @Test func aDelayedOlderRecentlyDeletedReportCannotReplaceANewerOne() async throws {
+        let trashedUID = PhotoUID(volumeID: "primary-volume", nodeID: "just-trashed")
+        let backend = ControlledLibrarySourceBackend()
+        let coordinator = LibrarySourceCoordinator(remote: backend, thumbnailLoader: backend, inventoryStore: nil)
+        await coordinator.prepare()
+        await coordinator.replacePrimaryInventory([], authority: .authoritative)
+
+        // The newer report (with the photo just trashed) arrives first; a listing's older report arrives late.
+        await coordinator.setIdentitiesOutsideInventory([trashedUID], sequence: 5)
+        await coordinator.setIdentitiesOutsideInventory([], sequence: 4)
+
+        let delivered = ThumbnailDeliveryRecorder()
+        let result = await coordinator.loadThumbnails(for: [trashedUID], priority: .visibleNow) { uid, data in
+            delivered.store(data, for: uid)
+        }
+        #expect(result.itemErrors[trashedUID] == nil, "the newer report must stay in force")
+        #expect(delivered.data(for: trashedUID) != nil)
         await coordinator.shutdown()
     }
 

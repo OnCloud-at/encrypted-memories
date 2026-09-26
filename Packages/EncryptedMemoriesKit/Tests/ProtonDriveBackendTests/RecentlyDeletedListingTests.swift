@@ -63,34 +63,46 @@ struct RecentlyDeletedListingTests {
         #expect(identities.ordered == [newer.uid, older.uid])
     }
 
-    @Test func photosTrashedHereKeepTheirThumbnailsUntilAListingShowsThem() {
+    @Test func photosTrashedHereJoinTheStoredListingUntilAListingShowsThem() {
         let listed = Self.item("listed", at: 1)
         let trashedHere = Self.item("trashed-here", at: 5)
+        let unknownToTheLibrary = PhotoUID(volumeID: "volume", nodeID: "not-in-library")
         var identities = RecentlyDeletedIdentities(listing: [listed])
 
-        identities.trashed([trashedHere.uid])
-        #expect(identities.ordered == [trashedHere.uid, listed.uid])
+        identities.trashed([trashedHere.uid, unknownToTheLibrary], items: [trashedHere])
+        #expect(identities.ordered == [unknownToTheLibrary, trashedHere.uid, listed.uid])
+        #expect(identities.listing == [listed, trashedHere], "a relaunch must keep the photo trashed here")
 
-        // A listing that lags behind the trash request must not release the new photo.
+        // A listing that lags behind the trash request must not release the new photos.
         identities.received([listed])
-        #expect(identities.ordered == [trashedHere.uid, listed.uid])
+        #expect(identities.ordered == [unknownToTheLibrary, trashedHere.uid, listed.uid])
+        #expect(identities.listing == [listed, trashedHere])
 
         identities.received([listed, trashedHere])
-        #expect(identities.ordered == [trashedHere.uid, listed.uid])
+        #expect(identities.ordered == [unknownToTheLibrary, trashedHere.uid, listed.uid])
         #expect(identities.listing == [listed, trashedHere])
     }
 
-    @Test func restoredPhotosKeepTheirThumbnailsUntilTheLibraryListsThemAgain() {
+    @Test func restoredPhotosStayRegisteredUntilOneRefreshAfterTheLibraryListsThemAgain() {
         let restored = Self.item("restored", at: 1)
         var identities = RecentlyDeletedIdentities(listing: [restored])
 
         identities.restored([restored.uid])
         #expect(identities.listing == [], "a restored photo leaves the stored listing at once")
-
         identities.received([])
-
         #expect(identities.ordered == [restored.uid])
-        #expect(identities.listing == [])
+
+        // A refresh that does not list it yet keeps it; the refresh that lists it only marks it, because the
+        // caller publishes that library afterwards; the next refresh releases it.
+        let notListedYet = identities.libraryRefreshed(lists: { _ in false })
+        #expect(!notListedYet)
+        let listedNow = identities.libraryRefreshed(lists: { $0 == restored.uid })
+        #expect(!listedNow)
+        #expect(identities.ordered == [restored.uid])
+        let listedBefore = identities.libraryRefreshed(lists: { $0 == restored.uid })
+        #expect(listedBefore)
+        #expect(identities.ordered.isEmpty)
+        #expect(!identities.hasRestoredPhotos)
     }
 
     @Test func emptyingTheTrashReleasesEveryTrashedPhoto() {
@@ -98,7 +110,7 @@ struct RecentlyDeletedListingTests {
         let trashedHere = Self.item("trashed-here", at: 2)
         let restored = Self.item("restored", at: 3)
         var identities = RecentlyDeletedIdentities(listing: [listed, restored])
-        identities.trashed([trashedHere.uid])
+        identities.trashed([trashedHere.uid], items: [trashedHere])
         identities.restored([restored.uid])
 
         identities.emptied()

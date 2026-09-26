@@ -94,8 +94,8 @@ public final class ProtonClientFacade {
         // retained only for writes the SDK does not expose.
         // Recently Deleted lists photos that left every inventory. The coordinator authorizes their
         // thumbnails from that listing; a weak reference keeps the bridge from retaining the coordinator.
-        bridge.setIdentitiesOutsideInventoryObserver { [weak librarySources] uids in
-            await librarySources?.setIdentitiesOutsideInventory(uids)
+        bridge.setIdentitiesOutsideInventoryObserver { [weak librarySources] uids, sequence in
+            await librarySources?.setIdentitiesOutsideInventory(uids, sequence: sequence)
         }
         let albumWrite = bridge.makeAlbumWriteService()
         let albumCatalog = bridge.makeAlbumCatalogBackend()

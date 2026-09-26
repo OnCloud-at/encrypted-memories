@@ -1034,6 +1034,30 @@ public final class TimelineMetadataStore {
         return result
     }
 
+    /// Capture time and media type of the given photos that this store lists, by primary key. The items carry no
+    /// tags or series members; unknown photos are left out. Recently Deleted stores the photos trashed here with it.
+    public func items(for uids: [PhotoUID]) -> [PhotoItem] {
+        guard !uids.isEmpty else { return [] }
+        var stmt: OpaquePointer?
+        let sql = "SELECT t, mime FROM photos WHERE vol=? AND node=?;"
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return [] }
+        defer { sqlite3_finalize(stmt) }
+        var items: [PhotoItem] = []
+        for uid in uids {
+            sqlite3_reset(stmt)
+            sqlite3_bind_text(stmt, 1, uid.volumeID, -1, transient)
+            sqlite3_bind_text(stmt, 2, uid.nodeID, -1, transient)
+            guard sqlite3_step(stmt) == SQLITE_ROW else { continue }
+            items.append(
+                PhotoItem(
+                    uid: uid,
+                    captureTime: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 0)),
+                    mediaType: sqlite3_column_text(stmt, 1).map { String(cString: $0) } ?? "image/jpeg"
+                ))
+        }
+        return items
+    }
+
     // MARK: Digest
 
     /// Deterministic SHA-256 over the canonically ordered rows' persisted fields. Doubles hash by

@@ -90,7 +90,8 @@ public enum ProtonDriveBackendFactory {
         )
         await librarySources.prepare()
         // Before any consumer binds: the first cache sweep keeps the thumbnails of the photos in Recently Deleted.
-        await librarySources.setIdentitiesOutsideInventory(await bridge.recentlyDeletedIdentities())
+        let recentlyDeleted = await bridge.recentlyDeletedReport()
+        await librarySources.setIdentitiesOutsideInventory(recentlyDeleted.uids, sequence: recentlyDeleted.sequence)
         SDKCapabilities.current.log()
         // Opening account-scoped SQLite stores is synchronous. Prepare them on a utility executor before the
         // facade's MainActor composition so account activation does not block the UI executor on disk I/O.

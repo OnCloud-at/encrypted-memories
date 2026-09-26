@@ -62,6 +62,9 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     /// thumbnails before the route opens. One task per bridge.
     private var trashListingTask: Task<Void, Never>?
     private var hasListedTrash = false
+    /// Orders identity reports: the coordinator applies only a report newer than the last one it applied, so a
+    /// report that an actor hop delayed cannot replace a newer list.
+    private var recentlyDeletedReportSequence: UInt64 = 0
     /// Set by a timeline save that removed photos; a trash listing then follows the load.
     private var timelineLostPhotos = false
     /// Counts completed trash, restore, and Empty Trash requests. A listing that a request overtook is stale:
@@ -517,7 +520,24 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                 items: reconciliationItems,
                 alreadyClassifiedNodeIDs: Set(mediaTypeEvidence.keys)
             )
-            scheduleTrashListing()
+            if timelineLostPhotos {
+                // Photos left the library, maybe into the trash on another device. List the trash before the caller
+                // publishes the smaller library, so the cache sweep keeps the thumbnails of photos now in the trash.
+                timelineLostPhotos = false
+                do {
+                    _ = try await listTrash()
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch {
+                    DebugLog.log("trash: listing after a library change failed - \(error)")
+                }
+            } else {
+                scheduleTrashListing()
+            }
+            if recentlyDeleted.hasRestoredPhotos {
+                let libraryUIDs = Set(sections.lazy.flatMap(\.items).map(\.uid))
+                if recentlyDeleted.libraryRefreshed(lists: libraryUIDs.contains) { await reportRecentlyDeleted() }
+            }
             return TimelineLoadSnapshot(
                 sections: sections,
                 validationToken: monitorToken(remoteToken: commit.monitorBaseline)
@@ -1187,7 +1207,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
 
     /// Wired by the account composition. Every trash listing then authorizes what it shows.
     nonisolated func setIdentitiesOutsideInventoryObserver(
-        _ observer: @escaping @Sendable ([PhotoUID]) async -> Void
+        _ observer: @escaping @Sendable (_ uids: [PhotoUID], _ sequence: UInt64) async -> Void
     ) {
         identitiesOutsideInventoryObserver.set(observer)
     }
@@ -1230,9 +1250,13 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
-                // When the listing fails, for example offline, Recently Deleted shows the last listing it
-                // received; the thumbnail crawl already put its thumbnails on disk.
-                guard let listing = recentlyDeleted.listing else { throw error }
+                // Offline or unreachable, Recently Deleted shows the last listing it received; the thumbnail crawl
+                // already put its thumbnails on disk. Every other failure, such as a lost session, still shows.
+                guard (error as NSError).domain == NSURLErrorDomain, let listing = recentlyDeleted.listing else {
+                    throw error
+                }
+                DebugLog.log("trash: listing unreachable, showing the stored listing (\(listing.count) items)")
+                PhotoDiagnostics.shared.increment("recentlyDeleted.storedListingShown")
                 photos = listing
             }
             return [
@@ -1276,9 +1300,15 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         try await withOpenSession { bridge in
             let root = try await bridge.resolvePhotosRoot()
             try await bridge.driveSession.trash(volumeID: root.volumeID, linkIDs: uids.map(\.nodeID))
-            // The next library refresh drops these photos; they keep their thumbnails in Recently Deleted.
+            // The next library refresh drops these photos; they keep their thumbnails in Recently Deleted. They
+            // join the stored listing at once, so a relaunch before the next listing keeps them too.
             bridge.trashMutationGeneration &+= 1
-            bridge.recentlyDeleted.trashed(uids)
+            let known = (bridge.timelineStore?.items(for: uids) ?? []).map {
+                RecentlyDeletedItem.make(
+                    volumeID: $0.uid.volumeID, nodeID: $0.uid.nodeID, captureTime: $0.captureTime, isVideo: $0.isVideo)
+            }
+            bridge.recentlyDeleted.trashed(uids, items: known)
+            if let listing = bridge.recentlyDeleted.listing { bridge.recentlyDeletedStore.save(listing) }
             await bridge.reportRecentlyDeleted()
             // Debug-gated end-to-end verification: the moved links must actually surface in the volume trash
             // listing (this is the seam that silently broke before - trash "succeeded" but Recently Deleted
@@ -1325,14 +1355,16 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
 
     // MARK: - Recently Deleted
 
-    /// The photos of the stored listing, newest first. The account composition registers them before the first
-    /// cache sweep, so their thumbnails survive a launch before the route or a listing runs.
-    func recentlyDeletedIdentities() -> [PhotoUID] {
-        recentlyDeleted.ordered
+    /// The photos of the stored listing, newest first, with the report sequence. The account composition registers
+    /// them before the first cache sweep, so their thumbnails survive a launch before the route or a listing runs.
+    func recentlyDeletedReport() -> (uids: [PhotoUID], sequence: UInt64) {
+        recentlyDeletedReportSequence &+= 1
+        return (recentlyDeleted.ordered, recentlyDeletedReportSequence)
     }
 
     /// Lists the volume trash, stores the listing, and registers its photos for their thumbnails.
     private func listTrash() async throws -> [PhotoItem] {
+        guard !isShutDown else { throw CancellationError() }
         let generation = trashMutationGeneration
         let root = try await resolvePhotosRoot()
         let links = try await driveSession.listTrash(volumeID: root.volumeID)
@@ -1349,26 +1381,32 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                     isVideo: l.mimeType?.hasPrefix("video/") == true)
             }
             .sorted(by: TimelineOrder.areInIncreasingOrder)
-        // A trash, restore, or Empty Trash request finished meanwhile and already updated the state. The route
-        // hides photos it moved; the next listing stores the current trash.
-        guard generation == trashMutationGeneration else { return photos }
+        guard !isShutDown else { throw CancellationError() }
+        // A trash, restore, or Empty Trash request finished meanwhile and already updated the state, which is newer
+        // than this listing. The route shows that state; the next listing stores the current trash.
+        guard generation == trashMutationGeneration else { return recentlyDeleted.listing ?? photos }
         hasListedTrash = true
-        if recentlyDeleted.listing != photos { recentlyDeletedStore.save(photos) }
+        let stored = recentlyDeleted.listing
         recentlyDeleted.received(photos)
+        if let listing = recentlyDeleted.listing, listing != stored {
+            DebugLog.log("trash: listing has \(listing.count) items")
+            recentlyDeletedStore.save(listing)
+        }
         // A trashed photo left every inventory, so only this listing proves that the user may read it.
         await reportRecentlyDeleted()
         return photos
     }
 
     private func reportRecentlyDeleted() async {
-        await identitiesOutsideInventoryObserver.report(recentlyDeleted.ordered)
+        let report = recentlyDeletedReport()
+        await identitiesOutsideInventoryObserver.report(report.uids, sequence: report.sequence)
     }
 
-    /// Lists the trash once per session and again after the library lost photos, which another device may have
-    /// moved to the trash. It runs at maintenance priority; the thumbnail crawl then fetches the new photos last.
+    /// Lists the trash once per session, at maintenance priority, so photos trashed on another device before this
+    /// launch get their thumbnails; the crawl fetches them last. After that, a library refresh that lost photos
+    /// lists the trash itself.
     private func scheduleTrashListing() {
-        guard !isShutDown, trashListingTask == nil, !hasListedTrash || timelineLostPhotos else { return }
-        timelineLostPhotos = false
+        guard !isShutDown, trashListingTask == nil, !hasListedTrash else { return }
         trashListingTask = Task(priority: .utility) { [weak self] in
             guard let self else { return }
             await self.listTrashInBackground()
@@ -2071,14 +2109,14 @@ private final class BatchFailureBox: @unchecked Sendable {
 /// composition time and read from the actor, so it needs no isolation of its own.
 final class IdentitiesOutsideInventoryObserver: @unchecked Sendable {
     private let lock = NSLock()
-    private var observer: (@Sendable ([PhotoUID]) async -> Void)?
+    private var observer: (@Sendable ([PhotoUID], UInt64) async -> Void)?
 
-    func set(_ observer: @escaping @Sendable ([PhotoUID]) async -> Void) {
+    func set(_ observer: @escaping @Sendable ([PhotoUID], UInt64) async -> Void) {
         lock.withLock { self.observer = observer }
     }
 
-    func report(_ uids: [PhotoUID]) async {
+    func report(_ uids: [PhotoUID], sequence: UInt64) async {
         guard let observer = lock.withLock({ observer }) else { return }
-        await observer(uids)
+        await observer(uids, sequence)
     }
 }
