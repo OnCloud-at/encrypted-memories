@@ -44,8 +44,9 @@ public actor BackupSyncRunner {
         public var uploadStallPollInterval: TimeInterval
         public var retry: BackupRetryPolicy
         public var throttle: BackupThrottlePolicy
-        /// How long a source the platform still prepares waits before the next try.
-        public var sourceNotReadyDelay: TimeInterval
+        /// How often a one-shot drain (`waitForScheduledRetries`, such as an album backup the user waits for) checks
+        /// a photo the camera still processes again. Library passes check it once, at the end of the camera window.
+        public var oneShotSourceRecheckInterval: TimeInterval
 
         public init(
             batchSize: Int = 32,
@@ -55,7 +56,7 @@ public actor BackupSyncRunner {
             uploadStallPollInterval: TimeInterval = 5,
             retry: BackupRetryPolicy = BackupRetryPolicy(),
             throttle: BackupThrottlePolicy = BackupThrottlePolicy(),
-            sourceNotReadyDelay: TimeInterval = 30
+            oneShotSourceRecheckInterval: TimeInterval = 30
         ) {
             self.batchSize = max(1, batchSize)
             self.staleActiveGrace = max(0, staleActiveGrace)
@@ -64,7 +65,7 @@ public actor BackupSyncRunner {
             self.uploadStallPollInterval = max(0.01, min(uploadStallPollInterval, uploadStallTimeout))
             self.retry = retry
             self.throttle = throttle
-            self.sourceNotReadyDelay = max(0, sourceNotReadyDelay)
+            self.oneShotSourceRecheckInterval = max(0, oneShotSourceRecheckInterval)
         }
     }
 
@@ -85,6 +86,7 @@ public actor BackupSyncRunner {
     private let now: @Sendable () -> Date
 
     private var isRunning = false
+    private var drainMode: DrainMode = .waitForScheduledRetries
     private var stopRequested = false
     /// Consecutive items that could not even reserve disk space since the last one that did.
     /// Reset to 0 the moment any export succeeds; when it reaches a full wave the drain ends the
@@ -258,6 +260,7 @@ public actor BackupSyncRunner {
             return progress
         }
         isRunning = true
+        drainMode = mode
         stopRequested = false
         removedSources = []
         activeTransfers = [:]
@@ -398,6 +401,9 @@ public actor BackupSyncRunner {
                     break
                 }
                 if mode == .eligibleOnly { break }
+                // Only an item waiting for Proton storage waits longer than any regular retry. A one-shot drain the
+                // user waits for ends then instead of sleeping for hours.
+                if wait > longestRegularRetryWait { break }
                 do {
                     try await clock.sleep(for: wait)
                 } catch {
@@ -481,6 +487,12 @@ public actor BackupSyncRunner {
         // moves rows to `checking`. Never filter after claiming: a discarded claim has no worker
         // and would remain falsely active until crash recovery.
         return queue.claimRunnable(limit: claimLimit, claimedAt: now())
+    }
+
+    /// The longest wait of a runnable retry other than a full Proton account: the retry policy's cap, its
+    /// 30-second minimum after low disk space, and the recheck of a photo the camera still processes.
+    private var longestRegularRetryWait: TimeInterval {
+        max(configuration.retry.maxDelay, 30, configuration.oneShotSourceRecheckInterval)
     }
 
     /// The wait until the next persisted retry becomes eligible, or nil when none is pending.
@@ -612,13 +624,14 @@ public actor BackupSyncRunner {
             return
         }
 
+        // A resolve can already hold temp files, such as an iCloud original its identity pass staged.
+        resourceCleanup = resolved?.cleanup
         if sourceWasRemoved(entry) { return }
 
         guard let resolved else {
             discardMissingSource(entry, from: persistedState)
             return
         }
-        resourceCleanup = resolved.cleanup
         resourcePressureStreak = 0  // A successful export indicates available volume space.
         if stopRequested {
             revert(entry, from: persistedState)
@@ -887,6 +900,12 @@ public actor BackupSyncRunner {
         workIntent: LibraryWorkIntent,
         preparationProgress: @escaping BackupResourcePreparationHandler
     ) async throws -> UploadDecisionOperationResult<PrimaryScopedOutcome> {
+        // Before the original is copied: a file that cannot fit into the account is neither copied nor sent. Replacing
+        // a draft is left to Proton, because the draft's own blocks may be what fills the account.
+        if preflightResult.decision != .uploadReplacingDraft {
+            try await uploader.ensureRemoteCapacity(
+                forBytes: resolved.descriptor.fileSize, filename: resolved.descriptor.filename)
+        }
         let descriptor: UploadResourceDescriptor
         if resolved.hasDeferredMaterialization {
             descriptor = try await resourceCoordinator.withHeavyPermit(
@@ -1302,6 +1321,10 @@ public actor BackupSyncRunner {
                         case .skip(.inconsistentRemoteState, _), .uploadMissingSecondaries:
                             return .noUpload(.inconsistent)
                         case .upload, .uploadReplacingDraft:
+                            if result.decision != .uploadReplacingDraft {
+                                try await self.uploader.ensureRemoteCapacity(
+                                    forBytes: secondary.descriptor.fileSize, filename: secondary.descriptor.filename)
+                            }
                             let uploadDescriptor: UploadResourceDescriptor
                             if secondary.hasDeferredMaterialization {
                                 uploadDescriptor = try await self.resourceCoordinator.withHeavyPermit(
@@ -1561,10 +1584,15 @@ public actor BackupSyncRunner {
             return
         }
         // Not a failure: the camera still processes the photo. Uploading now would send its preliminary
-        // version and then the finished one again. Wait without counting an attempt; the finished photo
-        // usually arrives sooner as a new revision.
-        if case UploadError.sourceNotReady = error {
-            let eligibleAt = now().addingTimeInterval(configuration.sourceNotReadyDelay)
+        // version and then the finished one again. The row waits, without an attempt, until the end of the
+        // camera's window: the platform's change notification enqueues the finished photo as a new revision
+        // sooner, so no timer re-checks it before that date. Only a one-shot drain that the user waits for checks
+        // again sooner. A known state keeps older builds able to read the row.
+        if case UploadError.sourceNotReady(_, let until) = error {
+            let recheck =
+                drainMode == .waitForScheduledRetries
+                ? min(until, now().addingTimeInterval(configuration.oneShotSourceRecheckInterval)) : until
+            let eligibleAt = max(recheck, now())
             guard
                 queue.updateState(
                     source: entry.source, revision: entry.revision,
@@ -1630,6 +1658,30 @@ public actor BackupSyncRunner {
                     attempts: entry.attempts,
                     lastError: issue.persistedValue,
                     updatedAt: issue.nextAttemptAt ?? now()
+                )
+            else {
+                stopRequested = true
+                return
+            }
+            adjustProgress(from: oldState, to: .discovered)
+            emitProgress()
+            return
+        }
+
+        // A full Proton account is not the item's fault either. The item waits without burning its attempts; the
+        // check is cheap, but reaching it may download the original from iCloud again, so it recurs only rarely.
+        // Freeing space or a larger plan and Back Up Now take it up at once.
+        if case UploadError.accountStorageFull = error {
+            let eligibleAt = now().addingTimeInterval(Self.accountStorageRecheckInterval)
+            guard
+                queue.updateState(
+                    source: entry.source, revision: entry.revision,
+                    state: .discovered,
+                    attempts: entry.attempts,
+                    lastError: BackupIssueRecord(
+                        kind: .accountStorage, detail: message, nextAttemptAt: eligibleAt
+                    ).persistedValue,
+                    updatedAt: eligibleAt
                 )
             else {
                 stopRequested = true
@@ -1818,8 +1870,14 @@ public actor BackupSyncRunner {
     /// Errors that reflect a temporary lack of disk space rather than a bad item. These are
     /// retried indefinitely (with backoff) and never parked as `.failed`.
     private static func isTransientResourcePressure(_ error: Error) -> Bool {
-        (error as? BackupTempFileStore.BackupTempFileError) == .diskBudgetExceeded
+        switch error as? BackupTempFileStore.BackupTempFileError {
+        case .diskBudgetExceeded, .needsFreeSpace: true
+        case nil: false
+        }
     }
+
+    /// How long an item that did not fit into the Proton account waits before the next automatic check.
+    static let accountStorageRecheckInterval: TimeInterval = 6 * 3600
 
     private static func issueKind(for error: Error) -> BackupIssueKind {
         if isTransientResourcePressure(error) { return .deviceStorage }
@@ -1835,6 +1893,8 @@ public actor BackupSyncRunner {
             return .network
         case UploadError.retryableBackend, UploadError.backend, UploadError.albumStep:
             return .remoteService
+        case UploadError.accountStorageFull:
+            return .accountStorage
         default:
             return .unknown
         }

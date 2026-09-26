@@ -14,6 +14,8 @@ public enum BackupIssueKind: String, Codable, Sendable, Equatable {
     case remoteService
     case localState
     case remoteDeletion
+    /// The Proton account has too little storage left for the item.
+    case accountStorage
     case unknown
 
     public var isRetryable: Bool {

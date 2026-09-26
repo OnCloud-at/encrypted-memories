@@ -17,3 +17,5 @@ Only media with usable location information appears. An empty Map does not mean 
 - **Mac:** Select **Map** in the sidebar. The map stays beside the native sidebar and opens media in the shared viewer.
 
 The local location index is account-scoped and encrypted at rest. Apple MapKit provides the native map surface and the place names. To resolve a place name, the app sends the location coordinates to Apple.
+
+After you opened the Map once on a device, the app loads the map area it opens at while the app starts, so the Map appears without a grey background. Like opening the Map, this requests the map tiles of that area from Apple. Signing out resets it.

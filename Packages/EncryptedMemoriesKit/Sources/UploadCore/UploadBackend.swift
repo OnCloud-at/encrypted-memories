@@ -74,11 +74,17 @@ public protocol PhotoUploading: Sendable {
     func cancel(token: UUID) async
     func pause(token: UUID) async throws
     func resume(token: UUID) async throws
+
+    /// Throws `UploadError.accountStorageFull` when the account's remaining storage cannot hold `bytes`. The runner
+    /// asks after the duplicate check and before it copies an original for upload, so a file that cannot fit is
+    /// neither copied for upload nor sent. An original that lives only in iCloud was already read for its identity.
+    func ensureRemoteCapacity(forBytes bytes: Int64, filename: String) async throws
 }
 
 public extension PhotoUploading {
     func pause(token: UUID) async throws {}
     func resume(token: UUID) async throws {}
+    func ensureRemoteCapacity(forBytes bytes: Int64, filename: String) async throws {}
 }
 
 // MARK: - Photo tags (series migration seam, optional)

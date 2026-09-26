@@ -59,9 +59,12 @@ final class ScriptedBackupResolver: BackupResourceResolving, @unchecked Sendable
         /// Throw `BackupTempFileError.diskBudgetExceeded` for the first `times` resolves, then
         /// behave like `.standard`. Models a device low on space while a pass runs.
         case diskPressure(times: Int)
-        /// Throw `UploadError.sourceNotReady` for the first `times` resolves, then behave like `.standard`.
-        /// Models a new photo the camera still processes.
-        case notReady(times: Int)
+        /// Throw `UploadError.sourceNotReady(until:)` for the first `times` resolves, then behave like
+        /// `.standard`. Models a new photo the camera still processes.
+        case notReady(times: Int, until: Date)
+        /// Throw `BackupTempFileError.needsFreeSpace` from the first `times` copies for upload, after the duplicate
+        /// check. Models a large video whose copy does not fit on the device.
+        case needsFreeSpaceOnCopy(times: Int)
     }
 
     private let lock = NSLock()
@@ -139,7 +142,8 @@ final class ScriptedBackupResolver: BackupResourceResolving, @unchecked Sendable
             behaviors[identifier] = behavior
             if case .transientFailure(let times) = behavior { remainingFailures[identifier] = times }
             if case .diskPressure(let times) = behavior { remainingFailures[identifier] = times }
-            if case .notReady(let times) = behavior { remainingFailures[identifier] = times }
+            if case .notReady(let times, _) = behavior { remainingFailures[identifier] = times }
+            if case .needsFreeSpaceOnCopy(let times) = behavior { remainingFailures[identifier] = times }
         }
     }
 
@@ -181,9 +185,9 @@ final class ScriptedBackupResolver: BackupResourceResolving, @unchecked Sendable
             if consumeFailure() { throw UploadError.backend("transient resolve failure for \(id)") }
         case .diskPressure:
             if consumeFailure() { throw BackupTempFileStore.BackupTempFileError.diskBudgetExceeded }
-        case .notReady:
-            if consumeFailure() { throw UploadError.sourceNotReady(id) }
-        case .standard:
+        case .notReady(_, let until):
+            if consumeFailure() { throw UploadError.sourceNotReady(id, until: until) }
+        case .standard, .needsFreeSpaceOnCopy:
             break
         }
 
@@ -211,9 +215,17 @@ final class ScriptedBackupResolver: BackupResourceResolving, @unchecked Sendable
             let materialize: (@Sendable () async throws -> UploadResourceDescriptor)?
             if isDeferred {
                 materialize = { @Sendable [self] in
-                    let shouldMismatch = lock.withLock {
+                    let (shouldMismatch, copyFails) = lock.withLock { () -> (Bool, Bool) in
                         materializeCounts[id, default: 0] += 1
-                        return mismatchOnceIdentifiers.remove(id) != nil
+                        var copyFails = false
+                        if case .needsFreeSpaceOnCopy = behaviors[id], let left = remainingFailures[id], left > 0 {
+                            remainingFailures[id] = left - 1
+                            copyFails = true
+                        }
+                        return (mismatchOnceIdentifiers.remove(id) != nil, copyFails)
+                    }
+                    if copyFails {
+                        throw BackupTempFileStore.BackupTempFileError.needsFreeSpace(requiredBytes: 1 << 34)
                     }
                     return UploadResourceDescriptor(
                         source: entry.source,
@@ -318,6 +330,41 @@ final class ScriptedBackupResolver: BackupResourceResolving, @unchecked Sendable
         var digest = Data(repeating: 0, count: 20)
         for (index, byte) in seed.utf8.enumerated() { digest[index % 20] ^= byte }
         return digest
+    }
+}
+
+/// Removes its source while the runner still waits for the resolve, like a deletion during an iCloud download.
+final class SourceRemovedDuringResolveResolver: BackupResourceResolving, @unchecked Sendable {
+    private let inner: ScriptedBackupResolver
+    private let lock = NSLock()
+    private var cleanups = 0
+    private var _onResolve: (@Sendable (UploadBackupSyncQueueEntry) async -> Void)?
+
+    init(inner: ScriptedBackupResolver) { self.inner = inner }
+
+    var onResolve: (@Sendable (UploadBackupSyncQueueEntry) async -> Void)? {
+        get { lock.withLock { _onResolve } }
+        set { lock.withLock { _onResolve = newValue } }
+    }
+
+    var cleanupCount: Int { lock.withLock { cleanups } }
+
+    func resolve(_ entry: UploadBackupSyncQueueEntry) async throws -> BackupResolvedResource? {
+        await onResolve?(entry)
+        guard let resolved = try await inner.resolve(entry) else { return nil }
+        return BackupResolvedResource(
+            candidate: resolved.candidate,
+            descriptor: resolved.descriptor,
+            mediaType: resolved.mediaType,
+            additionalMetadata: resolved.additionalMetadata,
+            captureDate: resolved.captureDate,
+            secondaries: resolved.secondaries,
+            cleanup: { [weak self] in self?.recordCleanup() }
+        )
+    }
+
+    private func recordCleanup() {
+        lock.withLock { cleanups += 1 }
     }
 }
 
@@ -884,19 +931,170 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertEqual(resolver.resolveCount(for: entry.source.identifier), 8, "7 pressure failures, then success")
     }
 
-    func testPhotoTheCameraStillProcessesWaitsWithoutFailing() async throws {
+    func testPhotoTheCameraStillProcessesWaitsForTheEndOfItsWindowWithoutPolling() async throws {
         let entry = seedEntry("processing.heic")
-        resolver.set(.notReady(times: 5), for: entry.source.identifier)
+        let windowEnd = clock.now.addingTimeInterval(600)
+        resolver.set(.notReady(times: 1, until: windowEnd), for: entry.source.identifier)
 
+        // The library pass waits for nothing: the photo stays due at the end of the camera window.
         let runner = makeRunner()
-        let progress = await runner.runUntilDrained()
+        let parked = await runner.runUntilDrained(mode: .eligibleOnly)
+        let row = try XCTUnwrap(queueStore.entry(for: entry.source, revision: entry.revision))
+        XCTAssertEqual(row.state, .discovered, "a state that older builds know, never a failure")
+        XCTAssertEqual(row.attempts, 0)
+        XCTAssertEqual(row.updatedAt.timeIntervalSince1970, windowEnd.timeIntervalSince1970, accuracy: 0.001)
+        XCTAssertEqual(parked.failed, 0)
+        XCTAssertTrue(clock.sleeps.isEmpty)
+        XCTAssertTrue(uploader.requests.isEmpty)
 
-        XCTAssertEqual(state(of: entry), .completed, "a photo in camera processing must never park as failed")
-        XCTAssertEqual(uploader.requests.count, 1, "only the finished photo uploads")
+        // A pass before that date does not look at the photo again.
+        clock.advance(by: 300)
+        _ = await runner.runUntilDrained(mode: .eligibleOnly)
+        XCTAssertEqual(resolver.resolveCount(for: entry.source.identifier), 1)
+
+        // One check at the end of the window backs up whatever version exists.
+        clock.advance(by: 301)
+        _ = await runner.runUntilDrained(mode: .eligibleOnly)
+        XCTAssertEqual(state(of: entry), .completed)
+        XCTAssertEqual(uploader.requests.count, 1)
+        XCTAssertEqual(resolver.resolveCount(for: entry.source.identifier), 2)
+    }
+
+    func testAnAlbumBackupTheUserWaitsForChecksAWaitingPhotoEvery30Seconds() async throws {
+        let entry = seedEntry("processing-wait.heic")
+        resolver.set(.notReady(times: 2, until: clock.now.addingTimeInterval(600)), for: entry.source.identifier)
+
+        // A one-shot drain must not sleep through the camera's whole window once the finished photo exists.
+        let progress = await makeRunner().runUntilDrained()
+
+        XCTAssertEqual(state(of: entry), .completed)
         XCTAssertEqual(progress.failed, 0)
-        XCTAssertEqual(resolver.resolveCount(for: entry.source.identifier), 6)
-        XCTAssertEqual(clock.sleeps.count, 5)
+        XCTAssertEqual(clock.sleeps.count, 2)
         XCTAssertEqual(try XCTUnwrap(clock.sleeps.first), 30, accuracy: 0.001)
+        XCTAssertEqual(resolver.resolveCount(for: entry.source.identifier), 3)
+    }
+
+    func testAPhotoThatDoesNotFitIntoTheAccountWaitsWithoutACopyOrAnAttempt() async throws {
+        let entry = seedEntry("huge.mov")
+        resolver.setDeferredMaterialization(for: entry.source.identifier)
+        uploader.remoteCapacityBytes = 0
+
+        let progress = await makeRunner().runUntilDrained(mode: .eligibleOnly)
+
+        let row = try XCTUnwrap(queueStore.entry(for: entry.source, revision: entry.revision))
+        XCTAssertEqual(row.state, .discovered, "a full account is not the photo's fault")
+        XCTAssertEqual(row.attempts, 0)
+        let issue = try XCTUnwrap(BackupIssueRecord.decode(row.lastError))
+        XCTAssertEqual(issue.kind, .accountStorage)
+        XCTAssertEqual(
+            row.updatedAt.timeIntervalSince(clock.now), BackupSyncRunner.accountStorageRecheckInterval, accuracy: 1)
+        XCTAssertEqual(resolver.materializeCount(for: entry.source.identifier), 0, "no copy of a file that cannot fit")
+        XCTAssertTrue(uploader.requests.isEmpty)
+        XCTAssertEqual(progress.failed, 0)
+
+        // More storage, then Back Up Now.
+        uploader.remoteCapacityBytes = nil
+        queueStore.makeRetryableWorkEligible(updatedAt: clock.now)
+        _ = await makeRunner().runUntilDrained(mode: .eligibleOnly)
+        XCTAssertEqual(state(of: entry), .completed)
+    }
+
+    func testReplacingOwnDraftLeavesTheStorageDecisionToProton() async throws {
+        // The draft's own blocks may be what fills the account.
+        let entry = seedEntry("full-draft.jpg")
+        let hashes = expectedHashes(id: "full-draft.jpg")
+        checker.remoteItemsByNameHash[hashes.nameHash] = [
+            RemotePhotoDuplicate(
+                nameHash: hashes.nameHash,
+                contentHash: hashes.contentHash,
+                linkState: .draft,
+                linkID: "full-draft",
+                clientUID: "this-installation"
+            )
+        ]
+        let pipeline = UploadDedupePipeline(
+            store: identityStore,
+            hasher: hasher,
+            checker: checker,
+            currentClientUID: "this-installation",
+            now: { [clock] in clock!.now }
+        )
+        uploader.remoteCapacityBytes = 0
+
+        _ = await makeRunner(identityResolver: pipeline).runUntilDrained(mode: .eligibleOnly)
+
+        XCTAssertEqual(state(of: entry), .completed)
+        XCTAssertTrue(try XCTUnwrap(uploader.requests.first).overrideExistingDraft)
+    }
+
+    func testAnAlbumBackupTheUserWaitsForEndsWhenTheAccountIsFull() async throws {
+        let entry = seedEntry("full-account.mov")
+        uploader.remoteCapacityBytes = 0
+
+        let progress = await makeRunner().runUntilDrained()
+
+        XCTAssertFalse(progress.isRunning)
+        XCTAssertTrue(clock.sleeps.isEmpty, "the drain must not sleep until the next storage check")
+        XCTAssertEqual(state(of: entry), .discovered)
+        XCTAssertEqual(progress.failed, 0)
+    }
+
+    func testALivePhotoVideoThatDoesNotFitIntoTheAccountWaitsWithoutAnAttempt() async throws {
+        let entry = seedEntry("fits.heic")
+        resolver.setSecondaries(["too-large.mov"], for: entry.source.identifier)
+        // The photo (1 byte) fits, its paired video (2 bytes) does not.
+        uploader.remoteCapacityBytes = 1
+
+        let progress = await makeRunner().runUntilDrained(mode: .eligibleOnly)
+
+        let row = try XCTUnwrap(queueStore.entry(for: entry.source, revision: entry.revision))
+        XCTAssertFalse(row.state.isTerminalSuccess)
+        XCTAssertEqual(row.attempts, 0)
+        XCTAssertEqual(try XCTUnwrap(BackupIssueRecord.decode(row.lastError)).kind, .accountStorage)
+        XCTAssertFalse(uploader.requests.contains { $0.name == "too-large.mov" })
+        XCTAssertEqual(progress.failed, 0)
+
+        uploader.remoteCapacityBytes = nil
+        queueStore.makeRetryableWorkEligible(updatedAt: clock.now)
+        _ = await makeRunner().runUntilDrained(mode: .eligibleOnly)
+        XCTAssertEqual(state(of: entry)?.isTerminalSuccess, true)
+        XCTAssertEqual(uploader.requests.filter { $0.name == "fits.heic" }.count, 1, "the photo uploads only once")
+    }
+
+    func testALargeVideoWithoutSpaceOnTheDeviceWaitsForSpace() async throws {
+        let entry = seedEntry("prores.mov")
+        resolver.setDeferredMaterialization(for: entry.source.identifier)
+        resolver.set(.needsFreeSpaceOnCopy(times: 1), for: entry.source.identifier)
+
+        let progress = await makeRunner().runUntilDrained(mode: .eligibleOnly)
+
+        let row = try XCTUnwrap(queueStore.entry(for: entry.source, revision: entry.revision))
+        XCTAssertEqual(row.state, .discovered)
+        XCTAssertEqual(row.attempts, 0, "missing space on the device is not the photo's fault")
+        let issue = try XCTUnwrap(BackupIssueRecord.decode(row.lastError))
+        XCTAssertEqual(issue.kind, .deviceStorage)
+        XCTAssertEqual(progress.failed, 0)
+        XCTAssertEqual(resolver.materializeCount(for: entry.source.identifier), 1)
+        XCTAssertTrue(uploader.requests.isEmpty)
+
+        queueStore.makeRetryableWorkEligible(updatedAt: clock.now)
+        _ = await makeRunner().runUntilDrained(mode: .eligibleOnly)
+        XCTAssertEqual(state(of: entry), .completed)
+    }
+
+    func testBackUpNowChecksAWaitingPhotoAgain() async throws {
+        let entry = seedEntry("waiting.heic")
+        resolver.set(.notReady(times: 1, until: clock.now.addingTimeInterval(600)), for: entry.source.identifier)
+        let runner = makeRunner()
+        _ = await runner.runUntilDrained(mode: .eligibleOnly)
+        XCTAssertEqual(resolver.resolveCount(for: entry.source.identifier), 1)
+
+        // The camera finished without a change notification reaching the app; Back Up Now finds it done.
+        queueStore.makeRetryableWorkEligible(updatedAt: clock.now)
+        _ = await runner.runUntilDrained(mode: .eligibleOnly)
+
+        XCTAssertEqual(state(of: entry), .completed)
+        XCTAssertEqual(resolver.resolveCount(for: entry.source.identifier), 2)
     }
 
     func testTwoRevisionsOfOnePhotoNeverRunAtTheSameTime() async throws {
@@ -1465,6 +1663,21 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertEqual(progress.total, 0)
         XCTAssertEqual(progress.failed, 0)
         XCTAssertEqual(progress.sourceMissing, 0)
+    }
+
+    func testPhotoDeletedDuringItsIdentityPassReleasesItsTempFiles() async throws {
+        let entry = seedEntry("deleted-during-download.heic")
+        let removing = SourceRemovedDuringResolveResolver(inner: resolver)
+        let runner = makeRunner(resolver: removing)
+        removing.onResolve = { entry in
+            _ = await runner.removeSources(kind: entry.source.kind, identifiers: [entry.source.identifier])
+        }
+
+        _ = await runner.runUntilDrained()
+
+        XCTAssertEqual(removing.cleanupCount, 1, "a staged iCloud original must not outlive a deleted photo")
+        XCTAssertNil(queueStore.entry(for: entry.source, revision: entry.revision))
+        XCTAssertTrue(uploader.requests.isEmpty)
     }
 
     func testDraftBlocksWithBackoffAndNeverCountsAsBackedUp() async throws {

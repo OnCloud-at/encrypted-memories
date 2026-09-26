@@ -9,34 +9,41 @@ enum SmartSearchSettingsContent: Equatable {
     case off
     /// The device cannot run Smart Search. The switch stays off and disabled.
     case unsupported
-    /// Smart Search starts only after the person taps a model.
+    /// The switch is on and the model list loads; Smart Search then starts with the recommended model.
+    case starting
+    /// Smart Search runs but lost its model, for example when the catalog dropped it; the person picks one.
     case modelChoice
     case status
 }
 
 enum SmartSearchSettingsPolicy {
-    /// The switch looks on while the person chooses a model, before anything is stored.
-    static func isToggleOn(isEnabled: Bool, isChoosingModel: Bool) -> Bool {
-        isEnabled || isChoosingModel
+    /// The switch looks on while Smart Search starts, before anything is stored.
+    static func isToggleOn(isEnabled: Bool, isStarting: Bool) -> Bool {
+        isEnabled || isStarting
     }
 
     static func content(
         isSupported: Bool,
         isEnabled: Bool,
         hasSelectedModel: Bool,
-        isChoosingModel: Bool
+        isStarting: Bool
     ) -> SmartSearchSettingsContent {
         // Enabled Smart Search stays manageable, so it can always be turned off.
         if isEnabled { return hasSelectedModel ? .status : .modelChoice }
         guard isSupported else { return .unsupported }
-        return isChoosingModel ? .modelChoice : .off
+        return isStarting ? .starting : .off
+    }
+
+    /// Replacing a model that was activated rebuilds its index, so it asks first, also while that model is not
+    /// loaded. Before the first model is ready, the choice only stops or skips a download.
+    static func asksBeforeSwitching(hasActivatedModel: Bool) -> Bool {
+        hasActivatedModel
     }
 }
 
 /// Shared Smart Search settings for macOS, iOS and iPadOS.
 public struct SmartSearchSettingsSection: View {
     private let controller: MLSmartSearchController
-    @State private var isChoosingModel = false
     @State private var pendingModelSwitch: MLModelCatalogEntry?
     @State private var confirmingDisable = false
     @State private var pickingDeveloperArtifact = false
@@ -52,7 +59,7 @@ public struct SmartSearchSettingsSection: View {
             isSupported: snapshot.isSupported,
             isEnabled: snapshot.isEnabled,
             hasSelectedModel: snapshot.selectedModelID != nil,
-            isChoosingModel: isChoosingModel
+            isStarting: isStarting
         )
         Section {
             Toggle(isOn: enabledBinding) {
@@ -69,6 +76,8 @@ public struct SmartSearchSettingsSection: View {
                 Text(L10n.string("mlsearch.unsupported_device"))
                     .font(.footnote)
                     .foregroundStyle(.secondary)
+            case .starting:
+                modelStatusRows
             case .modelChoice:
                 modelChoices
             case .status:
@@ -82,9 +91,6 @@ public struct SmartSearchSettingsSection: View {
                 .foregroundStyle(.secondary)
         }
         .animation(.easeInOut(duration: 0.2), value: content)
-        .onChange(of: snapshot.isEnabled) { _, isEnabled in
-            if isEnabled { isChoosingModel = false }
-        }
         .alert(
             L10n.string("mlsearch.disable_confirm_title \(MLSmartSearchPresentation.productName)"),
             isPresented: $confirmingDisable
@@ -125,22 +131,27 @@ public struct SmartSearchSettingsSection: View {
         }
     }
 
+    /// The lifecycle owns a pending switch-on; the controller shows the person's latest tap until it arrives there.
+    private var isStarting: Bool {
+        controller.startSwitch.isStarting(controller.snapshot)
+    }
+
     private var enabledBinding: Binding<Bool> {
         Binding(
             get: {
                 SmartSearchSettingsPolicy.isToggleOn(
                     isEnabled: controller.snapshot.isEnabled,
-                    isChoosingModel: isChoosingModel
+                    isStarting: isStarting
                 )
             },
             set: { enable in
                 if enable {
-                    isChoosingModel = true
-                    controller.loadModelChoices()
+                    // Starts at once with the recommended model; the picker below changes it at any time.
+                    controller.enableRecommended()
                 } else if controller.snapshot.isEnabled {
                     confirmingDisable = true
                 } else {
-                    isChoosingModel = false
+                    controller.cancelRecommendedEnable()
                 }
             }
         )
@@ -148,7 +159,7 @@ public struct SmartSearchSettingsSection: View {
 
     // MARK: - Model choice
 
-    /// Before Smart Search starts: the recommended model first, one tap starts download and indexing.
+    /// Smart Search runs without a model: the recommended model first, one tap starts download and indexing.
     @ViewBuilder
     private var modelChoices: some View {
         let models = MLModelRecommendation.ordered(controller.snapshot.availableModels)
@@ -207,7 +218,8 @@ public struct SmartSearchSettingsSection: View {
         .contentShape(Rectangle())
     }
 
-    /// While Smart Search runs, the model is one compact row. A switch rebuilds the index and asks first.
+    /// While Smart Search runs, the model is one compact row. It works during the first download too; replacing
+    /// a model that already serves rebuilds its index and asks first.
     @ViewBuilder
     private var modelPicker: some View {
         let snapshot = controller.snapshot
@@ -219,7 +231,7 @@ public struct SmartSearchSettingsSection: View {
                         .tag(Optional(model.id))
                 }
             }
-            .disabled(controller.modelPresentation.isBusy)
+            .disabled(!snapshot.allowsModelChoice)
         }
         if let selected = snapshot.availableModels.first(where: { $0.id == snapshot.selectedModelID }),
             selected.releaseTrack == .developerOnly
@@ -237,7 +249,13 @@ public struct SmartSearchSettingsSection: View {
                 guard let id, id != controller.snapshot.selectedModelID,
                     let model = controller.snapshot.availableModels.first(where: { $0.id == id })
                 else { return }
-                pendingModelSwitch = model
+                if SmartSearchSettingsPolicy.asksBeforeSwitching(
+                    hasActivatedModel: controller.snapshot.hasActivatedModel)
+                {
+                    pendingModelSwitch = model
+                } else {
+                    activate(model)
+                }
             }
         )
     }

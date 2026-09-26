@@ -705,6 +705,13 @@
         "de": { "stringUnit": { "state": "translated", "value": "Warten auf eine stabile Verbindung" } }
       }
     },
+    "backup.phase_waiting_account_storage": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Proton storage full" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Proton-Speicher voll" } }
+      }
+    },
     "backup.phase_waiting_storage": {
       "extractionState": "manual",
       "localizations": {
@@ -731,6 +738,19 @@
       "localizations": {
         "en": { "stringUnit": { "state": "translated", "value": "The connection was interrupted. Backup will retry when eligible." } },
         "de": { "stringUnit": { "state": "translated", "value": "Die Verbindung wurde unterbrochen. Das Backup versucht es erneut, sobald es möglich ist." } }
+      }
+    },
+    "backup.error_needs_free_space %@": {
+      "localizations": {
+        "de": { "stringUnit": { "state": "translated", "value": "Dafür werden etwa %@ freier Speicher auf diesem Gerät benötigt." } },
+        "en": { "stringUnit": { "state": "translated", "value": "This needs about %@ of free space on this device." } }
+      }
+    },
+    "backup.issue_account_storage": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Your Proton storage is full. Free up space or upgrade your plan, then select Back Up Now." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Dein Proton-Speicher ist voll. Gib Speicher frei oder erweitere dein Abo und wähle dann „Jetzt sichern“." } }
       }
     },
     "backup.issue_device_storage": {
@@ -3403,6 +3423,12 @@
             "value": "„%@“ konnte nicht gefunden werden."
           }
         }
+      }
+    },
+    "error.upload_account_storage_full %@ %@ %@": {
+      "localizations": {
+        "de": { "stringUnit": { "state": "translated", "value": "„%1$@“ braucht %2$@, im Proton-Speicher sind aber nur noch %3$@ frei." } },
+        "en": { "stringUnit": { "state": "translated", "value": "“%1$@” needs %2$@, but only %3$@ is left in your Proton storage." } }
       }
     },
     "error.upload_source_not_ready %@": {

@@ -579,3 +579,76 @@ import Testing
         }
     }
 }
+
+@Suite struct MLSmartSearchStartSwitchTests {
+    private func snapshot(
+        isEnabled: Bool = false, isStartPending: Bool = false, startIntent: UInt64
+    ) -> MLSmartSearchSnapshot {
+        MLSmartSearchSnapshot(
+            isEnabled: isEnabled, selectedModelID: nil, phase: .disabled, installedModelBytes: 0,
+            isStartPending: isStartPending, startIntent: startIntent, availableModels: [], isSearchAvailable: false)
+    }
+
+    @Test func aTapShowsAtOnceAndAnOlderSnapshotCannotUndoIt() {
+        var start = MLSmartSearchStartSwitch()
+        let on = start.request(on: true)
+        #expect(start.isStarting(snapshot(startIntent: 0)), "on at once, before the lifecycle answers")
+
+        start.apply(snapshot(startIntent: on - 1))
+        #expect(start.isStarting(snapshot(startIntent: on - 1)))
+
+        start.apply(snapshot(isStartPending: true, startIntent: on))
+        #expect(start.isStarting(snapshot(isStartPending: true, startIntent: on)))
+    }
+
+    @Test func switchingOffWinsOverAStalePendingSnapshot() {
+        var start = MLSmartSearchStartSwitch()
+        let on = start.request(on: true)
+        start.apply(snapshot(isStartPending: true, startIntent: on))
+        let off = start.request(on: false)
+
+        // The pending snapshot is older than the switch-off: the switch stays off, it does not spring back.
+        start.apply(snapshot(isStartPending: true, startIntent: on))
+        #expect(!start.isStarting(snapshot(isStartPending: true, startIntent: on)))
+
+        start.apply(snapshot(startIntent: off))
+        #expect(!start.isStarting(snapshot(startIntent: off)))
+    }
+
+    @Test func onOffOnNeverFlickersOff() {
+        var start = MLSmartSearchStartSwitch()
+        _ = start.request(on: true)
+        _ = start.request(on: false)
+        let lastOn = start.request(on: true)
+
+        for intent in 1..<lastOn {
+            let stale = snapshot(isStartPending: intent == 1, startIntent: intent)
+            start.apply(stale)
+            #expect(start.isStarting(stale), "a snapshot of an earlier intent must not show the switch off")
+        }
+    }
+
+    @Test func aRefusedSwitchOnSettlesOff() {
+        var start = MLSmartSearchStartSwitch()
+        let on = start.request(on: true)
+
+        start.refused(on)
+
+        #expect(!start.isStarting(snapshot(startIntent: 0)))
+    }
+
+    @Test func aNewControllerCountsOnFromTheLifecycleNumber() {
+        var start = MLSmartSearchStartSwitch()
+        start.apply(snapshot(startIntent: 7))
+
+        let next = start.request(on: true)
+
+        #expect(next == 8, "a lifecycle that already applied intent 7 must accept the next tap")
+    }
+
+    @Test func anEnabledSearchIsNoLongerStarting() {
+        var start = MLSmartSearchStartSwitch()
+        let on = start.request(on: true)
+        #expect(!start.isStarting(snapshot(isEnabled: true, startIntent: on)))
+    }
+}

@@ -30,6 +30,8 @@ public final class MLSmartSearchController {
     public private(set) var presentation = MLSmartSearchPresentation(snapshot: .disabled)
     public private(set) var modelPresentation = MLSmartSearchModelPresentation(snapshot: .disabled)
     public private(set) var availableSearchScopes: [MLSearchScope] = [.all]
+    /// The switch between a tap and the lifecycle's answer; it shows the tap at once and never an older state.
+    public private(set) var startSwitch = MLSmartSearchStartSwitch()
 
     @ObservationIgnored private let lifecycle: MLSmartSearchLifecycle
     @ObservationIgnored private let artifactAccess: MLScopedArtifactAccess
@@ -58,6 +60,7 @@ public final class MLSmartSearchController {
     }
 
     private func apply(_ snapshot: MLSmartSearchSnapshot) {
+        startSwitch.apply(snapshot)
         guard snapshot != self.snapshot else { return }
         self.snapshot = snapshot
         self.presentation = MLSmartSearchPresentation(snapshot: snapshot)
@@ -66,9 +69,19 @@ public final class MLSmartSearchController {
 
     // MARK: - Intents (fire-and-forget into the lifecycle actor)
 
-    /// Loads the model list while Smart Search is off, so the person can choose before anything starts.
-    public func loadModelChoices() {
-        Task { await lifecycle.loadModelChoices() }
+    /// Turns Smart Search on with the model that suits the device language; it downloads without asking.
+    public func enableRecommended(preferredLanguages: [String] = Locale.preferredLanguages) {
+        let intent = startSwitch.request(on: true)
+        Task { [weak self, lifecycle] in
+            let accepted = await lifecycle.enableRecommended(preferredLanguages: preferredLanguages, intent: intent)
+            if !accepted { self?.startSwitch.refused(intent) }
+        }
+    }
+
+    /// Turning the switch off again before Smart Search started drops that start.
+    public func cancelRecommendedEnable() {
+        let intent = startSwitch.request(on: false)
+        Task { [lifecycle] in await lifecycle.cancelRecommendedEnable(intent: intent) }
     }
 
     /// Turns Smart Search on with the chosen model, or switches to it when Smart Search is on.

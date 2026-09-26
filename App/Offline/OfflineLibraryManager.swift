@@ -1,4 +1,5 @@
 import Foundation
+import MapFeature
 import MediaByteCache
 import MediaCache
 import MediaLocationCore
@@ -42,6 +43,8 @@ final class OfflineLibraryManager {
     /// sign-out. The Map UI binds to `locationIndex`.
     let locationStore = PhotoLocationStore()
     let locationIndex = PhotoLocationIndex()
+    /// Loads the area the map opens at into MapKit's cache, so the map draws at once.
+    @ObservationIgnored private let mapPrewarmer = PhotoMapPrewarmer()
     private let locationCrawl = LocationCrawl()
     private var locationCrawlStarted = false
     private var locationCrawlGeneration: UInt64 = 0
@@ -209,6 +212,8 @@ final class OfflineLibraryManager {
                 self.locationStore.isCurrentSessionLease(sessionLease)
             else { return }
             self.locationIndex.replaceAll(snapshot)
+            // Map tiles come from Apple, so this runs only where the Map was opened before.
+            self.mapPrewarmer.prewarm(coordinates: self.locationIndex.coordinates)
             self.locationConfigurationTask = nil
         }
         if originalsCapGate.isClosed { originalsCapGate = JoinedShutdownGate() }

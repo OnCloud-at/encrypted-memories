@@ -583,9 +583,13 @@ public enum UploadError: LocalizedError, Equatable {
     case backend(String)
     case albumStep(String)
     case cancelled
-    /// The platform still prepares the source (the camera still processes a new photo). The runner tries
-    /// again shortly without counting an attempt; the finished file usually arrives as a new revision.
-    case sourceNotReady(String)
+    /// The platform still prepares the source (the camera still processes a new photo). The runner makes the
+    /// row due at `until` without counting an attempt; the finished file usually arrives sooner as a new
+    /// revision, which the platform's change notification enqueues.
+    case sourceNotReady(String, until: Date)
+    /// The account's remaining Proton storage cannot hold the file. The item waits; freeing space or a larger plan
+    /// and Back Up Now take it up again.
+    case accountStorageFull(String, requiredBytes: Int64, availableBytes: Int64)
 
     public var errorDescription: String? {
         switch self {
@@ -597,7 +601,10 @@ public enum UploadError: LocalizedError, Equatable {
         case .backend(let message): message
         case .albumStep(let message): L10n.string("error.upload_album_step \(message)")
         case .cancelled: L10n.string("error.upload_cancelled")
-        case .sourceNotReady(let name): L10n.string("error.upload_source_not_ready \(name)")
+        case .sourceNotReady(let name, _): L10n.string("error.upload_source_not_ready \(name)")
+        case .accountStorageFull(let name, let required, let available):
+            L10n.string(
+                "error.upload_account_storage_full \(name) \(L10n.fileSize(required)) \(L10n.fileSize(available))")
         }
     }
 }

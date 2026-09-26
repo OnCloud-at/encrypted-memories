@@ -50,6 +50,20 @@ final class TimelineMetadataStoreTests: XCTestCase {
         )
     }
 
+    func testItemsForUIDsReturnsCaptureTimeAndMediaTypeOfKnownPhotosOnly() throws {
+        let (store, _) = try makeStore(in: try makeTempDir())
+        let photo = makeItem(node: "photo", t: 10)
+        let video = makeItem(node: "video", t: 20, mime: "video/quicktime", tags: [.videos])
+        XCTAssertTrue(store.save([photo, video]).succeeded)
+
+        let items = store.items(for: [video.uid, PhotoUID(volumeID: "vol1", nodeID: "unknown"), photo.uid])
+
+        XCTAssertEqual(items.map(\.uid), [video.uid, photo.uid])
+        XCTAssertEqual(items.map(\.captureTime), [video.captureTime, photo.captureTime])
+        XCTAssertEqual(items.map(\.isVideo), [true, false])
+        XCTAssertTrue(store.items(for: []).isEmpty)
+    }
+
     /// Reads rows through a separate raw connection so assertions see exactly what is on disk
     /// (normalized rows, not what the store's own decode layer reconstructs).
     private func rawRows(_ dbURL: URL, _ sql: String) -> [[String]] {

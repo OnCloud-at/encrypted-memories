@@ -165,6 +165,15 @@ public actor MLSmartSearchLifecycle {
     private var catalogRefreshInProgress = false
     private var catalogRefreshTask: Task<Void, Never>?
     private var activationGeneration: UInt64 = 0
+    /// The preferred languages of a switch-on that waits for the model list; a retry resumes it, and turning
+    /// Smart Search off before the list arrives drops it.
+    private var pendingRecommendedEnable: [String]?
+    /// Orders switch-on and switch-off intents: hosts number them, and an older one than the last applied one is
+    /// ignored, because separate intent tasks may reach the actor in any order.
+    private var startIntentSequence: UInt64 = 0
+    private var recommendedStartTask: Task<Void, Never>?
+    /// The model whose download runs now, so choosing another first model can stop it.
+    private var downloadingModelID: MLModelID?
 
     /// `true` while a model switch is mid-flight: the still-running old-epoch index loop must
     /// not overwrite switch/download phases.
@@ -310,6 +319,9 @@ public actor MLSmartSearchLifecycle {
             selectedModelID: persistent.selectedModelID,
             phase: phase,
             installedModelBytes: activeModel?.record.installedByteCount ?? 0,
+            hasActivatedModel: persistent.activatedRevision != nil,
+            isStartPending: pendingRecommendedEnable != nil,
+            startIntent: startIntentSequence,
             availableModels: catalog.selectableEntries(allowsDeveloperModels: deps.allowsDeveloperModels),
             isSearchAvailable: persistent.isEnabled
                 && ((session != nil && lastCoverage.indexed > 0)
@@ -407,6 +419,7 @@ public actor MLSmartSearchLifecycle {
         guard !isShutDown else { return }
         isShutDown = true
         activationGeneration &+= 1
+        recommendedStartTask?.cancel()
         await stopActivations()
         await stopCatalogRefreshLoop()
         await stopIndexing()
@@ -424,8 +437,9 @@ public actor MLSmartSearchLifecycle {
     /// Loads the selectable models while Smart Search is off, so the person can choose one before
     /// anything is stored or downloaded. A failure stays retryable through `retry()`.
     public func loadModelChoices() async {
+        // A pending switch-on loads the list itself.
         guard started, !isShutDown, deps.featureAvailability == .available, !persistent.isEnabled,
-            persistent.pendingOperation == nil, !stateLoadFailed
+            persistent.pendingOperation == nil, !stateLoadFailed, pendingRecommendedEnable == nil
         else { return }
         // The built-in catalog has no download plans, so a fresh signed catalog is required once.
         if let lastCatalogRefreshAt, lastCatalogRefreshAt.duration(to: .now) < configuration.catalogRefreshInterval {
@@ -434,6 +448,78 @@ public actor MLSmartSearchLifecycle {
         guard await refreshCatalog(), !isShutDown, !persistent.isEnabled else { return }
         phase = .disabled
         emit()
+    }
+
+    /// Turns Smart Search on with the model that suits the device language, without asking first. The model
+    /// list loads first when needed. The person can choose another model at once, also while the first one
+    /// downloads. Returns at once whether the switch-on was accepted; `isStartPending` shows it until Smart
+    /// Search is on, the model list failed, or no model suits.
+    @discardableResult
+    public func enableRecommended(preferredLanguages: [String], intent: UInt64) -> Bool {
+        guard intent > startIntentSequence else { return false }
+        startIntentSequence = intent
+        stopWaitingRecommendedStart()
+        guard started, !isShutDown, deps.featureAvailability == .available, !persistent.isEnabled,
+            persistent.pendingOperation == nil, !stateLoadFailed
+        else {
+            // The snapshot carries the applied intent, so the host stops showing the refused switch-on.
+            emit()
+            return false
+        }
+        pendingRecommendedEnable = preferredLanguages
+        emit()
+        recommendedStartTask = Task { await self.startRecommended(intent: intent) }
+        return true
+    }
+
+    /// Turning the switch off before Smart Search started drops that start.
+    public func cancelRecommendedEnable(intent: UInt64) {
+        guard intent > startIntentSequence else { return }
+        startIntentSequence = intent
+        let wasPending = pendingRecommendedEnable != nil
+        stopWaitingRecommendedStart()
+        pendingRecommendedEnable = nil
+        if wasPending, !persistent.isEnabled { phase = .disabled }
+        emit()
+    }
+
+    /// A newer intent stops a switch-on that still waits for the model list, so its late failure cannot
+    /// overwrite a newer state. A start past the list owns a download and keeps running.
+    private func stopWaitingRecommendedStart() {
+        guard pendingRecommendedEnable != nil else { return }
+        recommendedStartTask?.cancel()
+    }
+
+    /// Waits for a switch-on that `enableRecommended` accepted, including its first model activation.
+    func awaitRecommendedStart() async {
+        await recommendedStartTask?.value
+    }
+
+    private func startRecommended(intent: UInt64) async {
+        guard let preferredLanguages = pendingRecommendedEnable else { return }
+        // The built-in catalog has no download plans, so a fresh signed catalog is required once.
+        let catalogIsFresh =
+            lastCatalogRefreshAt.map { $0.duration(to: .now) < configuration.catalogRefreshInterval } ?? false
+        if !catalogIsFresh {
+            // A failed list stays visible with a retry that resumes this switch-on.
+            guard await refreshCatalog() else { return }
+        }
+        // A cancelled start belongs to an intent or Retry that replaced it, even when its list request succeeded.
+        guard !isShutDown, !Task.isCancelled, !persistent.isEnabled, startIntentSequence == intent,
+            pendingRecommendedEnable != nil
+        else { return }
+        pendingRecommendedEnable = nil
+        let choices = catalog.selectableEntries(allowsDeveloperModels: deps.allowsDeveloperModels)
+            .filter { $0.releaseTrack == .production }
+        guard
+            let model = MLModelRecommendation.recommendedModel(
+                among: choices, preferredLanguages: preferredLanguages)
+        else {
+            phase = .disabled
+            emit()
+            return
+        }
+        await enable(with: model.id)
     }
 
     /// Turns Smart Search on with the chosen model: native analysis starts at once, and the model
@@ -493,7 +579,8 @@ public actor MLSmartSearchLifecycle {
     /// Select a model. The same selection is a no-op; another model runs the transactional switch,
     /// retires the old epoch, activates the new model, and starts a clean reindex.
     public func select(_ id: MLModelID) async {
-        guard !isShutDown, persistent.isEnabled, id != persistent.selectedModelID,
+        // A journaled switch whose cleanup failed must finish first (Retry); a choice now would overwrite it.
+        guard !isShutDown, persistent.isEnabled, persistent.pendingOperation == nil, id != persistent.selectedModelID,
             let target = catalog.entry(for: id), isSelectable(target)
         else { return }
 
@@ -502,14 +589,22 @@ public actor MLSmartSearchLifecycle {
         activationGeneration &+= 1
         let selectionGeneration = activationGeneration
         blockedRuntimeFailure = nil
+        // Another first model while the first one still downloads: stop that download instead of finishing
+        // it for nothing. Its caller sees the newer generation and gives up.
+        if activeModel == nil, let downloading = downloadingModelID, downloading != id {
+            await deps.installer.cancelInstall(of: downloading)
+            guard !isShutDown, persistent.isEnabled, activationGeneration == selectionGeneration else { return }
+        }
 
         let previousSelection = persistent.selectedModelID
         let previousActivatedRevision = persistent.activatedRevision
         let previousActivatedDescriptor = persistent.activatedDescriptor
         let previousID = previousSelection
-        let startsWithoutActiveModel = previousID == nil
+        // A selection that never activated, such as a first model whose download was just stopped, serves nothing:
+        // the choice replaces it right away like a dropped selection.
+        let startsWithoutActiveModel = previousID == nil || previousActivatedRevision == nil
         if startsWithoutActiveModel {
-            // Persist a choice that replaces a dropped selection before download, so a failed
+            // Persist a choice that replaces a dropped or never activated selection before download, so a failed
             // transfer is retryable after relaunch. Existing selections use the switch journal below
             // and remain serving until their replacement is installed.
             persistent.selectedModelID = id
@@ -548,7 +643,11 @@ public actor MLSmartSearchLifecycle {
             }
         if targetRecord == nil {
             guard target.isDownloadable else {
-                if previousID == nil {
+                if startsWithoutActiveModel {
+                    // The replaced selection never activated: no index to remove, only its files.
+                    if let previousID, previousID != id, let previousEntry = catalog.entry(for: previousID) {
+                        await deps.installer.uninstall(previousEntry)
+                    }
                     phase = .notInstalled(downloadable: false)
                     emit()
                     startIndexingLoopIfAvailable()
@@ -639,8 +738,22 @@ public actor MLSmartSearchLifecycle {
         }
         guard case .failed(let failure) = phase, failure.isRetryable else { return }
         if !persistent.isEnabled, persistent.pendingOperation == nil {
-            // Off: only the model list can fail, while the person is choosing a model.
-            if failure.kind == .catalog { await loadModelChoices() }
+            // Off: only the model list can fail, while Smart Search switches on or the person chooses a model.
+            if failure.kind == .catalog {
+                if pendingRecommendedEnable != nil {
+                    // As the start's own task, so a newer intent can stop it like the first attempt. The phase
+                    // leaves the failure before the first suspension, so a second Retry tap starts nothing.
+                    let intent = startIntentSequence
+                    recommendedStartTask?.cancel()
+                    phase = .loadingCatalog
+                    emit()
+                    let task = Task { await self.startRecommended(intent: intent) }
+                    recommendedStartTask = task
+                    await task.value
+                } else {
+                    await loadModelChoices()
+                }
+            }
             return
         }
         guard persistent.isEnabled || persistent.pendingOperation == .purge else { return }
@@ -707,9 +820,11 @@ public actor MLSmartSearchLifecycle {
     /// only). The artifact is hashed, staged and installed with the same guarantees as a
     /// download.
     public func installDeveloperModel(from artifactDirectory: URL, for id: MLModelID) async {
+        // A journaled switch whose cleanup failed finishes first; its failure and Retry stay visible.
         guard !isShutDown,
             deps.allowsDeveloperModels,
             persistent.isEnabled,
+            persistent.pendingOperation == nil,
             let entry = catalog.entry(for: id)
         else { return }
         phase = .installing
@@ -1328,6 +1443,8 @@ public actor MLSmartSearchLifecycle {
         phase = .downloading(MLModelTransferProgress(bytesReceived: 0, totalBytes: entry.downloadPlan?.totalByteCount))
         lastEmittedDownloadFraction = -1
         emit()
+        downloadingModelID = entry.id
+        defer { if downloadingModelID == entry.id { downloadingModelID = nil } }
         do {
             let record = try await deps.installer.install(entry) { [weak self] progress in
                 guard let self else { return }
@@ -2264,6 +2381,8 @@ public actor MLSmartSearchLifecycle {
     /// completes on next start).
     private func performPurge() async {
         activationGeneration &+= 1
+        recommendedStartTask?.cancel()
+        pendingRecommendedEnable = nil
         // Journal first: any crash from here on re-runs the purge. If the journal itself
         // cannot be written, the purge does not start silently; the failure phase is honest
         // and `retry()` re-attempts the whole purge.
@@ -2362,7 +2481,8 @@ public actor MLSmartSearchLifecycle {
             lastCatalogRefreshAt = .now
             return true
         } catch {
-            guard !isShutDown else { return false }
+            // A cancelled request belongs to an intent that a newer one replaced; it reports nothing.
+            guard !isShutDown, !Task.isCancelled else { return false }
             phase = .failed(
                 MLSmartSearchFailure(
                     kind: .catalog,

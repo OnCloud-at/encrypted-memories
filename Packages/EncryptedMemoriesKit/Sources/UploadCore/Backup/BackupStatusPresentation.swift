@@ -145,6 +145,7 @@ public struct BackupStatusPresentation: Sendable, Equatable {
                 switch status.outstandingIssue {
                 case .network: "backup.phase_waiting_network"
                 case .deviceStorage: "backup.phase_waiting_storage"
+                case .accountStorage: "backup.phase_waiting_account_storage"
                 case .remoteDraft: "backup.phase_waiting_draft"
                 default: "backup.phase_waiting"
                 }
@@ -213,6 +214,7 @@ public struct BackupStatusPresentation: Sendable, Equatable {
         case "backup.phase_waiting": return L10n.string("backup.phase_waiting")
         case "backup.phase_waiting_network": return L10n.string("backup.phase_waiting_network")
         case "backup.phase_waiting_storage": return L10n.string("backup.phase_waiting_storage")
+        case "backup.phase_waiting_account_storage": return L10n.string("backup.phase_waiting_account_storage")
         case "backup.phase_waiting_draft": return L10n.string("backup.phase_waiting_draft")
         case "backup.phase_completed": return L10n.string("backup.phase_completed")
         case "backup.phase_completed_with_remote_deletions":

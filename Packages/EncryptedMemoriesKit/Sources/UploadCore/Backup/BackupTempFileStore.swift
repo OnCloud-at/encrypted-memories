@@ -16,11 +16,16 @@ import PhotosCore
 public final class BackupTempFileStore: @unchecked Sendable {
     public enum BackupTempFileError: Error, Equatable, LocalizedError {
         case diskBudgetExceeded
+        /// The device needs about `requiredBytes` of free space for this file, for example a large video that must
+        /// be downloaded from iCloud and copied for its upload.
+        case needsFreeSpace(requiredBytes: Int64)
 
         public var errorDescription: String? {
             switch self {
             case .diskBudgetExceeded:
                 return L10n.string("backup.error_low_space")
+            case .needsFreeSpace(let requiredBytes):
+                return L10n.string("backup.error_needs_free_space \(L10n.fileSize(requiredBytes))")
             }
         }
     }
@@ -39,6 +44,10 @@ public final class BackupTempFileStore: @unchecked Sendable {
         var expectedBytes: Int64
         var writtenBytes: Int64
         let isOversized: Bool
+        /// Bytes staged ahead of the duplicate check. All staged files together use at most half of the normal
+        /// pool, so exports of photos selected for upload always keep the other half. An iCloud original whose known
+        /// size exceeds that half is not staged this way: it reserves its exact size like its export would.
+        var isStaged = false
     }
     private var reservations: [URL: Reservation] = [:]
     private struct CapacitySample {
@@ -92,8 +101,10 @@ public final class BackupTempFileStore: @unchecked Sendable {
     }
 
     /// Reserves a unique `.partial` destination for an export of roughly `expectedBytes`.
-    /// The caller streams into the returned URL, then calls `commit` (or `discard`).
-    public func reserve(filename: String, expectedBytes: Int64) throws -> URL {
+    /// The caller streams into the returned URL, then calls `commit` (or `discard`). A `staging` reservation holds
+    /// bytes read before the duplicate check; `recordWrite` refuses a chunk once all staged files together would
+    /// exceed half of `maximumBytes`.
+    public func reserve(filename: String, expectedBytes: Int64, staging: Bool = false) throws -> URL {
         try lock.withLock {
             let expected = max(0, expectedBytes)
             let isOversized = expected > maximumBytes
@@ -123,9 +134,26 @@ public final class BackupTempFileStore: @unchecked Sendable {
             reservations[url] = Reservation(
                 expectedBytes: expected,
                 writtenBytes: 0,
-                isOversized: isOversized
+                isOversized: isOversized,
+                isStaged: staging
             )
             return url
+        }
+    }
+
+    /// Whether the volume has room for `bytes` more on top of the reserved free space and the unwritten reservations.
+    public func hasFreeSpace(forAdditionalBytes bytes: Int64) -> Bool {
+        (try? ensureFreeSpace(forAdditionalBytes: bytes)) != nil
+    }
+
+    /// Throws `needsFreeSpace` unless the volume has room for `bytes` more on top of the reserved free space. Callers
+    /// check before a large copy for upload, so a file that cannot fit fails at once with the space it needs.
+    public func ensureFreeSpace(forAdditionalBytes bytes: Int64) throws {
+        try lock.withLock {
+            let required = addingClamped(minimumFreeBytes, addingClamped(max(0, bytes), reservedUnwrittenBytesLocked()))
+            if let free = sampledFreeBytesLocked(forceRefresh: true), free < required {
+                throw BackupTempFileError.needsFreeSpace(requiredBytes: required)
+            }
         }
     }
 
@@ -156,6 +184,13 @@ public final class BackupTempFileStore: @unchecked Sendable {
                     + nextAllocation
                 guard normalAllocation <= maximumBytes else {
                     throw BackupTempFileError.diskBudgetExceeded
+                }
+                if reservation.isStaged {
+                    let stagedAllocation =
+                        stagedBytesLocked() - reservation.writtenBytes + nextWritten
+                    guard stagedAllocation <= maximumBytes / 2 else {
+                        throw BackupTempFileError.diskBudgetExceeded
+                    }
                 }
             }
 
@@ -215,6 +250,13 @@ public final class BackupTempFileStore: @unchecked Sendable {
         }
         let untrackedBytes = max(0, usedBytesLocked() - trackedWrites)
         return addingClamped(reserved, untrackedBytes)
+    }
+
+    private func stagedBytesLocked() -> Int64 {
+        reservations.values.reduce(into: Int64(0)) { total, reservation in
+            guard reservation.isStaged else { return }
+            total = addingClamped(total, reservation.writtenBytes)
+        }
     }
 
     private func normalReservedBytesLocked() -> Int64 {

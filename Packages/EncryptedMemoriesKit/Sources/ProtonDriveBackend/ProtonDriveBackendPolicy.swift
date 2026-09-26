@@ -89,6 +89,9 @@ public enum ProtonDriveBackendFactory {
             inventoryStore: sourceInventoryStore
         )
         await librarySources.prepare()
+        // Before any consumer binds: the first cache sweep keeps the thumbnails of the photos in Recently Deleted.
+        let recentlyDeleted = await bridge.recentlyDeletedReport()
+        await librarySources.setIdentitiesOutsideInventory(recentlyDeleted.uids, sequence: recentlyDeleted.sequence)
         SDKCapabilities.current.log()
         // Opening account-scoped SQLite stores is synchronous. Prepare them on a utility executor before the
         // facade's MainActor composition so account activation does not block the UI executor on disk I/O.
@@ -114,6 +117,8 @@ public enum ProtonDriveBackendFactory {
 
     public static func purgeLocalAccountData(uid: String, policy: ProtonDriveBackendPolicy) {
         AccountDataCache.clear(uid: uid, in: policy.sdkCacheDirectory)
+        // The next account prewarms map tiles only after it opened the Map itself.
+        UserDefaults.standard.removeObject(forKey: AppSettingsKey.libraryMapViewportSize)
         DriveSDKBridge.purgeMetadata(uid: uid, policy: policy)
         VideoByteRangeCache.shared.clearAll()
     }
