@@ -120,13 +120,25 @@ final class PhotoKitStagingSinkTests: XCTestCase {
         tempStore.discard(staged)
     }
 
-    func testAKnownSizeWithinTheBudgetStagesInChunks() {
+    func testAKnownSizeAboveHalfTheBudgetReservesItExactlyLikeItsExport() throws {
         let tempStore = store(maximumBytes: 100)
-        let sink = PhotoKitStagingSink(tempStore: tempStore, filename: "SHORT.MOV", expectedBytes: 80)
-        sink.receive(Data(count: 60))
+        let chunks = [Data(count: 40), Data(count: 40)]
+        let sink = PhotoKitStagingSink(tempStore: tempStore, filename: "4K.MOV", expectedBytes: 80)
+        chunks.forEach(sink.receive)
 
-        XCTAssertFalse(sink.isStaging, "within the budget, the size gives no exclusive slot; half the budget applies")
-        XCTAssertEqual(sink.finish().byteCount, 60)
+        let staged = try XCTUnwrap(sink.finish().stagedURL, "a video above the staging share still downloads once")
+        XCTAssertEqual(try Data(contentsOf: staged).count, 80)
+        tempStore.discard(staged)
+    }
+
+    func testTheDuplicateCheckStagesExactlyOnlyWhenBothCopiesFit() {
+        XCTAssertEqual(
+            PhotoLibraryResourceResolver.exactStagingSize(knownSize: 300, tempStore: store(freeBytes: 600)), 300)
+        XCTAssertNil(
+            PhotoLibraryResourceResolver.exactStagingSize(knownSize: 300, tempStore: store(freeBytes: 599)),
+            "without room for both copies, the original is only hashed; the check itself never fails")
+        XCTAssertNil(PhotoLibraryResourceResolver.exactStagingSize(knownSize: nil, tempStore: store()))
+        XCTAssertNil(PhotoLibraryResourceResolver.exactStagingSize(knownSize: .max, tempStore: store()))
     }
 
     func testALargeOriginalThatGrowsBeyondItsKnownSizeIsOnlyHashed() {

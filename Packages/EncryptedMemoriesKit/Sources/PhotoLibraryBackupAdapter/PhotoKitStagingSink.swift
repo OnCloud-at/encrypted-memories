@@ -6,8 +6,8 @@ import UploadCore
 /// refuses a chunk, the sink drops the partial file and only hashes the rest; the upload then exports the original
 /// again, as before. The store gives all staged files together at most half of its budget, so large iCloud videos
 /// never starve the exports of photos already selected for upload. An original whose size PhotoKit reports up
-/// front and that exceeds the whole budget is staged like an export instead: with its exact size, in the store's
-/// single slot for large files, so even a 20 GB video downloads only once.
+/// front and that exceeds that share reserves its exact size instead, as its export would: in the normal budget up
+/// to its limit, and above it in the store's single slot for large files. So even a 20 GB video downloads only once.
 ///
 /// Not synchronized: the PhotoKit liveness guard serializes `receive`, and `finish`/`abandon` run after the request ended.
 final class PhotoKitStagingSink: @unchecked Sendable {
@@ -27,7 +27,7 @@ final class PhotoKitStagingSink: @unchecked Sendable {
     init(tempStore: BackupTempFileStore, filename: String, expectedBytes: Int64? = nil) {
         self.tempStore = tempStore
         let reserved: URL?
-        if let expectedBytes, expectedBytes > tempStore.maximumBytes {
+        if let expectedBytes, expectedBytes > tempStore.maximumBytes / 2 {
             reserved = try? tempStore.reserve(filename: filename, expectedBytes: expectedBytes)
         } else {
             // Without a known size the reservation starts empty and each chunk is accounted.

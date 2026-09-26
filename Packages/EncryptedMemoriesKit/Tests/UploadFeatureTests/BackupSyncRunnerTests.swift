@@ -62,9 +62,9 @@ final class ScriptedBackupResolver: BackupResourceResolving, @unchecked Sendable
         /// Throw `UploadError.sourceNotReady(until:)` for the first `times` resolves, then behave like
         /// `.standard`. Models a new photo the camera still processes.
         case notReady(times: Int, until: Date)
-        /// Throw `BackupTempFileError.needsFreeSpace` for the first `times` resolves, then behave like `.standard`.
-        /// Models a large video whose copy does not fit on the device.
-        case needsFreeSpace(times: Int)
+        /// Throw `BackupTempFileError.needsFreeSpace` from the first `times` copies for upload, after the duplicate
+        /// check. Models a large video whose copy does not fit on the device.
+        case needsFreeSpaceOnCopy(times: Int)
     }
 
     private let lock = NSLock()
@@ -143,7 +143,7 @@ final class ScriptedBackupResolver: BackupResourceResolving, @unchecked Sendable
             if case .transientFailure(let times) = behavior { remainingFailures[identifier] = times }
             if case .diskPressure(let times) = behavior { remainingFailures[identifier] = times }
             if case .notReady(let times, _) = behavior { remainingFailures[identifier] = times }
-            if case .needsFreeSpace(let times) = behavior { remainingFailures[identifier] = times }
+            if case .needsFreeSpaceOnCopy(let times) = behavior { remainingFailures[identifier] = times }
         }
     }
 
@@ -187,9 +187,7 @@ final class ScriptedBackupResolver: BackupResourceResolving, @unchecked Sendable
             if consumeFailure() { throw BackupTempFileStore.BackupTempFileError.diskBudgetExceeded }
         case .notReady(_, let until):
             if consumeFailure() { throw UploadError.sourceNotReady(id, until: until) }
-        case .needsFreeSpace:
-            if consumeFailure() { throw BackupTempFileStore.BackupTempFileError.needsFreeSpace(requiredBytes: 1 << 34) }
-        case .standard:
+        case .standard, .needsFreeSpaceOnCopy:
             break
         }
 
@@ -217,9 +215,17 @@ final class ScriptedBackupResolver: BackupResourceResolving, @unchecked Sendable
             let materialize: (@Sendable () async throws -> UploadResourceDescriptor)?
             if isDeferred {
                 materialize = { @Sendable [self] in
-                    let shouldMismatch = lock.withLock {
+                    let (shouldMismatch, copyFails) = lock.withLock { () -> (Bool, Bool) in
                         materializeCounts[id, default: 0] += 1
-                        return mismatchOnceIdentifiers.remove(id) != nil
+                        var copyFails = false
+                        if case .needsFreeSpaceOnCopy = behaviors[id], let left = remainingFailures[id], left > 0 {
+                            remainingFailures[id] = left - 1
+                            copyFails = true
+                        }
+                        return (mismatchOnceIdentifiers.remove(id) != nil, copyFails)
+                    }
+                    if copyFails {
+                        throw BackupTempFileStore.BackupTempFileError.needsFreeSpace(requiredBytes: 1 << 34)
                     }
                     return UploadResourceDescriptor(
                         source: entry.source,
@@ -1057,7 +1063,8 @@ final class BackupSyncRunnerTests: XCTestCase {
 
     func testALargeVideoWithoutSpaceOnTheDeviceWaitsForSpace() async throws {
         let entry = seedEntry("prores.mov")
-        resolver.set(.needsFreeSpace(times: 1), for: entry.source.identifier)
+        resolver.setDeferredMaterialization(for: entry.source.identifier)
+        resolver.set(.needsFreeSpaceOnCopy(times: 1), for: entry.source.identifier)
 
         let progress = await makeRunner().runUntilDrained(mode: .eligibleOnly)
 
@@ -1067,6 +1074,12 @@ final class BackupSyncRunnerTests: XCTestCase {
         let issue = try XCTUnwrap(BackupIssueRecord.decode(row.lastError))
         XCTAssertEqual(issue.kind, .deviceStorage)
         XCTAssertEqual(progress.failed, 0)
+        XCTAssertEqual(resolver.materializeCount(for: entry.source.identifier), 1)
+        XCTAssertTrue(uploader.requests.isEmpty)
+
+        queueStore.makeRetryableWorkEligible(updatedAt: clock.now)
+        _ = await makeRunner().runUntilDrained(mode: .eligibleOnly)
+        XCTAssertEqual(state(of: entry), .completed)
     }
 
     func testBackUpNowChecksAWaitingPhotoAgain() async throws {

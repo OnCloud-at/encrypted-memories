@@ -67,9 +67,11 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
 
     /// Set by a timeline save that removed photos; a trash listing then follows the load.
     private var timelineLostPhotos = false
-    /// Bytes this session uploaded since the account quota was last read, so the capacity check sees them before the
-    /// next account refresh.
+    /// Bytes this session uploaded since the account's used storage last changed, so the capacity check sees them
+    /// before the next account refresh. Another used value means a newer refresh that already contains them.
     private var uploadedBytesSinceQuotaRefresh: Int64 = 0
+    private var quotaBaselineUsedBytes: Int64?
+    private var quotaRefresh: Task<Void, Never>?
     private var lastQuotaRefreshAt: ContinuousClock.Instant?
     /// Where the per-account upload-identity manifest lives (next to `library-v1.sqlite`, so the
     /// sign-out purge covers it) and the platform SQLite tuning it opens with. Module-internal:
@@ -1745,7 +1747,8 @@ extension DriveSDKBridge: PhotoUploading {
 
     /// Compares the file with the account's remaining Drive storage: the last account refresh minus what this session
     /// uploaded since. When it does not fit, the account data is refreshed first, at most once a minute, because the
-    /// person may have freed space or upgraded. Without a known quota the upload proceeds; Proton then decides.
+    /// person may have freed space or upgraded; checks during a refresh wait for it. Without a known quota the upload
+    /// proceeds; Proton then decides.
     nonisolated func ensureRemoteCapacity(forBytes bytes: Int64, filename: String) async throws {
         guard bytes > 0, let available = await remainingDriveBytes(), bytes > available else { return }
         await refreshQuotaIfDue()
@@ -1762,17 +1765,31 @@ extension DriveSDKBridge: PhotoUploading {
             return (used, maximum)
         }
         guard let quota else { return nil }
+        rebaseUploadedBytes(onUsedBytes: quota.used)
         return quota.max - quota.used - uploadedBytesSinceQuotaRefresh
     }
 
+    private func recordUploadedBytes(_ bytes: Int64) async {
+        let used = await MainActor.run { AccountInfo.shared.driveUsedSpaceBytes }
+        rebaseUploadedBytes(onUsedBytes: used)
+        uploadedBytesSinceQuotaRefresh += max(0, bytes)
+    }
+
+    private func rebaseUploadedBytes(onUsedBytes used: Int64?) {
+        guard used != quotaBaselineUsedBytes else { return }
+        quotaBaselineUsedBytes = used
+        uploadedBytesSinceQuotaRefresh = 0
+    }
+
     private func refreshQuotaIfDue() async {
+        if let quotaRefresh { return await quotaRefresh.value }
         let now = ContinuousClock.now
         if let lastQuotaRefreshAt, lastQuotaRefreshAt.duration(to: now) < .seconds(60) { return }
         lastQuotaRefreshAt = now
-        let counted = uploadedBytesSinceQuotaRefresh
-        guard (try? await refreshAccountInfo()) != nil else { return }
-        // Uploads that finished during the refresh stay counted; the server may not include them yet.
-        uploadedBytesSinceQuotaRefresh -= counted
+        let refresh = Task { _ = try? await self.refreshAccountInfo() }
+        quotaRefresh = refresh
+        await refresh.value
+        quotaRefresh = nil
     }
 
     /// The universal dedupe pipeline for this account: the SQLite identity manifest (per-account
@@ -1908,7 +1925,7 @@ extension DriveSDKBridge: PhotoUploading {
                 throw error
             }
             await operation.releaseResources()
-            uploadedBytesSinceQuotaRefresh += max(0, request.fileSize)
+            await recordUploadedBytes(request.fileSize)
             DebugLog.log("[Upload] completed node=\(ids.nodeUid.nodeID.prefix(8))… file=\(request.name)")
             let uid = PhotoUID(volumeID: ids.nodeUid.volumeID, nodeID: ids.nodeUid.nodeID)
             if mainPhotoUid == nil {

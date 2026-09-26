@@ -384,13 +384,9 @@ public struct PhotoLibraryResourceResolver: BackupResourceResolving {
             // gets one networked pass, which reports the definitive error.
         }
 
-        // Photos keeps its own copy of an original it downloads, and staging for the upload writes a second one. A
-        // large original of known size is staged exactly only when both fit; otherwise it is only hashed now. The
-        // duplicate check never waits for space: a photo already in Proton needs no copy at all.
         let knownSize = Self.knownSize(of: resource)
-        let stagesExactly = knownSize.map { tempStore.hasFreeSpace(forAdditionalBytes: $0 * 2) } ?? false
-        let sink = PhotoKitStagingSink(
-            tempStore: tempStore, filename: filename, expectedBytes: stagesExactly ? knownSize : nil)
+        let exactSize = Self.exactStagingSize(knownSize: knownSize, tempStore: tempStore)
+        let sink = PhotoKitStagingSink(tempStore: tempStore, filename: filename, expectedBytes: exactSize)
         do {
             try await Self.requestData(
                 for: resource, networkAccessAllowed: true, progressGate: progressGate
@@ -404,7 +400,7 @@ public struct PhotoLibraryResourceResolver: BackupResourceResolving {
         progressGate.publish(1)
         let result = sink.finish()
         Self.logger.notice(
-            "[Backup] original from iCloud staged=\(result.stagedURL != nil, privacy: .public) sizeKnown=\(knownSize != nil, privacy: .public) exact=\(stagesExactly, privacy: .public)"
+            "[Backup] original from iCloud staged=\(result.stagedURL != nil, privacy: .public) sizeKnown=\(knownSize != nil, privacy: .public) exact=\(exactSize != nil, privacy: .public)"
         )
         let staged = result.stagedURL.map { url in
             exported.append(url)
@@ -504,6 +500,16 @@ public struct PhotoLibraryResourceResolver: BackupResourceResolving {
                 liveness.complete(error: error)
             }
         }
+    }
+
+    /// The size an iCloud original may reserve for staging. Photos keeps its own copy of an original it downloads, and
+    /// staging writes a second one, so the size counts only when both fit. Otherwise the original is only hashed now:
+    /// the duplicate check never waits for space, because a photo already in Proton needs no copy at all.
+    static func exactStagingSize(knownSize: Int64?, tempStore: BackupTempFileStore) -> Int64? {
+        guard let knownSize, knownSize <= Int64.max / 2,
+            tempStore.hasFreeSpace(forAdditionalBytes: knownSize * 2)
+        else { return nil }
+        return knownSize
     }
 
     /// The size PhotoKit reports before a download (iOS and macOS 27); nil before that or while unknown.

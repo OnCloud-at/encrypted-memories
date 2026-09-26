@@ -18,7 +18,9 @@ report does not come, one check ten minutes after the shot backs up the version 
 checks a waiting photo again at once.
 
 Large videos, for example ProRes recordings of many gigabytes, also download from iCloud only once when the device
-has room for the copy in Apple Photos and the backup copy. If the device does not have room for the backup copy,
+has room for the copy in Apple Photos and the backup copy. This needs iOS, iPadOS, or macOS 27, which report the
+size of an iCloud original before the download. On version 26, an original larger than 1 GB downloads a second time
+for its upload. If the device does not have room for the backup copy,
 the backup status names the free space the video needs, and the backup tries again later. A file that does not fit
 into the remaining Proton storage waits and does not use the device's storage for a copy. The backup status shows
 this, smaller photos continue, and the waiting file is checked again every six hours or with **Back Up Now**.
