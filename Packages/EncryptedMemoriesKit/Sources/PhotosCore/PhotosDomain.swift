@@ -212,10 +212,18 @@ public struct ThumbnailBatchLoadResult: Sendable, Equatable {
     /// Failures the backend reported per item (uid to short reason), such as "no thumbnail" or a
     /// decrypt error. These are authoritative answers, not transport problems.
     public let itemErrors: [PhotoUID: String]
+    /// Items whose bytes arrived after the caller's read authorization for them changed. They were withheld, not
+    /// refused: a later request may deliver them.
+    public let withheldUIDs: Set<PhotoUID>
 
-    public init(batchError: String? = nil, itemErrors: [PhotoUID: String] = [:]) {
+    public init(
+        batchError: String? = nil,
+        itemErrors: [PhotoUID: String] = [:],
+        withheldUIDs: Set<PhotoUID> = []
+    ) {
         self.batchError = batchError
         self.itemErrors = itemErrors
+        self.withheldUIDs = withheldUIDs
     }
 
     /// The loader finished normally and reported no failures (items it didn't deliver are simply unknown).

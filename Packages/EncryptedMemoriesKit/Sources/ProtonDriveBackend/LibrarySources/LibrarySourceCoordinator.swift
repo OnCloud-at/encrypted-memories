@@ -494,13 +494,14 @@ public actor LibrarySourceCoordinator: PriorityThumbnailBatchLoader {
             loader: thumbnailLoader, uids: authorized, priority: priority, continuation: continuation
         )
         var itemErrors = denied
+        var withheld = Set<PhotoUID>()
         var delivered = Set<PhotoUID>()
         // Validate on this actor at delivery time, not on the SDK callback thread. One slow item must
         // not hold already-available thumbnails behind the completion of the entire network batch.
         for await (uid, data) in stream {
             if Task.isCancelled { break }
-            guard let lease = leases[uid], !closed, isStillAuthorized(uid, by: lease) else {
-                itemErrors[uid] = "source authorization changed"
+            guard let lease = leases[uid], !closed, isStillAuthorized(by: lease) else {
+                withheld.insert(uid)
                 continue
             }
             delivered.insert(uid)
@@ -508,11 +509,13 @@ public actor LibrarySourceCoordinator: PriorityThumbnailBatchLoader {
         }
         let result = await loading
         for (uid, reason) in result.itemErrors
-        where leases[uid] != nil && !delivered.contains(uid) && itemErrors[uid] == nil {
+        where leases[uid] != nil && !delivered.contains(uid) && !withheld.contains(uid) && itemErrors[uid] == nil {
             itemErrors[uid] = reason
         }
         return ThumbnailBatchLoadResult(
-            batchError: Task.isCancelled ? "cancelled" : result.batchError, itemErrors: itemErrors
+            batchError: Task.isCancelled ? "cancelled" : result.batchError,
+            itemErrors: itemErrors,
+            withheldUIDs: withheld
         )
     }
 
@@ -540,13 +543,11 @@ public actor LibrarySourceCoordinator: PriorityThumbnailBatchLoader {
     }
 
     /// Checks a late thumbnail against the graph as it is now. Every inventory refresh that changes an item, even
-    /// only its tags, renews the lease generation of the whole source, and after sign-in such refreshes follow each
-    /// other. Bytes of a photo that the same source still authorizes are delivered; a photo that left the source,
-    /// or a source that lost access, keeps them fenced.
-    private func isStillAuthorized(_ uid: PhotoUID, by lease: SourceAccessLease) -> Bool {
-        if graph.isCurrent(lease) { return true }
-        guard let renewed = thumbnailAccessLeases(for: [uid])[uid] else { return false }
-        return renewed.sourceID == lease.sourceID
+    /// only its tags, invalidates the leases of the whole source, and after sign-in such refreshes follow each
+    /// other. Bytes of a photo whose route the graph still authorizes are delivered; a photo that left the source,
+    /// or a source that lost access, keeps them withheld.
+    private func isStillAuthorized(by lease: SourceAccessLease) -> Bool {
+        graph.isCurrent(lease) || graph.renewed(lease) != nil
     }
 
     private static func streamThumbnails(

@@ -374,6 +374,7 @@ public actor ThumbnailFeedCore {
     private var prefetchFailedBatchError = 0
     private var prefetchFailedItemError = 0
     private var prefetchFailedUnreported = 0
+    private var prefetchFailedWithheld = 0
     private var prefetchDiskHit = 0
     private var prefetchDownloadStarted = 0
     private var prefetchDownloadCompleted = 0
@@ -1742,6 +1743,7 @@ public actor ThumbnailFeedCore {
         prefetchFailedBatchError = 0
         prefetchFailedItemError = 0
         prefetchFailedUnreported = 0
+        prefetchFailedWithheld = 0
         prefetchDiskHit = 0
         prefetchDownloadStarted = 0
         prefetchDownloadCompleted = 0
@@ -1817,6 +1819,8 @@ public actor ThumbnailFeedCore {
         public let failedBatchError: Int
         public let failedItemError: Int
         public let failedUnreported: Int
+        /// Withheld because the photo's read authorization changed during the download; retried, never quarantined.
+        public let failedWithheld: Int
         public let diskHit: Int
         public let downloadStarted: Int
         public let downloadCompleted: Int
@@ -1864,6 +1868,7 @@ public actor ThumbnailFeedCore {
             failedBatchError: prefetchFailedBatchError,
             failedItemError: prefetchFailedItemError,
             failedUnreported: prefetchFailedUnreported,
+            failedWithheld: prefetchFailedWithheld,
             diskHit: prefetchDiskHit,
             downloadStarted: prefetchDownloadStarted,
             downloadCompleted: prefetchDownloadCompleted,
@@ -2032,8 +2037,21 @@ public actor ThumbnailFeedCore {
                         recordError(
                             "thumbnail refused for \(refused.count) item(s), e.g. \(Self.key(first)): \(reason)")
                     }
-                    let unreported = undelivered.count - refused.count
-                    let reportedUnreported = reportedUndelivered.filter { result.itemErrors[$0] == nil }.count
+                    // Withheld after an authorization change: not the photo's fault. The coverage pass at the end of
+                    // the crawl and every visible request load it again.
+                    let withheld = undelivered.filter {
+                        result.itemErrors[$0] == nil && result.withheldUIDs.contains($0)
+                    }
+                    prefetchFailedWithheld += withheld.filter(isReportedForPrefetch).count
+                    if let first = withheld.first {
+                        recordError(
+                            "thumbnail withheld for \(withheld.count) item(s) after an authorization change, e.g. \(Self.key(first)); retried"
+                        )
+                    }
+                    let unreported = undelivered.count - refused.count - withheld.count
+                    let reportedUnreported = reportedUndelivered.filter {
+                        result.itemErrors[$0] == nil && !result.withheldUIDs.contains($0)
+                    }.count
                     prefetchFailedUnreported += reportedUnreported
                     if unreported > 0 {
                         networkSuspect = true
@@ -3116,6 +3134,7 @@ public actor ThumbnailFeedCore {
                     "failedBatchError": "\(prefetchFailedBatchError)",
                     "failedItemError": "\(prefetchFailedItemError)",
                     "failedUnreported": "\(prefetchFailedUnreported)",
+                    "failedWithheld": "\(prefetchFailedWithheld)",
                     "unfetchable": "\(unfetchable.count)",
                     "skippedUnfetchable": "\(skippedUnfetchable)",
                     "diskHit": "\(prefetchDiskHit)",

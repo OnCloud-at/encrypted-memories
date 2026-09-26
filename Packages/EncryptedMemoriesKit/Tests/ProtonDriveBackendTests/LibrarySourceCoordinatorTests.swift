@@ -152,7 +152,8 @@ struct LibrarySourceCoordinatorTests {
         let result = await load.value
 
         #expect(delivered.data(for: remoteUID) == nil)
-        #expect(result.itemErrors[remoteUID] == "source authorization changed")
+        #expect(result.withheldUIDs == [remoteUID])
+        #expect(result.itemErrors.isEmpty, "a withheld thumbnail is not a refusal")
         await coordinator.shutdown()
     }
 
@@ -185,6 +186,69 @@ struct LibrarySourceCoordinatorTests {
         await coordinator.shutdown()
     }
 
+    @Test func aSeriesMemberThumbnailSurvivesARefreshOfItsSeries() async throws {
+        let keyUID = PhotoUID(volumeID: "primary-volume", nodeID: "burst-key")
+        let memberUID = PhotoUID(volumeID: "primary-volume", nodeID: "burst-member")
+        let backend = ControlledLibrarySourceBackend(blockThumbnailLoads: true)
+        let coordinator = LibrarySourceCoordinator(remote: backend, thumbnailLoader: backend, inventoryStore: nil)
+        await coordinator.prepare()
+        func series(tags: Set<PhotoTag>) -> [PhotoItem] {
+            [
+                PhotoItem(
+                    uid: keyUID, captureTime: Date(timeIntervalSince1970: 1), mediaType: "image/jpeg", tags: tags,
+                    burstMemberIDs: [keyUID.nodeID, memberUID.nodeID])
+            ]
+        }
+        await coordinator.replacePrimaryInventory(series(tags: []), authority: .authoritative)
+        let delivered = ThumbnailDeliveryRecorder()
+        let load = Task {
+            await coordinator.loadThumbnails(for: [memberUID], priority: .visibleNow) { uid, data in
+                delivered.store(data, for: uid)
+            }
+        }
+        while await !backend.isThumbnailLoadWaiting() { await Task.yield() }
+
+        await coordinator.replacePrimaryInventory(series(tags: [.favorites]), authority: .authoritative)
+        await backend.releaseThumbnailLoad()
+        let result = await load.value
+
+        #expect(delivered.data(for: memberUID) != nil)
+        #expect(result.withheldUIDs.isEmpty)
+        await coordinator.shutdown()
+    }
+
+    @Test(arguments: [false, true])
+    func aRecentlyDeletedThumbnailFollowsTheCurrentListing(photoWasRestored: Bool) async throws {
+        let itemUID = PhotoUID(volumeID: "primary-volume", nodeID: "library-item")
+        let trashedUID = PhotoUID(volumeID: "primary-volume", nodeID: "trashed-photo")
+        let backend = ControlledLibrarySourceBackend(blockThumbnailLoads: true)
+        let coordinator = LibrarySourceCoordinator(remote: backend, thumbnailLoader: backend, inventoryStore: nil)
+        await coordinator.prepare()
+        let captured = Date(timeIntervalSince1970: 1)
+        await coordinator.replacePrimaryInventory(
+            [PhotoItem(uid: itemUID, captureTime: captured, mediaType: "image/jpeg")], authority: .authoritative)
+        await coordinator.setIdentitiesOutsideInventory([trashedUID], sequence: 1)
+        let delivered = ThumbnailDeliveryRecorder()
+        let load = Task {
+            await coordinator.loadThumbnails(for: [trashedUID], priority: .visibleNow) { uid, data in
+                delivered.store(data, for: uid)
+            }
+        }
+        while await !backend.isThumbnailLoadWaiting() { await Task.yield() }
+
+        // A refresh of another photo keeps the trashed photo readable; a listing without it withholds its bytes.
+        await coordinator.replacePrimaryInventory(
+            [PhotoItem(uid: itemUID, captureTime: captured, mediaType: "image/jpeg", tags: [.favorites])],
+            authority: .authoritative)
+        if photoWasRestored { await coordinator.setIdentitiesOutsideInventory([], sequence: 2) }
+        await backend.releaseThumbnailLoad()
+        let result = await load.value
+
+        #expect((delivered.data(for: trashedUID) != nil) == !photoWasRestored)
+        #expect(result.withheldUIDs == (photoWasRestored ? [trashedUID] : []))
+        await coordinator.shutdown()
+    }
+
     @Test func aThumbnailThatArrivesAfterItsPhotoLeftTheLibraryIsRefused() async throws {
         let uid = PhotoUID(volumeID: "primary-volume", nodeID: "photo")
         let backend = ControlledLibrarySourceBackend(blockThumbnailLoads: true)
@@ -206,7 +270,8 @@ struct LibrarySourceCoordinatorTests {
         let result = await load.value
 
         #expect(delivered.data(for: uid) == nil)
-        #expect(result.itemErrors[uid] == "source authorization changed")
+        #expect(result.withheldUIDs == [uid])
+        #expect(result.itemErrors.isEmpty)
         await coordinator.shutdown()
     }
 
@@ -240,9 +305,8 @@ struct LibrarySourceCoordinatorTests {
 
         #expect(deliveredBeforeCompletion, "An available thumbnail must not wait for the remaining download")
         #expect(delivered.data(for: lateUID) == nil)
-        #expect(result.itemErrors[lateUID] == "source authorization changed")
-        #expect(result.itemErrors[firstUID] == nil, "Already delivered items must not also be reported as failures")
-        #expect(result.itemErrors.count == 1, "Unrequested callbacks must not create item errors")
+        #expect(result.withheldUIDs == [lateUID], "Already delivered items must not also be reported as withheld")
+        #expect(result.itemErrors.isEmpty, "Unrequested callbacks must not create item errors")
         await coordinator.shutdown()
     }
 
