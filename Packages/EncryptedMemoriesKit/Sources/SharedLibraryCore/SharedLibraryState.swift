@@ -58,7 +58,9 @@ public struct SharedLibraryState: Sendable, Equatable {
             case .hidden, .personal, .shardRetired, .unrecognized: break
             }
         }
-        state.shards.sort { ($0.index, $0.album.nodeID) < ($1.index, $1.album.nodeID) }
+        state.shards.sort {
+            ($0.index, $0.album.volumeID, $0.album.nodeID) < ($1.index, $1.album.volumeID, $1.album.nodeID)
+        }
         return state
     }
 }

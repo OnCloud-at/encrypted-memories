@@ -1,7 +1,8 @@
 import Foundation
 
 /// A JSON value kept verbatim. A change type that a newer build wrote survives when this build rewrites its journal.
-/// Numbers keep every digit, so large identifiers do not change.
+/// Numbers keep up to 38 significant digits, so large identifiers do not change. A number beyond that range reads as
+/// null instead of making the whole journal unreadable.
 public enum SharedLibraryJSONValue: Sendable, Equatable, Codable {
     case null
     case bool(Bool)
@@ -22,8 +23,11 @@ public enum SharedLibraryJSONValue: Sendable, Equatable, Codable {
             self = .string(value)
         } else if let value = try? container.decode([SharedLibraryJSONValue].self) {
             self = .array(value)
+        } else if let value = try? container.decode([String: SharedLibraryJSONValue].self) {
+            self = .object(value)
         } else {
-            self = .object(try container.decode([String: SharedLibraryJSONValue].self))
+            // Valid JSON that fits none of the above is a number too large for Decimal.
+            self = .null
         }
     }
 
@@ -49,6 +53,15 @@ public enum SharedLibraryJSONValue: Sendable, Equatable, Codable {
 
     var boolValue: Bool? {
         if case .bool(let value) = self { value } else { nil }
+    }
+
+    /// The value when it is a whole number in `range`, read exactly from its digits.
+    func integerValue<Integer: FixedWidthInteger>(in range: ClosedRange<Integer>) -> Integer? {
+        guard case .number(var value) = self, !value.isNaN else { return nil }
+        var whole = Decimal()
+        NSDecimalRound(&whole, &value, 0, .plain)
+        guard whole == value, let integer = Integer(whole.description), range.contains(integer) else { return nil }
+        return integer
     }
 
     var numberValue: Double? {

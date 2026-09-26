@@ -318,3 +318,89 @@ struct SharedLibraryJournalRobustnessTests {
         #expect(SharedLibraryState.merged([reread]).settings.scope == .since(start))
     }
 }
+
+@Suite("Shared library journal limits")
+struct SharedLibraryJournalLimitTests {
+    private let photo = PhotoUID(volumeID: "volume", nodeID: "photo")
+
+    private func journal(_ json: String) throws -> SharedLibraryJournal {
+        try JSONDecoder().decode(SharedLibraryJournal.self, from: Data(json.utf8))
+    }
+
+    @Test func aHugeNumberInOneEntryLeavesTheOtherEntriesReadable() throws {
+        let decoded = try journal(
+            """
+            {"format":1,"device":"mac","entries":[
+              {"device":"mac","seq":1,"time":1,"change":{"type":"futureThing","size":1e400}},
+              {"device":"mac","seq":2,"time":2,"change":{"type":"hidden",
+               "photo":{"volumeID":"volume","nodeID":"photo"},"value":true}}
+            ]}
+            """)
+        #expect(SharedLibraryState.merged([decoded]).visibility(of: photo) == .hidden)
+    }
+
+    @Test func aUsedUpSequenceRefusesTheChangeInsteadOfCrashing() throws {
+        var full = try journal(#"{"format":1,"device":"mac","entries":[],"last":18446744073709551615}"#)
+        #expect(throws: SharedLibraryJournalInvalidChangeError()) {
+            try full.record(.hidden(photo, isHidden: true), at: Date(timeIntervalSince1970: 1))
+        }
+        #expect(full.entries.isEmpty)
+    }
+
+    @Test func aDateThatIsNotFiniteIsRefusedAndNeverCrashesAWrite() throws {
+        var mac = SharedLibraryJournal(deviceID: "mac")
+        let infinite = Date(timeIntervalSince1970: .infinity)
+        #expect(throws: SharedLibraryJournalInvalidChangeError()) {
+            try mac.record(.settings(SharedLibrarySettings(isEnabled: true, scope: .since(infinite))), at: Date())
+        }
+        #expect(throws: SharedLibraryJournalInvalidChangeError()) {
+            try mac.record(.hidden(photo, isHidden: true), at: infinite)
+        }
+        let bypassed = SharedLibraryJournal(
+            deviceID: "mac",
+            entries: [
+                SharedLibraryJournalEntry(
+                    deviceID: "mac", sequence: 1, recordedAt: Date(timeIntervalSince1970: 1),
+                    change: .settings(SharedLibrarySettings(isEnabled: true, scope: .since(infinite))))
+            ])
+        _ = try? JSONEncoder().encode(bypassed)
+    }
+
+    @Test func aShardIndexIsCheckedFromItsExactDigits() throws {
+        let decoded = try journal(
+            """
+            {"format":1,"device":"mac","entries":[
+              {"device":"mac","seq":1,"time":1,"change":{"type":"shardCreated","index":1.0000000000000001,
+               "album":{"volumeID":"v","nodeID":"a"}}},
+              {"device":"mac","seq":2,"time":2,"change":{"type":"shardCreated","index":9007199254740993,
+               "album":{"volumeID":"v","nodeID":"b"}}}
+            ]}
+            """)
+        #expect(SharedLibraryState.merged([decoded]).shards.map(\.index) == [9_007_199_254_740_993])
+    }
+
+    @Test func aSequenceInAnUnreadableEntryIsNeverUsedAgain() throws {
+        var decoded = try journal(
+            """
+            {"format":1,"device":"mac","entries":[
+              {"device":"mac","seq":1,"time":1,"change":{"type":"hidden",
+               "photo":{"volumeID":"volume","nodeID":"photo"},"value":true}},
+              {"device":"mac","seq":2,"change":{"type":"hidden",
+               "photo":{"volumeID":"volume","nodeID":"photo"},"value":false}}
+            ]}
+            """)
+        #expect(decoded.lastSequence == 2)
+        try decoded.record(.personal(photo, isPersonal: true), at: Date(timeIntervalSince1970: 3))
+        #expect(decoded.entries.last?.sequence == 3)
+    }
+
+    @Test func shardsWithTheSameIndexAndNodeSortByVolumeToo() throws {
+        var a = SharedLibraryJournal(deviceID: "a")
+        var b = SharedLibraryJournal(deviceID: "b")
+        try a.record(.shardCreated(index: 1, album: AlbumNodeIdentifier(volumeID: "v2", nodeID: "n")), at: .init())
+        try b.record(.shardCreated(index: 1, album: AlbumNodeIdentifier(volumeID: "v1", nodeID: "n")), at: .init())
+        let merged = SharedLibraryState.merged([a, b])
+        #expect(merged == SharedLibraryState.merged([b, a]))
+        #expect(merged.shards.map(\.album.volumeID) == ["v1", "v2"])
+    }
+}

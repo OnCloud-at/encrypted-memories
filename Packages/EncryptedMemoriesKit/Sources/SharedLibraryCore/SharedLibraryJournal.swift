@@ -64,8 +64,7 @@ extension SharedLibraryChange: Codable {
                     SharedLibrarySettings(isEnabled: enabled, scope: .since(Date(timeIntervalSince1970: seconds))))
             }
         case "shardCreated":
-            guard let number = raw["index"]?.numberValue, let index = Int(exactly: number), index >= 1,
-                let album = albumIdentifier(raw["album"])
+            guard let index = raw["index"]?.integerValue(in: 1...Int.max), let album = albumIdentifier(raw["album"])
             else { return nil }
             return .shardCreated(index: index, album: album)
         case "shardRetired":
@@ -81,14 +80,26 @@ extension SharedLibraryChange: Codable {
             "type": .string("settings"), "enabled": .bool(settings.isEnabled),
         ]
         if case .since(let date) = settings.scope {
-            fields["since"] = .number(Self.decimal(date.timeIntervalSince1970))
+            fields["since"] = Self.decimal(date.timeIntervalSince1970).map(SharedLibraryJSONValue.number) ?? .null
         }
         return fields
     }
 
-    /// The shortest decimal text that reads back as the same `Double`.
-    private static func decimal(_ value: Double) -> Decimal {
-        Decimal(string: "\(value)", locale: Locale(identifier: "en_US_POSIX")) ?? Decimal(value)
+    /// The shortest decimal text that reads back as the same `Double`; nil for a value that is not finite.
+    private static func decimal(_ value: Double) -> Decimal? {
+        guard value.isFinite else { return nil }
+        return Decimal(string: "\(value)", locale: Locale(identifier: "en_US_POSIX"))
+    }
+
+    /// Whether the change can be written and read back unchanged.
+    var isWritable: Bool {
+        switch self {
+        case .settings(let settings):
+            if case .since(let date) = settings.scope { return date.timeIntervalSince1970.isFinite }
+            return true
+        case .shardCreated(let index, _): return index >= 1
+        case .hidden, .personal, .shardRetired, .unrecognized: return true
+        }
     }
 
     private static func json(_ photo: PhotoUID) -> SharedLibraryJSONValue {
@@ -164,6 +175,9 @@ public struct SharedLibraryJournalReadOnlyError: Error, Equatable {
     public let format: Int
 }
 
+/// A change that cannot be recorded: a date that is not finite, an invalid shard index, or a used-up sequence.
+public struct SharedLibraryJournalInvalidChangeError: Error, Equatable {}
+
 /// The changes one device recorded. Each device writes only its own journal, so devices never overwrite each
 /// other; every device reads all journals and merges them.
 public struct SharedLibraryJournal: Sendable, Equatable {
@@ -203,7 +217,11 @@ public struct SharedLibraryJournal: Sendable, Equatable {
     /// Records `change` as this device's next change. A journal in a newer format stays unchanged.
     public mutating func record(_ change: SharedLibraryChange, at date: Date) throws {
         guard isSupported else { throw SharedLibraryJournalReadOnlyError(format: format) }
-        lastSequence += 1
+        let (next, overflow) = lastSequence.addingReportingOverflow(1)
+        guard !overflow, date.timeIntervalSince1970.isFinite, change.isWritable else {
+            throw SharedLibraryJournalInvalidChangeError()
+        }
+        lastSequence = next
         entries.append(
             SharedLibraryJournalEntry(deviceID: deviceID, sequence: lastSequence, recordedAt: date, change: change))
     }
@@ -266,7 +284,13 @@ extension SharedLibraryJournal: Codable {
                 unreadable.append(raw)
             }
         }
-        let last = try container.decodeIfPresent(UInt64.self, forKey: .lastSequence) ?? 0
+        // A sequence in an unreadable entry of this device still counts, so it is never used twice.
+        let unreadableSequences = unreadable.compactMap { raw -> UInt64? in
+            guard raw["device"]?.stringValue == deviceID else { return nil }
+            return raw["seq"]?.integerValue(in: 0...UInt64.max)
+        }
+        let recorded = (try? container.decodeIfPresent(UInt64.self, forKey: .lastSequence)) ?? nil
+        let last = max(recorded ?? 0, unreadableSequences.max() ?? 0)
         self.init(
             format: format, deviceID: deviceID, entries: entries, unreadableEntries: unreadable, lastSequence: last)
     }
