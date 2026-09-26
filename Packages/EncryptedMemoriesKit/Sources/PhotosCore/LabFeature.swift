@@ -30,6 +30,15 @@ public struct LabFeature: Identifiable, Sendable, Equatable {
     /// Features in Labs, in display order. Empty while nothing is ready for testing.
     public static let catalog: [LabFeature] = []
 
+    /// The shared library (Geteilte Mediathek), offered to prerelease builds. It joins the catalog once people can
+    /// try something; until then no toggle exists and it stays off.
+    public static let sharedLibrary = LabFeature(
+        id: .sharedLibrary,
+        titleKey: "labs.shared_library_title",
+        summaryKey: "labs.shared_library_summary",
+        audience: .prereleaseBuilds
+    )
+
     /// Features that `build` offers, in catalog order.
     public static func offered(for build: AppBuildInfo, in catalog: [LabFeature] = catalog) -> [LabFeature] {
         catalog.filter { $0.isOffered(for: build) }
