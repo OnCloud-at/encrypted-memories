@@ -1275,8 +1275,10 @@ public final class LibrarySourceGraph {
     ///
     /// Renewal authorizes by the current state only. It deliberately accepts a route that was removed and added
     /// again, or a source reactivated after access loss, while the result was in flight, because the graph
-    /// authorizes that route now. Use it only for reads whose bytes depend on the photo identity alone, such as
-    /// thumbnails; a consumer that needs the remove-then-readd fence must keep checking `isCurrent(_:)`.
+    /// authorizes that route now. It also returns nil when a source of higher precedence now serves the photo,
+    /// although the original source still lists it; the caller withholds the result and requests it again. Use it
+    /// only for reads whose bytes depend on the photo identity alone, such as thumbnails; a consumer that needs the
+    /// remove-then-readd fence must keep checking `isCurrent(_:)`.
     public func renewed(_ lease: SourceAccessLease) -> SourceAccessLease? {
         guard lease.epoch == epoch else { return nil }
         let includeExcludedSources = !lease.requiresInclusion

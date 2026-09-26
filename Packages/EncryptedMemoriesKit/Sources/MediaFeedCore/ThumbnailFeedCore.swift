@@ -375,7 +375,10 @@ public actor ThumbnailFeedCore {
     private var prefetchFailedItemError = 0
     private var prefetchFailedUnreported = 0
     private var prefetchFailedWithheld = 0
-    /// Crawl requests per photo withheld after an authorization change; bounded so churn cannot loop forever.
+    /// Photos withheld after an authorization change, which the crawl requests again behind its own gates (pause,
+    /// backoff, visible demand, storage pressure), and how often each was requeued in this crawl. The bound keeps
+    /// churn from looping forever.
+    private var withheldRetry: [PhotoUID] = []
     private var withheldRequeues: [PhotoUID: Int] = [:]
     private static let maxWithheldRequeues = 3
     private var prefetchDiskHit = 0
@@ -804,14 +807,14 @@ public actor ThumbnailFeedCore {
         return true
     }
 
-    /// Requests withheld photos again at crawl priority. The next request issues a fresh authorization; a photo that
-    /// left the library is then refused, or the feed no longer authorizes it and the request is dropped.
+    /// Hands withheld photos back to the crawl. The next request issues a fresh authorization; a photo that left
+    /// the library is then refused, or the feed no longer authorizes it and the crawl skips it.
     private func requeueWithheld(_ uids: [PhotoUID]) {
-        for uid in uids {
+        for uid in uids where !uid.isLocalPending && readAllowed(uid) {
             let attempts = withheldRequeues[uid, default: 0]
             guard attempts < Self.maxWithheldRequeues else { continue }
             withheldRequeues[uid] = attempts + 1
-            _ = requestPriority(uid, priority: .idleLibraryCrawl)
+            withheldRetry.append(uid)
         }
     }
 
@@ -1438,6 +1441,7 @@ public actor ThumbnailFeedCore {
         sequentialIndex = 0
         diskPresence.beginTracking(uids, reporting: reportingUIDs, knownPresent: [])
         unfetchable.removeAll()  // a fresh crawl retries backend-refused items exactly once
+        withheldRetry.removeAll()
         withheldRequeues.removeAll()
         lastRepassPercent = -1.0
         coverageScanCursor = 0
@@ -1697,6 +1701,7 @@ public actor ThumbnailFeedCore {
             checkpointHints.removeAll(keepingCapacity: true)
             pendingCheckpointUpdates.removeAll(keepingCapacity: true)
             unfetchable.removeAll()
+            withheldRetry.removeAll()
             withheldRequeues.removeAll()
             visibleDiskDemand.cancelAll()
             diskProbeBatchesInFlight = 0
@@ -1945,7 +1950,7 @@ public actor ThumbnailFeedCore {
             }
             let chunk = localChunk.isEmpty ? work.uids : work.uids.filter { !$0.isLocalPending }
             if chunk.isEmpty {
-                if priority.isEmpty && sequentialIndex >= sequential.count {
+                if priority.isEmpty && sequentialIndex >= sequential.count && withheldRetry.isEmpty {
                     if diskProbeBatchesInFlight > 0 {
                         try? await Task.sleep(for: .milliseconds(10))
                         continue
@@ -2304,6 +2309,13 @@ public actor ThumbnailFeedCore {
                 startupAuthenticationPending = false
             }
             return batch
+        }
+
+        // Withheld photos first: the crawl reached them before. They pass the same gates as the crawl.
+        while candidates.count < configuration.batchSize, !withheldRetry.isEmpty {
+            let uid = withheldRetry.removeFirst()
+            guard readAllowed(uid), !unfetchable.contains(uid), reserved.insert(uid).inserted else { continue }
+            candidates.append(uid)
         }
 
         var scannedThisCall = 0

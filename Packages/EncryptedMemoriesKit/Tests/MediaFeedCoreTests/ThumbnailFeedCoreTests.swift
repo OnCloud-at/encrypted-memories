@@ -2907,26 +2907,31 @@ struct ThumbnailFeedCoreTests {
         #expect(await loader.requestCount() == 2)
     }
 
-    @Test func aWithheldThumbnailIsNotQuarantinedAndLoadsOnTheNextRequest() async throws {
-        let uid = Self.uid("withheld")
-        let loader = RecordingLoader(payloads: [uid: Self.pngData(width: 8, height: 8)], withheldOnce: [uid])
+    @Test func aWithheldThumbnailIsNotQuarantinedAndTheCrawlLoadsItAgain() async throws {
+        // A library large enough that the end-of-crawl coverage pass settles with one photo missing; only the
+        // requeue can fetch that photo again.
+        let uids = (0..<400).map { Self.uid("withheld-\($0)") }
+        let withheld = uids[7]
+        let png = Self.pngData(width: 8, height: 8)
+        let loader = RecordingLoader(
+            payloads: Dictionary(uniqueKeysWithValues: uids.map { ($0, png) }), withheldOnce: [withheld])
+        let cache = Self.cache("withheld")
         let feed = ThumbnailFeedCore(
-            cache: Self.cache("withheld"),
+            cache: cache,
             loader: loader,
-            configuration: Self.configuration(downloadConcurrencyLimit: 1, batchSize: 1)
+            configuration: Self.configuration(downloadConcurrencyLimit: 2, batchSize: 50)
         )
 
-        await feed.startPrefetch([uid])
-        try await Self.waitUntil { await feed.prefetchStatus().failedWithheld == 1 }
+        await feed.startPrefetch(uids)
+        try await Self.waitUntil { await loader.requestOrder().filter { $0 == withheld }.count == 2 }
+
+        #expect(await loader.requestOrder().filter { $0 == withheld }.count == 2)
         let status = await feed.prefetchStatus()
         #expect(status.failedWithheld == 1)
         #expect(status.unfetchableCount == 0, "an authorization change during the download is not the photo's fault")
         #expect(status.failedUnreported == 0, "and no transport problem either")
-
-        // The photo is still in the library: the crawl requests it again without any visible demand.
-        try await Self.waitUntil { await loader.requestCount() == 2 }
-        #expect(await loader.requestCount() == 2)
-        #expect(await feed.decoded(for: uid) != nil)
+        try await Self.waitUntil { cache.diskData(for: withheld) != nil }
+        #expect(cache.diskData(for: withheld) != nil, "the crawl stored it without any visible request")
     }
 
     @Test func visiblePathDoesNotRefetchBackendRefusedItems() async throws {
