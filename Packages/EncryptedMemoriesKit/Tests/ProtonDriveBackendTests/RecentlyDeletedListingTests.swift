@@ -135,6 +135,27 @@ struct RecentlyDeletedListingTests {
         #expect(afterRelaunch.needsListing)
     }
 
+    @Test func aRelaunchKeepsMissedListingsAndPhotosWithoutLibraryData() throws {
+        let directory = try Self.directory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = RecentlyDeletedListingStore(directory: directory, accountUID: "account", keyPassword: "secret")
+        let known = Self.item("known", at: 5)
+        let unknown = PhotoUID(volumeID: "volume", nodeID: "unknown-to-the-library")
+        var beforeRelaunch = RecentlyDeletedIdentities(listing: [])
+        beforeRelaunch.trashed([known.uid, unknown], items: [known])
+        receive([], into: &beforeRelaunch)
+        store.save(beforeRelaunch.persisted)
+
+        let loaded = try #require(store.load())
+        #expect(loaded == beforeRelaunch.persisted, "misses and photos without library data must survive")
+        #expect(loaded.trashedHere.map(\.misses) == [1, 1])
+
+        // The second listing that lacks them, now after the relaunch, releases both.
+        var afterRelaunch = RecentlyDeletedIdentities(persisted: loaded)
+        receive([], into: &afterRelaunch)
+        #expect(afterRelaunch.ordered.isEmpty)
+    }
+
     @Test func trashingHereAsksForAListingEvenAfterOneApplied() {
         var identities = RecentlyDeletedIdentities(listing: nil)
         receive([], into: &identities)
