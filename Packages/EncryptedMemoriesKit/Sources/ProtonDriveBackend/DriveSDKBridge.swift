@@ -144,7 +144,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
             keyPassword: session.keyPassword
         )
         self.recentlyDeletedStore = recentlyDeletedStore
-        self.recentlyDeleted = RecentlyDeletedIdentities(listing: recentlyDeletedStore.load())
+        self.recentlyDeleted = RecentlyDeletedIdentities(persisted: recentlyDeletedStore.load() ?? .init())
         self.uploadManifestPolicy = policy.libraryDatabasePolicy
         // Keep the optional native SDK cache in memory. SDK 0.29.1 only frees the managed client handle;
         // it does not deterministically dispose its SQLite repository. A persistent native cache can therefore
@@ -1306,7 +1306,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                     volumeID: $0.uid.volumeID, nodeID: $0.uid.nodeID, captureTime: $0.captureTime, isVideo: $0.isVideo)
             }
             bridge.recentlyDeleted.trashed(uids, items: known)
-            if let listing = bridge.recentlyDeleted.listing { bridge.recentlyDeletedStore.save(listing) }
+            bridge.recentlyDeletedStore.save(bridge.recentlyDeleted.persisted)
             await bridge.reportRecentlyDeleted()
             // Debug-gated end-to-end verification: the moved links must actually surface in the volume trash
             // listing (this is the seam that silently broke before - trash "succeeded" but Recently Deleted
@@ -1330,7 +1330,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
             try await bridge.driveSession.restore(volumeID: root.volumeID, linkIDs: uids.map(\.nodeID))
             // A listing can drop these photos before the library lists them again; their thumbnails stay.
             bridge.recentlyDeleted.restored(uids)
-            if let listing = bridge.recentlyDeleted.listing { bridge.recentlyDeletedStore.save(listing) }
+            bridge.recentlyDeletedStore.save(bridge.recentlyDeleted.persisted)
             await bridge.reportRecentlyDeleted()
         }
     }
@@ -1344,7 +1344,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                 try? await photosClient.cancelEmptyTrash(cancellationToken: cancellationToken)
             }
             bridge.recentlyDeleted.emptied()
-            bridge.recentlyDeletedStore.save([])
+            bridge.recentlyDeletedStore.save(bridge.recentlyDeleted.persisted)
             await bridge.reportRecentlyDeleted()
         }
     }
@@ -1380,20 +1380,21 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         guard !isShutDown else { throw CancellationError() }
         // A trash, restore, or Empty Trash request finished meanwhile, or a listing that started later was already
         // applied. Both are newer than this listing, so the route shows that state instead.
-        let stored = recentlyDeleted.listing
+        let stored = recentlyDeleted.persisted
         switch recentlyDeleted.received(photos, ticket: ticket) {
         case .applied:
             break
         case .overtakenByChange:
-            // Photos that left the library meanwhile may still lack a listing; a background listing follows.
+            // Photos that left the library meanwhile may still lack a listing. A background listing follows; when
+            // this is the background listing itself, the next library refresh starts it.
             scheduleTrashListing()
-            return stored ?? photos
+            return recentlyDeleted.listing ?? photos
         case .superseded:
-            return stored ?? photos
+            return recentlyDeleted.listing ?? photos
         }
-        if let listing = recentlyDeleted.listing, listing != stored {
-            DebugLog.log("trash: listing has \(listing.count) items")
-            recentlyDeletedStore.save(listing)
+        if recentlyDeleted.persisted != stored {
+            DebugLog.log("trash: listing has \(photos.count) items")
+            recentlyDeletedStore.save(recentlyDeleted.persisted)
         }
         // A trashed photo left every inventory, so only this listing proves that the user may read it.
         await reportRecentlyDeleted()

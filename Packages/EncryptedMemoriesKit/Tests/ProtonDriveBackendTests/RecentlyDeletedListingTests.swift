@@ -23,11 +23,11 @@ struct RecentlyDeletedListingTests {
         defer { try? FileManager.default.removeItem(at: directory) }
         let listing = [Self.item("photo", at: 1), Self.item("video", at: 2, video: true)]
         RecentlyDeletedListingStore(directory: directory, accountUID: "account", keyPassword: "secret")
-            .save(listing)
+            .save(.init(listing: listing))
 
         let reopened = RecentlyDeletedListingStore(directory: directory, accountUID: "account", keyPassword: "secret")
 
-        #expect(reopened.load() == listing)
+        #expect(reopened.load() == .init(listing: listing))
         let blob = try Data(contentsOf: directory.appendingPathComponent(RecentlyDeletedListingStore.fileName))
         #expect(blob.range(of: Data("photo".utf8)) == nil, "the listing is encrypted at rest")
     }
@@ -36,7 +36,7 @@ struct RecentlyDeletedListingTests {
         let directory = try Self.directory()
         defer { try? FileManager.default.removeItem(at: directory) }
         RecentlyDeletedListingStore(directory: directory, accountUID: "account", keyPassword: "secret")
-            .save([Self.item("photo", at: 1)])
+            .save(.init(listing: [Self.item("photo", at: 1)]))
 
         #expect(
             RecentlyDeletedListingStore(directory: directory, accountUID: "account", keyPassword: "other").load()
@@ -113,6 +113,36 @@ struct RecentlyDeletedListingTests {
         #expect(identities.ordered == [listed.uid])
         #expect(identities.listing == [listed], "Recently Deleted must not show a photo that is back in the library")
         #expect(!identities.needsListing)
+    }
+
+    @Test func aPhotoTrashedHereKeepsItsWaitAcrossARelaunch() throws {
+        let directory = try Self.directory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = RecentlyDeletedListingStore(directory: directory, accountUID: "account", keyPassword: "secret")
+        let listed = Self.item("listed", at: 1)
+        let trashedHere = Self.item("trashed-here", at: 5)
+        var beforeRelaunch = RecentlyDeletedIdentities(listing: [listed])
+        beforeRelaunch.trashed([trashedHere.uid], items: [trashedHere])
+        store.save(beforeRelaunch.persisted)
+
+        var afterRelaunch = RecentlyDeletedIdentities(persisted: try #require(store.load()))
+        #expect(afterRelaunch.ordered == [trashedHere.uid, listed.uid])
+        #expect(afterRelaunch.listing == [listed, trashedHere], "offline, the photo trashed here still shows")
+
+        // One lagging listing after the relaunch must not release it.
+        receive([listed], into: &afterRelaunch)
+        #expect(afterRelaunch.ordered == [trashedHere.uid, listed.uid])
+        #expect(afterRelaunch.needsListing)
+    }
+
+    @Test func trashingHereAsksForAListingEvenAfterOneApplied() {
+        var identities = RecentlyDeletedIdentities(listing: nil)
+        receive([], into: &identities)
+        #expect(!identities.needsListing)
+
+        identities.trashed([PhotoUID(volumeID: "volume", nodeID: "new")], items: [])
+
+        #expect(identities.needsListing, "a listing must confirm or release the photo trashed here")
     }
 
     @Test func aFailedListingAsksForAnotherOne() {

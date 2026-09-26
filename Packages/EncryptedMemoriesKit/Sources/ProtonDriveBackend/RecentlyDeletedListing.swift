@@ -14,7 +14,8 @@ enum RecentlyDeletedItem {
     }
 }
 
-/// The last Recently Deleted listing of one account, AES-GCM sealed next to `library-v1.sqlite`.
+/// The last Recently Deleted listing of one account and the photos trashed here that no listing settled yet,
+/// AES-GCM sealed next to `library-v1.sqlite`.
 ///
 /// A trashed photo left every inventory, and only a listing proves that the user may read it. Without the
 /// stored listing, Recently Deleted could not open offline, and the first cache sweep after a launch removed
@@ -27,6 +28,31 @@ struct RecentlyDeletedListingStore: Sendable {
         let nodeID: String
         let captureTime: Double
         let isVideo: Bool
+
+        init(_ item: PhotoItem) {
+            volumeID = item.uid.volumeID
+            nodeID = item.uid.nodeID
+            captureTime = item.captureTime.timeIntervalSince1970
+            isVideo = item.isVideo
+        }
+
+        var item: PhotoItem {
+            RecentlyDeletedItem.make(
+                volumeID: volumeID, nodeID: nodeID, captureTime: Date(timeIntervalSince1970: captureTime),
+                isVideo: isVideo)
+        }
+    }
+
+    private struct TrashedHereRecord: Codable {
+        let volumeID: String
+        let nodeID: String
+        let item: Record?
+        let misses: Int
+    }
+
+    private struct Contents: Codable {
+        let listing: [Record]?
+        let trashedHere: [TrashedHereRecord]
     }
 
     private let url: URL
@@ -40,32 +66,32 @@ struct RecentlyDeletedListingStore: Sendable {
         key = HKDF<SHA256>.deriveKey(inputKeyMaterial: input, salt: salt, info: info, outputByteCount: 32)
     }
 
-    /// The stored listing, or nil when there is none or it cannot be opened (another key, corruption).
-    func load() -> [PhotoItem]? {
+    /// The stored state, or nil when there is none or it cannot be opened (another key, corruption).
+    func load() -> RecentlyDeletedIdentities.Persisted? {
         guard let blob = try? Data(contentsOf: url),
             let box = try? AES.GCM.SealedBox(combined: blob),
             let plaintext = try? AES.GCM.open(box, using: key),
-            let records = try? JSONDecoder().decode([Record].self, from: plaintext)
+            let contents = try? JSONDecoder().decode(Contents.self, from: plaintext)
         else { return nil }
-        return records.map {
-            RecentlyDeletedItem.make(
-                volumeID: $0.volumeID,
-                nodeID: $0.nodeID,
-                captureTime: Date(timeIntervalSince1970: $0.captureTime),
-                isVideo: $0.isVideo)
-        }
+        return RecentlyDeletedIdentities.Persisted(
+            listing: contents.listing?.map(\.item),
+            trashedHere: contents.trashedHere.map {
+                .init(
+                    uid: PhotoUID(volumeID: $0.volumeID, nodeID: $0.nodeID), item: $0.item?.item,
+                    misses: $0.misses)
+            })
     }
 
     /// Best effort: a failed write only means that the next offline launch shows an older listing.
-    func save(_ items: [PhotoItem]) {
-        let records = items.map {
-            Record(
-                volumeID: $0.uid.volumeID,
-                nodeID: $0.uid.nodeID,
-                captureTime: $0.captureTime.timeIntervalSince1970,
-                isVideo: $0.isVideo)
-        }
-        guard let plaintext = try? JSONEncoder().encode(records),
+    func save(_ persisted: RecentlyDeletedIdentities.Persisted) {
+        let contents = Contents(
+            listing: persisted.listing?.map(Record.init),
+            trashedHere: persisted.trashedHere.map {
+                TrashedHereRecord(
+                    volumeID: $0.uid.volumeID, nodeID: $0.uid.nodeID, item: $0.item.map(Record.init),
+                    misses: $0.misses)
+            })
+        guard let plaintext = try? JSONEncoder().encode(contents),
             let sealed = try? AES.GCM.seal(plaintext, using: key).combined
         else { return }
         do {
@@ -116,8 +142,37 @@ struct RecentlyDeletedIdentities: Sendable, Equatable {
     /// photo trashed here still waits for a listing that shows it.
     private(set) var needsListing = true
 
+    /// What survives a relaunch: the last listing and the photos trashed here that no second listing settled.
+    struct Persisted: Sendable, Equatable {
+        struct TrashedHere: Sendable, Equatable {
+            let uid: PhotoUID
+            let item: PhotoItem?
+            let misses: Int
+        }
+
+        var listing: [PhotoItem]?
+        var trashedHere: [TrashedHere] = []
+    }
+
     init(listing: [PhotoItem]?) {
-        receivedListing = listing
+        self.init(persisted: Persisted(listing: listing))
+    }
+
+    init(persisted: Persisted) {
+        receivedListing = persisted.listing
+        for entry in persisted.trashedHere where !trashedHere.contains(entry.uid) {
+            trashedHere.append(entry.uid)
+            if let item = entry.item { trashedHereItems[entry.uid] = item }
+            if entry.misses > 0 { trashedHereMisses[entry.uid] = entry.misses }
+        }
+    }
+
+    var persisted: Persisted {
+        Persisted(
+            listing: receivedListing,
+            trashedHere: trashedHere.map {
+                .init(uid: $0, item: trashedHereItems[$0], misses: trashedHereMisses[$0] ?? 0)
+            })
     }
 
     /// What Recently Deleted shows and stores: the last listing and the photos trashed here that it lacks.
@@ -176,6 +231,7 @@ struct RecentlyDeletedIdentities: Sendable, Equatable {
     /// `items` holds what the library knew about the moved photos; a photo without one is registered only.
     mutating func trashed(_ uids: [PhotoUID], items: [PhotoItem]) {
         changesHere &+= 1
+        needsListing = true
         let moved = Set(uids)
         restoredHere.removeAll { moved.contains($0) }
         restoredListedByLibrary.subtract(moved)
