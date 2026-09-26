@@ -6,9 +6,7 @@
 </p>
 
 <p align="center">
-  <img src="Branding/readme/mac-library.png" alt="Encrypted Memories library on macOS" width="31%">
-  <img src="Branding/readme/iphone-library.png" alt="Encrypted Memories library on iPhone" width="31%">
-  <img src="Branding/readme/ipad-library.png" alt="Encrypted Memories library on iPad" width="31%">
+  <img src="Branding/readme/devices.png" alt="Encrypted Memories library on iPad, Mac, and iPhone">
 </p>
 
 <p align="center">
