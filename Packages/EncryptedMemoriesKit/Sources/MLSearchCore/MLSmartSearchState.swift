@@ -317,7 +317,10 @@ public struct MLSmartSearchStartSwitch: Sendable, Equatable {
     }
 
     public mutating func apply(_ snapshot: MLSmartSearchSnapshot) {
-        if snapshot.startIntent >= lastIntent { override = nil }
+        guard snapshot.startIntent >= lastIntent else { return }
+        override = nil
+        // A lifecycle that outlived an earlier controller counts on from its own number.
+        lastIntent = snapshot.startIntent
     }
 
     /// The lifecycle refused the switch-on outright.

@@ -719,6 +719,38 @@ import Testing
         }
     }
 
+    /// Answers each request by its script entry: fail, hold until the test fails it, or return the catalog
+    /// (also for every request after the script).
+    private actor ScriptedCatalogProvider: MLModelCatalogProvider {
+        enum Step { case fail, hold }
+        private let value: MLModelCatalog
+        private var script: [Step]
+        private var held: CheckedContinuation<Void, Never>?
+
+        init(_ value: MLModelCatalog, script: [Step]) {
+            self.value = value
+            self.script = script
+        }
+
+        var isHolding: Bool { held != nil }
+
+        func catalog() async throws -> MLModelCatalog {
+            guard !script.isEmpty else { return value }
+            switch script.removeFirst() {
+            case .fail:
+                throw FailingCatalogProvider.Failure()
+            case .hold:
+                await withCheckedContinuation { held = $0 }
+                throw FailingCatalogProvider.Failure()
+            }
+        }
+
+        func failHeldRequest() {
+            held?.resume()
+            held = nil
+        }
+    }
+
     /// Holds its first request until the test fails it; later requests return the catalog at once.
     private actor GatedFirstCatalogProvider: MLModelCatalogProvider {
         private let value: MLModelCatalog
@@ -1445,6 +1477,40 @@ import Testing
             Issue.record("a superseded catalog failure must not replace the ready state")
         }
         #expect(snapshot.startIntent == 3)
+    }
+
+    @Test func aSwitchOnResumedByRetryStopsWhenTheSwitchTurnsOff() async throws {
+        let payload = Data("model".utf8)
+        let (entry, url) = downloadableEntry(id: "model", payload: payload)
+        let catalogProvider = ScriptedCatalogProvider(MLModelCatalog(entries: [entry]), script: [.fail, .hold])
+        let harness = try makeHarness(
+            catalog: MLModelCatalog(entries: []),
+            payloads: [url: payload],
+            assets: [uid("asset")],
+            catalogProvider: catalogProvider
+        )
+        defer { try? FileManager.default.removeItem(at: harness.layout.rootDirectory) }
+
+        await harness.lifecycle.start()
+        await harness.lifecycle.enableRecommended(preferredLanguages: ["en"], intent: 1)
+        await harness.lifecycle.awaitRecommendedStart()
+        let retry = Task { await harness.lifecycle.retry() }
+        #expect(await waitUntil { await catalogProvider.isHolding })
+
+        // Off, then on again: the new start loads the list and enables Smart Search.
+        await harness.lifecycle.cancelRecommendedEnable(intent: 2)
+        await harness.lifecycle.enableRecommended(preferredLanguages: ["en"], intent: 3)
+        await harness.lifecycle.awaitRecommendedStart()
+        #expect(await waitForCompleteIndex(harness, total: 1))
+
+        // The request that Retry started fails late; it belongs to a stopped start and reports nothing.
+        await catalogProvider.failHeldRequest()
+        await retry.value
+        let snapshot = await harness.lifecycle.currentSnapshot()
+        #expect(snapshot.isEnabled)
+        if case .failed = snapshot.phase {
+            Issue.record("a stopped start's late catalog failure must not replace the ready state")
+        }
     }
 
     @Test func aRefusedSwitchOnStillReportsItsIntent() async throws {

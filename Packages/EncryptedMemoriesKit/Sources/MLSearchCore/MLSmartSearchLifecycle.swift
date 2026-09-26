@@ -737,7 +737,10 @@ public actor MLSmartSearchLifecycle {
             // Off: only the model list can fail, while Smart Search switches on or the person chooses a model.
             if failure.kind == .catalog {
                 if pendingRecommendedEnable != nil {
-                    await startRecommended(intent: startIntentSequence)
+                    // As the start's own task, so a newer intent can stop it like the first attempt.
+                    let intent = startIntentSequence
+                    recommendedStartTask = Task { await self.startRecommended(intent: intent) }
+                    await recommendedStartTask?.value
                 } else {
                     await loadModelChoices()
                 }
@@ -808,9 +811,11 @@ public actor MLSmartSearchLifecycle {
     /// only). The artifact is hashed, staged and installed with the same guarantees as a
     /// download.
     public func installDeveloperModel(from artifactDirectory: URL, for id: MLModelID) async {
+        // A journaled switch whose cleanup failed finishes first; its failure and Retry stay visible.
         guard !isShutDown,
             deps.allowsDeveloperModels,
             persistent.isEnabled,
+            persistent.pendingOperation == nil,
             let entry = catalog.entry(for: id)
         else { return }
         phase = .installing

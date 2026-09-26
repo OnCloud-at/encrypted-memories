@@ -637,6 +637,15 @@ import Testing
         #expect(!start.isStarting(snapshot(startIntent: 0)))
     }
 
+    @Test func aNewControllerCountsOnFromTheLifecycleNumber() {
+        var start = MLSmartSearchStartSwitch()
+        start.apply(snapshot(startIntent: 7))
+
+        let next = start.request(on: true)
+
+        #expect(next == 8, "a lifecycle that already applied intent 7 must accept the next tap")
+    }
+
     @Test func anEnabledSearchIsNoLongerStarting() {
         var start = MLSmartSearchStartSwitch()
         let on = start.request(on: true)
