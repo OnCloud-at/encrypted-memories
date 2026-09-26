@@ -125,18 +125,27 @@ public final class PhotoMapAnnotationLoader {
 
     public func annotation(for uid: PhotoUID) -> PhotoMapAnnotation? { annotationByUID[uid] }
 
-    public func frameToDenseCoreIfNeeded() {
-        guard !didFrame, let mapView, !index.coordinates.isEmpty,
-            let box = PhotoLocationFraming.denseBoundingBox(for: index.coordinates)
-        else { return }
+    /// Screen points kept free around the dense core when the map opens.
+    public nonisolated static let framingPadding: CGFloat = 80
+
+    /// The map area around the dense core of `coordinates`, which the map shows when it opens.
+    public nonisolated static func denseCoreMapRect(for coordinates: [PhotoCoordinate]) -> MKMapRect? {
+        guard let box = PhotoLocationFraming.denseBoundingBox(for: coordinates) else { return nil }
         let a = MKMapPoint(CLLocationCoordinate2D(latitude: box.minLatitude, longitude: box.minLongitude))
         let b = MKMapPoint(CLLocationCoordinate2D(latitude: box.maxLatitude, longitude: box.maxLongitude))
         let rect = MKMapRect(x: min(a.x, b.x), y: min(a.y, b.y), width: abs(a.x - b.x), height: abs(a.y - b.y))
-        guard !rect.isNull else { return }
+        return rect.isNull ? nil : rect
+    }
+
+    public func frameToDenseCoreIfNeeded() {
+        guard !didFrame, let mapView, !index.coordinates.isEmpty,
+            let rect = Self.denseCoreMapRect(for: index.coordinates)
+        else { return }
+        let inset = Self.framingPadding
         #if canImport(UIKit)
-            let padding = UIEdgeInsets(top: 80, left: 80, bottom: 80, right: 80)
+            let padding = UIEdgeInsets(top: inset, left: inset, bottom: inset, right: inset)
         #else
-            let padding = NSEdgeInsets(top: 80, left: 80, bottom: 80, right: 80)
+            let padding = NSEdgeInsets(top: inset, left: inset, bottom: inset, right: inset)
         #endif
         mapView.setVisibleMapRect(rect, edgePadding: padding, animated: false)
         didFrame = true

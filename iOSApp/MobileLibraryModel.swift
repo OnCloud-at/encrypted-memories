@@ -286,6 +286,8 @@ final class MobileLibraryModel {
 
     /// Encrypted GPS index shared with the Map tab. The per-account key protects it at rest.
     let locationIndex = PhotoLocationIndex()
+    /// Loads the area the map opens at into MapKit's cache, so the map draws at once.
+    @ObservationIgnored private let mapPrewarmer = PhotoMapPrewarmer()
     private let locationStore = PhotoLocationStore()
     private let locationCrawl = LocationCrawl()
     private var locationCrawlStarted = false
@@ -1554,6 +1556,10 @@ final class MobileLibraryModel {
                     locationStore.isCurrentSessionLease(locationLease)
                 else { return }
                 self.locationIndex.replaceAll(savedLocations)
+                self.mapPrewarmer.prewarm(
+                    coordinates: self.locationIndex.coordinates,
+                    viewportSize: UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+                        .first?.screen.bounds.size ?? .zero)
                 let client = try await ProtonDriveBackendFactory.makeFacade(
                     session: session,
                     store: store,
