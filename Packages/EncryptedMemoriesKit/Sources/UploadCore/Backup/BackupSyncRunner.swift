@@ -44,6 +44,9 @@ public actor BackupSyncRunner {
         public var uploadStallPollInterval: TimeInterval
         public var retry: BackupRetryPolicy
         public var throttle: BackupThrottlePolicy
+        /// How often a one-shot drain (`waitForScheduledRetries`, such as an album backup the user waits for) checks
+        /// a photo the camera still processes again. Library passes check it once, at the end of the camera window.
+        public var oneShotSourceRecheckInterval: TimeInterval
 
         public init(
             batchSize: Int = 32,
@@ -52,7 +55,8 @@ public actor BackupSyncRunner {
             uploadStallTimeout: TimeInterval = 180,
             uploadStallPollInterval: TimeInterval = 5,
             retry: BackupRetryPolicy = BackupRetryPolicy(),
-            throttle: BackupThrottlePolicy = BackupThrottlePolicy()
+            throttle: BackupThrottlePolicy = BackupThrottlePolicy(),
+            oneShotSourceRecheckInterval: TimeInterval = 30
         ) {
             self.batchSize = max(1, batchSize)
             self.staleActiveGrace = max(0, staleActiveGrace)
@@ -61,6 +65,7 @@ public actor BackupSyncRunner {
             self.uploadStallPollInterval = max(0.01, min(uploadStallPollInterval, uploadStallTimeout))
             self.retry = retry
             self.throttle = throttle
+            self.oneShotSourceRecheckInterval = max(0, oneShotSourceRecheckInterval)
         }
     }
 
@@ -81,6 +86,7 @@ public actor BackupSyncRunner {
     private let now: @Sendable () -> Date
 
     private var isRunning = false
+    private var drainMode: DrainMode = .waitForScheduledRetries
     private var stopRequested = false
     /// Consecutive items that could not even reserve disk space since the last one that did.
     /// Reset to 0 the moment any export succeeds; when it reaches a full wave the drain ends the
@@ -254,6 +260,7 @@ public actor BackupSyncRunner {
             return progress
         }
         isRunning = true
+        drainMode = mode
         stopRequested = false
         removedSources = []
         activeTransfers = [:]
@@ -1560,9 +1567,13 @@ public actor BackupSyncRunner {
         // Not a failure: the camera still processes the photo. Uploading now would send its preliminary
         // version and then the finished one again. The row waits, without an attempt, until the end of the
         // camera's window: the platform's change notification enqueues the finished photo as a new revision
-        // sooner, so no timer re-checks it before that date. A known state keeps older builds able to read it.
+        // sooner, so no timer re-checks it before that date. Only a one-shot drain that the user waits for checks
+        // again sooner. A known state keeps older builds able to read the row.
         if case UploadError.sourceNotReady(_, let until) = error {
-            let eligibleAt = max(until, now())
+            let recheck =
+                drainMode == .waitForScheduledRetries
+                ? min(until, now().addingTimeInterval(configuration.oneShotSourceRecheckInterval)) : until
+            let eligibleAt = max(recheck, now())
             guard
                 queue.updateState(
                     source: entry.source, revision: entry.revision,

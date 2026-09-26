@@ -85,6 +85,24 @@ final class PhotoKitStagingSinkTests: XCTestCase {
         XCTAssertTrue(files().isEmpty)
     }
 
+    func testConcurrentStagingSharesHalfTheBudgetAndLeavesTheRestForUploads() throws {
+        let tempStore = store(maximumBytes: 100)
+        let first = PhotoKitStagingSink(tempStore: tempStore, filename: "IMG_8.MOV")
+        let second = PhotoKitStagingSink(tempStore: tempStore, filename: "IMG_9.MOV")
+        first.receive(Data(count: 30))
+        second.receive(Data(count: 30))
+
+        XCTAssertTrue(first.isStaging)
+        XCTAssertFalse(second.isStaging, "two staged files together may not exceed half of the budget")
+
+        // A photo already selected for upload still gets the other half.
+        let export = try tempStore.reserve(filename: "IMG_10.HEIC", expectedBytes: 60)
+        try tempStore.recordWrite(to: export, byteCount: 60)
+        tempStore.discard(export)
+        _ = first.finish()
+        _ = second.finish()
+    }
+
     func testLowDiskSpaceDropsTheFileButStillHashesEveryByte() {
         let tempStore = store(freeBytes: 4)
         let chunks = [Data("12345".utf8)]

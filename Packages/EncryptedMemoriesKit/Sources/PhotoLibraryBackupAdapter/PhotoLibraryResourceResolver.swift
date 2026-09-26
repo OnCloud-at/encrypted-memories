@@ -420,6 +420,8 @@ public struct PhotoLibraryResourceResolver: BackupResourceResolving {
         onProgress: @escaping @Sendable (Double) -> Void
     ) async throws -> ExportResult {
         if let export = staged.take() {
+            // Counts how often a staged original is reused, to check on a device that one download is the rule.
+            logger.notice("[Backup] staged original reused=\(sourceUnchanged, privacy: .public)")
             if sourceUnchanged {
                 onProgress(1)
                 return export

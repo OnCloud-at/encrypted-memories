@@ -82,6 +82,13 @@ struct RecentlyDeletedListingStore: Sendable {
 /// listing at once, so their thumbnails survive a relaunch before the next listing shows them. Restored photos
 /// stay registered until the library lists them again, so their thumbnails never lose their place in between.
 struct RecentlyDeletedIdentities: Sendable, Equatable {
+    /// Taken when a listing starts. A listing is stale when a trash change here finished while it ran, or when a
+    /// listing that started later was already applied; a stale listing changes nothing.
+    struct ListingTicket: Sendable, Equatable {
+        fileprivate let start: UInt64
+        fileprivate let changes: UInt64
+    }
+
     /// The last trash listing that the server returned.
     private var receivedListing: [PhotoItem]?
     /// Photos trashed here that no listing has shown yet, oldest request first, with the items the library knew.
@@ -91,6 +98,9 @@ struct RecentlyDeletedIdentities: Sendable, Equatable {
     /// then the library that lists it was published.
     private var restoredHere: [PhotoUID] = []
     private var restoredListedByLibrary: Set<PhotoUID> = []
+    private var listingStarts: UInt64 = 0
+    private var appliedListingStart: UInt64 = 0
+    private var changesHere: UInt64 = 0
 
     init(listing: [PhotoItem]?) {
         receivedListing = listing
@@ -115,15 +125,25 @@ struct RecentlyDeletedIdentities: Sendable, Equatable {
 
     var hasRestoredPhotos: Bool { !restoredHere.isEmpty }
 
-    mutating func received(_ listing: [PhotoItem]) {
+    mutating func beginListing() -> ListingTicket {
+        listingStarts &+= 1
+        return ListingTicket(start: listingStarts, changes: changesHere)
+    }
+
+    /// Applies a listing unless it is stale. Returns whether it applied.
+    mutating func received(_ listing: [PhotoItem], ticket: ListingTicket) -> Bool {
+        guard ticket.changes == changesHere, ticket.start > appliedListingStart else { return false }
+        appliedListingStart = ticket.start
         receivedListing = listing
         let listed = Set(listing.map(\.uid))
         trashedHere.removeAll { listed.contains($0) }
         trashedHereItems = trashedHereItems.filter { !listed.contains($0.key) }
+        return true
     }
 
     /// `items` holds what the library knew about the moved photos; a photo without one is registered only.
     mutating func trashed(_ uids: [PhotoUID], items: [PhotoItem]) {
+        changesHere &+= 1
         let moved = Set(uids)
         restoredHere.removeAll { moved.contains($0) }
         restoredListedByLibrary.subtract(moved)
@@ -133,6 +153,7 @@ struct RecentlyDeletedIdentities: Sendable, Equatable {
     }
 
     mutating func restored(_ uids: [PhotoUID]) {
+        changesHere &+= 1
         let moved = Set(uids)
         receivedListing?.removeAll { moved.contains($0.uid) }
         trashedHere.removeAll { moved.contains($0) }
@@ -144,6 +165,7 @@ struct RecentlyDeletedIdentities: Sendable, Equatable {
 
     /// The trash is empty now; restored photos keep their thumbnails until the library lists them again.
     mutating func emptied() {
+        changesHere &+= 1
         receivedListing = []
         trashedHere = []
         trashedHereItems = [:]

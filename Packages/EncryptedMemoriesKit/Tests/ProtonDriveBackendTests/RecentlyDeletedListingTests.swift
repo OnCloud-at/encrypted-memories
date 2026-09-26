@@ -74,11 +74,11 @@ struct RecentlyDeletedListingTests {
         #expect(identities.listing == [listed, trashedHere], "a relaunch must keep the photo trashed here")
 
         // A listing that lags behind the trash request must not release the new photos.
-        identities.received([listed])
+        receive([listed], into: &identities)
         #expect(identities.ordered == [unknownToTheLibrary, trashedHere.uid, listed.uid])
         #expect(identities.listing == [listed, trashedHere])
 
-        identities.received([listed, trashedHere])
+        receive([listed, trashedHere], into: &identities)
         #expect(identities.ordered == [unknownToTheLibrary, trashedHere.uid, listed.uid])
         #expect(identities.listing == [listed, trashedHere])
     }
@@ -89,7 +89,7 @@ struct RecentlyDeletedListingTests {
 
         identities.restored([restored.uid])
         #expect(identities.listing == [], "a restored photo leaves the stored listing at once")
-        identities.received([])
+        receive([], into: &identities)
         #expect(identities.ordered == [restored.uid])
 
         // A refresh that does not list it yet keeps it; the refresh that lists it only marks it, because the
@@ -103,6 +103,39 @@ struct RecentlyDeletedListingTests {
         #expect(listedBefore)
         #expect(identities.ordered.isEmpty)
         #expect(!identities.hasRestoredPhotos)
+    }
+
+    @Test func aListingThatATrashChangeOvertookChangesNothing() {
+        let listed = Self.item("listed", at: 1)
+        var identities = RecentlyDeletedIdentities(listing: [listed])
+
+        let ticket = identities.beginListing()
+        identities.emptied()
+        let applied = identities.received([listed], ticket: ticket)
+
+        #expect(!applied, "emptied photos must not come back")
+        #expect(identities.listing == [])
+        #expect(identities.ordered.isEmpty)
+    }
+
+    @Test func aListingThatStartedEarlierButFinishedLaterChangesNothing() {
+        let trashedElsewhere = Self.item("trashed-elsewhere", at: 2)
+        var identities = RecentlyDeletedIdentities(listing: [])
+
+        let slow = identities.beginListing()
+        let fast = identities.beginListing()
+        let fastApplied = identities.received([trashedElsewhere], ticket: fast)
+        let slowApplied = identities.received([], ticket: slow)
+
+        #expect(fastApplied)
+        #expect(!slowApplied, "an older listing must not release a photo that a newer one registered")
+        #expect(identities.ordered == [trashedElsewhere.uid])
+    }
+
+    private func receive(_ listing: [PhotoItem], into identities: inout RecentlyDeletedIdentities) {
+        let ticket = identities.beginListing()
+        let applied = identities.received(listing, ticket: ticket)
+        #expect(applied)
     }
 
     @Test func emptyingTheTrashReleasesEveryTrashedPhoto() {

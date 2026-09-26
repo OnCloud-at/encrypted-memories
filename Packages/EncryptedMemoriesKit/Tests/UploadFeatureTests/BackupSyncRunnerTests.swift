@@ -948,16 +948,18 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertEqual(resolver.resolveCount(for: entry.source.identifier), 2)
     }
 
-    func testAWaitingBackupSleepsOnceUntilTheCameraWindowEnds() async throws {
+    func testAnAlbumBackupTheUserWaitsForChecksAWaitingPhotoEvery30Seconds() async throws {
         let entry = seedEntry("processing-wait.heic")
-        resolver.set(.notReady(times: 1, until: clock.now.addingTimeInterval(600)), for: entry.source.identifier)
+        resolver.set(.notReady(times: 2, until: clock.now.addingTimeInterval(600)), for: entry.source.identifier)
 
+        // A one-shot drain must not sleep through the camera's whole window once the finished photo exists.
         let progress = await makeRunner().runUntilDrained()
 
         XCTAssertEqual(state(of: entry), .completed)
         XCTAssertEqual(progress.failed, 0)
-        XCTAssertEqual(clock.sleeps.count, 1, "no 30-second polling")
-        XCTAssertEqual(try XCTUnwrap(clock.sleeps.first), 600, accuracy: 0.001)
+        XCTAssertEqual(clock.sleeps.count, 2)
+        XCTAssertEqual(try XCTUnwrap(clock.sleeps.first), 30, accuracy: 0.001)
+        XCTAssertEqual(resolver.resolveCount(for: entry.source.identifier), 3)
     }
 
     func testBackUpNowChecksAWaitingPhotoAgain() async throws {
