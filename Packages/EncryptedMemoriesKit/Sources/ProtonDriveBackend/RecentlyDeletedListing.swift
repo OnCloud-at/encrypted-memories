@@ -112,6 +112,7 @@ struct RecentlyDeletedIdentities: Sendable, Equatable {
 
     mutating func restored(_ uids: [PhotoUID]) {
         let moved = Set(uids)
+        listing?.removeAll { moved.contains($0.uid) }
         trashedHere.removeAll { moved.contains($0) }
         restoredHere.removeAll { moved.contains($0) }
         restoredHere.append(contentsOf: uids)

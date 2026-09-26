@@ -64,6 +64,9 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     private var hasListedTrash = false
     /// Set by a timeline save that removed photos; a trash listing then follows the load.
     private var timelineLostPhotos = false
+    /// Counts completed trash, restore, and Empty Trash requests. A listing that a request overtook is stale:
+    /// it must not store or register photos that the request already moved.
+    private var trashMutationGeneration: UInt64 = 0
     /// Where the per-account upload-identity manifest lives (next to `library-v1.sqlite`, so the
     /// sign-out purge covers it) and the platform SQLite tuning it opens with. Module-internal:
     /// the facade derives the account data directory + store policy for the backup sync stores
@@ -1274,6 +1277,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
             let root = try await bridge.resolvePhotosRoot()
             try await bridge.driveSession.trash(volumeID: root.volumeID, linkIDs: uids.map(\.nodeID))
             // The next library refresh drops these photos; they keep their thumbnails in Recently Deleted.
+            bridge.trashMutationGeneration &+= 1
             bridge.recentlyDeleted.trashed(uids)
             await bridge.reportRecentlyDeleted()
             // Debug-gated end-to-end verification: the moved links must actually surface in the volume trash
@@ -1297,7 +1301,9 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
             let root = try await bridge.resolvePhotosRoot()
             try await bridge.driveSession.restore(volumeID: root.volumeID, linkIDs: uids.map(\.nodeID))
             // A listing can drop these photos before the library lists them again; their thumbnails stay.
+            bridge.trashMutationGeneration &+= 1
             bridge.recentlyDeleted.restored(uids)
+            if let listing = bridge.recentlyDeleted.listing { bridge.recentlyDeletedStore.save(listing) }
             await bridge.reportRecentlyDeleted()
         }
     }
@@ -1310,6 +1316,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
             } cancel: { [photosClient = bridge.photosClient] cancellationToken in
                 try? await photosClient.cancelEmptyTrash(cancellationToken: cancellationToken)
             }
+            bridge.trashMutationGeneration &+= 1
             bridge.recentlyDeleted.emptied()
             bridge.recentlyDeletedStore.save([])
             await bridge.reportRecentlyDeleted()
@@ -1326,6 +1333,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
 
     /// Lists the volume trash, stores the listing, and registers its photos for their thumbnails.
     private func listTrash() async throws -> [PhotoItem] {
+        let generation = trashMutationGeneration
         let root = try await resolvePhotosRoot()
         let links = try await driveSession.listTrash(volumeID: root.volumeID)
             .filter { $0.type != 1 && $0.type != 3 }  // drop folders + albums; keep files/unknown
@@ -1341,6 +1349,9 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                     isVideo: l.mimeType?.hasPrefix("video/") == true)
             }
             .sorted(by: TimelineOrder.areInIncreasingOrder)
+        // A trash, restore, or Empty Trash request finished meanwhile and already updated the state. The route
+        // hides photos it moved; the next listing stores the current trash.
+        guard generation == trashMutationGeneration else { return photos }
         hasListedTrash = true
         if recentlyDeleted.listing != photos { recentlyDeletedStore.save(photos) }
         recentlyDeleted.received(photos)

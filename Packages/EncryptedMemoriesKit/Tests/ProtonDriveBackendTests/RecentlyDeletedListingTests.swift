@@ -85,6 +85,8 @@ struct RecentlyDeletedListingTests {
         var identities = RecentlyDeletedIdentities(listing: [restored])
 
         identities.restored([restored.uid])
+        #expect(identities.listing == [], "a restored photo leaves the stored listing at once")
+
         identities.received([])
 
         #expect(identities.ordered == [restored.uid])
