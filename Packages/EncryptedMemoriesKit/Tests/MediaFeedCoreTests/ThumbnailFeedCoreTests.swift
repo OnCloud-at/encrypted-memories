@@ -2923,7 +2923,9 @@ struct ThumbnailFeedCoreTests {
         #expect(status.unfetchableCount == 0, "an authorization change during the download is not the photo's fault")
         #expect(status.failedUnreported == 0, "and no transport problem either")
 
-        // The photo is still in the library: the next request loads it in the same session.
+        // The photo is still in the library: the crawl requests it again without any visible demand.
+        try await Self.waitUntil { await loader.requestCount() == 2 }
+        #expect(await loader.requestCount() == 2)
         #expect(await feed.decoded(for: uid) != nil)
     }
 

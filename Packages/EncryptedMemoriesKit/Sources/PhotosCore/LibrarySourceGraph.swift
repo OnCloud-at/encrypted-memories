@@ -1272,6 +1272,11 @@ public final class LibrarySourceGraph {
     /// The same route as `lease`, issued from the graph as it is now: the same photo, capability, source, and
     /// relationship owner, or the same Recently Deleted registration. Nil when the graph no longer authorizes that
     /// route. A delivery fence uses it for a result that arrives after an inventory refresh changed any item.
+    ///
+    /// Renewal authorizes by the current state only. It deliberately accepts a route that was removed and added
+    /// again, or a source reactivated after access loss, while the result was in flight, because the graph
+    /// authorizes that route now. Use it only for reads whose bytes depend on the photo identity alone, such as
+    /// thumbnails; a consumer that needs the remove-then-readd fence must keep checking `isCurrent(_:)`.
     public func renewed(_ lease: SourceAccessLease) -> SourceAccessLease? {
         guard lease.epoch == epoch else { return nil }
         let includeExcludedSources = !lease.requiresInclusion

@@ -375,6 +375,9 @@ public actor ThumbnailFeedCore {
     private var prefetchFailedItemError = 0
     private var prefetchFailedUnreported = 0
     private var prefetchFailedWithheld = 0
+    /// Crawl requests per photo withheld after an authorization change; bounded so churn cannot loop forever.
+    private var withheldRequeues: [PhotoUID: Int] = [:]
+    private static let maxWithheldRequeues = 3
     private var prefetchDiskHit = 0
     private var prefetchDownloadStarted = 0
     private var prefetchDownloadCompleted = 0
@@ -604,7 +607,11 @@ public actor ThumbnailFeedCore {
             readAllowed(uid)
         else { return nil }
         guard let data = buffer.value else {
-            if result.itemErrors[uid] != nil { unfetchable.insert(uid) }
+            if result.itemErrors[uid] != nil {
+                unfetchable.insert(uid)
+            } else if result.withheldUIDs.contains(uid) {
+                recordError("thumbnail withheld for \(Self.key(uid)) after an authorization change")
+            }
             return nil
         }
         let maxPixels = configuration.targetPixels
@@ -795,6 +802,17 @@ public actor ThumbnailFeedCore {
         trimPriorityQueueIfNeeded()
         startWorkers()
         return true
+    }
+
+    /// Requests withheld photos again at crawl priority. The next request issues a fresh authorization; a photo that
+    /// left the library is then refused, or the feed no longer authorizes it and the request is dropped.
+    private func requeueWithheld(_ uids: [PhotoUID]) {
+        for uid in uids {
+            let attempts = withheldRequeues[uid, default: 0]
+            guard attempts < Self.maxWithheldRequeues else { continue }
+            withheldRequeues[uid] = attempts + 1
+            _ = requestPriority(uid, priority: .idleLibraryCrawl)
+        }
     }
 
     /// Replace the queued network demand owned by the live grid viewport.
@@ -1303,6 +1321,8 @@ public actor ThumbnailFeedCore {
             if let reason = result.itemErrors[uid] {
                 unfetchable.insert(uid)
                 recordError("thumbnail refused for \(Self.key(uid)): \(reason)")
+            } else if result.withheldUIDs.contains(uid) {
+                recordError("thumbnail withheld for \(Self.key(uid)) after an authorization change")
             } else if let reason = result.batchError {
                 recordError("thumbnail fetch failed for \(Self.key(uid)): \(reason)")
             }
@@ -1418,6 +1438,7 @@ public actor ThumbnailFeedCore {
         sequentialIndex = 0
         diskPresence.beginTracking(uids, reporting: reportingUIDs, knownPresent: [])
         unfetchable.removeAll()  // a fresh crawl retries backend-refused items exactly once
+        withheldRequeues.removeAll()
         lastRepassPercent = -1.0
         coverageScanCursor = 0
         coverageSettled = false
@@ -1676,6 +1697,7 @@ public actor ThumbnailFeedCore {
             checkpointHints.removeAll(keepingCapacity: true)
             pendingCheckpointUpdates.removeAll(keepingCapacity: true)
             unfetchable.removeAll()
+            withheldRequeues.removeAll()
             visibleDiskDemand.cancelAll()
             diskProbeBatchesInFlight = 0
             sequential = []
@@ -2037,17 +2059,18 @@ public actor ThumbnailFeedCore {
                         recordError(
                             "thumbnail refused for \(refused.count) item(s), e.g. \(Self.key(first)): \(reason)")
                     }
-                    // Withheld after an authorization change: not the photo's fault. The coverage pass at the end of
-                    // the crawl and every visible request load it again.
+                    // Withheld after an authorization change: not the photo's fault. The crawl requests it again with
+                    // a fresh authorization, a bounded number of times; a visible request always does.
                     let withheld = undelivered.filter {
                         result.itemErrors[$0] == nil && result.withheldUIDs.contains($0)
                     }
                     prefetchFailedWithheld += withheld.filter(isReportedForPrefetch).count
                     if let first = withheld.first {
                         recordError(
-                            "thumbnail withheld for \(withheld.count) item(s) after an authorization change, e.g. \(Self.key(first)); retried"
+                            "thumbnail withheld for \(withheld.count) item(s) after an authorization change, e.g. \(Self.key(first))"
                         )
                     }
+                    requeueWithheld(withheld)
                     let unreported = undelivered.count - refused.count - withheld.count
                     let reportedUnreported = reportedUndelivered.filter {
                         result.itemErrors[$0] == nil && !result.withheldUIDs.contains($0)
