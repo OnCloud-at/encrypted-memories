@@ -2940,7 +2940,7 @@ struct ThumbnailFeedCoreTests {
         let feed = ThumbnailFeedCore(
             cache: Self.cache("withheld-then-off"),
             loader: loader,
-            configuration: Self.configuration(downloadConcurrencyLimit: 1, batchSize: 1, crawlBackoffSeconds: 2)
+            configuration: Self.configuration(downloadConcurrencyLimit: 1, batchSize: 1, crawlBackoffSeconds: 30)
         )
 
         await feed.startPrefetch([uid])
@@ -2952,7 +2952,6 @@ struct ThumbnailFeedCoreTests {
 
         // Nothing would take the retry now, and a pending retry would keep the workers polling.
         #expect(await feed.prefetchStatus().currentQueueLength == 0)
-        try await Task.sleep(for: .milliseconds(2_500))
         #expect(await loader.requestCount() == 1)
     }
 

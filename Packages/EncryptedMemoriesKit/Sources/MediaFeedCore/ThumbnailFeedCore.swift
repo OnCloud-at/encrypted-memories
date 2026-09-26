@@ -810,9 +810,9 @@ public actor ThumbnailFeedCore {
     /// Hands withheld photos back to the crawl. The next request issues a fresh authorization; a photo that left
     /// the library is then refused, or the feed no longer authorizes it and the crawl skips it.
     private func requeueWithheld(_ uids: [PhotoUID]) {
-        // Without a crawl, nothing would take them; a visible request loads them instead.
+        // Without a crawl, nothing would take them; the next request for the photo loads it. The apps keep the crawl on.
         guard prefetchEnabled else { return }
-        for uid in uids where !uid.isLocalPending && readAllowed(uid) {
+        for uid in uids where !uid.isLocalPending && readAllowed(uid) && !withheldRetry.contains(uid) {
             let attempts = withheldRequeues[uid, default: 0]
             guard attempts < Self.maxWithheldRequeues else {
                 if attempts == Self.maxWithheldRequeues {
