@@ -461,3 +461,22 @@ struct SharedLibraryScopeSafetyTests {
         #expect(damaged.compacted() == damaged)
     }
 }
+
+@Suite("Shared library date and counter edges")
+struct SharedLibraryEdgeTests {
+    @Test(arguments: [-86_400.5, 0.000_001, 1_790_000_000.987_654, 4_102_444_800.25, 1e15, -1e-7])
+    func realisticStartDatesRoundTripExactly(seconds: Double) throws {
+        var mac = SharedLibraryJournal(deviceID: "mac")
+        let start = Date(timeIntervalSince1970: seconds)
+        try mac.record(.settings(SharedLibrarySettings(isEnabled: true, scope: .since(start))), at: Date())
+        let reread = try JSONDecoder().decode(SharedLibraryJournal.self, from: JSONEncoder().encode(mac))
+        #expect(SharedLibraryState.merged([reread]).settings.scope == .since(start))
+    }
+
+    @Test(arguments: ["-1", "1.5", "null", "true", "[1]"])
+    func everyDamagedCounterMakesTheJournalReadOnly(last: String) throws {
+        let json = #"{"format":1,"device":"mac","entries":[],"last":\#(last)}"#
+        let decoded = try JSONDecoder().decode(SharedLibraryJournal.self, from: Data(json.utf8))
+        #expect(!decoded.isAppendable)
+    }
+}
