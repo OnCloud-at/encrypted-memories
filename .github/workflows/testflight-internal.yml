@@ -607,7 +607,7 @@ jobs:
             release_fail credentials \
               "Provisioning profile '$PROFILE_NAME' expired on $expiration." \
               "Renew the provisioning profile and update the App Store Connect profile configuration."
-          elif (( expiration_epoch <= now_epoch + 14 * 86_400 )); then
+          elif (( expiration_epoch <= now_epoch + 14 * 86400 )); then
             echo "::warning title=Provisioning profile expires soon::Profile '$PROFILE_NAME' expires on $expiration; renew it within 14 days."
           fi
 
