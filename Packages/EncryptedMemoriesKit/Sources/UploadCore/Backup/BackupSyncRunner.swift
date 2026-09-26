@@ -1856,7 +1856,10 @@ public actor BackupSyncRunner {
     /// Errors that reflect a temporary lack of disk space rather than a bad item. These are
     /// retried indefinitely (with backoff) and never parked as `.failed`.
     private static func isTransientResourcePressure(_ error: Error) -> Bool {
-        (error as? BackupTempFileStore.BackupTempFileError) == .diskBudgetExceeded
+        switch error as? BackupTempFileStore.BackupTempFileError {
+        case .diskBudgetExceeded, .needsFreeSpace: true
+        case nil: false
+        }
     }
 
     /// How long an item that did not fit into the Proton account waits before the next automatic check.

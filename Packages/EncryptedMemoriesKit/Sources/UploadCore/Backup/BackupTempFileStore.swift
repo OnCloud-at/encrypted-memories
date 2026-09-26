@@ -16,11 +16,16 @@ import PhotosCore
 public final class BackupTempFileStore: @unchecked Sendable {
     public enum BackupTempFileError: Error, Equatable, LocalizedError {
         case diskBudgetExceeded
+        /// The device needs about `requiredBytes` of free space for this file, for example a large video that must
+        /// be downloaded from iCloud and copied for its upload.
+        case needsFreeSpace(requiredBytes: Int64)
 
         public var errorDescription: String? {
             switch self {
             case .diskBudgetExceeded:
                 return L10n.string("backup.error_low_space")
+            case .needsFreeSpace(let requiredBytes):
+                return L10n.string("backup.error_needs_free_space \(L10n.fileSize(requiredBytes))")
             }
         }
     }
@@ -132,6 +137,17 @@ public final class BackupTempFileStore: @unchecked Sendable {
                 isStaged: staging
             )
             return url
+        }
+    }
+
+    /// Throws `needsFreeSpace` unless the volume has room for `bytes` more on top of the reserved free space. Callers
+    /// check before a large download or copy, so a file that cannot fit fails at once with the space it needs.
+    public func ensureFreeSpace(forAdditionalBytes bytes: Int64) throws {
+        try lock.withLock {
+            let required = addingClamped(minimumFreeBytes, addingClamped(max(0, bytes), reservedUnwrittenBytesLocked()))
+            if let free = sampledFreeBytesLocked(forceRefresh: true), free < required {
+                throw BackupTempFileError.needsFreeSpace(requiredBytes: required)
+            }
         }
     }
 

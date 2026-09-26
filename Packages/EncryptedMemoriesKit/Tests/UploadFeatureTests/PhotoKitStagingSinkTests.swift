@@ -103,6 +103,37 @@ final class PhotoKitStagingSinkTests: XCTestCase {
         _ = second.finish()
     }
 
+    func testALargeOriginalOfKnownSizeStagesInTheLargeFileSlotAndDownloadsOnce() throws {
+        let tempStore = store(maximumBytes: 100)
+        let chunks = [Data(count: 120), Data(count: 120)]
+        let sink = PhotoKitStagingSink(tempStore: tempStore, filename: "PRORES.MOV", expectedBytes: 240)
+        XCTAssertTrue(sink.isStaging, "a known size above half the budget still stages, exclusively")
+        chunks.forEach(sink.receive)
+
+        let result = sink.finish()
+
+        let staged = try XCTUnwrap(result.stagedURL)
+        XCTAssertEqual(try Data(contentsOf: staged).count, 240)
+        XCTAssertEqual(result.sha1Digest, digest(of: chunks))
+        // While it holds the large-file slot, nothing else stages beside it.
+        XCTAssertFalse(PhotoKitStagingSink(tempStore: tempStore, filename: "OTHER.HEIC").isStaging)
+        tempStore.discard(staged)
+    }
+
+    func testALargeOriginalThatGrowsBeyondItsKnownSizeIsOnlyHashed() {
+        let tempStore = store(maximumBytes: 100)
+        let chunks = [Data(count: 150), Data(count: 150)]
+        let sink = PhotoKitStagingSink(tempStore: tempStore, filename: "CHANGED.MOV", expectedBytes: 200)
+        chunks.forEach(sink.receive)
+
+        let result = sink.finish()
+
+        XCTAssertNil(result.stagedURL, "more bytes than announced means the asset changed; export it again")
+        XCTAssertEqual(result.byteCount, 300)
+        XCTAssertEqual(result.sha1Digest, digest(of: chunks))
+        XCTAssertTrue(files().isEmpty)
+    }
+
     func testLowDiskSpaceDropsTheFileButStillHashesEveryByte() {
         let tempStore = store(freeBytes: 4)
         let chunks = [Data("12345".utf8)]

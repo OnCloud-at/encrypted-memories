@@ -384,7 +384,13 @@ public struct PhotoLibraryResourceResolver: BackupResourceResolving {
             // gets one networked pass, which reports the definitive error.
         }
 
-        let sink = PhotoKitStagingSink(tempStore: tempStore, filename: filename)
+        // Photos keeps its own copy of an original it downloads, and the upload needs a second one. With the size
+        // known before the download, a file that cannot fit fails at once instead of after gigabytes.
+        let knownSize = Self.knownSize(of: resource)
+        if let knownSize {
+            try tempStore.ensureFreeSpace(forAdditionalBytes: knownSize * 2)
+        }
+        let sink = PhotoKitStagingSink(tempStore: tempStore, filename: filename, expectedBytes: knownSize)
         do {
             try await Self.requestData(
                 for: resource, networkAccessAllowed: true, progressGate: progressGate
@@ -429,6 +435,8 @@ public struct PhotoLibraryResourceResolver: BackupResourceResolving {
             // The photo changed after its identity pass: read it again, so the runner compares current bytes.
             tempStore.discard(export.url)
         }
+        // A file that cannot fit fails at once with the space it needs, not after part of the copy.
+        try tempStore.ensureFreeSpace(forAdditionalBytes: expectedBytes)
         let partialURL = try tempStore.reserve(filename: uploadFilename, expectedBytes: expectedBytes)
         do {
             guard FileManager.default.createFile(atPath: partialURL.path, contents: nil) else {
@@ -495,6 +503,14 @@ public struct PhotoLibraryResourceResolver: BackupResourceResolving {
                 liveness.complete(error: error)
             }
         }
+    }
+
+    /// The size PhotoKit reports before a download (iOS and macOS 27); nil before that or while unknown.
+    static func knownSize(of resource: PHAssetResource) -> Int64? {
+        if #available(iOS 27, macOS 27, *), let size = resource.dataSize, size > 0 {
+            return Int64(size)
+        }
+        return nil
     }
 
     /// Converts stable PhotoKit failure codes into Core upload categories. Network and storage conditions stay

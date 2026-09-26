@@ -5,7 +5,9 @@ import UploadCore
 /// temp store, so the upload reuses the file and the original downloads only once. When the temp store or the disk
 /// refuses a chunk, the sink drops the partial file and only hashes the rest; the upload then exports the original
 /// again, as before. The store gives all staged files together at most half of its budget, so large iCloud videos
-/// never starve the exports of photos already selected for upload.
+/// never starve the exports of photos already selected for upload. An original whose size PhotoKit reports up
+/// front and that exceeds that share is staged like an export instead: with its exact size, in the store's single
+/// slot for large files, so even a 20 GB video downloads only once.
 ///
 /// Not synchronized: the PhotoKit liveness guard serializes `receive`, and `finish`/`abandon` run after the request ended.
 final class PhotoKitStagingSink: @unchecked Sendable {
@@ -22,10 +24,16 @@ final class PhotoKitStagingSink: @unchecked Sendable {
     private var partialURL: URL?
     private var handle: FileHandle?
 
-    init(tempStore: BackupTempFileStore, filename: String) {
+    init(tempStore: BackupTempFileStore, filename: String, expectedBytes: Int64? = nil) {
         self.tempStore = tempStore
-        // PhotoKit exposes no size before the download, so the reservation starts empty and each chunk is accounted.
-        guard let url = try? tempStore.reserve(filename: filename, expectedBytes: 0, staging: true) else { return }
+        let reserved: URL?
+        if let expectedBytes, expectedBytes > tempStore.maximumBytes / 2 {
+            reserved = try? tempStore.reserve(filename: filename, expectedBytes: expectedBytes)
+        } else {
+            // Without a known size the reservation starts empty and each chunk is accounted.
+            reserved = try? tempStore.reserve(filename: filename, expectedBytes: 0, staging: true)
+        }
+        guard let url = reserved else { return }
         guard FileManager.default.createFile(atPath: url.path, contents: nil),
             let handle = try? FileHandle(forWritingTo: url)
         else {

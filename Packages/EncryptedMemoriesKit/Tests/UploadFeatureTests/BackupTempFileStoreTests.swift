@@ -56,6 +56,20 @@ final class BackupTempFileStoreTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: partial.path))
     }
 
+    func testALargeFileThatCannotFitReportsTheSpaceItNeeds() throws {
+        let probe = CapacityProbe(10_000)
+        let store = BackupTempFileStore(
+            directory: directory, maximumBytes: 1_000, minimumFreeBytes: 500,
+            availableCapacity: { probe.read($0) }, now: { Date() })
+
+        XCTAssertNoThrow(try store.ensureFreeSpace(forAdditionalBytes: 9_000))
+        XCTAssertThrowsError(try store.ensureFreeSpace(forAdditionalBytes: 20_000)) { error in
+            XCTAssertEqual(
+                error as? BackupTempFileStore.BackupTempFileError, .needsFreeSpace(requiredBytes: 20_500),
+                "the message names the free space the file needs")
+        }
+    }
+
     func testSweepClearsPartialsAndCommittedFiles() throws {
         let store = BackupTempFileStore(directory: directory)
         let partial = try store.reserve(filename: "a.jpg", expectedBytes: 1)

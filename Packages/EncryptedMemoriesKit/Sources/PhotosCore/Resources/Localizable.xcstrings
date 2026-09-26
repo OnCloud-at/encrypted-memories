@@ -740,6 +740,12 @@
         "de": { "stringUnit": { "state": "translated", "value": "Die Verbindung wurde unterbrochen. Das Backup versucht es erneut, sobald es möglich ist." } }
       }
     },
+    "backup.error_needs_free_space %@": {
+      "localizations": {
+        "de": { "stringUnit": { "state": "translated", "value": "Dafür werden etwa %@ freier Speicher auf diesem Gerät benötigt." } },
+        "en": { "stringUnit": { "state": "translated", "value": "This needs about %@ of free space on this device." } }
+      }
+    },
     "backup.issue_account_storage": {
       "extractionState": "manual",
       "localizations": {
