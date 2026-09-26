@@ -2934,6 +2934,28 @@ struct ThumbnailFeedCoreTests {
         #expect(cache.diskData(for: withheld) != nil, "the crawl stored it without any visible request")
     }
 
+    @Test func turningPrefetchOffDropsPendingWithheldRetries() async throws {
+        let uid = Self.uid("withheld-then-off")
+        let loader = RecordingLoader(payloads: [uid: Self.pngData(width: 8, height: 8)], withheldOnce: [uid])
+        let feed = ThumbnailFeedCore(
+            cache: Self.cache("withheld-then-off"),
+            loader: loader,
+            configuration: Self.configuration(downloadConcurrencyLimit: 1, batchSize: 1, crawlBackoffSeconds: 2)
+        )
+
+        await feed.startPrefetch([uid])
+        try await Self.waitUntil { await feed.prefetchStatus().failedWithheld == 1 }
+        // The retry waits behind the crawl backoff and shows in the queue.
+        #expect(await feed.prefetchStatus().currentQueueLength == 1)
+
+        await feed.setPrefetchEnabled(false)
+
+        // Nothing would take the retry now, and a pending retry would keep the workers polling.
+        #expect(await feed.prefetchStatus().currentQueueLength == 0)
+        try await Task.sleep(for: .milliseconds(2_500))
+        #expect(await loader.requestCount() == 1)
+    }
+
     @Test func visiblePathDoesNotRefetchBackendRefusedItems() async throws {
         let uid = Self.uid("visible-refused")
         let loader = RecordingLoader(itemErrors: [uid: "Node has no thumbnails"])

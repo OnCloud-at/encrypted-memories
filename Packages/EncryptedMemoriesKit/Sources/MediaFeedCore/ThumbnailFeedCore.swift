@@ -810,9 +810,19 @@ public actor ThumbnailFeedCore {
     /// Hands withheld photos back to the crawl. The next request issues a fresh authorization; a photo that left
     /// the library is then refused, or the feed no longer authorizes it and the crawl skips it.
     private func requeueWithheld(_ uids: [PhotoUID]) {
+        // Without a crawl, nothing would take them; a visible request loads them instead.
+        guard prefetchEnabled else { return }
         for uid in uids where !uid.isLocalPending && readAllowed(uid) {
             let attempts = withheldRequeues[uid, default: 0]
-            guard attempts < Self.maxWithheldRequeues else { continue }
+            guard attempts < Self.maxWithheldRequeues else {
+                if attempts == Self.maxWithheldRequeues {
+                    withheldRequeues[uid] = attempts + 1
+                    recordError(
+                        "thumbnail withheld for \(Self.key(uid)) \(attempts + 1) times; the next crawl or a visible request loads it"
+                    )
+                }
+                continue
+            }
             withheldRequeues[uid] = attempts + 1
             withheldRetry.append(uid)
         }
@@ -1476,6 +1486,8 @@ public actor ThumbnailFeedCore {
         priorityByUID.removeAll()
         priorityReservations.removeAll(keepingCapacity: false)
         sequential.removeAll()
+        withheldRetry.removeAll()
+        withheldRequeues.removeAll()
         startupAuthenticationPending = false
         for flight in directDecodeFlights.values {
             flight.task.cancel()
@@ -1880,7 +1892,8 @@ public actor ThumbnailFeedCore {
             diskThumbnailCoverageFraction: coverage.percent,
             diskThumbnailTotal: coverage.total,
             diskCoverageVerified: coverageSettled,
-            currentQueueLength: priority.count + reportedSequentialRemaining,
+            currentQueueLength: priority.count + reportedSequentialRemaining
+                + withheldRetry.filter(isReportedForPrefetch).count,
             downloadsInFlight: downloadInFlight,
             decodesInFlight: decodeInFlight,
             lastErrors: lastErrors,
@@ -1950,7 +1963,9 @@ public actor ThumbnailFeedCore {
             }
             let chunk = localChunk.isEmpty ? work.uids : work.uids.filter { !$0.isLocalPending }
             if chunk.isEmpty {
-                if priority.isEmpty && sequentialIndex >= sequential.count && withheldRetry.isEmpty {
+                if priority.isEmpty && sequentialIndex >= sequential.count
+                    && (withheldRetry.isEmpty || !prefetchEnabled)
+                {
                     if diskProbeBatchesInFlight > 0 {
                         try? await Task.sleep(for: .milliseconds(10))
                         continue
