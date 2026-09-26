@@ -71,6 +71,18 @@ final class MockUploader: PhotoUploading, @unchecked Sendable {
         self.serviceFailures = serviceFailures
     }
 
+    private var _remoteCapacityBytes: Int64?
+    /// Remaining account storage the capacity check reports; nil means unknown, so every upload proceeds.
+    var remoteCapacityBytes: Int64? {
+        get { lock.withLock { _remoteCapacityBytes } }
+        set { lock.withLock { _remoteCapacityBytes = newValue } }
+    }
+
+    func ensureRemoteCapacity(forBytes bytes: Int64, filename: String) async throws {
+        guard let capacity = remoteCapacityBytes, bytes > capacity else { return }
+        throw UploadError.accountStorageFull(filename, requiredBytes: bytes, availableBytes: capacity)
+    }
+
     var peakConcurrent: Int { lock.withLock { _peakConcurrent } }
     var startedOrder: [String] { lock.withLock { _startedOrder } }
     var cancelledTokens: [UUID] { lock.withLock { _cancelledTokens } }

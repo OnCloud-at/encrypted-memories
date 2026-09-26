@@ -891,6 +891,9 @@ public actor BackupSyncRunner {
         workIntent: LibraryWorkIntent,
         preparationProgress: @escaping BackupResourcePreparationHandler
     ) async throws -> UploadDecisionOperationResult<PrimaryScopedOutcome> {
+        // Before the original is copied: a file that cannot fit into the account is neither copied nor sent.
+        try await uploader.ensureRemoteCapacity(
+            forBytes: resolved.descriptor.fileSize, filename: resolved.descriptor.filename)
         let descriptor: UploadResourceDescriptor
         if resolved.hasDeferredMaterialization {
             descriptor = try await resourceCoordinator.withHeavyPermit(
@@ -1306,6 +1309,8 @@ public actor BackupSyncRunner {
                         case .skip(.inconsistentRemoteState, _), .uploadMissingSecondaries:
                             return .noUpload(.inconsistent)
                         case .upload, .uploadReplacingDraft:
+                            try await self.uploader.ensureRemoteCapacity(
+                                forBytes: secondary.descriptor.fileSize, filename: secondary.descriptor.filename)
                             let uploadDescriptor: UploadResourceDescriptor
                             if secondary.hasDeferredMaterialization {
                                 uploadDescriptor = try await self.resourceCoordinator.withHeavyPermit(
@@ -1649,6 +1654,30 @@ public actor BackupSyncRunner {
             return
         }
 
+        // A full Proton account is not the item's fault either. The item waits without burning its attempts; the
+        // check is cheap, but reaching it may download the original from iCloud again, so it recurs only rarely.
+        // Freeing space or a larger plan and Back Up Now take it up at once.
+        if case UploadError.accountStorageFull = error {
+            let eligibleAt = now().addingTimeInterval(Self.accountStorageRecheckInterval)
+            guard
+                queue.updateState(
+                    source: entry.source, revision: entry.revision,
+                    state: .discovered,
+                    attempts: entry.attempts,
+                    lastError: BackupIssueRecord(
+                        kind: .accountStorage, detail: message, nextAttemptAt: eligibleAt
+                    ).persistedValue,
+                    updatedAt: eligibleAt
+                )
+            else {
+                stopRequested = true
+                return
+            }
+            adjustProgress(from: oldState, to: .discovered)
+            emitProgress()
+            return
+        }
+
         // Rate limits and temporary Proton service failures are environmental, just like a lost
         // connection. Keep the item runnable indefinitely with bounded backoff; a healthy photo must
         // never become a permanent failure merely because the service stayed unavailable longer than
@@ -1830,6 +1859,9 @@ public actor BackupSyncRunner {
         (error as? BackupTempFileStore.BackupTempFileError) == .diskBudgetExceeded
     }
 
+    /// How long an item that did not fit into the Proton account waits before the next automatic check.
+    static let accountStorageRecheckInterval: TimeInterval = 6 * 3600
+
     private static func issueKind(for error: Error) -> BackupIssueKind {
         if isTransientResourcePressure(error) { return .deviceStorage }
         if isTransientNetwork(error) { return .network }
@@ -1844,6 +1876,8 @@ public actor BackupSyncRunner {
             return .network
         case UploadError.retryableBackend, UploadError.backend, UploadError.albumStep:
             return .remoteService
+        case UploadError.accountStorageFull:
+            return .accountStorage
         default:
             return .unknown
         }

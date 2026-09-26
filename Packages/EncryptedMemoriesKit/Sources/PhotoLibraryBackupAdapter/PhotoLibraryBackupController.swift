@@ -1332,6 +1332,7 @@ public final class PhotoLibraryBackupController {
         case .remoteService: L10n.string("backup.issue_remote_service")
         case .localState: L10n.string("backup.error_local_state_unavailable")
         case .remoteDeletion: L10n.string("backup.state_skipped_remote_deletion")
+        case .accountStorage: L10n.string("backup.issue_account_storage")
         case .unknown: L10n.string("backup.fail_reason_generic")
         }
     }

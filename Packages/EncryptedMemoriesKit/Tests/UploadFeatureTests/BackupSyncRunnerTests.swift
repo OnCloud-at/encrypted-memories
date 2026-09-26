@@ -962,6 +962,31 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertEqual(resolver.resolveCount(for: entry.source.identifier), 3)
     }
 
+    func testAPhotoThatDoesNotFitIntoTheAccountWaitsWithoutACopyOrAnAttempt() async throws {
+        let entry = seedEntry("huge.mov")
+        resolver.setDeferredMaterialization(for: entry.source.identifier)
+        uploader.remoteCapacityBytes = 0
+
+        let progress = await makeRunner().runUntilDrained(mode: .eligibleOnly)
+
+        let row = try XCTUnwrap(queueStore.entry(for: entry.source, revision: entry.revision))
+        XCTAssertEqual(row.state, .discovered, "a full account is not the photo's fault")
+        XCTAssertEqual(row.attempts, 0)
+        let issue = try XCTUnwrap(BackupIssueRecord.decode(row.lastError))
+        XCTAssertEqual(issue.kind, .accountStorage)
+        XCTAssertEqual(
+            row.updatedAt.timeIntervalSince(clock.now), BackupSyncRunner.accountStorageRecheckInterval, accuracy: 1)
+        XCTAssertEqual(resolver.materializeCount(for: entry.source.identifier), 0, "no copy of a file that cannot fit")
+        XCTAssertTrue(uploader.requests.isEmpty)
+        XCTAssertEqual(progress.failed, 0)
+
+        // More storage, then Back Up Now.
+        uploader.remoteCapacityBytes = nil
+        queueStore.makeRetryableWorkEligible(updatedAt: clock.now)
+        _ = await makeRunner().runUntilDrained(mode: .eligibleOnly)
+        XCTAssertEqual(state(of: entry), .completed)
+    }
+
     func testBackUpNowChecksAWaitingPhotoAgain() async throws {
         let entry = seedEntry("waiting.heic")
         resolver.set(.notReady(times: 1, until: clock.now.addingTimeInterval(600)), for: entry.source.identifier)

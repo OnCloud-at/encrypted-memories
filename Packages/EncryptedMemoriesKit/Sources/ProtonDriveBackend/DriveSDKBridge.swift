@@ -1739,6 +1739,24 @@ extension DriveSDKBridge: PhotoUploading {
         .sdkUploader
     }
 
+    /// Compares the file with the account's remaining Drive storage from the last account refresh. When it does not
+    /// fit, the account data is refreshed once first, because the person may have freed space or upgraded since.
+    /// Without a known quota the upload proceeds; Proton then decides.
+    nonisolated func ensureRemoteCapacity(forBytes bytes: Int64, filename: String) async throws {
+        guard bytes > 0, let available = await Self.remainingDriveBytes(), bytes > available else { return }
+        try? await refreshAccountInfo()
+        guard let refreshed = await Self.remainingDriveBytes(), bytes > refreshed else { return }
+        DebugLog.log("[Upload] storage full file=\(filename) needs=\(bytes) left=\(refreshed)")
+        throw UploadError.accountStorageFull(filename, requiredBytes: bytes, availableBytes: max(0, refreshed))
+    }
+
+    @MainActor private static func remainingDriveBytes() -> Int64? {
+        guard let used = AccountInfo.shared.driveUsedSpaceBytes, let maximum = AccountInfo.shared.driveMaxSpaceBytes,
+            maximum > 0
+        else { return nil }
+        return maximum - used
+    }
+
     /// The universal dedupe pipeline for this account: the SQLite identity manifest (per-account
     /// directory, purged on sign-out) + the Proton-keyed duplicate service. Built once at facade
     /// composition. If the manifest cannot open, return a fail-closed resolver: uploading without

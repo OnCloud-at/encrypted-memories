@@ -74,11 +74,16 @@ public protocol PhotoUploading: Sendable {
     func cancel(token: UUID) async
     func pause(token: UUID) async throws
     func resume(token: UUID) async throws
+
+    /// Throws `UploadError.accountStorageFull` when the account's remaining storage cannot hold `bytes`. The runner
+    /// asks before it copies an original for upload, so a 20 GB video that cannot fit is neither copied nor sent.
+    func ensureRemoteCapacity(forBytes bytes: Int64, filename: String) async throws
 }
 
 public extension PhotoUploading {
     func pause(token: UUID) async throws {}
     func resume(token: UUID) async throws {}
+    func ensureRemoteCapacity(forBytes bytes: Int64, filename: String) async throws {}
 }
 
 // MARK: - Photo tags (series migration seam, optional)
