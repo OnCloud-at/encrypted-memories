@@ -66,9 +66,14 @@ public final class MLSmartSearchController {
 
     // MARK: - Intents (fire-and-forget into the lifecycle actor)
 
-    /// Loads the model list while Smart Search is off, so the person can choose before anything starts.
-    public func loadModelChoices() {
-        Task { await lifecycle.loadModelChoices() }
+    /// Turns Smart Search on with the model that suits the device language; it downloads without asking.
+    public func enableRecommended(preferredLanguages: [String] = Locale.preferredLanguages) {
+        Task { await lifecycle.enableRecommended(preferredLanguages: preferredLanguages) }
+    }
+
+    /// Turning the switch off again before Smart Search started drops that start.
+    public func cancelRecommendedEnable() {
+        Task { await lifecycle.cancelRecommendedEnable() }
     }
 
     /// Turns Smart Search on with the chosen model, or switches to it when Smart Search is on.

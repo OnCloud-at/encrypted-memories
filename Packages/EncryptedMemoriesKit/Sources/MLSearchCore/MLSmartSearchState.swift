@@ -156,6 +156,17 @@ public struct MLSmartSearchSnapshot: Sendable, Equatable {
         indexingState: .idle
     )
 
+    /// A model serves searches. Until then, choosing another model discards no index.
+    public var hasActiveModel: Bool { installedModelBytes > 0 }
+
+    /// The person may choose a model now: whenever no model work runs, and while the first model downloads,
+    /// which the choice stops.
+    public var allowsModelChoice: Bool {
+        guard isEnabled else { return false }
+        if case .downloading = phase, !hasActiveModel { return true }
+        return !phase.isBusy
+    }
+
     /// Semantic coverage is independent of native OCR/document retries.
     public var isVisualIndexComplete: Bool {
         guard isEnabled, selectedModelID != nil else { return false }

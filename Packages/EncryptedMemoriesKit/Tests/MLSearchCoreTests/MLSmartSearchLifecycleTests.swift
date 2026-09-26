@@ -18,6 +18,7 @@ import Testing
         private var blocksNext = false
         private var blocked = false
         private var release: CheckedContinuation<Void, Never>?
+        private var cancelledWhileBlocked = false
 
         init(payloads: [URL: Data], failFirst: [URL: Int] = [:]) {
             self.payloads = payloads
@@ -35,12 +36,27 @@ import Testing
                 return blocksNext
             }
             if blocks {
-                await withCheckedContinuation { continuation in
-                    lock.withLock {
-                        blocked = true
-                        release = continuation
+                // Like the URLSession transport, a cancelled download ends at once.
+                await withTaskCancellationHandler {
+                    await withCheckedContinuation { continuation in
+                        let resumeNow = lock.withLock {
+                            guard !cancelledWhileBlocked else { return true }
+                            blocked = true
+                            release = continuation
+                            return false
+                        }
+                        if resumeNow { continuation.resume() }
                     }
+                } onCancel: {
+                    let continuation = lock.withLock {
+                        cancelledWhileBlocked = true
+                        blocked = false
+                        defer { release = nil }
+                        return release
+                    }
+                    continuation?.resume()
                 }
+                try Task.checkCancellation()
             }
             let payload: Data = try lock.withLock {
                 downloads += 1
@@ -1217,6 +1233,109 @@ import Testing
         #expect(loaded.availableModels.map(\.id) == [entry.id])
         #expect(try harness.stateStore.load() == nil)
         #expect(harness.transport.downloadCount == 0)
+    }
+
+    @Test func switchingOnStartsTheRecommendedModelWithoutAChoice() async throws {
+        let small = Data("small".utf8)
+        let large = Data("the-larger-model".utf8)
+        let (smallEntry, smallURL) = downloadableEntry(id: "small", payload: small)
+        let (largeEntry, largeURL) = downloadableEntry(id: "large", payload: large)
+        let harness = try makeHarness(
+            catalog: MLModelCatalog(entries: []),
+            payloads: [smallURL: small, largeURL: large],
+            assets: [uid("asset")],
+            catalogProvider: RecordingCatalogProvider(MLModelCatalog(entries: [largeEntry, smallEntry]))
+        )
+        defer { try? FileManager.default.removeItem(at: harness.layout.rootDirectory) }
+
+        await harness.lifecycle.start()
+        await harness.lifecycle.enableRecommended(preferredLanguages: ["en-US"])
+
+        let stored = try #require(try harness.stateStore.load())
+        #expect(stored.isEnabled)
+        #expect(stored.selectedModelID == smallEntry.id, "English speakers get the smallest model, unasked")
+        #expect(await waitForCompleteIndex(harness, total: 1))
+        #expect(harness.transport.downloadCount == 1)
+    }
+
+    @Test func aFailedModelListResumesTheSwitchOnWithRetry() async throws {
+        let payload = Data("model".utf8)
+        let (entry, url) = downloadableEntry(id: "model", payload: payload)
+        let harness = try makeHarness(
+            catalog: MLModelCatalog(entries: []),
+            payloads: [url: payload],
+            assets: [uid("asset")],
+            catalogProvider: FailingOnceCatalogProvider(MLModelCatalog(entries: [entry]))
+        )
+        defer { try? FileManager.default.removeItem(at: harness.layout.rootDirectory) }
+
+        await harness.lifecycle.start()
+        await harness.lifecycle.enableRecommended(preferredLanguages: ["de-AT"])
+        let failed = await harness.lifecycle.currentSnapshot()
+        #expect(!failed.isEnabled)
+        #expect(MLSmartSearchModelPresentation(snapshot: failed).canRetry)
+        #expect(try harness.stateStore.load() == nil)
+
+        await harness.lifecycle.retry()
+
+        #expect(try harness.stateStore.load()?.selectedModelID == entry.id)
+        #expect(await waitForCompleteIndex(harness, total: 1))
+    }
+
+    @Test func turningOffBeforeTheModelListArrivesStartsNothing() async throws {
+        let payload = Data("model".utf8)
+        let (entry, url) = downloadableEntry(id: "model", payload: payload)
+        let harness = try makeHarness(
+            catalog: MLModelCatalog(entries: []),
+            payloads: [url: payload],
+            assets: [uid("asset")],
+            catalogProvider: FailingOnceCatalogProvider(MLModelCatalog(entries: [entry]))
+        )
+        defer { try? FileManager.default.removeItem(at: harness.layout.rootDirectory) }
+
+        await harness.lifecycle.start()
+        await harness.lifecycle.enableRecommended(preferredLanguages: ["en"])
+        await harness.lifecycle.cancelRecommendedEnable()
+        await harness.lifecycle.retry()
+
+        let snapshot = await harness.lifecycle.currentSnapshot()
+        #expect(!snapshot.isEnabled)
+        #expect(snapshot.phase == .disabled)
+        #expect(try harness.stateStore.load() == nil)
+        #expect(harness.transport.downloadCount == 0)
+    }
+
+    @Test func choosingAnotherModelWhileTheFirstDownloadsStopsItAndStartsTheChoice() async throws {
+        let small = Data("small".utf8)
+        let large = Data("the-larger-model".utf8)
+        let (smallEntry, smallURL) = downloadableEntry(id: "small", payload: small)
+        let (largeEntry, largeURL) = downloadableEntry(id: "large", payload: large)
+        let harness = try makeHarness(
+            catalog: MLModelCatalog(entries: [smallEntry, largeEntry]),
+            payloads: [smallURL: small, largeURL: large],
+            assets: [uid("asset")]
+        )
+        defer { try? FileManager.default.removeItem(at: harness.layout.rootDirectory) }
+        let transport = harness.transport
+        transport.blockNextDownload()
+
+        await harness.lifecycle.start()
+        let enable = Task { await harness.lifecycle.enableRecommended(preferredLanguages: ["en"]) }
+        #expect(await waitUntil { transport.isBlocked })
+        let downloading = await harness.lifecycle.currentSnapshot()
+        #expect(downloading.allowsModelChoice, "the first download must not lock the model choice")
+        #expect(!downloading.hasActiveModel)
+
+        await harness.lifecycle.select(largeEntry.id)
+        await enable.value
+        #expect(transport.downloadCount == 1, "the first model's download stops; only the choice downloads")
+
+        #expect(await waitForCompleteIndex(harness, total: 1))
+        let ready = await harness.lifecycle.currentSnapshot()
+        #expect(ready.selectedModelID == largeEntry.id)
+        #expect(ready.hasActiveModel)
+        #expect(try harness.stateStore.load()?.selectedModelID == largeEntry.id)
+        #expect(!FileManager.default.fileExists(atPath: harness.layout.modelDirectory(for: smallEntry.id).path))
     }
 
     @Test func enablingAgainSwitchesToTheChosenModel() async throws {
