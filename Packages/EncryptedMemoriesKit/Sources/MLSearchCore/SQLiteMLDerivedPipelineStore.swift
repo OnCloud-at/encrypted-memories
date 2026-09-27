@@ -845,28 +845,7 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
         }
     }
 
-    private enum OpenResult {
-        case opened(OpaquePointer)
-        case incompatible
-        case failed
-    }
-
     private static func openVerified(url: URL, policy: LibraryDatabasePolicy) -> OpaquePointer? {
-        switch openOnce(url: url, policy: policy) {
-        case .opened(let handle):
-            return handle
-        case .failed:
-            return nil
-        case .incompatible:
-            guard destroyDatabaseFiles(at: url) else { return nil }
-            if case .opened(let handle) = openOnce(url: url, policy: policy) {
-                return handle
-            }
-            return nil
-        }
-    }
-
-    private static func openOnce(url: URL, policy: LibraryDatabasePolicy) -> OpenResult {
         let schema = """
             CREATE TABLE IF NOT EXISTS ml_derived_accounts(
               account_key        INTEGER PRIMARY KEY,
@@ -986,54 +965,16 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
             END;
             """
 
-        let compatibility = SQLiteStoreSchemaGate.compatibility(
-            at: url,
-            schemaSQL: schema,
-            busyTimeoutMs: policy.busyTimeoutMs,
-            versionIsCurrent: verifyVersion
-        )
-        guard compatibility != .incompatible else { return .incompatible }
-        guard compatibility != .unavailable else { return .failed }
-        var handle: OpaquePointer?
-        let flags =
-            SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX
-            | (compatibility == .empty ? SQLITE_OPEN_CREATE : 0)
-        guard sqlite3_open_v2(url.path, &handle, flags, nil) == SQLITE_OK,
-            let handle
-        else {
-            sqlite3_close(handle)
-            return .failed
-        }
-        sqlite3_busy_timeout(handle, Int32(clamping: policy.busyTimeoutMs))
-        sqlite3_exec(handle, "PRAGMA foreign_keys=ON;", nil, nil, nil)
-        switch compatibility {
-        case .empty:
-            SQLiteStoreSchemaGate.configureConnection(handle, policy: policy)
-            guard
-                SQLiteStoreSchemaGate.initializeCurrentSchema(
-                    handle,
-                    schemaSQL: schema,
-                    stamp: { stampVersion(handle) }
-                )
-            else {
-                sqlite3_close(handle)
-                return .failed
-            }
-        case .current:
-            guard verifyVersion(handle),
-                SQLiteStoreSchemaGate.matchesCurrentSchema(handle, schemaSQL: schema)
-            else {
-                sqlite3_close(handle)
-                return .incompatible
-            }
-            SQLiteStoreSchemaGate.configureConnection(handle, policy: policy)
-        case .incompatible:
-            sqlite3_close(handle)
-            return .incompatible
-        case .unavailable:
-            sqlite3_close(handle)
-            return .failed
-        }
+        guard
+            let handle = SQLiteStoreSchemaGate.openRebuildableStore(
+                at: url,
+                schemaSQL: schema,
+                policy: policy,
+                enforceForeignKeys: true,
+                verifyVersion: verifyVersion,
+                stampVersion: stampVersion
+            )
+        else { return nil }
         // A previous process may have exited with a large committed WAL. This is the one canonical
         // derived index, so fold it into the main database before starting another indexing pass.
         _ = sqlite3_wal_checkpoint_v2(
@@ -1043,7 +984,7 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
             nil,
             nil
         )
-        return .opened(handle)
+        return handle
     }
 
     private static func verifyVersion(_ handle: OpaquePointer?) -> Bool {
@@ -1056,20 +997,6 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
 
     private static func stampVersion(_ handle: OpaquePointer?) -> Bool {
         sqlite3_exec(handle, "PRAGMA user_version=\(schemaVersion);", nil, nil, nil) == SQLITE_OK
-    }
-
-    private static func destroyDatabaseFiles(at url: URL) -> Bool {
-        guard !url.hasDirectoryPath else { return false }
-        for suffix in ["", "-wal", "-shm"] {
-            let target = URL(fileURLWithPath: url.path + suffix)
-            guard FileManager.default.fileExists(atPath: target.path) else { continue }
-            do {
-                try FileManager.default.removeItem(at: target)
-            } catch {
-                return false
-            }
-        }
-        return true
     }
 
     private func artifactIDsLocked(
