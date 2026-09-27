@@ -1,6 +1,69 @@
 {
   "sourceLanguage": "en",
   "strings": {
+    "albums.add_busy_message": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Another album change is still running. Try again in a moment." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Eine andere Album-Änderung läuft noch. Versuche es gleich noch einmal." } }
+      }
+    },
+    "albums.add_to_menu": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Add to" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Hinzufügen" } }
+      }
+    },
+    "albums.new_album_menu": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "New Album…" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Neues Album …" } }
+      }
+    },
+    "library.filter": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Filter" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Filter" } }
+      }
+    },
+    "library.filter_all": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "All Items" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Alle Objekte" } }
+      }
+    },
+    "library.filter_empty_description": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Remove a filter to show more items." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Entferne einen Filter, um mehr Objekte anzuzeigen." } }
+      }
+    },
+    "library.filter_empty_title": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "No Matching Items" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Keine passenden Objekte" } }
+      }
+    },
+    "library.filter_photos": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Photos" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Fotos" } }
+      }
+    },
+    "library.filter_remove": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Remove Filters" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Filter entfernen" } }
+      }
+    },
     "library.save_to_library": {
       "localizations": {
         "de": { "stringUnit": { "state": "translated", "value": "In Mediathek sichern" } },

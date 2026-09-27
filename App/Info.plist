@@ -6,5 +6,18 @@
 	<string>$(ENCRYPTED_MEMORIES_BUILD_COMMIT)</string>
 	<key>EncryptedMemoriesProtonChannel</key>
 	<string>$(ENCRYPTED_MEMORIES_PROTON_CHANNEL)</string>
+	<key>UTExportedTypeDeclarations</key>
+	<array>
+		<dict>
+			<key>UTTypeIdentifier</key>
+			<string>at.oncloud.encryptedmemories.photo-reference</string>
+			<key>UTTypeDescription</key>
+			<string>Encrypted Memories photo reference</string>
+			<key>UTTypeConformsTo</key>
+			<array>
+				<string>public.data</string>
+			</array>
+		</dict>
+	</array>
 </dict>
 </plist>

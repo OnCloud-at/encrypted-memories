@@ -328,20 +328,22 @@ private struct AlbumNameForm: View {
     }
 }
 
-private extension View {
-    func albumActionFailureAlert(_ coordinator: AlbumActionCoordinator) -> some View {
+extension View {
+    /// Presents the coordinator's last album action failure once, with the shared title and message. Hosts whose
+    /// album support is optional pass `nil` and show nothing.
+    public func albumActionFailureAlert(_ coordinator: AlbumActionCoordinator?) -> some View {
         alert(
-            coordinator.actionFailure?.title ?? "",
+            coordinator?.actionFailure?.title ?? "",
             isPresented: Binding(
-                get: { coordinator.actionFailure != nil },
-                set: { if !$0 { coordinator.clearActionFailure() } }
+                get: { coordinator?.actionFailure != nil },
+                set: { if !$0 { coordinator?.clearActionFailure() } }
             )
         ) {
             Button(L10n.string("albums.failure_done"), role: .cancel) {
-                coordinator.clearActionFailure()
+                coordinator?.clearActionFailure()
             }
         } message: {
-            Text(coordinator.actionFailure?.message ?? "")
+            Text(coordinator?.actionFailure?.message ?? "")
         }
     }
 }

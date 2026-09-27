@@ -98,6 +98,14 @@ final class ProjectHygieneTests: XCTestCase {
         XCTAssertTrue(manifest.contains("platforms: [.macOS(\"26.0\"), .iOS(\"26.0\")]"))
     }
 
+    /// The Mac grid adds this type to dragged photos (`PhotoDragReference.typeIdentifier`); the sidebar accepts it
+    /// only when the app exports it, so a missing declaration silently disables dropping photos on albums.
+    func testMacAppExportsThePhotoDragReferenceType() throws {
+        let plist = try String(contentsOf: repoRoot.appendingPathComponent("App/Info.plist"), encoding: .utf8)
+        XCTAssertTrue(plist.contains("<key>UTExportedTypeDeclarations</key>"))
+        XCTAssertTrue(plist.contains("<string>at.oncloud.encryptedmemories.photo-reference</string>"))
+    }
+
     func testProtonAppVersionHeaderInputsReachEveryShippedApp() throws {
         func read(_ path: String) throws -> String {
             try String(contentsOf: repoRoot.appendingPathComponent(path), encoding: .utf8)

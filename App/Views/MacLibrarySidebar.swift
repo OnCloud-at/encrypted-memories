@@ -7,6 +7,7 @@ import MediaCache
 import PhotosCore
 import SwiftUI
 import TimelineFeature
+import UniformTypeIdentifiers
 
 /// Collapsible left sidebar - a native macOS sidebar `List` (Liquid-Glass vibrant material, native
 /// selection): Proton smart filters (tags) on top, user albums below.
@@ -19,12 +20,17 @@ struct SidebarView: View {
     let isLoadingSharedAlbums: Bool
     let sharedAlbumCatalogFailed: Bool
     let canLeaveSharedAlbum: Bool
+    let canCreateAlbum: Bool
+    let canAddPhotos: Bool
     let thumbnailFeed: ThumbnailFeed
     let sourceAnalysisRevision: UInt64
     @Binding var selection: PhotoFilter
     let onRetryAlbums: () -> Void
     let onRetrySharedAlbums: () -> Void
     let onLeaveSharedAlbum: (SharedAlbumSummary) -> Void
+    let onCreateAlbum: () -> Void
+    /// Photos dragged from the grid onto an album.
+    let onDropPhotos: (AlbumSummary, [PhotoUID]) -> Void
     @State private var pendingSharedAlbumLeave: SharedAlbumSummary?
 
     var body: some View {
@@ -39,7 +45,7 @@ struct SidebarView: View {
                 Label("sidebar.map", systemImage: "map")
                     .tag(PhotoFilter.map)
             }
-            Section("sidebar.albums") {
+            Section {
                 if isLoadingAlbums, albums.isEmpty {
                     Label("sidebar.albums_loading", systemImage: "arrow.trianglehead.2.clockwise.rotate.90")
                         .foregroundStyle(.secondary)
@@ -67,6 +73,20 @@ struct SidebarView: View {
                         sourceAnalysisRevision: sourceAnalysisRevision
                     )
                     .tag(PhotoFilter.album(id: album.id, title: album.title))
+                    .modifier(AlbumPhotoDropTarget(isEnabled: canAddPhotos) { onDropPhotos(album, $0) })
+                }
+            } header: {
+                // New Album sits next to the albums it creates, like the Albums heading in Apple Photos.
+                HStack {
+                    Text("sidebar.albums")
+                    Spacer()
+                    Button(action: onCreateAlbum) {
+                        Image(systemName: "plus")
+                    }
+                    .buttonStyle(.borderless)
+                    .disabled(!canCreateAlbum)
+                    .help(L10n.string("albums.create_title"))
+                    .accessibilityLabel(L10n.string("albums.create_title"))
                 }
             }
             Section(L10n.string("collections.section_shared_with_me")) {
@@ -253,4 +273,66 @@ private struct SharedAlbumSidebarRow: View {
         .accessibilityLabel(presentation.accessibilityLabel)
         .accessibilityHint(presentation.accessibilityHint ?? "")
     }
+}
+
+/// Accepts photos dragged from the grid. Only the app's own photo references count; files from other apps are
+/// refused, so a drop never uploads anything.
+private struct AlbumPhotoDropTarget: ViewModifier {
+    let isEnabled: Bool
+    let onDrop: ([PhotoUID]) -> Void
+    @State private var isTargeted = false
+
+    private static let referenceType = UTType(exportedAs: PhotoDragReference.typeIdentifier)
+
+    func body(content: Content) -> some View {
+        content
+            .background(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(Color.accentColor.opacity(isTargeted ? 0.3 : 0))
+            )
+            .onDrop(of: isEnabled ? [Self.referenceType] : [], isTargeted: $isTargeted) { providers in
+                Self.loadReferences(from: providers) { uids, sessions in
+                    // This drag delivers no files to other apps, so the grid stops preparing them.
+                    PhotoDragReference.postInternalDrop(sessions: sessions)
+                    if !uids.isEmpty { onDrop(uids) }
+                }
+                return true
+            }
+    }
+
+    private static func loadReferences(
+        from providers: [NSItemProvider], completion: @escaping @MainActor ([PhotoUID], Set<UUID>) -> Void
+    ) {
+        let collector = PhotoReferenceCollector()
+        let group = DispatchGroup()
+        for provider in providers where provider.hasItemConformingToTypeIdentifier(referenceType.identifier) {
+            group.enter()
+            _ = provider.loadDataRepresentation(for: referenceType) { data, _ in
+                if let data, let reference = PhotoDragReference.decode(data) {
+                    collector.append(reference.uid, session: reference.session)
+                }
+                group.leave()
+            }
+        }
+        group.notify(queue: .main) {
+            MainActor.assumeIsolated { completion(collector.uids, collector.sessions) }
+        }
+    }
+}
+
+/// Collects references that load on arbitrary queues. Adding to an album does not depend on their order.
+private final class PhotoReferenceCollector: @unchecked Sendable {
+    private let lock = NSLock()
+    private var collectedUIDs: [PhotoUID] = []
+    private var collectedSessions: Set<UUID> = []
+
+    func append(_ uid: PhotoUID, session: UUID) {
+        lock.withLock {
+            collectedUIDs.append(uid)
+            collectedSessions.insert(session)
+        }
+    }
+
+    var uids: [PhotoUID] { lock.withLock { collectedUIDs } }
+    var sessions: Set<UUID> { lock.withLock { collectedSessions } }
 }
