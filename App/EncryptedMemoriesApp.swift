@@ -55,6 +55,10 @@ struct EncryptedMemoriesApp: App {
         .commands {
             CommandGroup(after: .newItem) {
                 if metal3Supported {
+                    Button(L10n.string("albums.new_album_menu")) {
+                        NotificationCenter.default.post(name: .encryptedMemoriesNewAlbum, object: nil)
+                    }
+                    Divider()
                     Button("menu.upload_photos") {
                         NotificationCenter.default.post(
                             name: .encryptedMemoriesUploadPhotos,

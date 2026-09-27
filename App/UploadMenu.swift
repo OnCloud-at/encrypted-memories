@@ -12,6 +12,7 @@ extension Notification.Name {
     static let encryptedMemoriesUploadFolder = Notification.Name("EncryptedMemories.uploadFolder")
     static let encryptedMemoriesShowUploadQueue = Notification.Name("EncryptedMemories.showUploadQueue")
     static let encryptedMemoriesRefreshLibrary = Notification.Name("EncryptedMemories.refreshLibrary")
+    static let encryptedMemoriesNewAlbum = Notification.Name("EncryptedMemories.newAlbum")
 }
 
 func uploadCommandUserInfo(trigger: UploadUITrigger) -> [AnyHashable: Any] {

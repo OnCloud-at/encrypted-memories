@@ -4,6 +4,7 @@ import DesignSystemCore
 import Foundation
 import GridCore
 import MLSearchCore
+import MLSearchFeature
 import PhotoViewerCore
 import PhotosCore
 import SwiftUI
@@ -298,42 +299,13 @@ struct MobileTimelineScreen: View {
     private var libraryOptionsMenu: some View {
         Menu {
             Menu {
-                Section {
-                    Button {
-                        resetRefinement()
-                    } label: {
-                        Label(
-                            String(localized: "library.filter_all"),
-                            systemImage: refinement.isActive ? "square.grid.3x3" : "checkmark"
-                        )
-                    }
-                }
-
-                Section {
-                    Toggle(isOn: favoritesFilterBinding) {
-                        Label(PhotoTag.favorites.title, systemImage: "heart")
-                    }
-                    .disabled(model.favoriteFilterAvailability != .available)
-                    Toggle(isOn: mediaKindBinding(.photo)) {
-                        Label(String(localized: "library.filter_photos"), systemImage: "photo")
-                    }
-                    Toggle(isOn: mediaKindBinding(.video)) {
-                        Label(PhotoTag.videos.title, systemImage: "video")
-                    }
-                }
-
-                if refinement.isActive {
-                    Section {
-                        Button {
-                            resetRefinement()
-                        } label: {
-                            Label(String(localized: "library.filter_remove"), systemImage: "minus.circle")
-                        }
-                    }
-                }
+                LibraryRefinementMenuContent(
+                    refinement: refinementBinding,
+                    favoritesAvailable: model.favoriteFilterAvailability == .available
+                )
             } label: {
                 Label(
-                    refinement.isActive ? refinementSummary : String(localized: "library.filter"),
+                    refinement.isActive ? refinement.localizedSummary : L10n.string("library.filter"),
                     systemImage: "line.3.horizontal.decrease"
                 )
             }
@@ -370,9 +342,7 @@ struct MobileTimelineScreen: View {
                 .foregroundStyle(refinement.isActive ? ProtonColor.primary : ProtonColor.textNorm)
         }
         .accessibilityLabel(String(localized: "library.options"))
-        .accessibilityValue(
-            refinement.isActive ? refinementSummary : String(localized: "library.filter_all")
-        )
+        .accessibilityValue(refinement.localizedSummary)
     }
 
     /// Bulk actions on the selection. iOS 27 places them in the system overflow menu; iOS 26 shows them in the
@@ -400,27 +370,11 @@ struct MobileTimelineScreen: View {
         .accessibilityLabel(String(localized: "selection.more_a11y"))
     }
 
-    private var favoritesFilterBinding: Binding<Bool> {
+    /// Every change goes through `updateRefinement`, which also places the filtered grid at its first result.
+    private var refinementBinding: Binding<TimelineRefinement> {
         Binding(
-            get: { refinement.favoritesOnly },
-            set: { selected in
-                updateRefinement { $0.favoritesOnly = selected }
-            }
-        )
-    }
-
-    private func mediaKindBinding(_ kind: TimelineRefinement.MediaKind) -> Binding<Bool> {
-        Binding(
-            get: { refinement.mediaKinds.contains(kind) },
-            set: { selected in
-                updateRefinement { refinement in
-                    if selected {
-                        refinement.mediaKinds.insert(kind)
-                    } else {
-                        refinement.mediaKinds.remove(kind)
-                    }
-                }
-            }
+            get: { refinement },
+            set: { next in updateRefinement { $0 = next } }
         )
     }
 
@@ -450,16 +404,6 @@ struct MobileTimelineScreen: View {
                 gridProxy.setContentMode?(displayMode)
             }
         )
-    }
-
-    private var refinementSummary: String {
-        var labels: [String] = []
-        if refinement.favoritesOnly { labels.append(PhotoTag.favorites.title) }
-        if refinement.mediaKinds.contains(.photo) {
-            labels.append(String(localized: "library.filter_photos"))
-        }
-        if refinement.mediaKinds.contains(.video) { labels.append(PhotoTag.videos.title) }
-        return ListFormatter.localizedString(byJoining: labels)
     }
 
     private var selectedAllFavorited: Bool {
@@ -584,13 +528,13 @@ struct MobileTimelineScreen: View {
                 } else if isEmptyRefinementResult {
                     ContentUnavailableView {
                         Label(
-                            String(localized: "library.filter_empty_title"),
+                            L10n.string("library.filter_empty_title"),
                             systemImage: "line.3.horizontal.decrease.circle"
                         )
                     } description: {
-                        Text(String(localized: "library.filter_empty_description"))
+                        Text(L10n.string("library.filter_empty_description"))
                     } actions: {
-                        Button(String(localized: "library.filter_remove")) {
+                        Button(L10n.string("library.filter_remove")) {
                             resetRefinement()
                         }
                         .buttonStyle(.borderedProminent)

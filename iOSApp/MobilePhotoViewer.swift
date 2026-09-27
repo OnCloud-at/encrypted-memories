@@ -1,6 +1,7 @@
 import AVFoundation
 import AVKit
 import AlbumCore
+import AlbumsFeature
 import Combine
 import DesignSystemCore
 import MapUIKitAdapter
@@ -47,6 +48,8 @@ struct MobilePhotoViewer: View {
     @State private var showInfo = false
     @State private var metadataLoadState: PhotoMetadataLoadState = .idle
     @State private var metadataRequestGeneration: UInt64 = 0
+    /// Photos that a new album starts with while its name form is open.
+    @State private var newAlbumPhotoUIDs: [PhotoUID] = []
     @State private var albumTitles: [String] = []
     @State private var isLoadingAlbumMemberships = false
     @State private var albumMembershipsLoadFailed = false
@@ -255,6 +258,34 @@ struct MobilePhotoViewer: View {
             )
         ) {
             Button(L10n.string("action.ok"), role: .cancel) { saveToLibraryMessage = nil }
+        }
+        .sheet(
+            isPresented: Binding(
+                get: { !newAlbumPhotoUIDs.isEmpty },
+                set: { if !$0 { newAlbumPhotoUIDs = [] } }
+            )
+        ) {
+            if let coordinator = libraryModel.albumActions {
+                AlbumCreationSheet(
+                    coordinator: coordinator,
+                    photoUIDs: newAlbumPhotoUIDs,
+                    onAlbumsChanged: { libraryModel.noteAlbumsChanged() },
+                    onCompleted: { _ in
+                        newAlbumPhotoUIDs = []
+                        metadataRequestGeneration &+= 1
+                    }
+                )
+            }
+        }
+        .albumActionFailureAlert(libraryModel.albumActions)
+        .task {
+            // The album list is otherwise loaded by the Albums tab; the Add to menu needs it here too.
+            // A failed earlier load is retried too, so the menu does not stay without albums.
+            if let coordinator = libraryModel.albumActions,
+                !coordinator.hasCompletedInitialAlbumLoad || coordinator.loadErrorMessage != nil
+            {
+                await coordinator.refresh()
+            }
         }
         .onChange(of: currentBaseItem?.uid) { _, _ in
             cancelViewerMutationPresentation()
@@ -515,6 +546,18 @@ struct MobilePhotoViewer: View {
             Label(String(localized: "viewer.share_action"), systemImage: "square.and.arrow.up")
         }
         .disabled(currentBaseItem == nil || selection.isBusy)
+
+        if viewerMutationAction == .moveToTrash, let coordinator = libraryModel.albumActions,
+            let uid = currentBaseItem?.uid
+        {
+            AlbumAddMenu(
+                coordinator: coordinator,
+                photoUIDs: [uid],
+                onNewAlbum: { newAlbumPhotoUIDs = [uid] },
+                // The album list in this menu shows where the photo is; read it again after adding.
+                onAdded: { _ in metadataRequestGeneration &+= 1 }
+            )
+        }
 
         if currentBaseItem?.uid != nil, liveTextUID == currentBaseItem?.uid {
             Button {

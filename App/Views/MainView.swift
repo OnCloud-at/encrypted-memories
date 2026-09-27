@@ -36,6 +36,8 @@ struct MainView: View {
     @State private var viewerModel: PhotoViewerModel?
     @State private var level: Int = 3  // 0 is largest; 5 is the densest overview.
     @State private var temporalMode: TimelineTemporalMode = .allPhotos
+    /// Library filters of the Mediathek, shared with iPhone and iPad through `LibraryRefinementMenuContent`.
+    @State private var refinement: TimelineRefinement = .all
     @State private var temporalProjection = TimelineTemporalProjection.loading(mode: .years)
     @State private var focusedTemporalYear: Int?
     // Levels L0-L3 use this content mode. Overview levels always crop to a square.
@@ -53,6 +55,8 @@ struct MainView: View {
     @State private var albumLoadGeneration: UInt64 = 0
     @State private var albumActions: AlbumActionCoordinator
     @State private var showCreateAlbum = false
+    /// Photos that a new album starts with; empty when the album is created on its own.
+    @State private var createAlbumPhotoUIDs: [PhotoUID] = []
     @State private var showAlbumDestination = false
     @State private var selection: PhotoFilter = .all
     @State private var mapClusterPresentation: MapClusterPresentation?
@@ -200,6 +204,8 @@ struct MainView: View {
                         isLoadingSharedAlbums: albumActions.showsInitialSharedAlbumLoadingPlaceholder,
                         sharedAlbumCatalogFailed: albumActions.sharedLoadErrorMessage != nil,
                         canLeaveSharedAlbum: albumActions.canLeaveSharedAlbum,
+                        canCreateAlbum: albumActions.canCreate,
+                        canAddPhotos: albumActions.canAddPhotos && !albumActions.isWorking,
                         thumbnailFeed: feed,
                         sourceAnalysisRevision: model.sourceAnalysisRevision,
                         selection: $selection,
@@ -207,6 +213,10 @@ struct MainView: View {
                         onRetrySharedAlbums: { Task { await albumActions.refreshSharedAlbums() } },
                         onLeaveSharedAlbum: { album in
                             Task { _ = await albumActions.leaveSharedAlbum(album) }
+                        },
+                        onCreateAlbum: { presentCreateAlbum() },
+                        onDropPhotos: { album, uids in
+                            Task { await addDroppedPhotos(uids, to: album) }
                         }
                     )
                     // Fixed width. (The OS still draws a resize cursor on the divider even though the column is not
@@ -319,6 +329,9 @@ struct MainView: View {
             .onReceive(NotificationCenter.default.publisher(for: .encryptedMemoriesShowUploadQueue)) { notification in
                 performUploadUIAction("showQueue", trigger: uploadTrigger(from: notification))
             }
+            .onReceive(NotificationCenter.default.publisher(for: .encryptedMemoriesNewAlbum)) { _ in
+                presentCreateAlbum()
+            }
             .onReceive(NotificationCenter.default.publisher(for: .encryptedMemoriesRefreshLibrary)) { _ in
                 refreshLibraryManually()
             }
@@ -424,9 +437,10 @@ struct MainView: View {
         )
         .coordinateSpace(name: "root")
         .animation(.easeInOut(duration: 0.22), value: sidebarOpen)
-        .sheet(isPresented: $showCreateAlbum) {
+        .sheet(isPresented: $showCreateAlbum, onDismiss: { createAlbumPhotoUIDs = [] }) {
             AlbumCreationSheet(
                 coordinator: albumActions,
+                photoUIDs: createAlbumPhotoUIDs,
                 onAlbumsChanged: { Task { await loadAlbums() } },
                 onCompleted: { _ in showCreateAlbum = false }
             )
@@ -614,6 +628,8 @@ struct MainView: View {
                     isSearchPending: isCommittedSemanticSearchPending,
                     semanticMatches: committedSemanticMatches,
                     requiredUIDs: committedSuggestionMatches,
+                    refinement: activeRefinement,
+                    onClearRefinement: { applyRefinement(.all) },
                     selectionMode: selectionMode,
                     media: backend,
                     metadataProvider: backend,
@@ -702,21 +718,29 @@ struct MainView: View {
         .accessibilityLabel(L10n.string("albums.more_actions"))
     }
 
-    /// Keeps album creation available independently of the current selection.
-    private var createAlbumToolbarMenu: some View {
-        Menu {
-            Button {
-                showCreateAlbum = true
-            } label: {
-                Label(L10n.string("albums.create_title"), systemImage: "rectangle.stack.badge.plus")
-            }
-            .disabled(!albumActions.canCreate)
-        } label: {
-            Label(L10n.string("albums.create_title"), systemImage: "plus")
-                .labelStyle(.iconOnly)
+    /// Adds photos dropped on a sidebar album. The drop can land while another album change finishes; it waits for
+    /// that change instead of losing the photos, and says so if the change does not finish.
+    private func addDroppedPhotos(_ uids: [PhotoUID], to album: AlbumSummary) async {
+        var waitedIntervals = 0
+        while albumActions.isWorking, waitedIntervals < 300 {  // at most 30 seconds
+            try? await Task.sleep(for: .milliseconds(100))
+            waitedIntervals += 1
         }
-        .help(L10n.string("albums.create_title"))
-        .accessibilityLabel(L10n.string("albums.create_title"))
+        if await albumActions.add(uids, to: album.id) {
+            await loadAlbums()
+        } else if albumActions.actionFailure == nil {
+            albumActions.actionFailure = AlbumActionFailure(
+                title: L10n.string("albums.add_failed_title"),
+                message: L10n.string("albums.add_busy_message")
+            )
+        }
+    }
+
+    /// Opens the shared name form. A new album can start with photos, for example the one open in the viewer.
+    private func presentCreateAlbum(adding photoUIDs: [PhotoUID] = []) {
+        guard albumActions.canCreate else { return }
+        createAlbumPhotoUIDs = photoUIDs
+        showCreateAlbum = true
     }
 
     /// Reuses one toolbar region for download progress or the Trash restore action.
@@ -1207,13 +1231,59 @@ struct MainView: View {
     }
 
     private var gridFillOrder: GridFillOrder {
-        selection == .all && committedSearchText.isEmpty ? .newestBottomTrailing : .topLeading
+        selection == .all && committedSearchText.isEmpty && !activeRefinement.isActive
+            ? .newestBottomTrailing : .topLeading
+    }
+
+    /// Filters apply to the Mediathek only; albums and smart collections keep their own contents.
+    private var activeRefinement: TimelineRefinement {
+        selection == .all ? refinement : .all
     }
 
     private var showsTemporalBrowser: Bool {
         selection == .all
             && committedSearchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !activeRefinement.isActive
             && temporalMode != .allPhotos
+    }
+
+    /// A filter shows single photos, so it switches Years and Months to All Photos; choosing Years or Months again
+    /// removes the filter (see `temporalModeBinding`). The picker and the zoom controls always match the grid.
+    private var refinementBinding: Binding<TimelineRefinement> {
+        Binding {
+            refinement
+        } set: { next in
+            if next.isActive, temporalMode != .allPhotos {
+                temporalModeBinding.wrappedValue = .allPhotos
+            }
+            applyRefinement(next)
+        }
+    }
+
+    /// Every filter change starts a new reading position, like a search: a filtered grid opens at its newest
+    /// result, and removing the filter returns the full library to its newest photo at the bottom.
+    private func applyRefinement(_ next: TimelineRefinement) {
+        guard next != refinement else { return }
+        refinement = next
+        routeInitialScrollAnchor = nil
+        routeScrollGeneration += 1
+    }
+
+    /// Filter menu of the Mediathek, with the same entries as on iPhone and iPad.
+    private var libraryFilterMenu: some View {
+        Menu {
+            LibraryRefinementMenuContent(refinement: refinementBinding, favoritesAvailable: favoritesLoaded)
+        } label: {
+            Label(
+                L10n.string("library.filter"),
+                systemImage: refinement.isActive
+                    ? "line.3.horizontal.decrease.circle.fill" : "line.3.horizontal.decrease"
+            )
+            .labelStyle(.iconOnly)
+        }
+        .help(refinement.localizedSummary)
+        .accessibilityLabel(L10n.string("library.filter"))
+        .accessibilityValue(refinement.localizedSummary)
     }
 
     private var temporalProjectionRequestID: String {
@@ -1228,6 +1298,9 @@ struct MainView: View {
                 temporalMode = mode
                 if mode != .months {
                     focusedTemporalYear = nil
+                }
+                if mode != .allPhotos {
+                    applyRefinement(.all)
                 }
             }
         }
@@ -2060,6 +2133,15 @@ struct MainView: View {
                         }
                         Divider()
                     }
+                    if viewerMutationAction == .moveToTrash {
+                        AlbumAddMenu(
+                            coordinator: albumActions,
+                            photoUIDs: [viewerModel.current.uid],
+                            onNewAlbum: { presentCreateAlbum(adding: [viewerModel.current.uid]) },
+                            onAdded: { _ in Task { await loadAlbums() } }
+                        )
+                        Divider()
+                    }
                     switch viewerMutationAction {
                     case .restore:
                         Button {
@@ -2105,8 +2187,6 @@ struct MainView: View {
                 ToolbarItem(placement: .primaryAction) { albumActionsToolbarMenu }
                 ToolbarSpacer(.fixed, placement: .primaryAction)
             }
-            ToolbarItem(placement: .primaryAction) { createAlbumToolbarMenu }
-            ToolbarSpacer(.fixed, placement: .primaryAction)
             ToolbarItem(placement: .primaryAction) { uploadToolbarMenu }
             librarySelectionAndViewToolbarContent
         }
@@ -2224,7 +2304,9 @@ struct MainView: View {
             .opacity(selection == .all ? 1 : 0)
             .allowsHitTesting(selection == .all)
             .accessibilityHidden(selection != .all)
-
+        }
+        // Its own item, so the pair renders as one grouped capsule like Apple Photos.
+        ToolbarItem(placement: .principal) {
             ControlGroup {
                 Button {
                     activeGridProxy.zoomOut?()
@@ -2243,7 +2325,10 @@ struct MainView: View {
                 .disabled(level <= 0 || temporalMode != .allPhotos)
                 .accessibilityLabel("toolbar.larger_thumbnails")
             }
-            aspectSquareToggleButton
+        }
+        ToolbarItem(placement: .principal) { aspectSquareToggleButton }
+        if selection == .all {
+            ToolbarItem(placement: .principal) { libraryFilterMenu }
         }
     }
 
