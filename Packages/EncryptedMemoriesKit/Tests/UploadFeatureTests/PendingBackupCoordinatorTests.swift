@@ -393,6 +393,32 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         XCTAssertEqual(effects.trashed, [[PhotoUID(volumeID: "vol", nodeID: "late")]])
     }
 
+    func testOnlyThePhotoWithoutAnAnswerFromProtonTriesTheTrashAgain() async throws {
+        enqueue("answered", state: .uploading)
+        enqueue("unanswered", state: .uploading)
+        await coordinator.start()
+        for id in ["answered", "unanswered"] {
+            recorder.recordHandoff(
+                source: source(id), revision: revision, remote: PhotoUID(volumeID: "", nodeID: "link-\(id)"),
+                kind: .uploaded)
+        }
+        await waitForSnapshot("handoffs known") { $0.tiles.count == 2 && $0.tiles.allSatisfy { $0.handoff != nil } }
+        effects.trashRetry = [PhotoUID(volumeID: "photos-volume", nodeID: "link-unanswered")]
+
+        await coordinator.exclude([
+            PhotoUID(localPending: .photoLibrary, identifier: "answered"),
+            PhotoUID(localPending: .photoLibrary, identifier: "unanswered"),
+        ])
+
+        let answered = try XCTUnwrap(store.sourceState(for: key("answered")))
+        let unanswered = try XCTUnwrap(store.sourceState(for: key("unanswered")))
+        XCTAssertTrue(answered.remoteTrashed)
+        XCTAssertFalse(answered.needsRemoteTrash, "a confirmed photo must not be trashed again")
+        XCTAssertFalse(unanswered.remoteTrashed)
+        XCTAssertTrue(unanswered.needsRemoteTrash, "a photo without an answer must try again")
+        XCTAssertEqual(unanswered.attempts, 1)
+    }
+
     func testFailedRemovalStaysDueAndRetries() async throws {
         enqueue("stuck", state: .queuedForUpload)
         effects.removeSucceeds = false
@@ -414,6 +440,45 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         let snapshot = await coordinator.currentSnapshot()
         XCTAssertTrue(snapshot.trashTiles.isEmpty)
         XCTAssertEqual(snapshot.excludedTiles.map(\.item.uid), [uid])
+    }
+
+    func testProgressTicksKeepTheTrashListUntilAPhotoExpires() async throws {
+        await coordinator.close()
+        let clock = MutableClock(date)
+        coordinator = PendingBackupCoordinator(
+            store: store,
+            queues: [.photoLibraryAsset: queue],
+            metadataProvider: metadata,
+            effects: effects,
+            recorder: recorder,
+            configuration: .init(
+                membershipInterval: .zero,
+                progressInterval: .milliseconds(1),
+                doneLinger: .milliseconds(20),
+                trashRetention: 60
+            ),
+            now: { clock.now }
+        )
+        enqueue("old", state: .queuedForUpload)
+        enqueue("up", state: .uploading)
+        await coordinator.start()
+        let uid = PhotoUID(localPending: .photoLibrary, identifier: "old")
+        await coordinator.exclude([uid])
+
+        recorder.reportProgress(source: source("up"), revision: revision, step: 3)
+        var snapshot = await waitForSnapshot("the step arrives") { !$0.progress.isEmpty }
+        XCTAssertEqual(snapshot.trashTiles.map(\.item.uid), [uid])
+
+        clock.advance(by: 61)
+        recorder.reportProgress(source: source("up"), revision: revision, step: 4)
+        snapshot = await waitForSnapshot("the expired photo leaves the trash list") { $0.trashTiles.isEmpty }
+        XCTAssertEqual(snapshot.excludedTiles.map(\.item.uid), [uid], "the photo stays excluded")
+
+        // A clock set back (for example by the network time) puts the photo into its retention again.
+        clock.advance(by: -30)
+        recorder.reportProgress(source: source("up"), revision: revision, step: 5)
+        snapshot = await waitForSnapshot("the photo returns to the trash list") { !$0.trashTiles.isEmpty }
+        XCTAssertEqual(snapshot.trashTiles.map(\.item.uid), [uid])
     }
 
     // MARK: - Deferred actions
@@ -524,6 +589,7 @@ private final class FakePendingEffects: PendingBackupEffects, @unchecked Sendabl
     private var _favorites: [PhotoUID] = []
     private var _removeSucceeds = true
     private var _albumResult = PendingEffectResult.done
+    private var _trashRetry = Set<PhotoUID>()
     private var _order: [String] = []
 
     var order: [String] { lock.withLock { _order } }
@@ -539,6 +605,11 @@ private final class FakePendingEffects: PendingBackupEffects, @unchecked Sendabl
     var albumResult: PendingEffectResult {
         get { lock.withLock { _albumResult } }
         set { lock.withLock { _albumResult = newValue } }
+    }
+    /// Photos that the fake Proton trash leaves without an answer.
+    var trashRetry: Set<PhotoUID> {
+        get { lock.withLock { _trashRetry } }
+        set { lock.withLock { _trashRetry = newValue } }
     }
 
     func removeFromBackup(kind: UploadSourceIdentity.Kind, identifiers: [String]) async -> Bool {
@@ -558,15 +629,15 @@ private final class FakePendingEffects: PendingBackupEffects, @unchecked Sendabl
 
     func photosVolumeID() async -> String? { "photos-volume" }
 
-    func trashRemote(_ uids: [PhotoUID]) async -> PendingEffectResult {
+    func trashRemote(_ uids: [PhotoUID]) async -> PendingBatchEffectResult {
         lock.withLock {
             _trashed.append(uids)
             _order.append("trash")
+            return PendingBatchEffectResult(retry: _trashRetry.intersection(uids))
         }
-        return .done
     }
 
-    func restoreRemote(_ uids: [PhotoUID]) async -> PendingEffectResult {
+    func restoreRemote(_ uids: [PhotoUID]) async -> PendingBatchEffectResult {
         lock.withLock { _order.append("restore") }
         return .done
     }
@@ -578,5 +649,18 @@ private final class FakePendingEffects: PendingBackupEffects, @unchecked Sendabl
 
     func addToAlbum(_ uid: PhotoUID, albumID: String) async -> PendingEffectResult {
         lock.withLock { _albumResult }
+    }
+}
+
+private final class MutableClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: Date
+
+    init(_ start: Date) { value = start }
+
+    var now: Date { lock.withLock { value } }
+
+    func advance(by seconds: TimeInterval) {
+        lock.withLock { value = value.addingTimeInterval(seconds) }
     }
 }

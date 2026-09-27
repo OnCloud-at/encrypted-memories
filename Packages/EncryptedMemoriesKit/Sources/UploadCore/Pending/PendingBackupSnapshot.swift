@@ -108,6 +108,22 @@ public enum PendingEffectResult: Sendable, Equatable {
     case permanentFailure
 }
 
+/// Outcome of one batched trash or restore: the photos to try again. Every other photo is settled, either done or
+/// refused by Proton (for example a photo that is already in or out of the trash).
+public struct PendingBatchEffectResult: Sendable, Equatable {
+    public var retry: Set<PhotoUID>
+
+    public init(retry: Set<PhotoUID> = []) {
+        self.retry = retry
+    }
+
+    public static let done = PendingBatchEffectResult()
+
+    public static func retrying(_ uids: [PhotoUID]) -> PendingBatchEffectResult {
+        PendingBatchEffectResult(retry: Set(uids))
+    }
+}
+
 /// The side effects of pending-grid decisions. The account host implements them with the backup runner,
 /// the Photos adapter and the Proton backend.
 public protocol PendingBackupEffects: Sendable {
@@ -117,16 +133,16 @@ public protocol PendingBackupEffects: Sendable {
     func returnToBackup(_ keys: [PendingSourceKey]) async -> Bool
     /// The account's photos volume, used for link-only handoffs. Nil while unknown.
     func photosVolumeID() async -> String?
-    func trashRemote(_ uids: [PhotoUID]) async -> PendingEffectResult
-    func restoreRemote(_ uids: [PhotoUID]) async -> PendingEffectResult
+    func trashRemote(_ uids: [PhotoUID]) async -> PendingBatchEffectResult
+    func restoreRemote(_ uids: [PhotoUID]) async -> PendingBatchEffectResult
     func setFavorite(_ uid: PhotoUID, favorite: Bool) async -> PendingEffectResult
     func addToAlbum(_ uid: PhotoUID, albumID: String) async -> PendingEffectResult
 }
 
 /// The Proton side of pending decisions, implemented by the backend. Each call reports whether to retry.
 public protocol PendingRemoteEffects: Sendable {
-    func trash(_ uids: [PhotoUID]) async -> PendingEffectResult
-    func restore(_ uids: [PhotoUID]) async -> PendingEffectResult
+    func trash(_ uids: [PhotoUID]) async -> PendingBatchEffectResult
+    func restore(_ uids: [PhotoUID]) async -> PendingBatchEffectResult
     func setFavorite(_ uid: PhotoUID, favorite: Bool) async -> PendingEffectResult
     func addToAlbum(_ uid: PhotoUID, albumID: String) async -> PendingEffectResult
 }

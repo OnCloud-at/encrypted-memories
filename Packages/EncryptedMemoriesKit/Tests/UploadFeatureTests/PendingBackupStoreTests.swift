@@ -336,6 +336,25 @@ final class PendingQueueIntegrationTests: XCTestCase {
         XCTAssertEqual(queue.rows(kind: .photoLibraryAsset, identifiers: ["done"]).map(\.state), [.completed])
     }
 
+    func testRowsForSeveralSourcesReturnEachSourceAndSkipUnknownOnes() {
+        XCTAssertTrue(
+            queue.upsertBatch([
+                entry("waiting", state: .discovered),
+                entry("done", state: .completed),
+                entry("failed", state: .failedPermanent),
+            ]))
+
+        let rows = queue.rows(kind: .photoLibraryAsset, identifiers: ["waiting", "done", "unknown", "failed"])
+
+        XCTAssertEqual(rows.count, 3)
+        XCTAssertEqual(
+            Dictionary(uniqueKeysWithValues: rows.map { ($0.source.identifier, $0.state) }),
+            ["waiting": .discovered, "done": .completed, "failed": .failedPermanent])
+        XCTAssertTrue(queue.rows(kind: .photoLibraryAsset, identifiers: []).isEmpty)
+        XCTAssertTrue(queue.rows(kind: .fileURL, identifiers: ["waiting"]).isEmpty)
+        XCTAssertTrue(queue.isOperational())
+    }
+
     func testEngineDropsExcludedPhotosAndRefusesWithoutAnAnswer() async throws {
         let exclusions = StubExclusions(excluded: ["excluded"])
         let engine = UploadBackupSyncEngine(
