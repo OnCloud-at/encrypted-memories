@@ -27,13 +27,17 @@ struct SmartSearchDiscoveryPersistence: Codable, Sendable {
     }
 
     static func assetFingerprint(sections: [TimelineSection]) throws -> Data {
-        let items: [PhotoItem] = sections.flatMap(\.items)
-        let uids: [PhotoUID] = items.map(\.uid).sorted { lhs, rhs in
-            lhs.volumeID == rhs.volumeID ? lhs.nodeID < rhs.nodeID : lhs.volumeID < rhs.volumeID
-        }
+        try assetFingerprint(sortedUIDs: sections.flatMap(\.items).map(\.uid).sorted(by: precedes))
+    }
+
+    private static func assetFingerprint(sortedUIDs: [PhotoUID]) throws -> Data {
         let encoder = JSONEncoder()
         encoder.outputFormatting = .sortedKeys
-        return Data(SHA256.hash(data: try encoder.encode(uids)))
+        return Data(SHA256.hash(data: try encoder.encode(sortedUIDs)))
+    }
+
+    private static func precedes(_ lhs: PhotoUID, _ rhs: PhotoUID) -> Bool {
+        lhs.volumeID == rhs.volumeID ? lhs.nodeID < rhs.nodeID : lhs.volumeID < rhs.volumeID
     }
 
     func hasCompleteEvidence(requiresVisualEvidence: Bool) -> Bool {
@@ -60,6 +64,33 @@ struct SmartSearchDiscoveryPersistence: Codable, Sendable {
         sections: [TimelineSection], favorites: Set<PhotoUID>, coordinates: [PhotoCoordinate],
         now: Date = Date(), calendar: Calendar = .current, locale: Locale = .current
     ) throws -> Data {
+        try fingerprint(
+            sortedItems: sortedSuggestionItems(sections), favorites: favorites, coordinates: coordinates, now: now,
+            calendar: calendar, locale: locale)
+    }
+
+    /// Both fingerprints from one pass over the library: the full content and the asset identities.
+    static func fingerprints(
+        sections: [TimelineSection], favorites: Set<PhotoUID>, coordinates: [PhotoCoordinate],
+        now: Date = Date(), calendar: Calendar = .current, locale: Locale = .current
+    ) throws -> (content: Data, assets: Data) {
+        let items = sortedSuggestionItems(sections)
+        return (
+            try fingerprint(
+                sortedItems: items, favorites: favorites, coordinates: coordinates, now: now, calendar: calendar,
+                locale: locale),
+            try assetFingerprint(sortedUIDs: items.map(\.uid))
+        )
+    }
+
+    private static func sortedSuggestionItems(_ sections: [TimelineSection]) -> [PhotoItem] {
+        sections.flatMap(\.items).map(suggestionItem).sorted { precedes($0.uid, $1.uid) }
+    }
+
+    private static func fingerprint(
+        sortedItems: [PhotoItem], favorites: Set<PhotoUID>, coordinates: [PhotoCoordinate],
+        now: Date, calendar: Calendar, locale: Locale
+    ) throws -> Data {
         struct Content: Encodable {
             let items: [PhotoItem]
             let favorites: [PhotoUID]
@@ -69,14 +100,11 @@ struct SmartSearchDiscoveryPersistence: Codable, Sendable {
             let timeZone: String
             let locale: String
         }
-        func precedes(_ lhs: PhotoUID, _ rhs: PhotoUID) -> Bool {
-            lhs.volumeID == rhs.volumeID ? lhs.nodeID < rhs.nodeID : lhs.volumeID < rhs.volumeID
-        }
         let encoder = JSONEncoder()
         encoder.outputFormatting = .sortedKeys
         let data = try encoder.encode(
             Content(
-                items: sections.flatMap(\.items).map(suggestionItem).sorted { precedes($0.uid, $1.uid) },
+                items: sortedItems,
                 favorites: favorites.sorted(by: precedes),
                 coordinates: coordinates.sorted { precedes($0.uid, $1.uid) }, day: calendar.startOfDay(for: now),
                 calendar: String(describing: calendar.identifier), timeZone: calendar.timeZone.identifier,

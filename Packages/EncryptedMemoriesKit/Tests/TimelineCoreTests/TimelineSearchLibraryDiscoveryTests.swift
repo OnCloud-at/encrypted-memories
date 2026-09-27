@@ -73,10 +73,11 @@ import Testing
         let outsideWindow = item("y1-out", date(2025, 9, 10))
         let tooFewTwoYearsAgo = (0..<2).map { item("y2-\($0)", date(2024, 9, 21)) }
 
-        let result = TimelineSearchDiscovery.onThisDaySuggestions(
+        let discovery = context(now: now)
+        let result = TimelineSearchDiscovery.onThisDayRows(
             items: sorted(inWindow + [outsideWindow] + tooFewTwoYearsAgo),
-            context: context(now: now)
-        )
+            context: discovery
+        ).map { $0.suggestion(context: discovery) }
 
         #expect(result.map(\.id) == ["on-this-day:1"])
         #expect(result.first?.matchingUIDs == Set(inWindow.map(\.uid)))
@@ -89,10 +90,9 @@ import Testing
         let dayOne = (0..<20).map { item("d1-\($0)", date(2024, 8, 3, hour: $0 % 24)) }
         let dayTwo = (0..<18).map { item("d2-\($0)", date(2024, 8, 4, hour: $0 % 24)) }
 
-        let result = TimelineSearchDiscovery.tripSuggestions(
-            items: sorted(quiet + dayOne + dayTwo),
-            context: context(now: date(2026, 1, 1))
-        )
+        let discovery = context(now: date(2026, 1, 1))
+        let result = TimelineSearchDiscovery.tripRows(items: sorted(quiet + dayOne + dayTwo), context: discovery)
+            .map { $0.suggestion(context: discovery) }
 
         #expect(result.count == 1)
         #expect(result.first?.matchingUIDs == Set((dayOne + dayTwo).map(\.uid)))
@@ -105,10 +105,9 @@ import Testing
             + (0..<10).map { item("jan-\($0)", date(2025, 1, 10)) }
         let currentSummer = (0..<30).map { item("now-\($0)", date(2026, 7, 1)) }
 
-        let result = TimelineSearchDiscovery.seasonSuggestions(
-            items: sorted(winter + currentSummer),
-            context: context(now: date(2026, 7, 15))
-        )
+        let discovery = context(now: date(2026, 7, 15))
+        let result = TimelineSearchDiscovery.seasonRows(items: sorted(winter + currentSummer), context: discovery)
+            .map { $0.suggestion(context: discovery) }
 
         #expect(result.map(\.id) == ["season:\(TimelineSearchSeason.winter.rawValue):2025"])
         #expect(result.first?.matchingUIDs == Set(winter.map(\.uid)))
@@ -120,14 +119,44 @@ import Testing
         let photos = (0..<7).map { item("p\($0)", date(2024, 2, 1 + $0)) }
         let mixed = [TimelineSection(id: "s", date: videos[0].captureTime, title: "", items: videos + photos)]
 
-        let chips = TimelineSearchDiscovery.mediaTypeSuggestions(
-            items: videos + photos, sections: mixed, context: context(now: date(2026, 1, 1)))
+        let discovery = context(now: date(2026, 1, 1))
+        let chips = TimelineSearchDiscovery.mediaTypeRows(items: videos + photos, sections: mixed, context: discovery)
+            .map { $0.suggestion(context: discovery) }
         #expect(chips.first { $0.id == "media:\(PhotoTag.videos.rawValue)" }?.matchingUIDs == Set(videos.map(\.uid)))
 
         let onlyVideos = [TimelineSection(id: "s", date: videos[0].captureTime, title: "", items: videos)]
-        let dominated = TimelineSearchDiscovery.mediaTypeSuggestions(
-            items: videos, sections: onlyVideos, context: context(now: date(2026, 1, 1)))
+        let dominated = TimelineSearchDiscovery.mediaTypeRows(items: videos, sections: onlyVideos, context: discovery)
         #expect(!dominated.contains { $0.id == "media:\(PhotoTag.videos.rawValue)" })
+    }
+
+    @Test func rowsBuiltWithoutPreviewsGetTheSamePreviewsAsADirectBuild() {
+        let now = date(2026, 9, 21)
+        var items = (0..<20).map { item("y1-\($0)", date(2025, 9, 19 + $0 % 4, hour: $0)) }
+        items += (0..<40).map { item("trip-\($0)", date(2024, 8, 3 + $0 / 20, hour: $0 % 20)) }
+        items += (0..<12).map { item("video-\($0)", date(2023, 5, 1 + $0), mediaType: "video/mp4") }
+        let sections = [TimelineSection(id: "all", date: now, title: "", items: sorted(items))]
+        let favorites = Set(items.filter { $0.uid.nodeID.hasSuffix("-3") }.map(\.uid))
+        let excluded = Set(items.filter { $0.uid.nodeID.hasSuffix("-5") }.map(\.uid))
+        let scanned = Set(items.filter { !$0.uid.nodeID.hasSuffix("-7") }.map(\.uid))
+        let gated = TimelineSearchDiscoveryContext(
+            now: now, calendar: calendar, locale: Locale(identifier: "de_AT"), favoriteUIDs: favorites,
+            excludedRepresentativeUIDs: excluded, allowsRepresentative: { scanned.contains($0) })
+        var withoutPreviews = gated
+        withoutPreviews.excludedRepresentativeUIDs = []
+        withoutPreviews.allowsRepresentative = nil
+        withoutPreviews.suppressesRepresentatives = true
+
+        let rows = TimelineSearchDiscovery.libraryRows(sections: sections, context: withoutPreviews)
+        let reused = TimelineSearchDiscovery.librarySuggestions(rows: rows, context: gated)
+        let direct = TimelineSearchDiscovery.librarySuggestions(sections: sections, context: gated)
+
+        #expect(!direct.forYou.isEmpty && !direct.chips.isEmpty, "fixture must produce rows and chips")
+        #expect(direct.forYou.contains { !$0.representativeUIDs.isEmpty })
+        #expect(reused == direct)
+        #expect(
+            TimelineSearchDiscovery.librarySuggestions(rows: rows, context: withoutPreviews).forYou.allSatisfy {
+                $0.representativeUIDs.isEmpty
+            })
     }
 
     // MARK: Places

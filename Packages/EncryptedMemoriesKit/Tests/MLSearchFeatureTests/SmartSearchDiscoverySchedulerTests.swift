@@ -470,6 +470,157 @@ import TimelineCore
         #expect(try fingerprint(items) != fingerprint(Array(items.dropLast())))
     }
 
+    /// Saved suggestions stay valid across the update only while both fingerprints keep their bytes.
+    @Test func bothFingerprintsFromOnePassKeepTheSavedFormat() throws {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(identifier: "Europe/Vienna")!
+        let items = (0..<8).map {
+            PhotoItem(
+                uid: PhotoUID(volumeID: "v", nodeID: "\(7 - $0)"), captureTime: now.addingTimeInterval(Double($0)),
+                mediaType: "image/jpeg")
+        }
+        let sections = [TimelineSection(id: "all", date: now, title: "", items: items)]
+        let favorites: Set = [items[2].uid]
+        let coordinates = [PhotoCoordinate(uid: items[1].uid, latitude: 48.2, longitude: 16.3, date: now)]
+        let both = try SmartSearchDiscoveryPersistence.fingerprints(
+            sections: sections, favorites: favorites, coordinates: coordinates, now: now, calendar: calendar,
+            locale: Locale(identifier: "de_AT"))
+
+        #expect(
+            both.content
+                == (try SmartSearchDiscoveryPersistence.fingerprint(
+                    sections: sections, favorites: favorites, coordinates: coordinates, now: now, calendar: calendar,
+                    locale: Locale(identifier: "de_AT"))))
+        #expect(both.assets == (try SmartSearchDiscoveryPersistence.assetFingerprint(sections: sections)))
+        #expect(
+            both.assets.map { String(format: "%02x", $0) }.joined()
+                == "146fc7a30bf45d23de138afeb6608a3122c7594ff0a2b9e2da9755b6058eaabe")
+    }
+
+    @Test func changedPhotosMatchAComparisonOfTheWholeLibrary() {
+        let base = Date(timeIntervalSince1970: 1_700_000_000)
+        func item(_ index: Int, mediaType: String = "image/jpeg", duration: Double? = nil) -> PhotoItem {
+            PhotoItem(
+                uid: PhotoUID(volumeID: "v", nodeID: "\(index)"), captureTime: base.addingTimeInterval(Double(index)),
+                mediaType: mediaType, durationSeconds: duration)
+        }
+        func sections(_ items: [PhotoItem]) -> [TimelineSection] {
+            stride(from: 0, to: items.count, by: 40).map {
+                TimelineSection(id: "\($0)", date: base, title: "", items: Array(items[$0..<min($0 + 40, items.count)]))
+            }
+        }
+        func wholeLibrary(_ previous: [PhotoItem], _ current: [PhotoItem]) -> Set<PhotoUID> {
+            let index = Dictionary(
+                current.map { ($0.uid, SmartSearchDiscoveryPersistence.suggestionItem($0)) },
+                uniquingKeysWith: { first, _ in first })
+            return Set(
+                previous.filter { index[$0.uid] != SmartSearchDiscoveryPersistence.suggestionItem($0) }.map(\.uid))
+        }
+        let original = (0..<200).map { item($0) }
+        var edited = original
+        edited[100] = item(100, mediaType: "image/heic")
+        var deletedAndAdded = original
+        deletedAndAdded.remove(at: 57)
+        deletedAndAdded.append(item(900))
+        var reordered = original
+        reordered.swapAt(10, 190)
+        var learnedDuration = original
+        learnedDuration[5] = item(5, duration: 12)
+        let cases: [[PhotoItem]] = [
+            original, Array(original.dropFirst(3)), original + [item(901), item(902)], [item(903)] + original,
+            edited, deletedAndAdded, reordered, learnedDuration, original.reversed(), [],
+        ]
+        for current in cases {
+            #expect(
+                SmartSearchDiscoveryScheduler.changedPhotos(from: sections(original), to: sections(current))
+                    == wholeLibrary(original, current))
+            #expect(
+                SmartSearchDiscoveryScheduler.changedPhotos(from: sections(current), to: sections(original))
+                    == wholeLibrary(current, original))
+        }
+    }
+
+    @Test func metadataRowsAreBuiltOncePerLibraryContent() async throws {
+        let probe = EvidenceProbe()
+        let cache = SnapshotCache()
+        let items = (0..<8).map {
+            PhotoItem(uid: PhotoUID(volumeID: "v", nodeID: "\($0)"), captureTime: Date(), mediaType: "image/jpeg")
+        }
+        let scheduler = SmartSearchDiscoveryScheduler(runtimeState: LibraryRuntimeState(), debounce: .zero) { _, _ in
+            await probe.placeName()
+        }
+        defer { scheduler.reset() }
+        // The saved fingerprint covers the content, so each step changes the content, not only a revision.
+        func apply(revision: UInt64, library: [PhotoItem], latitude: Double) {
+            scheduler.update(
+                sections: [TimelineSection(id: "all", date: Date(), title: "", items: library)],
+                timelineRevision: revision, favoriteUIDs: Set(items.map(\.uid)),
+                coordinates: library.map {
+                    PhotoCoordinate(uid: $0.uid, latitude: latitude, longitude: 16.3, date: $0.captureTime)
+                }, snapshot: visualSnapshot(settled: 8, ready: true), indexedAssetCount: { 8 },
+                searchEvidence: { await probe.query(sensitive: items[0].uid, conceptUIDs: items.map(\.uid)) },
+                cacheAccess: { await cache.access() }, coordinateRevision: Int(latitude))
+        }
+        func waitForSave(_ count: Int) async throws {
+            for _ in 0..<400 where await cache.saves < count || scheduler.isRefreshing {
+                try await Task.sleep(for: .milliseconds(5))
+            }
+            try #require(await cache.saves == count)
+        }
+
+        apply(revision: 1, library: items, latitude: 48)
+        try await waitForSave(1)
+        #expect(scheduler.libraryRowBuildCount == 1, "the metadata pass and the full pass share one build")
+
+        apply(revision: 1, library: items, latitude: 47)
+        try await waitForSave(2)
+        #expect(scheduler.libraryRowBuildCount == 1, "a place change keeps the library rows")
+
+        apply(revision: 2, library: Array(items.dropLast()), latitude: 47)
+        try await waitForSave(3)
+        #expect(scheduler.libraryRowBuildCount == 2, "a library change builds new rows")
+    }
+
+    @Test func lowPowerDefersCheckingSavedSuggestionsAgainstChangedContent() async throws {
+        let probe = EvidenceProbe()
+        let cache = SnapshotCache()
+        let runtime = LibraryRuntimeState()
+        let items = (0..<8).map {
+            PhotoItem(uid: PhotoUID(volumeID: "v", nodeID: "\($0)"), captureTime: Date(), mediaType: "image/jpeg")
+        }
+        let scheduler = SmartSearchDiscoveryScheduler(runtimeState: runtime, debounce: .zero) { _, _ in nil }
+        defer { scheduler.reset() }
+        func apply(revision: UInt64) {
+            let library = revision == 1 ? items : Array(items.dropLast())
+            scheduler.update(
+                sections: [TimelineSection(id: "all", date: Date(), title: "", items: library)],
+                timelineRevision: revision, favoriteUIDs: [], coordinates: [],
+                snapshot: visualSnapshot(settled: 8, ready: true), indexedAssetCount: { 8 },
+                searchEvidence: { await probe.query(sensitive: items[0].uid, conceptUIDs: items.map(\.uid)) },
+                cacheAccess: { await cache.access() })
+        }
+        apply(revision: 1)
+        for _ in 0..<400 where await cache.saves < 1 || scheduler.isRefreshing {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        try #require(await cache.saves == 1)
+        let reads = await cache.reads
+
+        runtime.update { $0.isLowPowerMode = true }
+        apply(revision: 2)
+        try await Task.sleep(for: .milliseconds(30))
+        #expect(await cache.reads == reads, "changed content waits instead of reading every photo again")
+        #expect(scheduler.discovery.hasComputed, "the shown rows stay")
+
+        runtime.update { $0.isLowPowerMode = false }
+        for _ in 0..<400 where await cache.saves < 2 || scheduler.isRefreshing {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        #expect(await cache.reads > reads)
+        #expect(await cache.saves == 2)
+    }
+
     @Test func learnedVideoDurationDoesNotInvalidateSavedSuggestions() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
