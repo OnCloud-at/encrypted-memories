@@ -8,12 +8,14 @@ Thank you for helping improve Encrypted Memories. Keep each pull request focused
 - Open an issue before a large feature or architecture change.
 - Never include credentials, private user data, signing files, or local build output.
 - PR authors never set app versions, build numbers, release tags, or release notes. Maintainers own releases.
+- Coding agents also follow `AGENTS.md`.
 
 ## Planning
 
 GitHub issues and milestones hold all planned work. People and coding agents use the same process.
 
 - Each milestone is a release: the next maintenance release, or a feature release such as 1.5 or 2.0.
+- Versions follow semantic versioning. A release with a new user-facing feature raises the minor version, for example 1.1.0. A release with only fixes raises the patch version, for example 1.1.1.
 - Find the issue before you start. Open one when the work has none.
 - Reference the issue in the pull request, for example `Closes #98`.
 - Record design decisions and remaining work in the issue, not only in the pull request.
@@ -36,12 +38,19 @@ The repository is public, and a pull request keeps every commit you push, even w
 - State an actual platform limitation in the pull request when parity is impossible.
 - Do not duplicate business logic across platform targets.
 - Prefer a smaller implementation when it preserves behavior and makes regressions less likely.
-- Add or update tests for every changed contract and regression.
-- Test behavior through the code under test. Do not add tests that search source files for code text; they break on renames and stay green when the behavior breaks. Module import rules in `CoreArchitectureGateTests` and build-configuration checks in `ProjectHygieneTests` are the exceptions.
 - Treat `project.yml` as the project source. Do not commit the generated Xcode project.
 - Update the pinned SDK patch set when a Proton SDK change modifies vendored code.
 
 The package uses feature modules and shared cores. A feature module owns reusable state, policy, and behavior. The macOS and mobile apps own native presentation and system integration.
+
+## Tests
+
+Every change that alters behavior comes with tests:
+
+- A new feature: unit tests for its shared logic in `Packages/EncryptedMemoriesKit`, and a UI test in `iOSUITests` for each new user action.
+- A bug fix: a regression test that fails without the fix and passes with it.
+- A refactor without a behavior change: the existing tests stay green. Add a test first when the changed code has none.
+- Test behavior through the code under test. Do not add tests that search source files for code text; they break on renames and stay green when the behavior breaks. Module import rules in `CoreArchitectureGateTests` and build-configuration checks in `ProjectHygieneTests` are the exceptions.
 
 ## Pull request scope
 
@@ -52,7 +61,7 @@ The package uses feature modules and shared cores. A feature module owns reusabl
 - Keep unrelated formatting and refactors out of the pull request.
 - Do not weaken a test to hide an application defect.
 
-GitHub runs repository hygiene, Swift style, package tests, iOS app tests, and both platform builds. A maintainer reviews the result before merge.
+GitHub runs repository hygiene, Swift style, package tests, iOS app tests, iOS UI tests, and both platform builds. A maintainer reviews the result before merge.
 
 ## Own your pull request
 

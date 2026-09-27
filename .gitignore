@@ -46,6 +46,7 @@ Archiv.zip
 # Local Markdown notes and reports. Public documentation must be allow-listed.
 *.md
 !/README.md
+!/AGENTS.md
 !/SECURITY.md
 !/CONTRIBUTING.md
 !/.github/pull_request_template.md
