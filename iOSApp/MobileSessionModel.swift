@@ -72,6 +72,13 @@ final class MobileSessionModel: ObservableObject {
 
     private func beginStartupCleanup(plaintextPurgeSucceeded: Bool? = nil, signInAfterCleanup: Bool = false) {
         guard startupCleanupTask == nil else { return }
+        #if DEBUG
+            // UI tests run on the offline fixture account. A saved real account must never start behind it.
+            guard !MobileUITestLaunch.isRequested else {
+                isCheckingSession = false
+                return
+            }
+        #endif
         apply(.checking)
         guard UIApplication.shared.isProtectedDataAvailable else { return }
         let purgeClaim = BackupLocalDataPurge.claimSignOutPurge()

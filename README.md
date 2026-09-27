@@ -291,6 +291,12 @@ Run the iOS app-shell tests on a simulator:
 ./scripts/verify-ios-app-tests.sh
 ```
 
+Run the iOS UI tests. They launch the app on an offline test account and tap through it:
+
+```bash
+./scripts/verify-ios-app-tests.sh ui
+```
+
 Override `IOS_TEST_DESTINATION` when the default iPhone simulator is not installed.
 
 Run the fast shared-core and platform-boundary gate:

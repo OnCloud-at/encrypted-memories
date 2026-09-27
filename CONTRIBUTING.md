@@ -70,8 +70,12 @@ Run focused tests while you work. Run these gates before requesting review:
 ```bash
 ./scripts/verify-tests.sh
 ./scripts/verify-ios-app-tests.sh
+./scripts/verify-ios-app-tests.sh ui
 ./scripts/verify-universal-core.sh fast
 ```
+
+`./scripts/verify-ios-app-tests.sh ui` runs the UI tests. They launch the app in the simulator on an offline test
+account and tap through it. They need no Proton account and no network. Add a UI test when you add a user action.
 
 Run the platform shell build when your change affects that app:
 

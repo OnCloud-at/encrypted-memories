@@ -5,6 +5,16 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEVELOPER_DIR="${DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Developer}"
 source "$ROOT/scripts/build-paths.sh"
 DERIVED_DATA="${ENCRYPTED_MEMORIES_IOS_TEST_DERIVED_DATA:-$ENCRYPTED_MEMORIES_BUILD_ROOT/DD.tests.ios.noindex}"
+# No argument runs the hosted tests. `ui` runs the UI tests, which launch the app on the offline fixture account and
+# tap through it in the simulator.
+case "${1:-hosted}" in
+  hosted) SCHEME="EncryptedMemoriesMobileTests" ;;
+  ui) SCHEME="EncryptedMemoriesMobileUITests" ;;
+  *)
+    echo "usage: $0 [hosted|ui]" >&2
+    exit 64
+    ;;
+esac
 # The runner image decides which iPhone simulators exist, and Apple renames the lineup every year. A
 # pinned device name therefore fails as "Unable to find a device matching the provided destination
 # specifier" on a new image. Resolve an installed iPhone instead; IOS_TEST_DESTINATION still overrides it.
@@ -44,7 +54,7 @@ else
 fi
 export DEVELOPER_DIR
 
-encryptedmemories_acquire_build_lock "verify-ios-app-tests"
+encryptedmemories_acquire_build_lock "verify-ios-app-tests ${1:-hosted}"
 
 if ! command -v xcodegen >/dev/null 2>&1; then
   echo "[ios-tests] xcodegen is required to generate EncryptedMemories.xcodeproj." >&2
@@ -59,16 +69,16 @@ echo "[ios-tests] resolving pinned packages into shared cache"
 xcrun xcodebuild \
   -resolvePackageDependencies \
   -project "$ROOT/EncryptedMemories.xcodeproj" \
-  -scheme EncryptedMemoriesMobileTests \
+  -scheme "$SCHEME" \
   -clonedSourcePackagesDirPath "$ENCRYPTED_MEMORIES_XCODE_SOURCE_PACKAGES" \
   -packageCachePath "$ENCRYPTED_MEMORIES_XCODE_PACKAGE_CACHE" \
   -packageAuthorizationProvider netrc \
   -onlyUsePackageVersionsFromResolvedFile
 
-echo "[ios-tests] destination: $DESTINATION"
+echo "[ios-tests] scheme: $SCHEME, destination: $DESTINATION"
 xcrun xcodebuild \
   -project "$ROOT/EncryptedMemories.xcodeproj" \
-  -scheme EncryptedMemoriesMobileTests \
+  -scheme "$SCHEME" \
   -destination "$DESTINATION" \
   -derivedDataPath "$DERIVED_DATA" \
   -clonedSourcePackagesDirPath "$ENCRYPTED_MEMORIES_XCODE_SOURCE_PACKAGES" \
