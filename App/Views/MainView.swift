@@ -629,7 +629,7 @@ struct MainView: View {
                     semanticMatches: committedSemanticMatches,
                     requiredUIDs: committedSuggestionMatches,
                     refinement: activeRefinement,
-                    onClearRefinement: { refinement = .all },
+                    onClearRefinement: { applyRefinement(.all) },
                     selectionMode: selectionMode,
                     media: backend,
                     metadataProvider: backend,
@@ -1256,8 +1256,17 @@ struct MainView: View {
             if next.isActive, temporalMode != .allPhotos {
                 temporalModeBinding.wrappedValue = .allPhotos
             }
-            refinement = next
+            applyRefinement(next)
         }
+    }
+
+    /// Every filter change starts a new reading position, like a search: a filtered grid opens at its newest
+    /// result, and removing the filter returns the full library to its newest photo at the bottom.
+    private func applyRefinement(_ next: TimelineRefinement) {
+        guard next != refinement else { return }
+        refinement = next
+        routeInitialScrollAnchor = nil
+        routeScrollGeneration += 1
     }
 
     /// Filter menu of the Mediathek, with the same entries as on iPhone and iPad.
@@ -1291,7 +1300,7 @@ struct MainView: View {
                     focusedTemporalYear = nil
                 }
                 if mode != .allPhotos {
-                    refinement = .all
+                    applyRefinement(.all)
                 }
             }
         }
