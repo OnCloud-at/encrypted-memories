@@ -809,19 +809,7 @@ public final class LibrarySourceInventoryStore: @unchecked Sendable {
     }
 
     private static func destroyDatabaseFiles(at url: URL) -> Bool {
-        guard url.lastPathComponent == databaseFileName,
-            !url.hasDirectoryPath
-        else { return false }
-        for suffix in ["", "-wal", "-shm"] {
-            let target = URL(fileURLWithPath: url.path + suffix)
-            guard FileManager.default.fileExists(atPath: target.path) else { continue }
-            do {
-                try FileManager.default.removeItem(at: target)
-            } catch {
-                return false
-            }
-        }
-        return true
+        url.lastPathComponent == databaseFileName && SQLiteStoreSchemaGate.removeDatabaseFiles(at: url)
     }
 
     private func prepare(
