@@ -2054,10 +2054,11 @@ struct MainView: View {
 
         if let viewerModel {
             // Apple-Photos centered two-line metadata in a pill: location/POI (or date) over the
-            // secondary line, both inside a capsule padded comfortably larger than the text.
+            // secondary line. No vertical padding: the toolbar gives the pill the height of the other
+            // glass groups and centers the text, so the pill never grows below them.
             ToolbarItem(placement: .principal) {
                 let t = viewerTitle(viewerModel)
-                VStack(spacing: 1) {
+                VStack(spacing: 0) {
                     Text(t.line1)
                         .font(.system(size: 13, weight: .semibold))
                         .opacity(t.reservesLocationLine ? 0 : 1)
@@ -2070,7 +2071,6 @@ struct MainView: View {
                 .multilineTextAlignment(.center)
                 .fixedSize()
                 .padding(.horizontal, 16)
-                .padding(.vertical, 6)
                 // The system toolbar supplies the single glass background for the principal item.
             }
             ToolbarItemGroup(placement: .primaryAction) {
