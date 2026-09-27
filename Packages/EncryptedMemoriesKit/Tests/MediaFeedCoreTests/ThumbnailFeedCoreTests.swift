@@ -2606,6 +2606,31 @@ struct ThumbnailFeedCoreTests {
         await feed.stopPrefetch()
     }
 
+    @Test func restartedCrawlDoesNotDecryptBlobsThatThisFeedAlreadyAuthenticated() async throws {
+        let first = Self.uid("restart-proven-first")
+        let second = Self.uid("restart-proven-second")
+        let cache = Self.cache("restart-proven")
+        cache.storeToDisk(Self.pngData(width: 8, height: 8), for: first)
+        cache.storeToDisk(Self.pngData(width: 8, height: 8), for: second)
+        let loader = RecordingLoader(payloads: [second: Self.pngData(width: 8, height: 8)])
+        let feed = ThumbnailFeedCore(
+            cache: cache,
+            loader: loader,
+            configuration: Self.configuration(downloadConcurrencyLimit: 1, batchSize: 2)
+        )
+        await feed.startPrefetch([first, second])
+        try await Self.waitUntil { await feed.prefetchStatus().diskCoverageVerified }
+
+        // A source change (for example after an upload) restarts the crawl. The first crawl authenticated both
+        // blobs, so the restart only looks them up. A blob changed in place shows whether the restart read it.
+        try Data(repeating: 0xA5, count: 64).write(to: cache.diskURL(for: second), options: .atomic)
+        await feed.startPrefetch([first, second])
+        try await Self.waitUntil { await feed.prefetchStatus().diskCoverageVerified }
+
+        #expect(await loader.requestCount() == 0)
+        await feed.stopPrefetch()
+    }
+
     @Test func destructiveClearRejectsLateNonCooperativeThumbnailWriter() async throws {
         let uid = Self.uid("late-thumbnail-after-clear")
         let cache = Self.cache("late-thumbnail-after-clear")
