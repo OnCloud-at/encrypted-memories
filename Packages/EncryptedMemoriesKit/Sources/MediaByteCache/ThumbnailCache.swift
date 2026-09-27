@@ -48,7 +48,9 @@ public actor ThumbnailCache {
     private nonisolated let namespace: String
     private nonisolated let derivative: String
     private nonisolated let storageKind: LibraryDiskCacheKind
-    private nonisolated let runtimeState: LibraryRuntimeState
+    /// Storage pressure from this state decides whether the cache writes to disk. The thumbnail crawl follows
+    /// the same state, so it never downloads bytes that the cache cannot keep.
+    public nonisolated let runtimeState: LibraryRuntimeState
     private nonisolated(unsafe) var storageTask: Task<Void, Never>?
     private nonisolated let crypto: CryptoBox
     /// Fence for loaders and detached writers that can outlive a destructive clear or session change.
