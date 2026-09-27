@@ -251,6 +251,22 @@ targets:
         TARGETED_DEVICE_FAMILY: "1,2"
         SUPPORTS_MACCATALYST: NO
 
+  EncryptedMemoriesMobileUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    deploymentTarget: "26.0"
+    sources:
+      - iOSUITests
+    dependencies:
+      - target: EncryptedMemoriesMobile
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: at.oncloud.encryptedmemories.uitests
+        GENERATE_INFOPLIST_FILE: YES
+        TEST_TARGET_NAME: EncryptedMemoriesMobile
+        TARGETED_DEVICE_FAMILY: "1,2"
+        SUPPORTS_MACCATALYST: NO
+
 schemes:
   EncryptedMemories:
     build:
@@ -274,3 +290,13 @@ schemes:
     test:
       targets:
         - EncryptedMemoriesMobileTests
+
+  EncryptedMemoriesMobileUITests:
+    build:
+      targets:
+        EncryptedMemoriesMobile: all
+        EncryptedMemoriesMobileUITests: [test]
+    test:
+      config: Debug
+      targets:
+        - EncryptedMemoriesMobileUITests

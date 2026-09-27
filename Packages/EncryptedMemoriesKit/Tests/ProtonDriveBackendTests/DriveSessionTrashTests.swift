@@ -1,6 +1,8 @@
 import Foundation
+import PhotosCore
 import ProtonAuth
 import Testing
+import UploadCore
 
 @testable import ProtonDriveBackend
 
@@ -146,9 +148,11 @@ extension DriveSessionStubSuite {
                     ]}
                     """#)
 
-            await #expect(throws: DriveBatchActionError.self) {
+            let error = await #expect(throws: DriveBatchActionError.self) {
                 try await makeSession().trash(volumeID: "vol1", linkIDs: ["ok", "bad"])
             }
+            #expect(error?.failed == 1)
+            #expect(error?.retryableLinkIDs.isEmpty == true, "Proton refused the link; a retry cannot change that")
         }
 
         @Test(arguments: [
@@ -166,12 +170,105 @@ extension DriveSessionStubSuite {
             StubURLProtocol.route("PUT /drive/v2/volumes/vol1/trash/restore_multiple", json: response)
             let session = makeSession()
 
-            await #expect(throws: DriveBatchActionError.self) {
+            let trashError = await #expect(throws: DriveBatchActionError.self) {
                 try await session.trash(volumeID: "vol1", linkIDs: ["l1", "l2"])
             }
-            await #expect(throws: DriveBatchActionError.self) {
+            let restoreError = await #expect(throws: DriveBatchActionError.self) {
                 try await session.restore(volumeID: "vol1", linkIDs: ["l1", "l2"])
             }
+            #expect(trashError?.retryableLinkIDs.isEmpty == false, "an unanswered link is worth another attempt")
+            #expect(restoreError?.retryableLinkIDs.isEmpty == false, "an unanswered link is worth another attempt")
+        }
+
+        @Test func aFailedLaterRequestKeepsEveryUnansweredAndUnsentLinkRetryable() async throws {
+            StubURLProtocol.reset()
+            let links = (0..<60).map { "l\($0)" }
+            // The first 50 links get no per-item answer; the request for the last 10 fails for a transient reason.
+            StubURLProtocol.routeSequence(
+                "PUT /drive/v2/volumes/vol1/trash/restore_multiple",
+                responses: [
+                    (status: 200, json: #"{"Code":1001,"Responses":[]}"#),
+                    (status: 503, json: #"{"Code":503,"Error":"unavailable"}"#),
+                ])
+
+            let error = await #expect(throws: DriveBatchActionError.self) {
+                try await makeSession().restore(volumeID: "vol1", linkIDs: links)
+            }
+            #expect(error?.retryableLinkIDs == Set(links))
+            #expect(StubURLProtocol.requests().count == 2)
+        }
+
+        @Test func aFailedLaterRequestSettlesTheLinksThatProtonAlreadyConfirmed() async throws {
+            StubURLProtocol.reset()
+            let links = (0..<60).map { "l\($0)" }
+            let answers = links.prefix(50).map { #"{"LinkID":"\#($0)","Response":{"Code":1000}}"# }
+            StubURLProtocol.routeSequence(
+                "PUT /drive/v2/volumes/vol1/trash/restore_multiple",
+                responses: [
+                    (status: 200, json: #"{"Code":1001,"Responses":["# + answers.joined(separator: ",") + "]}"),
+                    (status: 503, json: #"{"Code":503,"Error":"unavailable"}"#),
+                ])
+
+            let error = await #expect(throws: DriveBatchActionError.self) {
+                try await makeSession().restore(volumeID: "vol1", linkIDs: links)
+            }
+            #expect(error?.retryableLinkIDs == Set(links.suffix(10)))
+        }
+
+        @Test func aRejectedFirstRequestRetriesTheLinksOfLaterRequests() async throws {
+            StubURLProtocol.reset()
+            let links = (0..<120).map { "l\($0)" }
+            StubURLProtocol.routeSequence(
+                "PUT /drive/v2/volumes/vol1/trash/restore_multiple",
+                responses: [(status: 422, json: #"{"Code":2011,"Error":"refused"}"#)])
+
+            let error = await #expect(throws: DriveBatchActionError.self) {
+                try await makeSession().restore(volumeID: "vol1", linkIDs: links)
+            }
+            #expect(error?.retryableLinkIDs == Set(links.dropFirst(50)), "unsent links have no outcome yet")
+            #expect(error?.failed == 120)
+            #expect(StubURLProtocol.requests().count == 1)
+        }
+
+        @Test func aPartialAnswerSettlesItsConfirmedLinksAndRetriesTheRest() async throws {
+            StubURLProtocol.reset()
+            StubURLProtocol.route(
+                "PUT /drive/v2/volumes/vol1/trash/restore_multiple",
+                json: #"""
+                    {"Code":1001,"Responses":[
+                        {"LinkID":"confirmed","Response":{"Code":1000}},
+                        {"LinkID":"refused","Response":{"Code":2501,"Error":"Not in trash"}},
+                        {"LinkID":"twice","Response":{"Code":1000}},
+                        {"LinkID":"twice","Response":{"Code":1000}}
+                    ]}
+                    """#)
+
+            let error = await #expect(throws: DriveBatchActionError.self) {
+                try await makeSession().restore(
+                    volumeID: "vol1", linkIDs: ["confirmed", "refused", "twice", "missing"])
+            }
+            #expect(error?.retryableLinkIDs == ["twice", "missing"])
+            #expect(error?.failed == 3)
+        }
+
+        @Test func pendingEffectsRetryOnlyPhotosThatProtonDidNotAnswer() async {
+            let answered = PhotoUID(volumeID: "vol1", nodeID: "answered")
+            let refused = PhotoUID(volumeID: "vol1", nodeID: "refused")
+            let unanswered = PhotoUID(volumeID: "vol1", nodeID: "unanswered")
+
+            let batch = await ProtonPendingRemoteEffects.runBatch([answered, refused, unanswered]) {
+                throw DriveBatchActionError(failed: 2, retryableLinkIDs: ["unanswered"], total: 3)
+            }
+            let allRefused = await ProtonPendingRemoteEffects.run {
+                throw DriveBatchActionError(failed: 1, retryableLinkIDs: [], total: 1)
+            }
+            let transport = await ProtonPendingRemoteEffects.runBatch([answered, refused]) {
+                throw URLError(.timedOut)
+            }
+
+            #expect(batch == PendingBatchEffectResult(retry: [unanswered]))
+            #expect(allRefused == .permanentFailure)
+            #expect(transport == .retrying([answered, refused]))
         }
 
         @Test func restorePutsLinkIDsToRestoreMultiple() async throws {

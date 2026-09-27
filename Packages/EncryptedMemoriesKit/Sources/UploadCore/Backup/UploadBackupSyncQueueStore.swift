@@ -1232,24 +1232,27 @@ extension UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueObserving {
                 state NOT IN ('alreadyBackedUp', 'completed', 'skippedRemoteDeletion', 'sourceMissing',
                               'dismissedFailure')
                 """,
-            bind: nil
+            bindings: [nil]
         )
     }
 
     public func rows(kind: UploadSourceIdentity.Kind, identifiers: Set<String>) -> [UploadBackupQueueRowState] {
-        var result: [UploadBackupQueueRowState] = []
-        for identifier in identifiers {
-            result += rowStates(where: "source_kind=? AND source_id=?") { stmt in
-                self.bindText(stmt, 1, kind.rawValue)
-                self.bindText(stmt, 2, identifier)
+        guard !identifiers.isEmpty else { return [] }
+        return rowStates(
+            where: "source_kind=? AND source_id=?",
+            bindings: identifiers.map { identifier in
+                { stmt in
+                    self.bindText(stmt, 1, kind.rawValue)
+                    self.bindText(stmt, 2, identifier)
+                }
             }
-        }
-        return result
+        )
     }
 
+    /// Runs one prepared query once for each set of bindings, so a batch of sources costs one prepare.
     private func rowStates(
         where condition: String,
-        bind: ((OpaquePointer?) -> Void)?
+        bindings: [((OpaquePointer?) -> Void)?]
     ) -> [UploadBackupQueueRowState] {
         lock.withLock {
             var stmt: OpaquePointer?
@@ -1265,27 +1268,31 @@ extension UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueObserving {
                     ) == SQLITE_OK)
             else { return [] }
             defer { sqlite3_finalize(stmt) }
-            bind?(stmt)
             var result: [UploadBackupQueueRowState] = []
-            var step = sqlite3_step(stmt)
-            while step == SQLITE_ROW {
-                if let source = sourceFromColumns(stmt, kindColumn: 0, idColumn: 1, resourceColumn: 2),
-                    let state = columnText(stmt, 4).flatMap(UploadBackupSyncQueueState.init(rawValue:))
-                {
-                    result.append(
-                        UploadBackupQueueRowState(
-                            source: source,
-                            revision: UploadBackupRevision(rawValue: sqlite3_column_int64(stmt, 3)),
-                            state: state,
-                            originalFilename: columnText(stmt, 5) ?? "",
-                            updatedAt: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 6))
-                        ))
-                } else {
-                    operationFailed = true
+            for bind in bindings {
+                sqlite3_reset(stmt)
+                sqlite3_clear_bindings(stmt)
+                bind?(stmt)
+                var step = sqlite3_step(stmt)
+                while step == SQLITE_ROW {
+                    if let source = sourceFromColumns(stmt, kindColumn: 0, idColumn: 1, resourceColumn: 2),
+                        let state = columnText(stmt, 4).flatMap(UploadBackupSyncQueueState.init(rawValue:))
+                    {
+                        result.append(
+                            UploadBackupQueueRowState(
+                                source: source,
+                                revision: UploadBackupRevision(rawValue: sqlite3_column_int64(stmt, 3)),
+                                state: state,
+                                originalFilename: columnText(stmt, 5) ?? "",
+                                updatedAt: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 6))
+                            ))
+                    } else {
+                        operationFailed = true
+                    }
+                    step = sqlite3_step(stmt)
                 }
-                step = sqlite3_step(stmt)
+                if step != SQLITE_DONE { operationFailed = true }
             }
-            if step != SQLITE_DONE { operationFailed = true }
             return result
         }
     }

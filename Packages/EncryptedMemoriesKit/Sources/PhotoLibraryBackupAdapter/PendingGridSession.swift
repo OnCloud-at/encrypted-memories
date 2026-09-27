@@ -400,8 +400,8 @@ private struct SessionEffects: PendingBackupEffects {
     }
 
     func photosVolumeID() async -> String? { volume.get() }
-    func trashRemote(_ uids: [PhotoUID]) async -> PendingEffectResult { await remote.trash(uids) }
-    func restoreRemote(_ uids: [PhotoUID]) async -> PendingEffectResult { await remote.restore(uids) }
+    func trashRemote(_ uids: [PhotoUID]) async -> PendingBatchEffectResult { await remote.trash(uids) }
+    func restoreRemote(_ uids: [PhotoUID]) async -> PendingBatchEffectResult { await remote.restore(uids) }
 
     func setFavorite(_ uid: PhotoUID, favorite: Bool) async -> PendingEffectResult {
         await remote.setFavorite(uid, favorite: favorite)

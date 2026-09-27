@@ -107,8 +107,12 @@ public final class PhotoLibraryBackupController {
             && lockStore != nil
             && queueStore?.isOperational() == true
             && catalogStore?.isOperational() == true
-            // Without readable exclusions a deleted pending photo could upload.
-            && (requiresPendingStore ? pendingStore?.isOperational() == true : pendingStore?.isOperational() != false)
+            && pendingStoreIsReady
+    }
+
+    /// Without readable exclusions a photo that the person excluded or deleted could upload.
+    private var pendingStoreIsReady: Bool {
+        requiresPendingStore ? pendingStore?.isOperational() == true : pendingStore?.isOperational() != false
     }
 
     /// Identity of the currently active orchestration pass. Platform expiration handlers use this
@@ -489,7 +493,7 @@ public final class PhotoLibraryBackupController {
             !isRetiringInstantWork, runnerStopTask == nil,
             let engine, let runner, let queueStore, let catalogStore
         else { return nil }
-        guard queueStore.isOperational(), catalogStore.isOperational() else {
+        guard queueStore.isOperational(), catalogStore.isOperational(), pendingStoreIsReady else {
             lastMessage = L10n.string("backup.error_local_state_unavailable")
             refreshFromQueue()
             return nil
@@ -789,6 +793,10 @@ public final class PhotoLibraryBackupController {
     }
 
     #if DEBUG
+        internal func setAccessStateForTesting(_ state: PhotoBackupAccessState) {
+            accessState = state
+        }
+
         @discardableResult
         internal func installSyncRunForTesting(
             runID: String,

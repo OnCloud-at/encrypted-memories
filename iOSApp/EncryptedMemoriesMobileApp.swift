@@ -89,6 +89,11 @@ private struct MobileSupportedAppRoot: View {
             .task {
                 runtime.start()
             }
+            #if DEBUG
+                .task {
+                    await MobileUITestLaunch.installFixtureIfRequested(into: runtime)
+                }
+            #endif
             .task {
                 await TipJarTransactionProcessor.shared.start()
             }
