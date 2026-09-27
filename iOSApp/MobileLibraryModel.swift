@@ -423,6 +423,8 @@ final class MobileLibraryModel {
         self.store = store
         // Reuse the configured account on relaunch or route changes without restarting the crawl.
         guard configuredUID != session.uid || backend == nil else { return }
+        // Another account closes its services, pending grid session, and stores before this one starts.
+        if let configuredUID, configuredUID != session.uid { teardown() }
         self.session = session
         if let teardownTask {
             configuredUID = session.uid
@@ -939,10 +941,10 @@ final class MobileLibraryModel {
     }
 
     /// Best-effort settings metadata refresh. A failed foreground refresh keeps the last encrypted-cache value
-    /// visible instead of turning a temporary network problem into an app-level error.
+    /// visible instead of turning a temporary network problem into an app-level error. Library sources are not
+    /// refreshed here: each activation already starts one fresh source refresh through `setApplicationActive`.
     func refreshAccountInfo() async {
         try? await facade?.refreshAccountInfo()
-        await sourceAnalysisRuntime?.refresh()
     }
 
     /// Coalesces source discovery with any active refresh. Callers use this after connectivity or
