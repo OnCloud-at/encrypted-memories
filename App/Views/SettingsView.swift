@@ -564,7 +564,8 @@ private struct PhotoLibraryBackupSection: View {
                 }
             } else {
                 let display = rowModel.displayed
-                HStack(alignment: .top, spacing: 10) {
+                // Icon, headline, and action share the headline's first line; details stay below.
+                HStack(alignment: .firstTextBaseline, spacing: 10) {
                     statusIcon(display)
                         .frame(width: 18, height: 20, alignment: .center)
 
