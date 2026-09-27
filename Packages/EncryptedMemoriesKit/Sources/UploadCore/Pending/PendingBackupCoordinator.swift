@@ -62,7 +62,9 @@ public actor PendingBackupCoordinator {
     private var rows: [PendingSourceKey: UploadBackupQueueRowState] = [:]
     private var evidence: [PendingSourceKey: Set<UploadBackupRevision>] = [:]
     private var handoffs: [PendingSourceKey: PendingHandoff] = [:]
-    private var sourceStates: [PendingSourceKey: PendingSourceState] = [:]
+    private var sourceStates: [PendingSourceKey: PendingSourceState] = [:] {
+        didSet { excludedListsCache = nil }
+    }
     private var savedFromApp = Set<String>()
     private var metadata: [PendingSourceKey: PendingPresentationMetadata] = [:]
     /// The revision each cached metadata entry belongs to; a new revision can change the capture time.
@@ -74,9 +76,17 @@ public actor PendingBackupCoordinator {
     private var liveProgress: [PendingSourceKey: (revision: UploadBackupRevision, step: Int)] = [:]
     private var retiring: [PendingSourceKey: UploadBackupRevision] = [:]
     private var actions: [PendingAction] = []
-    private var excludedAccessible = Set<PendingSourceKey>()
+    private var excludedAccessible = Set<PendingSourceKey>() {
+        didSet { excludedListsCache = nil }
+    }
+    /// The trash and excluded lists as last built, when they were built, and the moment the oldest trash entry
+    /// leaves the trash list. Progress ticks publish several times a second; the lists change only with the two
+    /// properties above or with the clock.
+    private var excludedListsCache: (trash: [PendingTile], excluded: [PendingTile], builtAt: Date, validUntil: Date)?
     /// Whether unchecked photos may show now; see `Configuration.uncheckedAdmissionLimit`.
     private var admitsUnchecked = false
+    /// The sources that count against `Configuration.uncheckedAdmissionLimit`, kept current from the dirty keys.
+    private var uncheckedSources = Set<PendingSourceKey>()
     /// Sources whose tile showed. They keep it through a retry, a pause, or a new revision whose check has not
     /// finished, also when a large scan starts meanwhile.
     private var shownSources = Set<PendingSourceKey>()
@@ -424,6 +434,7 @@ public actor PendingBackupCoordinator {
             rememberDurableHandoffs(for: kindKeys)
             for key in kindKeys where rows[key] == nil && handoffs[key] == nil { dropSourceState(key) }
         }
+        dirty.formUnion(keys)
     }
 
     /// The source left the queue (local deletion or exclusion): its live state is gone too.
@@ -499,20 +510,28 @@ public actor PendingBackupCoordinator {
     /// A few new photos (a normal day's shots) show at once with an empty ring; a large scan waits for checks.
     /// Counts every unchecked photo, shown ones included, so a scan that arrives in many small steps cannot
     /// slip past the limit.
+    ///
+    /// Every change to a row, its evidence, its accessibility, or the person's choice marks the source dirty, so
+    /// one event costs O(dirty sources), not O(queue).
     private func updateUncheckedAdmission() {
-        var unchecked = 0
-        var waiting: [PendingSourceKey] = []
-        for (key, row) in rows
-        where Self.isUnchecked(row.state) && evidence[key]?.contains(row.revision) != true
-            && !inaccessible.contains(key) && !isHiddenByChoice(key)
-        {
-            unchecked += 1
-            if !shownSources.contains(key) { waiting.append(key) }
+        for key in dirty {
+            if countsAsUnchecked(key) {
+                uncheckedSources.insert(key)
+            } else {
+                uncheckedSources.remove(key)
+            }
         }
-        let admits = unchecked <= configuration.uncheckedAdmissionLimit
+        assert(uncheckedSources == Set(rows.keys.filter(countsAsUnchecked)), "a changed source was not marked dirty")
+        let admits = uncheckedSources.count <= configuration.uncheckedAdmissionLimit
         guard admits != admitsUnchecked else { return }
         admitsUnchecked = admits
-        if admits { dirty.formUnion(waiting) }
+        if admits { dirty.formUnion(uncheckedSources.subtracting(shownSources)) }
+    }
+
+    private func countsAsUnchecked(_ key: PendingSourceKey) -> Bool {
+        guard let row = rows[key] else { return false }
+        return Self.isUnchecked(row.state) && evidence[key]?.contains(row.revision) != true
+            && !inaccessible.contains(key) && !isHiddenByChoice(key)
     }
 
     /// Excluded by the person, or saved to Apple Photos from Proton by this app.
@@ -767,7 +786,12 @@ public actor PendingBackupCoordinator {
     }
 
     private func excludedLists() -> (trash: [PendingTile], excluded: [PendingTile]) {
-        let retentionStart = now().addingTimeInterval(-configuration.trashRetention)
+        let currentTime = now()
+        // A clock set back can return an expired photo to the trash list, so only a forward clock reuses the lists.
+        if let cache = excludedListsCache, cache.builtAt <= currentTime, currentTime <= cache.validUntil {
+            return (cache.trash, cache.excluded)
+        }
+        let retentionStart = currentTime.addingTimeInterval(-configuration.trashRetention)
         var trash: [(Date, PendingTile)] = []
         var excluded: [(Date, PendingTile)] = []
         for state in sourceStates.values where state.desired == .excluded && excludedAccessible.contains(state.key) {
@@ -788,7 +812,14 @@ public actor PendingBackupCoordinator {
         let newestFirst: ((Date, PendingTile), (Date, PendingTile)) -> Bool = {
             $0.0 == $1.0 ? $0.1.key < $1.1.key : $0.0 > $1.0
         }
-        return (trash.sorted(by: newestFirst).map(\.1), excluded.sorted(by: newestFirst).map(\.1))
+        let lists = (
+            trash: trash.sorted(by: newestFirst).map(\.1),
+            excluded: excluded.sorted(by: newestFirst).map(\.1)
+        )
+        let validUntil =
+            trash.map(\.0).min().map { $0.addingTimeInterval(configuration.trashRetention) } ?? .distantFuture
+        excludedListsCache = (lists.trash, lists.excluded, currentTime, validUntil)
+        return lists
     }
 
     // MARK: - Reconciler
@@ -869,20 +900,32 @@ public actor PendingBackupCoordinator {
             return
         }
         let uids = dispatched.compactMap { Self.normalized($0.remote, volume: volume) }
-        let result: PendingEffectResult =
+        let result: PendingBatchEffectResult =
             switch effect {
             case .remoteTrash: await effects.trashRemote(uids)
             case .remoteRestore: await effects.restoreRemote(uids)
             case .queueSync: .done
             }
         guard !closed else { return }
-        // A photo that can no longer be trashed or restored (deleted permanently) needs no further attempt.
-        finish(effect, dispatched, succeeded: result != .retry, at: date)
+        // Only photos without a confirmed answer try again. A photo that can no longer be trashed or restored
+        // (deleted permanently) needs no further attempt, and one unanswered photo never holds back the others.
+        finish(effect, dispatched, at: date) { state in
+            Self.normalized(state.remote, volume: volume).map { !result.retry.contains($0) } ?? true
+        }
     }
 
     private func finish(_ effect: PendingSourceEffect, _ states: [PendingSourceState], succeeded: Bool, at date: Date) {
+        finish(effect, states, at: date) { _ in succeeded }
+    }
+
+    private func finish(
+        _ effect: PendingSourceEffect,
+        _ states: [PendingSourceState],
+        at date: Date,
+        succeeded: (PendingSourceState) -> Bool
+    ) {
         for state in states {
-            if succeeded {
+            if succeeded(state) {
                 _ = store.completeEffect(effect, for: state.key, generation: state.generation, at: date)
             } else {
                 _ = store.deferEffects(for: state.key, at: date)
