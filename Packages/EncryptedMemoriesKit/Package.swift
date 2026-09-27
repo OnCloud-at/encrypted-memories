@@ -53,7 +53,7 @@ let package = Package(
         .library(name: "AlbumCore", targets: ["AlbumCore"]),
         .library(name: "AlbumsFeature", targets: ["AlbumsFeature"]),
         .library(name: "AlbumSyncCore", targets: ["AlbumSyncCore"]),
-        .library(name: "SharedLibraryCore", targets: ["SharedLibraryCore"]),
+        .library(name: "AccountStateCore", targets: ["AccountStateCore"]),
         .library(name: "UploadCore", targets: ["UploadCore"]),
         .library(name: "UploadFeature", targets: ["UploadFeature"]),
         .library(name: "PhotoLibraryBackupAdapter", targets: ["PhotoLibraryBackupAdapter"]),
@@ -277,9 +277,9 @@ let package = Package(
         .testTarget(
             name: "AlbumSyncCoreTests", dependencies: ["AlbumSyncCore", "AlbumCore", "UploadCore", "PhotosCore"],
             swiftSettings: disableDynamicActorIsolation),
-        // The shared library (Geteilte Mediathek): visibility, account journal, and shard rules. Pure Core.
-        .target(name: "SharedLibraryCore", dependencies: ["AlbumCore", "PhotosCore"]),
-        .testTarget(name: "SharedLibraryCoreTests", dependencies: ["SharedLibraryCore", "AlbumCore", "PhotosCore"]),
+        // The account state that all of the owner's devices agree on: hidden photos and account settings. Pure Core.
+        .target(name: "AccountStateCore", dependencies: ["PhotosCore"]),
+        .testTarget(name: "AccountStateCoreTests", dependencies: ["AccountStateCore", "PhotosCore"]),
         .target(name: "UploadCore", dependencies: ["PhotosCore"]),
         .target(name: "UploadFeature", dependencies: ["UploadCore", "PhotosCore"]),
         // PhotoLibraryBackupAdapter is the package boundary for PhotoKit.

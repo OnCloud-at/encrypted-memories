@@ -115,9 +115,9 @@ final class CoreArchitectureGateTests: XCTestCase {
             extraForbiddenTokens: []
         ),
         CoreTargetRule(
-            name: "SharedLibraryCore",
-            allowedImports: ["AlbumCore", "Foundation", "PhotosCore"],
-            expectedDependencies: ["AlbumCore", "PhotosCore"],
+            name: "AccountStateCore",
+            allowedImports: ["Foundation", "PhotosCore"],
+            expectedDependencies: ["PhotosCore"],
             extraForbiddenTokens: []
         ),
         CoreTargetRule(
