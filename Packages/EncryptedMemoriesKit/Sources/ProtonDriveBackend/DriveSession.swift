@@ -461,42 +461,65 @@ extension DriveSession {
 
     /// Runs one batched link mutation in web-client-sized chunks and decodes the per-item multistatus
     /// body, throwing `DriveBatchActionError` if any link failed so callers never mistake a failed or
-    /// partial move for success.
+    /// partial move for success. The error names the links worth another attempt: links without an unambiguous
+    /// answer, and links whose request failed for a transient reason or was never sent.
     private func batchLinkAction(
         _ action: String, volumeID: String, linkIDs: [String], path: String, method: String
     ) async throws {
         guard !linkIDs.isEmpty else { return }
         var succeeded = 0
-        var failed = 0
+        var refused = 0
+        var retryable = Set<String>()
         var firstError: String?
-        for chunk in Self.chunked(linkIDs, size: Self.batchRequestSize) {
-            let data = try await send(path, method: method, body: ["LinkIDs": chunk])
-            guard let decoded = try? JSONDecoder().decode(BatchLinkResponses.self, from: data),
-                let responses = decoded.responses,
-                responses.count == chunk.count,
-                Set(responses.compactMap(\.linkID)) == Set(chunk)
-            else {
-                failed += chunk.count
-                firstError = firstError ?? "incomplete multistatus response"
-                continue
-            }
-            for item in responses {
-                if let error = item.response?.error, !error.isEmpty {
-                    failed += 1
-                    if firstError == nil { firstError = error }
-                } else if item.response?.code != 1000 {
-                    failed += 1
-                    if firstError == nil { firstError = "missing or unsuccessful item status" }
+        let chunks = Self.chunked(linkIDs, size: Self.batchRequestSize)
+        for (index, chunk) in chunks.enumerated() {
+            let data: Data
+            do {
+                data = try await send(path, method: method, body: ["LinkIDs": chunk])
+            } catch {
+                // A single request keeps its own error for the caller. Otherwise every link settles on its own: a final
+                // rejection refuses this request's links, and links of a transient failure or of unsent requests retry.
+                guard chunks.count > 1 else { throw error }
+                if DriveBatchActionError.isFinal(error) {
+                    refused += chunk.count
                 } else {
-                    succeeded += 1
+                    retryable.formUnion(chunk)
+                }
+                retryable.formUnion(chunks[(index + 1)...].joined())
+                firstError = firstError ?? "request \(index + 1) of \(chunks.count) failed"
+                break
+            }
+            let responses = (try? JSONDecoder().decode(BatchLinkResponses.self, from: data))?.responses ?? []
+            let byLink = Dictionary(grouping: responses.filter { $0.linkID != nil }) { $0.linkID ?? "" }
+            for linkID in chunk {
+                // A missing or repeated answer is ambiguous; only one answer per link settles it.
+                guard let answers = byLink[linkID], answers.count == 1, let status = answers[0].response else {
+                    retryable.insert(linkID)
+                    if firstError == nil { firstError = "missing or ambiguous item status" }
+                    continue
+                }
+                if let error = status.error, !error.isEmpty {
+                    refused += 1
+                    if firstError == nil { firstError = error }
+                } else if let code = status.code {
+                    if code == 1000 {
+                        succeeded += 1
+                    } else {
+                        refused += 1
+                        if firstError == nil { firstError = "unsuccessful item status \(code)" }
+                    }
+                } else {
+                    retryable.insert(linkID)
+                    if firstError == nil { firstError = "missing item status" }
                 }
             }
         }
+        let failed = refused + retryable.count
         DebugLog.log(
             "\(action): vol=\(volumeID.prefix(8))… n=\(linkIDs.count) ok=\(succeeded) failed=\(failed)"
                 + (firstError.map { " firstError=\($0)" } ?? ""))
         if failed > 0 {
-            throw DriveBatchActionError(failed: failed, total: linkIDs.count)
+            throw DriveBatchActionError(failed: failed, retryableLinkIDs: retryable, total: linkIDs.count)
         }
     }
 
@@ -656,7 +679,17 @@ private struct BatchLinkResponses: Decodable {
 /// A batched link mutation partially or fully failed (per-item multistatus codes).
 struct DriveBatchActionError: LocalizedError {
     let failed: Int
+    /// Failed links without an unambiguous answer, and links of a request that failed for a transient reason or was
+    /// never sent. Proton may still apply the change, so only these are worth another attempt; the other failed
+    /// links were refused.
+    let retryableLinkIDs: Set<String>
     let total: Int
+
+    /// Proton refused the request itself (a 4xx answer other than 408 and 429); repeating it cannot succeed.
+    static func isFinal(_ error: any Error) -> Bool {
+        guard case .apiError(let code, _)? = error as? ProtonAuthError else { return false }
+        return (400...499).contains(code) && code != 408 && code != 429
+    }
     var errorDescription: String? {
         L10n.string("error.batch_action_incomplete \(failed) \(total)")
     }

@@ -497,6 +497,40 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
         )
     }
 
+    func testBackupDoesNotStartWhenTheRequiredPendingStoreIsMissing() async throws {
+        let suite = "photo-backup-controller-pending-store-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(suite, isDirectory: true)
+        defer {
+            defaults.removePersistentDomain(forName: suite)
+            try? FileManager.default.removeItem(at: directory)
+        }
+        defaults.set(true, forKey: "photoBackup.enabled.v1")
+
+        let controller = PhotoLibraryBackupController(
+            configuration: .init(
+                accountDataDirectory: directory,
+                databasePolicy: .conservative,
+                defaults: defaults
+            ),
+            identityResolver: FakeIdentityResolver(),
+            uploader: MockUploader(),
+            pendingStore: nil,
+            requiresPendingStore: true
+        )
+        controller.setAccessStateForTesting(.full)
+
+        // Without the exclusions an excluded photo could upload, so no pass may start.
+        controller.syncNow()
+        await controller.retryFailedAndSync()
+
+        XCTAssertFalse(controller.isAvailable)
+        XCTAssertFalse(controller.isSyncing)
+        XCTAssertEqual(controller.lastMessage, L10n.string("backup.error_local_state_unavailable"))
+        await controller.shutdown()
+    }
+
     func testDisablingBackupClearsPersistedUserPause() throws {
         let suite = "photo-backup-controller-tests-\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
