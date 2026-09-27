@@ -9,6 +9,16 @@ Thank you for helping improve Encrypted Memories. Keep each pull request focused
 - Never include credentials, private user data, signing files, or local build output.
 - PR authors never set app versions, build numbers, release tags, or release notes. Maintainers own releases.
 
+## Planning
+
+GitHub issues and milestones hold all planned work. People and coding agents use the same process.
+
+- Each milestone is a release: the next maintenance release, or a feature release such as 1.5 or 2.0.
+- Find the issue before you start. Open one when the work has none.
+- Reference the issue in the pull request, for example `Closes #98`.
+- Record design decisions and remaining work in the issue, not only in the pull request.
+- The `labs` label marks work that ships behind a Labs flag. It stays inert in App Store builds until the maintainers widen the audience.
+
 ## Architecture rules
 
 - Put shared behavior in `Packages/EncryptedMemoriesKit`.
