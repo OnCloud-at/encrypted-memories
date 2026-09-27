@@ -15,7 +15,7 @@ List the exact focused tests and final gates that you ran.
 
 - [ ] I added or updated regression tests.
 - [ ] I ran `./scripts/verify-tests.sh`.
-- [ ] I ran `./scripts/verify-ios-app-tests.sh`.
+- [ ] I ran `./scripts/verify-ios-app-tests.sh` and `./scripts/verify-ios-app-tests.sh ui`.
 - [ ] I ran the relevant platform or architecture gate.
 - [ ] I documented every skipped or manual check.
 

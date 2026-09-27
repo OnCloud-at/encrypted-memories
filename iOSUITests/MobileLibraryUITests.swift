@@ -1,0 +1,76 @@
+import XCTest
+
+/// Taps through the iOS app like a person does, on the offline fixture account: no Proton account, no network.
+/// The app runs in English so the tests can find controls by their visible names.
+final class MobileLibraryUITests: XCTestCase {
+    private var app: XCUIApplication!
+
+    override func setUp() {
+        continueAfterFailure = false
+        app = XCUIApplication()
+        app.launchArguments += [
+            "-EncryptedMemoriesUITestFixture",
+            "-AppleLanguages", "(en)",
+            "-AppleLocale", "en_US",
+        ]
+        app.launch()
+    }
+
+    override func tearDown() {
+        app.terminate()
+    }
+
+    func testLibraryShowsThePhotosOfTheAccount() {
+        XCTAssertTrue(firstPhoto.waitForExistence(timeout: 60), "the library grid shows no photo")
+        XCTAssertTrue(app.buttons["Select"].exists)
+    }
+
+    func testAPhotoOpensInTheViewerAndClosesAgain() {
+        XCTAssertTrue(firstPhoto.waitForExistence(timeout: 60))
+        firstPhoto.tap()
+
+        let close = app.buttons["Close"]
+        XCTAssertTrue(close.waitForExistence(timeout: 10), "the viewer did not open")
+        close.tap()
+
+        XCTAssertTrue(firstPhoto.waitForExistence(timeout: 10), "the library did not return")
+    }
+
+    func testSelectingPhotosShowsTheirActionsAndDoneEndsTheSelection() {
+        XCTAssertTrue(firstPhoto.waitForExistence(timeout: 60))
+        app.buttons["Select"].tap()
+        firstPhoto.tap()
+
+        XCTAssertTrue(wait(for: firstPhoto, "isSelected == true"), "the tapped photo is not selected")
+        XCTAssertTrue(app.buttons["Share selected items"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.buttons["Move selected items to Trash"].isEnabled)
+
+        app.buttons["Done"].tap()
+        XCTAssertTrue(app.buttons["Select"].waitForExistence(timeout: 5))
+        XCTAssertTrue(wait(for: firstPhoto, "isSelected == false"), "Done must clear the selection")
+    }
+
+    func testTabsSwitchToCollectionsBackToTheLibraryAndToSearch() {
+        XCTAssertTrue(firstPhoto.waitForExistence(timeout: 60))
+
+        app.tabBars.buttons["Collections"].tap()
+        XCTAssertTrue(wait(for: firstPhoto, "exists == false"), "the library grid stays visible under Collections")
+
+        app.tabBars.buttons["Library"].tap()
+        XCTAssertTrue(firstPhoto.waitForExistence(timeout: 10), "the library did not return")
+
+        // The search tab turns the tab bar into a search field, so it comes last.
+        app.tabBars.buttons["Search"].tap()
+        XCTAssertTrue(app.searchFields.firstMatch.waitForExistence(timeout: 10), "Search shows no search field")
+    }
+
+    private func wait(for element: XCUIElement, _ predicate: String, timeout: TimeInterval = 5) -> Bool {
+        let expectation = XCTNSPredicateExpectation(predicate: NSPredicate(format: predicate), object: element)
+        return XCTWaiter.wait(for: [expectation], timeout: timeout) == .completed
+    }
+
+    /// Grid photos are accessibility elements named "Photo, <date>".
+    private var firstPhoto: XCUIElement {
+        app.descendants(matching: .any).matching(NSPredicate(format: "label BEGINSWITH 'Photo, '")).firstMatch
+    }
+}
