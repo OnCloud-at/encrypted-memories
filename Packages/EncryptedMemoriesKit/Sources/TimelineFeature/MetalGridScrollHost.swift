@@ -182,14 +182,27 @@ final class MetalGridScrollHost: NSView {
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("init(coder:) is unavailable") }
 
-    /// Decline events under the translucent sidebar so they reach it (the grid renders full-width but must not
-    /// steal the sidebar's clicks or scroll). Coordinates to the right of the inset remain unchanged,
-    /// preserving click-to-photo routing and the pinch anchor.
+    /// Decline events under the translucent sidebar and under the translucent toolbar. The grid renders beneath
+    /// both, but a click there belongs to the sidebar or the window chrome: it must never select or drag the photo
+    /// underneath. Coordinates inside the visible grid remain unchanged, preserving click-to-photo routing and the
+    /// pinch anchor.
     override func hitTest(_ point: NSPoint) -> NSView? {
-        if eventLeadingInset > 0 {
-            if point.x < eventLeadingInset { return nil }
+        let local = convert(point, from: superview)
+        if Self.declinesEvent(
+            atX: point.x, distanceFromTop: isFlipped ? local.y : bounds.height - local.y,
+            leadingInset: eventLeadingInset, topInset: topBarInset)
+        {
+            return nil
         }
         return super.hitTest(point)
+    }
+
+    /// Whether an event at this position lies under the sidebar (`leadingInset`, in the superview's x) or under the
+    /// toolbar (`topInset`, measured from the top edge).
+    static func declinesEvent(
+        atX x: CGFloat, distanceFromTop: CGFloat, leadingInset: CGFloat, topInset: CGFloat
+    ) -> Bool {
+        (leadingInset > 0 && x < leadingInset) || (topInset > 0 && distanceFromTop < topInset)
     }
 
     private func setUp() {

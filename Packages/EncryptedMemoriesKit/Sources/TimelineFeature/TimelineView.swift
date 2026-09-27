@@ -24,6 +24,9 @@ public struct TimelineView: View {
     private let semanticMatches: Set<PhotoUID>?
     /// Resolved result set of a selected structured suggestion. `searchText` is then its display title only.
     private let requiredUIDs: Set<PhotoUID>?
+    /// Library filters (favorites, photos, videos). They narrow the same projection as a search query.
+    private let refinement: TimelineRefinement
+    private let onClearRefinement: (() -> Void)?
     private let selectionMode: Bool
     private let onSelectionChange: (Set<PhotoUID>) -> Void
     private let media: FullMediaProvider?
@@ -54,6 +57,8 @@ public struct TimelineView: View {
         isSearchPending: Bool = false,
         semanticMatches: Set<PhotoUID>? = nil,
         requiredUIDs: Set<PhotoUID>? = nil,
+        refinement: TimelineRefinement = .all,
+        onClearRefinement: (() -> Void)? = nil,
         selectionMode: Bool = false,
         media: FullMediaProvider? = nil,
         metadataProvider: PhotoMetadataProvider? = nil,
@@ -78,6 +83,8 @@ public struct TimelineView: View {
         self.isSearchPending = isSearchPending
         self.semanticMatches = semanticMatches
         self.requiredUIDs = requiredUIDs
+        self.refinement = refinement
+        self.onClearRefinement = onClearRefinement
         self.selectionMode = selectionMode
         self.media = media
         self.metadataProvider = metadataProvider
@@ -216,18 +223,34 @@ public struct TimelineView: View {
         .background(timelineSurfaceBackground)
     }
 
+    @ViewBuilder
     private var searchEmptyState: some View {
-        ContentUnavailableView.search(text: searchText)
+        if requiredUIDs == nil, TimelineSearchQuery(normalizedSearchText).isEmpty, refinement.isActive {
+            ContentUnavailableView {
+                Label(L10n.string("library.filter_empty_title"), systemImage: "line.3.horizontal.decrease")
+            } description: {
+                Text(L10n.string("library.filter_empty_description"))
+            } actions: {
+                if let onClearRefinement {
+                    Button(L10n.string("library.filter_remove"), action: onClearRefinement)
+                }
+            }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(timelineSurfaceBackground)
+        } else {
+            ContentUnavailableView.search(text: searchText)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(timelineSurfaceBackground)
+        }
     }
 
     private var normalizedSearchText: String {
         searchText.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    /// Whether the grid shows a projection instead of the library: a search query, a suggestion, or a filter.
     private var hasSearchQuery: Bool {
-        requiredUIDs != nil || !TimelineSearchQuery(normalizedSearchText).isEmpty
+        requiredUIDs != nil || !TimelineSearchQuery(normalizedSearchText).isEmpty || refinement.isActive
     }
 
     private var searchKey: TimelineSearchProjectionKey {
@@ -236,6 +259,7 @@ public struct TimelineView: View {
             query: requiredUIDs == nil ? normalizedSearchText : "",
             context: TimelineSearchContext(activeFilter: model.filter, favoriteUIDs: favoriteUIDs),
             semanticMatches: requiredUIDs == nil ? semanticMatches : nil,
+            refinement: refinement,
             requiredUIDs: requiredUIDs
         )
     }

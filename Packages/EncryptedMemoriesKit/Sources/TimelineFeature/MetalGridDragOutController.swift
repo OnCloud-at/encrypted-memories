@@ -37,6 +37,11 @@ final class MetalGridDragOutController: NSObject, NSDraggingSource, NSFilePromis
     /// its async lookup lands uses the synchronous fallback instead (Finder renames collisions).
     private var cachedFilenames: [PhotoUID: String] = [:]
     private var items: [PhotoUID: PhotoItem] = [:]
+    /// Identity of the running drag session, carried in every photo reference it puts on the pasteboard.
+    private var sessionID: UUID?
+    /// The session that ended last and its stager, until the grace cleanup runs.
+    private var endedSessionID: UUID?
+    private var endedStager: DragOutStager?
 
     /// Per-promise session payload attached to every `NSFilePromiseProvider`. Promise callbacks
     /// (`writePromiseTo`, `fileNameForType`) arrive after the session has visually ended on
@@ -63,6 +68,23 @@ final class MetalGridDragOutController: NSObject, NSDraggingSource, NSFilePromis
         self.liftItems = liftItems
         self.onFailed = onFailed
         super.init()
+        // Selector-based, so the center drops the registration when the controller goes away.
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(internalDropCompleted(_:)),
+            name: PhotoDragReference.internalDropCompleted, object: nil)
+    }
+
+    /// A drop inside the app took the photo references of a session, so no other app will ask for its files: stop
+    /// preparing them instead of downloading and decrypting originals that nobody receives. Other sessions, for
+    /// example an earlier drag into Finder that still delivers, stay untouched.
+    @objc private func internalDropCompleted(_ notification: Notification) {
+        let sessions = PhotoDragReference.sessions(in: notification)
+        if let sessionID, sessions.contains(sessionID), let stager {
+            Task { await stager.cancelAll() }
+        }
+        if let endedSessionID, sessions.contains(endedSessionID), let endedStager {
+            Task { await endedStager.cancelAll() }
+        }
     }
 
     deinit {
@@ -173,6 +195,8 @@ final class MetalGridDragOutController: NSObject, NSDraggingSource, NSFilePromis
         let stager = DragOutStager(
             fileProvider: fileProvider, stagingDirectory: Self.makeSessionStagingDirectory())
         self.stager = stager
+        let dragSessionID = UUID()
+        sessionID = dragSessionID
         reportedFailure = false
         items = Dictionary(uniqueKeysWithValues: dragged.map { ($0.uid, $0) })
         cachedFilenames.removeAll()
@@ -191,8 +215,9 @@ final class MetalGridDragOutController: NSObject, NSDraggingSource, NSFilePromis
         prefetchFilenames(for: dragged)
 
         let providers = dragged.map { item in
-            let provider = NSFilePromiseProvider(
+            let provider = PhotoFilePromiseProvider(
                 fileType: Self.promiseFileType(for: item), delegate: self)
+            provider.photoReference = PhotoDragReference.data(for: item.uid, session: dragSessionID)
             provider.userInfo = PromisePayload(uid: item.uid, stager: stager)
             return provider
         }
@@ -365,6 +390,9 @@ final class MetalGridDragOutController: NSObject, NSDraggingSource, NSFilePromis
         _ session: NSDraggingSession, endedAt screenPoint: NSPoint, operation: NSDragOperation
     ) {
         let stager = stager
+        endedStager = stager
+        endedSessionID = sessionID
+        sessionID = nil
         self.stager = nil
         items.removeAll()
         cachedFilenames.removeAll()
@@ -376,7 +404,33 @@ final class MetalGridDragOutController: NSObject, NSDraggingSource, NSFilePromis
                 self.items.removeAll()
                 self.cachedFilenames.removeAll()
             }
+            if self.endedStager === stager {
+                self.endedStager = nil
+                self.endedSessionID = nil
+            }
             await stager?.finishAndCleanup()
         }
+    }
+}
+
+/// A file promise that also carries the photo reference. Other apps see only the promised file; a drop inside the
+/// app reads the reference instead (Apple's documented pattern for adding types to `NSFilePromiseProvider`).
+private final class PhotoFilePromiseProvider: NSFilePromiseProvider {
+    var photoReference = Data()
+
+    private static let referenceType = NSPasteboard.PasteboardType(PhotoDragReference.typeIdentifier)
+
+    override func writableTypes(for pasteboard: NSPasteboard) -> [NSPasteboard.PasteboardType] {
+        super.writableTypes(for: pasteboard) + [Self.referenceType]
+    }
+
+    override func writingOptions(
+        forType type: NSPasteboard.PasteboardType, pasteboard: NSPasteboard
+    ) -> NSPasteboard.WritingOptions {
+        type == Self.referenceType ? [] : super.writingOptions(forType: type, pasteboard: pasteboard)
+    }
+
+    override func pasteboardPropertyList(forType type: NSPasteboard.PasteboardType) -> Any? {
+        type == Self.referenceType ? photoReference : super.pasteboardPropertyList(forType: type)
     }
 }
