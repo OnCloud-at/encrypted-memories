@@ -15,6 +15,14 @@ public enum SQLiteStoreSchemaCompatibility: Sendable, Equatable {
     case unavailable
 }
 
+private enum SQLiteStoreOpenResult {
+    case opened(OpaquePointer)
+    /// The file holds another schema or version.
+    case incompatible
+    /// The file could not be read, created, or initialized.
+    case failed
+}
+
 /// Exact-schema gate for operational and user-authored stores.
 ///
 /// Existing files are inspected without writes. Only a database with no application schema may be
@@ -35,28 +43,103 @@ public enum SQLiteStoreSchemaGate {
         at url: URL,
         schemaSQL: String,
         policy: LibraryDatabasePolicy,
+        includeMemoryTuning: Bool = true,
         verifyVersion: (OpaquePointer?) -> Bool,
         stampVersion: (OpaquePointer?) -> Bool
     ) -> OpaquePointer? {
+        guard
+            case .opened(let handle) = openStore(
+                at: url,
+                schemaSQL: schemaSQL,
+                policy: policy,
+                includeMemoryTuning: includeMemoryTuning,
+                verifyVersion: verifyVersion,
+                stampVersion: stampVersion
+            )
+        else { return nil }
+        return handle
+    }
+
+    /// Opens a rebuildable cache. A file with another schema is deleted together with its WAL and shared-memory
+    /// files and created once more. A read, create, or delete failure returns `nil` and leaves the file in place.
+    public static func openRebuildableStore(
+        at url: URL,
+        schemaSQL: String,
+        policy: LibraryDatabasePolicy,
+        enforceForeignKeys: Bool = false,
+        verifyVersion: (OpaquePointer?) -> Bool,
+        stampVersion: (OpaquePointer?) -> Bool
+    ) -> OpaquePointer? {
+        func open() -> SQLiteStoreOpenResult {
+            openStore(
+                at: url,
+                schemaSQL: schemaSQL,
+                policy: policy,
+                enforceForeignKeys: enforceForeignKeys,
+                verifyVersion: verifyVersion,
+                stampVersion: stampVersion
+            )
+        }
+        switch open() {
+        case .opened(let handle):
+            return handle
+        case .failed:
+            return nil
+        case .incompatible:
+            guard removeDatabaseFiles(at: url), case .opened(let handle) = open() else { return nil }
+            return handle
+        }
+    }
+
+    /// Removes a database file and its `-wal` and `-shm` files. Missing files count as removed.
+    public static func removeDatabaseFiles(at url: URL) -> Bool {
+        guard !url.hasDirectoryPath else { return false }
+        for suffix in ["", "-wal", "-shm"] {
+            let target = URL(fileURLWithPath: url.path + suffix)
+            guard FileManager.default.fileExists(atPath: target.path) else { continue }
+            do {
+                try FileManager.default.removeItem(at: target)
+            } catch {
+                return false
+            }
+        }
+        return true
+    }
+
+    /// The one open sequence for every store: read-only inspection, read-write open, busy timeout, optional
+    /// foreign keys, then either schema creation or exact verification, and connection tuning.
+    private static func openStore(
+        at url: URL,
+        schemaSQL: String,
+        policy: LibraryDatabasePolicy,
+        includeMemoryTuning: Bool = true,
+        enforceForeignKeys: Bool = false,
+        verifyVersion: (OpaquePointer?) -> Bool,
+        stampVersion: (OpaquePointer?) -> Bool
+    ) -> SQLiteStoreOpenResult {
         let compatibility = compatibility(
             at: url,
             schemaSQL: schemaSQL,
             busyTimeoutMs: policy.busyTimeoutMs,
             versionIsCurrent: verifyVersion
         )
-        guard compatibility == .empty || compatibility == .current else { return nil }
+        guard compatibility != .incompatible else { return .incompatible }
+        guard compatibility != .unavailable else { return .failed }
         var opened: OpaquePointer?
         let flags =
             SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX
             | (compatibility == .empty ? SQLITE_OPEN_CREATE : 0)
         guard sqlite3_open_v2(url.path, &opened, flags, nil) == SQLITE_OK, let handle = opened else {
             sqlite3_close(opened)
-            return nil
+            return .failed
         }
         sqlite3_busy_timeout(handle, Int32(clamping: policy.busyTimeoutMs))
+        if enforceForeignKeys {
+            sqlite3_exec(handle, "PRAGMA foreign_keys=ON;", nil, nil, nil)
+        }
         switch compatibility {
         case .empty:
-            configureConnection(handle, policy: policy)
+            configureConnection(handle, policy: policy, includeMemoryTuning: includeMemoryTuning)
             guard
                 initializeCurrentSchema(
                     handle,
@@ -65,21 +148,24 @@ public enum SQLiteStoreSchemaGate {
                 )
             else {
                 sqlite3_close(handle)
-                return nil
+                return .failed
             }
         case .current:
             guard verifyVersion(handle),
                 matchesCurrentSchema(handle, schemaSQL: schemaSQL)
             else {
                 sqlite3_close(handle)
-                return nil
+                return .incompatible
             }
-            configureConnection(handle, policy: policy)
-        case .incompatible, .unavailable:
+            configureConnection(handle, policy: policy, includeMemoryTuning: includeMemoryTuning)
+        case .incompatible:
             sqlite3_close(handle)
-            return nil
+            return .incompatible
+        case .unavailable:
+            sqlite3_close(handle)
+            return .failed
         }
-        return handle
+        return .opened(handle)
     }
 
     /// Inspects an existing database through a read-only connection. Missing files are empty stores.
