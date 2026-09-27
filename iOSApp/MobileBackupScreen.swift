@@ -226,7 +226,8 @@ private struct MobilePhotoBackupSections: View {
     @ViewBuilder private var statusRow: some View {
         let display = rowModel.displayed
 
-        HStack(alignment: .top, spacing: 12) {
+        // Icon, headline, and action share the headline's first line; details stay below.
+        HStack(alignment: .firstTextBaseline, spacing: 12) {
             statusIcon(display)
                 .frame(width: 20, height: 24, alignment: .center)
 
