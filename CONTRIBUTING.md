@@ -19,6 +19,15 @@ GitHub issues and milestones hold all planned work. People and coding agents use
 - Record design decisions and remaining work in the issue, not only in the pull request.
 - The `labs` label marks work that ships behind a Labs flag. It stays inert in App Store builds until the maintainers widen the audience.
 
+## Secrets and private data
+
+The repository is public, and a pull request keeps every commit you push, even when a later commit removes a line again.
+
+- Never commit credentials, keys, tokens, certificates, provisioning profiles, or `.env` files.
+- Never commit personal data: real names, host names, local paths, device identifiers, or private network addresses. This includes commit metadata.
+- Use your GitHub noreply address as commit email, and run `git config --global user.useConfigOnly true`, so Git never derives an address from your machine name.
+- Check each commit before you push, not only the final result. CI scans every commit of a pull request, and GitHub push protection blocks known secret formats.
+
 ## Architecture rules
 
 - Put shared behavior in `Packages/EncryptedMemoriesKit`.
