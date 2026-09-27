@@ -359,6 +359,10 @@ public actor ThumbnailFeedCore {
     /// Forces one authenticated probe for every UID in a fresh crawl before normal validated-presence fast paths
     /// resume. This protects startup against a corrupted blob whose filename remains in the in-process proof set.
     private var startupAuthenticationPending = false
+    /// Set once a crawl of this feed authenticated every thumbnail it queued. A source change restarts the crawl,
+    /// for example after each upload; the restart then checks proven blobs with a file lookup instead of reading
+    /// and decrypting every cached thumbnail again. New blobs are still authenticated on their first probe.
+    private var authenticatedCrawlCompleted = false
     /// Coalesces durable coverage updates so a first crawl does not open the checkpoint file once per tiny
     /// network batch. Losing the final unflushed block on process termination is safe: blobs remain on disk and
     /// are verified again on the next crawl.
@@ -1447,7 +1451,8 @@ public actor ThumbnailFeedCore {
         checkpointPresent.removeAll(keepingCapacity: true)
         // A persisted checkpoint is advisory only. Every UID starts at zero and crosses the bounded utility
         // probe before the crawl can skip it, so a removed or corrupt blob cannot hide behind a stale checkpoint.
-        startupAuthenticationPending = !uids.isEmpty
+        // Only the first complete crawl of this feed authenticates blobs that the process already proved.
+        startupAuthenticationPending = !uids.isEmpty && !authenticatedCrawlCompleted
         sequentialIndex = 0
         diskPresence.beginTracking(uids, reporting: reportingUIDs, knownPresent: [])
         unfetchable.removeAll()  // a fresh crawl retries backend-refused items exactly once
@@ -1571,6 +1576,7 @@ public actor ThumbnailFeedCore {
         checkpointPresent.removeAll()
         checkpointHints.removeAll()
         diskPresence.invalidate()
+        authenticatedCrawlCompleted = false
         if shouldRestart { await startPrefetch(current) }
     }
 
@@ -2321,7 +2327,7 @@ public actor ThumbnailFeedCore {
                 sequentialIndex >= sequential.count,
                 candidates.isEmpty || batch.probedDisk
             {
-                startupAuthenticationPending = false
+                completeStartupAuthentication()
             }
             return batch
         }
@@ -2358,7 +2364,7 @@ public actor ThumbnailFeedCore {
         }
         guard !candidates.isEmpty else {
             if startupAuthenticationPending, sequentialIndex >= sequential.count {
-                startupAuthenticationPending = false
+                completeStartupAuthentication()
             }
             return BatchWork(priority: batchPriority)
         }
@@ -2395,9 +2401,14 @@ public actor ThumbnailFeedCore {
         recordCheckpointMissing(diskMisses, writerGeneration: probeGeneration)
         releasePriorityReservations(for: diskHits, generation: prefetchGeneration)
         if forceAuthentication, sequentialIndex >= sequential.count {
-            startupAuthenticationPending = false
+            completeStartupAuthentication()
         }
         return BatchWork(uids: diskMisses, priority: batchPriority, probedDisk: !candidates.isEmpty)
+    }
+
+    private func completeStartupAuthentication() {
+        startupAuthenticationPending = false
+        authenticatedCrawlCompleted = true
     }
 
     private func finishDiskProbeBatch(
