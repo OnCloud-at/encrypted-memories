@@ -21,7 +21,9 @@ import PhotosCore
             for await isChecking in runtime.sessionModel.$isCheckingSession.values where !isChecking {
                 break
             }
-            guard fixture == nil, let installed = try? await MobileSignedInFixture(runtime: runtime) else { return }
+            guard fixture == nil,
+                let installed = try? await MobileSignedInFixture(runtime: runtime, includesVideo: true)
+            else { return }
             fixture = installed
             installed.install()
         }

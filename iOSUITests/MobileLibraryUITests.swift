@@ -36,6 +36,19 @@ final class MobileLibraryUITests: XCTestCase {
         XCTAssertTrue(firstPhoto.waitForExistence(timeout: 10), "the library did not return")
     }
 
+    /// Swiping down closes the viewer for a video too, also while its stream cannot play.
+    func testSwipingDownOnAVideoClosesTheViewer() {
+        XCTAssertTrue(firstVideo.waitForExistence(timeout: 60), "the library grid shows no video")
+        firstVideo.tap()
+        XCTAssertTrue(app.buttons["Close"].waitForExistence(timeout: 10), "the viewer did not open")
+
+        let middle = app.windows.firstMatch.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.4))
+        middle.press(forDuration: 0.05, thenDragTo: middle.withOffset(CGVector(dx: 0, dy: 400)))
+
+        XCTAssertTrue(wait(for: app.buttons["Close"], "exists == false"), "swiping down did not close the viewer")
+        XCTAssertTrue(firstVideo.waitForExistence(timeout: 10), "the library did not return")
+    }
+
     func testTheAlbumButtonOfTheViewerAddsTheOpenPhotoToAnAlbum() {
         XCTAssertTrue(firstPhoto.waitForExistence(timeout: 60))
         firstPhoto.tap()
@@ -109,5 +122,10 @@ final class MobileLibraryUITests: XCTestCase {
     /// Grid photos are accessibility elements named "Photo, <date>".
     private var firstPhoto: XCUIElement {
         app.descendants(matching: .any).matching(NSPredicate(format: "label BEGINSWITH 'Photo, '")).firstMatch
+    }
+
+    /// Grid videos are named "Video, <date>".
+    private var firstVideo: XCUIElement {
+        app.descendants(matching: .any).matching(NSPredicate(format: "label BEGINSWITH 'Video, '")).firstMatch
     }
 }
