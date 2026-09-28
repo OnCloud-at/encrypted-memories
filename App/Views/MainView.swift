@@ -2127,6 +2127,8 @@ struct MainView: View {
                         onAlbumsChanged: { Task { await loadAlbums() } }
                     )
                     .labelStyle(.iconOnly)
+                    // A photo that is moving to the Trash cannot join an album.
+                    .disabled(isTrashMutating)
                 }
 
                 Menu {
