@@ -1,4 +1,5 @@
 import Foundation
+import MLSearchCore
 import Testing
 
 @Suite struct MLModelReleaseSchemaTests {
@@ -59,22 +60,34 @@ import Testing
         }
     }
 
-    @Test func releaseToolAndRuntimeShareTheSameCompatibilityKeys() throws {
-        let releaseTool = try String(
-            contentsOf: Self.repositoryRoot.appendingPathComponent("scripts/prepare-ml-model-release.swift"),
-            encoding: .utf8
-        )
-        let runtimeRegistry = try String(
-            contentsOf: Self.repositoryRoot.appendingPathComponent(
-                "Packages/EncryptedMemoriesKit/Sources/MLSearchCore/MLModelCompatibilityRegistry.swift"
-            ),
-            encoding: .utf8
-        )
+    @Test func releaseCompatibilityFileMatchesTheAppRegistry() throws {
+        let file = try Self.loadJSON(Self.toolsRoot.appendingPathComponent("catalog-compatibility.json"))
+        let recipes = try #require(file["recipes"] as? [[String: Any]])
+        let registry = MLModelCompatibilityRegistry.builtIn.recipes
+        #expect(recipes.compactMap { $0["key"] as? String }.sorted() == registry.keys.sorted())
 
-        for key in ["clip-dual-encoder-v1", "siglip-dual-encoder-v1"] {
-            #expect(releaseTool.contains("\"\(key)\""))
-            #expect(runtimeRegistry.contains("key: \"\(key)\""))
+        for recipe in recipes {
+            let key = try #require(recipe["key"] as? String)
+            let expected = try #require(registry[key])
+            #expect(recipe["minimumDescriptorVersion"] as? Int == expected.descriptorVersionRange.lowerBound)
+            #expect(recipe["maximumDescriptorVersion"] as? Int == expected.descriptorVersionRange.upperBound)
+            #expect(recipe["embeddingDimension"] as? Int == expected.embeddingDimension)
+            #expect(recipe["role"] as? String == expected.role.rawValue)
+            #expect(
+                (recipe["capabilities"] as? [String])?.sorted() == expected.capabilities.map(\.rawValue).sorted())
+            #expect(
+                (recipe["requiredRuntimeResources"] as? [String])?.sorted() == expected.runtimeResourcePaths.sorted())
+            #expect((recipe["maximumBytes"] as? NSNumber)?.int64Value == expected.maximumArtifactBytes)
+            #expect((recipe["maximumFileBytes"] as? NSNumber)?.int64Value == expected.maximumArtifactFileBytes)
+            #expect(recipe["license"] as? String == expected.license.identifier)
         }
+
+        let manifest = try Self.loadJSON(Self.toolsRoot.appendingPathComponent("release-manifest.schema.json"))
+        let properties = try #require(manifest["properties"] as? [String: Any])
+        let keys = try #require((properties["compatibilityKey"] as? [String: Any])?["enum"] as? [String])
+        let licenses = try #require((properties["licenseIdentifier"] as? [String: Any])?["enum"] as? [String])
+        #expect(keys.sorted() == registry.keys.sorted())
+        #expect(Set(licenses) == Set(registry.values.map(\.license.identifier)))
     }
 
     @Test func publicTreeDoesNotContainThePrivateCandidateRegistry() {

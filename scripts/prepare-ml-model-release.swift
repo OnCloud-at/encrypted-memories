@@ -391,6 +391,8 @@ private struct Options {
     let allowUnchangedCandidate: Bool
     let allowEmptyV1: Bool
     let models: [ModelInput]
+    let recipes: [String: CompatibilityRecipe]
+    let strictReaders: [StrictReader]
 }
 
 private struct CompatibilityRecipe {
@@ -405,30 +407,42 @@ private struct CompatibilityRecipe {
     let license: String
 }
 
-private let compatibilityRecipes: [String: CompatibilityRecipe] = [
-    "clip-dual-encoder-v1": CompatibilityRecipe(
-        key: "clip-dual-encoder-v1",
-        descriptorVersions: 1...65_535,
-        embeddingDimension: 512,
-        role: "dualEncoder",
-        capabilities: ["imageEmbedding", "textEmbedding"],
-        requiredRuntimeResources: [],
-        maximumBytes: 220_000_000,
-        maximumFileBytes: 220_000_000,
-        license: "MIT"
-    ),
-    "siglip-dual-encoder-v1": CompatibilityRecipe(
-        key: "siglip-dual-encoder-v1",
-        descriptorVersions: 1...65_535,
-        embeddingDimension: 768,
-        role: "dualEncoder",
-        capabilities: ["imageEmbedding", "textEmbedding"],
-        requiredRuntimeResources: ["tokenizer.json"],
-        maximumBytes: 900_000_000,
-        maximumFileBytes: 900_000_000,
-        license: "Apache-2.0"
-    ),
-]
+private enum CatalogChannel: String, CaseIterable {
+    case production
+    case preview
+}
+
+/// An app generation that rejects a whole catalog with an unknown recipe and drops retired models.
+private struct StrictReader: Decodable {
+    let apps: String
+    let recipes: [String]
+}
+
+/// `Tools/MLModels/catalog-compatibility.json`. A package test keeps its recipes equal to the
+/// app's `MLModelCompatibilityRegistry`.
+private struct CompatibilityFile: Decodable {
+    struct Recipe: Decodable {
+        let key: String
+        let minimumDescriptorVersion: Int
+        let maximumDescriptorVersion: Int
+        let embeddingDimension: Int
+        let role: String
+        let capabilities: [String]
+        let requiredRuntimeResources: [String]
+        let maximumBytes: Int64
+        let maximumFileBytes: Int64
+        let license: String
+    }
+
+    let schemaVersion: Int
+    let recipes: [Recipe]
+    let strictReaders: [String: [StrictReader]]
+}
+
+private let defaultCompatibilityFile = URL(fileURLWithPath: #filePath)
+    .deletingLastPathComponent()
+    .deletingLastPathComponent()
+    .appendingPathComponent("Tools/MLModels/catalog-compatibility.json")
 
 private let legacyCompatibilityKeys: [String: String] = [
     "tinyclip-vit-40m-32-text-19m": "clip-dual-encoder-v1",
@@ -449,7 +463,7 @@ private enum ReleaseError: Error, CustomStringConvertible {
         switch self {
         case .usage:
             return
-                "Usage: prepare-ml-model-release.swift --private-key PATH --output DIR --bucket NAME --base-url URL --candidate-root DIR --evidence-dir DIR --qualification-dir DIR --notices-dir DIR --repository-revision SHA --released-at ISO8601 --catalog-sequence NUMBER [--model ID=DIR ...] [--retired-models FILE] [--previous-catalog-v1 FILE --previous-signature-v1 FILE [--previous-catalog-v2 FILE --previous-signature-v2 FILE]] [--rclone-remote NAME] [--allow-unchanged-candidate] [--allow-empty-v1]"
+                "Usage: prepare-ml-model-release.swift --private-key PATH --output DIR --bucket NAME --base-url URL --candidate-root DIR --evidence-dir DIR --qualification-dir DIR --notices-dir DIR --repository-revision SHA --released-at ISO8601 --catalog-sequence NUMBER [--model ID=DIR ...] [--retired-models FILE] [--previous-catalog-v1 FILE --previous-signature-v1 FILE [--previous-catalog-v2 FILE --previous-signature-v2 FILE]] [--rclone-remote NAME] [--channel production|preview] [--compatibility FILE] [--allow-unchanged-candidate] [--allow-empty-v1]"
         case .invalid(let reason):
             return reason
         case .missing(let url):
@@ -471,7 +485,7 @@ private func parseOptions() throws -> Options {
         "--retired-models",
         "--previous-catalog-v1", "--previous-signature-v1", "--previous-catalog-v2",
         "--previous-signature-v2",
-        "--allow-empty-v1",
+        "--allow-empty-v1", "--channel", "--compatibility",
     ])
 
     while index < CommandLine.arguments.count {
@@ -559,6 +573,13 @@ private func parseOptions() throws -> Options {
     else {
         throw ReleaseError.invalid("Previous catalogs require their matching detached signatures")
     }
+    guard let channel = CatalogChannel(rawValue: values["--channel"] ?? CatalogChannel.production.rawValue) else {
+        throw ReleaseError.invalid("--channel must be production or preview")
+    }
+    let compatibility = try loadCompatibility(
+        values["--compatibility"].map(URL.init(fileURLWithPath:)) ?? defaultCompatibilityFile,
+        channel: channel
+    )
 
     return Options(
         privateKey: URL(fileURLWithPath: privateKey),
@@ -580,8 +601,74 @@ private func parseOptions() throws -> Options {
         retiredModelsManifest: retiredModelsManifest,
         allowUnchangedCandidate: allowUnchangedCandidate,
         allowEmptyV1: allowEmptyV1,
-        models: models.sorted { $0.id < $1.id }
+        models: models.sorted { $0.id < $1.id },
+        recipes: compatibility.recipes,
+        strictReaders: compatibility.strictReaders
     )
+}
+
+private func loadCompatibility(
+    _ url: URL,
+    channel: CatalogChannel
+) throws -> (recipes: [String: CompatibilityRecipe], strictReaders: [StrictReader]) {
+    let file = try load(CompatibilityFile.self, from: url)
+    guard file.schemaVersion == 1,
+        Set(file.strictReaders.keys) == Set(CatalogChannel.allCases.map(\.rawValue)),
+        let strictReaders = file.strictReaders[channel.rawValue]
+    else {
+        throw ReleaseError.invalid("The compatibility file must list strict readers for every channel")
+    }
+    var recipes: [String: CompatibilityRecipe] = [:]
+    for recipe in file.recipes {
+        guard !recipe.key.isEmpty,
+            recipes[recipe.key] == nil,
+            recipe.minimumDescriptorVersion >= 1,
+            recipe.minimumDescriptorVersion <= recipe.maximumDescriptorVersion,
+            recipe.embeddingDimension > 0,
+            recipe.maximumFileBytes > 0,
+            recipe.maximumFileBytes <= recipe.maximumBytes
+        else {
+            throw ReleaseError.invalid("The compatibility file contains an invalid recipe: \(recipe.key)")
+        }
+        recipes[recipe.key] = CompatibilityRecipe(
+            key: recipe.key,
+            descriptorVersions: recipe.minimumDescriptorVersion...recipe.maximumDescriptorVersion,
+            embeddingDimension: recipe.embeddingDimension,
+            role: recipe.role,
+            capabilities: Set(recipe.capabilities),
+            requiredRuntimeResources: Set(recipe.requiredRuntimeResources),
+            maximumBytes: recipe.maximumBytes,
+            maximumFileBytes: recipe.maximumFileBytes,
+            license: recipe.license
+        )
+    }
+    guard !recipes.isEmpty, strictReaders.allSatisfy({ !$0.recipes.isEmpty }) else {
+        throw ReleaseError.invalid("The compatibility file must list recipes and each strict reader's recipes")
+    }
+    return (recipes, strictReaders)
+}
+
+/// Apps that reject an unknown recipe or drop retired models must keep every model they can
+/// have selected. Such a catalog must wait until those apps no longer read the channel.
+private func validateStrictReaders(
+    _ readers: [StrictReader],
+    previous: [String: CatalogModelV2],
+    candidate: CatalogV2
+) throws {
+    let candidateByID = Dictionary(uniqueKeysWithValues: candidate.models.map { ($0.id, $0) })
+    for reader in readers {
+        let knownRecipes = Set(reader.recipes)
+        if let model = candidate.models.first(where: { !knownRecipes.contains($0.compatibilityKey) }) {
+            throw ReleaseError.invalid(
+                "Apps \(reader.apps) reject the whole catalog: model \(model.id) uses unknown recipe \(model.compatibilityKey)"
+            )
+        }
+        for (id, model) in previous.sorted(by: { $0.key < $1.key }) where model.availability ?? .active == .active {
+            guard let next = candidateByID[id], next.availability ?? .active == .active else {
+                throw ReleaseError.invalid("Apps \(reader.apps) lose model \(id) when a catalog retires or removes it")
+            }
+        }
+    }
 }
 
 private func isSafeModelID(_ value: String) -> Bool {
@@ -809,11 +896,12 @@ private func isAllowedArtifactURL(_ url: URL, baseURL: URL, expectedPath: String
 
 private func deriveV2Model(
     from legacy: CatalogModelV1,
-    baseURL: URL
+    baseURL: URL,
+    recipes: [String: CompatibilityRecipe]
 ) throws -> CatalogModelV2 {
     guard let compatibilityKey = legacyCompatibilityKeys[legacy.id],
         let sourceRevision = legacySourceRevisions[legacy.id],
-        let recipe = compatibilityRecipes[compatibilityKey]
+        let recipe = recipes[compatibilityKey]
     else {
         throw ReleaseError.invalid(
             "V1-only migration cannot derive V2 metadata for \(legacy.id); provide a verified V2 catalog"
@@ -915,7 +1003,7 @@ private func prepareModel(input: ModelInput, options: Options) throws -> Prepare
     let manifest = try load(ReleaseManifest.self, from: releaseManifestURL)
     guard manifest.schemaVersion == 1,
         manifest.modelID == input.id,
-        let recipe = compatibilityRecipes[manifest.compatibilityKey],
+        let recipe = options.recipes[manifest.compatibilityKey],
         recipe.descriptorVersions.contains(manifest.descriptorVersion),
         manifest.embeddingDimension == recipe.embeddingDimension,
         manifest.role == recipe.role,
@@ -1115,7 +1203,8 @@ private func validatePreviousCatalogs(
     v1: CatalogV1,
     v2: CatalogV2,
     nextSequence: UInt64,
-    baseURL: URL
+    baseURL: URL,
+    recipes: [String: CompatibilityRecipe]
 ) throws {
     guard v1.schemaVersion == 1,
         v2.schemaVersion == 2,
@@ -1126,10 +1215,15 @@ private func validatePreviousCatalogs(
     else {
         throw ReleaseError.invalid("Previous catalogs are invalid or the next sequence is not monotonic")
     }
-    try validateCatalogPair(v1: v1, v2: v2, baseURL: baseURL)
+    try validateCatalogPair(v1: v1, v2: v2, baseURL: baseURL, recipes: recipes)
 }
 
-private func validateCatalogPair(v1: CatalogV1, v2: CatalogV2, baseURL: URL) throws {
+private func validateCatalogPair(
+    v1: CatalogV1,
+    v2: CatalogV2,
+    baseURL: URL,
+    recipes: [String: CompatibilityRecipe]
+) throws {
     guard v1.schemaVersion == 1,
         v2.schemaVersion == 2,
         Set(v1.models.map(\.id)).count == v1.models.count,
@@ -1138,7 +1232,7 @@ private func validateCatalogPair(v1: CatalogV1, v2: CatalogV2, baseURL: URL) thr
         throw ReleaseError.invalid("Catalog pair contains duplicate or unsupported model IDs")
     }
     for model in v2.models {
-        try validateV2Model(model, baseURL: baseURL)
+        try validateV2Model(model, baseURL: baseURL, recipes: recipes)
     }
     let v2ByID = Dictionary(uniqueKeysWithValues: v2.models.map { ($0.id, $0) })
     for legacy in v1.models {
@@ -1157,9 +1251,13 @@ private func validateCatalogPair(v1: CatalogV1, v2: CatalogV2, baseURL: URL) thr
     }
 }
 
-private func validateV2Model(_ model: CatalogModelV2, baseURL: URL) throws {
+private func validateV2Model(
+    _ model: CatalogModelV2,
+    baseURL: URL,
+    recipes: [String: CompatibilityRecipe]
+) throws {
     guard isSafeModelID(model.id),
-        let recipe = compatibilityRecipes[model.compatibilityKey],
+        let recipe = recipes[model.compatibilityKey],
         model.releaseSequence > 0,
         isSafeCatalogRevision(model.revision),
         isImmutableRevision(model.sourceRevision),
@@ -1548,7 +1646,8 @@ do {
             v1: previousV1,
             v2: previousV2,
             nextSequence: options.catalogSequence,
-            baseURL: options.baseURL
+            baseURL: options.baseURL,
+            recipes: options.recipes
         )
     } else if let previousV1 {
         guard options.catalogSequence == 1 else {
@@ -1569,10 +1668,11 @@ do {
     var v2ByID = Dictionary(uniqueKeysWithValues: (previousV2?.models ?? []).map { ($0.id, $0) })
     if previousV2 == nil, let previousV1 {
         for legacy in previousV1.models {
-            let derived = try deriveV2Model(from: legacy, baseURL: options.baseURL)
+            let derived = try deriveV2Model(from: legacy, baseURL: options.baseURL, recipes: options.recipes)
             v2ByID[derived.id] = derived
         }
     }
+    let previousModels = v2ByID
     for model in prepared {
         if let v1 = model.v1 { v1ByID[v1.id] = v1 }
         let releaseSequence = try nextModelReleaseSequence(
@@ -1632,7 +1732,8 @@ do {
         catalogSequence: options.catalogSequence,
         models: v2ByID.values.sorted { $0.id < $1.id }
     )
-    try validateCatalogPair(v1: catalogV1, v2: catalogV2, baseURL: options.baseURL)
+    try validateStrictReaders(options.strictReaders, previous: previousModels, candidate: catalogV2)
+    try validateCatalogPair(v1: catalogV1, v2: catalogV2, baseURL: options.baseURL, recipes: options.recipes)
     try fileManager.createDirectory(at: options.output, withIntermediateDirectories: true)
     let catalogV1URL = options.output.appendingPathComponent("catalog-v1.json")
     let catalogV1Data = try writeJSON(catalogV1, to: catalogV1URL)

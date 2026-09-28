@@ -882,6 +882,32 @@ private func waitUntil(
         #expect(!coordinator.isActive)
     }
 
+    @Test func directAccountSwitchClosesThePreviousAccountFirst() async throws {
+        let fixture = try await MobileSignedInFixture(itemsPerSection: 1)
+        defer { fixture.removeCache() }
+        let model = MobileLibraryModel()
+        fixture.install(into: model)
+        let feed = fixture.feed
+        await feed.pausePrefetch()
+        await feed.startPrefetch(fixture.items.map(\.uid))
+        #expect(await feed.hasPendingThumbnailWork())
+
+        let store = SessionKeychainStore()
+        model.configure(
+            session: ProtonSession(
+                uid: "second-account",
+                accessToken: "access-b",
+                refreshToken: "refresh-b",
+                keyPassword: "key-b"
+            ),
+            store: store
+        )
+        // Sign out before the second account opens a backend. The test covers the first account only.
+        model.configure(session: nil, store: store)
+
+        try await waitUntil { await !feed.hasPendingThumbnailWork() }
+    }
+
     @Test func favoriteFilterWaitsForAuthoritativeMembership() {
         let model = MobileLibraryModel()
 

@@ -139,6 +139,35 @@ import UIKit
         await runtime.shutdown()
     }
 
+    @Test func activationRefreshesLibrarySourcesOnce() async throws {
+        let fixture = try await MobileSignedInFixture(itemsPerSection: 1)
+        defer { fixture.removeCache() }
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let remote = ThumbnailLoaderProbe(data: [:])
+        let coordinator = LibrarySourceCoordinator(remote: remote, thumbnailLoader: remote, inventoryStore: nil)
+        await coordinator.prepare()
+        let cache = ThumbnailCache(rootDirectory: root)
+        cache.configure(accountUID: "fixture-account", key: SymmetricKey(size: .bits256))
+        let feed = UIKitThumbnailFeed(cache: cache, loader: coordinator, concurrency: 1, batch: 1)
+        let runtime = LibrarySourceAnalysisRuntime(
+            coordinator: coordinator, feed: feed.feedCore, assets: MLAssetUniverse(),
+            initiallyActive: false, onAssetsChanged: {})
+        _ = await runtime.start(primaryItems: [], authority: .authoritative, generation: 0)
+        let model = MobileLibraryModel()
+        fixture.install(
+            into: model, backend: fixture.backend, sections: [], thumbnailFeed: feed, thumbnailCache: cache)
+        model.installIsolatedSourceAnalysisForTests(runtime)
+
+        // MobileAccountRuntime makes both calls on every activation.
+        model.setApplicationActive(true)
+        #expect(await waitUntil { await remote.sourceLocatorRequests == 1 })
+        await model.refreshAccountInfo()
+
+        #expect(await remote.sourceLocatorRequests == 1)
+        await runtime.shutdown()
+    }
+
     @Test func trashedNewPhotoLeavesThePendingThumbnailWork() async throws {
         let fixture = try await MobileSignedInFixture(itemsPerSection: 1)
         defer { fixture.removeCache() }
@@ -250,8 +279,12 @@ private actor ThumbnailLoaderProbe: ThumbnailBatchLoader, LibrarySourceRemoteBac
     }
 
     var callCount: Int { calls }
+    private(set) var sourceLocatorRequests = 0
     func requests(for uid: PhotoUID) -> Int { requested[uid, default: 0] }
-    func librarySourceLocators() async throws -> [AlbumNodeIdentifier] { [] }
+    func librarySourceLocators() async throws -> [AlbumNodeIdentifier] {
+        sourceLocatorRequests += 1
+        return []
+    }
     func librarySourceItems(for _: AlbumNodeIdentifier) async throws -> [LibrarySourceItem] { [] }
 }
 
