@@ -23,6 +23,8 @@ import UploadCore
 import UploadFeature
 
 struct MainView: View {
+    @AppStorage(AppSettingsKey.mapAndPlacesEnabled) private var mapAndPlacesEnabled =
+        AppSettingsDefault.mapAndPlacesEnabled
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.undoManager) private var undoManager
 
@@ -244,6 +246,7 @@ struct MainView: View {
             .onChange(of: timelineModel.contentRevision) { _, _ in evaluateVeilLift() }
             // Split out of this chain: inline, the added handlers exceed the type-checker's time budget.
             .applying { searchDiscoveryLifecycle($0) }
+            .applying { mapAndPlacesLifecycle($0) }
             .task(id: temporalProjectionRequestID) {
                 await rebuildTemporalProjection()
             }
@@ -347,7 +350,7 @@ struct MainView: View {
 
             // Library Map route. Match the other library routes with a plain unavailable surface until the
             // location index contains a place; rendering an empty world map only adds visual noise.
-            if selection == .map {
+            if selection == .map && mapAndPlacesEnabled {
                 let locationIndex = OfflineLibraryManager.shared.locationIndex
                 Group {
                     if locationIndex.coordinates.isEmpty {
@@ -1841,13 +1844,28 @@ struct MainView: View {
                     sections: currentTimelineSections,
                     timelineRevision: UInt64(truncatingIfNeeded: timelineModel.contentRevision),
                     favoriteUIDs: favorites,
-                    coordinates: OfflineLibraryManager.shared.locationIndex.coordinates,
+                    coordinates: MapAndPlacesPolicy.suggestionCoordinates(
+                        OfflineLibraryManager.shared.locationIndex.coordinates, enabled: mapAndPlacesEnabled),
                     smartSearch: model.smartSearch,
                     libraryIsSettled: librarySettled && !backgroundLibraryActivityActive,
                     cacheContentIsSettled: suggestionCacheContentReady,
                     coordinateRevision: OfflineLibraryManager.shared.locationIndex.revision
                 )
             }
+    }
+
+    private func mapAndPlacesLifecycle<Content: View>(_ view: Content) -> some View {
+        view.onChange(of: mapAndPlacesEnabled) { _, enabled in
+            if enabled {
+                viewerModel?.refreshPlaceNames()
+                OfflineLibraryManager.shared.resumeMapAndPlaces(
+                    items: timelineModel.wholeLibraryItemsForViewer, metadata: backend)
+            } else {
+                if selection == .map { selection = .all }
+                OfflineLibraryManager.shared.pauseMapAndPlaces()
+                Task { await NativePlaceNameResolver.shared.cancelPending() }
+            }
+        }
     }
 
     private func updateSearchActivity() {
@@ -1866,6 +1884,7 @@ struct MainView: View {
             smartSearch: model.smartSearch, coordinateRevision: OfflineLibraryManager.shared.locationIndex.revision
         ) + "|librarySettled:\(librarySettled)|thumbnailWork:\(backgroundLibraryActivityActive)"
             + "|cacheContentSettled:\(suggestionCacheContentReady)"
+            + "|mapAndPlaces:\(mapAndPlacesEnabled)"
     }
 
     private var suggestionCacheContentReady: Bool {
@@ -2400,8 +2419,8 @@ struct MainView: View {
             captureDate: vm.current.captureTime,
             index: vm.index,
             total: vm.items.count,
-            locationName: vm.placeName,
-            locationIsResolving: vm.isPlaceNameResolving,
+            locationName: mapAndPlacesEnabled ? vm.placeName : nil,
+            locationIsResolving: mapAndPlacesEnabled && vm.isPlaceNameResolving,
             filename: vm.metadata?.filename
         )
     }

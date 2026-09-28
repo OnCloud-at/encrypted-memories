@@ -46,6 +46,8 @@ jobs:
           LLM_MODEL: ${{ vars.LLM_MODEL }}
           LLM_REVIEW_IDLE_SECONDS: ${{ vars.LLM_REVIEW_IDLE_SECONDS }}
           LLM_REASONING_EFFORT: ${{ vars.LLM_REASONING_EFFORT }}
+          # Off until maintainers adjudicate a replay; set the repository variable to 1 to apply the rules.
+          LLM_REVIEW_REPOSITORY_RULES: ${{ vars.LLM_REVIEW_REPOSITORY_RULES }}
         run: python3 .github/scripts/review_pull_request.py
 
       - name: Report unavailable advisory review

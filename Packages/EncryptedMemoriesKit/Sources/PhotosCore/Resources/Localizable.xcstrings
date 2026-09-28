@@ -5008,6 +5008,34 @@
         "de": { "stringUnit": { "state": "translated", "value": "Der Supportbericht konnte nicht erstellt werden." } }
       }
     },
+    "settings.privacy_tab": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Privacy" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Datenschutz" } }
+      }
+    },
+    "settings.privacy_map_and_places": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Map and Places" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Karte und Orte" } }
+      }
+    },
+    "settings.privacy_map_explanation": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "When off, maps and place names stop contacting Apple. Coordinates remain encrypted on this device." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Ausgeschaltet kontaktieren Karten und Ortsnamen Apple nicht mehr. Koordinaten bleiben verschlüsselt auf diesem Gerät." } }
+      }
+    },
+    "settings.privacy_policy": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Privacy Policy" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Datenschutzerklärung" } }
+      }
+    },
     "settings.bug_report_privacy": {
       "extractionState": "manual",
       "localizations": {

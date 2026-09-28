@@ -60,6 +60,7 @@ let package = Package(
         .library(name: "MapCore", targets: ["MapCore"]),
         .library(name: "MapUIKitAdapter", targets: ["MapUIKitAdapter"]),
         .library(name: "MapFeature", targets: ["MapFeature"]),
+        .library(name: "PrivacyFeature", targets: ["PrivacyFeature"]),
         .library(name: "MLSearchCore", targets: ["MLSearchCore"]),
         .library(name: "MLSearchAppleAdapter", targets: ["MLSearchAppleAdapter"]),
         .library(name: "MLSearchBackgroundAppleAdapter", targets: ["MLSearchBackgroundAppleAdapter"]),
@@ -304,6 +305,7 @@ let package = Package(
         .target(
             name: "MapFeature", dependencies: ["PhotosCore", "MediaLocationCore", "MapCore", "DesignSystem"],
             swiftSettings: disableDynamicActorIsolation),
+        .target(name: "PrivacyFeature", dependencies: ["PhotosCore"], swiftSettings: disableDynamicActorIsolation),
         .target(name: "MLSearchCore", dependencies: ["PhotosCore"], swiftSettings: disableDynamicActorIsolation),
         .testTarget(
             name: "MLSearchCoreTests", dependencies: ["MLSearchCore", "PhotosCore"],

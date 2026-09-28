@@ -7,6 +7,8 @@ import SwiftUI
 /// Content of the viewer's native inspector: all available file metadata for the current photo or video plus a
 /// native map when GPS is present.
 struct InfoPanelView: View {
+    @AppStorage(AppSettingsKey.mapAndPlacesEnabled) private var mapAndPlacesEnabled =
+        AppSettingsDefault.mapAndPlacesEnabled
     let item: PhotoItem
     let metadataLoadState: PhotoMetadataLoadState
     let albumTitles: [String]
@@ -21,7 +23,15 @@ struct InfoPanelView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
                 captureSection
-                if let m = metadata, m.hasLocation { mapSection(m) }
+                if let m = metadata, m.hasLocation {
+                    if mapAndPlacesEnabled {
+                        mapSection(m)
+                    } else if let latitude = m.latitude, let longitude = m.longitude {
+                        Text(PhotoCoordinateText.format(latitude: latitude, longitude: longitude))
+                            .monospacedDigit()
+                            .textSelection(.enabled)
+                    }
+                }
                 fileSection
                 if canLoadAlbumMemberships {
                     albumSection
