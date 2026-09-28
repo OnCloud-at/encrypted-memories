@@ -294,6 +294,7 @@ jobs:
             --repository-revision "$RELEASE_COMMIT" \
             --released-at "$RELEASED_AT" \
             --catalog-sequence "$CATALOG_SEQUENCE" \
+            --channel preview \
             --allow-empty-v1 \
             "${previous_args[@]}" \
             "${retirement_args[@]}" \
