@@ -164,14 +164,16 @@ final class UploadDedupePipelineTests: XCTestCase {
         path: String = "/photos/IMG_1.HEIC",
         filename: String? = nil,
         size: Int64 = 1000,
-        mtime: TimeInterval = 1_700_000_000
+        mtime: TimeInterval = 1_700_000_000,
+        digest: Data? = nil
     ) -> UploadResourceDescriptor {
         UploadResourceDescriptor(
             source: .file(URL(fileURLWithPath: path)),
             fileURL: URL(fileURLWithPath: path),
             filename: filename ?? (path as NSString).lastPathComponent,
             fileSize: size,
-            modificationDate: Date(timeIntervalSince1970: mtime)
+            modificationDate: Date(timeIntervalSince1970: mtime),
+            precomputedSHA1Digest: digest
         )
     }
 
@@ -557,6 +559,28 @@ final class UploadDedupePipelineTests: XCTestCase {
         XCTAssertEqual(result.decision, .skip(.knownFromManifest, remoteLinkID: "link-9"))
         XCTAssertEqual(checker.findCallCount, callsAfterConfirmation, "manifest hit must not re-query")
         XCTAssertEqual(hasher.hashCount, hashesAfterConfirmation, "manifest hit must not rehash")
+    }
+
+    /// A photo library source keeps its name, size, and capture-date mtime when the user edits it again. Only the
+    /// digest read from the new bytes proves the change, so the manifest must not answer for the old bytes.
+    func testChangedPrecomputedDigestIsNotAnsweredFromTheManifest() async throws {
+        let before = Data(repeating: 0x11, count: 20)
+        let after = Data(repeating: 0x22, count: 20)
+        let original = descriptor(digest: before)
+        let first = try await pipeline.resolve(original)
+        XCTAssertEqual(first.decision, .upload)
+        try await pipeline.recordUploaded(
+            original, identity: first.identity, remoteVolumeID: "vol", remoteLinkID: "old-link")
+
+        pipeline = UploadDedupePipeline(store: store, hasher: hasher, checker: checker)
+        let unchanged = try await pipeline.resolve(original)
+        XCTAssertEqual(unchanged.decision, .skip(.knownFromManifest, remoteLinkID: "old-link"))
+
+        pipeline = UploadDedupePipeline(store: store, hasher: hasher, checker: checker)
+        let edited = try await pipeline.resolve(descriptor(digest: after))
+        XCTAssertEqual(edited.decision, .upload, "new bytes with the same name and size must upload")
+        XCTAssertEqual(edited.identity.sha1Hex, UploadContentSHA1.hexString(digest: after))
+        XCTAssertEqual(hasher.hashCount, 0, "a supplied digest needs no hashing")
     }
 
     func testRecordUploadedEnablesManifestFastPathNextRun() async throws {
