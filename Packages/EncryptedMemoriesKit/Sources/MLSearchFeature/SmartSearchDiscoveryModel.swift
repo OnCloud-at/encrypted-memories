@@ -18,6 +18,45 @@ public struct SmartSearchContentIdentity: Hashable, Sendable {
     }
 }
 
+/// Metadata rows of the latest content. One scheduler shares it with every model it creates, so the second pass
+/// of a refresh and a refresh after an interruption reuse the rows instead of reading every photo again.
+@MainActor
+final class SmartSearchLibraryRowsCache {
+    struct Key: Equatable {
+        let content: SmartSearchContentIdentity
+        let day: Date
+        let calendar: Calendar
+        let locale: Locale
+
+        init(content: SmartSearchContentIdentity, context: TimelineSearchDiscoveryContext) {
+            self.content = content
+            day = context.calendar.startOfDay(for: context.now)
+            calendar = context.calendar
+            locale = context.locale
+        }
+    }
+
+    private var entry: (key: Key, rows: TimelineSearchLibraryRows)?
+    #if DEBUG
+        private(set) var buildCount = 0
+    #endif
+
+    func rows(for key: Key) -> TimelineSearchLibraryRows? {
+        entry?.key == key ? entry?.rows : nil
+    }
+
+    func store(_ rows: TimelineSearchLibraryRows, for key: Key) {
+        entry = (key, rows)
+        #if DEBUG
+            buildCount += 1
+        #endif
+    }
+
+    func removeAll() {
+        entry = nil
+    }
+}
+
 /// What a host does with a search text that may be the title of a structured suggestion.
 public enum SmartSearchSuggestionCommitDecision: Equatable {
     /// A displayable suggestion owns the text: commit its exact result set.
@@ -92,6 +131,7 @@ public final class SmartSearchDiscoveryModel {
 
     @ObservationIgnored private let placeName: PlaceNameResolver
     @ObservationIgnored private let refreshPolicy: RefreshPolicy
+    @ObservationIgnored private let libraryRows: SmartSearchLibraryRowsCache
     /// Whether this model computed visual concepts with a finished visual index.
     private var visualConceptsCompletedWhenReady = false
     /// Only the current refresh may publish after an asynchronous boundary.
@@ -106,9 +146,16 @@ public final class SmartSearchDiscoveryModel {
     @ObservationIgnored private var conceptKey: String?
     @ObservationIgnored private var conceptEvidence: [MLSearchConceptEvidence] = []
 
-    public init(refreshPolicy: RefreshPolicy = .continuous, placeName: @escaping PlaceNameResolver) {
+    public convenience init(refreshPolicy: RefreshPolicy = .continuous, placeName: @escaping PlaceNameResolver) {
+        self.init(refreshPolicy: refreshPolicy, placeName: placeName, libraryRows: SmartSearchLibraryRowsCache())
+    }
+
+    init(
+        refreshPolicy: RefreshPolicy, placeName: @escaping PlaceNameResolver, libraryRows: SmartSearchLibraryRowsCache
+    ) {
         self.refreshPolicy = refreshPolicy
         self.placeName = placeName
+        self.libraryRows = libraryRows
     }
 
     struct PersistedSnapshot: Codable, Sendable {
@@ -537,9 +584,21 @@ public final class SmartSearchDiscoveryModel {
             suppressesRepresentatives: !gatePassed
         )
 
-        // Stage 2: metadata. It needs no network and no further ML.
+        // Stage 2: metadata. It needs no network and no further ML. Building the rows reads every photo; the
+        // previews depend on the gate only, so every pass for the same content reuses the rows.
+        let rowsKey = SmartSearchLibraryRowsCache.Key(content: content, context: context)
+        let rows: TimelineSearchLibraryRows
+        if let cached = libraryRows.rows(for: rowsKey) {
+            rows = cached
+        } else {
+            rows = await Self.background {
+                TimelineSearchDiscovery.libraryRows(sections: sections, context: context)
+            }
+            guard !Task.isCancelled, generation == refreshGeneration else { return }
+            libraryRows.store(rows, for: rowsKey)
+        }
         let newMetadata = await Self.background {
-            TimelineSearchDiscovery.librarySuggestions(sections: sections, context: context)
+            TimelineSearchDiscovery.librarySuggestions(rows: rows, context: context)
         }
         guard !Task.isCancelled, generation == refreshGeneration else { return }
         if computedContent != content {

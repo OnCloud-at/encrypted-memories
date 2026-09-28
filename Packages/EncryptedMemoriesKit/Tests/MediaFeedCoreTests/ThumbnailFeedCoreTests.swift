@@ -647,6 +647,40 @@ struct ThumbnailFeedCoreTests {
         #expect(await loader.recordedPriorities == [.visibleNow])
     }
 
+    @Test func crawlSleepsWhileTheDeviceIsNearlyFullAndResumesWhenStorageRecovers() async throws {
+        let crawled = [Self.uid("storage-crawl-a"), Self.uid("storage-crawl-b")]
+        let visible = Self.uid("storage-crawl-visible")
+        let loader = PriorityRecordingLoader(payload: Self.pngData(width: 24, height: 24))
+        let runtimeState = LibraryRuntimeState(initial: LibraryRuntimeSnapshot(storagePressure: .critical))
+        let feed = ThumbnailFeedCore(
+            cache: Self.cache("storage-critical-crawl", runtimeState: runtimeState),
+            loader: loader,
+            configuration: Self.configuration(downloadConcurrencyLimit: 2, batchSize: 1)
+        )
+        await feed.startPrefetch(crawled)
+
+        let stopped = Counter()
+        let waiter = Task {
+            try await feed.waitForPrefetchToFinish()
+            stopped.increment()
+        }
+        try await Self.waitUntil { stopped.value() == 1 }
+        #expect(stopped.value() == 1, "the crawl workers stop instead of polling")
+        waiter.cancel()
+        _ = try? await waiter.value
+        #expect(await feed.hasPendingThumbnailWork())
+        #expect(await loader.recordedPriorities.isEmpty)
+
+        _ = await feed.requestPriority(visible)
+        try await Self.waitUntil { await loader.recordedPriorities.count == 1 }
+        #expect(await loader.recordedPriorities == [.visibleNow], "visible photos still load")
+
+        runtimeState.update { $0.storagePressure = .normal }
+        try await Self.waitUntil { await loader.recordedPriorities.count == 3 }
+        #expect(await loader.recordedPriorities == [.visibleNow, .idleLibraryCrawl, .idleLibraryCrawl])
+        await feed.stopPrefetchAndWait()
+    }
+
     @Test func localPendingPhotosLoadFromTheDeviceOnly() async throws {
         let local = PhotoUID(localPending: .photoLibrary, identifier: "asset-1")
         let remoteLoader = PriorityRecordingLoader(payload: Self.pngData(width: 24, height: 24))

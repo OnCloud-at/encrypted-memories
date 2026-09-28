@@ -37,6 +37,10 @@ class MLPreviewWorkflowContractTests(unittest.TestCase):
         self.assertIn("active-pair.json?preview=", self.preview)
         self.assertIn('--expected-pair "$PAIR_ID"', self.preview)
 
+    def test_only_production_releases_check_shipped_app_readers(self) -> None:
+        self.assertIn("--channel preview", self.preview)
+        self.assertNotIn("--channel", self.production)
+
     def test_preview_rejects_the_production_base_url(self) -> None:
         self.assertEqual(
             self.preview.count('ML_MODEL_PREVIEW_BASE_URL" != "https://models.oncloud.at/models/"'),
