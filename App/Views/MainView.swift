@@ -102,6 +102,9 @@ struct MainView: View {
     // The floating sidebar width is the grid's leading obstruction. Keep it stable during resize so geometry
     // is not recomputed per frame.
     private var leadingObstructionInset: CGFloat { columnVisibility == .detailOnly ? 0 : sidebarWidth }
+    /// The sidebar's show and hide timing. Every surface that follows the sidebar uses it, like the grid's
+    /// `MetalGridScrollHost`: two different curves lay the window out for the longer one and let the viewer trail.
+    private static let sidebarAnimation = Animation.easeInOut(duration: 0.22)
     // Selection + export.
     @State private var selectionMode = false
     @State private var selectedUIDs: Set<PhotoUID> = []
@@ -366,7 +369,7 @@ struct MainView: View {
                     }
                 }
                 .padding(.leading, leadingObstructionInset)
-                .animation(.easeInOut(duration: 0.3), value: leadingObstructionInset)
+                .animation(Self.sidebarAnimation, value: leadingObstructionInset)
                 .ignoresSafeArea()
             }
 
@@ -398,7 +401,7 @@ struct MainView: View {
                 // grid. Move the whole surface beside the floating sidebar and keep the Metal host's local
                 // obstruction at zero so the sidebar is neither covered nor applied twice.
                 .padding(.leading, leadingObstructionInset)
-                .animation(.easeInOut(duration: 0.3), value: leadingObstructionInset)
+                .animation(Self.sidebarAnimation, value: leadingObstructionInset)
                 .ignoresSafeArea(.container, edges: [.top, .bottom])
                 .environment(\.gridTopBarInset, topBarInset)
                 .transition(.opacity)
@@ -416,7 +419,7 @@ struct MainView: View {
                 )
                 // Keep the viewer beside the floating sidebar. The inset matches the zoom overlay's content rect.
                 .padding(.leading, leadingObstructionInset)
-                .animation(.easeInOut(duration: 0.3), value: leadingObstructionInset)  // slide with the sidebar toggle
+                .animation(Self.sidebarAnimation, value: leadingObstructionInset)  // slide with the sidebar toggle
                 // Do not hide the view with opacity while dismissing. Keep it hit-testable so the gesture cannot
                 // reach the grid behind it.
             }
@@ -439,7 +442,7 @@ struct MainView: View {
             }
         )
         .coordinateSpace(name: "root")
-        .animation(.easeInOut(duration: 0.22), value: sidebarOpen)
+        .animation(Self.sidebarAnimation, value: sidebarOpen)
         .sheet(isPresented: $showCreateAlbum, onDismiss: { createAlbumPhotoUIDs = [] }) {
             AlbumCreationSheet(
                 coordinator: albumActions,
@@ -617,7 +620,7 @@ struct MainView: View {
                 // floating sidebar obstruction explicitly. Keep its visible content and hit targets beside the
                 // sidebar while the shared root still extends beneath the native title bar.
                 .padding(.leading, leadingObstructionInset)
-                .animation(reduceMotion ? nil : .easeInOut(duration: 0.3), value: leadingObstructionInset)
+                .animation(reduceMotion ? nil : Self.sidebarAnimation, value: leadingObstructionInset)
                 .transition(.opacity)
             } else {
                 TimelineView(
@@ -2436,7 +2439,7 @@ struct MainView: View {
     // MARK: - Sidebar
 
     private func toggleSidebar() {
-        withAnimation(.easeInOut(duration: 0.22)) {
+        withAnimation(Self.sidebarAnimation) {
             sidebarOpen.toggle()
             columnVisibility = sidebarOpen ? .all : .detailOnly  // drive the native split view
         }
@@ -2451,7 +2454,7 @@ struct MainView: View {
         // This is called only after the first content frame or a settled empty/error state. By then AppKit has
         // committed the `.all` mount. Drive the same native transition as a real sidebar toggle so AppKit also
         // establishes its titlebar navigation region; the launch cover and its 250 ms settle barrier hide it.
-        withAnimation(.easeInOut(duration: 0.22)) {
+        withAnimation(Self.sidebarAnimation) {
             sidebarOpen = false
             columnVisibility = .detailOnly
         }
