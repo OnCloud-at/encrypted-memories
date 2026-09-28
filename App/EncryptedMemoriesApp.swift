@@ -12,6 +12,7 @@ import TimelineFeature
 struct EncryptedMemoriesApp: App {
     @NSApplicationDelegateAdaptor(EncryptedMemoriesAppDelegate.self) private var appDelegate
     @State private var model: AppModel?
+    @AppStorage(AppSettingsKey.blurAppPreview) private var blurAppPreview = AppSettingsDefault.blurAppPreview
     private let metal3Supported: Bool
 
     init() {
@@ -42,7 +43,7 @@ struct EncryptedMemoriesApp: App {
                 }
             }
             .frame(minWidth: 720, minHeight: 480)
-            .background(WindowConfigurator())
+            .background(WindowConfigurator(blurAppPreview: blurAppPreview))
             .background { TipJarCelebrationWindowOverlay() }
             .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
                 model?.smartSearch?.noteConditionsChanged()
@@ -246,6 +247,8 @@ private final class LibraryWindowDelegateProxy: NSObject, NSWindowDelegate {
 /// Attaches window-level lifecycle controllers. Window chrome belongs to the SwiftUI scene declaration above;
 /// mutating title-bar style here is not durable because SwiftUI can rebuild AppKit's title-bar hierarchy later.
 private struct WindowConfigurator: NSViewRepresentable {
+    let blurAppPreview: Bool
+
     func makeCoordinator() -> Coordinator { Coordinator() }
 
     func makeNSView(context: Context) -> WindowAttachmentView {
@@ -263,11 +266,13 @@ private struct WindowConfigurator: NSViewRepresentable {
         guard let window else { return }
         window.identifier = NSUserInterfaceItemIdentifier("library")
         coordinator.frameController.attach(to: window)
+        coordinator.privacyPreviewShield.attach(to: window, enabled: blurAppPreview)
         LibraryWindowVisibilityController.shared.attach(to: window)
     }
 
     @MainActor final class Coordinator {
         let frameController = MainWindowFrameController(defaultSize: CGSize(width: 1080, height: 720))
+        let privacyPreviewShield = MacPrivacyPreviewShield()
     }
 }
 
