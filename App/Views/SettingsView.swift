@@ -3,9 +3,11 @@ import AppKit
 import DesignSystem
 import DesignSystemCore
 import MLSearchCore
+import MapFeature
 import MediaCache
 import PhotoLibraryBackupAdapter
 import PhotosCore
+import PrivacyFeature
 import ProtonDriveBackend
 import SwiftUI
 import UploadCore
@@ -14,6 +16,8 @@ import UploadFeature
 /// Native macOS settings window.
 struct SettingsView: View {
     @Environment(\.dismissWindow) private var dismissWindow
+    @AppStorage(AppSettingsKey.mapAndPlacesEnabled) private var mapAndPlacesEnabled =
+        AppSettingsDefault.mapAndPlacesEnabled
 
     let isAccountAvailable: Bool
     let uploadCoordinator: UploadCoordinator?
@@ -35,8 +39,14 @@ struct SettingsView: View {
                 .padding(.vertical, 7)
         }
         .navigationTitle("sidebar.settings")
-        // German tab titles need at least 530 pt; a narrower window hides a tab behind the overflow menu.
-        .frame(width: 560, height: 520)
+        .onChange(of: mapAndPlacesEnabled) { _, enabled in
+            if !enabled {
+                OfflineLibraryManager.shared.pauseMapAndPlaces()
+                Task { await NativePlaceNameResolver.shared.cancelPending() }
+            }
+        }
+        // Leave room for all German tab titles in the native toolbar.
+        .frame(width: 660, height: 520)
         .task {
             await refreshAccountInfo()
             while !Task.isCancelled {
@@ -92,6 +102,11 @@ struct SettingsView: View {
                         )
                     })
             }
+            tabs.append(
+                .init(id: .privacy, title: L10n.string("settings.privacy_tab"), systemImage: "hand.raised") {
+                    Form { PrivacySettingsContent() }
+                        .formStyle(.grouped)
+                })
             tabs.append(
                 .init(id: .labs, title: L10n.string("labs.title"), systemImage: "flask") {
                     LabsSettingsTab()

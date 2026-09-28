@@ -3,6 +3,7 @@ import Foundation
 import MLSearchCore
 import PhotoLibraryBackupAdapter
 import PhotosCore
+import PrivacyFeature
 import ProtonDriveBackend
 import SwiftUI
 import TimelineCore
@@ -36,6 +37,7 @@ struct MobileSettingsScreen: View {
                 accountSection
                 tipJarSection
                 featuresSection
+                privacySection
                 labsSection
                 cacheSection
                 supportSection
@@ -183,6 +185,17 @@ struct MobileSettingsScreen: View {
 
     private func onOffSummary(_ isOn: Bool) -> String {
         isOn ? L10n.string("settings.summary_on") : L10n.string("settings.summary_off")
+    }
+
+    private var privacySection: some View {
+        Section {
+            NavigationLink {
+                Form { PrivacySettingsContent() }
+                    .navigationTitle(L10n.string("settings.privacy_tab"))
+            } label: {
+                Label(L10n.string("settings.privacy_tab"), systemImage: "hand.raised")
+            }
+        }
     }
 
     private func albumSyncSummary(_ albumSync: AlbumSyncController) -> String {

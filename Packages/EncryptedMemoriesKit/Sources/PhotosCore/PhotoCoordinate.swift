@@ -22,6 +22,12 @@ public struct PhotoCoordinate: Sendable, Equatable, Codable, Identifiable {
     }
 }
 
+public enum PhotoCoordinateText {
+    public static func format(latitude: Double, longitude: Double) -> String {
+        "\(latitude.formatted(.number.precision(.fractionLength(6)))), \(longitude.formatted(.number.precision(.fractionLength(6))))"
+    }
+}
+
 /// A lat/lon bounding box - the visible map rect (+ margin) the index is queried against.
 public struct GeoBoundingBox: Sendable, Equatable {
     public let minLatitude, maxLatitude, minLongitude, maxLongitude: Double

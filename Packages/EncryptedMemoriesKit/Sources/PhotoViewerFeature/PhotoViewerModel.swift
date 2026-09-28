@@ -190,6 +190,12 @@ public final class PhotoViewerModel {
         loadAlbumMemberships()
     }
 
+    public func refreshPlaceNames() {
+        placeTask?.cancel()
+        titleMetadataCoordinator.cancelAll()
+        resolvePlaceName(for: current)
+    }
+
     private func loadAlbumMemberships() {
         albumMembershipTask?.cancel()
         albumTitles = []
