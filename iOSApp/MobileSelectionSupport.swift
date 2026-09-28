@@ -375,6 +375,7 @@ enum MobileMediaExporter {
         // Two selected photos can share an original Proton name. Reserve a unique path before writing
         // so concurrent exports cannot overwrite each other.
         let names = ExportNames()
+        let removeLocationWhenSharing = PrivacyExportPolicy.isEnabled()
 
         let maxConcurrent = 2
         var exported: [URL] = []
@@ -395,7 +396,11 @@ enum MobileMediaExporter {
                 }
                 let item = items[index]
                 index += 1
-                group.addTask { await export(item, backend: backend, names: names, into: directory) }
+                group.addTask {
+                    await export(
+                        item, backend: backend, names: names, into: directory,
+                        removeLocationWhenSharing: removeLocationWhenSharing)
+                }
             }
             for _ in 0..<min(maxConcurrent, items.count) { addNext() }
             for await outcome in group {
@@ -430,7 +435,8 @@ enum MobileMediaExporter {
         _ item: PhotoItem,
         backend: any OriginalFileProvider & PhotoMetadataProvider,
         names: ExportNames,
-        into directory: URL
+        into directory: URL,
+        removeLocationWhenSharing: Bool
     ) async -> ItemExport {
         let staging = directory.appendingPathComponent(".\(UUID().uuidString).download")
         defer { try? FileManager.default.removeItem(at: staging) }
@@ -447,7 +453,11 @@ enum MobileMediaExporter {
             )
             let url = directory.appendingPathComponent(await names.unique(desired))
             try Task.checkCancellation()
-            try FileManager.default.moveItem(at: staging, to: url)
+            if removeLocationWhenSharing {
+                try await LocationSanitizedCopy.write(from: staging, to: url)
+            } else {
+                try FileManager.default.moveItem(at: staging, to: url)
+            }
             return .exported(url)
         } catch {
             return DeviceStorage.isOutOfSpace(error) ? .outOfSpace : .failed

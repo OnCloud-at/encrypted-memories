@@ -4,6 +4,8 @@ import Foundation
 /// Centralised here (in the SDK-agnostic core) so the App glue and the test target share one
 /// source of truth - UserDefaults key strings drift silently otherwise.
 public enum AppSettingsKey {
+    /// Removes standard GPS metadata from copies that leave the library.
+    public static let removeLocationWhenSharing = "EncryptedMemories.removeLocationWhenSharing"
     /// Allows MapKit maps and Apple place lookup for library locations.
     public static let mapAndPlacesEnabled = "EncryptedMemories.mapAndPlacesEnabled"
     /// Offline Photo Library master switch. When on, full-resolution originals viewed in the photo viewer are
@@ -34,6 +36,7 @@ public enum AppSettingsKey {
 }
 
 public enum AppSettingsDefault {
+    public static let removeLocationWhenSharing = false
     public static let mapAndPlacesEnabled = true
     /// Offline Photo Library is **on by default**: viewed originals are kept locally (encrypted) up to the cap.
     /// Thumbnails are always crawled while signed in, regardless of this value.
@@ -44,6 +47,16 @@ public enum AppSettingsDefault {
     public static let offlineOriginalsCapGB = 5.0
     /// Auto-lock remains enabled unless the user explicitly opts in for a large foreground import.
     public static let keepDisplayAwakeDuringForegroundBackup = false
+}
+
+/// One preference gate for every outbound original-media copy.
+public enum PrivacyExportPolicy {
+    public static func isEnabled(defaults: UserDefaults = .standard) -> Bool {
+        guard defaults.object(forKey: AppSettingsKey.removeLocationWhenSharing) != nil else {
+            return AppSettingsDefault.removeLocationWhenSharing
+        }
+        return defaults.bool(forKey: AppSettingsKey.removeLocationWhenSharing)
+    }
 }
 
 /// One shared admission rule for every location-to-Apple consumer.

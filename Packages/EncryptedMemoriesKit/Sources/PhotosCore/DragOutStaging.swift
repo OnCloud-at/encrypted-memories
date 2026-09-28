@@ -21,6 +21,7 @@ public actor DragOutStager {
     private let safetyMarginBytes: Int64
     private let maxConcurrentWrites: Int
     private let runtimeState: LibraryRuntimeState
+    private let removeLocationWhenSharing: Bool
 
     private enum JobState {
         case pending
@@ -48,13 +49,15 @@ public actor DragOutStager {
         stagingDirectory: URL,
         safetyMarginBytes: Int64 = 128 * 1024 * 1024,
         maxConcurrentWrites: Int = 2,
-        runtimeState: LibraryRuntimeState = .shared
+        runtimeState: LibraryRuntimeState = .shared,
+        removeLocationWhenSharing: Bool = PrivacyExportPolicy.isEnabled()
     ) {
         self.fileProvider = fileProvider
         self.stagingDirectory = stagingDirectory
         self.safetyMarginBytes = safetyMarginBytes
         self.maxConcurrentWrites = max(1, maxConcurrentWrites)
         self.runtimeState = runtimeState
+        self.removeLocationWhenSharing = removeLocationWhenSharing
     }
 
     // MARK: - Public API
@@ -222,10 +225,16 @@ public actor DragOutStager {
             let finalURL = await self.reserveFinalName(for: uid, downloadURL: destination)
             do {
                 try? FileManager.default.removeItem(at: finalURL)
-                try FileManager.default.moveItem(at: destination, to: finalURL)
+                if removeLocationWhenSharing {
+                    try await LocationSanitizedCopy.write(from: destination, to: finalURL)
+                    try FileManager.default.removeItem(at: destination)
+                } else {
+                    try FileManager.default.moveItem(at: destination, to: finalURL)
+                }
                 await self.finishJob(uid: uid, finalURL: finalURL, failure: nil)
             } catch {
                 try? FileManager.default.removeItem(at: destination)
+                try? FileManager.default.removeItem(at: finalURL)
                 await self.finishJob(
                     uid: uid,
                     finalURL: nil,
