@@ -6,6 +6,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
+import pathlib
 import re
 import sys
 import time
@@ -453,6 +454,8 @@ class ReviewPlan:
     excluded_text_files: int = 0
     excluded_text_lines: int = 0
     unlisted_files: int = 0
+    # Empty means the base prompt; `plan_review` adds the repository rules when they are enabled.
+    system_prompt: str = ""
 
 
 @dataclass(frozen=True)
@@ -778,6 +781,62 @@ REVIEW_SYSTEM_PROMPT = (
 )
 
 
+REPOSITORY_ROOT = pathlib.Path(__file__).resolve().parents[2]
+# The sections that state the architecture rules. The workflow checks out the default branch, so this text is
+# trusted maintainer text, never pull request content.
+REPOSITORY_RULE_SECTIONS = (("CONTRIBUTING.md", "Architecture rules"), ("AGENTS.md", "Code"))
+MAX_REPOSITORY_RULES_BYTES = 6_000
+REPOSITORY_RULES_INSTRUCTIONS = (
+    "Repository rules follow. They come from the trusted default branch, not from the pull request. Apply them "
+    "only to the supplied changed lines. Report a rule violation only when a changed line itself shows it, for "
+    "example shared or business logic added to a platform app target (App/ or iOSApp/) that belongs in "
+    "Packages/EncryptedMemoriesKit, logic that duplicates other code supplied in this review, or a feature added "
+    "for one platform when the pull request body states no platform limitation. Do not infer a violation from "
+    "code that is not supplied. Use warning or suggestion for a rule violation, never blocking, and name the rule "
+    "in the title. Missing tests stay testing_gaps or review_notes, never findings.\n\nRepository rules:\n"
+)
+
+
+def repository_rules_enabled() -> bool:
+    return os.environ.get("LLM_REVIEW_REPOSITORY_RULES", "").strip().lower() in {"1", "true"}
+
+
+def _markdown_section(text: str, heading: str) -> str | None:
+    lines = split_lines(text)
+    title = f"## {heading}"
+    start = next((index for index, line in enumerate(lines) if line.strip() == title), None)
+    if start is None:
+        return None
+    end = next(
+        (index for index in range(start + 1, len(lines)) if re.match(r"#{1,2} ", lines[index])),
+        len(lines),
+    )
+    section = "\n".join(lines[start:end]).strip()
+    return section if section != title else None
+
+
+def load_repository_rules(root: pathlib.Path = REPOSITORY_ROOT) -> str | None:
+    """The architecture rules from the checked-out default branch, or None when a section is missing."""
+    sections = []
+    for filename, heading in REPOSITORY_RULE_SECTIONS:
+        try:
+            text = (root / filename).read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            return None
+        section = _markdown_section(text, heading)
+        if section is None:
+            return None
+        sections.append(f"From {filename}:\n{section}")
+    rules = "\n\n".join(sections)
+    return rules if len(rules.encode("utf-8")) <= MAX_REPOSITORY_RULES_BYTES else None
+
+
+def review_system_prompt(repository_rules: str | None) -> str:
+    if not repository_rules:
+        return REVIEW_SYSTEM_PROMPT
+    return f"{REVIEW_SYSTEM_PROMPT} {REPOSITORY_RULES_INSTRUCTIONS}{repository_rules}"
+
+
 def _review_schema() -> dict[str, Any]:
     return {
         "type": "object",
@@ -848,7 +907,7 @@ def _review_payload(plan: ReviewPlan, review_input: dict[str, Any]) -> dict[str,
             },
         },
         "messages": [
-            {"role": "system", "content": REVIEW_SYSTEM_PROMPT},
+            {"role": "system", "content": plan.system_prompt or REVIEW_SYSTEM_PROMPT},
             {"role": "user", "content": _compact_json(review_input)},
         ],
     }
@@ -863,6 +922,7 @@ def plan_review(
     *,
     model: str,
     reasoning_effort: str | None,
+    repository_rules: str | None = None,
 ) -> ReviewPlan:
     """Assign every textual patch line to exactly one bounded batch, or record why it cannot be sent."""
 
@@ -914,6 +974,7 @@ def plan_review(
         excluded_text_files=len(excluded),
         excluded_text_lines=excluded_lines,
         unlisted_files=max(0, declared_file_count - len(files)),
+        system_prompt=review_system_prompt(repository_rules),
     )
     base = request_bytes(_review_payload(plan, _review_input(plan, _BATCH_LABEL_PLACEHOLDER, [], [])))
     space = REVIEW_REQUEST_TARGET_BYTES - base - EARLIER_BATCH_CONTEXT_BYTES - VALIDATION_RETRY_BYTES
@@ -1579,6 +1640,70 @@ def upsert_review_comment(
     return True
 
 
+def review_idle_seconds() -> float:
+    idle_seconds = float(os.environ.get("LLM_REVIEW_IDLE_SECONDS") or 600)
+    if not 120 <= idle_seconds <= REVIEW_LLM_TOTAL_SECONDS:
+        raise RuntimeError("LLM_REVIEW_IDLE_SECONDS must be between 120 and 1800")
+    return idle_seconds
+
+
+def review_pull_request_files(
+    pull_request: dict[str, Any],
+    files: list[dict[str, Any]],
+    snapshot: PullRequestSnapshot,
+    repo: str,
+    *,
+    github_token: str,
+    api_url: str,
+    llm_token: str,
+    llm_api_url: str,
+    model: str,
+    reasoning_effort: str | None,
+    repository_rules: str | None,
+    deadline: float,
+    idle_seconds: float,
+    is_current: Callable[[], bool],
+) -> BatchReviewOutcome | None:
+    """Review and verify the changed files. Publishes nothing; the advisory run and the replay share it."""
+    plan = plan_review(
+        pull_request, files, model=model, reasoning_effort=reasoning_effort, repository_rules=repository_rules)
+
+    def source_lines(text):
+        records = tuple(PatchLine("source", index, "context", "", index, line)
+                        for index, line in enumerate(split_lines(text), 1))
+        redacted, _, _ = _redact_patch_lines(records, 400_000, len(records))
+        return [{"line": item["new_line"], "text": item["text"]} for item in redacted]
+
+    def review_batch(payload, changed_lines, file_paths):
+        candidates = request_review_with_retries(
+            llm_api_url,
+            token=llm_token,
+            payload=payload,
+            changed_lines=changed_lines,
+            file_paths=file_paths,
+            deadline=deadline,
+            idle_seconds=idle_seconds,
+        )
+        verified = verify_findings(
+            candidates, payload, files, snapshot, repo, token=github_token, api_url=api_url,
+            fetch=github_request, redact=source_lines,
+            request=lambda verification, validator: request_review_with_retries(
+                llm_api_url, token=llm_token, payload=verification, changed_lines=changed_lines,
+                file_paths=file_paths, deadline=deadline, idle_seconds=idle_seconds, validator=validator),
+            max_request_bytes=REVIEW_REQUEST_TARGET_BYTES,
+            repository_rules=repository_rules,
+        )
+        # Keep gaps from evidence verification apart from the testing gaps that the review model reported.
+        model_gaps = set(candidates["testing_gaps"])
+        return dict(
+            verified,
+            testing_gaps=[gap for gap in verified["testing_gaps"] if gap in model_gaps],
+            verification_gaps=[gap for gap in verified["testing_gaps"] if gap not in model_gaps],
+        )
+
+    return review_batches(plan, review_batch=review_batch, is_current=is_current, deadline=deadline)
+
+
 def main() -> int:
     github_token = os.environ.get("GH_TOKEN", "")
     llm_token = os.environ.get("LLM_API_KEY", "")
@@ -1607,50 +1732,29 @@ def main() -> int:
     if not same_pull_request_snapshot(event_snapshot, pull_request_after_files):
         print("::notice::The pull request snapshot changed; this stale review run was skipped.")
         return 0
-    deadline = time.monotonic() + REVIEW_LLM_TOTAL_SECONDS
-    idle_seconds = float(os.environ.get("LLM_REVIEW_IDLE_SECONDS") or 600)
-    if not 120 <= idle_seconds <= REVIEW_LLM_TOTAL_SECONDS:
-        raise RuntimeError("LLM_REVIEW_IDLE_SECONDS must be between 120 and 1800")
+    idle_seconds = review_idle_seconds()
     llm_api_url, model, reasoning_effort = llm_configuration()
-    plan = plan_review(pull_request_after_files, files, model=model, reasoning_effort=reasoning_effort)
-
-    def source_lines(text):
-        records = tuple(PatchLine("source", index, "context", "", index, line)
-                        for index, line in enumerate(split_lines(text), 1))
-        redacted, _, _ = _redact_patch_lines(records, 400_000, len(records))
-        return [{"line": item["new_line"], "text": item["text"]} for item in redacted]
-
-    def review_batch(payload, changed_lines, file_paths):
-        candidates = request_review_with_retries(
-            llm_api_url,
-            token=llm_token,
-            payload=payload,
-            changed_lines=changed_lines,
-            file_paths=file_paths,
-            deadline=deadline,
-            idle_seconds=idle_seconds,
-        )
-        verified = verify_findings(
-            candidates, payload, files, event_snapshot, repo, token=github_token, api_url=api_url,
-            fetch=github_request, redact=source_lines,
-            request=lambda verification, validator: request_review_with_retries(
-                llm_api_url, token=llm_token, payload=verification, changed_lines=changed_lines,
-                file_paths=file_paths, deadline=deadline, idle_seconds=idle_seconds, validator=validator),
-            max_request_bytes=REVIEW_REQUEST_TARGET_BYTES,
-        )
-        # Keep gaps from evidence verification apart from the testing gaps that the review model reported.
-        model_gaps = set(candidates["testing_gaps"])
-        return dict(
-            verified,
-            testing_gaps=[gap for gap in verified["testing_gaps"] if gap in model_gaps],
-            verification_gaps=[gap for gap in verified["testing_gaps"] if gap not in model_gaps],
-        )
 
     def is_current():
         current = fetch_pull_request(repo, number, token=github_token, api_url=api_url)
         return same_pull_request_snapshot(event_snapshot, current)
 
-    outcome = review_batches(plan, review_batch=review_batch, is_current=is_current, deadline=deadline)
+    outcome = review_pull_request_files(
+        pull_request_after_files,
+        files,
+        event_snapshot,
+        repo,
+        github_token=github_token,
+        api_url=api_url,
+        llm_token=llm_token,
+        llm_api_url=llm_api_url,
+        model=model,
+        reasoning_effort=reasoning_effort,
+        repository_rules=load_repository_rules() if repository_rules_enabled() else None,
+        deadline=time.monotonic() + REVIEW_LLM_TOTAL_SECONDS,
+        idle_seconds=idle_seconds,
+        is_current=is_current,
+    )
     if outcome is None:
         print("::notice::The pull request snapshot changed; this stale review result was not published.")
         return 0
