@@ -9,6 +9,7 @@ public actor DeviceRootEnrollmentFileJournal: DeviceRootEnrollmentJournal {
         var version: Int
         var pendingIncarnation: String?
         var pendingLocation: DeviceRootLocation?
+        var pendingDispatchAttempted: Bool?
         var createdDeviceUID: String?
         var createdRootFolderUID: String?
         var createdLocation: DeviceRootLocation?
@@ -40,7 +41,8 @@ public actor DeviceRootEnrollmentFileJournal: DeviceRootEnrollmentJournal {
             }
             return DeviceRootCreateIntent(
                 incarnation: pendingIncarnation, createdDevice: device,
-                location: pendingLocation ?? .computer)
+                location: pendingLocation ?? .computer,
+                dispatchAttempted: pendingDispatchAttempted ?? true)
         }
 
         mutating func select(_ root: DeviceRootIdentity) {
@@ -61,11 +63,27 @@ public actor DeviceRootEnrollmentFileJournal: DeviceRootEnrollmentJournal {
     private let directory: URL
     private let fileURL: URL
     private let lockURL: URL
+    private let onBeforeFileLock: (@Sendable () -> Void)?
+    private let synchronizeOverride: (@Sendable (URL) throws -> Void)?
 
     public init(accountDataDirectory: URL) {
         directory = accountDataDirectory
         fileURL = accountDataDirectory.appendingPathComponent("device-root-enrollment.json")
         lockURL = accountDataDirectory.appendingPathComponent("device-root-enrollment.lock")
+        onBeforeFileLock = nil
+        synchronizeOverride = nil
+    }
+
+    init(
+        accountDataDirectory: URL,
+        onBeforeFileLock: (@Sendable () -> Void)?,
+        synchronize: (@Sendable (URL) throws -> Void)?
+    ) {
+        directory = accountDataDirectory
+        fileURL = accountDataDirectory.appendingPathComponent("device-root-enrollment.json")
+        lockURL = accountDataDirectory.appendingPathComponent("device-root-enrollment.lock")
+        self.onBeforeFileLock = onBeforeFileLock
+        synchronizeOverride = synchronize
     }
 
     public func selectedRoot() throws -> DeviceRootIdentity? {
@@ -85,6 +103,39 @@ public actor DeviceRootEnrollmentFileJournal: DeviceRootEnrollmentJournal {
             guard record.pendingCreate == nil, record.selectedRoot == nil else { return false }
             record.pendingIncarnation = incarnation
             record.pendingLocation = location
+            record.pendingDispatchAttempted = false
+            try saveUnlocked(record)
+            return true
+        }
+    }
+
+    public func markCreateDispatchAttempted(
+        location: DeviceRootLocation, incarnation: String
+    ) throws -> Bool {
+        try withExclusiveLock {
+            var record = try loadUnlocked()
+            guard record.selectedRoot == nil, let intent = record.pendingCreate,
+                intent.location == location, intent.incarnation == incarnation,
+                !intent.dispatchAttempted, intent.createdDevice == nil
+            else { return false }
+            record.pendingDispatchAttempted = true
+            try saveUnlocked(record)
+            return true
+        }
+    }
+
+    public func abortPreparedCreate(
+        location: DeviceRootLocation, incarnation: String
+    ) throws -> Bool {
+        try withExclusiveLock {
+            var record = try loadUnlocked()
+            guard record.selectedRoot == nil, let intent = record.pendingCreate,
+                intent.location == location, intent.incarnation == incarnation,
+                !intent.dispatchAttempted, intent.createdDevice == nil
+            else { return false }
+            record.pendingIncarnation = nil
+            record.pendingLocation = nil
+            record.pendingDispatchAttempted = nil
             try saveUnlocked(record)
             return true
         }
@@ -98,11 +149,29 @@ public actor DeviceRootEnrollmentFileJournal: DeviceRootEnrollmentJournal {
             var record = try loadUnlocked()
             guard let intent = record.pendingCreate else { throw JournalError.noPendingCreate }
             guard intent.location == device.location else { throw JournalError.conflictingRoot }
+            guard intent.dispatchAttempted else { throw JournalError.invalidRecord }
             if let existing = intent.createdDevice, existing != device { throw JournalError.conflictingRoot }
             record.createdDeviceUID = device.deviceUID
             record.createdRootFolderUID = device.rootFolderUID
             record.createdLocation = device.location
             try saveUnlocked(record)
+        }
+    }
+
+    public func abortCreateBeforeRemoteCall(
+        location: DeviceRootLocation, incarnation: String
+    ) throws -> Bool {
+        try withExclusiveLock {
+            var record = try loadUnlocked()
+            guard record.selectedRoot == nil, let intent = record.pendingCreate,
+                intent.location == location, intent.incarnation == incarnation,
+                intent.createdDevice == nil
+            else { return false }
+            record.pendingIncarnation = nil
+            record.pendingLocation = nil
+            record.pendingDispatchAttempted = nil
+            try saveUnlocked(record)
+            return true
         }
     }
 
@@ -149,6 +218,7 @@ public actor DeviceRootEnrollmentFileJournal: DeviceRootEnrollmentJournal {
             guard record.pendingCreate != nil else { return }
             record.pendingIncarnation = nil
             record.pendingLocation = nil
+            record.pendingDispatchAttempted = nil
             record.createdDeviceUID = nil
             record.createdRootFolderUID = nil
             record.createdLocation = nil
@@ -163,6 +233,7 @@ public actor DeviceRootEnrollmentFileJournal: DeviceRootEnrollmentJournal {
         let descriptor = Darwin.open(lockURL.path, O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0o600)
         guard descriptor >= 0 else { throw posixError() }
         defer { _ = Darwin.close(descriptor) }
+        onBeforeFileLock?()
         while Darwin.lockf(descriptor, F_LOCK, 0) != 0 {
             guard errno == EINTR else { throw posixError() }
         }
@@ -178,7 +249,8 @@ public actor DeviceRootEnrollmentFileJournal: DeviceRootEnrollmentJournal {
             let nsError = error as NSError
             if nsError.domain == NSCocoaErrorDomain, nsError.code == NSFileReadNoSuchFileError {
                 return Record(
-                    version: 3, pendingIncarnation: nil, pendingLocation: nil,
+                    version: 4, pendingIncarnation: nil, pendingLocation: nil,
+                    pendingDispatchAttempted: nil,
                     createdDeviceUID: nil, createdRootFolderUID: nil, createdLocation: nil,
                     selectedDeviceUID: nil, selectedRootFolderUID: nil,
                     selectedIncarnation: nil, selectedLocation: nil)
@@ -190,7 +262,7 @@ public actor DeviceRootEnrollmentFileJournal: DeviceRootEnrollmentJournal {
             record.selectedDeviceUID, record.selectedRootFolderUID, record.selectedIncarnation,
         ]
         let createdFields = [record.createdDeviceUID, record.createdRootFolderUID]
-        guard record.version == 2 || record.version == 3,
+        guard record.version == 2 || record.version == 3 || record.version == 4,
             record.version != 2
                 || (record.pendingLocation == nil && record.createdLocation == nil
                     && record.selectedLocation == nil),
@@ -202,6 +274,10 @@ public actor DeviceRootEnrollmentFileJournal: DeviceRootEnrollmentJournal {
             record.version == 2 || record.createdLocation != nil || createdFields.allSatisfy({ $0 == nil }),
             record.version == 2 || record.selectedLocation != nil || selectedFields.allSatisfy({ $0 == nil }),
             record.pendingIncarnation != nil || record.pendingLocation == nil,
+            record.pendingIncarnation != nil || record.pendingDispatchAttempted == nil,
+            record.version < 4 || record.pendingIncarnation == nil
+                || record.pendingDispatchAttempted != nil,
+            record.createdDeviceUID == nil || record.pendingCreate?.dispatchAttempted == true,
             record.selectedRoot != nil || record.selectedLocation == nil,
             record.pendingCreate?.createdDevice != nil || record.createdLocation == nil
         else { throw JournalError.invalidRecord }
@@ -215,13 +291,17 @@ public actor DeviceRootEnrollmentFileJournal: DeviceRootEnrollmentJournal {
                 else { throw JournalError.invalidRecord }
             }
         }
-        if record.version == 2 { try saveUnlocked(record) }
+        if record.version < 4 { try saveUnlocked(record) }
         return record
     }
 
     private func saveUnlocked(_ record: Record) throws {
         var upgraded = record
-        upgraded.version = 3
+        upgraded.version = 4
+        if upgraded.pendingIncarnation != nil, upgraded.pendingDispatchAttempted == nil {
+            // Older journals cannot prove whether remote create was sent.
+            upgraded.pendingDispatchAttempted = true
+        }
         if upgraded.pendingIncarnation != nil, upgraded.pendingLocation == nil {
             upgraded.pendingLocation = .computer
         }
@@ -237,6 +317,7 @@ public actor DeviceRootEnrollmentFileJournal: DeviceRootEnrollmentJournal {
     }
 
     private func sync(_ url: URL, flags: Int32) throws {
+        if let synchronizeOverride { return try synchronizeOverride(url) }
         let descriptor = Darwin.open(url.path, flags | O_CLOEXEC)
         guard descriptor >= 0 else { throw posixError() }
         defer { _ = Darwin.close(descriptor) }

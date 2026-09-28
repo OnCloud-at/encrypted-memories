@@ -15,7 +15,7 @@ struct DeviceRootSDKListedDevice: Sendable {
     }
 }
 
-enum DeviceRootSDKMarkerStatus: Sendable {
+enum DeviceRootSDKMarkerStatus: Equatable, Sendable {
     case missing
     case verified(name: String)
     case unverified

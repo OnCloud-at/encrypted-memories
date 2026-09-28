@@ -44,14 +44,17 @@ public struct DeviceRootCreateIntent: Equatable, Sendable {
     public let incarnation: String
     public let createdDevice: DeviceRootUnclaimedDevice?
     public let location: DeviceRootLocation
+    /// False proves that this journal version has not reserved any remote create.
+    public let dispatchAttempted: Bool
 
     public init(
         incarnation: String, createdDevice: DeviceRootUnclaimedDevice?,
-        location: DeviceRootLocation = .computer
+        location: DeviceRootLocation = .computer, dispatchAttempted: Bool = true
     ) {
         self.incarnation = incarnation
         self.createdDevice = createdDevice
         self.location = location
+        self.dispatchAttempted = dispatchAttempted
     }
 }
 
@@ -108,6 +111,11 @@ public protocol DeviceRootEnrollmentJournal: Sendable {
     func selectedRoot() async throws -> DeviceRootIdentity?
     func pendingCreate() async throws -> DeviceRootCreateIntent?
     func beginCreateIfAbsent(location: DeviceRootLocation, incarnation: String) async throws -> Bool
+    func markCreateDispatchAttempted(location: DeviceRootLocation, incarnation: String) async throws -> Bool
+    /// Safe after restart only while no remote dispatch was reserved.
+    func abortPreparedCreate(location: DeviceRootLocation, incarnation: String) async throws -> Bool
+    /// Only the coordinator that has not invoked backend create may abort this exact intent.
+    func abortCreateBeforeRemoteCall(location: DeviceRootLocation, incarnation: String) async throws -> Bool
     func recordCreatedDevice(_ device: DeviceRootUnclaimedDevice) async throws
     func select(_ root: DeviceRootIdentity) async throws
     /// Atomically adopts a discovered root only while no local create intent exists.
@@ -176,11 +184,41 @@ public actor DeviceRootEnrollmentCoordinator {
             guard try await journal.beginCreateIfAbsent(location: location, incarnation: incarnation)
             else { return .ambiguous }
         } catch {
-            return .unavailable
+            let aborted =
+                (try? await journal.abortCreateBeforeRemoteCall(
+                    location: location, incarnation: incarnation)) ?? false
+            return aborted ? .unavailable : .ambiguous
         }
 
-        // A cancelled task must not start a new remote mutation. The intent remains recoverable.
-        guard !Task.isCancelled else { return .ambiguous }
+        // A cancelled task must not start a new remote mutation.
+        if Task.isCancelled {
+            do {
+                return try await journal.abortCreateBeforeRemoteCall(
+                    location: location, incarnation: incarnation) ? .unavailable : .ambiguous
+            } catch {
+                return .ambiguous
+            }
+        }
+
+        do {
+            guard
+                try await journal.markCreateDispatchAttempted(
+                    location: location, incarnation: incarnation)
+            else { return .ambiguous }
+        } catch {
+            let aborted =
+                (try? await journal.abortCreateBeforeRemoteCall(
+                    location: location, incarnation: incarnation)) ?? false
+            return aborted ? .unavailable : .ambiguous
+        }
+        if Task.isCancelled {
+            do {
+                return try await journal.abortCreateBeforeRemoteCall(
+                    location: location, incarnation: incarnation) ? .unavailable : .ambiguous
+            } catch {
+                return .ambiguous
+            }
+        }
 
         do {
             let device: DeviceRootUnclaimedDevice
@@ -198,11 +236,38 @@ public actor DeviceRootEnrollmentCoordinator {
             else { return .ambiguous }
             guard !Task.isCancelled else { return .ambiguous }
             try await journal.select(created)
+        } catch DeviceRootOperationError.notDispatched {
+            let aborted =
+                (try? await journal.abortCreateBeforeRemoteCall(
+                    location: location, incarnation: incarnation)) ?? false
+            return aborted ? .unavailable : .ambiguous
         } catch {
             // The request may have succeeded. The pending intent prevents a blind retry.
             return .ambiguous
         }
         return await resolve()
+    }
+
+    /// Clears a prepared intent after a crash only when the journal proves no create was dispatched.
+    public func recoverPreparedEnrollment() async -> DeviceRootResolution {
+        guard !operationInProgress else { return .ambiguous }
+        operationInProgress = true
+        defer { operationInProgress = false }
+
+        do {
+            guard let intent = try await journal.pendingCreate() else { return await resolve() }
+            guard !intent.dispatchAttempted, intent.createdDevice == nil else { return .ambiguous }
+            guard try await journal.selectedRoot() == nil else { return .ambiguous }
+            guard !Task.isCancelled else { return .unavailable }
+            guard
+                try await journal.abortPreparedCreate(
+                    location: intent.location, incarnation: intent.incarnation
+                )
+            else { return .ambiguous }
+            return await resolve()
+        } catch {
+            return .unavailable
+        }
     }
 
     /// An explicit recovery action after marker creation returned an unknown result.
@@ -285,7 +350,7 @@ public actor DeviceRootEnrollmentCoordinator {
 
             let inventory: DeviceRootCandidateInventory
             if selected?.location == .myFiles || pending?.location == .myFiles {
-                inventory = try await backend.inventory(location: .myFiles)
+                inventory = try await backend.inventoryForExplicitFallback()
             } else if preferredLocation == .myFiles {
                 inventory = try await backend.inventoryForExplicitFallback()
             } else {

@@ -1,3 +1,4 @@
+import DeviceRootCore
 import Foundation
 import Testing
 
@@ -45,7 +46,17 @@ struct DeviceRootCheckedMutationTests {
         task.cancel()
         await probe.release()
 
-        await #expect(throws: CancellationError.self) { try await task.value }
+        await #expect(throws: DeviceRootOperationError.notDispatched) { try await task.value }
+        #expect(await probe.mutations == 0)
+    }
+
+    @Test func lookupFailureDoesNotStartFolderCreation() async {
+        let probe = PausedRootLookup()
+        await #expect(throws: DeviceRootOperationError.notDispatched) {
+            try await DeviceRootCheckedMutation.afterLookup(
+                lookup: { throw DeviceRootOperationError.unavailable },
+                mutate: { await probe.mutate($0) })
+        }
         #expect(await probe.mutations == 0)
     }
 }

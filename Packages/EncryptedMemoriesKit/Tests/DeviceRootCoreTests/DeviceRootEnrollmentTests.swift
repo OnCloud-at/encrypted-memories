@@ -17,6 +17,7 @@ private actor Catalog: DeviceRootEnrollmentBackend {
     var computerUnavailable = false
     var createCount = 0
     var createFallbackCount = 0
+    var failFallbackBeforeCreate = false
     var loseCreateResponse = false
     var loseClaimResponse = false
     var failBeforeClaim = false
@@ -94,6 +95,7 @@ private actor Catalog: DeviceRootEnrollmentBackend {
     }
 
     func createFallbackFolder() async throws -> DeviceRootUnclaimedDevice {
+        if failFallbackBeforeCreate { throw DeviceRootOperationError.notDispatched }
         if let journalAtCreate {
             sawPersistedIntent = try await journalAtCreate.pendingCreate()?.location == .myFiles
         }
@@ -126,6 +128,8 @@ private actor Catalog: DeviceRootEnrollmentBackend {
 
     func count() -> Int { createCount }
     func fallbackCount() -> Int { createFallbackCount }
+    func failNextFallbackPreparation() { failFallbackBeforeCreate = true }
+    func allowFallbackPreparation() { failFallbackBeforeCreate = false }
     func sawIntent() -> Bool { sawPersistedIntent }
     func sawDeviceCheckpoint() -> Bool { sawPersistedDevice }
     func pauseInventoryOnce() { pauseNextInventory = true }
@@ -155,6 +159,9 @@ private actor Journal: DeviceRootEnrollmentJournal {
     var selected: DeviceRootIdentity?
     var pending: DeviceRootCreateIntent?
     var began = 0
+    var pauseAfterBegin = false
+    var beginResume: CheckedContinuation<Void, Never>?
+    var beginEntered: [CheckedContinuation<Void, Never>] = []
 
     func selectedRoot() async throws -> DeviceRootIdentity? { selected }
     func pendingCreate() async throws -> DeviceRootCreateIntent? { pending }
@@ -163,8 +170,38 @@ private actor Journal: DeviceRootEnrollmentJournal {
     ) async throws -> Bool {
         guard pending == nil else { return false }
         pending = DeviceRootCreateIntent(
-            incarnation: incarnation, createdDevice: nil, location: location)
+            incarnation: incarnation, createdDevice: nil, location: location,
+            dispatchAttempted: false)
         began += 1
+        if pauseAfterBegin {
+            pauseAfterBegin = false
+            await withCheckedContinuation { continuation in
+                beginResume = continuation
+                for waiter in beginEntered { waiter.resume() }
+                beginEntered.removeAll()
+            }
+        }
+        return true
+    }
+    func markCreateDispatchAttempted(
+        location: DeviceRootLocation, incarnation: String
+    ) async throws -> Bool {
+        guard let pending, pending.location == location, pending.incarnation == incarnation,
+            !pending.dispatchAttempted, pending.createdDevice == nil
+        else { return false }
+        self.pending = DeviceRootCreateIntent(
+            incarnation: incarnation, createdDevice: nil, location: location,
+            dispatchAttempted: true)
+        return true
+    }
+    func abortPreparedCreate(
+        location: DeviceRootLocation, incarnation: String
+    ) async throws -> Bool {
+        guard selected == nil, let pending, pending.location == location,
+            pending.incarnation == incarnation, !pending.dispatchAttempted,
+            pending.createdDevice == nil
+        else { return false }
+        self.pending = nil
         return true
     }
     func recordCreatedDevice(_ device: DeviceRootUnclaimedDevice) async throws {
@@ -172,6 +209,15 @@ private actor Journal: DeviceRootEnrollmentJournal {
         self.pending = DeviceRootCreateIntent(
             incarnation: pending.incarnation, createdDevice: device,
             location: pending.location)
+    }
+    func abortCreateBeforeRemoteCall(
+        location: DeviceRootLocation, incarnation: String
+    ) async throws -> Bool {
+        guard selected == nil, let pending, pending.location == location,
+            pending.incarnation == incarnation, pending.createdDevice == nil
+        else { return false }
+        self.pending = nil
+        return true
     }
     func select(_ root: DeviceRootIdentity) async throws { selected = root }
     func selectIfNoPending(_ root: DeviceRootIdentity) async throws -> Bool {
@@ -182,6 +228,15 @@ private actor Journal: DeviceRootEnrollmentJournal {
     }
     func finishCreate() async throws { pending = nil }
     func snapshot() -> (DeviceRootIdentity?, DeviceRootCreateIntent?, Int) { (selected, pending, began) }
+    func pauseBeginOnce() { pauseAfterBegin = true }
+    func waitForBeginPersisted() async {
+        if beginResume != nil { return }
+        await withCheckedContinuation { beginEntered.append($0) }
+    }
+    func releaseBegin() {
+        beginResume?.resume()
+        beginResume = nil
+    }
 }
 
 @Suite("Device root enrollment")
@@ -223,6 +278,75 @@ struct DeviceRootEnrollmentTests {
         #expect((await journal.snapshot()).1 == nil)
         #expect((await journal.snapshot()).2 == 0)
         #expect(await catalog.count() == 0)
+    }
+
+    @Test func cancellationAfterIntentPersistenceAllowsCleanRestart() async {
+        let catalog = Catalog()
+        let journal = Journal()
+        await journal.pauseBeginOnce()
+        let coordinator = DeviceRootEnrollmentCoordinator(backend: catalog, journal: journal)
+        let enrollment = Task { await coordinator.enroll() }
+        await journal.waitForBeginPersisted()
+
+        enrollment.cancel()
+        await journal.releaseBegin()
+        #expect(await enrollment.value == .unavailable)
+        #expect((await journal.snapshot()).1 == nil)
+        #expect(await catalog.count() == 0)
+
+        let restarted = DeviceRootEnrollmentCoordinator(backend: catalog, journal: journal)
+        guard case .ready = await restarted.enroll() else {
+            Issue.record("Enrollment must resume after an unsent intent was aborted")
+            return
+        }
+        #expect(await catalog.count() == 1)
+    }
+
+    @Test func preparedIntentCanBeRecoveredAfterCrashWithoutRemoteCreate() async throws {
+        let catalog = Catalog()
+        let journal = Journal()
+        #expect(try await journal.beginCreateIfAbsent(incarnation: "prepared"))
+        let restarted = DeviceRootEnrollmentCoordinator(backend: catalog, journal: journal)
+
+        #expect(await restarted.discover() == .ambiguous)
+        #expect(await restarted.recoverPreparedEnrollment() == .enrollmentRequired)
+        #expect((await journal.snapshot()).1 == nil)
+        guard case .ready = await restarted.enroll() else {
+            Issue.record("Explicit recovery must allow one new enrollment")
+            return
+        }
+        #expect(await catalog.count() == 1)
+    }
+
+    @Test func preparedRecoveryCannotClearPossibleRemoteCreate() async throws {
+        let journal = Journal()
+        #expect(try await journal.beginCreateIfAbsent(incarnation: "dispatched"))
+        #expect(
+            try await journal.markCreateDispatchAttempted(
+                location: .computer, incarnation: "dispatched"))
+        let coordinator = DeviceRootEnrollmentCoordinator(backend: Catalog(), journal: journal)
+
+        #expect(await coordinator.recoverPreparedEnrollment() == .ambiguous)
+        #expect((await journal.snapshot()).1?.incarnation == "dispatched")
+    }
+
+    @Test func knownFallbackPreparationFailureLeavesNoRemoteIntent() async {
+        let catalog = Catalog()
+        await catalog.failNextFallbackPreparation()
+        let journal = Journal()
+        let coordinator = DeviceRootEnrollmentCoordinator(backend: catalog, journal: journal)
+
+        #expect(await coordinator.enrollFallback() == .unavailable)
+        #expect((await journal.snapshot()).1 == nil)
+        #expect(await catalog.fallbackCount() == 0)
+
+        await catalog.allowFallbackPreparation()
+        let restarted = DeviceRootEnrollmentCoordinator(backend: catalog, journal: journal)
+        guard case .ready = await restarted.enrollFallback() else {
+            Issue.record("A proven unsent fallback create must allow a later explicit retry")
+            return
+        }
+        #expect(await catalog.fallbackCount() == 1)
     }
 
     @Test func cancellationOfStalledInventoryAllowsAnotherDiscovery() async {
@@ -499,6 +623,46 @@ struct DeviceRootEnrollmentTests {
         let coordinator = DeviceRootEnrollmentCoordinator(backend: catalog, journal: journal)
 
         #expect(await coordinator.discover() == .ready(fallback))
+    }
+
+    @Test func selectedFallbackRejectsLaterComputerRoot() async throws {
+        let fallback = DeviceRootIdentity(
+            deviceUID: "my-files", rootFolderUID: "fallback-folder",
+            incarnation: "fallback", location: .myFiles)
+        let journal = Journal()
+        try await journal.select(fallback)
+        let coordinator = DeviceRootEnrollmentCoordinator(
+            backend: Catalog(candidates: [fallback, rootA]), journal: journal)
+
+        #expect(await coordinator.discover() == .ambiguous)
+        #expect((await journal.snapshot()).0 == fallback)
+    }
+
+    @Test func selectedFallbackRejectsLaterUnclaimedComputer() async throws {
+        let fallback = DeviceRootIdentity(
+            deviceUID: "my-files", rootFolderUID: "fallback-folder",
+            incarnation: "fallback", location: .myFiles)
+        let journal = Journal()
+        try await journal.select(fallback)
+        let catalog = Catalog(candidates: [fallback])
+        await catalog.addUnclaimed(deviceA)
+        let coordinator = DeviceRootEnrollmentCoordinator(backend: catalog, journal: journal)
+
+        #expect(await coordinator.discover() == .ambiguous)
+    }
+
+    @Test func pendingFallbackSelectionDoesNotSettleBesideComputerRoot() async throws {
+        let fallback = DeviceRootIdentity(
+            deviceUID: "my-files", rootFolderUID: "fallback-folder",
+            incarnation: "fallback", location: .myFiles)
+        let journal = Journal()
+        #expect(try await journal.beginCreateIfAbsent(location: .myFiles, incarnation: "fallback"))
+        try await journal.select(fallback)
+        let coordinator = DeviceRootEnrollmentCoordinator(
+            backend: Catalog(candidates: [fallback, rootA]), journal: journal)
+
+        #expect(await coordinator.discover() == .ambiguous)
+        #expect((await journal.snapshot()).1 != nil)
     }
 
     @Test func anotherDeviceExplicitlyJoinsVerifiedFallbackWhenComputerIsUnavailable() async {

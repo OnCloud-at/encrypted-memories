@@ -58,6 +58,8 @@ public enum DeviceRootOperationError: Error, Equatable {
     case quota
     case verificationFailed
     case unknownOutcome
+    /// The adapter proves that the create request was never submitted.
+    case notDispatched
     case unsupported
 }
 
