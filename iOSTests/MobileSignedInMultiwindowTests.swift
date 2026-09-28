@@ -38,7 +38,7 @@ final class MobileSignedInMultiwindowTests: XCTestCase {
     @MainActor private func verifyTwoWindowLifecycle(explicitSignOut: Bool) async throws {
         try XCTSkipUnless(
             UIApplication.shared.showsSeveralWindows,
-            "several windows of one app need iPadOS or the open inner display of iPhone Duo")
+            "several windows of one app need iPadOS")
         let runtime = MobileAccountRuntime.shared
         let fixture = try await MobileSignedInFixture()
         defer {
