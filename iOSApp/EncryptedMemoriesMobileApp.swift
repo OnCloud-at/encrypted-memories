@@ -122,7 +122,7 @@ private enum MobileBuildProvenanceLog {
 
     static func noteCurrentBuild(bundle: Bundle = .main) {
         #if DEBUG
-            let commit = bundle.object(forInfoDictionaryKey: "EncryptedMemoriesBuildCommit") as? String ?? "unknown"
+            let commit = bundle.object(forInfoDictionaryKey: AppBuildInfo.buildCommitInfoKey) as? String ?? "unknown"
             let build = bundle.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "unknown"
             logger.notice("[BuildProvenance] commit=\(commit, privacy: .public) build=\(build, privacy: .public)")
         #endif

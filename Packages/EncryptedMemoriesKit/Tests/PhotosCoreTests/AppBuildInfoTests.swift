@@ -12,11 +12,39 @@ final class AppBuildInfoTests: XCTestCase {
         XCTAssertNil(AppBuildInfo(version: nil, build: "\n").build)
     }
 
-    func testSettingsSummaryIncludesVersionAndBuild() {
-        let summary = AppBuildInfo(version: "1.2.3", build: "683").localizedSettingsSummary
+    func testSettingsShowVersionAndShortCommitButNotTheBuild() {
+        let info = AppBuildInfo(version: "1.2.3", build: "683", commit: "A1B2C3D4E5F6")
 
-        XCTAssertTrue(summary.contains("1.2.3"))
-        XCTAssertTrue(summary.contains("683"))
+        XCTAssertTrue(info.localizedVersion.contains("1.2.3"))
+        XCTAssertFalse(info.localizedVersion.contains("683"))
+        XCTAssertEqual(info.shortCommit, "a1b2c3d")
+        XCTAssertEqual(
+            info.commitURL?.absoluteString,
+            "https://github.com/OnCloud-at/encrypted-memories/commit/a1b2c3d4e5f6")
+    }
+
+    func testVersionOpensItsReleaseAndPrereleasesOpenTheReleaseList() {
+        XCTAssertEqual(
+            AppBuildInfo(version: "1.1.0", build: "130", releaseChannel: "stable").releaseURL.absoluteString,
+            "https://github.com/OnCloud-at/encrypted-memories/releases/tag/v1.1.0")
+        XCTAssertEqual(
+            AppBuildInfo(version: "1.1.0", build: "130", releaseChannel: "beta").releaseURL.absoluteString,
+            "https://github.com/OnCloud-at/encrypted-memories/releases")
+        XCTAssertEqual(
+            AppBuildInfo(version: nil, build: nil).releaseURL.absoluteString,
+            "https://github.com/OnCloud-at/encrypted-memories/releases")
+    }
+
+    func testInvalidCommitValuesAreIgnored() {
+        for commit in [
+            nil, "unknown", "$(ENCRYPTED_MEMORIES_BUILD_COMMIT)", "a1b2c3", "a1b2c3d-dirty",
+            String(repeating: "a", count: 41),
+        ] {
+            let info = AppBuildInfo(version: "1.2.3", build: "683", commit: commit)
+            XCTAssertNil(info.commit, "\(commit ?? "nil")")
+            XCTAssertNil(info.shortCommit)
+            XCTAssertNil(info.commitURL)
+        }
     }
 
     func testOnlyBetaAndDevelopmentChannelsArePrereleaseBuilds() {

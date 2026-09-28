@@ -4725,12 +4725,12 @@
         "de": { "stringUnit": { "state": "translated", "value": "Fortsetzen" } }
       }
     },
-    "settings.version_build %@ %@": {
+    "settings.version %@": {
       "extractionState": "manual",
-      "comment": "App version and build number shown at the bottom of Settings.",
+      "comment": "App version shown at the bottom of Settings when the build names no source commit.",
       "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "Version %1$@ (Build %2$@)" } },
-        "de": { "stringUnit": { "state": "translated", "value": "Version %1$@ (Build %2$@)" } }
+        "en": { "stringUnit": { "state": "translated", "value": "Version %@" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Version %@" } }
       }
     },
     "settings.upload_check_attention %lld": {
