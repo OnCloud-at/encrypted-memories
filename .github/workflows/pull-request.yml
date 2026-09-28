@@ -89,6 +89,7 @@ jobs:
           python3 .github/scripts/test_triage_issue.py
           python3 .github/scripts/test_review_pull_request.py
           python3 .github/scripts/test_review_advisory.py
+          python3 .github/scripts/test_review_replay.py
 
       - name: Lint GitHub Actions workflows
         env:
