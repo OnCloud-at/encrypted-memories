@@ -34,3 +34,15 @@ xcodebuild build \
   -skipPackagePluginValidation \
   -skipMacroValidation \
   CODE_SIGNING_ALLOWED=NO
+
+xcodebuild test \
+  -project EncryptedMemories.xcodeproj \
+  -scheme EncryptedMemoriesMacAdapterTests \
+  -destination 'platform=macOS' \
+  -derivedDataPath "$DERIVED_DATA_PATH" \
+  -clonedSourcePackagesDirPath "$ENCRYPTED_MEMORIES_XCODE_SOURCE_PACKAGES" \
+  -packageCachePath "$ENCRYPTED_MEMORIES_XCODE_PACKAGE_CACHE" \
+  -disableAutomaticPackageResolution \
+  -skipPackagePluginValidation \
+  -skipMacroValidation \
+  CODE_SIGNING_ALLOWED=NO

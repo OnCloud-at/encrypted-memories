@@ -24,14 +24,10 @@ final class MobilePrivacyPreviewShield {
             return
         }
 
-        let effect = UIVisualEffectView(effect: UIBlurEffect(style: .systemThickMaterial))
+        let effect = UIVisualEffectView(effect: UIBlurEffect(style: .systemMaterialLight))
         effect.frame = window.bounds
         effect.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         effect.accessibilityElementsHidden = true
-        let tint = UIView(frame: effect.bounds)
-        tint.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-        tint.backgroundColor = UIColor.systemBackground.withAlphaComponent(0.7)
-        effect.contentView.addSubview(tint)
         window.addSubview(effect)
         blur = effect
     }

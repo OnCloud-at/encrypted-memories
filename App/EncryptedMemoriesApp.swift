@@ -405,7 +405,7 @@ private struct LaunchVeilModifier: ViewModifier {
 
     func body(content: Content) -> some View {
         content
-            .toolbarVisibility(visible ? .hidden : .automatic, for: .windowToolbar)
+            .background(PrivacyAwareToolbarVisibility(contentVisible: !visible))
             .overlay {
                 ZStack {
                     LibraryLoadingCover(
@@ -476,6 +476,27 @@ private struct LaunchVeilModifier: ViewModifier {
                 withAnimation(.easeOut(duration: LibraryLoadingCoverMetrics.fadeDuration)) { visible = false }
             }
         }
+    }
+}
+
+/// One native owner combines the launch cover's intent with privacy coverage.
+private struct PrivacyAwareToolbarVisibility: NSViewRepresentable {
+    let contentVisible: Bool
+
+    func makeNSView(context: Context) -> WindowAttachmentView {
+        let view = WindowAttachmentView()
+        view.windowChanged = apply
+        return view
+    }
+
+    func updateNSView(_ view: WindowAttachmentView, context: Context) {
+        view.windowChanged = apply
+        apply(view.window)
+    }
+
+    private func apply(_ window: NSWindow?) {
+        guard let window else { return }
+        MacPrivacyPreviewShield.shared.setToolbarContentVisible(contentVisible, on: window)
     }
 }
 

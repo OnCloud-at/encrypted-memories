@@ -238,6 +238,21 @@ targets:
           CODE_SIGN_IDENTITY: $(ENCRYPTED_MEMORIES_CODE_SIGN_IDENTITY)
           PROVISIONING_PROFILE_SPECIFIER: $(ENCRYPTED_MEMORIES_PROVISIONING_PROFILE_SPECIFIER)
 
+  EncryptedMemoriesMacAdapterTests:
+    type: bundle.unit-test
+    platform: macOS
+    deploymentTarget: "26.0"
+    sources:
+      - MacTests
+      - App/Windowing/MacPrivacyPreviewShield.swift
+    dependencies:
+      - package: EncryptedMemoriesKit
+        product: PhotosCore
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: at.oncloud.encryptedmemories.mac-adapter-tests
+        GENERATE_INFOPLIST_FILE: YES
+
   EncryptedMemoriesMobileTests:
     type: bundle.unit-test
     platform: iOS
@@ -272,6 +287,14 @@ targets:
         SUPPORTS_MACCATALYST: NO
 
 schemes:
+  EncryptedMemoriesMacAdapterTests:
+    build:
+      targets:
+        EncryptedMemoriesMacAdapterTests: [test]
+    test:
+      targets:
+        - EncryptedMemoriesMacAdapterTests
+
   EncryptedMemories:
     build:
       targets:

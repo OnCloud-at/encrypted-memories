@@ -5046,8 +5046,8 @@
     "settings.privacy_blur_preview_explanation": {
       "extractionState": "manual",
       "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "Covers the app when it becomes inactive. Check the app switcher or Mission Control to see how your device shows the preview." } },
-        "de": { "stringUnit": { "state": "translated", "value": "Deckt die App ab, sobald sie inaktiv wird. Prüfe im App-Umschalter oder in Mission Control, wie dein Gerät die Vorschau zeigt." } }
+        "en": { "stringUnit": { "state": "translated", "value": "Blurs photos in new app previews." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Zeichnet Fotos in neuen App-Vorschauen weich." } }
       }
     },
     "settings.privacy_policy": {
