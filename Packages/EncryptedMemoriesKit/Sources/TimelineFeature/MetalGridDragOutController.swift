@@ -415,10 +415,10 @@ final class MetalGridDragOutController: NSObject, NSDraggingSource, NSFilePromis
 
 /// A file promise that also carries the photo reference. Other apps see only the promised file; a drop inside the
 /// app reads the reference instead (Apple's documented pattern for adding types to `NSFilePromiseProvider`).
-private final class PhotoFilePromiseProvider: NSFilePromiseProvider {
+final class PhotoFilePromiseProvider: NSFilePromiseProvider {
     var photoReference = Data()
 
-    private static let referenceType = NSPasteboard.PasteboardType(PhotoDragReference.typeIdentifier)
+    private static let referenceType = PhotoDragPasteboard.referenceType
 
     override func writableTypes(for pasteboard: NSPasteboard) -> [NSPasteboard.PasteboardType] {
         super.writableTypes(for: pasteboard) + [Self.referenceType]

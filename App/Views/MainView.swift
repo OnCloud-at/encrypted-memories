@@ -727,6 +727,7 @@ struct MainView: View {
             waitedIntervals += 1
         }
         if await albumActions.add(uids, to: album.id) {
+            endSelection(afterAdding: uids)
             await loadAlbums()
         } else if albumActions.actionFailure == nil {
             albumActions.actionFailure = AlbumActionFailure(
@@ -734,6 +735,14 @@ struct MainView: View {
                 message: L10n.string("albums.add_busy_message")
             )
         }
+    }
+
+    /// The grid's feedback after photos joined an album: the selection that was added ends. A drag of one photo
+    /// outside the selection leaves the selection alone.
+    private func endSelection(afterAdding uids: [PhotoUID]) {
+        guard !selectedUIDs.isEmpty, Set(uids) == selectedUIDs else { return }
+        selectionMode = false
+        selectedUIDs.removeAll()
     }
 
     /// Opens the shared name form. A new album can start with photos, for example the one open in the viewer.
@@ -2234,8 +2243,7 @@ struct MainView: View {
                         onAlbumsChanged: { Task { await loadAlbums() } },
                         onCompleted: { _ in
                             showAlbumDestination = false
-                            selectionMode = false
-                            selectedUIDs.removeAll()
+                            endSelection(afterAdding: Array(selectedUIDs))
                         }
                     )
                 }
