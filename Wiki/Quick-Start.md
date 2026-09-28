@@ -37,6 +37,6 @@ The layout differs, but the library, albums, viewer, map, backup, cache, and sea
 
 ## 5. Know what stays local
 
-Local thumbnails, previews, originals, account metadata, location data, and search indexes are encrypted at rest. Search queries and photos are not sent to a separate search service. Decrypted originals are created only for an explicit share or export operation.
+Local thumbnails, previews, originals, cached Proton account data, location data, and search indexes are encrypted at rest. The library and backup bookkeeping databases hold no photos; FileVault or iOS Data Protection protects them. Search queries and photos are not sent to a separate search service. Decrypted originals are created only for an explicit share, drag, or export operation.
 
 Continue with [[Settings, Cache, and Privacy|Settings-Cache-and-Privacy]] or [[Troubleshooting|Troubleshooting]].
