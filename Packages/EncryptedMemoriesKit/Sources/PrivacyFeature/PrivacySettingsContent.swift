@@ -5,8 +5,10 @@ import SwiftUI
 public struct PrivacySettingsContent: View {
     @AppStorage(AppSettingsKey.mapAndPlacesEnabled) private var mapAndPlacesEnabled =
         AppSettingsDefault.mapAndPlacesEnabled
-    @AppStorage(AppSettingsKey.blurAppPreview) private var blurAppPreview =
-        AppSettingsDefault.blurAppPreview
+    #if os(iOS)
+        @AppStorage(AppSettingsKey.blurAppPreview) private var blurAppPreview =
+            AppSettingsDefault.blurAppPreview
+    #endif
 
     public init() {}
 
@@ -16,11 +18,13 @@ public struct PrivacySettingsContent: View {
         } footer: {
             Text(L10n.string("settings.privacy_map_explanation"))
         }
-        Section {
-            Toggle(L10n.string("settings.privacy_blur_preview"), isOn: $blurAppPreview)
-        } footer: {
-            Text(L10n.string("settings.privacy_blur_preview_explanation"))
-        }
+        #if os(iOS)
+            Section {
+                Toggle(L10n.string("settings.privacy_blur_preview"), isOn: $blurAppPreview)
+            } footer: {
+                Text(L10n.string("settings.privacy_blur_preview_explanation"))
+            }
+        #endif
         Section {
             Link(
                 L10n.string("settings.privacy_policy"),

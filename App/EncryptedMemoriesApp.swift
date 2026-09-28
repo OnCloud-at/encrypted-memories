@@ -12,7 +12,6 @@ import TimelineFeature
 struct EncryptedMemoriesApp: App {
     @NSApplicationDelegateAdaptor(EncryptedMemoriesAppDelegate.self) private var appDelegate
     @State private var model: AppModel?
-    @AppStorage(AppSettingsKey.blurAppPreview) private var blurAppPreview = AppSettingsDefault.blurAppPreview
     private let metal3Supported: Bool
 
     init() {
@@ -43,7 +42,7 @@ struct EncryptedMemoriesApp: App {
                 }
             }
             .frame(minWidth: 720, minHeight: 480)
-            .background(WindowConfigurator(blurAppPreview: blurAppPreview))
+            .background(WindowConfigurator())
             .background { TipJarCelebrationWindowOverlay() }
             .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
                 model?.smartSearch?.noteConditionsChanged()
@@ -247,8 +246,6 @@ private final class LibraryWindowDelegateProxy: NSObject, NSWindowDelegate {
 /// Attaches window-level lifecycle controllers. Window chrome belongs to the SwiftUI scene declaration above;
 /// mutating title-bar style here is not durable because SwiftUI can rebuild AppKit's title-bar hierarchy later.
 private struct WindowConfigurator: NSViewRepresentable {
-    let blurAppPreview: Bool
-
     func makeCoordinator() -> Coordinator { Coordinator() }
 
     func makeNSView(context: Context) -> WindowAttachmentView {
@@ -266,7 +263,6 @@ private struct WindowConfigurator: NSViewRepresentable {
         guard let window else { return }
         window.identifier = NSUserInterfaceItemIdentifier("library")
         coordinator.frameController.attach(to: window)
-        MacPrivacyPreviewShield.shared.attach(to: window, enabled: blurAppPreview)
         LibraryWindowVisibilityController.shared.attach(to: window)
     }
 
@@ -405,7 +401,7 @@ private struct LaunchVeilModifier: ViewModifier {
 
     func body(content: Content) -> some View {
         content
-            .background(PrivacyAwareToolbarVisibility(contentVisible: !visible))
+            .toolbarVisibility(visible ? .hidden : .automatic, for: .windowToolbar)
             .overlay {
                 ZStack {
                     LibraryLoadingCover(
@@ -476,27 +472,6 @@ private struct LaunchVeilModifier: ViewModifier {
                 withAnimation(.easeOut(duration: LibraryLoadingCoverMetrics.fadeDuration)) { visible = false }
             }
         }
-    }
-}
-
-/// One native owner combines the launch cover's intent with privacy coverage.
-private struct PrivacyAwareToolbarVisibility: NSViewRepresentable {
-    let contentVisible: Bool
-
-    func makeNSView(context: Context) -> WindowAttachmentView {
-        let view = WindowAttachmentView()
-        view.windowChanged = apply
-        return view
-    }
-
-    func updateNSView(_ view: WindowAttachmentView, context: Context) {
-        view.windowChanged = apply
-        apply(view.window)
-    }
-
-    private func apply(_ window: NSWindow?) {
-        guard let window else { return }
-        MacPrivacyPreviewShield.shared.setToolbarContentVisible(contentVisible, on: window)
     }
 }
 

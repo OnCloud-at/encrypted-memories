@@ -67,7 +67,7 @@ public enum MapAndPlacesPolicy {
     }
 }
 
-/// Shared admission rule for the native preview covers on macOS, iOS, and iPadOS.
+/// Shared admission rule for the native iOS and iPadOS preview covers.
 public enum PrivacyPreviewPolicy {
     public static func isEnabled(defaults: UserDefaults = .standard) -> Bool {
         defaults.object(forKey: AppSettingsKey.blurAppPreview) == nil
