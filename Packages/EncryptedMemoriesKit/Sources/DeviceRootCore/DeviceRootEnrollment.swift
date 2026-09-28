@@ -23,7 +23,7 @@ public struct DeviceRootIdentity: Hashable, Sendable {
     }
 }
 
-/// Device identifiers returned before the app claim has been published.
+/// Device identifiers returned before the app root marker has been published.
 public struct DeviceRootUnclaimedDevice: Hashable, Sendable {
     public let deviceUID: String
     public let rootFolderUID: String
@@ -55,8 +55,8 @@ public struct DeviceRootCreateIntent: Equatable, Sendable {
     }
 }
 
-/// The backend includes only roots whose claim it verified for the current account.
-/// A failed name decryption, unreadable claim, or failed signature sets hasUnverifiedCandidate.
+/// The backend includes only roots whose marker it verified for the current account.
+/// A failed name decryption, unreadable marker, or failed signature sets hasUnverifiedCandidate.
 public struct DeviceRootCandidateInventory: Sendable {
     public let verifiedCandidates: [DeviceRootIdentity]
     public let unclaimedCandidates: [DeviceRootUnclaimedDevice]
@@ -96,7 +96,7 @@ public protocol DeviceRootEnrollmentBackend: Sendable {
         -> DeviceRootCandidateInventory
     func createDevice() async throws -> DeviceRootUnclaimedDevice
     func createFallbackFolder() async throws -> DeviceRootUnclaimedDevice
-    /// Checks for an existing identical claim before writing. An uncertain upload is never retried blindly.
+    /// Checks for an existing identical marker before writing. An uncertain create is never retried blindly.
     func ensureClaim(
         for device: DeviceRootUnclaimedDevice, incarnation: String
     ) async throws
@@ -205,7 +205,7 @@ public actor DeviceRootEnrollmentCoordinator {
         return await resolve()
     }
 
-    /// An explicit recovery action after a claim upload returned an unknown result.
+    /// An explicit recovery action after marker creation returned an unknown result.
     public func recoverCreatedRoot(_ root: DeviceRootIdentity) async -> DeviceRootResolution {
         guard !operationInProgress else { return .ambiguous }
         operationInProgress = true

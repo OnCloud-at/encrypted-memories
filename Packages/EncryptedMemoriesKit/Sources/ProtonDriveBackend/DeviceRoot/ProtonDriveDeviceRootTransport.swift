@@ -6,12 +6,10 @@ import ProtonDriveSDK
 /// Construct this only after the account Labs gate opens.
 struct ProtonDriveDeviceRootTransport: DeviceRootSDKTransport {
     private let client: ProtonDriveClient
-    private let stagingDirectory: URL
     private let ownerAddresses: Set<String>
 
-    init(client: ProtonDriveClient, accountDataDirectory: URL, ownerAddresses: Set<String>) {
+    init(client: ProtonDriveClient, ownerAddresses: Set<String>) {
         self.client = client
-        stagingDirectory = accountDataDirectory.appendingPathComponent("device-root-staging", isDirectory: true)
         self.ownerAddresses = Set(ownerAddresses.map { $0.lowercased() })
     }
 
@@ -136,7 +134,7 @@ struct ProtonDriveDeviceRootTransport: DeviceRootSDKTransport {
         }
     }
 
-    func claim(for device: DeviceRootSDKListedDevice) async throws -> DeviceRootSDKClaimStatus {
+    func marker(for device: DeviceRootSDKListedDevice) async throws -> DeviceRootSDKMarkerStatus {
         guard let folderUID = SDKNodeUid(sdkCompatibleIdentifier: device.rootFolderUID),
             case .folder(let folder) = try await node(folderUID),
             folder.trashTime == nil, folder.errors.isEmpty,
@@ -144,107 +142,74 @@ struct ProtonDriveDeviceRootTransport: DeviceRootSDKTransport {
                 || folder.parentUid?.sdkCompatibleIdentifier == device.deviceUID
         else { return .unverified }
 
-        var claimFile: FileNode?
+        var markerName: String?
         for uid in try await folderChildren(folderUID) {
-            guard let node = try await node(uid) else {
-                return .unverified
-            }
+            guard let child = try await node(uid) else { return .unverified }
             let name: String
-            switch node {
+            switch child {
+            case .folder(let marker):
+                guard let verifiedName = try? marker.name.get() else { return .unverified }
+                name = verifiedName
+                if name.hasPrefix(DeviceRootMarker.prefix) {
+                    guard markerName == nil,
+                        marker.parentUid?.sdkCompatibleIdentifier == device.rootFolderUID,
+                        marker.trashTime == nil, marker.errors.isEmpty,
+                        DeviceRootClaimAuthorPolicy.accepts(marker.nameAuthor, ownerAddresses: ownerAddresses),
+                        DeviceRootClaimAuthorPolicy.accepts(marker.keyAuthor, ownerAddresses: ownerAddresses)
+                    else { return .unverified }
+                    markerName = name
+                }
             case .file(let file):
                 guard let verifiedName = try? file.name.get() else { return .unverified }
                 name = verifiedName
-                if name.hasPrefix(SDKDeviceRootEnrollmentBackend.claimPrefix) {
-                    guard claimFile == nil else { return .unverified }
-                    claimFile = file
-                }
-            case .folder(let child):
-                guard let verifiedName = try? child.name.get() else { return .unverified }
+                if name.hasPrefix(DeviceRootMarker.prefix) { return .unverified }
+            case .album(let album):
+                guard let verifiedName = try? album.name.get() else { return .unverified }
                 name = verifiedName
-                if name.hasPrefix(SDKDeviceRootEnrollmentBackend.claimPrefix) { return .unverified }
-            case .album(let child):
-                guard let verifiedName = try? child.name.get() else { return .unverified }
+                if name.hasPrefix(DeviceRootMarker.prefix) { return .unverified }
+            case .photo(let photo):
+                guard let verifiedName = try? photo.name.get() else { return .unverified }
                 name = verifiedName
-                if name.hasPrefix(SDKDeviceRootEnrollmentBackend.claimPrefix) { return .unverified }
-            case .photo(let child):
-                guard let verifiedName = try? child.name.get() else { return .unverified }
-                name = verifiedName
-                if name.hasPrefix(SDKDeviceRootEnrollmentBackend.claimPrefix) { return .unverified }
+                if name.hasPrefix(DeviceRootMarker.prefix) { return .unverified }
             }
+            if name.hasPrefix(DeviceRootMarker.prefix), markerName != name { return .unverified }
         }
         switch DeviceRootClaimFolderPolicy.disposition(
-            hasClaim: claimFile != nil,
-            nameAuthor: folder.nameAuthor,
-            keyAuthor: folder.keyAuthor,
-            ownerAddresses: ownerAddresses)
+            hasClaim: markerName != nil, nameAuthor: folder.nameAuthor,
+            keyAuthor: folder.keyAuthor, ownerAddresses: ownerAddresses)
         {
         case .missing: return .missing
         case .unverified: return .unverified
         case .eligible: break
         }
-        guard let claimFile else { return .unverified }
-        guard claimFile.parentUid?.sdkCompatibleIdentifier == folderUID.sdkCompatibleIdentifier,
-            claimFile.trashTime == nil, claimFile.errors.isEmpty,
-            DeviceRootClaimAuthorPolicy.accepts(claimFile.nameAuthor, ownerAddresses: ownerAddresses),
-            DeviceRootClaimAuthorPolicy.accepts(claimFile.keyAuthor, ownerAddresses: ownerAddresses),
-            let contentAuthor = claimFile.activeRevision.contentAuthor,
-            DeviceRootClaimAuthorPolicy.accepts(contentAuthor, ownerAddresses: ownerAddresses),
-            let claimedSize = claimFile.activeRevision.claimedSize,
-            claimedSize >= 0,
-            claimedSize <= SDKDeviceRootEnrollmentBackend.maxClaimBytes,
-            claimFile.activeRevision.storageSize >= 0,
-            claimFile.activeRevision.storageSize <= 65_536,
-            let filename = try? claimFile.name.get()
-        else { return .unverified }
-
-        let stream = DeviceRootClaimDownloadStream(
-            limit: SDKDeviceRootEnrollmentBackend.maxClaimBytes)
-        let result = try await SDKCancellableOperation.run { token in
-            let operation = try await client.downloadToStreamOperation(
-                revisionUid: claimFile.activeRevision.uid,
-                outputStream: stream,
-                cancellationToken: token,
-                progressCallback: { _ in })
-            return await operation.awaitDownloadCompletion()
-        } cancel: { token in
-            try? await client.cancelDownload(cancellationToken: token)
-        }
-        switch result {
-        case .succeeded: break
-        case .completedWithVerificationError: return .unverified
-        case .pausedOnError(let error), .failed(let error): throw error
-        }
-        let bytes = stream.bytes()
-        return .verified(filename: filename, bytes: bytes)
+        guard let markerName else { return .unverified }
+        return .verified(name: markerName)
     }
 
-    func uploadClaim(
-        for device: DeviceRootSDKListedDevice, filename: String, bytes: Data,
-        overrideExistingDraft: Bool
-    ) async throws {
+    func createMarker(for device: DeviceRootSDKListedDevice, name: String) async throws {
         guard let folderUID = SDKNodeUid(sdkCompatibleIdentifier: device.rootFolderUID),
-            bytes.count <= SDKDeviceRootEnrollmentBackend.maxClaimBytes,
-            filename.hasPrefix(SDKDeviceRootEnrollmentBackend.claimPrefix)
+            name.hasPrefix(DeviceRootMarker.prefix),
+            case .folder(let root) = try await node(folderUID),
+            root.trashTime == nil, root.errors.isEmpty,
+            device.location == .computer
+                || root.parentUid?.sdkCompatibleIdentifier == device.deviceUID,
+            DeviceRootClaimAuthorPolicy.accepts(root.nameAuthor, ownerAddresses: ownerAddresses),
+            DeviceRootClaimAuthorPolicy.accepts(root.keyAuthor, ownerAddresses: ownerAddresses)
         else { throw DeviceRootOperationError.verificationFailed }
-        try FileManager.default.createDirectory(at: stagingDirectory, withIntermediateDirectories: true)
-        let source = stagingDirectory.appendingPathComponent("upload-\(DeviceRootDigest.hex(bytes)).bin")
-        try bytes.write(to: source, options: .atomic)
-        _ = try await SDKCancellableOperation.run { token in
-            try await client.uploadFile(
-                parentFolderUid: folderUID,
-                name: filename,
-                url: source,
-                fileSize: Int64(bytes.count),
-                modificationDate: nil,
-                mediaType: "application/json",
-                thumbnails: [],
-                overrideExistingDraft: overrideExistingDraft,
-                cancellationToken: token,
-                progressCallback: { _ in },
-                onRetriableErrorReceived: { _ in })
+        try Task.checkCancellation()
+        let marker = try await SDKCancellableOperation.run { token in
+            try await client.createFolder(
+                parentFolderUid: folderUID, folderName: name,
+                lastModificationTime: Date(), cancellationToken: token)
         } cancel: { token in
-            try? await client.cancelUpload(cancellationToken: token)
+            try? await client.cancelCreateFolder(cancellationToken: token)
         }
+        guard marker.parentUid?.sdkCompatibleIdentifier == device.rootFolderUID,
+            (try? marker.name.get()) == name,
+            marker.trashTime == nil, marker.errors.isEmpty,
+            DeviceRootClaimAuthorPolicy.accepts(marker.nameAuthor, ownerAddresses: ownerAddresses),
+            DeviceRootClaimAuthorPolicy.accepts(marker.keyAuthor, ownerAddresses: ownerAddresses)
+        else { throw DeviceRootOperationError.verificationFailed }
     }
 }
 

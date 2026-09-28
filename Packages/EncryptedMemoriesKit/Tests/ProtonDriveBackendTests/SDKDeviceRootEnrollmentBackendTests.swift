@@ -9,6 +9,8 @@ private let listedDevice = DeviceRootSDKListedDevice(
 private let listedFallback = DeviceRootSDKListedDevice(
     deviceUID: "volume~my-files", rootFolderUID: "volume~fallback", name: "Encrypted Memories",
     location: .myFiles)
+private let incarnationA = "550e8400-e29b-41d4-a716-446655440000"
+private let incarnationB = "550e8400-e29b-41d4-a716-446655440001"
 
 private actor RootTransport: DeviceRootSDKTransport {
     var listed: [DeviceRootSDKListedDevice] = []
@@ -17,12 +19,11 @@ private actor RootTransport: DeviceRootSDKTransport {
     var partialComputerFailure = false
     var myFilesFailuresRemaining = 0
     var computerClaimUnavailable = false
-    var claims: [String: DeviceRootSDKClaimStatus] = [:]
+    var markers: [String: DeviceRootSDKMarkerStatus] = [:]
     var createCount = 0
-    var uploadCount = 0
-    var loseUploadResponse = false
-    var foreignDraft = false
-    var draftOverridden = false
+    var markerCount = 0
+    var loseMarkerResponse = false
+    var markerCollision = false
 
     func devices() async throws -> [DeviceRootSDKListedDevice] {
         if computerUnavailable { throw DeviceRootOperationError.unsupported }
@@ -50,24 +51,18 @@ private actor RootTransport: DeviceRootSDKTransport {
         return listedFallback
     }
 
-    func claim(for device: DeviceRootSDKListedDevice) async throws -> DeviceRootSDKClaimStatus {
+    func marker(for device: DeviceRootSDKListedDevice) async throws -> DeviceRootSDKMarkerStatus {
         if computerClaimUnavailable, device.location == .computer {
             throw DeviceRootOperationError.unavailable
         }
-        return claims[device.rootFolderUID] ?? .missing
+        return markers[device.rootFolderUID] ?? .missing
     }
 
-    func uploadClaim(
-        for device: DeviceRootSDKListedDevice, filename: String, bytes: Data,
-        overrideExistingDraft: Bool
-    ) async throws {
-        uploadCount += 1
-        if foreignDraft {
-            guard overrideExistingDraft else { throw DraftCollision() }
-            draftOverridden = true
-        }
-        claims[device.rootFolderUID] = .verified(filename: filename, bytes: bytes)
-        if loseUploadResponse { throw CancellationError() }
+    func createMarker(for device: DeviceRootSDKListedDevice, name: String) async throws {
+        markerCount += 1
+        if markerCollision { throw MarkerCollision() }
+        markers[device.rootFolderUID] = .verified(name: name)
+        if loseMarkerResponse { throw CancellationError() }
     }
 
     func add(_ device: DeviceRootSDKListedDevice) { listed.append(device) }
@@ -78,23 +73,32 @@ private actor RootTransport: DeviceRootSDKTransport {
                 : $0
         }
     }
-    func setClaim(_ status: DeviceRootSDKClaimStatus, for device: DeviceRootSDKListedDevice) {
-        claims[device.rootFolderUID] = status
+    func setMarker(_ status: DeviceRootSDKMarkerStatus, for device: DeviceRootSDKListedDevice) {
+        markers[device.rootFolderUID] = status
     }
-    func loseNextUploadResponse() { loseUploadResponse = true }
-    func setForeignDraft() { foreignDraft = true }
+    func loseNextMarkerResponse() { loseMarkerResponse = true }
+    func setMarkerCollision() { markerCollision = true }
     func setComputerUnavailable() { computerUnavailable = true }
     func setPartialComputerFailure() { partialComputerFailure = true }
     func failNextMyFilesListing() { myFilesFailuresRemaining = 1 }
     func setComputerClaimUnavailable() { computerClaimUnavailable = true }
-    func wasDraftOverridden() -> Bool { draftOverridden }
-    func counts() -> (Int, Int) { (createCount, uploadCount) }
+    func counts() -> (Int, Int) { (createCount, markerCount) }
 }
 
-private struct DraftCollision: Error {}
+private struct MarkerCollision: Error {}
 
 @Suite("SDK device root enrollment")
 struct SDKDeviceRootEnrollmentBackendTests {
+    @Test func markerIsBoundToItsContainerAndIncarnation() {
+        let incarnation = "550e8400-e29b-41d4-a716-446655440000"
+        let name = DeviceRootMarker.name(for: listedDevice, incarnation: incarnation) ?? ""
+        #expect(!name.isEmpty)
+        #expect(DeviceRootMarker.incarnation(from: name, for: listedDevice) == incarnation)
+        #expect(DeviceRootMarker.incarnation(from: name, for: listedFallback) == nil)
+        #expect(DeviceRootMarker.incarnation(from: name + "x", for: listedDevice) == nil)
+        #expect(DeviceRootMarker.name(for: listedDevice, incarnation: "claim-a") == nil)
+    }
+
     @Test func listingDoesNotCreateARoot() async throws {
         let transport = RootTransport()
         let backend = SDKDeviceRootEnrollmentBackend(transport: transport)
@@ -112,7 +116,7 @@ struct SDKDeviceRootEnrollmentBackendTests {
 
         let folder = try await backend.createFallbackFolder()
         #expect(folder.location == .myFiles)
-        let claimed = try await backend.ensureClaim(for: folder, incarnation: "fallback")
+        let claimed = try await backend.ensureClaim(for: folder, incarnation: incarnationA)
         #expect(claimed.location == .myFiles)
         #expect(claimed.rootFolderUID == listedFallback.rootFolderUID)
         #expect(try await backend.inventory().verifiedCandidates == [claimed])
@@ -122,7 +126,7 @@ struct SDKDeviceRootEnrollmentBackendTests {
         let transport = RootTransport()
         let backend = SDKDeviceRootEnrollmentBackend(transport: transport)
         let folder = try await backend.createFallbackFolder()
-        let claimed = try await backend.ensureClaim(for: folder, incarnation: "fallback")
+        let claimed = try await backend.ensureClaim(for: folder, incarnation: incarnationA)
         await transport.setComputerUnavailable()
 
         let inventory = try await backend.inventory(location: .myFiles)
@@ -135,7 +139,7 @@ struct SDKDeviceRootEnrollmentBackendTests {
         let backend = SDKDeviceRootEnrollmentBackend(transport: transport)
         let folder = try await backend.createFallbackFolder()
 
-        let claimed = try await backend.ensureClaim(for: folder, incarnation: "fallback")
+        let claimed = try await backend.ensureClaim(for: folder, incarnation: incarnationA)
         #expect(claimed.location == .myFiles)
         #expect(try await backend.inventory(location: .myFiles).verifiedCandidates == [claimed])
     }
@@ -179,7 +183,7 @@ struct SDKDeviceRootEnrollmentBackendTests {
         let backend = SDKDeviceRootEnrollmentBackend(transport: transport)
         let computer = try await backend.ensureClaim(
             for: .init(deviceUID: listedDevice.deviceUID, rootFolderUID: listedDevice.rootFolderUID),
-            incarnation: "computer")
+            incarnation: incarnationB)
         let folder = try await backend.createFallbackFolder()
 
         let inventory = try await backend.inventoryIncludingKnown(folder)
@@ -201,26 +205,26 @@ struct SDKDeviceRootEnrollmentBackendTests {
         #expect(inventory.verifiedCandidates.isEmpty)
     }
 
-    @Test func claimUploadIsCheckedAfterLostResponseBeforeAnyRetry() async throws {
+    @Test func markerCreateIsCheckedAfterLostResponseBeforeAnyRetry() async throws {
         let transport = RootTransport()
         let backend = SDKDeviceRootEnrollmentBackend(transport: transport)
         let device = try await backend.createDevice()
-        await transport.loseNextUploadResponse()
+        await transport.loseNextMarkerResponse()
         await #expect(throws: (any Error).self) {
-            try await backend.ensureClaim(for: device, incarnation: "claim-a")
+            try await backend.ensureClaim(for: device, incarnation: incarnationA)
         }
 
-        let recovered = try await backend.ensureClaim(for: device, incarnation: "claim-a")
+        let recovered = try await backend.ensureClaim(for: device, incarnation: incarnationA)
         #expect(recovered.deviceUID == device.deviceUID)
-        #expect(recovered.incarnation == "claim-a")
+        #expect(recovered.incarnation == incarnationA)
         #expect((await transport.counts()).1 == 1)
         #expect(try await backend.inventory().verifiedCandidates == [recovered])
     }
 
-    @Test func damagedClaimNeverBecomesVerified() async throws {
+    @Test func damagedMarkerNeverBecomesVerified() async throws {
         let transport = RootTransport()
         await transport.add(listedDevice)
-        await transport.setClaim(.verified(filename: "em-root-bad.json", bytes: Data("bad".utf8)), for: listedDevice)
+        await transport.setMarker(.verified(name: "em-root-v1-bad"), for: listedDevice)
         let backend = SDKDeviceRootEnrollmentBackend(transport: transport)
 
         let inventory = try await backend.inventory()
@@ -244,7 +248,7 @@ struct SDKDeviceRootEnrollmentBackendTests {
         let transport = RootTransport()
         let backend = SDKDeviceRootEnrollmentBackend(transport: transport)
         let device = try await backend.createDevice()
-        let claimed = try await backend.ensureClaim(for: device, incarnation: "claim-a")
+        let claimed = try await backend.ensureClaim(for: device, incarnation: incarnationA)
         await transport.rename(listedDevice, to: "Renamed computer")
 
         let inventory = try await backend.inventory()
@@ -256,7 +260,7 @@ struct SDKDeviceRootEnrollmentBackendTests {
         let transport = RootTransport()
         let backend = SDKDeviceRootEnrollmentBackend(transport: transport)
         let device = try await backend.createDevice()
-        let claimed = try await backend.ensureClaim(for: device, incarnation: "claim-a")
+        let claimed = try await backend.ensureClaim(for: device, incarnation: incarnationA)
         await transport.rename(listedDevice, to: "Renamed computer")
         let second = DeviceRootSDKListedDevice(
             deviceUID: "volume~second", rootFolderUID: "volume~second-folder",
@@ -271,16 +275,15 @@ struct SDKDeviceRootEnrollmentBackendTests {
             ])
     }
 
-    @Test func foreignDraftRemainsUntouchedAfterClaimCollision() async throws {
+    @Test func markerCollisionRemainsUnresolved() async throws {
         let transport = RootTransport()
         let backend = SDKDeviceRootEnrollmentBackend(transport: transport)
         let device = try await backend.createDevice()
-        await transport.setForeignDraft()
+        await transport.setMarkerCollision()
 
-        await #expect(throws: DraftCollision.self) {
-            try await backend.ensureClaim(for: device, incarnation: "claim-a")
+        await #expect(throws: MarkerCollision.self) {
+            try await backend.ensureClaim(for: device, incarnation: incarnationA)
         }
-        #expect(!(await transport.wasDraftOverridden()))
         #expect(try await backend.inventory().unclaimedCandidates == [device])
     }
 
@@ -290,7 +293,7 @@ struct SDKDeviceRootEnrollmentBackendTests {
         let device = try await backend.createDevice()
         await transport.rename(listedDevice, to: "Renamed before claim")
 
-        let recovered = try await backend.ensureClaim(for: device, incarnation: "claim-a")
+        let recovered = try await backend.ensureClaim(for: device, incarnation: incarnationA)
         #expect(recovered.deviceUID == device.deviceUID)
         #expect(try await backend.inventory().verifiedCandidates == [recovered])
         #expect((await transport.counts()).0 == 1)
