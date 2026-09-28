@@ -67,7 +67,7 @@ final class MobileLibraryUITests: XCTestCase {
 
     func testPrivacySwitchHidesTheMapTab() {
         XCTAssertTrue(firstPhoto.waitForExistence(timeout: 60))
-        XCTAssertTrue(app.tabBars.buttons["Map"].exists)
+        XCTAssertTrue(tab("Map").exists)
 
         app.buttons["Proton Account and Settings"].tap()
         app.buttons["Privacy"].tap()
@@ -76,11 +76,11 @@ final class MobileLibraryUITests: XCTestCase {
         XCTAssertEqual(mapSwitch.value as? String, "1")
         mapSwitch.coordinate(withNormalizedOffset: CGVector(dx: 0.9, dy: 0.5)).tap()
         XCTAssertTrue(wait(for: mapSwitch, "value == '0'"))
-        app.buttons["Settings"].tap()
+        backButton(to: "Settings").tap()
         app.buttons["Done"].tap()
 
-        XCTAssertTrue(wait(for: app.tabBars.buttons["Map"], "exists == false"))
-        XCTAssertTrue(app.tabBars.buttons["Library"].exists)
+        XCTAssertTrue(wait(for: tab("Map"), "exists == false"))
+        XCTAssertTrue(tab("Library").exists)
     }
 
     private func wait(for element: XCUIElement, _ predicate: String, timeout: TimeInterval = 5) -> Bool {
@@ -93,6 +93,13 @@ final class MobileLibraryUITests: XCTestCase {
     private func tab(_ name: String) -> XCUIElement {
         let tabBarButton = app.tabBars.buttons[name]
         return tabBarButton.exists ? tabBarButton : app.buttons[name].firstMatch
+    }
+
+    /// The back button shows the previous title in a horizontal bar. In the vertical bar on iPhone Duo it is a
+    /// chevron without a title, which UIKit identifies as the back button.
+    private func backButton(to title: String) -> XCUIElement {
+        let titled = app.buttons[title]
+        return titled.exists ? titled : app.buttons["BackButton"].firstMatch
     }
 
     /// Grid photos are accessibility elements named "Photo, <date>".
