@@ -727,12 +727,16 @@ struct MainView: View {
     /// Adds photos dropped on a sidebar album. The drop can land while another album change finishes; it waits for
     /// that change instead of losing the photos, and says so if the change does not finish.
     private func addDroppedPhotos(_ uids: [PhotoUID], to album: AlbumSummary) async {
+        // Decide now whether the drag carried the selection: the add can wait, and the selection can change meanwhile.
+        let droppedSelection = selectedUIDs.isEmpty || Set(uids) != selectedUIDs ? nil : selectedUIDs
         var waitedIntervals = 0
         while albumActions.isWorking, waitedIntervals < 300 {  // at most 30 seconds
             try? await Task.sleep(for: .milliseconds(100))
             waitedIntervals += 1
         }
         if await albumActions.add(uids, to: album.id) {
+            // The toolbar's feedback: the added selection ends, unless the person selected something else meanwhile.
+            if let droppedSelection, selectedUIDs == droppedSelection { endSelection() }
             await loadAlbums()
         } else if albumActions.actionFailure == nil {
             albumActions.actionFailure = AlbumActionFailure(
@@ -740,6 +744,12 @@ struct MainView: View {
                 message: L10n.string("albums.add_busy_message")
             )
         }
+    }
+
+    /// The grid's feedback after the selection joined an album: the selection ends.
+    private func endSelection() {
+        selectionMode = false
+        selectedUIDs.removeAll()
     }
 
     /// Opens the shared name form. A new album can start with photos, for example the one open in the viewer.
@@ -2256,8 +2266,7 @@ struct MainView: View {
                         onAlbumsChanged: { Task { await loadAlbums() } },
                         onCompleted: { _ in
                             showAlbumDestination = false
-                            selectionMode = false
-                            selectedUIDs.removeAll()
+                            endSelection()
                         }
                     )
                 }
