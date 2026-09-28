@@ -31,4 +31,33 @@ final class MobilePrivacyPreviewShieldTests: XCTestCase {
         XCTAssertEqual(firstWindow.subviews.compactMap { $0 as? UIVisualEffectView }.count, 1)
         XCTAssertTrue(secondWindow.subviews.compactMap { $0 as? UIVisualEffectView }.isEmpty)
     }
+
+    @MainActor func testCenterRetainsWindowShieldAfterPresentationAnchorDetaches() {
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 390, height: 844))
+        window.rootViewController = UIViewController()
+        let center = MobilePrivacyPreviewShieldCenter()
+
+        center.register(window: window)
+        center.refreshAll(enabled: true)
+
+        XCTAssertEqual(window.subviews.compactMap { $0 as? UIVisualEffectView }.count, 1)
+        // A full-screen cover can remove the SwiftUI anchor without destroying its scene window.
+        center.refreshAll(enabled: true)
+        XCTAssertEqual(window.subviews.compactMap { $0 as? UIVisualEffectView }.count, 1)
+
+        center.refreshAll(enabled: false)
+        XCTAssertTrue(window.subviews.compactMap { $0 as? UIVisualEffectView }.isEmpty)
+    }
+
+    @MainActor func testCenterUpdatesEveryRegisteredWindowWhenPreferenceChanges() {
+        let windows = (0..<2).map { _ in UIWindow(frame: CGRect(x: 0, y: 0, width: 390, height: 844)) }
+        let center = MobilePrivacyPreviewShieldCenter()
+        for window in windows { center.register(window: window) }
+
+        center.refreshAll(enabled: true)
+        XCTAssertTrue(windows.allSatisfy { $0.subviews.compactMap { $0 as? UIVisualEffectView }.count == 1 })
+
+        center.refreshAll(enabled: false)
+        XCTAssertTrue(windows.allSatisfy { $0.subviews.compactMap { $0 as? UIVisualEffectView }.isEmpty })
+    }
 }

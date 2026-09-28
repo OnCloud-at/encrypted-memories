@@ -266,13 +266,12 @@ private struct WindowConfigurator: NSViewRepresentable {
         guard let window else { return }
         window.identifier = NSUserInterfaceItemIdentifier("library")
         coordinator.frameController.attach(to: window)
-        coordinator.privacyPreviewShield.attach(to: window, enabled: blurAppPreview)
+        MacPrivacyPreviewShield.shared.attach(to: window, enabled: blurAppPreview)
         LibraryWindowVisibilityController.shared.attach(to: window)
     }
 
     @MainActor final class Coordinator {
         let frameController = MainWindowFrameController(defaultSize: CGSize(width: 1080, height: 720))
-        let privacyPreviewShield = MacPrivacyPreviewShield()
     }
 }
 

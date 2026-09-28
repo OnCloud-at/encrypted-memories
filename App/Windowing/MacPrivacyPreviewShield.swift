@@ -1,66 +1,92 @@
 import AppKit
 import PhotosCore
 
-/// Covers the library window before AppKit records an inactive or occluded preview.
+/// Covers app windows before AppKit records inactive and minimized previews.
 @MainActor
 final class MacPrivacyPreviewShield: NSObject {
-    private weak var window: NSWindow?
-    private var blur: NSVisualEffectView?
+    static let shared = MacPrivacyPreviewShield()
+    private final class Entry {
+        weak var window: NSWindow?
+        var blur: NSVisualEffectView?
+
+        init(window: NSWindow) { self.window = window }
+    }
+
+    private weak var libraryWindow: NSWindow?
+    private var entries: [Entry] = []
     private var enabled = false
     private var observesApplication = false
+    private var applicationDeactivating = false
 
     func attach(to window: NSWindow, enabled: Bool) {
-        if self.window !== window {
-            if let previous = self.window {
-                NotificationCenter.default.removeObserver(
-                    self, name: NSWindow.didChangeOcclusionStateNotification, object: previous)
-            }
-            remove()
-            self.window = window
-            NotificationCenter.default.addObserver(
-                self, selector: #selector(windowOcclusionChanged),
-                name: NSWindow.didChangeOcclusionStateNotification, object: window)
-        }
+        libraryWindow = window
         self.enabled = enabled
         if !observesApplication {
             observesApplication = true
-            NotificationCenter.default.addObserver(
+            let center = NotificationCenter.default
+            center.addObserver(
                 self, selector: #selector(applicationWillResignActive),
                 name: NSApplication.willResignActiveNotification, object: NSApp)
-            NotificationCenter.default.addObserver(
-                self, selector: #selector(applicationDidBecomeActive),
-                name: NSApplication.didBecomeActiveNotification, object: NSApp)
+            center.addObserver(
+                self, selector: #selector(applicationDidBecomeActive), name: NSApplication.didBecomeActiveNotification,
+                object: NSApp)
+            center.addObserver(
+                self, selector: #selector(windowVisibilityChanged), name: NSWindow.didChangeOcclusionStateNotification,
+                object: nil)
+            center.addObserver(
+                self, selector: #selector(windowWillMiniaturize), name: NSWindow.willMiniaturizeNotification,
+                object: nil)
+            center.addObserver(
+                self, selector: #selector(windowVisibilityChanged), name: NSWindow.didDeminiaturizeNotification,
+                object: nil)
         }
         refresh()
     }
 
     @objc private func applicationWillResignActive(_ notification: Notification) {
-        setCovered(enabled)
+        applicationDeactivating = true
+        for window in NSApp.windows { setCovered(enabled, on: window) }
     }
 
     @objc private func applicationDidBecomeActive(_ notification: Notification) {
+        applicationDeactivating = false
         refresh()
     }
 
-    @objc private func windowOcclusionChanged(_ notification: Notification) {
-        refresh()
+    @objc private func windowVisibilityChanged(_ notification: Notification) { refresh() }
+
+    @objc private func windowWillMiniaturize(_ notification: Notification) {
+        guard let window = notification.object as? NSWindow else { return }
+        setCovered(enabled, on: window)
     }
 
     private func refresh() {
-        guard let window else { return }
-        setCovered(
-            PrivacyPreviewPolicy.shouldCover(
-                enabled: enabled, isSceneActive: NSApp.isActive,
-                isWindowVisible: window.occlusionState.contains(.visible)))
+        entries.removeAll { $0.window == nil }
+        guard libraryWindow != nil else { return }
+        for window in NSApp.windows {
+            setCovered(
+                PrivacyPreviewPolicy.shouldCover(
+                    enabled: enabled,
+                    isSceneActive: NSApp.isActive && !applicationDeactivating,
+                    isWindowVisible: window.occlusionState.contains(.visible) && !window.isMiniaturized),
+                on: window)
+        }
     }
 
-    private func setCovered(_ covered: Bool) {
-        guard let content = window?.contentView else { return }
-        guard covered else {
-            remove()
+    private func setCovered(_ covered: Bool, on window: NSWindow) {
+        let entry: Entry
+        if let existing = entries.first(where: { $0.window === window }) {
+            entry = existing
+        } else {
+            entry = Entry(window: window)
+            entries.append(entry)
+        }
+        guard covered, let content = window.contentView else {
+            entry.blur?.removeFromSuperview()
+            entry.blur = nil
             return
         }
-        if let blur {
+        if let blur = entry.blur {
             if blur.superview !== content {
                 blur.removeFromSuperview()
                 content.addSubview(blur, positioned: .above, relativeTo: nil)
@@ -79,15 +105,8 @@ final class MacPrivacyPreviewShield: NSObject {
         tint.layer?.backgroundColor = NSColor.windowBackgroundColor.withAlphaComponent(0.7).cgColor
         effect.addSubview(tint)
         content.addSubview(effect, positioned: .above, relativeTo: nil)
-        blur = effect
+        entry.blur = effect
     }
 
-    private func remove() {
-        blur?.removeFromSuperview()
-        blur = nil
-    }
-
-    deinit {
-        NotificationCenter.default.removeObserver(self)
-    }
+    deinit { NotificationCenter.default.removeObserver(self) }
 }

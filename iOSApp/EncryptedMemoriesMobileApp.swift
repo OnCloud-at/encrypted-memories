@@ -73,7 +73,6 @@ struct EncryptedMemoriesMobileApp: App {
 private struct MobileSupportedAppRoot: View {
     private let runtime = MobileAccountRuntime.shared
     @State private var sceneContext = MobileSceneContext()
-    @State private var privacyPreviewShield = MobilePrivacyPreviewShield()
     @State private var confettiMotion = MobileConfettiMotion.shared
     @State private var tipJarCelebration = TipJarCelebrationCoordinator.shared
     @AppStorage(AppSettingsKey.blurAppPreview) private var blurAppPreview = AppSettingsDefault.blurAppPreview
@@ -87,29 +86,13 @@ private struct MobileSupportedAppRoot: View {
             .environment(sceneContext)
             .mobileSceneWindowAnchor(sceneContext)
             .onAppear {
-                let shield = privacyPreviewShield
-                sceneContext.onWindowChange = { [weak shield] window in
-                    shield?.update(
-                        enabled: PrivacyPreviewPolicy.isEnabled(),
-                        isSceneActive: window?.windowScene?.activationState == .foregroundActive,
-                        window: window)
+                sceneContext.onWindowChange = { window in
+                    if let window { MobilePrivacyPreviewShieldCenter.shared.register(window: window) }
                 }
                 updatePrivacyPreviewShield()
             }
             .onChange(of: scenePhase) { _, _ in updatePrivacyPreviewShield() }
             .onChange(of: blurAppPreview) { _, _ in updatePrivacyPreviewShield() }
-            .onReceive(NotificationCenter.default.publisher(for: UIScene.willDeactivateNotification)) { notification in
-                guard let window = sceneContext.window,
-                    notification.object as? UIWindowScene === window.windowScene
-                else { return }
-                privacyPreviewShield.update(enabled: blurAppPreview, isSceneActive: false, window: window)
-            }
-            .onReceive(NotificationCenter.default.publisher(for: UIScene.didActivateNotification)) { notification in
-                guard let window = sceneContext.window,
-                    notification.object as? UIWindowScene === window.windowScene
-                else { return }
-                privacyPreviewShield.update(enabled: blurAppPreview, isSceneActive: true, window: window)
-            }
             .background {
                 TipJarCelebrationWindowOverlay(horizontalBias: confettiMotion.horizontalBias)
             }
@@ -141,13 +124,12 @@ private struct MobileSupportedAppRoot: View {
             .onDisappear {
                 confettiMotion.stop()
                 sceneContext.onWindowChange = nil
-                privacyPreviewShield.remove()
             }
     }
 
     private func updatePrivacyPreviewShield() {
-        privacyPreviewShield.update(
-            enabled: blurAppPreview, isSceneActive: scenePhase == .active, window: sceneContext.window)
+        if let window = sceneContext.window { MobilePrivacyPreviewShieldCenter.shared.register(window: window) }
+        MobilePrivacyPreviewShieldCenter.shared.refreshAll(enabled: blurAppPreview)
     }
 }
 
