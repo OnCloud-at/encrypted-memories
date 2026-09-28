@@ -332,6 +332,8 @@ public actor ThumbnailFeedCore {
     private var lastErrors: [String] = []
     private var prefetchEnabled = true
     private var prefetchPaused = false
+    /// Wakes the crawl after storage leaves the critical level. It exists only while the crawl sleeps for storage.
+    private var storageWakeTask: Task<Void, Never>?
     private var sourceEpoch: LibrarySourceEpoch?
     private var lastSelectedScope: SelectedDerivedDataScope?
     private var lastAnalysisScope: AnalysisDerivedDataScope?
@@ -1415,6 +1417,7 @@ public actor ThumbnailFeedCore {
         restorePriorityReservationsForRestart()
         prefetchGeneration &+= 1
         let generation = prefetchGeneration
+        cancelStorageWake()
         let activeWorker = workerTask
         workerTasks.forEach { $0.cancel() }
         workerTasks.removeAll(keepingCapacity: false)
@@ -1478,6 +1481,7 @@ public actor ThumbnailFeedCore {
         }
         flushCheckpointUpdates()
         prefetchGeneration &+= 1
+        cancelStorageWake()
         let activeWorker = workerTask
         workerTasks.forEach { $0.cancel() }
         workerTasks.removeAll(keepingCapacity: false)
@@ -1951,7 +1955,38 @@ public actor ThumbnailFeedCore {
         workerTasks.removeAll(keepingCapacity: false)
         workerTask = nil
         workersRunning = false
-        if !priority.isEmpty || sequentialIndex < sequential.count { startWorkers() }
+        if !priority.isEmpty || (sequentialIndex < sequential.count && storageWakeTask == nil) { startWorkers() }
+    }
+
+    private nonisolated func storageIsCritical() -> Bool {
+        cache.runtimeState.snapshot().storagePressure == .critical
+    }
+
+    /// The workers stop instead of polling while only the crawl remains. Visible demand still starts them.
+    private func sleepUntilStorageRecovers() {
+        guard storageWakeTask == nil else { return }
+        let runtimeState = cache.runtimeState
+        let generation = prefetchGeneration
+        storageWakeTask = Task { [weak self] in
+            for await snapshot in runtimeState.updates() where snapshot.storagePressure != .critical {
+                break
+            }
+            guard !Task.isCancelled else { return }
+            await self?.storageRecovered(generation: generation)
+        }
+    }
+
+    private func storageRecovered(generation: UInt64) {
+        guard generation == prefetchGeneration else { return }
+        storageWakeTask = nil
+        startWorkers()
+    }
+
+    private func cancelStorageWake() {
+        guard let storageWakeTask else { return }
+        storageWakeTask.cancel()
+        retiredWorkerTasks.append(storageWakeTask)
+        self.storageWakeTask = nil
     }
 
     private func worker(generation: UInt64) async {
@@ -2013,6 +2048,12 @@ public actor ThumbnailFeedCore {
                 // ran on the utility executor and the next iteration will observe a newly arrived visible-demand
                 // signal before reserving more crawl candidates. Do not delay after a disk-hit-only batch.
                 if work.probedDisk { continue }
+                // With almost no free space the cache cannot keep what the crawl downloads. Stop instead of
+                // waking every 150 ms until storage recovers.
+                if priority.isEmpty, storageIsCritical() {
+                    sleepUntilStorageRecovers()
+                    return
+                }
                 try? await Task.sleep(for: .milliseconds(150))
                 continue
             }
@@ -2315,8 +2356,8 @@ public actor ThumbnailFeedCore {
         let now = clock()
         let backingOff = crawlBackoffUntil.map { now < $0 } ?? false
         // With almost no free space the cache cannot keep what the crawl downloads; visible photos still load.
-        let storageIsCritical = LibraryRuntimeState.shared.snapshot().storagePressure == .critical
-        guard !prefetchPaused, prefetchEnabled, !recentVisibleDemand(now: now), !backingOff, !storageIsCritical else {
+        guard !prefetchPaused, prefetchEnabled, !recentVisibleDemand(now: now), !backingOff, !storageIsCritical()
+        else {
             let batch = await finishDiskProbeBatch(
                 candidates,
                 priority: batchPriority,

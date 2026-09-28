@@ -240,8 +240,11 @@ final class LivePhotoMotionTests: XCTestCase {
             streamer: FailingVideoStreamProvider()
         ) { true }
 
-        for _ in 0..<100 where controller.loadState != .failed {
-            await Task.yield()
+        // The preparation leaves the main actor for the stream provider. A yield count can run out on a busy
+        // machine before it returns, so wait for the state with a deadline.
+        let deadline = ContinuousClock.now + .seconds(5)
+        while controller.loadState != .failed, ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(10))
         }
 
         XCTAssertEqual(controller.loadState, .failed)

@@ -322,7 +322,8 @@ public actor MLSmartSearchLifecycle {
             hasActivatedModel: persistent.activatedRevision != nil,
             isStartPending: pendingRecommendedEnable != nil,
             startIntent: startIntentSequence,
-            availableModels: catalog.selectableEntries(allowsDeveloperModels: deps.allowsDeveloperModels),
+            availableModels: catalog.selectableEntries(
+                allowsDeveloperModels: deps.allowsDeveloperModels, keeping: persistent.selectedModelID),
             isSearchAvailable: persistent.isEnabled
                 && ((session != nil && lastCoverage.indexed > 0)
                     || (nativeSearch != nil && (lastNativeProgress?.completed ?? 0) > 0)),
@@ -1128,11 +1129,15 @@ public actor MLSmartSearchLifecycle {
         for task in tasks { await task.value }
     }
 
-    /// A model may be selected/activated in this environment: developer environments see every
-    /// entry; release environments require the production track AND a product-usable license.
+    /// A model may be chosen now in this environment: developer environments see every entry; release
+    /// environments require the production track AND a product-usable license. Retired models are never chosen anew.
     private func isSelectable(_ entry: MLModelCatalogEntry) -> Bool {
-        deps.allowsDeveloperModels
-            || entry.isReleaseReady
+        !entry.isRetired && canKeepUsing(entry)
+    }
+
+    /// The selected model keeps working in this environment, also after the catalog retired it.
+    private func canKeepUsing(_ entry: MLModelCatalogEntry) -> Bool {
+        catalog.isUsable(entry, allowsDeveloperModels: deps.allowsDeveloperModels)
     }
 
     /// Native Apple analysis is the zero-download baseline. It is activated independently from
@@ -1224,7 +1229,7 @@ public actor MLSmartSearchLifecycle {
         let token: ActivationToken? =
             if let selectedID = persistent.selectedModelID,
                 let entry = catalog.entry(for: selectedID),
-                isSelectable(entry)
+                canKeepUsing(entry)
             {
                 ActivationToken(generation: activationGeneration, entry: entry)
             } else {
@@ -2454,7 +2459,7 @@ public actor MLSmartSearchLifecycle {
             persistent.isEnabled,
             let selectedID = persistent.selectedModelID,
             let entry = catalog.entry(for: selectedID),
-            isSelectable(entry)
+            canKeepUsing(entry)
         else {
             return
         }
@@ -2535,7 +2540,7 @@ public actor MLSmartSearchLifecycle {
 
         guard let selectedID = persistent.selectedModelID,
             let entry = refreshed.entry(for: selectedID),
-            isSelectable(entry)
+            canKeepUsing(entry)
         else {
             if recoveredFromCatalogFailure {
                 phase = activeModel == nil ? .selectingModel : .ready(lastCoverage)

@@ -95,6 +95,29 @@ the next `releaseSequence`. Retired rows remain fully validated but are not sele
 A retirement-only candidate can omit model directories. A later qualified candidate for the same ID
 restores it as active with the next release sequence and the same compatibility recipe.
 
+## Shipped app readers
+
+`catalog-compatibility.json` is the release tool's only recipe list. A package test keeps it equal
+to `MLModelCompatibilityRegistry` and to the enums in `release-manifest.schema.json`. Change all
+three in the same pull request.
+
+The file also lists the strict readers of each channel. A strict reader is an app generation that
+rejects the whole catalog when one model uses a recipe it does not know. It also drops retired
+models, so a user who selected such a model loses it. Apps 1.0.5 and earlier are strict readers of
+the production channel. Apps from 1.1.0 skip unknown recipes and keep a selected retired model.
+
+For each strict reader of the channel, the release tool rejects a catalog that:
+
+- contains a model whose recipe is not in that reader's `recipes` list;
+- retires or removes a model that was active in the previous catalog.
+
+Preview builds come from current source, so the preview channel lists no strict readers. The
+preview workflow passes `--channel preview`. Every other run uses the production channel.
+
+Remove a strict reader only after its apps no longer read the channel. A rollback republishes the
+models of an earlier pair at a new sequence and does not apply these checks. Before a production
+rollback, confirm that the earlier pair still contains every model that strict readers can select.
+
 ## Local preview channel
 
 Preview composition is available only in Debug builds. In Xcode, use the `EncryptedMemories`
