@@ -1967,9 +1967,11 @@ final class MobileLibraryModel {
             backend: any PhotosBackend,
             sections: [TimelineSection],
             thumbnailFeed: UIKitThumbnailFeed,
-            thumbnailCache: ThumbnailCache? = nil
+            thumbnailCache: ThumbnailCache? = nil,
+            albums: AlbumsRepository? = nil
         ) {
             let projection = TimelineContentProjection(sections: sections)
+            albumActions = albums.map(AlbumActionCoordinator.init(repository:))
             self.store = store
             self.session = session
             configuredUID = session.uid
