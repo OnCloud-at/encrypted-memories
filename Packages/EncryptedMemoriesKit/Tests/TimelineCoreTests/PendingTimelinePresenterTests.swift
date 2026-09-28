@@ -155,6 +155,35 @@ import UploadCore
         #expect(presentation.uploadBadges.isEmpty)
     }
 
+    @Test func aBadgeChangeKeepsTheGridMembership() async {
+        let presenter = PendingTimelinePresenter()
+        presenter.setRemote(TimelineSnapshot(orderedItems: [remote("a", second: 0)]))
+        presenter.setPending(pending([tile("b", second: 10)], membership: 1), enabled: true)
+        let before = await settle(presenter)
+
+        presenter.setPending(pending([tile("b", second: 10, badge: .done)], membership: 2), enabled: true)
+        let after = await settle(presenter)
+
+        #expect(after.revision != before.revision)
+        #expect(after.membershipRevision == before.membershipRevision)
+        #expect(after.snapshot == before.snapshot)
+        #expect(after.uploadBadges[tile("b", second: 10).item.uid] == .done)
+    }
+
+    @Test func aNewPendingPhotoChangesTheGridMembership() async {
+        let presenter = PendingTimelinePresenter()
+        presenter.setRemote(TimelineSnapshot(orderedItems: [remote("a", second: 0)]))
+        presenter.setPending(pending([tile("b", second: 10)], membership: 1), enabled: true)
+        let before = await settle(presenter)
+
+        let (b, c) = (tile("b", second: 10), tile("c", second: 20))
+        presenter.setPending(pending([b, c], membership: 2), enabled: true)
+        let after = await settle(presenter)
+
+        #expect(after.membershipRevision != before.membershipRevision)
+        #expect(after.items.map(\.uid) == [remote("a", second: 0).uid, b.item.uid, c.item.uid])
+    }
+
     @Test func progressChangesOnlyTheBadges() async {
         let presenter = PendingTimelinePresenter()
         presenter.setRemote(TimelineSnapshot(orderedItems: [remote("a", second: 0)]))

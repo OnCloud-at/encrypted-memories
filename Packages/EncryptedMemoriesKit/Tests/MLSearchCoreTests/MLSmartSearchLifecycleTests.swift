@@ -814,6 +814,18 @@ import Testing
         )
     }
 
+    private func retired(_ entry: MLModelCatalogEntry) -> MLModelCatalogEntry {
+        MLModelCatalogEntry(
+            id: entry.id, compatibilityKey: entry.compatibilityKey, displayName: entry.displayName,
+            family: entry.family, role: entry.role, capabilities: entry.capabilities,
+            sourceRevision: entry.sourceRevision, descriptor: entry.descriptor, tokenizerID: entry.tokenizerID,
+            preprocessingID: entry.preprocessingID, runtimeContract: entry.runtimeContract,
+            relevancePolicy: entry.relevancePolicy, runtimeResourcePaths: entry.runtimeResourcePaths,
+            license: entry.license, releaseTrack: entry.releaseTrack, localizedMetadata: entry.localizedMetadata,
+            estimatedInstalledBytes: entry.estimatedInstalledBytes, downloadPlan: entry.downloadPlan,
+            releaseQualification: entry.releaseQualification, isRetired: true)
+    }
+
     private func downloadableEntry(
         id: String,
         payload: Data,
@@ -1447,6 +1459,89 @@ import Testing
 
         #expect(await waitForCompleteIndex(second, total: 1))
         #expect(await second.lifecycle.currentSnapshot().selectedModelID == largeEntry.id)
+    }
+
+    @Test func aRetiredModelKeepsWorkingAfterARelaunchButIsNeverChosenAgain() async throws {
+        let payloadA = Data("model-a".utf8)
+        let payloadB = Data("model-b".utf8)
+        let (entryA, urlA) = downloadableEntry(id: "model-a", payload: payloadA)
+        let (entryB, urlB) = downloadableEntry(id: "model-b", payload: payloadB)
+        let payloads = [urlA: payloadA, urlB: payloadB]
+        let first = try makeHarness(
+            catalog: MLModelCatalog(entries: [entryA, entryB]),
+            payloads: payloads,
+            assets: [uid("asset")],
+            allowsDeveloperModels: false
+        )
+        defer { try? FileManager.default.removeItem(at: first.layout.rootDirectory) }
+        await first.lifecycle.start()
+        await first.lifecycle.enable(with: entryA.id)
+        #expect(await waitForCompleteIndex(first, total: 1))
+        await first.lifecycle.shutdown()
+
+        // The next catalog retires model A. The person who uses it keeps search after the relaunch.
+        let second = try makeHarness(
+            catalog: MLModelCatalog(entries: [retired(entryA), entryB]),
+            payloads: payloads,
+            assets: [uid("asset")],
+            allowsDeveloperModels: false,
+            root: first.layout.rootDirectory,
+            stateStoreOverride: first.stateStore,
+            storeProviderOverride: first.storeProvider
+        )
+        await second.lifecycle.start()
+        #expect(await waitForCompleteIndex(second, total: 1))
+        let kept = await second.lifecycle.currentSnapshot()
+        #expect(kept.selectedModelID == entryA.id)
+        #expect(kept.availableModels.map(\.id) == [entryA.id, entryB.id], "the current choice stays visible")
+        #expect(second.transport.downloadCount == 0, "the relaunch downloads nothing")
+
+        // Moving to another model works; moving back to the retired one does not.
+        await second.lifecycle.select(entryB.id)
+        #expect(await waitForCompleteIndex(second, total: 1))
+        #expect(await second.lifecycle.currentSnapshot().availableModels.map(\.id) == [entryB.id])
+        await second.lifecycle.select(entryA.id)
+        #expect(await second.lifecycle.currentSnapshot().selectedModelID == entryB.id)
+        await second.lifecycle.shutdown()
+    }
+
+    @Test func aCatalogRefreshThatRetiresTheActiveModelKeepsItActive() async throws {
+        let payloadA = Data("model-a".utf8)
+        let payloadB = Data("model-b".utf8)
+        let (entryA, urlA) = downloadableEntry(id: "model-a", payload: payloadA)
+        let (entryB, urlB) = downloadableEntry(id: "model-b", payload: payloadB)
+        let catalogProvider = RecordingCatalogProvider(MLModelCatalog(entries: [entryA, entryB]))
+        let harness = try makeHarness(
+            catalog: MLModelCatalog(entries: [entryA, entryB]),
+            payloads: [urlA: payloadA, urlB: payloadB],
+            assets: [uid("asset")],
+            allowsDeveloperModels: false,
+            catalogProvider: catalogProvider,
+            catalogRefreshInterval: .zero
+        )
+        defer { try? FileManager.default.removeItem(at: harness.layout.rootDirectory) }
+        await harness.lifecycle.start()
+        await harness.lifecycle.enable(with: entryA.id)
+        #expect(await waitForCompleteIndex(harness, total: 1))
+        let sessionsBefore = harness.provider.builtCount
+
+        await catalogProvider.replace(MLModelCatalog(entries: [retired(entryA), entryB]))
+        await harness.lifecycle.noteConditionsChanged()
+
+        #expect(
+            await waitUntil {
+                await harness.lifecycle.currentSnapshot().availableModels.contains {
+                    $0.id == entryA.id && $0.isRetired
+                }
+            })
+        let snapshot = await harness.lifecycle.currentSnapshot()
+        #expect(snapshot.selectedModelID == entryA.id)
+        guard case .ready = snapshot.phase else {
+            Issue.record("search must stay ready, not ask for a new model: \(snapshot.phase)")
+            return
+        }
+        #expect(harness.provider.builtCount == sessionsBefore, "the active model is neither reloaded nor dropped")
+        await harness.lifecycle.shutdown()
     }
 
     @Test func aSupersededSwitchOnCannotOverwriteTheNewerStateWithItsCatalogFailure() async throws {

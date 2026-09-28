@@ -70,8 +70,13 @@ public final class TimelineViewModel {
     /// Flat, chronological items of the currently active route (whole library for `.all`, else the
     /// filtered tag/album/trash set) - backs selection and the upload-found lookup, not viewer paging.
     public private(set) var allItems: [PhotoItem] = [] {
-        didSet { presentationItems = filter == .all ? allItems : Array(allItems.reversed()) }
+        didSet {
+            presentationItems = filter == .all ? allItems : Array(allItems.reversed())
+            allItemsRevision &+= 1
+        }
     }
+    /// Changes with every `allItems` assignment, so a refresh can tell whether its off-main comparison still holds.
+    @ObservationIgnored private var allItemsRevision: UInt64 = 0
     /// Reuse one display array across grid, viewer and chrome updates. Only collections reverse it;
     /// the full library retains its chronological order and bottom-trailing anchor.
     public private(set) var presentationItems: [PhotoItem] = []
@@ -226,15 +231,52 @@ public final class TimelineViewModel {
     @ObservationIgnored private var hiddenFromLibrary = Set<PhotoUID>()
     @ObservationIgnored private var hiddenFromTrash = Set<PhotoUID>()
 
-    private func updateAllRouteSnapshot(_ projection: TimelineContentProjection) {
-        let contentChanged = wholeLibrarySnapshot != projection.snapshot
+    /// `change` compares `projection` with the current whole-library snapshot. Without it, the comparison runs here.
+    private func updateAllRouteSnapshot(
+        _ projection: TimelineContentProjection,
+        change: TimelineProjectionChange? = nil
+    ) {
+        let contentChanged = change?.contentChanged ?? (wholeLibrarySnapshot != projection.snapshot)
         allRouteSnapshot = projection.sections
         wholeLibrarySnapshot = projection.snapshot
         if contentChanged { wholeLibraryContentRevision &+= 1 }
         let uids = projection.uids
-        guard uids != wholeLibraryUIDs else { return }
+        guard change?.identitiesChanged ?? (uids != wholeLibraryUIDs) else { return }
         wholeLibraryUIDs = uids
         wholeLibraryRevision &+= 1
+    }
+
+    /// Revisions of everything that a refresh compares with. Equal values mean equal content.
+    private var shownTimelineRevisions: [UInt64] {
+        [allItemsRevision, wholeLibraryRevision, wholeLibraryContentRevision]
+    }
+
+    /// A refreshed route and its comparison with the content shown when the refresh started.
+    private struct RouteRefresh: Sendable {
+        let projection: TimelineContentProjection
+        /// The route shows exactly these items already.
+        let unchanged: Bool
+        /// The comparison with the whole-library snapshot; nil for other routes.
+        let wholeLibraryChange: TimelineProjectionChange?
+    }
+
+    /// Builds the route projection and compares it off the main actor, so an unchanged refresh makes no pass
+    /// over the library on the main actor.
+    private func prepareRefreshOffMain(
+        _ sections: [TimelineSection],
+        for route: PhotoFilter,
+        shownItems: [PhotoItem],
+        shownWholeLibrary: TimelineSnapshot?
+    ) async -> RouteRefresh {
+        let hidden = route == .trash ? hiddenFromTrash : hiddenFromLibrary
+        return await Task.detached(priority: .userInitiated) {
+            let projection = TimelineContentProjection(sections: sections).removing(hidden)
+            return RouteRefresh(
+                projection: projection,
+                unchanged: Self.timelineContentUnchanged(projection.sections, vs: shownItems),
+                wholeLibraryChange: shownWholeLibrary.map { TimelineProjectionChange(from: $0, to: projection) }
+            )
+        }.value
     }
 
     private func updateWholeLibraryAuthority(_ authority: SourceInventoryAuthority) {
@@ -628,8 +670,14 @@ public final class TimelineViewModel {
         let before = allItems.count
         let previousWholeLibraryUIDs = wholeLibraryUIDs
         let f = filter  // the route this refresh is for
+        let shownItems = allItems
+        let shownWholeLibrary = f == .all ? wholeLibrarySnapshot : nil
+        let shownRevisions = shownTimelineRevisions
         do {
-            let projection = await normalizeOffMain(try await freshSectionsForCurrentFilter(), for: f)
+            let refresh = await prepareRefreshOffMain(
+                try await freshSectionsForCurrentFilter(), for: f, shownItems: shownItems,
+                shownWholeLibrary: shownWholeLibrary)
+            let projection = refresh.projection
             let sections = projection.sections
             guard filter == f else {  // a sidebar switch landed mid-refresh - don't clobber the new route
                 return TimelineRefreshResult(
@@ -640,13 +688,15 @@ public final class TimelineViewModel {
                     failureReason: .superseded
                 )
             }
+            // The off-main comparisons hold while nothing else published since this refresh started.
+            let comparison = shownRevisions == shownTimelineRevisions ? refresh : nil
             // No-op refresh: if fetched content matches the displayed content, do not
             // reassign state/allItems, refresh the route cache, or restart the crawl - the grid stays put
             // (scroll + selection preserved). The found-item lookup still runs against the current list.
-            if Self.timelineContentUnchanged(sections, vs: allItems) {
+            if comparison?.unchanged ?? Self.timelineContentUnchanged(sections, vs: allItems) {
                 if f == .all {
                     updateWholeLibraryAuthority(.authoritative)
-                    updateAllRouteSnapshot(projection)
+                    updateAllRouteSnapshot(projection, change: comparison?.wholeLibraryChange)
                 }
                 noteRefresh("unchangedSkip")
                 let foundItem = uploadedUID.flatMap { uid in allItems.first { $0.uid == uid } }
@@ -660,16 +710,19 @@ public final class TimelineViewModel {
                 )
             }
             let items = sections.flatMap(\.items)
+            let wholeLibraryChange = comparison?.wholeLibraryChange
             let addedUIDs =
                 f == .all
-                ? LibraryInventoryDelta.addedUIDs(previous: previousWholeLibraryUIDs, current: projection.uids)
+                ? wholeLibraryChange?.addedUIDs
+                    ?? LibraryInventoryDelta.addedUIDs(previous: previousWholeLibraryUIDs, current: projection.uids)
                 : []
-            let gridChanged = f != .all || projection.uids != wholeLibraryUIDs
+            let gridChanged =
+                f != .all || (wholeLibraryChange?.identitiesChanged ?? (projection.uids != wholeLibraryUIDs))
             allItems = items
             state = items.isEmpty ? .empty : .loaded(sections)
             if f == .all {
                 updateWholeLibraryAuthority(.authoritative)
-                updateAllRouteSnapshot(projection)
+                updateAllRouteSnapshot(projection, change: wholeLibraryChange)
             } else {
                 filterCache.insert(sections, for: f, activeRoute: filter)
             }  // keep the route's instant-revisit view fresh
