@@ -209,6 +209,7 @@ final class CoreArchitectureGateTests: XCTestCase {
         "PhotoViewerFeature",
         "PhotoViewerCore",
         "PhotoViewerUIKitAdapter",
+        "PrivacyFeature",
         "ProtonAuth",
         "TimelineFeature",
         "TimelineUIKitAdapter",

@@ -46,6 +46,7 @@ final class OfflineLibraryManager {
     /// Loads the area the map opens at into MapKit's cache, so the map draws at once.
     @ObservationIgnored private let mapPrewarmer = PhotoMapPrewarmer()
     private let locationCrawl = LocationCrawl()
+    private var locationPrivacyStopTask: Task<Void, Never>?
     private var locationCrawlStarted = false
     private var locationCrawlGeneration: UInt64 = 0
     private var locationConfigurationGeneration: UInt64 = 0
@@ -298,6 +299,10 @@ final class OfflineLibraryManager {
     /// Starts one resumable, throttled GPS crawl for the Map view. It yields to visible thumbnail work and
     /// persists the encrypted index periodically. Repeated calls are safe.
     func startLocationCrawl(items: [PhotoItem], metadata: any PhotoMetadataProvider) {
+        guard
+            MapAndPlacesPolicy.allowsLocationCrawl(
+                enabled: MapAndPlacesPolicy.isEnabled(), itemCount: items.count)
+        else { return }
         let inventoryTask = Task.detached(priority: .utility) {
             LocationCrawlInventory(items: items)
         }
@@ -308,30 +313,35 @@ final class OfflineLibraryManager {
         {
             locationCrawlStarted = false
         }
-        guard !locationCrawlStarted, !items.isEmpty else { return }
+        guard !locationCrawlStarted else { return }
         locationCrawlStarted = true
         locationCrawlGeneration &+= 1
         let crawlGeneration = locationCrawlGeneration
         let accountUID = configuredAccountUID ?? ""
         let previousStarter = locationCrawlStartTask
+        let previousPrivacyStop = locationPrivacyStopTask
         let previousConfiguration = locationConfigurationTask
         previousStarter?.cancel()
         let index = locationIndex
         let store = locationStore
         let feed = self.feed
         let governor = LibraryWorkloadGovernorPolicy()
-        locationCrawlStartTask = Task { @MainActor [weak self, previousStarter, previousConfiguration] in
+        locationCrawlStartTask = Task {
+            @MainActor [weak self, previousStarter, previousConfiguration, previousPrivacyStop] in
+            await previousPrivacyStop?.value
             await previousConfiguration?.value
             await previousStarter?.value
             guard let self,
                 !Task.isCancelled,
                 crawlGeneration == self.locationCrawlGeneration,
-                self.configuredAccountUID == accountUID
+                self.configuredAccountUID == accountUID,
+                MapAndPlacesPolicy.isEnabled()
             else { return }
             let initialInventory = await inventoryTask.value
             guard !Task.isCancelled,
                 crawlGeneration == self.locationCrawlGeneration,
-                self.configuredAccountUID == accountUID
+                self.configuredAccountUID == accountUID,
+                MapAndPlacesPolicy.isEnabled()
             else { return }
             // Give the thumbnail crawl a head start, then crawl GPS whenever the grid isn't actively
             // demanding on-screen thumbnails - so the Map crawl shares the rate-limit budget as P2 and
@@ -343,7 +353,8 @@ final class OfflineLibraryManager {
             }
             guard !Task.isCancelled,
                 crawlGeneration == self.locationCrawlGeneration,
-                self.configuredAccountUID == accountUID
+                self.configuredAccountUID == accountUID,
+                MapAndPlacesPolicy.isEnabled()
             else { return }
             await self.locationCrawl.start(
                 uids: initialInventory.uids,
@@ -378,6 +389,25 @@ final class OfflineLibraryManager {
                 return
             }
         }
+    }
+
+    func pauseMapAndPlaces() {
+        mapPrewarmer.cancel()
+        locationCrawlGeneration &+= 1
+        locationCrawlStarted = false
+        locationCrawlStartTask?.cancel()
+        let previousStop = locationPrivacyStopTask
+        let crawl = locationCrawl
+        locationPrivacyStopTask = Task {
+            await previousStop?.value
+            await crawl.cancel()
+        }
+    }
+
+    func resumeMapAndPlaces(items: [PhotoItem], metadata: any PhotoMetadataProvider) {
+        guard MapAndPlacesPolicy.isEnabled() else { return }
+        mapPrewarmer.prewarm(coordinates: locationIndex.coordinates)
+        startLocationCrawl(items: items, metadata: metadata)
     }
 
     func restartLocationCrawl(items: [PhotoItem], metadata: any PhotoMetadataProvider) {

@@ -59,6 +59,24 @@ final class ViewerTitleMetadataCoordinatorTests: XCTestCase {
         let requestedNodeIDs = await metadata.requestedNodeIDs()
         XCTAssertEqual(requestedNodeIDs, Set(["n1", "n2", "n3"]))
     }
+
+    @MainActor
+    func testCancelledPrivacyResolutionCanResolveAfterReenabling() async {
+        let places = TogglePlaceResolver()
+        let item = PhotoItem(
+            uid: PhotoUID(volumeID: "v", nodeID: "n0"), captureTime: .distantPast, mediaType: "image/jpeg")
+        let coordinator = ViewerTitleMetadataCoordinator(
+            metadataProvider: MetadataProvider(), placeNameResolver: places)
+
+        let disabled = await coordinator.resolve(item)
+        XCTAssertNil(disabled.placeName)
+        await places.enable()
+        let cached = await coordinator.resolve(item)
+        XCTAssertNil(cached.placeName, "cached disabled result is the negative control")
+        coordinator.cancelAll()
+        let refreshed = await coordinator.resolve(item)
+        XCTAssertEqual(refreshed.placeName, "48.0,16.2")
+    }
 }
 
 private actor MetadataProvider: PhotoMetadataProvider {
@@ -76,5 +94,15 @@ private actor MetadataProvider: PhotoMetadataProvider {
 private actor PlaceResolver: PlaceNameResolving {
     func placeName(latitude: Double, longitude: Double) async -> String? {
         String(format: "%.1f,%.1f", latitude, longitude)
+    }
+}
+
+private actor TogglePlaceResolver: PlaceNameResolving {
+    private var enabled = false
+
+    func enable() { enabled = true }
+
+    func placeName(latitude: Double, longitude: Double) async -> String? {
+        enabled ? String(format: "%.1f,%.1f", latitude, longitude) : nil
     }
 }

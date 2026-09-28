@@ -23,8 +23,16 @@ public final class PhotoMapPrewarmer {
     private static let logger = Logger(subsystem: "at.oncloud.encryptedmemories", category: "Map")
     private var snapshotter: MKMapSnapshotter?
     private var prewarmedRect: MKMapRect?
+    private let defaults: UserDefaults
+    var isPrewarming: Bool { snapshotter != nil }
 
-    public init() {}
+    public init(defaults: UserDefaults = .standard) { self.defaults = defaults }
+
+    public func cancel() {
+        snapshotter?.cancel()
+        snapshotter = nil
+        prewarmedRect = nil
+    }
 
     /// Called by the map loader whenever the map's size changes.
     nonisolated static func rememberViewport(_ size: CGSize, defaults: UserDefaults = .standard) {
@@ -40,7 +48,11 @@ public final class PhotoMapPrewarmer {
     }
 
     public func prewarm(coordinates: [PhotoCoordinate]) {
-        guard let viewportSize = Self.rememberedViewport(),
+        guard MapAndPlacesPolicy.isEnabled(defaults: defaults) else {
+            cancel()
+            return
+        }
+        guard let viewportSize = Self.rememberedViewport(defaults: defaults),
             let rect = PhotoMapAnnotationLoader.denseCoreMapRect(for: coordinates),
             let visible = Self.visibleMapRect(framing: rect, in: viewportSize),
             !(prewarmedRect.map { MKMapRectEqualToRect($0, visible) } ?? false)
