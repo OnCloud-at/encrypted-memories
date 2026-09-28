@@ -139,7 +139,7 @@ import Testing
         #expect(entry.isReleaseReady)
     }
 
-    @Test func retiredV2ModelIsValidatedButNotSelectable() throws {
+    @Test func retiredV2ModelStaysUsableButIsNeverOfferedAnew() throws {
         let id = MLModelID.tinyCLIPVit40M
         let document = MLRemoteModelCatalogDocumentV2(
             catalogSequence: 8,
@@ -151,7 +151,69 @@ import Testing
             allowedBaseURL: baseURL
         ).resolve(document)
 
-        #expect(catalog.entry(for: id) == nil)
+        let entry = try #require(catalog.entry(for: id), "a person who uses the model keeps it")
+        #expect(entry.isRetired)
+        #expect(entry.downloadPlan?.revision == "artifact-revision-2")
+        #expect(catalog.entries.filter { $0.id == id }.count == 1, "the retired entry replaces the built-in one")
+        for allowsDeveloperModels in [false, true] {
+            #expect(!catalog.selectableEntries(allowsDeveloperModels: allowsDeveloperModels).contains { $0.id == id })
+            #expect(
+                catalog.selectableEntries(allowsDeveloperModels: allowsDeveloperModels, keeping: id).contains {
+                    $0.id == id
+                })
+        }
+    }
+
+    @Test func unknownRecipesAreSkippedAndTheKnownModelsStillUpdate() throws {
+        let known = MLModelID("tinyclip-next")
+        let future = MLModelID("future-family")
+        let document = MLRemoteModelCatalogDocumentV2(
+            catalogSequence: 9,
+            models: [
+                v2Model(id: future, compatibilityKey: "future-dual-encoder-v9"),
+                v2Model(id: known),
+                v2Model(id: .sigLIP2Base256, compatibilityKey: "future-dual-encoder-v9"),
+            ]
+        )
+
+        let catalog = try MLRemoteModelCatalogResolver(
+            trustedCatalog: .builtIn,
+            allowedBaseURL: baseURL
+        ).resolve(document)
+
+        #expect(catalog.entry(for: known)?.downloadPlan?.revision == "artifact-revision-2")
+        #expect(catalog.entry(for: future) == nil)
+        #expect(
+            catalog.entry(for: .sigLIP2Base256) == MLModelCatalog.builtIn.entry(for: .sigLIP2Base256),
+            "a skipped entry never removes the built-in model of the same ID")
+    }
+
+    @Test func aCatalogWithOnlyUnknownRecipesResolvesToTheBuiltInModels() throws {
+        let document = MLRemoteModelCatalogDocumentV2(
+            catalogSequence: 10,
+            models: [v2Model(id: MLModelID("future-family"), compatibilityKey: "future-dual-encoder-v9")]
+        )
+
+        let catalog = try MLRemoteModelCatalogResolver(
+            trustedCatalog: .builtIn,
+            allowedBaseURL: baseURL
+        ).resolve(document)
+
+        #expect(catalog == MLModelCatalog.builtIn)
+    }
+
+    @Test func anEmptyRecipeKeyStillRejectsTheCatalog() {
+        let document = MLRemoteModelCatalogDocumentV2(
+            catalogSequence: 11,
+            models: [v2Model(id: MLModelID("no-recipe"), compatibilityKey: "")]
+        )
+
+        #expect(throws: MLRemoteModelCatalogError.unknownCompatibilityRecipe("")) {
+            _ = try MLRemoteModelCatalogResolver(
+                trustedCatalog: .builtIn,
+                allowedBaseURL: baseURL
+            ).resolve(document)
+        }
     }
 
     @Test func retiredV2ModelStillValidatesItsArtifactPlan() {
@@ -266,6 +328,7 @@ import Testing
     private func v2Model(
         id: MLModelID,
         availability: MLRemoteModelCatalogDocumentV2.Availability? = nil,
+        compatibilityKey: String = "clip-dual-encoder-v1",
         releaseSequence: UInt64 = 1,
         revision: String = "artifact-revision-2",
         sourceRevision: String = String(repeating: "b", count: 40),
@@ -274,7 +337,7 @@ import Testing
         .init(
             id: id,
             availability: availability,
-            compatibilityKey: "clip-dual-encoder-v1",
+            compatibilityKey: compatibilityKey,
             releaseSequence: releaseSequence,
             revision: revision,
             descriptor: .init(
