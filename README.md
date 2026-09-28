@@ -85,13 +85,32 @@ boundaries and are not a stable third-party library API.
 
 ## Security
 
-- Sign-in uses Proton's web flow. The app does not collect the user's Proton password.
-- Session credentials are stored in the platform Keychain with device-only accessibility.
-- The SDK's unified cache is account-scoped and encrypted with a dedicated 32-byte derived key.
-  Legacy plaintext SDK databases are removed during launch.
-- Local thumbnails, previews, originals, account metadata, location data, and ML vectors are encrypted at rest.
-- Video playback stores Proton-encrypted blocks on disk and decrypts requested ranges in memory.
-- Decrypted originals are written only when the user exports or shares them.
+Proton Drive's end-to-end encryption protects your photos in Proton Drive. Encrypted Memories adds protection for the data that it keeps on your device.
+
+**Sign-in and keys**
+
+- Sign-in uses Proton's web sign-in (session fork). Proton's sign-in page opens in the system authentication sheet. You enter your password and two-factor code only there, and the app cannot read that page. The app never receives your Proton password.
+- After sign-in, Proton gives the app a session for this device. The session includes the key password that unlocks your account's encryption keys, because every client that decrypts on the device needs it.
+- The session is stored in the Keychain on this device only, without iCloud sync. Signing out deletes it.
+- Proton Drive content is encrypted and decrypted on the device through Proton's official Drive SDK. The SDK's cache of decrypted keys stays in memory.
+
+**Data on the device**
+
+- Thumbnails, previews, offline originals, the location index, Smart Search data (vectors and recognized text), and cached Proton account data are encrypted at rest with AES-GCM. The key is derived per account from the session.
+- Video playback stores Proton-encrypted blocks on disk and decrypts the requested ranges in memory.
+- The app does not encrypt its library and backup bookkeeping databases. They hold photo IDs, capture times, media types, and dimensions, and for backups also local filenames and file hashes. They hold no photos. FileVault or iOS Data Protection and the app sandbox protect them.
+- Decrypted photos are written to disk only when you share, drag out, or export them. The app removes its temporary share and drag files automatically.
+
+**Network**
+
+- The app connects to Proton for sign-in and for Proton Drive.
+- When you turn on Smart Search, the app downloads the model catalog and the model from `models.oncloud.at`. These requests contain no photos and no search text. Smart Search runs on the device.
+- Map tiles and place names come from Apple Maps. Place names in the viewer and on the map send the photo's coordinates. Search suggestions send a location rounded to about 1 km.
+- There is no analytics, crash reporting, or tracking. The Proton Drive SDK's telemetry callback discards all events.
+
+**Build and platform**
+
+- The source code is public, and GitHub Actions builds the releases. The builds are not reproducible yet, so you trust the published release to match the source.
 - Release builds do not write file debug logs. Runtime-gated unified logging is disabled unless explicitly enabled for a local investigation.
 - The macOS app uses App Sandbox, outgoing network access, and user-selected file access. Hardened Runtime remains enabled without JIT or unsigned executable memory.
 
