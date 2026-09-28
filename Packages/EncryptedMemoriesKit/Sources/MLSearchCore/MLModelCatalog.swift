@@ -272,6 +272,9 @@ public struct MLModelCatalogEntry: Sendable, Equatable, Identifiable {
     /// Optional on-device evidence for the exact hosted revision. When supplied, stale or failed
     /// evidence keeps the entry out of Release.
     public let releaseQualification: MLModelReleaseQualification?
+    /// The signed catalog retired this model. A person who already uses it keeps it; it is never offered
+    /// for a new choice.
+    public let isRetired: Bool
 
     public init(
         id: MLModelID,
@@ -296,7 +299,8 @@ public struct MLModelCatalogEntry: Sendable, Equatable, Identifiable {
         ),
         estimatedInstalledBytes: Int64,
         downloadPlan: MLModelDownloadPlan?,
-        releaseQualification: MLModelReleaseQualification? = nil
+        releaseQualification: MLModelReleaseQualification? = nil,
+        isRetired: Bool = false
     ) {
         self.id = id
         self.compatibilityKey = compatibilityKey
@@ -317,6 +321,7 @@ public struct MLModelCatalogEntry: Sendable, Equatable, Identifiable {
         self.estimatedInstalledBytes = estimatedInstalledBytes
         self.downloadPlan = downloadPlan
         self.releaseQualification = releaseQualification
+        self.isRetired = isRetired
     }
 
     /// A model is downloadable only with a pinned plan AND a license that permits both
@@ -358,7 +363,8 @@ public struct MLModelCatalogEntry: Sendable, Equatable, Identifiable {
             localizedMetadata: localizedMetadata,
             estimatedInstalledBytes: estimatedInstalledBytes,
             downloadPlan: plan,
-            releaseQualification: qualification
+            releaseQualification: qualification,
+            isRetired: isRetired
         )
     }
 
@@ -383,7 +389,8 @@ public struct MLModelCatalogEntry: Sendable, Equatable, Identifiable {
             localizedMetadata: localizedMetadata,
             estimatedInstalledBytes: estimatedInstalledBytes,
             downloadPlan: downloadPlan,
-            releaseQualification: releaseQualification
+            releaseQualification: releaseQualification,
+            isRetired: isRetired
         )
     }
 }
@@ -403,13 +410,28 @@ public struct MLModelCatalog: Sendable, Equatable {
         entries.first { $0.id == id }
     }
 
-    /// Entries this environment may select. Release builds require a signed immutable download
+    /// Entries this environment may choose now. Release builds require a signed immutable download
     /// plan, production track and a license permitting product use. Developer environments
-    /// additionally see local-artifact entries.
+    /// additionally see local-artifact entries. Retired entries are never offered.
     public func selectableEntries(allowsDeveloperModels: Bool) -> [MLModelCatalogEntry] {
-        allowsDeveloperModels
-            ? entries
-            : entries.filter(\.isReleaseReady)
+        entries.filter { !$0.isRetired && isUsable($0, allowsDeveloperModels: allowsDeveloperModels) }
+    }
+
+    /// The choices plus the model already selected, even when the catalog retired it, so the current
+    /// choice stays visible.
+    public func selectableEntries(
+        allowsDeveloperModels: Bool,
+        keeping selectedID: MLModelID?
+    ) -> [MLModelCatalogEntry] {
+        entries.filter { entry in
+            isUsable(entry, allowsDeveloperModels: allowsDeveloperModels)
+                && (!entry.isRetired || entry.id == selectedID)
+        }
+    }
+
+    /// Whether this environment can run the entry at all, retired or not.
+    public func isUsable(_ entry: MLModelCatalogEntry, allowsDeveloperModels: Bool) -> Bool {
+        allowsDeveloperModels || entry.isReleaseReady
     }
 }
 
