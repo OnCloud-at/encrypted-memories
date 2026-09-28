@@ -111,6 +111,24 @@ final class MobileLibraryUITests: XCTestCase {
         return false
     }
 
+    func testPrivacySwitchHidesTheMapTab() {
+        XCTAssertTrue(firstPhoto.waitForExistence(timeout: 60))
+        XCTAssertTrue(app.tabBars.buttons["Map"].exists)
+
+        app.buttons["Proton Account and Settings"].tap()
+        app.buttons["Privacy"].tap()
+        let mapSwitch = app.switches["Map and Places"]
+        XCTAssertTrue(mapSwitch.waitForExistence(timeout: 5))
+        XCTAssertEqual(mapSwitch.value as? String, "1")
+        mapSwitch.coordinate(withNormalizedOffset: CGVector(dx: 0.9, dy: 0.5)).tap()
+        XCTAssertTrue(wait(for: mapSwitch, "value == '0'"))
+        app.buttons["Settings"].tap()
+        app.buttons["Done"].tap()
+
+        XCTAssertTrue(wait(for: app.tabBars.buttons["Map"], "exists == false"))
+        XCTAssertTrue(app.tabBars.buttons["Library"].exists)
+    }
+
     private func wait(for element: XCUIElement, _ predicate: String, timeout: TimeInterval = 5) -> Bool {
         let expectation = XCTNSPredicateExpectation(predicate: NSPredicate(format: predicate), object: element)
         return XCTWaiter.wait(for: [expectation], timeout: timeout) == .completed

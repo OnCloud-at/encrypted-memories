@@ -19,6 +19,8 @@ import VisionKit
 /// titles, video-playback and pinch-to-close semantics come from shared `PhotoViewerCore` and the shared
 /// backend - no viewer business logic is reimplemented per platform.
 struct MobilePhotoViewer: View {
+    @AppStorage(AppSettingsKey.mapAndPlacesEnabled) private var mapAndPlacesEnabled =
+        AppSettingsDefault.mapAndPlacesEnabled
     let items: [PhotoItem]
     let startIndex: Int
     let context: ViewerCollectionContext
@@ -217,6 +219,10 @@ struct MobilePhotoViewer: View {
         .task(id: metadataTaskID) {
             await resolveCurrentTitleMetadata()
         }
+        .onChange(of: mapAndPlacesEnabled) { _, _ in
+            titleMetadataCoordinator.cancelAll()
+            metadataRequestGeneration &+= 1
+        }
         // A native inspector: a trailing column beside the media in regular iPad windows, the familiar sheet in
         // compact widths. The immersive viewer, its pager and its gestures stay mounted in both cases.
         .inspector(isPresented: $showInfo) {
@@ -228,7 +234,7 @@ struct MobilePhotoViewer: View {
                     canLoadAlbumMemberships: libraryModel.facade?.albums != nil,
                     isLoadingAlbumMemberships: isLoadingAlbumMemberships,
                     albumMembershipsLoadFailed: albumMembershipsLoadFailed,
-                    placeName: titleMetadataState.resolution?.placeName,
+                    placeName: mapAndPlacesEnabled ? titleMetadataState.resolution?.placeName : nil,
                     onRetry: retryCurrentMetadata,
                     onClose: { showInfo = false }
                 )
@@ -415,10 +421,11 @@ struct MobilePhotoViewer: View {
             captureDate: current.captureTime,
             index: index,
             total: items.count,
-            locationName: titleMetadataState.resolution?.placeName,
-            locationIsResolving: titleMetadataState.shouldReservePlaceNameLine(
-                hasKnownLocation: libraryModel.locationIndex.hasKnownLocation(current.uid)
-            ),
+            locationName: mapAndPlacesEnabled ? titleMetadataState.resolution?.placeName : nil,
+            locationIsResolving: mapAndPlacesEnabled
+                && titleMetadataState.shouldReservePlaceNameLine(
+                    hasKnownLocation: libraryModel.locationIndex.hasKnownLocation(current.uid)
+                ),
             filename: metadataLoadState.metadata?.filename
         )
     }

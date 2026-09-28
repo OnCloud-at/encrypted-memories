@@ -1,4 +1,5 @@
 import Foundation
+import PhotosCore
 
 #if DEBUG
     /// Starts the app signed in to the offline fixture account when a UI test passes `fixtureArgument`.
@@ -18,6 +19,7 @@ import Foundation
         /// Waits for the session check at launch, so it cannot replace the fixture session afterward.
         static func installFixtureIfRequested(into runtime: MobileAccountRuntime) async {
             guard isRequested, fixture == nil else { return }
+            UserDefaults.standard.removeObject(forKey: AppSettingsKey.mapAndPlacesEnabled)
             for await isChecking in runtime.sessionModel.$isCheckingSession.values where !isChecking {
                 break
             }

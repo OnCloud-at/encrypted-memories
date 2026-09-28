@@ -4,6 +4,8 @@ import Foundation
 /// Centralised here (in the SDK-agnostic core) so the App glue and the test target share one
 /// source of truth - UserDefaults key strings drift silently otherwise.
 public enum AppSettingsKey {
+    /// Allows MapKit maps and Apple place lookup for library locations.
+    public static let mapAndPlacesEnabled = "EncryptedMemories.mapAndPlacesEnabled"
     /// Offline Photo Library master switch. When on, full-resolution originals viewed in the photo viewer are
     /// persisted to the encrypted on-disk `originals` cache so reopening them (even after relaunch / offline) is
     /// instant. Grid thumbnails are mandatory infrastructure and crawl independently of this toggle.
@@ -32,6 +34,7 @@ public enum AppSettingsKey {
 }
 
 public enum AppSettingsDefault {
+    public static let mapAndPlacesEnabled = true
     /// Offline Photo Library is **on by default**: viewed originals are kept locally (encrypted) up to the cap.
     /// Thumbnails are always crawled while signed in, regardless of this value.
     public static let offlineLibraryEnabled = true
@@ -41,6 +44,24 @@ public enum AppSettingsDefault {
     public static let offlineOriginalsCapGB = 5.0
     /// Auto-lock remains enabled unless the user explicitly opts in for a large foreground import.
     public static let keepDisplayAwakeDuringForegroundBackup = false
+}
+
+/// One shared admission rule for every location-to-Apple consumer.
+public enum MapAndPlacesPolicy {
+    public static func isEnabled(defaults: UserDefaults = .standard) -> Bool {
+        guard defaults.object(forKey: AppSettingsKey.mapAndPlacesEnabled) != nil else {
+            return AppSettingsDefault.mapAndPlacesEnabled
+        }
+        return defaults.bool(forKey: AppSettingsKey.mapAndPlacesEnabled)
+    }
+
+    public static func suggestionCoordinates(_ coordinates: [PhotoCoordinate], enabled: Bool) -> [PhotoCoordinate] {
+        enabled ? coordinates : []
+    }
+
+    public static func allowsLocationCrawl(enabled: Bool, itemCount: Int) -> Bool {
+        enabled && itemCount > 0
+    }
 }
 
 /// Pure admission rule for the iOS idle-timer adapter. Keeping this in Core makes the three
