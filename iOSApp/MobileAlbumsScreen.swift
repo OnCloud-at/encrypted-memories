@@ -568,7 +568,12 @@ private struct MobileFilterGridScreen: View {
 
     @ViewBuilder private var topTrailingToolbarAction: some View {
         if selection.isSelecting {
-            Button(L10n.string("action.done")) { selection.finish() }
+            Button {
+                selection.finish()
+            } label: {
+                MobileSelectionModeLabel(isSelecting: true)
+            }
+            .textBarItem()
         } else if case .album = filter {
             albumActionsMenu
         } else if filter == .trash, isEmptyingTrash {
@@ -578,7 +583,7 @@ private struct MobileFilterGridScreen: View {
                 Button {
                     selection.toggleMode()
                 } label: {
-                    Label(L10n.string("action.select"), systemImage: "checkmark.circle")
+                    MobileSelectionModeLabel(isSelecting: false)
                 }
                 .disabled(isRouteEmpty || phase != .loaded || isEmptyingTrash)
 
@@ -603,7 +608,7 @@ private struct MobileFilterGridScreen: View {
             Button {
                 selection.toggleMode()
             } label: {
-                Label(L10n.string("action.select"), systemImage: "checkmark.circle")
+                MobileSelectionModeLabel(isSelecting: false)
             }
             .disabled(snapshot.isEmpty || phase != .loaded)
 

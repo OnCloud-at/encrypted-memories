@@ -1,4 +1,5 @@
 import AlbumSyncCore
+import DesignSystemCore
 import PhotoLibraryBackupAdapter
 import PhotosCore
 import SwiftUI
@@ -252,14 +253,22 @@ private struct MobileAlbumPickerSheet: View {
             .searchable(text: $searchText, prompt: L10n.string("settings.albumsync_picker_search"))
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button(L10n.string("action.cancel")) { dismiss() }
+                    Button {
+                        dismiss()
+                    } label: {
+                        Label(L10n.string("action.cancel"), systemImage: "xmark")
+                    }
+                    .textBarItem()
                 }
                 .mobileVisibilityPriority(.high)
                 ToolbarItem(placement: .confirmationAction) {
-                    Button(L10n.string("settings.albumsync_picker_apply")) {
+                    Button {
                         controller.applySelection(draft)
                         dismiss()
+                    } label: {
+                        Label(L10n.string("settings.albumsync_picker_apply"), systemImage: "checkmark")
                     }
+                    .textBarItem()
                     .fontWeight(.semibold)
                     .disabled(!didLoad || draft == controller.selectedAlbumIDs)
                 }
