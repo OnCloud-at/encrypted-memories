@@ -21,7 +21,8 @@ public actor DragOutStager {
     private let safetyMarginBytes: Int64
     private let maxConcurrentWrites: Int
     private let runtimeState: LibraryRuntimeState
-    private let removeLocationWhenSharing: Bool
+    /// Read when a file is written, so a setting changed during a long drag applies to every later file.
+    private let removeLocationWhenSharing: @Sendable () -> Bool
 
     private enum JobState {
         case pending
@@ -50,7 +51,7 @@ public actor DragOutStager {
         safetyMarginBytes: Int64 = 128 * 1024 * 1024,
         maxConcurrentWrites: Int = 2,
         runtimeState: LibraryRuntimeState = .shared,
-        removeLocationWhenSharing: Bool = PrivacyExportPolicy.isEnabled()
+        removeLocationWhenSharing: @escaping @Sendable () -> Bool = { PrivacyExportPolicy.isEnabled() }
     ) {
         self.fileProvider = fileProvider
         self.stagingDirectory = stagingDirectory
@@ -225,7 +226,7 @@ public actor DragOutStager {
             let finalURL = await self.reserveFinalName(for: uid, downloadURL: destination)
             do {
                 try? FileManager.default.removeItem(at: finalURL)
-                if removeLocationWhenSharing {
+                if removeLocationWhenSharing() {
                     try await LocationSanitizedCopy.write(from: destination, to: finalURL)
                     try FileManager.default.removeItem(at: destination)
                 } else {

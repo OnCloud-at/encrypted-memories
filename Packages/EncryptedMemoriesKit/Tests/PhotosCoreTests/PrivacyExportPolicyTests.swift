@@ -36,6 +36,7 @@ final class PrivacyExportPolicyTests: XCTestCase {
 
             XCTAssertNotNil(gpsProperties(at: original), ext)
             XCTAssertNil(gpsProperties(at: shared), ext)
+            XCTAssertNil(iptcCity(at: shared), ext)
             XCTAssertEqual(lensModel(at: shared), Self.lensModel, ext)
             XCTAssertEqual(try Data(contentsOf: original), originalBytes, ext)
         }
@@ -103,6 +104,14 @@ final class PrivacyExportPolicyTests: XCTestCase {
     private static let livePhotoContentIdentifier = "6F1C1D2E-0000-4000-8000-00000000A11E"
     private static let lensModel = "Test lens"
 
+    private func iptcCity(at url: URL) -> String? {
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+            let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+            let iptc = properties[kCGImagePropertyIPTCDictionary] as? [CFString: Any]
+        else { return nil }
+        return iptc[kCGImagePropertyIPTCCity] as? String
+    }
+
     private func lensModel(at url: URL) -> String? {
         guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
             let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
@@ -147,9 +156,11 @@ final class PrivacyExportPolicyTests: XCTestCase {
             [
                 kCGImagePropertyGPSDictionary: gps, kCGImagePropertyMakerAppleDictionary: apple,
                 kCGImagePropertyExifDictionary: [kCGImagePropertyExifLensModel: Self.lensModel],
+                kCGImagePropertyIPTCDictionary: [kCGImagePropertyIPTCCity: "Test City"],
             ] as CFDictionary)
         XCTAssertTrue(CGImageDestinationFinalize(destination))
         XCTAssertNotNil(gpsProperties(at: url))
+        XCTAssertEqual(iptcCity(at: url), "Test City")
         XCTAssertEqual(stillContentIdentifier(at: url), Self.livePhotoContentIdentifier)
     }
 

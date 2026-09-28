@@ -59,7 +59,16 @@ public enum LocationSanitizedCopy {
         for index in 0..<CGImageSourceGetCount(output) {
             let properties = CGImageSourceCopyPropertiesAtIndex(output, index, nil) as? [CFString: Any]
             guard properties?[kCGImagePropertyGPSDictionary] == nil else { throw Failure.locationRemains }
+            let iptc = properties?[kCGImagePropertyIPTCDictionary] as? [CFString: Any] ?? [:]
+            guard Self.iptcPlaceKeys.allSatisfy({ iptc[$0] == nil }) else { throw Failure.locationRemains }
         }
+    }
+
+    private static var iptcPlaceKeys: [CFString] {
+        [
+            kCGImagePropertyIPTCCity, kCGImagePropertyIPTCSubLocation, kCGImagePropertyIPTCProvinceState,
+            kCGImagePropertyIPTCCountryPrimaryLocationName, kCGImagePropertyIPTCCountryPrimaryLocationCode,
+        ]
     }
 
     /// EXIF GPS tags, plus the place names that IPTC and Photoshop metadata can carry.
@@ -75,6 +84,20 @@ public enum LocationSanitizedCopy {
         default: return false
         }
     }
+
+    /// The location keys of QuickTime, 3GP, and common movie metadata.
+    private static let movieLocationIdentifiers: Set<AVMetadataIdentifier> = [
+        .commonIdentifierLocation,
+        .identifier3GPUserDataLocation,
+        .quickTimeUserDataLocationISO6709,
+        .quickTimeMetadataLocationISO6709,
+        .quickTimeMetadataLocationName,
+        .quickTimeMetadataLocationBody,
+        .quickTimeMetadataLocationNote,
+        .quickTimeMetadataLocationRole,
+        .quickTimeMetadataLocationDate,
+        .quickTimeMetadataLocationHorizontalAccuracyInMeters,
+    ]
 
     private static func writeMovie(from source: URL, to destination: URL) async throws {
         let fileType: AVFileType
@@ -92,14 +115,7 @@ public enum LocationSanitizedCopy {
         session.metadataItemFilter = .forSharing()
         try await session.export(to: destination, as: fileType)
         let outputMetadata = try await AVURLAsset(url: destination).load(.metadata)
-        let locationIdentifiers: Set<AVMetadataIdentifier> = [
-            .quickTimeMetadataLocationISO6709,
-            .quickTimeUserDataLocationISO6709,
-        ]
-        guard
-            !outputMetadata.contains(where: { item in
-                item.identifier.map(locationIdentifiers.contains) ?? false
-            })
+        guard !outputMetadata.contains(where: { $0.identifier.map(Self.movieLocationIdentifiers.contains) ?? false })
         else { throw Failure.locationRemains }
     }
 }
