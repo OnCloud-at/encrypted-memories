@@ -1,11 +1,14 @@
 import PhotosCore
+import PrivacyFeature
 import UIKit
+import os
 
 /// Covers one scene's complete window, including presented viewers and sheets, before iOS captures a preview.
 @MainActor
 final class MobilePrivacyPreviewShield {
     private weak var window: UIWindow?
-    private var blur: UIVisualEffectView?
+    private var preview: UIImageView?
+    private static let logger = Logger(subsystem: "at.oncloud.encryptedmemories", category: "PrivacyPreview")
 
     func update(enabled: Bool, isSceneActive: Bool, window: UIWindow?) {
         if self.window !== window {
@@ -19,22 +22,48 @@ final class MobilePrivacyPreviewShield {
             remove()
             return
         }
-        if let blur {
-            window.bringSubviewToFront(blur)
+        if let preview {
+            window.bringSubviewToFront(preview)
             return
         }
 
-        let effect = UIVisualEffectView(effect: UIBlurEffect(style: .systemMaterialLight))
-        effect.frame = window.bounds
-        effect.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-        effect.accessibilityElementsHidden = true
-        window.addSubview(effect)
-        blur = effect
+        let image = blurredSnapshot(of: window)
+        if image == nil {
+            Self.logger.error("Could not render the privacy preview; obscuring the window without an image.")
+        }
+        let cover = UIImageView(image: image)
+        cover.frame = window.bounds
+        cover.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        cover.contentMode = .scaleToFill
+        cover.backgroundColor = .systemBackground
+        cover.accessibilityElementsHidden = true
+        window.addSubview(cover)
+        preview = cover
+    }
+
+    private func blurredSnapshot(of window: UIWindow) -> UIImage? {
+        let bounds = window.bounds
+        guard bounds.width > 0, bounds.height > 0 else { return nil }
+        let scale = min(1, PrivacyPreviewImageRenderer.maximumDimension / max(bounds.width, bounds.height))
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        format.opaque = true
+        let renderer = UIGraphicsImageRenderer(
+            size: CGSize(width: bounds.width * scale, height: bounds.height * scale), format: format)
+        var complete = false
+        let snapshot = renderer.image { context in
+            context.cgContext.scaleBy(x: scale, y: scale)
+            complete = window.drawHierarchy(in: bounds, afterScreenUpdates: false)
+        }
+        guard complete, let source = snapshot.cgImage,
+            let blurred = PrivacyPreviewImageRenderer.render(source)
+        else { return nil }
+        return UIImage(cgImage: blurred)
     }
 
     func remove() {
-        blur?.removeFromSuperview()
-        blur = nil
+        preview?.removeFromSuperview()
+        preview = nil
     }
 }
 
