@@ -2138,6 +2138,95 @@ class RequestBudgetTests(unittest.TestCase):
         self.assertLessEqual(wire_bytes(requests[0]), limit)
 
 
+class RepositoryRulesTests(unittest.TestCase):
+    def test_rules_load_from_the_repository_documents(self) -> None:
+        rules = review_pull_request.load_repository_rules()
+
+        self.assertIsNotNone(rules)
+        self.assertIn("From CONTRIBUTING.md:\n## Architecture rules", rules)
+        self.assertIn("Put shared behavior in `Packages/EncryptedMemoriesKit`.", rules)
+        self.assertIn("From AGENTS.md:\n## Code", rules)
+        self.assertNotIn("## Tests", rules)
+        self.assertLessEqual(len(rules.encode("utf-8")), review_pull_request.MAX_REPOSITORY_RULES_BYTES)
+
+    def test_a_missing_or_oversized_section_disables_the_rules(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            (root / "AGENTS.md").write_text("# A\n\n## Code\n\n- Rule.\n", encoding="utf-8")
+            (root / "CONTRIBUTING.md").write_text("# C\n\n## Tests\n\n- Test.\n", encoding="utf-8")
+            self.assertIsNone(review_pull_request.load_repository_rules(root))
+
+            (root / "CONTRIBUTING.md").write_text(
+                "# C\n\n## Architecture rules\n\n- Shared.\n\n## Tests\n\n- Test.\n", encoding="utf-8")
+            rules = review_pull_request.load_repository_rules(root)
+            self.assertIn("- Shared.", rules)
+            self.assertNotIn("- Test.", rules)
+
+            (root / "AGENTS.md").write_text("## Code\n\n" + "x" * 7_000 + "\n", encoding="utf-8")
+            self.assertIsNone(review_pull_request.load_repository_rules(root))
+
+    def test_rules_are_off_unless_the_variable_enables_them(self) -> None:
+        for value, expected in (("", False), ("0", False), ("1", True), ("true", True), ("TRUE", True)):
+            with patch.dict("os.environ", {"LLM_REVIEW_REPOSITORY_RULES": value}, clear=True):
+                self.assertEqual(review_pull_request.repository_rules_enabled(), expected)
+
+    def test_rules_extend_the_system_prompt_and_count_against_the_request_budget(self) -> None:
+        files = [changed_file()]
+        _, baseline, _, _ = single_batch(pull_request(), files)
+        plan = review_pull_request.plan_review(
+            pull_request(), files, model="review-model", reasoning_effort=None, repository_rules="- Shared rule.")
+        with_rules, _, _ = review_pull_request.batch_request(plan, plan.batches[0])
+
+        self.assertEqual(baseline["messages"][0]["content"], review_pull_request.REVIEW_SYSTEM_PROMPT)
+        prompt = with_rules["messages"][0]["content"]
+        self.assertTrue(prompt.startswith(review_pull_request.REVIEW_SYSTEM_PROMPT))
+        self.assertIn("never blocking", prompt)
+        self.assertTrue(prompt.endswith("- Shared rule."))
+        self.assertGreater(wire_bytes(with_rules), wire_bytes(baseline))
+
+    def _verify_rule_violation(self, repository_rules: str | None) -> dict[str, object]:
+        import base64
+
+        files = [changed_file(filename="App/Views/MainView.swift")]
+        plan = review_pull_request.plan_review(
+            pull_request(), files, model="review-model", reasoning_effort=None, repository_rules=repository_rules)
+        payload, _, paths = review_pull_request.batch_request(plan, plan.batches[0])
+        source_text = "let total = items.reduce(0, +)\n"
+        source = {"type": "file", "encoding": "base64", "size": len(source_text),
+                  "content": base64.b64encode(source_text.encode()).decode()}
+        candidate = {"severity": "warning", "file_id": "file-001", "path": paths["file-001"], "line": 1,
+                     "title": "Shared logic in the app target", "detail": "The sum belongs in the package."}
+        decision = {
+            "id": "0", "decision": "confirmed", "severity": "high", "category": "repository_rule",
+            "confidence": "high", "introduced": True, "line": 1, "quote": "let total",
+            "trigger": "The Mac app target adds library logic.", "impact": "iOS would duplicate it.",
+            "counterevidence": "No package type provides it.", "missing_context": "",
+        }
+        prompts: list[str] = []
+
+        def request(verification, validator):
+            prompts.append(verification["messages"][0]["content"])
+            return validator(json.dumps({"decisions": [decision]}))
+
+        return {"prompts": prompts, "result": review_evidence.verify_findings(
+            valid_review(findings=[candidate]), payload, files,
+            review_pull_request.pull_request_snapshot(pull_request()), "example/repo",
+            token="token", api_url="https://api.github.test", fetch=lambda *_, **__: source,
+            redact=lambda text: [{"line": index, "text": line} for index, line in enumerate(text.splitlines(), 1)],
+            request=request, repository_rules=repository_rules)}
+
+    def test_a_confirmed_rule_violation_publishes_as_a_warning_only(self) -> None:
+        verified = self._verify_rule_violation("- Shared rule.")
+
+        self.assertIn("Repository rules from the trusted default branch", verified["prompts"][0])
+        self.assertTrue(verified["prompts"][0].endswith("- Shared rule."))
+        self.assertEqual([item["severity"] for item in verified["result"]["findings"]], ["warning"])
+
+    def test_without_rules_the_verifier_rejects_the_rule_category(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "Invalid verification enum"):
+            self._verify_rule_violation(None)
+
+
 class ContextLimitTests(unittest.TestCase):
     url = "https://api.example.test/v1/chat/completions"
 
