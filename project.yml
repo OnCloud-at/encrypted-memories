@@ -89,6 +89,8 @@ targets:
       - package: EncryptedMemoriesKit
         product: MapFeature
       - package: EncryptedMemoriesKit
+        product: PrivacyFeature
+      - package: EncryptedMemoriesKit
         product: MLSearchCore
       - package: EncryptedMemoriesKit
         product: MLSearchAppleAdapter
@@ -137,6 +139,8 @@ targets:
     dependencies:
       - package: EncryptedMemoriesKit
         product: PhotosCore
+      - package: EncryptedMemoriesKit
+        product: PrivacyFeature
       - package: EncryptedMemoriesKit
         product: LibraryRuntimeAppleAdapter
       - package: EncryptedMemoriesKit

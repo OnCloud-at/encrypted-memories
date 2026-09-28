@@ -9,6 +9,8 @@ import SwiftUI
 /// Metadata and album membership are supplied by the viewer so this view only owns presentation. The
 /// shared `PhotoMetadataLoadState` remains the single source of truth for the metadata request lifecycle.
 struct MobileViewerInfoSheet: View {
+    @AppStorage(AppSettingsKey.mapAndPlacesEnabled) private var mapAndPlacesEnabled =
+        AppSettingsDefault.mapAndPlacesEnabled
     let item: PhotoItem
     let metadataLoadState: PhotoMetadataLoadState
     let albumTitles: [String]
@@ -143,31 +145,33 @@ struct MobileViewerInfoSheet: View {
     private var locationSection: some View {
         if placeName != nil || metadata?.hasLocation == true {
             VStack(alignment: .leading, spacing: 10) {
-                if let placeName = nonEmpty(placeName) {
+                if mapAndPlacesEnabled, let placeName = nonEmpty(placeName) {
                     Label(placeName, systemImage: "mappin.and.ellipse")
                         .font(.headline)
                         .fixedSize(horizontal: false, vertical: true)
                 }
 
                 if let latitude = metadata?.latitude, let longitude = metadata?.longitude {
-                    let coordinate = CLLocationCoordinate2D(latitude: latitude, longitude: longitude)
-                    let mapTitle = placeName ?? L10n.string("map.cluster_title")
-                    Map(
-                        initialPosition: .region(
-                            MKCoordinateRegion(
-                                center: coordinate,
-                                span: MKCoordinateSpan(latitudeDelta: 0.01, longitudeDelta: 0.01)
-                            ))
-                    ) {
-                        Marker(mapTitle, coordinate: coordinate)
+                    if mapAndPlacesEnabled {
+                        let coordinate = CLLocationCoordinate2D(latitude: latitude, longitude: longitude)
+                        let mapTitle = placeName ?? L10n.string("map.cluster_title")
+                        Map(
+                            initialPosition: .region(
+                                MKCoordinateRegion(
+                                    center: coordinate,
+                                    span: MKCoordinateSpan(latitudeDelta: 0.01, longitudeDelta: 0.01)
+                                ))
+                        ) {
+                            Marker(mapTitle, coordinate: coordinate)
+                        }
+                        .frame(maxWidth: .infinity)
+                        .aspectRatio(1.55, contentMode: .fit)
+                        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                        .accessibilityElement(children: .ignore)
+                        .accessibilityLabel(
+                            Text("\(mapTitle), \(coordinateText(latitude: latitude, longitude: longitude))")
+                        )
                     }
-                    .frame(maxWidth: .infinity)
-                    .aspectRatio(1.55, contentMode: .fit)
-                    .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-                    .accessibilityElement(children: .ignore)
-                    .accessibilityLabel(
-                        Text("\(mapTitle), \(coordinateText(latitude: latitude, longitude: longitude))")
-                    )
 
                     Text(coordinateText(latitude: latitude, longitude: longitude))
                         .font(.subheadline.monospacedDigit())
@@ -253,6 +257,6 @@ struct MobileViewerInfoSheet: View {
     }
 
     private func coordinateText(latitude: Double, longitude: Double) -> String {
-        "\(latitude.formatted(.number.precision(.fractionLength(6)))), \(longitude.formatted(.number.precision(.fractionLength(6))))"
+        PhotoCoordinateText.format(latitude: latitude, longitude: longitude)
     }
 }
