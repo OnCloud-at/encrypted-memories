@@ -46,6 +46,41 @@ public struct TimelineSearchDiscoveryResult: Equatable, Sendable {
     }
 }
 
+/// Metadata rows with their matching photos, before previews are chosen. They depend only on the photos, the
+/// favorites, the calendar day, and the locale of the context. A caller can build them once and choose the
+/// previews for each state of the sensitive gate with `librarySuggestions(rows:context:)`.
+public struct TimelineSearchLibraryRows: Sendable {
+    struct Row: Sendable {
+        let id: String
+        let title: String
+        let subtitle: String?
+        let systemImage: String
+        let kind: TimelineSearchSuggestionKind
+        let matches: [PhotoItem]
+
+        func suggestion(context: TimelineSearchDiscoveryContext) -> TimelineSearchSuggestion {
+            TimelineSearchSuggestion(
+                id: id,
+                query: title,
+                title: title,
+                subtitle: subtitle,
+                systemImage: systemImage,
+                kind: kind,
+                matchingUIDs: Set(matches.map(\.uid)),
+                representativeUIDs: TimelineSearchDiscovery.representatives(for: matches, context: context)
+            )
+        }
+    }
+
+    let forYou: [Row]
+    let chips: [Row]
+
+    init(forYou: [Row] = [], chips: [Row] = []) {
+        self.forYou = forYou
+        self.chips = chips
+    }
+}
+
 public enum TimelineSearchSeason: Int, CaseIterable, Sendable {
     case spring
     case summer
@@ -122,40 +157,60 @@ extension TimelineSearchDiscovery {
         sections: [TimelineSection],
         context: TimelineSearchDiscoveryContext
     ) -> TimelineSearchDiscoveryResult {
+        librarySuggestions(rows: libraryRows(sections: sections, context: context), context: context)
+    }
+
+    /// The metadata families of `librarySuggestions(sections:context:)` without previews. This is the expensive
+    /// part: it reads every photo. Empty when the task is cancelled.
+    public static func libraryRows(
+        sections: [TimelineSection],
+        context: TimelineSearchDiscoveryContext
+    ) -> TimelineSearchLibraryRows {
         var items: [PhotoItem] = []
         items.reserveCapacity(sections.reduce(0) { $0 + $1.items.count })
         for section in sections {
-            guard !Task.isCancelled else { return TimelineSearchDiscoveryResult() }
+            guard !Task.isCancelled else { return TimelineSearchLibraryRows() }
             items.append(contentsOf: section.items)
         }
-        guard !items.isEmpty else { return TimelineSearchDiscoveryResult() }
+        guard !items.isEmpty else { return TimelineSearchLibraryRows() }
         items.sort { $0.captureTime < $1.captureTime }
 
-        var forYou: [TimelineSearchSuggestion] = []
-        forYou.append(contentsOf: onThisDaySuggestions(items: items, context: context))
-        guard !Task.isCancelled else { return TimelineSearchDiscoveryResult() }
-        forYou.append(contentsOf: tripSuggestions(items: items, context: context))
-        guard !Task.isCancelled else { return TimelineSearchDiscoveryResult() }
-        forYou.append(contentsOf: seasonSuggestions(items: items, context: context))
-        if let favorites = favoritesYearSuggestion(items: items, context: context) {
+        var forYou: [TimelineSearchLibraryRows.Row] = []
+        forYou.append(contentsOf: onThisDayRows(items: items, context: context))
+        guard !Task.isCancelled else { return TimelineSearchLibraryRows() }
+        forYou.append(contentsOf: tripRows(items: items, context: context))
+        guard !Task.isCancelled else { return TimelineSearchLibraryRows() }
+        forYou.append(contentsOf: seasonRows(items: items, context: context))
+        if let favorites = favoritesYearRow(items: items, context: context) {
             forYou.append(favorites)
         }
-        guard !Task.isCancelled else { return TimelineSearchDiscoveryResult() }
-        return TimelineSearchDiscoveryResult(
+        guard !Task.isCancelled else { return TimelineSearchLibraryRows() }
+        return TimelineSearchLibraryRows(
             forYou: forYou,
-            chips: mediaTypeSuggestions(items: items, sections: sections, context: context)
+            chips: mediaTypeRows(items: items, sections: sections, context: context)
+        )
+    }
+
+    /// Adds the previews that `context` allows to rows from `libraryRows(sections:context:)`.
+    public static func librarySuggestions(
+        rows: TimelineSearchLibraryRows,
+        context: TimelineSearchDiscoveryContext
+    ) -> TimelineSearchDiscoveryResult {
+        TimelineSearchDiscoveryResult(
+            forYou: rows.forYou.map { $0.suggestion(context: context) },
+            chips: rows.chips.map { $0.suggestion(context: context) }
         )
     }
 
     /// "One year ago", "3 years ago": the same local calendar day plus or minus three days in earlier years.
-    static func onThisDaySuggestions(
+    static func onThisDayRows(
         items: [PhotoItem],
         context: TimelineSearchDiscoveryContext,
         limit: Int = 2
-    ) -> [TimelineSearchSuggestion] {
+    ) -> [TimelineSearchLibraryRows.Row] {
         let calendar = context.calendar
         guard let earliest = items.first?.captureTime else { return [] }
-        var result: [TimelineSearchSuggestion] = []
+        var result: [TimelineSearchLibraryRows.Row] = []
         for yearsAgo in 1...30 {
             guard result.count < limit,
                 let anchor = calendar.date(byAdding: .year, value: -yearsAgo, to: context.now)
@@ -169,14 +224,13 @@ extension TimelineSearchDiscovery {
             guard matches.count >= minimumRowMatches else { continue }
             let title = L10n.string("search.suggestion.years_ago \(yearsAgo)")
             result.append(
-                suggestion(
+                row(
                     id: "on-this-day:\(yearsAgo)",
                     title: title,
                     subtitle: subtitle(date: anchorDay, count: matches.count, context: context),
                     systemImage: "clock.arrow.circlepath",
                     kind: .onThisDay,
-                    matches: matches,
-                    context: context
+                    matches: matches
                 ))
         }
         return result
@@ -184,13 +238,13 @@ extension TimelineSearchDiscovery {
 
     /// Unusually dense runs of days. A trip is at least `minimumDayCount` items on a day, merged with
     /// adjacent dense days, and needs `minimumTripCount` items in total.
-    static func tripSuggestions(
+    static func tripRows(
         items: [PhotoItem],
         context: TimelineSearchDiscoveryContext,
         limit: Int = 2,
         minimumDayCount: Int = 15,
         minimumTripCount: Int = 25
-    ) -> [TimelineSearchSuggestion] {
+    ) -> [TimelineSearchLibraryRows.Row] {
         let calendar = context.calendar
         var itemsByDay: [Date: [PhotoItem]] = [:]
         for item in items {
@@ -235,26 +289,25 @@ extension TimelineSearchDiscovery {
                 trip.days.count == 1
                 ? dayFormatter.string(from: first)
                 : intervalFormatter.string(from: first, to: last)
-            return suggestion(
+            return row(
                 id: "trip:\(Int(first.timeIntervalSince1970))",
                 title: title,
                 subtitle: countText(trip.matches.count),
                 systemImage: "suitcase",
                 kind: .trip,
-                matches: trip.matches,
-                context: context
+                matches: trip.matches
             )
         }
     }
 
     /// The densest past seasons, for example "Summer 2024". The current season is skipped because the
     /// newest photos are already at the top of the library.
-    static func seasonSuggestions(
+    static func seasonRows(
         items: [PhotoItem],
         context: TimelineSearchDiscoveryContext,
         limit: Int = 2,
         minimumCount: Int = 20
-    ) -> [TimelineSearchSuggestion] {
+    ) -> [TimelineSearchLibraryRows.Row] {
         let calendar = context.calendar
         struct SeasonKey: Hashable {
             let season: TimelineSearchSeason
@@ -282,24 +335,23 @@ extension TimelineSearchDiscovery {
                 group.key.season == .winter
                 ? "\(group.key.year - 1)/\(String(format: "%02d", group.key.year % 100))"
                 : "\(group.key.year)"
-            return suggestion(
+            return row(
                 id: "season:\(group.key.season.rawValue):\(group.key.year)",
                 title: "\(group.key.season.title) \(yearLabel)",
                 subtitle: countText(group.value.count),
                 systemImage: seasonSymbol(group.key.season),
                 kind: .season,
-                matches: group.value,
-                context: context
+                matches: group.value
             )
         }
     }
 
     /// "Favorites from 2025" for the most recent year that has enough favorites.
-    static func favoritesYearSuggestion(
+    static func favoritesYearRow(
         items: [PhotoItem],
         context: TimelineSearchDiscoveryContext,
         minimumCount: Int = 6
-    ) -> TimelineSearchSuggestion? {
+    ) -> TimelineSearchLibraryRows.Row? {
         guard !context.favoriteUIDs.isEmpty else { return nil }
         var byYear: [Int: [PhotoItem]] = [:]
         for item in items where context.favoriteUIDs.contains(item.uid) {
@@ -308,24 +360,23 @@ extension TimelineSearchDiscovery {
         guard let year = byYear.keys.sorted(by: >).first(where: { (byYear[$0]?.count ?? 0) >= minimumCount }),
             let matches = byYear[year]
         else { return nil }
-        return suggestion(
+        return row(
             id: "favorites:\(year)",
             title: L10n.string("search.suggestion.favorites_year \(String(year))"),
             subtitle: countText(matches.count),
             systemImage: "heart",
             kind: .favorites,
-            matches: matches,
-            context: context
+            matches: matches
         )
     }
 
     /// Media-type shortcuts. A type is shown only when it exists and does not dominate the library, because a
     /// filter that matches almost everything carries no information.
-    static func mediaTypeSuggestions(
+    static func mediaTypeRows(
         items: [PhotoItem],
         sections: [TimelineSection],
         context: TimelineSearchDiscoveryContext
-    ) -> [TimelineSearchSuggestion] {
+    ) -> [TimelineSearchLibraryRows.Row] {
         let searchContext = TimelineSearchContext(favoriteUIDs: context.favoriteUIDs)
         let lexical: [(PhotoTag, String, String)] = [
             (.favorites, "favorites", "heart"),
@@ -334,11 +385,11 @@ extension TimelineSearchDiscovery {
             (.selfies, "selfies", "person.crop.square"),
             (.raw, "raw", "r.square"),
         ]
-        var result: [TimelineSearchSuggestion] = []
+        var result: [TimelineSearchLibraryRows.Row] = []
         for (tag, token, symbol) in lexical {
             guard !Task.isCancelled else { return [] }
             let matches = TimelineSearch.filter(sections, query: token, context: searchContext).flatMap(\.items)
-            if let chip = mediaChip(tag: tag, symbol: symbol, matches: matches, total: items.count, context: context) {
+            if let chip = mediaChip(tag: tag, symbol: symbol, matches: matches, total: items.count) {
                 result.append(chip)
             }
         }
@@ -350,7 +401,7 @@ extension TimelineSearchDiscovery {
         ]
         for (tag, symbol, predicate) in tagged {
             let matches = items.filter(predicate)
-            if let chip = mediaChip(tag: tag, symbol: symbol, matches: matches, total: items.count, context: context) {
+            if let chip = mediaChip(tag: tag, symbol: symbol, matches: matches, total: items.count) {
                 result.append(chip)
             }
         }
@@ -361,18 +412,16 @@ extension TimelineSearchDiscovery {
         tag: PhotoTag,
         symbol: String,
         matches: [PhotoItem],
-        total: Int,
-        context: TimelineSearchDiscoveryContext
-    ) -> TimelineSearchSuggestion? {
+        total: Int
+    ) -> TimelineSearchLibraryRows.Row? {
         guard matches.count >= minimumRowMatches, Double(matches.count) <= Double(total) * 0.6 else { return nil }
-        return suggestion(
+        return row(
             id: "media:\(tag.rawValue)",
             title: tag.title,
             subtitle: countText(matches.count),
             systemImage: symbol,
             kind: .mediaType,
-            matches: matches,
-            context: context
+            matches: matches
         )
     }
 
@@ -574,16 +623,20 @@ extension TimelineSearchDiscovery {
         matches: [PhotoItem],
         context: TimelineSearchDiscoveryContext
     ) -> TimelineSearchSuggestion {
-        TimelineSearchSuggestion(
-            id: id,
-            query: title,
-            title: title,
-            subtitle: subtitle,
-            systemImage: systemImage,
-            kind: kind,
-            matchingUIDs: Set(matches.map(\.uid)),
-            representativeUIDs: representatives(for: matches, context: context)
-        )
+        row(id: id, title: title, subtitle: subtitle, systemImage: systemImage, kind: kind, matches: matches)
+            .suggestion(context: context)
+    }
+
+    static func row(
+        id: String,
+        title: String,
+        subtitle: String?,
+        systemImage: String,
+        kind: TimelineSearchSuggestionKind,
+        matches: [PhotoItem]
+    ) -> TimelineSearchLibraryRows.Row {
+        TimelineSearchLibraryRows.Row(
+            id: id, title: title, subtitle: subtitle, systemImage: systemImage, kind: kind, matches: matches)
     }
 
     public static func countText(_ count: Int) -> String {
