@@ -95,6 +95,9 @@ Run the platform shell build when your change affects that app:
 
 Use the shared build root documented in the README. Do not create build caches in the repository or `/private/tmp`.
 
+A change to layout, bars, or the viewer also runs both iOS test gates on the iPhone Duo simulator.
+The README lists the commands and the separate build root for Xcode 27.1.
+
 ## Automated PR review
 
 The LLM review is advisory. You can merge if it fails, times out, or reports a serious finding,

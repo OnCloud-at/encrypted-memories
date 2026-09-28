@@ -106,7 +106,7 @@ import UIKit
     /// Opens a real second window scene of the production app in the iPad simulator, verifies that it attaches
     /// to the one account runtime, then closes it and verifies that the account survives the closed window.
     @Test func secondWindowSceneAttachesToAndDetachesFromTheSharedAccount() async throws {
-        guard UIApplication.shared.supportsMultipleScenes else {
+        guard UIApplication.shared.showsSeveralWindows else {
             return
         }
         let runtime = MobileAccountRuntime.shared
