@@ -721,13 +721,16 @@ struct MainView: View {
     /// Adds photos dropped on a sidebar album. The drop can land while another album change finishes; it waits for
     /// that change instead of losing the photos, and says so if the change does not finish.
     private func addDroppedPhotos(_ uids: [PhotoUID], to album: AlbumSummary) async {
+        // Decide now whether the drag carried the selection: the add can wait, and the selection can change meanwhile.
+        let droppedSelection = selectedUIDs.isEmpty || Set(uids) != selectedUIDs ? nil : selectedUIDs
         var waitedIntervals = 0
         while albumActions.isWorking, waitedIntervals < 300 {  // at most 30 seconds
             try? await Task.sleep(for: .milliseconds(100))
             waitedIntervals += 1
         }
         if await albumActions.add(uids, to: album.id) {
-            endSelection(afterAdding: uids)
+            // The toolbar's feedback: the added selection ends, unless the person selected something else meanwhile.
+            if let droppedSelection, selectedUIDs == droppedSelection { endSelection() }
             await loadAlbums()
         } else if albumActions.actionFailure == nil {
             albumActions.actionFailure = AlbumActionFailure(
@@ -737,10 +740,8 @@ struct MainView: View {
         }
     }
 
-    /// The grid's feedback after photos joined an album: the selection that was added ends. A drag of one photo
-    /// outside the selection leaves the selection alone.
-    private func endSelection(afterAdding uids: [PhotoUID]) {
-        guard !selectedUIDs.isEmpty, Set(uids) == selectedUIDs else { return }
+    /// The grid's feedback after the selection joined an album: the selection ends.
+    private func endSelection() {
         selectionMode = false
         selectedUIDs.removeAll()
     }
@@ -2243,7 +2244,7 @@ struct MainView: View {
                         onAlbumsChanged: { Task { await loadAlbums() } },
                         onCompleted: { _ in
                             showAlbumDestination = false
-                            endSelection(afterAdding: Array(selectedUIDs))
+                            endSelection()
                         }
                     )
                 }

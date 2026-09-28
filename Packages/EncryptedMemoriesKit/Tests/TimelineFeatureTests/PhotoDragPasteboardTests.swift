@@ -45,10 +45,25 @@ final class PhotoDragPasteboardTests: XCTestCase {
         let uids = (0..<4).map { PhotoUID(volumeID: "volume", nodeID: "node-\($0)") }
         XCTAssertTrue(pasteboard.writeObjects(uids.map { gridItem($0, session: session) }))
 
-        let references = PhotoDragPasteboard.references(on: pasteboard)
+        let references = PhotoDragPasteboard.references(on: pasteboard, activeSessions: [session])
 
         XCTAssertEqual(references.uids, uids)
         XCTAssertEqual(references.sessions, [session])
+    }
+
+    /// Photo references of an earlier drag, or of another app that writes the same type, must not join an album.
+    func testReferencesOfADragThatIsNotRunningAreSkipped() {
+        let current = UUID()
+        let earlier = UUID()
+        let uid = PhotoUID(volumeID: "volume", nodeID: "node")
+        XCTAssertTrue(
+            pasteboard.writeObjects([
+                gridItem(PhotoUID(volumeID: "volume", nodeID: "earlier"), session: earlier),
+                gridItem(uid, session: current),
+            ]))
+
+        XCTAssertEqual(PhotoDragPasteboard.references(on: pasteboard, activeSessions: [current]).uids, [uid])
+        XCTAssertTrue(PhotoDragPasteboard.references(on: pasteboard, activeSessions: []).uids.isEmpty)
     }
 
     func testItemsWithoutAPhotoReferenceAreSkipped() {
@@ -61,7 +76,7 @@ final class PhotoDragPasteboardTests: XCTestCase {
                 gridItem(uid, session: session),
             ]))
 
-        let references = PhotoDragPasteboard.references(on: pasteboard)
+        let references = PhotoDragPasteboard.references(on: pasteboard, activeSessions: [session])
 
         XCTAssertEqual(references.uids, [uid])
         XCTAssertEqual(references.sessions, [session])
@@ -71,7 +86,7 @@ final class PhotoDragPasteboardTests: XCTestCase {
         let otherAppFile = NSFilePromiseProvider(fileType: UTType.jpeg.identifier, delegate: delegate)
         XCTAssertTrue(pasteboard.writeObjects([otherAppFile, URL(fileURLWithPath: "/tmp/photo.jpg") as NSURL]))
 
-        let references = PhotoDragPasteboard.references(on: pasteboard)
+        let references = PhotoDragPasteboard.references(on: pasteboard, activeSessions: [UUID()])
 
         XCTAssertTrue(references.uids.isEmpty)
         XCTAssertTrue(references.sessions.isEmpty)

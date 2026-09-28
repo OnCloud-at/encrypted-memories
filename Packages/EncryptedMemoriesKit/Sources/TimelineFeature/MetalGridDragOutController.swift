@@ -196,7 +196,9 @@ final class MetalGridDragOutController: NSObject, NSDraggingSource, NSFilePromis
             fileProvider: fileProvider, stagingDirectory: Self.makeSessionStagingDirectory())
         self.stager = stager
         let dragSessionID = UUID()
+        if let sessionID { PhotoDragPasteboard.endSession(sessionID) }
         sessionID = dragSessionID
+        PhotoDragPasteboard.beginSession(dragSessionID)
         reportedFailure = false
         items = Dictionary(uniqueKeysWithValues: dragged.map { ($0.uid, $0) })
         cachedFilenames.removeAll()
@@ -392,6 +394,7 @@ final class MetalGridDragOutController: NSObject, NSDraggingSource, NSFilePromis
         let stager = stager
         endedStager = stager
         endedSessionID = sessionID
+        if let sessionID { PhotoDragPasteboard.endSession(sessionID) }
         sessionID = nil
         self.stager = nil
         items.removeAll()
