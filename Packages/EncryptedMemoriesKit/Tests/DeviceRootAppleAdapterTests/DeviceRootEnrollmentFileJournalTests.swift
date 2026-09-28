@@ -1,3 +1,4 @@
+import Darwin
 import DeviceRootCore
 import Foundation
 import Testing
@@ -10,6 +11,21 @@ private actor JournalCompletionFlag {
 }
 
 private struct JournalSyncFailure: Error {}
+
+private final class JournalSyncRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var values: [(Int32, Bool)] = []
+
+    func record(descriptor: Int32, command: Int32) {
+        var metadata = stat()
+        let isDirectory =
+            Darwin.fstat(descriptor, &metadata) == 0
+            && metadata.st_mode & S_IFMT == S_IFDIR
+        lock.withLock { values.append((command, isDirectory)) }
+    }
+
+    func snapshot() -> [(Int32, Bool)] { lock.withLock { values } }
+}
 
 private func waitForLockAttempt(_ semaphore: DispatchSemaphore) -> Bool {
     semaphore.wait(timeout: .now() + 5) == .success
@@ -136,7 +152,7 @@ struct DeviceRootEnrollmentFileJournalTests {
         let failing = DeviceRootEnrollmentFileJournal(
             accountDataDirectory: directory,
             onBeforeFileLock: nil,
-            synchronize: { _ in throw JournalSyncFailure() })
+            synchronize: { _, _ in throw JournalSyncFailure() })
         await #expect(throws: JournalSyncFailure.self) {
             try await failing.beginCreateIfAbsent(incarnation: "prepared")
         }
@@ -147,6 +163,61 @@ struct DeviceRootEnrollmentFileJournalTests {
         #expect(try await restarted.pendingCreate() == nil)
     }
 
+    @Test func dispatchReservationUsesFullSyncForFileAndDirectory() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let recorder = JournalSyncRecorder()
+        let journal = DeviceRootEnrollmentFileJournal(
+            accountDataDirectory: directory, onBeforeFileLock: nil,
+            synchronize: { descriptor, command in
+                recorder.record(descriptor: descriptor, command: command)
+                return 0
+            })
+        #expect(try await journal.beginCreateIfAbsent(incarnation: "claim"))
+        #expect(
+            try await journal.markCreateDispatchAttempted(
+                location: .computer, incarnation: "claim"))
+        let calls = recorder.snapshot()
+        #expect(calls.count == 4)
+        #expect(calls.allSatisfy { $0.0 == F_FULLFSYNC })
+        #expect(calls.map(\.1) == [false, true, false, true])
+        let reopened = DeviceRootEnrollmentFileJournal(accountDataDirectory: directory)
+        #expect(try await reopened.pendingCreate()?.dispatchAttempted == true)
+    }
+
+    @Test func productionSyncForwardsTheCommandToDarwin() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let file = directory.appendingPathComponent("journal-probe")
+        try Data("probe".utf8).write(to: file)
+        let descriptor = Darwin.open(file.path, O_RDONLY | O_NOFOLLOW)
+        #expect(descriptor >= 0)
+        defer { if descriptor >= 0 { _ = Darwin.close(descriptor) } }
+
+        #expect(DeviceRootEnrollmentFileJournal.systemSync(descriptor, command: -1) == -1)
+        #expect(DeviceRootEnrollmentFileJournal.systemSync(descriptor, command: F_FULLFSYNC) == 0)
+    }
+
+    @Test func failedSystemCallReturnStopsEnrollmentJournal() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let failing = DeviceRootEnrollmentFileJournal(
+            accountDataDirectory: directory, onBeforeFileLock: nil,
+            synchronize: { _, _ in
+                errno = EIO
+                return -1
+            })
+        do {
+            _ = try await failing.beginCreateIfAbsent(incarnation: "claim")
+            Issue.record("A failed full-sync syscall must block enrollment")
+        } catch {
+            let failure = error as NSError
+            #expect(failure.domain == NSPOSIXErrorDomain)
+            #expect(failure.code == Int(EIO))
+        }
+    }
+
     @Test func failedDispatchBarrierNeverPermitsCrashRecoveryToAssumeNoCreate() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -155,7 +226,30 @@ struct DeviceRootEnrollmentFileJournalTests {
         let failing = DeviceRootEnrollmentFileJournal(
             accountDataDirectory: directory,
             onBeforeFileLock: nil,
-            synchronize: { _ in throw JournalSyncFailure() })
+            synchronize: { _, _ in throw JournalSyncFailure() })
+        await #expect(throws: JournalSyncFailure.self) {
+            try await failing.markCreateDispatchAttempted(
+                location: .computer, incarnation: "claim")
+        }
+
+        let restarted = DeviceRootEnrollmentFileJournal(accountDataDirectory: directory)
+        #expect(try await restarted.pendingCreate()?.dispatchAttempted == true)
+        #expect(!(try await restarted.abortPreparedCreate(location: .computer, incarnation: "claim")))
+    }
+
+    @Test func failedDirectoryBarrierNeverAuthorizesRemoteCreate() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let first = DeviceRootEnrollmentFileJournal(accountDataDirectory: directory)
+        #expect(try await first.beginCreateIfAbsent(incarnation: "claim"))
+        let failing = DeviceRootEnrollmentFileJournal(
+            accountDataDirectory: directory, onBeforeFileLock: nil,
+            synchronize: { descriptor, _ in
+                var metadata = stat()
+                guard Darwin.fstat(descriptor, &metadata) == 0 else { throw JournalSyncFailure() }
+                if metadata.st_mode & S_IFMT == S_IFDIR { throw JournalSyncFailure() }
+                return 0
+            })
         await #expect(throws: JournalSyncFailure.self) {
             try await failing.markCreateDispatchAttempted(
                 location: .computer, incarnation: "claim")

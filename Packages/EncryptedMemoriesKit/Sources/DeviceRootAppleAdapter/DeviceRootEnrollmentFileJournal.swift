@@ -64,26 +64,26 @@ public actor DeviceRootEnrollmentFileJournal: DeviceRootEnrollmentJournal {
     private let fileURL: URL
     private let lockURL: URL
     private let onBeforeFileLock: (@Sendable () -> Void)?
-    private let synchronizeOverride: (@Sendable (URL) throws -> Void)?
+    private let synchronize: @Sendable (Int32, Int32) throws -> Int32
 
     public init(accountDataDirectory: URL) {
         directory = accountDataDirectory
         fileURL = accountDataDirectory.appendingPathComponent("device-root-enrollment.json")
         lockURL = accountDataDirectory.appendingPathComponent("device-root-enrollment.lock")
         onBeforeFileLock = nil
-        synchronizeOverride = nil
+        synchronize = Self.systemSync
     }
 
     init(
         accountDataDirectory: URL,
         onBeforeFileLock: (@Sendable () -> Void)?,
-        synchronize: (@Sendable (URL) throws -> Void)?
+        synchronize: (@Sendable (Int32, Int32) throws -> Int32)?
     ) {
         directory = accountDataDirectory
         fileURL = accountDataDirectory.appendingPathComponent("device-root-enrollment.json")
         lockURL = accountDataDirectory.appendingPathComponent("device-root-enrollment.lock")
         self.onBeforeFileLock = onBeforeFileLock
-        synchronizeOverride = synchronize
+        self.synchronize = synchronize ?? Self.systemSync
     }
 
     public func selectedRoot() throws -> DeviceRootIdentity? {
@@ -312,16 +312,20 @@ public actor DeviceRootEnrollmentFileJournal: DeviceRootEnrollmentJournal {
             upgraded.selectedLocation = .computer
         }
         try JSONEncoder().encode(upgraded).write(to: fileURL, options: .atomic)
-        try sync(fileURL, flags: O_RDONLY | O_NOFOLLOW)
-        try sync(directory, flags: O_RDONLY | O_DIRECTORY)
+        // The dispatch reservation must survive power loss before a remote create starts.
+        try fullSync(fileURL, flags: O_RDONLY | O_NOFOLLOW)
+        try fullSync(directory, flags: O_RDONLY | O_DIRECTORY)
     }
 
-    private func sync(_ url: URL, flags: Int32) throws {
-        if let synchronizeOverride { return try synchronizeOverride(url) }
+    static func systemSync(_ descriptor: Int32, command: Int32) -> Int32 {
+        Darwin.fcntl(descriptor, command)
+    }
+
+    private func fullSync(_ url: URL, flags: Int32) throws {
         let descriptor = Darwin.open(url.path, flags | O_CLOEXEC)
         guard descriptor >= 0 else { throw posixError() }
         defer { _ = Darwin.close(descriptor) }
-        guard Darwin.fsync(descriptor) == 0 else { throw posixError() }
+        guard try synchronize(descriptor, F_FULLFSYNC) == 0 else { throw posixError() }
     }
 
     private func posixError() -> NSError {
