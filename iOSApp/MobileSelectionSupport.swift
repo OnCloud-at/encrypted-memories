@@ -73,7 +73,9 @@ final class MobileGridSelectionController {
         guard !items.isEmpty, !isBusy else { return }
         isExporting = true
         exportTask = Task { [weak self] in
-            let result = await MobileMediaExporter.exportOriginals(items, backend: backend)
+            // A Live Photo leaves as its still and its motion video.
+            let files = OutboundMedia.files(for: items).map(\.item)
+            let result = await MobileMediaExporter.exportOriginals(files, backend: backend)
             guard let self else {
                 MobileMediaExporter.cleanup(result.urls)
                 return

@@ -2568,7 +2568,9 @@ struct MainView: View {
     /// Single entry point for launching an export, so the toolbar ring's menu has one task to cancel.
     private func startExport(_ items: [PhotoItem], zipSuggestedName: String? = nil) {
         exportTask?.cancel()
-        exportTask = Task { await performExport(items, zipSuggestedName: zipSuggestedName) }
+        // A Live Photo leaves as its still and its motion video, so it exports as an archive of both.
+        let files = OutboundMedia.files(for: items).map(\.item)
+        exportTask = Task { await performExport(files, zipSuggestedName: zipSuggestedName) }
     }
 
     /// Cancels the running download (from the toolbar ring's menu). `performExport` discards any partial ZIP.
