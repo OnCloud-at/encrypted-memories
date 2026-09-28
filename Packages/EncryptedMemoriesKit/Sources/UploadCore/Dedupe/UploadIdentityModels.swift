@@ -313,12 +313,15 @@ public struct UploadIdentityRecord: Sendable, Equatable {
     /// Conservative cache validity for the SHA-1: reusable only when every cheap attribute still
     /// matches exactly. Any drift - size, mtime, name, or a different claimed filename - forces a
     /// rehash. Equal mtimes compare in the same `timeIntervalSince1970` projection they were
-    /// persisted in, so filesystem/date round-trips stay exact.
+    /// persisted in, so filesystem/date round-trips stay exact. A digest the source supplied is
+    /// authoritative: photo library resources keep their name and capture-date mtime across edits,
+    /// so only the digest shows that an edit with the same byte count changed the bytes.
     public func isValid(for descriptor: UploadResourceDescriptor) -> Bool {
         source == descriptor.source
             && filename == descriptor.filename
             && fileSize == descriptor.fileSize
             && modificationDate.timeIntervalSince1970 == descriptor.modificationDate.timeIntervalSince1970
+            && descriptor.precomputedSHA1Digest.map { UploadContentSHA1.hexString(digest: $0) == sha1Hex } ?? true
     }
 
     /// Cached HMACs (name/content hash) are additionally keyed by the hash-key epoch.
