@@ -177,6 +177,72 @@ final class MobilePrivacyPreviewShieldTests: XCTestCase {
         return (values.reduce(0, +) / Double(values.count), profile)
     }
 
+    @MainActor func testPreviewFadesInAndOutAndSurvivesRapidReactivation() async throws {
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let previous = scene.windows.first(where: \.isKeyWindow)
+        let window = UIWindow(windowScene: scene)
+        window.rootViewController = UIViewController()
+        window.rootViewController?.view.backgroundColor = .red
+        window.makeKeyAndVisible()
+        let shield = MobilePrivacyPreviewShield()
+        defer {
+            shield.remove()
+            window.isHidden = true
+            previous?.makeKey()
+        }
+
+        shield.update(enabled: true, isSceneActive: false, window: window, animated: true)
+        let cover = try XCTUnwrap(window.subviews.compactMap { $0 as? UIImageView }.first)
+        try await Task.sleep(for: .milliseconds(40))
+        let enteringOpacity = try XCTUnwrap(cover.layer.presentation()).opacity
+        XCTAssertGreaterThan(enteringOpacity, 0)
+        XCTAssertLessThan(enteringOpacity, 1, "Deactivation must fade instead of appearing instantly")
+        shield.prepareForSnapshot()
+        XCTAssertEqual(cover.alpha, 1)
+        XCTAssertTrue(cover.layer.animationKeys()?.isEmpty ?? true)
+
+        shield.update(enabled: true, isSceneActive: true, window: window, animated: true)
+        XCTAssertNotNil(cover.superview, "Activation must keep the cover until its fade finishes")
+        try await Task.sleep(for: .milliseconds(40))
+        let leavingOpacity = try XCTUnwrap(cover.layer.presentation()).opacity
+        XCTAssertGreaterThan(leavingOpacity, 0)
+        XCTAssertLessThan(leavingOpacity, 1)
+        shield.update(enabled: true, isSceneActive: false, window: window, animated: true)
+        shield.prepareForSnapshot()
+        try await Task.sleep(for: .milliseconds(220))
+        XCTAssertTrue(cover.superview === window, "An old fade-out must not remove a new privacy cover")
+        XCTAssertEqual(cover.alpha, 1)
+
+        shield.update(enabled: true, isSceneActive: true, window: window, animated: true)
+        try await Task.sleep(for: .milliseconds(220))
+        XCTAssertNil(cover.superview)
+    }
+
+    @MainActor func testBackgroundNotificationFinishesTheFadeBeforeTheSnapshot() async throws {
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let previous = scene.windows.first(where: \.isKeyWindow)
+        let window = UIWindow(windowScene: scene)
+        window.rootViewController = UIViewController()
+        window.makeKeyAndVisible()
+        let original = UserDefaults.standard.object(forKey: AppSettingsKey.blurAppPreview)
+        UserDefaults.standard.set(true, forKey: AppSettingsKey.blurAppPreview)
+        let center = MobilePrivacyPreviewShieldCenter()
+        defer {
+            center.refreshAll(enabled: false)
+            UserDefaults.standard.set(original, forKey: AppSettingsKey.blurAppPreview)
+            window.isHidden = true
+            previous?.makeKey()
+        }
+        center.register(window: window)
+        NotificationCenter.default.post(name: UIScene.willDeactivateNotification, object: scene)
+        let cover = try XCTUnwrap(window.subviews.compactMap { $0 as? UIImageView }.first)
+        NotificationCenter.default.post(name: UIScene.didEnterBackgroundNotification, object: scene)
+        XCTAssertEqual(cover.alpha, 1)
+        XCTAssertTrue(cover.layer.animationKeys()?.isEmpty ?? true)
+        try await Task.sleep(for: .milliseconds(40))
+        XCTAssertEqual(cover.layer.presentation()?.opacity ?? 1, 1)
+    }
+
     @MainActor func testInactiveSceneCoversItsWindowAndActiveSceneRestoresIt() {
         let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 390, height: 844))
         window.rootViewController = UIViewController()

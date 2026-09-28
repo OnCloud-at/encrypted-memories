@@ -64,6 +64,22 @@ final class MobileLibraryUITests: XCTestCase {
         XCTAssertTrue(app.searchFields.firstMatch.waitForExistence(timeout: 10), "Search shows no search field")
     }
 
+    func testReturningFromBackgroundRestoresTheViewerWithPreviewProtection() {
+        app.terminate()
+        app.launchArguments += ["-EncryptedMemories.blurAppPreview", "YES"]
+        app.launch()
+        XCTAssertTrue(firstPhoto.waitForExistence(timeout: 60))
+        firstPhoto.tap()
+        XCTAssertTrue(app.buttons["Close"].waitForExistence(timeout: 10))
+
+        XCUIDevice.shared.press(.home)
+        app.activate()
+        let close = app.buttons["Close"]
+        XCTAssertTrue(close.waitForExistence(timeout: 10))
+        close.tap()
+        XCTAssertTrue(firstPhoto.waitForExistence(timeout: 10))
+    }
+
     func testPrivacyPreviewSwitchPersistsAfterClosingSettings() throws {
         XCTAssertTrue(firstPhoto.waitForExistence(timeout: 60))
         app.buttons["Proton Account and Settings"].tap()

@@ -8,37 +8,78 @@ import os
 final class MobilePrivacyPreviewShield {
     private weak var window: UIWindow?
     private var preview: UIImageView?
+    private var animator: UIViewPropertyAnimator?
+    private var covered = false
     private static let logger = Logger(subsystem: "at.oncloud.encryptedmemories", category: "PrivacyPreview")
 
-    func update(enabled: Bool, isSceneActive: Bool, window: UIWindow?) {
+    func update(enabled: Bool, isSceneActive: Bool, window: UIWindow?, animated: Bool = false) {
         if self.window !== window {
             remove()
             self.window = window
         }
-        guard let window,
-            PrivacyPreviewPolicy.shouldCover(
+        let shouldCover =
+            window != nil
+            && PrivacyPreviewPolicy.shouldCover(
                 enabled: enabled, isSceneActive: isSceneActive, isWindowVisible: true)
-        else {
-            remove()
+        // SwiftUI also reports scene changes. Repeated refreshes must not interrupt an in-progress fade.
+        guard shouldCover != covered else {
+            if covered, let preview { window?.bringSubviewToFront(preview) }
             return
         }
-        if let preview {
-            window.bringSubviewToFront(preview)
+        covered = shouldCover
+        let animate =
+            animated && !UIAccessibility.isReduceMotionEnabled && UIView.areAnimationsEnabled
+            && window?.isHidden == false && window?.windowScene?.activationState != .background
+        guard shouldCover, let window else {
+            transition(to: 0, animated: animate)
             return
         }
+        if preview == nil {
+            let image = blurredSnapshot(of: window)
+            if image == nil {
+                Self.logger.error("Could not render the privacy preview; obscuring the window without an image.")
+            }
+            let cover = UIImageView(image: image)
+            cover.frame = window.bounds
+            cover.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+            cover.contentMode = .scaleToFill
+            cover.backgroundColor = .systemBackground
+            cover.accessibilityElementsHidden = true
+            cover.alpha = animate ? 0 : 1
+            window.addSubview(cover)
+            preview = cover
+        }
+        transition(to: 1, animated: animate)
+    }
 
-        let image = blurredSnapshot(of: window)
-        if image == nil {
-            Self.logger.error("Could not render the privacy preview; obscuring the window without an image.")
+    private func transition(to alpha: CGFloat, animated: Bool) {
+        guard let preview else { return }
+        stopAnimation()
+        guard animated else {
+            preview.alpha = alpha
+            if alpha == 0 { remove() }
+            return
         }
-        let cover = UIImageView(image: image)
-        cover.frame = window.bounds
-        cover.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-        cover.contentMode = .scaleToFill
-        cover.backgroundColor = .systemBackground
-        cover.accessibilityElementsHidden = true
-        window.addSubview(cover)
-        preview = cover
+        let fade = UIViewPropertyAnimator(duration: 0.16, curve: .easeOut) { preview.alpha = alpha }
+        fade.addCompletion { [weak self, weak preview] _ in
+            guard let self, self.preview === preview else { return }
+            self.animator = nil
+            if !self.covered { self.remove() }
+        }
+        animator = fade
+        fade.startAnimation()
+    }
+
+    /// UIKit captures the scene after its background notification returns. Never snapshot a partial fade.
+    func prepareForSnapshot() {
+        guard covered else { return }
+        stopAnimation()
+        UIView.performWithoutAnimation { preview?.alpha = 1 }
+    }
+
+    private func stopAnimation() {
+        if animator?.state == .active { animator?.stopAnimation(true) }
+        animator = nil
     }
 
     private func blurredSnapshot(of window: UIWindow) -> UIImage? {
@@ -62,6 +103,8 @@ final class MobilePrivacyPreviewShield {
     }
 
     func remove() {
+        stopAnimation()
+        covered = false
         preview?.removeFromSuperview()
         preview = nil
     }
@@ -88,6 +131,9 @@ final class MobilePrivacyPreviewShieldCenter: NSObject {
         let center = NotificationCenter.default
         center.addObserver(
             self, selector: #selector(sceneWillDeactivate), name: UIScene.willDeactivateNotification, object: nil)
+        center.addObserver(
+            self, selector: #selector(sceneDidEnterBackground), name: UIScene.didEnterBackgroundNotification,
+            object: nil)
         center.addObserver(
             self, selector: #selector(sceneDidActivate), name: UIScene.didActivateNotification, object: nil)
         center.addObserver(
@@ -122,13 +168,13 @@ final class MobilePrivacyPreviewShieldCenter: NSObject {
         }
     }
 
-    private func refresh(window: UIWindow, enabled: Bool, isActive: Bool? = nil) {
+    private func refresh(window: UIWindow, enabled: Bool, isActive: Bool? = nil, animated: Bool = false) {
         guard let entry = entries.first(where: { $0.window === window }) else { return }
         entry.shield.update(
             enabled: enabled,
             isSceneActive: isActive
                 ?? (!entry.deactivating && window.windowScene?.activationState == .foregroundActive),
-            window: window)
+            window: window, animated: animated)
     }
 
     @objc private func sceneWillDeactivate(_ notification: Notification) {
@@ -136,7 +182,18 @@ final class MobilePrivacyPreviewShieldCenter: NSObject {
         for entry in entries where entry.window?.windowScene === scene {
             entry.deactivating = true
             if let window = entry.window {
+                refresh(window: window, enabled: PrivacyPreviewPolicy.isEnabled(), isActive: false, animated: true)
+            }
+        }
+    }
+
+    @objc private func sceneDidEnterBackground(_ notification: Notification) {
+        guard let scene = notification.object as? UIWindowScene else { return }
+        for entry in entries where entry.window?.windowScene === scene {
+            entry.deactivating = true
+            if let window = entry.window {
                 refresh(window: window, enabled: PrivacyPreviewPolicy.isEnabled(), isActive: false)
+                entry.shield.prepareForSnapshot()
             }
         }
     }
@@ -146,7 +203,7 @@ final class MobilePrivacyPreviewShieldCenter: NSObject {
         for entry in entries where entry.window?.windowScene === scene {
             entry.deactivating = false
             if let window = entry.window {
-                refresh(window: window, enabled: PrivacyPreviewPolicy.isEnabled(), isActive: true)
+                refresh(window: window, enabled: PrivacyPreviewPolicy.isEnabled(), isActive: true, animated: true)
             }
         }
     }
