@@ -196,7 +196,9 @@ final class MetalGridDragOutController: NSObject, NSDraggingSource, NSFilePromis
             fileProvider: fileProvider, stagingDirectory: Self.makeSessionStagingDirectory())
         self.stager = stager
         let dragSessionID = UUID()
+        if let sessionID { PhotoDragPasteboard.endSession(sessionID) }
         sessionID = dragSessionID
+        PhotoDragPasteboard.beginSession(dragSessionID)
         reportedFailure = false
         items = Dictionary(uniqueKeysWithValues: dragged.map { ($0.uid, $0) })
         cachedFilenames.removeAll()
@@ -392,6 +394,7 @@ final class MetalGridDragOutController: NSObject, NSDraggingSource, NSFilePromis
         let stager = stager
         endedStager = stager
         endedSessionID = sessionID
+        if let sessionID { PhotoDragPasteboard.endSession(sessionID) }
         sessionID = nil
         self.stager = nil
         items.removeAll()
@@ -415,10 +418,10 @@ final class MetalGridDragOutController: NSObject, NSDraggingSource, NSFilePromis
 
 /// A file promise that also carries the photo reference. Other apps see only the promised file; a drop inside the
 /// app reads the reference instead (Apple's documented pattern for adding types to `NSFilePromiseProvider`).
-private final class PhotoFilePromiseProvider: NSFilePromiseProvider {
+final class PhotoFilePromiseProvider: NSFilePromiseProvider {
     var photoReference = Data()
 
-    private static let referenceType = NSPasteboard.PasteboardType(PhotoDragReference.typeIdentifier)
+    private static let referenceType = PhotoDragPasteboard.referenceType
 
     override func writableTypes(for pasteboard: NSPasteboard) -> [NSPasteboard.PasteboardType] {
         super.writableTypes(for: pasteboard) + [Self.referenceType]
