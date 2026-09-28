@@ -217,17 +217,19 @@ public final class PendingTimelinePresenter {
     private func rebuild() {
         computeGeneration &+= 1
         let generation = computeGeneration
+        // Only `apply` replaces the shown snapshot, and it accepts only this generation. The merge can
+        // therefore compare with this snapshot off the main actor.
         let input = MergeInput(
             remote: remote,
             pending: isEnabled ? pending : .empty,
             anchors: anchors,
-            revisions: tileRevisions
+            revisions: tileRevisions,
+            shown: presentation.snapshot
         )
         lastMembershipRevision = pending.membershipRevision
         computeTask?.cancel()
         computeTask = Task.detached(priority: .userInitiated) { [weak self] in
-            let result = Self.merge(input)
-            guard !Task.isCancelled else { return }
+            guard let result = Self.merge(input), !Task.isCancelled else { return }
             await self?.apply(result, generation: generation)
         }
     }
@@ -245,7 +247,7 @@ public final class PendingTimelinePresenter {
         // image is loaded, so the tile never shows black in between.
         if !contentEpochs.isEmpty { contentEpochs = contentEpochs.filter { result.localUIDs.contains($0.key) } }
         revision &+= 1
-        if result.snapshot != presentation.snapshot { membershipRevision &+= 1 }
+        if result.snapshotChanged { membershipRevision &+= 1 }
         let shown = isEnabled ? pending : .empty
         presentation = PendingTimelinePresentation(
             revision: revision,
@@ -318,10 +320,14 @@ public final class PendingTimelinePresenter {
         let pending: PendingBackupSnapshot
         let anchors: [PhotoUID: PhotoItem]
         let revisions: [PhotoUID: UploadBackupRevision]
+        /// The snapshot that the grid shows now.
+        let shown: TimelineSnapshot
     }
 
     private struct MergeResult: Sendable {
+        /// `shown` itself when the order did not change, so its index is reused.
         let snapshot: TimelineSnapshot
+        let snapshotChanged: Bool
         let localUIDs: Set<PhotoUID>
         let presentKeys: Set<PendingSourceKey>
         let newAnchors: [PhotoUID: PhotoItem]
@@ -333,7 +339,8 @@ public final class PendingTimelinePresenter {
         let revised: [PhotoUID]
     }
 
-    private nonisolated static func merge(_ input: MergeInput) -> MergeResult {
+    /// Nil when a newer merge cancelled this one.
+    private nonisolated static func merge(_ input: MergeInput) -> MergeResult? {
         let remoteItems = input.remote.items
         // Owned photos share one volume; link-only handoffs resolve to it.
         let photosVolume = remoteItems.first?.uid.volumeID
@@ -372,17 +379,20 @@ public final class PendingTimelinePresenter {
         let presentLocal = Dictionary(uniqueKeysWithValues: present.map { ($0.value.item.uid, $0.key) })
         let baseBadges = badges(for: input.pending, gridUIDs: presentLocal)
         guard !visible.isEmpty || !anchors.isEmpty else {
+            let changed = input.remote != input.shown
             return MergeResult(
-                snapshot: input.remote, localUIDs: [], presentKeys: presentKeys,
-                newAnchors: newAnchors, adoptions: adoptions, baseBadges: baseBadges, presentLocal: presentLocal,
-                revisions: revisions, revised: revised)
+                snapshot: changed ? input.remote : input.shown, snapshotChanged: changed, localUIDs: [],
+                presentKeys: presentKeys, newAnchors: newAnchors, adoptions: adoptions, baseBadges: baseBadges,
+                presentLocal: presentLocal, revisions: revisions, revised: revised)
         }
+        guard !Task.isCancelled else { return nil }
 
         // Three streams sorted by one presentation key; a linear merge keeps their total order.
         var anchored: [(key: PhotoItem, item: PhotoItem)] = []
         var canonical: [PhotoItem] = []
         canonical.reserveCapacity(remoteItems.count)
-        for item in remoteItems {
+        for (index, item) in remoteItems.enumerated() {
+            if index % cancellationStride == 0, Task.isCancelled { return nil }
             if let key = anchors[item.uid] {
                 anchored.append((key, item))
             } else {
@@ -397,6 +407,7 @@ public final class PendingTimelinePresenter {
         var v = 0
         var a = 0
         while c < canonical.count || v < visible.count || a < anchored.count {
+            if merged.count % cancellationStride == 0, Task.isCancelled { return nil }
             var bestKey: PhotoItem?
             var source = 0
             if c < canonical.count {
@@ -424,8 +435,12 @@ public final class PendingTimelinePresenter {
                 a += 1
             }
         }
+        guard !Task.isCancelled else { return nil }
+        // A badge change keeps the order; reuse the shown snapshot instead of building a new index.
+        let changed = merged != input.shown.items
         return MergeResult(
-            snapshot: TimelineSnapshot(trustingOrderOf: merged),
+            snapshot: changed ? TimelineSnapshot(trustingOrderOf: merged) : input.shown,
+            snapshotChanged: changed,
             localUIDs: localUIDs,
             presentKeys: presentKeys,
             newAnchors: newAnchors,
@@ -436,6 +451,9 @@ public final class PendingTimelinePresenter {
             revised: revised
         )
     }
+
+    /// A merge checks for cancellation once per this many photos.
+    private nonisolated static let cancellationStride = 4096
 
     private nonisolated static func resolve(_ handoff: PhotoUID, photosVolume: String?) -> PhotoUID? {
         guard handoff.volumeID.isEmpty else { return handoff }

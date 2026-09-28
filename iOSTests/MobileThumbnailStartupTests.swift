@@ -168,6 +168,35 @@ import UIKit
         await runtime.shutdown()
     }
 
+    @Test func trashedNewPhotoLeavesThePendingThumbnailWork() async throws {
+        let fixture = try await MobileSignedInFixture(itemsPerSection: 1)
+        defer { fixture.removeCache() }
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        // The loader never answers for the new photo, so its thumbnail stays pending.
+        let loader = UnansweredThumbnailLoader(data: fixture.backend.thumbnails)
+        let cache = ThumbnailCache(rootDirectory: root)
+        let feed = UIKitThumbnailFeed(cache: cache, loader: loader, concurrency: 1, batch: 1)
+        let model = MobileLibraryModel()
+        fixture.install(
+            into: model, backend: fixture.backend, sections: fixture.sections, thumbnailFeed: feed,
+            thumbnailCache: cache)
+        model.startIsolatedThumbnailPrefetchForTests()
+        #expect(await waitUntil { !model.isBackgroundLoading })
+
+        let added = PhotoUID(volumeID: "fixture", nodeID: "unanswered")
+        model.replaceIsolatedThumbnailInventoryForTests(fixture.sections + [section(items: [item(added)])])
+        #expect(await waitUntil { await loader.requests(for: added) > 0 })
+        #expect(model.isBackgroundLoading)
+
+        try await model.trashItems([added])
+        // The next refresh finds the identities that trash already showed.
+        model.replaceIsolatedThumbnailInventoryForTests(fixture.sections)
+
+        #expect(await waitUntil { !model.isBackgroundLoading }, "the trashed photo leaves the pending thumbnails")
+        await feed.stopPrefetch()
+    }
+
     @Test func explicitCacheClearRestartsTheOwnedCrawl() async throws {
         let fixture = try await MobileSignedInFixture(itemsPerSection: 1)
         defer { fixture.removeCache() }
@@ -257,4 +286,27 @@ private actor ThumbnailLoaderProbe: ThumbnailBatchLoader, LibrarySourceRemoteBac
         return []
     }
     func librarySourceItems(for _: AlbumNodeIdentifier) async throws -> [LibrarySourceItem] { [] }
+}
+
+/// Delivers known thumbnails and never answers for the others, neither with the image nor with an error.
+private actor UnansweredThumbnailLoader: ThumbnailBatchLoader {
+    private let data: [PhotoUID: Data]
+    private var requested: [PhotoUID: Int] = [:]
+
+    init(data: [PhotoUID: Data]) {
+        self.data = data
+    }
+
+    func loadThumbnails(
+        for uids: [PhotoUID],
+        onLoaded: @Sendable @escaping (PhotoUID, Data) -> Void
+    ) async -> ThumbnailBatchLoadResult {
+        for uid in uids {
+            requested[uid, default: 0] += 1
+            if let bytes = data[uid] { onLoaded(uid, bytes) }
+        }
+        return ThumbnailBatchLoadResult(itemErrors: [:])
+    }
+
+    func requests(for uid: PhotoUID) -> Int { requested[uid, default: 0] }
 }

@@ -1024,17 +1024,20 @@ final class MobileLibraryModel {
         }
     }
 
+    /// Reports photos that appeared since `shownBefore`. `change` comes from `applyItems`; without it, another
+    /// publication replaced the timeline, and the comparison runs here against the timeline shown now.
     private func reconcileNewAssetThumbnails(
-        previousUIDs: [PhotoUID],
+        since shownBefore: TimelineSnapshot,
+        change: TimelineProjectionChange?,
         using feed: UIKitThumbnailFeed
     ) {
-        let currentUIDs = items.map(\.uid)
+        let change = change ?? TimelineProjectionChange(from: shownBefore, to: snapshot, nextUIDs: items.map(\.uid))
+        // The same identities leave an empty pending set empty. A pending set can still hold a photo that trash
+        // removed without a reconcile, so it is reconciled against the current identities.
+        guard change.identitiesChanged || thumbnailUpdateCoordinator.state.isActive else { return }
         thumbnailUpdateCoordinator.reconcile(
-            currentUIDs: currentUIDs,
-            addedUIDs: LibraryInventoryDelta.addedUIDs(
-                previous: previousUIDs,
-                current: currentUIDs
-            ),
+            currentUIDs: change.uids,
+            addedUIDs: change.addedUIDs,
             onStateChange: { [weak self] state in
                 self?.isNewAssetThumbnailLoading = state.isActive
             },
@@ -1692,15 +1695,15 @@ final class MobileLibraryModel {
                     loadGeneration == self.loadToken,
                     self.session == session
                 else { return }
-                let previousUIDs = items.map(\.uid)
-                try await applyItems(refreshed.sections, cached: false, authoritative: true)
+                let shownBefore = snapshot
+                let change = try await applyItems(refreshed.sections, cached: false, authoritative: true)
                 guard !Task.isCancelled,
                     loadGeneration == self.loadToken,
                     self.session == session
                 else { return }
                 scheduleThumbnailPrefetch(using: feed)
                 if hadCachedInventory {
-                    reconcileNewAssetThumbnails(previousUIDs: previousUIDs, using: feed)
+                    reconcileNewAssetThumbnails(since: shownBefore, change: change, using: feed)
                 }
                 initialLibraryLoadSettled = true
                 self.startLibraryChangeMonitorIfPossible(
@@ -1739,23 +1742,28 @@ final class MobileLibraryModel {
     }
 
     /// Builds an immutable `TimelineSnapshot` off the main actor and publishes it only for the current load.
+    /// It compares the new timeline with the shown one off the main actor too, and returns that comparison.
+    /// Nil means that a cancelled or superseded load published nothing.
     @discardableResult
     private func applyItems(
         _ sections: [TimelineSection],
         cached: Bool,
         authoritative: Bool = false
-    ) async throws -> Bool {
+    ) async throws -> TimelineProjectionChange? {
         let token = loadToken
         let mutationGeneration = timelineMutationGeneration
         let removals = pendingTimelineRemovals
-        let prepared = await Task.detached(priority: .userInitiated) {
-            TimelineContentProjection(sections: sections).removing(removals)
+        let shown = snapshot
+        let shownRevision = timelineRevision
+        let (prepared, preparedChange) = await Task.detached(priority: .userInitiated) {
+            let projection = TimelineContentProjection(sections: sections).removing(removals)
+            return (projection, TimelineProjectionChange(from: shown, to: projection))
         }.value
         // The generation token rejects results from cancelled or superseded loads.
         guard !Task.isCancelled,
             token == loadToken,
             mutationGeneration == timelineMutationGeneration
-        else { return false }
+        else { return nil }
         let sourceReady = await synchronizePrimarySourceInventory(
             prepared.snapshot.items,
             authority: authoritative ? .authoritative : .cached
@@ -1763,12 +1771,14 @@ final class MobileLibraryModel {
         try Task.checkCancellation()
         guard token == loadToken,
             mutationGeneration == timelineMutationGeneration
-        else { return false }
-        if sourceReady == .superseded { return false }
+        else { return nil }
+        if sourceReady == .superseded { return nil }
         guard sourceReady == .accepted else { throw SourceAnalysisStartupError() }
-        let requiresNewFrame =
-            prepared.snapshot.items.lazy.map(\.uid).elementsEqual(snapshot.items.lazy.map(\.uid)) == false
-        let changed = prepared.snapshot != snapshot
+        // A concurrent load can publish while this one waits; then compare with the timeline shown now.
+        let change =
+            timelineRevision == shownRevision ? preparedChange : TimelineProjectionChange(from: snapshot, to: prepared)
+        let requiresNewFrame = change.identitiesChanged
+        let changed = change.contentChanged
         if authoritative {
             primaryInventoryAuthority = .authoritative
         } else if cached, primaryInventoryAuthority != .authoritative {
@@ -1790,7 +1800,7 @@ final class MobileLibraryModel {
         } else {
             apply(.inventoryResolved(count: prepared.snapshot.count, cached: cached))
         }
-        return changed
+        return change
     }
 
     private func publish(
@@ -1908,12 +1918,12 @@ final class MobileLibraryModel {
             let refreshed = try await backend.loadTimeline()
             try Task.checkCancellation()
             try requireCurrentMutation(refreshLease)
-            let previousUIDs = items.map(\.uid)
-            try await applyItems(refreshed, cached: false, authoritative: true)
+            let shownBefore = snapshot
+            let change = try await applyItems(refreshed, cached: false, authoritative: true)
             try requireCurrentMutation(refreshLease)
             if let thumbnailFeed {
                 scheduleThumbnailPrefetch(using: thumbnailFeed)
-                reconcileNewAssetThumbnails(previousUIDs: previousUIDs, using: thumbnailFeed)
+                reconcileNewAssetThumbnails(since: shownBefore, change: change, using: thumbnailFeed)
             }
             // The same opaque server event token covers album mutations. Reuse this central foreground
             // refresh instead of adding a second poller; Collections reloads through its existing revision key.
@@ -1982,14 +1992,16 @@ final class MobileLibraryModel {
 
         /// Drives the production startup and new-identity paths without opening a real account backend.
         func replaceIsolatedThumbnailInventoryForTests(_ sections: [TimelineSection]) {
-            let previousUIDs = items.map(\.uid)
+            let shownBefore = snapshot
             let projection = TimelineContentProjection(sections: sections)
             snapshot = projection.snapshot
             self.sections = projection.sections
             timelineRevision &+= 1
             guard let thumbnailFeed else { return }
             scheduleThumbnailPrefetch(using: thumbnailFeed)
-            reconcileNewAssetThumbnails(previousUIDs: previousUIDs, using: thumbnailFeed)
+            reconcileNewAssetThumbnails(
+                since: shownBefore, change: TimelineProjectionChange(from: shownBefore, to: projection),
+                using: thumbnailFeed)
         }
 
         func startIsolatedThumbnailPrefetchForTests() {
