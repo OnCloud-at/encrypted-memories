@@ -244,6 +244,73 @@ import Testing
         #expect(retirementResult.error.contains("Retirement would remove the final V1 model"))
     }
 
+    @Test func onlyThePreviewChannelCanRetireAModelThatShippedAppsCanSelect() throws {
+        let first = try makeFixture()
+        let retirement = try makeFixture()
+        defer {
+            try? FileManager.default.removeItem(at: first.root)
+            try? FileManager.default.removeItem(at: retirement.root)
+        }
+        try Data(contentsOf: first.privateKey).write(to: retirement.privateKey, options: .atomic)
+        let firstResult = try runRelease(first)
+        #expect(firstResult.status == 0, Comment(rawValue: firstResult.error))
+
+        let production = try runRelease(
+            retirement,
+            sequence: 2,
+            previousOutput: first.output,
+            includeModel: false,
+            retiredModelIDs: ["siglip2-base-patch16-256"],
+            allowEmptyV1: true
+        )
+        #expect(production.status != 0)
+        #expect(production.error.contains("Apps 1.0.5 and earlier lose model siglip2-base-patch16-256"))
+
+        let preview = try runRelease(
+            retirement,
+            sequence: 2,
+            previousOutput: first.output,
+            includeModel: false,
+            retiredModelIDs: ["siglip2-base-patch16-256"],
+            channel: "preview",
+            allowEmptyV1: true
+        )
+        #expect(preview.status == 0, Comment(rawValue: preview.error))
+        let catalog = try Self.loadJSON(retirement.output.appendingPathComponent("catalog-v2.json"))
+        let models = try #require(catalog["models"] as? [[String: Any]])
+        #expect(models.first?["availability"] as? String == "retired")
+    }
+
+    @Test func onlyThePreviewChannelCanPublishARecipeThatShippedAppsDoNotKnow() throws {
+        let fixture = try makeFixture(modelID: "siglip-next", compatibilityKey: "siglip-dual-encoder-v2")
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        var compatibility = try Self.loadJSON(
+            Self.repositoryRoot.appendingPathComponent("Tools/MLModels/catalog-compatibility.json")
+        )
+        var recipes = try #require(compatibility["recipes"] as? [[String: Any]])
+        var nextRecipe = try #require(recipes.first { $0["key"] as? String == "siglip-dual-encoder-v1" })
+        nextRecipe["key"] = "siglip-dual-encoder-v2"
+        recipes.append(nextRecipe)
+        compatibility["recipes"] = recipes
+        let compatibilityURL = fixture.root.appendingPathComponent("catalog-compatibility.json")
+        try Self.writeJSON(compatibility, to: compatibilityURL)
+
+        let production = try runRelease(fixture, allowEmptyV1: true, compatibility: compatibilityURL)
+        #expect(production.status != 0)
+        #expect(production.error.contains("model siglip-next uses unknown recipe siglip-dual-encoder-v2"))
+
+        let preview = try runRelease(
+            fixture,
+            channel: "preview",
+            allowEmptyV1: true,
+            compatibility: compatibilityURL
+        )
+        #expect(preview.status == 0, Comment(rawValue: preview.error))
+        let catalog = try Self.loadJSON(fixture.output.appendingPathComponent("catalog-v2.json"))
+        let models = try #require(catalog["models"] as? [[String: Any]])
+        #expect(models.first?["compatibilityKey"] as? String == "siglip-dual-encoder-v2")
+    }
+
     @Test func v1OnlyMigrationPreservesEveryLegacyModelInV2() throws {
         let first = try makeFixture()
         let migration = try makeFixture(descriptorVersion: 2, modelPayload: "compiled-model-migration")
@@ -504,6 +571,7 @@ import Testing
         let notices: URL
         let output: URL
         let privateKey: URL
+        let modelID: String
     }
 
     private func makeFixture(
@@ -512,7 +580,9 @@ import Testing
         duplicateManifestPath: Bool = false,
         descriptorVersion: Int = 1,
         modelPackageExtension: String = "mlmodelc",
-        modelPayload: String = "compiled-model"
+        modelPayload: String = "compiled-model",
+        modelID: String = "siglip2-base-patch16-256",
+        compatibilityKey: String = "siglip-dual-encoder-v1"
     ) throws -> Fixture {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("ml-release-tests-\(UUID().uuidString)", isDirectory: true)
@@ -542,8 +612,8 @@ import Testing
         ]
         let fingerprint =
             ([
-                "modelID:siglip2-base-patch16-256",
-                "compatibilityKey:siglip-dual-encoder-v1",
+                "modelID:\(modelID)",
+                "compatibilityKey:\(compatibilityKey)",
                 "sourceRevision:3f9f96cb90da5dbc758b01813f2f6f1aee24c1ab",
                 "descriptorVersion:\(descriptorVersion)",
                 "embeddingDimension:768",
@@ -569,8 +639,8 @@ import Testing
         try Self.writeJSON(manifest, to: model.appendingPathComponent("artifact-manifest.json"))
         let releaseManifest: [String: Any] = [
             "schemaVersion": 1,
-            "modelID": "siglip2-base-patch16-256",
-            "compatibilityKey": "siglip-dual-encoder-v1",
+            "modelID": modelID,
+            "compatibilityKey": compatibilityKey,
             "sourceRevision": "3f9f96cb90da5dbc758b01813f2f6f1aee24c1ab",
             "descriptorVersion": descriptorVersion,
             "embeddingDimension": 768,
@@ -592,7 +662,7 @@ import Testing
         ]
         let report: [String: Any] = [
             "schemaVersion": 1,
-            "modelID": "siglip2-base-patch16-256",
+            "modelID": modelID,
             "sourceRevision": "3f9f96cb90da5dbc758b01813f2f6f1aee24c1ab",
             "artifactRevision": artifactRevision,
             "converterRevision": String(repeating: "a", count: 40),
@@ -610,14 +680,14 @@ import Testing
         ]
         try Self.writeJSON(
             report,
-            to: qualification.appendingPathComponent("siglip2-base-patch16-256.json")
+            to: qualification.appendingPathComponent("\(modelID).json")
         )
         let notice = Data("Apache-2.0 test notice".utf8)
-        let noticeURL = notices.appendingPathComponent("siglip2-base-patch16-256.txt")
+        let noticeURL = notices.appendingPathComponent("\(modelID).txt")
         try notice.write(to: noticeURL)
         let releaseEvidence: [String: Any] = [
             "schemaVersion": 1,
-            "modelID": "siglip2-base-patch16-256",
+            "modelID": modelID,
             "sourceRevision": "3f9f96cb90da5dbc758b01813f2f6f1aee24c1ab",
             "sourceURL": "https://example.test/models/siglip2",
             "licenseIdentifier": "Apache-2.0",
@@ -634,7 +704,7 @@ import Testing
         ]
         try Self.writeJSON(
             releaseEvidence,
-            to: evidence.appendingPathComponent("siglip2-base-patch16-256.json")
+            to: evidence.appendingPathComponent("\(modelID).json")
         )
         let privateKey = root.appendingPathComponent("catalog.key")
         try Curve25519.Signing.PrivateKey().rawRepresentation.write(to: privateKey)
@@ -645,7 +715,8 @@ import Testing
             qualification: qualification,
             notices: notices,
             output: output,
-            privateKey: privateKey
+            privateKey: privateKey,
+            modelID: modelID
         )
     }
 
@@ -657,7 +728,10 @@ import Testing
         previousV1Only: (catalog: URL, signature: URL)? = nil,
         allowUnchangedCandidate: Bool = false,
         includeModel: Bool = true,
-        retiredModelIDs: [String] = []
+        retiredModelIDs: [String] = [],
+        channel: String? = nil,
+        allowEmptyV1: Bool = false,
+        compatibility: URL? = nil
     ) throws -> (status: Int32, output: String, error: String) {
         var arguments = [
             "--private-key", fixture.privateKey.path,
@@ -672,7 +746,7 @@ import Testing
             "--catalog-sequence", String(sequence),
         ]
         if includeModel {
-            arguments += ["--model", "siglip2-base-patch16-256=\(fixture.model.path)"]
+            arguments += ["--model", "\(fixture.modelID)=\(fixture.model.path)"]
         }
         if !retiredModelIDs.isEmpty {
             let manifestURL = fixture.root.appendingPathComponent("retired-models.json")
@@ -702,6 +776,15 @@ import Testing
         }
         if allowUnchangedCandidate {
             arguments.append("--allow-unchanged-candidate")
+        }
+        if allowEmptyV1 {
+            arguments.append("--allow-empty-v1")
+        }
+        if let channel {
+            arguments += ["--channel", channel]
+        }
+        if let compatibility {
+            arguments += ["--compatibility", compatibility.path]
         }
         let script = Self.repositoryRoot.appendingPathComponent("scripts/prepare-ml-model-release.swift")
         return try Self.run(

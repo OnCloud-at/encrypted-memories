@@ -1,0 +1,38 @@
+{
+  "schemaVersion": 1,
+  "recipes": [
+    {
+      "key": "clip-dual-encoder-v1",
+      "minimumDescriptorVersion": 1,
+      "maximumDescriptorVersion": 65535,
+      "embeddingDimension": 512,
+      "role": "dualEncoder",
+      "capabilities": ["imageEmbedding", "textEmbedding"],
+      "requiredRuntimeResources": [],
+      "maximumBytes": 220000000,
+      "maximumFileBytes": 220000000,
+      "license": "MIT"
+    },
+    {
+      "key": "siglip-dual-encoder-v1",
+      "minimumDescriptorVersion": 1,
+      "maximumDescriptorVersion": 65535,
+      "embeddingDimension": 768,
+      "role": "dualEncoder",
+      "capabilities": ["imageEmbedding", "textEmbedding"],
+      "requiredRuntimeResources": ["tokenizer.json"],
+      "maximumBytes": 900000000,
+      "maximumFileBytes": 900000000,
+      "license": "Apache-2.0"
+    }
+  ],
+  "strictReaders": {
+    "production": [
+      {
+        "apps": "1.0.5 and earlier",
+        "recipes": ["clip-dual-encoder-v1", "siglip-dual-encoder-v1"]
+      }
+    ],
+    "preview": []
+  }
+}
