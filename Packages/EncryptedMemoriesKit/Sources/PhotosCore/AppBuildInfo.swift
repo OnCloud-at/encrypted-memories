@@ -16,12 +16,16 @@ public struct AppBuildInfo: Sendable, Equatable {
     /// TestFlight beta builds and local development builds. App Store builds and bundles without a
     /// known release channel are never prerelease builds.
     public let isPrerelease: Bool
+    /// App Store and TestFlight builds. Only CI builds them, from commits that exist on GitHub.
+    public let isReleaseBuild: Bool
 
     public init(version: String?, build: String?, releaseChannel: String? = nil, commit: String? = nil) {
         self.version = Self.normalized(version)
         self.build = Self.normalized(build)
         self.commit = Self.normalized(commit).map { $0.lowercased() }.flatMap(Self.validCommit)
-        self.isPrerelease = Self.prereleaseChannels.contains(Self.normalized(releaseChannel)?.lowercased() ?? "")
+        let channel = Self.normalized(releaseChannel)?.lowercased() ?? ""
+        self.isPrerelease = Self.prereleaseChannels.contains(channel)
+        self.isReleaseBuild = Self.releaseChannels.contains(channel)
     }
 
     public init(bundle: Bundle = .main) {
@@ -36,9 +40,11 @@ public struct AppBuildInfo: Sendable, Equatable {
     /// The first seven characters, as GitHub shows a commit.
     public var shortCommit: String? { commit.map { String($0.prefix(7)) } }
 
-    /// The commit on GitHub, so anyone can match the installed app with its source and CI run.
+    /// The commit on GitHub, so anyone can match the installed app with its source and CI run. Local builds
+    /// can name a commit that was never pushed, so they get no link.
     public var commitURL: URL? {
-        commit.map { Self.sourceRepositoryURL.appendingPathComponent("commit").appendingPathComponent($0) }
+        guard isReleaseBuild, let commit else { return nil }
+        return Self.sourceRepositoryURL.appendingPathComponent("commit").appendingPathComponent(commit)
     }
 
     /// The release page of this version. Prerelease builds do not know their beta tag, so they open the
@@ -56,6 +62,8 @@ public struct AppBuildInfo: Sendable, Equatable {
 
     /// TestFlight prereleases ship as `beta`; local builds default to `alpha`.
     private static let prereleaseChannels: Set<String> = ["beta", "alpha"]
+    /// Channels that only CI builds: App Store (`stable`) and TestFlight (`beta`).
+    private static let releaseChannels: Set<String> = ["stable", "beta"]
 
     private static func validCommit(_ value: String) -> String? {
         guard (7...40).contains(value.count), value.allSatisfy(\.isHexDigit) else { return nil }

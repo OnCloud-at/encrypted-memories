@@ -10,13 +10,17 @@ public struct AppBuildInfoLabel: View {
     }
 
     public var body: some View {
-        // Both links open the system browser: the version its release page, the commit its source.
+        // Links open the system browser: the version its release page, the commit its source (CI builds only).
         HStack(spacing: 4) {
             Link(destination: info.releaseURL) { styled(Text(info.localizedVersion)) }
-            if let shortCommit = info.shortCommit, let commitURL = info.commitURL {
+            if let shortCommit = info.shortCommit {
                 styled(Text(verbatim: "·"))
                     .accessibilityHidden(true)
-                Link(destination: commitURL) { styled(Text(verbatim: shortCommit)) }
+                if let commitURL = info.commitURL {
+                    Link(destination: commitURL) { styled(Text(verbatim: shortCommit)) }
+                } else {
+                    styled(Text(verbatim: shortCommit))
+                }
             }
         }
         .accessibilityElement(children: .contain)

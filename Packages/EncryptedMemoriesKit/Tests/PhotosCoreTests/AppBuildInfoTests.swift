@@ -13,7 +13,7 @@ final class AppBuildInfoTests: XCTestCase {
     }
 
     func testSettingsShowVersionAndShortCommitButNotTheBuild() {
-        let info = AppBuildInfo(version: "1.2.3", build: "683", commit: "A1B2C3D4E5F6")
+        let info = AppBuildInfo(version: "1.2.3", build: "683", releaseChannel: "stable", commit: "A1B2C3D4E5F6")
 
         XCTAssertTrue(info.localizedVersion.contains("1.2.3"))
         XCTAssertFalse(info.localizedVersion.contains("683"))
@@ -33,6 +33,17 @@ final class AppBuildInfoTests: XCTestCase {
         XCTAssertEqual(
             AppBuildInfo(version: nil, build: nil).releaseURL.absoluteString,
             "https://github.com/OnCloud-at/encrypted-memories/releases")
+    }
+
+    func testOnlyCIBuildsLinkTheirCommit() {
+        let commit = "a1b2c3d4e5f6"
+        XCTAssertNotNil(AppBuildInfo(version: "1.2.3", build: nil, releaseChannel: "stable", commit: commit).commitURL)
+        XCTAssertNotNil(AppBuildInfo(version: "1.2.3", build: nil, releaseChannel: "beta", commit: commit).commitURL)
+        // A local build can name a commit that was never pushed: it shows the hash without a link.
+        let local = AppBuildInfo(version: "1.2.3", build: nil, releaseChannel: "alpha", commit: commit)
+        XCTAssertEqual(local.shortCommit, "a1b2c3d")
+        XCTAssertNil(local.commitURL)
+        XCTAssertNil(AppBuildInfo(version: "1.2.3", build: nil, commit: commit).commitURL)
     }
 
     func testInvalidCommitValuesAreIgnored() {
