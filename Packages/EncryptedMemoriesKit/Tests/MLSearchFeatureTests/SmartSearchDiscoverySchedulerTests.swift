@@ -395,6 +395,37 @@ import TimelineCore
         #expect(!scheduler.discovery.forYou.contains { $0.title == "Vienna" })
     }
 
+    @Test func disablingMapAndPlacesRemovesPlaceSuggestionsButKeepsOtherRows() async throws {
+        let items = (0..<8).map {
+            PhotoItem(uid: PhotoUID(volumeID: "v", nodeID: "\($0)"), captureTime: Date(), mediaType: "image/jpeg")
+        }
+        let coordinates = items.map {
+            PhotoCoordinate(uid: $0.uid, latitude: 48, longitude: 16, date: $0.captureTime)
+        }
+        let scheduler = SmartSearchDiscoveryScheduler(runtimeState: LibraryRuntimeState(), debounce: .zero) {
+            _, _ in "Vienna"
+        }
+        defer { scheduler.reset() }
+        func apply(enabled: Bool) {
+            scheduler.update(
+                sections: [TimelineSection(id: "all", date: Date(), title: "", items: items)],
+                timelineRevision: 1, favoriteUIDs: Set(items.map(\.uid)),
+                coordinates: MapAndPlacesPolicy.suggestionCoordinates(coordinates, enabled: enabled),
+                snapshot: .disabled, indexedAssetCount: { 0 }, searchEvidence: nil)
+        }
+        apply(enabled: true)
+        for _ in 0..<200 where !scheduler.discovery.forYou.contains(where: { $0.title == "Vienna" }) {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        try #require(scheduler.discovery.forYou.contains { $0.title == "Vienna" })
+        apply(enabled: false)
+        for _ in 0..<200 where scheduler.discovery.forYou.isEmpty {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        #expect(!scheduler.discovery.forYou.contains { $0.title == "Vienna" })
+        #expect(scheduler.discovery.forYou.contains { $0.kind == .favorites })
+    }
+
     @Test func metadataSuggestionsSurviveRelaunchWithoutVisualEvidence() async throws {
         let cache = SnapshotCache()
         let items = (0..<8).map {

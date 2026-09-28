@@ -1,5 +1,6 @@
 import Foundation
 import MapKit
+import PhotosCore
 import Testing
 
 @testable import MapCore
@@ -49,5 +50,18 @@ struct PhotoMapPrewarmerTests {
         let core = MKMapRect(x: 0, y: 0, width: 10, height: 10)
         #expect(PhotoMapPrewarmer.visibleMapRect(framing: core, in: .zero) == nil)
         #expect(PhotoMapPrewarmer.visibleMapRect(framing: core, in: CGSize(width: 150, height: 900)) == nil)
+    }
+
+    @Test @MainActor func disabledMapDoesNotStartPrewarm() throws {
+        let suite = "PhotoMapPrewarmerDisabled-\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        defaults.set(false, forKey: AppSettingsKey.mapAndPlacesEnabled)
+        PhotoMapPrewarmer.rememberViewport(CGSize(width: 500, height: 500), defaults: defaults)
+        let prewarmer = PhotoMapPrewarmer(defaults: defaults)
+        prewarmer.prewarm(coordinates: [
+            PhotoCoordinate(uid: PhotoUID(volumeID: "v", nodeID: "p"), latitude: 48, longitude: 16, date: .now)
+        ])
+        #expect(!prewarmer.isPrewarming)
     }
 }
