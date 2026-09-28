@@ -294,49 +294,15 @@ private struct AlbumPhotoDropTarget: ViewModifier {
                 RoundedRectangle(cornerRadius: 6, style: .continuous)
                     .fill(Color.accentColor.opacity(isTargeted ? 0.3 : 0))
             )
-            .onDrop(of: isEnabled ? [Self.referenceType] : [], isTargeted: $isTargeted) { providers in
-                Self.loadReferences(from: providers) { uids, sessions in
-                    // This drag delivers no files to other apps, so the grid stops preparing them.
-                    PhotoDragReference.postInternalDrop(sessions: sessions)
-                    if !uids.isEmpty { onDrop(uids) }
-                }
+            .onDrop(of: isEnabled ? [Self.referenceType] : [], isTargeted: $isTargeted) { _ in
+                // The item providers of this drop carry no types, so read the references from the drag itself.
+                let references = PhotoDragPasteboard.references(on: NSPasteboard(name: .drag))
+                // Refusing a drop without photos lets the system return the drag instead of showing it as taken.
+                guard !references.uids.isEmpty else { return false }
+                // This drag delivers no files to other apps, so the grid stops preparing them.
+                PhotoDragReference.postInternalDrop(sessions: references.sessions)
+                onDrop(references.uids)
                 return true
             }
     }
-
-    private static func loadReferences(
-        from providers: [NSItemProvider], completion: @escaping @MainActor ([PhotoUID], Set<UUID>) -> Void
-    ) {
-        let collector = PhotoReferenceCollector()
-        let group = DispatchGroup()
-        for provider in providers where provider.hasItemConformingToTypeIdentifier(referenceType.identifier) {
-            group.enter()
-            _ = provider.loadDataRepresentation(for: referenceType) { data, _ in
-                if let data, let reference = PhotoDragReference.decode(data) {
-                    collector.append(reference.uid, session: reference.session)
-                }
-                group.leave()
-            }
-        }
-        group.notify(queue: .main) {
-            MainActor.assumeIsolated { completion(collector.uids, collector.sessions) }
-        }
-    }
-}
-
-/// Collects references that load on arbitrary queues. Adding to an album does not depend on their order.
-private final class PhotoReferenceCollector: @unchecked Sendable {
-    private let lock = NSLock()
-    private var collectedUIDs: [PhotoUID] = []
-    private var collectedSessions: Set<UUID> = []
-
-    func append(_ uid: PhotoUID, session: UUID) {
-        lock.withLock {
-            collectedUIDs.append(uid)
-            collectedSessions.insert(session)
-        }
-    }
-
-    var uids: [PhotoUID] { lock.withLock { collectedUIDs } }
-    var sessions: Set<UUID> { lock.withLock { collectedSessions } }
 }
