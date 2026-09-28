@@ -8,13 +8,6 @@
         "de": { "stringUnit": { "state": "translated", "value": "Eine andere Album-Änderung läuft noch. Versuche es gleich noch einmal." } }
       }
     },
-    "albums.add_to_menu": {
-      "extractionState": "manual",
-      "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "Add to" } },
-        "de": { "stringUnit": { "state": "translated", "value": "Hinzufügen" } }
-      }
-    },
     "albums.new_album_menu": {
       "extractionState": "manual",
       "localizations": {
