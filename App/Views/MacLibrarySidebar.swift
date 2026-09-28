@@ -12,6 +12,8 @@ import UniformTypeIdentifiers
 /// Collapsible left sidebar - a native macOS sidebar `List` (Liquid-Glass vibrant material, native
 /// selection): Proton smart filters (tags) on top, user albums below.
 struct SidebarView: View {
+    @AppStorage(AppSettingsKey.mapAndPlacesEnabled) private var mapAndPlacesEnabled =
+        AppSettingsDefault.mapAndPlacesEnabled
     let albums: [AlbumSummary]
     let isLoadingAlbums: Bool
     let albumCatalogFailed: Bool
@@ -42,8 +44,10 @@ struct SidebarView: View {
                     Label(tag.title, systemImage: tag.systemImage)
                         .tag(PhotoFilter.tag(tag))
                 }
-                Label("sidebar.map", systemImage: "map")
-                    .tag(PhotoFilter.map)
+                if mapAndPlacesEnabled {
+                    Label("sidebar.map", systemImage: "map")
+                        .tag(PhotoFilter.map)
+                }
             }
             Section {
                 if isLoadingAlbums, albums.isEmpty {

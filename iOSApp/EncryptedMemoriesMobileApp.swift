@@ -257,6 +257,8 @@ private struct MobileRootView: View {
 /// Shared tab hierarchy; the system adapts its presentation for iPhone and iPad.
 private struct MobileMainTabView: View {
     @Environment(MobileLibraryModel.self) private var libraryModel
+    @AppStorage(AppSettingsKey.mapAndPlacesEnabled) private var mapAndPlacesEnabled =
+        AppSettingsDefault.mapAndPlacesEnabled
     @Environment(MobileSceneContext.self) private var sceneContext
     @State private var selection: MobileTab = .photos
     @Environment(\.scenePhase) private var scenePhase
@@ -280,6 +282,7 @@ private struct MobileMainTabView: View {
             coordinateRevision: libraryModel.locationIndex.revision
         ) + "|librarySettled:\(libraryModel.allowsAutomaticSuggestionRefresh)"
             + "|cacheContentSettled:\(libraryModel.allowsSuggestionCacheRestore)"
+            + "|mapAndPlaces:\(mapAndPlacesEnabled)"
     }
 
     private func updateSearchActivity() {
@@ -305,13 +308,17 @@ private struct MobileMainTabView: View {
 
     var body: some View {
         @Bindable var sceneContext = sceneContext
-        MobileAdaptiveTabShell(selection: $selection, searchText: $searchText)
-            .environment(viewerRouter)
+        let shell = MobileAdaptiveTabShell(
+            selection: $selection, searchText: $searchText, mapAndPlacesEnabled: mapAndPlacesEnabled
+        )
+        shell.environment(viewerRouter)
             .task(id: suggestionsRevision) {
                 updateSearchActivity()
                 libraryModel.searchSuggestions.update(
                     sections: libraryModel.sections, timelineRevision: libraryModel.timelineRevision,
-                    favoriteUIDs: libraryModel.favoriteUIDs, coordinates: libraryModel.locationIndex.coordinates,
+                    favoriteUIDs: libraryModel.favoriteUIDs,
+                    coordinates: MapAndPlacesPolicy.suggestionCoordinates(
+                        libraryModel.locationIndex.coordinates, enabled: mapAndPlacesEnabled),
                     smartSearch: libraryModel.smartSearch,
                     libraryIsSettled: libraryModel.allowsAutomaticSuggestionRefresh,
                     cacheContentIsSettled: libraryModel.allowsSuggestionCacheRestore,
@@ -319,6 +326,15 @@ private struct MobileMainTabView: View {
                 )
             }
             .onChange(of: selection, initial: true) { _, _ in updateSearchActivity() }
+            .onChange(of: mapAndPlacesEnabled) { _, enabled in
+                if enabled {
+                    libraryModel.resumeMapAndPlaces()
+                } else {
+                    if selection == .map { selection = .photos }
+                    libraryModel.pauseMapAndPlaces()
+                    Task { await NativePlaceNameResolver.shared.cancelPending() }
+                }
+            }
             .onChange(of: scenePhase) { _, _ in updateSearchActivity() }
             .onChange(of: searchText) { _, _ in updateSearchActivity() }
             .onDisappear {
@@ -347,7 +363,9 @@ private struct MobileMainTabView: View {
             .focusedSceneValue(
                 \.mobileSceneCommands,
                 MobileSceneCommandTarget(
-                    selectTab: { selection = $0 },
+                    selectTab: { tab in
+                        if tab != .map || mapAndPlacesEnabled { selection = tab }
+                    },
                     openSettings: { sceneContext.settingsPresented = true }
                 )
             )
@@ -384,6 +402,7 @@ private struct MobileMainTabView: View {
 private struct MobileAdaptiveTabShell: View {
     @Binding var selection: MobileTab
     @Binding var searchText: String
+    let mapAndPlacesEnabled: Bool
     /// Bumped when the already-active Photos tab is retapped, so the timeline scrolls to the newest photos.
     @State private var photosScrollSignal = 0
     @State private var searchScope: MLSearchScope = .all
@@ -416,8 +435,10 @@ private struct MobileAdaptiveTabShell: View {
             ) {
                 MobileCollectionsScreen()
             }
-            Tab(MobileTab.map.title, systemImage: MobileTab.map.systemImage, value: MobileTab.map) {
-                MobileMapScreen()
+            if mapAndPlacesEnabled {
+                Tab(MobileTab.map.title, systemImage: MobileTab.map.systemImage, value: MobileTab.map) {
+                    MobileMapScreen()
+                }
             }
             Tab(value: MobileTab.search, role: .search) {
                 MobileSearchTabScreen(
@@ -639,6 +660,8 @@ private struct MobileSearchTabScreen: View {
 /// `MobileMainTabView` publishes, so two windows never share navigation state.
 private struct MobileNavigationCommands: Commands {
     @FocusedValue(\.mobileSceneCommands) private var target
+    @AppStorage(AppSettingsKey.mapAndPlacesEnabled) private var mapAndPlacesEnabled =
+        AppSettingsDefault.mapAndPlacesEnabled
 
     var body: some Commands {
         CommandGroup(replacing: .appSettings) {
@@ -649,7 +672,8 @@ private struct MobileNavigationCommands: Commands {
             .disabled(target == nil)
         }
         CommandMenu(String(localized: "menu.go")) {
-            ForEach(Array(MobileTab.allCases.enumerated()), id: \.element) { index, tab in
+            ForEach(Array(MobileTab.allCases.filter { $0 != .map || mapAndPlacesEnabled }.enumerated()), id: \.element)
+            { index, tab in
                 Button(tab.title) {
                     target?.selectTab(tab)
                 }
