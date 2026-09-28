@@ -153,6 +153,17 @@ Also run the existing review and issue-triage tests when changing their shared c
 Before claiming improved model accuracy, replay maintainer-adjudicated true findings and false positives
 through the configured provider. Deterministic tests alone do not establish model accuracy.
 
+The review can also check the architecture rules of this file and the Code section of `AGENTS.md`.
+It reads them from the default branch. The repository variable `LLM_REVIEW_REPOSITORY_RULES` set to `1` turns this on.
+A rule violation is never blocking.
+
+Maintainers measure a reviewer change with the manual `Replay automated review` workflow.
+It runs only from the default branch, because it uses the LLM key. A reviewer change therefore ships behind a switch first.
+It reviews the recorded pull request snapshots in `.github/review-replay/cases.json` with and without the rules.
+It posts nothing. Its report lists the findings that only one variant reports.
+A variant that did not review everything cannot show that a finding is absent; the report marks it incomplete.
+Record each verdict in the case file with path, line, severity, title, and `true_finding` or `false_positive`.
+
 References: [GitHub required checks](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches),
 [CodeRabbit context verification](https://www.coderabbit.ai/blog/context-engineering-ai-code-reviews).
 

@@ -13,8 +13,16 @@ class EvidenceValidationError(RuntimeError):
     """A claimed finding failed client validation and must be regenerated."""
 
 
+REPOSITORY_RULE_VERIFICATION = (
+    " Repository rules from the trusted default branch follow. A violation of these rules that the supplied patch "
+    "itself demonstrates is confirmable with category repository_rule, even without a runtime failure. Its trigger "
+    "names the rule and the changed code; its impact names the consequence for shared code, duplication, or "
+    "platform parity. A rule violation is never high severity.\n\nRepository rules:\n"
+)
+
+
 def verify_findings(review, payload, files, snapshot, repo, *, token, api_url, request, fetch, redact,
-                    max_request_bytes=MAX_LLM_REQUEST_BYTES):
+                    max_request_bytes=MAX_LLM_REQUEST_BYTES, repository_rules=None):
     # Legacy callers used testing_gaps for optional notes. New parsed reviews keep
     # those notes in review_notes and reserve testing_gaps for real limitations.
     has_explicit_notes = "review_notes" in review
@@ -72,7 +80,8 @@ def verify_findings(review, payload, files, snapshot, repo, *, token, api_url, r
         "id": {"type": "string", "enum": list(contexts)},
         "decision": {"type": "string", "enum": ["confirmed", "dismissed", "uncertain"]},
         "severity": {"type": "string", "enum": ["high", "medium"]},
-        "category": {"type": "string", "enum": ["data_loss", "security", "crash", "build", "correctness"]},
+        "category": {"type": "string", "enum": ["data_loss", "security", "crash", "build", "correctness",
+                                                *(["repository_rule"] if repository_rules else [])]},
         "confidence": {"type": "string", "enum": ["high", "low"]},
         "introduced": {"type": "boolean"},
         "line": {"type": "integer", "minimum": 1},
@@ -105,6 +114,7 @@ def verify_findings(review, payload, files, snapshot, repo, *, token, api_url, r
             "line. Set introduced only when the patch demonstrates the regression. Do not invent evidence. "
             "Return one decision per candidate, including dismissed and uncertain candidates. "
             "Keep trigger, impact and counterevidence to one concise sentence each."
+            + (REPOSITORY_RULE_VERIFICATION + repository_rules if repository_rules else "")
         )},
         {"role": "user", "content": ""},
     ]
@@ -192,7 +202,7 @@ def verify_findings(review, payload, files, snapshot, repo, *, token, api_url, r
                 raise EvidenceValidationError("A confirmed finding needs an exact source quote at its candidate line, "
                                               "a trigger, impact and considered counterevidence.")
             severity = ("blocking" if decision["severity"] == "high"
-                        and decision["category"] != "correctness" else "warning")
+                        and decision["category"] not in {"correctness", "repository_rule"} else "warning")
             finding = dict(candidate, severity=severity,
                            detail=f"{decision['trigger']} {decision['impact']}")
             if not any(item["file_id"] == finding["file_id"] and item["line"] == finding["line"] for item in findings):
