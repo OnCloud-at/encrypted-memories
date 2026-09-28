@@ -123,59 +123,64 @@ struct MobilePhotoViewer: View {
             ZStack {
                 Color.black.ignoresSafeArea()
 
-                // UIKit pager (UIPageViewController) instead of SwiftUI's page TabView, because rotation
-                // must preserve the current page during the size transition.
-                // The SwiftUI pager keeps its width-bound content offset and page size through a device rotation,
-                // so the photo rotated displaced in a corner and snapped to centre only afterwards (a rebuild via
-                // `.id` was a hard cut instead). UIPageViewController participates in the size transition and keeps
-                // the current page centred through the whole rotation - the Photos-app behavior.
-                MobileViewerPager(count: items.count, index: $index) { i, isCurrent in
-                    let item = items[i]
-                    MobileViewerPage(
-                        item: item,
-                        isCurrent: isCurrent,
-                        showsChrome: chromeVisible,
-                        resolvedMediaKind: resolvedMediaKinds[item.uid],
-                        libraryModel: libraryModel,
-                        imageStore: imageStore,
-                        liveTextHighlighted: isCurrent && liveTextHighlighted,
-                        onLiveTextAvailable: { uid, available in
-                            if available {
-                                liveTextUID = uid
-                            } else if liveTextUID == uid {
-                                liveTextUID = nil
-                                liveTextHighlighted = false
-                            }
-                        },
-                        onToggleChrome: {
-                            withAnimation(
-                                MobileViewerMotionPolicy.animation(
-                                    .easeInOut(duration: 0.2), reduceMotion: reduceMotion
-                                )
-                            ) {
-                                chromeVisible.toggle()
-                            }
-                        },
-                        onCloseRequested: { dismiss() }
-                    )
-                    .id(item.uid)
+                // The filmstrip shortens the media while the display is whole; on a partially open iPhone Duo the
+                // arrangement moves it to the other part of the display, so neither crosses the fold.
+                MobileViewerArrangement(showsAccessory: chromeVisible) {
+                    // UIKit pager (UIPageViewController) instead of SwiftUI's page TabView, because rotation
+                    // must preserve the current page during the size transition.
+                    // The SwiftUI pager keeps its width-bound content offset and page size through a device rotation,
+                    // so the photo rotated displaced in a corner and snapped to centre only afterwards (a rebuild via
+                    // `.id` was a hard cut instead). UIPageViewController participates in the size transition and keeps
+                    // the current page centred through the whole rotation - the Photos-app behavior.
+                    MobileViewerPager(count: items.count, index: $index) { i, isCurrent in
+                        let item = items[i]
+                        MobileViewerPage(
+                            item: item,
+                            isCurrent: isCurrent,
+                            showsChrome: chromeVisible,
+                            resolvedMediaKind: resolvedMediaKinds[item.uid],
+                            libraryModel: libraryModel,
+                            imageStore: imageStore,
+                            liveTextHighlighted: isCurrent && liveTextHighlighted,
+                            onLiveTextAvailable: { uid, available in
+                                if available {
+                                    liveTextUID = uid
+                                } else if liveTextUID == uid {
+                                    liveTextUID = nil
+                                    liveTextHighlighted = false
+                                }
+                            },
+                            onToggleChrome: {
+                                withAnimation(
+                                    MobileViewerMotionPolicy.animation(
+                                        .easeInOut(duration: 0.2), reduceMotion: reduceMotion
+                                    )
+                                ) {
+                                    chromeVisible.toggle()
+                                }
+                            },
+                            onCloseRequested: { dismiss() }
+                        )
+                        .id(item.uid)
+                    }
+                    // The Live Photo status sits on the media inside the safe area, below the navigation bar.
+                    .overlay(alignment: .topLeading) {
+                        if currentBaseItem?.isLivePhoto == true {
+                            viewerLiveIndicator
+                        }
+                    }
+                    // A series shows its photo count in the same place; a burst is never a Live Photo.
+                    .overlay(alignment: .topLeading) {
+                        if let seriesItems = currentSeriesItems {
+                            viewerSeriesButton(count: seriesItems.count)
+                        }
+                    }
+                } accessory: {
+                    // The Photos-app contract: the media refits when the chrome toggles, and the native bottom bar
+                    // stacks below the strip.
+                    viewerBottomAccessory
                 }
             }
-            // The Live Photo status sits on the media inside the safe area, below the navigation bar.
-            .overlay(alignment: .topLeading) {
-                if currentBaseItem?.isLivePhoto == true {
-                    viewerLiveIndicator
-                }
-            }
-            // A series shows its photo count in the same place; a burst is never a Live Photo.
-            .overlay(alignment: .topLeading) {
-                if let seriesItems = currentSeriesItems {
-                    viewerSeriesButton(count: seriesItems.count)
-                }
-            }
-            // The filmstrip is bottom safe-area content, the Photos-app contract: the media refits when the chrome
-            // toggles, and the native bottom bar stacks below the strip.
-            .safeAreaInset(edge: .bottom, spacing: 0) { viewerBottomAccessory }
             .overlay {
                 UndoNoticeOverlay(
                     notice: Binding(get: { libraryModel.undoNotice }, set: { libraryModel.undoNotice = $0 }))
@@ -301,26 +306,24 @@ struct MobilePhotoViewer: View {
         )
     }
 
-    /// Bottom safe-area content below the media: the route filmstrip. It leaves with the bars on a chrome tap,
-    /// so the media refits to the full window the way the Photos app does. The strip keeps its bounded UIKit
-    /// collection view; it is not a bar item, so the system never moves it to a vertical bar.
-    @ViewBuilder private var viewerBottomAccessory: some View {
-        if chromeVisible {
-            let profile = chromeLayoutProfile
-            MobileViewerFilmstrip(
-                items: items,
-                selectedUID: currentBaseItem?.uid,
-                feed: libraryModel.thumbnailFeed,
-                itemSide: min(46, profile.filmstripHeight),
-                onSelect: selectPage
-            )
-            .frame(height: profile.filmstripHeight)
-            .padding(.horizontal, MobileViewerBottomLayout.horizontalPadding)
-            .padding(.top, profile.rowSpacing)
-            .padding(.bottom, profile.bottomPadding)
-            .frame(maxWidth: .infinity)
-            .transition(.opacity)
-        }
+    /// The accessory below the media: the route filmstrip. It leaves with the bars on a chrome tap, so the media
+    /// refits to the full window the way the Photos app does. The strip keeps its bounded UIKit collection view;
+    /// it is not a bar item, so the system never moves it to a vertical bar.
+    private var viewerBottomAccessory: some View {
+        let profile = chromeLayoutProfile
+        return MobileViewerFilmstrip(
+            items: items,
+            selectedUID: currentBaseItem?.uid,
+            feed: libraryModel.thumbnailFeed,
+            itemSide: min(46, profile.filmstripHeight),
+            onSelect: selectPage
+        )
+        .frame(height: profile.filmstripHeight)
+        .padding(.horizontal, MobileViewerBottomLayout.horizontalPadding)
+        .padding(.top, profile.rowSpacing)
+        .padding(.bottom, profile.bottomPadding)
+        .frame(maxWidth: .infinity)
+        .transition(.opacity)
     }
 
     private var isCompactLandscape: Bool { verticalSizeClass == .compact }

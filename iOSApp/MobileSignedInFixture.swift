@@ -1,3 +1,4 @@
+import AVFoundation
 import Foundation
 import MediaByteCache
 import MediaCacheUIKitAdapter
@@ -28,7 +29,12 @@ import UIKit
         private let runtime: MobileAccountRuntime
         private let cacheDirectory: URL
 
-        init(runtime: MobileAccountRuntime = .shared, itemsPerSection: Int = 36) async throws {
+        /// `includesVideo` adds one short video as the newest item, for the video UI tests.
+        init(
+            runtime: MobileAccountRuntime = .shared, itemsPerSection: Int = 36, includesVideo: Bool = false
+        )
+            async throws
+        {
             guard !BackupLocalDataPurge.isPurgePending() else { throw MobileFixtureError.pendingAccountPurge }
             self.runtime = runtime
             cacheDirectory = FileManager.default.temporaryDirectory.appendingPathComponent(
@@ -58,8 +64,26 @@ import UIKit
                 sections.append(
                     TimelineSection(id: "fixture-\(name)", date: sectionDate, title: "Fixture \(name)", items: items))
             }
+            var videos: [PhotoUID: URL] = [:]
+            if includesVideo, let last = sections.popLast() {
+                let uid = PhotoUID(volumeID: "fixture", nodeID: "video")
+                let url = cacheDirectory.appendingPathComponent("fixture-video.mp4")
+                try FileManager.default.createDirectory(at: cacheDirectory, withIntermediateDirectories: true)
+                try await MobileFixtureVideo.write(to: url)
+                let poster = UIGraphicsImageRenderer(size: CGSize(width: 160, height: 160)).image { context in
+                    UIColor.darkGray.setFill()
+                    context.fill(CGRect(x: 0, y: 0, width: 160, height: 160))
+                }
+                guard let data = poster.jpegData(compressionQuality: 0.8) else { throw MobileFixtureError.bitmap }
+                thumbnails[uid] = data
+                videos[uid] = url
+                let newest = last.items.map(\.captureTime).max() ?? last.date
+                let video = PhotoItem(uid: uid, captureTime: newest.addingTimeInterval(60), mediaType: "video/mp4")
+                sections.append(
+                    TimelineSection(id: last.id, date: last.date, title: last.title, items: last.items + [video]))
+            }
             self.sections = sections
-            backend = MobileFixtureBackend(sections: sections, thumbnails: thumbnails)
+            backend = MobileFixtureBackend(sections: sections, thumbnails: thumbnails, videos: videos)
             cache = ThumbnailCache(rootDirectory: cacheDirectory)
             feed = UIKitThumbnailFeed(cache: cache, loader: backend)
             for (uid, data) in thumbnails {
@@ -107,6 +131,58 @@ import UIKit
         }
     }
 
+    /// A short silent H.264 clip whose shade changes every frame, written once per fixture.
+    enum MobileFixtureVideo {
+        static func write(to url: URL, seconds: Int = 8) async throws {
+            let width = 320
+            let height = 240
+            let framesPerSecond: Int32 = 10
+            try? FileManager.default.removeItem(at: url)
+            let writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
+            let input = AVAssetWriterInput(
+                mediaType: .video,
+                outputSettings: [
+                    AVVideoCodecKey: AVVideoCodecType.h264, AVVideoWidthKey: width, AVVideoHeightKey: height,
+                ])
+            input.expectsMediaDataInRealTime = false
+            let adaptor = AVAssetWriterInputPixelBufferAdaptor(
+                assetWriterInput: input,
+                sourcePixelBufferAttributes: [
+                    kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+                    kCVPixelBufferWidthKey as String: width, kCVPixelBufferHeightKey as String: height,
+                ])
+            guard writer.canAdd(input) else { throw MobileFixtureError.unavailable }
+            writer.add(input)
+            guard writer.startWriting() else { throw writer.error ?? MobileFixtureError.unavailable }
+            writer.startSession(atSourceTime: .zero)
+            for frame in 0..<(seconds * Int(framesPerSecond)) {
+                while !input.isReadyForMoreMediaData {
+                    guard writer.status == .writing else { throw writer.error ?? MobileFixtureError.unavailable }
+                    try await Task.sleep(for: .milliseconds(5))
+                }
+                var buffer: CVPixelBuffer?
+                guard let pool = adaptor.pixelBufferPool,
+                    CVPixelBufferPoolCreatePixelBuffer(nil, pool, &buffer) == kCVReturnSuccess, let buffer
+                else { throw MobileFixtureError.unavailable }
+                CVPixelBufferLockBaseAddress(buffer, [])
+                if let base = CVPixelBufferGetBaseAddress(buffer) {
+                    memset(base, Int32(40 + (frame * 3) % 180), CVPixelBufferGetBytesPerRow(buffer) * height)
+                }
+                CVPixelBufferUnlockBaseAddress(buffer, [])
+                guard
+                    adaptor.append(
+                        buffer, withPresentationTime: CMTime(value: CMTimeValue(frame), timescale: framesPerSecond))
+                else {
+                    writer.cancelWriting()
+                    throw writer.error ?? MobileFixtureError.unavailable
+                }
+            }
+            input.markAsFinished()
+            await writer.finishWriting()
+            guard writer.status == .completed else { throw writer.error ?? MobileFixtureError.unavailable }
+        }
+    }
+
     enum MobileFixtureError: Error {
         case bitmap
         case unavailable
@@ -118,6 +194,8 @@ import UIKit
     struct MobileFixtureBackend: PhotosBackend {
         let sections: [TimelineSection]
         let thumbnails: [PhotoUID: Data]
+        /// Local video files by photo; the viewer streams them like a Proton video.
+        var videos: [PhotoUID: URL] = [:]
         var favoriteLoader: (@Sendable () async throws -> Set<PhotoUID>)? = nil
         var favoriteWriter: (@Sendable ([PhotoUID], Bool) async throws -> Void)? = nil
 
@@ -161,11 +239,17 @@ import UIKit
             throw MobileFixtureError.unavailable
         }
         func makeStreamingAsset(for uid: PhotoUID) async throws -> StreamingVideoAsset {
-            throw MobileFixtureError.unavailable
+            guard let url = videos[uid] else { throw MobileFixtureError.unavailable }
+            return StreamingVideoAsset(asset: AVURLAsset(url: url), retaining: url as NSURL)
         }
         func prefetchEncrypted(for uid: PhotoUID) async throws {}
         func metadata(for uid: PhotoUID) async throws -> PhotoMetadata {
-            PhotoMetadata(filename: "\(uid.nodeID).jpg", mimeType: "image/jpeg", pixelWidth: 160, pixelHeight: 160)
+            if videos[uid] != nil {
+                return PhotoMetadata(
+                    filename: "\(uid.nodeID).mp4", mimeType: "video/mp4", pixelWidth: 320, pixelHeight: 240)
+            }
+            return PhotoMetadata(
+                filename: "\(uid.nodeID).jpg", mimeType: "image/jpeg", pixelWidth: 160, pixelHeight: 160)
         }
         func burstGroup(containing uid: PhotoUID) async throws -> [PhotoItem] { [] }
         func favoriteUIDs() async throws -> Set<PhotoUID> {
