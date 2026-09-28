@@ -1,5 +1,6 @@
 import AppKit
 import PhotosCore
+import QuartzCore
 
 /// Covers app windows before AppKit records inactive and minimized previews.
 @MainActor
@@ -58,6 +59,11 @@ final class MacPrivacyPreviewShield: NSObject {
     @objc private func windowWillMiniaturize(_ notification: Notification) {
         guard let window = notification.object as? NSWindow else { return }
         setCovered(enabled, on: window)
+        if enabled {
+            window.contentView?.layoutSubtreeIfNeeded()
+            window.display()
+            CATransaction.flush()
+        }
     }
 
     private func refresh() {
