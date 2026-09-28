@@ -57,8 +57,6 @@ struct MainView: View {
     @State private var albumLoadGeneration: UInt64 = 0
     @State private var albumActions: AlbumActionCoordinator
     @State private var showCreateAlbum = false
-    /// Photos that a new album starts with; empty when the album is created on its own.
-    @State private var createAlbumPhotoUIDs: [PhotoUID] = []
     @State private var showAlbumDestination = false
     @State private var selection: PhotoFilter = .all
     @State private var mapClusterPresentation: MapClusterPresentation?
@@ -443,10 +441,9 @@ struct MainView: View {
         )
         .coordinateSpace(name: "root")
         .animation(Self.sidebarAnimation, value: sidebarOpen)
-        .sheet(isPresented: $showCreateAlbum, onDismiss: { createAlbumPhotoUIDs = [] }) {
+        .sheet(isPresented: $showCreateAlbum) {
             AlbumCreationSheet(
                 coordinator: albumActions,
-                photoUIDs: createAlbumPhotoUIDs,
                 onAlbumsChanged: { Task { await loadAlbums() } },
                 onCompleted: { _ in showCreateAlbum = false }
             )
@@ -752,10 +749,9 @@ struct MainView: View {
         selectedUIDs.removeAll()
     }
 
-    /// Opens the shared name form. A new album can start with photos, for example the one open in the viewer.
-    private func presentCreateAlbum(adding photoUIDs: [PhotoUID] = []) {
+    /// Opens the shared name form.
+    private func presentCreateAlbum() {
         guard albumActions.canCreate else { return }
-        createAlbumPhotoUIDs = photoUIDs
         showCreateAlbum = true
     }
 
@@ -2152,6 +2148,20 @@ struct MainView: View {
                         favorites.contains(viewerModel.current.uid) ? "toolbar.remove_favorite" : "toolbar.favorite")
                 }
 
+                if viewerMutationAction == .moveToTrash {
+                    // The grid's album button for the open photo. The grid toolbar is hidden while the viewer is
+                    // open, so both share one popover state.
+                    AlbumAddButton(
+                        coordinator: albumActions,
+                        photoUIDs: [viewerModel.current.uid],
+                        isPresented: $showAlbumDestination,
+                        onAlbumsChanged: { Task { await loadAlbums() } }
+                    )
+                    .labelStyle(.iconOnly)
+                    // A photo that is moving to the Trash cannot join an album.
+                    .disabled(isTrashMutating)
+                }
+
                 Menu {
                     if viewerModel.hasLiveText {
                         Button {
@@ -2163,15 +2173,6 @@ struct MainView: View {
                                 systemImage: "text.viewfinder"
                             )
                         }
-                        Divider()
-                    }
-                    if viewerMutationAction == .moveToTrash {
-                        AlbumAddMenu(
-                            coordinator: albumActions,
-                            photoUIDs: [viewerModel.current.uid],
-                            onNewAlbum: { presentCreateAlbum(adding: [viewerModel.current.uid]) },
-                            onAdded: { _ in Task { await loadAlbums() } }
-                        )
                         Divider()
                     }
                     switch viewerMutationAction {
@@ -2250,26 +2251,14 @@ struct MainView: View {
         if selection != .trash, !selection.isReadOnly {
             ToolbarItemGroup(placement: .secondaryAction) {
                 downloadActionItem
-                Button {
-                    showAlbumDestination = true
-                } label: {
-                    Label(L10n.string("albums.add_selection_title"), systemImage: "rectangle.stack.badge.plus")
-                        .labelStyle(.iconOnly)
-                }
-                .disabled(selectedUIDs.isEmpty || !albumActions.canAddPhotos)
-                .help(L10n.string("albums.add_selection_title"))
-                .accessibilityLabel(L10n.string("albums.add_selection_title"))
-                .popover(isPresented: $showAlbumDestination, arrowEdge: .top) {
-                    AlbumDestinationPicker(
-                        coordinator: albumActions,
-                        photoUIDs: Array(selectedUIDs),
-                        onAlbumsChanged: { Task { await loadAlbums() } },
-                        onCompleted: { _ in
-                            showAlbumDestination = false
-                            endSelection()
-                        }
-                    )
-                }
+                AlbumAddButton(
+                    coordinator: albumActions,
+                    photoUIDs: Array(selectedUIDs),
+                    isPresented: $showAlbumDestination,
+                    onAlbumsChanged: { Task { await loadAlbums() } },
+                    onCompleted: { _ in endSelection() }
+                )
+                .labelStyle(.iconOnly)
                 Button {
                     requestSelectedRemovalOrTrash()
                 } label: {

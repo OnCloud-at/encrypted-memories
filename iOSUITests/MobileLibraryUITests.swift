@@ -36,6 +36,25 @@ final class MobileLibraryUITests: XCTestCase {
         XCTAssertTrue(firstPhoto.waitForExistence(timeout: 10), "the library did not return")
     }
 
+    func testTheAlbumButtonOfTheViewerAddsTheOpenPhotoToAnAlbum() {
+        XCTAssertTrue(firstPhoto.waitForExistence(timeout: 60))
+        firstPhoto.tap()
+
+        let addToAlbum = app.buttons["Add to Album"].firstMatch
+        XCTAssertTrue(addToAlbum.waitForExistence(timeout: 10), "the viewer shows no album button")
+        addToAlbum.tap()
+        let album = app.buttons.matching(NSPredicate(format: "label BEGINSWITH 'Fixture Album'")).firstMatch
+        XCTAssertTrue(album.waitForExistence(timeout: 10), "the album list did not open")
+        XCTAssertTrue(album.isEnabled, "the photo is in the album before it was added")
+        album.tap()
+        XCTAssertTrue(wait(for: album, "exists == false"), "adding the photo did not close the album list")
+
+        // The album list opens again and marks the album that already holds the photo.
+        addToAlbum.tap()
+        XCTAssertTrue(album.waitForExistence(timeout: 10))
+        XCTAssertTrue(wait(for: album, "isEnabled == false"), "the album does not hold the photo")
+    }
+
     func testSelectingPhotosShowsTheirActionsAndDoneEndsTheSelection() {
         XCTAssertTrue(firstPhoto.waitForExistence(timeout: 60))
         app.buttons["Select"].tap()
