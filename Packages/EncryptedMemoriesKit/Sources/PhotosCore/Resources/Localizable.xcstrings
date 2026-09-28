@@ -5046,8 +5046,8 @@
     "settings.privacy_blur_preview_explanation": {
       "extractionState": "manual",
       "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "Blurs photos in new app previews." } },
-        "de": { "stringUnit": { "state": "translated", "value": "Zeichnet Fotos in neuen App-Vorschauen weich." } }
+        "en": { "stringUnit": { "state": "translated", "value": "Hides app content in the App Switcher." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Verbirgt den App-Inhalt im App-Umschalter." } }
       }
     },
     "settings.privacy_policy": {
