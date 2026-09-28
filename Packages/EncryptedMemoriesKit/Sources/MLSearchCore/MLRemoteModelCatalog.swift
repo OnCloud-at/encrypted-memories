@@ -257,11 +257,12 @@ public struct MLRemoteModelCatalogResolver: Sendable {
             guard Self.isSafeModelID(remote.id.rawValue) else {
                 throw MLRemoteModelCatalogError.unsafeModelID(remote.id.rawValue)
             }
-            guard !remote.compatibilityKey.isEmpty,
-                let recipe = compatibilityRegistry.recipe(for: remote.compatibilityKey)
-            else {
+            guard !remote.compatibilityKey.isEmpty else {
                 throw MLRemoteModelCatalogError.unknownCompatibilityRecipe(remote.compatibilityKey)
             }
+            // A model family from a newer app release. Skipping it keeps this catalog, and with it every
+            // later update of the known models; rejecting the whole document would freeze this app.
+            guard let recipe = compatibilityRegistry.recipe(for: remote.compatibilityKey) else { continue }
             guard remote.releaseSequence > 0 else {
                 throw MLRemoteModelCatalogError.invalidModelReleaseSequence(remote.id.rawValue)
             }
@@ -319,8 +320,9 @@ public struct MLRemoteModelCatalogResolver: Sendable {
                 artifacts: remote.artifacts,
                 recipe: recipe
             )
-            if remote.availability ?? .active == .active {
-                let entry = MLModelCatalogEntry(
+            // A retired model stays in the catalog, so a person who uses it keeps search; it is never offered anew.
+            resolvedEntries.append(
+                MLModelCatalogEntry(
                     id: remote.id,
                     compatibilityKey: remote.compatibilityKey,
                     displayName: trusted?.displayName ?? recipe.family,
@@ -339,14 +341,13 @@ public struct MLRemoteModelCatalogResolver: Sendable {
                     localizedMetadata: recipe.localizedMetadata,
                     estimatedInstalledBytes: recipe.estimatedInstalledBytes,
                     downloadPlan: plan,
-                    releaseQualification: remote.qualification
-                )
-                resolvedEntries.append(entry)
-            }
+                    releaseQualification: remote.qualification,
+                    isRetired: remote.availability == .retired
+                ))
         }
 
-        let remoteIDs = Set(seenModels)
-        let legacyEntries = trustedCatalog.entries.filter { !remoteIDs.contains($0.id) }
+        let resolvedIDs = Set(resolvedEntries.map(\.id))
+        let legacyEntries = trustedCatalog.entries.filter { !resolvedIDs.contains($0.id) }
         return MLModelCatalog(entries: legacyEntries + resolvedEntries)
     }
 
