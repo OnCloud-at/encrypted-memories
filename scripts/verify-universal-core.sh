@@ -59,6 +59,7 @@ CORE_TARGETS=(
   TimelineCore
   PhotoViewerCore
   MLSearchCore
+  DeviceRootCore
 )
 
 SHARED_UI_TARGETS=(
@@ -73,6 +74,7 @@ RENDERING_CORE_TARGETS=(
 )
 
 IOS_PLATFORM_ADAPTER_TARGETS=(
+  DeviceRootAppleAdapter
   LibraryRuntimeAppleAdapter
   MetalGridTextureUIKitAdapter
   TimelineUIKitAdapter
@@ -82,6 +84,7 @@ IOS_PLATFORM_ADAPTER_TARGETS=(
 )
 
 MACOS_PLATFORM_ADAPTER_TARGETS=(
+  DeviceRootAppleAdapter
   LibraryRuntimeAppleAdapter
   MetalGridTextureAppKitAdapter
   PhotoLibraryBackupAdapter

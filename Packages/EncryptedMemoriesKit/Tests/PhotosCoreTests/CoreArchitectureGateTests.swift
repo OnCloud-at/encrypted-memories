@@ -123,6 +123,12 @@ final class CoreArchitectureGateTests: XCTestCase {
             extraForbiddenTokens: []
         ),
         CoreTargetRule(
+            name: "DeviceRootCore",
+            allowedImports: ["Foundation"],
+            expectedDependencies: [],
+            extraForbiddenTokens: []
+        ),
+        CoreTargetRule(
             name: "TimelineCore",
             // UploadCore: photos that the backup has not uploaded yet are part of the timeline (pending grid).
             allowedImports: [
