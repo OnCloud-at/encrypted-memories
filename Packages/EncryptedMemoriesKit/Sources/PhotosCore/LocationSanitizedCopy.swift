@@ -84,8 +84,9 @@ public enum LocationSanitizedCopy {
         case "m4v": fileType = .m4v
         default: throw Failure.unsupportedFormat
         }
-        guard let session = try await AVAssetExportSession(
-            asset: AVURLAsset(url: source), presetName: AVAssetExportPresetPassthrough)
+        guard
+            let session = try await AVAssetExportSession(
+                asset: AVURLAsset(url: source), presetName: AVAssetExportPresetPassthrough)
         else { throw Failure.unsupportedFormat }
         guard await session.supportedFileTypes.contains(fileType) else { throw Failure.unsupportedFormat }
         session.metadataItemFilter = .forSharing()
