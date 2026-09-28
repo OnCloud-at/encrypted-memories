@@ -33,6 +33,7 @@ public enum SupportDiagnosticsExporter {
         let generatedAt: Date
         let appVersion: String
         let appBuild: String
+        let appCommit: String
         let operatingSystem: String
         let runtime: Runtime
         let resources: Resources
@@ -53,6 +54,7 @@ public enum SupportDiagnosticsExporter {
             generatedAt: Date(),
             appVersion: buildInfo.version ?? "unknown",
             appBuild: buildInfo.build ?? "unknown",
+            appCommit: buildInfo.commit ?? "unknown",
             operatingSystem: ProcessInfo.processInfo.operatingSystemVersionString,
             runtime: Report.Runtime(
                 thermal: String(describing: snapshot.thermalLevel),

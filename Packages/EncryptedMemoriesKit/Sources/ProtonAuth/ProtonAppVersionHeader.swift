@@ -11,7 +11,7 @@ public enum ProtonAppVersionHeader {
     /// Info.plist key filled from the `ENCRYPTED_MEMORIES_PROTON_CHANNEL` build setting.
     public static let channelInfoKey = AppBuildInfo.releaseChannelInfoKey
     /// Info.plist key filled from the `ENCRYPTED_MEMORIES_BUILD_COMMIT` build setting.
-    public static let buildCommitInfoKey = "EncryptedMemoriesBuildCommit"
+    public static let buildCommitInfoKey = AppBuildInfo.buildCommitInfoKey
 
     public enum Channel: String, Sendable, CaseIterable {
         case stable
