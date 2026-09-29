@@ -708,9 +708,10 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         "\(remoteToken)#media=\(timelineStore?.mediaTypeEvidenceRevision() ?? 0)"
     }
 
-    /// Returns active photo-volume file IDs represented by events after the cached inventory token. The Photos
-    /// listing can lag the volume event feed; callers must not commit the new token until these IDs are visible.
-    /// A server-requested full event refresh returns nil because no bounded event evidence remains to validate.
+    /// Returns the files that the events after the cached inventory token made active or removed. The Photos
+    /// listing can lag the volume event feed: callers must not commit the new token until the active IDs are
+    /// visible, and they drop the removed IDs from the listing. A server-requested full event refresh returns nil
+    /// because no bounded event evidence remains to validate.
     private func remoteEventChanges(
         since cachedEventToken: String?,
         currentEventToken: String,
@@ -1830,10 +1831,12 @@ extension DriveSDKBridge: PhotoUploading {
                     admission: shutdownGate
                 ),
                 duplicateChecker: nil,
+                identityStore: nil,
                 replacementJournal: nil,
                 close: {}
             )
         }
+        // Nil when the journal file cannot be read: edits then keep their earlier uploads.
         let replacementJournal = EditReplacementJournalFileStore(
             accountDataDirectory: uploadManifestURL.deletingLastPathComponent())
         let service = ProtonUploadDedupeService(
@@ -1853,6 +1856,7 @@ extension DriveSDKBridge: PhotoUploading {
         return UploadIdentityResolverComposition(
             resolver: ShutdownGatedUploadIdentityResolver(base: pipeline, admission: shutdownGate),
             duplicateChecker: service,
+            identityStore: store,
             replacementJournal: replacementJournal,
             close: { store.close() }
         )

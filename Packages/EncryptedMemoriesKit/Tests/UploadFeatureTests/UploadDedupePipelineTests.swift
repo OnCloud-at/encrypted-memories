@@ -30,6 +30,16 @@ final class FakeIdentityStore: UploadIdentityStore, @unchecked Sendable {
         }
     }
 
+    func sources(withRemoteLinkID linkID: String) -> [UploadSourceIdentity]? {
+        lock.withLock {
+            rows.values.filter { row in
+                row.remoteLinkID == linkID
+                    && (row.outcome == UploadIdentityManifestStore.Outcome.uploaded.rawValue
+                        || row.outcome == UploadIdentityManifestStore.Outcome.duplicateActive.rawValue)
+            }.map(\.source)
+        }
+    }
+
     @discardableResult
     func upsert(_ record: UploadIdentityRecord) -> Bool {
         lock.withLock {

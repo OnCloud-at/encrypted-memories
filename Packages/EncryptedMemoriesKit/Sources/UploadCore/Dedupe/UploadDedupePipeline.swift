@@ -317,8 +317,8 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
         return result(nameDecision)
     }
 
-    /// A photo-library primary with other bytes than this installation uploaded before was edited. The journal
-    /// keeps the earlier photo before the record below forgets it, so the backup can replace it after the upload.
+    /// A photo-library primary with other bytes than its proven earlier upload was edited. The journal keeps the
+    /// earlier photo before the record below forgets it, so the backup can replace it after the upload.
     private func replacementScope(
         for descriptor: UploadResourceDescriptor,
         cached: UploadIdentityRecord?,
@@ -330,7 +330,9 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
             return UploadReplacementScope(superseded: [], retired: [])
         }
         var entry = replacementJournal.entry(for: descriptor.source)
-        if let cached, cached.outcome == UploadIdentityManifestStore.Outcome.uploaded.rawValue,
+        // An earlier upload of another client counts as well: the duplicate check proved it was this photo.
+        let provenOutcomes = [UploadIdentityManifestStore.Outcome.uploaded, .duplicateActive].map(\.rawValue)
+        if let cached, cached.outcome.map(provenOutcomes.contains) == true,
             let link = cached.remoteLinkID, !link.isEmpty, cached.sha1Hex != sha1Hex,
             !entry.superseded.contains(where: { $0.nodeID == link })
         {

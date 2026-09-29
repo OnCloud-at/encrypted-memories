@@ -153,6 +153,26 @@ final class UploadIdentityManifestTests: XCTestCase {
         )
     }
 
+    func testSourcesOfARemoteLinkListOnlyTrustworthyRows() throws {
+        let store = try makeStore()
+        var uploaded = makeRecord(identifier: "asset-a")
+        uploaded.remoteLinkID = "link-shared"
+        uploaded.outcome = UploadIdentityManifestStore.Outcome.uploaded.rawValue
+        store.upsert(uploaded)
+        var duplicate = makeRecord(identifier: "asset-b")
+        duplicate.remoteLinkID = "link-shared"
+        duplicate.outcome = UploadIdentityManifestStore.Outcome.duplicateActive.rawValue
+        store.upsert(duplicate)
+        var trashed = makeRecord(identifier: "asset-c")
+        trashed.remoteLinkID = "link-shared"
+        trashed.outcome = UploadIdentityManifestStore.Outcome.duplicateTrashed.rawValue
+        store.upsert(trashed)
+
+        XCTAssertEqual(
+            Set(store.sources(withRemoteLinkID: "link-shared")?.map(\.identifier) ?? []), ["asset-a", "asset-b"])
+        XCTAssertEqual(store.sources(withRemoteLinkID: "link-unknown")?.count, 0)
+    }
+
     func testTrustedContentLookupFiltersOutcomesAndSurvivesReopen() throws {
         var store = try makeStore()
 

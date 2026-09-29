@@ -349,6 +349,13 @@ public protocol UploadIdentityStore: Sendable {
     func trustedRecord(contentHash: String, hashKeyEpoch: String) -> UploadIdentityRecord?
     @discardableResult
     func upsert(_ record: UploadIdentityRecord) -> Bool
+    /// Every source whose trustworthy record (`uploaded` or `duplicateActive`) names this remote link. Nil when the
+    /// store cannot tell, so a caller never trashes a photo that another source may still need.
+    func sources(withRemoteLinkID linkID: String) -> [UploadSourceIdentity]?
+}
+
+extension UploadIdentityStore {
+    public func sources(withRemoteLinkID linkID: String) -> [UploadSourceIdentity]? { nil }
 }
 
 /// One active remote photo identity retained by the local content index. The hash is already keyed

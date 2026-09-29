@@ -100,6 +100,13 @@ final class ScriptedBackupResolver: BackupResourceResolving, @unchecked Sendable
         lock.withLock { secondaryNames[identifier] = names }
     }
 
+    /// Secondary resources other than the Live Photo video, by filename, for example the original of an edit.
+    private var secondaryResources: [String: UploadSourceIdentity.Resource] = [:]
+
+    func setSecondaryResource(_ resource: UploadSourceIdentity.Resource, forName name: String) {
+        lock.withLock { secondaryResources[name] = resource }
+    }
+
     /// Member filenames per source id - the resolved entry becomes the main photo of a series compound.
     private var burstMemberNames: [String: [String]] = [:]
 
@@ -195,6 +202,7 @@ final class ScriptedBackupResolver: BackupResourceResolving, @unchecked Sendable
         do {
             let modified = lock.withLock { modifiedOverrides[id] } ?? defaultModified
             let secondaries = lock.withLock { secondaryNames[id] } ?? []
+            let secondaryResources = lock.withLock { self.secondaryResources }
             let burstMembers = lock.withLock { burstMemberNames[id] } ?? []
             let additionalMetadata = lock.withLock { metadataByIdentifier[id] } ?? []
             let isDeferred = lock.withLock { deferredIdentifiers.contains(id) }
@@ -257,7 +265,7 @@ final class ScriptedBackupResolver: BackupResourceResolving, @unchecked Sendable
                             source: UploadSourceIdentity(
                                 kind: entry.source.kind,
                                 identifier: entry.source.identifier,
-                                resource: .livePairedVideo
+                                resource: secondaryResources[name] ?? .livePairedVideo
                             ),
                             fileURL: URL(fileURLWithPath: "\(entry.source.identifier)#\(name)"),
                             filename: name,
@@ -2220,14 +2228,15 @@ final class BackupSyncRunnerTests: XCTestCase {
         let replacement: EditedPhotoReplacement
     }
 
-    private func makeReplacementHarness() -> ReplacementHarness {
-        let journal = EditReplacementJournalFileStore(accountDataDirectory: tempDir)
+    private func makeReplacementHarness() throws -> ReplacementHarness {
+        let journal = try XCTUnwrap(EditReplacementJournalFileStore(accountDataDirectory: tempDir))
         let pipeline = UploadDedupePipeline(
             store: identityStore, hasher: hasher, checker: checker, replacementJournal: journal,
             now: { [clock] in clock!.now })
         let remote = FakeEditReplacementRemote()
         let replacement = EditedPhotoReplacement(
-            remote: remote, albums: FakeAlbumCarryOver(), relations: checker, journal: journal)
+            remote: remote, albums: FakeAlbumCarryOver(), relations: checker, identities: identityStore,
+            journal: journal)
         // The server names every upload that referenced a main photo as one of its related photos.
         checker.relatedLinkIDsProvider = { [uploader] mainLinkID in
             Set(uploader!.requests.filter { $0.mainPhotoUID?.nodeID == mainLinkID }.map { testUID($0.name).nodeID })
@@ -2250,8 +2259,11 @@ final class BackupSyncRunnerTests: XCTestCase {
         return entry
     }
 
-    /// Uploads IMG_1.HEIC with a Live Photo video, then edits the photo in the library: new bytes, new name.
-    private func uploadThenEdit(_ harness: ReplacementHarness) async -> UploadBackupSyncQueueEntry {
+    /// Uploads IMG_1.HEIC with a Live Photo video, then edits the photo in the library: new bytes, new name, and
+    /// the original becomes a secondary of the edit.
+    private func uploadThenEdit(
+        _ harness: ReplacementHarness, keepsOriginal: Bool = true
+    ) async -> UploadBackupSyncQueueEntry {
         let first = seedLibraryEntry("IMG_1.HEIC")
         resolver.setSecondaries(["IMG_1.MOV"], for: first.source.identifier)
         _ = await makeRunner(identityResolver: harness.pipeline, editReplacement: harness.replacement)
@@ -2261,11 +2273,15 @@ final class BackupSyncRunnerTests: XCTestCase {
 
         hasher.contentSeeds[first.source.identifier] = "rotated"
         harness.remote.active = [testUID("IMG_1.HEIC")]
+        if keepsOriginal {
+            resolver.setSecondaries(["IMG_1.HEIC", "IMG_1.MOV"], for: first.source.identifier)
+            resolver.setSecondaryResource(.photoKit(role: "originalPhoto", ordinal: 0), forName: "IMG_1.HEIC")
+        }
         return seedLibraryEntry("IMG_1.JPG", revisionOffset: 1)
     }
 
     func testAnEditedPhotoReplacesItsEarlierUploadAndKeepsItsSecondariesUnderTheNewPhoto() async throws {
-        let harness = makeReplacementHarness()
+        let harness = try makeReplacementHarness()
         let edited = await uploadThenEdit(harness)
         // The resource structure of the unedited photo, as the preflight index remembers it.
         let unedited = UploadBackupRevision(rawValue: 1)
@@ -2278,8 +2294,8 @@ final class BackupSyncRunnerTests: XCTestCase {
             .runUntilDrained()
 
         XCTAssertEqual(
-            uploader.requests.map(\.name), ["IMG_1.HEIC", "IMG_1.MOV", "IMG_1.JPG", "IMG_1.MOV"],
-            "the secondary uploads again: its earlier copy leaves with the earlier photo")
+            uploader.requests.map(\.name), ["IMG_1.HEIC", "IMG_1.MOV", "IMG_1.JPG", "IMG_1.HEIC", "IMG_1.MOV"],
+            "the original and the video upload again: their earlier copies leave with the earlier photo")
         XCTAssertEqual(uploader.requests.last?.mainPhotoUID, testUID("IMG_1.JPG"))
         XCTAssertEqual(harness.remote.trashCalls, [[testUID("IMG_1.HEIC")]])
         XCTAssertEqual(state(of: edited), .completed)
@@ -2291,24 +2307,37 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertEqual(
             harness.journal.entry(for: edited.source),
             EditReplacementJournalEntry(
-                superseded: [], retired: [testUID("IMG_1.HEIC").nodeID, testUID("IMG_1.MOV").nodeID]))
+                superseded: [], retired: [testUID("IMG_1.MOV").nodeID, testUID("IMG_1.HEIC").nodeID]))
     }
 
     func testAFailedTrashRetriesWithoutUploadingTheEditedPhotoAgain() async throws {
-        let harness = makeReplacementHarness()
+        let harness = try makeReplacementHarness()
         let edited = await uploadThenEdit(harness)
         harness.remote.trashFailures = 1
 
         _ = await makeRunner(identityResolver: harness.pipeline, editReplacement: harness.replacement)
             .runUntilDrained()
 
-        XCTAssertEqual(uploader.requests.map(\.name), ["IMG_1.HEIC", "IMG_1.MOV", "IMG_1.JPG", "IMG_1.MOV"])
+        XCTAssertEqual(
+            uploader.requests.map(\.name), ["IMG_1.HEIC", "IMG_1.MOV", "IMG_1.JPG", "IMG_1.HEIC", "IMG_1.MOV"])
         XCTAssertEqual(harness.remote.trashCalls, [[testUID("IMG_1.HEIC")]])
         XCTAssertEqual(state(of: edited)?.isTerminalSuccess, true)
     }
 
+    func testAnEditWithoutItsOriginalKeepsTheEarlierUpload() async throws {
+        let harness = try makeReplacementHarness()
+        let edited = await uploadThenEdit(harness, keepsOriginal: false)
+
+        _ = await makeRunner(identityResolver: harness.pipeline, editReplacement: harness.replacement)
+            .runUntilDrained()
+
+        XCTAssertTrue(harness.remote.trashCalls.isEmpty, "the earlier upload may be the only copy of the original")
+        XCTAssertEqual(state(of: edited), .completed)
+        XCTAssertTrue(harness.journal.entry(for: edited.source).superseded.isEmpty)
+    }
+
     func testAnEditedSeriesKeepsItsEarlierUpload() async throws {
-        let harness = makeReplacementHarness()
+        let harness = try makeReplacementHarness()
         let edited = await uploadThenEdit(harness)
         resolver.setSecondaries([], for: edited.source.identifier)
         resolver.setBurstMembers(["IMG_2.HEIC"], for: edited.source.identifier)

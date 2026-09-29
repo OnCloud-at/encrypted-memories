@@ -1252,12 +1252,21 @@ public actor BackupSyncRunner {
         }
         if let editReplacement, let primaryUID {
             do {
+                // Before the trash: forgetting too early costs one extra duplicate check, forgetting too late lets a
+                // crash leave an undone edit counted as backed up.
                 if replacesEarlierUpload {
                     try await preflight.forgetEarlierStates(of: resolved.candidate.snapshot)
                 }
                 if isSeries {
                     try editReplacement.keepSuperseded(of: entry.source)
-                } else if try await editReplacement.replaceSuperseded(of: entry.source, with: primaryUID) {
+                } else if try await editReplacement.replaceSuperseded(
+                    of: entry.source,
+                    with: primaryUID,
+                    holdsOriginal: EditedPhotoReplacement.holdsOriginal(
+                        editRevision: resolved.candidate.snapshot.editRevision,
+                        secondaries: resolved.secondaries.map(\.descriptor.source.resource)
+                    )
+                ) {
                     await identityResolver.invalidateCachedRemoteState()
                 }
             } catch is CancellationError {

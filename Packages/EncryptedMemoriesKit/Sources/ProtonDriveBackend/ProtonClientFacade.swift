@@ -8,7 +8,10 @@ struct UploadIdentityResolverComposition: Sendable {
     let resolver: any UploadIdentityResolving
     /// The Proton-keyed duplicate service behind `resolver`. Nil when the upload manifest is unavailable.
     let duplicateChecker: (any UploadDuplicateChecking)?
-    /// Earlier uploads of edited photos that the backup replaces. Nil when the upload manifest is unavailable.
+    /// The upload manifest behind `resolver`. Nil when it is unavailable.
+    let identityStore: (any UploadIdentityStore)?
+    /// Earlier uploads of edited photos that the backup replaces. Nil when the upload manifest or the journal is
+    /// unavailable.
     let replacementJournal: (any EditReplacementJournaling)?
     let close: @Sendable () -> Void
 }
@@ -176,16 +179,19 @@ public final class ProtonClientFacade {
                 duplicateChecker: identityComposition.duplicateChecker,
                 albums: AlbumRepositorySeriesCarryOver(repository: albumsRepo)
             ),
-            editedPhotoReplacement: identityComposition.duplicateChecker.flatMap { checker in
-                identityComposition.replacementJournal.map { journal in
-                    EditedPhotoReplacement(
-                        remote: bridge,
-                        albums: AlbumRepositorySeriesCarryOver(repository: albumsRepo),
-                        relations: checker,
-                        journal: journal
-                    )
-                }
-            },
+            editedPhotoReplacement: {
+                guard let checker = identityComposition.duplicateChecker,
+                    let identities = identityComposition.identityStore,
+                    let journal = identityComposition.replacementJournal
+                else { return nil }
+                return EditedPhotoReplacement(
+                    remote: bridge,
+                    albums: AlbumRepositorySeriesCarryOver(repository: albumsRepo),
+                    relations: checker,
+                    identities: identities,
+                    journal: journal
+                )
+            }(),
             uploadIdentityResolver: identityResolver,
             accountDataDirectory: bridge.uploadManifestURL.deletingLastPathComponent(),
             accountDatabasePolicy: bridge.uploadManifestPolicy,

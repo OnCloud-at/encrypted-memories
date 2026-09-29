@@ -3,8 +3,8 @@ import PhotosCore
 
 /// The earlier uploads of one photo-library primary after the person edited the photo.
 public struct EditReplacementJournalEntry: Sendable, Equatable, Codable {
-    /// Photos this installation uploaded with earlier bytes. The backup moves them to the trash after the edited
-    /// photo and its secondaries are uploaded.
+    /// Photos that held earlier bytes of this primary. The backup moves them to the trash after the edited photo and
+    /// its secondaries are uploaded.
     public var superseded: [PhotoUID]
     /// Links the backup already moved to the trash, with their related photos. A trashed copy among them is no
     /// deletion by the person.
@@ -27,21 +27,27 @@ public protocol EditReplacementJournaling: Sendable {
     func settle(_ nodeIDs: Set<String>, related: Set<String>, trashed: Bool, for source: UploadSourceIdentity) throws
 }
 
-/// One JSON file in the account data directory, so the sign-out purge removes it with the other stores.
+/// One JSON file in the account data directory, so the sign-out purge removes it with the other stores. Retired
+/// links stay without a limit: each edit adds only a few, and a dropped one could hide an undo.
 public final class EditReplacementJournalFileStore: EditReplacementJournaling, @unchecked Sendable {
     public static let fileName = "edit-replacement-journal-v1.json"
-    /// Retired links only filter duplicate rows; the oldest ones leave the list after this many.
-    static let retiredLimit = 64
 
     private let url: URL
     private let lock = NSLock()
     private var entries: [String: EditReplacementJournalEntry]
 
-    public init(accountDataDirectory: URL) {
+    /// Nil when the file exists but cannot be read. Edits then keep their earlier uploads instead of losing the
+    /// photos that still wait for their replacement.
+    public init?(accountDataDirectory: URL) {
         url = accountDataDirectory.appendingPathComponent(Self.fileName)
-        entries =
-            (try? JSONDecoder().decode([String: EditReplacementJournalEntry].self, from: Data(contentsOf: url)))
-            ?? [:]
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            entries = [:]
+            return
+        }
+        guard let data = try? Data(contentsOf: url),
+            let decoded = try? JSONDecoder().decode([String: EditReplacementJournalEntry].self, from: data)
+        else { return nil }
+        entries = decoded
     }
 
     public func entry(for source: UploadSourceIdentity) -> EditReplacementJournalEntry {
@@ -64,7 +70,6 @@ public final class EditReplacementJournalFileStore: EditReplacementJournaling, @
             for linkID in nodeIDs.union(related).sorted() where !entry.retired.contains(linkID) {
                 entry.retired.append(linkID)
             }
-            entry.retired = Array(entry.retired.suffix(Self.retiredLimit))
         }
     }
 
