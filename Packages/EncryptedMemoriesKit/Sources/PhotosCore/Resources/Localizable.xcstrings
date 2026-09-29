@@ -5029,6 +5029,20 @@
         "de": { "stringUnit": { "state": "translated", "value": "Ausgeschaltet kontaktieren Karten und Ortsnamen Apple nicht mehr. Koordinaten bleiben verschlüsselt auf diesem Gerät." } }
       }
     },
+    "settings.privacy_blur_preview": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Blur App Preview" } },
+        "de": { "stringUnit": { "state": "translated", "value": "App-Vorschau weichzeichnen" } }
+      }
+    },
+    "settings.privacy_blur_preview_explanation": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Hides app content in the App Switcher." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Verbirgt den App-Inhalt im App-Umschalter." } }
+      }
+    },
     "settings.privacy_policy": {
       "extractionState": "manual",
       "localizations": {

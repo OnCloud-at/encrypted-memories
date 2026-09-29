@@ -5,18 +5,31 @@ import SwiftUI
 public struct PrivacySettingsContent: View {
     @AppStorage(AppSettingsKey.mapAndPlacesEnabled) private var mapAndPlacesEnabled =
         AppSettingsDefault.mapAndPlacesEnabled
+    #if os(iOS)
+        @AppStorage(AppSettingsKey.blurAppPreview) private var blurAppPreview =
+            AppSettingsDefault.blurAppPreview
+    #endif
 
     public init() {}
 
     public var body: some View {
         Section {
             Toggle(L10n.string("settings.privacy_map_and_places"), isOn: $mapAndPlacesEnabled)
+        } footer: {
+            Text(L10n.string("settings.privacy_map_explanation"))
+        }
+        #if os(iOS)
+            Section {
+                Toggle(L10n.string("settings.privacy_blur_preview"), isOn: $blurAppPreview)
+            } footer: {
+                Text(L10n.string("settings.privacy_blur_preview_explanation"))
+            }
+        #endif
+        Section {
             Link(
                 L10n.string("settings.privacy_policy"),
                 destination: URL(string: "https://memories.oncloud.at/privacy.html")!
             )
-        } footer: {
-            Text(L10n.string("settings.privacy_map_explanation"))
         }
     }
 }
