@@ -192,6 +192,7 @@ public final class PhotoLibraryBackupController {
         identityResolver: (any UploadIdentityResolving)?,
         uploader: any PhotoUploading,
         tagAdder: (any PhotoTagAdding)? = nil,
+        editReplacement: EditedPhotoReplacement? = nil,
         pendingStore: PendingBackupManifestStore? = nil,
         requiresPendingStore: Bool = false
     ) {
@@ -256,6 +257,7 @@ public final class PhotoLibraryBackupController {
                 identityResolver: identityResolver,
                 uploader: uploader,
                 tagAdder: tagAdder,
+                editReplacement: editReplacement,
                 configuration: .init(retry: retryPolicy),
                 throttleInputs: { AppleBackupRuntimeSignals.current() },
                 events: pendingRecorder

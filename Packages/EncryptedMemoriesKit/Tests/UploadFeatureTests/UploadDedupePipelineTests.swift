@@ -30,6 +30,16 @@ final class FakeIdentityStore: UploadIdentityStore, @unchecked Sendable {
         }
     }
 
+    func sources(withRemoteLinkID linkID: String) -> [UploadSourceIdentity]? {
+        lock.withLock {
+            rows.values.filter { row in
+                row.remoteLinkID == linkID
+                    && (row.outcome == UploadIdentityManifestStore.Outcome.uploaded.rawValue
+                        || row.outcome == UploadIdentityManifestStore.Outcome.duplicateActive.rawValue)
+            }.map(\.source)
+        }
+    }
+
     @discardableResult
     func upsert(_ record: UploadIdentityRecord) -> Bool {
         lock.withLock {
@@ -111,9 +121,12 @@ final class FakeChecker: UploadDuplicateChecking, @unchecked Sendable {
     }
 
     var relatedLinkIDsByMainLinkID: [String: Set<String>] = [:]
+    /// Answers like the server from state outside the checker, for example the uploads a test made.
+    var relatedLinkIDsProvider: (@Sendable (String) -> Set<String>)?
 
     func relatedPhotoLinkIDs(ofMainLinkID mainLinkID: String) async throws -> Set<String> {
-        lock.withLock { relatedLinkIDsByMainLinkID[mainLinkID] ?? [] }
+        let provided = lock.withLock { relatedLinkIDsProvider }?(mainLinkID) ?? []
+        return lock.withLock { relatedLinkIDsByMainLinkID[mainLinkID] ?? [] }.union(provided)
     }
 
     func findExactActiveDuplicates(correctedName: String, sha1Digest: Data) async -> [PhotoUID] {

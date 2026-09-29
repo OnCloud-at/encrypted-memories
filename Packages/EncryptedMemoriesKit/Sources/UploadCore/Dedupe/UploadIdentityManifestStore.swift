@@ -273,6 +273,42 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
         }
     }
 
+    /// Scans without an index: the schema gate forbids a new one, and only a replacement after an edit reads this.
+    public func sources(withRemoteLinkID linkID: String) -> [UploadSourceIdentity]? {
+        lock.withLock {
+            var stmt: OpaquePointer?
+            guard
+                sqlite3_prepare_v2(
+                    db,
+                    """
+                    SELECT source_kind, source_id, resource FROM upload_identity
+                    WHERE remote_link=? AND outcome IN ('uploaded', 'duplicateActive');
+                    """,
+                    -1, &stmt, nil
+                ) == SQLITE_OK
+            else { return nil }
+            defer { sqlite3_finalize(stmt) }
+            bindText(stmt, 1, linkID)
+            var sources: [UploadSourceIdentity] = []
+            while true {
+                switch sqlite3_step(stmt) {
+                case SQLITE_ROW:
+                    guard let kindRaw = columnText(stmt, 0), let kind = UploadSourceIdentity.Kind(rawValue: kindRaw),
+                        let identifier = columnText(stmt, 1)
+                    else { return nil }
+                    sources.append(
+                        UploadSourceIdentity(
+                            kind: kind, identifier: identifier,
+                            resource: UploadSourceIdentity.Resource(rawValue: columnText(stmt, 2) ?? "")))
+                case SQLITE_DONE:
+                    return sources
+                default:
+                    return nil
+                }
+            }
+        }
+    }
+
     @discardableResult
     public func upsert(_ record: UploadIdentityRecord) -> Bool {
         lock.withLock {

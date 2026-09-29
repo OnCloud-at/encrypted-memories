@@ -1627,6 +1627,7 @@ final class MobileLibraryModel {
                     identityResolver: client.uploadIdentityResolver,
                     uploader: client.photoUploader,
                     tagAdder: client.photoTagAdder,
+                    editReplacement: client.editedPhotoReplacement,
                     pendingStore: pendingStore,
                     requiresPendingStore: true
                 )

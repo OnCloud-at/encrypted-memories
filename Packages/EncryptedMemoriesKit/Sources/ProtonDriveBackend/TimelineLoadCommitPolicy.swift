@@ -317,21 +317,32 @@ enum TimelineInventorySourcePolicy {
     }
 }
 
+/// The files that the volume events since the cached listing made active or removed. The last event of a file wins.
+struct TimelineRemoteEventChanges: Equatable {
+    /// Photos-share files the next listing must contain.
+    var active: Set<String> = []
+    /// Files that were deleted or moved to the trash. The photos listing can still return them for a short time.
+    var removed: Set<String> = []
+}
+
 enum TimelineRemoteEventVisibilityPolicy {
     static func apply(
         _ events: [VolumeEventPage.Item],
         photosShareID: String,
-        to activeNodeIDs: inout Set<String>
+        to changes: inout TimelineRemoteEventChanges
     ) {
         for event in events {
-            if event.eventType == 0 {
-                activeNodeIDs.remove(event.linkID)
+            let isFile = event.linkType == nil || event.linkType == 2
+            if event.eventType == 0 || (isFile && event.linkState == 2) {
+                changes.active.remove(event.linkID)
+                changes.removed.insert(event.linkID)
             } else if event.contextShareID == photosShareID,
                 event.linkState != 0,
-                event.linkType == nil || event.linkType == 2,
+                isFile,
                 event.linkState == nil || event.linkState == 1
             {
-                activeNodeIDs.insert(event.linkID)
+                changes.active.insert(event.linkID)
+                changes.removed.remove(event.linkID)
             }
         }
     }

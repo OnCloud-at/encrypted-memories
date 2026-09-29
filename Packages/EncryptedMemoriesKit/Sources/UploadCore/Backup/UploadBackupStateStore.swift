@@ -176,6 +176,31 @@ public final class UploadBackupStateManifestStore: UploadBackupStateStore, @unch
     }
 
     @discardableResult
+    public func removeRecords(for source: UploadSourceIdentity, keeping revisions: Set<UploadBackupRevision>) -> Bool {
+        lock.withLock {
+            let kept = revisions.map(\.rawValue).sorted()
+            let placeholders = Array(repeating: "?", count: kept.count).joined(separator: ",")
+            let keepClause = kept.isEmpty ? "" : " AND revision_us NOT IN (\(placeholders))"
+            var stmt: OpaquePointer?
+            guard
+                sqlite3_prepare_v2(
+                    db,
+                    "DELETE FROM backup_asset_state WHERE source_kind=? AND source_id=? AND resource=?\(keepClause);",
+                    -1, &stmt, nil
+                ) == SQLITE_OK
+            else { return false }
+            defer { sqlite3_finalize(stmt) }
+            bindText(stmt, 1, source.kind.rawValue)
+            bindText(stmt, 2, source.identifier)
+            bindText(stmt, 3, source.resource.rawValue)
+            for (offset, revision) in kept.enumerated() {
+                sqlite3_bind_int64(stmt, Int32(4 + offset), revision)
+            }
+            return sqlite3_step(stmt) == SQLITE_DONE
+        }
+    }
+
+    @discardableResult
     public func upsertBatch(_ records: [UploadBackupAssetRecord]) -> Bool {
         guard !records.isEmpty else { return true }
         return lock.withLock {
