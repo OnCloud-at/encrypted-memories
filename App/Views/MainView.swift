@@ -802,8 +802,7 @@ struct MainView: View {
         let pct = Int((exportFraction * 100).rounded())
         return ProgressView(value: max(0.001, min(1, exportFraction)))
             .progressViewStyle(.circular)
-            .controlSize(.regular)
-            .scaleEffect(0.6)
+            .controlSize(.small)
             .help("export.progress_percent \(pct)")
             .accessibilityLabel("export.progress_percent \(pct)")
     }
@@ -2581,7 +2580,11 @@ struct MainView: View {
         if single {
             let item = items[0]
             let meta = try? await backend.metadata(for: item.uid)
-            let name = meta?.filename ?? Self.defaultName(item, ext: Self.defaultExtension(item, metadata: meta))
+            let original = meta?.filename ?? Self.defaultName(item, ext: Self.defaultExtension(item, metadata: meta))
+            // Without location, a RAW photo leaves as a JPEG, so the save panel suggests that name.
+            let name =
+                PrivacyExportPolicy.isEnabled()
+                ? LocationSanitizedCopy.outputFilename(forOriginalName: original) : original
             guard let chosen = chooseSingleDestination(suggestedName: name) else { return }
             dest = chosen
         } else {

@@ -223,16 +223,20 @@ public actor DragOutStager {
             try await fileProvider.writeOriginal(for: uid, to: destination) { fraction in
                 relay.emit(uid: uid, fraction: fraction)
             }
-            let finalURL = await self.reserveFinalName(for: uid, downloadURL: destination)
+            let removesLocation = removeLocationWhenSharing()
+            let finalURL = await self.reserveFinalName(
+                for: uid, downloadURL: destination, removesLocation: removesLocation)
             do {
                 try? FileManager.default.removeItem(at: finalURL)
-                if removeLocationWhenSharing() {
-                    try await LocationSanitizedCopy.write(from: destination, to: finalURL)
+                let deliveredURL: URL
+                if removesLocation {
+                    deliveredURL = try await LocationSanitizedCopy.write(from: destination, to: finalURL)
                     try FileManager.default.removeItem(at: destination)
                 } else {
                     try FileManager.default.moveItem(at: destination, to: finalURL)
+                    deliveredURL = finalURL
                 }
-                await self.finishJob(uid: uid, finalURL: finalURL, failure: nil)
+                await self.finishJob(uid: uid, finalURL: deliveredURL, failure: nil)
             } catch {
                 try? FileManager.default.removeItem(at: destination)
                 try? FileManager.default.removeItem(at: finalURL)
@@ -252,8 +256,10 @@ public actor DragOutStager {
     }
 
     /// Atomic same-volume rename `X.download` → final unique name, reserving the target first.
-    private func reserveFinalName(for uid: PhotoUID, downloadURL: URL) async -> URL {
-        let desired = await Self.desiredFilename(for: uid, provider: fileProvider)
+    private func reserveFinalName(for uid: PhotoUID, downloadURL: URL, removesLocation: Bool) async -> URL {
+        let original = await Self.desiredFilename(for: uid, provider: fileProvider)
+        // A location-free copy of a RAW photo is a JPEG; reserve that name so it never replaces another file.
+        let desired = removesLocation ? LocationSanitizedCopy.outputFilename(forOriginalName: original) : original
         let reserved = await names.unique(desired)
         return stagingDirectory.appendingPathComponent(reserved)
     }

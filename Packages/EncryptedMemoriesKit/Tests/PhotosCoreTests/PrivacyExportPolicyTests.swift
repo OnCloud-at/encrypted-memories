@@ -3,9 +3,10 @@ import CoreGraphics
 import CoreVideo
 import Foundation
 import ImageIO
-import PhotosCore
 import UniformTypeIdentifiers
 import XCTest
+
+@testable import PhotosCore
 
 final class PrivacyExportPolicyTests: XCTestCase {
     func testRemoveLocationDefaultsOffAndReadsSavedPreference() throws {
@@ -78,6 +79,92 @@ final class PrivacyExportPolicyTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: original), originalBytes)
     }
 
+    /// A staged download has no media extension. The movie must still open, like the motion video of a Live Photo
+    /// that the share sheet and the drag stage as `.download` files.
+    func testStagedMovieWithoutMediaExtensionLosesItsLocationAndKeepsItsPairing() async throws {
+        let directory = try makeDirectory()
+        let movie = directory.appendingPathComponent("IMG_0001.mov")
+        try await makeGPSVideo(at: movie)
+        let staged = directory.appendingPathComponent(".staged.download")
+        try FileManager.default.moveItem(at: movie, to: staged)
+
+        let written = try await LocationSanitizedCopy.write(
+            from: staged, to: directory.appendingPathComponent("IMG_0001.MOV"))
+
+        XCTAssertEqual(written.lastPathComponent, "IMG_0001.MOV")
+        let hasLocation = try await hasVideoLocation(at: written)
+        let identifier = try await movieContentIdentifier(at: written)
+        XCTAssertFalse(hasLocation)
+        XCTAssertEqual(identifier, Self.livePhotoContentIdentifier)
+    }
+
+    /// A photo or movie without location leaves as its original bytes, whatever its format.
+    func testCopiesWithoutLocationKeepTheOriginalBytes() async throws {
+        let directory = try makeDirectory()
+        let photo = directory.appendingPathComponent("plain.png")
+        try makeImage(at: photo, type: .png, gps: false)
+        let movie = directory.appendingPathComponent("plain.download")
+        try await makeVideo(at: directory.appendingPathComponent("plain.mov"), location: false)
+        try FileManager.default.moveItem(at: directory.appendingPathComponent("plain.mov"), to: movie)
+
+        let sharedPhoto = try await LocationSanitizedCopy.write(
+            from: photo, to: directory.appendingPathComponent("shared.png"))
+        let sharedMovie = try await LocationSanitizedCopy.write(
+            from: movie, to: directory.appendingPathComponent("shared.mov"))
+
+        XCTAssertEqual(try Data(contentsOf: sharedPhoto), try Data(contentsOf: photo))
+        XCTAssertEqual(try Data(contentsOf: sharedMovie), try Data(contentsOf: movie))
+    }
+
+    /// Every photo format that ImageIO writes keeps its format and loses its location.
+    func testEveryWritablePhotoFormatLosesItsLocation() async throws {
+        let directory = try makeDirectory()
+        for type in [UTType.jpeg, .heic, .png, .tiff, UTType("public.avif")!] {
+            let ext = try XCTUnwrap(type.preferredFilenameExtension)
+            let original = directory.appendingPathComponent("original.\(ext)")
+            try makeImage(at: original, type: type, gps: true)
+            XCTAssertNotNil(gpsProperties(at: original), ext)
+
+            let written = try await LocationSanitizedCopy.write(
+                from: original, to: directory.appendingPathComponent("shared.\(ext)"))
+
+            XCTAssertEqual(written.pathExtension, ext)
+            XCTAssertNil(gpsProperties(at: written), ext)
+        }
+    }
+
+    /// A photo format that ImageIO reads but cannot write, like RAW, DNG, or WebP, leaves as a JPEG without location.
+    func testUnwritablePhotoFormatLeavesAsAJPEGWithoutLocation() async throws {
+        let directory = try makeDirectory()
+        let original = directory.appendingPathComponent("original.jpg")
+        try makeGPSImage(at: original)
+
+        let written = try await LocationSanitizedCopy.write(
+            from: original, to: directory.appendingPathComponent("IMG_0001.dng"), writableImageTypes: [])
+
+        XCTAssertEqual(written.lastPathComponent, "IMG_0001.jpg")
+        XCTAssertNil(gpsProperties(at: written))
+        XCTAssertNil(iptcCity(at: written))
+        XCTAssertEqual(lensModel(at: written), Self.lensModel)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: directory.appendingPathComponent("IMG_0001.dng").path))
+    }
+
+    func testOutputNamesFollowTheFormatThatLeaves() {
+        XCTAssertEqual(LocationSanitizedCopy.outputFilename(forOriginalName: "IMG_1.DNG"), "IMG_1.jpg")
+        XCTAssertEqual(LocationSanitizedCopy.outputFilename(forOriginalName: "DSC_2.NEF"), "DSC_2.jpg")
+        XCTAssertEqual(LocationSanitizedCopy.outputFilename(forOriginalName: "a.webp"), "a.jpg")
+        XCTAssertEqual(LocationSanitizedCopy.outputFilename(forOriginalName: "IMG_3.HEIC"), "IMG_3.HEIC")
+        XCTAssertEqual(LocationSanitizedCopy.outputFilename(forOriginalName: "clip.3gp"), "clip.mov")
+        XCTAssertEqual(LocationSanitizedCopy.outputFilename(forOriginalName: "clip.mp4"), "clip.mp4")
+    }
+
+    private func makeDirectory() throws -> URL {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        return directory
+    }
+
     /// A Live Photo pairs its still and its movie by this identifier; a copy without location must keep it.
     func testCopiesKeepTheLivePhotoPairingIdentifier() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
@@ -137,6 +224,13 @@ final class PrivacyExportPolicyTests: XCTestCase {
     }
 
     private func makeGPSImage(at url: URL, type: UTType = .jpeg) throws {
+        try makeImage(at: url, type: type, gps: true)
+        XCTAssertNotNil(gpsProperties(at: url))
+        XCTAssertEqual(iptcCity(at: url), "Test City")
+        XCTAssertEqual(stillContentIdentifier(at: url), Self.livePhotoContentIdentifier)
+    }
+
+    private func makeImage(at url: URL, type: UTType, gps withLocation: Bool) throws {
         let context = try XCTUnwrap(
             CGContext(
                 data: nil, width: 64, height: 64, bitsPerComponent: 8, bytesPerRow: 0,
@@ -151,17 +245,16 @@ final class PrivacyExportPolicyTests: XCTestCase {
             kCGImagePropertyGPSLongitudeRef: "E",
         ]
         let apple: [String: Any] = ["17": Self.livePhotoContentIdentifier]
-        CGImageDestinationAddImage(
-            destination, image,
-            [
-                kCGImagePropertyGPSDictionary: gps, kCGImagePropertyMakerAppleDictionary: apple,
-                kCGImagePropertyExifDictionary: [kCGImagePropertyExifLensModel: Self.lensModel],
-                kCGImagePropertyIPTCDictionary: [kCGImagePropertyIPTCCity: "Test City"],
-            ] as CFDictionary)
+        var properties: [CFString: Any] = [
+            kCGImagePropertyMakerAppleDictionary: apple,
+            kCGImagePropertyExifDictionary: [kCGImagePropertyExifLensModel: Self.lensModel],
+        ]
+        if withLocation {
+            properties[kCGImagePropertyGPSDictionary] = gps
+            properties[kCGImagePropertyIPTCDictionary] = [kCGImagePropertyIPTCCity: "Test City"]
+        }
+        CGImageDestinationAddImage(destination, image, properties as CFDictionary)
         XCTAssertTrue(CGImageDestinationFinalize(destination))
-        XCTAssertNotNil(gpsProperties(at: url))
-        XCTAssertEqual(iptcCity(at: url), "Test City")
-        XCTAssertEqual(stillContentIdentifier(at: url), Self.livePhotoContentIdentifier)
     }
 
     private func gpsProperties(at url: URL) -> [CFString: Any]? {
@@ -172,6 +265,12 @@ final class PrivacyExportPolicyTests: XCTestCase {
     }
 
     private func makeGPSVideo(at url: URL) async throws {
+        try await makeVideo(at: url, location: true)
+        let hasLocation = try await hasVideoLocation(at: url)
+        XCTAssertTrue(hasLocation)
+    }
+
+    private func makeVideo(at url: URL, location withLocation: Bool) async throws {
         let writer = try AVAssetWriter(outputURL: url, fileType: .mov)
         let location = AVMutableMetadataItem()
         location.identifier = .quickTimeMetadataLocationISO6709
@@ -179,7 +278,7 @@ final class PrivacyExportPolicyTests: XCTestCase {
         let pairing = AVMutableMetadataItem()
         pairing.identifier = .quickTimeMetadataContentIdentifier
         pairing.value = Self.livePhotoContentIdentifier as NSString
-        writer.metadata = [location, pairing]
+        writer.metadata = withLocation ? [location, pairing] : [pairing]
 
         let width = 16
         let height = 16
@@ -213,8 +312,6 @@ final class PrivacyExportPolicyTests: XCTestCase {
         input.markAsFinished()
         await writer.finishWriting()
         XCTAssertEqual(writer.status, .completed)
-        let hasLocation = try await hasVideoLocation(at: url)
-        XCTAssertTrue(hasLocation)
     }
 
     private func hasVideoLocation(at url: URL) async throws -> Bool {

@@ -453,13 +453,15 @@ enum MobileMediaExporter {
             let desired = try OriginalExportWriter.exportFilename(
                 forDownloadedOriginal: staging, item: item, metadata: meta, fallbackBase: fallbackBase(for: item)
             )
-            let url = directory.appendingPathComponent(await names.unique(desired))
+            // A location-free copy of a RAW photo is a JPEG; reserve that name so it never replaces another file.
+            let name =
+                removeLocationWhenSharing ? LocationSanitizedCopy.outputFilename(forOriginalName: desired) : desired
+            let url = directory.appendingPathComponent(await names.unique(name))
             try Task.checkCancellation()
             if removeLocationWhenSharing {
-                try await LocationSanitizedCopy.write(from: staging, to: url)
-            } else {
-                try FileManager.default.moveItem(at: staging, to: url)
+                return .exported(try await LocationSanitizedCopy.write(from: staging, to: url))
             }
+            try FileManager.default.moveItem(at: staging, to: url)
             return .exported(url)
         } catch {
             return DeviceStorage.isOutOfSpace(error) ? .outOfSpace : .failed
