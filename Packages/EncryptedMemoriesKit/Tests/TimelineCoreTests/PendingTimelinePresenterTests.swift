@@ -153,6 +153,65 @@ import UploadCore
         #expect(restored.items.map(\.uid).contains(earlier))
     }
 
+    @Test func aTrashedPhotoThatThePersonRestoredShowsAgainAtTheLatestAfterTheLimit() async {
+        let clock = TestClock(Date(timeIntervalSince1970: 1_000))
+        let presenter = PendingTimelinePresenter(now: { clock.now })
+        let earlier = PhotoUID(volumeID: "vol", nodeID: "earlier")
+        let uploaded = PhotoUID(volumeID: "vol", nodeID: "0-new")
+        let listed = sameSecond(["earlier", "0-new"])
+        presenter.setRemote(TimelineSnapshot(orderedItems: listed))
+        presenter.setPending(
+            pending(
+                [tile("p", second: 10, handoff: uploaded, settled: true, badge: .done, replaces: [earlier])],
+                membership: 1),
+            enabled: true)
+        _ = await settle(presenter)
+        presenter.setPending(pending([], membership: 2), enabled: true)
+        let hidden = await settle(presenter)
+        #expect(hidden.items.map(\.uid) == [uploaded])
+
+        // Restored before the listing dropped it: the listing keeps returning it.
+        clock.now = clock.now.addingTimeInterval(PendingTimelinePresenter.trashedHideLimit + 1)
+        presenter.setRemote(TimelineSnapshot(orderedItems: listed + [remote("b", second: 20)]))
+        let restored = await settle(presenter)
+        #expect(restored.items.map(\.uid).contains(earlier))
+    }
+
+    @Test func aSecondEditTakesThePlaceWhereTheFirstEditShows() async {
+        let presenter = PendingTimelinePresenter()
+        let original = PhotoUID(volumeID: "vol", nodeID: "m-original")
+        let first = PhotoUID(volumeID: "vol", nodeID: "z-first")
+        let second = PhotoUID(volumeID: "vol", nodeID: "0-second")
+        let listed = sameSecond(["a", "m-original", "q"])
+        presenter.setRemote(TimelineSnapshot(orderedItems: listed))
+        presenter.setPending(
+            pending(
+                [tile("p", second: 10, handoff: first, badge: .uploading(step: 5), replaces: [original])],
+                membership: 1),
+            enabled: true)
+        presenter.setRemote(TimelineSnapshot(orderedItems: listed + [remote("z-first", second: 10)]))
+        let firstEdit = await settle(presenter)
+        let place = listed.map { $0.uid == original ? first : $0.uid }
+        #expect(firstEdit.items.map(\.uid) == place)
+
+        // The first tile retired and the listing dropped the original; then the photo is edited again.
+        let afterFirst = sameSecond(["a", "q", "z-first"])
+        presenter.setRemote(TimelineSnapshot(orderedItems: afterFirst))
+        presenter.setPending(pending([], membership: 2), enabled: true)
+        #expect(await settle(presenter).items.map(\.uid) == place)
+        let edit = tile("p", second: 10, replaces: [first])
+        presenter.setPending(pending([edit], membership: 3), enabled: true)
+        #expect(await settle(presenter).items.map(\.uid) == listed.map { $0.uid == original ? edit.item.uid : $0.uid })
+
+        presenter.setPending(
+            pending(
+                [tile("p", second: 10, handoff: second, badge: .uploading(step: 5), replaces: [first])],
+                membership: 4),
+            enabled: true)
+        presenter.setRemote(TimelineSnapshot(orderedItems: afterFirst + [remote("0-second", second: 10)]))
+        #expect(await settle(presenter).items.map(\.uid) == listed.map { $0.uid == original ? second : $0.uid })
+    }
+
     @Test func anEarlierPhotoThatTheReplacementKeptShowsAgain() async {
         let presenter = PendingTimelinePresenter()
         let earlier = PhotoUID(volumeID: "vol", nodeID: "earlier")
@@ -296,5 +355,17 @@ import UploadCore
         #expect(after.membershipRevision == before.membershipRevision)
         #expect(after.revision != before.revision)
         #expect(after.uploadBadges[pendingTile.item.uid] == .uploading(step: 12))
+    }
+}
+
+private final class TestClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: Date
+
+    init(_ start: Date) { value = start }
+
+    var now: Date {
+        get { lock.withLock { value } }
+        set { lock.withLock { value = newValue } }
     }
 }

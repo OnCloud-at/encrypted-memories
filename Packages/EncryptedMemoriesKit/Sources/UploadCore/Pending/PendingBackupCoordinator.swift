@@ -98,9 +98,9 @@ public actor PendingBackupCoordinator {
     /// Sources with an earlier revision that is backed up. Their Proton photo represents them until the
     /// duplicate check of a newer revision decides on an upload, so no tile shows beside it meanwhile.
     private var backedUpBefore = Set<PendingSourceKey>()
-    /// The earlier Proton photos that the current revision of a source replaces, latched from the journal while
-    /// the upload runs; the journal forgets them once the replacement settles.
-    private var replacing: [PendingSourceKey: [PhotoUID]] = [:]
+    /// The earlier Proton photos that one revision of a source replaces, latched from the journal while the upload
+    /// runs; the journal forgets them once the replacement settles. A newer revision never reuses the latch.
+    private var replacing: [PendingSourceKey: (revision: UploadBackupRevision, earlier: [PhotoUID])] = [:]
 
     // Presentation, maintained incrementally.
     private var tilesByKey: [PendingSourceKey: PendingTile] = [:]
@@ -470,10 +470,12 @@ public actor PendingBackupCoordinator {
 
     /// The unsettled read has no earlier revisions. Unchecked rows can show before their check only while few of
     /// them wait, so reading the earlier revisions of those few stays cheap.
-    private func learnEarlierRevisions() {
-        let unchecked = rows.filter { Self.isUnchecked($0.value.state) && !backedUpBefore.contains($0.key) }
+    private func learnEarlierRevisions(of candidates: Set<PendingSourceKey>? = nil) {
+        let unchecked = (candidates.map { Array($0) } ?? Array(rows.keys)).filter { key in
+            rows[key].map { Self.isUnchecked($0.state) } == true && !backedUpBefore.contains(key)
+        }
         guard !unchecked.isEmpty, unchecked.count <= configuration.uncheckedAdmissionLimit else { return }
-        for (kind, keys) in Dictionary(grouping: unchecked.keys, by: \.kind) {
+        for (kind, keys) in Dictionary(grouping: unchecked, by: \.kind) {
             guard let queue = queues[kind] else { continue }
             for row in queue.rows(kind: kind, identifiers: Set(keys.map(\.identifier)))
             where row.state == .completed || row.state == .alreadyBackedUp {
@@ -559,7 +561,11 @@ public actor PendingBackupCoordinator {
         let admits = uncheckedSources.count <= configuration.uncheckedAdmissionLimit
         guard admits != admitsUnchecked else { return }
         admitsUnchecked = admits
-        if admits { dirty.formUnion(uncheckedSources.subtracting(shownSources)) }
+        guard admits else { return }
+        // Above the limit the earlier revisions were not read, so an edit could otherwise show beside its photo.
+        let admitted = uncheckedSources.subtracting(shownSources)
+        learnEarlierRevisions(of: admitted)
+        dirty.formUnion(admitted)
     }
 
     private func countsAsUnchecked(_ key: PendingSourceKey) -> Bool {
@@ -618,7 +624,10 @@ public actor PendingBackupCoordinator {
         }
         let handoff = handoffs[key].flatMap { $0.revision == row.revision ? $0.remote : nil }
         let settled = row.state == .completed || row.state == .alreadyBackedUp
-        let replaces = settled ? retiredReplacements(of: key) : latchReplacements(of: key)
+        let replaces =
+            settled
+            ? retiredReplacements(of: key, revision: row.revision)
+            : latchReplacements(of: key, revision: row.revision)
         let badge: PendingUploadBadge =
             switch row.state {
             case .completed, .alreadyBackedUp: settledBadge(key, revision: row.revision)
@@ -644,16 +653,18 @@ public actor PendingBackupCoordinator {
     }
 
     /// While the upload runs, the journal names the earlier photos; the tile takes their place.
-    private func latchReplacements(of key: PendingSourceKey) -> [PhotoUID] {
+    private func latchReplacements(of key: PendingSourceKey, revision: UploadBackupRevision) -> [PhotoUID] {
         let earlier = earlierUploads(of: key)
-        if !earlier.isEmpty { replacing[key] = earlier }
-        return replacing[key] ?? []
+        if !earlier.isEmpty { replacing[key] = (revision, earlier) }
+        guard let latched = replacing[key], latched.revision == revision else { return [] }
+        return latched.earlier
     }
 
     /// After the upload settled, only the earlier photos that moved to the trash stay hidden. A photo that the
     /// replacement kept, for example because another photo needs it, shows again.
-    private func retiredReplacements(of key: PendingSourceKey) -> [PhotoUID] {
-        guard let earlier = replacing[key], let replacementJournal else { return [] }
+    private func retiredReplacements(of key: PendingSourceKey, revision: UploadBackupRevision) -> [PhotoUID] {
+        guard let latched = replacing[key], latched.revision == revision, let replacementJournal else { return [] }
+        let earlier = latched.earlier
         let retired = Set(
             replacementJournal.entry(for: UploadSourceIdentity(kind: key.kind, identifier: key.identifier)).retired)
         return earlier.filter { retired.contains($0.nodeID) }
