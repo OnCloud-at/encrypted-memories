@@ -83,7 +83,8 @@ public final class PendingGridSession {
             queues: queues,
             metadataProvider: SessionMetadata(photos: metadata, files: files?.metadata),
             effects: SessionEffects(photoBackup: photoBackup, files: files, remote: remote, volume: volume),
-            recorder: recorder
+            recorder: recorder,
+            replacementJournal: photoBackup.pendingReplacementJournal
         )
         self.photoBackup = photoBackup
         presenter.onRemotePresence = { [coordinator] keys in

@@ -54,6 +54,8 @@ public actor PendingBackupCoordinator {
     private let metadataProvider: any PendingSourceMetadataProviding
     private let effects: any PendingBackupEffects
     private let recorder: PendingBackupEventRecorder?
+    /// The earlier uploads of edited photo-library sources. Nil when edits keep their earlier uploads.
+    private let replacementJournal: (any EditReplacementJournaling)?
     private let configuration: Configuration
     private let now: @Sendable () -> Date
     private let sleep: @Sendable (Duration) async throws -> Void
@@ -93,6 +95,12 @@ public actor PendingBackupCoordinator {
     /// Settled revisions whose checkmark showed and ended.
     private var checkmarkShown: [PendingSourceKey: UploadBackupRevision] = [:]
     private var checkmarkEnded: [PendingSourceKey: UploadBackupRevision] = [:]
+    /// Sources with an earlier revision that is backed up. Their Proton photo represents them until the
+    /// duplicate check of a newer revision decides on an upload, so no tile shows beside it meanwhile.
+    private var backedUpBefore = Set<PendingSourceKey>()
+    /// The earlier Proton photos that the current revision of a source replaces, latched from the journal while
+    /// the upload runs; the journal forgets them once the replacement settles.
+    private var replacing: [PendingSourceKey: [PhotoUID]] = [:]
 
     // Presentation, maintained incrementally.
     private var tilesByKey: [PendingSourceKey: PendingTile] = [:]
@@ -122,6 +130,7 @@ public actor PendingBackupCoordinator {
         metadataProvider: any PendingSourceMetadataProviding,
         effects: any PendingBackupEffects,
         recorder: PendingBackupEventRecorder?,
+        replacementJournal: (any EditReplacementJournaling)? = nil,
         configuration: Configuration = Configuration(),
         now: @Sendable @escaping () -> Date = { Date() },
         sleep: @Sendable @escaping (Duration) async throws -> Void = { try await Task.sleep(for: $0) }
@@ -131,6 +140,7 @@ public actor PendingBackupCoordinator {
         self.metadataProvider = metadataProvider
         self.effects = effects
         self.recorder = recorder
+        self.replacementJournal = replacementJournal
         self.configuration = configuration
         self.now = now
         self.sleep = sleep
@@ -172,6 +182,7 @@ public actor PendingBackupCoordinator {
                 })
             for row in queue.unsettledRows() where row.source.kind == kind { absorb(row) }
         }
+        learnEarlierRevisions()
         // Settled rows are not part of the unsettled read; unacknowledged handoffs still need their rows.
         reloadRows(for: Set(handoffs.keys).subtracting(rows.keys))
         if let recorder {
@@ -356,6 +367,7 @@ public actor PendingBackupCoordinator {
             let previousRows = rows.filter { $0.key.kind == kind }
             for key in previousRows.keys { rows[key] = nil }
             for row in queue.unsettledRows() where row.source.kind == kind { absorb(row) }
+            learnEarlierRevisions()
             let current = Set(rows.keys.filter { $0.kind == kind })
             let gone = Set(previousRows.keys).subtracting(current)
             // A row that was still active settled or left: it takes the per-source path, so its durable handoff
@@ -430,7 +442,12 @@ public actor PendingBackupCoordinator {
         for (kind, kindKeys) in grouped {
             guard let queue = queues[kind] else { continue }
             for key in kindKeys { rows[key] = nil }
-            for row in queue.rows(kind: kind, identifiers: Set(kindKeys.map(\.identifier))) { absorb(row) }
+            let fetched = queue.rows(kind: kind, identifiers: Set(kindKeys.map(\.identifier)))
+            for row in fetched { absorb(row) }
+            for row in fetched where row.state == .completed || row.state == .alreadyBackedUp {
+                let key = PendingSourceKey(row.source)
+                if let newest = rows[key]?.revision, row.revision < newest { backedUpBefore.insert(key) }
+            }
             rememberDurableHandoffs(for: kindKeys)
             for key in kindKeys where rows[key] == nil && handoffs[key] == nil { dropSourceState(key) }
         }
@@ -447,6 +464,23 @@ public actor PendingBackupCoordinator {
         metadataRevision[key] = nil
         staleMetadata.remove(key)
         inaccessible.remove(key)
+        backedUpBefore.remove(key)
+        replacing[key] = nil
+    }
+
+    /// The unsettled read has no earlier revisions. Unchecked rows can show before their check only while few of
+    /// them wait, so reading the earlier revisions of those few stays cheap.
+    private func learnEarlierRevisions() {
+        let unchecked = rows.filter { Self.isUnchecked($0.value.state) && !backedUpBefore.contains($0.key) }
+        guard !unchecked.isEmpty, unchecked.count <= configuration.uncheckedAdmissionLimit else { return }
+        for (kind, keys) in Dictionary(grouping: unchecked.keys, by: \.kind) {
+            guard let queue = queues[kind] else { continue }
+            for row in queue.rows(kind: kind, identifiers: Set(keys.map(\.identifier)))
+            where row.state == .completed || row.state == .alreadyBackedUp {
+                let key = PendingSourceKey(row.source)
+                if let newest = rows[key]?.revision, row.revision < newest { backedUpBefore.insert(key) }
+            }
+        }
     }
 
     /// The runner writes a handoff to the store before the queue settles its row, but the coordinator hears
@@ -558,6 +592,9 @@ public actor PendingBackupCoordinator {
             if Self.needsEvidence(row.state), handoff == nil, evidence[key]?.contains(row.revision) != true,
                 !shownSources.contains(key)
             {
+                // The earlier Proton photo shows until the check decides on an upload: a tile beside it would
+                // show the photo twice, and most rechecks upload nothing.
+                guard !backedUpBefore.contains(key), earlierUploads(of: key).isEmpty else { return false }
                 guard admitsUnchecked, Self.isUnchecked(row.state) else { return false }
             }
             shownSources.insert(key)
@@ -581,6 +618,7 @@ public actor PendingBackupCoordinator {
         }
         let handoff = handoffs[key].flatMap { $0.revision == row.revision ? $0.remote : nil }
         let settled = row.state == .completed || row.state == .alreadyBackedUp
+        let replaces = settled ? retiredReplacements(of: key) : latchReplacements(of: key)
         let badge: PendingUploadBadge =
             switch row.state {
             case .completed, .alreadyBackedUp: settledBadge(key, revision: row.revision)
@@ -594,8 +632,31 @@ public actor PendingBackupCoordinator {
             handoff: handoff,
             isSettled: settled,
             badge: badge,
-            displayName: metadata.displayName
+            displayName: metadata.displayName,
+            replaces: replaces
         )
+    }
+
+    private func earlierUploads(of key: PendingSourceKey) -> [PhotoUID] {
+        guard key.kind == .photoLibraryAsset, let replacementJournal else { return [] }
+        return replacementJournal.entry(for: UploadSourceIdentity(kind: key.kind, identifier: key.identifier))
+            .superseded
+    }
+
+    /// While the upload runs, the journal names the earlier photos; the tile takes their place.
+    private func latchReplacements(of key: PendingSourceKey) -> [PhotoUID] {
+        let earlier = earlierUploads(of: key)
+        if !earlier.isEmpty { replacing[key] = earlier }
+        return replacing[key] ?? []
+    }
+
+    /// After the upload settled, only the earlier photos that moved to the trash stay hidden. A photo that the
+    /// replacement kept, for example because another photo needs it, shows again.
+    private func retiredReplacements(of key: PendingSourceKey) -> [PhotoUID] {
+        guard let earlier = replacing[key], let replacementJournal else { return [] }
+        let retired = Set(
+            replacementJournal.entry(for: UploadSourceIdentity(kind: key.kind, identifier: key.identifier)).retired)
+        return earlier.filter { retired.contains($0.nodeID) }
     }
 
     /// The checkmark shows for `checkmarkDuration` after the backup finished, then the tile shows no badge.
