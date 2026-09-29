@@ -1939,10 +1939,8 @@ final class MobileLibraryModel {
             self.thumbnailCache = thumbnailCache
             snapshot = projection.snapshot
             self.sections = projection.sections
-            // The fixture account has no favorites and needs no server read.
+            // Unread favorites, so the first library refresh reads them like a signed-in account.
             favoriteState.reset(keepingFavorites: false)
-            let read = favoriteState.beginLoad()
-            favoriteState.finishLoad([], for: read)
             timelineRevision &+= 1
             loadState = .contentReady(count: projection.snapshot.items.count)
         }
