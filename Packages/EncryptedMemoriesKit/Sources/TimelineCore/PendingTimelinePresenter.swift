@@ -166,8 +166,9 @@ public final class PendingTimelinePresenter {
     /// Earlier Proton photos that the backup moved to the trash, with the moment the grid first hid them as
     /// trashed, until the listing no longer returns them.
     private var trashedEarlier: [PhotoUID: Date] = [:]
-    /// Proton photos that the person restored in this session; no replacement hides them.
-    private var restored = Set<PhotoUID>()
+    /// Proton photos that the person restored in this session, with the tile revisions that replaced them then.
+    /// Those no longer hide them; a later edit that replaces them again does.
+    private var restored: [PhotoUID: Set<Replacement>] = [:]
     private let now: @Sendable () -> Date
     /// The longest time a trashed earlier photo stays hidden while the listing still returns it.
     package nonisolated static let trashedHideLimit: TimeInterval = 300
@@ -302,11 +303,19 @@ public final class PendingTimelinePresenter {
 
     /// The person restored these Proton photos from the trash: they show at once, even while the listing lags.
     public func showRestored(_ uids: [PhotoUID]) {
-        let added = Set(uids).subtracting(restored)
-        guard !added.isEmpty else { return }
-        restored.formUnion(added)
-        for uid in added { trashedEarlier[uid] = nil }
-        rebuild()
+        let photosVolume = remote.items.first?.uid.volumeID
+        var changed = false
+        for uid in Set(uids) {
+            let replacements = pending.tiles.lazy
+                .filter { $0.replaces.contains { Self.resolve($0, photosVolume: photosVolume) == uid } }
+                .map(Replacement.init)
+            let exempt = restored[uid, default: []].union(replacements)
+            guard exempt != restored[uid] || trashedEarlier[uid] != nil else { continue }
+            restored[uid] = exempt
+            trashedEarlier[uid] = nil
+            changed = true
+        }
+        if changed { rebuild() }
     }
 
     /// The feed holds new images for these revised photos; grids upload them in place of the old textures.
@@ -370,7 +379,7 @@ public final class PendingTimelinePresenter {
         let anchors: [PhotoUID: Anchor]
         let tileKeys: [PendingSourceKey: PhotoItem]
         let trashedEarlier: [PhotoUID: Date]
-        let restored: Set<PhotoUID>
+        let restored: [PhotoUID: Set<Replacement>]
         let now: Date
         let revisions: [PhotoUID: UploadBackupRevision]
         /// The snapshot that the grid shows now.
@@ -520,6 +529,17 @@ public final class PendingTimelinePresenter {
         )
     }
 
+    /// One revision of the tile of an edit, which replaces earlier photos.
+    private struct Replacement: Hashable, Sendable {
+        let key: PendingSourceKey
+        let revision: UploadBackupRevision?
+
+        init(_ tile: PendingTile) {
+            key = tile.key
+            revision = tile.revision
+        }
+    }
+
     /// The Proton photos that edits replace in this merge, and the places their tiles take.
     private struct Replacements {
         /// Listed Proton photos to hide.
@@ -533,7 +553,6 @@ public final class PendingTimelinePresenter {
     private nonisolated static func replacements(in input: MergeInput, photosVolume: String?) -> Replacements {
         var result = Replacements()
         func noteTrashed(_ uid: PhotoUID) {
-            guard !input.restored.contains(uid) else { return }
             let since = input.trashedEarlier[uid] ?? input.now
             result.trashedEarlier[uid] = since
             if input.now.timeIntervalSince(since) < trashedHideLimit { result.hidden.insert(uid) }
@@ -544,10 +563,13 @@ public final class PendingTimelinePresenter {
             let current = tile.handoff.flatMap { resolve($0, photosVolume: photosVolume) }
             let earlier = tile.replaces.compactMap { resolve($0, photosVolume: photosVolume) }.filter { $0 != current }
             let listed = earlier.compactMap { input.remote.index(of: $0).map { input.remote.items[$0] } }
+            // A photo restored while this revision replaced it stays.
+            let replacement = Replacement(tile)
+            let replaced = listed.lazy.map(\.uid).filter { input.restored[$0]?.contains(replacement) != true }
             if tile.isSettled {
-                listed.forEach { noteTrashed($0.uid) }
+                replaced.forEach(noteTrashed)
             } else {
-                result.hidden.formUnion(listed.map(\.uid).filter { !input.restored.contains($0) })
+                result.hidden.formUnion(replaced)
             }
             // The tile takes the place where the earlier photo shows, which an earlier edit may have anchored.
             // The first place stays while the tile shows, even when the listing drops the earlier photo.

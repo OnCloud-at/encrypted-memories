@@ -193,6 +193,31 @@ import UploadCore
         #expect(Set(await settle(presenter).items.map(\.uid)) == [earlier, uploaded], "and after it retired")
     }
 
+    @Test func aRestoreKeepsOnlyTheEditsOfItsMomentFromHidingThePhoto() async {
+        let presenter = PendingTimelinePresenter()
+        let photo = PhotoUID(volumeID: "vol", nodeID: "photo")
+        presenter.setRemote(TimelineSnapshot(orderedItems: sameSecond(["a", "photo"])))
+        // Restored before any edit replaced it.
+        presenter.showRestored([photo])
+        _ = await settle(presenter)
+
+        let edit = tile("p", second: 10, replaces: [photo])
+        presenter.setPending(pending([edit], membership: 1), enabled: true)
+        let edited = await settle(presenter)
+        #expect(!edited.items.map(\.uid).contains(photo), "a later edit replaces it")
+
+        presenter.showRestored([photo])
+        let restored = await settle(presenter)
+        #expect(restored.items.map(\.uid).contains(photo), "restored while this edit replaced it")
+
+        let secondEdit = PendingTile(
+            key: edit.key, item: edit.item, revision: UploadBackupRevision(rawValue: 2), handoff: nil,
+            isSettled: false, badge: .waiting, displayName: "p", replaces: [photo])
+        presenter.setPending(pending([secondEdit], membership: 2), enabled: true)
+        let editedAgain = await settle(presenter)
+        #expect(!editedAgain.items.map(\.uid).contains(photo), "a second edit replaces it again")
+    }
+
     @Test func aSecondEditTakesThePlaceWhereTheFirstEditShows() async {
         let presenter = PendingTimelinePresenter()
         let original = PhotoUID(volumeID: "vol", nodeID: "m-original")
