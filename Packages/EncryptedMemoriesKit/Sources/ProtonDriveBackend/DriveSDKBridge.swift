@@ -320,11 +320,14 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                     hasPendingLocalUploads: !pendingUploadedNodeIDs.isEmpty,
                     hasUnmaterializedLocalEvidence: !unmaterializedEvidenceNodeIDs.isEmpty
                 )
-            let sections: [TimelineSection]
+            var sections: [TimelineSection]
             let reconciliationItems: [PhotoItem]
             let burstMemberIDs: [String: [String]]
             let burstEntries: [PhotosListEntry]?
             var authoritativeInventoryFingerprint: String?
+            // Only while photos trashed here may still appear in a listing.
+            var listingRead: LibraryListingRead?
+            let listingReadAt = Date()
 
             switch source {
             case .authoritativePhotosList:
@@ -351,6 +354,15 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                     }
                 } else {
                     entries = try await driveSession.fetchPhotosList(volumeID: root.volumeID)
+                }
+                if recentlyDeleted.hasPhotosAwaitingLibrary {
+                    // Read before the events below filter the listing: a photo that they leave out must still
+                    // wait, as the next listing can return it without that event.
+                    listingRead = LibraryListingRead(
+                        listed: Set(entries.map { PhotoUID(volumeID: root.volumeID, nodeID: $0.linkID) }),
+                        restoredElsewhere: Set(
+                            (remoteChanges?.active ?? []).map { PhotoUID(volumeID: root.volumeID, nodeID: $0) }),
+                        readAt: listingReadAt)
                 }
                 // The listing can return a photo for a short time after it moved to the trash, for example the
                 // earlier upload that the backup just replaced. The newer events decide.
@@ -449,11 +461,15 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                     burstMemberIDs: burstMemberIDs
                 )
                 reconciliationItems = sections.flatMap(\.items)
+                if recentlyDeleted.hasPhotosAwaitingLibrary {
+                    listingRead = LibraryListingRead(listed: Set(reconciliationItems.map(\.uid)), readAt: listingReadAt)
+                }
             }
             try checkTimelineLoad(generation: generation)
             guard pendingUploadedNodeIDs.isEmpty else {
                 throw TimelineInventoryVisibilityError.pendingUploadsNotVisible(pendingUploadedNodeIDs.count)
             }
+            if let listingRead { sections = withoutPhotosTrashedHere(sections, read: listingRead) }
             var continuityRecoveryQualified = false
             let endEventToken: String
             if continuityRecoveryRequired {
@@ -521,6 +537,9 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                 }
             } else {
                 DebugLog.log("timeline: usable inventory kept in memory; incomplete enrichment will retry")
+            }
+            if let listingRead, recentlyDeleted.libraryAccepted(listingRead, now: Date()) {
+                recentlyDeletedStore.save(recentlyDeleted.persisted)
             }
             if let burstEntries {
                 burstCatalogEntries = burstEntries
@@ -804,6 +823,17 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         } catch {
             DebugLog.log("timeline: media-type reconciliation paused after a recoverable failure - \(error)")
         }
+    }
+
+    /// A listing can lag behind a trash made here, by the person or by the backup. It must not bring those photos
+    /// back into the library or into the stored timeline that the next launch shows.
+    private func withoutPhotosTrashedHere(
+        _ sections: [TimelineSection], read: LibraryListingRead
+    ) -> [TimelineSection] {
+        let lagging = recentlyDeleted.lagging(in: read, now: Date())
+        guard !lagging.isEmpty else { return sections }
+        DebugLog.log("timeline: left out \(lagging.count) photos that the listing returns after their trash")
+        return TimelineContentProjection(sections: sections).removing(lagging).sections
     }
 
     @discardableResult
