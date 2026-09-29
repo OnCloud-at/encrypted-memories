@@ -98,6 +98,7 @@ final class PhotoBackupBackgroundCoordinator {
         updateIdleTimer()
         processingIssue = nil
         publishExecutionIssue(to: controller)
+        controller?.applicationDidBecomeActive()
     }
 
     func backupPaused() {

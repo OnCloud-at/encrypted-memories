@@ -379,6 +379,13 @@ public final class PhotoLibraryBackupController {
         _ = startSync(owner: .foreground)
     }
 
+    /// Runs a pass when the app becomes active. An edit in Photos while this app was in the background may reach
+    /// the app without a change notification; the pass reads the persistent change history since its last run.
+    public func applicationDidBecomeActive() {
+        guard isEnabled, !isUserPaused, !isSyncing else { return }
+        syncNow()
+    }
+
     /// Durable user pause: stop the current pass AND suppress every automatic (re)start until the user
     /// resumes. Persisted so it survives relaunch. This is what the Pause button does; unlike a bare
     /// `stopSync()`, a change notification or the auto-resume can't quietly restart behind the user.

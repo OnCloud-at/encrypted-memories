@@ -24,6 +24,76 @@ final class PhotoBackupPlannerTests: XCTestCase {
         )
     }
 
+    // MARK: - Edit readiness
+
+    private let now = Date(timeIntervalSince1970: 1_700_001_000)
+    private let original = PhotoBackupAssetInfo.Resource(
+        role: .originalPhoto, originalFilename: "IMG_1.HEIC", mimeType: "image/heic")
+    private let render = PhotoBackupAssetInfo.Resource(
+        role: .fullSizePhoto, originalFilename: "FullSizeRender.heic", mimeType: "image/heic")
+
+    private func edited(
+        secondsAgo: TimeInterval, hasAdjustments: Bool = true, rendered: Bool = true
+    ) -> PhotoBackupAssetInfo {
+        var asset = info(resources: rendered ? [original, render] : [original])
+        asset.hasAdjustments = hasAdjustments
+        asset.adjustmentTimestamp = now.addingTimeInterval(-secondsAgo)
+        return asset
+    }
+
+    func testAPhotoNeverEditedIsReadyAtOnce() {
+        XCTAssertNil(PhotoBackupAssetPlanner.notReadyUntil(for: info(resources: [original]), now: now))
+    }
+
+    func testQuickSuccessiveEditsWaitForAQuietPeriod() {
+        XCTAssertEqual(
+            PhotoBackupAssetPlanner.notReadyUntil(for: edited(secondsAgo: 2), now: now), now.addingTimeInterval(3))
+        XCTAssertNil(PhotoBackupAssetPlanner.notReadyUntil(for: edited(secondsAgo: 6), now: now))
+    }
+
+    func testAnUndoWaitsForTheQuietPeriodToo() {
+        // An undo removes the adjustments and moves the timestamp.
+        let reverted = edited(secondsAgo: 1, hasAdjustments: false, rendered: false)
+        XCTAssertEqual(PhotoBackupAssetPlanner.notReadyUntil(for: reverted, now: now), now.addingTimeInterval(4))
+        let settled = edited(secondsAgo: 30, hasAdjustments: false, rendered: false)
+        XCTAssertNil(PhotoBackupAssetPlanner.notReadyUntil(for: settled, now: now))
+    }
+
+    func testAnEditWithoutItsRenderedFileWaitsInsteadOfUploadingTheOriginal() {
+        let rendering = edited(secondsAgo: 20, rendered: false)
+        XCTAssertEqual(
+            PhotoBackupAssetPlanner.notReadyUntil(for: rendering, now: now), now.addingTimeInterval(15),
+            "the original must not replace the edit while Photos still renders it")
+        let abandoned = edited(secondsAgo: 200, rendered: false)
+        XCTAssertNil(
+            PhotoBackupAssetPlanner.notReadyUntil(for: abandoned, now: now), "the backup never waits for good")
+    }
+
+    func testTheRenderWaitEndsAtItsLimit() {
+        XCTAssertEqual(
+            PhotoBackupAssetPlanner.notReadyUntil(for: edited(secondsAgo: 110, rendered: false), now: now),
+            now.addingTimeInterval(10))
+    }
+
+    func testAnEditTimestampAheadOfTheClockDoesNotHoldThePhotoBack() {
+        // The device clock ran an hour ahead during the edit.
+        XCTAssertNil(PhotoBackupAssetPlanner.notReadyUntil(for: edited(secondsAgo: -3600), now: now))
+        XCTAssertNil(
+            PhotoBackupAssetPlanner.notReadyUntil(for: edited(secondsAgo: -3600, rendered: false), now: now))
+    }
+
+    func testAnEditedVideoWaitsForItsRenderedVideo() {
+        var video = info(
+            video: true,
+            resources: [.init(role: .originalVideo, originalFilename: "IMG_2.MOV", mimeType: "video/quicktime")])
+        video.hasAdjustments = true
+        video.adjustmentTimestamp = now.addingTimeInterval(-20)
+        XCTAssertNotNil(PhotoBackupAssetPlanner.notReadyUntil(for: video, now: now))
+        video.resources.append(
+            .init(role: .fullSizeVideo, originalFilename: "FullSizeRender.mov", mimeType: "video/quicktime"))
+        XCTAssertNil(PhotoBackupAssetPlanner.notReadyUntil(for: video, now: now))
+    }
+
     func testOriginalFilenameAndExtensionArePreserved() throws {
         let asset = info(resources: [
             .init(role: .originalPhoto, originalFilename: "IMG_1234.HEIC", mimeType: "image/heic")
