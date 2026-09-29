@@ -7,16 +7,19 @@ public struct DeviceRootItem: Equatable, Sendable {
     public let activeRevisionUID: String?
     public let chargedBytes: Int64
     public let isFolder: Bool
+    /// The node is in the trash. Only a restore makes it live again.
+    public let isTrashed: Bool
 
     public init(
         path: DeviceRootPath, nodeUID: String, activeRevisionUID: String?,
-        chargedBytes: Int64, isFolder: Bool
+        chargedBytes: Int64, isFolder: Bool, isTrashed: Bool = false
     ) {
         self.path = path
         self.nodeUID = nodeUID
         self.activeRevisionUID = activeRevisionUID
         self.chargedBytes = chargedBytes
         self.isFolder = isFolder
+        self.isTrashed = isTrashed
     }
 }
 
@@ -56,6 +59,8 @@ public enum DeviceRootOperationError: Error, Equatable {
     case ambiguousRoot
     case conflict
     case quota
+    /// The request governor gave up after throttling. Nothing was sent.
+    case rateLimited
     case verificationFailed
     case unknownOutcome
     /// The adapter proves that the create request was never submitted.
@@ -68,6 +73,9 @@ public enum DeviceRootOperationError: Error, Equatable {
 /// Every path is relative to the adapter's selected root. The adapter binds the account and writer
 /// instance at construction, then checks actual node ancestry and root incarnation before mutation.
 /// A nil expected revision means create only if absent.
+///
+/// `read` returns nil only when a complete listing proves that nothing exists at the path, including the trash. A
+/// trashed node comes back with `isTrashed`. An incomplete or stale listing throws instead of returning nil.
 public protocol DeviceRootStore: Sendable {
     func inventory(at path: DeviceRootPath) async throws -> DeviceRootInventory
     func read(at path: DeviceRootPath) async throws -> DeviceRootReadResult?
