@@ -178,7 +178,8 @@ final class EditReplacementTests: XCTestCase {
         try journal.settle(["b"], related: [], trashed: false, for: asset)
 
         let reopened = EditReplacementJournalFileStore(accountDataDirectory: directory)
-        XCTAssertEqual(reopened.entry(for: asset), EditReplacementJournalEntry(superseded: [], retired: ["a", "a-video"]))
+        XCTAssertEqual(
+            reopened.entry(for: asset), EditReplacementJournalEntry(superseded: [], retired: ["a", "a-video"]))
     }
 
     // MARK: - Dedupe rules
@@ -278,7 +279,8 @@ final class EditReplacementTests: XCTestCase {
         XCTAssertEqual(albums.addCalls.map(\.albumID), ["own-album"], "a shared album is never a write target")
         XCTAssertEqual(albums.addCalls.first?.uids, [new])
         XCTAssertEqual(remote.trashCalls, [[old]])
-        XCTAssertEqual(journal.entry(for: asset), EditReplacementJournalEntry(superseded: [], retired: ["old", "old-video"]))
+        XCTAssertEqual(
+            journal.entry(for: asset), EditReplacementJournalEntry(superseded: [], retired: ["old", "old-video"]))
     }
 
     func testTheReplacementNeverTrashesThePhotoThatCarriesTheNewOne() async throws {

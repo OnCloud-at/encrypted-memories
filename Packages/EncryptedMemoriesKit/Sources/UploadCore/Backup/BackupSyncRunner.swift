@@ -1261,7 +1261,9 @@ public actor BackupSyncRunner {
                 revert(entry, from: persistedState)
                 return
             } catch {
-                if stopRequested { revert(entry, from: persistedState) } else {
+                if stopRequested {
+                    revert(entry, from: persistedState)
+                } else {
                     retryOrPark(entry, from: persistedState, error: error)
                 }
                 return

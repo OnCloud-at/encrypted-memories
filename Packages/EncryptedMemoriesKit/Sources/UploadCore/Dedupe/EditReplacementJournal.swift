@@ -39,7 +39,8 @@ public final class EditReplacementJournalFileStore: EditReplacementJournaling, @
 
     public init(accountDataDirectory: URL) {
         url = accountDataDirectory.appendingPathComponent(Self.fileName)
-        entries = (try? JSONDecoder().decode([String: EditReplacementJournalEntry].self, from: Data(contentsOf: url)))
+        entries =
+            (try? JSONDecoder().decode([String: EditReplacementJournalEntry].self, from: Data(contentsOf: url)))
             ?? [:]
     }
 
