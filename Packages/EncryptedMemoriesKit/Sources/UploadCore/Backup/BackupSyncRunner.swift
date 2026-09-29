@@ -1262,6 +1262,7 @@ public actor BackupSyncRunner {
                 } else if try await editReplacement.replaceSuperseded(
                     of: entry.source,
                     with: primaryUID,
+                    edited: resolved.candidate.snapshot.editRevision == .unavailable,
                     holdsOriginal: EditedPhotoReplacement.holdsOriginal(
                         editRevision: resolved.candidate.snapshot.editRevision,
                         secondaries: resolved.secondaries.map(\.descriptor.source.resource)

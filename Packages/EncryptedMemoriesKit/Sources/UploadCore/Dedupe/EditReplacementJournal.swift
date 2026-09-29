@@ -9,13 +9,21 @@ public struct EditReplacementJournalEntry: Sendable, Equatable, Codable {
     /// Links the backup already moved to the trash, with their related photos. A trashed copy among them is no
     /// deletion by the person.
     public var retired: [String]
+    /// True when the last upload of this photo was an edit. Only then do other bytes of the unedited photo undo an
+    /// edit. Nil in journals of earlier builds.
+    public var uploadedEdit: Bool?
 
-    public init(superseded: [PhotoUID] = [], retired: [String] = []) {
+    public init(superseded: [PhotoUID] = [], retired: [String] = [], uploadedEdit: Bool? = nil) {
         self.superseded = superseded
         self.retired = retired
+        self.uploadedEdit = uploadedEdit
     }
 
-    public var isEmpty: Bool { superseded.isEmpty && retired.isEmpty }
+    /// Without the flag, a photo that already replaced an earlier upload counts as edited: only edits and undos
+    /// replaced photos in earlier builds.
+    public var lastUploadWasEdit: Bool { uploadedEdit ?? !retired.isEmpty }
+
+    public var isEmpty: Bool { superseded.isEmpty && retired.isEmpty && uploadedEdit != true }
 }
 
 /// Durable record of edited photos that replace their earlier upload. The dedupe pipeline adds the earlier
@@ -25,6 +33,8 @@ public protocol EditReplacementJournaling: Sendable {
     func addSuperseded(_ uid: PhotoUID, for source: UploadSourceIdentity) throws
     /// Removes the photos from `superseded`. With `trashed` true they and `related` join `retired`.
     func settle(_ nodeIDs: Set<String>, related: Set<String>, trashed: Bool, for source: UploadSourceIdentity) throws
+    /// Records whether the upload that the backup finished for `source` was an edit.
+    func recordUpload(edited: Bool, for source: UploadSourceIdentity) throws
 }
 
 /// One JSON file in the account data directory, so the sign-out purge removes it with the other stores. Retired
@@ -70,6 +80,13 @@ public final class EditReplacementJournalFileStore: EditReplacementJournaling, @
             for linkID in nodeIDs.union(related).sorted() where !entry.retired.contains(linkID) {
                 entry.retired.append(linkID)
             }
+        }
+    }
+
+    public func recordUpload(edited: Bool, for source: UploadSourceIdentity) throws {
+        try update(source) { entry in
+            // An unedited photo without other entries needs no flag: nil counts as unedited then.
+            entry.uploadedEdit = edited || !entry.retired.isEmpty ? edited : nil
         }
     }
 
