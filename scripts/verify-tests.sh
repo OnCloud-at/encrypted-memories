@@ -28,6 +28,7 @@ xcrun swift test \
   --package-path "$ROOT/Packages/EncryptedMemoriesKit" \
   --scratch-path "$PHOTOS_SCRATCH" \
   --cache-path "$ENCRYPTED_MEMORIES_SWIFTPM_CACHE" \
+  --force-resolved-versions \
   --no-parallel
 
 # sdk-swift is a local path dependency, so SwiftPM does not execute its own test target while
@@ -37,6 +38,7 @@ xcrun swift test \
   --package-path "$ROOT/Vendor/sdk-swift" \
   --scratch-path "$SDK_SCRATCH" \
   --cache-path "$ENCRYPTED_MEMORIES_SWIFTPM_CACHE" \
+  --force-resolved-versions \
   --no-parallel
 
 echo "[tests] all package suites passed"

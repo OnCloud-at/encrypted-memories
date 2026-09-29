@@ -96,6 +96,45 @@ final class MobileLibraryUITests: XCTestCase {
         XCTAssertTrue(app.searchFields.firstMatch.waitForExistence(timeout: 10), "Search shows no search field")
     }
 
+    func testReturningFromBackgroundRestoresTheViewerWithPreviewProtection() {
+        app.terminate()
+        app.launchArguments += ["-EncryptedMemories.blurAppPreview", "YES"]
+        app.launch()
+        XCTAssertTrue(firstPhoto.waitForExistence(timeout: 60))
+        firstPhoto.tap()
+        XCTAssertTrue(app.buttons["Close"].waitForExistence(timeout: 10))
+
+        XCUIDevice.shared.press(.home)
+        app.activate()
+        let close = app.buttons["Close"]
+        XCTAssertTrue(close.waitForExistence(timeout: 10))
+        close.tap()
+        XCTAssertTrue(firstPhoto.waitForExistence(timeout: 10))
+    }
+
+    func testPrivacyPreviewSwitchPersistsAfterClosingSettings() throws {
+        XCTAssertTrue(firstPhoto.waitForExistence(timeout: 60))
+        app.buttons["Proton Account and Settings"].tap()
+        app.buttons["Privacy"].tap()
+
+        let previewSwitch = app.switches["Blur App Preview"]
+        XCTAssertTrue(previewSwitch.waitForExistence(timeout: 5))
+        let initialValue = try XCTUnwrap(previewSwitch.value as? String)
+        XCTAssertTrue(initialValue == "0" || initialValue == "1")
+        let changedValue = initialValue == "0" ? "1" : "0"
+        previewSwitch.coordinate(withNormalizedOffset: CGVector(dx: 0.9, dy: 0.5)).tap()
+        XCTAssertTrue(wait(for: previewSwitch, "value == '\(changedValue)'"))
+
+        app.buttons["Settings"].tap()
+        app.buttons["Done"].tap()
+        app.buttons["Proton Account and Settings"].tap()
+        app.buttons["Privacy"].tap()
+        let reopenedSwitch = app.switches["Blur App Preview"]
+        XCTAssertEqual(reopenedSwitch.value as? String, changedValue)
+        reopenedSwitch.coordinate(withNormalizedOffset: CGVector(dx: 0.9, dy: 0.5)).tap()
+        XCTAssertTrue(wait(for: reopenedSwitch, "value == '\(initialValue)'"))
+    }
+
     func testPrivacySwitchHidesTheMapTab() {
         XCTAssertTrue(firstPhoto.waitForExistence(timeout: 60))
         XCTAssertTrue(app.tabBars.buttons["Map"].exists)

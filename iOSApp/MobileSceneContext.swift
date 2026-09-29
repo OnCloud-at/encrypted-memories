@@ -15,9 +15,11 @@ final class MobileSceneContext {
     var settingsPresented = false
 
     @ObservationIgnored private(set) weak var window: UIWindow?
+    @ObservationIgnored var onWindowChange: ((UIWindow?) -> Void)?
 
     func attach(window: UIWindow?) {
         self.window = window
+        onWindowChange?(window)
     }
 
     /// The view controller that presents UIKit-hosted system UI (for example the limited-library picker)
