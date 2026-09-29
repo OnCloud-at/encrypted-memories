@@ -61,7 +61,13 @@ public enum OriginalExportWriter {
         defer { try? FileManager.default.removeItem(at: stagingDirectory) }
         let stagedFile = stagingDirectory.appendingPathComponent(destination.lastPathComponent, isDirectory: false)
         try await provider.writeOriginal(for: item.uid, to: stagedFile, onProgress: onProgress)
-        try installCompletedFile(stagedFile, at: destination)
+        if PrivacyExportPolicy.isEnabled() {
+            let cleanFile = stagingDirectory.appendingPathComponent("clean-" + destination.lastPathComponent)
+            let written = try await LocationSanitizedCopy.write(from: stagedFile, to: cleanFile)
+            try installCompletedFile(written, at: destination)
+        } else {
+            try installCompletedFile(stagedFile, at: destination)
+        }
     }
 
     /// Streams several originals into one staged ZIP archive, one download at a time, then installs the archive.
@@ -108,7 +114,24 @@ public enum OriginalExportWriter {
                 metadata: metadata,
                 fallbackBase: String(item.uid.nodeID.prefix(8))
             )
-            try writer.addFile(name: uniqueArchiveName(name, used: &used), fileURL: sidecar)
+            var cleanFile: URL?
+            defer { if let cleanFile { try? FileManager.default.removeItem(at: cleanFile) } }
+            let archiveSource: URL
+            var archiveName = name
+            if PrivacyExportPolicy.isEnabled() {
+                let output = stagingDirectory.appendingPathComponent(
+                    UUID().uuidString + "." + URL(fileURLWithPath: name).pathExtension)
+                let written = try await LocationSanitizedCopy.write(from: sidecar, to: output)
+                cleanFile = written
+                archiveSource = written
+                // A RAW photo leaves as a JPEG; the entry name follows the written format.
+                archiveName =
+                    URL(fileURLWithPath: name).deletingPathExtension()
+                    .appendingPathExtension(written.pathExtension).lastPathComponent
+            } else {
+                archiveSource = sidecar
+            }
+            try writer.addFile(name: uniqueArchiveName(archiveName, used: &used), fileURL: archiveSource)
             onProgress(Double(index + 1) / total)
         }
         try writer.finish()
