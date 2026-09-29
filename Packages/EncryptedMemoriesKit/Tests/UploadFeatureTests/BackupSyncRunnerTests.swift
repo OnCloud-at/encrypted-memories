@@ -96,6 +96,13 @@ final class ScriptedBackupResolver: BackupResourceResolving, @unchecked Sendable
         lock.withLock { peakResolves[identifier] ?? 0 }
     }
 
+    private var editRevisions: [String: UploadBackupEditRevision] = [:]
+
+    /// The edit revision that resolves report for `identifier`; `.unavailable` (edit evidence) by default.
+    func setEditRevision(_ revision: UploadBackupEditRevision, for identifier: String) {
+        lock.withLock { editRevisions[identifier] = revision }
+    }
+
     func setSecondaries(_ names: [String], for identifier: String) {
         lock.withLock { secondaryNames[identifier] = names }
     }
@@ -209,7 +216,7 @@ final class ScriptedBackupResolver: BackupResourceResolving, @unchecked Sendable
             let snapshot = UploadBackupAssetSnapshot(
                 source: entry.source,
                 revision: UploadBackupRevision(date: modified),
-                editRevision: .unavailable,
+                editRevision: lock.withLock { editRevisions[id] } ?? .unavailable,
                 resourceCount: 1 + secondaries.count + burstMembers.count
             )
             let descriptor = UploadResourceDescriptor(
@@ -2336,7 +2343,30 @@ final class BackupSyncRunnerTests: XCTestCase {
 
         XCTAssertTrue(harness.remote.trashCalls.isEmpty, "the earlier upload may be the only copy of the original")
         XCTAssertEqual(state(of: edited), .completed)
-        XCTAssertTrue(harness.journal.entry(for: edited.source).superseded.isEmpty)
+        XCTAssertEqual(
+            harness.journal.entry(for: edited.source).superseded.map(\.nodeID), [testUID("IMG_1.HEIC").nodeID],
+            "an upload that holds the original replaces the earlier photo later")
+    }
+
+    func testUndoingAnEditReplacesTheEditWithTheOriginal() async throws {
+        let harness = try makeReplacementHarness()
+        let edited = await uploadThenEdit(harness)
+        _ = await makeRunner(identityResolver: harness.pipeline, editReplacement: harness.replacement)
+            .runUntilDrained()
+        XCTAssertEqual(harness.remote.trashCalls, [[testUID("IMG_1.HEIC")]])
+
+        // Undo in Photos: the original bytes, the Live Photo video, and no edit evidence.
+        hasher.contentSeeds[edited.source.identifier] = nil
+        resolver.setSecondaries(["IMG_1.MOV"], for: edited.source.identifier)
+        resolver.setEditRevision(.revision(UploadBackupRevision(rawValue: 7)), for: edited.source.identifier)
+        harness.remote.active = [testUID("IMG_1.JPG")]
+        let undone = seedLibraryEntry("IMG_1.HEIC", revisionOffset: 2)
+        _ = await makeRunner(identityResolver: harness.pipeline, editReplacement: harness.replacement)
+            .runUntilDrained()
+
+        XCTAssertEqual(state(of: undone), .completed)
+        XCTAssertEqual(harness.remote.trashCalls, [[testUID("IMG_1.HEIC")], [testUID("IMG_1.JPG")]])
+        XCTAssertFalse(harness.journal.entry(for: edited.source).lastUploadWasEdit)
     }
 
     func testAnEditedSeriesKeepsItsEarlierUpload() async throws {

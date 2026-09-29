@@ -184,15 +184,21 @@ final class UploadIdentityManifestTests: XCTestCase {
         active.remoteLinkID = "link-active"
         active.outcome = UploadIdentityManifestStore.Outcome.uploaded.rawValue
         store.upsert(active)
+        var adopted = makeRecord(identifier: "asset-c")
+        adopted.remoteLinkID = "link-trashed"
+        adopted.outcome = UploadIdentityManifestStore.Outcome.duplicateActive.rawValue
+        store.upsert(adopted)
 
-        XCTAssertTrue(store.forgetRemoteLinks(["link-trashed", ""]))
+        XCTAssertTrue(store.forgetRemoteLinks(["link-trashed", ""], of: trashed.source))
 
         let forgotten = try XCTUnwrap(store.record(for: trashed.source))
         XCTAssertNil(forgotten.remoteVolumeID)
         XCTAssertNil(forgotten.remoteLinkID)
         XCTAssertNil(forgotten.outcome)
         XCTAssertEqual(forgotten.sha1Hex, trashed.sha1Hex, "the next check must not hash the file again")
-        XCTAssertEqual(store.sources(withRemoteLinkID: "link-trashed")?.count, 0)
+        XCTAssertEqual(
+            store.sources(withRemoteLinkID: "link-trashed")?.map(\.identifier), ["asset-c"],
+            "another source may count a restored photo as its backup")
         XCTAssertEqual(store.record(for: active.source)?.remoteLinkID, "link-active")
     }
 

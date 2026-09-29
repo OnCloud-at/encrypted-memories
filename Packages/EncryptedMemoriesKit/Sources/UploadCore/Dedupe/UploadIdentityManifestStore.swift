@@ -310,7 +310,7 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
     }
 
     @discardableResult
-    public func forgetRemoteLinks(_ linkIDs: Set<String>) -> Bool {
+    public func forgetRemoteLinks(_ linkIDs: Set<String>, of source: UploadSourceIdentity) -> Bool {
         let unique = linkIDs.filter { !$0.isEmpty }
         guard !unique.isEmpty else { return true }
         return lock.withLock {
@@ -318,7 +318,10 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
             guard
                 sqlite3_prepare_v2(
                     db,
-                    "UPDATE upload_identity SET remote_vol=NULL, remote_link=NULL, outcome=NULL WHERE remote_link=?;",
+                    """
+                    UPDATE upload_identity SET remote_vol=NULL, remote_link=NULL, outcome=NULL
+                    WHERE remote_link=? AND source_kind=? AND source_id=?;
+                    """,
                     -1, &stmt, nil
                 ) == SQLITE_OK
             else { return false }
@@ -327,6 +330,8 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
                 sqlite3_reset(stmt)
                 sqlite3_clear_bindings(stmt)
                 bindText(stmt, 1, linkID)
+                bindText(stmt, 2, source.kind.rawValue)
+                bindText(stmt, 3, source.identifier)
                 guard sqlite3_step(stmt) == SQLITE_DONE else { return false }
             }
             return true
