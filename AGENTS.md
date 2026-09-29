@@ -36,6 +36,5 @@ Follow the Tests section of `CONTRIBUTING.md`: every new feature and every bug f
 
 ## Pull requests
 
-- State in the pull request that a coding agent made the change.
 - Describe the result for users, the platforms, the tests that you ran, and the checks that remain manual.
 - An automated review comments on every pull request. It is advisory; a maintainer reviews every pull request before it merges.
