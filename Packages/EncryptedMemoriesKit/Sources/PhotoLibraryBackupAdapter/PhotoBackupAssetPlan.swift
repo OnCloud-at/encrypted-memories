@@ -57,6 +57,10 @@ public struct PhotoBackupAssetInfo: Sendable, Equatable {
     /// Stable iCloud identity when PhotoKit can provide one. Discovery resolves these in batches;
     /// Core treats it as upload metadata, never as the local lookup key.
     public var cloudIdentifier: String?
+    /// Photos reports an edit (`PHAsset.hasAdjustments`), whether or not its rendered file is listed yet.
+    public var hasAdjustments: Bool
+    /// When the photo was last edited or reverted (`PHAsset.adjustmentTimestamp`); nil for a photo never edited.
+    public var adjustmentTimestamp: Date?
 
     public init(
         localIdentifier: String,
@@ -68,7 +72,9 @@ public struct PhotoBackupAssetInfo: Sendable, Equatable {
         isLivePhoto: Bool,
         isVideo: Bool,
         resources: [Resource],
-        cloudIdentifier: String? = nil
+        cloudIdentifier: String? = nil,
+        hasAdjustments: Bool = false,
+        adjustmentTimestamp: Date? = nil
     ) {
         self.localIdentifier = localIdentifier
         self.creationDate = creationDate
@@ -80,6 +86,8 @@ public struct PhotoBackupAssetInfo: Sendable, Equatable {
         self.isVideo = isVideo
         self.resources = resources
         self.cloudIdentifier = cloudIdentifier
+        self.hasAdjustments = hasAdjustments
+        self.adjustmentTimestamp = adjustmentTimestamp
     }
 
     public var hasEditEvidence: Bool {
@@ -136,6 +144,29 @@ public struct PhotoBackupExportPlan: Sendable, Equatable {
 
 /// Pure planning over `PhotoBackupAssetInfo`. No PhotoKit, no I/O.
 public enum PhotoBackupAssetPlanner {
+    /// Quick successive edits (rotating twice, undoing) upload once: a photo waits this long after its last edit.
+    public static let editQuietPeriod: TimeInterval = 5
+    /// Photos lists the rendered file of an edit a moment after it reports the edit. The backup waits for it at
+    /// most this long after the edit, then plans with the resources that exist; it never renders by itself.
+    public static let renderWaitLimit: TimeInterval = 120
+    /// While the rendered file is missing, the photo is checked again at this interval.
+    public static let renderRecheckInterval: TimeInterval = 15
+
+    /// The moment to check the photo again, or nil when it can be planned now. Planning during an edit
+    /// could upload an intermediate state, or the original as if the edit were undone.
+    public static func notReadyUntil(for info: PhotoBackupAssetInfo, now: Date) -> Date? {
+        // A timestamp ahead of the clock comes from a clock that ran ahead; waiting for it could hold the photo
+        // back for as long as the difference, so the photo is ready.
+        guard let edited = info.adjustmentTimestamp, edited <= now else { return nil }
+        let quietEnd = edited.addingTimeInterval(editQuietPeriod)
+        if now < quietEnd { return quietEnd }
+        let render: PhotoBackupAssetInfo.Resource.Role = info.isVideo ? .fullSizeVideo : .fullSizePhoto
+        let renderWaitEnd = edited.addingTimeInterval(renderWaitLimit)
+        guard info.hasAdjustments, !info.resources.contains(where: { $0.role == render }), now < renderWaitEnd
+        else { return nil }
+        return min(now.addingTimeInterval(renderRecheckInterval), renderWaitEnd)
+    }
+
     /// The candidate the shared preflight classifies. Nil when the asset exposes no exportable
     /// primary resource (broken/placeholder assets are skipped, never guessed at).
     public static func candidate(for info: PhotoBackupAssetInfo) -> UploadBackupAssetCandidate? {
