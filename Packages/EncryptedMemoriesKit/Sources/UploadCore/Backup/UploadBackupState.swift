@@ -126,6 +126,9 @@ public protocol UploadBackupStateStore: Sendable {
     func upsert(_ record: UploadBackupAssetRecord) -> Bool
     @discardableResult
     func upsertBatch(_ records: [UploadBackupAssetRecord]) -> Bool
+    /// Removes every state of `source` except `revisions`. Returns false when nothing was durably removed.
+    @discardableResult
+    func removeRecords(for source: UploadSourceIdentity, keeping revisions: Set<UploadBackupRevision>) -> Bool
     func count() -> Int
 }
 
@@ -168,6 +171,11 @@ public extension UploadBackupStateStore {
 
     func upsertBatch(_ records: [UploadBackupAssetRecord]) -> Bool {
         records.allSatisfy(upsert)
+    }
+
+    /// Stores without removal fail, so a caller never trusts a state it could not forget.
+    func removeRecords(for source: UploadSourceIdentity, keeping revisions: Set<UploadBackupRevision>) -> Bool {
+        false
     }
 }
 
@@ -260,6 +268,16 @@ public actor UploadBackupPreflightIndex {
                 ))
         else {
             throw UploadError.backend("Backup state could not be saved")
+        }
+    }
+
+    /// Forgets every earlier state of the asset. An edit replaced its earlier upload, so a later return to an
+    /// earlier state, for example undoing the edit, is no longer backed up and must pass the duplicate check.
+    public func forgetEarlierStates(of snapshot: UploadBackupAssetSnapshot) throws {
+        var keeping: Set<UploadBackupRevision> = [snapshot.revision]
+        if case .revision(let editRevision) = snapshot.editRevision { keeping.insert(editRevision) }
+        guard store.removeRecords(for: snapshot.source, keeping: keeping) else {
+            throw UploadError.backend("Backup state could not be updated")
         }
     }
 

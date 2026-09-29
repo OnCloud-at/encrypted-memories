@@ -1252,6 +1252,9 @@ public actor BackupSyncRunner {
         }
         if let editReplacement, let primaryUID {
             do {
+                if replacesEarlierUpload {
+                    try await preflight.forgetEarlierStates(of: resolved.candidate.snapshot)
+                }
                 if isSeries {
                     try editReplacement.keepSuperseded(of: entry.source)
                 } else if try await editReplacement.replaceSuperseded(of: entry.source, with: primaryUID) {

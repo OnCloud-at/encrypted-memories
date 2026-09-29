@@ -875,6 +875,11 @@ final class BackupSyncRunnerTests: XCTestCase {
             return true
         }
 
+        func removeRecords(for source: UploadSourceIdentity, keeping revisions: Set<UploadBackupRevision>) -> Bool {
+            lock.withLock { rows[source] = rows[source]?.filter { revisions.contains($0.key) } }
+            return true
+        }
+
         func count() -> Int {
             lock.withLock { rows.values.reduce(0) { $0 + $1.count } }
         }
@@ -2262,6 +2267,12 @@ final class BackupSyncRunnerTests: XCTestCase {
     func testAnEditedPhotoReplacesItsEarlierUploadAndKeepsItsSecondariesUnderTheNewPhoto() async throws {
         let harness = makeReplacementHarness()
         let edited = await uploadThenEdit(harness)
+        // The resource structure of the unedited photo, as the preflight index remembers it.
+        let unedited = UploadBackupRevision(rawValue: 1)
+        stateStore.upsert(
+            UploadBackupAssetRecord(
+                source: edited.source, revision: unedited, resourceCount: 2, pendingResourceCount: 0,
+                updatedAt: clock.now))
 
         _ = await makeRunner(identityResolver: harness.pipeline, editReplacement: harness.replacement)
             .runUntilDrained()
@@ -2272,6 +2283,11 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertEqual(uploader.requests.last?.mainPhotoUID, testUID("IMG_1.JPG"))
         XCTAssertEqual(harness.remote.trashCalls, [[testUID("IMG_1.HEIC")]])
         XCTAssertEqual(state(of: edited), .completed)
+        XCTAssertNil(
+            stateStore.record(for: edited.source, revision: unedited),
+            "the earlier upload is trashed, so undoing the edit must reach the duplicate check again")
+        XCTAssertNotNil(
+            stateStore.record(for: edited.source, revision: UploadBackupRevision(date: resolver.defaultModified)))
         XCTAssertEqual(
             harness.journal.entry(for: edited.source),
             EditReplacementJournalEntry(

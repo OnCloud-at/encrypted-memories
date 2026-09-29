@@ -140,6 +140,26 @@ final class UploadBackupStateTests: XCTestCase {
         XCTAssertNotNil(store.record(for: changed.source, revision: changed.revision))
     }
 
+    func testUndoingAnEditThatReplacedTheEarlierUploadNeedsTheDuplicateCheckAgain() async throws {
+        let url = tempDir.appendingPathComponent(UploadBackupStateManifestStore.databaseFileName)
+        let store = try XCTUnwrap(UploadBackupStateManifestStore(url: url))
+        defer { store.close() }
+        let index = UploadBackupPreflightIndex(store: store)
+        // The unedited photo was backed up with this resource structure; the edit then replaced that upload.
+        let original = revision(15)
+        try await index.markBackedUp(snapshot(revision: 10, editRevision: .revision(original)))
+        let edited = snapshot(revision: 20)
+        try await index.markBackedUp(edited)
+
+        try await index.forgetEarlierStates(of: edited)
+
+        XCTAssertNotNil(store.record(for: edited.source, revision: edited.revision))
+        let undone = try await index.classify(snapshot(revision: 30, editRevision: .revision(original)))
+        XCTAssertEqual(
+            undone, .needsBackendCheck(.unseenEditRevision),
+            "the earlier upload moved to the trash, so the original structure is no longer backed up")
+    }
+
     func testUnknownEditRevisionRequiresBackendCheck() async throws {
         let store = MemoryStore()
         let index = UploadBackupPreflightIndex(store: store)
