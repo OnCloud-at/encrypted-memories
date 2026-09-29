@@ -17,10 +17,63 @@ import XCTest
 /// Set `ENCRYPTED_MEMORIES_UI_SNAPSHOT_DIR` (through `TEST_RUNNER_…`) to also write PNG snapshots per step.
 final class MobileWindowGeometryTests: XCTestCase {
     @MainActor func testRepeatedWindowResizesKeepGridIdentityAndVisibleAnchor() async throws {
+        // Regular and compact widths that iPadOS produces for Split View and Slide Over, then the full window
+        // again, repeated to expose growth or identity loss. On iPhone the same fractions exercise the compact
+        // range. This checks geometry changes, not hinge events or display handoff.
+        try await verifyResizes(named: "resize") { full in
+            [1, 0.5, 0.34, 0.66, 1, 0.5, 1, 0.34, 1].map {
+                CGSize(width: (full.width * $0).rounded(.down), height: full.height)
+            }
+        }
+    }
+
+    /// iPhone Duo hands the app between its outer display and its inner display as people open, close and rotate
+    /// it: the window changes width, height and grid profile together. The anchored photo stays in place.
+    @MainActor func testFoldAndUnfoldSizesKeepGridIdentityAndVisibleAnchor() async throws {
+        let outer = CGSize(width: 466, height: 678)
+        let inner = CGSize(width: 669, height: 951)
+        let innerLandscape = CGSize(width: 951, height: 669)
+        try await verifyResizes(named: "fold") { _ in [outer, inner, outer, innerLandscape, inner, outer] }
+    }
+
+    /// An explicit scroll to the top chooses a new place: a later resize keeps the top instead of returning to the
+    /// photo that an earlier resize anchored, even when that photo is still in view and the tiles grow.
+    @MainActor func testAResizeAfterAScrollToTheTopKeepsTheTop() async throws {
+        let probe = try await makeProbe()
+        defer { probe.tearDown() }
+        let full = probe.fullBounds.size
+        probe.grid.scrollView.setContentOffset(CGPoint(x: 0, y: 150), animated: false)
+        try await Task.sleep(for: .milliseconds(300))
+        try await resize(probe.window, to: CGSize(width: (full.width * 0.5).rounded(.down), height: full.height))
+        probe.grid.scrollToTop()
+        try await Task.sleep(for: .milliseconds(300))
+        try await resize(probe.window, to: full)
+        XCTAssertEqual(
+            probe.grid.scrollView.contentOffset.y, -probe.grid.safeAreaInsets.top, accuracy: 1,
+            "a resize after a scroll to the top must keep the top")
+    }
+
+    @MainActor private func resize(_ window: UIWindow, to size: CGSize) async throws {
+        window.frame = CGRect(origin: .zero, size: size)
+        window.layoutIfNeeded()
+        try await Task.sleep(for: .milliseconds(350))
+    }
+
+    /// The production grid and chrome in a test window, with 240 decoded thumbnails.
+    private struct Probe {
+        let window: UIWindow
+        let grid: UIKitTimelineGridHostView
+        let fullBounds: CGRect
+        let tearDown: @MainActor () -> Void
+    }
+
+    @MainActor private func makeProbe() async throws -> Probe {
         let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
         let scene = try XCTUnwrap(scenes.first { $0.activationState == .foregroundActive } ?? scenes.first)
         let cacheDirectory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        defer { try? FileManager.default.removeItem(at: cacheDirectory) }
+        // Until the window exists, a failure only has the cache directory to remove.
+        var cacheOwnedByProbe = false
+        defer { if !cacheOwnedByProbe { try? FileManager.default.removeItem(at: cacheDirectory) } }
         let cache = ThumbnailCache(rootDirectory: cacheDirectory)
         let feed = UIKitThumbnailFeed(cache: cache, loader: ChromeProbeLoader())
         let items = (0..<240).map {
@@ -47,24 +100,38 @@ final class MobileWindowGeometryTests: XCTestCase {
         window.rootViewController = UIHostingController(
             rootView: ChromeProbeShell(items: items, feed: feed, state: state))
         window.makeKeyAndVisible()
-        defer {
-            descendants(window).compactMap { $0 as? UIKitTimelineGridHostView }.forEach { $0.setActive(false) }
+        cacheOwnedByProbe = true
+        let tearDown: @MainActor () -> Void = { [weak self] in
+            self?.descendants(window).compactMap { $0 as? UIKitTimelineGridHostView }.forEach { $0.setActive(false) }
             window.isHidden = true
             window.rootViewController = nil
             previousKeyWindow?.makeKey()
+            try? FileManager.default.removeItem(at: cacheDirectory)
         }
-        try await Task.sleep(for: .seconds(2))
+        do {
+            try await Task.sleep(for: .seconds(2))
+            let grid = try XCTUnwrap(descendants(window).compactMap { $0 as? UIKitTimelineGridHostView }.first)
+            return Probe(window: window, grid: grid, fullBounds: fullBounds, tearDown: tearDown)
+        } catch {
+            tearDown()
+            throw error
+        }
+    }
 
-        let grid = try XCTUnwrap(descendants(window).compactMap { $0 as? UIKitTimelineGridHostView }.first)
+    @MainActor private func verifyResizes(named name: String, sizes: (CGSize) -> [CGSize]) async throws {
+        let probe = try await makeProbe()
+        defer { probe.tearDown() }
+        let window = probe.window
+        let fullBounds = probe.fullBounds
+        let grid = probe.grid
         grid.scrollView.setContentOffset(CGPoint(x: 0, y: 420), animated: false)
         try await Task.sleep(for: .milliseconds(500))
         let initialAnchor = try XCTUnwrap(grid.currentScrollAnchor())
         let residentBefore = residentMemoryBytes()
 
-        // Regular and compact widths that iPadOS produces for Split View and Slide Over, then the full window
-        // again, repeated to expose growth or identity loss. On iPhone the same fractions exercise the compact
-        // range. This checks geometry changes, not hinge events or display handoff.
-        let fractions: [CGFloat] = [1, 0.5, 0.34, 0.66, 1, 0.5, 1, 0.34, 1]
+        let steps = sizes(fullBounds.size)
+        // Folding, unfolding and resizing back to a size shows that size's density again.
+        var densityBySize: [String: String] = [:]
         var report: [String] = []
         // Main-run-loop callback cadence after each resize. This includes scheduling delays and is not GPU
         // presentation timing. Actual callback arrival avoids stale display timestamps across a resize.
@@ -73,11 +140,11 @@ final class MobileWindowGeometryTests: XCTestCase {
         let maximumFramesPerSecond = window.screen.maximumFramesPerSecond
         report.append("max_fps=\(maximumFramesPerSecond)")
         for cycle in 0..<3 {
-            for (step, fraction) in fractions.enumerated() {
-                let width = (fullBounds.width * fraction).rounded(.down)
+            for (step, size) in steps.enumerated() {
+                let width = size.width
                 cadence.begin()
                 let started = CFAbsoluteTimeGetCurrent()
-                window.frame = CGRect(x: 0, y: 0, width: width, height: fullBounds.height)
+                window.frame = CGRect(origin: .zero, size: size)
                 window.layoutIfNeeded()
                 let layoutSeconds = CFAbsoluteTimeGetCurrent() - started
                 try await Task.sleep(for: .milliseconds(350))
@@ -89,6 +156,13 @@ final class MobileWindowGeometryTests: XCTestCase {
                 // Column changes can put another photo first in the same row. Measure the original photo itself,
                 // not the row's first item, to detect actual viewport drift.
                 let plan = try XCTUnwrap(grid.accessibilityFramePlan())
+                let sizeKey = "\(Int(size.width))x\(Int(size.height))"
+                let density = "\(plan.columns) columns of \(Int(plan.slotSide.rounded())) pt"
+                if let earlier = densityBySize[sizeKey] {
+                    XCTAssertEqual(density, earlier, "cycle \(cycle) step \(step): the density at \(sizeKey) changed")
+                } else {
+                    densityBySize[sizeKey] = density
+                }
                 let visible = plan.visibleSlots.map { grid.itemUIDs[$0.index] }
                 XCTAssertTrue(
                     visible.contains(initialAnchor.itemID),
@@ -119,7 +193,7 @@ final class MobileWindowGeometryTests: XCTestCase {
                         frames.maxGapMs, frames.delayedGaps))
                 if cycle == 0 {
                     let idiom = UIDevice.current.userInterfaceIdiom == .pad ? "iPad" : "iPhone"
-                    snapshot(window, name: "resize-\(idiom)-\(Int(width))")
+                    snapshot(window, name: "\(name)-\(idiom)-\(Int(width))x\(Int(size.height))")
                 }
             }
         }
@@ -127,11 +201,11 @@ final class MobileWindowGeometryTests: XCTestCase {
         report.append("resident_before_mb=\(residentBefore / 1_048_576) resident_after_mb=\(residentAfter / 1_048_576)")
         let text = report.joined(separator: "\n")
         let attachment = XCTAttachment(string: text)
-        attachment.name = "resize-report"
+        attachment.name = "\(name)-report"
         attachment.lifetime = .keepAlways
         add(attachment)
-        writeSnapshotArtifact(name: "resize-report.txt", data: Data(text.utf8))
-        // 27 resizes of the same content must not accumulate whole render surfaces; a generous bound catches leaks
+        writeSnapshotArtifact(name: "\(name)-report.txt", data: Data(text.utf8))
+        // Repeated resizes of the same content must not accumulate whole render surfaces; a generous bound catches leaks
         // without failing on simulator noise.
         XCTAssertLessThan(residentAfter, residentBefore + 96 * 1_048_576, text)
     }

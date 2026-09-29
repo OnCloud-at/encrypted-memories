@@ -270,6 +270,8 @@
         var itemIndexByUID: [PhotoUID: Int] = [:]
         private var levelOverride: Int?
         private var requestedProfile: GridLevelProfile?
+        /// The level each grid profile last showed, so a fold, unfold or rotation round trip keeps the density.
+        private var profileLevelMemory = GridProfileLevelMemory()
         /// The user-driven density level set by pinch. Takes precedence over the profile default so pinch survives
         /// item refreshes; cleared when an explicit external `level` arrives. Nil uses the data-driven profile default.
         var interactiveLevel: Int?
@@ -560,6 +562,7 @@
                 cachedEngine = nil
                 committedPhase = nil
                 interactiveLevel = nil
+                profileLevelMemory.reset()
             }
             if fillOrder != self.fillOrder {
                 self.fillOrder = fillOrder
@@ -592,6 +595,7 @@
                 interactiveLevel = nil
                 committedPhase = nil
                 cancelLiveZoomState()
+                profileLevelMemory.reset()
             }
             self.levelOverride = level
             self.displayMode = displayMode
@@ -948,6 +952,7 @@
             scrollView.setContentOffset(CGPoint(x: 0, y: targetY), animated: false)
             isApplyingProgrammaticScroll = false
             needsInitialViewportPlacement = false
+            resizeAnchorItemID = nil
         }
 
         private var initialViewportOpensAtNewest: Bool {
@@ -982,6 +987,8 @@
         /// placement, not a learned user position, so later projection changes can still apply their own contract.
         public func scrollToTop(animated: Bool = false) {
             guard window != nil, bounds.height > 0, !itemUIDs.isEmpty else { return }
+            // An explicit placement chooses a new place, like a scroll; the next resize anchors at the top.
+            resizeAnchorItemID = nil
             let target = -safeAreaInsets.top
             guard abs(scrollView.contentOffset.y - target) > 0.5 else { return }
             isApplyingProgrammaticScroll = true
@@ -1027,7 +1034,12 @@
                 overscan: 0,
                 columnPhase: committedPhase
             )
-            guard let top = plan.visibleSlots.min(by: { $0.slotRect.minY < $1.slotRect.minY }),
+            guard
+                let top = GridScrollAnchorPolicy.anchor(
+                    among: plan.visibleSlots,
+                    visibleTop: scrollView.contentOffset.y + safeAreaInsets.top,
+                    visibleBottom: scrollView.contentOffset.y + bounds.height - safeAreaInsets.bottom,
+                    frame: \.slotRect),
                 itemUIDs.indices.contains(top.index)
             else { return nil }
             return GridScrollAnchor(
@@ -1039,6 +1051,7 @@
         /// Re-resolves a captured photo through the current width, density and phase, then restores it to the
         /// same viewport position. If the item disappeared, the current position is left untouched.
         public func restoreScrollAnchor(_ anchor: GridScrollAnchor<PhotoUID>) {
+            resizeAnchorItemID = nil
             restoreScrollAnchor(anchor, marksTimelineAsScrolled: true)
         }
 
@@ -1109,17 +1122,24 @@
                 overscan: 0,
                 columnPhase: committedPhase
             )
-            guard let top = plan.visibleSlots.min(by: { $0.slotRect.minY < $1.slotRect.minY }),
+            let visibleTop = scrollView.contentOffset.y + lastLaidOutSafeAreaInsets.top
+            let visibleBottom =
+                scrollView.contentOffset.y + lastLaidOutViewportSize.height - lastLaidOutSafeAreaInsets.bottom
+            guard
+                let top = GridScrollAnchorPolicy.anchor(
+                    among: plan.visibleSlots, visibleTop: visibleTop, visibleBottom: visibleBottom,
+                    frame: \.slotRect),
                 itemUIDs.indices.contains(top.index)
             else { return nil }
-            // Repeated Split View / Stage Manager resizes: keep the photo the user anchored as long as it is still
-            // in the top row, so a changed column count does not creep the viewport up by a fraction of a row.
+            // Repeated Split View, Stage Manager, fold and unfold resizes: keep the photo anchored by the first resize
+            // while its top stays in the visible area. Choosing again after each resize would pick another row once
+            // tiles shrink, and the place would creep with every change.
             var anchorSlot = top
             if let remembered = resizeAnchorItemID,
                 let slot = plan.visibleSlots.first(where: {
                     itemUIDs.indices.contains($0.index) && itemUIDs[$0.index] == remembered
                 }),
-                abs(slot.slotRect.minY - top.slotRect.minY) < 0.5
+                slot.slotRect.minY >= visibleTop - 0.5, slot.slotRect.minY < visibleBottom
             {
                 anchorSlot = slot
             }
@@ -1195,12 +1215,16 @@
                 let targetEngine = SquareTileGridEngine(
                     sectionCounts: [items.count], profile: profile, fillOrder: fillOrder
                 )
-                interactiveLevel = sourceEngine.closestVisualLevel(
-                    sourceLevel: sourceLevel,
-                    sourceWidth: previousLayoutSize.width,
-                    in: targetEngine,
-                    targetWidth: layoutSize.width
-                )
+                interactiveLevel = profileLevelMemory.level(
+                    leaving: previousProfile.id, at: sourceLevel, entering: profile.id
+                ) {
+                    sourceEngine.closestVisualLevel(
+                        sourceLevel: sourceLevel,
+                        sourceWidth: previousLayoutSize.width,
+                        in: targetEngine,
+                        targetWidth: layoutSize.width
+                    )
+                }
             }
             cachedProfile = profile
             cachedProfileLayoutSize = layoutSize
@@ -1810,6 +1834,8 @@
 
     extension UIKitTimelineGridHostView: UIScrollViewDelegate {
         public func scrollViewWillBeginDragging(_ scrollView: UIScrollView) {
+            // A scroll chooses a new place; the next resize anchors the photo at its top.
+            resizeAnchorItemID = nil
             scrollInputActive = true
             updateFeedInteractionState()
         }
