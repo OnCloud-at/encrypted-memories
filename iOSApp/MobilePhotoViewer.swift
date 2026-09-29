@@ -1721,6 +1721,11 @@ private struct MobileVideoPage: View {
         }
         .scaleEffect(pinch.displayScale * drag.scale, anchor: drag.isActive ? .center : pinch.anchor)
         .offset(drag.offset)
+        // AVKit's surface carries the dismiss pan once the player is mounted. Before that, and when the video
+        // cannot play, the same swipe down closes the viewer from anywhere on the page.
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .contentShape(Rectangle())
+        .simultaneousGesture(placeholderDismissDrag, including: player == nil ? .all : .subviews)
         .onGeometryChange(for: CGFloat.self) {
             $0.size.height
         } action: {
@@ -1843,6 +1848,12 @@ private struct MobileVideoPage: View {
         let target = min(max(0, seconds), upper)
         player.seek(to: CMTime(seconds: target, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero)
         playbackTime = target
+    }
+
+    private var placeholderDismissDrag: some Gesture {
+        DragGesture(minimumDistance: 10)
+            .onChanged { handleDragChanged($0.translation) }
+            .onEnded { handleDragEnded($0.translation, velocityY: $0.velocity.height, completed: true) }
     }
 
     private func handleDragChanged(_ translation: CGSize) {

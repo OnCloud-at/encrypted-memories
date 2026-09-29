@@ -16,6 +16,7 @@ import UIKit
     /// unchanged. No real account, keychain entry, network request, or physical device is involved.
     @MainActor final class MobileSignedInFixture {
         static let sectionNames = ["alpha", "beta", "gamma", "delta", "epsilon", "zeta"]
+        nonisolated static let videoNodeID = "zeta-video"
 
         let session = ProtonSession(
             uid: "fixture-account", accessToken: "fixture-access", refreshToken: "fixture-refresh",
@@ -29,7 +30,10 @@ import UIKit
         private let runtime: MobileAccountRuntime
         private let cacheDirectory: URL
 
-        init(runtime: MobileAccountRuntime = .shared, itemsPerSection: Int = 36) async throws {
+        /// `includesVideo` adds one video as the newest item; the UI tests use it, the hosted tests count photos only.
+        init(
+            runtime: MobileAccountRuntime = .shared, itemsPerSection: Int = 36, includesVideo: Bool = false
+        ) async throws {
             guard !BackupLocalDataPurge.isPurgePending() else { throw MobileFixtureError.pendingAccountPurge }
             self.runtime = runtime
             cacheDirectory = FileManager.default.temporaryDirectory.appendingPathComponent(
@@ -55,6 +59,16 @@ import UIKit
                         PhotoItem(
                             uid: uid, captureTime: sectionDate.addingTimeInterval(TimeInterval(index) * 60),
                             mediaType: "image/jpeg"))
+                }
+                if includesVideo, sectionIndex == Self.sectionNames.count - 1 {
+                    // The newest item is one video whose stream is unavailable, like a video that an offline
+                    // account cannot play.
+                    let uid = PhotoUID(volumeID: "fixture", nodeID: Self.videoNodeID)
+                    thumbnails[uid] = thumbnails[items[0].uid]
+                    items.append(
+                        PhotoItem(
+                            uid: uid, captureTime: sectionDate.addingTimeInterval(TimeInterval(itemsPerSection) * 60),
+                            mediaType: "video/quicktime", durationSeconds: 3))
                 }
                 sections.append(
                     TimelineSection(id: "fixture-\(name)", date: sectionDate, title: "Fixture \(name)", items: items))
@@ -203,7 +217,12 @@ import UIKit
         }
         func prefetchEncrypted(for uid: PhotoUID) async throws {}
         func metadata(for uid: PhotoUID) async throws -> PhotoMetadata {
-            PhotoMetadata(filename: "\(uid.nodeID).jpg", mimeType: "image/jpeg", pixelWidth: 160, pixelHeight: 160)
+            guard uid.nodeID == MobileSignedInFixture.videoNodeID else {
+                return PhotoMetadata(
+                    filename: "\(uid.nodeID).jpg", mimeType: "image/jpeg", pixelWidth: 160, pixelHeight: 160)
+            }
+            return PhotoMetadata(
+                filename: "\(uid.nodeID).mov", mimeType: "video/quicktime", pixelWidth: 160, pixelHeight: 160)
         }
         func burstGroup(containing uid: PhotoUID) async throws -> [PhotoItem] { [] }
         func favoriteUIDs() async throws -> Set<PhotoUID> {
