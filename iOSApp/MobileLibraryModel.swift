@@ -152,12 +152,6 @@ struct MobileScopeRecoveryDriver {
     }
 }
 
-enum MobileFavoriteFilterAvailability: Equatable, Sendable {
-    case loading
-    case available
-    case unavailable
-}
-
 /// Owns signed-in iOS/iPadOS library state and composes the shared backend and thumbnail feed.
 /// Core owns loading; this model sequences cached data, authoritative data, and crawling.
 /// `@Observable` invalidates views per property, so non-grid tabs do not observe timeline snapshots.
@@ -187,14 +181,16 @@ final class MobileLibraryModel {
     var items: [PhotoItem] { snapshot.items }
     /// Timeline sections retained for the shared section-based `TimelineSearch` filter.
     private(set) var sections: [TimelineSection] = []
-    /// Authoritative server favorite identities used by shared search semantics. Loading is independent of the
-    /// timeline so a slow favorite endpoint never delays first thumbnails.
-    private(set) var favoriteUIDs: Set<PhotoUID> = []
+    /// Server favorites, writes in flight, and read state. Loading is independent of the timeline so a slow
+    /// favorite endpoint never delays first thumbnails.
+    private(set) var favoriteState = FavoriteState()
+    /// Authoritative server favorite identities used by shared search semantics.
+    var favoriteUIDs: Set<PhotoUID> { favoriteState.favorites }
     /// Favorites cannot be filtered honestly until the independent authoritative endpoint has settled.
-    private(set) var favoriteFilterAvailability: MobileFavoriteFilterAvailability = .loading
-    /// Viewer and grid favorite buttons share one authoritative in-flight set. A repeated tap for the same
-    /// identity cannot issue a second write while the first partial-success contract is still settling.
-    private(set) var favoriteMutationsInFlight: Set<PhotoUID> = []
+    var favoriteFilterAvailability: FavoriteState.Availability { favoriteState.availability }
+    /// Viewer and grid favorite buttons share one in-flight set. A repeated tap for the same identity cannot
+    /// issue a second write while the first partial-success contract is still settling.
+    var favoriteMutationsInFlight: Set<PhotoUID> { favoriteState.inFlight }
     private(set) var thumbnailFeed: UIKitThumbnailFeed?
     /// Keep the launch activity pill until known missing thumbnails finish, as well as later new-asset batches.
     var isBackgroundLoading: Bool { isThumbnailPrefetchLoading || isNewAssetThumbnailLoading }
@@ -207,7 +203,7 @@ final class MobileLibraryModel {
     /// A complete local inventory can restore its matching suggestions before server validation or thumbnails.
     /// Source recovery still retires the account-owned scheduler before admitting replacement content.
     var allowsSuggestionCacheRestore: Bool {
-        favoriteLoadSettled && favoriteFilterAvailability == .available
+        favoriteFilterAvailability == .available
             && loadState.knownCount != nil && !isRecoveringScope && !isSigningOut
     }
     /// Indicates that explicit sign-out is closing account owners and deleting account data.
@@ -330,10 +326,6 @@ final class MobileLibraryModel {
     /// Resume and abandon work of "Keep Only Favorites". Teardown cancels it, so no journal write survives
     /// the account. The orchestrator's own admission gate joins a write that is already in flight.
     private var seriesDissolutionTask: Task<Void, Never>?
-    /// Mutations newer than the in-flight authoritative favorite read. The loader merges this journal before
-    /// publishing, so a slow response cannot erase a newer heart tap.
-    @ObservationIgnored private var favoriteLoadOverrides: [PhotoUID: Bool] = [:]
-    private var favoriteLoadSettled = false
     /// Generation token used to reject off-main snapshot results from superseded loads or teardown.
     private var loadToken = 0
     private let libraryChangeMonitor = LibraryChangeMonitor()
@@ -628,47 +620,15 @@ final class MobileLibraryModel {
         if !split.local.isEmpty {
             localSucceeded = await pendingGrid?.setFavorite(split.local, favorite: target) ?? false
         }
-        let selection = Set(split.remote)
         let mutationGeneration = loadToken
-        guard
-            let mutation = FavoriteMutationPolicy.request(
-                selection: selection,
-                current: favoriteUIDs,
-                inFlight: favoriteMutationsInFlight,
-                target: target
-            )
-        else { return localSucceeded }
-        let requested = mutation.requested
-        if !favoriteLoadSettled {
-            for requestedUID in requested {
-                favoriteLoadOverrides[requestedUID] = mutation.target
-            }
-        }
-        favoriteMutationsInFlight.formUnion(requested)
-        favoriteUIDs = mutation.optimisticState
-        defer {
-            if mutationGeneration == loadToken, session == activeSession {
-                favoriteMutationsInFlight.subtract(requested)
-            }
-        }
-        do {
-            try await backend.setFavorites(Array(requested), mutation.target)
+        guard let request = favoriteState.beginWrite(selection: Set(split.remote), target: target) else {
             return localSucceeded
-        } catch {
-            guard mutationGeneration == loadToken, session == activeSession else { return true }
-            let failed = FavoriteMutationPolicy.failedUIDs(after: error, requested: requested)
-            if !favoriteLoadSettled {
-                for failedUID in failed {
-                    favoriteLoadOverrides.removeValue(forKey: failedUID)
-                }
-            }
-            favoriteUIDs = FavoriteMutationPolicy.rollbackState(
-                current: favoriteUIDs,
-                failed: failed,
-                target: mutation.target
-            )
-            return localSucceeded && failed.isDisjoint(with: requested)
         }
+        let failed = await FavoriteState.perform(request) { try await backend.setFavorites($0, $1) }
+        // A write of an earlier session must not touch the state of the current one.
+        guard mutationGeneration == loadToken, session == activeSession else { return true }
+        favoriteState.finishWrite(request, failed: failed)
+        return localSucceeded && failed.isDisjoint(with: request.requested)
     }
 
     @discardableResult
@@ -853,11 +813,7 @@ final class MobileLibraryModel {
                 self.seriesDissolutionTask?.cancel()
                 self.snapshot = TimelineSnapshot()
                 self.sections = []
-                self.favoriteUIDs = []
-                self.favoriteMutationsInFlight = []
-                self.favoriteLoadOverrides.removeAll(keepingCapacity: false)
-                self.favoriteLoadSettled = false
-                self.favoriteFilterAvailability = .loading
+                self.favoriteState.reset(keepingFavorites: false)
                 self.timelineRemovals = TimelineRemovalOverlay()
                 self.timelineMutationGeneration &+= 1
                 self.timelineRevision &+= 1
@@ -961,39 +917,21 @@ final class MobileLibraryModel {
     /// The task owner coalesces startup and refresh calls; known membership needs no further server read.
     private func loadFavoritesIfNeeded() {
         guard favoriteLoadTask == nil,
-            !favoriteLoadSettled || favoriteFilterAvailability == .unavailable,
+            favoriteFilterAvailability != .available,
             !isSigningOut, !isRecoveringScope,
             let backend, let session
         else { return }
         let loadGeneration = loadToken
-        // A mutation can start after a failed read settled but before this retry.
-        for uid in favoriteMutationsInFlight {
-            favoriteLoadOverrides[uid] = favoriteUIDs.contains(uid)
-        }
-        favoriteLoadSettled = false
-        favoriteFilterAvailability = .loading
+        let read = favoriteState.beginLoad()
         favoriteLoadTask = Task { [weak self, backend] in
-            let loaded: Set<PhotoUID>?
-            do {
-                loaded = try await backend.favoriteUIDs()
-            } catch {
-                loaded = nil
-            }
+            let loaded = try? await backend.favoriteUIDs()
             guard let self,
                 !Task.isCancelled,
                 loadGeneration == self.loadToken,
                 self.session == session
             else { return }
-            if let loaded {
-                self.favoriteUIDs = FavoriteMutationPolicy.reconciling(
-                    authoritative: loaded,
-                    newerTargets: self.favoriteLoadOverrides
-                )
-            }
             self.favoriteLoadTask = nil
-            self.favoriteFilterAvailability = loaded == nil ? .unavailable : .available
-            self.favoriteLoadOverrides.removeAll(keepingCapacity: false)
-            self.favoriteLoadSettled = true
+            self.favoriteState.finishLoad(loaded, for: read)
         }
     }
 
@@ -1275,10 +1213,7 @@ final class MobileLibraryModel {
         favoriteLoadTask = nil
         seriesDissolutionTask?.cancel()
         seriesDissolutionTask = nil
-        favoriteMutationsInFlight = []
-        favoriteLoadOverrides.removeAll(keepingCapacity: false)
-        favoriteLoadSettled = false
-        favoriteFilterAvailability = .loading
+        favoriteState.reset(keepingFavorites: true)
         let activeThumbnailUpdateTask = thumbnailUpdateCoordinator.cancel()
         locationCrawlGeneration &+= 1
         activeLocationCrawlStarter?.cancel()
@@ -1377,10 +1312,7 @@ final class MobileLibraryModel {
         isThumbnailPrefetchLoading = false
         favoriteLoadTask?.cancel()
         favoriteLoadTask = nil
-        favoriteMutationsInFlight = []
-        favoriteLoadOverrides.removeAll(keepingCapacity: false)
-        favoriteLoadSettled = false
-        favoriteFilterAvailability = .loading
+        favoriteState.reset(keepingFavorites: true)
         let activeThumbnailUpdateTask = thumbnailUpdateCoordinator.cancel()
         isRefreshingLibrary = false
         initialLibraryLoadSettled = false
@@ -1399,8 +1331,7 @@ final class MobileLibraryModel {
         timelineMutationGeneration &+= 1
         snapshot = TimelineSnapshot()
         sections = []
-        favoriteUIDs = []
-        favoriteMutationsInFlight = []
+        favoriteState.reset(keepingFavorites: false)
         timelineRevision &+= 1
         thumbnailFeed = nil
         searchSuggestions.reset()
@@ -1522,9 +1453,7 @@ final class MobileLibraryModel {
         isThumbnailPrefetchLoading = false
         favoriteLoadTask?.cancel()
         favoriteLoadTask = nil
-        favoriteLoadOverrides.removeAll(keepingCapacity: false)
-        favoriteLoadSettled = false
-        favoriteFilterAvailability = .loading
+        favoriteState.reset(keepingFavorites: preserveVisibleSnapshot)
         thumbnailUpdateCoordinator.cancel()
         isRefreshingLibrary = false
         initialLibraryLoadSettled = false
@@ -1541,8 +1470,6 @@ final class MobileLibraryModel {
         if !preserveVisibleSnapshot {
             snapshot = TimelineSnapshot()
             sections = []
-            favoriteUIDs = []
-            favoriteMutationsInFlight = []
             timelineRevision &+= 1
         }
         thumbnailFeed = nil
@@ -2012,8 +1939,8 @@ final class MobileLibraryModel {
             self.thumbnailCache = thumbnailCache
             snapshot = projection.snapshot
             self.sections = projection.sections
-            favoriteUIDs = []
-            favoriteFilterAvailability = .available
+            // Unread favorites, so the first library refresh reads them like a signed-in account.
+            favoriteState.reset(keepingFavorites: false)
             timelineRevision &+= 1
             loadState = .contentReady(count: projection.snapshot.items.count)
         }
