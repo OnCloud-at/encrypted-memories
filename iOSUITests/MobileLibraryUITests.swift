@@ -36,6 +36,25 @@ final class MobileLibraryUITests: XCTestCase {
         XCTAssertTrue(firstPhoto.waitForExistence(timeout: 10), "the library did not return")
     }
 
+    func testTheAlbumButtonOfTheViewerAddsTheOpenPhotoToAnAlbum() {
+        XCTAssertTrue(firstPhoto.waitForExistence(timeout: 60))
+        firstPhoto.tap()
+
+        let addToAlbum = app.buttons["Add to Album"].firstMatch
+        XCTAssertTrue(addToAlbum.waitForExistence(timeout: 10), "the viewer shows no album button")
+        addToAlbum.tap()
+        let album = app.buttons.matching(NSPredicate(format: "label BEGINSWITH 'Fixture Album'")).firstMatch
+        XCTAssertTrue(album.waitForExistence(timeout: 10), "the album list did not open")
+        XCTAssertTrue(album.isEnabled, "the photo is in the album before it was added")
+        album.tap()
+        XCTAssertTrue(wait(for: album, "exists == false"), "adding the photo did not close the album list")
+
+        // The album list opens again and marks the album that already holds the photo.
+        addToAlbum.tap()
+        XCTAssertTrue(album.waitForExistence(timeout: 10))
+        XCTAssertTrue(wait(for: album, "isEnabled == false"), "the album does not hold the photo")
+    }
+
     func testSelectingPhotosShowsTheirActionsAndDoneEndsTheSelection() {
         XCTAssertTrue(firstPhoto.waitForExistence(timeout: 60))
         app.buttons["Select"].tap()
@@ -62,6 +81,45 @@ final class MobileLibraryUITests: XCTestCase {
         // The search tab turns the tab bar into a search field, so it comes last.
         app.tabBars.buttons["Search"].tap()
         XCTAssertTrue(app.searchFields.firstMatch.waitForExistence(timeout: 10), "Search shows no search field")
+    }
+
+    func testReturningFromBackgroundRestoresTheViewerWithPreviewProtection() {
+        app.terminate()
+        app.launchArguments += ["-EncryptedMemories.blurAppPreview", "YES"]
+        app.launch()
+        XCTAssertTrue(firstPhoto.waitForExistence(timeout: 60))
+        firstPhoto.tap()
+        XCTAssertTrue(app.buttons["Close"].waitForExistence(timeout: 10))
+
+        XCUIDevice.shared.press(.home)
+        app.activate()
+        let close = app.buttons["Close"]
+        XCTAssertTrue(close.waitForExistence(timeout: 10))
+        close.tap()
+        XCTAssertTrue(firstPhoto.waitForExistence(timeout: 10))
+    }
+
+    func testPrivacyPreviewSwitchPersistsAfterClosingSettings() throws {
+        XCTAssertTrue(firstPhoto.waitForExistence(timeout: 60))
+        app.buttons["Proton Account and Settings"].tap()
+        app.buttons["Privacy"].tap()
+
+        let previewSwitch = app.switches["Blur App Preview"]
+        XCTAssertTrue(previewSwitch.waitForExistence(timeout: 5))
+        let initialValue = try XCTUnwrap(previewSwitch.value as? String)
+        XCTAssertTrue(initialValue == "0" || initialValue == "1")
+        let changedValue = initialValue == "0" ? "1" : "0"
+        previewSwitch.coordinate(withNormalizedOffset: CGVector(dx: 0.9, dy: 0.5)).tap()
+        XCTAssertTrue(wait(for: previewSwitch, "value == '\(changedValue)'"))
+
+        app.buttons["Settings"].tap()
+        app.buttons["Done"].tap()
+        app.buttons["Proton Account and Settings"].tap()
+        app.buttons["Privacy"].tap()
+        let reopenedSwitch = app.switches["Blur App Preview"]
+        XCTAssertEqual(reopenedSwitch.value as? String, changedValue)
+        reopenedSwitch.coordinate(withNormalizedOffset: CGVector(dx: 0.9, dy: 0.5)).tap()
+        XCTAssertTrue(wait(for: reopenedSwitch, "value == '\(initialValue)'"))
     }
 
     func testPrivacySwitchHidesTheMapTab() {

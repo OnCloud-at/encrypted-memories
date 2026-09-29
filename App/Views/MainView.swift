@@ -57,8 +57,6 @@ struct MainView: View {
     @State private var albumLoadGeneration: UInt64 = 0
     @State private var albumActions: AlbumActionCoordinator
     @State private var showCreateAlbum = false
-    /// Photos that a new album starts with; empty when the album is created on its own.
-    @State private var createAlbumPhotoUIDs: [PhotoUID] = []
     @State private var showAlbumDestination = false
     @State private var selection: PhotoFilter = .all
     @State private var mapClusterPresentation: MapClusterPresentation?
@@ -102,6 +100,9 @@ struct MainView: View {
     // The floating sidebar width is the grid's leading obstruction. Keep it stable during resize so geometry
     // is not recomputed per frame.
     private var leadingObstructionInset: CGFloat { columnVisibility == .detailOnly ? 0 : sidebarWidth }
+    /// The sidebar's show and hide timing. Every surface that follows the sidebar uses it, like the grid's
+    /// `MetalGridScrollHost`: two different curves lay the window out for the longer one and let the viewer trail.
+    private static let sidebarAnimation = Animation.easeInOut(duration: 0.22)
     // Selection + export.
     @State private var selectionMode = false
     @State private var selectedUIDs: Set<PhotoUID> = []
@@ -366,7 +367,7 @@ struct MainView: View {
                     }
                 }
                 .padding(.leading, leadingObstructionInset)
-                .animation(.easeInOut(duration: 0.3), value: leadingObstructionInset)
+                .animation(Self.sidebarAnimation, value: leadingObstructionInset)
                 .ignoresSafeArea()
             }
 
@@ -398,7 +399,7 @@ struct MainView: View {
                 // grid. Move the whole surface beside the floating sidebar and keep the Metal host's local
                 // obstruction at zero so the sidebar is neither covered nor applied twice.
                 .padding(.leading, leadingObstructionInset)
-                .animation(.easeInOut(duration: 0.3), value: leadingObstructionInset)
+                .animation(Self.sidebarAnimation, value: leadingObstructionInset)
                 .ignoresSafeArea(.container, edges: [.top, .bottom])
                 .environment(\.gridTopBarInset, topBarInset)
                 .transition(.opacity)
@@ -416,7 +417,7 @@ struct MainView: View {
                 )
                 // Keep the viewer beside the floating sidebar. The inset matches the zoom overlay's content rect.
                 .padding(.leading, leadingObstructionInset)
-                .animation(.easeInOut(duration: 0.3), value: leadingObstructionInset)  // slide with the sidebar toggle
+                .animation(Self.sidebarAnimation, value: leadingObstructionInset)  // slide with the sidebar toggle
                 // Do not hide the view with opacity while dismissing. Keep it hit-testable so the gesture cannot
                 // reach the grid behind it.
             }
@@ -439,11 +440,10 @@ struct MainView: View {
             }
         )
         .coordinateSpace(name: "root")
-        .animation(.easeInOut(duration: 0.22), value: sidebarOpen)
-        .sheet(isPresented: $showCreateAlbum, onDismiss: { createAlbumPhotoUIDs = [] }) {
+        .animation(Self.sidebarAnimation, value: sidebarOpen)
+        .sheet(isPresented: $showCreateAlbum) {
             AlbumCreationSheet(
                 coordinator: albumActions,
-                photoUIDs: createAlbumPhotoUIDs,
                 onAlbumsChanged: { Task { await loadAlbums() } },
                 onCompleted: { _ in showCreateAlbum = false }
             )
@@ -617,7 +617,7 @@ struct MainView: View {
                 // floating sidebar obstruction explicitly. Keep its visible content and hit targets beside the
                 // sidebar while the shared root still extends beneath the native title bar.
                 .padding(.leading, leadingObstructionInset)
-                .animation(reduceMotion ? nil : .easeInOut(duration: 0.3), value: leadingObstructionInset)
+                .animation(reduceMotion ? nil : Self.sidebarAnimation, value: leadingObstructionInset)
                 .transition(.opacity)
             } else {
                 TimelineView(
@@ -749,10 +749,9 @@ struct MainView: View {
         selectedUIDs.removeAll()
     }
 
-    /// Opens the shared name form. A new album can start with photos, for example the one open in the viewer.
-    private func presentCreateAlbum(adding photoUIDs: [PhotoUID] = []) {
+    /// Opens the shared name form.
+    private func presentCreateAlbum() {
         guard albumActions.canCreate else { return }
-        createAlbumPhotoUIDs = photoUIDs
         showCreateAlbum = true
     }
 
@@ -2149,6 +2148,20 @@ struct MainView: View {
                         favorites.contains(viewerModel.current.uid) ? "toolbar.remove_favorite" : "toolbar.favorite")
                 }
 
+                if viewerMutationAction == .moveToTrash {
+                    // The grid's album button for the open photo. The grid toolbar is hidden while the viewer is
+                    // open, so both share one popover state.
+                    AlbumAddButton(
+                        coordinator: albumActions,
+                        photoUIDs: [viewerModel.current.uid],
+                        isPresented: $showAlbumDestination,
+                        onAlbumsChanged: { Task { await loadAlbums() } }
+                    )
+                    .labelStyle(.iconOnly)
+                    // A photo that is moving to the Trash cannot join an album.
+                    .disabled(isTrashMutating)
+                }
+
                 Menu {
                     if viewerModel.hasLiveText {
                         Button {
@@ -2160,15 +2173,6 @@ struct MainView: View {
                                 systemImage: "text.viewfinder"
                             )
                         }
-                        Divider()
-                    }
-                    if viewerMutationAction == .moveToTrash {
-                        AlbumAddMenu(
-                            coordinator: albumActions,
-                            photoUIDs: [viewerModel.current.uid],
-                            onNewAlbum: { presentCreateAlbum(adding: [viewerModel.current.uid]) },
-                            onAdded: { _ in Task { await loadAlbums() } }
-                        )
                         Divider()
                     }
                     switch viewerMutationAction {
@@ -2247,26 +2251,14 @@ struct MainView: View {
         if selection != .trash, !selection.isReadOnly {
             ToolbarItemGroup(placement: .secondaryAction) {
                 downloadActionItem
-                Button {
-                    showAlbumDestination = true
-                } label: {
-                    Label(L10n.string("albums.add_selection_title"), systemImage: "rectangle.stack.badge.plus")
-                        .labelStyle(.iconOnly)
-                }
-                .disabled(selectedUIDs.isEmpty || !albumActions.canAddPhotos)
-                .help(L10n.string("albums.add_selection_title"))
-                .accessibilityLabel(L10n.string("albums.add_selection_title"))
-                .popover(isPresented: $showAlbumDestination, arrowEdge: .top) {
-                    AlbumDestinationPicker(
-                        coordinator: albumActions,
-                        photoUIDs: Array(selectedUIDs),
-                        onAlbumsChanged: { Task { await loadAlbums() } },
-                        onCompleted: { _ in
-                            showAlbumDestination = false
-                            endSelection()
-                        }
-                    )
-                }
+                AlbumAddButton(
+                    coordinator: albumActions,
+                    photoUIDs: Array(selectedUIDs),
+                    isPresented: $showAlbumDestination,
+                    onAlbumsChanged: { Task { await loadAlbums() } },
+                    onCompleted: { _ in endSelection() }
+                )
+                .labelStyle(.iconOnly)
                 Button {
                     requestSelectedRemovalOrTrash()
                 } label: {
@@ -2445,7 +2437,7 @@ struct MainView: View {
     // MARK: - Sidebar
 
     private func toggleSidebar() {
-        withAnimation(.easeInOut(duration: 0.22)) {
+        withAnimation(Self.sidebarAnimation) {
             sidebarOpen.toggle()
             columnVisibility = sidebarOpen ? .all : .detailOnly  // drive the native split view
         }
@@ -2460,7 +2452,7 @@ struct MainView: View {
         // This is called only after the first content frame or a settled empty/error state. By then AppKit has
         // committed the `.all` mount. Drive the same native transition as a real sidebar toggle so AppKit also
         // establishes its titlebar navigation region; the launch cover and its 250 ms settle barrier hide it.
-        withAnimation(.easeInOut(duration: 0.22)) {
+        withAnimation(Self.sidebarAnimation) {
             sidebarOpen = false
             columnVisibility = .detailOnly
         }

@@ -206,15 +206,6 @@ public struct PhotoViewerView: View {
 
     private let mediaTransition = ViewerMediaTransitionStyle.standard
 
-    /// Size of the media area, used to place the Live badge at the displayed image's top-left corner.
-    /// The image is aspect-fit (letterboxed), so a portrait photo in a wide window must show
-    /// the badge inset to the image edge, not at the window edge.
-    @State private var contentSize: CGSize = .zero
-
-    /// Displayed photo rect after aspect-fit, magnification, and panning. The Live Photo motion overlay uses
-    /// this rect so motion and still content share the same zoom and position.
-    @State private var livePhotoFrame: CGRect?
-
     public init(
         model: PhotoViewerModel,
         onClose: @escaping () -> Void,
@@ -286,43 +277,30 @@ public struct PhotoViewerView: View {
     }
 
     /// The media below the native window toolbar. The media uses its final frame from the first layout pass.
+    /// Nothing here stores the media size in view state: a resize, for example while the sidebar slides, then lays
+    /// out the viewer without evaluating its body, the inspector, and the info panel again on every frame.
     private var viewerBody: some View {
         content
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .clipped()
-            .onGeometryChange(for: CGSize.self) {
-                $0.size
-            } action: {
-                contentSize = $0
-            }
-            // Live and burst badges stay at the image edge after aspect-fit letterboxing.
-            .overlay(alignment: .topLeading) {
-                if model.player == nil, model.image != nil, !isDismissing,
+            // Live and burst badges stay at the image edge after aspect-fit letterboxing: a clear rectangle with the
+            // image's aspect ratio takes the displayed image's place and carries the badges at its corner.
+            .overlay {
+                if model.player == nil, let image = model.image, !isDismissing,
+                    image.size.width > 0, image.size.height > 0,
                     model.current.isLivePhoto || model.isLoadingBurst || model.hasBurstFilmstrip
                 {
-                    let inset = livePhotoBadgeImageInset(in: contentSize)
-                    mediaBadges.offset(x: inset.width, y: inset.height)
+                    Color.clear
+                        .aspectRatio(image.size, contentMode: .fit)
+                        .overlay(alignment: .topLeading) { mediaBadges }
                 }
             }
             .safeAreaInset(edge: .bottom, spacing: 0) {
                 if model.hasBurstFilmstrip, !isDismissing {
-                    burstFilmstrip
+                    // Only the filmstrip follows the width, so a resize evaluates it alone.
+                    ViewerWidthReader { burstFilmstrip(areaWidth: $0) }
                 }
             }
-    }
-
-    /// Top-left inset of the displayed aspect-fit image within the content area. The Live badge follows the
-    /// image corner for every aspect ratio.
-    /// the badge follows the letterbox edge, not the window edge. Returns `.zero` before the image/size is known.
-    private func livePhotoBadgeImageInset(in area: CGSize) -> CGSize {
-        guard let img = model.image else { return .zero }
-        let iw = img.size.width
-        let ih = img.size.height
-        guard iw > 0, ih > 0, area.width > 0, area.height > 0 else { return .zero }
-        let scale = min(area.width / iw, area.height / ih)  // aspect-fit (matches the image view's gravity)
-        return CGSize(
-            width: max(0, (area.width - iw * scale) / 2),
-            height: max(0, (area.height - ih * scale) / 2))
     }
 
     @ViewBuilder private var content: some View {
@@ -338,44 +316,16 @@ public struct PhotoViewerView: View {
         } else if let image = model.image {
             // Still image, including a Live Photo key frame, with the motion clip crossfaded over it. Hovering
             // the Live badge or force-clicking the photo plays motion with sound.
-            ZStack {
-                ZoomableImageView(
-                    image: image,  // pinch-zoom + interactive pinch-out-to-dismiss
-                    itemIdentity: model.current.uid.nodeID,
-                    isSharp: model.isSharp,
-                    transitionStyle: mediaTransition,
-                    isDismissing: isDismissing,
-                    onPinchDismissBegan: onPinchDismissBegan,
-                    onPinchDismissChanged: onPinchDismissChanged,
-                    onPinchDismissEnded: onPinchDismissEnded,
-                    onForceClick: { model.playMotion() },  // Press starts motion playback.
-                    onForceClickEnded: { model.stopMotion() },  // Release stops motion and fades to still.
-                    onPageSwipe: handlePageSwipe,
-                    onPhotoFrameChanged: { livePhotoFrame = $0 },
-                    onZoomChanged: { zoom in
-                        guard zoom > 1.01 else { return }
-                        model.requestOriginal(maxPixelSize: ViewerImageLoadPolicy.maxZoomedPixelSize)
-                    },
-                    liveTextAnalysis: model.liveTextAnalysis,
-                    liveTextHighlighted: model.liveTextHighlighted)
-                // Framed to the displayed photo rect (magnification/pan-transformed), so a zoomed-in Live Photo
-                // plays its motion at the same zoom/position as the still - never an unzoomed clip on top.
-                if model.current.isLivePhoto, let motion = model.motionPlayer {
-                    if let pf = livePhotoFrame {
-                        MotionPlayerLayerView(player: motion)
-                            .frame(width: pf.width, height: pf.height)
-                            .position(x: pf.midX, y: pf.midY)
-                            .opacity(model.isMotionPlaying ? 1 : 0)
-                            .animation(mediaTransition.opacityAnimation, value: model.isMotionPlaying)
-                            .allowsHitTesting(false)
-                    } else {
-                        MotionPlayerLayerView(player: motion)
-                            .opacity(model.isMotionPlaying ? 1 : 0)
-                            .animation(mediaTransition.opacityAnimation, value: model.isMotionPlaying)
-                            .allowsHitTesting(false)
-                    }
-                }
-            }
+            ViewerStillImage(
+                model: model,
+                image: image,
+                mediaTransition: mediaTransition,
+                isDismissing: isDismissing,
+                onPinchDismissBegan: onPinchDismissBegan,
+                onPinchDismissChanged: onPinchDismissChanged,
+                onPinchDismissEnded: onPinchDismissEnded,
+                onPageSwipe: handlePageSwipe
+            )
             // "Come alive": a subtle zoom while the motion plays (and back on stop) that, together with the
             // opacity crossfade above, masks the photo-to-video-to-photo seam. Apply it to the whole ZStack so the still and
             // the motion scale as one (the viewer frame is `.clipped()`, so the tiny overflow is cropped, like
@@ -442,8 +392,8 @@ public struct PhotoViewerView: View {
         .accessibilityLabel(Text(L10n.string("viewer.burst_filmstrip_label")))
     }
 
-    private var burstFilmstrip: some View {
-        let width = max(contentSize.width - 40, 320)
+    private func burstFilmstrip(areaWidth: CGFloat) -> some View {
+        let width = max(areaWidth - 40, 320)
         let itemSide = burstFilmstripItemSide(panelWidth: width, itemCount: model.burstItems.count)
         let needsScroller = burstFilmstripNeedsScroller(
             panelWidth: width, itemCount: model.burstItems.count, itemSide: itemSide)
@@ -574,5 +524,83 @@ public struct PhotoViewerView: View {
         case .previous: model.previousInContext()
         case .next: model.nextInContext()
         }
+    }
+}
+
+/// A still image, including a Live Photo key frame, with the motion clip crossfaded over it. Hovering the Live badge
+/// or force-clicking the photo plays motion with sound.
+///
+/// The displayed photo rect is view state here, not in `PhotoViewerView`: it changes on every frame of a resize, and
+/// only the image and its motion layer depend on it.
+private struct ViewerStillImage: View {
+    let model: PhotoViewerModel
+    let image: NSImage
+    let mediaTransition: ViewerMediaTransitionStyle
+    let isDismissing: Bool
+    let onPinchDismissBegan: () -> Void
+    let onPinchDismissChanged: (CGFloat) -> Void
+    let onPinchDismissEnded: (Bool) -> Void
+    let onPageSwipe: (ViewerPageSwipeDirection) -> Void
+
+    /// Displayed photo rect after aspect-fit, magnification, and panning. The Live Photo motion overlay uses
+    /// this rect so motion and still content share the same zoom and position.
+    @State private var livePhotoFrame: CGRect?
+
+    var body: some View {
+        ZStack {
+            ZoomableImageView(
+                image: image,  // pinch-zoom + interactive pinch-out-to-dismiss
+                itemIdentity: model.current.uid.nodeID,
+                isSharp: model.isSharp,
+                transitionStyle: mediaTransition,
+                isDismissing: isDismissing,
+                onPinchDismissBegan: onPinchDismissBegan,
+                onPinchDismissChanged: onPinchDismissChanged,
+                onPinchDismissEnded: onPinchDismissEnded,
+                onForceClick: { model.playMotion() },  // Press starts motion playback.
+                onForceClickEnded: { model.stopMotion() },  // Release stops motion and fades to still.
+                onPageSwipe: onPageSwipe,
+                onPhotoFrameChanged: { livePhotoFrame = $0 },
+                onZoomChanged: { zoom in
+                    guard zoom > 1.01 else { return }
+                    model.requestOriginal(maxPixelSize: ViewerImageLoadPolicy.maxZoomedPixelSize)
+                },
+                liveTextAnalysis: model.liveTextAnalysis,
+                liveTextHighlighted: model.liveTextHighlighted)
+            // Framed to the displayed photo rect (magnification/pan-transformed), so a zoomed-in Live Photo
+            // plays its motion at the same zoom/position as the still - never an unzoomed clip on top.
+            if model.current.isLivePhoto, let motion = model.motionPlayer {
+                if let pf = livePhotoFrame {
+                    MotionPlayerLayerView(player: motion)
+                        .frame(width: pf.width, height: pf.height)
+                        .position(x: pf.midX, y: pf.midY)
+                        .opacity(model.isMotionPlaying ? 1 : 0)
+                        .animation(mediaTransition.opacityAnimation, value: model.isMotionPlaying)
+                        .allowsHitTesting(false)
+                } else {
+                    MotionPlayerLayerView(player: motion)
+                        .opacity(model.isMotionPlaying ? 1 : 0)
+                        .animation(mediaTransition.opacityAnimation, value: model.isMotionPlaying)
+                        .allowsHitTesting(false)
+                }
+            }
+        }
+    }
+}
+
+/// Passes its own width to `content`. The width is view state of this reader, so a width change evaluates only
+/// `content`, not the view around it.
+private struct ViewerWidthReader<Content: View>: View {
+    @ViewBuilder let content: (CGFloat) -> Content
+    @State private var width: CGFloat = 0
+
+    var body: some View {
+        content(width)
+            .frame(maxWidth: .infinity)
+            .onGeometryChange(for: CGFloat.self) {
+                $0.size.width
+            } action: {
+                width = $0
+            }
     }
 }

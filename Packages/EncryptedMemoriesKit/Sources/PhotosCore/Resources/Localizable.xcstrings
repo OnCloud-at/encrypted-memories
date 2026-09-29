@@ -8,13 +8,6 @@
         "de": { "stringUnit": { "state": "translated", "value": "Eine andere Album-Änderung läuft noch. Versuche es gleich noch einmal." } }
       }
     },
-    "albums.add_to_menu": {
-      "extractionState": "manual",
-      "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "Add to" } },
-        "de": { "stringUnit": { "state": "translated", "value": "Hinzufügen" } }
-      }
-    },
     "albums.new_album_menu": {
       "extractionState": "manual",
       "localizations": {
@@ -5034,6 +5027,20 @@
       "localizations": {
         "en": { "stringUnit": { "state": "translated", "value": "When off, maps and place names stop contacting Apple. Coordinates remain encrypted on this device." } },
         "de": { "stringUnit": { "state": "translated", "value": "Ausgeschaltet kontaktieren Karten und Ortsnamen Apple nicht mehr. Koordinaten bleiben verschlüsselt auf diesem Gerät." } }
+      }
+    },
+    "settings.privacy_blur_preview": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Blur App Preview" } },
+        "de": { "stringUnit": { "state": "translated", "value": "App-Vorschau weichzeichnen" } }
+      }
+    },
+    "settings.privacy_blur_preview_explanation": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Hides app content in the App Switcher." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Verbirgt den App-Inhalt im App-Umschalter." } }
       }
     },
     "settings.privacy_policy": {

@@ -7,6 +7,10 @@ public struct PrivacySettingsContent: View {
         AppSettingsDefault.mapAndPlacesEnabled
     @AppStorage(AppSettingsKey.removeLocationWhenSharing) private var removeLocationWhenSharing =
         AppSettingsDefault.removeLocationWhenSharing
+    #if os(iOS)
+        @AppStorage(AppSettingsKey.blurAppPreview) private var blurAppPreview =
+            AppSettingsDefault.blurAppPreview
+    #endif
 
     public init() {}
 
@@ -21,6 +25,13 @@ public struct PrivacySettingsContent: View {
         } footer: {
             Text(L10n.string("settings.privacy_remove_location_explanation"))
         }
+        #if os(iOS)
+            Section {
+                Toggle(L10n.string("settings.privacy_blur_preview"), isOn: $blurAppPreview)
+            } footer: {
+                Text(L10n.string("settings.privacy_blur_preview_explanation"))
+            }
+        #endif
         Section {
             Link(
                 L10n.string("settings.privacy_policy"),

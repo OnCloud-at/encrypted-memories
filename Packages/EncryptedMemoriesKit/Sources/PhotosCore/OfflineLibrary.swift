@@ -8,6 +8,8 @@ public enum AppSettingsKey {
     public static let removeLocationWhenSharing = "EncryptedMemories.removeLocationWhenSharing"
     /// Allows MapKit maps and Apple place lookup for library locations.
     public static let mapAndPlacesEnabled = "EncryptedMemories.mapAndPlacesEnabled"
+    /// Covers app windows before the system captures an inactive preview.
+    public static let blurAppPreview = "EncryptedMemories.blurAppPreview"
     /// Offline Photo Library master switch. When on, full-resolution originals viewed in the photo viewer are
     /// persisted to the encrypted on-disk `originals` cache so reopening them (even after relaunch / offline) is
     /// instant. Grid thumbnails are mandatory infrastructure and crawl independently of this toggle.
@@ -38,6 +40,7 @@ public enum AppSettingsKey {
 public enum AppSettingsDefault {
     public static let removeLocationWhenSharing = false
     public static let mapAndPlacesEnabled = true
+    public static let blurAppPreview = false
     /// Offline Photo Library is **on by default**: viewed originals are kept locally (encrypted) up to the cap.
     /// Thumbnails are always crawled while signed in, regardless of this value.
     public static let offlineLibraryEnabled = true
@@ -74,6 +77,19 @@ public enum MapAndPlacesPolicy {
 
     public static func allowsLocationCrawl(enabled: Bool, itemCount: Int) -> Bool {
         enabled && itemCount > 0
+    }
+}
+
+/// Shared admission rule for the native iOS and iPadOS preview covers.
+public enum PrivacyPreviewPolicy {
+    public static func isEnabled(defaults: UserDefaults = .standard) -> Bool {
+        defaults.object(forKey: AppSettingsKey.blurAppPreview) == nil
+            ? AppSettingsDefault.blurAppPreview
+            : defaults.bool(forKey: AppSettingsKey.blurAppPreview)
+    }
+
+    public static func shouldCover(enabled: Bool, isSceneActive: Bool, isWindowVisible: Bool) -> Bool {
+        enabled && (!isSceneActive || !isWindowVisible)
     }
 }
 
