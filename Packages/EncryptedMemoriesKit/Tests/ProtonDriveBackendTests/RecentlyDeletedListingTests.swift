@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import PhotosCore
 import Testing
@@ -53,6 +54,149 @@ struct RecentlyDeletedListingTests {
         #expect(
             RecentlyDeletedListingStore(directory: directory, accountUID: "account", keyPassword: "secret").load()
                 == nil)
+    }
+
+    // MARK: - Library listings that lag behind a trash
+
+    private static let trashTime = Date(timeIntervalSince1970: 1_000)
+
+    private static func read(
+        _ listed: [PhotoUID], restoredElsewhere: [PhotoUID] = [], after seconds: TimeInterval
+    ) -> LibraryListingRead {
+        LibraryListingRead(
+            listed: Set(listed), restoredElsewhere: Set(restoredElsewhere),
+            readAt: trashTime.addingTimeInterval(seconds))
+    }
+
+    @Test func aLibraryListingThatLagsBehindATrashHereLeavesThePhotoOut() {
+        let trashed = Self.item("trashed", at: 1).uid
+        let kept = Self.item("kept", at: 2).uid
+        var identities = RecentlyDeletedIdentities(listing: nil)
+        identities.trashed([trashed], items: [], at: Self.trashTime)
+
+        let lagging = Self.read([trashed, kept], after: 40)
+        #expect(identities.lagging(in: lagging, now: lagging.readAt) == [trashed])
+        let released = identities.libraryAccepted(lagging, now: lagging.readAt)
+        #expect(!released)
+
+        let caughtUp = Self.read([kept], after: 90)
+        #expect(identities.lagging(in: caughtUp, now: caughtUp.readAt).isEmpty)
+        let caughtUpReleased = identities.libraryAccepted(caughtUp, now: caughtUp.readAt)
+        #expect(caughtUpReleased)
+        #expect(!identities.hasPhotosAwaitingLibrary)
+        // Restored elsewhere later: the library lists it again and nothing hides it.
+        let restored = Self.read([trashed, kept], after: 300)
+        #expect(identities.lagging(in: restored, now: restored.readAt).isEmpty)
+    }
+
+    @Test func onlyAnAcceptedListingEndsTheWait() {
+        let photo = Self.item("photo", at: 1).uid
+        var identities = RecentlyDeletedIdentities(listing: nil)
+        identities.trashed([photo], items: [], at: Self.trashTime)
+
+        // A refresh whose events left the photo out reads it before that filter; its listing still returns it.
+        let filteredByEvents = Self.read([photo], after: 20)
+        let released = identities.libraryAccepted(filteredByEvents, now: filteredByEvents.readAt)
+        #expect(!released)
+        // A refresh that is discarded after reading a listing without the photo ends nothing.
+        let discarded = Self.read([], after: 30)
+        #expect(identities.lagging(in: discarded, now: discarded.readAt).isEmpty)
+
+        let next = Self.read([photo], after: 50)
+        #expect(identities.lagging(in: next, now: next.readAt) == [photo])
+    }
+
+    @Test func aPhotoTrashedAfterTheListingWasReadKeepsWaiting() {
+        let photo = Self.item("photo", at: 1).uid
+        var identities = RecentlyDeletedIdentities(listing: nil)
+        let readBeforeTheTrash = Self.read([], after: -5)
+        identities.trashed([photo], items: [], at: Self.trashTime)
+
+        let released = identities.libraryAccepted(readBeforeTheTrash, now: Self.trashTime.addingTimeInterval(1))
+        #expect(!released)
+        let next = Self.read([photo], after: 10)
+        #expect(identities.lagging(in: next, now: next.readAt) == [photo])
+    }
+
+    @Test func aPhotoRestoredElsewhereShowsAtOnce() {
+        let photo = Self.item("photo", at: 1).uid
+        var identities = RecentlyDeletedIdentities(listing: nil)
+        identities.trashed([photo], items: [], at: Self.trashTime)
+
+        let restored = Self.read([photo], restoredElsewhere: [photo], after: 60)
+        #expect(identities.lagging(in: restored, now: restored.readAt).isEmpty)
+        let released = identities.libraryAccepted(restored, now: restored.readAt)
+        #expect(released)
+        #expect(!identities.hasPhotosAwaitingLibrary)
+    }
+
+    @Test func aPhotoRestoredHereIsNoLongerLeftOut() {
+        let photo = Self.item("photo", at: 1).uid
+        var identities = RecentlyDeletedIdentities(listing: nil)
+        identities.trashed([photo], items: [], at: Self.trashTime)
+
+        identities.restored([photo])
+
+        #expect(!identities.hasPhotosAwaitingLibrary)
+        let listed = Self.read([photo], after: 0)
+        #expect(identities.lagging(in: listed, now: listed.readAt).isEmpty)
+    }
+
+    @Test func aPhotoThatTheListingKeepsReturningShowsAfterTheLagLimit() {
+        let photo = Self.item("photo", at: 1).uid
+        var identities = RecentlyDeletedIdentities(listing: nil)
+        identities.trashed([photo], items: [], at: Self.trashTime)
+
+        let later = Self.read([photo], after: RecentlyDeletedIdentities.libraryLagLimit)
+        #expect(identities.lagging(in: later, now: later.readAt).isEmpty, "it was restored elsewhere")
+        let released = identities.libraryAccepted(later, now: later.readAt)
+        #expect(released)
+    }
+
+    @Test func aClockThatMovedBackBehindTheTrashEndsTheWait() {
+        let photo = Self.item("photo", at: 1).uid
+        var identities = RecentlyDeletedIdentities(listing: nil)
+        identities.trashed([photo], items: [], at: Self.trashTime)
+
+        let earlier = Self.read([photo], after: -3_600)
+        #expect(identities.lagging(in: earlier, now: earlier.readAt).isEmpty)
+        let released = identities.libraryAccepted(earlier, now: earlier.readAt)
+        #expect(released)
+    }
+
+    @Test func thePhotosAwaitingTheLibraryKeepTheirWaitAcrossARelaunch() throws {
+        let directory = try Self.directory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let photo = Self.item("photo", at: 1).uid
+        var identities = RecentlyDeletedIdentities(listing: nil)
+        identities.trashed([photo], items: [], at: Self.trashTime)
+        let store = RecentlyDeletedListingStore(directory: directory, accountUID: "account", keyPassword: "secret")
+        store.save(identities.persisted)
+
+        let loaded = try #require(store.load())
+        #expect(loaded == identities.persisted)
+        let relaunched = RecentlyDeletedIdentities(persisted: loaded)
+        let listed = Self.read([photo], after: 30)
+        #expect(relaunched.lagging(in: listed, now: listed.readAt) == [photo])
+    }
+
+    @Test func aFileOfAnEarlierBuildOpensWithoutPhotosAwaitingTheLibrary() throws {
+        let directory = try Self.directory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        // The key and the contents of builds before the wait, without `awaitingLibrary`.
+        let key = HKDF<SHA256>.deriveKey(
+            inputKeyMaterial: SymmetricKey(data: Data("secret".utf8)),
+            salt: Data("EncryptedMemories.recently-deleted.v1.account".utf8),
+            info: Data("recently-deleted-listing".utf8), outputByteCount: 32)
+        let plaintext = Data(#"{"listing":[],"trashedHere":[]}"#.utf8)
+        try #require(try AES.GCM.seal(plaintext, using: key).combined)
+            .write(to: directory.appendingPathComponent(RecentlyDeletedListingStore.fileName))
+
+        let store = RecentlyDeletedListingStore(directory: directory, accountUID: "account", keyPassword: "secret")
+        let loaded = try #require(store.load())
+
+        #expect(loaded.listing == [])
+        #expect(loaded.trashedAwaitingLibrary.isEmpty)
     }
 
     @Test func theListingRegistersItsPhotosNewestFirst() {
