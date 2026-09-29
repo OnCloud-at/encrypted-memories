@@ -138,9 +138,9 @@ struct MainView: View {
     /// A failed drag-out (drag-to-Finder) staging session, surfaced through the shared alert surface.
     @State private var dragOutFailureMessage: String?
     // Favorites (read from server so iOS favorites show up; toggle writes back).
-    @State private var favorites: Set<PhotoUID> = []
-    @State private var favoritesLoaded = false
-    @State private var favoriteMutationsInFlight: Set<PhotoUID> = []
+    private var favorites: Set<PhotoUID> { favoriteState.favorites }
+    private var favoritesLoaded: Bool { favoriteState.availability == .available }
+    @State private var favoriteState = FavoriteState()
     /// Offers to undo the last delete of photos that were not backed up yet.
     @State private var undoNotice: UndoNoticeContent?
     /// Refresh routes and the library activity banner state.
@@ -1360,11 +1360,7 @@ struct MainView: View {
         let loadGeneration = albumLoadGeneration
         async let owned: Void = albumActions.refresh()
         async let shared: Void = albumActions.refreshSharedAlbums()
-        async let fetchedFavorites = try? backend.favoriteUIDs()
-        let newFavorites = await fetchedFavorites
-        guard !Task.isCancelled, loadGeneration == albumLoadGeneration else { return }
-        if let newFavorites { favorites = newFavorites }
-        favoritesLoaded = newFavorites != nil
+        await reloadFavorites()
         let (_, _) = await (owned, shared)
         guard !Task.isCancelled, loadGeneration == albumLoadGeneration else { return }
         if albumActions.loadErrorMessage == nil {
@@ -1516,37 +1512,30 @@ struct MainView: View {
         if !split.local.isEmpty, let session = model.pendingGrid {
             Task { await session.setFavorite(split.local, favorite: target) }
         }
-        guard
-            let mutation = FavoriteMutationPolicy.request(
-                selection: Set(split.remote),
-                current: favorites,
-                inFlight: favoriteMutationsInFlight,
-                target: target
-            )
-        else { return }
-        favoriteMutationsInFlight.formUnion(mutation.requested)
-        favorites = mutation.optimisticState
+        guard let request = favoriteState.beginWrite(selection: Set(split.remote), target: target) else { return }
         Task {
-            do {
-                try await backend.setFavorites(Array(mutation.requested), mutation.target)
-            } catch {
-                rollbackFavoriteMutation(
-                    FavoriteMutationPolicy.failedUIDs(after: error, requested: mutation.requested),
-                    target: mutation.target
-                )
-            }
-            favoriteMutationsInFlight.subtract(mutation.requested)
+            let failed = await FavoriteState.perform(request) { try await backend.setFavorites($0, $1) }
+            favoriteState.finishWrite(request, failed: failed)
         }
+    }
+
+    /// Reads the server favorites, also after a trash or restore changed which photos can carry them. When the
+    /// read fails, the `trashed` photos still lose their hearts.
+    private func reloadFavorites(trashed: Set<PhotoUID> = []) async {
+        let read = favoriteState.beginLoad()
+        let loaded = try? await backend.favoriteUIDs()
+        guard !Task.isCancelled else {
+            favoriteState.cancelLoad(read)
+            return
+        }
+        favoriteState.finishLoad(loaded, for: read)
+        if loaded == nil { favoriteState.removeTrashed(trashed) }
     }
 
     /// Indicates whether every selected photo is a favorite.
     private var selectedAllFavorited: Bool {
         let favorites = displayedFavorites
         return !selectedUIDs.isEmpty && selectedUIDs.allSatisfy { favorites.contains($0) }
-    }
-
-    private func rollbackFavoriteMutation(_ failed: Set<PhotoUID>, target: Bool) {
-        favorites = FavoriteMutationPolicy.rollbackState(current: favorites, failed: failed, target: target)
     }
 
     /// Sets the single selected photo as the current album's cover (direct REST), then refreshes the album list
@@ -1641,7 +1630,7 @@ struct MainView: View {
                     metadata: backend,
                     recrawlRestoredItems: false
                 )
-                favorites = (try? await backend.favoriteUIDs()) ?? favorites.subtracting(uids)
+                await reloadFavorites(trashed: Set(uids))
                 selectionMode = false
                 selectedUIDs = []
                 if closeViewer { closePhoto() }
@@ -1681,7 +1670,7 @@ struct MainView: View {
                     metadata: backend,
                     recrawlRestoredItems: true
                 )
-                favorites = (try? await backend.favoriteUIDs()) ?? favorites
+                await reloadFavorites()
                 selectionMode = false
                 selectedUIDs = []
                 if closeViewer { closePhoto() }
