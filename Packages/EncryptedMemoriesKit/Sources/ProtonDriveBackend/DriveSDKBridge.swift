@@ -1318,6 +1318,8 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
             }
             bridge.recentlyDeleted.trashed(uids, items: known)
             bridge.recentlyDeletedStore.save(bridge.recentlyDeleted.persisted)
+            // The launch shows the stored timeline before the next listing; it must not show these photos.
+            bridge.timelineStore?.remove(uids)
             await bridge.reportRecentlyDeleted()
             // Debug-gated end-to-end verification: the moved links must actually surface in the volume trash
             // listing (this is the seam that silently broke before - trash "succeeded" but Recently Deleted
