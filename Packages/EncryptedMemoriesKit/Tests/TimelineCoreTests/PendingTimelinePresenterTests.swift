@@ -261,6 +261,26 @@ import UploadCore
         #expect(presentation.items.map(\.uid) == [earlier])
     }
 
+    @Test func aTileThatShowsAgainAfterAnotherEditReloadsItsImage() async {
+        let presenter = PendingTimelinePresenter()
+        var revisedUIDs: [PhotoUID] = []
+        presenter.onFeedUpdate = { _, _, revised in revisedUIDs += revised }
+        let first = tile("p", second: 10)
+        presenter.setPending(pending([first], membership: 1), enabled: true)
+        _ = await settle(presenter)
+        // The first edit uploaded and its tile retired.
+        presenter.setPending(pending([], membership: 2), enabled: true)
+        _ = await settle(presenter)
+
+        let again = PendingTile(
+            key: first.key, item: first.item, revision: UploadBackupRevision(rawValue: 2), handoff: nil,
+            isSettled: false, badge: .waiting, displayName: "p")
+        presenter.setPending(pending([again], membership: 3), enabled: true)
+        _ = await settle(presenter)
+
+        #expect(revisedUIDs == [first.item.uid], "the grid and the feed still hold the image of the first edit")
+    }
+
     @Test func pendingPhotosSortIntoTheTimeline() async {
         let presenter = PendingTimelinePresenter()
         presenter.setRemote(TimelineSnapshot(orderedItems: [remote("a", second: 0), remote("c", second: 20)]))

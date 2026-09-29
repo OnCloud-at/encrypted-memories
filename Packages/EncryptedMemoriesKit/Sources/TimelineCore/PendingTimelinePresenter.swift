@@ -171,7 +171,7 @@ public final class PendingTimelinePresenter {
     private let now: @Sendable () -> Date
     /// The longest time a trashed earlier photo stays hidden while the listing still returns it.
     package nonisolated static let trashedHideLimit: TimeInterval = 300
-    /// Content revisions of the pending tiles in the last merge.
+    /// The last content revision of each pending tile shown in this session.
     private var tileRevisions: [PhotoUID: UploadBackupRevision] = [:]
     private var contentEpochs: [PhotoUID: UInt64] = [:]
     private var contentEpoch: UInt64 = 0
@@ -275,7 +275,8 @@ public final class PendingTimelinePresenter {
         }
         tileKeys = result.tileKeys
         trashedEarlier = result.trashedEarlier
-        tileRevisions = result.revisions
+        // Kept for the session: a tile that shows again after an edit must not reuse the image of its last showing.
+        tileRevisions.merge(result.revisions) { $1 }
         // A revised photo keeps its current image; `noteContentRefreshed` bumps its epoch once the new
         // image is loaded, so the tile never shows black in between.
         if !contentEpochs.isEmpty { contentEpochs = contentEpochs.filter { result.localUIDs.contains($0.key) } }
