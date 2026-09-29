@@ -173,6 +173,29 @@ final class UploadIdentityManifestTests: XCTestCase {
         XCTAssertEqual(store.sources(withRemoteLinkID: "link-unknown")?.count, 0)
     }
 
+    func testForgettingTrashedLinksKeepsTheHashesButNoLongerProvesABackup() throws {
+        let store = try makeStore()
+        var trashed = makeRecord(identifier: "asset-a")
+        trashed.remoteVolumeID = "vol-1"
+        trashed.remoteLinkID = "link-trashed"
+        trashed.outcome = UploadIdentityManifestStore.Outcome.uploaded.rawValue
+        store.upsert(trashed)
+        var active = makeRecord(identifier: "asset-b")
+        active.remoteLinkID = "link-active"
+        active.outcome = UploadIdentityManifestStore.Outcome.uploaded.rawValue
+        store.upsert(active)
+
+        XCTAssertTrue(store.forgetRemoteLinks(["link-trashed", ""]))
+
+        let forgotten = try XCTUnwrap(store.record(for: trashed.source))
+        XCTAssertNil(forgotten.remoteVolumeID)
+        XCTAssertNil(forgotten.remoteLinkID)
+        XCTAssertNil(forgotten.outcome)
+        XCTAssertEqual(forgotten.sha1Hex, trashed.sha1Hex, "the next check must not hash the file again")
+        XCTAssertEqual(store.sources(withRemoteLinkID: "link-trashed")?.count, 0)
+        XCTAssertEqual(store.record(for: active.source)?.remoteLinkID, "link-active")
+    }
+
     func testTrustedContentLookupFiltersOutcomesAndSurvivesReopen() throws {
         var store = try makeStore()
 

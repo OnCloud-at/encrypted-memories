@@ -352,6 +352,11 @@ public protocol UploadIdentityStore: Sendable {
     /// Every source whose trustworthy record (`uploaded` or `duplicateActive`) names this remote link. Nil when the
     /// store cannot tell, so a caller never trashes a photo that another source may still need.
     func sources(withRemoteLinkID linkID: String) -> [UploadSourceIdentity]?
+    /// Forgets the remote links and outcomes of every row that names one of `linkIDs`, after the backup moved those
+    /// photos to the trash. The rows keep their hashes, so the next check of such a resource asks the server again
+    /// instead of taking a trashed photo as its backup. False when the write fails.
+    @discardableResult
+    func forgetRemoteLinks(_ linkIDs: Set<String>) -> Bool
 }
 
 extension UploadIdentityStore {

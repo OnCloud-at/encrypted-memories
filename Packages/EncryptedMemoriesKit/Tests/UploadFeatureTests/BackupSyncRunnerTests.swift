@@ -2237,9 +2237,11 @@ final class BackupSyncRunnerTests: XCTestCase {
         let replacement = EditedPhotoReplacement(
             remote: remote, albums: FakeAlbumCarryOver(), relations: checker, identities: identityStore,
             journal: journal)
-        // The server names every upload that referenced a main photo as one of its related photos.
+        // The server names every upload that referenced a main photo as one of its related photos, and each upload
+        // creates a new photo even when its name uploaded before.
+        uploader.distinctNodesForRepeatedNames = true
         checker.relatedLinkIDsProvider = { [uploader] mainLinkID in
-            Set(uploader!.requests.filter { $0.mainPhotoUID?.nodeID == mainLinkID }.map { testUID($0.name).nodeID })
+            Set(uploader!.uploaded.filter { $0.request.mainPhotoUID?.nodeID == mainLinkID }.map(\.uid.nodeID))
         }
         return ReplacementHarness(journal: journal, pipeline: pipeline, remote: remote, replacement: replacement)
     }
@@ -2307,7 +2309,8 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertEqual(
             harness.journal.entry(for: edited.source),
             EditReplacementJournalEntry(
-                superseded: [], retired: [testUID("IMG_1.MOV").nodeID, testUID("IMG_1.HEIC").nodeID]))
+                superseded: [], retired: [testUID("IMG_1.MOV").nodeID, testUID("IMG_1.HEIC").nodeID],
+                uploadedEdit: true))
     }
 
     func testAFailedTrashRetriesWithoutUploadingTheEditedPhotoAgain() async throws {
@@ -2348,7 +2351,8 @@ final class BackupSyncRunnerTests: XCTestCase {
 
         XCTAssertTrue(harness.remote.trashCalls.isEmpty, "series edits keep today's behavior until their own model")
         XCTAssertEqual(state(of: edited), .completed)
-        XCTAssertTrue(harness.journal.entry(for: edited.source).isEmpty)
+        XCTAssertTrue(harness.journal.entry(for: edited.source).superseded.isEmpty)
+        XCTAssertTrue(harness.journal.entry(for: edited.source).retired.isEmpty)
     }
 
     func testSeriesUploadsMembersAsRelatedPhotosWithTheBurstsTag() async throws {

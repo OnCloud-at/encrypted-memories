@@ -310,6 +310,30 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
     }
 
     @discardableResult
+    public func forgetRemoteLinks(_ linkIDs: Set<String>) -> Bool {
+        let unique = linkIDs.filter { !$0.isEmpty }
+        guard !unique.isEmpty else { return true }
+        return lock.withLock {
+            var stmt: OpaquePointer?
+            guard
+                sqlite3_prepare_v2(
+                    db,
+                    "UPDATE upload_identity SET remote_vol=NULL, remote_link=NULL, outcome=NULL WHERE remote_link=?;",
+                    -1, &stmt, nil
+                ) == SQLITE_OK
+            else { return false }
+            defer { sqlite3_finalize(stmt) }
+            for linkID in unique.sorted() {
+                sqlite3_reset(stmt)
+                sqlite3_clear_bindings(stmt)
+                bindText(stmt, 1, linkID)
+                guard sqlite3_step(stmt) == SQLITE_DONE else { return false }
+            }
+            return true
+        }
+    }
+
+    @discardableResult
     public func upsert(_ record: UploadIdentityRecord) -> Bool {
         lock.withLock {
             var stmt: OpaquePointer?

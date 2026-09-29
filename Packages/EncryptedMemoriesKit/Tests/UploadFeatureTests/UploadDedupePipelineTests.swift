@@ -41,6 +41,20 @@ final class FakeIdentityStore: UploadIdentityStore, @unchecked Sendable {
     }
 
     @discardableResult
+    func forgetRemoteLinks(_ linkIDs: Set<String>) -> Bool {
+        lock.withLock {
+            for (source, row) in rows where row.remoteLinkID.map(linkIDs.contains) == true {
+                var forgotten = row
+                forgotten.remoteVolumeID = nil
+                forgotten.remoteLinkID = nil
+                forgotten.outcome = nil
+                rows[source] = forgotten
+            }
+            return true
+        }
+    }
+
+    @discardableResult
     func upsert(_ record: UploadIdentityRecord) -> Bool {
         lock.withLock {
             if failNextWrite {

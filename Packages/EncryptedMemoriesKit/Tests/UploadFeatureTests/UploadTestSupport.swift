@@ -90,6 +90,17 @@ final class MockUploader: PhotoUploading, @unchecked Sendable {
     /// `expectedSHA1` pass-through.
     var requests: [PhotoUploadRequest] { lock.withLock { _requests } }
 
+    private var _uploaded: [(request: PhotoUploadRequest, uid: PhotoUID)] = []
+    private var _distinctNodesForRepeatedNames = false
+    /// Like the server, gives a new photo to each upload of a name that uploaded before: `node-NAME#2` and so on.
+    /// Off by default, so a repeated name keeps `testUID(name)`.
+    var distinctNodesForRepeatedNames: Bool {
+        get { lock.withLock { _distinctNodesForRepeatedNames } }
+        set { lock.withLock { _distinctNodesForRepeatedNames = newValue } }
+    }
+    /// Every finished upload with the photo it created.
+    var uploaded: [(request: PhotoUploadRequest, uid: PhotoUID)] { lock.withLock { _uploaded } }
+
     func upload(
         _ request: PhotoUploadRequest, onProgress: @Sendable @escaping (UploadProgress) -> Void
     ) async throws -> PhotoUID {
@@ -133,7 +144,15 @@ final class MockUploader: PhotoUploading, @unchecked Sendable {
         }
         if service > 0 { throw UploadError.retryableBackend(code: 503, message: "service unavailable") }
         if failNames.contains(request.name) { throw UploadError.backend("mock failure for \(request.name)") }
-        return testUID(request.name)
+        return lock.withLock {
+            let earlier = _uploaded.filter { $0.request.name == request.name }.count
+            let base = testUID(request.name)
+            let uid =
+                _distinctNodesForRepeatedNames && earlier > 0
+                ? PhotoUID(volumeID: base.volumeID, nodeID: "\(base.nodeID)#\(earlier + 1)") : base
+            _uploaded.append((request, uid))
+            return uid
+        }
     }
 
     func cancel(token: UUID) async { lock.withLock { _cancelledTokens.append(token) } }
