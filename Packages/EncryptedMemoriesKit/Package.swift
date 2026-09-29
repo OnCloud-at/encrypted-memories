@@ -306,6 +306,8 @@ let package = Package(
             name: "MapFeature", dependencies: ["PhotosCore", "MediaLocationCore", "MapCore", "DesignSystem"],
             swiftSettings: disableDynamicActorIsolation),
         .target(name: "PrivacyFeature", dependencies: ["PhotosCore"], swiftSettings: disableDynamicActorIsolation),
+        .testTarget(
+            name: "PrivacyFeatureTests", dependencies: ["PrivacyFeature"], swiftSettings: disableDynamicActorIsolation),
         .target(name: "MLSearchCore", dependencies: ["PhotosCore"], swiftSettings: disableDynamicActorIsolation),
         .testTarget(
             name: "MLSearchCoreTests", dependencies: ["MLSearchCore", "PhotosCore"],
