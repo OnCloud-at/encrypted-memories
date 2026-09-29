@@ -2,15 +2,7 @@ import Foundation
 import PhotosCore
 
 /// Remote reads and writes that replace an earlier upload with the edited photo. The backend implements it.
-public protocol EditReplacementRemote: Sendable {
-    /// The account's own photos volume.
-    func ownPhotosVolumeID() async throws -> String
-    /// The subset of `uids` that are active photos now: not trashed, not deleted, not drafts.
-    func activeUIDs(among uids: [PhotoUID]) async throws -> Set<PhotoUID>
-    /// The subset of `uids` that carry Proton's favorite tag now.
-    func favoriteUIDs(among uids: [PhotoUID]) async throws -> Set<PhotoUID>
-    /// Adds Proton's favorite tag to the photos. Fails when any photo does not confirm the tag.
-    func markFavorite(_ uids: [PhotoUID]) async throws
+public protocol EditReplacementRemote: PhotoCarryOverRemote {
     /// Moves the photos to the Proton trash, where the person can restore them.
     func trash(_ uids: [PhotoUID]) async throws
 }
@@ -95,14 +87,7 @@ public struct EditedPhotoReplacement: Sendable {
         if !favorites.contains(replacement), earlier.contains(where: favorites.contains) {
             try await remote.markFavorite([replacement])
         }
-        var albumIDs: [String] = []
-        for uid in earlier {
-            for album in try await albums.albums(containing: uid)
-            where album.volumeID == ownVolumeID && !albumIDs.contains(album.albumID) {
-                albumIDs.append(album.albumID)
-            }
-        }
-        for albumID in albumIDs {
+        for albumID in try await albums.ownAlbumIDs(containing: earlier, ownVolumeID: ownVolumeID) {
             try Task.checkCancellation()
             // An existing membership counts as success, so a retry adds nothing twice.
             try await albums.addPhotos([replacement], toOwnAlbum: albumID)

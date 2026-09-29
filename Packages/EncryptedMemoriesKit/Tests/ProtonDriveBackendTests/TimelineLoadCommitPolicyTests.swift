@@ -451,11 +451,34 @@ import Testing
             }
             """#.utf8)
         let page = try JSONDecoder().decode(VolumeEventPage.self, from: data)
-        var active = Set(["removed"])
+        var changes = TimelineRemoteEventChanges(active: ["removed"])
 
-        TimelineRemoteEventVisibilityPolicy.apply(page.events, photosShareID: "photos", to: &active)
+        TimelineRemoteEventVisibilityPolicy.apply(page.events, photosShareID: "photos", to: &changes)
 
-        #expect(active == Set(["new-photo"]))
+        #expect(changes.active == Set(["new-photo"]))
+        #expect(changes.removed == Set(["removed"]))
+    }
+
+    @Test func aPhotoMovedToTheTrashCountsAsRemovedUntilItIsRestored() throws {
+        let data = Data(
+            #"""
+            {
+              "Events": [
+                {"EventType": 1, "ContextShareID": "photos", "Link": {"LinkID": "edited", "Type": 2, "State": 1}},
+                {"EventType": 2, "ContextShareID": "photos", "Link": {"LinkID": "earlier", "Type": 2, "State": 2}},
+                {"EventType": 2, "ContextShareID": "photos", "Link": {"LinkID": "restored", "Type": 2, "State": 2}},
+                {"EventType": 2, "ContextShareID": "photos", "Link": {"LinkID": "restored", "Type": 2, "State": 1}}
+              ],
+              "EventID": "event-6", "More": 0, "Refresh": 0
+            }
+            """#.utf8)
+        let page = try JSONDecoder().decode(VolumeEventPage.self, from: data)
+        var changes = TimelineRemoteEventChanges()
+
+        TimelineRemoteEventVisibilityPolicy.apply(page.events, photosShareID: "photos", to: &changes)
+
+        #expect(changes.active == Set(["edited", "restored"]))
+        #expect(changes.removed == Set(["earlier"]), "the listing must not show the trashed photo again")
     }
 
     @Test func remoteVisibilityFailureUsesTheSharedConvergenceMarker() {

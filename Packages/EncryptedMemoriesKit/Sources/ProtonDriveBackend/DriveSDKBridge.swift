@@ -328,20 +328,20 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
 
             switch source {
             case .authoritativePhotosList:
-                let expectedRemoteNodeIDs: Set<String>?
+                let remoteChanges: TimelineRemoteEventChanges?
                 if continuityRecoveryRequired {
-                    expectedRemoteNodeIDs = nil
+                    remoteChanges = nil
                 } else {
-                    expectedRemoteNodeIDs = try await remotelyChangedActivePhotoNodeIDs(
+                    remoteChanges = try await remoteEventChanges(
                         since: cachedEventToken,
                         currentEventToken: startEventToken,
                         volumeID: root.volumeID
                     )
-                    if expectedRemoteNodeIDs == nil {
+                    if remoteChanges == nil {
                         continuityRecoveryRequired = true
                     }
                 }
-                let entries: [PhotosListEntry]
+                var entries: [PhotosListEntry]
                 if continuityRecoveryRequired {
                     entries = try await continuityRecovery.fetchInventory(
                         cursor: startEventToken,
@@ -352,11 +352,16 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                 } else {
                     entries = try await driveSession.fetchPhotosList(volumeID: root.volumeID)
                 }
+                // The listing can return a photo for a short time after it moved to the trash, for example the
+                // earlier upload that the backup just replaced. The newer events decide.
+                if let removed = remoteChanges?.removed, !removed.isEmpty {
+                    entries.removeAll { removed.contains($0.linkID) }
+                }
                 authoritativeInventoryFingerprint = TimelineContinuityInventoryFingerprint.make(entries: entries)
                 let representedNodeIDs = Set(entries.map(\.linkID)).union(
                     entries.flatMap { $0.relatedPhotos.map(\.linkID) }
                 )
-                if let expectedRemoteNodeIDs {
+                if let expectedRemoteNodeIDs = remoteChanges?.active {
                     let missing = expectedRemoteNodeIDs.subtracting(representedNodeIDs)
                     guard missing.isEmpty else {
                         throw TimelineInventoryVisibilityError.remoteChangesNotVisible(missing.count)
@@ -706,19 +711,19 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     /// Returns active photo-volume file IDs represented by events after the cached inventory token. The Photos
     /// listing can lag the volume event feed; callers must not commit the new token until these IDs are visible.
     /// A server-requested full event refresh returns nil because no bounded event evidence remains to validate.
-    private func remotelyChangedActivePhotoNodeIDs(
+    private func remoteEventChanges(
         since cachedEventToken: String?,
         currentEventToken: String,
         volumeID: String
-    ) async throws -> Set<String>? {
+    ) async throws -> TimelineRemoteEventChanges? {
         guard let cachedEventToken,
             !cachedEventToken.isEmpty,
             cachedEventToken != currentEventToken,
             let photosShareID
-        else { return [] }
+        else { return TimelineRemoteEventChanges() }
 
         var eventID = cachedEventToken
-        var activeNodeIDs = Set<String>()
+        var changes = TimelineRemoteEventChanges()
         while true {
             try Task.checkCancellation()
             let page = try await driveSession.fetchVolumeEvents(volumeID: volumeID, since: eventID)
@@ -726,10 +731,10 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
             TimelineRemoteEventVisibilityPolicy.apply(
                 page.events,
                 photosShareID: photosShareID,
-                to: &activeNodeIDs
+                to: &changes
             )
             eventID = page.eventID
-            if !page.hasMore { return activeNodeIDs }
+            if !page.hasMore { return changes }
         }
     }
 

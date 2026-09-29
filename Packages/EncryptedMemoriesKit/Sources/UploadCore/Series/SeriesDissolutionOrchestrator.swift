@@ -38,17 +38,22 @@ public struct SeriesAlbumReference: Sendable, Hashable {
     }
 }
 
-/// Remote reads and the trash write of a series dissolution. The backend implements it; tests use a fake.
-public protocol SeriesDissolutionRemote: OriginalFileProvider {
-    /// The account's own photos volume. A series in any other volume belongs to a shared album.
+/// Remote reads and writes that give a new photo the place of photos that leave the library: the series
+/// dissolution and the replacement of an edited photo share them. The backend implements it; tests use a fake.
+public protocol PhotoCarryOverRemote: Sendable {
+    /// The account's own photos volume. A photo in any other volume belongs to a shared album.
     func ownPhotosVolumeID() async throws -> String
-    func source(for member: PhotoUID) async throws -> SeriesMemberSource
     /// The subset of `uids` that are active photos now: not trashed, not deleted, not drafts.
     func activeUIDs(among uids: [PhotoUID]) async throws -> Set<PhotoUID>
     /// The subset of `uids` that carry Proton's favorite tag now.
     func favoriteUIDs(among uids: [PhotoUID]) async throws -> Set<PhotoUID>
     /// Adds Proton's favorite tag to the photos. Fails when any photo does not confirm the tag.
     func markFavorite(_ uids: [PhotoUID]) async throws
+}
+
+/// Remote reads and the trash write of a series dissolution.
+public protocol SeriesDissolutionRemote: OriginalFileProvider, PhotoCarryOverRemote {
+    func source(for member: PhotoUID) async throws -> SeriesMemberSource
     /// Moves the photos to the Proton trash, where the user can restore them.
     func trashSeries(_ uids: [PhotoUID]) async throws
 }
@@ -60,6 +65,21 @@ public protocol SeriesAlbumCarryOver: Sendable {
     /// Adds the photos to an album of the account's own library. A shared album is never a valid target.
     /// Succeeds only when every photo is a member afterwards; an existing membership counts as success.
     func addPhotos(_ uids: [PhotoUID], toOwnAlbum albumID: String) async throws
+}
+
+extension SeriesAlbumCarryOver {
+    /// The albums of the own library that contain any of the photos, each once, in first-seen order. Shared
+    /// albums are skipped: their writes cannot address a foreign volume.
+    public func ownAlbumIDs(containing uids: [PhotoUID], ownVolumeID: String) async throws -> [String] {
+        var albumIDs: [String] = []
+        for uid in uids {
+            for album in try await albums(containing: uid)
+            where album.volumeID == ownVolumeID && !albumIDs.contains(album.albumID) {
+                albumIDs.append(album.albumID)
+            }
+        }
+        return albumIDs
+    }
 }
 
 // MARK: - Dedupe collision rule
@@ -441,11 +461,8 @@ public actor SeriesDissolutionOrchestrator {
             try journalStore.save(journal)
         }
 
-        let ownVolumeID = try await remote.ownPhotosVolumeID()
-        var seenAlbumIDs = Set<String>()
-        let ownAlbumIDs = try await albums.albums(containing: mainUID)
-            .filter { $0.volumeID == ownVolumeID && seenAlbumIDs.insert($0.albumID).inserted }
-            .map(\.albumID)
+        let ownAlbumIDs = try await albums.ownAlbumIDs(
+            containing: [mainUID], ownVolumeID: try await remote.ownPhotosVolumeID())
         for albumID in ownAlbumIDs {
             try Task.checkCancellation()
             let missing = journal.favorites.indices.filter { !journal.favorites[$0].addedAlbumIDs.contains(albumID) }
