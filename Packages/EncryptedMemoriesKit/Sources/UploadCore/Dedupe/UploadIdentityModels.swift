@@ -87,6 +87,9 @@ public struct UploadResourceDescriptor: Sendable {
     /// The remote main photo that a burst member becomes a related photo of. The dedupe rule for burst members
     /// reads the relation from it. It is never persisted.
     public let mainRemoteLinkID: String?
+    /// Set on a secondary of an edited photo that replaces an earlier upload. Only a remote copy that is a related
+    /// photo of `mainRemoteLinkID` counts; a copy under the replaced photo moves to the trash with it.
+    public let requiresRelatedMatch: Bool
 
     public init(
         source: UploadSourceIdentity,
@@ -97,7 +100,8 @@ public struct UploadResourceDescriptor: Sendable {
         precomputedSHA1Digest: Data? = nil,
         workIntent: LibraryWorkIntent = .userInitiated,
         mainResource: UploadSourceIdentity? = nil,
-        mainRemoteLinkID: String? = nil
+        mainRemoteLinkID: String? = nil,
+        requiresRelatedMatch: Bool = false
     ) {
         self.source = source
         self.fileURL = fileURL
@@ -108,23 +112,23 @@ public struct UploadResourceDescriptor: Sendable {
         self.workIntent = workIntent
         self.mainResource = mainResource
         self.mainRemoteLinkID = mainRemoteLinkID
+        self.requiresRelatedMatch = requiresRelatedMatch
     }
 
     public func withWorkIntent(_ intent: LibraryWorkIntent) -> UploadResourceDescriptor {
-        UploadResourceDescriptor(
-            source: source,
-            fileURL: fileURL,
-            filename: filename,
-            fileSize: fileSize,
-            modificationDate: modificationDate,
-            precomputedSHA1Digest: precomputedSHA1Digest,
-            workIntent: intent,
-            mainResource: mainResource,
-            mainRemoteLinkID: mainRemoteLinkID
-        )
+        copy(workIntent: intent)
     }
 
-    public func relatedTo(mainRemoteLinkID: String) -> UploadResourceDescriptor {
+    /// `requiresRelatedMatch` is true for the secondaries of an edited photo that replaces an earlier upload.
+    public func relatedTo(mainRemoteLinkID: String, requiresRelatedMatch: Bool = false) -> UploadResourceDescriptor {
+        copy(mainRemoteLinkID: mainRemoteLinkID, requiresRelatedMatch: requiresRelatedMatch)
+    }
+
+    private func copy(
+        workIntent: LibraryWorkIntent? = nil,
+        mainRemoteLinkID: String? = nil,
+        requiresRelatedMatch: Bool? = nil
+    ) -> UploadResourceDescriptor {
         UploadResourceDescriptor(
             source: source,
             fileURL: fileURL,
@@ -132,9 +136,10 @@ public struct UploadResourceDescriptor: Sendable {
             fileSize: fileSize,
             modificationDate: modificationDate,
             precomputedSHA1Digest: precomputedSHA1Digest,
-            workIntent: workIntent,
+            workIntent: workIntent ?? self.workIntent,
             mainResource: mainResource,
-            mainRemoteLinkID: mainRemoteLinkID
+            mainRemoteLinkID: mainRemoteLinkID ?? self.mainRemoteLinkID,
+            requiresRelatedMatch: requiresRelatedMatch ?? self.requiresRelatedMatch
         )
     }
 }

@@ -15,6 +15,7 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
     private let resourceCoordinator: LibraryResourceCoordinator
     private let currentClientUID: String?
     private let batchSize: Int
+    private let replacementJournal: (any EditReplacementJournaling)?
     private let now: @Sendable () -> Date
 
     /// Per-batch remote view from each name hash to matching remote items.
@@ -57,6 +58,7 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
         resourceCoordinator: LibraryResourceCoordinator = .shared,
         currentClientUID: String? = nil,
         batchSize: Int = UploadDedupePipeline.protonDuplicateBatchSize,
+        replacementJournal: (any EditReplacementJournaling)? = nil,
         now: @Sendable @escaping () -> Date = { Date() }
     ) {
         self.store = store
@@ -65,6 +67,7 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
         self.resourceCoordinator = resourceCoordinator
         self.currentClientUID = currentClientUID
         self.batchSize = max(1, batchSize)
+        self.replacementJournal = replacementJournal
         self.now = now
     }
 
@@ -95,10 +98,13 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
         // Burst-member rule, see `UploadDuplicateDecisionPolicy.burstMemberCandidates`: the same bytes as an active
         // photo prove nothing. Only this member's own upload, or the server's related list, proves the relation.
         let isBurstMember = descriptor.source.resource.isBurstMember
+        // A secondary of an edited photo that replaces an earlier upload: its earlier copy is a related photo of
+        // the replaced photo and moves to the trash with it. Only a copy under the new main photo counts.
+        let requiresRelatedMatch = descriptor.requiresRelatedMatch && !isBurstMember
 
         // Manifest fast path: this exact resource (same name/size/mtime/key epoch) is known to be
         // on the server - uploaded by us or confirmed as an active duplicate. No hash, no query.
-        if let cached, hmacReusable,
+        if let cached, hmacReusable, !requiresRelatedMatch,
             let outcome = cached.outcome.flatMap(UploadIdentityManifestStore.Outcome.init(rawValue:)),
             outcome == .uploaded || (outcome == .duplicateActive && !isBurstMember),
             let remoteLink = cached.remoteLinkID,
@@ -152,6 +158,10 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
             correctedName: corrected, nameHash: nameHash,
             sha1Hex: sha1Hex, sha1Digest: sha1Digest, contentHash: contentHash
         )
+        let replacement = try replacementScope(for: descriptor, cached: cached, sha1Hex: sha1Hex)
+        func result(_ decision: UploadDuplicateDecision) -> UploadPreflightResult {
+            UploadPreflightResult(identity: identity, decision: decision)
+        }
 
         // Persist the identity before the remote check so a crash never re-pays the hashing.
         // An outcome from a still-valid prior row survives; anything stale is dropped.
@@ -178,18 +188,18 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
         while true {
             // Bytes already proven on the server under ANY source path/filename (copied folder,
             // renamed file): adopt that remote link for this source - no remote query, no upload.
-            if !isBurstMember,
+            if !isBurstMember, !requiresRelatedMatch,
                 let known = store.trustedRecord(contentHash: contentHash, hashKeyEpoch: epoch),
                 known.sha1Hex == sha1Hex,
-                let knownLink = known.remoteLinkID
+                let knownLink = known.remoteLinkID,
+                replacement.isEmpty || known.source == descriptor.source
             {
                 record.remoteVolumeID = known.remoteVolumeID
                 record.remoteLinkID = knownLink
                 record.outcome = UploadIdentityManifestStore.Outcome.duplicateActive.rawValue
                 record.updatedAt = now()
                 try persistRecord(record)
-                return UploadPreflightResult(
-                    identity: identity, decision: .skip(.knownFromManifest, remoteLinkID: knownLink))
+                return result(.skip(.knownFromManifest, remoteLinkID: knownLink))
             }
             guard pendingContentUploads[contentKey] != nil else {
                 // Claim the content before the remote check - identical items resolving
@@ -231,7 +241,7 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
             // already active; an empty/failed result cannot authorize an upload, so fail closed
             // with the original detailed-lookup error.
             let exactMatches =
-                isBurstMember
+                isBurstMember || requiresRelatedMatch || !replacement.isEmpty
                 ? []
                 : await checker.findExactActiveDuplicates(
                     correctedName: corrected,
@@ -246,7 +256,7 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
                     throw error
                 }
                 releasePendingUploadClaims(ownedBy: descriptor)
-                return UploadPreflightResult(identity: identity, decision: decision)
+                return result(decision)
             }
             releasePendingUploadClaims(ownedBy: descriptor)
             throw detailedLookupError
@@ -254,10 +264,8 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
 
         let nameCandidates: [RemotePhotoDuplicate]
         do {
-            nameCandidates =
-                isBurstMember
-                ? try await burstMemberCandidates(remoteItems, contentHash: contentHash, descriptor: descriptor)
-                : remoteItems
+            nameCandidates = try await candidates(
+                remoteItems, contentHash: contentHash, descriptor: descriptor, replacement: replacement)
         } catch {
             releasePendingUploadClaims(ownedBy: descriptor)
             throw error
@@ -274,10 +282,9 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
         if nameDecision.uploadsBytes {
             do {
                 if let found = try await checker.findDuplicate(contentHash: contentHash),
-                    let remoteContent = isBurstMember
-                        ? try await burstMemberCandidates([found], contentHash: contentHash, descriptor: descriptor)
-                            .first
-                        : found
+                    let remoteContent = try await candidates(
+                        [found], contentHash: contentHash, descriptor: descriptor, replacement: replacement
+                    ).first
                 {
                     let contentDecision = decisionForRemoteContent(
                         remoteContent,
@@ -287,7 +294,7 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
                     if !contentDecision.uploadsBytes {
                         releasePendingUploadClaims(ownedBy: descriptor)
                     }
-                    return UploadPreflightResult(identity: identity, decision: contentDecision)
+                    return result(contentDecision)
                 }
                 try Task.checkCancellation()
             } catch {
@@ -302,12 +309,71 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
                 throw error
             }
             releasePendingUploadClaims(ownedBy: descriptor)
-            return UploadPreflightResult(identity: identity, decision: nameDecision)
+            return result(nameDecision)
         }
 
         // Both claims stay held: the caller now owns this content/name upload and must settle it via
         // `recordUploaded` (success) or `uploadDidFail` (anything else).
-        return UploadPreflightResult(identity: identity, decision: nameDecision)
+        return result(nameDecision)
+    }
+
+    /// A photo-library primary with other bytes than this installation uploaded before was edited. The journal
+    /// keeps the earlier photo before the record below forgets it, so the backup can replace it after the upload.
+    private func replacementScope(
+        for descriptor: UploadResourceDescriptor,
+        cached: UploadIdentityRecord?,
+        sha1Hex: String
+    ) throws -> UploadReplacementScope {
+        guard let replacementJournal, descriptor.source.kind == .photoLibraryAsset,
+            descriptor.source.resource == .primary, descriptor.mainRemoteLinkID == nil
+        else {
+            return UploadReplacementScope(superseded: [], retired: [])
+        }
+        var entry = replacementJournal.entry(for: descriptor.source)
+        if let cached, cached.outcome == UploadIdentityManifestStore.Outcome.uploaded.rawValue,
+            let link = cached.remoteLinkID, !link.isEmpty, cached.sha1Hex != sha1Hex,
+            !entry.superseded.contains(where: { $0.nodeID == link })
+        {
+            let uid = PhotoUID(volumeID: cached.remoteVolumeID ?? "", nodeID: link)
+            try replacementJournal.addSuperseded(uid, for: descriptor.source)
+            entry.superseded.append(uid)
+        }
+        return UploadReplacementScope(superseded: Set(entry.superseded.map(\.nodeID)), retired: Set(entry.retired))
+    }
+
+    /// The remote rows that can prove this resource. A burst member and a secondary of a replacing edit count
+    /// only a copy under their main photo. A primary ignores the photos that an edit replaces or replaced and
+    /// their related photos: the backup moves those to the trash itself, so they are neither this photo nor a
+    /// deletion by the person.
+    private func candidates(
+        _ remoteItems: [RemotePhotoDuplicate],
+        contentHash: String,
+        descriptor: UploadResourceDescriptor,
+        replacement: UploadReplacementScope
+    ) async throws -> [RemotePhotoDuplicate] {
+        if descriptor.source.resource.isBurstMember {
+            return try await burstMemberCandidates(remoteItems, contentHash: contentHash, descriptor: descriptor)
+        }
+        if descriptor.requiresRelatedMatch {
+            var relatedLinkIDs: Set<String> = []
+            if remoteItems.contains(where: { $0.linkState != .draft }), let mainLinkID = descriptor.mainRemoteLinkID {
+                relatedLinkIDs = try await checker.relatedPhotoLinkIDs(ofMainLinkID: mainLinkID)
+            }
+            return remoteItems.filter { item in
+                item.linkState == .draft || (item.linkID.map(relatedLinkIDs.contains) ?? false)
+            }
+        }
+        guard !replacement.isEmpty else { return remoteItems }
+        let excluded = replacement.superseded.union(replacement.retired)
+        let remaining = remoteItems.filter { !($0.linkID.map(excluded.contains) ?? false) }
+        guard remaining.contains(where: { $0.linkState == .active && $0.contentHash == contentHash }) else {
+            return remaining
+        }
+        var replacedRelated: Set<String> = []
+        for linkID in replacement.superseded.sorted() {
+            replacedRelated.formUnion(try await checker.relatedPhotoLinkIDs(ofMainLinkID: linkID))
+        }
+        return remaining.filter { !($0.linkID.map(replacedRelated.contains) ?? false) }
     }
 
     /// Applies the burst-member rule. The server names the related photos of the member's main photo only when
@@ -659,4 +725,12 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
         }
         return grouped
     }
+}
+
+/// The earlier uploads of one primary that an edit replaces (`superseded`) or already replaced (`retired`).
+private struct UploadReplacementScope {
+    var superseded: Set<String>
+    var retired: Set<String>
+
+    var isEmpty: Bool { superseded.isEmpty && retired.isEmpty }
 }

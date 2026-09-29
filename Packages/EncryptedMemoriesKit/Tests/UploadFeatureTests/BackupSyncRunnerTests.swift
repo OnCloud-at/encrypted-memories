@@ -1264,6 +1264,7 @@ final class BackupSyncRunnerTests: XCTestCase {
         uploader: (any PhotoUploading)? = nil,
         tagAdder: (any PhotoTagAdding)? = nil,
         identityResolver: (any UploadIdentityResolving)? = nil,
+        editReplacement: EditedPhotoReplacement? = nil,
         resolver: (any BackupResourceResolving)? = nil,
         queue: (any UploadBackupSyncQueueStore)? = nil,
         retry: BackupRetryPolicy = BackupRetryPolicy(baseDelay: 1, maxDelay: 64, maxAttempts: 4),
@@ -1281,6 +1282,7 @@ final class BackupSyncRunnerTests: XCTestCase {
             identityResolver: identityResolver ?? makePipeline(resourceCoordinator: resourceCoordinator),
             uploader: uploader ?? self.uploader,
             tagAdder: tagAdder,
+            editReplacement: editReplacement,
             resourceCoordinator: resourceCoordinator,
             configuration: BackupSyncRunner.Configuration(
                 uploadStallTimeout: uploadStallTimeout,
@@ -2202,6 +2204,106 @@ final class BackupSyncRunnerTests: XCTestCase {
         )
         XCTAssertEqual(record?.isComplete, true)
         XCTAssertEqual(record?.resourceCount, 2)
+    }
+
+    // MARK: - Edited photos replace their earlier upload
+
+    private struct ReplacementHarness {
+        let journal: EditReplacementJournalFileStore
+        let pipeline: UploadDedupePipeline
+        let remote: FakeEditReplacementRemote
+        let replacement: EditedPhotoReplacement
+    }
+
+    private func makeReplacementHarness() -> ReplacementHarness {
+        let journal = EditReplacementJournalFileStore(accountDataDirectory: tempDir)
+        let pipeline = UploadDedupePipeline(
+            store: identityStore, hasher: hasher, checker: checker, replacementJournal: journal,
+            now: { [clock] in clock!.now })
+        let remote = FakeEditReplacementRemote()
+        let replacement = EditedPhotoReplacement(
+            remote: remote, albums: FakeAlbumCarryOver(), relations: checker, journal: journal)
+        // The server names every upload that referenced a main photo as one of its related photos.
+        checker.relatedLinkIDsProvider = { [uploader] mainLinkID in
+            Set(uploader!.requests.filter { $0.mainPhotoUID?.nodeID == mainLinkID }.map { testUID($0.name).nodeID })
+        }
+        return ReplacementHarness(journal: journal, pipeline: pipeline, remote: remote, replacement: replacement)
+    }
+
+    private func seedLibraryEntry(_ name: String, revisionOffset: Int64 = 0) -> UploadBackupSyncQueueEntry {
+        let entry = UploadBackupSyncQueueEntry(
+            source: UploadSourceIdentity(kind: .photoLibraryAsset, identifier: "/library/IMG_1"),
+            revision: UploadBackupRevision(
+                rawValue: UploadBackupRevision(date: resolver.defaultModified).rawValue + revisionOffset),
+            originalFilename: name,
+            byteCount: 4,
+            state: .discovered,
+            attempts: 0,
+            updatedAt: clock.now.addingTimeInterval(-60)
+        )
+        queueStore.upsert(entry)
+        return entry
+    }
+
+    /// Uploads IMG_1.HEIC with a Live Photo video, then edits the photo in the library: new bytes, new name.
+    private func uploadThenEdit(_ harness: ReplacementHarness) async -> UploadBackupSyncQueueEntry {
+        let first = seedLibraryEntry("IMG_1.HEIC")
+        resolver.setSecondaries(["IMG_1.MOV"], for: first.source.identifier)
+        _ = await makeRunner(identityResolver: harness.pipeline, editReplacement: harness.replacement)
+            .runUntilDrained()
+        XCTAssertEqual(uploader.requests.map(\.name), ["IMG_1.HEIC", "IMG_1.MOV"])
+        XCTAssertTrue(harness.remote.trashCalls.isEmpty, "a first upload replaces nothing")
+
+        hasher.contentSeeds[first.source.identifier] = "rotated"
+        harness.remote.active = [testUID("IMG_1.HEIC")]
+        return seedLibraryEntry("IMG_1.JPG", revisionOffset: 1)
+    }
+
+    func testAnEditedPhotoReplacesItsEarlierUploadAndKeepsItsSecondariesUnderTheNewPhoto() async throws {
+        let harness = makeReplacementHarness()
+        let edited = await uploadThenEdit(harness)
+
+        _ = await makeRunner(identityResolver: harness.pipeline, editReplacement: harness.replacement)
+            .runUntilDrained()
+
+        XCTAssertEqual(
+            uploader.requests.map(\.name), ["IMG_1.HEIC", "IMG_1.MOV", "IMG_1.JPG", "IMG_1.MOV"],
+            "the secondary uploads again: its earlier copy leaves with the earlier photo")
+        XCTAssertEqual(uploader.requests.last?.mainPhotoUID, testUID("IMG_1.JPG"))
+        XCTAssertEqual(harness.remote.trashCalls, [[testUID("IMG_1.HEIC")]])
+        XCTAssertEqual(state(of: edited), .completed)
+        XCTAssertEqual(
+            harness.journal.entry(for: edited.source),
+            EditReplacementJournalEntry(
+                superseded: [], retired: [testUID("IMG_1.HEIC").nodeID, testUID("IMG_1.MOV").nodeID]))
+    }
+
+    func testAFailedTrashRetriesWithoutUploadingTheEditedPhotoAgain() async throws {
+        let harness = makeReplacementHarness()
+        let edited = await uploadThenEdit(harness)
+        harness.remote.trashFailures = 1
+
+        _ = await makeRunner(identityResolver: harness.pipeline, editReplacement: harness.replacement)
+            .runUntilDrained()
+
+        XCTAssertEqual(uploader.requests.map(\.name), ["IMG_1.HEIC", "IMG_1.MOV", "IMG_1.JPG", "IMG_1.MOV"])
+        XCTAssertEqual(harness.remote.trashCalls, [[testUID("IMG_1.HEIC")]])
+        XCTAssertEqual(state(of: edited)?.isTerminalSuccess, true)
+    }
+
+    func testAnEditedSeriesKeepsItsEarlierUpload() async throws {
+        let harness = makeReplacementHarness()
+        let edited = await uploadThenEdit(harness)
+        resolver.setSecondaries([], for: edited.source.identifier)
+        resolver.setBurstMembers(["IMG_2.HEIC"], for: edited.source.identifier)
+
+        _ = await makeRunner(
+            tagAdder: SpyTagAdder(), identityResolver: harness.pipeline, editReplacement: harness.replacement
+        ).runUntilDrained()
+
+        XCTAssertTrue(harness.remote.trashCalls.isEmpty, "series edits keep today's behavior until their own model")
+        XCTAssertEqual(state(of: edited), .completed)
+        XCTAssertTrue(harness.journal.entry(for: edited.source).isEmpty)
     }
 
     func testSeriesUploadsMembersAsRelatedPhotosWithTheBurstsTag() async throws {

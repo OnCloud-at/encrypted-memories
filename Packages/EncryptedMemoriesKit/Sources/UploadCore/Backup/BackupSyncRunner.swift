@@ -79,6 +79,8 @@ public actor BackupSyncRunner {
     /// Marks an existing main photo as a series when only its missing members upload. Nil for sources
     /// that never produce a series (folder backup).
     private let tagAdder: (any PhotoTagAdding)?
+    /// Replaces the earlier upload of an edited photo-library photo. Nil for sources without edits (folder backup).
+    private let editReplacement: EditedPhotoReplacement?
     private let resourceCoordinator: LibraryResourceCoordinator
     private let configuration: Configuration
     private let throttleInputs: @Sendable () -> BackupThrottleInputs
@@ -147,6 +149,7 @@ public actor BackupSyncRunner {
         identityResolver: any UploadIdentityResolving,
         uploader: any PhotoUploading,
         tagAdder: (any PhotoTagAdding)? = nil,
+        editReplacement: EditedPhotoReplacement? = nil,
         resourceCoordinator: LibraryResourceCoordinator = .shared,
         configuration: Configuration = Configuration(),
         throttleInputs: @Sendable @escaping () -> BackupThrottleInputs = { .unconstrained },
@@ -161,6 +164,7 @@ public actor BackupSyncRunner {
         self.identityResolver = identityResolver
         self.uploader = uploader
         self.tagAdder = tagAdder
+        self.editReplacement = editReplacement
         self.resourceCoordinator = resourceCoordinator
         self.configuration = configuration
         self.throttleInputs = throttleInputs
@@ -1112,6 +1116,10 @@ public actor BackupSyncRunner {
         workIntent: LibraryWorkIntent
     ) async {
         var persistedState = state
+        let isSeries = resolved.secondaries.contains(where: { $0.descriptor.source.resource.isBurstMember })
+        // An edit that replaces an earlier upload uploads its secondaries under the edited photo again: their
+        // earlier copies are related photos of the earlier photo and move to the trash with it.
+        let replacesEarlierUpload = !isSeries && editReplacement?.isReplacing(entry.source) == true
         if !resolved.secondaries.isEmpty {
             if persistedState != .uploading {
                 guard let nextState = transition(entry, from: persistedState, to: .uploading) else { return }
@@ -1127,6 +1135,7 @@ public actor BackupSyncRunner {
             switch await settleSecondaries(
                 resolved.secondaries,
                 primaryUID: primaryUID,
+                requiresRelatedMatch: replacesEarlierUpload,
                 entry: entry,
                 entryKey: Self.key(entry),
                 workIntent: workIntent
@@ -1232,15 +1241,30 @@ public actor BackupSyncRunner {
             }
             // Series migration: an earlier build uploaded this main photo alone and untagged. Its members are
             // related to it now, so the existing node needs the bursts tag. The main photo never uploads again.
-            if terminal == .alreadyBackedUp, let tagAdder,
-                resolved.secondaries.contains(where: { $0.descriptor.source.resource.isBurstMember })
-            {
+            if terminal == .alreadyBackedUp, let tagAdder, isSeries {
                 do {
                     try await tagAdder.addTags([PhotoTag.bursts.rawValue], to: primaryUID)
                 } catch {
                     retryOrPark(entry, from: persistedState, error: error)
                     return
                 }
+            }
+        }
+        if let editReplacement, let primaryUID {
+            do {
+                if isSeries {
+                    try editReplacement.keepSuperseded(of: entry.source)
+                } else if try await editReplacement.replaceSuperseded(of: entry.source, with: primaryUID) {
+                    await identityResolver.invalidateCachedRemoteState()
+                }
+            } catch is CancellationError {
+                revert(entry, from: persistedState)
+                return
+            } catch {
+                if stopRequested { revert(entry, from: persistedState) } else {
+                    retryOrPark(entry, from: persistedState, error: error)
+                }
+                return
             }
         }
         do {
@@ -1269,6 +1293,7 @@ public actor BackupSyncRunner {
     private func settleSecondaries(
         _ secondaries: [BackupSecondaryResource],
         primaryUID: PhotoUID,
+        requiresRelatedMatch: Bool,
         entry: UploadBackupSyncQueueEntry,
         entryKey: String,
         workIntent: LibraryWorkIntent
@@ -1281,7 +1306,8 @@ public actor BackupSyncRunner {
             if stopRequested { return .cancelled }
             do {
                 let outcome: SecondaryScopedOutcome = try await identityResolver.withUploadDecision(
-                    secondary.descriptor.withWorkIntent(workIntent).relatedTo(mainRemoteLinkID: primaryUID.nodeID),
+                    secondary.descriptor.withWorkIntent(workIntent).relatedTo(
+                        mainRemoteLinkID: primaryUID.nodeID, requiresRelatedMatch: requiresRelatedMatch),
                     onRemoteCommit: { [queue, now] identity, receipt in
                         let reconciliation = UploadRemoteCommitReconciliation(
                             source: secondary.descriptor.source,

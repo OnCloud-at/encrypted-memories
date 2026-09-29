@@ -1825,9 +1825,12 @@ extension DriveSDKBridge: PhotoUploading {
                     admission: shutdownGate
                 ),
                 duplicateChecker: nil,
+                replacementJournal: nil,
                 close: {}
             )
         }
+        let replacementJournal = EditReplacementJournalFileStore(
+            accountDataDirectory: uploadManifestURL.deletingLastPathComponent())
         let service = ProtonUploadDedupeService(
             session: driveSession,
             crypto: crypto,
@@ -1839,11 +1842,13 @@ extension DriveSDKBridge: PhotoUploading {
         let pipeline = UploadDedupePipeline(
             store: store,
             checker: service,
-            currentClientUID: uploadClientUID
+            currentClientUID: uploadClientUID,
+            replacementJournal: replacementJournal
         )
         return UploadIdentityResolverComposition(
             resolver: ShutdownGatedUploadIdentityResolver(base: pipeline, admission: shutdownGate),
             duplicateChecker: service,
+            replacementJournal: replacementJournal,
             close: { store.close() }
         )
     }
@@ -2075,6 +2080,8 @@ extension DriveSDKBridge: PhotoTagAdding {
         }
     }
 }
+
+extension DriveSDKBridge: EditReplacementRemote {}
 
 extension DriveSDKBridge: SeriesDissolutionRemote {
     func ownPhotosVolumeID() async throws -> String {

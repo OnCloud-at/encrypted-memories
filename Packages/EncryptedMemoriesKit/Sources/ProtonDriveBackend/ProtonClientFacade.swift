@@ -8,6 +8,8 @@ struct UploadIdentityResolverComposition: Sendable {
     let resolver: any UploadIdentityResolving
     /// The Proton-keyed duplicate service behind `resolver`. Nil when the upload manifest is unavailable.
     let duplicateChecker: (any UploadDuplicateChecking)?
+    /// Earlier uploads of edited photos that the backup replaces. Nil when the upload manifest is unavailable.
+    let replacementJournal: (any EditReplacementJournaling)?
     let close: @Sendable () -> Void
 }
 
@@ -35,6 +37,8 @@ public final class ProtonClientFacade {
     public let photoTagAdder: any PhotoTagAdding
     /// "Keep Only Favorites" for a series of the account's own library. Nil while uploads are disabled.
     public let seriesDissolution: SeriesDissolutionOrchestrator?
+    /// Replaces the earlier upload of a photo that was edited in the photo library. Nil while uploads are disabled.
+    public let editedPhotoReplacement: EditedPhotoReplacement?
     /// The single dedupe resolver for this account, shared by manual uploads and backup sync so both
     /// see the same manifest and remote duplicate view. If the manifest database cannot open,
     /// the bridge supplies a fail-closed resolver; uploads must never silently run without dedupe.
@@ -61,6 +65,7 @@ public final class ProtonClientFacade {
         photoUploader: any PhotoUploading,
         photoTagAdder: any PhotoTagAdding,
         seriesDissolution: SeriesDissolutionOrchestrator?,
+        editedPhotoReplacement: EditedPhotoReplacement?,
         uploadIdentityResolver: (any UploadIdentityResolving)?,
         accountDataDirectory: URL,
         accountDatabasePolicy: LibraryDatabasePolicy,
@@ -76,6 +81,7 @@ public final class ProtonClientFacade {
         self.photoUploader = photoUploader
         self.photoTagAdder = photoTagAdder
         self.seriesDissolution = seriesDissolution
+        self.editedPhotoReplacement = editedPhotoReplacement
         self.uploadIdentityResolver = uploadIdentityResolver
         self.accountDataDirectory = accountDataDirectory
         self.accountDatabasePolicy = accountDatabasePolicy
@@ -170,6 +176,16 @@ public final class ProtonClientFacade {
                 duplicateChecker: identityComposition.duplicateChecker,
                 albums: AlbumRepositorySeriesCarryOver(repository: albumsRepo)
             ),
+            editedPhotoReplacement: identityComposition.duplicateChecker.flatMap { checker in
+                identityComposition.replacementJournal.map { journal in
+                    EditedPhotoReplacement(
+                        remote: bridge,
+                        albums: AlbumRepositorySeriesCarryOver(repository: albumsRepo),
+                        relations: checker,
+                        journal: journal
+                    )
+                }
+            },
             uploadIdentityResolver: identityResolver,
             accountDataDirectory: bridge.uploadManifestURL.deletingLastPathComponent(),
             accountDatabasePolicy: bridge.uploadManifestPolicy,

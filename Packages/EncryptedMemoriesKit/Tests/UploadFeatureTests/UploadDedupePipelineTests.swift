@@ -111,9 +111,12 @@ final class FakeChecker: UploadDuplicateChecking, @unchecked Sendable {
     }
 
     var relatedLinkIDsByMainLinkID: [String: Set<String>] = [:]
+    /// Answers like the server from state outside the checker, for example the uploads a test made.
+    var relatedLinkIDsProvider: (@Sendable (String) -> Set<String>)?
 
     func relatedPhotoLinkIDs(ofMainLinkID mainLinkID: String) async throws -> Set<String> {
-        lock.withLock { relatedLinkIDsByMainLinkID[mainLinkID] ?? [] }
+        let provided = lock.withLock { relatedLinkIDsProvider }?(mainLinkID) ?? []
+        return lock.withLock { relatedLinkIDsByMainLinkID[mainLinkID] ?? [] }.union(provided)
     }
 
     func findExactActiveDuplicates(correctedName: String, sha1Digest: Data) async -> [PhotoUID] {
