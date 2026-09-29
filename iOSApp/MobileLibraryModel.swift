@@ -345,7 +345,8 @@ final class MobileLibraryModel {
     private(set) var sourceAnalysisRevision: UInt64 = 0
     private var smartSearchAssets: MLAssetUniverse { smartSearchSession.assets }
     @ObservationIgnored private var primaryInventoryAuthority: SourceInventoryAuthority = .hydrating
-    @ObservationIgnored private var pendingTimelineRemovals = Set<PhotoUID>()
+    /// Successful trash and restore mutations of this session, laid over every later listing.
+    @ObservationIgnored private var timelineRemovals = TimelineRemovalOverlay()
     @ObservationIgnored private var timelineMutationGeneration = 0
     @ObservationIgnored private let sourceAnalysis = LibrarySourceAnalysisSession()
     private var sourceAnalysisRuntime: LibrarySourceAnalysisRuntime? { sourceAnalysis.runtime }
@@ -551,11 +552,11 @@ final class MobileLibraryModel {
         let locationStoreLease = locationStore.captureSessionLease()
         try await remoteMutation()
         try requireCurrentMutation(mutationLease)
-        pendingTimelineRemovals.formUnion(uids)
+        timelineRemovals.trashed(uids)
         timelineMutationGeneration &+= 1
         let generation = timelineMutationGeneration
         let currentSections = sections
-        let allRemovals = pendingTimelineRemovals
+        let allRemovals = timelineRemovals.hiddenFromLibrary
         let result = await Task.detached(priority: .userInitiated) {
             let projection = TimelineContentProjection(sections: currentSections).removing(allRemovals)
             return (projection, Set(projection.snapshot.items.map(\.uid)))
@@ -585,11 +586,11 @@ final class MobileLibraryModel {
         let uids = Set(items.map(\.uid))
         try await backend.restore(Array(uids))
         try requireCurrentMutation(mutationLease)
-        pendingTimelineRemovals.subtract(uids)
+        timelineRemovals.restored(uids)
         timelineMutationGeneration &+= 1
         let generation = timelineMutationGeneration
         let currentSections = sections
-        let remainingRemovals = pendingTimelineRemovals
+        let remainingRemovals = timelineRemovals.hiddenFromLibrary
         let result = await Task.detached(priority: .userInitiated) {
             let projection = TimelineContentProjection(sections: currentSections)
                 .inserting(items)
@@ -857,7 +858,7 @@ final class MobileLibraryModel {
                 self.favoriteLoadOverrides.removeAll(keepingCapacity: false)
                 self.favoriteLoadSettled = false
                 self.favoriteFilterAvailability = .loading
-                self.pendingTimelineRemovals.removeAll(keepingCapacity: false)
+                self.timelineRemovals = TimelineRemovalOverlay()
                 self.timelineMutationGeneration &+= 1
                 self.timelineRevision &+= 1
                 self.initialLibraryLoadSettled = false
@@ -1394,7 +1395,7 @@ final class MobileLibraryModel {
         photoBackup = nil
         albumSync = nil
         albumCatalogRevision = 0
-        pendingTimelineRemovals.removeAll(keepingCapacity: false)
+        timelineRemovals = TimelineRemovalOverlay()
         timelineMutationGeneration &+= 1
         snapshot = TimelineSnapshot()
         sections = []
@@ -1535,7 +1536,7 @@ final class MobileLibraryModel {
         photoBackup = nil
         _ = retirePendingGrid()
         albumSync = nil
-        pendingTimelineRemovals.removeAll(keepingCapacity: false)
+        timelineRemovals = TimelineRemovalOverlay()
         timelineMutationGeneration &+= 1
         if !preserveVisibleSnapshot {
             snapshot = TimelineSnapshot()
@@ -1783,7 +1784,7 @@ final class MobileLibraryModel {
     ) async throws -> TimelineProjectionChange? {
         let token = loadToken
         let mutationGeneration = timelineMutationGeneration
-        let removals = pendingTimelineRemovals
+        let removals = timelineRemovals.hiddenFromLibrary
         let shown = snapshot
         let shownRevision = timelineRevision
         let (prepared, preparedChange) = await Task.detached(priority: .userInitiated) {

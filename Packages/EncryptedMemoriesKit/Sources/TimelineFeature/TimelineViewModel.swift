@@ -228,8 +228,7 @@ public final class TimelineViewModel {
     @ObservationIgnored private var wholeLibrarySnapshot = TimelineSnapshot()
     /// Successful server mutations are overlaid on every later fetch for this session. This closes the race
     /// where an older in-flight response completed after trash/restore and resurrected an item in a grid.
-    @ObservationIgnored private var hiddenFromLibrary = Set<PhotoUID>()
-    @ObservationIgnored private var hiddenFromTrash = Set<PhotoUID>()
+    @ObservationIgnored private var removals = TimelineRemovalOverlay()
 
     /// `change` compares `projection` with the current whole-library snapshot. Without it, the comparison runs here.
     private func updateAllRouteSnapshot(
@@ -268,7 +267,7 @@ public final class TimelineViewModel {
         shownItems: [PhotoItem],
         shownWholeLibrary: TimelineSnapshot?
     ) async -> RouteRefresh {
-        let hidden = route == .trash ? hiddenFromTrash : hiddenFromLibrary
+        let hidden = removals.hidden(on: route)
         return await Task.detached(priority: .userInitiated) {
             let projection = TimelineContentProjection(sections: sections).removing(hidden)
             return RouteRefresh(
@@ -464,8 +463,7 @@ public final class TimelineViewModel {
     public func commitTrash(_ items: [PhotoItem]) async {
         let uids = Set(items.map(\.uid))
         guard !uids.isEmpty else { return }
-        hiddenFromLibrary.formUnion(uids)
-        hiddenFromTrash.subtract(uids)
+        removals.trashed(uids)
 
         let all = allRouteSnapshot
         let caches = filterCache
@@ -505,8 +503,7 @@ public final class TimelineViewModel {
     public func commitRestore(_ items: [PhotoItem]) async {
         let uids = Set(items.map(\.uid))
         guard !uids.isEmpty else { return }
-        hiddenFromLibrary.subtract(uids)
-        hiddenFromTrash.formUnion(uids)
+        removals.restored(uids)
 
         let all = allRouteSnapshot
         let trash = filterCache.snapshot(for: .trash)
@@ -528,7 +525,7 @@ public final class TimelineViewModel {
     /// the network request was in flight.
     public func commitEmptyTrash(_ uids: Set<PhotoUID>) {
         guard !uids.isEmpty else { return }
-        hiddenFromTrash.formUnion(uids)
+        removals.trashEmptied(uids)
         filterCache.insert([], for: .trash, activeRoute: filter)
         if filter == .trash { publish([]) }
     }
@@ -787,7 +784,7 @@ public final class TimelineViewModel {
     private func normalizeOffMain(
         _ sections: [TimelineSection], for route: PhotoFilter
     ) async -> TimelineContentProjection {
-        let hidden = route == .trash ? hiddenFromTrash : hiddenFromLibrary
+        let hidden = removals.hidden(on: route)
         return await Task.detached(priority: .userInitiated) {
             TimelineContentProjection(sections: sections).removing(hidden)
         }.value
