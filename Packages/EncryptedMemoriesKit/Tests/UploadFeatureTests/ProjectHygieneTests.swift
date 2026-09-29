@@ -107,6 +107,31 @@ final class ProjectHygieneTests: XCTestCase {
         XCTAssertTrue(plist.contains("<string>at.oncloud.encryptedmemories.photo-reference</string>"))
     }
 
+    /// The package gates use only the pinned package versions, and CI stops on an unexpected Xcode.
+    func testBuildGatesStopOnPackageDriftAndOnAnotherXcode() throws {
+        func read(_ path: String) throws -> String {
+            try String(contentsOf: repoRoot.appendingPathComponent(path), encoding: .utf8)
+        }
+        for script in ["scripts/verify-tests.sh", "scripts/verify-universal-core.sh"] {
+            let invocations = try read(script).components(separatedBy: "xcrun swift test").dropFirst()
+            XCTAssertFalse(invocations.isEmpty, script)
+            for invocation in invocations {
+                // The command ends at the first line without a continuation backslash.
+                var lines: [String] = []
+                for line in invocation.components(separatedBy: "\n") {
+                    lines.append(line)
+                    if !line.hasSuffix("\\") { break }
+                }
+                let command = lines.joined(separator: "\n")
+                XCTAssertTrue(command.contains("--force-resolved-versions"), "\(script): \(command)")
+            }
+        }
+        let action = try read(".github/actions/prepare-apple-build/action.yml")
+        XCTAssertTrue(action.contains("--force-resolved-versions \\\n          resolve"))
+        XCTAssertTrue(
+            action.contains("[[ \"$xcode_version\" == \"$EXPECTED_XCODE_VERSION\" ]] || release_fail toolchain"))
+    }
+
     func testProtonAppVersionHeaderInputsReachEveryShippedApp() throws {
         func read(_ path: String) throws -> String {
             try String(contentsOf: repoRoot.appendingPathComponent(path), encoding: .utf8)

@@ -6,6 +6,10 @@ inputs:
     description: Reviewed Proton Drive SDK tag.
     required: false
     default: "0.29.1"
+  xcode-version:
+    description: Xcode version that the build expects. A runner with another version fails.
+    required: false
+    default: "27.0"
 
 outputs:
   source-packages-path:
@@ -18,6 +22,18 @@ outputs:
 runs:
   using: composite
   steps:
+    - name: Check the pinned Xcode version
+      shell: bash
+      env:
+        EXPECTED_XCODE_VERSION: ${{ inputs.xcode-version }}
+      run: |
+        set -euo pipefail
+        source .github/scripts/release_failure.sh
+        xcode_version="$(awk '/^Xcode / { print $2; exit }' <<< "$(xcodebuild -version)")"
+        [[ "$xcode_version" == "$EXPECTED_XCODE_VERSION" ]] || release_fail toolchain \
+          "The runner uses Xcode '${xcode_version:-unknown}'; the build expects Xcode '$EXPECTED_XCODE_VERSION'." \
+          "Select the expected Xcode on the runner, or update the xcode-version input in a reviewed change."
+
     - name: Install pinned XcodeGen
       shell: bash
       run: |
@@ -92,6 +108,7 @@ runs:
           --package-path Packages/EncryptedMemoriesKit \
           --scratch-path "$ENCRYPTED_MEMORIES_SPM_SCRATCH" \
           --cache-path "$ENCRYPTED_MEMORIES_SWIFTPM_CACHE" \
+          --force-resolved-versions \
           resolve
         git diff --exit-code -- Packages/EncryptedMemoriesKit/Package.resolved
         xcodegen generate

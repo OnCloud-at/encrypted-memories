@@ -108,6 +108,7 @@ if [[ "$RUN_ARCHITECTURE_TESTS" == "true" ]]; then
     --package-path "$PACKAGE" \
     --scratch-path "$SPM_SCRATCH" \
     --cache-path "$ENCRYPTED_MEMORIES_SWIFTPM_CACHE" \
+    --force-resolved-versions \
     --filter CoreArchitectureGateTests
 fi
 
