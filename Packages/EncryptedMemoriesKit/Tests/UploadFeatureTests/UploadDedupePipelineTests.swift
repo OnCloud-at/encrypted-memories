@@ -40,6 +40,33 @@ final class FakeIdentityStore: UploadIdentityStore, @unchecked Sendable {
         }
     }
 
+    private var failNextForget = false
+
+    func rejectNextForget() {
+        lock.withLock { failNextForget = true }
+    }
+
+    @discardableResult
+    func forgetRemoteLinks(_ linkIDs: Set<String>, of owner: UploadSourceIdentity) -> Bool {
+        lock.withLock {
+            if failNextForget {
+                failNextForget = false
+                return false
+            }
+            for (source, row) in rows
+            where source.kind == owner.kind && source.identifier == owner.identifier
+                && row.remoteLinkID.map(linkIDs.contains) == true
+            {
+                var forgotten = row
+                forgotten.remoteVolumeID = nil
+                forgotten.remoteLinkID = nil
+                forgotten.outcome = nil
+                rows[source] = forgotten
+            }
+            return true
+        }
+    }
+
     @discardableResult
     func upsert(_ record: UploadIdentityRecord) -> Bool {
         lock.withLock {

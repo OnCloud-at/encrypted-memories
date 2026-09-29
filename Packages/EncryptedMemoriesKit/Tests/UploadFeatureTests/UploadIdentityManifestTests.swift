@@ -173,6 +173,35 @@ final class UploadIdentityManifestTests: XCTestCase {
         XCTAssertEqual(store.sources(withRemoteLinkID: "link-unknown")?.count, 0)
     }
 
+    func testForgettingTrashedLinksKeepsTheHashesButNoLongerProvesABackup() throws {
+        let store = try makeStore()
+        var trashed = makeRecord(identifier: "asset-a")
+        trashed.remoteVolumeID = "vol-1"
+        trashed.remoteLinkID = "link-trashed"
+        trashed.outcome = UploadIdentityManifestStore.Outcome.uploaded.rawValue
+        store.upsert(trashed)
+        var active = makeRecord(identifier: "asset-b")
+        active.remoteLinkID = "link-active"
+        active.outcome = UploadIdentityManifestStore.Outcome.uploaded.rawValue
+        store.upsert(active)
+        var adopted = makeRecord(identifier: "asset-c")
+        adopted.remoteLinkID = "link-trashed"
+        adopted.outcome = UploadIdentityManifestStore.Outcome.duplicateActive.rawValue
+        store.upsert(adopted)
+
+        XCTAssertTrue(store.forgetRemoteLinks(["link-trashed", ""], of: trashed.source))
+
+        let forgotten = try XCTUnwrap(store.record(for: trashed.source))
+        XCTAssertNil(forgotten.remoteVolumeID)
+        XCTAssertNil(forgotten.remoteLinkID)
+        XCTAssertNil(forgotten.outcome)
+        XCTAssertEqual(forgotten.sha1Hex, trashed.sha1Hex, "the next check must not hash the file again")
+        XCTAssertEqual(
+            store.sources(withRemoteLinkID: "link-trashed")?.map(\.identifier), ["asset-c"],
+            "another source may count a restored photo as its backup")
+        XCTAssertEqual(store.record(for: active.source)?.remoteLinkID, "link-active")
+    }
+
     func testTrustedContentLookupFiltersOutcomesAndSurvivesReopen() throws {
         var store = try makeStore()
 

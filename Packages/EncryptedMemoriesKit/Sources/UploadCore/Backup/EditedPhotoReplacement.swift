@@ -14,8 +14,9 @@ public protocol EditReplacementRemote: PhotoCarryOverRemote {
 /// favorite tag and its albums of the own library to the edited photo, then moves to the trash with its related
 /// photos. Every step reads the server state again, so a retry after a failure repeats no write twice.
 ///
-/// An earlier photo stays when the new compound does not hold the original, when another local source still
-/// needs it or one of its related photos, or when it carries the new photo.
+/// An earlier photo stays when the new compound does not hold the original, when an original resource of the photo
+/// lives only under the earlier photo, when another local source still needs it or one of its related photos, or
+/// when it carries the new photo. Other bytes replace the earlier photo only as an edit or as the undo of an edit.
 public struct EditedPhotoReplacement: Sendable {
     let remote: any EditReplacementRemote
     let albums: any SeriesAlbumCarryOver
@@ -61,17 +62,26 @@ public struct EditedPhotoReplacement: Sendable {
         try journal.settle(Set(superseded.map(\.nodeID)), related: [], trashed: false, for: source)
     }
 
-    /// Returns true when photos moved to the trash, so cached duplicate rows that still show them active are stale.
+    /// Returns true when earlier photos left the library, so cached duplicate rows that still show them active are
+    /// stale. `edited` tells whether the new primary is an edit; the backup calls this after each upload of a photo.
     @discardableResult
     public func replaceSuperseded(
         of source: UploadSourceIdentity,
         with primary: PhotoUID,
+        edited: Bool,
         holdsOriginal: Bool
     ) async throws -> Bool {
-        let superseded = journal.entry(for: source).superseded
-        guard !superseded.isEmpty else { return false }
-        guard holdsOriginal else {
+        let entry = journal.entry(for: source)
+        let superseded = entry.superseded
+        // Other bytes of a photo that is unedited now and was unedited before are no edit, so both photos stay.
+        guard !superseded.isEmpty, edited || entry.lastUploadWasEdit else {
             try keepSuperseded(of: source)
+            try recordUpload(of: source, edited: edited)
+            return false
+        }
+        // The earlier photos may hold the only copy of the original. They wait for an upload that holds it.
+        guard holdsOriginal else {
+            try recordUpload(of: source, edited: edited)
             return false
         }
         let volumeID = try await remote.ownPhotosVolumeID()
@@ -81,6 +91,7 @@ public struct EditedPhotoReplacement: Sendable {
         let replacement = resolved(primary)
         // The edit was undone and the earlier photo is the current one again.
         var kept = Set(superseded.map(\.nodeID).filter { $0 == replacement.nodeID })
+        var waiting: Set<String> = []
         let targets = superseded.map(resolved).filter { $0.nodeID != replacement.nodeID }
         let active = try await remote.activeUIDs(among: targets)
         var trashable: [PhotoUID] = []
@@ -88,12 +99,16 @@ public struct EditedPhotoReplacement: Sendable {
         for target in targets where active.contains(target) {
             try Task.checkCancellation()
             let linked = try await relations.relatedPhotoLinkIDs(ofMainLinkID: target.nodeID)
+            let links = linked.union([target.nodeID])
             // The trash takes related photos along. A photo that carries the edited photo stays, and so does a
             // photo that another local source, such as a duplicate in Photos, still counts as its backup.
-            guard !linked.contains(replacement.nodeID),
-                !isNeededElsewhere(linked.union([target.nodeID]), by: source)
-            else {
+            guard !linked.contains(replacement.nodeID), !isNeededElsewhere(links, by: source) else {
                 kept.insert(target.nodeID)
+                continue
+            }
+            // An original resource of this photo lives only there. The photo waits for an upload that carries it.
+            guard !leavesOriginalBehind(links, of: source, primaryIsOriginal: !edited) else {
+                waiting.insert(target.nodeID)
                 continue
             }
             trashable.append(target)
@@ -106,10 +121,22 @@ public struct EditedPhotoReplacement: Sendable {
             try journal.settle([], related: related, trashed: true, for: source)
             try await remote.trash(trashable)
         }
-        let retired = Set(targets.map(\.nodeID)).subtracting(kept)
+        let retired = Set(targets.map(\.nodeID)).subtracting(kept).subtracting(waiting)
+        // A row of this photo that names a trashed photo no longer proves a backup. The journal's retired links
+        // include the related photos of an earlier attempt, so a retry after a failed write forgets them too.
+        let trashedLinks = retired.union(related).union(journal.entry(for: source).retired)
+        guard identities.forgetRemoteLinks(trashedLinks, of: source) else {
+            throw UploadError.backend("Upload identity manifest could not be updated")
+        }
         try journal.settle(retired, related: related, trashed: true, for: source)
         try journal.settle(kept, related: [], trashed: false, for: source)
-        return !trashable.isEmpty
+        try recordUpload(of: source, edited: edited)
+        return !retired.isEmpty
+    }
+
+    private func recordUpload(of source: UploadSourceIdentity, edited: Bool) throws {
+        guard source.kind == .photoLibraryAsset else { return }
+        try journal.recordUpload(edited: edited, for: source)
     }
 
     private func isNeededElsewhere(_ linkIDs: Set<String>, by source: UploadSourceIdentity) -> Bool {
@@ -117,6 +144,28 @@ public struct EditedPhotoReplacement: Sendable {
             guard let sources = identities.sources(withRemoteLinkID: linkID) else { return true }
             return sources.contains { $0.kind != source.kind || $0.identifier != source.identifier }
         }
+    }
+
+    /// True when a row of `source` with an original resource still names one of `linkIDs`: the new compound did not
+    /// upload that resource again, because its rows moved to the new photos. An unedited primary is the original
+    /// photo or video itself.
+    private func leavesOriginalBehind(
+        _ linkIDs: Set<String>, of source: UploadSourceIdentity, primaryIsOriginal: Bool
+    ) -> Bool {
+        linkIDs.contains { linkID in
+            (identities.sources(withRemoteLinkID: linkID) ?? []).contains { row in
+                row.kind == source.kind && row.identifier == source.identifier
+                    && Self.isOriginal(row.resource, carriedByPrimary: primaryIsOriginal)
+            }
+        }
+    }
+
+    /// The resources that Photos keeps unchanged through an edit: the original photo or video, a RAW alternate,
+    /// and the paired video of a Live Photo.
+    static func isOriginal(_ resource: UploadSourceIdentity.Resource, carriedByPrimary: Bool) -> Bool {
+        if resource == .livePairedVideo { return true }
+        let roles = ["alternatePhoto", "pairedVideo"] + (carriedByPrimary ? [] : ["originalPhoto", "originalVideo"])
+        return roles.contains { resource.rawValue.hasPrefix("photoKit.\($0).") }
     }
 
     private func carryOver(from earlier: [PhotoUID], to replacement: PhotoUID, ownVolumeID: String) async throws {
