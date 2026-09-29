@@ -150,8 +150,9 @@
         /// The context-menu actions capture the item's provider the same way a drag session does, so
         /// Share/Copy reuse one load path: staging starts now, the system resolves lazily.
         private func makeDragItem(
-            for item: PhotoItem, stager: DragOutStager?, action: ActionStagingLifetime? = nil
+            for file: OutboundMediaFile, stager: DragOutStager?, action: ActionStagingLifetime? = nil
         ) -> UIDragItem {
+            let item = file.item
             let provider = NSItemProvider()
             let uid = item.uid
             let typeIdentifier = Self.typeIdentifier(for: item)
@@ -198,11 +199,12 @@
                 return progress
             }
             let dragItem = UIDragItem(itemProvider: provider)
-            dragItem.localObject = item
+            // The motion video of a Live Photo lifts with the still's thumbnail.
+            dragItem.localObject = file.picked
             // Per-item image preview, matching Apple Photos: the actual thumbnail bitmap with the
             // grid's current content mode and tile corner radius. Fallback is the system
             // default preview (no provider set), never nil-provider hiding.
-            if let preview = makePreviewView(for: item) {
+            if let preview = makePreviewView(for: file.picked) {
                 dragItem.previewProvider = { UIDragPreview(view: preview) }
             }
             return dragItem
@@ -275,13 +277,15 @@
                 !host.swipeSelection.ownsLongPress(on: pressed)
             else { return [] }
             let items = liftItems(around: pressed)
-            beginStagingIfNeeded(for: items)
+            // A Live Photo leaves as its still and its motion video.
+            let files = OutboundMedia.files(for: items)
+            beginStagingIfNeeded(for: files.map(\.item))
             sessionItemUIDs = Set(items.map(\.uid))
             Self.logger.notice(
                 "Drag began: \(items.count, privacy: .public) item(s), nodes=\(items.map(\.uid.nodeID), privacy: .public)"
             )
             hapticFeedback.impactOccurred()
-            return items.map { makeDragItem(for: $0, stager: stager) }
+            return files.map { makeDragItem(for: $0, stager: stager) }
         }
 
         public func dragInteraction(_ interaction: UIDragInteraction, sessionWillBegin session: UIDragSession) {
@@ -311,13 +315,14 @@
             // Only add photos the session does not already carry, and never remove what's lifted.
             let newItems = liftItems(around: pressed).filter { !sessionItemUIDs.contains($0.uid) }
             guard !newItems.isEmpty else { return [] }
-            extendStaging(with: newItems)
+            let newFiles = OutboundMedia.files(for: newItems)
+            extendStaging(with: newFiles.map(\.item))
             sessionItemUIDs.formUnion(newItems.map(\.uid))
             Self.logger.notice(
                 "Drag added: \(newItems.count, privacy: .public) item(s), now \(self.sessionItemUIDs.count, privacy: .public) total"
             )
             hapticFeedback.impactOccurred()
-            return newItems.map { makeDragItem(for: $0, stager: stager) }
+            return newFiles.map { makeDragItem(for: $0, stager: stager) }
         }
 
         public func dragInteraction(
@@ -499,7 +504,8 @@
             let stager = DragOutStager(
                 fileProvider: provider, stagingDirectory: Self.makeSessionStagingDirectory())
             let action = ActionStagingLifetime(stager: stager)
-            let dragItems = items.map { makeDragItem(for: $0, stager: stager, action: action) }
+            let files = OutboundMedia.files(for: items)
+            let dragItems = files.map { makeDragItem(for: $0, stager: stager, action: action) }
             let configuration = UIActivityItemsConfiguration(itemProviders: dragItems.map(\.itemProvider))
             let activityVC = UIActivityViewController(activityItemsConfiguration: configuration)
             if let popover = activityVC.popoverPresentationController {
@@ -511,7 +517,7 @@
             activityVC.completionWithItemsHandler = { _, _, _, _ in
                 action.finishAfterDeliveryGrace()
             }
-            beginActionStaging(action: action, items: items)
+            beginActionStaging(action: action, items: files.map(\.item))
             presenter.present(activityVC, animated: true)
         }
 
@@ -520,9 +526,10 @@
             let stager = DragOutStager(
                 fileProvider: provider, stagingDirectory: Self.makeSessionStagingDirectory())
             let action = ActionStagingLifetime(stager: stager)
-            let dragItems = items.map { makeDragItem(for: $0, stager: stager, action: action) }
+            let files = OutboundMedia.files(for: items)
+            let dragItems = files.map { makeDragItem(for: $0, stager: stager, action: action) }
             // The providers capture this copy's stager; opening Share must not retire it.
-            beginActionStaging(action: action, items: items)
+            beginActionStaging(action: action, items: files.map(\.item))
             pasteboard.itemProviders = dragItems.map(\.itemProvider)
         }
     }

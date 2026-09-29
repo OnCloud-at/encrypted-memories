@@ -73,7 +73,9 @@ final class MobileGridSelectionController {
         guard !items.isEmpty, !isBusy else { return }
         isExporting = true
         exportTask = Task { [weak self] in
-            let result = await MobileMediaExporter.exportOriginals(items, backend: backend)
+            // A Live Photo leaves as its still and its motion video.
+            let files = OutboundMedia.files(for: items).map(\.item)
+            let result = await MobileMediaExporter.exportOriginals(files, backend: backend)
             guard let self else {
                 MobileMediaExporter.cleanup(result.urls)
                 return
@@ -375,6 +377,7 @@ enum MobileMediaExporter {
         // Two selected photos can share an original Proton name. Reserve a unique path before writing
         // so concurrent exports cannot overwrite each other.
         let names = ExportNames()
+        let removeLocationWhenSharing = PrivacyExportPolicy.isEnabled()
 
         let maxConcurrent = 2
         var exported: [URL] = []
@@ -395,7 +398,11 @@ enum MobileMediaExporter {
                 }
                 let item = items[index]
                 index += 1
-                group.addTask { await export(item, backend: backend, names: names, into: directory) }
+                group.addTask {
+                    await export(
+                        item, backend: backend, names: names, into: directory,
+                        removeLocationWhenSharing: removeLocationWhenSharing)
+                }
             }
             for _ in 0..<min(maxConcurrent, items.count) { addNext() }
             for await outcome in group {
@@ -430,7 +437,8 @@ enum MobileMediaExporter {
         _ item: PhotoItem,
         backend: any OriginalFileProvider & PhotoMetadataProvider,
         names: ExportNames,
-        into directory: URL
+        into directory: URL,
+        removeLocationWhenSharing: Bool
     ) async -> ItemExport {
         let staging = directory.appendingPathComponent(".\(UUID().uuidString).download")
         defer { try? FileManager.default.removeItem(at: staging) }
@@ -445,8 +453,14 @@ enum MobileMediaExporter {
             let desired = try OriginalExportWriter.exportFilename(
                 forDownloadedOriginal: staging, item: item, metadata: meta, fallbackBase: fallbackBase(for: item)
             )
-            let url = directory.appendingPathComponent(await names.unique(desired))
+            // A location-free copy of a RAW photo is a JPEG; reserve that name so it never replaces another file.
+            let name =
+                removeLocationWhenSharing ? LocationSanitizedCopy.outputFilename(forOriginalName: desired) : desired
+            let url = directory.appendingPathComponent(await names.unique(name))
             try Task.checkCancellation()
+            if removeLocationWhenSharing {
+                return .exported(try await LocationSanitizedCopy.write(from: staging, to: url))
+            }
             try FileManager.default.moveItem(at: staging, to: url)
             return .exported(url)
         } catch {
