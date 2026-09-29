@@ -317,6 +317,12 @@ struct MainView: View {
             .onReceive(NotificationCenter.default.publisher(for: .encryptedMemoriesToggleSidebar)) { _ in
                 toggleSidebar()
             }
+            .onAppear {
+                // The menu command shows ⌥⌘S; the key itself must bypass AppKit's hidden sidebar item.
+                SidebarToggleShortcut.install {
+                    NotificationCenter.default.post(name: .encryptedMemoriesToggleSidebar, object: nil)
+                }
+            }
             .onChange(of: networkMonitor.didRecentlyRestoreConnection) { _, restored in
                 if restored {
                     retryAfterConnectivityRestored()
