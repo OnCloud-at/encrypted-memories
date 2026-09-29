@@ -59,6 +59,15 @@ public struct PhotoLibraryResourceResolver: BackupResourceResolving {
             throw UploadError.sourceNotReady(
                 entry.originalFilename, until: created.addingTimeInterval(Self.processingWaitWindow))
         }
+        if let until = PhotoBackupAssetPlanner.notReadyUntil(for: info, now: Date()) {
+            // Edit state only, for checking edits on a device; no names or identifiers.
+            let roles = info.resources.map(\.role.rawValue).sorted().joined(separator: ",")
+            let editAge = info.adjustmentTimestamp.map { Int(Date().timeIntervalSince($0)) } ?? -1
+            Self.logger.notice(
+                "[Backup] edit not ready adjusted=\(info.hasAdjustments, privacy: .public) editAgeS=\(editAge, privacy: .public) roles=\(roles, privacy: .public)"
+            )
+            throw UploadError.sourceNotReady(entry.originalFilename, until: until)
+        }
         guard let plan = PhotoBackupAssetPlanner.exportPlan(for: info),
             let candidate = PhotoBackupAssetPlanner.candidate(for: info),
             let primaryResource = PhotoKitAssetMapper.resource(for: plan.primary.role, of: asset)

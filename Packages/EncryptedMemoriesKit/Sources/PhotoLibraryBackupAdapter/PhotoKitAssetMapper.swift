@@ -85,7 +85,9 @@ enum PhotoKitAssetMapper {
             isLivePhoto: asset.mediaSubtypes.contains(.photoLive),
             isVideo: asset.mediaType == .video,
             resources: resources,
-            cloudIdentifier: cloudIdentifier
+            cloudIdentifier: cloudIdentifier,
+            hasAdjustments: asset.hasAdjustments,
+            adjustmentTimestamp: asset.adjustmentTimestamp
         )
     }
 

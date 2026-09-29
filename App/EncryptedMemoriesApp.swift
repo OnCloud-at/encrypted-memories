@@ -47,6 +47,7 @@ struct EncryptedMemoriesApp: App {
             .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
                 model?.smartSearch?.noteConditionsChanged()
                 model?.refreshLibrarySources()
+                model?.photoBackupController?.applicationDidBecomeActive()
             }
         }
         .defaultSize(width: 1080, height: 720)
