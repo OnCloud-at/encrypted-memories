@@ -9,18 +9,18 @@ final class FavoriteStateTests: XCTestCase {
 
     private func loaded(_ favorites: Set<PhotoUID>) -> FavoriteState {
         var state = FavoriteState()
-        state.beginLoad()
-        state.finishLoad(favorites)
+        let read = state.beginLoad()
+        state.finishLoad(favorites, for: read)
         return state
     }
 
     func testAWriteDuringARunningReadWinsOverTheDelayedResponse() throws {
         var state = loaded([])
-        state.beginLoad()
+        let read = state.beginLoad()
         let request = try XCTUnwrap(state.beginWrite(selection: [a], target: true))
         state.finishWrite(request, failed: [])
 
-        state.finishLoad([])
+        state.finishLoad([], for: read)
 
         XCTAssertEqual(state.favorites, [a], "the response predates the write")
     }
@@ -28,8 +28,8 @@ final class FavoriteStateTests: XCTestCase {
     func testAWriteBeforeTheFirstReadWinsOverThatRead() throws {
         var state = FavoriteState()
         let request = try XCTUnwrap(state.beginWrite(selection: [a], target: true))
-        state.beginLoad()
-        state.finishLoad([b])
+        let read = state.beginLoad()
+        state.finishLoad([b], for: read)
 
         XCTAssertEqual(state.favorites, [a, b])
         state.finishWrite(request, failed: [])
@@ -58,20 +58,20 @@ final class FavoriteStateTests: XCTestCase {
 
     func testAFailedFirstReadMakesFavoritesUnavailable() {
         var state = FavoriteState()
-        state.beginLoad()
+        let read = state.beginLoad()
         XCTAssertEqual(state.availability, .loading)
 
-        state.finishLoad(nil)
+        state.finishLoad(nil, for: read)
 
         XCTAssertEqual(state.availability, .unavailable)
     }
 
     func testAFailedReloadKeepsKnownFavoritesAvailable() {
         var state = loaded([a])
-        state.beginLoad()
+        let read = state.beginLoad()
         XCTAssertEqual(state.availability, .available)
 
-        state.finishLoad(nil)
+        state.finishLoad(nil, for: read)
 
         XCTAssertEqual(state.availability, .available)
         XCTAssertEqual(state.favorites, [a])
@@ -88,7 +88,106 @@ final class FavoriteStateTests: XCTestCase {
         XCTAssertEqual(retry.availability, .loading)
 
         state.reset(keepingFavorites: false)
-        XCTAssertEqual(state, FavoriteState())
+        XCTAssertTrue(state.favorites.isEmpty)
+        XCTAssertTrue(state.inFlight.isEmpty)
+        XCTAssertEqual(state.availability, .loading)
+    }
+
+    func testAReadStartedBeforeAResetChangesNothing() {
+        var state = loaded([a])
+        let staleRead = state.beginLoad()
+        state.reset(keepingFavorites: true)
+        let read = state.beginLoad()
+
+        state.finishLoad([b], for: staleRead)
+        XCTAssertEqual(state.favorites, [a])
+        XCTAssertEqual(state.availability, .loading)
+
+        state.finishLoad([c], for: read)
+        XCTAssertEqual(state.favorites, [c])
+    }
+
+    func testAnOlderResponseThatArrivesLastIsStale() throws {
+        var state = loaded([])
+        let slow = state.beginLoad()
+        let fast = state.beginLoad()
+        state.finishLoad([b], for: fast)
+        let request = try XCTUnwrap(state.beginWrite(selection: [a], target: true))
+        state.finishWrite(request, failed: [])
+
+        state.finishLoad([], for: slow)
+
+        XCTAssertEqual(state.favorites, [a, b], "neither the older response nor its missing heart wins")
+    }
+
+    func testAWriteDuringTwoOverlappingReadsSurvivesBothResponses() throws {
+        var state = loaded([])
+        let first = state.beginLoad()
+        let second = state.beginLoad()
+        state.finishLoad([], for: first)
+        // The second read is still open, so this write predates its response.
+        let request = try XCTUnwrap(state.beginWrite(selection: [a], target: true))
+        state.finishWrite(request, failed: [])
+
+        state.finishLoad([], for: second)
+
+        XCTAssertEqual(state.favorites, [a])
+    }
+
+    func testACancelledReadStopsTrackingWrites() throws {
+        var state = loaded([a])
+        let cancelled = state.beginLoad()
+        state.cancelLoad(cancelled)
+        // Another device removed the heart; this write of another photo must not bring it back.
+        let request = try XCTUnwrap(state.beginWrite(selection: [b], target: true))
+        state.finishWrite(request, failed: [])
+
+        let read = state.beginLoad()
+        state.finishLoad([b], for: read)
+
+        XCTAssertEqual(state.favorites, [b])
+        XCTAssertEqual(state.availability, .available)
+    }
+
+    func testAWriteThatFailsDuringAReadLetsTheServerStateWin() throws {
+        var state = loaded([a])
+        let read = state.beginLoad()
+        let request = try XCTUnwrap(state.beginWrite(selection: [a], target: false))
+        XCTAssertTrue(state.favorites.isEmpty)
+
+        state.finishWrite(request, failed: [a])
+        state.finishLoad([a], for: read)
+
+        XCTAssertEqual(state.favorites, [a])
+    }
+
+    func testAReadDuringAWriteKeepsTheOptimisticState() throws {
+        var state = loaded([a])
+        let request = try XCTUnwrap(state.beginWrite(selection: [a], target: false))
+        let read = state.beginLoad()
+
+        state.finishLoad([a], for: read)
+        XCTAssertTrue(state.favorites.isEmpty, "the unfavorite in flight wins over the older server state")
+
+        state.finishWrite(request, failed: [])
+        XCTAssertTrue(state.favorites.isEmpty)
+    }
+
+    func testAFailedUnfavoriteRestoresTheHeart() throws {
+        var state = loaded([a, b])
+        let request = try XCTUnwrap(state.beginWrite(selection: [a, b], target: false))
+
+        state.finishWrite(request, failed: [b])
+
+        XCTAssertEqual(state.favorites, [b])
+    }
+
+    func testTrashedPhotosLoseTheirHeartsWhenTheReadFails() {
+        var state = loaded([a, b])
+
+        state.removeTrashed([a])
+
+        XCTAssertEqual(state.favorites, [b])
     }
 
     func testPerformReportsThePartialFailureOfTheBackend() async throws {

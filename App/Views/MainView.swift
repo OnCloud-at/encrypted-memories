@@ -1360,11 +1360,7 @@ struct MainView: View {
         let loadGeneration = albumLoadGeneration
         async let owned: Void = albumActions.refresh()
         async let shared: Void = albumActions.refreshSharedAlbums()
-        favoriteState.beginLoad()
-        async let fetchedFavorites = try? backend.favoriteUIDs()
-        let newFavorites = await fetchedFavorites
-        guard !Task.isCancelled, loadGeneration == albumLoadGeneration else { return }
-        favoriteState.finishLoad(newFavorites)
+        await reloadFavorites()
         let (_, _) = await (owned, shared)
         guard !Task.isCancelled, loadGeneration == albumLoadGeneration else { return }
         if albumActions.loadErrorMessage == nil {
@@ -1523,10 +1519,17 @@ struct MainView: View {
         }
     }
 
-    /// Reads the server favorites again after a trash or restore changed which photos can carry them.
-    private func reloadFavorites() async {
-        favoriteState.beginLoad()
-        favoriteState.finishLoad(try? await backend.favoriteUIDs())
+    /// Reads the server favorites, also after a trash or restore changed which photos can carry them. When the
+    /// read fails, the `trashed` photos still lose their hearts.
+    private func reloadFavorites(trashed: Set<PhotoUID> = []) async {
+        let read = favoriteState.beginLoad()
+        let loaded = try? await backend.favoriteUIDs()
+        guard !Task.isCancelled else {
+            favoriteState.cancelLoad(read)
+            return
+        }
+        favoriteState.finishLoad(loaded, for: read)
+        if loaded == nil { favoriteState.removeTrashed(trashed) }
     }
 
     /// Indicates whether every selected photo is a favorite.
@@ -1627,7 +1630,7 @@ struct MainView: View {
                     metadata: backend,
                     recrawlRestoredItems: false
                 )
-                await reloadFavorites()
+                await reloadFavorites(trashed: Set(uids))
                 selectionMode = false
                 selectedUIDs = []
                 if closeViewer { closePhoto() }

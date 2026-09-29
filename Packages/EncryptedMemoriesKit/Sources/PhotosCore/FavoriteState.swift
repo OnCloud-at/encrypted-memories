@@ -11,6 +11,11 @@ public struct FavoriteState: Sendable, Equatable {
         case unavailable
     }
 
+    /// One server read of the favorites, from `beginLoad` to `finishLoad` or `cancelLoad`.
+    public struct Read: Sendable, Equatable {
+        fileprivate let id: Int
+    }
+
     public private(set) var favorites: Set<PhotoUID> = []
     /// Identities with a write in flight. A new write that overlaps them is refused.
     public private(set) var inFlight: Set<PhotoUID> = []
@@ -18,38 +23,66 @@ public struct FavoriteState: Sendable, Equatable {
     /// Writes that started while a server read ran or no read was known. The next read applies them, so a
     /// delayed response cannot undo a newer optimistic or completed write.
     private var newerTargets: [PhotoUID: Bool] = [:]
-    private var isReading = false
+    private var openReads: Set<Int> = []
+    private var nextRead = 0
+    /// The newest read whose response was applied. An older response that arrives later is stale.
+    private var appliedRead = -1
 
-    private var tracksNewerWrites: Bool { isReading || availability != .available }
+    private var tracksNewerWrites: Bool { !openReads.isEmpty || availability != .available }
 
     public init() {}
 
     /// Forgets the writes in flight and the read state, for a new session or a retry. The shown favorites stay
-    /// when `keepingFavorites` is true, so a retry does not blank the hearts.
+    /// when `keepingFavorites` is true, so a retry does not blank the hearts. A read started before the reset
+    /// changes nothing when it ends.
     public mutating func reset(keepingFavorites: Bool) {
         let shown = favorites
+        let next = nextRead
         self = FavoriteState()
+        nextRead = next
         if keepingFavorites { favorites = shown }
     }
 
     /// Starts a server read. The writes in flight win over its result. Known favorites stay available meanwhile.
-    public mutating func beginLoad() {
+    public mutating func beginLoad() -> Read {
         for uid in inFlight { newerTargets[uid] = favorites.contains(uid) }
-        isReading = true
+        let read = Read(id: nextRead)
+        nextRead += 1
+        openReads.insert(read.id)
         if availability != .available { availability = .loading }
+        return read
     }
 
     /// Ends a server read. `nil` means that the read failed: the shown favorites stay, and favorites that were
-    /// known before stay available.
-    public mutating func finishLoad(_ loaded: Set<PhotoUID>?) {
+    /// known before stay available. A response older than an applied one changes no favorites.
+    public mutating func finishLoad(_ loaded: Set<PhotoUID>?, for read: Read) {
+        guard openReads.remove(read.id) != nil else { return }
         if let loaded {
-            favorites = FavoriteMutationPolicy.reconciling(authoritative: loaded, newerTargets: newerTargets)
+            if read.id > appliedRead {
+                favorites = FavoriteMutationPolicy.reconciling(authoritative: loaded, newerTargets: newerTargets)
+                appliedRead = read.id
+            }
             availability = .available
         } else if availability != .available {
             availability = .unavailable
         }
-        newerTargets.removeAll(keepingCapacity: false)
-        isReading = false
+        endRead()
+    }
+
+    /// Ends a read whose task was cancelled, without a result.
+    public mutating func cancelLoad(_ read: Read) {
+        guard openReads.remove(read.id) != nil else { return }
+        endRead()
+    }
+
+    /// Removes photos that moved to the trash, for when the server read after the trash fails.
+    public mutating func removeTrashed(_ uids: Set<PhotoUID>) {
+        favorites.subtract(uids)
+    }
+
+    private mutating func endRead() {
+        // A later read that is still open predates the writes of this journal, so they must stay.
+        if openReads.isEmpty { newerTargets.removeAll(keepingCapacity: false) }
     }
 
     /// Plans a write for `selection` and publishes its optimistic state. Nil when the write overlaps one in

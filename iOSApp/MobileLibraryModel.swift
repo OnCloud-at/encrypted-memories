@@ -922,7 +922,7 @@ final class MobileLibraryModel {
             let backend, let session
         else { return }
         let loadGeneration = loadToken
-        favoriteState.beginLoad()
+        let read = favoriteState.beginLoad()
         favoriteLoadTask = Task { [weak self, backend] in
             let loaded = try? await backend.favoriteUIDs()
             guard let self,
@@ -931,7 +931,7 @@ final class MobileLibraryModel {
                 self.session == session
             else { return }
             self.favoriteLoadTask = nil
-            self.favoriteState.finishLoad(loaded)
+            self.favoriteState.finishLoad(loaded, for: read)
         }
     }
 
@@ -1939,7 +1939,10 @@ final class MobileLibraryModel {
             self.thumbnailCache = thumbnailCache
             snapshot = projection.snapshot
             self.sections = projection.sections
+            // The fixture account has no favorites and needs no server read.
             favoriteState.reset(keepingFavorites: false)
+            let read = favoriteState.beginLoad()
+            favoriteState.finishLoad([], for: read)
             timelineRevision &+= 1
             loadState = .contentReady(count: projection.snapshot.items.count)
         }
