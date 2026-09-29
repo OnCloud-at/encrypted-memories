@@ -97,17 +97,20 @@ public final class PendingGridSession {
                     "[PendingGrid] local=\(localUIDs.count, privacy: .public) handovers=\(adoptions.count, privacy: .public) revised=\(revised.count, privacy: .public)"
                 )
             }
-            // The tile keeps its image while the new one loads; the grid swaps textures once it is there. This
-            // runs beside the authorization chain, so a slow iCloud load never delays new tiles.
+            self.gridLocalUIDs = localUIDs
+            self.publishFeedAuthorization(adoptions: adoptions)
+            // The tile keeps its image while the new one loads; the grid swaps textures once it is there. The
+            // load waits for the authorization above, as the feed loads only authorized photos, such as a tile
+            // that shows again. It runs beside the authorization chain, so a slow iCloud load never delays new tiles.
             if !revised.isEmpty, let feed = self.feed {
                 let presenter = self.presenter
+                let authorization = self.feedUpdate
                 Task {
+                    await authorization?.value
                     let refreshed = await feed.refreshLocal(revised)
                     presenter.noteContentRefreshed(refreshed)
                 }
             }
-            self.gridLocalUIDs = localUIDs
-            self.publishFeedAuthorization(adoptions: adoptions)
         }
     }
 
