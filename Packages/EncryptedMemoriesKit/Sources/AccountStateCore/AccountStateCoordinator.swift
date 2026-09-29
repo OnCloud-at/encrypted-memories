@@ -120,6 +120,7 @@ public actor AccountStateCoordinator {
     public func refresh() async -> AccountStateStatus {
         await acquire()
         defer { release() }
+        guard !Task.isCancelled else { return .unavailable(lastKnown: nil) }
         return await synchronize(change: nil)
     }
 
@@ -131,6 +132,7 @@ public actor AccountStateCoordinator {
         guard configuration.criticalWritesEnabled else { throw AccountStateWritesUnsupportedError() }
         await acquire()
         defer { release() }
+        guard !Task.isCancelled else { return .unavailable(lastKnown: nil) }
         return try await synchronizeThrowing(change: change)
     }
 
@@ -140,6 +142,7 @@ public actor AccountStateCoordinator {
         guard configuration.criticalWritesEnabled else { throw AccountStateWritesUnsupportedError() }
         await acquire()
         defer { release() }
+        guard !Task.isCancelled else { return .unavailable(lastKnown: nil) }
         let record: AccountStateLocalRecord?
         switch await loadLocal() {
         case .record(let loaded): record = loaded
@@ -152,14 +155,13 @@ public actor AccountStateCoordinator {
             return await synchronize(change: nil)
         case .absent:
             guard record?.published != true else { return .closed(.missing) }
-            let document: AccountStateDocument
-            if let record {
-                guard let decoded = decodeLocal(record) else { return .closed(.localCopyUnavailable) }
-                document = decoded
-            } else {
-                document = AccountStateDocument()
-            }
-            return await create(document, basedOn: record?.lastSealed)
+            guard let record else { return await create(AccountStateDocument(), basedOn: nil) }
+            // A local copy can stem from an earlier create whose settlement was lost before the state vanished, so
+            // it cannot prove a true first setup. It is recreated like an owner reset, with sharing off.
+            guard var document = decodeLocal(record) else { return .closed(.localCopyUnavailable) }
+            if document.movedTo != nil { return .moved(document) }
+            try turnSharingOff(in: &document)
+            return await create(document, basedOn: record.lastSealed)
         }
     }
 
@@ -169,6 +171,7 @@ public actor AccountStateCoordinator {
         guard configuration.criticalWritesEnabled else { throw AccountStateWritesUnsupportedError() }
         await acquire()
         defer { release() }
+        guard !Task.isCancelled else { return .unavailable(lastKnown: nil) }
         let record: AccountStateLocalRecord?
         switch await loadLocal() {
         case .record(let loaded): record = loaded
@@ -183,9 +186,7 @@ public actor AccountStateCoordinator {
             guard let record, record.published else { return .closed(.notInitialized) }
             guard var document = decodeLocal(record) else { return .closed(.localCopyUnavailable) }
             if document.movedTo != nil { return .moved(document) }
-            if document.value(for: .sharedLibraryEnabled) != false {
-                try document.setValue(false, for: .sharedLibraryEnabled, at: now(), deviceID: configuration.deviceID)
-            }
+            try turnSharingOff(in: &document)
             return await create(document, basedOn: record.lastSealed)
         }
     }
@@ -218,17 +219,15 @@ public actor AccountStateCoordinator {
 
         guard let merged = merge(decodeLocal(record), snapshot.document) else { return .closed(.damaged) }
         var next = merged
-        if let change, merged.movedTo == nil {
-            try change(&next)
-            guard try next.encoded().count <= configuration.maximumBytes else { return .closed(.oversized) }
-        }
+        if let change, merged.movedTo == nil { try change(&next) }
+        guard let bytes = try? next.encoded() else { return .closed(.damaged) }
+        guard bytes.count <= configuration.maximumBytes else { return .closed(.oversized) }
         guard isCurrent() else { return .closed(.fenced) }
         let unpublished = next != snapshot.document
         do {
             try await local.save(
                 AccountStateLocalRecord(
-                    binding: binding,
-                    document: try next.encoded(), lastSealed: snapshot.sealed, published: true,
+                    binding: binding, document: bytes, lastSealed: snapshot.sealed, published: true,
                     hasUnpublishedChanges: unpublished))
         } catch {
             return .closed(.localCopyUnavailable)
@@ -242,7 +241,6 @@ public actor AccountStateCoordinator {
     private func create(_ document: AccountStateDocument, basedOn previous: Data?) async -> AccountStateStatus {
         // A moved state is never written at the old location, not even to recreate it.
         if document.movedTo != nil { return .moved(document) }
-        guard isCurrent() else { return .closed(.fenced) }
         guard let bytes = try? document.encoded() else { return .closed(.damaged) }
         do {
             try await local.save(
@@ -312,7 +310,9 @@ public actor AccountStateCoordinator {
                 // A create that did not arrive is retried; a file that vanished after it existed stays closed.
                 guard base == nil else { return .closed(.missing) }
             case .present(let snapshot):
-                guard let merged = merge(document, snapshot.document) else { return .closed(.damaged) }
+                guard let merged = merge(document, snapshot.document), let mergedBytes = try? merged.encoded() else {
+                    return .closed(.damaged)
+                }
                 document = merged
                 base = snapshot
                 basedOn = snapshot.sealed
@@ -320,8 +320,7 @@ public actor AccountStateCoordinator {
                 guard isCurrent() else { return .closed(.fenced) }
                 try? await local.save(
                     AccountStateLocalRecord(
-                        binding: binding,
-                        document: (try? merged.encoded()) ?? Data(), lastSealed: snapshot.sealed, published: true,
+                        binding: binding, document: mergedBytes, lastSealed: snapshot.sealed, published: true,
                         hasUnpublishedChanges: !settled))
                 if merged.movedTo != nil { return .moved(merged) }
                 if settled { return .ready(merged) }
@@ -349,7 +348,10 @@ public actor AccountStateCoordinator {
             guard let result else { return .absent }
 
             if result.item.isTrashed {
-                guard !restored else { return .status(.unavailable(lastKnown: nil)) }
+                // A restore changes the server, so it waits until critical writes are allowed.
+                guard configuration.criticalWritesEnabled, !restored, !Task.isCancelled else {
+                    return .status(.unavailable(lastKnown: nil))
+                }
                 do {
                     _ = try await store.restore(item: result.item)
                 } catch DeviceRootOperationError.unknownOutcome, DeviceRootOperationError.conflict {
@@ -399,6 +401,11 @@ public actor AccountStateCoordinator {
     }
 
     // MARK: - Helpers
+
+    private func turnSharingOff(in document: inout AccountStateDocument) throws {
+        guard document.value(for: .sharedLibraryEnabled) != false else { return }
+        try document.setValue(false, for: .sharedLibraryEnabled, at: now(), deviceID: configuration.deviceID)
+    }
 
     private enum LocalLoad {
         case record(AccountStateLocalRecord?)

@@ -36,7 +36,8 @@ public enum AccountStateOpenResult: Equatable, Sendable {
 public protocol AccountStateSealing: Sendable {
     func open(_ sealed: Data, binding: AccountStateBinding) async throws -> AccountStateOpenResult
     /// Seals a document. With `basedOn`, the new file reuses the key of that sealed file, so every device keeps
-    /// reading data encrypted under it. Without it, the sealer creates the first key.
+    /// reading data encrypted under it; the sealer throws when that file does not open for `binding`. Without it,
+    /// the sealer creates the first key.
     func seal(_ document: Data, binding: AccountStateBinding, basedOn previous: Data?) async throws -> Data
 }
 

@@ -51,6 +51,12 @@ struct AccountStateCoordinatorTests {
         #expect(harness.store.writeAttempts == 0)
         #expect(await coordinator.refresh().isReady)
         #expect(harness.store.writeAttempts == 0)
+
+        // A restore changes the server too, so a trashed state stays trashed.
+        harness.store.trash()
+        #expect(await coordinator.refresh().isUnavailable)
+        #expect(harness.store.restores == 0)
+        #expect(harness.store.isTrashed)
     }
 
     @Test func refreshWithoutWritePermissionKeepsLocalChangesPending() async throws {
@@ -185,5 +191,38 @@ struct AccountStateCoordinatorTests {
 
         #expect(try await harness.coordinator().initialize() == .moved(moved))
         #expect(harness.store.writeAttempts == 0)
+    }
+
+    @Test func firstSetupFromAnEarlierLocalCopyTurnsSharingOff() async throws {
+        // An earlier create arrived, its settlement was lost, and the state vanished before a refresh healed it.
+        let harness = Harness()
+        var local = try documentHiding([photoA])
+        try local.setValue(true, for: .sharedLibraryEnabled, at: stateDate(3_000), deviceID: "mac", nonce: 1)
+        harness.local.set(
+            AccountStateLocalRecord(
+                binding: testBinding, document: try local.encoded(), lastSealed: nil, published: false,
+                hasUnpublishedChanges: true))
+
+        #expect(try await harness.coordinator().initialize().isReady)
+        let remote = try #require(harness.store.remoteDocument)
+        #expect(remote.hiddenPhotos == [photoA])
+        #expect(remote.value(for: .sharedLibraryEnabled) == false)
+    }
+
+    @Test func aCancelledCallerCausesNoSideEffect() async throws {
+        let harness = try Harness.published()
+        harness.store.trash()
+        let coordinator = harness.coordinator()
+
+        let status = try await Task {
+            withUnsafeCurrentTask { $0?.cancel() }
+            return try await coordinator.update(hiding(photoB))
+        }.value
+
+        #expect(status.isUnavailable)
+        #expect(harness.store.reads == 0)
+        #expect(harness.store.restores == 0)
+        #expect(harness.store.writeAttempts == 0)
+        #expect(harness.local.saves == 0)
     }
 }
