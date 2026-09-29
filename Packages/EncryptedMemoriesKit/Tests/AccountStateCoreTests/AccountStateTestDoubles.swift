@@ -237,6 +237,10 @@ final class FakeLocalStore: AccountStateLocalStore, @unchecked Sendable {
     private var stored: AccountStateLocalRecord?
     var failLoad = false
     var failSave = false
+    /// Saves fail once this many succeeded.
+    var failSavesAfter: Int?
+    /// Runs before each save, for example a fence change.
+    var onSave: (@Sendable () -> Void)?
     private(set) var saves = 0
 
     init(_ record: AccountStateLocalRecord? = nil) { stored = record }
@@ -253,7 +257,9 @@ final class FakeLocalStore: AccountStateLocalStore, @unchecked Sendable {
     }
 
     func save(_ record: AccountStateLocalRecord) async throws {
+        onSave?()
         if failSave { throw TestFailure() }
+        if let failSavesAfter, lock.withLock({ saves >= failSavesAfter }) { throw TestFailure() }
         lock.withLock {
             saves += 1
             stored = record

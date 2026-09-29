@@ -155,13 +155,13 @@ public actor AccountStateCoordinator {
             return await synchronize(change: nil)
         case .absent:
             guard record?.published != true else { return .closed(.missing) }
-            guard let record else { return await create(AccountStateDocument(), basedOn: nil) }
+            guard let record else { return await create(AccountStateDocument(), basedOn: nil, published: false) }
             // A local copy can stem from an earlier create whose settlement was lost before the state vanished, so
             // it cannot prove a true first setup. It is recreated like an owner reset, with sharing off.
             guard var document = decodeLocal(record) else { return .closed(.localCopyUnavailable) }
             if document.movedTo != nil { return .moved(document) }
             try turnSharingOff(in: &document)
-            return await create(document, basedOn: record.lastSealed)
+            return await create(document, basedOn: record.lastSealed, published: false)
         }
     }
 
@@ -187,7 +187,7 @@ public actor AccountStateCoordinator {
             guard var document = decodeLocal(record) else { return .closed(.localCopyUnavailable) }
             if document.movedTo != nil { return .moved(document) }
             try turnSharingOff(in: &document)
-            return await create(document, basedOn: record.lastSealed)
+            return await create(document, basedOn: record.lastSealed, published: true)
         }
     }
 
@@ -232,13 +232,17 @@ public actor AccountStateCoordinator {
         } catch {
             return .closed(.localCopyUnavailable)
         }
+        guard isCurrent() else { return .closed(.fenced) }
         if next.movedTo != nil { return .moved(next) }
         guard unpublished, configuration.criticalWritesEnabled else { return .ready(next) }
         return await publish(next, base: snapshot, basedOn: snapshot.sealed)
     }
 
     /// Creates the first file, or recreates a lost one, with create-if-absent.
-    private func create(_ document: AccountStateDocument, basedOn previous: Data?) async -> AccountStateStatus {
+    /// `published` keeps whether the state existed before, so a reset that fails before it is sent can run again.
+    private func create(
+        _ document: AccountStateDocument, basedOn previous: Data?, published: Bool
+    ) async -> AccountStateStatus {
         // A moved state is never written at the old location, not even to recreate it.
         if document.movedTo != nil { return .moved(document) }
         guard let bytes = try? document.encoded() else { return .closed(.damaged) }
@@ -246,7 +250,7 @@ public actor AccountStateCoordinator {
             try await local.save(
                 AccountStateLocalRecord(
                     binding: binding,
-                    document: bytes, lastSealed: previous, published: false, hasUnpublishedChanges: true))
+                    document: bytes, lastSealed: previous, published: published, hasUnpublishedChanges: true))
         } catch {
             return .closed(.localCopyUnavailable)
         }
@@ -272,6 +276,7 @@ public actor AccountStateCoordinator {
             }
             guard sealed.count <= configuration.maximumBytes else { return .closed(.oversized) }
             guard isCurrent() else { return .closed(.fenced) }
+            guard !Task.isCancelled else { return .unavailable(lastKnown: document) }
 
             do {
                 _ = try await store.compareAndSwap(
@@ -282,6 +287,7 @@ public actor AccountStateCoordinator {
                     AccountStateLocalRecord(
                         binding: binding,
                         document: bytes, lastSealed: sealed, published: true, hasUnpublishedChanges: false))
+                guard isCurrent() else { return .closed(.fenced) }
                 return .ready(document)
             } catch DeviceRootOperationError.conflict, DeviceRootOperationError.unknownOutcome {
                 // Resolve against the current revision below.
@@ -318,10 +324,16 @@ public actor AccountStateCoordinator {
                 basedOn = snapshot.sealed
                 let settled = merged == snapshot.document
                 guard isCurrent() else { return .closed(.fenced) }
-                try? await local.save(
-                    AccountStateLocalRecord(
-                        binding: binding, document: mergedBytes, lastSealed: snapshot.sealed, published: true,
-                        hasUnpublishedChanges: !settled))
+                // The merge holds another writer's changes; a retry without a durable copy could lose them.
+                do {
+                    try await local.save(
+                        AccountStateLocalRecord(
+                            binding: binding, document: mergedBytes, lastSealed: snapshot.sealed, published: true,
+                            hasUnpublishedChanges: !settled))
+                } catch {
+                    return .closed(.localCopyUnavailable)
+                }
+                guard isCurrent() else { return .closed(.fenced) }
                 if merged.movedTo != nil { return .moved(merged) }
                 if settled { return .ready(merged) }
             }
@@ -346,48 +358,52 @@ public actor AccountStateCoordinator {
             }
             guard isCurrent() else { return .status(.closed(.fenced)) }
             guard let result else { return .absent }
-
-            if result.item.isTrashed {
-                // A restore changes the server, so it waits until critical writes are allowed.
-                guard configuration.criticalWritesEnabled, !restored, !Task.isCancelled else {
-                    return .status(.unavailable(lastKnown: nil))
-                }
-                do {
-                    _ = try await store.restore(item: result.item)
-                } catch DeviceRootOperationError.unknownOutcome, DeviceRootOperationError.conflict {
-                    // The next read shows whether the restore arrived.
-                } catch {
-                    return .status(Self.status(forReadError: error))
-                }
-                restored = true
-                continue
-            }
-
-            guard result.item.activeRevisionUID != nil else { return .status(.closed(.incomplete)) }
-            guard result.verification == .verified else { return .status(.closed(.verificationFailed)) }
-            guard result.bytes.count <= configuration.maximumBytes else { return .status(.closed(.oversized)) }
-
-            let opened: AccountStateOpenResult
-            do {
-                opened = try await sealer.open(result.bytes, binding: binding)
-            } catch {
+            // The file is checked before a restore, so a foreign, damaged, newer, or moved state never changes the
+            // server.
+            let checked = await check(result)
+            guard result.item.isTrashed, case .present(let snapshot) = checked, snapshot.document.movedTo == nil
+            else { return checked }
+            // A restore changes the server, so it waits until critical writes are allowed.
+            guard configuration.criticalWritesEnabled, !restored, !Task.isCancelled else {
                 return .status(.unavailable(lastKnown: nil))
             }
-            guard isCurrent() else { return .status(.closed(.fenced)) }
-            switch opened {
-            case .newerFormat(let format):
-                return .status(.readOnly(format: format))
-            case .rejected(let rejection):
-                return .status(.closed(.rejected(rejection)))
-            case .opened(let data):
-                guard data.count <= configuration.maximumBytes else { return .status(.closed(.oversized)) }
-                guard let document = try? AccountStateDocument(data: data) else {
-                    return .status(.closed(.damaged))
-                }
-                guard document.isSupported else { return .status(.readOnly(format: document.format)) }
-                guard !document.isDamaged else { return .status(.closed(.damaged)) }
-                return .present(RemoteSnapshot(item: result.item, sealed: result.bytes, document: document))
+            do {
+                _ = try await store.restore(item: result.item)
+            } catch DeviceRootOperationError.unknownOutcome, DeviceRootOperationError.conflict {
+                // The next read shows whether the restore arrived.
+            } catch {
+                return .status(Self.status(forReadError: error))
             }
+            restored = true
+        }
+    }
+
+    /// Verifies and opens one read of the state file.
+    private func check(_ result: DeviceRootReadResult) async -> RemoteRead {
+        guard result.item.activeRevisionUID != nil else { return .status(.closed(.incomplete)) }
+        guard result.verification == .verified else { return .status(.closed(.verificationFailed)) }
+        guard result.bytes.count <= configuration.maximumBytes else { return .status(.closed(.oversized)) }
+
+        let opened: AccountStateOpenResult
+        do {
+            opened = try await sealer.open(result.bytes, binding: binding)
+        } catch {
+            return .status(.unavailable(lastKnown: nil))
+        }
+        guard isCurrent() else { return .status(.closed(.fenced)) }
+        switch opened {
+        case .newerFormat(let format):
+            return .status(.readOnly(format: format))
+        case .rejected(let rejection):
+            return .status(.closed(.rejected(rejection)))
+        case .opened(let data):
+            guard data.count <= configuration.maximumBytes else { return .status(.closed(.oversized)) }
+            guard let document = try? AccountStateDocument(data: data) else {
+                return .status(.closed(.damaged))
+            }
+            guard document.isSupported else { return .status(.readOnly(format: document.format)) }
+            guard !document.isDamaged else { return .status(.closed(.damaged)) }
+            return .present(RemoteSnapshot(item: result.item, sealed: result.bytes, document: document))
         }
     }
 

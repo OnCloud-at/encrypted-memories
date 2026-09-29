@@ -225,4 +225,57 @@ struct AccountStateCoordinatorTests {
         #expect(harness.store.writeAttempts == 0)
         #expect(harness.local.saves == 0)
     }
+
+    @Test func aConflictRetryStopsWhenItsMergeCannotBeSaved() async throws {
+        let harness = try Harness.published()
+        harness.store.addWriteFaults(.competingWrite(try documentHiding([photoA, photoC])))
+        // The copy before the write succeeds; the copy of the merge with the other writer fails.
+        harness.local.failSavesAfter = 1
+
+        let status = try await harness.coordinator().update(hiding(photoB))
+
+        #expect(status == .closed(.localCopyUnavailable))
+        #expect(harness.store.writeAttempts == 1, "no retry without a durable copy of the merge")
+    }
+
+    @Test func aResetThatFailsBeforeItIsSentCanRunAgain() async throws {
+        let harness = try Harness.published()
+        harness.store.deletePermanently()
+        harness.store.addWriteFaults(.fail(DeviceRootOperationError.unavailable))
+        let coordinator = harness.coordinator()
+
+        #expect(try await coordinator.resetFromLocalCopy().isUnavailable)
+        #expect(harness.local.record?.published == true)
+        #expect(await coordinator.refresh() == .closed(.missing), "the state still counts as lost, not as new")
+        #expect(try await coordinator.resetFromLocalCopy().isReady)
+    }
+
+    @Test func aFenceChangeDuringTheLocalSaveIgnoresTheResult() async throws {
+        let harness = try Harness.published()
+        let fence = harness.fence
+        harness.local.onSave = { fence.isCurrent = false }
+
+        #expect(await harness.coordinator().refresh() == .closed(.fenced))
+    }
+
+    @Test func aCancellationDuringSealingSendsNothing() async throws {
+        let harness = try Harness.published()
+        harness.sealer.onSeal = { withUnsafeCurrentTask { $0?.cancel() } }
+        let coordinator = harness.coordinator()
+
+        let status = try await Task { try await coordinator.update(hiding(photoB)) }.value
+
+        #expect(status.isUnavailable)
+        #expect(harness.store.writeAttempts == 0)
+    }
+
+    @Test func aDamagedStateInTheTrashStaysThere() async throws {
+        let harness = Harness()
+        harness.store.seedRaw(Data("S1|account|incarnation|state|k0|{\"format\":1,\"hidden\":7}".utf8))
+        harness.store.trash()
+
+        #expect(await harness.coordinator().refresh() == .closed(.damaged))
+        #expect(harness.store.restores == 0)
+        #expect(harness.store.isTrashed)
+    }
 }

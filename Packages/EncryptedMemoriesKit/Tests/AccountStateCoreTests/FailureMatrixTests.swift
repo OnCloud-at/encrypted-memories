@@ -354,7 +354,7 @@ struct FailureMatrixTests {
         harness.store.seedRaw(harness.sealer.sealDirect(try documentHiding([photoA])), committed: false)
         harness.store.trash()
         #expect(await harness.coordinator().refresh() == .closed(.incomplete))
-        #expect(harness.store.restores == 1)
+        #expect(harness.store.restores == 0, "an incomplete state stays in the trash")
         #expect(harness.store.writeAttempts == 0)
     }
 
@@ -472,7 +472,7 @@ struct FailureMatrixTests {
         harness.store.seedRaw(Data("S2|account|incarnation|state|k0|opaque".utf8))
         harness.store.trash()
         #expect(await harness.coordinator().refresh() == .readOnly(format: 2))
-        #expect(harness.store.restores == 1)
+        #expect(harness.store.restores == 0, "a state this build cannot read stays in the trash")
         #expect(harness.store.writeAttempts == 0)
     }
 
@@ -496,7 +496,7 @@ struct FailureMatrixTests {
         let harness = try trashedHarness()
         harness.sealer.openOverride = .rejected(.keyUnavailable)
         #expect(await harness.coordinator().refresh() == .closed(.rejected(.keyUnavailable)))
-        #expect(harness.store.restores == 1)
+        #expect(harness.store.restores == 0, "a state that does not open stays in the trash")
         #expect(harness.store.writeAttempts == 0)
     }
 
@@ -713,7 +713,7 @@ struct FailureMatrixTests {
         harness.store.externalWrite(moved)
         harness.store.trash()
         #expect(await harness.coordinator().refresh().document?.movedTo == "new-location")
-        #expect(harness.store.restores == 1)
+        #expect(harness.store.restores == 0, "a moved state is never restored at the old location")
         #expect(harness.store.writeAttempts == 0)
     }
 
@@ -770,7 +770,7 @@ struct FailureMatrixTests {
         harness.store.seedRaw(Data(repeating: 0x53, count: 4_096))
         harness.store.trash()
         #expect(await harness.coordinator(maximumBytes: 1_024).refresh() == .closed(.oversized))
-        #expect(harness.store.restores == 1)
+        #expect(harness.store.restores == 0, "an oversized state stays in the trash")
         #expect(harness.store.writeAttempts == 0)
     }
 
