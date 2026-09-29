@@ -1058,6 +1058,39 @@ public final class TimelineMetadataStore {
         return items
     }
 
+    /// Removes photos that left the library, for example after a move to the trash, before the next full
+    /// enumeration. The stored digest is cleared, so the next save writes even if it lists the same photos
+    /// again, for example after a restore. The validation token stays: the removal only drops rows.
+    @discardableResult
+    public func remove(_ uids: [PhotoUID]) -> Bool {
+        guard !uids.isEmpty else { return true }
+        guard sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK else { return false }
+        let statements = [
+            "DELETE FROM photos WHERE vol=? AND node=?;",
+            "DELETE FROM photo_tags WHERE vol=? AND node=?;",
+            "DELETE FROM burst_members WHERE anchor_vol=? AND anchor_node=?;",
+        ]
+        let ok: Bool = {
+            for sql in statements {
+                var stmt: OpaquePointer?
+                guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return false }
+                defer { sqlite3_finalize(stmt) }
+                for uid in uids {
+                    sqlite3_reset(stmt)
+                    sqlite3_bind_text(stmt, 1, uid.volumeID, -1, transient)
+                    sqlite3_bind_text(stmt, 2, uid.nodeID, -1, transient)
+                    guard sqlite3_step(stmt) == SQLITE_DONE else { return false }
+                }
+            }
+            return deleteMeta(Self.metaDigestKey)
+        }()
+        guard ok, sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK else {
+            sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
+            return false
+        }
+        return true
+    }
+
     // MARK: Digest
 
     /// Deterministic SHA-256 over the canonically ordered rows' persisted fields. Doubles hash by

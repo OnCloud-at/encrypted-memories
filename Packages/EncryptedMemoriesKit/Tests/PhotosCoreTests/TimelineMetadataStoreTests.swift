@@ -384,6 +384,31 @@ final class TimelineMetadataStoreTests: XCTestCase {
         store.close()
     }
 
+    /// A photo moved to the trash must not come back from the stored timeline at the next launch.
+    func testRemovedPhotosLeaveTheStoredTimelineAndReturnWithTheNextListing() throws {
+        let dir = try makeTempDir()
+        let (store, url) = try makeStore(in: dir)
+        let a = makeItem(node: "a", t: 100)
+        let b = makeItem(node: "b", t: 200, tags: [.favorites], burst: ["b", "b2"])
+        let c = makeItem(node: "c", t: 300)
+        XCTAssertTrue(store.save([a, b, c], validationToken: "event-a").succeeded)
+
+        XCTAssertTrue(store.remove([b.uid]))
+        store.close()
+
+        let (relaunched, _) = try makeStore(in: dir)
+        XCTAssertEqual(relaunched.load(), [a, c])
+        XCTAssertTrue(rawRows(url, "SELECT * FROM photo_tags WHERE node='b';").isEmpty)
+        XCTAssertTrue(rawRows(url, "SELECT * FROM burst_members WHERE anchor_node='b';").isEmpty)
+        XCTAssertEqual(relaunched.validationToken(), "event-a")
+
+        // A restore lists the same photos as before the removal; that listing must still be written.
+        let restored = relaunched.save([a, b, c], validationToken: "event-b")
+        XCTAssertFalse(restored.skippedUnchanged)
+        XCTAssertEqual(relaunched.load(), [a, b, c])
+        relaunched.close()
+    }
+
     func testOnlyRowsWithChangedContentAreRewrittenNullSafe() throws {
         let dir = try makeTempDir()
         let (store, _) = try makeStore(in: dir)
