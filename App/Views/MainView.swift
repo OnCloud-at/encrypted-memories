@@ -797,14 +797,12 @@ struct MainView: View {
         }
     }
 
-    /// Native determinate progress paired with a separate cancellation control.
+    /// Determinate export progress paired with a separate cancellation control.
     private var exportProgressIndicator: some View {
         let pct = Int((exportFraction * 100).rounded())
-        return ProgressView(value: max(0.001, min(1, exportFraction)))
-            .progressViewStyle(.circular)
-            .controlSize(.regular)
-            .scaleEffect(0.6)
+        return ExportProgressRing(fraction: exportFraction)
             .help("export.progress_percent \(pct)")
+            .accessibilityElement()
             .accessibilityLabel("export.progress_percent \(pct)")
     }
 
@@ -2112,7 +2110,7 @@ struct MainView: View {
                 .accessibilityLabel("toolbar.info")
 
                 if isExporting {
-                    exportProgressIndicator  // the download icon is replaced by the native progress while exporting
+                    exportProgressIndicator  // the download icon is replaced by the progress ring while exporting
                     exportCancelButton
                 } else {
                     let downloadTitle =
@@ -2560,7 +2558,9 @@ struct MainView: View {
     /// Single entry point for launching an export, so the toolbar ring's menu has one task to cancel.
     private func startExport(_ items: [PhotoItem], zipSuggestedName: String? = nil) {
         exportTask?.cancel()
-        exportTask = Task { await performExport(items, zipSuggestedName: zipSuggestedName) }
+        // A Live Photo leaves as its still and its motion video, so it exports as an archive of both.
+        let files = OutboundMedia.files(for: items).map(\.item)
+        exportTask = Task { await performExport(files, zipSuggestedName: zipSuggestedName) }
     }
 
     /// Cancels the running download (from the toolbar ring's menu). `performExport` discards any partial ZIP.
@@ -2579,7 +2579,11 @@ struct MainView: View {
         if single {
             let item = items[0]
             let meta = try? await backend.metadata(for: item.uid)
-            let name = meta?.filename ?? Self.defaultName(item, ext: Self.defaultExtension(item, metadata: meta))
+            let original = meta?.filename ?? Self.defaultName(item, ext: Self.defaultExtension(item, metadata: meta))
+            // Without location, a RAW photo leaves as a JPEG, so the save panel suggests that name.
+            let name =
+                PrivacyExportPolicy.isEnabled()
+                ? LocationSanitizedCopy.outputFilename(forOriginalName: original) : original
             guard let chosen = chooseSingleDestination(suggestedName: name) else { return }
             dest = chosen
         } else {

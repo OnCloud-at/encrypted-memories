@@ -189,8 +189,10 @@ final class MetalGridDragOutController: NSObject, NSDraggingSource, NSFilePromis
             let pressedHit = coordinator.hitTestDragOut(contentPoint: contentPoint),
             let item = itemForUID?(pressedHit.uid)
         else { return false }
-        let dragged = liftItems?(item) ?? [item]
-        guard !dragged.isEmpty else { return false }
+        // A Live Photo leaves as its still and its motion video.
+        let files = OutboundMedia.files(for: liftItems?(item) ?? [item])
+        guard !files.isEmpty else { return false }
+        let dragged = files.map(\.item)
 
         let stager = DragOutStager(
             fileProvider: fileProvider, stagingDirectory: Self.makeSessionStagingDirectory())
@@ -216,11 +218,14 @@ final class MetalGridDragOutController: NSObject, NSDraggingSource, NSFilePromis
         // still race this and get the fallback name (benign - Finder deduplicates collisions).
         prefetchFilenames(for: dragged)
 
-        let providers = dragged.map { item in
+        let providers = files.map { file in
             let provider = PhotoFilePromiseProvider(
-                fileType: Self.promiseFileType(for: item), delegate: self)
-            provider.photoReference = PhotoDragReference.data(for: item.uid, session: dragSessionID)
-            provider.userInfo = PromisePayload(uid: item.uid, stager: stager)
+                fileType: Self.promiseFileType(for: file.item), delegate: self)
+            // The motion video is no photo of its own; an album drop adds its Live Photo once.
+            if !file.isLivePhotoMotion {
+                provider.photoReference = PhotoDragReference.data(for: file.item.uid, session: dragSessionID)
+            }
+            provider.userInfo = PromisePayload(uid: file.item.uid, stager: stager)
             return provider
         }
         let draggingItems = providers.map { NSDraggingItem(pasteboardWriter: $0) }
@@ -236,7 +241,7 @@ final class MetalGridDragOutController: NSObject, NSDraggingSource, NSFilePromis
         let ghostDisplayMode = coordinator.effectiveDisplayMode
         if let anchorSpacerFrame {
             for (index, draggingItem) in draggingItems.enumerated() {
-                if let cg = coordinator.thumbnailImage(for: dragged[index].uid) {
+                if let cg = coordinator.thumbnailImage(for: files[index].picked.uid) {
                     // Uniform inset on the (always square) slot keeps the slot square, so the
                     // fitted ghost shrinks proportionally - the slight "lift off the grid" gap
                     // stays intact.
@@ -424,7 +429,7 @@ final class PhotoFilePromiseProvider: NSFilePromiseProvider {
     private static let referenceType = PhotoDragPasteboard.referenceType
 
     override func writableTypes(for pasteboard: NSPasteboard) -> [NSPasteboard.PasteboardType] {
-        super.writableTypes(for: pasteboard) + [Self.referenceType]
+        super.writableTypes(for: pasteboard) + (photoReference.isEmpty ? [] : [Self.referenceType])
     }
 
     override func writingOptions(

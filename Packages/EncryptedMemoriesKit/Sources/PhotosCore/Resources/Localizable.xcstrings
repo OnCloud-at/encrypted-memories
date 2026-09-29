@@ -5050,6 +5050,20 @@
         "de": { "stringUnit": { "state": "translated", "value": "Datenschutzerklärung" } }
       }
     },
+    "settings.privacy_remove_location": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Remove location when sharing" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Standort beim Teilen entfernen" } }
+      }
+    },
+    "settings.privacy_remove_location_explanation": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "When on, shared and exported copies have no standard GPS metadata. Originals remain unchanged." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Eingeschaltet enthalten geteilte und exportierte Kopien keine üblichen GPS-Metadaten. Originale bleiben unverändert." } }
+      }
+    },
     "settings.bug_report_privacy": {
       "extractionState": "manual",
       "localizations": {

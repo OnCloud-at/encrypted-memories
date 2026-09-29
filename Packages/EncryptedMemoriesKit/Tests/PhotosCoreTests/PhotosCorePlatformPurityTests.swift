@@ -127,13 +127,14 @@ final class PhotosCorePlatformPurityTests: XCTestCase {
     }
 
     /// Confirms the only frameworks imported by PhotosCore are the cross-platform
-    /// allowlist: Foundation, CoreGraphics, AVFoundation, CryptoKit, Observation, OSLog, SQLite3. A new
+    /// allowlist: Foundation, CoreGraphics, AVFoundation, CryptoKit, ImageIO, Observation, OSLog, SQLite3. A new
     /// import here is a review trigger - the change should be intentional and documented.
     private static let allowedFrameworkImports: Set<String> = [
         "Foundation",
         "CoreGraphics",
         "AVFoundation",
         "CryptoKit",  // timeline save-skip digest (TimelineMetadataStore)
+        "ImageIO",  // location-free copies of outbound photos (LocationSanitizedCopy)
         "Observation",  // shared immutable snapshot publication; no platform UI dependency
         "OSLog",  // cross-platform Apple signposts for package-wide performance diagnostics
         "SQLite3",  // system SQLite C API backing library-v1.sqlite (TimelineMetadataStore)
@@ -163,7 +164,7 @@ final class PhotosCorePlatformPurityTests: XCTestCase {
             PhotosCore imports frameworks outside the cross-platform allowlist:
             \(unexpected.sorted().joined(separator: ", "))
 
-            Allowed: Foundation, CoreGraphics, AVFoundation, CryptoKit, Observation, OSLog, SQLite3. \
+            Allowed: Foundation, CoreGraphics, AVFoundation, CryptoKit, ImageIO, Observation, OSLog, SQLite3. \
             Adding a new import requires updating PhotosCorePlatformPurityTests.allowList \
             AND confirming the framework compiles on macOS 26+, iOS 26+, and iPadOS 26+.
             """
