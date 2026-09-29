@@ -531,6 +531,47 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
         await controller.shutdown()
     }
 
+    func testActivationDoesNotStartAPassWhileBackupIsPaused() async throws {
+        let fixture = try makeControllerFixture(prefix: "photo-backup-activation-paused", enabled: true)
+        defer { fixture.cleanup() }
+        fixture.controller.setAccessStateForTesting(.full)
+        fixture.controller.pauseBackup()
+
+        fixture.controller.applicationDidBecomeActive()
+
+        XCTAssertFalse(fixture.controller.isSyncing)
+        await fixture.controller.shutdown()
+    }
+
+    func testActivationDoesNotStartAPassWhileBackupIsOff() async throws {
+        let fixture = try makeControllerFixture(prefix: "photo-backup-activation-off")
+        defer { fixture.cleanup() }
+        fixture.controller.setAccessStateForTesting(.full)
+
+        fixture.controller.applicationDidBecomeActive()
+
+        XCTAssertFalse(fixture.controller.isSyncing)
+        await fixture.controller.shutdown()
+    }
+
+    func testActivationKeepsTheRunningPass() async throws {
+        let fixture = try makeControllerFixture(prefix: "photo-backup-activation-running", enabled: true)
+        defer { fixture.cleanup() }
+        let writer = NonCooperativeWriterLatch()
+        let task = makeNonCooperativeWriter(writer)
+        XCTAssertTrue(fixture.controller.installSyncRunForTesting(runID: "foreground", task: task))
+        await writer.waitUntilStarted()
+        await writer.waitUntilBlocked()
+
+        fixture.controller.applicationDidBecomeActive()
+
+        XCTAssertEqual(fixture.controller.activeExecutionRunID, "foreground")
+        XCTAssertFalse(fixture.controller.isRunnerStopPendingForTesting)
+        await writer.release()
+        await task.value
+        await fixture.controller.shutdown()
+    }
+
     func testDisablingBackupClearsPersistedUserPause() throws {
         let suite = "photo-backup-controller-tests-\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
@@ -571,9 +612,10 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
         }
     }
 
-    private func makeControllerFixture(prefix: String) throws -> ControllerFixture {
+    private func makeControllerFixture(prefix: String, enabled: Bool = false) throws -> ControllerFixture {
         let suite = "\(prefix)-\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        if enabled { defaults.set(true, forKey: "photoBackup.enabled.v1") }
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent(suite, isDirectory: true)
         let controller = PhotoLibraryBackupController(

@@ -149,18 +149,22 @@ public enum PhotoBackupAssetPlanner {
     /// Photos lists the rendered file of an edit a moment after it reports the edit. The backup waits for it at
     /// most this long after the edit, then plans with the resources that exist; it never renders by itself.
     public static let renderWaitLimit: TimeInterval = 120
+    /// While the rendered file is missing, the photo is checked again at this interval.
+    public static let renderRecheckInterval: TimeInterval = 15
 
     /// The moment to check the photo again, or nil when it can be planned now. Planning during an edit
     /// could upload an intermediate state, or the original as if the edit were undone.
     public static func notReadyUntil(for info: PhotoBackupAssetInfo, now: Date) -> Date? {
-        guard let edited = info.adjustmentTimestamp else { return nil }
+        // A timestamp ahead of the clock comes from a clock that ran ahead; waiting for it could hold the photo
+        // back for as long as the difference, so the photo is ready.
+        guard let edited = info.adjustmentTimestamp, edited <= now else { return nil }
         let quietEnd = edited.addingTimeInterval(editQuietPeriod)
         if now < quietEnd { return quietEnd }
         let render: PhotoBackupAssetInfo.Resource.Role = info.isVideo ? .fullSizeVideo : .fullSizePhoto
         let renderWaitEnd = edited.addingTimeInterval(renderWaitLimit)
         guard info.hasAdjustments, !info.resources.contains(where: { $0.role == render }), now < renderWaitEnd
         else { return nil }
-        return min(now.addingTimeInterval(editQuietPeriod), renderWaitEnd)
+        return min(now.addingTimeInterval(renderRecheckInterval), renderWaitEnd)
     }
 
     /// The candidate the shared preflight classifies. Nil when the asset exposes no exportable

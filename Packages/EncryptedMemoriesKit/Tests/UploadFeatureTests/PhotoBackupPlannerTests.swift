@@ -62,11 +62,24 @@ final class PhotoBackupPlannerTests: XCTestCase {
     func testAnEditWithoutItsRenderedFileWaitsInsteadOfUploadingTheOriginal() {
         let rendering = edited(secondsAgo: 20, rendered: false)
         XCTAssertEqual(
-            PhotoBackupAssetPlanner.notReadyUntil(for: rendering, now: now), now.addingTimeInterval(5),
+            PhotoBackupAssetPlanner.notReadyUntil(for: rendering, now: now), now.addingTimeInterval(15),
             "the original must not replace the edit while Photos still renders it")
         let abandoned = edited(secondsAgo: 200, rendered: false)
         XCTAssertNil(
             PhotoBackupAssetPlanner.notReadyUntil(for: abandoned, now: now), "the backup never waits for good")
+    }
+
+    func testTheRenderWaitEndsAtItsLimit() {
+        XCTAssertEqual(
+            PhotoBackupAssetPlanner.notReadyUntil(for: edited(secondsAgo: 110, rendered: false), now: now),
+            now.addingTimeInterval(10))
+    }
+
+    func testAnEditTimestampAheadOfTheClockDoesNotHoldThePhotoBack() {
+        // The device clock ran an hour ahead during the edit.
+        XCTAssertNil(PhotoBackupAssetPlanner.notReadyUntil(for: edited(secondsAgo: -3600), now: now))
+        XCTAssertNil(
+            PhotoBackupAssetPlanner.notReadyUntil(for: edited(secondsAgo: -3600, rendered: false), now: now))
     }
 
     func testAnEditedVideoWaitsForItsRenderedVideo() {
