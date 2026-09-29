@@ -54,6 +54,8 @@ let package = Package(
         .library(name: "AlbumsFeature", targets: ["AlbumsFeature"]),
         .library(name: "AlbumSyncCore", targets: ["AlbumSyncCore"]),
         .library(name: "AccountStateCore", targets: ["AccountStateCore"]),
+        .library(name: "DeviceRootCore", targets: ["DeviceRootCore"]),
+        .library(name: "DeviceRootAppleAdapter", targets: ["DeviceRootAppleAdapter"]),
         .library(name: "UploadCore", targets: ["UploadCore"]),
         .library(name: "UploadFeature", targets: ["UploadFeature"]),
         .library(name: "PhotoLibraryBackupAdapter", targets: ["PhotoLibraryBackupAdapter"]),
@@ -117,6 +119,7 @@ let package = Package(
                 "ProtonAuth",
                 "AlbumCore",
                 "AlbumSyncCore",
+                "DeviceRootCore",
                 "UploadCore",
                 .product(name: "ProtonDriveSDK", package: "ProtonDriveSDK"),
                 .product(name: "ProtonCoreDataModel", package: "protoncore_ios"),
@@ -128,7 +131,7 @@ let package = Package(
         .testTarget(
             name: "ProtonDriveBackendTests",
             dependencies: [
-                "ProtonDriveBackend", "ProtonAuth", "PhotosCore", "AlbumSyncCore", "UploadCore",
+                "ProtonDriveBackend", "ProtonAuth", "PhotosCore", "AlbumSyncCore", "DeviceRootCore", "UploadCore",
                 .product(name: "ProtonDriveSDK", package: "ProtonDriveSDK"),
                 .product(name: "ProtonCoreCryptoGoInterface", package: "protoncore_ios"),
                 // Crypto round-trip tests require the implementation injected by the app.
@@ -281,6 +284,11 @@ let package = Package(
         // The account state that all of the owner's devices agree on: hidden photos and account settings. Pure Core.
         .target(name: "AccountStateCore", dependencies: ["PhotosCore"]),
         .testTarget(name: "AccountStateCoreTests", dependencies: ["AccountStateCore", "PhotosCore"]),
+        .target(name: "DeviceRootCore"),
+        .testTarget(name: "DeviceRootCoreTests", dependencies: ["DeviceRootCore"]),
+        .target(name: "DeviceRootAppleAdapter", dependencies: ["DeviceRootCore"]),
+        .testTarget(
+            name: "DeviceRootAppleAdapterTests", dependencies: ["DeviceRootAppleAdapter", "DeviceRootCore"]),
         .target(name: "UploadCore", dependencies: ["PhotosCore"]),
         .target(name: "UploadFeature", dependencies: ["UploadCore", "PhotosCore"]),
         // PhotoLibraryBackupAdapter is the package boundary for PhotoKit.
