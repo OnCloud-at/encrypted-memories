@@ -272,6 +272,10 @@ public final class PendingGridSession {
     @discardableResult
     public func restore(_ uids: [PhotoUID]) async -> Bool { await coordinator.restore(uids) }
 
+    /// The person restored these Proton photos from the trash. They show at once, also when an edit's
+    /// replacement hid them while the listing still returned them.
+    public func photosRestored(_ uids: [PhotoUID]) { presenter.showRestored(uids) }
+
     /// A Proton photo came back from the trash; a pending delete that trashed it is undone as well.
     public func restoreSources(ofRemote uids: [PhotoUID]) async { await coordinator.restoreSources(ofRemote: uids) }
 

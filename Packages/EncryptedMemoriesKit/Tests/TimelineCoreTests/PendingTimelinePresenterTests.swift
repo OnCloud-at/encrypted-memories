@@ -170,11 +170,27 @@ import UploadCore
         let hidden = await settle(presenter)
         #expect(hidden.items.map(\.uid) == [uploaded])
 
-        // Restored before the listing dropped it: the listing keeps returning it.
+        // Restored on another device before the listing dropped it: the listing keeps returning it.
         clock.now = clock.now.addingTimeInterval(PendingTimelinePresenter.trashedHideLimit + 1)
         presenter.setRemote(TimelineSnapshot(orderedItems: listed + [remote("b", second: 20)]))
         let restored = await settle(presenter)
         #expect(restored.items.map(\.uid).contains(earlier))
+    }
+
+    @Test func aTrashedPhotoRestoredInThisAppShowsAtOnce() async {
+        let presenter = PendingTimelinePresenter()
+        let earlier = PhotoUID(volumeID: "vol", nodeID: "earlier")
+        let uploaded = PhotoUID(volumeID: "vol", nodeID: "0-new")
+        let listed = sameSecond(["earlier", "0-new"])
+        presenter.setRemote(TimelineSnapshot(orderedItems: listed))
+        let done = tile("p", second: 10, handoff: uploaded, settled: true, badge: .done, replaces: [earlier])
+        presenter.setPending(pending([done], membership: 1), enabled: true)
+        #expect(await settle(presenter).items.map(\.uid) == [uploaded])
+
+        presenter.showRestored([earlier])
+        #expect(Set(await settle(presenter).items.map(\.uid)) == [earlier, uploaded], "while the tile still shows")
+        presenter.setPending(pending([], membership: 2), enabled: true)
+        #expect(Set(await settle(presenter).items.map(\.uid)) == [earlier, uploaded], "and after it retired")
     }
 
     @Test func aSecondEditTakesThePlaceWhereTheFirstEditShows() async {

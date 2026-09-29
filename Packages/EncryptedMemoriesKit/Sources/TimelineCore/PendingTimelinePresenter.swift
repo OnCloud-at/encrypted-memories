@@ -137,8 +137,9 @@ public struct PendingTimelinePresentation: Sendable {
 /// An edit of a backed-up photo replaces that earlier Proton photo. Its tile, and later its Proton photo, take
 /// the earlier photo's place, and the earlier photo is hidden while its replacement shows. Once the backup moved
 /// the earlier photo to the trash, it stays hidden until the Proton listing drops it, so a listing that lags
-/// behind the trash cannot show it again, but at most for `trashedHideLimit`: a photo that the person restored
-/// before the listing dropped it shows again then. Every hidden photo is derived in each merge.
+/// behind the trash cannot show it again. A photo that the person restores in this app shows at once
+/// (`showRestored`). A restore on another device cannot be told apart from a lagging listing, so such a photo
+/// shows after `trashedHideLimit` at the latest. Every hidden photo is derived in each merge.
 @MainActor
 public final class PendingTimelinePresenter {
     /// A new presentation; the host installs it in its grid and viewer.
@@ -165,6 +166,8 @@ public final class PendingTimelinePresenter {
     /// Earlier Proton photos that the backup moved to the trash, with the moment the grid first hid them as
     /// trashed, until the listing no longer returns them.
     private var trashedEarlier: [PhotoUID: Date] = [:]
+    /// Proton photos that the person restored in this session; no replacement hides them.
+    private var restored = Set<PhotoUID>()
     private let now: @Sendable () -> Date
     /// The longest time a trashed earlier photo stays hidden while the listing still returns it.
     package nonisolated static let trashedHideLimit: TimeInterval = 300
@@ -222,6 +225,7 @@ public final class PendingTimelinePresenter {
         anchors.removeAll()
         tileKeys.removeAll()
         trashedEarlier.removeAll()
+        restored.removeAll()
         tileRevisions.removeAll()
         contentEpochs.removeAll()
         lastMembershipRevision = nil
@@ -247,6 +251,7 @@ public final class PendingTimelinePresenter {
             anchors: anchors,
             tileKeys: tileKeys,
             trashedEarlier: trashedEarlier,
+            restored: restored,
             now: now(),
             revisions: tileRevisions,
             shown: presentation.snapshot
@@ -292,6 +297,15 @@ public final class PendingTimelinePresenter {
         if !result.presentKeys.isEmpty { onRemotePresence?(result.presentKeys) }
         presentLocal = result.presentLocal
         onChange?(presentation)
+    }
+
+    /// The person restored these Proton photos from the trash: they show at once, even while the listing lags.
+    public func showRestored(_ uids: [PhotoUID]) {
+        let added = Set(uids).subtracting(restored)
+        guard !added.isEmpty else { return }
+        restored.formUnion(added)
+        for uid in added { trashedEarlier[uid] = nil }
+        rebuild()
     }
 
     /// The feed holds new images for these revised photos; grids upload them in place of the old textures.
@@ -355,6 +369,7 @@ public final class PendingTimelinePresenter {
         let anchors: [PhotoUID: Anchor]
         let tileKeys: [PendingSourceKey: PhotoItem]
         let trashedEarlier: [PhotoUID: Date]
+        let restored: Set<PhotoUID>
         let now: Date
         let revisions: [PhotoUID: UploadBackupRevision]
         /// The snapshot that the grid shows now.
@@ -517,6 +532,7 @@ public final class PendingTimelinePresenter {
     private nonisolated static func replacements(in input: MergeInput, photosVolume: String?) -> Replacements {
         var result = Replacements()
         func noteTrashed(_ uid: PhotoUID) {
+            guard !input.restored.contains(uid) else { return }
             let since = input.trashedEarlier[uid] ?? input.now
             result.trashedEarlier[uid] = since
             if input.now.timeIntervalSince(since) < trashedHideLimit { result.hidden.insert(uid) }
@@ -530,7 +546,7 @@ public final class PendingTimelinePresenter {
             if tile.isSettled {
                 listed.forEach { noteTrashed($0.uid) }
             } else {
-                result.hidden.formUnion(listed.map(\.uid))
+                result.hidden.formUnion(listed.map(\.uid).filter { !input.restored.contains($0) })
             }
             // The tile takes the place where the earlier photo shows, which an earlier edit may have anchored.
             // The first place stays while the tile shows, even when the listing drops the earlier photo.
