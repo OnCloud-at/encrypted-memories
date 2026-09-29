@@ -318,6 +318,20 @@ Run the iOS UI tests. They launch the app on an offline test account and tap thr
 
 Override `IOS_TEST_DESTINATION` when the default iPhone simulator is not installed.
 
+Run both iOS test gates on the iPhone Duo simulator with Xcode 27.1 or later and the iOS 27.1 simulator runtime.
+Give the second Xcode its own build root, because the cached build products do not record the Xcode version:
+
+```bash
+export DEVELOPER_DIR=/Applications/Xcode-beta.app/Contents/Developer
+export ENCRYPTED_MEMORIES_BUILD_ROOT="$HOME/Developer/xcode/EncryptedMemories-xcode27.1"
+export IOS_TEST_DESTINATION="platform=iOS Simulator,name=iPhone Duo"
+./scripts/verify-ios-app-tests.sh
+./scripts/verify-ios-app-tests.sh ui
+```
+
+The tests run in the pose that the simulator shows. XCTest cannot fold the device, so set the outer display,
+the open inner display, or the partially folded pose in Device Hub before a run.
+
 Run the fast shared-core and platform-boundary gate:
 
 ```bash

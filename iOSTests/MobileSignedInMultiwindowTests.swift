@@ -24,7 +24,7 @@ final class MobileSignedInMultiwindowTests: XCTestCase {
     }
 
     @MainActor func testExplicitSignOutPurgesBeforeTwoWindowsReconfigure() async throws {
-        try XCTSkipUnless(UIApplication.shared.supportsMultipleScenes, "the runtime must support multiple scenes")
+        try XCTSkipUnless(UIApplication.shared.showsSeveralWindows, "the display must show several windows")
         // The canonical unsigned test host has no Keychain entitlement. Probe a unique, empty service so
         // this check never reads an account credential. A locally signed simulator host exercises the purge.
         do {
@@ -37,7 +37,7 @@ final class MobileSignedInMultiwindowTests: XCTestCase {
 
     @MainActor private func verifyTwoWindowLifecycle(explicitSignOut: Bool) async throws {
         try XCTSkipUnless(
-            UIApplication.shared.supportsMultipleScenes,
+            UIApplication.shared.showsSeveralWindows,
             "several windows of one app need iPadOS")
         let runtime = MobileAccountRuntime.shared
         let fixture = try await MobileSignedInFixture()
