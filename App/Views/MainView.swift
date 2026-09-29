@@ -797,13 +797,12 @@ struct MainView: View {
         }
     }
 
-    /// Native determinate progress paired with a separate cancellation control.
+    /// Determinate export progress paired with a separate cancellation control.
     private var exportProgressIndicator: some View {
         let pct = Int((exportFraction * 100).rounded())
-        return ProgressView(value: max(0.001, min(1, exportFraction)))
-            .progressViewStyle(.circular)
-            .controlSize(.small)
+        return ExportProgressRing(fraction: exportFraction)
             .help("export.progress_percent \(pct)")
+            .accessibilityElement()
             .accessibilityLabel("export.progress_percent \(pct)")
     }
 
@@ -2111,7 +2110,7 @@ struct MainView: View {
                 .accessibilityLabel("toolbar.info")
 
                 if isExporting {
-                    exportProgressIndicator  // the download icon is replaced by the native progress while exporting
+                    exportProgressIndicator  // the download icon is replaced by the progress ring while exporting
                     exportCancelButton
                 } else {
                     let downloadTitle =
