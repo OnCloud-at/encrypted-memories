@@ -187,48 +187,57 @@ final class EditScenarioTests: XCTestCase {
 
     func testEditWhoseCompoundLacksTheOriginal() async throws {
         let original = try await firstBackup()
-        harness.knownDefect =
-            "Defect 5b (#194): the queue completes while the earlier main waits for its original, and two active "
-            + "mains remain."
         let entry = try await edit("render-without-original", omitOriginal: true)
-        await harness.drain()
-        // Defect 5b candidate: completion must not conceal an earlier main still waiting for its original.
-        let source = try harness.library.candidate().snapshot.source
+        harness.clock.advance(by: 5)
+        await harness.pass()
+        let waiting = try XCTUnwrap(harness.queue.entry(for: entry.source, revision: entry.revision))
+        XCTAssertEqual(waiting.state, .discovered)
+        XCTAssertEqual(waiting.attempts, 0, "waiting for an original spends no attempt")
+        XCTAssertGreaterThan(waiting.updatedAt, harness.clock.now)
+        XCTAssertEqual(BackupIssueRecord.decode(waiting.lastError)?.nextAttemptAt, waiting.updatedAt)
+        XCTAssertEqual(harness.activeMains.count, 2, "the earlier main protects the original while the edit waits")
+        XCTAssertEqual(harness.server.links.first { $0.uid == original }?.state, .active)
         harness.check(
             !(harness.state(of: entry)?.isTerminalSuccess == true
-                && harness.journal.entry(for: source).superseded.contains(original)),
-            "defect 5b: the queue completes while the earlier main waits and two active mains remain")
-        harness.expectKnownDefect(
-            signature: "defect 5b",
-            consequences: [
-                "S1/U3 mains:", "S1 the main must hold the current version",
-                "S3 the edited main lacks its active original",
-            ])
+                && harness.journal.entry(for: entry.source).superseded.contains(original)),
+            "the queue must not complete while the earlier main waits for its original")
+        harness.assertRetired()
+
+        harness.library.makeOriginalAvailable()
+        try harness.relaunch()
+        harness.clock.advance(by: waiting.updatedAt.timeIntervalSince(harness.clock.now) + 1)
+        await harness.drain()
+        XCTAssertEqual(harness.state(of: entry)?.isTerminalSuccess, true)
+        XCTAssertEqual(harness.activeMains.count, 1)
+        XCTAssertEqual(harness.server.links.first { $0.uid == original }?.state, .trashed)
+        let main = try harness.liveMain()
+        let asset = try XCTUnwrap(harness.library.snapshot.first)
+        XCTAssertTrue(
+            harness.server.links.contains {
+                $0.mainLinkID == main.nodeID && $0.state == .active
+                    && $0.contentHash == EditScenarioServer.contentHash(Data(Insecure.SHA1.hash(data: asset.original)))
+            }, "the edited main holds the original as an active related file")
     }
 
     func testFailedTrashThenRelaunch() async throws {
         let earlier = try await firstBackup(live: true)
         let entry = try await edit("render-one")
         harness.server.failNextTrash()
-        harness.knownDefect =
-            "Defect 5b (#194): related links join retired before the trash succeeds."
         harness.clock.advance(by: 5)
         await harness.pass()
         XCTAssertEqual(harness.server.links.first { $0.uid == earlier }?.state, .active)
         XCTAssertFalse(harness.state(of: entry)?.isTerminalSuccess == true)
         XCTAssertEqual(harness.server.steps.filter { $0.action == "failed backup trash" }.count, 1)
-        // Defect 5b-retired candidate: a failed write cannot authorize retirement of still-active links.
+        // A failed write cannot retire links that remain in the library.
         harness.assertRetired()
         let uploadedBeforeRetry = harness.server.steps.filter { $0.action.hasPrefix("upload") }.count
         try harness.relaunch()
         harness.clock.advance(by: 8)
-        await harness.pass()
-        harness.assertQuiescent()
+        await harness.drain()
         harness.check(harness.activeMains.count == 1, "U3 one main after the retry")
         harness.check(
             harness.server.steps.filter { $0.action.hasPrefix("upload") }.count == uploadedBeforeRetry,
             "A trash retry must not upload the compound again")
-        harness.expectKnownDefect(signature: "U4 retired names a link that is still in the library", consequences: [])
     }
 
     func testLocalDeletionKeepsTheRemoteBackup() async throws {
@@ -421,7 +430,9 @@ final class EditScenarioTests: XCTestCase {
         XCTAssertEqual(decision, .skip(.knownFromManifest, remoteLinkID: deletedEdit.nodeID))
         await harness.pass()
         // The unchanged digest and capture date reuse the manifest; this path does not revalidate the deleted main.
-        XCTAssertEqual(harness.state(of: drifted), .alreadyBackedUp)
+        XCTAssertEqual(
+            harness.state(of: drifted), .skippedRemoteDeletion,
+            "the person trashed the edit, so the photo is not backed up")
         let settled = try XCTUnwrap(harness.queue.entry(for: drifted.source, revision: drifted.revision))
         XCTAssertEqual(settled.attempts, 0)
         XCTAssertNil(settled.remoteCommitReconciliation)

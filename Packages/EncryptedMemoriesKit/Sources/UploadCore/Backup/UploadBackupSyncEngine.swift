@@ -137,7 +137,7 @@ public actor UploadBackupSyncEngine: UploadBackupCandidateEnqueueing {
         if let remoteProofResolver {
             let identities: [UploadBackupExternalIdentity] = candidates.indices.compactMap {
                 index -> UploadBackupExternalIdentity? in
-                guard decisions[index] != .alreadyBackedUp else { return nil }
+                guard Self.remoteProofCanSettle(decisions[index]) else { return nil }
                 return candidates[index].snapshot.externalIdentity
             }
             if !identities.isEmpty {
@@ -153,7 +153,7 @@ public actor UploadBackupSyncEngine: UploadBackupCandidateEnqueueing {
                 if !proofs.isEmpty {
                     var provenSnapshots: [UploadBackupAssetSnapshot] = []
                     for index in candidates.indices {
-                        guard decisions[index] != .alreadyBackedUp,
+                        guard Self.remoteProofCanSettle(decisions[index]),
                             let identity = candidates[index].snapshot.externalIdentity,
                             let proof = proofs[identity],
                             proof.externalIdentity == identity,
@@ -211,6 +211,16 @@ public actor UploadBackupSyncEngine: UploadBackupCandidateEnqueueing {
             state = .checking
         }
         return (delta, entry(for: candidate, state: state))
+    }
+
+    /// A remote proof settles a photo that this device knows nothing about. A pending state record means
+    /// unfinished work for this exact revision, such as an earlier photo that still waits for its replacement;
+    /// the uploaded files alone do not finish that.
+    private static func remoteProofCanSettle(_ decision: UploadBackupCheckDecision) -> Bool {
+        switch decision {
+        case .alreadyBackedUp, .pendingUpload: false
+        case .newAsset, .needsBackendCheck: true
+        }
     }
 
     private func withoutExcludedSources(

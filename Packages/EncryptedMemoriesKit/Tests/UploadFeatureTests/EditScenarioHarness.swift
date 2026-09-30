@@ -98,6 +98,10 @@ final class EditScenarioLibrary: UploadBackupAssetCatalog, @unchecked Sendable {
         }
     }
 
+    func makeOriginalAvailable(_ identifier: String = "asset-1") {
+        lock.withLock { assets[identifier]?.omitOriginal = false }
+    }
+
     func undo(_ identifier: String = "asset-1", at timestamp: Date, restoreEarlierDate: Bool = false) {
         lock.withLock {
             guard var asset = assets[identifier] else { return }

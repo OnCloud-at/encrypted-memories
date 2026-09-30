@@ -12,18 +12,26 @@ public struct EditReplacementJournalEntry: Sendable, Equatable, Codable {
     /// True when the last upload of this photo was an edit. Only then do other bytes of the unedited photo undo an
     /// edit. Nil in journals of earlier builds.
     public var uploadedEdit: Bool?
+    /// Related links by earlier main, recorded before its trash. Nil in journals of earlier builds.
+    public var retireIntent: [String: [String]]?
 
-    public init(superseded: [PhotoUID] = [], retired: [String] = [], uploadedEdit: Bool? = nil) {
+    public init(
+        superseded: [PhotoUID] = [], retired: [String] = [], uploadedEdit: Bool? = nil,
+        retireIntent: [String: [String]]? = nil
+    ) {
         self.superseded = superseded
         self.retired = retired
         self.uploadedEdit = uploadedEdit
+        self.retireIntent = retireIntent
     }
 
     /// Without the flag, a photo that already replaced an earlier upload counts as edited: only edits and undos
     /// replaced photos in earlier builds.
     public var lastUploadWasEdit: Bool { uploadedEdit ?? !retired.isEmpty }
 
-    public var isEmpty: Bool { superseded.isEmpty && retired.isEmpty && uploadedEdit != true }
+    public var isEmpty: Bool {
+        superseded.isEmpty && retired.isEmpty && uploadedEdit != true && (retireIntent?.isEmpty ?? true)
+    }
 }
 
 /// Durable record of edited photos that replace their earlier upload. The dedupe pipeline adds the earlier
@@ -31,6 +39,10 @@ public struct EditReplacementJournalEntry: Sendable, Equatable, Codable {
 public protocol EditReplacementJournaling: Sendable {
     func entry(for source: UploadSourceIdentity) -> EditReplacementJournalEntry
     func addSuperseded(_ uid: PhotoUID, for source: UploadSourceIdentity) throws
+    /// Records related links before trashing their mains, without retiring active links.
+    func prepareToRetire(_ relatedByMain: [String: [String]], for source: UploadSourceIdentity) throws
+    /// Clears an earlier intent when a retry confirms that its main is still active.
+    func clearRetireIntent(_ nodeIDs: Set<String>, for source: UploadSourceIdentity) throws
     /// Removes the photos from `superseded`. With `trashed` true they and `related` join `retired`.
     func settle(_ nodeIDs: Set<String>, related: Set<String>, trashed: Bool, for source: UploadSourceIdentity) throws
     /// Records whether the upload that the backup finished for `source` was an edit.
@@ -73,13 +85,34 @@ public final class EditReplacementJournalFileStore: EditReplacementJournaling, @
         }
     }
 
+    public func prepareToRetire(_ relatedByMain: [String: [String]], for source: UploadSourceIdentity) throws {
+        try update(source) { entry in
+            var intent = entry.retireIntent ?? [:]
+            for (main, related) in relatedByMain { intent[main] = related.sorted() }
+            entry.retireIntent = intent.isEmpty ? nil : intent
+        }
+    }
+
+    public func clearRetireIntent(_ nodeIDs: Set<String>, for source: UploadSourceIdentity) throws {
+        try update(source) { entry in
+            for nodeID in nodeIDs { entry.retireIntent?[nodeID] = nil }
+            if entry.retireIntent?.isEmpty == true { entry.retireIntent = nil }
+        }
+    }
+
     public func settle(
         _ nodeIDs: Set<String>, related: Set<String>, trashed: Bool, for source: UploadSourceIdentity
     ) throws {
         try update(source) { entry in
             entry.superseded.removeAll { nodeIDs.contains($0.nodeID) }
+            var confirmedRelated = related
+            for nodeID in nodeIDs {
+                if trashed { confirmedRelated.formUnion(entry.retireIntent?[nodeID] ?? []) }
+                entry.retireIntent?[nodeID] = nil
+            }
+            if entry.retireIntent?.isEmpty == true { entry.retireIntent = nil }
             guard trashed else { return }
-            for linkID in nodeIDs.union(related).sorted() where !entry.retired.contains(linkID) {
+            for linkID in nodeIDs.union(confirmedRelated).sorted() where !entry.retired.contains(linkID) {
                 entry.retired.append(linkID)
             }
         }

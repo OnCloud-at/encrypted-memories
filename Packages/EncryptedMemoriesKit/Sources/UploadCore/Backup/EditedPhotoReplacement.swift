@@ -18,6 +18,16 @@ public protocol EditReplacementRemote: PhotoCarryOverRemote {
 /// lives only under the earlier photo, when another local source still needs it or one of its related photos, or
 /// when it carries the new photo. Other bytes replace the earlier photo only as an edit or as the undo of an edit.
 public struct EditedPhotoReplacement: Sendable {
+    public enum Outcome: Sendable, Equatable {
+        case replaced(retiredAny: Bool)
+        /// At least one earlier main still protects an original resource that the new compound lacks.
+        case waiting
+        case kept
+        /// Earlier mains would wait, but the photo that replaces them left the library, for example because the
+        /// person trashed it. Nothing replaces them, and the photo is not backed up.
+        case replacementGone
+    }
+
     let remote: any EditReplacementRemote
     let albums: any SeriesAlbumCarryOver
     let relations: any UploadDuplicateChecking
@@ -62,40 +72,42 @@ public struct EditedPhotoReplacement: Sendable {
         try journal.settle(Set(superseded.map(\.nodeID)), related: [], trashed: false, for: source)
     }
 
-    /// Returns true when earlier photos left the library, so cached duplicate rows that still show them active are
-    /// stale. `edited` tells whether the new primary is an edit; the backup calls this after each upload of a photo.
+    /// Reports whether earlier photos left, still wait for original resources, or stay for good. Cached duplicate
+    /// rows are stale after retirement. The backup calls this after each upload of a photo.
     @discardableResult
     public func replaceSuperseded(
         of source: UploadSourceIdentity,
         with primary: PhotoUID,
         edited: Bool,
         holdsOriginal: Bool
-    ) async throws -> Bool {
+    ) async throws -> Outcome {
         let entry = journal.entry(for: source)
         let superseded = entry.superseded
         // Other bytes of a photo that is unedited now and was unedited before are no edit, so both photos stay.
         guard !superseded.isEmpty, edited || entry.lastUploadWasEdit else {
             try keepSuperseded(of: source)
             try recordUpload(of: source, edited: edited)
-            return false
-        }
-        // The earlier photos may hold the only copy of the original. They wait for an upload that holds it.
-        guard holdsOriginal else {
-            try recordUpload(of: source, edited: edited)
-            return false
+            return .kept
         }
         let volumeID = try await remote.ownPhotosVolumeID()
         func resolved(_ uid: PhotoUID) -> PhotoUID {
             uid.volumeID.isEmpty ? PhotoUID(volumeID: volumeID, nodeID: uid.nodeID) : uid
         }
         let replacement = resolved(primary)
+        // The earlier photos may hold the only copy of the original. They wait for an upload that holds it.
+        guard holdsOriginal else {
+            return try await waitingOutcome(of: source, for: replacement, edited: edited)
+        }
         // The edit was undone and the earlier photo is the current one again.
         var kept = Set(superseded.map(\.nodeID).filter { $0 == replacement.nodeID })
         var waiting: Set<String> = []
         let targets = superseded.map(resolved).filter { $0.nodeID != replacement.nodeID }
         let active = try await remote.activeUIDs(among: targets)
         var trashable: [PhotoUID] = []
-        var related: Set<String> = []
+        var related = Set(
+            targets.filter { !active.contains($0) }.flatMap { entry.retireIntent?[$0.nodeID] ?? [] })
+        try journal.clearRetireIntent(Set(active.map(\.nodeID)), for: source)
+        var intent: [String: [String]] = [:]
         for target in targets where active.contains(target) {
             try Task.checkCancellation()
             let linked = try await relations.relatedPhotoLinkIDs(ofMainLinkID: target.nodeID)
@@ -113,25 +125,39 @@ public struct EditedPhotoReplacement: Sendable {
             }
             trashable.append(target)
             related.formUnion(linked)
+            intent[target.nodeID] = linked.sorted()
         }
         try await carryOver(from: trashable, to: replacement, ownVolumeID: volumeID)
         if !trashable.isEmpty {
-            // Durable before the trash: a retry after a crash finds the related photos trashed and could no longer
-            // list them, and an undo must not take their trashed copies for a deletion by the person.
-            try journal.settle([], related: related, trashed: true, for: source)
+            // A crash after the trash loses the server's related listing. The intent keeps those links without
+            // retiring them until the main's trash is confirmed.
+            try journal.prepareToRetire(intent, for: source)
             try await remote.trash(trashable)
         }
         let retired = Set(targets.map(\.nodeID)).subtracting(kept).subtracting(waiting)
-        // A row of this photo that names a trashed photo no longer proves a backup. The journal's retired links
-        // include the related photos of an earlier attempt, so a retry after a failed write forgets them too.
+        // A row that names a trashed photo no longer proves a backup. Related links from an earlier intent join
+        // confirmed retired links, so a retry after a failed manifest write forgets them too.
         let trashedLinks = retired.union(related).union(journal.entry(for: source).retired)
         guard identities.forgetRemoteLinks(trashedLinks, of: source) else {
             throw UploadError.backend("Upload identity manifest could not be updated")
         }
         try journal.settle(retired, related: related, trashed: true, for: source)
         try journal.settle(kept, related: [], trashed: false, for: source)
+        if !waiting.isEmpty { return try await waitingOutcome(of: source, for: replacement, edited: edited) }
         try recordUpload(of: source, edited: edited)
-        return !retired.isEmpty
+        return retired.isEmpty ? .kept : .replaced(retiredAny: true)
+    }
+
+    /// Earlier photos wait only for a photo that is in the library. When the photo that would replace them left it,
+    /// for example because the person trashed it, nothing can replace them, and they stay.
+    ///
+    /// A waiting replacement is unsettled: the journal notes an uploaded edit, so a later undo still replaces it,
+    /// but an undo that waits does not clear the note, or its own retry would keep the edit for good.
+    private func waitingOutcome(
+        of source: UploadSourceIdentity, for replacement: PhotoUID, edited: Bool
+    ) async throws -> Outcome {
+        if edited { try recordUpload(of: source, edited: true) }
+        return try await remote.activeUIDs(among: [replacement]).contains(replacement) ? .waiting : .replacementGone
     }
 
     private func recordUpload(of source: UploadSourceIdentity, edited: Bool) throws {
