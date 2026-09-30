@@ -26,6 +26,7 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
         let generation: Int
         let isOriginal: Bool
         var personDeleted = false
+        var externalIdentity: UploadBackupExternalIdentity?
 
         var uid: PhotoUID { PhotoUID(volumeID: "vol", nodeID: linkID) }
         var duplicate: RemotePhotoDuplicate {
@@ -49,10 +50,22 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
     private var history: [Step] = []
     private var nextID = 1
     private var failTrash = false
+    private var failRelatedLookupForTrashedMain = false
+    private var rejectedRelatedLookups: [String] = []
+    private var proofLookups: [[UploadBackupExternalIdentity]] = []
+    let uploadGate = EditScenarioUploadGate()
     private let ownAlbumIDs: Set<String> = ["own-album"]
 
     var links: [Link] { lock.withLock { orderedLinks() } }
     var steps: [Step] { lock.withLock { history } }
+    var remoteProofLookups: [[UploadBackupExternalIdentity]] { lock.withLock { proofLookups } }
+    var rejectedTrashedMainLookupIDs: [String] { lock.withLock { rejectedRelatedLookups } }
+
+    /// The real endpoint's behavior for trashed mains remains unverified.
+    var relatedLookupFailsForTrashedMain: Bool {
+        get { lock.withLock { failRelatedLookupForTrashedMain } }
+        set { lock.withLock { failRelatedLookupForTrashedMain = newValue } }
+    }
 
     private func orderedLinks() -> [Link] {
         table.values.sorted { $0.linkID < $1.linkID }
@@ -77,10 +90,12 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
         guard request.expectedSHA1 == digest else {
             throw UploadError.backend("The scenario upload bytes do not match the pipeline identity")
         }
+        let generation = Int(request.fileURL.lastPathComponent.split(separator: "-")[0]) ?? 0
+        await uploadGate.suspendIfArmed(generation: generation, isMain: request.mainPhotoUID == nil)
+        let externalIdentity = try Self.externalIdentity(in: request.additionalMetadata)
         onProgress(.init(phase: .uploading, fraction: 1))
         return lock.withLock {
             let assetID = request.fileURL.deletingLastPathComponent().lastPathComponent
-            let generation = Int(request.fileURL.lastPathComponent.split(separator: "-")[0]) ?? 0
             let id = String(format: "link-%04d", nextID)
             nextID += 1
             let main = request.mainPhotoUID?.nodeID
@@ -95,9 +110,46 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
                 linkID: id, nameHash: "nh(\(request.name))", contentHash: Self.contentHash(digest),
                 state: .active, mainLinkID: main, captureTime: request.captureTime,
                 assetID: assetID, generation: generation,
-                isOriginal: request.name.hasSuffix(".HEIC") || request.name.hasSuffix(".MOV"))
+                isOriginal: request.name.hasSuffix(".HEIC") || request.name.hasSuffix(".MOV"),
+                externalIdentity: externalIdentity)
             record("upload \(id)", violations: violations)
             return PhotoUID(volumeID: "vol", nodeID: id)
+        }
+    }
+
+    private static func externalIdentity(
+        in metadata: [PhotoUploadAdditionalMetadata]
+    ) throws -> UploadBackupExternalIdentity? {
+        guard let value = metadata.first(where: { $0.name == "iOS.photos" }) else { return nil }
+        let photos = try JSONDecoder().decode(PhotoUploadMetadataEncoder.IOSPhotos.self, from: value.utf8JsonValue)
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        guard let identifier = photos.iCloudID, !identifier.isEmpty,
+            let timestamp = photos.modificationTime, let date = formatter.date(from: timestamp)
+        else { throw UploadError.backend("The scenario upload has invalid iOS.photos metadata") }
+        return UploadBackupExternalIdentity(identifier: identifier, modificationDate: date)
+    }
+
+    /// Mirrors the active compound proof: every resource must carry the same external identity.
+    /// The count comes from actual uploaded links, rather than the candidate asking for a proof.
+    func findRemoteAssetProofs(
+        for identities: [UploadBackupExternalIdentity]
+    ) async throws -> [UploadBackupExternalIdentity: UploadRemoteAssetIndexRecord] {
+        lock.withLock {
+            proofLookups.append(identities)
+            var proofs: [UploadBackupExternalIdentity: UploadRemoteAssetIndexRecord] = [:]
+            var ambiguous: Set<UploadBackupExternalIdentity> = []
+            for main in orderedLinks() where main.mainLinkID == nil && main.state == .active {
+                guard let identity = main.externalIdentity, identities.contains(identity) else { continue }
+                let compound = [main] + orderedLinks().filter { $0.mainLinkID == main.linkID }
+                guard compound.allSatisfy({ $0.state == .active && $0.externalIdentity == identity }) else { continue }
+                if proofs[identity] != nil { ambiguous.insert(identity) }
+                proofs[identity] = UploadRemoteAssetIndexRecord(
+                    externalIdentity: identity, resourceCount: compound.count,
+                    remoteLinkIDs: compound.map(\.linkID), hashKeyEpoch: "scenario-epoch")
+            }
+            for identity in ambiguous { proofs.removeValue(forKey: identity) }
+            return proofs
         }
     }
 
@@ -134,6 +186,11 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
         try lock.withLock {
             guard let main = table[mainLinkID], main.state != .deleted else {
                 throw UploadError.backend("Related photos of the main photo are unavailable")
+            }
+            if main.state == .trashed && failRelatedLookupForTrashedMain {
+                rejectedRelatedLookups.append(mainLinkID)
+                record("failed related lookup of trashed main \(mainLinkID)")
+                throw UploadError.backend("The scenario endpoint rejects related lookup of a trashed main")
             }
             return Set(table.values.filter { $0.mainLinkID == mainLinkID && $0.state != .deleted }.map(\.linkID))
         }
@@ -289,5 +346,37 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
                 assetID: original.assetID, generation: 0, isOriginal: true)
             record("earlier device trashed \(id)")
         }
+    }
+}
+
+/// Suspends one real pipeline upload before the fake transport commits it. No sleeps or scheduling races.
+actor EditScenarioUploadGate {
+    private var generation: Int?
+    private var suspended = false
+    private var releaseContinuation: CheckedContinuation<Void, Never>?
+    private var observers: [CheckedContinuation<Void, Never>] = []
+
+    func arm(generation: Int) { self.generation = generation }
+
+    func suspendIfArmed(generation: Int, isMain: Bool) async {
+        guard isMain, self.generation == generation else { return }
+        self.generation = nil
+        await withCheckedContinuation { continuation in
+            releaseContinuation = continuation
+            suspended = true
+            for observer in observers { observer.resume() }
+            observers.removeAll()
+        }
+    }
+
+    func waitUntilSuspended() async {
+        if suspended { return }
+        await withCheckedContinuation { observers.append($0) }
+    }
+
+    func release() {
+        releaseContinuation?.resume()
+        releaseContinuation = nil
+        suspended = false
     }
 }
