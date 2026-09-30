@@ -391,12 +391,20 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
             // photos of the replacement do not count, and a trashed copy outside them is a deletion by the person.
             // An active copy under a main photo is a related file, such as the hidden original under a replaced
             // photo. It is no backup. The states above name those copies without a lookup of the related photos
-            // of a main photo that may be in the trash or gone. A copy that is no longer active was a main photo
-            // when the listing named it, so it stays.
+            // of a main photo that may be in the trash or gone. A copy that left the library after the listing
+            // named it active was a main photo, so it counts as a deletion by the person.
             let related = Set(
                 matches.filter { visibility[$0].map { $0.isActive && $0.mainPhotoLinkID != nil } ?? false })
+            let removed = Set(matches.filter { visibility[$0]?.isActive != true })
             let excluded = replacement.superseded.union(replacement.retired).union(related)
-            return remoteItems.filter { !($0.linkID.map(excluded.contains) ?? false) }
+            return remoteItems.compactMap { item in
+                guard let linkID = item.linkID else { return item }
+                guard !excluded.contains(linkID) else { return nil }
+                guard removed.contains(linkID) else { return item }
+                return RemotePhotoDuplicate(
+                    nameHash: item.nameHash, contentHash: item.contentHash, linkState: .trashed, linkID: linkID,
+                    clientUID: item.clientUID)
+            }
         }
         // A restored earlier version with other bytes is an earlier photo again, so this upload replaces it.
         if !restored.isEmpty {
