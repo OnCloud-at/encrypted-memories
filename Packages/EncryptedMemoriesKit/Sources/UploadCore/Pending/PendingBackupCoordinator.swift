@@ -420,7 +420,11 @@ public actor PendingBackupCoordinator {
 
     private func remember(_ handoff: PendingHandoff) {
         guard !handoff.acknowledged else { return }
-        if let existing = handoffs[handoff.key], existing.revision > handoff.revision { return }
+        if let existing = handoffs[handoff.key],
+            (existing.createdAt, existing.revision) > (handoff.createdAt, handoff.revision)
+        {
+            return
+        }
         handoffs[handoff.key] = handoff
     }
 

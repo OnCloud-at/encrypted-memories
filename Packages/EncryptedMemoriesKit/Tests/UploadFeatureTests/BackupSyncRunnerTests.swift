@@ -467,6 +467,9 @@ final class SpyQueueStore: UploadBackupSyncQueueStore, @unchecked Sendable {
     func remove(source: UploadSourceIdentity, revision: UploadBackupRevision) -> Bool {
         inner.remove(source: source, revision: revision)
     }
+    func removeSettledRevisions(of source: UploadSourceIdentity, except revision: UploadBackupRevision) -> Bool {
+        inner.removeSettledRevisions(of: source, except: revision)
+    }
 
     func removeSources(kind: UploadSourceIdentity.Kind, identifiers: [String]) -> Int {
         inner.removeSources(kind: kind, identifiers: identifiers)
@@ -540,6 +543,9 @@ final class ReenqueueOnFirstRetryQueueStore: UploadBackupSyncQueueStore, @unchec
     }
     func remove(source: UploadSourceIdentity, revision: UploadBackupRevision) -> Bool {
         inner.remove(source: source, revision: revision)
+    }
+    func removeSettledRevisions(of source: UploadSourceIdentity, except revision: UploadBackupRevision) -> Bool {
+        inner.removeSettledRevisions(of: source, except: revision)
     }
     func removeSources(kind: UploadSourceIdentity.Kind, identifiers: [String]) -> Int {
         inner.removeSources(kind: kind, identifiers: identifiers)

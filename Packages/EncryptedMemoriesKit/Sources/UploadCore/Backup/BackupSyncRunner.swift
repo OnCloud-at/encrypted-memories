@@ -1256,6 +1256,9 @@ public actor BackupSyncRunner {
                 // crash leave an undone edit counted as backed up.
                 if replacesEarlierUpload {
                     try await preflight.forgetEarlierStates(of: resolved.candidate.snapshot)
+                    guard queue.removeSettledRevisions(of: entry.source, except: entry.revision) else {
+                        throw UploadError.backend("Backup queue could not be updated")
+                    }
                 }
                 if isSeries {
                     try editReplacement.keepSuperseded(of: entry.source)

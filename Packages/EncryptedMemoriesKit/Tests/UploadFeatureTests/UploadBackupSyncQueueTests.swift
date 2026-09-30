@@ -492,6 +492,36 @@ final class UploadBackupSyncQueueTests: XCTestCase {
         XCTAssertNotNil(store.entry(for: source("other"), revision: revision(1)))
     }
 
+    func testRemovingSettledRevisionsKeepsTheCurrentRevisionAndUnsettledWork() throws {
+        let url = tempDir.appendingPathComponent(UploadBackupSyncQueueManifestStore.databaseFileName)
+        let store = try XCTUnwrap(UploadBackupSyncQueueManifestStore(url: url))
+        func entry(
+            _ id: String, _ seconds: TimeInterval, _ state: UploadBackupSyncQueueState
+        ) -> UploadBackupSyncQueueEntry {
+            UploadBackupSyncQueueEntry(
+                source: source(id), revision: revision(seconds), originalFilename: "\(id).heic", state: state,
+                updatedAt: .now)
+        }
+        for entry in [
+            entry("asset", 1, .completed), entry("asset", 2, .alreadyBackedUp), entry("asset", 3, .completed),
+            entry("asset", 4, .failed), entry("asset", 5, .skippedRemoteDeletion), entry("other", 1, .completed),
+        ] {
+            XCTAssertTrue(store.upsert(entry))
+        }
+
+        XCTAssertTrue(store.removeSettledRevisions(of: source("asset"), except: revision(3)))
+
+        XCTAssertNil(store.entry(for: source("asset"), revision: revision(1)))
+        XCTAssertNil(store.entry(for: source("asset"), revision: revision(2)))
+        XCTAssertEqual(store.entry(for: source("asset"), revision: revision(3))?.state, .completed)
+        XCTAssertEqual(store.entry(for: source("asset"), revision: revision(4))?.state, .failed)
+        XCTAssertEqual(store.entry(for: source("asset"), revision: revision(5))?.state, .skippedRemoteDeletion)
+        XCTAssertNotNil(store.entry(for: source("other"), revision: revision(1)))
+        // The earlier revision starts as new work when the photo returns to it.
+        XCTAssertTrue(store.upsert(entry("asset", 1, .discovered)))
+        XCTAssertEqual(store.entry(for: source("asset"), revision: revision(1))?.state, .discovered)
+    }
+
     func testFolderQueueReconciliationKeepsOnlyRegisteredRoots() throws {
         let url = tempDir.appendingPathComponent(UploadBackupSyncQueueManifestStore.databaseFileName)
         let store = try XCTUnwrap(UploadBackupSyncQueueManifestStore(url: url))

@@ -277,6 +277,10 @@ public protocol UploadBackupSyncQueueStore: Sendable {
     /// is user intent, not a terminal backup failure.
     @discardableResult
     func remove(source: UploadSourceIdentity, revision: UploadBackupRevision) -> Bool
+    /// Removes the backed-up rows of every other revision of the source. An edit replaced its earlier upload, so a
+    /// later return to an earlier revision, for example undoing the edit, must start as new work.
+    @discardableResult
+    func removeSettledRevisions(of source: UploadSourceIdentity, except revision: UploadBackupRevision) -> Bool
     /// Removes every queued revision/resource for the supplied source identifiers. This is used by
     /// live catalog change delivery so a deletion also cancels work already claimed by the runner.
     @discardableResult
@@ -403,6 +407,10 @@ public extension UploadBackupSyncQueueStore {
     }
 
     func remove(source: UploadSourceIdentity, revision: UploadBackupRevision) -> Bool { false }
+
+    func removeSettledRevisions(of source: UploadSourceIdentity, except revision: UploadBackupRevision) -> Bool {
+        true
+    }
 
     func removeSources(kind: UploadSourceIdentity.Kind, identifiers: [String]) -> Int { 0 }
 

@@ -650,6 +650,32 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
         }
     }
 
+    private func removeSettledRevisionsUnobserved(
+        of source: UploadSourceIdentity, except revision: UploadBackupRevision
+    ) -> Bool {
+        lock.withLock {
+            var stmt: OpaquePointer?
+            guard
+                requireOperational(
+                    sqlite3_prepare_v2(
+                        db,
+                        """
+                        DELETE FROM backup_sync_queue
+                        WHERE source_kind=? AND source_id=? AND resource=? AND revision_us<>?
+                          AND state IN ('alreadyBackedUp','completed');
+                        """,
+                        -1, &stmt, nil
+                    ) == SQLITE_OK)
+            else { return false }
+            defer { sqlite3_finalize(stmt) }
+            bindText(stmt, 1, source.kind.rawValue)
+            bindText(stmt, 2, source.identifier)
+            bindText(stmt, 3, source.resource.rawValue)
+            sqlite3_bind_int64(stmt, 4, revision.rawValue)
+            return requireOperational(sqlite3_step(stmt) == SQLITE_DONE)
+        }
+    }
+
     @discardableResult
     private func removeSourcesUnobserved(kind: UploadSourceIdentity.Kind, identifiers: [String]) -> Int {
         let identifiers = Array(Set(identifiers))
@@ -1142,6 +1168,15 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
     @discardableResult
     public func remove(source: UploadSourceIdentity, revision: UploadBackupRevision) -> Bool {
         let result = removeUnobserved(source: source, revision: revision)
+        if result { notify(UploadBackupSyncQueueChange(sources: [source])) }
+        return result
+    }
+
+    @discardableResult
+    public func removeSettledRevisions(
+        of source: UploadSourceIdentity, except revision: UploadBackupRevision
+    ) -> Bool {
+        let result = removeSettledRevisionsUnobserved(of: source, except: revision)
         if result { notify(UploadBackupSyncQueueChange(sources: [source])) }
         return result
     }

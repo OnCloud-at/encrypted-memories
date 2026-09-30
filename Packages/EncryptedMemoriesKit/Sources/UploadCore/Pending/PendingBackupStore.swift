@@ -121,7 +121,13 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
                           END,
                           remote_volume_id=excluded.remote_volume_id,
                           remote_link_id=excluded.remote_link_id,
-                          kind=excluded.kind;
+                          kind=excluded.kind,
+                          created_at=CASE
+                            WHEN handoff.remote_volume_id=excluded.remote_volume_id
+                             AND handoff.remote_link_id=excluded.remote_link_id
+                             AND handoff.kind='uploaded' AND excluded.kind='uploaded' THEN handoff.created_at
+                            ELSE excluded.created_at
+                          END;
                         """,
                         bind: { stmt in
                             bindKey(stmt, handoff.key)
@@ -158,7 +164,19 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
         lock.withLock { handoffsLocked(where: "acknowledged=0") }
     }
 
-    /// The newest handoff of each source, acknowledged or not.
+    /// When the handoff of a revision became the current one. A repeated record of the same upload, for example
+    /// the replay of its receipt, keeps the first time.
+    public func handoffTime(for key: PendingSourceKey, revision: UploadBackupRevision) -> Date? {
+        lock.withLock {
+            handoffsLocked(where: "source_kind=? AND source_id=? AND revision_us=?") { stmt in
+                self.bindKey(stmt, key)
+                sqlite3_bind_int64(stmt, 3, revision.rawValue)
+            }.first?.createdAt
+        }
+    }
+
+    /// The handoff recorded last for each source, acknowledged or not. Undoing an edit can return a photo to an
+    /// earlier revision, so the revision does not tell which handoff is the current one.
     public func latestHandoffs(for keys: [PendingSourceKey]) -> [PendingSourceKey: PendingHandoff] {
         guard !keys.isEmpty else { return [:] }
         return lock.withLock {
@@ -171,7 +189,7 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
                         SELECT source_kind, source_id, revision_us, remote_volume_id, remote_link_id, kind,
                                created_at, acknowledged
                         FROM handoff WHERE source_kind=? AND source_id=?
-                        ORDER BY revision_us DESC LIMIT 1;
+                        ORDER BY created_at DESC, revision_us DESC LIMIT 1;
                         """, &stmt)
                 else { return result }
                 bindKey(stmt, key)
