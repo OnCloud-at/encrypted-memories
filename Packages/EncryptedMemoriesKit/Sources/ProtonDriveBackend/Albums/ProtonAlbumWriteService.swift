@@ -754,7 +754,23 @@ struct AlbumPhotoLinkBody: Decodable, Sendable {
         let activeRevision: Revision?
         struct Revision: Decodable, Sendable {
             let xAttr: String?
-            enum CodingKeys: String, CodingKey { case xAttr = "XAttr" }
+            let photo: Photo?
+            struct Photo: Decodable, Sendable {
+                let mainPhotoLinkID: String?
+                enum CodingKeys: String, CodingKey { case mainPhotoLinkID = "MainPhotoLinkID" }
+            }
+            enum CodingKeys: String, CodingKey {
+                case xAttr = "XAttr"
+                case photo = "Photo"
+            }
+
+            init(from decoder: any Decoder) throws {
+                let container = try decoder.container(keyedBy: CodingKeys.self)
+                xAttr = try container.decodeIfPresent(String.self, forKey: .xAttr)
+                // Only the lineage index reads the photo section. A malformed one leaves the role unknown and must
+                // not fail the metadata of the whole batch, which the content index and albums read as well.
+                photo = (try? container.decodeIfPresent(Photo.self, forKey: .photo)) ?? nil
+            }
         }
         enum CodingKeys: String, CodingKey { case activeRevision = "ActiveRevision" }
     }

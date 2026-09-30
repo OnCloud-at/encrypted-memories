@@ -4,10 +4,47 @@ import UploadCore
 struct DedupeXAttr: Decodable {
     let common: Common?
     let iOSPhotos: IOSPhotos?
+    let lineage: Lineage?
+    let unreadableLineageMarker: Bool
 
     enum CodingKeys: String, CodingKey {
         case common = "Common"
         case iOSPhotos = "iOS.photos"
+        case lineage = "EncryptedMemories.lineage"
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        common = try values.decodeIfPresent(Common.self, forKey: .common)
+        iOSPhotos = try values.decodeIfPresent(IOSPhotos.self, forKey: .iOSPhotos)
+        if values.contains(.lineage) {
+            let decoded = try? values.decode(Lineage.self, forKey: .lineage)
+            let readable = decoded?.version == 1 && decoded?.replaces.allSatisfy { !$0.isEmpty } == true
+            lineage = readable ? decoded : nil
+            unreadableLineageMarker = !readable
+        } else {
+            lineage = nil
+            unreadableLineageMarker = false
+        }
+    }
+
+    struct Lineage: Decodable {
+        let version: Int
+        let reason: String?
+        let replaces: [String]
+
+        init(from decoder: Decoder) throws {
+            let values = try decoder.container(keyedBy: CodingKeys.self)
+            version = try values.decode(Int.self, forKey: .version)
+            replaces = try values.decode([String].self, forKey: .replaces)
+            reason = try? values.decode(String.self, forKey: .reason)
+        }
+
+        enum CodingKeys: String, CodingKey {
+            case version = "V"
+            case reason = "Reason"
+            case replaces = "Replaces"
+        }
     }
 
     struct Common: Decodable {
