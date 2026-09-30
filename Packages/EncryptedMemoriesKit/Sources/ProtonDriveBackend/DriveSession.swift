@@ -460,7 +460,8 @@ extension DriveSession {
                 guard let id = link.linkID else { continue }
                 result[id] = .init(
                     isActive: link.state == nil || link.state == 1,
-                    mainPhotoLinkID: link.fileProperties?.activeRevision?.photo?.mainPhotoLinkID)
+                    mainPhotoLinkID: link.fileProperties?.activeRevision?.photo?.mainPhotoLinkID,
+                    trashTime: link.trashed)
             }
         }
         return result
@@ -677,10 +678,12 @@ private struct LinkVisibilityResponse: Decodable {
         let linkID: String?
         let state: Int?
         let fileProperties: TrashLink.FileProps?
+        let trashed: Int64?
         enum CodingKeys: String, CodingKey {
             case linkID = "LinkID"
             case state = "State"
             case fileProperties = "FileProperties"
+            case trashed = "Trashed"
         }
     }
     enum CodingKeys: String, CodingKey { case links = "Links" }

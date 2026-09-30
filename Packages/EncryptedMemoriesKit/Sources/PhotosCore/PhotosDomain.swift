@@ -149,10 +149,13 @@ public struct RemoteLinkVisibility: Equatable, Sendable {
     public var isActive: Bool
     /// Nil for a main photo.
     public var mainPhotoLinkID: String?
+    /// The server time of the move to the trash, in seconds. Nil for a link that is not in the trash.
+    public var trashTime: Int64?
 
-    public init(isActive: Bool, mainPhotoLinkID: String?) {
+    public init(isActive: Bool, mainPhotoLinkID: String?, trashTime: Int64? = nil) {
         self.isActive = isActive
         self.mainPhotoLinkID = mainPhotoLinkID
+        self.trashTime = trashTime
     }
 }
 
