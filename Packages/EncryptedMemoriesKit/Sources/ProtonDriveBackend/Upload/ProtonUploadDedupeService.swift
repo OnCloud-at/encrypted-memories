@@ -42,9 +42,10 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
     private let crypto: DriveCrypto
     private let photosClient: EncryptedMemoriesClient
     private let contentIndexStore: any UploadRemoteContentIndexStore
+    private let lineageIndexStore: UploadRemoteLineageIndexStore?
     private let contextProvider: @Sendable () async throws -> PhotosShareContext
 
-    private struct Material: Sendable {
+    struct Material: Sendable {
         let context: PhotosShareContext
         let rootKey: UnlockableKey
         let hashKey: Data
@@ -70,12 +71,14 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
         crypto: DriveCrypto,
         photosClient: EncryptedMemoriesClient,
         contentIndexStore: any UploadRemoteContentIndexStore,
+        lineageIndexStore: UploadRemoteLineageIndexStore? = nil,
         contextProvider: @Sendable @escaping () async throws -> PhotosShareContext
     ) {
         self.session = session
         self.crypto = crypto
         self.photosClient = photosClient
         self.contentIndexStore = contentIndexStore
+        self.lineageIndexStore = lineageIndexStore
         self.contextProvider = contextProvider
     }
 
@@ -187,6 +190,30 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
         return health
     }
 
+    func activeMainLinkIDs(
+        forExternalIdentifier identifier: String
+    ) async throws -> (links: Set<String>, complete: Bool) {
+        let material = try await resolveMaterial()
+        try await refreshRemoteContentIndex(material: material)
+        guard let lineageIndexStore else { return ([], false) }
+        let links = lineageIndexStore.activeMainLinkIDs(forExternalIdentifier: identifier, hashKeyEpoch: material.epoch)
+        let health = lineageIndexStore.health(
+            hashKeyEpoch: material.epoch,
+            contentCheckpoint: contentIndexStore.remoteContentIndexCheckpoint(hashKeyEpoch: material.epoch))
+        return (links, health == .complete)
+    }
+
+    func replacingMainLinkIDs(ofReplacedLink linkID: String) async throws -> (links: Set<String>, complete: Bool) {
+        let material = try await resolveMaterial()
+        try await refreshRemoteContentIndex(material: material)
+        guard let lineageIndexStore else { return ([], false) }
+        let links = lineageIndexStore.replacingMainLinkIDs(ofReplacedLink: linkID, hashKeyEpoch: material.epoch)
+        let health = lineageIndexStore.health(
+            hashKeyEpoch: material.epoch,
+            contentCheckpoint: contentIndexStore.remoteContentIndexCheckpoint(hashKeyEpoch: material.epoch))
+        return (links, health == .complete)
+    }
+
     func prepareRemoteIndex(
         progress: @escaping @Sendable (UploadRemoteIndexPreparationProgress) async -> Void
     ) async throws {
@@ -295,31 +322,15 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
         let session = self.session
         let crypto = self.crypto
         let store = self.contentIndexStore
+        let lineageStore = self.lineageIndexStore
         let generation = remoteContentIndexGeneration
         let report: @Sendable (UploadRemoteIndexPreparationProgress) async -> Void = { [weak self] value in
             await self?.emitRemoteIndexProgress(value)
         }
         let task = Task {
-            if let checkpoint = store.remoteContentIndexCheckpoint(hashKeyEpoch: material.epoch),
-                store.hasRemoteAssetIndexCheckpoint(hashKeyEpoch: material.epoch)
-            {
-                try await Self.applyRemoteEvents(
-                    from: checkpoint,
-                    material: material,
-                    session: session,
-                    crypto: crypto,
-                    store: store,
-                    progress: report
-                )
-            } else {
-                try await Self.rebuildRemoteContentIndex(
-                    material: material,
-                    session: session,
-                    crypto: crypto,
-                    store: store,
-                    progress: report
-                )
-            }
+            try await Self.refreshRemoteContentIndex(
+                material: material, session: session, crypto: crypto, store: store,
+                lineageStore: lineageStore, progress: report)
         }
         remoteContentIndexTask = task
         do {
@@ -337,11 +348,33 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
         for handler in remoteIndexProgressHandlers.values { await handler(value) }
     }
 
+    static func refreshRemoteContentIndex(
+        material: Material,
+        session: DriveSession,
+        crypto: DriveCrypto,
+        store: any UploadRemoteContentIndexStore,
+        lineageStore: UploadRemoteLineageIndexStore?,
+        progress: @escaping @Sendable (UploadRemoteIndexPreparationProgress) async -> Void
+    ) async throws {
+        if let checkpoint = store.remoteContentIndexCheckpoint(hashKeyEpoch: material.epoch),
+            store.hasRemoteAssetIndexCheckpoint(hashKeyEpoch: material.epoch)
+        {
+            try await applyRemoteEvents(
+                from: checkpoint, material: material, session: session, crypto: crypto,
+                store: store, lineageStore: lineageStore, progress: progress)
+        } else {
+            try await rebuildRemoteContentIndex(
+                material: material, session: session, crypto: crypto,
+                store: store, lineageStore: lineageStore, progress: progress)
+        }
+    }
+
     private static func rebuildRemoteContentIndex(
         material: Material,
         session: DriveSession,
         crypto: DriveCrypto,
         store: any UploadRemoteContentIndexStore,
+        lineageStore: UploadRemoteLineageIndexStore?,
         progress: @escaping @Sendable (UploadRemoteIndexPreparationProgress) async -> Void
     ) async throws {
         await progress(.init(phase: .loading))
@@ -372,6 +405,7 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
         else {
             throw UploadError.backend("Remote duplicate index checkpoint could not be saved")
         }
+        var lineageBuildReady = lineageStore?.prepareBuild(build, hashKeyEpoch: material.epoch) == true
         await progress(.init(phase: .indexing, completed: build.cursor, total: ids.count))
         for start in stride(from: build.cursor, to: ids.count, by: remoteMetadataWindow) {
             try Task.checkCancellation()
@@ -399,6 +433,12 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
             )
             let external = rows.externalIdentitiesByLinkID.map {
                 UploadRemoteExternalIdentityRecord(remoteLinkID: $0.key, externalIdentity: $0.value)
+            }
+            if lineageBuildReady, let lineageStore {
+                lineageBuildReady = lineageStore.appendBuild(
+                    identities: rows.lineageRows.identities, lineage: rows.lineageRows.lineage,
+                    hashKeyEpoch: material.epoch, buildID: build.buildID, nextCursor: end,
+                    unresolvedRemoteLinkIDs: rows.lineageRows.unresolvedLinkIDs)
             }
             guard
                 store.appendRemoteContentIndexBuild(
@@ -443,6 +483,11 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
         else {
             throw UploadError.backend("Remote duplicate index could not be saved")
         }
+        if let lineageStore {
+            if !lineageBuildReady || !lineageStore.finishBuild(build, hashKeyEpoch: material.epoch) {
+                DebugLog.log("[Dedupe] lineage index build could not be saved; reads remain incomplete")
+            }
+        }
         DebugLog.log(
             "[Dedupe] remote content index rebuilt links=\(ids.count)"
         )
@@ -454,10 +499,14 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
         session: DriveSession,
         crypto: DriveCrypto,
         store: any UploadRemoteContentIndexStore,
+        lineageStore: UploadRemoteLineageIndexStore?,
         progress: @escaping @Sendable (UploadRemoteIndexPreparationProgress) async -> Void = { _ in }
     ) async throws {
         await progress(.init(phase: .applyingChanges))
         var eventID = checkpoint.eventID
+        let eventLineageStore = lineageStore.flatMap {
+            $0.hasCheckpoint(hashKeyEpoch: material.epoch, eventID: checkpoint.eventID) ? $0 : nil
+        }
         while true {
             try Task.checkCancellation()
             let page = try await session.fetchVolumeEvents(
@@ -470,6 +519,7 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
                     session: session,
                     crypto: crypto,
                     store: store,
+                    lineageStore: lineageStore,
                     progress: progress
                 )
                 return
@@ -500,6 +550,13 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
                 crypto: crypto,
                 generation: page.eventID
             )
+            for event in relevant where event.eventType != 0 {
+                if event.linkType == nil || event.linkType == 2,
+                    let state = event.linkState, state != 0 && state != 1 && state != 2
+                {
+                    rows.lineageRows.unresolvedLinkIDs.insert(event.linkID)
+                }
+            }
             await repairUnresolvedRows(
                 &rows,
                 links: fetched.links,
@@ -520,6 +577,15 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
                 )
             else {
                 throw UploadError.backend("Remote duplicate index changes could not be saved")
+            }
+            if let eventLineageStore,
+                !eventLineageStore.applyChanges(
+                    identities: rows.lineageRows.identities, lineage: rows.lineageRows.lineage,
+                    removingRemoteLinkIDs: removedIDs, hashKeyEpoch: material.epoch,
+                    expectedEventID: eventID, eventID: page.eventID,
+                    unresolvedRemoteLinkIDs: rows.lineageRows.unresolvedLinkIDs)
+            {
+                DebugLog.log("[Dedupe] lineage index changes could not be saved; reads remain incomplete")
             }
             eventID = page.eventID
             if !page.hasMore { return }
@@ -603,11 +669,13 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
         var remoteAssetRecords: [UploadRemoteAssetIndexRecord] = []
         var unresolvedIssues: [UploadRemoteContentIndexIssue] = []
         var externalIdentitiesByLinkID: [String: UploadBackupExternalIdentity] = [:]
+        var lineageRows = RemotePhotoLineageRows()
 
         mutating func merge(_ other: Self) {
             records.append(contentsOf: other.records)
             unresolvedIssues.append(contentsOf: other.unresolvedIssues)
             externalIdentitiesByLinkID.merge(other.externalIdentitiesByLinkID) { _, new in new }
+            lineageRows.merge(other.lineageRows)
         }
     }
 
@@ -643,11 +711,18 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
         }
         var externalIdentitiesByLinkID: [String: UploadBackupExternalIdentity] = [:]
         externalIdentitiesByLinkID.reserveCapacity(expectedActiveFileIDs.count)
+        var lineageRows = RemotePhotoLineageRows()
         for id in expectedActiveFileIDs {
             try Task.checkCancellation()
             guard let link = links[id] else {
                 unresolved.append(issue(id, endpointFailureIDs.contains(id) ? .endpointFailure : .missingLinkMetadata))
+                lineageRows.unresolvedLinkIDs.insert(id)
                 continue
+            }
+            if link.type == nil || link.type == 2,
+                let state = link.state, state != 0 && state != 1 && state != 2
+            {
+                lineageRows.unresolvedLinkIDs.insert(id)
             }
             guard link.type == nil || link.type == 2,
                 link.state == nil || link.state == 1
@@ -656,10 +731,12 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
             }
             guard let nodeKey = link.nodeKey, let nodePassphrase = link.nodePassphrase else {
                 unresolved.append(issue(id, .missingKeyMetadata))
+                lineageRows.unresolvedLinkIDs.insert(id)
                 continue
             }
             guard let armoredXAttr = link.xAttr ?? link.fileProperties?.activeRevision?.xAttr else {
                 unresolved.append(issue(id, .missingEncryptedAttributes))
+                lineageRows.unresolvedLinkIDs.insert(id)
                 continue
             }
             let fileKey: UnlockableKey
@@ -673,6 +750,7 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
                 data = try crypto.decryptXAttr(armoredXAttr, node: fileKey)
             } catch {
                 unresolved.append(issue(id, .decryptFailure))
+                lineageRows.unresolvedLinkIDs.insert(id)
                 continue
             }
             let attributes: DedupeXAttr
@@ -680,8 +758,12 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
                 attributes = try JSONDecoder().decode(DedupeXAttr.self, from: data)
             } catch {
                 unresolved.append(issue(id, .invalidAttributes))
+                lineageRows.unresolvedLinkIDs.insert(id)
                 continue
             }
+            lineageRows.merge(
+                RemotePhotoLineageRows(
+                    attributes: attributes, link: link, remoteLinkID: id, hashKeyEpoch: material.epoch))
             if let iOSPhotos = attributes.iOSPhotos,
                 let cloudID = iOSPhotos.iCloudID,
                 !cloudID.isEmpty,
@@ -708,7 +790,8 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
         return RemoteContentIndexRows(
             records: records,
             unresolvedIssues: unresolved,
-            externalIdentitiesByLinkID: externalIdentitiesByLinkID
+            externalIdentitiesByLinkID: externalIdentitiesByLinkID,
+            lineageRows: lineageRows
         )
     }
 

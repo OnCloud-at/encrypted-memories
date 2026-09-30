@@ -1923,11 +1923,19 @@ extension DriveSDKBridge: PhotoUploading {
         // Nil when the journal file cannot be read: edits then keep their earlier uploads.
         let replacementJournal = EditReplacementJournalFileStore.shared(
             accountDataDirectory: uploadManifestURL.deletingLastPathComponent())
+        let lineageStore = UploadRemoteLineageIndexStore(
+            url: uploadManifestURL.deletingLastPathComponent()
+                .appendingPathComponent(UploadRemoteLineageIndexStore.databaseFileName),
+            policy: uploadManifestPolicy)
+        if lineageStore == nil {
+            DebugLog.log("[Dedupe] lineage index unavailable; reads remain incomplete")
+        }
         let service = ProtonUploadDedupeService(
             session: driveSession,
             crypto: crypto,
             photosClient: photosClient,
-            contentIndexStore: store
+            contentIndexStore: store,
+            lineageIndexStore: lineageStore
         ) { [self] in
             try await photosShareContext()
         }
@@ -1942,7 +1950,10 @@ extension DriveSDKBridge: PhotoUploading {
             duplicateChecker: service,
             identityStore: store,
             replacementJournal: replacementJournal,
-            close: { store.close() }
+            close: {
+                lineageStore?.close()
+                store.close()
+            }
         )
     }
 

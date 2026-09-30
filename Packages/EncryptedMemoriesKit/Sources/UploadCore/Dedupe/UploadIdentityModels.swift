@@ -661,6 +661,16 @@ public protocol UploadDuplicateChecking: Sendable {
     /// The current state and main photo of each link. A link that the server no longer knows is absent. The edit
     /// replacement reads it, because only the state of a photo proves that the person deleted it.
     func linkVisibility(of linkIDs: [String]) async throws -> [String: RemoteLinkVisibility]
+    /// Active main photos carrying this iCloud identifier. Incomplete results cannot prove absence.
+    /// Complete means complete as of the content index event frontier.
+    /// Own uploads recorded through recordUploaded and events newer than the checkpoint are not in these tables yet.
+    func activeMainLinkIDs(
+        forExternalIdentifier identifier: String
+    ) async throws -> (links: Set<String>, complete: Bool)
+    /// Active main photos whose lineage names this earlier link.
+    /// Complete means complete as of the content index event frontier.
+    /// Own uploads recorded through recordUploaded and events newer than the checkpoint are not in these tables yet.
+    func replacingMainLinkIDs(ofReplacedLink linkID: String) async throws -> (links: Set<String>, complete: Bool)
     /// Brings the persistent remote identity index current before a queue starts resolving items.
     /// Backends without such an index use the default no-op implementation.
     func prepareRemoteIndex(
@@ -684,6 +694,14 @@ public protocol UploadDuplicateChecking: Sendable {
 }
 
 public extension UploadDuplicateChecking {
+    func activeMainLinkIDs(
+        forExternalIdentifier identifier: String
+    ) async throws -> (links: Set<String>, complete: Bool) {
+        ([], false)
+    }
+    func replacingMainLinkIDs(ofReplacedLink linkID: String) async throws -> (links: Set<String>, complete: Bool) {
+        ([], false)
+    }
     func nameHashes(forCorrectedNames names: [String]) async throws -> [String] {
         var hashes: [String] = []
         hashes.reserveCapacity(names.count)
