@@ -1,5 +1,6 @@
 import Foundation
 import PhotosCore
+import SQLite3
 import XCTest
 
 @testable import UploadCore
@@ -194,6 +195,73 @@ final class PendingBackupStoreTests: XCTestCase {
     }
 
     // MARK: - Evidence and handoffs
+
+    func testV105HandoffsKeepTheirInsertTimesAndReturnTheNewestRevisionAfterUpgrade() throws {
+        let original = PendingHandoff(
+            key: key, revision: UploadBackupRevision(rawValue: 1), remote: remote, kind: .uploaded, createdAt: date)
+        let edit = PendingHandoff(
+            key: key, revision: UploadBackupRevision(rawValue: 2),
+            remote: PhotoUID(volumeID: "vol", nodeID: "edit"), kind: .uploaded, createdAt: date)
+        let replay = PendingHandoff(
+            key: key, revision: original.revision, remote: PhotoUID(volumeID: "vol", nodeID: "replayed-original"),
+            kind: .uploaded, createdAt: date.addingTimeInterval(10))
+        store.close()
+
+        // Use the v1.0.5 conflict update. Today's API can update created_at when the remote link changes.
+        // v1.0.5 PendingBackupStore.swift:113-124 sets created_at only on insert.
+        try writeV105Handoffs([original, edit, replay])
+        store = try XCTUnwrap(PendingBackupManifestStore(url: storeURL))
+
+        XCTAssertEqual(store.handoffTime(for: key, revision: original.revision), date)
+        XCTAssertEqual(store.handoffTime(for: key, revision: edit.revision), date)
+        XCTAssertEqual(store.unacknowledgedHandoffs().count, 2)
+        let latest = try XCTUnwrap(store.latestHandoffs(for: [key])[key])
+        XCTAssertEqual(latest, edit, "Equal insert times must still select the newer date revision")
+        XCTAssertEqual(
+            store.handoffs(forRemoteLinkIDs: [replay.remote.nodeID]).first?.remote, replay.remote,
+            "The old conflict write changes the receipt without moving its insert time")
+    }
+
+    private func writeV105Handoffs(_ handoffs: [PendingHandoff]) throws {
+        var handle: OpaquePointer?
+        let opened = sqlite3_open_v2(storeURL.path, &handle, SQLITE_OPEN_READWRITE, nil)
+        defer { sqlite3_close(handle) }
+        XCTAssertEqual(opened, SQLITE_OK)
+        let db = try XCTUnwrap(handle)
+        var statement: OpaquePointer?
+        let prepared = sqlite3_prepare_v2(
+            db,
+            """
+            INSERT INTO handoff(source_kind, source_id, revision_us, remote_volume_id, remote_link_id,
+                                kind, created_at, acknowledged)
+            VALUES(?, ?, ?, ?, ?, ?, ?, 0)
+            ON CONFLICT(source_kind, source_id, revision_us) DO UPDATE SET
+              acknowledged=CASE
+                WHEN handoff.remote_volume_id=excluded.remote_volume_id
+                 AND handoff.remote_link_id=excluded.remote_link_id THEN handoff.acknowledged
+                ELSE 0
+              END,
+              remote_volume_id=excluded.remote_volume_id,
+              remote_link_id=excluded.remote_link_id,
+              kind=excluded.kind;
+            """, -1, &statement, nil)
+        defer { sqlite3_finalize(statement) }
+        XCTAssertEqual(prepared, SQLITE_OK)
+        let stmt = try XCTUnwrap(statement)
+        for handoff in handoffs {
+            sqlite3_reset(stmt)
+            sqlite3_clear_bindings(stmt)
+            let transient = SQLiteStoreSchemaGate.transientDestructor
+            sqlite3_bind_text(stmt, 1, handoff.key.kind.rawValue, -1, transient)
+            sqlite3_bind_text(stmt, 2, handoff.key.identifier, -1, transient)
+            sqlite3_bind_int64(stmt, 3, handoff.revision.rawValue)
+            sqlite3_bind_text(stmt, 4, handoff.remote.volumeID, -1, transient)
+            sqlite3_bind_text(stmt, 5, handoff.remote.nodeID, -1, transient)
+            sqlite3_bind_text(stmt, 6, handoff.kind.rawValue, -1, transient)
+            sqlite3_bind_double(stmt, 7, handoff.createdAt.timeIntervalSince1970)
+            XCTAssertEqual(sqlite3_step(stmt), SQLITE_DONE)
+        }
+    }
 
     func testEvidenceAndHandoffsSurviveReopening() throws {
         let revision = UploadBackupRevision(rawValue: 42)

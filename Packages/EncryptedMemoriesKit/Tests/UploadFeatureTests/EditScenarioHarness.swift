@@ -7,7 +7,7 @@ import XCTest
 @testable import UploadCore
 
 /// A mutable library resolves the current revision, even when the queue contains an earlier scan.
-final class EditScenarioLibrary: UploadBackupAssetCatalog, @unchecked Sendable {
+final class EditScenarioLibrary: UploadBackupAssetCatalog, PhotoLibraryAssetEnumerator, @unchecked Sendable {
     struct Asset: Sendable {
         let identifier: String
         let basename: String
@@ -73,10 +73,12 @@ final class EditScenarioLibrary: UploadBackupAssetCatalog, @unchecked Sendable {
     var resolutions: [UploadBackupSyncQueueEntry] { lock.withLock { resolvedEntries } }
     var materializations: [SecondaryMaterialization] { lock.withLock { secondaryMaterializations } }
 
-    func add(_ identifier: String = "asset-1", live: Bool = false, basename: String = "IMG_1") {
+    func add(
+        _ identifier: String = "asset-1", live: Bool = false, basename: String = "IMG_1", original: Data? = nil
+    ) {
         lock.withLock {
             assets[identifier] = Asset(
-                identifier: identifier, basename: basename, original: Data("original-\(identifier)".utf8),
+                identifier: identifier, basename: basename, original: original ?? Data("original-\(identifier)".utf8),
                 pairedVideo: live ? Data("video-\(identifier)".utf8) : nil)
         }
     }
@@ -157,6 +159,19 @@ final class EditScenarioLibrary: UploadBackupAssetCatalog, @unchecked Sendable {
         }
     }
 
+    func infoChunks(
+        identifiers: [String]?, startOffset: Int, chunkSize: Int
+    ) -> AsyncThrowingStream<[PhotoBackupAssetInfo], any Error> {
+        let infos = snapshot.filter { !$0.deleted && (identifiers?.contains($0.identifier) ?? true) }
+            .dropFirst(identifiers == nil ? startOffset : 0).map(\.info)
+        return AsyncThrowingStream { continuation in
+            for offset in stride(from: 0, to: infos.count, by: chunkSize) {
+                continuation.yield(Array(infos[offset..<min(offset + chunkSize, infos.count)]))
+            }
+            continuation.finish()
+        }
+    }
+
     func resolve(_ entry: UploadBackupSyncQueueEntry, now: Date) async throws -> BackupResolvedResource? {
         lock.withLock { resolvedEntries.append(entry) }
         guard let asset = lock.withLock({ assets[entry.source.identifier] }), !asset.deleted else { return nil }
@@ -210,7 +225,7 @@ final class EditScenarioLibrary: UploadBackupAssetCatalog, @unchecked Sendable {
             captureDate: asset.captureTime, secondaries: secondaries)
     }
 
-    private func descriptor(
+    func descriptor(
         _ item: PhotoBackupExportPlan.Item, asset: Asset, materialize: Bool
     ) throws -> UploadResourceDescriptor {
         let bytes: Data
@@ -263,6 +278,10 @@ final class EditScenarioHarness {
     private var pipeline: UploadDedupePipeline!
     private var runner: BackupSyncRunner!
     private var engine: UploadBackupSyncEngine!
+    private(set) var catalog: PhotoLibraryCatalogManifestStore!
+    private var legacyMains: Set<String> = []
+    private var sharedMains: [String: String] = [:]
+    private var legacyMissingRenders: Set<String> = []
     private(set) var lastScan = UploadBackupSyncScanResult()
     private var entries: [UploadBackupSyncQueueEntry] = []
     private var checkedSteps = 0
@@ -287,6 +306,117 @@ final class EditScenarioHarness {
         try open()
     }
 
+    enum V105Fixture: Equatable {
+        case unchanged
+        case edited
+        case identicalBytes
+        case missingRender
+    }
+
+    /// Seeds the values v1.0.5 wrote, then opens them again with today's stores and runner.
+    convenience init(v105 fixture: V105Fixture, assetCount: Int = 1) throws {
+        try self.init()
+        do {
+            if fixture == .unchanged {
+                for number in 2..<max(2, assetCount + 1) {
+                    library.add("asset-\(number)", basename: "IMG_\(number)")
+                }
+            }
+            if fixture == .edited {
+                try seedV105(try XCTUnwrap(library.snapshot.first))
+                library.edit("legacy-render", at: clock.now.addingTimeInterval(-121))
+            } else if fixture == .missingRender {
+                library.edit("missing-render", at: clock.now.addingTimeInterval(-121), renderPresent: false)
+                legacyMissingRenders.insert("asset-1")
+            } else if fixture == .identicalBytes {
+                library.add("asset-2", basename: "IMG_2", original: try XCTUnwrap(library.snapshot.first).original)
+            }
+            for asset in library.snapshot {
+                try seedV105(asset)
+            }
+            // The index may have no compound proof. The local stores must still protect existing uploads.
+            try relaunch()
+            for asset in library.snapshot {
+                let revision = UploadBackupRevision(date: asset.modificationDate)
+                let record = try XCTUnwrap(backupState.record(for: asset.source, revision: revision))
+                XCTAssertTrue(record.isComplete)
+                XCTAssertEqual(record.pendingResourceCount, 0)
+                XCTAssertEqual(catalog.entry(for: asset.identifier)?.metadataRevision, revision.rawValue)
+                XCTAssertTrue(journal.entry(for: asset.source).isEmpty)
+            }
+            XCTAssertFalse(journalFileExists)
+        } catch {
+            try? cleanup()
+            throw error
+        }
+    }
+
+    private func seedV105(_ asset: EditScenarioLibrary.Asset) throws {
+        let plan = try XCTUnwrap(PhotoBackupAssetPlanner.exportPlan(for: asset.info))
+        var main: PhotoUID?
+        for item in [plan.primary] + plan.secondaries {
+            let descriptor = try library.descriptor(item, asset: asset, materialize: false)
+            let digest = try XCTUnwrap(descriptor.precomputedSHA1Digest)
+            let existing = server.links.first {
+                $0.state == .active && $0.contentHash == EditScenarioServer.contentHash(digest)
+            }
+            let uid: PhotoUID
+            let wasDuplicate: Bool
+            if let existing {
+                // v1.0.5 dedupes the original against L0; it does not upload another original under E.
+                uid = existing.uid
+                wasDuplicate = true
+            } else {
+                uid = server.seedV105Upload(descriptor, digest: digest, asset: asset, main: main)
+                wasDuplicate = false
+            }
+            if item.sourceResource == .primary {
+                main = uid
+                legacyMains.insert(uid.nodeID)
+                if let existing, existing.assetID != asset.identifier {
+                    sharedMains[asset.identifier] = uid.nodeID
+                }
+            }
+            // v1.0.5 UploadDedupePipeline.swift:569-582 writes these hashes, receipt, and outcome.
+            // Its local content reuse at 175-192 also copies the known volume; a server duplicate has only a link.
+            let volumeID =
+                wasDuplicate
+                ? identities.trustedRecord(
+                    contentHash: EditScenarioServer.contentHash(digest), hashKeyEpoch: "scenario-epoch")?.remoteVolumeID
+                : uid.volumeID
+            XCTAssertTrue(
+                identities.upsert(
+                    UploadIdentityRecord(
+                        source: descriptor.source, filename: descriptor.filename, correctedName: descriptor.filename,
+                        fileSize: descriptor.fileSize, modificationDate: descriptor.modificationDate,
+                        sha1Hex: UploadContentSHA1.hexString(digest: digest), nameHash: "nh(\(descriptor.filename))",
+                        contentHash: EditScenarioServer.contentHash(digest), hashKeyEpoch: "scenario-epoch",
+                        remoteVolumeID: volumeID, remoteLinkID: uid.nodeID,
+                        outcome: wasDuplicate ? "duplicateActive" : "uploaded", updatedAt: clock.now)))
+        }
+        let candidate = try XCTUnwrap(PhotoBackupAssetPlanner.candidate(for: asset.info))
+        // v1.0.5 PhotoBackupAssetPlan.swift:167-170 uses the date even when the render is absent.
+        let revision = UploadBackupRevision(date: asset.modificationDate)
+        var revisions: Set<UploadBackupRevision> = [revision]
+        if case .revision(let editRevision) = candidate.snapshot.editRevision { revisions.insert(editRevision) }
+        // v1.0.5 UploadBackupState.swift:275-294 records complete date and edit revisions.
+        for revision in revisions {
+            XCTAssertTrue(
+                backupState.upsert(
+                    UploadBackupAssetRecord(
+                        source: asset.source, revision: revision, resourceCount: candidate.snapshot.resourceCount,
+                        pendingResourceCount: 0, updatedAt: clock.now)))
+        }
+        XCTAssertTrue(
+            queue.upsert(
+                UploadBackupSyncQueueEntry(
+                    source: asset.source, revision: revision, originalFilename: candidate.originalFilename,
+                    state: .completed, updatedAt: clock.now)))
+        var entry = PhotoLibraryCatalogMapper.entry(for: asset.info, observedAt: clock.now)
+        entry.metadataRevision = revision.rawValue
+        XCTAssertTrue(catalog.upsertBatch([entry]))
+    }
+
     private func open() throws {
         queue = try XCTUnwrap(
             UploadBackupSyncQueueManifestStore(
@@ -297,6 +427,9 @@ final class EditScenarioHarness {
         backupState = try XCTUnwrap(
             UploadBackupStateManifestStore(
                 url: directory.appendingPathComponent(UploadBackupStateManifestStore.databaseFileName)))
+        catalog = try XCTUnwrap(
+            PhotoLibraryCatalogManifestStore(
+                url: directory.appendingPathComponent(PhotoLibraryCatalogManifestStore.databaseFileName)))
         journal = try XCTUnwrap(EditReplacementJournalFileStore(accountDataDirectory: directory))
         pipeline = UploadDedupePipeline(
             store: identities, checker: index, resourceCoordinator: coordinator, replacementJournal: journal,
@@ -324,6 +457,7 @@ final class EditScenarioHarness {
         queue?.close()
         identities?.close()
         backupState?.close()
+        catalog?.close()
     }
 
     func cleanup() throws {
@@ -335,6 +469,20 @@ final class EditScenarioHarness {
         close()
         clock.advance(by: 1)
         try open()
+    }
+
+    /// A full production catalog scan must classify the old rows before it offers work to the engine.
+    func fullRescan() async throws -> PhotoLibraryCatalogProgress {
+        let result = try await PhotoLibraryCatalogSync(
+            store: catalog, enumerator: library, now: { [clock] in clock.now }
+        ).run(engine: engine)
+        clock.advance(by: 1)
+        return result
+    }
+
+    var journalFileExists: Bool {
+        FileManager.default.fileExists(
+            atPath: directory.appendingPathComponent(EditReplacementJournalFileStore.fileName).path)
     }
 
     /// Discovery uses the real scan, preflight, remote proof lookup, and persistent queue upsert.
@@ -504,7 +652,12 @@ final class EditScenarioHarness {
         let links = server.links
         for asset in library.snapshot {
             let mains = links.filter {
-                $0.assetID == asset.identifier && $0.mainLinkID == nil && $0.state == .active
+                ($0.assetID == asset.identifier || sharedMains[asset.identifier] == $0.linkID)
+                    && $0.mainLinkID == nil && $0.state == .active
+                    // An upgrade keeps unrelated legacy mains; exactly one must still hold today's bytes.
+                    && (!legacyMains.contains($0.linkID)
+                        || $0.contentHash
+                            == EditScenarioServer.contentHash(Data(Insecure.SHA1.hash(data: asset.current))))
             }
             if links.contains(where: { $0.assetID == asset.identifier && $0.personDeleted }) {
                 check(mains.isEmpty, "S5 a deleted asset has a new active main", file: file, line: line)
@@ -512,7 +665,7 @@ final class EditScenarioHarness {
             }
             // Local deletion does not remove a backup from the server.
             guard !asset.deleted else { continue }
-            if asset.hasAdjustments && asset.render == nil {
+            if asset.hasAdjustments && asset.render == nil && !legacyMissingRenders.contains(asset.identifier) {
                 check(
                     false, "K6 missing render cannot count an original as the current version", file: file, line: line)
                 continue
@@ -524,7 +677,7 @@ final class EditScenarioHarness {
                 "S1 the main must hold the current version", file: file, line: line)
             check(main.captureTime == asset.captureTime, "S1 the main keeps the capture time", file: file, line: line)
             let resources = links.filter { $0.mainLinkID == main.linkID && $0.state == .active }
-            if asset.hasAdjustments {
+            if asset.hasAdjustments && asset.render != nil {
                 let currentHash = EditScenarioServer.contentHash(Data(Insecure.SHA1.hash(data: asset.current)))
                 for editedMain in mains where editedMain.contentHash == currentHash {
                     let editedResources = links.filter { $0.mainLinkID == editedMain.linkID && $0.state == .active }

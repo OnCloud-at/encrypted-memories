@@ -85,6 +85,24 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
 
     func failNextTrash() { lock.withLock { failTrash = true } }
 
+    /// The fixture starts with links that v1.0.5 uploaded; these are not uploads by today's runner.
+    func seedV105Upload(
+        _ descriptor: UploadResourceDescriptor, digest: Data, asset: EditScenarioLibrary.Asset, main: PhotoUID?
+    ) -> PhotoUID {
+        lock.withLock {
+            let id = String(format: "link-%04d", nextID)
+            nextID += 1
+            table[id] = Link(
+                linkID: id, nameHash: "nh(\(descriptor.filename))",
+                contentHash: Self.contentHash(digest), state: .active,
+                mainLinkID: main?.nodeID, captureTime: asset.captureTime, assetID: asset.identifier,
+                generation: asset.generation,
+                isOriginal: descriptor.filename.hasSuffix(".HEIC") || descriptor.filename.hasSuffix(".MOV"))
+            record("v1.0.5 upload \(id)")
+            return PhotoUID(volumeID: "vol", nodeID: id)
+        }
+    }
+
     func upload(
         _ request: PhotoUploadRequest,
         onProgress: @Sendable @escaping (UploadProgress) -> Void
