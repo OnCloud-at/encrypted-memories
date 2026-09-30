@@ -225,20 +225,87 @@ struct RecentlyDeletedListingTests {
     @Test func aFileOfAnEarlierBuildOpensWithoutPhotosAwaitingTheLibrary() throws {
         let directory = try Self.directory()
         defer { try? FileManager.default.removeItem(at: directory) }
-        // The key and the contents of builds before the wait, without `awaitingLibrary`.
-        let key = HKDF<SHA256>.deriveKey(
-            inputKeyMaterial: SymmetricKey(data: Data("secret".utf8)),
-            salt: Data("EncryptedMemories.recently-deleted.v1.account".utf8),
-            info: Data("recently-deleted-listing".utf8), outputByteCount: 32)
-        let plaintext = Data(#"{"listing":[],"trashedHere":[]}"#.utf8)
-        try #require(try AES.GCM.seal(plaintext, using: key).combined)
+        // v1.0.5 RecentlyDeletedListing.swift:26-56 has no awaitingLibrary field.
+        let listed = Self.item("listed", at: 1)
+        let moved = Self.item("moved", at: 2, video: true)
+        let contents = V105Contents(
+            listing: [V105Record(listed)],
+            trashedHere: [
+                V105TrashedHere(volumeID: "volume", nodeID: "moved", item: V105Record(moved), misses: 1),
+                V105TrashedHere(volumeID: "volume", nodeID: "unknown", item: nil, misses: 0),
+            ])
+        let plaintext = try JSONEncoder().encode(contents)
+        try #require(try AES.GCM.seal(plaintext, using: Self.listingKey).combined)
             .write(to: directory.appendingPathComponent(RecentlyDeletedListingStore.fileName))
 
         let store = RecentlyDeletedListingStore(directory: directory, accountUID: "account", keyPassword: "secret")
         let loaded = try #require(store.load())
 
-        #expect(loaded.listing == [])
+        #expect(loaded.listing == [listed])
+        #expect(loaded.trashedHere.map(\.uid.nodeID) == ["moved", "unknown"])
+        #expect(loaded.trashedHere.map(\.misses) == [1, 0])
+        #expect(loaded.trashedHere.first?.item == moved)
+        #expect(loaded.trashedHere.last?.item == nil)
         #expect(loaded.trashedAwaitingLibrary.isEmpty)
+    }
+
+    @Test func aV105ReaderIgnoresAwaitingLibraryInAFileOfTheNewBuild() throws {
+        let directory = try Self.directory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let listed = Self.item("listed", at: 1)
+        let moved = Self.item("moved", at: 2, video: true)
+        let state = RecentlyDeletedIdentities.Persisted(
+            listing: [listed], trashedHere: [.init(uid: moved.uid, item: moved, misses: 1)],
+            trashedAwaitingLibrary: [moved.uid: Self.trashTime])
+        let store = RecentlyDeletedListingStore(directory: directory, accountUID: "account", keyPassword: "secret")
+        store.save(state)
+        #expect(store.load() == state, "The file must contain a nonempty wait before the old reader opens it")
+        let blob = try Data(contentsOf: directory.appendingPathComponent(RecentlyDeletedListingStore.fileName))
+        let plaintext = try AES.GCM.open(AES.GCM.SealedBox(combined: blob), using: Self.listingKey)
+
+        // Decode the actual new writer's file with the v1.0.5 Contents shape, which has no wait field.
+        let old = try JSONDecoder().decode(V105Contents.self, from: plaintext)
+
+        #expect(old.listing == [V105Record(listed)])
+        #expect(
+            old.trashedHere == [
+                V105TrashedHere(volumeID: "volume", nodeID: "moved", item: V105Record(moved), misses: 1)
+            ])
+    }
+
+    // v1.0.5 RecentlyDeletedListing.swift:26-56 defines these stored records.
+    private struct V105Record: Codable, Equatable {
+        let volumeID: String
+        let nodeID: String
+        let captureTime: Double
+        let isVideo: Bool
+
+        init(_ item: PhotoItem) {
+            volumeID = item.uid.volumeID
+            nodeID = item.uid.nodeID
+            captureTime = item.captureTime.timeIntervalSince1970
+            isVideo = item.isVideo
+        }
+    }
+
+    private struct V105TrashedHere: Codable, Equatable {
+        let volumeID: String
+        let nodeID: String
+        let item: V105Record?
+        let misses: Int
+    }
+
+    private struct V105Contents: Codable {
+        let listing: [V105Record]?
+        let trashedHere: [V105TrashedHere]
+    }
+
+    // v1.0.5 RecentlyDeletedListing.swift:61-66 derives the encryption key this way.
+    private static var listingKey: SymmetricKey {
+        HKDF<SHA256>.deriveKey(
+            inputKeyMaterial: SymmetricKey(data: Data("secret".utf8)),
+            salt: Data("EncryptedMemories.recently-deleted.v1.account".utf8),
+            info: Data("recently-deleted-listing".utf8), outputByteCount: 32)
     }
 
     @Test func theListingRegistersItsPhotosNewestFirst() {

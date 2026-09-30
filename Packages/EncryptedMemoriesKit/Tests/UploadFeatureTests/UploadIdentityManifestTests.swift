@@ -173,6 +173,29 @@ final class UploadIdentityManifestTests: XCTestCase {
         XCTAssertEqual(store.sources(withRemoteLinkID: "link-unknown")?.count, 0)
     }
 
+    func testV105ManifestRowsReopenWithBothOwnersOfASharedLink() throws {
+        let store = try makeStore()
+        var uploaded = makeRecord(identifier: "asset-a")
+        uploaded.source = UploadSourceIdentity(kind: .photoLibraryAsset, identifier: "asset-a")
+        uploaded.remoteVolumeID = "vol"
+        uploaded.remoteLinkID = "shared"
+        uploaded.outcome = "uploaded"
+        var duplicate = uploaded
+        duplicate.source = UploadSourceIdentity(kind: .photoLibraryAsset, identifier: "asset-b")
+        duplicate.outcome = "duplicateActive"
+        // v1.0.5 UploadDedupePipeline.swift:569-582 and 175-192 persist these receipt outcomes.
+        XCTAssertTrue(store.upsert(uploaded))
+        XCTAssertTrue(store.upsert(duplicate))
+        store.close()
+
+        let reopened = try makeStore()
+        defer { reopened.close() }
+        XCTAssertEqual(reopened.record(for: uploaded.source), uploaded)
+        XCTAssertEqual(reopened.record(for: duplicate.source), duplicate)
+        XCTAssertEqual(
+            Set(try XCTUnwrap(reopened.sources(withRemoteLinkID: "shared"))), [uploaded.source, duplicate.source])
+    }
+
     func testForgettingTrashedLinksKeepsTheHashesButNoLongerProvesABackup() throws {
         let store = try makeStore()
         var trashed = makeRecord(identifier: "asset-a")
