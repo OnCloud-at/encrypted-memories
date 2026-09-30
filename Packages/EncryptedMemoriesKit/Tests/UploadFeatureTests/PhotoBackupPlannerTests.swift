@@ -164,6 +164,17 @@ final class PhotoBackupPlannerTests: XCTestCase {
         XCTAssertEqual(plan.secondaries.first?.uploadFilename, "IMG_2000.MOV")
     }
 
+    func testCatalogRoundTripKeepsTheRevisionOfAnEditWithoutItsRenderedFile() throws {
+        let asset = edited(secondsAgo: 600, rendered: false)
+        let entry = PhotoLibraryCatalogMapper.entry(for: asset, observedAt: Date())
+        let replayed = PhotoLibraryCatalogMapper.info(for: entry)
+
+        XCTAssertEqual(
+            try XCTUnwrap(PhotoBackupAssetPlanner.candidate(for: replayed)).snapshot.revision,
+            try XCTUnwrap(PhotoBackupAssetPlanner.candidate(for: asset)).snapshot.revision,
+            "a replay that plans the revision with the rendered file completes it before that file exists")
+    }
+
     func testCatalogRoundTripRetainsExternalIdentityForProofReplay() throws {
         var asset = info(
             modified: Date(timeIntervalSince1970: 1_700_000_100.1234),
@@ -201,6 +212,22 @@ final class PhotoBackupPlannerTests: XCTestCase {
         XCTAssertNotEqual(
             fpBase, PhotoBackupAssetPlanner.metadataRevision(for: base),
             "fingerprint must be distinct from the metadata revision")
+    }
+
+    func testTheRenderedFileOfAnEditMovesTheRevisionWithoutADateChange() {
+        let unrendered = edited(secondsAgo: 600, rendered: false)
+        let rendered = edited(secondsAgo: 600)
+        let unedited = edited(secondsAgo: 600, hasAdjustments: false, rendered: false)
+
+        XCTAssertEqual(unrendered.modificationDate, rendered.modificationDate)
+        XCTAssertLessThan(
+            PhotoBackupAssetPlanner.metadataRevision(for: unrendered).rawValue,
+            PhotoBackupAssetPlanner.metadataRevision(for: rendered).rawValue,
+            "a backup that holds the original re-opens as a later revision when Photos lists the rendered file")
+        XCTAssertEqual(
+            PhotoBackupAssetPlanner.metadataRevision(for: rendered),
+            PhotoBackupAssetPlanner.metadataRevision(for: unedited),
+            "a photo without a missing rendered file keeps its date revision")
     }
 
     func testEditedAssetRefusesFingerprintTrust() {

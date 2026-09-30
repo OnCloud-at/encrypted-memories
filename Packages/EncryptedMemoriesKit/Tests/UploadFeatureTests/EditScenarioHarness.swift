@@ -132,7 +132,11 @@ final class EditScenarioLibrary: UploadBackupAssetCatalog, @unchecked Sendable {
     }
 
     func publishRender(_ bytes: String, identifier: String = "asset-1") {
-        lock.withLock { assets[identifier]?.render = Data(bytes.utf8) }
+        lock.withLock {
+            // A new version for the server, while Photos leaves the dates alone.
+            assets[identifier]?.generation += 1
+            assets[identifier]?.render = Data(bytes.utf8)
+        }
     }
 
     /// Metadata drifts without changing the compound bytes or its adjustment data.
