@@ -380,31 +380,19 @@ final class EditScenarioTests: XCTestCase {
             await harness.pass()
             XCTAssertEqual(harness.server.steps.filter { $0.action.hasPrefix("upload") }.count, uploadsBeforeEdit)
         }
-        harness.knownDefect =
-            "K6 (#194): a missing render falls through to the original after 120 seconds or without a timestamp."
         if timestampPresent { harness.clock.advance(by: 121) }
         await harness.pass()
-        harness.check(
-            harness.server.steps.filter { $0.action.hasPrefix("upload") }.count == uploadsBeforeEdit,
-            "K6 missing render must not upload any resource of the edit")
-        // A duplicate original is also wrong: it must not be counted as the completed current edit.
-        let missingRender = try harness.library.candidate()
-        let entry = try XCTUnwrap(
-            harness.queue.entry(for: missingRender.snapshot.source, revision: missingRender.snapshot.revision))
-        harness.check(
-            harness.state(of: entry)?.isTerminalSuccess != true,
-            "K6 missing render must not count the original as the current version")
+        // Photos may never list a rendered file, so the backup stores what exists instead of waiting forever.
+        XCTAssertEqual(harness.activeMains.count, 1, "the photo is backed up with its original")
+        let unrendered = try harness.library.candidate()
         harness.library.publishRender("late-render")
+        XCTAssertNotEqual(
+            try harness.library.candidate().snapshot.revision, unrendered.snapshot.revision,
+            "the rendered file re-opens the photo although its dates did not move")
         try await harness.enqueue()
         harness.clock.advance(by: 15)
         await harness.pass()
         harness.assertQuiescent()
-        harness.expectKnownDefect(
-            signature: "K6 missing render",
-            consequences: [
-                "S1 the main must hold the current version", "S3 the edited main lacks its active original",
-                "S3 the edited main lacks its current adjustment data",
-            ])
     }
 
     func testWaitingOriginalThenPersonDeletesTheEditAndMetadataDrifts() async throws {

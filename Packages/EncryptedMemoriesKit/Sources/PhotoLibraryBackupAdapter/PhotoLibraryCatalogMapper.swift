@@ -39,7 +39,7 @@ public enum PhotoLibraryCatalogMapper {
     /// Rehydrates the pure planning input from the durable inventory. This never reads PhotoKit or
     /// media bytes; it is used only to replay an incomplete queue after launch or an app upgrade.
     public static func info(for entry: PhotoLibraryCatalogEntry) -> PhotoBackupAssetInfo {
-        PhotoBackupAssetInfo(
+        var info = PhotoBackupAssetInfo(
             localIdentifier: entry.localIdentifier,
             creationDate: entry.creationDate,
             modificationDate: entry.modificationDate,
@@ -58,5 +58,11 @@ public enum PhotoLibraryCatalogMapper {
             },
             cloudIdentifier: entry.cloudIdentifier
         )
+        // The inventory does not store the adjustment state. Only an edit without its rendered file moves the
+        // revision away from the one that the stored values give, and a replay must plan that same revision.
+        if PhotoBackupAssetPlanner.metadataRevision(for: info).rawValue != entry.metadataRevision {
+            info.hasAdjustments = true
+        }
+        return info
     }
 }

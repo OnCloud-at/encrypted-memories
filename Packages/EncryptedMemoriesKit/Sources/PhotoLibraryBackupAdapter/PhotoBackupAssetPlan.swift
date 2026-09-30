@@ -160,10 +160,8 @@ public enum PhotoBackupAssetPlanner {
         guard let edited = info.adjustmentTimestamp, edited <= now else { return nil }
         let quietEnd = edited.addingTimeInterval(editQuietPeriod)
         if now < quietEnd { return quietEnd }
-        let render: PhotoBackupAssetInfo.Resource.Role = info.isVideo ? .fullSizeVideo : .fullSizePhoto
         let renderWaitEnd = edited.addingTimeInterval(renderWaitLimit)
-        guard info.hasAdjustments, !info.resources.contains(where: { $0.role == render }), now < renderWaitEnd
-        else { return nil }
+        guard lacksRender(info), now < renderWaitEnd else { return nil }
         return min(now.addingTimeInterval(renderRecheckInterval), renderWaitEnd)
     }
 
@@ -196,9 +194,19 @@ public enum PhotoBackupAssetPlanner {
     /// when members appear or change, and a main photo that an earlier build backed up as a plain photo must
     /// re-open so that its missing members upload.
     public static func metadataRevision(for info: PhotoBackupAssetInfo) -> UploadBackupRevision {
-        let dateRevision = UploadBackupRevision(date: info.modificationDate ?? info.creationDate ?? .distantPast)
+        let date = UploadBackupRevision(date: info.modificationDate ?? info.creationDate ?? .distantPast)
+        // One step earlier than the revision with the rendered file: revisions of one photo order by time.
+        let dateRevision = lacksRender(info) ? UploadBackupRevision(rawValue: date.rawValue - 1) : date
         guard info.resources.contains(where: { $0.role == .burstMember }) else { return dateRevision }
         return revision(hashing: "series#\(dateRevision.rawValue)#\(fingerprintRevision(for: info).rawValue)")
+    }
+
+    /// An edit whose rendered file Photos does not list. The backup of such a photo holds the original, so its
+    /// revision differs from the one with the rendered file: the photo re-opens when the rendered file appears,
+    /// even when Photos leaves the dates alone.
+    static func lacksRender(_ info: PhotoBackupAssetInfo) -> Bool {
+        let render: PhotoBackupAssetInfo.Resource.Role = info.isVideo ? .fullSizeVideo : .fullSizePhoto
+        return info.hasAdjustments && !info.resources.contains { $0.role == render }
     }
 
     private static func externalIdentity(for info: PhotoBackupAssetInfo) -> UploadBackupExternalIdentity? {
