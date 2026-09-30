@@ -389,16 +389,14 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
         guard replacement.current.map(isLiveMain) == true || !restored.isEmpty || !adoptable.isEmpty else {
             // Nothing proves the photo live. Who removed it stays unknown, so the earlier rule applies: the
             // photos of the replacement do not count, and a trashed copy outside them is a deletion by the person.
-            let excluded = replacement.superseded.union(replacement.retired)
-            let remaining = remoteItems.filter { !($0.linkID.map(excluded.contains) ?? false) }
-            guard remaining.contains(where: { $0.linkState == .active && $0.contentHash == contentHash }) else {
-                return remaining
-            }
-            var replacedRelated: Set<String> = []
-            for linkID in replacement.superseded.sorted() {
-                replacedRelated.formUnion(try await checker.relatedPhotoLinkIDs(ofMainLinkID: linkID))
-            }
-            return remaining.filter { !($0.linkID.map(replacedRelated.contains) ?? false) }
+            // An active copy under a main photo is a related file, such as the hidden original under a replaced
+            // photo. It is no backup. The states above name those copies without a lookup of the related photos
+            // of a main photo that may be in the trash or gone. A copy that is no longer active was a main photo
+            // when the listing named it, so it stays.
+            let related = Set(
+                matches.filter { visibility[$0].map { $0.isActive && $0.mainPhotoLinkID != nil } ?? false })
+            let excluded = replacement.superseded.union(replacement.retired).union(related)
+            return remoteItems.filter { !($0.linkID.map(excluded.contains) ?? false) }
         }
         // A restored earlier version with other bytes is an earlier photo again, so this upload replaces it.
         if !restored.isEmpty {

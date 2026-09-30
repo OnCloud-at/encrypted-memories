@@ -491,21 +491,19 @@ final class EditScenarioTests: XCTestCase {
         harness.server.personTrash(edited)
         harness.server.relatedLookupFailsForTrashedMain = true
         harness.knownDefect =
-            "H6 (#194): the duplicate check asks for the related photos of a trashed main. When the service rejects "
-            + "that, as it does for a permanently deleted main, the row fails on every attempt."
+            "Defect F1 (#194): an undo after the person trashed the photo uploads again. Without a marker on the "
+            + "server, nothing proves who trashed the photo."
         let undone = try await undo()
         for _ in 0..<6 {
             harness.clock.advance(by: 8)
             await harness.pass()
         }
         let row = try XCTUnwrap(harness.queue.entry(for: undone.source, revision: undone.revision))
-        harness.check(
+        XCTAssertTrue(
             harness.server.rejectedTrashedMainLookupIDs.isEmpty,
-            "H6 the check must not ask for the related photos of a trashed main")
-        harness.check(row.state != .failed && row.state != .discovered, "H6 the row must settle: \(row.state)")
-        harness.expectKnownDefect(
-            signature: "H6 the check must not ask for the related photos of a trashed main",
-            consequences: ["H6 the row must settle"])
+            "the check must not ask for the related photos of a trashed main")
+        XCTAssertTrue(row.state.isTerminalSuccess, "the row must settle: \(row.state)")
+        harness.expectKnownDefect(signature: "S5 uploaded", consequences: ["S5"])
     }
 
     func testServerTrashRestoreAndEmptyTrashRules() async throws {
