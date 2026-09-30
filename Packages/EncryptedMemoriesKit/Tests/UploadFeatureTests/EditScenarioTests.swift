@@ -250,6 +250,27 @@ final class EditScenarioTests: XCTestCase {
         XCTAssertEqual(try harness.liveMain(), original, "a local deletion keeps the backup")
     }
 
+    func testADeviceIndexHoldsNoCompoundThatAppearedAfterItsFullBuild() async throws {
+        harness = try EditScenarioHarness()
+        // The second device opens the account before the first device backs the photo up.
+        let deviceB = try EditScenarioHarness(server: harness.server, library: harness.library)
+        defer { try? deviceB.cleanup() }
+        try await harness.enqueue()
+        await harness.drain()
+        let original = try harness.liveMain()
+        let uploads = deviceB.server.steps.filter { $0.action.hasPrefix("upload") }.count
+
+        let discovered = try await deviceB.enqueue()
+        XCTAssertEqual(deviceB.lastScan.alreadyBackedUp, 0, "the index of a device gains no record from events")
+        deviceB.clock.advance(by: 5)
+        await deviceB.drain()
+
+        XCTAssertEqual(deviceB.state(of: discovered), .alreadyBackedUp, "the duplicate check adopts the photo")
+        XCTAssertEqual(deviceB.server.steps.filter { $0.action.hasPrefix("upload") }.count, uploads)
+        XCTAssertEqual(deviceB.identities.record(for: discovered.source)?.remoteLinkID, original.nodeID)
+        deviceB.assertQuiescent()
+    }
+
     func testRemoteProofOnSecondDeviceThenFirstEdit() async throws {
         harness = try EditScenarioHarness()
         try await harness.enqueue()

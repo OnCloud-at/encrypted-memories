@@ -163,7 +163,11 @@ final class EditScenarioLibrary: UploadBackupAssetCatalog, @unchecked Sendable {
         if let until = PhotoBackupAssetPlanner.notReadyUntil(for: asset.info, now: now) {
             throw UploadError.sourceNotReady(entry.originalFilename, until: until)
         }
-        let candidate = try XCTUnwrap(PhotoBackupAssetPlanner.candidate(for: asset.info))
+        // The production resolver maps the asset without its cloud identifier, so the resolved candidate carries no
+        // external identity; only the candidates of a scan do. PhotoLibraryResourceResolver.swift:47.
+        var resolvedInfo = asset.info
+        resolvedInfo.cloudIdentifier = nil
+        let candidate = try XCTUnwrap(PhotoBackupAssetPlanner.candidate(for: resolvedInfo))
         let plan = try XCTUnwrap(PhotoBackupAssetPlanner.exportPlan(for: asset.info))
         // The real planner supplies edit fingerprints and every secondary resource role.
         // PhotoBackupAssetPlan.swift:213-217, 251-288, 325-332.
@@ -254,6 +258,8 @@ final class EditScenarioHarness {
     private(set) var identities: UploadIdentityManifestStore!
     private var backupState: UploadBackupStateManifestStore!
     private(set) var journal: EditReplacementJournalFileStore!
+    /// Survives a relaunch like the stored index of a device.
+    private let index: EditScenarioDeviceIndex
     private var pipeline: UploadDedupePipeline!
     private var runner: BackupSyncRunner!
     private var engine: UploadBackupSyncEngine!
@@ -277,6 +283,7 @@ final class EditScenarioHarness {
             library.add(live: live, basename: basename)
         }
         checkedSteps = server.steps.count
+        index = EditScenarioDeviceIndex(server: server)
         try open()
     }
 
@@ -292,7 +299,7 @@ final class EditScenarioHarness {
                 url: directory.appendingPathComponent(UploadBackupStateManifestStore.databaseFileName)))
         journal = try XCTUnwrap(EditReplacementJournalFileStore(accountDataDirectory: directory))
         pipeline = UploadDedupePipeline(
-            store: identities, checker: server, resourceCoordinator: coordinator, replacementJournal: journal,
+            store: identities, checker: index, resourceCoordinator: coordinator, replacementJournal: journal,
             now: { [clock] in clock.now })
         let replacement = EditedPhotoReplacement(
             remote: server, albums: server, relations: server, identities: identities, journal: journal)
