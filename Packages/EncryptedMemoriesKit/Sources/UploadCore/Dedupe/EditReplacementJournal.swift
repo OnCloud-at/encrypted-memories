@@ -87,6 +87,7 @@ public final class EditReplacementJournalFileStore: EditReplacementJournaling, @
                 return nil
             }
             registry[key] = WeakStore(store: store)
+            SupportDiagnosticsSources.shared.registerEditReplacements(store, key: key)
             return store
         }
     }
@@ -262,5 +263,20 @@ public final class EditReplacementJournalFileStore: EditReplacementJournaling, @
 
     private static func key(_ source: UploadSourceIdentity) -> String {
         "\(source.kind.rawValue)|\(source.identifier)|\(source.resource.rawValue)"
+    }
+}
+
+extension EditReplacementJournalFileStore: EditReplacementSupportSource {
+    public func editReplacementSupportSnapshot() -> EditReplacementSupportSnapshot {
+        lock.withLock {
+            var result = EditReplacementSupportSnapshot()
+            for entry in entries.values {
+                if !entry.superseded.isEmpty { result.sourcesWithSupersededEntries += 1 }
+                result.totalSuperseded += entry.superseded.count
+                result.totalRetired += entry.retired.count
+                if !(entry.retireIntent?.isEmpty ?? true) { result.rowsWithRetireIntent += 1 }
+            }
+            return result
+        }
     }
 }

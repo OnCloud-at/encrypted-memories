@@ -23,6 +23,7 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
         // compatible future build or explicit recovery. Never replace it with an empty queue.
         guard let handle = Self.openOnce(url: url, policy: policy) else { return nil }
         db = handle
+        SupportDiagnosticsSources.shared.registerQueue(self, key: url.standardizedFileURL.path)
     }
 
     deinit { close() }
@@ -1330,5 +1331,82 @@ extension UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueObserving {
             }
             return result
         }
+    }
+}
+
+extension UploadBackupSyncQueueManifestStore: BackupQueueSupportSource {
+    /// Group only local scalar columns. No source, filename, receipt, or backend detail can leave this method.
+    public func backupSupportSnapshot() -> BackupQueueSupportSnapshot {
+        lock.withLock {
+            guard db != nil, !operationFailed else { return BackupQueueSupportSnapshot() }
+            var stmt: OpaquePointer?
+            guard
+                sqlite3_prepare_v2(
+                    db,
+                    "SELECT state, resource, last_error, COUNT(*) FROM backup_sync_queue GROUP BY state, resource, last_error;",
+                    -1, &stmt, nil
+                ) == SQLITE_OK
+            else { return BackupQueueSupportSnapshot() }
+            defer { sqlite3_finalize(stmt) }
+            var states: [BackupQueueSupportSnapshot.State: Int] = [:]
+            var resources: [BackupQueueSupportSnapshot.ResourceKind: Int] = [:]
+            var waiting: [BackupQueueSupportSnapshot.Reason: Int] = [:]
+            var parked: [BackupQueueSupportSnapshot.Reason: Int] = [:]
+            var total = 0
+            var step = sqlite3_step(stmt)
+            while step == SQLITE_ROW {
+                let state = BackupQueueSupportSnapshot.State(rawValue: columnText(stmt, 0) ?? "") ?? .unknown
+                let resource = Self.supportResourceKind(columnText(stmt, 1) ?? "")
+                let error = columnText(stmt, 2)
+                let reason: BackupQueueSupportSnapshot.Reason
+                if let issue = BackupIssueRecord.decode(error) {
+                    reason = BackupQueueSupportSnapshot.Reason(rawValue: issue.kind.rawValue) ?? .unknown
+                } else {
+                    reason = (error?.isEmpty ?? true) ? .none : .unclassified
+                }
+                let count = Int(sqlite3_column_int64(stmt, 3))
+                total += count
+                states[state, default: 0] += count
+                resources[resource, default: 0] += count
+                switch state {
+                case .discovered, .queuedForUpload, .needsRemoteReconciliation, .failed:
+                    waiting[reason, default: 0] += count
+                case .blockedByDraft, .failedPermanent, .paused, .sourceMissing, .dismissedFailure:
+                    parked[reason, default: 0] += count
+                default:
+                    break
+                }
+                step = sqlite3_step(stmt)
+            }
+            guard step == SQLITE_DONE else { return BackupQueueSupportSnapshot() }
+            var result = BackupQueueSupportSnapshot()
+            result.isAvailable = true
+            result.total = total
+            result.countsByState = BackupQueueSupportSnapshot.State.allCases.map {
+                .init(state: $0, count: states[$0, default: 0])
+            }
+            result.countsByResourceKind = BackupQueueSupportSnapshot.ResourceKind.allCases.map {
+                .init(resourceKind: $0, count: resources[$0, default: 0])
+            }
+            result.waitingByReason = BackupQueueSupportSnapshot.Reason.allCases.map {
+                .init(reason: $0, count: waiting[$0, default: 0])
+            }
+            result.parkedByReason = BackupQueueSupportSnapshot.Reason.allCases.map {
+                .init(reason: $0, count: parked[$0, default: 0])
+            }
+            return result
+        }
+    }
+
+    private static func supportResourceKind(_ raw: String) -> BackupQueueSupportSnapshot.ResourceKind {
+        if raw == UploadSourceIdentity.Resource.primary.rawValue { return .primary }
+        if raw == UploadSourceIdentity.Resource.livePairedVideo.rawValue { return .livePairedVideo }
+        let parts = raw.split(separator: ".", omittingEmptySubsequences: false)
+        guard parts.count == 3, parts[0] == "photoKit", !parts[2].isEmpty,
+            parts[2].utf8.allSatisfy({ $0 >= 48 && $0 <= 57 }),
+            let role = BackupQueueSupportSnapshot.ResourceKind(rawValue: String(parts[1])),
+            role != .primary, role != .livePairedVideo
+        else { return .other }
+        return role
     }
 }

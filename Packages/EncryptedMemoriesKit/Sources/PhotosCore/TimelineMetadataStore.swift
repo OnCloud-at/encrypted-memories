@@ -189,6 +189,7 @@ public final class TimelineMetadataStore {
     private static let metaDigestKey = "timeline.digest"
     private static let metaGenerationKey = "timeline.generation"
     private static let metaValidationTokenKey = "timeline.validationToken"
+    private static let metaValidationTokenStoredAtKey = "timeline.validationTokenStoredAt"
     private static let metaMediaTypeEvidenceRevisionKey = "mediaTypeEvidence.revision"
 
     private enum ValidationTokenUpdate {
@@ -435,6 +436,14 @@ public final class TimelineMetadataStore {
         readMeta(Self.metaValidationTokenKey)
     }
 
+    /// Nil for stores written before cursor timing was recorded, or when no cursor is stored.
+    public func validationTokenStoredAt() -> Date? {
+        guard validationToken() != nil,
+            let value = readMeta(Self.metaValidationTokenStoredAtKey).flatMap(Double.init), value.isFinite
+        else { return nil }
+        return Date(timeIntervalSince1970: value)
+    }
+
     @discardableResult
     private func saveInstrumented(
         _ items: [PhotoItem],
@@ -567,8 +576,14 @@ public final class TimelineMetadataStore {
     }
 
     private func writeValidationToken(_ token: String?) -> Bool {
-        guard let token, !token.isEmpty else { return deleteMeta(Self.metaValidationTokenKey) }
-        return writeMeta(Self.metaValidationTokenKey, token)
+        guard let token, !token.isEmpty else {
+            return deleteMeta(Self.metaValidationTokenKey) && deleteMeta(Self.metaValidationTokenStoredAtKey)
+        }
+        // Revalidating an unchanged cursor does not make that stored cursor younger.
+        let unchanged = readMeta(Self.metaValidationTokenKey) == token
+        guard writeMeta(Self.metaValidationTokenKey, token) else { return false }
+        if unchanged { return true }
+        return writeMeta(Self.metaValidationTokenStoredAtKey, String(Date().timeIntervalSince1970))
     }
 
     /// Incremental upsert of the ordered enumeration. Two things happen per row: the `(vol, node)`

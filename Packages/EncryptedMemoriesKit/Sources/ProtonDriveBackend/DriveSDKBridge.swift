@@ -57,6 +57,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     private nonisolated let identitiesOutsideInventoryObserver = IdentitiesOutsideInventoryObserver()
     /// The last Recently Deleted listing on disk, so the route opens offline and its thumbnails survive a launch.
     private let recentlyDeletedStore: RecentlyDeletedListingStore
+    private var librarySupport = LibrarySyncSupportSnapshot()
     private var recentlyDeleted: RecentlyDeletedIdentities
     /// Low-priority trash listing after the library lost photos, so photos trashed elsewhere get their
     /// thumbnails before the route opens. One task per bridge.
@@ -179,6 +180,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
             featureFlagProviderCallback: { _, completion in completion(false) },
             recordMetricEventCallback: { _ in }
         )
+        SupportDiagnosticsSources.shared.registerLibrary(self)
         DebugLog.log("bridge: EncryptedMemoriesClient created ✓")
     }
 
@@ -187,6 +189,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     func shutdown() async {
         if !isShutDown {
             isShutDown = true
+            SupportDiagnosticsSources.shared.unregisterLibrary(self)
             timelineLoadGeneration &+= 1
             shutdownGate.closeAdmission()
             timelineLoadTask?.task.cancel()
@@ -265,6 +268,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     }
 
     private func performTimelineLoad(generation: UInt64) async throws -> TimelineLoadSnapshot {
+        var supportSource = LibrarySyncSupportSnapshot.SourcePath.preparation
         do {
             try checkTimelineLoad(generation: generation)
             let root = try await resolvePhotosRoot()
@@ -283,6 +287,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
             )
             if historyEventProbe.scopeAccessLost { throw DriveEventScopeAccessLostError() }
             var continuityRecoveryRequired = historyEventProbe.requiresAuthoritativeRefresh
+            if continuityRecoveryRequired { supportSource = .continuity }
             let startEventProbe: SDKEventCursorResult
             if continuityRecoveryRequired {
                 // A continuity event is not a committable cursor. Seed a fresh current cursor, then prove a
@@ -331,6 +336,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
 
             switch source {
             case .authoritativePhotosList:
+                supportSource = continuityRecoveryRequired ? .continuity : .authoritative
                 let remoteChanges: TimelineRemoteEventChanges?
                 if continuityRecoveryRequired {
                     remoteChanges = nil
@@ -342,6 +348,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                     )
                     if remoteChanges == nil {
                         continuityRecoveryRequired = true
+                        supportSource = .continuity
                     }
                 }
                 var entries: [PhotosListEntry]
@@ -355,6 +362,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                 } else {
                     entries = try await driveSession.fetchPhotosList(volumeID: root.volumeID)
                 }
+                librarySupport.listedPhotoCount = entries.count
                 if recentlyDeleted.hasPhotosAwaitingLibrary {
                     // Read before the events below filter the listing: a photo that they leave out must still
                     // wait, as the next listing can return it without that event.
@@ -403,6 +411,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                 DebugLog.log("timeline: authoritative photos listing returned \(reconciliationItems.count) items ✓")
 
             case .sdkCache:
+                supportSource = .sdkCache
                 let collector = SDKEnumerationCollector<PhotoTimelineItem>()
                 let items = try await SDKCancellableOperation.run { [photosClient] cancellationToken in
                     try await photosClient.enumerateTimeline(
@@ -415,6 +424,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                     try? await photosClient.cancelEnumerateTimeline(cancellationToken: cancellationToken)
                 }
                 try checkTimelineLoad(generation: generation)
+                librarySupport.listedPhotoCount = items.count
                 DebugLog.log("timeline: SDK cache enumerated \(items.count) items ✓")
                 let enrichment = await TimelineTagEnrichmentLoader.load {
                     [driveSession, volumeID = root.volumeID] tag, onPage in
@@ -590,11 +600,16 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                 let libraryUIDs = Set(sections.lazy.flatMap(\.items).map(\.uid))
                 if recentlyDeleted.libraryRefreshed(lists: libraryUIDs.contains) { await reportRecentlyDeleted() }
             }
+            librarySupport.lastSuccessfulLoad = .init(timestamp: Date(), sourcePath: supportSource)
             return TimelineLoadSnapshot(sections: sections, validationToken: validationToken)
         } catch is TimelineContinuityRecoveryPendingError {
+            librarySupport.lastFailedLoad = .init(
+                timestamp: Date(), sourcePath: supportSource, errorKind: .continuityPending)
             DebugLog.log("timeline: continuity recovery is still converging")
             throw TimelineContinuityRecoveryPendingError()
         } catch {
+            librarySupport.lastFailedLoad = .init(
+                timestamp: Date(), sourcePath: supportSource, errorKind: Self.supportLoadErrorKind(error))
             // A transport error, cancellation, or other invalid observation breaks the quiet window. A future
             // recovery attempt must collect all three qualified full inventories again.
             continuityRecovery.reset()
@@ -623,6 +638,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         let items = store.load()
         let validationToken = store.validationToken()
         guard !items.isEmpty || validationToken != nil else { return nil }
+        librarySupport.lastSuccessfulLoad = .init(timestamp: Date(), sourcePath: .cache)
         DebugLog.log("timeline: served \(items.count) items from SQLite cache ✓")
         let sections =
             items.isEmpty
@@ -2309,5 +2325,27 @@ final class IdentitiesOutsideInventoryObserver: @unchecked Sendable {
     func report(_ uids: [PhotoUID], sequence: UInt64) async {
         guard let observer = lock.withLock({ observer }) else { return }
         await observer(uids, sequence)
+    }
+}
+
+extension DriveSDKBridge: LibrarySyncSupportSource {
+    func librarySyncSupportSnapshot(now: Date) -> LibrarySyncSupportSnapshot? {
+        guard !isShutDown else { return nil }
+        var result = librarySupport
+        result.storedPhotoCount = timelineStore?.count()
+        result.storedEventCursorAgeSeconds = timelineStore?.validationTokenStoredAt().map {
+            max(0, now.timeIntervalSince($0))
+        }
+        result.photosTrashedHereAwaitingLibrary = recentlyDeleted.photosTrashedHereAwaitingLibraryCount
+        return result
+    }
+
+    private static func supportLoadErrorKind(_ error: Error) -> LibrarySyncSupportSnapshot.ErrorKind {
+        if error is CancellationError || isSDKCancellation(error) { return .cancellation }
+        if error is TimelineInventoryVisibilityError { return .inventoryVisibility }
+        if error is DriveEventScopeAccessLostError { return .scopeAccessLost }
+        if (error as NSError).domain == NSURLErrorDomain { return .network }
+        if error is ProtonDriveSDKError { return .sdk }
+        return .unknown
     }
 }

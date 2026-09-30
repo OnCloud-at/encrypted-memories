@@ -231,6 +231,8 @@ struct RecentlyDeletedIdentities: Sendable, Equatable {
         return (trashedHere.reversed() + listed + restoredHere).filter { seen.insert($0).inserted }
     }
 
+    var photosTrashedHereAwaitingLibraryCount: Int { trashedAwaitingLibrary.count }
+
     var hasRestoredPhotos: Bool { !restoredHere.isEmpty }
 
     mutating func beginListing() -> ListingTicket {

@@ -68,6 +68,20 @@ struct RecentlyDeletedListingTests {
             readAt: trashTime.addingTimeInterval(seconds))
     }
 
+    @Test func supportCountTracksPhotosAwaitingAnAcceptedLibraryListing() {
+        let uid = Self.item("private-photo", at: 1).uid
+        var identities = RecentlyDeletedIdentities(listing: nil)
+        #expect(identities.photosTrashedHereAwaitingLibraryCount == 0)
+        identities.trashed([uid, uid], items: [], at: Self.trashTime)
+        #expect(identities.photosTrashedHereAwaitingLibraryCount == 1)
+        let lagging = Self.read([uid], after: 40)
+        _ = identities.libraryAccepted(lagging, now: lagging.readAt)
+        #expect(identities.photosTrashedHereAwaitingLibraryCount == 1)
+        let caughtUp = Self.read([], after: 90)
+        _ = identities.libraryAccepted(caughtUp, now: caughtUp.readAt)
+        #expect(identities.photosTrashedHereAwaitingLibraryCount == 0)
+    }
+
     @Test func aLibraryListingThatLagsBehindATrashHereLeavesThePhotoOut() {
         let trashed = Self.item("trashed", at: 1).uid
         let kept = Self.item("kept", at: 2).uid

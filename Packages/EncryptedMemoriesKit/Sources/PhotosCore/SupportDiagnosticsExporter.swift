@@ -29,6 +29,13 @@ public enum SupportDiagnosticsExporter {
             let maximumWaitMilliseconds: UInt64
         }
 
+        struct Backup: Codable {
+            let queues: [BackupQueueSupportSnapshot]
+            let editReplacements: [EditReplacementSupportSnapshot]
+        }
+
+        let librarySync: LibrarySyncSupportSnapshot
+        let backup: Backup
         let schemaVersion: Int
         let generatedAt: Date
         let appVersion: String
@@ -44,14 +51,22 @@ public enum SupportDiagnosticsExporter {
         runtimeState: LibraryRuntimeState = .shared,
         resourceCoordinator: LibraryResourceCoordinator = .shared,
         diagnostics: PhotoDiagnostics = .shared,
-        bundle: Bundle = .main
+        bundle: Bundle = .main,
+        sources: SupportDiagnosticsSources = .shared
     ) async throws -> Data {
         let snapshot = runtimeState.snapshot()
         let metrics = await resourceCoordinator.metrics()
         let buildInfo = AppBuildInfo(bundle: bundle)
+        let now = Date()
+        let librarySync = await sources.librarySnapshot(now: now)
         let report = Report(
+            librarySync: librarySync,
+            backup: Report.Backup(
+                queues: sources.queueSnapshots(),
+                editReplacements: sources.editReplacementSnapshots()
+            ),
             schemaVersion: 1,
-            generatedAt: Date(),
+            generatedAt: now,
             appVersion: buildInfo.version ?? "unknown",
             appBuild: buildInfo.build ?? "unknown",
             appCommit: buildInfo.commit ?? "unknown",
