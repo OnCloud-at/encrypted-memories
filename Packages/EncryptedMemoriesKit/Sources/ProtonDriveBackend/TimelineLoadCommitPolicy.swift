@@ -325,6 +325,34 @@ struct TimelineRemoteEventChanges: Equatable {
     var removed: Set<String> = []
 }
 
+/// Which changed files the photos listing must show before a load may commit. A related file, such as the original of
+/// an edit, its edit data, or a Live Photo video, shows only through its main photo. When that main photo moves to the
+/// trash, the server keeps the related file active and sends no event for it, yet no listing shows it again.
+enum TimelineRemoteVisibilityRequirement {
+    struct Link: Equatable, Sendable {
+        var isActive: Bool
+        /// Nil for a main photo.
+        var mainPhotoLinkID: String?
+    }
+
+    /// The main photos whose state decides whether the listing must show the given related files.
+    static func mainPhotoLinkIDs(of links: [String: Link]) -> Set<String> {
+        Set(links.values.compactMap(\.mainPhotoLinkID))
+    }
+
+    /// The missing files that the listing must still show. A file that the server no longer returns or keeps in the
+    /// trash never shows; a related file waits only while its main photo is active.
+    static func awaited(
+        _ missing: Set<String>, links: [String: Link], mainPhotos: [String: Link]
+    ) -> Set<String> {
+        missing.filter { id in
+            guard let link = links[id], link.isActive else { return false }
+            guard let main = link.mainPhotoLinkID else { return true }
+            return mainPhotos[main]?.isActive == true
+        }
+    }
+}
+
 enum TimelineRemoteEventVisibilityPolicy {
     static func apply(
         _ events: [VolumeEventPage.Item],
