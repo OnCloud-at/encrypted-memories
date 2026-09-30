@@ -59,6 +59,9 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
     var links: [Link] { lock.withLock { orderedLinks() } }
     var steps: [Step] { lock.withLock { history } }
     var remoteProofLookups: [[UploadBackupExternalIdentity]] { lock.withLock { proofLookups } }
+    func noteProofLookup(_ identities: [UploadBackupExternalIdentity]) {
+        lock.withLock { proofLookups.append(identities) }
+    }
     var rejectedTrashedMainLookupIDs: [String] { lock.withLock { rejectedRelatedLookups } }
 
     /// The real endpoint's behavior for trashed mains remains unverified.
@@ -130,17 +133,23 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
         return UploadBackupExternalIdentity(identifier: identifier, modificationDate: date)
     }
 
-    /// Mirrors the active compound proof: every resource must carry the same external identity.
-    /// The count comes from actual uploaded links, rather than the candidate asking for a proof.
+    /// The answer of a full index build at this moment, as `RemotePhotoAssetProofBuilder` gives it. A device keeps
+    /// it in `EditScenarioDeviceIndex`; the server itself answers no proof lookup of a pipeline.
     func findRemoteAssetProofs(
         for identities: [UploadBackupExternalIdentity]
     ) async throws -> [UploadBackupExternalIdentity: UploadRemoteAssetIndexRecord] {
+        lock.withLock { proofLookups.append(identities) }
+        return allRemoteAssetProofs().filter { identities.contains($0.key) }
+    }
+
+    /// Mirrors the active compound proof: every resource must carry the same external identity.
+    /// The count comes from actual uploaded links, rather than the candidate asking for a proof.
+    func allRemoteAssetProofs() -> [UploadBackupExternalIdentity: UploadRemoteAssetIndexRecord] {
         lock.withLock {
-            proofLookups.append(identities)
             var proofs: [UploadBackupExternalIdentity: UploadRemoteAssetIndexRecord] = [:]
             var ambiguous: Set<UploadBackupExternalIdentity> = []
             for main in orderedLinks() where main.mainLinkID == nil && main.state == .active {
-                guard let identity = main.externalIdentity, identities.contains(identity) else { continue }
+                guard let identity = main.externalIdentity else { continue }
                 let compound = [main] + orderedLinks().filter { $0.mainLinkID == main.linkID }
                 guard compound.allSatisfy({ $0.state == .active && $0.externalIdentity == identity }) else { continue }
                 if proofs[identity] != nil { ambiguous.insert(identity) }
@@ -378,5 +387,55 @@ actor EditScenarioUploadGate {
         releaseContinuation?.resume()
         releaseContinuation = nil
         suspended = false
+    }
+}
+
+/// The remote asset index of one device, as `ProtonUploadDedupeService` keeps it. A full build reads every active
+/// compound. The refresh from events only removes the record of a compound whose link changed; it adds none
+/// (`makeIndexRows` returns no asset records). Every other lookup goes to the server.
+final class EditScenarioDeviceIndex: UploadDuplicateChecking, @unchecked Sendable {
+    private let server: EditScenarioServer
+    private let lock = NSLock()
+    private var proofs: [UploadBackupExternalIdentity: UploadRemoteAssetIndexRecord]
+
+    /// A device builds its index when it first opens the account.
+    init(server: EditScenarioServer) {
+        self.server = server
+        proofs = server.allRemoteAssetProofs()
+    }
+
+    func findRemoteAssetProofs(
+        for identities: [UploadBackupExternalIdentity]
+    ) async throws -> [UploadBackupExternalIdentity: UploadRemoteAssetIndexRecord] {
+        server.noteProofLookup(identities)
+        let indexed = lock.withLock { proofs }
+        let links = indexed.values.flatMap(\.remoteLinkIDs)
+        let visibility = try await server.linkVisibility(of: links)
+        let stale = indexed.filter { !$0.value.remoteLinkIDs.allSatisfy { visibility[$0]?.isActive == true } }.keys
+        lock.withLock { for identity in stale { proofs[identity] = nil } }
+        return lock.withLock { proofs.filter { identities.contains($0.key) } }
+    }
+
+    func nameHash(forCorrectedName name: String) async throws -> String {
+        try await server.nameHash(forCorrectedName: name)
+    }
+    func contentHash(forSHA1Hex sha1Hex: String) async throws -> String {
+        try await server.contentHash(forSHA1Hex: sha1Hex)
+    }
+    func hashKeyEpoch() async throws -> String { try await server.hashKeyEpoch() }
+    func findDuplicates(nameHashes: [String]) async throws -> [RemotePhotoDuplicate] {
+        try await server.findDuplicates(nameHashes: nameHashes)
+    }
+    func findDuplicate(contentHash: String) async throws -> RemotePhotoDuplicate? {
+        try await server.findDuplicate(contentHash: contentHash)
+    }
+    func relatedPhotoLinkIDs(ofMainLinkID mainLinkID: String) async throws -> Set<String> {
+        try await server.relatedPhotoLinkIDs(ofMainLinkID: mainLinkID)
+    }
+    func linkVisibility(of linkIDs: [String]) async throws -> [String: RemoteLinkVisibility] {
+        try await server.linkVisibility(of: linkIDs)
+    }
+    func remoteContentIndexHealth() async throws -> UploadRemoteContentIndexHealth {
+        try await server.remoteContentIndexHealth()
     }
 }
