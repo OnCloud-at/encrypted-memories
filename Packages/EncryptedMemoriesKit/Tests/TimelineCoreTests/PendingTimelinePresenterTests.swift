@@ -20,7 +20,8 @@ import UploadCore
         second: TimeInterval,
         handoff: PhotoUID? = nil,
         settled: Bool = false,
-        badge: PendingUploadBadge = .waiting
+        badge: PendingUploadBadge = .waiting,
+        replaces: [PhotoUID] = []
     ) -> PendingTile {
         let key = PendingSourceKey(kind: .photoLibraryAsset, identifier: id)
         return PendingTile(
@@ -30,7 +31,8 @@ import UploadCore
             handoff: handoff,
             isSettled: settled,
             badge: badge,
-            displayName: id
+            displayName: id,
+            replaces: replaces
         )
     }
 
@@ -84,6 +86,224 @@ import UploadCore
         #expect(tracker.changes(in: presenter.current.uploadBadges.contentEpochs) == [original.item.uid])
         #expect(
             tracker.changes(in: presenter.current.uploadBadges.contentEpochs).isEmpty, "one change invalidates once")
+    }
+
+    // MARK: - Edits of backed-up photos
+
+    /// Proton photos in the same second as the edited photo, so only the anchor decides the place.
+    private func sameSecond(_ nodes: [String]) -> [PhotoItem] {
+        nodes.map { remote($0, second: 10) }.sorted(by: TimelineOrder.areInIncreasingOrder)
+    }
+
+    @Test func theTileOfAnEditTakesThePlaceOfItsEarlierPhotoAndHidesIt() async {
+        let presenter = PendingTimelinePresenter()
+        let listed = sameSecond(["a", "earlier", "z"])
+        presenter.setRemote(TimelineSnapshot(orderedItems: listed))
+        let edit = tile("p", second: 10, replaces: [PhotoUID(volumeID: "", nodeID: "earlier")])
+        presenter.setPending(pending([edit], membership: 1), enabled: true)
+        let presentation = await settle(presenter)
+
+        #expect(
+            presentation.items.map(\.uid) == listed.map { $0.uid.nodeID == "earlier" ? edit.item.uid : $0.uid },
+            "one photo, at the earlier photo's place")
+        #expect(!presentation.isCanonical)
+    }
+
+    @Test func theProtonPhotoOfAnEditKeepsThePlaceAndContinuesTheTileImage() async {
+        let presenter = PendingTimelinePresenter()
+        let listed = sameSecond(["a", "earlier", "z"])
+        presenter.setRemote(TimelineSnapshot(orderedItems: listed))
+        let earlier = PhotoUID(volumeID: "vol", nodeID: "earlier")
+        let uploaded = PhotoUID(volumeID: "vol", nodeID: "0-new")
+        let edit = tile("p", second: 10, handoff: uploaded, badge: .uploading(step: 10), replaces: [earlier])
+        presenter.setPending(pending([edit], membership: 1), enabled: true)
+        _ = await settle(presenter)
+
+        presenter.setRemote(TimelineSnapshot(orderedItems: listed + [remote("0-new", second: 10)]))
+        let presentation = await settle(presenter)
+
+        #expect(presentation.items.map(\.uid) == listed.map { $0.uid == earlier ? uploaded : $0.uid })
+        #expect(
+            presentation.uploadBadges.handovers[uploaded] == edit.item.uid,
+            "the Proton photo continues the tile's texture, never the earlier photo's")
+    }
+
+    @Test func aTrashedEarlierPhotoStaysHiddenUntilTheListingDropsIt() async {
+        let presenter = PendingTimelinePresenter()
+        let earlier = PhotoUID(volumeID: "vol", nodeID: "earlier")
+        let uploaded = PhotoUID(volumeID: "vol", nodeID: "0-new")
+        let listed = sameSecond(["a", "earlier", "0-new"])
+        presenter.setRemote(TimelineSnapshot(orderedItems: listed))
+        let done = tile("p", second: 10, handoff: uploaded, settled: true, badge: .done, replaces: [earlier])
+        presenter.setPending(pending([done], membership: 1), enabled: true)
+        _ = await settle(presenter)
+
+        // The tile retires, but the listing still returns the trashed photo.
+        presenter.setPending(pending([], membership: 2), enabled: true)
+        let lagging = await settle(presenter)
+        #expect(!lagging.items.map(\.uid).contains(earlier))
+        #expect(lagging.items.map(\.uid).contains(uploaded))
+
+        let withoutEarlier = listed.filter { $0.uid != earlier }
+        presenter.setRemote(TimelineSnapshot(orderedItems: withoutEarlier))
+        _ = await settle(presenter)
+        // The person restores it from Recently Deleted: it shows again.
+        presenter.setRemote(TimelineSnapshot(orderedItems: listed))
+        let restored = await settle(presenter)
+        #expect(restored.items.map(\.uid).contains(earlier))
+    }
+
+    @Test func aTrashedPhotoThatThePersonRestoredShowsAgainAtTheLatestAfterTheLimit() async {
+        let clock = TestClock(Date(timeIntervalSince1970: 1_000))
+        let presenter = PendingTimelinePresenter(now: { clock.now })
+        let earlier = PhotoUID(volumeID: "vol", nodeID: "earlier")
+        let uploaded = PhotoUID(volumeID: "vol", nodeID: "0-new")
+        let listed = sameSecond(["earlier", "0-new"])
+        presenter.setRemote(TimelineSnapshot(orderedItems: listed))
+        presenter.setPending(
+            pending(
+                [tile("p", second: 10, handoff: uploaded, settled: true, badge: .done, replaces: [earlier])],
+                membership: 1),
+            enabled: true)
+        _ = await settle(presenter)
+        presenter.setPending(pending([], membership: 2), enabled: true)
+        let hidden = await settle(presenter)
+        #expect(hidden.items.map(\.uid) == [uploaded])
+
+        // Restored on another device before the listing dropped it: the listing keeps returning it.
+        clock.now = clock.now.addingTimeInterval(PendingTimelinePresenter.trashedHideLimit + 1)
+        presenter.setRemote(TimelineSnapshot(orderedItems: listed + [remote("b", second: 20)]))
+        let restored = await settle(presenter)
+        #expect(restored.items.map(\.uid).contains(earlier))
+    }
+
+    @Test func aTrashedPhotoRestoredInThisAppShowsAtOnce() async {
+        let presenter = PendingTimelinePresenter()
+        let earlier = PhotoUID(volumeID: "vol", nodeID: "earlier")
+        let uploaded = PhotoUID(volumeID: "vol", nodeID: "0-new")
+        let listed = sameSecond(["earlier", "0-new"])
+        presenter.setRemote(TimelineSnapshot(orderedItems: listed))
+        let done = tile("p", second: 10, handoff: uploaded, settled: true, badge: .done, replaces: [earlier])
+        presenter.setPending(pending([done], membership: 1), enabled: true)
+        #expect(await settle(presenter).items.map(\.uid) == [uploaded])
+
+        presenter.showRestored([earlier])
+        #expect(Set(await settle(presenter).items.map(\.uid)) == [earlier, uploaded], "while the tile still shows")
+        presenter.setPending(pending([], membership: 2), enabled: true)
+        #expect(Set(await settle(presenter).items.map(\.uid)) == [earlier, uploaded], "and after it retired")
+    }
+
+    @Test func aRestoreKeepsOnlyTheEditsOfItsMomentFromHidingThePhoto() async {
+        let presenter = PendingTimelinePresenter()
+        let photo = PhotoUID(volumeID: "vol", nodeID: "photo")
+        presenter.setRemote(TimelineSnapshot(orderedItems: sameSecond(["a", "photo"])))
+        // Restored before any edit replaced it.
+        presenter.showRestored([photo])
+        _ = await settle(presenter)
+
+        let edit = tile("p", second: 10, replaces: [photo])
+        presenter.setPending(pending([edit], membership: 1), enabled: true)
+        let edited = await settle(presenter)
+        #expect(!edited.items.map(\.uid).contains(photo), "a later edit replaces it")
+
+        presenter.showRestored([photo])
+        let restored = await settle(presenter)
+        #expect(restored.items.map(\.uid).contains(photo), "restored while this edit replaced it")
+
+        let secondEdit = PendingTile(
+            key: edit.key, item: edit.item, revision: UploadBackupRevision(rawValue: 2), handoff: nil,
+            isSettled: false, badge: .waiting, displayName: "p", replaces: [photo])
+        presenter.setPending(pending([secondEdit], membership: 2), enabled: true)
+        let editedAgain = await settle(presenter)
+        #expect(!editedAgain.items.map(\.uid).contains(photo), "a second edit replaces it again")
+    }
+
+    @Test func aSecondEditTakesThePlaceWhereTheFirstEditShows() async {
+        let presenter = PendingTimelinePresenter()
+        let original = PhotoUID(volumeID: "vol", nodeID: "m-original")
+        let first = PhotoUID(volumeID: "vol", nodeID: "z-first")
+        let second = PhotoUID(volumeID: "vol", nodeID: "0-second")
+        let listed = sameSecond(["a", "m-original", "q"])
+        presenter.setRemote(TimelineSnapshot(orderedItems: listed))
+        presenter.setPending(
+            pending(
+                [tile("p", second: 10, handoff: first, badge: .uploading(step: 5), replaces: [original])],
+                membership: 1),
+            enabled: true)
+        presenter.setRemote(TimelineSnapshot(orderedItems: listed + [remote("z-first", second: 10)]))
+        let firstEdit = await settle(presenter)
+        let place = listed.map { $0.uid == original ? first : $0.uid }
+        #expect(firstEdit.items.map(\.uid) == place)
+
+        // The first tile retired and the listing dropped the original; then the photo is edited again.
+        let afterFirst = sameSecond(["a", "q", "z-first"])
+        presenter.setRemote(TimelineSnapshot(orderedItems: afterFirst))
+        presenter.setPending(pending([], membership: 2), enabled: true)
+        #expect(await settle(presenter).items.map(\.uid) == place)
+        let edit = tile("p", second: 10, replaces: [first])
+        presenter.setPending(pending([edit], membership: 3), enabled: true)
+        #expect(await settle(presenter).items.map(\.uid) == listed.map { $0.uid == original ? edit.item.uid : $0.uid })
+
+        presenter.setPending(
+            pending(
+                [tile("p", second: 10, handoff: second, badge: .uploading(step: 5), replaces: [first])],
+                membership: 4),
+            enabled: true)
+        presenter.setRemote(TimelineSnapshot(orderedItems: afterFirst + [remote("0-second", second: 10)]))
+        #expect(await settle(presenter).items.map(\.uid) == listed.map { $0.uid == original ? second : $0.uid })
+    }
+
+    @Test func anEarlierPhotoThatTheReplacementKeptShowsAgain() async {
+        let presenter = PendingTimelinePresenter()
+        let earlier = PhotoUID(volumeID: "vol", nodeID: "earlier")
+        let uploaded = PhotoUID(volumeID: "vol", nodeID: "0-new")
+        let listed = sameSecond(["earlier", "0-new"])
+        presenter.setRemote(TimelineSnapshot(orderedItems: listed))
+        presenter.setPending(
+            pending(
+                [tile("p", second: 10, handoff: uploaded, badge: .uploading(step: 5), replaces: [earlier])],
+                membership: 1),
+            enabled: true)
+        let uploading = await settle(presenter)
+        #expect(uploading.items.map(\.uid) == [uploaded])
+
+        presenter.setPending(
+            pending([tile("p", second: 10, handoff: uploaded, settled: true, badge: .done)], membership: 2),
+            enabled: true)
+        let kept = await settle(presenter)
+        #expect(Set(kept.items.map(\.uid)) == [earlier, uploaded])
+    }
+
+    @Test func anUndoThatHandsOverToTheEarlierPhotoKeepsIt() async {
+        let presenter = PendingTimelinePresenter()
+        let earlier = PhotoUID(volumeID: "vol", nodeID: "earlier")
+        presenter.setRemote(TimelineSnapshot(orderedItems: sameSecond(["earlier"])))
+        presenter.setPending(
+            pending([tile("p", second: 10, handoff: earlier, badge: .done, replaces: [earlier])], membership: 1),
+            enabled: true)
+        let presentation = await settle(presenter)
+
+        #expect(presentation.items.map(\.uid) == [earlier])
+    }
+
+    @Test func aTileThatShowsAgainAfterAnotherEditReloadsItsImage() async {
+        let presenter = PendingTimelinePresenter()
+        var revisedUIDs: [PhotoUID] = []
+        presenter.onFeedUpdate = { _, _, revised in revisedUIDs += revised }
+        let first = tile("p", second: 10)
+        presenter.setPending(pending([first], membership: 1), enabled: true)
+        _ = await settle(presenter)
+        // The first edit uploaded and its tile retired.
+        presenter.setPending(pending([], membership: 2), enabled: true)
+        _ = await settle(presenter)
+
+        let again = PendingTile(
+            key: first.key, item: first.item, revision: UploadBackupRevision(rawValue: 2), handoff: nil,
+            isSettled: false, badge: .waiting, displayName: "p")
+        presenter.setPending(pending([again], membership: 3), enabled: true)
+        _ = await settle(presenter)
+
+        #expect(revisedUIDs == [first.item.uid], "the grid and the feed still hold the image of the first edit")
     }
 
     @Test func pendingPhotosSortIntoTheTimeline() async {
@@ -196,5 +416,17 @@ import UploadCore
         #expect(after.membershipRevision == before.membershipRevision)
         #expect(after.revision != before.revision)
         #expect(after.uploadBadges[pendingTile.item.uid] == .uploading(step: 12))
+    }
+}
+
+private final class TestClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: Date
+
+    init(_ start: Date) { value = start }
+
+    var now: Date {
+        get { lock.withLock { value } }
+        set { lock.withLock { value = newValue } }
     }
 }

@@ -123,6 +123,8 @@ public final class PhotoLibraryBackupController {
     private let runner: BackupSyncRunner?
     /// Durable runner events for the pending grid. Nil without a pending store.
     public let pendingRecorder: PendingBackupEventRecorder?
+    /// The earlier uploads of edited photos, so the pending grid shows an edit in place of its earlier photo.
+    public let pendingReplacementJournal: (any EditReplacementJournaling)?
     private let pendingStore: PendingBackupManifestStore?
     private let requiresPendingStore: Bool
     private let queueStore: UploadBackupSyncQueueManifestStore?
@@ -199,6 +201,7 @@ public final class PhotoLibraryBackupController {
         let directory = configuration.accountDataDirectory
         let pendingRecorder = pendingStore.map { PendingBackupEventRecorder(store: $0) }
         self.pendingRecorder = pendingRecorder
+        pendingReplacementJournal = editReplacement?.journal
         self.pendingStore = pendingStore
         self.requiresPendingStore = requiresPendingStore
         defaults = configuration.defaults

@@ -578,6 +578,7 @@ final class MobileLibraryModel {
         let uids = Set(items.map(\.uid))
         try await backend.restore(Array(uids))
         try requireCurrentMutation(mutationLease)
+        pendingGrid?.photosRestored(Array(uids))
         timelineRemovals.restored(uids)
         timelineMutationGeneration &+= 1
         let generation = timelineMutationGeneration

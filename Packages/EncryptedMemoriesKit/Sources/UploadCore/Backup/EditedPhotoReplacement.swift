@@ -22,7 +22,7 @@ public struct EditedPhotoReplacement: Sendable {
     let albums: any SeriesAlbumCarryOver
     let relations: any UploadDuplicateChecking
     let identities: any UploadIdentityStore
-    let journal: any EditReplacementJournaling
+    public let journal: any EditReplacementJournaling
 
     public init(
         remote: any EditReplacementRemote,

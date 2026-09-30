@@ -133,6 +133,13 @@ public struct PendingTimelinePresentation: Sendable {
 /// over from a pending tile, it inherits the tile's sort key for the rest of the session: `TimelineOrder`
 /// breaks ties within one second by volume and node ID, which both change at the handoff, so without the
 /// anchor a photo could move by one position in front of the person.
+///
+/// An edit of a backed-up photo replaces that earlier Proton photo. Its tile, and later its Proton photo, take
+/// the earlier photo's place, and the earlier photo is hidden while its replacement shows. Once the backup moved
+/// the earlier photo to the trash, it stays hidden until the Proton listing drops it, so a listing that lags
+/// behind the trash cannot show it again. A photo that the person restores in this app shows at once
+/// (`showRestored`). A restore on another device cannot be told apart from a lagging listing, so such a photo
+/// shows after `trashedHideLimit` at the latest. Every hidden photo is derived in each merge.
 @MainActor
 public final class PendingTimelinePresenter {
     /// A new presentation; the host installs it in its grid and viewer.
@@ -152,9 +159,20 @@ public final class PendingTimelinePresenter {
     private var remote = TimelineSnapshot()
     private var pending = PendingBackupSnapshot.empty
     private var isEnabled = false
-    /// Session anchors: Proton photo -> the sort key of the pending tile it replaced.
-    private var anchors: [PhotoUID: PhotoItem] = [:]
-    /// Content revisions of the pending tiles in the last merge.
+    /// Session anchors: Proton photo -> the sort key and the UID of the pending tile it replaced.
+    private var anchors: [PhotoUID: Anchor] = [:]
+    /// The sort key that the tile of an edit took from its earlier Proton photo, fixed while the tile shows.
+    private var tileKeys: [PendingSourceKey: PhotoItem] = [:]
+    /// Earlier Proton photos that the backup moved to the trash, with the moment the grid first hid them as
+    /// trashed, until the listing no longer returns them.
+    private var trashedEarlier: [PhotoUID: Date] = [:]
+    /// Proton photos that the person restored in this session, with the tile revisions that replaced them then.
+    /// Those no longer hide them; a later edit that replaces them again does.
+    private var restored: [PhotoUID: Set<Replacement>] = [:]
+    private let now: @Sendable () -> Date
+    /// The longest time a trashed earlier photo stays hidden while the listing still returns it.
+    package nonisolated static let trashedHideLimit: TimeInterval = 300
+    /// The last content revision of each pending tile shown in this session.
     private var tileRevisions: [PhotoUID: UploadBackupRevision] = [:]
     private var contentEpochs: [PhotoUID: UInt64] = [:]
     private var contentEpoch: UInt64 = 0
@@ -165,7 +183,13 @@ public final class PendingTimelinePresenter {
     private var presentation = PendingTimelinePresentation.empty
     private var lastMembershipRevision: UInt64?
 
-    public init() {}
+    public convenience init() {
+        self.init(now: { Date() })
+    }
+
+    package init(now: @escaping @Sendable () -> Date) {
+        self.now = now
+    }
 
     public var current: PendingTimelinePresentation { presentation }
 
@@ -200,6 +224,9 @@ public final class PendingTimelinePresenter {
         pending = .empty
         isEnabled = false
         anchors.removeAll()
+        tileKeys.removeAll()
+        trashedEarlier.removeAll()
+        restored.removeAll()
         tileRevisions.removeAll()
         contentEpochs.removeAll()
         lastMembershipRevision = nil
@@ -223,6 +250,10 @@ public final class PendingTimelinePresenter {
             remote: remote,
             pending: isEnabled ? pending : .empty,
             anchors: anchors,
+            tileKeys: tileKeys,
+            trashedEarlier: trashedEarlier,
+            restored: restored,
+            now: now(),
             revisions: tileRevisions,
             shown: presentation.snapshot
         )
@@ -238,11 +269,15 @@ public final class PendingTimelinePresenter {
         guard generation == computeGeneration else { return }
         computeTask = nil
         for (remoteUID, anchor) in result.newAnchors { anchors[remoteUID] = anchor }
-        // Anchors of Proton photos that left the timeline are no longer needed.
+        // Anchors of Proton photos that the listing dropped are no longer needed. A hidden photo keeps its anchor:
+        // a second edit takes the place where the photo showed.
         if !anchors.isEmpty {
-            anchors = anchors.filter { result.snapshot.index(of: $0.key) != nil }
+            anchors = anchors.filter { remote.index(of: $0.key) != nil }
         }
-        tileRevisions = result.revisions
+        tileKeys = result.tileKeys
+        trashedEarlier = result.trashedEarlier
+        // Kept for the session: a tile that shows again after an edit must not reuse the image of its last showing.
+        tileRevisions.merge(result.revisions) { $1 }
         // A revised photo keeps its current image; `noteContentRefreshed` bumps its epoch once the new
         // image is loaded, so the tile never shows black in between.
         if !contentEpochs.isEmpty { contentEpochs = contentEpochs.filter { result.localUIDs.contains($0.key) } }
@@ -257,13 +292,30 @@ public final class PendingTimelinePresenter {
             favoriteIntents: shown.favoriteIntents.filter { result.localUIDs.contains($0.key) },
             uploadBadges: PendingUploadBadges(
                 base: result.baseBadges, progress: Self.progress(of: shown, gridUIDs: result.presentLocal),
-                contentEpochs: contentEpochs, handovers: anchors.mapValues(\.uid)),
-            isCanonical: result.localUIDs.isEmpty && anchors.isEmpty
+                contentEpochs: contentEpochs, handovers: anchors.mapValues(\.tile)),
+            isCanonical: result.localUIDs.isEmpty && anchors.isEmpty && !result.hidesRemote
         )
         onFeedUpdate?(result.localUIDs, result.adoptions, result.revised)
         if !result.presentKeys.isEmpty { onRemotePresence?(result.presentKeys) }
         presentLocal = result.presentLocal
         onChange?(presentation)
+    }
+
+    /// The person restored these Proton photos from the trash: they show at once, even while the listing lags.
+    public func showRestored(_ uids: [PhotoUID]) {
+        let photosVolume = remote.items.first?.uid.volumeID
+        var changed = false
+        for uid in Set(uids) {
+            let replacements = pending.tiles.lazy
+                .filter { $0.replaces.contains { Self.resolve($0, photosVolume: photosVolume) == uid } }
+                .map(Replacement.init)
+            let exempt = restored[uid, default: []].union(replacements)
+            guard exempt != restored[uid] || trashedEarlier[uid] != nil else { continue }
+            restored[uid] = exempt
+            trashedEarlier[uid] = nil
+            changed = true
+        }
+        if changed { rebuild() }
     }
 
     /// The feed holds new images for these revised photos; grids upload them in place of the old textures.
@@ -315,10 +367,20 @@ public final class PendingTimelinePresenter {
 
     // MARK: - Pure merge (off main)
 
+    /// Where a Proton photo that took over a pending tile sorts, and which tile's texture it continues.
+    private struct Anchor: Sendable, Equatable {
+        let key: PhotoItem
+        let tile: PhotoUID
+    }
+
     private struct MergeInput: Sendable {
         let remote: TimelineSnapshot
         let pending: PendingBackupSnapshot
-        let anchors: [PhotoUID: PhotoItem]
+        let anchors: [PhotoUID: Anchor]
+        let tileKeys: [PendingSourceKey: PhotoItem]
+        let trashedEarlier: [PhotoUID: Date]
+        let restored: [PhotoUID: Set<Replacement>]
+        let now: Date
         let revisions: [PhotoUID: UploadBackupRevision]
         /// The snapshot that the grid shows now.
         let shown: TimelineSnapshot
@@ -330,7 +392,11 @@ public final class PendingTimelinePresenter {
         let snapshotChanged: Bool
         let localUIDs: Set<PhotoUID>
         let presentKeys: Set<PendingSourceKey>
-        let newAnchors: [PhotoUID: PhotoItem]
+        let newAnchors: [PhotoUID: Anchor]
+        let tileKeys: [PendingSourceKey: PhotoItem]
+        let trashedEarlier: [PhotoUID: Date]
+        /// Some Proton photos are hidden, so the presentation differs from the canonical snapshot.
+        let hidesRemote: Bool
         let adoptions: [(local: PhotoUID, remote: PhotoUID)]
         let baseBadges: [PhotoUID: GridUploadBadge]
         let presentLocal: [PhotoUID: PhotoUID]
@@ -344,31 +410,36 @@ public final class PendingTimelinePresenter {
         let remoteItems = input.remote.items
         // Owned photos share one volume; link-only handoffs resolve to it.
         let photosVolume = remoteItems.first?.uid.volumeID
+        let replacements = replacements(in: input, photosVolume: photosVolume)
         var anchors = input.anchors
-        var newAnchors: [PhotoUID: PhotoItem] = [:]
+        var newAnchors: [PhotoUID: Anchor] = [:]
         var present: [PhotoUID: PendingTile] = [:]
         var presentKeys = Set<PendingSourceKey>()
         var adoptions: [(local: PhotoUID, remote: PhotoUID)] = []
         var visible: [PhotoItem] = []
+        // Tiles of edits, at the place of their earlier photo.
+        var placed: [(key: PhotoItem, item: PhotoItem)] = []
         visible.reserveCapacity(input.pending.tiles.count)
         for tile in input.pending.tiles {
+            let key = replacements.tileKeys[tile.key] ?? tile.item
             guard let handoff = tile.handoff,
                 let remoteUID = resolve(handoff, photosVolume: photosVolume),
                 input.remote.index(of: remoteUID) != nil
             else {
-                visible.append(tile.item)
+                if key == tile.item { visible.append(tile.item) } else { placed.append((key, tile.item)) }
                 continue
             }
             // The Proton photo is listed: it takes over the tile, in the tile's position.
             present[remoteUID] = tile
             presentKeys.insert(tile.key)
             if anchors[remoteUID] == nil {
-                anchors[remoteUID] = tile.item
-                newAnchors[remoteUID] = tile.item
+                let anchor = Anchor(key: key, tile: tile.item.uid)
+                anchors[remoteUID] = anchor
+                newAnchors[remoteUID] = anchor
                 adoptions.append((tile.item.uid, remoteUID))
             }
         }
-        let localUIDs = Set(visible.map(\.uid))
+        let localUIDs = Set(visible.map(\.uid)).union(placed.map(\.item.uid))
         var revisions: [PhotoUID: UploadBackupRevision] = [:]
         var revised: [PhotoUID] = []
         for tile in input.pending.tiles where localUIDs.contains(tile.item.uid) {
@@ -378,23 +449,26 @@ public final class PendingTimelinePresenter {
         }
         let presentLocal = Dictionary(uniqueKeysWithValues: present.map { ($0.value.item.uid, $0.key) })
         let baseBadges = badges(for: input.pending, gridUIDs: presentLocal)
-        guard !visible.isEmpty || !anchors.isEmpty else {
+        let hidden = replacements.hidden
+        guard !visible.isEmpty || !placed.isEmpty || !anchors.isEmpty || !hidden.isEmpty else {
             let changed = input.remote != input.shown
             return MergeResult(
                 snapshot: changed ? input.remote : input.shown, snapshotChanged: changed, localUIDs: [],
-                presentKeys: presentKeys, newAnchors: newAnchors, adoptions: adoptions, baseBadges: baseBadges,
-                presentLocal: presentLocal, revisions: revisions, revised: revised)
+                presentKeys: presentKeys, newAnchors: newAnchors, tileKeys: replacements.tileKeys,
+                trashedEarlier: replacements.trashedEarlier, hidesRemote: false, adoptions: adoptions,
+                baseBadges: baseBadges, presentLocal: presentLocal, revisions: revisions, revised: revised)
         }
         guard !Task.isCancelled else { return nil }
 
         // Three streams sorted by one presentation key; a linear merge keeps their total order.
-        var anchored: [(key: PhotoItem, item: PhotoItem)] = []
+        var anchored: [(key: PhotoItem, item: PhotoItem)] = placed
         var canonical: [PhotoItem] = []
         canonical.reserveCapacity(remoteItems.count)
         for (index, item) in remoteItems.enumerated() {
             if index % cancellationStride == 0, Task.isCancelled { return nil }
-            if let key = anchors[item.uid] {
-                anchored.append((key, item))
+            if hidden.contains(item.uid) { continue }
+            if let anchor = anchors[item.uid] {
+                anchored.append((anchor.key, item))
             } else {
                 canonical.append(item)
             }
@@ -444,12 +518,68 @@ public final class PendingTimelinePresenter {
             localUIDs: localUIDs,
             presentKeys: presentKeys,
             newAnchors: newAnchors,
+            tileKeys: replacements.tileKeys,
+            trashedEarlier: replacements.trashedEarlier,
+            hidesRemote: !hidden.isEmpty,
             adoptions: adoptions,
             baseBadges: baseBadges,
             presentLocal: presentLocal,
             revisions: revisions,
             revised: revised
         )
+    }
+
+    /// One revision of the tile of an edit, which replaces earlier photos.
+    private struct Replacement: Hashable, Sendable {
+        let key: PendingSourceKey
+        let revision: UploadBackupRevision?
+
+        init(_ tile: PendingTile) {
+            key = tile.key
+            revision = tile.revision
+        }
+    }
+
+    /// The Proton photos that edits replace in this merge, and the places their tiles take.
+    private struct Replacements {
+        /// Listed Proton photos to hide.
+        var hidden = Set<PhotoUID>()
+        /// Sort keys of tiles that stand in for an earlier photo.
+        var tileKeys: [PendingSourceKey: PhotoItem] = [:]
+        /// Trashed earlier photos that the listing still returns, with the moment they were first hidden.
+        var trashedEarlier: [PhotoUID: Date] = [:]
+    }
+
+    private nonisolated static func replacements(in input: MergeInput, photosVolume: String?) -> Replacements {
+        var result = Replacements()
+        func noteTrashed(_ uid: PhotoUID) {
+            let since = input.trashedEarlier[uid] ?? input.now
+            result.trashedEarlier[uid] = since
+            if input.now.timeIntervalSince(since) < trashedHideLimit { result.hidden.insert(uid) }
+        }
+        for uid in input.trashedEarlier.keys where input.remote.index(of: uid) != nil { noteTrashed(uid) }
+        for tile in input.pending.tiles {
+            // An undone edit can hand over to the earlier photo itself, which then stays.
+            let current = tile.handoff.flatMap { resolve($0, photosVolume: photosVolume) }
+            let earlier = tile.replaces.compactMap { resolve($0, photosVolume: photosVolume) }.filter { $0 != current }
+            let listed = earlier.compactMap { input.remote.index(of: $0).map { input.remote.items[$0] } }
+            // A photo restored while this revision replaced it stays.
+            let replacement = Replacement(tile)
+            let replaced = listed.lazy.map(\.uid).filter { input.restored[$0]?.contains(replacement) != true }
+            if tile.isSettled {
+                replaced.forEach(noteTrashed)
+            } else {
+                result.hidden.formUnion(replaced)
+            }
+            // The tile takes the place where the earlier photo shows, which an earlier edit may have anchored.
+            // The first place stays while the tile shows, even when the listing drops the earlier photo.
+            if let key = input.tileKeys[tile.key]
+                ?? listed.map({ input.anchors[$0.uid]?.key ?? $0 }).min(by: TimelineOrder.areInIncreasingOrder)
+            {
+                result.tileKeys[tile.key] = key
+            }
+        }
+        return result
     }
 
     /// A merge checks for cancellation once per this many photos.

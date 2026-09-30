@@ -1664,6 +1664,7 @@ struct MainView: View {
             }
             do {
                 try await backend.restore(uids)
+                model.pendingGrid?.photosRestored(uids)
                 await timelineModel.commitRestore(items)
                 await OfflineLibraryManager.shared.reconcileLocations(
                     items: timelineModel.wholeLibraryItemsForViewer,
