@@ -39,7 +39,7 @@ public final class PendingBackupEventRecorder: BackupItemEventSink, @unchecked S
         remote: PhotoUID,
         kind: PendingHandoffKind
     ) -> PendingHandoffOutcome {
-        let handoff = PendingHandoff(
+        var handoff = PendingHandoff(
             key: PendingSourceKey(source),
             revision: revision,
             remote: remote,
@@ -47,7 +47,13 @@ public final class PendingBackupEventRecorder: BackupItemEventSink, @unchecked S
             createdAt: now()
         )
         let outcome = store.recordHandoff(handoff)
-        if outcome != .failed { continuation.yield(.handoff(handoff, outcome)) }
+        guard outcome != .failed else { return outcome }
+        // The store keeps the first time of a repeated upload record, and the coordinator orders by that time.
+        if let recorded = store.handoffTime(for: handoff.key, revision: revision), recorded != handoff.createdAt {
+            handoff = PendingHandoff(
+                key: handoff.key, revision: revision, remote: remote, kind: kind, createdAt: recorded)
+        }
+        continuation.yield(.handoff(handoff, outcome))
         return outcome
     }
 

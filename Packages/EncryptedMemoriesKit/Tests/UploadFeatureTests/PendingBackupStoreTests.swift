@@ -214,6 +214,42 @@ final class PendingBackupStoreTests: XCTestCase {
         XCTAssertTrue(store.latestHandoffs(for: [key]).isEmpty)
     }
 
+    func testTheHandoffRecordedLastIsTheCurrentOneWhenUndoReturnsToAnEarlierRevision() {
+        let original = UploadBackupRevision(rawValue: 1)
+        let edit = UploadBackupRevision(rawValue: 2)
+        func handoff(_ revision: UploadBackupRevision, _ link: String, after seconds: TimeInterval) -> PendingHandoff {
+            PendingHandoff(
+                key: key, revision: revision, remote: PhotoUID(volumeID: "vol", nodeID: link), kind: .uploaded,
+                createdAt: date.addingTimeInterval(seconds))
+        }
+        XCTAssertEqual(store.recordHandoff(handoff(original, "original", after: 0)), .recorded)
+        XCTAssertEqual(store.recordHandoff(handoff(edit, "edit", after: 1)), .recorded)
+        XCTAssertEqual(store.latestHandoffs(for: [key])[key]?.remote.nodeID, "edit")
+
+        XCTAssertEqual(store.recordHandoff(handoff(original, "undone", after: 2)), .recorded)
+
+        XCTAssertEqual(
+            store.latestHandoffs(for: [key])[key]?.remote.nodeID, "undone",
+            "an action of the person must reach the photo that replaced the edit")
+    }
+
+    func testAReplayedUploadRecordOfAnEarlierRevisionDoesNotBecomeTheCurrentHandoff() {
+        func handoff(_ revision: Int64, _ link: String, after seconds: TimeInterval) -> PendingHandoff {
+            PendingHandoff(
+                key: key, revision: UploadBackupRevision(rawValue: revision),
+                remote: PhotoUID(volumeID: "vol", nodeID: link), kind: .uploaded,
+                createdAt: date.addingTimeInterval(seconds))
+        }
+        XCTAssertEqual(store.recordHandoff(handoff(1, "earlier", after: 0)), .recorded)
+        XCTAssertEqual(store.recordHandoff(handoff(2, "current", after: 1)), .recorded)
+
+        // The receipt of the earlier upload settles late and records its photo again.
+        XCTAssertEqual(store.recordHandoff(handoff(1, "earlier", after: 2)), .recorded)
+
+        XCTAssertEqual(store.latestHandoffs(for: [key])[key]?.remote.nodeID, "current")
+        XCTAssertEqual(store.handoffTime(for: key, revision: UploadBackupRevision(rawValue: 1)), date)
+    }
+
     func testClosedStoreCannotConfirmExclusions() {
         store.close()
         XCTAssertNil(store.excludedIdentifiers(kind: .photoLibraryAsset, among: ["asset-1"]))

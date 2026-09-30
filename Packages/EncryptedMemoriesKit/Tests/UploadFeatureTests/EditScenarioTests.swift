@@ -347,7 +347,6 @@ final class EditScenarioTests: XCTestCase {
         await harness.drain()
         XCTAssertEqual(harness.server.links.first { $0.uid == original }?.state, .trashed)
 
-        harness.knownDefect = "N3 (#194): a terminal queue row cannot reopen when undo restores its exact revision."
         harness.library.undo(at: harness.clock.now, restoreEarlierDate: true)
         let undoCandidate = try harness.library.candidate()
         XCTAssertEqual(undoCandidate.snapshot.revision, earlierCandidate.snapshot.revision)
@@ -355,11 +354,11 @@ final class EditScenarioTests: XCTestCase {
         XCTAssertEqual(undoCandidate.snapshot.editRevision, earlierCandidate.snapshot.editRevision)
         try await harness.enqueue()
         await harness.pass()
-        harness.check(
+        XCTAssertTrue(
             harness.activeMains.contains { $0.contentHash == originalHash },
             "S1 the main must hold the current version after exact-revision undo")
         await harness.drain()
-        harness.expectKnownDefect(signature: "S1 the main must hold the current version", consequences: [])
+        harness.assertQuiescent()
     }
 
     func testMissingRenderBeyondTheReadinessDeadline() async throws {
