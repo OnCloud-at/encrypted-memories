@@ -290,6 +290,7 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
                         remoteContent,
                         replacingNameHash: nameDecision == .uploadReplacingDraft ? nameHash : nil
                     )
+                    try noteRestored(contentDecision, in: replacement, of: descriptor.source)
                     try persist(contentDecision, in: &record)
                     if !contentDecision.uploadsBytes {
                         releasePendingUploadClaims(ownedBy: descriptor)
@@ -303,6 +304,7 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
             }
         } else {
             do {
+                try noteRestored(nameDecision, in: replacement, of: descriptor.source)
                 try persist(nameDecision, in: &record)
             } catch {
                 releasePendingUploadClaims(ownedBy: descriptor)
@@ -327,20 +329,26 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
         guard let replacementJournal, descriptor.source.kind == .photoLibraryAsset,
             descriptor.source.resource == .primary, descriptor.mainRemoteLinkID == nil
         else {
-            return UploadReplacementScope(superseded: [], retired: [])
+            return UploadReplacementScope(superseded: [], retired: [], current: nil)
         }
         var entry = replacementJournal.entry(for: descriptor.source)
         // An earlier upload of another client counts as well: the duplicate check proved it was this photo.
         let provenOutcomes = [UploadIdentityManifestStore.Outcome.uploaded, .duplicateActive].map(\.rawValue)
+        // The manifest names the last upload of this photo, also when its bytes did not change.
+        var lastUpload: String?
         if let cached, cached.outcome.map(provenOutcomes.contains) == true,
-            let link = cached.remoteLinkID, !link.isEmpty, cached.sha1Hex != sha1Hex,
-            !entry.superseded.contains(where: { $0.nodeID == link })
+            let link = cached.remoteLinkID, !link.isEmpty
         {
-            let uid = PhotoUID(volumeID: cached.remoteVolumeID ?? "", nodeID: link)
-            try replacementJournal.addSuperseded(uid, for: descriptor.source)
-            entry.superseded.append(uid)
+            lastUpload = link
+            if cached.sha1Hex != sha1Hex, !entry.superseded.contains(where: { $0.nodeID == link }) {
+                let uid = PhotoUID(volumeID: cached.remoteVolumeID ?? "", nodeID: link)
+                try replacementJournal.addSuperseded(uid, for: descriptor.source)
+                entry.superseded.append(uid)
+            }
         }
-        return UploadReplacementScope(superseded: Set(entry.superseded.map(\.nodeID)), retired: Set(entry.retired))
+        return UploadReplacementScope(
+            superseded: Set(entry.superseded.map(\.nodeID)), retired: Set(entry.retired),
+            current: lastUpload ?? entry.superseded.last?.nodeID)
     }
 
     /// The remote rows that can prove this resource. A burst member and a secondary of a replacing edit count
@@ -366,16 +374,58 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
             }
         }
         guard !replacement.isEmpty else { return remoteItems }
-        let excluded = replacement.superseded.union(replacement.retired)
-        let remaining = remoteItems.filter { !($0.linkID.map(excluded.contains) ?? false) }
-        guard remaining.contains(where: { $0.linkState == .active && $0.contentHash == contentHash }) else {
-            return remaining
+        // Only the state of a photo shows that it is still in the library: its current upload is active, the
+        // person restored an earlier version, or an active main photo holds these bytes.
+        let matches = remoteItems.filter { $0.linkState == .active && $0.contentHash == contentHash }
+            .compactMap(\.linkID)
+        var asked = replacement.retired.union(matches)
+        if let current = replacement.current { asked.insert(current) }
+        let visibility = try await checker.linkVisibility(of: asked.sorted())
+        func isLiveMain(_ linkID: String) -> Bool {
+            visibility[linkID].map { $0.isActive && $0.mainPhotoLinkID == nil } ?? false
         }
-        var replacedRelated: Set<String> = []
-        for linkID in replacement.superseded.sorted() {
-            replacedRelated.formUnion(try await checker.relatedPhotoLinkIDs(ofMainLinkID: linkID))
+        let adoptable = Set(matches.filter(isLiveMain)).subtracting(replacement.superseded)
+        let restored = replacement.retired.filter(isLiveMain).subtracting(adoptable)
+        guard replacement.current.map(isLiveMain) == true || !restored.isEmpty || !adoptable.isEmpty else {
+            // Nothing proves the photo live. Who removed it stays unknown, so the earlier rule applies: the
+            // photos of the replacement do not count, and a trashed copy outside them is a deletion by the person.
+            let excluded = replacement.superseded.union(replacement.retired)
+            let remaining = remoteItems.filter { !($0.linkID.map(excluded.contains) ?? false) }
+            guard remaining.contains(where: { $0.linkState == .active && $0.contentHash == contentHash }) else {
+                return remaining
+            }
+            var replacedRelated: Set<String> = []
+            for linkID in replacement.superseded.sorted() {
+                replacedRelated.formUnion(try await checker.relatedPhotoLinkIDs(ofMainLinkID: linkID))
+            }
+            return remaining.filter { !($0.linkID.map(replacedRelated.contains) ?? false) }
         }
-        return remaining.filter { !($0.linkID.map(replacedRelated.contains) ?? false) }
+        // A restored earlier version with other bytes is an earlier photo again, so this upload replaces it.
+        if !restored.isEmpty {
+            try replacementJournal?.unretire(restored, for: descriptor.source)
+            for linkID in restored.sorted() {
+                try replacementJournal?.addSuperseded(PhotoUID(volumeID: "", nodeID: linkID), for: descriptor.source)
+            }
+        }
+        // The photo is in the library, so a trashed or deleted copy of these bytes is an earlier version that the
+        // backup replaced, not a deletion by the person. An active copy counts only as a main photo: the hidden
+        // original under the photo that this upload replaces, or a related file of a trashed photo, is no backup.
+        let scope = replacement.superseded.union(replacement.retired)
+        return remoteItems.filter { item in
+            guard item.linkState != .draft else { return true }
+            guard item.linkState == .active, let linkID = item.linkID else { return false }
+            return item.contentHash == contentHash ? adoptable.contains(linkID) : !scope.contains(linkID)
+        }
+    }
+
+    /// An earlier version that the person restored is the photo again: it leaves the retired list.
+    private func noteRestored(
+        _ decision: UploadDuplicateDecision, in replacement: UploadReplacementScope, of source: UploadSourceIdentity
+    ) throws {
+        guard case .skip(.activeDuplicate, let linkID?) = decision, replacement.retired.contains(linkID) else {
+            return
+        }
+        try replacementJournal?.unretire([linkID], for: source)
     }
 
     /// Applies the burst-member rule. The server names the related photos of the member's main photo only when
@@ -733,6 +783,9 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
 private struct UploadReplacementScope {
     var superseded: Set<String>
     var retired: Set<String>
+    /// The photo that showed before this upload: the last upload that the manifest names, else the newest
+    /// superseded photo of the journal.
+    var current: String?
 
     var isEmpty: Bool { superseded.isEmpty && retired.isEmpty }
 }

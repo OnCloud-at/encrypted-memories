@@ -2250,6 +2250,8 @@ final class BackupSyncRunnerTests: XCTestCase {
         checker.relatedLinkIDsProvider = { [uploader] mainLinkID in
             Set(uploader!.uploaded.filter { $0.request.mainPhotoUID?.nodeID == mainLinkID }.map(\.uid.nodeID))
         }
+        // The duplicate check reads link states from the same fake that the replacement trashes in.
+        checker.linkActivityProvider = { [remote] linkID in remote.active.contains { $0.nodeID == linkID } }
         return ReplacementHarness(journal: journal, pipeline: pipeline, remote: remote, replacement: replacement)
     }
 

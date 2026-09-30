@@ -139,6 +139,18 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
         }
     }
 
+    func linkVisibility(of linkIDs: [String]) async throws -> [String: RemoteLinkVisibility] {
+        lock.withLock {
+            var result: [String: RemoteLinkVisibility] = [:]
+            for linkID in linkIDs {
+                guard let link = table[linkID], link.state != .deleted else { continue }
+                result[linkID] = RemoteLinkVisibility(
+                    isActive: link.state == .active, mainPhotoLinkID: link.mainLinkID)
+            }
+            return result
+        }
+    }
+
     func remoteContentIndexHealth() async throws -> UploadRemoteContentIndexHealth {
         lock.withLock { .complete(indexedCount: table.values.filter { $0.state == .active }.count) }
     }

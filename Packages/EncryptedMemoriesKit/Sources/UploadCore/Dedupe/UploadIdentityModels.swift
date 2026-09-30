@@ -658,6 +658,9 @@ public protocol UploadDuplicateChecking: Sendable {
     /// Link IDs of the photos that are related photos of `mainLinkID` now: a Live Photo's video, a series'
     /// members. The burst-member dedupe rule uses it, because no duplicate row names a link's main photo.
     func relatedPhotoLinkIDs(ofMainLinkID mainLinkID: String) async throws -> Set<String>
+    /// The current state and main photo of each link. A link that the server no longer knows is absent. The edit
+    /// replacement reads it, because only the state of a photo proves that the person deleted it.
+    func linkVisibility(of linkIDs: [String]) async throws -> [String: RemoteLinkVisibility]
     /// Brings the persistent remote identity index current before a queue starts resolving items.
     /// Backends without such an index use the default no-op implementation.
     func prepareRemoteIndex(

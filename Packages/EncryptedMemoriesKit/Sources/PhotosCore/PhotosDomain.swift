@@ -142,6 +142,20 @@ public struct TimelineLoadSnapshot: Sendable {
 /// upload. Callers may retry these failures with a bounded schedule; other errors remain terminal.
 public protocol TimelineInventoryConvergenceError: Error, Sendable {}
 
+/// Whether the library can show a remote link: its state and, for a related file such as the original of an edit or
+/// a Live Photo video, its main photo. A related file stays active on the server when its main photo moves to the
+/// trash, so only the main photo's state tells whether the file still belongs to a photo in the library.
+public struct RemoteLinkVisibility: Equatable, Sendable {
+    public var isActive: Bool
+    /// Nil for a main photo.
+    public var mainPhotoLinkID: String?
+
+    public init(isActive: Bool, mainPhotoLinkID: String?) {
+        self.isActive = isActive
+        self.mainPhotoLinkID = mainPhotoLinkID
+    }
+}
+
 /// Source of timeline metadata.
 public protocol PhotosRepository: Sendable {
     func loadTimeline() async throws -> [TimelineSection]

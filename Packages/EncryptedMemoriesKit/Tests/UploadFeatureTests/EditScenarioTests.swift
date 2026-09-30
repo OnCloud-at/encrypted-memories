@@ -113,18 +113,12 @@ final class EditScenarioTests: XCTestCase {
         XCTAssertEqual(historical.contentHash, originalLink.contentHash)
         let source = try harness.library.candidate().snapshot.source
         XCTAssertFalse(harness.journal.entry(for: source).retired.contains(historical.linkID))
-        harness.knownDefect =
-            "Defect 3 (#194): an undo counts as the person's deletion when a trashed copy of the original lies "
-            + "outside the journal."
         let entry = try undo()
         await harness.drain()
-        harness.check(harness.state(of: entry) != .skippedRemoteDeletion, "defect 3: undo is not person deletion")
+        harness.check(harness.state(of: entry) != .skippedRemoteDeletion, "an undo is not the person's deletion")
         harness.check(
             harness.activeMains.contains { $0.contentHash == originalLink.contentHash },
-            "defect 3: undo must make the original the main again")
-        harness.expectKnownDefect(
-            signature: "U2 skippedRemoteDeletion",
-            consequences: ["defect 3:", "S1 the main must hold the current version"])
+            "an undo must make the original the main again")
     }
 
     func testThreeRapidEdits() async throws {
@@ -154,8 +148,8 @@ final class EditScenarioTests: XCTestCase {
         harness.assertSafety()
         let uploads = harness.server.steps.filter { $0.action.hasPrefix("upload") }.count
         harness.knownDefect =
-            "Defect F1 (#194): an edit after the person trashed the live main uploads again; the cached main is "
-            + "superseded without reading its state."
+            "Defect F1 (#194): an edit after the person trashed the photo uploads again. Without a marker on the "
+            + "server, nothing proves who trashed the photo."
         try edit("render-after-person-deletion")
         await harness.drain()
         harness.check(
@@ -170,19 +164,24 @@ final class EditScenarioTests: XCTestCase {
         await harness.drain()
         harness.server.personRestore(original)
         harness.assertSafety()
-        harness.knownDefect =
-            "Defect F1 (#194): a restored main stays in the journal as retired and is ignored, so an undo uploads "
-            + "a second identical main."
         try undo()
         await harness.drain()
         harness.check(harness.activeMains.count == 1, "Restore plus undo must not create another identical main")
         harness.check(try harness.liveMain() == original, "The restored original already holds the current version")
-        harness.expectKnownDefect(
-            signature: "Restore plus undo must not create another identical main",
-            consequences: [
-                "S1/U3 mains:", "U4 retired names a link that is still in the library",
-                "The restored original already holds the current version",
-            ])
+    }
+
+    func testPersonTrashesTheEditRestoresTheEarlierVersionThenEditsAgain() async throws {
+        let original = try await firstBackup()
+        try edit("render-one")
+        await harness.drain()
+        let edited = try harness.liveMain()
+        harness.server.personTrash(edited)
+        harness.server.personRestore(original)
+        harness.assertSafety()
+        try edit("render-two")
+        await harness.drain()
+        XCTAssertEqual(harness.activeMains.count, 1, "the new edit replaces the restored earlier version")
+        XCTAssertEqual(harness.server.links.first { $0.uid == edited }?.state, .trashed, "the person's trash stays")
     }
 
     func testEditWhoseCompoundLacksTheOriginal() async throws {
