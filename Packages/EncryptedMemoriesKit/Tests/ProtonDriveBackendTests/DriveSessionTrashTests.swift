@@ -350,6 +350,36 @@ extension DriveSessionStubSuite {
             #expect(paths.contains("/drive/shares/share1/links/fetch_metadata"))
         }
 
+        @Test func linkVisibilityReadsTheStateAndTheMainPhoto() async throws {
+            StubURLProtocol.reset()
+            StubURLProtocol.route(
+                "POST /drive/shares/share1/links/fetch_metadata",
+                json: #"""
+                    {"Code":1000,"Links":[
+                        {"LinkID":"trashed-edit","Type":2,"State":2,
+                         "FileProperties":{"ActiveRevision":{"Photo":{"MainPhotoLinkID":null}}}},
+                        {"LinkID":"original","Type":2,"State":1,
+                         "FileProperties":{"ActiveRevision":{"Photo":{"MainPhotoLinkID":"trashed-edit"}}}}
+                    ]}
+                    """#)
+
+            let links = try await makeSession().fetchLinkVisibility(
+                shareID: "share1", linkIDs: ["trashed-edit", "original", "deleted"])
+
+            #expect(links["trashed-edit"] == .init(isActive: false, mainPhotoLinkID: nil))
+            #expect(links["original"] == .init(isActive: true, mainPhotoLinkID: "trashed-edit"))
+            #expect(links["deleted"] == nil, "a link that the server no longer knows is absent")
+        }
+
+        @Test func linkVisibilityRejectsAResponseWithoutLinks() async throws {
+            StubURLProtocol.reset()
+            StubURLProtocol.route("POST /drive/shares/share1/links/fetch_metadata", json: #"{"Code":1000}"#)
+
+            await #expect(throws: (any Error).self) {
+                try await makeSession().fetchLinkVisibility(shareID: "share1", linkIDs: ["photo"])
+            }
+        }
+
         @Test func listTrashEmptyVolumeYieldsNoLinksAndNoMetadataCall() async throws {
             StubURLProtocol.reset()
             StubURLProtocol.route("GET /drive/volumes/vol1/trash", json: #"{"Code":1000,"Trash":[]}"#)

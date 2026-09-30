@@ -180,6 +180,48 @@ struct RecentlyDeletedListingTests {
         #expect(relaunched.lagging(in: listed, now: listed.readAt) == [photo])
     }
 
+    @Test func aLaggingPhotoLeavesTheSectionsAndTheBurstEntries() {
+        let entries = ["trashed", "kept"].map {
+            PhotosListEntry(linkID: $0, captureTime: 0, tags: [], relatedPhotos: [])
+        }
+        let sections = DriveSDKBridge.group(entries, volumeID: "volume")
+        let trashed = PhotoUID(volumeID: "volume", nodeID: "trashed")
+
+        let kept = DriveSDKBridge.removing([trashed], from: sections, burstEntries: entries)
+
+        #expect(kept.sections.flatMap(\.items).map(\.uid.nodeID) == ["kept"])
+        #expect(kept.burstEntries?.map(\.linkID) == ["kept"])
+        #expect(DriveSDKBridge.removing([trashed], from: sections, burstEntries: nil).burstEntries == nil)
+    }
+
+    @Test func aLaggingBurstMemberLeavesTheRelatedPhotosOfItsBurst() {
+        let burst = PhotoTag.bursts.rawValue
+        let entries = [
+            PhotosListEntry(
+                linkID: "root", captureTime: 0, tags: [burst],
+                relatedPhotos: ["member", "trashed"].map(PhotosListEntry.Related.init(linkID:))),
+            PhotosListEntry(linkID: "trashed", captureTime: 0, tags: [burst], relatedPhotos: []),
+        ]
+        let trashed = PhotoUID(volumeID: "volume", nodeID: "trashed")
+
+        let kept = DriveSDKBridge.removing([trashed], from: [], burstEntries: entries)
+
+        #expect(kept.burstEntries?.map(\.linkID) == ["root"])
+        #expect(kept.burstEntries?.first?.relatedPhotos.map(\.linkID) == ["member"])
+    }
+
+    @Test func aTagOrAlbumListingLeavesOutAPhotoWithoutEndingItsWait() {
+        let photo = Self.item("photo", at: 1).uid
+        var identities = RecentlyDeletedIdentities(listing: nil)
+        identities.trashed([photo], items: [], at: Self.trashTime)
+
+        // A favorites listing that lacks the photo is no proof; only the library listing ends the wait.
+        let favorites = Self.read([], after: 30)
+        #expect(identities.lagging(in: favorites, now: favorites.readAt).isEmpty)
+        let library = Self.read([photo], after: 40)
+        #expect(identities.lagging(in: library, now: library.readAt) == [photo])
+    }
+
     @Test func aFileOfAnEarlierBuildOpensWithoutPhotosAwaitingTheLibrary() throws {
         let directory = try Self.directory()
         defer { try? FileManager.default.removeItem(at: directory) }

@@ -321,9 +321,9 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                     hasUnmaterializedLocalEvidence: !unmaterializedEvidenceNodeIDs.isEmpty
                 )
             var sections: [TimelineSection]
-            let reconciliationItems: [PhotoItem]
-            let burstMemberIDs: [String: [String]]
-            let burstEntries: [PhotosListEntry]?
+            var reconciliationItems: [PhotoItem]
+            var burstMemberIDs: [String: [String]]
+            var burstEntries: [PhotosListEntry]?
             var authoritativeInventoryFingerprint: String?
             // Only while photos trashed here may still appear in a listing.
             var listingRead: LibraryListingRead?
@@ -375,17 +375,22 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                 )
                 if let expectedRemoteNodeIDs = remoteChanges?.active {
                     let missing = expectedRemoteNodeIDs.subtracting(representedNodeIDs)
-                    guard missing.isEmpty else {
-                        throw TimelineInventoryVisibilityError.remoteChangesNotVisible(missing.count)
+                    if !missing.isEmpty {
+                        let awaited = try await filesTheListingMustShow(missing)
+                        guard awaited.isEmpty else {
+                            throw TimelineInventoryVisibilityError.remoteChangesNotVisible(awaited.count)
+                        }
+                        DebugLog.log(
+                            "timeline: \(missing.count) changed files belong to photos that left the library")
                     }
                 }
                 pendingUploadedNodeIDs.subtract(representedNodeIDs)
                 let unresolvedEvidenceNodeIDs = unmaterializedEvidenceNodeIDs.subtracting(representedNodeIDs)
-                if !unresolvedEvidenceNodeIDs.isEmpty {
-                    pendingUploadedNodeIDs.formUnion(
-                        try await activeNodeIDs(unresolvedEvidenceNodeIDs)
-                    )
-                }
+                // An upload whose photo left the library before a listing showed it, such as an edit that a later
+                // edit replaced, never shows; only uploads that can still show hold the load back.
+                let unlistedUploads = pendingUploadedNodeIDs.union(unresolvedEvidenceNodeIDs)
+                pendingUploadedNodeIDs =
+                    unlistedUploads.isEmpty ? [] : try await filesTheListingMustShow(unlistedUploads)
                 burstMemberIDs = Self.burstMemberLookup(from: entries)
                 burstEntries = entries
                 sections = Self.group(
@@ -469,7 +474,20 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
             guard pendingUploadedNodeIDs.isEmpty else {
                 throw TimelineInventoryVisibilityError.pendingUploadsNotVisible(pendingUploadedNodeIDs.count)
             }
-            if let listingRead { sections = withoutPhotosTrashedHere(sections, read: listingRead) }
+            if let listingRead {
+                let lagging = recentlyDeleted.lagging(in: listingRead, now: Date())
+                if !lagging.isEmpty {
+                    DebugLog.log("timeline: left out \(lagging.count) photos that the listing returns after a trash")
+                    let kept = Self.removing(lagging, from: sections, burstEntries: burstEntries)
+                    sections = kept.sections
+                    // The media-type check and the burst catalog must not keep them either.
+                    reconciliationItems = sections.flatMap(\.items)
+                    if let entries = kept.burstEntries {
+                        burstEntries = entries
+                        burstMemberIDs = Self.burstMemberLookup(from: entries)
+                    }
+                }
+            }
             var continuityRecoveryQualified = false
             let endEventToken: String
             if continuityRecoveryRequired {
@@ -825,15 +843,39 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         }
     }
 
-    /// A listing can lag behind a trash made here, by the person or by the backup. It must not bring those photos
-    /// back into the library or into the stored timeline that the next launch shows.
-    private func withoutPhotosTrashedHere(
-        _ sections: [TimelineSection], read: LibraryListingRead
-    ) -> [TimelineSection] {
-        let lagging = recentlyDeleted.lagging(in: read, now: Date())
+    /// A listing without the given photos: its sections, and the burst entries that the burst catalog reads. A kept
+    /// burst entry also loses them as related photos, so the burst viewer does not show them as members.
+    static func removing(
+        _ uids: Set<PhotoUID>, from sections: [TimelineSection], burstEntries: [PhotosListEntry]?
+    ) -> (sections: [TimelineSection], burstEntries: [PhotosListEntry]?) {
+        let nodeIDs = Set(uids.map(\.nodeID))
+        let entries = burstEntries?.compactMap { entry -> PhotosListEntry? in
+            guard !nodeIDs.contains(entry.linkID) else { return nil }
+            guard entry.relatedPhotos.contains(where: { nodeIDs.contains($0.linkID) }) else { return entry }
+            return PhotosListEntry(
+                linkID: entry.linkID, captureTime: entry.captureTime, tags: entry.tags,
+                relatedPhotos: entry.relatedPhotos.filter { !nodeIDs.contains($0.linkID) })
+        }
+        return (TimelineContentProjection(sections: sections).removing(uids).sections, entries)
+    }
+
+    /// Tag and album listings lag behind a trash like the library listing. They leave out the photos trashed here,
+    /// but only the library listing ends a wait.
+    private func withoutPhotosTrashedHere(_ sections: [TimelineSection]) -> [TimelineSection] {
+        guard recentlyDeleted.hasPhotosAwaitingLibrary else { return sections }
+        let read = LibraryListingRead(listed: Set(sections.lazy.flatMap(\.items).map(\.uid)), readAt: Date())
+        let lagging = recentlyDeleted.lagging(in: read, now: read.readAt)
         guard !lagging.isEmpty else { return sections }
-        DebugLog.log("timeline: left out \(lagging.count) photos that the listing returns after their trash")
-        return TimelineContentProjection(sections: sections).removing(lagging).sections
+        return Self.removing(lagging, from: sections, burstEntries: nil).sections
+    }
+
+    /// The files among `missing` that the photos listing must still show; see `TimelineRemoteVisibilityRequirement`.
+    private func filesTheListingMustShow(_ missing: Set<String>) async throws -> Set<String> {
+        guard let photosShareID else { return missing }
+        let links = try await driveSession.fetchLinkVisibility(shareID: photosShareID, linkIDs: missing.sorted())
+        let mainIDs = TimelineRemoteVisibilityRequirement.mainPhotoLinkIDs(of: links)
+        let mainPhotos = try await driveSession.fetchLinkVisibility(shareID: photosShareID, linkIDs: mainIDs.sorted())
+        return TimelineRemoteVisibilityRequirement.awaited(missing, links: links, mainPhotos: mainPhotos)
     }
 
     @discardableResult
@@ -1265,19 +1307,21 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         case .tag(let tag):
             let root = try await resolvePhotosRoot()
             let entries = try await driveSession.fetchPhotosList(volumeID: root.volumeID, tag: tag.rawValue)
-            return Self.group(
-                entries,
-                volumeID: root.volumeID,
-                mediaTypeOverrides: timelineStore?.mediaTypeEvidence(volumeID: root.volumeID) ?? [:]
-            )
+            return withoutPhotosTrashedHere(
+                Self.group(
+                    entries,
+                    volumeID: root.volumeID,
+                    mediaTypeOverrides: timelineStore?.mediaTypeEvidence(volumeID: root.volumeID) ?? [:]
+                ))
         case .album(let id, _):
             let root = try await resolvePhotosRoot()
             let entries = try await driveSession.fetchAlbumPhotos(volumeID: root.volumeID, albumLinkID: id)
-            return Self.group(
-                entries,
-                volumeID: root.volumeID,
-                mediaTypeOverrides: timelineStore?.mediaTypeEvidence(volumeID: root.volumeID) ?? [:]
-            )
+            return withoutPhotosTrashedHere(
+                Self.group(
+                    entries,
+                    volumeID: root.volumeID,
+                    mediaTypeOverrides: timelineStore?.mediaTypeEvidence(volumeID: root.volumeID) ?? [:]
+                ))
         case .sharedAlbum(let volumeID, let nodeID, _):
             // Shared albums live on another user's volume, so the owned-volume HTTP album route cannot list
             // them. The SDK catalog adapter is the only content source; it proves identity and capture time only.

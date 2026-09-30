@@ -481,6 +481,37 @@ import Testing
         #expect(changes.removed == Set(["earlier"]), "the listing must not show the trashed photo again")
     }
 
+    @Test func relatedFilesOfATrashedPhotoDoNotHoldTheListingBack() {
+        // Evidence of 2026-09-30: an edit replacement trashed the main photo; its original, edit data, and Live Photo
+        // video stayed active on the server and never appeared in a listing again.
+        typealias Link = TimelineRemoteVisibilityRequirement.Link
+        let links: [String: Link] = [
+            "original": Link(isActive: true, mainPhotoLinkID: "trashed-edit"),
+            "video": Link(isActive: true, mainPhotoLinkID: "trashed-edit"),
+            "new-video": Link(isActive: true, mainPhotoLinkID: "new-edit"),
+            "new-photo": Link(isActive: true, mainPhotoLinkID: nil),
+            "trashed-photo": Link(isActive: false, mainPhotoLinkID: nil),
+        ]
+        let mainPhotos: [String: Link] = [
+            "trashed-edit": Link(isActive: false, mainPhotoLinkID: nil),
+            "new-edit": Link(isActive: true, mainPhotoLinkID: nil),
+        ]
+        #expect(TimelineRemoteVisibilityRequirement.mainPhotoLinkIDs(of: links) == ["trashed-edit", "new-edit"])
+
+        let awaited = TimelineRemoteVisibilityRequirement.awaited(
+            ["original", "video", "new-video", "new-photo", "trashed-photo", "deleted"], links: links,
+            mainPhotos: mainPhotos)
+
+        #expect(awaited == ["new-video", "new-photo"], "only files of active photos can still appear")
+    }
+
+    @Test func aRelatedFileWhoseMainPhotoIsGoneForGoodDoesNotHoldTheListingBack() {
+        typealias Link = TimelineRemoteVisibilityRequirement.Link
+        let links = ["original": Link(isActive: true, mainPhotoLinkID: "deleted-edit")]
+
+        #expect(TimelineRemoteVisibilityRequirement.awaited(["original"], links: links, mainPhotos: [:]).isEmpty)
+    }
+
     @Test func remoteVisibilityFailureUsesTheSharedConvergenceMarker() {
         let error: any Error = TimelineInventoryVisibilityError.remoteChangesNotVisible(1)
         #expect(error is any TimelineInventoryConvergenceError)
