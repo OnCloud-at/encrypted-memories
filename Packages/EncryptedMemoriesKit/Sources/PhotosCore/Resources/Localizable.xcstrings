@@ -1,6 +1,13 @@
 {
   "sourceLanguage": "en",
   "strings": {
+    "backup.issue_waiting_original": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "The edited photo is waiting for its original resources. Backup will retry automatically." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Das bearbeitete Foto wartet auf seine Originalressourcen. Das Backup versucht es automatisch erneut." } }
+      }
+    },
     "albums.add_busy_message": {
       "extractionState": "manual",
       "localizations": {

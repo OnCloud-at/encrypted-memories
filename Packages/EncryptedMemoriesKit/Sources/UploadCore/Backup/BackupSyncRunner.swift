@@ -1259,16 +1259,41 @@ public actor BackupSyncRunner {
                 }
                 if isSeries {
                     try editReplacement.keepSuperseded(of: entry.source)
-                } else if try await editReplacement.replaceSuperseded(
-                    of: entry.source,
-                    with: primaryUID,
-                    edited: resolved.candidate.snapshot.editRevision == .unavailable,
-                    holdsOriginal: EditedPhotoReplacement.holdsOriginal(
-                        editRevision: resolved.candidate.snapshot.editRevision,
-                        secondaries: resolved.secondaries.map(\.descriptor.source.resource)
+                } else {
+                    let outcome = try await editReplacement.replaceSuperseded(
+                        of: entry.source,
+                        with: primaryUID,
+                        edited: resolved.candidate.snapshot.editRevision == .unavailable,
+                        holdsOriginal: EditedPhotoReplacement.holdsOriginal(
+                            editRevision: resolved.candidate.snapshot.editRevision,
+                            secondaries: resolved.secondaries.map(\.descriptor.source.resource)
+                        )
                     )
-                ) {
-                    await identityResolver.invalidateCachedRemoteState()
+                    switch outcome {
+                    case .replaced(let retiredAny):
+                        if retiredAny { await identityResolver.invalidateCachedRemoteState() }
+                    case .waiting:
+                        // Some earlier mains may have retired while another still protects an original resource.
+                        await identityResolver.invalidateCachedRemoteState()
+                        try await preflight.markPending(resolved.candidate.snapshot)
+                        let eligibleAt = now().addingTimeInterval(min(180, longestRegularRetryWait))
+                        deferSource(
+                            entry, from: persistedState, until: eligibleAt,
+                            issue: BackupIssueRecord(
+                                kind: .unknown, detail: L10n.string("backup.issue_waiting_original"),
+                                nextAttemptAt: eligibleAt
+                            ))
+                        return
+                    case .replacementGone:
+                        // The person removed the photo that the earlier ones waited for. Like every deletion in
+                        // Proton, it stays out of the backup until a restore.
+                        finish(
+                            entry, from: persistedState, as: .skippedRemoteDeletion,
+                            message: L10n.string("backup.state_skipped_remote_deletion"), resolved: resolved)
+                        return
+                    case .kept:
+                        break
+                    }
                 }
             } catch is CancellationError {
                 revert(entry, from: persistedState)
@@ -1613,6 +1638,31 @@ public actor BackupSyncRunner {
         adjustProgress(from: nil, to: terminal)
     }
 
+    /// Defers a source with unfinished resources without spending its failure budget or claiming backup success.
+    private func deferSource(
+        _ entry: UploadBackupSyncQueueEntry,
+        from oldState: UploadBackupSyncQueueState,
+        until eligibleAt: Date,
+        issue: BackupIssueRecord? = nil
+    ) {
+        endActiveExecution(key: Self.key(entry), publish: false)
+        if sourceWasRemoved(entry) { return }
+        guard
+            queue.updateState(
+                source: entry.source, revision: entry.revision,
+                state: .discovered,
+                attempts: entry.attempts,
+                lastError: issue?.persistedValue,
+                updatedAt: max(eligibleAt, now())
+            )
+        else {
+            stopRequested = true
+            return
+        }
+        adjustProgress(from: oldState, to: .discovered)
+        emitProgress()
+    }
+
     private func retryOrPark(
         _ entry: UploadBackupSyncQueueEntry,
         from oldState: UploadBackupSyncQueueState,
@@ -1633,21 +1683,7 @@ public actor BackupSyncRunner {
             let recheck =
                 drainMode == .waitForScheduledRetries
                 ? min(until, now().addingTimeInterval(configuration.oneShotSourceRecheckInterval)) : until
-            let eligibleAt = max(recheck, now())
-            guard
-                queue.updateState(
-                    source: entry.source, revision: entry.revision,
-                    state: .discovered,
-                    attempts: entry.attempts,
-                    lastError: nil,
-                    updatedAt: eligibleAt
-                )
-            else {
-                stopRequested = true
-                return
-            }
-            adjustProgress(from: oldState, to: .discovered)
-            emitProgress()
+            deferSource(entry, from: oldState, until: recheck)
             return
         }
         let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription

@@ -2283,7 +2283,7 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertTrue(harness.remote.trashCalls.isEmpty, "a first upload replaces nothing")
 
         hasher.contentSeeds[first.source.identifier] = "rotated"
-        harness.remote.active = [testUID("IMG_1.HEIC")]
+        harness.remote.active = [testUID("IMG_1.HEIC"), testUID("IMG_1.JPG")]
         if keepsOriginal {
             resolver.setSecondaries(["IMG_1.HEIC", "IMG_1.MOV"], for: first.source.identifier)
             resolver.setSecondaryResource(.photoKit(role: "originalPhoto", ordinal: 0), forName: "IMG_1.HEIC")
@@ -2318,7 +2318,7 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertEqual(
             harness.journal.entry(for: edited.source),
             EditReplacementJournalEntry(
-                superseded: [], retired: [testUID("IMG_1.MOV").nodeID, testUID("IMG_1.HEIC").nodeID],
+                superseded: [], retired: [testUID("IMG_1.HEIC").nodeID, testUID("IMG_1.MOV").nodeID],
                 uploadedEdit: true))
     }
 
@@ -2339,15 +2339,62 @@ final class BackupSyncRunnerTests: XCTestCase {
     func testAnEditWithoutItsOriginalKeepsTheEarlierUpload() async throws {
         let harness = try makeReplacementHarness()
         let edited = await uploadThenEdit(harness, keepsOriginal: false)
+        let runner = makeRunner(identityResolver: harness.pipeline, editReplacement: harness.replacement)
 
-        _ = await makeRunner(identityResolver: harness.pipeline, editReplacement: harness.replacement)
-            .runUntilDrained()
+        _ = await runner.runUntilDrained(mode: .eligibleOnly)
 
         XCTAssertTrue(harness.remote.trashCalls.isEmpty, "the earlier upload may be the only copy of the original")
-        XCTAssertEqual(state(of: edited), .completed)
+        let waiting = try XCTUnwrap(queueStore.entry(for: edited.source, revision: edited.revision))
+        XCTAssertEqual(waiting.state, .discovered)
+        XCTAssertEqual(waiting.attempts, edited.attempts)
+        XCTAssertEqual(waiting.updatedAt.timeIntervalSince(clock.now), 64)
+        let issue = try XCTUnwrap(BackupIssueRecord.decode(waiting.lastError))
+        XCTAssertEqual(issue.nextAttemptAt, waiting.updatedAt)
+        XCTAssertFalse(issue.detail.isEmpty)
+        XCTAssertEqual(
+            stateStore.record(for: edited.source, revision: UploadBackupRevision(date: resolver.defaultModified))?
+                .isComplete, false,
+            "an incomplete replacement must not count as backed up")
         XCTAssertEqual(
             harness.journal.entry(for: edited.source).superseded.map(\.nodeID), [testUID("IMG_1.HEIC").nodeID],
             "an upload that holds the original replaces the earlier photo later")
+
+        let requests = uploader.requests.count
+        clock.advance(by: 63)
+        _ = await runner.runUntilDrained(mode: .eligibleOnly)
+        XCTAssertEqual(uploader.requests.count, requests, "the retry date prevents another early pass")
+        XCTAssertEqual(state(of: edited), .discovered)
+
+        resolver.setSecondaries(["IMG_1.HEIC", "IMG_1.MOV"], for: edited.source.identifier)
+        resolver.setSecondaryResource(.photoKit(role: "originalPhoto", ordinal: 0), forName: "IMG_1.HEIC")
+        clock.advance(by: 2)
+        _ = await runner.runUntilDrained(mode: .eligibleOnly)
+        XCTAssertEqual(state(of: edited)?.isTerminalSuccess, true)
+        XCTAssertEqual(harness.remote.trashCalls, [[testUID("IMG_1.HEIC")]])
+        XCTAssertEqual(uploader.requests.filter { $0.name == "IMG_1.JPG" }.count, 1)
+    }
+
+    func testAnEditWaitsWhileItsLivePhotoVideoExistsOnlyUnderTheEarlierMain() async throws {
+        let harness = try makeReplacementHarness()
+        let edited = await uploadThenEdit(harness)
+        resolver.setSecondaries(["IMG_1.HEIC"], for: edited.source.identifier)
+        let runner = makeRunner(identityResolver: harness.pipeline, editReplacement: harness.replacement)
+
+        _ = await runner.runUntilDrained(mode: .eligibleOnly)
+
+        let waiting = try XCTUnwrap(queueStore.entry(for: edited.source, revision: edited.revision))
+        XCTAssertEqual(waiting.state, .discovered)
+        XCTAssertEqual(waiting.attempts, 0)
+        XCTAssertTrue(harness.remote.trashCalls.isEmpty, "the original video still needs the earlier main")
+        XCTAssertFalse(harness.journal.entry(for: edited.source).superseded.isEmpty)
+
+        resolver.setSecondaries(["IMG_1.HEIC", "IMG_1.MOV"], for: edited.source.identifier)
+        clock.advance(by: waiting.updatedAt.timeIntervalSince(clock.now) + 1)
+        _ = await runner.runUntilDrained(mode: .eligibleOnly)
+
+        XCTAssertEqual(state(of: edited)?.isTerminalSuccess, true)
+        XCTAssertEqual(harness.remote.trashCalls, [[testUID("IMG_1.HEIC")]])
+        XCTAssertEqual(uploader.requests.filter { $0.name == "IMG_1.JPG" }.count, 1)
     }
 
     func testUndoingAnEditReplacesTheEditWithTheOriginal() async throws {
