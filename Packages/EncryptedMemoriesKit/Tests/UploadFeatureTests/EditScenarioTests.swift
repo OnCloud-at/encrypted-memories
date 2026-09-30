@@ -185,6 +185,35 @@ final class EditScenarioTests: XCTestCase {
         XCTAssertEqual(harness.server.links.first { $0.uid == edited }?.state, .trashed, "the person's trash stays")
     }
 
+    func testAnEditThatKeepsWaitingChecksAgainLessOften() async throws {
+        let original = try await firstBackup()
+        let entry = try await edit("render-that-keeps-waiting", omitOriginal: true)
+        harness.clock.advance(by: 5)
+        var waits: [TimeInterval] = []
+        for _ in 0..<4 {
+            await harness.pass()
+            let row = try XCTUnwrap(harness.queue.entry(for: entry.source, revision: entry.revision))
+            XCTAssertEqual(row.state, .discovered)
+            XCTAssertEqual(row.attempts, 0, "waiting spends no attempt")
+            waits.append(row.updatedAt.timeIntervalSince(harness.clock.now))
+            harness.clock.advance(by: row.updatedAt.timeIntervalSince(harness.clock.now) + 1)
+        }
+
+        XCTAssertEqual(waits.count, 4)
+        for (earlier, later) in zip(waits, waits.dropFirst()) {
+            XCTAssertGreaterThan(later, earlier, "each check waits longer than the one before")
+        }
+        XCTAssertEqual(harness.server.links.first { $0.uid == original }?.state, .active)
+    }
+
+    func testTheWaitOfAnEditDoublesUpToSixHours() {
+        let delays = (0..<10).map { BackupSyncRunner.waitingReplacementDelay(afterWaits: $0, first: 180) }
+
+        XCTAssertEqual(Array(delays.prefix(4)), [180, 360, 720, 1440])
+        XCTAssertEqual(delays.last, 6 * 60 * 60)
+        XCTAssertEqual(BackupSyncRunner.waitingReplacementDelay(afterWaits: 3, first: 0.5), 4)
+    }
+
     func testEditWhoseCompoundLacksTheOriginal() async throws {
         let original = try await firstBackup()
         let entry = try await edit("render-without-original", omitOriginal: true)

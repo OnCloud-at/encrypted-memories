@@ -493,6 +493,19 @@ public actor BackupSyncRunner {
         return queue.claimRunnable(limit: claimLimit, claimedAt: now())
     }
 
+    /// The wait before an edit checks again whether it can replace its earlier upload. Each check reads and hashes
+    /// the photo again, which is expensive for a video, so the wait doubles from `first` up to six hours. The first
+    /// check after an upload usually succeeds, because the retry uploads the missing original.
+    static func waitingReplacementDelay(afterWaits waits: Int, first: TimeInterval) -> TimeInterval {
+        let limit = max(first, 6 * 60 * 60)
+        var delay = first
+        for _ in 0..<max(0, waits) {
+            guard delay < limit else { break }
+            delay *= 2
+        }
+        return min(delay, limit)
+    }
+
     /// The longest wait of a runnable retry other than a full Proton account: the retry policy's cap, its
     /// 30-second minimum after low disk space, and the recheck of a photo the camera still processes.
     private var longestRegularRetryWait: TimeInterval {
@@ -1279,12 +1292,16 @@ public actor BackupSyncRunner {
                         // Some earlier mains may have retired while another still protects an original resource.
                         await identityResolver.invalidateCachedRemoteState()
                         try await preflight.markPending(resolved.candidate.snapshot)
-                        let eligibleAt = now().addingTimeInterval(min(180, longestRegularRetryWait))
+                        let detail = L10n.string("backup.issue_waiting_original")
+                        let earlier = BackupIssueRecord.decode(entry.lastError)
+                        let waits = earlier?.detail == detail ? (earlier?.automaticRetryAttempt ?? 0) + 1 : 0
+                        let eligibleAt = now().addingTimeInterval(
+                            Self.waitingReplacementDelay(afterWaits: waits, first: min(180, longestRegularRetryWait)))
                         deferSource(
                             entry, from: persistedState, until: eligibleAt,
                             issue: BackupIssueRecord(
-                                kind: .unknown, detail: L10n.string("backup.issue_waiting_original"),
-                                nextAttemptAt: eligibleAt
+                                kind: .unknown, detail: detail, nextAttemptAt: eligibleAt,
+                                automaticRetryAttempt: waits
                             ))
                         return
                     case .replacementGone:
