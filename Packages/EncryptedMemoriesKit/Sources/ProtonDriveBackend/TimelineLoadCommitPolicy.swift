@@ -329,11 +329,7 @@ struct TimelineRemoteEventChanges: Equatable {
 /// an edit, its edit data, or a Live Photo video, shows only through its main photo. When that main photo moves to the
 /// trash, the server keeps the related file active and sends no event for it, yet no listing shows it again.
 enum TimelineRemoteVisibilityRequirement {
-    struct Link: Equatable, Sendable {
-        var isActive: Bool
-        /// Nil for a main photo.
-        var mainPhotoLinkID: String?
-    }
+    typealias Link = RemoteLinkVisibility
 
     /// The main photos whose state decides whether the listing must show the given related files.
     static func mainPhotoLinkIDs(of links: [String: Link]) -> Set<String> {

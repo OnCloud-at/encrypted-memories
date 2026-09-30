@@ -35,6 +35,8 @@ public protocol EditReplacementJournaling: Sendable {
     func settle(_ nodeIDs: Set<String>, related: Set<String>, trashed: Bool, for source: UploadSourceIdentity) throws
     /// Records whether the upload that the backup finished for `source` was an edit.
     func recordUpload(edited: Bool, for source: UploadSourceIdentity) throws
+    /// Removes photos from `retired`: the person restored them, so they are in the library again.
+    func unretire(_ nodeIDs: Set<String>, for source: UploadSourceIdentity) throws
 }
 
 /// One JSON file in the account data directory, so the sign-out purge removes it with the other stores. Retired
@@ -88,6 +90,10 @@ public final class EditReplacementJournalFileStore: EditReplacementJournaling, @
             // An unedited photo without other entries needs no flag: nil counts as unedited then.
             entry.uploadedEdit = edited || !entry.retired.isEmpty ? edited : nil
         }
+    }
+
+    public func unretire(_ nodeIDs: Set<String>, for source: UploadSourceIdentity) throws {
+        try update(source) { entry in entry.retired.removeAll(where: nodeIDs.contains) }
     }
 
     private func update(_ source: UploadSourceIdentity, _ change: (inout EditReplacementJournalEntry) -> Void) throws {

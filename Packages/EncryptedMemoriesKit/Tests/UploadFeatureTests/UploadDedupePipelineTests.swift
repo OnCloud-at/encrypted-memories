@@ -156,6 +156,41 @@ final class FakeChecker: UploadDuplicateChecking, @unchecked Sendable {
         return lock.withLock { relatedLinkIDsByMainLinkID[mainLinkID] ?? [] }.union(provided)
     }
 
+    /// Explicit answers. Other links derive from the rows above.
+    var linkVisibilityByID: [String: RemoteLinkVisibility?] = [:]
+    /// Answers activity from the same state that another fake of the test holds, so both agree like one server.
+    var linkActivityProvider: (@Sendable (String) -> Bool)?
+
+    func linkVisibility(of linkIDs: [String]) async throws -> [String: RemoteLinkVisibility] {
+        let provider = lock.withLock { relatedLinkIDsProvider }
+        let activity = lock.withLock { linkActivityProvider }
+        // The provider answers per main photo, so it can name the main only among the links asked about.
+        let provided = Dictionary(uniqueKeysWithValues: Set(linkIDs).map { ($0, provider?($0) ?? []) })
+        return lock.withLock {
+            let rows = remoteItemsByNameHash.values.flatMap { $0 } + remoteItemsByContentHash.values
+            var result: [String: RemoteLinkVisibility] = [:]
+            for linkID in linkIDs {
+                if let explicit = linkVisibilityByID[linkID] {
+                    result[linkID] = explicit
+                    continue
+                }
+                let main =
+                    relatedLinkIDsByMainLinkID.first { $0.value.contains(linkID) }?.key
+                    ?? provided.first { $0.value.contains(linkID) }?.key
+                if let activity {
+                    result[linkID] = RemoteLinkVisibility(isActive: activity(linkID), mainPhotoLinkID: main)
+                    continue
+                }
+                // A link without a row is one that the server no longer knows.
+                guard let row = rows.first(where: { $0.linkID == linkID }), let state = row.linkState else {
+                    continue
+                }
+                result[linkID] = RemoteLinkVisibility(isActive: state == .active, mainPhotoLinkID: main)
+            }
+            return result
+        }
+    }
+
     func findExactActiveDuplicates(correctedName: String, sha1Digest: Data) async -> [PhotoUID] {
         lock.withLock {
             exactFindCount += 1

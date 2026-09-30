@@ -1,6 +1,7 @@
 import CryptoKit
 import Foundation
 import PhotosCore
+import ProtonAuth
 import ProtonDriveSDK
 import UploadCore
 
@@ -161,6 +162,19 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
             throw UploadError.backend("Related photos of the main photo are unavailable")
         }
         return Set(main.relatedPhotoLinkIDs)
+    }
+
+    func linkVisibility(of linkIDs: [String]) async throws -> [String: RemoteLinkVisibility] {
+        guard !linkIDs.isEmpty else { return [:] }
+        let context = try await resolveMaterial().context
+        do {
+            return try await session.fetchLinkVisibility(shareID: context.shareID, linkIDs: linkIDs)
+        } catch ProtonAuthError.apiError(let code, let message)
+            where code == 408 || code == 429 || (500...599).contains(code)
+        {
+            // A busy service must not use up the retry budget of a photo.
+            throw UploadError.retryableBackend(code: code, message: message)
+        }
     }
 
     func remoteContentIndexHealth() async throws -> UploadRemoteContentIndexHealth {

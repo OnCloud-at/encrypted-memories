@@ -654,6 +654,8 @@ private final class FakeSeriesServer: SeriesDissolutionRemote, SeriesAlbumCarryO
         lock.withLock { _serverRelatedNodeIDs }
     }
 
+    func linkVisibility(of linkIDs: [String]) async throws -> [String: RemoteLinkVisibility] { [:] }
+
     func findDuplicates(nameHashes: [String]) async throws -> [RemotePhotoDuplicate] {
         lock.withLock {
             nodes.sorted { $0.key < $1.key }.compactMap { id, node in
