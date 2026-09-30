@@ -78,6 +78,37 @@ import Testing
         await monitor.stop()
     }
 
+    @Test func theWaitForALibraryThatHasNotCaughtUpDoublesUpToItsLimit() {
+        let policy = LibraryChangePollingPolicy.foreground
+        let delays = (1...7).map { policy.refreshRetryDelay(afterRetries: $0) }
+
+        #expect(
+            delays == [.seconds(5), .seconds(10), .seconds(20), .seconds(30), .seconds(30), .seconds(30), .seconds(30)])
+        // The listing lag of about 90 seconds needs about six loads, not eighteen.
+        var waited = Duration.zero
+        var loads = 0
+        while waited < .seconds(90) {
+            loads += 1
+            waited += policy.refreshRetryDelay(afterRetries: loads)
+        }
+        #expect(loads <= 6)
+        let fixed = LibraryChangePollingPolicy(interval: .seconds(5), failureInterval: .seconds(5))
+        #expect(fixed.refreshRetryDelay(afterRetries: 4) == .seconds(5), "without a limit the wait stays the same")
+    }
+
+    @Test func aNewerEventTokenStartsTheWaitAgainAtTheShortestInterval() {
+        let policy = LibraryChangePollingPolicy.foreground
+        var count = LibraryChangeRetryCount()
+
+        let behindB = (0..<5).map { _ in count.nextDelay(for: "b", policy: policy) }
+        #expect(behindB == [.seconds(5), .seconds(10), .seconds(20), .seconds(30), .seconds(30)])
+        #expect(count.nextDelay(for: "c", policy: policy) == .seconds(5), "a newer change waits the shortest time")
+        #expect(count.nextDelay(for: "c", policy: policy) == .seconds(10))
+
+        count.reset()
+        #expect(count.nextDelay(for: "c", policy: policy) == .seconds(5), "a load that caught up starts again")
+    }
+
     @Test(.timeLimit(.minutes(1)))
     func seededBaselineDetectsMutationBeforeFirstPoll() async {
         let provider = TokenProvider("new")

@@ -6,21 +6,63 @@ import PhotosCore
 public struct LibraryChangePollingPolicy: Sendable, Equatable {
     public let interval: Duration
     public let refreshRetryInterval: Duration
+    /// The longest wait between two loads of a library that has not caught up yet.
+    public let maxRefreshRetryInterval: Duration
     public let failureInterval: Duration
 
-    public init(interval: Duration, refreshRetryInterval: Duration? = nil, failureInterval: Duration) {
+    public init(
+        interval: Duration, refreshRetryInterval: Duration? = nil, maxRefreshRetryInterval: Duration? = nil,
+        failureInterval: Duration
+    ) {
         self.interval = interval
         self.refreshRetryInterval = refreshRetryInterval ?? interval
+        self.maxRefreshRetryInterval = max(
+            maxRefreshRetryInterval ?? self.refreshRetryInterval, self.refreshRetryInterval)
         self.failureInterval = failureInterval
     }
 
     /// Five seconds keeps a second foreground device visibly current without repeatedly enumerating
     /// a large library. Failures back off so an offline device does not hot-loop the API.
+    ///
+    /// The photos listing shows a change about 90 seconds after the event. A load during that time sees an old
+    /// library, so the wait between loads doubles up to 30 seconds: about six full loads instead of eighteen.
     public static let foreground = LibraryChangePollingPolicy(
         interval: .seconds(5),
         refreshRetryInterval: .seconds(5),
+        maxRefreshRetryInterval: .seconds(30),
         failureInterval: .seconds(30)
     )
+
+    /// The wait before the next load, after `retries` loads in a row saw a library that had not caught up.
+    public func refreshRetryDelay(afterRetries retries: Int) -> Duration {
+        var delay = refreshRetryInterval
+        for _ in 1..<max(1, retries) {
+            guard delay < maxRefreshRetryInterval else { break }
+            delay *= 2
+        }
+        return min(delay, maxRefreshRetryInterval)
+    }
+}
+
+/// Counts the loads in a row that saw a library behind one event token. A newer token starts the count again, so
+/// its first retry waits the shortest time.
+struct LibraryChangeRetryCount: Equatable {
+    private(set) var token: String?
+    private(set) var retries = 0
+
+    mutating func nextDelay(for token: String, policy: LibraryChangePollingPolicy) -> Duration {
+        if token != self.token {
+            self.token = token
+            retries = 0
+        }
+        retries += 1
+        return policy.refreshRetryDelay(afterRetries: retries)
+    }
+
+    mutating func reset() {
+        token = nil
+        retries = 0
+    }
 }
 
 /// Result of the authoritative refresh requested after a change-token transition. A terminal result retires
@@ -101,6 +143,7 @@ public actor LibraryChangeMonitor {
                     return
                 }
             }
+            var retryCount = LibraryChangeRetryCount()
             while !Task.isCancelled {
                 do {
                     let token = try await request.provider.libraryChangeToken()
@@ -108,11 +151,11 @@ public actor LibraryChangeMonitor {
                     if let lastToken, token != lastToken {
                         switch await request.onChange() {
                         case .refreshed:
-                            break
+                            retryCount.reset()
                         case .retry:
                             // A successful token probe with an inventory that has not converged is not a
-                            // transport failure. Keep the old token and retry at the normal foreground cadence.
-                            try? await Task.sleep(for: request.policy.refreshRetryInterval)
+                            // transport failure. Keep the old token and wait longer after each such load.
+                            try? await Task.sleep(for: retryCount.nextDelay(for: token, policy: request.policy))
                             continue
                         case .terminal:
                             await handleTerminal(
@@ -124,6 +167,7 @@ public actor LibraryChangeMonitor {
                         }
                     }
                     try Task.checkCancellation()
+                    retryCount.reset()
                     lastToken = token
                     try await Task.sleep(for: request.policy.interval)
                 } catch is CancellationError {
