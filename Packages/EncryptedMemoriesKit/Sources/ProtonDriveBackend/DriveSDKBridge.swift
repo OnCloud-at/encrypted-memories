@@ -375,17 +375,22 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                 )
                 if let expectedRemoteNodeIDs = remoteChanges?.active {
                     let missing = expectedRemoteNodeIDs.subtracting(representedNodeIDs)
-                    guard missing.isEmpty else {
-                        throw TimelineInventoryVisibilityError.remoteChangesNotVisible(missing.count)
+                    if !missing.isEmpty {
+                        let awaited = try await filesTheListingMustShow(missing)
+                        guard awaited.isEmpty else {
+                            throw TimelineInventoryVisibilityError.remoteChangesNotVisible(awaited.count)
+                        }
+                        DebugLog.log(
+                            "timeline: \(missing.count) changed files belong to photos that left the library")
                     }
                 }
                 pendingUploadedNodeIDs.subtract(representedNodeIDs)
                 let unresolvedEvidenceNodeIDs = unmaterializedEvidenceNodeIDs.subtracting(representedNodeIDs)
-                if !unresolvedEvidenceNodeIDs.isEmpty {
-                    pendingUploadedNodeIDs.formUnion(
-                        try await activeNodeIDs(unresolvedEvidenceNodeIDs)
-                    )
-                }
+                // An upload whose photo left the library before a listing showed it, such as an edit that a later
+                // edit replaced, never shows; only uploads that can still show hold the load back.
+                let unlistedUploads = pendingUploadedNodeIDs.union(unresolvedEvidenceNodeIDs)
+                pendingUploadedNodeIDs =
+                    unlistedUploads.isEmpty ? [] : try await filesTheListingMustShow(unlistedUploads)
                 burstMemberIDs = Self.burstMemberLookup(from: entries)
                 burstEntries = entries
                 sections = Self.group(
@@ -862,6 +867,15 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         let lagging = recentlyDeleted.lagging(in: read, now: read.readAt)
         guard !lagging.isEmpty else { return sections }
         return Self.removing(lagging, from: sections, burstEntries: nil).sections
+    }
+
+    /// The files among `missing` that the photos listing must still show; see `TimelineRemoteVisibilityRequirement`.
+    private func filesTheListingMustShow(_ missing: Set<String>) async throws -> Set<String> {
+        guard let photosShareID else { return missing }
+        let links = try await driveSession.fetchLinkVisibility(shareID: photosShareID, linkIDs: missing.sorted())
+        let mainIDs = TimelineRemoteVisibilityRequirement.mainPhotoLinkIDs(of: links)
+        let mainPhotos = try await driveSession.fetchLinkVisibility(shareID: photosShareID, linkIDs: mainIDs.sorted())
+        return TimelineRemoteVisibilityRequirement.awaited(missing, links: links, mainPhotos: mainPhotos)
     }
 
     @discardableResult

@@ -446,6 +446,26 @@ extension DriveSession {
     /// This endpoint is a multistatus batch. It returns HTTP 200 with per-item result codes
     /// in `Responses[].Response`. A failed move must be detected from the body; ignoring it turns every
     /// failure into a silent "success" (photo gone from the grid, never in Recently Deleted).
+    /// The state and the main photo of each link. A link that the server no longer knows is absent from the result.
+    func fetchLinkVisibility(
+        shareID: String, linkIDs: [String]
+    ) async throws -> [String: TimelineRemoteVisibilityRequirement.Link] {
+        var result: [String: TimelineRemoteVisibilityRequirement.Link] = [:]
+        for chunk in Self.chunked(linkIDs, size: Self.metadataBatchSize) {
+            try Task.checkCancellation()
+            let data = try await send(
+                "/drive/shares/\(shareID)/links/fetch_metadata", method: "POST", body: ["LinkIDs": chunk],
+                retryOnRateLimit: true)
+            for link in try JSONDecoder().decode(LinkVisibilityResponse.self, from: data).links {
+                guard let id = link.linkID else { continue }
+                result[id] = .init(
+                    isActive: link.state == nil || link.state == 1,
+                    mainPhotoLinkID: link.fileProperties?.activeRevision?.photo?.mainPhotoLinkID)
+            }
+        }
+        return result
+    }
+
     func trash(volumeID: String, linkIDs: [String]) async throws {
         try await batchLinkAction(
             "trash", volumeID: volumeID, linkIDs: linkIDs,
@@ -649,6 +669,23 @@ private struct VolumeTrashResponse: Decodable {
 }
 
 /// `POST /drive/shares/{shareID}/links/fetch_metadata` response.
+/// `links/fetch_metadata` fields that decide whether a photos listing can show a link.
+private struct LinkVisibilityResponse: Decodable {
+    /// Required: a response without it is incomplete, not a list of deleted links.
+    let links: [Body]
+    struct Body: Decodable {
+        let linkID: String?
+        let state: Int?
+        let fileProperties: TrashLink.FileProps?
+        enum CodingKeys: String, CodingKey {
+            case linkID = "LinkID"
+            case state = "State"
+            case fileProperties = "FileProperties"
+        }
+    }
+    enum CodingKeys: String, CodingKey { case links = "Links" }
+}
+
 private struct LinkMetaBatchResponse: Decodable {
     let links: [TrashLink]?
     enum CodingKeys: String, CodingKey { case links = "Links" }
