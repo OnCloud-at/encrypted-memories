@@ -282,6 +282,22 @@ final class EditReplacementTests: XCTestCase {
         XCTAssertEqual(result.decision, .skip(.trashedDuplicate, remoteLinkID: "deleted-by-person"))
     }
 
+    func testAPhotoTrashedAfterTheListingNamedItActiveIsNotUploadedAgain() async throws {
+        try journal.addSuperseded(PhotoUID(volumeID: "vol", nodeID: "old"), for: asset)
+        try journal.settle(["old"], related: [], trashed: true, for: asset)
+        checker.remoteItemsByNameHash["nh(IMG_1.JPG)"] = [
+            RemotePhotoDuplicate(
+                nameHash: "nh(IMG_1.JPG)", contentHash: contentHash("rotated"), linkState: .active,
+                linkID: "trashed-since")
+        ]
+        // The person trashed the photo after the listing: it was a main photo, not a related file.
+        checker.linkVisibilityByID["trashed-since"] = RemoteLinkVisibility(isActive: false, mainPhotoLinkID: nil)
+
+        let result = try await pipeline.resolve(descriptor(asset, filename: "IMG_1.JPG", bytes: "rotated"))
+
+        XCTAssertNotEqual(result.decision, .upload, "the backup must not bring back a photo that the person trashed")
+    }
+
     // MARK: - Replacement
 
     func testTheReplacementCarriesFavoriteAndAlbumsOverBeforeItTrashesTheEarlierPhoto() async throws {
