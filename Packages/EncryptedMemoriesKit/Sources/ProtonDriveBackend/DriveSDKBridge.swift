@@ -1386,7 +1386,17 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
 
     // MARK: - TrashProvider
 
+    /// The person moves photos to the trash.
     func trash(_ uids: [PhotoUID]) async throws {
+        try await moveToTrash(uids)
+    }
+
+    /// The backup moves the photos that an edit replaced to the trash. This is no deletion by the person.
+    func trashReplaced(_ uids: [PhotoUID]) async throws {
+        try await moveToTrash(uids)
+    }
+
+    private func moveToTrash(_ uids: [PhotoUID]) async throws {
         try await withOpenSession { bridge in
             let root = try await bridge.resolvePhotosRoot()
             try await bridge.driveSession.trash(volumeID: root.volumeID, linkIDs: uids.map(\.nodeID))
@@ -2198,8 +2208,9 @@ extension DriveSDKBridge: SeriesDissolutionRemote {
         try await setFavorites(uids, true)
     }
 
+    /// The series dissolution moves the photos of a dissolved series to the trash. This is no deletion by the person.
     func trashSeries(_ uids: [PhotoUID]) async throws {
-        try await trash(uids)
+        try await moveToTrash(uids)
         try await withOpenSession { bridge in
             // The cached bursts listing still names the trashed series; the next lookup must read it again.
             bridge.burstCatalogEntries = nil

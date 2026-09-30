@@ -3,8 +3,9 @@ import PhotosCore
 
 /// Remote reads and writes that replace an earlier upload with the edited photo. The backend implements it.
 public protocol EditReplacementRemote: PhotoCarryOverRemote {
-    /// Moves the photos to the Proton trash, where the person can restore them.
-    func trash(_ uids: [PhotoUID]) async throws
+    /// Moves the photos that an edit replaced to the Proton trash, where the person can restore them. This is no
+    /// deletion by the person.
+    func trashReplaced(_ uids: [PhotoUID]) async throws
 }
 
 /// Replaces the earlier upload of an edited photo, so the library shows the photo once.
@@ -132,7 +133,7 @@ public struct EditedPhotoReplacement: Sendable {
             // A crash after the trash loses the server's related listing. The intent keeps those links without
             // retiring them until the main's trash is confirmed.
             try journal.prepareToRetire(intent, for: source)
-            try await remote.trash(trashable)
+            try await remote.trashReplaced(trashable)
         }
         let retired = Set(targets.map(\.nodeID)).subtracting(kept).subtracting(waiting)
         // A row that names a trashed photo no longer proves a backup. Related links from an earlier intent join

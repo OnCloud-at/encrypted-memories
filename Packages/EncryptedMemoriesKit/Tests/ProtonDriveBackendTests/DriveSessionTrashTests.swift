@@ -356,9 +356,9 @@ extension DriveSessionStubSuite {
                 "POST /drive/shares/share1/links/fetch_metadata",
                 json: #"""
                     {"Code":1000,"Links":[
-                        {"LinkID":"trashed-edit","Type":2,"State":2,
+                        {"LinkID":"trashed-edit","Type":2,"State":2,"Trashed":1790000000,
                          "FileProperties":{"ActiveRevision":{"Photo":{"MainPhotoLinkID":null}}}},
-                        {"LinkID":"original","Type":2,"State":1,
+                        {"LinkID":"original","Type":2,"State":1,"Trashed":null,
                          "FileProperties":{"ActiveRevision":{"Photo":{"MainPhotoLinkID":"trashed-edit"}}}}
                     ]}
                     """#)
@@ -366,7 +366,7 @@ extension DriveSessionStubSuite {
             let links = try await makeSession().fetchLinkVisibility(
                 shareID: "share1", linkIDs: ["trashed-edit", "original", "deleted"])
 
-            #expect(links["trashed-edit"] == .init(isActive: false, mainPhotoLinkID: nil))
+            #expect(links["trashed-edit"] == .init(isActive: false, mainPhotoLinkID: nil, trashTime: 1_790_000_000))
             #expect(links["original"] == .init(isActive: true, mainPhotoLinkID: "trashed-edit"))
             #expect(links["deleted"] == nil, "a link that the server no longer knows is absent")
         }

@@ -269,7 +269,7 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
         }
     }
 
-    func trash(_ uids: [PhotoUID]) async throws {
+    func trashReplaced(_ uids: [PhotoUID]) async throws {
         try lock.withLock {
             if failTrash {
                 failTrash = false

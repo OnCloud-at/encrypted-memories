@@ -31,7 +31,7 @@ final class FakeEditReplacementRemote: EditReplacementRemote, @unchecked Sendabl
         }
     }
 
-    func trash(_ uids: [PhotoUID]) async throws {
+    func trashReplaced(_ uids: [PhotoUID]) async throws {
         try lock.withLock {
             if trashFailures > 0 {
                 trashFailures -= 1
