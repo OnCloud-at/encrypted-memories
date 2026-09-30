@@ -295,7 +295,9 @@ final class EditReplacementTests: XCTestCase {
 
         let result = try await pipeline.resolve(descriptor(asset, filename: "IMG_1.JPG", bytes: "rotated"))
 
-        XCTAssertNotEqual(result.decision, .upload, "the backup must not bring back a photo that the person trashed")
+        XCTAssertEqual(
+            result.decision, .skip(.trashedDuplicate, remoteLinkID: "trashed-since"),
+            "the backup neither brings the photo back nor counts it as backed up")
     }
 
     // MARK: - Replacement
