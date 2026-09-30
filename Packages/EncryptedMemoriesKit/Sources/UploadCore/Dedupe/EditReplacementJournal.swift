@@ -51,27 +51,105 @@ public protocol EditReplacementJournaling: Sendable {
     func unretire(_ nodeIDs: Set<String>, for source: UploadSourceIdentity) throws
 }
 
-/// One JSON file in the account data directory, so the sign-out purge removes it with the other stores. Retired
-/// links stay without a limit: each edit adds only a few, and a dropped one could hide an undo.
+/// A log of JSON lines in the account data directory, so the sign-out purge removes it with the other stores. Each
+/// change appends the new entry of one source, so a change costs one short line, also with thousands of edited
+/// photos. The log is rewritten from the entries when it holds many more lines than entries. Retired links stay
+/// without a limit: each edit adds only a few, and a dropped one could hide an undo.
 public final class EditReplacementJournalFileStore: EditReplacementJournaling, @unchecked Sendable {
+    /// The single JSON file of earlier builds. A store without a log reads it once and continues in the log.
     public static let fileName = "edit-replacement-journal-v1.json"
+    public static let logFileName = "edit-replacement-journal-v2.jsonl"
 
-    private let url: URL
+    private struct Line: Codable {
+        let key: String
+        /// Nil when the entry of `key` became empty.
+        let entry: EditReplacementJournalEntry?
+    }
+
+    /// Written in place of the file of earlier builds. An earlier build cannot read it and keeps earlier uploads,
+    /// instead of replacing photos without the history that only the log holds.
+    static let earlierBuildBarrier = Data(#"{"movedTo":"edit-replacement-journal-v2.jsonl"}"#.utf8)
+
+    private static let registryLock = NSLock()
+    nonisolated(unsafe) private static var registry: [String: WeakStore] = [:]
+
+    private struct WeakStore {
+        weak var store: EditReplacementJournalFileStore?
+    }
+
+    /// One store for each journal in the process. Two stores of one log would write over each other's lines.
+    /// Nil when the journal exists but cannot be read.
+    public static func shared(accountDataDirectory: URL) -> EditReplacementJournalFileStore? {
+        let key = accountDataDirectory.standardizedFileURL.resolvingSymlinksInPath().path
+        return registryLock.withLock {
+            if let store = registry[key]?.store { return store }
+            guard let store = EditReplacementJournalFileStore(accountDataDirectory: accountDataDirectory) else {
+                return nil
+            }
+            registry[key] = WeakStore(store: store)
+            return store
+        }
+    }
+
+    private let logURL: URL
     private let lock = NSLock()
     private var entries: [String: EditReplacementJournalEntry]
+    private var lineCount: Int
+    /// Set when a failed write could not be undone. The log then accepts no further line.
+    private var writeFailed = false
 
-    /// Nil when the file exists but cannot be read. Edits then keep their earlier uploads instead of losing the
-    /// photos that still wait for their replacement.
-    public init?(accountDataDirectory: URL) {
-        url = accountDataDirectory.appendingPathComponent(Self.fileName)
-        guard FileManager.default.fileExists(atPath: url.path) else {
+    /// Nil when the journal exists but cannot be read. Edits then keep their earlier uploads instead of losing the
+    /// photos that still wait for their replacement. The app opens it through `shared(accountDataDirectory:)`.
+    init?(accountDataDirectory: URL) {
+        let logURL = accountDataDirectory.appendingPathComponent(Self.logFileName)
+        self.logURL = logURL
+        let earlierURL = accountDataDirectory.appendingPathComponent(Self.fileName)
+        defer { Self.placeBarrier(at: earlierURL, whenLogExists: logURL) }
+        if FileManager.default.fileExists(atPath: logURL.path) {
+            guard let data = try? Data(contentsOf: logURL), let replay = Self.replay(data) else { return nil }
+            entries = replay.entries
+            lineCount = replay.lines
+            // A write that stopped halfway leaves a line without its end. The next line would join it.
+            if replay.tornTail {
+                guard (try? rewrite()) != nil else { return nil }
+            }
+        } else if FileManager.default.fileExists(atPath: earlierURL.path) {
+            guard let data = try? Data(contentsOf: earlierURL),
+                let decoded = try? JSONDecoder().decode([String: EditReplacementJournalEntry].self, from: data)
+            else { return nil }
+            entries = decoded
+            lineCount = 0
+            guard (try? rewrite()) != nil else { return nil }
+        } else {
             entries = [:]
-            return
+            lineCount = 0
         }
-        guard let data = try? Data(contentsOf: url),
-            let decoded = try? JSONDecoder().decode([String: EditReplacementJournalEntry].self, from: data)
-        else { return nil }
-        entries = decoded
+    }
+
+    /// Keeps earlier builds away from the log's history once the log exists.
+    private static func placeBarrier(at earlierURL: URL, whenLogExists logURL: URL) {
+        guard FileManager.default.fileExists(atPath: logURL.path),
+            (try? Data(contentsOf: earlierURL)) != earlierBuildBarrier
+        else { return }
+        try? earlierBuildBarrier.write(to: earlierURL, options: .atomic)
+    }
+
+    private static func replay(
+        _ data: Data
+    ) -> (entries: [String: EditReplacementJournalEntry], lines: Int, tornTail: Bool)? {
+        var entries: [String: EditReplacementJournalEntry] = [:]
+        let lines = data.split(separator: UInt8(ascii: "\n"), omittingEmptySubsequences: true)
+        let tornTail = !data.isEmpty && data.last != UInt8(ascii: "\n")
+        let decoder = JSONDecoder()
+        for (index, line) in lines.enumerated() {
+            guard let decoded = try? decoder.decode(Line.self, from: Data(line)) else {
+                // Only the last line can be cut off by a stop during a write. Any other broken line is damage.
+                guard tornTail, index == lines.count - 1 else { return nil }
+                return (entries, index, true)
+            }
+            entries[decoded.key] = decoded.entry
+        }
+        return (entries, lines.count, tornTail)
     }
 
     public func entry(for source: UploadSourceIdentity) -> EditReplacementJournalEntry {
@@ -132,14 +210,54 @@ public final class EditReplacementJournalFileStore: EditReplacementJournaling, @
     private func update(_ source: UploadSourceIdentity, _ change: (inout EditReplacementJournalEntry) -> Void) throws {
         try lock.withLock {
             let key = Self.key(source)
-            var next = entries
-            var entry = next[key] ?? EditReplacementJournalEntry()
+            var entry = entries[key] ?? EditReplacementJournalEntry()
             change(&entry)
-            next[key] = entry.isEmpty ? nil : entry
-            guard next != entries else { return }
-            try JSONEncoder().encode(next).write(to: url, options: .atomic)
-            entries = next
+            let next = entry.isEmpty ? nil : entry
+            guard next != entries[key] else { return }
+            try append(Line(key: key, entry: next))
+            entries[key] = next
+            lineCount += 1
+            if lineCount > max(1_000, entries.count * 2) { try rewrite() }
         }
+    }
+
+    private func append(_ line: Line) throws {
+        guard !writeFailed else { throw UploadError.backend("Edit replacement journal could not be written") }
+        var data = try JSONEncoder().encode(line)
+        data.append(UInt8(ascii: "\n"))
+        if !FileManager.default.fileExists(atPath: logURL.path) {
+            try data.write(to: logURL, options: .atomic)
+            Self.placeBarrier(
+                at: logURL.deletingLastPathComponent().appendingPathComponent(Self.fileName), whenLogExists: logURL)
+            return
+        }
+        let handle = try FileHandle(forWritingTo: logURL)
+        defer { try? handle.close() }
+        let end = try handle.seekToEnd()
+        do {
+            try handle.write(contentsOf: data)
+        } catch {
+            // A part of the line may be in the file, for example when the disk filled up. The next line would join
+            // it, so the log goes back to its length before this write.
+            do {
+                try handle.truncate(atOffset: end)
+            } catch {
+                writeFailed = true
+            }
+            throw error
+        }
+    }
+
+    /// Replaces the log with one line for each entry, in one atomic write.
+    private func rewrite() throws {
+        let encoder = JSONEncoder()
+        var data = Data()
+        for (key, entry) in entries.sorted(by: { $0.key < $1.key }) {
+            data.append(try encoder.encode(Line(key: key, entry: entry)))
+            data.append(UInt8(ascii: "\n"))
+        }
+        try data.write(to: logURL, options: .atomic)
+        lineCount = entries.count
     }
 
     private static func key(_ source: UploadSourceIdentity) -> String {

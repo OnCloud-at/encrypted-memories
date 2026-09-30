@@ -203,6 +203,96 @@ final class EditReplacementTests: XCTestCase {
         XCTAssertTrue(reopened.entry(for: asset).lastUploadWasEdit)
     }
 
+    private var logURL: URL { directory.appendingPathComponent(EditReplacementJournalFileStore.logFileName) }
+
+    func testAChangeAppendsOneLineInsteadOfWritingEveryEntry() throws {
+        for index in 0..<200 {
+            let source = UploadSourceIdentity(kind: .photoLibraryAsset, identifier: "asset-\(index)")
+            try journal.recordUpload(edited: true, for: source)
+        }
+        let before = try Data(contentsOf: logURL).count
+
+        try journal.addSuperseded(PhotoUID(volumeID: "vol", nodeID: "old"), for: asset)
+
+        let grown = try Data(contentsOf: logURL).count - before
+        XCTAssertLessThan(grown, 300, "one change writes one line, not the 200 other entries")
+        let reopened = try XCTUnwrap(EditReplacementJournalFileStore(accountDataDirectory: directory))
+        XCTAssertEqual(reopened.entry(for: asset).superseded.map(\.nodeID), ["old"])
+        XCTAssertTrue(
+            reopened.entry(for: UploadSourceIdentity(kind: .photoLibraryAsset, identifier: "asset-199"))
+                .lastUploadWasEdit)
+    }
+
+    func testTheLogIsRewrittenWhenItHoldsManyMoreLinesThanEntries() throws {
+        for round in 0..<1_500 {
+            try journal.recordUpload(edited: round % 2 == 0, for: asset)
+            try journal.addSuperseded(PhotoUID(volumeID: "vol", nodeID: "old-\(round)"), for: asset)
+            try journal.settle(["old-\(round)"], related: [], trashed: false, for: asset)
+        }
+        let lines = try String(decoding: Data(contentsOf: logURL), as: UTF8.self).split(separator: "\n")
+
+        XCTAssertLessThanOrEqual(lines.count, 1_001, "the log stays bounded")
+        let reopened = try XCTUnwrap(EditReplacementJournalFileStore(accountDataDirectory: directory))
+        XCTAssertEqual(reopened.entry(for: asset), journal.entry(for: asset))
+    }
+
+    func testALineCutOffByAStopIsDroppedAndTheLogStaysUsable() throws {
+        try journal.addSuperseded(PhotoUID(volumeID: "vol", nodeID: "kept"), for: asset)
+        let handle = try FileHandle(forWritingTo: logURL)
+        try handle.seekToEnd()
+        try handle.write(contentsOf: Data(#"{"key":"photoLibraryAsset|asset-1|primary","ent"#.utf8))
+        try handle.close()
+
+        let reopened = try XCTUnwrap(EditReplacementJournalFileStore(accountDataDirectory: directory))
+        XCTAssertEqual(reopened.entry(for: asset).superseded.map(\.nodeID), ["kept"])
+        try reopened.addSuperseded(PhotoUID(volumeID: "vol", nodeID: "next"), for: asset)
+        let again = try XCTUnwrap(EditReplacementJournalFileStore(accountDataDirectory: directory))
+        XCTAssertEqual(again.entry(for: asset).superseded.map(\.nodeID), ["kept", "next"])
+    }
+
+    func testAnEarlierBuildCannotReadTheJournalOnceTheLogHoldsIt() throws {
+        let earlierURL = directory.appendingPathComponent(EditReplacementJournalFileStore.fileName)
+        try Data(#"{"photoLibraryAsset|asset-1|primary":{"superseded":[],"retired":["old"]}}"#.utf8)
+            .write(to: earlierURL)
+
+        let migrated = try XCTUnwrap(EditReplacementJournalFileStore(accountDataDirectory: directory))
+        XCTAssertEqual(migrated.entry(for: asset).retired, ["old"])
+        let barrier = try Data(contentsOf: earlierURL)
+        XCTAssertNil(
+            try? JSONDecoder().decode([String: EditReplacementJournalEntry].self, from: barrier),
+            "an earlier build finds no journal it can read, so it keeps earlier uploads")
+        let reopened = try XCTUnwrap(EditReplacementJournalFileStore(accountDataDirectory: directory))
+        XCTAssertEqual(reopened.entry(for: asset).retired, ["old"], "the log, not the barrier, holds the journal")
+    }
+
+    func testTheFirstLineOfANewJournalBlocksEarlierBuildsAsWell() throws {
+        let earlierURL = directory.appendingPathComponent(EditReplacementJournalFileStore.fileName)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: earlierURL.path))
+
+        try journal.recordUpload(edited: true, for: asset)
+
+        XCTAssertEqual(try Data(contentsOf: earlierURL), EditReplacementJournalFileStore.earlierBuildBarrier)
+    }
+
+    func testTheAppOpensOneJournalForEachDirectory() throws {
+        let other = directory.appendingPathComponent("other", isDirectory: true)
+        try FileManager.default.createDirectory(at: other, withIntermediateDirectories: true)
+        let first = try XCTUnwrap(EditReplacementJournalFileStore.shared(accountDataDirectory: other))
+        let second = try XCTUnwrap(EditReplacementJournalFileStore.shared(accountDataDirectory: other))
+
+        XCTAssertTrue(first === second, "two stores of one log would write over each other's lines")
+        try first.recordUpload(edited: true, for: asset)
+        XCTAssertTrue(second.entry(for: asset).lastUploadWasEdit)
+    }
+
+    func testADamagedLineInsideTheLogDisablesReplacement() throws {
+        try journal.addSuperseded(PhotoUID(volumeID: "vol", nodeID: "a"), for: asset)
+        let valid = try Data(contentsOf: logURL)
+        try (Data("not json\n".utf8) + valid).write(to: logURL)
+
+        XCTAssertNil(EditReplacementJournalFileStore(accountDataDirectory: directory))
+    }
+
     func testAnUnreadableJournalDisablesReplacementInsteadOfForgettingWaitingPhotos() throws {
         try Data("not json".utf8).write(to: directory.appendingPathComponent(EditReplacementJournalFileStore.fileName))
 

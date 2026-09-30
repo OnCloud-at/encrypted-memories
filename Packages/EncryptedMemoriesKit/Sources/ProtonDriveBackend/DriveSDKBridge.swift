@@ -1921,7 +1921,7 @@ extension DriveSDKBridge: PhotoUploading {
             )
         }
         // Nil when the journal file cannot be read: edits then keep their earlier uploads.
-        let replacementJournal = EditReplacementJournalFileStore(
+        let replacementJournal = EditReplacementJournalFileStore.shared(
             accountDataDirectory: uploadManifestURL.deletingLastPathComponent())
         let service = ProtonUploadDedupeService(
             session: driveSession,
