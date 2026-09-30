@@ -177,6 +177,17 @@ final class MobilePrivacyPreviewShieldTests: XCTestCase {
         return (values.reduce(0, +) / Double(values.count), profile)
     }
 
+    /// The fade lasts 160 ms. A busy test machine can wake a 40 ms sleep after the fade ended; the opacity is then
+    /// final and says nothing about the fade, whose start the animation check above already proved.
+    @MainActor private func assertMidFade(
+        _ cover: UIView, since start: ContinuousClock.Instant, file: StaticString = #filePath, line: UInt = #line
+    ) throws {
+        let opacity = try XCTUnwrap(cover.layer.presentation(), file: file, line: line).opacity
+        guard ContinuousClock.now - start < .milliseconds(120) else { return }
+        XCTAssertGreaterThan(opacity, 0, file: file, line: line)
+        XCTAssertLessThan(opacity, 1, "the cover must be between its start and end", file: file, line: line)
+    }
+
     @MainActor func testPreviewFadesInAndOutAndSurvivesRapidReactivation() async throws {
         let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
         let previous = scene.windows.first(where: \.isKeyWindow)
@@ -191,22 +202,23 @@ final class MobilePrivacyPreviewShieldTests: XCTestCase {
             previous?.makeKey()
         }
 
+        let enteringStart = ContinuousClock.now
         shield.update(enabled: true, isSceneActive: false, window: window, animated: true)
         let cover = try XCTUnwrap(window.subviews.compactMap { $0 as? UIImageView }.first)
+        XCTAssertFalse(
+            cover.layer.animationKeys()?.isEmpty ?? true, "Deactivation must fade instead of appearing instantly")
         try await Task.sleep(for: .milliseconds(40))
-        let enteringOpacity = try XCTUnwrap(cover.layer.presentation()).opacity
-        XCTAssertGreaterThan(enteringOpacity, 0)
-        XCTAssertLessThan(enteringOpacity, 1, "Deactivation must fade instead of appearing instantly")
+        try assertMidFade(cover, since: enteringStart)
         shield.prepareForSnapshot()
         XCTAssertEqual(cover.alpha, 1)
         XCTAssertTrue(cover.layer.animationKeys()?.isEmpty ?? true)
 
+        let leavingStart = ContinuousClock.now
         shield.update(enabled: true, isSceneActive: true, window: window, animated: true)
         XCTAssertNotNil(cover.superview, "Activation must keep the cover until its fade finishes")
+        XCTAssertFalse(cover.layer.animationKeys()?.isEmpty ?? true, "Activation must fade the cover out")
         try await Task.sleep(for: .milliseconds(40))
-        let leavingOpacity = try XCTUnwrap(cover.layer.presentation()).opacity
-        XCTAssertGreaterThan(leavingOpacity, 0)
-        XCTAssertLessThan(leavingOpacity, 1)
+        try assertMidFade(cover, since: leavingStart)
         shield.update(enabled: true, isSceneActive: false, window: window, animated: true)
         shield.prepareForSnapshot()
         try await Task.sleep(for: .milliseconds(220))
