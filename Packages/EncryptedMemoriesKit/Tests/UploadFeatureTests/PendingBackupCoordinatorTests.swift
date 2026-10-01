@@ -457,6 +457,24 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         XCTAssertNotNil(recorder.replacementLedger.evidence(for: PendingSourceKey(other), revision: revision))
     }
 
+    func testAnEditWhoseEarlierUploadOnlyTheJournalKnowsWaitsWhileDiscovered() async throws {
+        await coordinator.close()
+        let journal = try makeJournalCoordinator()
+        // No earlier queue row, for example after a queue reset: the journal still names the earlier photo.
+        try journal.addSuperseded(earlier, for: source("p"))
+        metadata.set(
+            key("p"), PendingPresentationMetadata(captureTime: date, mediaType: "image/heic", displayName: "p.heic"))
+        enqueueEdit("p", state: .discovered)
+        await coordinator.start()
+        try await Task.sleep(for: .milliseconds(50))
+        let checking = await coordinator.currentSnapshot()
+        XCTAssertTrue(checking.tiles.isEmpty)
+
+        recorder.recordUploadEvidence(source: source("p"), revision: edit, replaces: [earlier])
+        let uploading = await waitForSnapshot("an upload decision shows the tile") { $0.tiles.count == 1 }
+        XCTAssertEqual(uploading.tiles.first?.replaces, [earlier])
+    }
+
     func testAnEditWhoseEarlierUploadOnlyTheJournalKnowsWaitsForItsCheck() async throws {
         await coordinator.close()
         let journal = try makeJournalCoordinator()
