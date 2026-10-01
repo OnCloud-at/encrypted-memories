@@ -50,6 +50,37 @@ final class TimelineMetadataStoreTests: XCTestCase {
         )
     }
 
+    func testStoredCursorTimestampSurvivesReopenAndUnchangedSaves() throws {
+        let directory = try makeTempDir()
+        let (store, url) = try makeStore(in: directory)
+        let items = [makeItem(node: "private-node", t: 10)]
+        XCTAssertNil(store.validationTokenStoredAt())
+        XCTAssertTrue(store.save(items, validationToken: "private-cursor").succeeded)
+        let storedAt = try XCTUnwrap(store.validationTokenStoredAt())
+        XCTAssertTrue(store.save(items, validationToken: "private-cursor").succeeded)
+        XCTAssertEqual(store.validationTokenStoredAt(), storedAt)
+        XCTAssertTrue(store.save(items + [makeItem(node: "second", t: 20)]).succeeded)
+        XCTAssertEqual(store.validationTokenStoredAt(), storedAt)
+        store.close()
+        let reopened = try XCTUnwrap(TimelineMetadataStore(url: url, policy: .conservative))
+        defer { reopened.close() }
+        XCTAssertEqual(reopened.validationTokenStoredAt(), storedAt)
+        XCTAssertTrue(reopened.save(items, validationToken: nil).succeeded)
+        XCTAssertNil(reopened.validationTokenStoredAt())
+    }
+
+    func testLegacyCursorAgeStaysUnknownUntilTheCursorChanges() throws {
+        let (store, url) = try makeStore(in: try makeTempDir())
+        defer { store.close() }
+        XCTAssertTrue(store.save([], validationToken: "legacy-cursor").succeeded)
+        rawExec(url, "DELETE FROM store_meta WHERE key='timeline.validationTokenStoredAt';")
+        XCTAssertNil(store.validationTokenStoredAt())
+        XCTAssertTrue(store.save([], validationToken: "legacy-cursor").succeeded)
+        XCTAssertNil(store.validationTokenStoredAt())
+        XCTAssertTrue(store.save([], validationToken: "new-cursor").succeeded)
+        XCTAssertNotNil(store.validationTokenStoredAt())
+    }
+
     func testItemsForUIDsReturnsCaptureTimeAndMediaTypeOfKnownPhotosOnly() throws {
         let (store, _) = try makeStore(in: try makeTempDir())
         let photo = makeItem(node: "photo", t: 10)
