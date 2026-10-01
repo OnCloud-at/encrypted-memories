@@ -1285,6 +1285,39 @@ extension UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueObserving {
         )
     }
 
+    /// Cosmetic admission read: failure must not change the queue's operational health.
+    public func backedUpRevisions(kind: UploadSourceIdentity.Kind) -> [String: UploadBackupRevision] {
+        lock.withLock {
+            var stmt: OpaquePointer?
+            guard
+                sqlite3_prepare_v2(
+                    db,
+                    """
+                    SELECT source_id, MAX(revision_us) FROM backup_sync_queue
+                    WHERE source_kind=? AND state IN ('alreadyBackedUp', 'completed')
+                      AND source_id IN (
+                        SELECT source_id FROM backup_sync_queue WHERE source_kind=? AND state='queuedForUpload'
+                      )
+                    GROUP BY source_id;
+                    """,
+                    -1, &stmt, nil) == SQLITE_OK
+            else { return [:] }
+            defer { sqlite3_finalize(stmt) }
+            bindText(stmt, 1, kind.rawValue)
+            bindText(stmt, 2, kind.rawValue)
+            var result: [String: UploadBackupRevision] = [:]
+            var step = sqlite3_step(stmt)
+            while step == SQLITE_ROW {
+                if let identifier = columnText(stmt, 0) {
+                    result[identifier] = UploadBackupRevision(rawValue: sqlite3_column_int64(stmt, 1))
+                }
+                step = sqlite3_step(stmt)
+            }
+            guard step == SQLITE_DONE else { return [:] }
+            return result
+        }
+    }
+
     /// Runs one prepared query once for each set of bindings, so a batch of sources costs one prepare.
     private func rowStates(
         where condition: String,

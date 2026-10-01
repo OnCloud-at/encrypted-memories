@@ -1,12 +1,16 @@
 import Foundation
 import PhotosCore
 
-/// Per-source events of the backup runner for the pending grid. Record calls are synchronous and durable:
+/// Per-source events of the backup runner for the pending grid. Upload decisions and handoffs are durable:
 /// the runner makes them before it moves a row on or clears a commit receipt, so a crash cannot lose the
 /// fact that a source has a Proton photo.
 public protocol BackupItemEventSink: Sendable {
     /// The duplicate check decided that this revision needs an upload.
-    func recordUploadEvidence(source: UploadSourceIdentity, revision: UploadBackupRevision)
+    func recordUploadEvidence(source: UploadSourceIdentity, revision: UploadBackupRevision, replaces: [PhotoUID])
+    /// Narrows this revision's in-memory mains to those actually retired after replacement settled.
+    func settleUploadEvidence(
+        source: UploadSourceIdentity, revision: UploadBackupRevision, retired: Set<String>
+    )
     /// The source has a Proton photo: its primary committed, or the check mapped it to an existing photo.
     /// An empty `remote.volumeID` means the account's photos volume.
     @discardableResult

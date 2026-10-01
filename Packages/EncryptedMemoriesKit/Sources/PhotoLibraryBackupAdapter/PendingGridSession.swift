@@ -16,7 +16,7 @@ import os
 /// the grid and viewer, and forward deletes, restores, favorites and album adds of local photos.
 @MainActor
 public final class PendingGridSession {
-    public let presenter = PendingTimelinePresenter()
+    public let presenter: PendingTimelinePresenter
     private static let logger = Logger(subsystem: "at.oncloud.encryptedmemories", category: "PendingGrid")
     /// The latest coordinator snapshot, including the trash and excluded lists.
     public private(set) var pendingSnapshot = PendingBackupSnapshot.empty
@@ -86,6 +86,9 @@ public final class PendingGridSession {
             recorder: recorder,
             replacementJournal: photoBackup.pendingReplacementJournal
         )
+        presenter = PendingTimelinePresenter(replacementLookup: { [ledger = recorder.replacementLedger] in
+            ledger.replacementHandoffs()
+        })
         self.photoBackup = photoBackup
         presenter.onRemotePresence = { [coordinator] keys in
             Task { await coordinator.noteRemotePresence(keys) }

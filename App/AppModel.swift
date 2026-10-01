@@ -286,6 +286,7 @@ final class AppModel {
                 },
                 AccountTeardownOwner(id: "shared.local-data-claim", stage: .purgeClaims) {
                     guard let purgeClaim else { throw TeardownFailure.purgeClaimUnavailable }
+                    PendingReplacementLedger.clearForSignOut()
                     let succeeded = await ProtonAuthLocalDataPurge.performOffMain(claim: purgeClaim)
                     guard succeeded else { throw TeardownFailure.purgeFailed }
                 },

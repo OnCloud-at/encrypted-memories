@@ -38,6 +38,8 @@ public struct EditReplacementJournalEntry: Sendable, Equatable, Codable {
 /// photo before its manifest record forgets it; the backup runner retires it after the trash write.
 public protocol EditReplacementJournaling: Sendable {
     func entry(for source: UploadSourceIdentity) -> EditReplacementJournalEntry
+    /// One in-memory snapshot for admission after a queue reset, without reading each queued source.
+    func supersededSourceIdentifiers() -> Set<String>
     func addSuperseded(_ uid: PhotoUID, for source: UploadSourceIdentity) throws
     /// Records related links before trashing their mains, without retiring active links.
     func prepareToRetire(_ relatedByMain: [String: [String]], for source: UploadSourceIdentity) throws
@@ -49,6 +51,10 @@ public protocol EditReplacementJournaling: Sendable {
     func recordUpload(edited: Bool, for source: UploadSourceIdentity) throws
     /// Removes photos from `retired`: the person restored them, so they are in the library again.
     func unretire(_ nodeIDs: Set<String>, for source: UploadSourceIdentity) throws
+}
+
+extension EditReplacementJournaling {
+    public func supersededSourceIdentifiers() -> Set<String> { [] }
 }
 
 /// A log of JSON lines in the account data directory, so the sign-out purge removes it with the other stores. Each
@@ -155,6 +161,18 @@ public final class EditReplacementJournalFileStore: EditReplacementJournaling, @
 
     public func entry(for source: UploadSourceIdentity) -> EditReplacementJournalEntry {
         lock.withLock { entries[Self.key(source)] ?? EditReplacementJournalEntry() }
+    }
+
+    public func supersededSourceIdentifiers() -> Set<String> {
+        let prefix = UploadSourceIdentity.Kind.photoLibraryAsset.rawValue + "|"
+        let suffix = "|" + UploadSourceIdentity.Resource.primary.rawValue
+        return lock.withLock {
+            Set(
+                entries.compactMap { key, entry in
+                    guard !entry.superseded.isEmpty, key.hasPrefix(prefix), key.hasSuffix(suffix) else { return nil }
+                    return String(key.dropFirst(prefix.count).dropLast(suffix.count))
+                })
+        }
     }
 
     public func addSuperseded(_ uid: PhotoUID, for source: UploadSourceIdentity) throws {

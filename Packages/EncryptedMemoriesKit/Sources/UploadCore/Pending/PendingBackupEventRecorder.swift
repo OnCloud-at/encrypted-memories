@@ -1,9 +1,9 @@
 import Foundation
 import PhotosCore
 
-/// A runner event after the recorder made it durable.
+/// A runner event after the recorder captured its durable facts and cosmetic replacement state.
 public enum PendingRuntimeEvent: Sendable, Equatable {
-    case evidence(PendingSourceKey, UploadBackupRevision)
+    case evidence(PendingUploadEvidence)
     case handoff(PendingHandoff, PendingHandoffOutcome)
     case progress(PendingSourceKey, UploadBackupRevision, step: Int?)
 }
@@ -14,11 +14,20 @@ public final class PendingBackupEventRecorder: BackupItemEventSink, @unchecked S
     public let events: AsyncStream<PendingRuntimeEvent>
     private let continuation: AsyncStream<PendingRuntimeEvent>.Continuation
     private let store: PendingBackupManifestStore
+    public let replacementLedger: PendingReplacementLedger
+    private let replacementJournal: (any EditReplacementJournaling)?
     private let now: @Sendable () -> Date
 
-    public init(store: PendingBackupManifestStore, now: @Sendable @escaping () -> Date = { Date() }) {
+    public init(
+        store: PendingBackupManifestStore,
+        replacementLedger: PendingReplacementLedger = PendingReplacementLedger(),
+        replacementJournal: (any EditReplacementJournaling)? = nil,
+        now: @Sendable @escaping () -> Date = { Date() }
+    ) {
         self.store = store
         self.now = now
+        self.replacementLedger = replacementLedger
+        self.replacementJournal = replacementJournal
         (events, continuation) = AsyncStream.makeStream(of: PendingRuntimeEvent.self, bufferingPolicy: .unbounded)
     }
 
@@ -26,10 +35,26 @@ public final class PendingBackupEventRecorder: BackupItemEventSink, @unchecked S
 
     public func finish() { continuation.finish() }
 
-    public func recordUploadEvidence(source: UploadSourceIdentity, revision: UploadBackupRevision) {
+    public func recordUploadEvidence(
+        source: UploadSourceIdentity, revision: UploadBackupRevision, replaces: [PhotoUID] = []
+    ) {
         let key = PendingSourceKey(source)
+        let replaces = source.kind == .photoLibraryAsset && source.resource == .primary ? replaces : []
         guard store.recordUploadEvidence(key, revision: revision, at: now()) else { return }
-        continuation.yield(.evidence(key, revision))
+        replacementLedger.record(key, revision: revision, replaces: replaces)
+        let evidence =
+            replacementLedger.evidence(for: key, revision: revision)
+            ?? PendingUploadEvidence(key: key, revision: revision, replaces: nil)
+        continuation.yield(.evidence(evidence))
+    }
+
+    public func settleUploadEvidence(
+        source: UploadSourceIdentity, revision: UploadBackupRevision, retired: Set<String>
+    ) {
+        let key = PendingSourceKey(source)
+        if let replaces = replacementLedger.settle(key, revision: revision, retired: retired) {
+            continuation.yield(.evidence(PendingUploadEvidence(key: key, revision: revision, replaces: replaces)))
+        }
     }
 
     @discardableResult
@@ -52,6 +77,9 @@ public final class PendingBackupEventRecorder: BackupItemEventSink, @unchecked S
         if let recorded = store.handoffTime(for: handoff.key, revision: revision), recorded != handoff.createdAt {
             handoff = PendingHandoff(
                 key: handoff.key, revision: revision, remote: remote, kind: kind, createdAt: recorded)
+        }
+        if source.resource == .primary {
+            replacementLedger.recordHandoff(handoff) { replacementJournal?.entry(for: source).superseded ?? [] }
         }
         continuation.yield(.handoff(handoff, outcome))
         return outcome

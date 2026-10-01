@@ -29,9 +29,8 @@ public struct PendingTile: Sendable, Equatable {
     public let isSettled: Bool
     public let badge: PendingUploadBadge
     public let displayName: String
-    /// Earlier Proton photos of this source that an edit replaces: while the edit uploads, the photos the journal
-    /// names; once it settled, those the backup moved to the trash. The grid shows the tile and its Proton photo in
-    /// their place and hides them. An empty volume ID means the account's photos volume.
+    /// Main photos named by this revision's in-memory replacement evidence. After settlement, only its retired mains
+    /// remain. The grid shows this tile or its Proton photo in their place. An empty volume ID means the photos volume.
     public let replaces: [PhotoUID]
 
     public init(

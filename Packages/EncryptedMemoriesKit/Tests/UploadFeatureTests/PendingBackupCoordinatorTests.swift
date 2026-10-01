@@ -23,7 +23,8 @@ final class PendingBackupCoordinatorTests: XCTestCase {
                 url: directory.appendingPathComponent(UploadBackupSyncQueueManifestStore.databaseFileName)))
         let storeURL = directory.appendingPathComponent(PendingBackupManifestStore.databaseFileName)
         store = try XCTUnwrap(PendingBackupManifestStore(url: storeURL))
-        recorder = PendingBackupEventRecorder(store: store, now: { [date] in date })
+        recorder = PendingBackupEventRecorder(
+            store: store, replacementLedger: .shared(accountDataDirectory: directory), now: { [date] in date })
         metadata = FakePendingMetadata()
         effects = FakePendingEffects()
         coordinator = makeCoordinator()
@@ -32,6 +33,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
     override func tearDown() async throws {
         await coordinator.close()
         recorder.finish()
+        PendingReplacementLedger.clearForSignOut(accountDataDirectory: directory)
         queue.close()
         store.close()
         try? FileManager.default.removeItem(at: directory)
@@ -40,23 +42,27 @@ final class PendingBackupCoordinatorTests: XCTestCase {
     private func makeCoordinator(
         checkmarkDuration: Duration = .seconds(60),
         uncheckedAdmissionLimit: Int = 64,
-        replacementJournal: (any EditReplacementJournaling)? = nil
+        replacementJournal: (any EditReplacementJournaling)? = nil,
+        sourceKind: UploadSourceIdentity.Kind = .photoLibraryAsset,
+        membershipInterval: Duration = .zero,
+        sleep: @Sendable @escaping (Duration) async throws -> Void = { try await Task.sleep(for: $0) }
     ) -> PendingBackupCoordinator {
         PendingBackupCoordinator(
             store: store,
-            queues: [.photoLibraryAsset: queue],
+            queues: [sourceKind: queue],
             metadataProvider: metadata,
             effects: effects,
             recorder: recorder,
             replacementJournal: replacementJournal,
             configuration: .init(
-                membershipInterval: .zero,
+                membershipInterval: membershipInterval,
                 progressInterval: .milliseconds(1),
                 doneLinger: .milliseconds(20),
                 checkmarkDuration: checkmarkDuration,
                 uncheckedAdmissionLimit: uncheckedAdmissionLimit
             ),
-            now: { [date] in date }
+            now: { [date] in date },
+            sleep: sleep
         )
     }
 
@@ -131,9 +137,157 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         return journal
     }
 
+    func testChangedWatchedFileShowsWithUploadEvidenceAndAfterAnUploadFailure() async throws {
+        await coordinator.close()
+        let journal = try XCTUnwrap(EditReplacementJournalFileStore(accountDataDirectory: directory))
+        coordinator = makeCoordinator(replacementJournal: journal, sourceKind: .fileURL)
+        let source = UploadSourceIdentity(kind: .fileURL, identifier: "watched-photo", resource: .primary)
+        let key = PendingSourceKey(source)
+        metadata.set(
+            key, PendingPresentationMetadata(captureTime: date, mediaType: "image/heic", displayName: "photo.heic"))
+        for (revision, state) in [(revision, UploadBackupSyncQueueState.completed), (edit, .discovered)] {
+            XCTAssertTrue(
+                queue.upsert(
+                    UploadBackupSyncQueueEntry(
+                        source: source, revision: revision, originalFilename: "photo.heic", state: state,
+                        updatedAt: date)))
+        }
+        await coordinator.start()
+        recorder.recordUploadEvidence(source: source, revision: edit, replaces: [earlier])
+        XCTAssertTrue(
+            queue.updateState(
+                source: source, revision: edit, state: .uploading, attempts: nil, lastError: nil, updatedAt: date))
+        let uploading = await waitForSnapshot("the changed watched file shows after its check") { $0.tiles.count == 1 }
+        XCTAssertEqual(uploading.tiles.first?.key, key)
+        XCTAssertEqual(uploading.tiles.first?.replaces, [])
+        let membership = uploading.membershipRevision
+
+        XCTAssertTrue(
+            queue.updateState(
+                source: source, revision: edit, state: .failedPermanent, attempts: nil, lastError: nil, updatedAt: date)
+        )
+        let failed = await waitForSnapshot("the watched file stays visible after an upload failure") {
+            $0.membershipRevision > membership && $0.tiles.first?.badge == .attention
+        }
+        XCTAssertEqual(failed.tiles.first?.key, key)
+        XCTAssertEqual(failed.tiles.first?.replaces, [])
+    }
+
+    func testManyReplacementEventsShareOneMembershipPublication() async throws {
+        await coordinator.close()
+        let journal = try XCTUnwrap(EditReplacementJournalFileStore(accountDataDirectory: directory))
+        let gate = PendingMembershipSleepGate()
+        coordinator = makeCoordinator(
+            uncheckedAdmissionLimit: 0, replacementJournal: journal, membershipInterval: .seconds(60),
+            sleep: { _ in await gate.wait() })
+        for index in 0..<40 { enqueue("edit-\(index)", state: .discovered) }
+        await coordinator.start()
+        let initial = await coordinator.currentSnapshot()
+        for index in 0..<40 {
+            let id = "edit-\(index)"
+            try journal.addSuperseded(earlier, for: source(id))
+            recorder.recordUploadEvidence(source: source(id), revision: revision, replaces: [earlier])
+        }
+        let deadline = ContinuousClock.now + .seconds(5)
+        while !(0..<40).allSatisfy({ metadata.wasRequested(key("edit-\($0)")) }), ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(2))
+        }
+        XCTAssertTrue((0..<40).allSatisfy { metadata.wasRequested(key("edit-\($0)")) })
+        let beforeTimer = await coordinator.currentSnapshot()
+        XCTAssertEqual(beforeTimer.membershipRevision, initial.membershipRevision, "no event bypasses the throttle")
+        await gate.release()
+        let burst = await waitForSnapshot("all edits publish together") { $0.tiles.count == 40 }
+        XCTAssertEqual(burst.membershipRevision - initial.membershipRevision, 1, "count actual membership publications")
+    }
+
+    func testRebuiltCoordinatorKeepsAnUnacknowledgedSettledReplacement() async throws {
+        await coordinator.close()
+        let journal = try makeJournalCoordinator()
+        enqueue("p", state: .completed)
+        enqueueEdit("p", state: .uploading)
+        try journal.addSuperseded(earlier, for: source("p"))
+        recorder.recordUploadEvidence(source: source("p"), revision: edit, replaces: [earlier])
+        try journal.settle([earlier.nodeID], related: [], trashed: true, for: source("p"))
+        recorder.recordHandoff(
+            source: source("p"), revision: edit, remote: PhotoUID(volumeID: "vol", nodeID: "edit"), kind: .uploaded)
+        XCTAssertTrue(
+            queue.updateState(
+                source: source("p"), revision: edit, state: .completed, attempts: nil, lastError: nil, updatedAt: date))
+        await coordinator.start()
+        await waitForSnapshot("the first coordinator consumed the events") { $0.tiles.first?.isSettled == true }
+        await coordinator.close()
+        recorder.finish()
+        recorder = PendingBackupEventRecorder(
+            store: store, replacementLedger: .shared(accountDataDirectory: directory), replacementJournal: journal,
+            now: { [date] in date })
+        coordinator = makeCoordinator(replacementJournal: journal)
+        await coordinator.start()
+        let rebuilt = await coordinator.currentSnapshot()
+        XCTAssertEqual(rebuilt.tiles.first?.replaces, [earlier])
+        XCTAssertEqual(rebuilt.tiles.first?.revision, edit)
+        XCTAssertEqual(store.unacknowledgedHandoffs().count, 1)
+    }
+
+    func testLargeQueuedLoadDoesNotReadIndividualSourcesOrTheirJournals() async {
+        await coordinator.close()
+        let queue = CountingPendingQueue(count: 5_000, date: date)
+        let journal = CountingPendingJournal()
+        coordinator = PendingBackupCoordinator(
+            store: store, queues: [.photoLibraryAsset: queue], metadataProvider: metadata, effects: effects,
+            recorder: nil, replacementJournal: journal)
+        await coordinator.start()
+        XCTAssertEqual(queue.sourceReads, 0)
+        XCTAssertEqual(queue.aggregateReads, 1)
+        XCTAssertEqual(journal.reads, 0)
+    }
+
+    func testWatchedFolderResetDoesNotRepeatPhotoLibraryAggregateRead() async throws {
+        await coordinator.close()
+        let library = CountingPendingQueue(count: 0, date: date)
+        let folder = CountingPendingQueue(count: 0, date: date)
+        coordinator = PendingBackupCoordinator(
+            store: store, queues: [.photoLibraryAsset: library, .fileURL: folder],
+            metadataProvider: metadata, effects: effects, recorder: nil)
+        await coordinator.start()
+        XCTAssertEqual(library.aggregateReads, 1)
+        folder.notifyAll()
+        let folderDeadline = ContinuousClock.now + .seconds(5)
+        while folder.unsettledReads < 2, ContinuousClock.now < folderDeadline {
+            try await Task.sleep(for: .milliseconds(2))
+        }
+        _ = await coordinator.currentSnapshot()
+        XCTAssertEqual(folder.unsettledReads, 2, "the watched-folder reset was consumed")
+        XCTAssertEqual(library.aggregateReads, 1, "only the photo-library queue owns the cosmetic read")
+        library.notifyAll()
+        let libraryDeadline = ContinuousClock.now + .seconds(5)
+        while library.aggregateReads < 2, ContinuousClock.now < libraryDeadline {
+            try await Task.sleep(for: .milliseconds(2))
+        }
+        XCTAssertEqual(library.aggregateReads, 2, "a photo-library reset still refreshes admission")
+    }
+
+    func testDurableEvidenceAloneDoesNotRecoverRetiredHistoryForARecheck() async throws {
+        await coordinator.close()
+        let journal = try makeJournalCoordinator()
+        try journal.addSuperseded(earlier, for: source("p"))
+        try journal.settle([earlier.nodeID], related: [], trashed: true, for: source("p"))
+        enqueue("p", state: .alreadyBackedUp)
+        // Evidence loaded from an earlier process is deliberately not sent through the live recorder.
+        XCTAssertTrue(store.recordUploadEvidence(key("p"), revision: revision, at: date))
+        recorder.recordHandoff(
+            source: source("p"), revision: revision, remote: PhotoUID(volumeID: "vol", nodeID: "link-edit"),
+            kind: .deduplicated)
+        await coordinator.start()
+
+        let rechecked = await waitForSnapshot("the manifest recheck hands off without an upload") {
+            $0.tiles.first?.isSettled == true
+        }
+        XCTAssertEqual(rechecked.tiles.first?.replaces, [], "durable evidence cannot hide a restored earlier photo")
+    }
+
     func testAnEditOfABackedUpPhotoShowsNoTileUntilItsCheckDecidesOnAnUpload() async throws {
         await coordinator.close()
-        _ = try makeJournalCoordinator()
+        let journal = try makeJournalCoordinator()
         enqueue("p", state: .completed)
         enqueueEdit("p", state: .discovered)
         await coordinator.start()
@@ -142,11 +296,168 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         XCTAssertTrue(
             checking.tiles.isEmpty, "the Proton photo shows until the check decided; most rechecks upload nothing")
 
-        recorder.recordUploadEvidence(source: source("p"), revision: edit)
+        try journal.addSuperseded(earlier, for: source("p"))
+        recorder.recordUploadEvidence(source: source("p"), revision: edit, replaces: [earlier])
         await waitForSnapshot("an upload decision shows the tile") { $0.tiles.count == 1 }
     }
 
-    func testAnEditWhoseEarlierUploadOnlyTheJournalKnowsWaitsForItsCheck() async throws {
+    func testQueuedEditOfABackedUpPhotoWaitsForEvidence() async throws {
+        enqueue("p", state: .completed)
+        enqueueEdit("p", state: .queuedForUpload)
+        await coordinator.start()
+        let queued = await coordinator.currentSnapshot()
+        XCTAssertTrue(queued.tiles.isEmpty, "queued state alone does not prove an edited upload")
+        recorder.recordUploadEvidence(source: source("p"), revision: edit, replaces: [earlier])
+        let decided = await waitForSnapshot("evidence admits the queued edit") { $0.tiles.count == 1 }
+        XCTAssertEqual(decided.tiles.first?.replaces, [earlier])
+    }
+
+    func testRelaunchedQueuedEditRecoversSupersededMainWithoutLedgerRecord() async throws {
+        await coordinator.close()
+        let journal = try makeJournalCoordinator()
+        enqueue("p", state: .completed)
+        enqueueEdit("p", state: .queuedForUpload)
+        try journal.addSuperseded(earlier, for: source("p"))
+        XCTAssertTrue(store.recordUploadEvidence(key("p"), revision: edit, at: date))
+        XCTAssertNil(recorder.replacementLedger.evidence(for: key("p"), revision: edit))
+        await coordinator.start()
+
+        let recovered = await coordinator.currentSnapshot()
+        XCTAssertEqual(recovered.tiles.first?.revision, edit)
+        XCTAssertEqual(recovered.tiles.first?.replaces, [earlier])
+        XCTAssertEqual(recovered.tiles.first?.isSettled, false)
+    }
+
+    func testNewerDiscoveredEditKeepsEarlierUploadsBeforeItsEvidence() async throws {
+        await coordinator.close()
+        let journal = try makeJournalCoordinator()
+        enqueue("p", state: .completed)
+        enqueueEdit("p", state: .uploading)
+        try journal.addSuperseded(earlier, for: source("p"))
+        recorder.recordUploadEvidence(source: source("p"), revision: edit, replaces: [earlier])
+        await coordinator.start()
+        let first = await coordinator.currentSnapshot()
+        XCTAssertEqual(first.tiles.first?.revision, edit)
+        let newer = UploadBackupRevision(rawValue: edit.rawValue + 1)
+        XCTAssertTrue(
+            queue.upsert(
+                UploadBackupSyncQueueEntry(
+                    source: source("p"), revision: newer, originalFilename: "p.heic",
+                    state: .discovered, updatedAt: date)))
+        let checking = await waitForSnapshot("the second edit owns the tile") { $0.tiles.first?.revision == newer }
+        XCTAssertNil(recorder.replacementLedger.evidence(for: key("p"), revision: newer))
+        XCTAssertEqual(checking.tiles.first?.replaces, [earlier])
+    }
+
+    func testSettlementNarrowedToEmptyDoesNotFallBackToSupersededJournal() async throws {
+        await coordinator.close()
+        let journal = try makeJournalCoordinator()
+        enqueue("p", state: .completed)
+        enqueueEdit("p", state: .uploading)
+        try journal.addSuperseded(earlier, for: source("p"))
+        recorder.recordUploadEvidence(source: source("p"), revision: edit, replaces: [earlier])
+        recorder.settleUploadEvidence(source: source("p"), revision: edit, retired: [])
+        await coordinator.start()
+        XCTAssertEqual(recorder.replacementLedger.evidence(for: key("p"), revision: edit)?.replaces, [])
+        // The recorded and the settled evidence arrive as two events; the settled one is final.
+        let uploading = await waitForSnapshot("an empty ledger record remains authoritative") {
+            $0.tiles.first?.replaces == []
+        }
+        XCTAssertEqual(uploading.tiles.count, 1)
+    }
+
+    func testSourceLeavingQueueDropsAllItsLedgerRevisions() async throws {
+        enqueue("p", state: .uploading)
+        for value in [revision, edit] {
+            recorder.recordUploadEvidence(source: source("p"), revision: value, replaces: [earlier])
+        }
+        recorder.recordUploadEvidence(source: source("other"), revision: revision, replaces: [earlier])
+        await coordinator.start()
+        let initial = await coordinator.currentSnapshot()
+        XCTAssertEqual(initial.tiles.count, 1)
+        XCTAssertEqual(queue.removeSources(kind: .photoLibraryAsset, identifiers: ["p"]), 1)
+        await waitForSnapshot("the removed source leaves the grid") { $0.tiles.isEmpty }
+        XCTAssertNil(recorder.replacementLedger.evidence(for: key("p"), revision: revision))
+        XCTAssertNil(recorder.replacementLedger.evidence(for: key("p"), revision: edit))
+        XCTAssertNotNil(recorder.replacementLedger.evidence(for: key("other"), revision: revision))
+    }
+
+    func testReturnedSourceRecordsItsSameRevisionAgain() async throws {
+        enqueue("p", state: .uploading)
+        recorder.recordUploadEvidence(source: source("p"), revision: revision, replaces: [earlier])
+        await coordinator.start()
+        await waitForSnapshot("the edit shows") { $0.tiles.count == 1 }
+        let excluded = await coordinator.exclude([key("p").localUID])
+        XCTAssertTrue(excluded)
+        // A late callback of the excluded attempt records nothing, also after the queue reloads its row.
+        enqueue("p", state: .queuedForUpload)
+        recorder.recordUploadEvidence(source: source("p"), revision: revision, replaces: [earlier])
+        XCTAssertNil(recorder.replacementLedger.evidence(for: key("p"), revision: revision))
+        // The person returns the unchanged photo to backup: the same revision starts a new attempt.
+        let restored = await coordinator.restore([key("p").localUID])
+        XCTAssertTrue(restored)
+        recorder.recordUploadEvidence(source: source("p"), revision: revision, replaces: [earlier])
+        XCTAssertEqual(recorder.replacementLedger.evidence(for: key("p"), revision: revision)?.replaces, [earlier])
+    }
+
+    func testReconciliationHandoffSeedsJournalWithoutUploadEvidence() async throws {
+        await coordinator.close()
+        let journal = try makeJournalCoordinator()
+        recorder.finish()
+        recorder = PendingBackupEventRecorder(
+            store: store, replacementLedger: .shared(accountDataDirectory: directory), replacementJournal: journal,
+            now: { [date] in date })
+        coordinator = makeCoordinator(replacementJournal: journal)
+        enqueue("p", state: .completed)
+        enqueueEdit("p", state: .needsRemoteReconciliation)
+        try journal.addSuperseded(earlier, for: source("p"))
+        await coordinator.start()
+        recorder.recordHandoff(
+            source: source("p"), revision: edit, remote: PhotoUID(volumeID: "vol", nodeID: "edit"), kind: .uploaded)
+        let recovered = await waitForSnapshot("reconciliation captures the still-superseded main") {
+            $0.tiles.first?.handoff != nil
+        }
+        XCTAssertEqual(recovered.tiles.first?.replaces, [earlier])
+        try journal.settle([earlier.nodeID], related: [], trashed: true, for: source("p"))
+        recorder.settleUploadEvidence(source: source("p"), revision: edit, retired: [earlier.nodeID])
+        XCTAssertEqual(recorder.replacementLedger.replacementHandoffs().first?.evidence.replaces, [earlier])
+    }
+
+    func testAcknowledgmentDropsOnlyItsLedgerRevision() async throws {
+        enqueue("p", state: .completed)
+        recorder.recordUploadEvidence(source: source("p"), revision: revision, replaces: [earlier])
+        recorder.recordHandoff(source: source("p"), revision: revision, remote: earlier, kind: .uploaded)
+        recorder.recordUploadEvidence(source: source("p"), revision: edit, replaces: [earlier])
+        await coordinator.start()
+        await coordinator.noteRemotePresence([key("p")])
+        XCTAssertNil(recorder.replacementLedger.evidence(for: key("p"), revision: revision))
+        XCTAssertEqual(recorder.replacementLedger.evidence(for: key("p"), revision: edit)?.replaces, [earlier])
+    }
+
+    func testAcknowledgmentDropsOlderLedgerRevisionsAndKeepsNewerOnes() async throws {
+        let newer = UploadBackupRevision(rawValue: edit.rawValue + 1)
+        let other = source("other")
+        for value in [revision, edit, newer] {
+            recorder.recordUploadEvidence(source: source("p"), revision: value, replaces: [earlier])
+            if value <= edit {
+                recorder.recordHandoff(source: source("p"), revision: value, remote: earlier, kind: .uploaded)
+            }
+        }
+        recorder.recordUploadEvidence(source: other, revision: revision, replaces: [earlier])
+        enqueue("p", state: .completed)
+        enqueueEdit("p", state: .completed)
+        await coordinator.start()
+        let settled = await coordinator.currentSnapshot()
+        XCTAssertEqual(settled.tiles.first?.revision, edit)
+        XCTAssertEqual(settled.tiles.first?.isSettled, true)
+        await coordinator.noteRemotePresence([key("p")])
+        XCTAssertNil(recorder.replacementLedger.evidence(for: key("p"), revision: revision))
+        XCTAssertNil(recorder.replacementLedger.evidence(for: key("p"), revision: edit))
+        XCTAssertNotNil(recorder.replacementLedger.evidence(for: key("p"), revision: newer))
+        XCTAssertNotNil(recorder.replacementLedger.evidence(for: PendingSourceKey(other), revision: revision))
+    }
+
+    func testAnEditWhoseEarlierUploadOnlyTheJournalKnowsWaitsWhileDiscovered() async throws {
         await coordinator.close()
         let journal = try makeJournalCoordinator()
         // No earlier queue row, for example after a queue reset: the journal still names the earlier photo.
@@ -159,7 +470,25 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         let checking = await coordinator.currentSnapshot()
         XCTAssertTrue(checking.tiles.isEmpty)
 
-        recorder.recordUploadEvidence(source: source("p"), revision: edit)
+        recorder.recordUploadEvidence(source: source("p"), revision: edit, replaces: [earlier])
+        let uploading = await waitForSnapshot("an upload decision shows the tile") { $0.tiles.count == 1 }
+        XCTAssertEqual(uploading.tiles.first?.replaces, [earlier])
+    }
+
+    func testAnEditWhoseEarlierUploadOnlyTheJournalKnowsWaitsForItsCheck() async throws {
+        await coordinator.close()
+        let journal = try makeJournalCoordinator()
+        // No earlier queue row, for example after a queue reset: the journal still names the earlier photo.
+        try journal.addSuperseded(earlier, for: source("p"))
+        metadata.set(
+            key("p"), PendingPresentationMetadata(captureTime: date, mediaType: "image/heic", displayName: "p.heic"))
+        enqueueEdit("p", state: .queuedForUpload)
+        await coordinator.start()
+        try await Task.sleep(for: .milliseconds(50))
+        let checking = await coordinator.currentSnapshot()
+        XCTAssertTrue(checking.tiles.isEmpty)
+
+        recorder.recordUploadEvidence(source: source("p"), revision: edit, replaces: [earlier])
         let uploading = await waitForSnapshot("an upload decision shows the tile") { $0.tiles.count == 1 }
         XCTAssertEqual(uploading.tiles.first?.replaces, [earlier])
     }
@@ -187,6 +516,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         try journal.addSuperseded(earlier, for: source("p"))
         enqueue("p", state: .completed)
         enqueueEdit("p", state: .uploading)
+        recorder.recordUploadEvidence(source: source("p"), revision: edit, replaces: [earlier])
         await coordinator.start()
 
         let uploading = await waitForSnapshot("the edit uploads") { $0.tiles.count == 1 }
@@ -199,6 +529,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         try journal.addSuperseded(earlier, for: source("p"))
         enqueue("p", state: .completed)
         enqueueEdit("p", state: .uploading)
+        recorder.recordUploadEvidence(source: source("p"), revision: edit, replaces: [earlier])
         await coordinator.start()
         await waitForSnapshot("the edit uploads") { [earlier] in $0.tiles.first?.replaces == [earlier] }
 
@@ -220,11 +551,13 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         try journal.addSuperseded(earlier, for: source("p"))
         enqueue("p", state: .completed)
         enqueueEdit("p", state: .uploading)
+        recorder.recordUploadEvidence(source: source("p"), revision: edit, replaces: [earlier])
         await coordinator.start()
         await waitForSnapshot("the edit uploads") { [earlier] in $0.tiles.first?.replaces == [earlier] }
 
         // Another photo of the library still needs the earlier upload.
         try journal.settle([earlier.nodeID], related: [], trashed: false, for: source("p"))
+        recorder.settleUploadEvidence(source: source("p"), revision: edit, retired: [])
         XCTAssertTrue(
             queue.updateState(
                 source: source("p"), revision: edit, state: .completed, attempts: nil, lastError: nil, updatedAt: date))
@@ -456,7 +789,8 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         recorder.finish()
 
         // A relaunch builds a new recorder and coordinator over the same stores.
-        recorder = PendingBackupEventRecorder(store: store, now: { [date] in date })
+        recorder = PendingBackupEventRecorder(
+            store: store, replacementLedger: .shared(accountDataDirectory: directory), now: { [date] in date })
         coordinator = makeCoordinator()
         await coordinator.start()
         let snapshot = await coordinator.currentSnapshot()
@@ -692,6 +1026,11 @@ final class PendingBackupCoordinatorTests: XCTestCase {
 private final class FakePendingMetadata: PendingSourceMetadataProviding, @unchecked Sendable {
     private let lock = NSLock()
     private var values: [PendingSourceKey: PendingPresentationMetadata] = [:]
+    private var requested = Set<PendingSourceKey>()
+
+    func wasRequested(_ key: PendingSourceKey) -> Bool {
+        lock.withLock { requested.contains(key) }
+    }
 
     func set(_ key: PendingSourceKey, _ value: PendingPresentationMetadata) {
         lock.withLock { values[key] = value }
@@ -702,7 +1041,10 @@ private final class FakePendingMetadata: PendingSourceMetadataProviding, @unchec
     }
 
     func metadata(for keys: [PendingSourceKey]) async -> [PendingSourceKey: PendingPresentationMetadata] {
-        lock.withLock { values.filter { keys.contains($0.key) } }
+        lock.withLock {
+            requested.formUnion(keys)
+            return values.filter { keys.contains($0.key) }
+        }
     }
 }
 
@@ -788,4 +1130,77 @@ private final class MutableClock: @unchecked Sendable {
     func advance(by seconds: TimeInterval) {
         lock.withLock { value = value.addingTimeInterval(seconds) }
     }
+}
+
+private actor PendingMembershipSleepGate {
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+    private var released = false
+
+    func wait() async {
+        guard !released else { return }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+
+    func release() {
+        released = true
+        for waiter in waiters { waiter.resume() }
+        waiters.removeAll()
+    }
+}
+
+private final class CountingPendingQueue: UploadBackupSyncQueueObserving, @unchecked Sendable {
+    private let lock = NSLock()
+    private var reads = 0
+    private var aggregates = 0
+    private var unsettled = 0
+    private var observer: (@Sendable (UploadBackupSyncQueueChange) -> Void)?
+    var unsettledReads: Int { lock.withLock { unsettled } }
+    var aggregateReads: Int { lock.withLock { aggregates } }
+    private let pending: [UploadBackupQueueRowState]
+    var sourceReads: Int { lock.withLock { reads } }
+
+    init(count: Int, date: Date) {
+        pending = (0..<count).map { index in
+            UploadBackupQueueRowState(
+                source: UploadSourceIdentity(kind: .photoLibraryAsset, identifier: "queued-\(index)"),
+                revision: UploadBackupRevision(rawValue: 1), state: .queuedForUpload,
+                originalFilename: "photo.heic", updatedAt: date)
+        }
+    }
+
+    func setChangeObserver(_ observer: (@Sendable (UploadBackupSyncQueueChange) -> Void)?) {
+        lock.withLock { self.observer = observer }
+    }
+    func notifyAll() {
+        let callback = lock.withLock { observer }
+        callback?(.all)
+    }
+    func unsettledRows() -> [UploadBackupQueueRowState] {
+        lock.withLock { unsettled += 1 }
+        return pending
+    }
+    func backedUpRevisions(kind: UploadSourceIdentity.Kind) -> [String: UploadBackupRevision] {
+        lock.withLock { aggregates += 1 }
+        return [:]
+    }
+    func rows(kind: UploadSourceIdentity.Kind, identifiers: Set<String>) -> [UploadBackupQueueRowState] {
+        lock.withLock { reads += identifiers.count }
+        return pending.filter { identifiers.contains($0.source.identifier) }
+    }
+}
+
+private final class CountingPendingJournal: EditReplacementJournaling, @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+    var reads: Int { lock.withLock { count } }
+    func entry(for source: UploadSourceIdentity) -> EditReplacementJournalEntry {
+        lock.withLock { count += 1 }
+        return EditReplacementJournalEntry()
+    }
+    func addSuperseded(_ uid: PhotoUID, for source: UploadSourceIdentity) throws {}
+    func prepareToRetire(_ relatedByMain: [String: [String]], for source: UploadSourceIdentity) throws {}
+    func clearRetireIntent(_ nodeIDs: Set<String>, for source: UploadSourceIdentity) throws {}
+    func settle(_ nodeIDs: Set<String>, related: Set<String>, trashed: Bool, for source: UploadSourceIdentity) throws {}
+    func recordUpload(edited: Bool, for source: UploadSourceIdentity) throws {}
+    func unretire(_ nodeIDs: Set<String>, for source: UploadSourceIdentity) throws {}
 }

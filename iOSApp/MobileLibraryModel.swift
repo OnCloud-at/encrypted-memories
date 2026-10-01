@@ -1397,6 +1397,7 @@ final class MobileLibraryModel {
         if let purgeClaim {
             teardownOwners.append(
                 AccountTeardownOwner(id: "shared.local-data-claim", stage: .purgeClaims) {
+                    PendingReplacementLedger.clearForSignOut()
                     let succeeded = await ProtonAuthLocalDataPurge.performOffMain(claim: purgeClaim)
                     guard succeeded else { throw TeardownFailure.purgeFailed }
                 }

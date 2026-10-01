@@ -890,6 +890,55 @@ final class UploadBackupSyncQueueTests: XCTestCase {
         return sqlite3_step(statement) == SQLITE_ROW ? Int(sqlite3_column_int64(statement, 0)) : -1
     }
 
+    func testFailedBackedUpRevisionReadLeavesQueueOperational() throws {
+        let url = tempDir.appendingPathComponent(UploadBackupSyncQueueManifestStore.databaseFileName)
+        let store = try XCTUnwrap(UploadBackupSyncQueueManifestStore(url: url))
+        defer { store.close() }
+        var handle: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(url.path, &handle), SQLITE_OK)
+        defer { sqlite3_close(handle) }
+        // Force prepare to fail on the live store, then restore the table before testing backup writes.
+        XCTAssertEqual(
+            sqlite3_exec(handle, "ALTER TABLE backup_sync_queue RENAME TO unavailable_queue;", nil, nil, nil),
+            SQLITE_OK)
+        XCTAssertTrue(store.backedUpRevisions(kind: .photoLibraryAsset).isEmpty)
+        XCTAssertEqual(
+            sqlite3_exec(handle, "ALTER TABLE unavailable_queue RENAME TO backup_sync_queue;", nil, nil, nil),
+            SQLITE_OK)
+        XCTAssertTrue(store.isOperational(), "cosmetic read failure must not set the sticky health latch")
+        let entry = UploadBackupSyncQueueEntry(
+            source: source("after-read-failure"), revision: revision(10), originalFilename: "photo.heic",
+            updatedAt: Date())
+        XCTAssertTrue(store.upsert(entry))
+        XCTAssertEqual(store.entry(for: entry.source, revision: entry.revision)?.state, entry.state)
+        XCTAssertTrue(store.isOperational())
+    }
+
+    func testBackedUpRevisionReadIncludesOnlyQueuedSourcesOfTheRequestedKind() throws {
+        let url = tempDir.appendingPathComponent(UploadBackupSyncQueueManifestStore.databaseFileName)
+        let store = try XCTUnwrap(UploadBackupSyncQueueManifestStore(url: url))
+        defer { store.close() }
+        for id in ["queued-edit", "history-only", "uploading-edit", "folder-queued"] {
+            XCTAssertTrue(
+                store.upsert(
+                    UploadBackupSyncQueueEntry(
+                        source: source(id), revision: revision(1), originalFilename: "photo.heic",
+                        state: .completed, updatedAt: Date())))
+        }
+        for (id, kind, state) in [
+            ("queued-edit", UploadSourceIdentity.Kind.photoLibraryAsset, UploadBackupSyncQueueState.queuedForUpload),
+            ("uploading-edit", .photoLibraryAsset, .uploading),
+            ("folder-queued", .fileURL, .queuedForUpload),
+        ] {
+            XCTAssertTrue(
+                store.upsert(
+                    UploadBackupSyncQueueEntry(
+                        source: UploadSourceIdentity(kind: kind, identifier: id), revision: revision(2),
+                        originalFilename: "photo.heic", state: state, updatedAt: Date())))
+        }
+        XCTAssertEqual(store.backedUpRevisions(kind: .photoLibraryAsset), ["queued-edit": revision(1)])
+    }
+
     func testClosedSQLiteQueueFailsClosedInsteadOfLookingEmpty() throws {
         let url = tempDir.appendingPathComponent(UploadBackupSyncQueueManifestStore.databaseFileName)
         let store = try XCTUnwrap(UploadBackupSyncQueueManifestStore(url: url))

@@ -199,7 +199,11 @@ public final class PhotoLibraryBackupController {
         requiresPendingStore: Bool = false
     ) {
         let directory = configuration.accountDataDirectory
-        let pendingRecorder = pendingStore.map { PendingBackupEventRecorder(store: $0) }
+        let pendingRecorder = pendingStore.map {
+            PendingBackupEventRecorder(
+                store: $0, replacementLedger: .shared(accountDataDirectory: directory),
+                replacementJournal: editReplacement?.journal)
+        }
         self.pendingRecorder = pendingRecorder
         pendingReplacementJournal = editReplacement?.journal
         self.pendingStore = pendingStore
