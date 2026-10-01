@@ -159,6 +159,7 @@ public final class PendingTimelinePresenter {
     private var remote = TimelineSnapshot()
     private var pending = PendingBackupSnapshot.empty
     private var isEnabled = false
+    private var hasPendingInput = false
     /// Session anchors: Proton photo -> the sort key and the UID of the pending tile it replaced.
     private var anchors: [PhotoUID: Anchor] = [:]
     /// The sort key that the tile of an edit took from its earlier Proton photo, fixed while the tile shows.
@@ -169,7 +170,12 @@ public final class PendingTimelinePresenter {
     /// Proton photos that the person restored in this session, with the tile revisions that replaced them then.
     /// Those no longer hide them; a later edit that replaces them again does.
     private var restored: [PhotoUID: Set<Replacement>] = [:]
+    private var waitingForTile: [Replacement: Date] = [:]
+    private var tileWaitTask: Task<Void, Never>?
+    package nonisolated static let tileWaitLimit: TimeInterval = 5
     private let now: @Sendable () -> Date
+    private let sleep: @Sendable (Duration) async throws -> Void
+    private let replacementLookup: (@Sendable () -> [PendingReplacementHandoff])?
     /// The longest time a trashed earlier photo stays hidden while the listing still returns it.
     package nonisolated static let trashedHideLimit: TimeInterval = 300
     /// The last content revision of each pending tile shown in this session.
@@ -183,12 +189,18 @@ public final class PendingTimelinePresenter {
     private var presentation = PendingTimelinePresentation.empty
     private var lastMembershipRevision: UInt64?
 
-    public convenience init() {
-        self.init(now: { Date() })
+    public convenience init(replacementLookup: (@Sendable () -> [PendingReplacementHandoff])? = nil) {
+        self.init(now: { Date() }, replacementLookup: replacementLookup)
     }
 
-    package init(now: @escaping @Sendable () -> Date) {
+    package init(
+        now: @escaping @Sendable () -> Date,
+        replacementLookup: (@Sendable () -> [PendingReplacementHandoff])? = nil,
+        sleep: @escaping @Sendable (Duration) async throws -> Void = { try await Task.sleep(for: $0) }
+    ) {
         self.now = now
+        self.sleep = sleep
+        self.replacementLookup = replacementLookup
     }
 
     public var current: PendingTimelinePresentation { presentation }
@@ -205,7 +217,8 @@ public final class PendingTimelinePresenter {
     public func setPending(_ snapshot: PendingBackupSnapshot, enabled: Bool) {
         let membershipChanged =
             enabled != isEnabled || snapshot.membershipRevision != pending.membershipRevision
-            || lastMembershipRevision == nil
+            || lastMembershipRevision == nil || !hasPendingInput
+        hasPendingInput = true
         pending = snapshot
         isEnabled = enabled
         if membershipChanged {
@@ -223,9 +236,13 @@ public final class PendingTimelinePresenter {
         remote = TimelineSnapshot()
         pending = .empty
         isEnabled = false
+        hasPendingInput = false
         anchors.removeAll()
         tileKeys.removeAll()
         trashedEarlier.removeAll()
+        waitingForTile.removeAll()
+        tileWaitTask?.cancel()
+        tileWaitTask = nil
         restored.removeAll()
         tileRevisions.removeAll()
         contentEpochs.removeAll()
@@ -252,10 +269,12 @@ public final class PendingTimelinePresenter {
             anchors: anchors,
             tileKeys: tileKeys,
             trashedEarlier: trashedEarlier,
+            waitingForTile: waitingForTile,
             restored: restored,
             now: now(),
             revisions: tileRevisions,
-            shown: presentation.snapshot
+            shown: presentation.snapshot,
+            replacementLookup: !hasPendingInput || isEnabled ? replacementLookup : nil
         )
         lastMembershipRevision = pending.membershipRevision
         computeTask?.cancel()
@@ -276,6 +295,17 @@ public final class PendingTimelinePresenter {
         }
         tileKeys = result.tileKeys
         trashedEarlier = result.trashedEarlier
+        waitingForTile = result.waitingForTile
+        tileWaitTask?.cancel()
+        tileWaitTask = nil
+        if let deadline = result.heldTileDeadlines.min() {
+            let remaining = max(0, deadline.timeIntervalSince(now()))
+            tileWaitTask = Task { [weak self, sleep] in
+                try? await sleep(.seconds(remaining))
+                guard !Task.isCancelled else { return }
+                self?.rebuild()
+            }
+        }
         // Kept for the session: a tile that shows again after an edit must not reuse the image of its last showing.
         tileRevisions.merge(result.revisions) { $1 }
         // A revised photo keeps its current image; `noteContentRefreshed` bumps its epoch once the new
@@ -304,12 +334,23 @@ public final class PendingTimelinePresenter {
     /// The person restored these Proton photos from the trash: they show at once, even while the listing lags.
     public func showRestored(_ uids: [PhotoUID]) {
         let photosVolume = remote.items.first?.uid.volumeID
+        let ledgerRecords = replacementLookup?() ?? []
         var changed = false
         for uid in Set(uids) {
             let replacements = pending.tiles.lazy
-                .filter { $0.replaces.contains { Self.resolve($0, photosVolume: photosVolume) == uid } }
+                .filter { tile in
+                    tile.replaces.contains { Self.resolve($0, photosVolume: photosVolume) == uid }
+                        || ledgerRecords.contains { record in
+                            record.evidence.key == tile.key
+                                && tile.revision.map({ record.evidence.revision < $0 }) == true
+                                && Self.resolve(record.remote, photosVolume: photosVolume) == uid
+                        }
+                }
                 .map(Replacement.init)
-            let exempt = restored[uid, default: []].union(replacements)
+            let ledgerReplacements = ledgerRecords.filter {
+                $0.evidence.replaces?.contains { Self.resolve($0, photosVolume: photosVolume) == uid } == true
+            }.map { Replacement(key: $0.evidence.key, revision: $0.evidence.revision) }
+            let exempt = restored[uid, default: []].union(replacements).union(ledgerReplacements)
             guard exempt != restored[uid] || trashedEarlier[uid] != nil else { continue }
             restored[uid] = exempt
             trashedEarlier[uid] = nil
@@ -379,11 +420,13 @@ public final class PendingTimelinePresenter {
         let anchors: [PhotoUID: Anchor]
         let tileKeys: [PendingSourceKey: PhotoItem]
         let trashedEarlier: [PhotoUID: Date]
+        let waitingForTile: [Replacement: Date]
         let restored: [PhotoUID: Set<Replacement>]
         let now: Date
         let revisions: [PhotoUID: UploadBackupRevision]
         /// The snapshot that the grid shows now.
         let shown: TimelineSnapshot
+        let replacementLookup: (@Sendable () -> [PendingReplacementHandoff])?
     }
 
     private struct MergeResult: Sendable {
@@ -395,6 +438,9 @@ public final class PendingTimelinePresenter {
         let newAnchors: [PhotoUID: Anchor]
         let tileKeys: [PendingSourceKey: PhotoItem]
         let trashedEarlier: [PhotoUID: Date]
+        let waitingForTile: [Replacement: Date]
+        /// Deadlines of holds actually used by this merge, including ones that expire before apply.
+        let heldTileDeadlines: [Date]
         /// Some Proton photos are hidden, so the presentation differs from the canonical snapshot.
         let hidesRemote: Bool
         let adoptions: [(local: PhotoUID, remote: PhotoUID)]
@@ -410,7 +456,30 @@ public final class PendingTimelinePresenter {
         let remoteItems = input.remote.items
         // Owned photos share one volume; link-only handoffs resolve to it.
         let photosVolume = remoteItems.first?.uid.volumeID
-        let replacements = replacements(in: input, photosVolume: photosVolume)
+        // The recorder captures both facts before announcing the remote commit. This lookup never reads a store
+        // or awaits pending metadata, and runs once per coalesced merge.
+        let ledgerRecords = input.replacementLookup?() ?? []
+        let records = Dictionary(grouping: ledgerRecords, by: \.evidence.key)
+        let tiles = input.pending.tiles.compactMap { tile -> PendingTile? in
+            guard let record = records[tile.key]?.max(by: { $0.evidence.revision < $1.evidence.revision }),
+                let revision = tile.revision, record.evidence.revision >= revision
+            else { return tile }
+            if record.evidence.revision > revision {
+                // Remote input also supersedes a stale snapshot of an older tile of this source.
+                if let remoteUID = resolve(record.remote, photosVolume: photosVolume),
+                    input.remote.index(of: remoteUID) != nil
+                {
+                    return nil
+                }
+                return tile
+            }
+            return PendingTile(
+                key: tile.key, item: tile.item, revision: tile.revision, handoff: record.remote,
+                isSettled: tile.isSettled, badge: tile.badge, displayName: tile.displayName,
+                replaces: record.evidence.replaces ?? [])
+        }
+        let replacements = replacements(
+            in: input, tiles: tiles, ledgerRecords: ledgerRecords, photosVolume: photosVolume)
         var anchors = input.anchors
         var newAnchors: [PhotoUID: Anchor] = [:]
         var present: [PhotoUID: PendingTile] = [:]
@@ -420,7 +489,7 @@ public final class PendingTimelinePresenter {
         // Tiles of edits, at the place of their earlier photo.
         var placed: [(key: PhotoItem, item: PhotoItem)] = []
         visible.reserveCapacity(input.pending.tiles.count)
-        for tile in input.pending.tiles {
+        for tile in tiles {
             let key = replacements.tileKeys[tile.key] ?? tile.item
             guard let handoff = tile.handoff,
                 let remoteUID = resolve(handoff, photosVolume: photosVolume),
@@ -439,10 +508,20 @@ public final class PendingTimelinePresenter {
                 adoptions.append((tile.item.uid, remoteUID))
             }
         }
+        // After the bounded metadata wait, a committed edit takes its earlier main's place.
+        for record in ledgerRecords {
+            guard let remoteUID = resolve(record.remote, photosVolume: photosVolume),
+                input.remote.index(of: remoteUID) != nil, anchors[remoteUID] == nil,
+                !replacements.hidden.contains(remoteUID), let key = replacements.tileKeys[record.evidence.key]
+            else { continue }
+            let anchor = Anchor(key: key, tile: record.evidence.key.localUID)
+            anchors[remoteUID] = anchor
+            newAnchors[remoteUID] = anchor
+        }
         let localUIDs = Set(visible.map(\.uid)).union(placed.map(\.item.uid))
         var revisions: [PhotoUID: UploadBackupRevision] = [:]
         var revised: [PhotoUID] = []
-        for tile in input.pending.tiles where localUIDs.contains(tile.item.uid) {
+        for tile in tiles where localUIDs.contains(tile.item.uid) {
             guard let revision = tile.revision else { continue }
             revisions[tile.item.uid] = revision
             if let previous = input.revisions[tile.item.uid], previous != revision { revised.append(tile.item.uid) }
@@ -455,13 +534,15 @@ public final class PendingTimelinePresenter {
             return MergeResult(
                 snapshot: changed ? input.remote : input.shown, snapshotChanged: changed, localUIDs: [],
                 presentKeys: presentKeys, newAnchors: newAnchors, tileKeys: replacements.tileKeys,
-                trashedEarlier: replacements.trashedEarlier, hidesRemote: false, adoptions: adoptions,
+                trashedEarlier: replacements.trashedEarlier, waitingForTile: replacements.waitingForTile,
+                heldTileDeadlines: replacements.heldTileDeadlines, hidesRemote: false, adoptions: adoptions,
                 baseBadges: baseBadges, presentLocal: presentLocal, revisions: revisions, revised: revised)
         }
         guard !Task.isCancelled else { return nil }
 
         // Three streams sorted by one presentation key; a linear merge keeps their total order.
         var anchored: [(key: PhotoItem, item: PhotoItem)] = placed
+        anchored.append(contentsOf: replacements.heldEarlier.map { (input.anchors[$0.uid]?.key ?? $0, $0) })
         var canonical: [PhotoItem] = []
         canonical.reserveCapacity(remoteItems.count)
         for (index, item) in remoteItems.enumerated() {
@@ -520,6 +601,8 @@ public final class PendingTimelinePresenter {
             newAnchors: newAnchors,
             tileKeys: replacements.tileKeys,
             trashedEarlier: replacements.trashedEarlier,
+            waitingForTile: replacements.waitingForTile,
+            heldTileDeadlines: replacements.heldTileDeadlines,
             hidesRemote: !hidden.isEmpty,
             adoptions: adoptions,
             baseBadges: baseBadges,
@@ -535,8 +618,12 @@ public final class PendingTimelinePresenter {
         let revision: UploadBackupRevision?
 
         init(_ tile: PendingTile) {
-            key = tile.key
-            revision = tile.revision
+            self.init(key: tile.key, revision: tile.revision)
+        }
+
+        init(key: PendingSourceKey, revision: UploadBackupRevision?) {
+            self.key = key
+            self.revision = revision
         }
     }
 
@@ -548,9 +635,14 @@ public final class PendingTimelinePresenter {
         var tileKeys: [PendingSourceKey: PhotoItem] = [:]
         /// Trashed earlier photos that the listing still returns, with the moment they were first hidden.
         var trashedEarlier: [PhotoUID: Date] = [:]
+        var waitingForTile: [Replacement: Date] = [:]
+        var heldEarlier: [PhotoItem] = []
+        var heldTileDeadlines: [Date] = []
     }
 
-    private nonisolated static func replacements(in input: MergeInput, photosVolume: String?) -> Replacements {
+    private nonisolated static func replacements(
+        in input: MergeInput, tiles: [PendingTile], ledgerRecords: [PendingReplacementHandoff], photosVolume: String?
+    ) -> Replacements {
         var result = Replacements()
         func noteTrashed(_ uid: PhotoUID) {
             let since = input.trashedEarlier[uid] ?? input.now
@@ -558,25 +650,89 @@ public final class PendingTimelinePresenter {
             if input.now.timeIntervalSince(since) < trashedHideLimit { result.hidden.insert(uid) }
         }
         for uid in input.trashedEarlier.keys where input.remote.index(of: uid) != nil { noteTrashed(uid) }
-        for tile in input.pending.tiles {
-            // An undone edit can hand over to the earlier photo itself, which then stays.
-            let current = tile.handoff.flatMap { resolve($0, photosVolume: photosVolume) }
-            let earlier = tile.replaces.compactMap { resolve($0, photosVolume: photosVolume) }.filter { $0 != current }
+        func note(_ replacement: Replacement, current: PhotoUID?, earlier: [PhotoUID], settled: Bool) {
+            let earlier = earlier.compactMap { resolve($0, photosVolume: photosVolume) }.filter { $0 != current }
             let listed = earlier.compactMap { input.remote.index(of: $0).map { input.remote.items[$0] } }
-            // A photo restored while this revision replaced it stays.
-            let replacement = Replacement(tile)
             let replaced = listed.lazy.map(\.uid).filter { input.restored[$0]?.contains(replacement) != true }
-            if tile.isSettled {
-                replaced.forEach(noteTrashed)
-            } else {
-                result.hidden.formUnion(replaced)
-            }
-            // The tile takes the place where the earlier photo shows, which an earlier edit may have anchored.
-            // The first place stays while the tile shows, even when the listing drops the earlier photo.
-            if let key = input.tileKeys[tile.key]
+            if settled { replaced.forEach(noteTrashed) } else { result.hidden.formUnion(replaced) }
+            if let key = input.tileKeys[replacement.key] ?? result.tileKeys[replacement.key]
                 ?? listed.map({ input.anchors[$0.uid]?.key ?? $0 }).min(by: TimelineOrder.areInIncreasingOrder)
             {
-                result.tileKeys[tile.key] = key
+                result.tileKeys[replacement.key] = key
+            }
+        }
+        for tile in tiles {
+            note(
+                Replacement(tile), current: tile.handoff.flatMap { resolve($0, photosVolume: photosVolume) },
+                earlier: tile.replaces, settled: tile.isSettled)
+        }
+        let represented = Set(tiles.map(Replacement.init))
+        let tilesByKey = Dictionary(tiles.map { ($0.key, $0) }, uniquingKeysWith: { first, _ in first })
+        for (key, records) in Dictionary(grouping: ledgerRecords, by: \.evidence.key) {
+            let records = records.sorted { $0.evidence.revision > $1.evidence.revision }
+            let tile = tilesByKey[key]
+            // Resolve a visible representative before hiding any link in this source's chain.
+            let record = records.first {
+                resolve($0.remote, photosVolume: photosVolume).map { input.remote.index(of: $0) != nil } == true
+            }
+            guard tile != nil || record != nil else { continue }
+            if let tile,
+                record.map({ record in tile.revision.map { $0 >= record.evidence.revision } ?? false }) ?? true
+            {
+                let current = tile.handoff.flatMap { resolve($0, photosVolume: photosVolume) } ?? tile.item.uid
+                let listedHandoff = tile.handoff.flatMap { resolve($0, photosVolume: photosVolume) }
+                    .flatMap { input.remote.index(of: $0) }
+                if listedHandoff == nil {
+                    for record in records where tile.revision.map({ record.evidence.revision < $0 }) == true {
+                        if let remote = resolve(record.remote, photosVolume: photosVolume),
+                            input.remote.index(of: remote) != nil,
+                            input.restored[remote]?.contains(Replacement(tile)) != true
+                        {
+                            result.hidden.insert(remote)
+                        }
+                    }
+                }
+                for record in records where tile.revision.map({ record.evidence.revision <= $0 }) == true {
+                    let replacement = Replacement(key: key, revision: record.evidence.revision)
+                    guard !represented.contains(replacement) else { continue }
+                    // Only settled records keep their ancestors hidden after acknowledgment.
+                    note(
+                        replacement, current: current, earlier: record.evidence.replaces ?? [], settled: record.settled)
+                }
+                continue
+            }
+            guard let record, let current = resolve(record.remote, photosVolume: photosVolume) else { continue }
+            let replacement = Replacement(key: key, revision: record.evidence.revision)
+            let ancestors = records.filter { $0.evidence.revision <= record.evidence.revision }
+            let earlier = ancestors.flatMap { ancestor in
+                let replacement = Replacement(key: key, revision: ancestor.evidence.revision)
+                return (ancestor.evidence.replaces ?? []).compactMap { resolve($0, photosVolume: photosVolume) }
+                    .filter { $0 != current && input.restored[$0]?.contains(replacement) != true }
+            }
+            // The newest listed ancestor supplies the image while metadata for the committed edit is late.
+            let olderRemotes = records.filter { $0.evidence.revision < record.evidence.revision }
+                .compactMap { resolve($0.remote, photosVolume: photosVolume) }
+            let listed = (olderRemotes + earlier).compactMap { uid in
+                input.remote.index(of: uid).map { input.remote.items[$0] }
+                    ?? input.shown.index(of: uid).map { input.shown.items[$0] }
+            }.filter { !result.hidden.contains($0.uid) }
+            let since = input.waitingForTile[replacement] ?? input.now
+            var representative = current
+            if let item = listed.first {
+                result.waitingForTile[replacement] = since
+                if input.now.timeIntervalSince(since) < tileWaitLimit {
+                    result.heldTileDeadlines.append(since.addingTimeInterval(tileWaitLimit))
+                    result.hidden.insert(current)
+                    result.hidden.remove(item.uid)
+                    representative = item.uid
+                    if input.remote.index(of: item.uid) == nil { result.heldEarlier.append(item) }
+                }
+                result.tileKeys[key] = input.tileKeys[key] ?? input.anchors[item.uid]?.key ?? item
+            }
+            for ancestor in ancestors {
+                note(
+                    Replacement(key: key, revision: ancestor.evidence.revision), current: representative,
+                    earlier: ancestor.evidence.replaces ?? [], settled: ancestor.settled)
             }
         }
         return result

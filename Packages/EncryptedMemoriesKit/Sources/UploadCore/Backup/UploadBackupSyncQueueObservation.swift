@@ -45,6 +45,8 @@ public protocol UploadBackupSyncQueueObserving: Sendable {
     /// Rows that are not settled: every state except the terminal outcomes. Completed rows are excluded;
     /// the pending store keeps their handoffs.
     func unsettledRows() -> [UploadBackupQueueRowState]
+    /// Latest backed-up revision per source, read with one aggregate query at load.
+    func backedUpRevisions(kind: UploadSourceIdentity.Kind) -> [String: UploadBackupRevision]
     /// Every row of the given sources, for an incremental update after a change notification.
     func rows(kind: UploadSourceIdentity.Kind, identifiers: Set<String>) -> [UploadBackupQueueRowState]
 }

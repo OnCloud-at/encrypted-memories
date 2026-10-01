@@ -38,6 +38,33 @@ public struct PendingSourceKey: Hashable, Sendable, Codable, Comparable {
     }
 }
 
+/// The upload decision and the main photos that this revision replaces.
+public struct PendingUploadEvidence: Sendable, Equatable {
+    public let key: PendingSourceKey
+    public let revision: UploadBackupRevision
+    /// Nil when this process has no replacement record for the revision.
+    public let replaces: [PhotoUID]?
+
+    public init(key: PendingSourceKey, revision: UploadBackupRevision, replaces: [PhotoUID]?) {
+        self.key = key
+        self.revision = revision
+        self.replaces = replaces
+    }
+}
+
+/// An in-memory replacement whose new main has committed, independent of pending metadata or publications.
+public struct PendingReplacementHandoff: Sendable, Equatable {
+    public let evidence: PendingUploadEvidence
+    public let remote: PhotoUID
+    public let settled: Bool
+
+    public init(evidence: PendingUploadEvidence, remote: PhotoUID, settled: Bool = false) {
+        self.evidence = evidence
+        self.remote = remote
+        self.settled = settled
+    }
+}
+
 /// How a pending source reached Proton.
 public enum PendingHandoffKind: String, Sendable, Codable {
     /// This app committed the primary resource.

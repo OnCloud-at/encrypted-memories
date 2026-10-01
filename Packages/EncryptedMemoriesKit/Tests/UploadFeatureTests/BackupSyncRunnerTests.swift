@@ -2297,6 +2297,40 @@ final class BackupSyncRunnerTests: XCTestCase {
         return seedLibraryEntry("IMG_1.JPG", revisionOffset: 1)
     }
 
+    func testUploadEvidenceCarriesOnlyTheRevisionsSupersededMain() async throws {
+        let harness = try makeReplacementHarness()
+        let edited = await uploadThenEdit(harness)
+        let historical = PhotoUID(volumeID: "vol", nodeID: "restored-history")
+        try harness.journal.addSuperseded(historical, for: edited.source)
+        try harness.journal.settle(
+            [historical.nodeID], related: ["historical-video"], trashed: true, for: edited.source)
+        let pending = try XCTUnwrap(
+            PendingBackupManifestStore(url: tempDir.appendingPathComponent("pending-evidence.sqlite")))
+        defer { pending.close() }
+        let recorder = PendingBackupEventRecorder(store: pending)
+        _ = await makeRunner(identityResolver: harness.pipeline, editReplacement: harness.replacement, events: recorder)
+            .runUntilDrained()
+        XCTAssertEqual(state(of: edited), .completed)
+        let record = try XCTUnwrap(
+            recorder.replacementLedger.evidence(for: PendingSourceKey(edited.source), revision: edited.revision))
+        XCTAssertEqual(record.replaces?.map(\.nodeID), [testUID("IMG_1.HEIC").nodeID])
+        XCTAssertTrue(
+            harness.journal.entry(for: edited.source).superseded.isEmpty, "the journal has already retired the main")
+    }
+
+    func testCosmeticSettlementDoesNotRetryFinishedUploadOrChangeTrash() async throws {
+        let harness = try makeReplacementHarness()
+        let edited = await uploadThenEdit(harness)
+        let events = SpyBackupItemEvents(queue: queueStore)
+        _ = await makeRunner(identityResolver: harness.pipeline, editReplacement: harness.replacement, events: events)
+            .runUntilDrained()
+        XCTAssertTrue(events.events.contains(.settlement(edited.source.identifier)))
+        XCTAssertEqual(state(of: edited), .completed)
+        XCTAssertEqual(harness.remote.trashCalls, [[testUID("IMG_1.HEIC")]])
+        XCTAssertEqual(
+            uploader.requests.map(\.name), ["IMG_1.HEIC", "IMG_1.MOV", "IMG_1.JPG", "IMG_1.HEIC", "IMG_1.MOV"])
+    }
+
     func testAnEditedPhotoReplacesItsEarlierUploadAndKeepsItsSecondariesUnderTheNewPhoto() async throws {
         let harness = try makeReplacementHarness()
         let edited = await uploadThenEdit(harness)
@@ -2859,6 +2893,7 @@ private final class SpyBackupItemEvents: BackupItemEventSink, @unchecked Sendabl
         case evidence(String)
         case handoff(String, PhotoUID, PendingHandoffKind, queueState: UploadBackupSyncQueueState?)
         case progress(String, Int?)
+        case settlement(String)
     }
 
     private let lock = NSLock()
@@ -2874,8 +2909,14 @@ private final class SpyBackupItemEvents: BackupItemEventSink, @unchecked Sendabl
 
     var events: [Event] { lock.withLock { recorded } }
 
-    func recordUploadEvidence(source: UploadSourceIdentity, revision: UploadBackupRevision) {
+    func recordUploadEvidence(source: UploadSourceIdentity, revision: UploadBackupRevision, replaces: [PhotoUID]) {
         lock.withLock { recorded.append(.evidence(source.identifier)) }
+    }
+
+    func settleUploadEvidence(
+        source: UploadSourceIdentity, revision: UploadBackupRevision, retired: Set<String>
+    ) {
+        lock.withLock { recorded.append(.settlement(source.identifier)) }
     }
 
     func recordHandoff(

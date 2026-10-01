@@ -887,7 +887,10 @@ public actor BackupSyncRunner {
     }
 
     private func recordUploadEvidence(_ entry: UploadBackupSyncQueueEntry) {
-        events?.recordUploadEvidence(source: entry.source, revision: entry.revision)
+        let replaces =
+            entry.source.kind == .photoLibraryAsset && entry.source.resource == .primary
+            ? editReplacement?.journal.entry(for: entry.source).superseded ?? [] : []
+        events?.recordUploadEvidence(source: entry.source, revision: entry.revision, replaces: replaces)
     }
 
     /// Link-only duplicate results resolve to the photos volume; the grid fills in its volume ID. A failed
@@ -1315,6 +1318,10 @@ public actor BackupSyncRunner {
                         break
                     }
                 }
+                events?.settleUploadEvidence(
+                    source: entry.source, revision: entry.revision,
+                    retired: Set(editReplacement.journal.entry(for: entry.source).retired)
+                )
             } catch is CancellationError {
                 revert(entry, from: persistedState)
                 return
