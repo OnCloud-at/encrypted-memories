@@ -18,15 +18,25 @@ public struct EditReplacementJournalEntry: Sendable, Equatable, Codable {
     /// Related links by earlier main, recorded before its trash. Nil in journals of earlier builds.
     public var retireIntent: [String: [String]]?
 
+    /// The person's deletion choice and a wait that survives queue retries and process death.
+    public var keptDeleted: Bool?
+    public var backUpAgainRevision: UploadBackupRevision?
+    public var deletionCheckStartedAt: Date?
+
     public init(
         superseded: [PhotoUID] = [], retired: [String] = [], uploadedEdit: Bool? = nil,
-        retireIntent: [String: [String]]? = nil, remoteSuperseded: [String]? = nil
+        retireIntent: [String: [String]]? = nil, remoteSuperseded: [String]? = nil,
+        keptDeleted: Bool? = nil, backUpAgainRevision: UploadBackupRevision? = nil,
+        deletionCheckStartedAt: Date? = nil
     ) {
         self.superseded = superseded
         self.remoteSuperseded = remoteSuperseded
         self.retired = retired
         self.uploadedEdit = uploadedEdit
         self.retireIntent = retireIntent
+        self.keptDeleted = keptDeleted
+        self.backUpAgainRevision = backUpAgainRevision
+        self.deletionCheckStartedAt = deletionCheckStartedAt
     }
 
     /// Without the flag, a photo that already replaced an earlier upload counts as edited: only edits and undos
@@ -42,12 +52,18 @@ public struct EditReplacementJournalEntry: Sendable, Equatable, Codable {
 
     public var isEmpty: Bool {
         allSuperseded.isEmpty && retired.isEmpty && uploadedEdit != true && (retireIntent?.isEmpty ?? true)
+            && keptDeleted != true && backUpAgainRevision == nil && deletionCheckStartedAt == nil
     }
 }
 
 /// Durable record of edited photos that replace their earlier upload. The dedupe pipeline adds the earlier
 /// photo before its manifest record forgets it; the backup runner retires it after the trash write.
 public protocol EditReplacementJournaling: Sendable {
+    func keepDeleted(for source: UploadSourceIdentity) throws
+    func backUpAgain(revision: UploadBackupRevision, for source: UploadSourceIdentity) throws
+    func startDeletionCheck(at date: Date, for source: UploadSourceIdentity) throws
+    func clearDeletionCheck(for source: UploadSourceIdentity) throws
+    func clearDeletionChoice(for source: UploadSourceIdentity) throws
     func entry(for source: UploadSourceIdentity) -> EditReplacementJournalEntry
     /// One in-memory snapshot for admission after a queue reset, without reading each queued source.
     func supersededSourceIdentifiers() -> Set<String>
@@ -234,6 +250,40 @@ public final class EditReplacementJournalFileStore: EditReplacementJournaling, @
             for linkID in nodeIDs.union(confirmedRelated).sorted() where !entry.retired.contains(linkID) {
                 entry.retired.append(linkID)
             }
+        }
+    }
+
+    public func keepDeleted(for source: UploadSourceIdentity) throws {
+        try update(source) { entry in
+            entry.keptDeleted = true
+            entry.backUpAgainRevision = nil
+            entry.deletionCheckStartedAt = nil
+        }
+    }
+
+    public func backUpAgain(revision: UploadBackupRevision, for source: UploadSourceIdentity) throws {
+        try update(source) { entry in
+            entry.keptDeleted = nil
+            entry.backUpAgainRevision = revision
+            entry.deletionCheckStartedAt = nil
+        }
+    }
+
+    public func startDeletionCheck(at date: Date, for source: UploadSourceIdentity) throws {
+        try update(source) { entry in
+            if entry.deletionCheckStartedAt == nil { entry.deletionCheckStartedAt = date }
+        }
+    }
+
+    public func clearDeletionCheck(for source: UploadSourceIdentity) throws {
+        try update(source) { entry in entry.deletionCheckStartedAt = nil }
+    }
+
+    public func clearDeletionChoice(for source: UploadSourceIdentity) throws {
+        try update(source) { entry in
+            entry.keptDeleted = nil
+            entry.backUpAgainRevision = nil
+            entry.deletionCheckStartedAt = nil
         }
     }
 

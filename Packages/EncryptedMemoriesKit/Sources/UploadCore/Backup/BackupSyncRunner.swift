@@ -89,6 +89,7 @@ public actor BackupSyncRunner {
 
     private var isRunning = false
     private var drainMode: DrainMode = .waitForScheduledRetries
+    private var deletionStateInvalidated = false
     private var stopRequested = false
     /// Consecutive items that could not even reserve disk space since the last one that did.
     /// Reset to 0 the moment any export succeeds; when it reaches a full wave the drain ends the
@@ -264,6 +265,7 @@ public actor BackupSyncRunner {
             return progress
         }
         isRunning = true
+        deletionStateInvalidated = false
         drainMode = mode
         stopRequested = false
         removedSources = []
@@ -678,7 +680,7 @@ public actor BackupSyncRunner {
         let scopedOutcome: PrimaryScopedOutcome
         do {
             scopedOutcome = try await identityResolver.withUploadDecision(
-                resolved.descriptor.withWorkIntent(workIntent),
+                resolved.descriptor.withWorkIntent(workIntent).withBackupRevision(resolved.candidate.snapshot.revision),
                 onRemoteCommit: { [queue, now, events] identity, receipt in
                     // Durable before anything else: the grid can swap the pending tile for this photo even if
                     // the app ends before local settlement, and an exclusion that raced the commit is honored.
@@ -731,7 +733,7 @@ public actor BackupSyncRunner {
                             workIntent: workIntent,
                             preparationProgress: preparationProgress
                         )
-                    case .uploadMissingSecondaries, .skip:
+                    case .uploadMissingSecondaries, .skip, .awaitDeletionCheck:
                         return .noUpload(.decision(preflightResult))
                     }
                 }
@@ -769,6 +771,8 @@ public actor BackupSyncRunner {
 
         case .decision(let preflightResult):
             switch preflightResult.decision {
+            case .awaitDeletionCheck:
+                await awaitDeletionCheck(entry, from: persistedState)
             case .uploadMissingSecondaries(let primaryLinkID, _):
                 // This entry IS the primary and the policy proved it active remotely; only paired
                 // secondaries would need bytes.
@@ -1359,12 +1363,60 @@ public actor BackupSyncRunner {
         finish(entry, from: persistedState, as: terminal, message: nil, resolved: resolved)
     }
 
+    private func awaitDeletionCheck(
+        _ entry: UploadBackupSyncQueueEntry, from oldState: UploadBackupSyncQueueState
+    ) async {
+        guard let journal = editReplacement?.journal else {
+            retryOrPark(entry, from: oldState, error: UploadError.backend("Deletion journal is unavailable"))
+            return
+        }
+        do {
+            let started = journal.entry(for: entry.source).deletionCheckStartedAt
+            let elapsed = started.map { max(0, now().timeIntervalSince($0)) } ?? 0
+            // A persisted timestamp proves a prior completed check, even when manual retry cleared last_error.
+            if started != nil, elapsed >= 600 {
+                if sourceWasRemoved(entry) {
+                    endActiveExecution(key: Self.key(entry), publish: false)
+                    return
+                }
+                guard
+                    queue.updateState(
+                        source: entry.source, revision: entry.revision, state: .failedPermanent,
+                        attempts: entry.attempts,
+                        lastError: BackupIssueRecord(
+                            kind: .deletedElsewhere, detail: L10n.string("backup.issue_deleted_elsewhere")
+                        ).persistedValue, updatedAt: now())
+                else {
+                    stopRequested = true
+                    return
+                }
+                endActiveExecution(key: Self.key(entry), publish: false)
+                adjustProgress(from: oldState, to: .failedPermanent)
+                emitProgress()
+                return
+            }
+            try journal.startDeletionCheck(at: now(), for: entry.source)
+            if !deletionStateInvalidated {
+                deletionStateInvalidated = true
+                await identityResolver.invalidateCachedRemoteState()
+            }
+            let delay = started == nil ? 120 : max(60, 600 - elapsed)
+            let eligibleAt = now().addingTimeInterval(delay)
+            deferSource(
+                entry, from: oldState, until: eligibleAt,
+                issue: BackupIssueRecord(
+                    kind: .unknown, detail: L10n.string("backup.issue_deletion_check"), nextAttemptAt: eligibleAt))
+        } catch {
+            retryOrPark(entry, from: oldState, error: error)
+        }
+    }
+
     private func primaryWasDeletedAfterUpload(_ descriptor: UploadResourceDescriptor) async throws -> Bool {
         guard let decision = try await identityResolver.revalidateKnownRemote(descriptor) else { return false }
         switch decision {
         case .skip(.trashedDuplicate, _), .skip(.deletedRemotely, _):
             return true
-        case .upload, .uploadReplacingDraft, .uploadMissingSecondaries,
+        case .upload, .uploadReplacingDraft, .uploadMissingSecondaries, .awaitDeletionCheck,
             .skip(.activeDuplicate, _), .skip(.knownFromManifest, _),
             .skip(.draftExists, _), .skip(.inconsistentRemoteState, _):
             return false
@@ -1427,7 +1479,7 @@ public actor BackupSyncRunner {
                                 secondary.descriptor.source.resource.isBurstMember ? .settled : .skippedRemoteDeletion)
                         case .skip(.draftExists, _):
                             return .noUpload(.blockedByDraft)
-                        case .skip(.inconsistentRemoteState, _), .uploadMissingSecondaries:
+                        case .skip(.inconsistentRemoteState, _), .uploadMissingSecondaries, .awaitDeletionCheck:
                             return .noUpload(.inconsistent)
                         case .upload, .uploadReplacingDraft:
                             if result.decision != .uploadReplacingDraft {
@@ -1633,6 +1685,14 @@ public actor BackupSyncRunner {
             default:
                 message
             }
+        let backedUp = terminal == .completed || terminal == .alreadyBackedUp
+        if backedUp, entry.source.kind == .photoLibraryAsset, entry.source.resource == .primary,
+            let journal = editReplacement?.journal
+        {
+            // The photo is in Proton Drive, so a choice about its deletion no longer applies. A consent that a failed
+            // write leaves behind covers only its own revision, which is backed up now: it cannot upload a later one.
+            try? journal.clearDeletionChoice(for: entry.source)
+        }
         guard
             queue.updateState(
                 source: entry.source, revision: entry.revision,
@@ -1646,6 +1706,13 @@ public actor BackupSyncRunner {
         // concurrency ramps back toward the policy limit (gentle recovery, not an all-at-once jump).
         if terminal.isTerminalSuccess, networkErrorStreak > 0 {
             networkErrorStreak -= 1
+        }
+        if backedUp {
+            // The resolved revision can be newer than the queued one when the photo changed meanwhile; every row up
+            // to it that ended without a backup is obsolete, and the drifted row below is written fresh.
+            let resolvedRevision =
+                resolved.map { max($0.candidate.snapshot.revision, entry.revision) } ?? entry.revision
+            queue.removeUnsavedEarlierRevisions(of: entry.source, through: resolvedRevision, except: entry.revision)
         }
         adjustProgress(from: oldState, to: terminal)
         if let resolved { closeDriftedRevisionRow(entry, resolved: resolved, as: terminal) }

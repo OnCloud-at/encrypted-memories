@@ -14,13 +14,19 @@ public enum BackupIssueKind: String, Codable, Sendable, Equatable {
     case remoteService
     case localState
     case remoteDeletion
+    case deletedElsewhere
     /// The Proton account has too little storage left for the item.
     case accountStorage
     case unknown
 
+    public init(from decoder: any Decoder) throws {
+        let value = try decoder.singleValueContainer().decode(String.self)
+        self = Self(rawValue: value) ?? .unknown
+    }
+
     public var isRetryable: Bool {
         switch self {
-        case .remoteDraftStale, .sourceMissing, .permission, .unsupported, .remoteDeletion:
+        case .remoteDraftStale, .sourceMissing, .permission, .unsupported, .remoteDeletion, .deletedElsewhere:
             false
         default:
             true

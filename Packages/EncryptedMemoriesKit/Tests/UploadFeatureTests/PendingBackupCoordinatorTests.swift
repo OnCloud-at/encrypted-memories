@@ -1197,6 +1197,11 @@ private final class CountingPendingJournal: EditReplacementJournaling, @unchecke
         lock.withLock { count += 1 }
         return EditReplacementJournalEntry()
     }
+    func keepDeleted(for source: UploadSourceIdentity) throws {}
+    func backUpAgain(revision: UploadBackupRevision, for source: UploadSourceIdentity) throws {}
+    func startDeletionCheck(at date: Date, for source: UploadSourceIdentity) throws {}
+    func clearDeletionCheck(for source: UploadSourceIdentity) throws {}
+    func clearDeletionChoice(for source: UploadSourceIdentity) throws {}
     func addSuperseded(_ uid: PhotoUID, for source: UploadSourceIdentity) throws {}
     func addRemoteSuperseded(_ uid: PhotoUID, for source: UploadSourceIdentity) throws {}
     func prepareToRetire(_ relatedByMain: [String: [String]], for source: UploadSourceIdentity) throws {}

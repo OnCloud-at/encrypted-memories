@@ -1,6 +1,71 @@
 {
   "sourceLanguage": "en",
   "strings": {
+    "backup.issue_deleted_elsewhere" : {
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Die letzte Sicherung dieses Fotos wurde aus Proton Drive entfernt. Lasse es aus der Sicherung weg oder sichere es erneut."
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "The last backup of this photo was removed from Proton Drive. Keep it out of the backup, or back it up again."
+          }
+        }
+      }
+    },
+    "backup.issue_deletion_check" : {
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Es wird geprüft, ob die letzte Sicherung dieses Fotos noch in Proton Drive ist."
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Checking whether the last backup of this photo is still in Proton Drive."
+          }
+        }
+      }
+    },
+    "backup.keep_deleted" : {
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Gelöscht lassen"
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Keep Deleted"
+          }
+        }
+      }
+    },
+    "backup.back_up_again" : {
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Erneut sichern"
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Back Up Again"
+          }
+        }
+      }
+    },
+
     "backup.issue_waiting_original": {
       "extractionState": "manual",
       "localizations": {

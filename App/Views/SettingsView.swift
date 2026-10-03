@@ -825,7 +825,22 @@ private struct MacFailedBackupSheet: View {
                             }
                         }
                         Spacer(minLength: 8)
-                        if item.isPermanent {
+                        if item.issue == .deletedElsewhere {
+                            Button(L10n.string("backup.keep_deleted")) {
+                                controller.keepDeleted(item)
+                                items = controller.failedItems()
+                            }
+                            .buttonStyle(.borderless)
+                            .help(L10n.string("backup.keep_deleted"))
+                            Button(L10n.string("backup.back_up_again")) {
+                                controller.backUpAgain(item)
+                                items = controller.failedItems().filter {
+                                    $0.id != item.id || $0.issue == .deletedElsewhere
+                                }
+                            }
+                            .buttonStyle(.borderless)
+                            .help(L10n.string("backup.back_up_again"))
+                        } else if item.isPermanent {
                             Button {
                                 controller.dismissFailedItem(item)
                                 items.removeAll { $0.id == item.id }
