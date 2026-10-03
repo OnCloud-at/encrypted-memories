@@ -167,6 +167,88 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
         return Set(main.relatedPhotoLinkIDs)
     }
 
+    private func attributes(of link: AlbumPhotoLinkBody, material: Material) throws -> DedupeXAttr? {
+        guard let nodeKey = link.nodeKey, let passphrase = link.nodePassphrase,
+            let xAttr = link.xAttr ?? link.fileProperties?.activeRevision?.xAttr
+        else { return nil }
+        let key = try crypto.unlockNode(key: nodeKey, passphrase: passphrase, parent: material.rootKey)
+        let data = try crypto.decryptXAttr(xAttr, node: key)
+        return try JSONDecoder().decode(DedupeXAttr.self, from: data)
+    }
+
+    func modificationDate(ofMainLink linkID: String) async throws -> Date? {
+        let material = try await resolveMaterial()
+        let metadata = try await session.fetchPhotoLinksMetadata(
+            shareID: material.context.shareID, linkIDs: [linkID])
+        guard let main = metadata.first(where: { $0.linkID == linkID }), main.state == 1,
+            let photo = main.fileProperties?.activeRevision?.photo, photo.mainPhotoLinkID == nil,
+            let raw = try attributes(of: main, material: material)?.iOSPhotos?.modificationTime
+        else { return nil }
+        let fractional = ISO8601DateFormatter()
+        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let standard = ISO8601DateFormatter()
+        standard.formatOptions = [.withInternetDateTime]
+        return fractional.date(from: raw) ?? standard.date(from: raw)
+    }
+
+    func compound(ofMainLink linkID: String) async throws -> UploadRemoteCompound? {
+        let material = try await resolveMaterial()
+        let metadata = try await session.fetchAlbumPhotoMetadata(
+            volumeID: material.context.volumeID, linkIDs: [linkID])
+        guard let main = metadata.first(where: { $0.link.linkID == linkID }),
+            main.photo?.hasCompleteRelatedPhotoLinkIDs == true
+        else { return nil }
+        let related = Set(main.relatedPhotoLinkIDs)
+        // Generic metadata carries State and MainPhotoLinkID, unlike the Photos compound response.
+        let ids = related.union([linkID]).sorted()
+        var resources: [AlbumPhotoLinkBody] = []
+        for start in stride(from: 0, to: ids.count, by: UploadDedupePipeline.protonDuplicateBatchSize) {
+            let end = min(start + UploadDedupePipeline.protonDuplicateBatchSize, ids.count)
+            resources.append(
+                contentsOf: try await session.fetchPhotoLinksMetadata(
+                    shareID: material.context.shareID, linkIDs: Array(ids[start..<end])))
+        }
+        guard let currentMain = resources.first(where: { $0.linkID == linkID }), currentMain.state == 1,
+            let role = currentMain.fileProperties?.activeRevision?.photo, role.mainPhotoLinkID == nil
+        else { return nil }
+        var files: [String: UploadRemoteCompound.File] = [:]
+        for resource in resources {
+            guard let resourceID = resource.linkID, related.contains(resourceID) || resourceID == linkID
+            else { return nil }
+            guard resource.state == 1,
+                resource.fileProperties?.activeRevision?.photo?.mainPhotoLinkID
+                    == (resourceID == linkID ? nil : linkID),
+                let armoredName = resource.name, let mimeType = resource.mimeType, !mimeType.isEmpty,
+                let sha1 = try attributes(of: resource, material: material)?.common?.digests?.sha1,
+                UploadContentSHA1.digest(fromHex: sha1) != nil
+            else { return nil }
+            let clearName = try crypto.decryptName(armoredName, parent: material.rootKey)
+            let correctedName = ProtonPhotoNameCorrection.correctedName(for: clearName)
+            guard !correctedName.isEmpty, files[resourceID] == nil else { return nil }
+            files[resourceID] = UploadRemoteCompound.File(
+                linkID: resourceID,
+                contentHash: ProtonPhotoHMAC.hex(message: sha1.lowercased(), key: material.hashKey),
+                nameHash: ProtonPhotoHMAC.hex(message: correctedName, key: material.hashKey), mimeType: mimeType)
+        }
+        guard Set(files.keys) == related.union([linkID]), let mainFile = files[linkID],
+            let tags = main.photo?.tags
+        else { return nil }
+        let attributes = try attributes(of: currentMain, material: material)
+        let fractional = ISO8601DateFormatter()
+        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let standard = ISO8601DateFormatter()
+        standard.formatOptions = [.withInternetDateTime]
+        let date = attributes?.iOSPhotos?.modificationTime.flatMap {
+            fractional.date(from: $0) ?? standard.date(from: $0)
+        }
+        let captureDate = main.photo?.captureTime.flatMap { value -> Date? in
+            value.isFinite ? Date(timeIntervalSince1970: value) : nil
+        }
+        return UploadRemoteCompound(
+            main: mainFile, related: related.sorted().compactMap { files[$0] }, tags: Set(tags),
+            externalIdentifier: attributes?.iOSPhotos?.iCloudID, captureDate: captureDate, modificationDate: date)
+    }
+
     func linkVisibility(of linkIDs: [String]) async throws -> [String: RemoteLinkVisibility] {
         guard !linkIDs.isEmpty else { return [:] }
         let context = try await resolveMaterial().context
@@ -208,6 +290,28 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
         try await refreshRemoteContentIndex(material: material)
         guard let lineageIndexStore else { return ([], false) }
         let links = lineageIndexStore.replacingMainLinkIDs(ofReplacedLink: linkID, hashKeyEpoch: material.epoch)
+        let health = lineageIndexStore.health(
+            hashKeyEpoch: material.epoch,
+            contentCheckpoint: contentIndexStore.remoteContentIndexCheckpoint(hashKeyEpoch: material.epoch))
+        return (links, health == .complete)
+    }
+
+    func externalIdentifier(ofMainLink linkID: String) async throws -> (identifier: String?, complete: Bool) {
+        let material = try await resolveMaterial()
+        try await refreshRemoteContentIndex(material: material)
+        guard let lineageIndexStore else { return (nil, false) }
+        let identifier = lineageIndexStore.externalIdentifier(ofMainLink: linkID, hashKeyEpoch: material.epoch)
+        let health = lineageIndexStore.health(
+            hashKeyEpoch: material.epoch,
+            contentCheckpoint: contentIndexStore.remoteContentIndexCheckpoint(hashKeyEpoch: material.epoch))
+        return (identifier, health == .complete)
+    }
+
+    func replacedLinkIDs(ofReplacingMain linkID: String) async throws -> (links: Set<String>, complete: Bool) {
+        let material = try await resolveMaterial()
+        try await refreshRemoteContentIndex(material: material)
+        guard let lineageIndexStore else { return ([], false) }
+        let links = lineageIndexStore.replacedLinkIDs(ofReplacingMain: linkID, hashKeyEpoch: material.epoch)
         let health = lineageIndexStore.health(
             hashKeyEpoch: material.epoch,
             contentCheckpoint: contentIndexStore.remoteContentIndexCheckpoint(hashKeyEpoch: material.epoch))

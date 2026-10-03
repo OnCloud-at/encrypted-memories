@@ -301,11 +301,20 @@ final class EditScenarioTests: XCTestCase {
     }
 
     func testRemoteProofOnSecondDeviceThenFirstEdit() async throws {
-        harness = try EditScenarioHarness()
+        try await remoteProofOnSecondDeviceThenFirstEdit(staleIndex: false)
+    }
+
+    func testRemoteProofOnSecondDeviceThenFirstEditWithStaleIndex() async throws {
+        try await remoteProofOnSecondDeviceThenFirstEdit(staleIndex: true)
+    }
+
+    private func remoteProofOnSecondDeviceThenFirstEdit(staleIndex: Bool) async throws {
+        harness = try EditScenarioHarness(staleLineageIndex: staleIndex)
         try await harness.enqueue()
         await harness.drain()
         let original = try harness.liveMain()
-        let deviceB = try EditScenarioHarness(server: harness.server, library: harness.library)
+        let deviceB = try EditScenarioHarness(
+            server: harness.server, library: harness.library, staleLineageIndex: staleIndex)
         defer { try? deviceB.cleanup() }
         let candidate = try deviceB.library.candidate()
         let identity = try XCTUnwrap(candidate.snapshot.externalIdentity)
@@ -325,7 +334,10 @@ final class EditScenarioTests: XCTestCase {
             deviceB.server.steps.filter { $0.action.hasPrefix("upload") }.count, uploadsBeforeDiscovery,
             "The remote compound proof must avoid resolving or uploading bytes")
 
-        deviceB.knownDefect = "N1 (#194): remote proof creates no source manifest for replacement discovery."
+        if staleIndex {
+            let before = try await deviceB.index.activeMainLinkIDs(forExternalIdentifier: "cloud-asset-1")
+            XCTAssertEqual(before.links, [original.nodeID])
+        }
         deviceB.library.edit("device-b-edit", at: deviceB.clock.now)
         try await deviceB.enqueue()
         deviceB.clock.advance(by: 5)
@@ -335,17 +347,27 @@ final class EditScenarioTests: XCTestCase {
             deviceB.server.links.first { $0.uid == original }?.state == .trashed,
             "N1 the remotely proven original must move to trash")
         await deviceB.drain()
-        deviceB.expectKnownDefect(
-            signature: "S1/U3 mains",
-            consequences: [
-                "N1 the remotely proven original", "S1 the main must hold the current version",
-                "S3 the edited main lacks its active original",
-            ])
+        deviceB.assertQuiescent()
     }
 
     func testTwoDevicesReplaceAnEditOutsideTheSecondDevicesJournal() async throws {
-        harness = try EditScenarioHarness()
-        let deviceB = try EditScenarioHarness(server: harness.server, library: harness.library)
+        try await twoDevicesReplaceAnEditOutsideTheSecondDevicesJournal(staleIndex: false)
+    }
+
+    func testTwoDevicesReplaceAnEditOutsideTheSecondDevicesJournalWithStaleIndex() async throws {
+        try await twoDevicesReplaceAnEditOutsideTheSecondDevicesJournal(staleIndex: true)
+    }
+
+    func testTwoDevicesReplaceLiveEditWithRenderedPairedVideo() async throws {
+        try await twoDevicesReplaceAnEditOutsideTheSecondDevicesJournal(staleIndex: true, live: true)
+    }
+
+    private func twoDevicesReplaceAnEditOutsideTheSecondDevicesJournal(
+        staleIndex: Bool, live: Bool = false
+    ) async throws {
+        harness = try EditScenarioHarness(live: live, staleLineageIndex: staleIndex)
+        let deviceB = try EditScenarioHarness(
+            server: harness.server, library: harness.library, staleLineageIndex: staleIndex)
         defer { try? deviceB.cleanup() }
         // Both discover before either uploads, so both run the real pipeline and acquire a manifest for O.
         try await harness.enqueue()
@@ -358,20 +380,23 @@ final class EditScenarioTests: XCTestCase {
         XCTAssertEqual(deviceB.identities.record(for: source)?.remoteLinkID, original.nodeID)
         XCTAssertNotEqual(deviceB.directory, harness.directory)
 
+        if live { harness.library.renderPairedVideo("device-a-rendered-video") }
         try await edit("device-a-edit-e")
         await harness.drain()
         let editE = try harness.liveMain()
         XCTAssertEqual(harness.server.links.first { $0.uid == original }?.state, .trashed)
         XCTAssertEqual(deviceB.identities.record(for: source)?.remoteLinkID, original.nodeID)
         XCTAssertFalse(deviceB.journal.entry(for: source).retired.contains(original.nodeID))
-        deviceB.knownDefect =
-            "N2 (#194): a device replaces only photos of its own manifest, so another device's edit stays active. "
-            + "Needs the replacement marker on the server."
+        if staleIndex {
+            let stale = try await deviceB.index.activeMainLinkIDs(forExternalIdentifier: "cloud-asset-1")
+            XCTAssertFalse(stale.links.contains(editE.nodeID), "The device must still see its earlier snapshot")
+        }
+        deviceB.clock.advance(by: 15)
+        if live { deviceB.library.renderPairedVideo("device-b-rendered-video") }
         deviceB.library.edit("device-b-edit-f", at: deviceB.clock.now)
         let editF = try await deviceB.enqueue()
         deviceB.clock.advance(by: 5)
         await deviceB.pass()
-        // These hard assertions cannot be collected as consequences of the known replacement defect.
         XCTAssertEqual(deviceB.state(of: editF), .completed, "Edit F must finish before checking replacement of E")
         let editFHash = EditScenarioServer.contentHash(Data(Insecure.SHA1.hash(data: Data("device-b-edit-f".utf8))))
         XCTAssertTrue(
@@ -382,11 +407,20 @@ final class EditScenarioTests: XCTestCase {
         deviceB.check(
             deviceB.server.links.first { $0.uid == editE }?.state == .trashed,
             "N2 the second device must trash the first device's edit E")
+        if staleIndex {
+            deviceB.clock.advance(by: 15)
+            let refreshed = try await deviceB.index.activeMainLinkIDs(forExternalIdentifier: "cloud-asset-1")
+            XCTAssertEqual(
+                refreshed.links, Set(deviceB.activeMains.map(\.linkID)),
+                "The index must converge to the server after the replacement pass")
+            XCTAssertFalse(
+                deviceB.server.steps.contains {
+                    $0.trashedByBackup.contains(where: { $0 != original.nodeID && $0 != editE.nodeID })
+                })
+        }
         XCTAssertFalse(deviceB.server.links.contains { $0.personDeleted })
         await deviceB.drain()
-        deviceB.expectKnownDefect(
-            signature: "N2 the second device must trash the first device's edit E",
-            consequences: ["S1/U3 mains:", "S1 the main must hold the current version"])
+        deviceB.assertQuiescent()
     }
 
     func testUndoRestoresTheExactEarlierRevision() async throws {

@@ -27,6 +27,11 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
         let isOriginal: Bool
         var personDeleted = false
         var externalIdentity: UploadBackupExternalIdentity?
+        var replacedLinkIDs: Set<String> = []
+        var modificationDate: Date?
+        var externalIdentifier: String?
+        var mimeType = "image/jpeg"
+        var tags: Set<Int> = []
 
         var uid: PhotoUID { PhotoUID(volumeID: "vol", nodeID: linkID) }
         var duplicate: RemotePhotoDuplicate {
@@ -50,6 +55,12 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
     private var history: [Step] = []
     private var nextID = 1
     private var failTrash = false
+    enum LineageRead: Sendable, Equatable { case identity, successors, ancestry, external }
+    private var incompleteLineageRead: LineageRead?
+    private var failLineageRead = false
+    private var failVisibilityRead = false
+    private var failCompoundRead = false
+    private var cancelCompoundRead = false
     private var failRelatedLookupForTrashedMain = false
     private var rejectedRelatedLookups: [String] = []
     private var proofLookups: [[UploadBackupExternalIdentity]] = []
@@ -85,9 +96,117 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
 
     func failNextTrash() { lock.withLock { failTrash = true } }
 
+    func configureLineageIndex(incomplete: LineageRead? = nil, failing: Bool = false) {
+        lock.withLock {
+            incompleteLineageRead = incomplete
+            failLineageRead = failing
+        }
+    }
+
+    func configureOptionalReads(
+        visibilityFails: Bool = false, compoundFails: Bool = false, compoundCancels: Bool = false
+    ) {
+        lock.withLock {
+            failVisibilityRead = visibilityFails
+            failCompoundRead = compoundFails
+            cancelCompoundRead = compoundCancels
+        }
+    }
+
+    func setModificationDate(_ date: Date?, of uid: PhotoUID) {
+        lock.withLock {
+            guard var link = table[uid.nodeID] else { return }
+            link.modificationDate = date
+            link.externalIdentity = link.externalIdentifier.flatMap { identifier in
+                date.map { UploadBackupExternalIdentity(identifier: identifier, modificationDate: $0) }
+            }
+            table[uid.nodeID] = link
+        }
+    }
+
+    func modificationDate(ofMainLink linkID: String) async throws -> Date? {
+        lock.withLock {
+            guard let link = table[linkID], link.state == .active, link.mainLinkID == nil else { return nil }
+            return link.modificationDate
+        }
+    }
+
+    func compound(ofMainLink linkID: String) async throws -> UploadRemoteCompound? {
+        try lock.withLock {
+            if cancelCompoundRead { throw CancellationError() }
+            if failCompoundRead { throw UploadError.backend("The scenario compound read failed") }
+            guard let main = table[linkID], main.state == .active, main.mainLinkID == nil else { return nil }
+            let resources = orderedLinks().filter { $0.mainLinkID == linkID && $0.state != .deleted }
+            guard resources.allSatisfy({ $0.state == .active }) else { return nil }
+            func file(_ link: Link) -> UploadRemoteCompound.File {
+                .init(
+                    linkID: link.linkID, contentHash: link.contentHash,
+                    nameHash: link.nameHash, mimeType: link.mimeType)
+            }
+            return UploadRemoteCompound(
+                main: file(main), related: resources.map(file), tags: main.tags,
+                externalIdentifier: main.externalIdentifier,
+                // The API returns CaptureTime in whole seconds.
+                captureDate: Date(timeIntervalSince1970: main.captureTime.timeIntervalSince1970.rounded(.down)),
+                modificationDate: main.modificationDate)
+        }
+    }
+
+    func setTags(_ tags: Set<Int>, of uid: PhotoUID) {
+        lock.withLock { table[uid.nodeID]?.tags = tags }
+    }
+
+    func activeMainLinkIDs(
+        forExternalIdentifier identifier: String
+    ) async throws -> (links: Set<String>, complete: Bool) {
+        try lock.withLock {
+            if failLineageRead { throw UploadError.backend("The scenario lineage read failed") }
+            return (
+                Set(
+                    table.values.filter {
+                        $0.state == .active && $0.mainLinkID == nil && $0.externalIdentifier == identifier
+                    }.map(\.linkID)), incompleteLineageRead != .identity
+            )
+        }
+    }
+
+    func replacingMainLinkIDs(ofReplacedLink linkID: String) async throws -> (links: Set<String>, complete: Bool) {
+        try lock.withLock {
+            if failLineageRead { throw UploadError.backend("The scenario lineage read failed") }
+            return (
+                Set(
+                    table.values.filter {
+                        $0.state == .active && $0.mainLinkID == nil && $0.replacedLinkIDs.contains(linkID)
+                    }.map(\.linkID)), incompleteLineageRead != .successors
+            )
+        }
+    }
+
+    func externalIdentifier(ofMainLink linkID: String) async throws -> (identifier: String?, complete: Bool) {
+        try lock.withLock {
+            if failLineageRead { throw UploadError.backend("The scenario lineage read failed") }
+            let link = table[linkID]
+            let identifier =
+                link?.state == .active && link?.mainLinkID == nil ? link?.externalIdentifier : nil
+            return (identifier, incompleteLineageRead != .external)
+        }
+    }
+
+    func replacedLinkIDs(ofReplacingMain linkID: String) async throws -> (links: Set<String>, complete: Bool) {
+        try lock.withLock {
+            if failLineageRead { throw UploadError.backend("The scenario lineage read failed") }
+            let link = table[linkID]
+            return (
+                link?.state == .active && link?.mainLinkID == nil ? link?.replacedLinkIDs ?? [] : [],
+                incompleteLineageRead != .ancestry
+            )
+        }
+    }
+
     /// The fixture starts with links that v1.0.5 uploaded; these are not uploads by today's runner.
     func seedV105Upload(
-        _ descriptor: UploadResourceDescriptor, digest: Data, asset: EditScenarioLibrary.Asset, main: PhotoUID?
+        _ descriptor: UploadResourceDescriptor, digest: Data, asset: EditScenarioLibrary.Asset, main: PhotoUID?,
+        externalIdentifier: String? = nil, replacing: Set<String> = [], mimeType: String = "image/jpeg"
     ) -> PhotoUID {
         lock.withLock {
             let id = String(format: "link-%04d", nextID)
@@ -97,7 +216,11 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
                 contentHash: Self.contentHash(digest), state: .active,
                 mainLinkID: main?.nodeID, captureTime: asset.captureTime, assetID: asset.identifier,
                 generation: asset.generation,
-                isOriginal: descriptor.filename.hasSuffix(".HEIC") || descriptor.filename.hasSuffix(".MOV"))
+                isOriginal: descriptor.filename.hasSuffix(".HEIC") || descriptor.filename.hasSuffix(".MOV"),
+                externalIdentity: externalIdentifier.map {
+                    UploadBackupExternalIdentity(identifier: $0, modificationDate: asset.modificationDate)
+                }, replacedLinkIDs: replacing, modificationDate: asset.modificationDate,
+                externalIdentifier: externalIdentifier, mimeType: mimeType)
             record("v1.0.5 upload \(id)")
             return PhotoUID(volumeID: "vol", nodeID: id)
         }
@@ -132,7 +255,8 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
                 state: .active, mainLinkID: main, captureTime: request.captureTime,
                 assetID: assetID, generation: generation,
                 isOriginal: request.name.hasSuffix(".HEIC") || request.name.hasSuffix(".MOV"),
-                externalIdentity: externalIdentity)
+                externalIdentity: externalIdentity, modificationDate: externalIdentity?.revision.date,
+                externalIdentifier: externalIdentity?.identifier, mimeType: request.mediaType, tags: Set(request.tags))
             record("upload \(id)", violations: violations)
             return PhotoUID(volumeID: "vol", nodeID: id)
         }
@@ -224,7 +348,9 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
     }
 
     func linkVisibility(of linkIDs: [String]) async throws -> [String: RemoteLinkVisibility] {
-        lock.withLock {
+        guard !linkIDs.isEmpty else { return [:] }
+        return try lock.withLock {
+            if failVisibilityRead { throw UploadError.backend("The scenario visibility read failed") }
             var result: [String: RemoteLinkVisibility] = [:]
             for linkID in linkIDs {
                 guard let link = table[linkID], link.state != .deleted else { continue }
@@ -410,16 +536,58 @@ actor EditScenarioUploadGate {
 
 /// The remote asset index of one device, as `ProtonUploadDedupeService` keeps it. A full build reads every active
 /// compound. The refresh from events only removes the record of a compound whose link changed; it adds none
-/// (`makeIndexRows` returns no asset records). Every other lookup goes to the server.
+/// (`makeIndexRows` returns no asset records). Optional stale mode keeps lineage answers for 15 seconds.
+/// Live visibility, compound contents, and modification metadata still come from the server.
 final class EditScenarioDeviceIndex: UploadDuplicateChecking, @unchecked Sendable {
     private let server: EditScenarioServer
     private let lock = NSLock()
     private var proofs: [UploadBackupExternalIdentity: UploadRemoteAssetIndexRecord]
 
+    private let staleLineage: Bool
+    private let now: @Sendable () -> Date
+    private var lineageSnapshot: [EditScenarioServer.Link]
+    private var lineageSnapshotAt: Date
+    private var lineageInvalidated = false
+    private var ownUploads: [String: Date] = [:]
+
     /// A device builds its index when it first opens the account.
-    init(server: EditScenarioServer) {
+    init(server: EditScenarioServer, staleLineage: Bool = false, now: @escaping @Sendable () -> Date = { Date() }) {
         self.server = server
         proofs = server.allRemoteAssetProofs()
+        self.staleLineage = staleLineage
+        self.now = now
+        lineageSnapshot = server.links
+        lineageSnapshotAt = now()
+    }
+
+    private func indexedLinks() -> [EditScenarioServer.Link] {
+        lock.withLock {
+            if lineageInvalidated || now().timeIntervalSince(lineageSnapshotAt) >= 15 {
+                let pending = Set(ownUploads.filter { now().timeIntervalSince($0.value) < 15 }.keys)
+                lineageSnapshot = server.links.filter { !pending.contains($0.linkID) }
+                lineageSnapshotAt = now()
+                lineageInvalidated = false
+            }
+            return lineageSnapshot
+        }
+    }
+
+    func recordUploaded(contentHash: String, remoteLinkID: String) async {
+        lock.withLock { ownUploads[remoteLinkID] = now() }
+        await server.recordUploaded(contentHash: contentHash, remoteLinkID: remoteLinkID)
+    }
+
+    func invalidateCachedRemoteState() async {
+        await server.invalidateCachedRemoteState()
+        lock.withLock { lineageInvalidated = true }
+    }
+
+    func modificationDate(ofMainLink linkID: String) async throws -> Date? {
+        try await server.modificationDate(ofMainLink: linkID)
+    }
+
+    func compound(ofMainLink linkID: String) async throws -> UploadRemoteCompound? {
+        try await server.compound(ofMainLink: linkID)
     }
 
     func findRemoteAssetProofs(
@@ -452,6 +620,36 @@ final class EditScenarioDeviceIndex: UploadDuplicateChecking, @unchecked Sendabl
     }
     func linkVisibility(of linkIDs: [String]) async throws -> [String: RemoteLinkVisibility] {
         try await server.linkVisibility(of: linkIDs)
+    }
+    func activeMainLinkIDs(
+        forExternalIdentifier identifier: String
+    ) async throws -> (links: Set<String>, complete: Bool) {
+        guard staleLineage else { return try await server.activeMainLinkIDs(forExternalIdentifier: identifier) }
+        return (
+            Set(
+                indexedLinks().filter {
+                    $0.state == .active && $0.mainLinkID == nil && $0.externalIdentifier == identifier
+                }.map(\.linkID)), true
+        )
+    }
+    func replacingMainLinkIDs(ofReplacedLink linkID: String) async throws -> (links: Set<String>, complete: Bool) {
+        guard staleLineage else { return try await server.replacingMainLinkIDs(ofReplacedLink: linkID) }
+        return (
+            Set(
+                indexedLinks().filter {
+                    $0.state == .active && $0.mainLinkID == nil && $0.replacedLinkIDs.contains(linkID)
+                }.map(\.linkID)), true
+        )
+    }
+    func externalIdentifier(ofMainLink linkID: String) async throws -> (identifier: String?, complete: Bool) {
+        guard staleLineage else { return try await server.externalIdentifier(ofMainLink: linkID) }
+        let main = indexedLinks().first { $0.linkID == linkID && $0.state == .active && $0.mainLinkID == nil }
+        return (main?.externalIdentifier, true)
+    }
+    func replacedLinkIDs(ofReplacingMain linkID: String) async throws -> (links: Set<String>, complete: Bool) {
+        guard staleLineage else { return try await server.replacedLinkIDs(ofReplacingMain: linkID) }
+        let main = indexedLinks().first { $0.linkID == linkID && $0.state == .active && $0.mainLinkID == nil }
+        return (main?.replacedLinkIDs ?? [], true)
     }
     func remoteContentIndexHealth() async throws -> UploadRemoteContentIndexHealth {
         try await server.remoteContentIndexHealth()

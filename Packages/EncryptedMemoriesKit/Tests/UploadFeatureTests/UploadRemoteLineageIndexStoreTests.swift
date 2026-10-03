@@ -29,6 +29,32 @@ final class UploadRemoteLineageIndexStoreTests: XCTestCase {
         XCTAssertTrue(reopened.activeMainLinkIDs(forExternalIdentifier: "cloud", hashKeyEpoch: "other").isEmpty)
     }
 
+    func testReplacingMainReadReturnsAncestorsOnlyForItsEpoch() throws {
+        let store = try XCTUnwrap(UploadRemoteLineageIndexStore(url: url))
+        defer { store.close() }
+        XCTAssertTrue(
+            store.replaceRows(
+                identities: [identity("main"), identity("other")],
+                lineage: [
+                    .init(hashKeyEpoch: "epoch", replacedLinkID: "old", replacingLinkID: "main"),
+                    .init(hashKeyEpoch: "epoch", replacedLinkID: "older", replacingLinkID: "main"),
+                    .init(hashKeyEpoch: "epoch", replacedLinkID: "unrelated", replacingLinkID: "other"),
+                ], hashKeyEpoch: "epoch", eventID: "one", unresolvedRemoteLinkIDs: []))
+
+        XCTAssertEqual(store.replacedLinkIDs(ofReplacingMain: "main", hashKeyEpoch: "epoch"), ["old", "older"])
+        XCTAssertTrue(store.replacedLinkIDs(ofReplacingMain: "main", hashKeyEpoch: "another-epoch").isEmpty)
+    }
+
+    func testMainIdentityReadIgnoresSecondariesAndOtherEpochs() throws {
+        let store = try XCTUnwrap(UploadRemoteLineageIndexStore(url: url))
+        defer { store.close() }
+        XCTAssertTrue(replace(store, links: [identity("main"), identity("related", isMain: false)]))
+
+        XCTAssertEqual(store.externalIdentifier(ofMainLink: "main", hashKeyEpoch: "epoch"), "cloud")
+        XCTAssertNil(store.externalIdentifier(ofMainLink: "related", hashKeyEpoch: "epoch"))
+        XCTAssertNil(store.externalIdentifier(ofMainLink: "main", hashKeyEpoch: "another-epoch"))
+    }
+
     func testFullBuildReplacesEpochRows() throws {
         let store = try XCTUnwrap(UploadRemoteLineageIndexStore(url: url))
         defer { store.close() }
