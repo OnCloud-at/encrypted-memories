@@ -4435,6 +4435,42 @@
         }
       }
     },
+    "map.cluster_next_page": {
+      "extractionState": "manual",
+      "comment": "Toolbar item that shows the next page of photos in a map cluster.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Next Page"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Nächste Seite"
+          }
+        }
+      }
+    },
+    "map.cluster_previous_page": {
+      "extractionState": "manual",
+      "comment": "Toolbar item that shows the previous page of photos in a map cluster.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Previous Page"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Vorherige Seite"
+          }
+        }
+      }
+    },
     "map.cluster_title": {
       "extractionState": "manual",
       "localizations": {

@@ -25,12 +25,48 @@ final class MobileLibraryUITests: XCTestCase {
         XCTAssertTrue(app.buttons["Select"].exists)
     }
 
+    /// iPhone Duo stacks the tabs and the toolbar items in a vertical bar on the side of the display. The grid then
+    /// stays beside the bar, so no photo lies under a control, also in selection mode.
+    func testThePhotoGridStaysBesideAVerticalBar() throws {
+        XCTAssertTrue(firstPhoto.waitForExistence(timeout: 60))
+        // One vertical bar holds the tabs and the toolbar items in a single column. An iPad sidebar also stacks
+        // the tabs, but Select stays in the navigation bar there.
+        let library = app.buttons["Library"].firstMatch.frame
+        let collections = app.buttons["Collections"].firstMatch.frame
+        let select = app.buttons["Select"].firstMatch.frame
+        try XCTSkipUnless(
+            abs(library.midX - collections.midX) < 1 && abs(library.midX - select.midX) < 1,
+            "no vertical bar holds the tabs and the toolbar")
+
+        assertPhotosStayBeside(bar: app.buttons["Library"].firstMatch)
+        app.buttons["Select"].tap()
+        XCTAssertTrue(app.buttons["Done"].waitForExistence(timeout: 5))
+        assertPhotosStayBeside(bar: app.buttons["Share selected items"])
+    }
+
+    private func assertPhotosStayBeside(bar control: XCUIElement, file: StaticString = #filePath, line: UInt = #line) {
+        let barFrame = control.frame
+        let window = app.windows.firstMatch.frame
+        let barOnTrailingEdge = barFrame.midX > window.midX
+        let photos = app.descendants(matching: .any).matching(NSPredicate(format: "label BEGINSWITH 'Photo, '"))
+        var checked = 0
+        for index in 0..<min(photos.count, 40) {
+            let photo = photos.element(boundBy: index).frame
+            guard photo.intersects(window) else { continue }
+            checked += 1
+            let clear = barOnTrailingEdge ? photo.maxX <= barFrame.minX : photo.minX >= barFrame.maxX
+            XCTAssertTrue(clear, "photo \(photo) lies under the vertical bar \(barFrame)", file: file, line: line)
+        }
+        XCTAssertGreaterThan(checked, 0, "no visible photo to check", file: file, line: line)
+    }
+
     func testAPhotoOpensInTheViewerAndClosesAgain() {
         XCTAssertTrue(firstPhoto.waitForExistence(timeout: 60))
         firstPhoto.tap()
 
         let close = app.buttons["Close"]
         XCTAssertTrue(close.waitForExistence(timeout: 10), "the viewer did not open")
+        XCTAssertTrue(app.buttons["Share"].exists, "the viewer bar shows no Share action")
         close.tap()
 
         XCTAssertTrue(firstPhoto.waitForExistence(timeout: 10), "the library did not return")

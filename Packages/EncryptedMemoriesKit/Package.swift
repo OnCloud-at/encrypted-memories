@@ -270,7 +270,7 @@ let package = Package(
         ),
         .target(name: "AlbumCore", dependencies: ["PhotosCore"], swiftSettings: disableDynamicActorIsolation),
         .target(
-            name: "AlbumsFeature", dependencies: ["AlbumCore", "PhotosCore"],
+            name: "AlbumsFeature", dependencies: ["AlbumCore", "DesignSystemCore", "PhotosCore"],
             swiftSettings: disableDynamicActorIsolation),
         .testTarget(
             name: "AlbumsFeatureTests", dependencies: ["AlbumCore", "AlbumsFeature", "PhotosCore"],

@@ -535,17 +535,25 @@ private struct MobileFailedBackupSheet: View {
             .mobileNavigationTitle(L10n.string("backup.failed_sheet_title"))
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button(L10n.string("backup.failed_sheet_done")) { dismiss() }
+                    Button {
+                        dismiss()
+                    } label: {
+                        Label(L10n.string("backup.failed_sheet_done"), systemImage: "checkmark")
+                    }
+                    .textBarItem()
                 }
                 .mobileVisibilityPriority(.high)
                 if controller.hasRetryableFailures {
                     ToolbarItem(placement: .confirmationAction) {
-                        Button(L10n.string("backup.failed_sheet_retry")) {
+                        Button {
                             Task {
                                 await controller.retryFailedAndSync()
                                 dismiss()
                             }
+                        } label: {
+                            Label(L10n.string("backup.failed_sheet_retry"), systemImage: "arrow.clockwise")
                         }
+                        .textBarItem()
                     }
                 }
             }

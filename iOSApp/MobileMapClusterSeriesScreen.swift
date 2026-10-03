@@ -56,7 +56,7 @@ struct MobileMapClusterSeriesScreen: View {
                     selection.finish()
                     pageIndex -= 1
                 } label: {
-                    Image(systemName: "chevron.left")
+                    Label(L10n.string("map.cluster_previous_page"), systemImage: "chevron.left")
                 }
                 .disabled(currentPage?.hasPrevious != true || selectionBusy)
             }
@@ -70,7 +70,7 @@ struct MobileMapClusterSeriesScreen: View {
                     selection.finish()
                     pageIndex += 1
                 } label: {
-                    Image(systemName: "chevron.right")
+                    Label(L10n.string("map.cluster_next_page"), systemImage: "chevron.right")
                 }
                 .disabled(currentPage?.hasNext != true || selectionBusy)
             }
@@ -78,9 +78,12 @@ struct MobileMapClusterSeriesScreen: View {
         }
         if !clusterItems.isEmpty {
             ToolbarItem(placement: .topBarTrailing) {
-                Button(selection.isSelecting ? L10n.string("action.done") : L10n.string("action.select")) {
+                Button {
                     selection.toggleMode()
+                } label: {
+                    MobileSelectionModeLabel(isSelecting: selection.isSelecting)
                 }
+                .textBarItem()
             }
             .mobileVisibilityPriority(.high)
         }

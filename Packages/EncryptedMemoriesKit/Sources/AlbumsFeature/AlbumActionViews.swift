@@ -1,4 +1,5 @@
 import AlbumCore
+import DesignSystemCore
 import PhotosCore
 import SwiftUI
 
@@ -126,7 +127,12 @@ public struct AlbumDestinationPicker: View {
             #endif
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button(L10n.string("action.cancel")) { dismiss() }
+                    Button {
+                        dismiss()
+                    } label: {
+                        Label(L10n.string("action.cancel"), systemImage: "xmark")
+                    }
+                    .textBarItem()
                 }
             }
         }
@@ -244,17 +250,25 @@ private struct AlbumNameForm: View {
             .toolbar {
                 if showsCancel {
                     ToolbarItem(placement: .cancellationAction) {
-                        Button(L10n.string("action.cancel")) { dismiss() }
+                        Button {
+                            dismiss()
+                        } label: {
+                            Label(L10n.string("action.cancel"), systemImage: "xmark")
+                        }
+                        .textBarItem()
                     }
                 }
                 ToolbarItem(placement: .confirmationAction) {
-                    Button(
-                        photoUIDs.isEmpty
-                            ? L10n.string("albums.create_action")
-                            : L10n.string("albums.create_and_add_action")
-                    ) {
+                    Button {
                         create()
+                    } label: {
+                        Label(
+                            photoUIDs.isEmpty
+                                ? L10n.string("albums.create_action")
+                                : L10n.string("albums.create_and_add_action"),
+                            systemImage: "checkmark")
                     }
+                    .textBarItem()
                     .disabled(trimmedName.isEmpty || coordinator.isWorking)
                 }
             }

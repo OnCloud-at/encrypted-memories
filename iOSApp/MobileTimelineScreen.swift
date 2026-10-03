@@ -29,6 +29,7 @@ enum MobileTimelineSurface: Equatable {
 struct MobileTimelineScreen: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.verticalSizeClass) private var verticalSizeClass
+    @Environment(\.verticalBarEdge) private var verticalBarEdge
     @Environment(MobileLibraryModel.self) private var model
     let surface: MobileTimelineSurface
     /// Whether the Photos tab is the active surface. Threaded into the grid so a hidden grid stops its
@@ -262,9 +263,12 @@ struct MobileTimelineScreen: View {
             ToolbarSpacer(.fixed, placement: .topBarTrailing)
         }
         ToolbarItem(placement: .topBarTrailing) {
-            Button(selection.isSelecting ? L10n.string("action.done") : L10n.string("action.select")) {
+            Button {
                 selection.toggleMode(reduceMotion: reduceMotion)
+            } label: {
+                MobileSelectionModeLabel(isSelecting: selection.isSelecting)
             }
+            .textBarItem()
             .disabled(!canSelect)
             .opacity(launchChromeVisible ? 1 : 0)
             .allowsHitTesting(launchChromeVisible)
@@ -474,7 +478,11 @@ struct MobileTimelineScreen: View {
                 // Extend the scroll surface below the floating navigation and tab bars. The UIKit grid keeps
                 // its safe-area content inset, so only the newest edge exposes protected space below the final
                 // row; as soon as the user scrolls away, thumbnails move naturally beneath Liquid Glass.
-                .ignoresSafeArea(.container, edges: [.top, .horizontal, .bottom])
+                // A vertical bar on iPhone Duo covers a whole column instead, so the grid stays beside it
+                // (HIG: use safe areas so controls on the side never cover content).
+                .ignoresSafeArea(
+                    .container, edges: verticalBarEdge == nil ? [.top, .horizontal, .bottom] : [.top, .bottom]
+                )
                 .allowsHitTesting(launchChromeVisible && !showsLibraryLoadingCover && !showsSearchLanding)
                 .accessibilityHidden(!launchChromeVisible || showsLibraryLoadingCover)
                 .accessibilityHidden(showsSearchLanding)

@@ -69,6 +69,20 @@ struct MobileSelectionToolbarItems<AlbumPicker: View>: ToolbarContent {
     }
 }
 
+/// The Select or Done action of a grid route with its symbol and title. Menus show both; bar items apply
+/// `mobileTextBarItem()`, so a horizontal bar keeps the text and the iPhone Duo vertical bar shows the symbol.
+struct MobileSelectionModeLabel: View {
+    let isSelecting: Bool
+
+    var body: some View {
+        if isSelecting {
+            Label(L10n.string("action.done"), systemImage: "checkmark")
+        } else {
+            Label(L10n.string("action.select"), systemImage: "checkmark.circle")
+        }
+    }
+}
+
 extension MobileGridSelectionController {
     /// The bar title of a grid route. In selection mode the selected count replaces the route title, the way
     /// the Photos app reports "Select Items" and "3 Items Selected"; the bottom bar then keeps symbol items only.
