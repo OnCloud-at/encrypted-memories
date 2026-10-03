@@ -881,6 +881,22 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         )
     }
 
+    /// The MIME type and the decrypted name of each link that a `fetch_metadata` batch names, by link ID. A name that
+    /// does not decrypt stays unknown.
+    private static func relatedFiles(
+        in links: [AlbumPhotoLinkBody], rootKey: UnlockableKey?, crypto: DriveCrypto
+    ) -> [String: BurstFrameVerdicts.RelatedFile] {
+        Dictionary(
+            links.compactMap { link -> (String, BurstFrameVerdicts.RelatedFile)? in
+                guard let linkID = link.linkID else { return nil }
+                var name: String?
+                if let armored = link.name, let rootKey { name = try? crypto.decryptName(armored, parent: rootKey) }
+                return (linkID, BurstFrameVerdicts.RelatedFile(mimeType: link.mimeType, name: name))
+            },
+            uniquingKeysWith: { first, _ in first }
+        )
+    }
+
     /// A listing without the given photos: its sections, and the burst entries that the burst catalog reads. A kept
     /// burst entry also loses them as related photos, so the burst viewer does not show them as members.
     static func removing(
@@ -1649,21 +1665,28 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
 
         let entriesByID = Dictionary(burstEntries.map { ($0.linkID, $0) }, uniquingKeysWith: { first, _ in first })
         // Related files outside the bursts listing can be frames of another Proton client or the adjustment data of
-        // an edit. One metadata read per open tells them apart; a reopen reuses the verdicts.
+        // an edit. One metadata read per open tells them apart by name and type; a reopen reuses the verdicts.
+        let keySource = try? await fileSource()
         let checked = await BurstFrameVerdicts.frames(
             of: relatedIDs,
             listed: Set(entriesByID.keys),
             verdicts: burstFrameVerdicts
-        ) { [driveSession, shareID = photosShareID] linkIDs in
-            guard let shareID else { throw DriveBridgeError.noPhotosShare }
-            var mimeTypes: [String: String] = [:]
+        ) { [driveSession, crypto, keySource, shareID = photosShareID, rootLinkID = root.nodeID] linkIDs in
+            guard let shareID, let keySource else { throw DriveBridgeError.noPhotosShare }
+            var links: [AlbumPhotoLinkBody] = []
             for batch in Self.metadataBatches(linkIDs) {
-                let links = try await ProtonRequestContext.$priority.withValue(.userInitiated) {
+                links += try await ProtonRequestContext.$priority.withValue(.userInitiated) {
                     try await driveSession.fetchPhotoLinksMetadata(shareID: shareID, linkIDs: batch)
                 }
-                mimeTypes.merge(Self.mimeTypes(in: links)) { first, _ in first }
             }
-            return mimeTypes
+            // Photos are children of the photos root, whose key decrypts their names. The stream source caches it.
+            var rootKey: UnlockableKey?
+            if links.contains(where: { $0.name != nil }) {
+                rootKey = try await ProtonRequestContext.$priority.withValue(.userInitiated) {
+                    try await keySource.nodeKey(ofLinkID: rootLinkID)
+                }
+            }
+            return Self.relatedFiles(in: links, rootKey: rootKey, crypto: crypto)
         }
         burstFrameVerdicts.merge(checked.verdicts)
         let memberIDs = checked.frames
