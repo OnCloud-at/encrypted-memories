@@ -2359,7 +2359,29 @@ final class BackupSyncRunnerTests: XCTestCase {
             harness.journal.entry(for: edited.source),
             EditReplacementJournalEntry(
                 superseded: [], retired: [testUID("IMG_1.HEIC").nodeID, testUID("IMG_1.MOV").nodeID],
-                uploadedEdit: true))
+                uploadedEdit: true, proven: [testUID("IMG_1.HEIC").nodeID]))
+    }
+
+    func testAnEditedPhotoNamesTheUploadItReplacesForOtherDevices() async throws {
+        let harness = try makeReplacementHarness()
+        _ = await uploadThenEdit(harness)
+        _ = await makeRunner(identityResolver: harness.pipeline, editReplacement: harness.replacement)
+            .runUntilDrained()
+
+        let lineage = UploadLineageMarker.sectionName
+        let first = try XCTUnwrap(uploader.requests.first)
+        XCTAssertEqual(first.name, "IMG_1.HEIC")
+        XCTAssertFalse(first.additionalMetadata.contains { $0.name == lineage }, "a first upload replaces nothing")
+        let edit = try XCTUnwrap(uploader.requests.first { $0.name == "IMG_1.JPG" })
+        let section = try XCTUnwrap(edit.additionalMetadata.first { $0.name == lineage })
+        let marker = try XCTUnwrap(JSONSerialization.jsonObject(with: section.utf8JsonValue) as? [String: Any])
+        XCTAssertEqual(marker["V"] as? Int, 1)
+        XCTAssertEqual(marker["Reason"] as? String, "edit")
+        XCTAssertEqual(marker["Replaces"] as? [String], [testUID("IMG_1.HEIC").nodeID])
+        XCTAssertTrue(
+            uploader.requests.filter { $0.mainPhotoUID != nil }
+                .allSatisfy { request in !request.additionalMetadata.contains { $0.name == lineage } },
+            "related files carry no marker")
     }
 
     func testAFailedTrashRetriesWithoutUploadingTheEditedPhotoAgain() async throws {
@@ -2384,6 +2406,13 @@ final class BackupSyncRunnerTests: XCTestCase {
         _ = await runner.runUntilDrained(mode: .eligibleOnly)
 
         XCTAssertTrue(harness.remote.trashCalls.isEmpty, "the earlier upload may be the only copy of the original")
+        // The marker names the earlier upload already. It stays active until the original arrives, and a reader
+        // counts only a named link outside the library as replaced.
+        let section = try XCTUnwrap(
+            try XCTUnwrap(uploader.requests.first { $0.name == "IMG_1.JPG" }).additionalMetadata
+                .first { $0.name == UploadLineageMarker.sectionName })
+        let marker = try XCTUnwrap(JSONSerialization.jsonObject(with: section.utf8JsonValue) as? [String: Any])
+        XCTAssertEqual(marker["Replaces"] as? [String], [testUID("IMG_1.HEIC").nodeID])
         let waiting = try XCTUnwrap(queueStore.entry(for: edited.source, revision: edited.revision))
         XCTAssertEqual(waiting.state, .discovered)
         XCTAssertEqual(waiting.attempts, edited.attempts)
@@ -2458,6 +2487,30 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertFalse(harness.journal.entry(for: edited.source).lastUploadWasEdit)
     }
 
+    func testOtherBytesOfAnUneditedPhotoNameNoReplacement() async throws {
+        let harness = try makeReplacementHarness()
+        let first = seedLibraryEntry("IMG_1.HEIC")
+        resolver.setEditRevision(.revision(UploadBackupRevision(rawValue: 7)), for: first.source.identifier)
+        _ = await makeRunner(identityResolver: harness.pipeline, editReplacement: harness.replacement)
+            .runUntilDrained()
+
+        // Photos delivers other bytes of the same unedited photo, for example after an iCloud download.
+        hasher.contentSeeds[first.source.identifier] = "redelivered"
+        harness.remote.active = [testUID("IMG_1.HEIC")]
+        let redelivered = seedLibraryEntry("IMG_1-1.HEIC", revisionOffset: 1)
+        _ = await makeRunner(identityResolver: harness.pipeline, editReplacement: harness.replacement)
+            .runUntilDrained()
+
+        XCTAssertEqual(state(of: redelivered), .completed)
+        XCTAssertEqual(uploader.requests.map(\.name), ["IMG_1.HEIC", "IMG_1-1.HEIC"])
+        XCTAssertTrue(harness.remote.trashCalls.isEmpty, "both photos stay")
+        XCTAssertTrue(harness.journal.entry(for: redelivered.source).isEmpty)
+        XCTAssertFalse(
+            uploader.requests.contains { request in
+                request.additionalMetadata.contains { $0.name == UploadLineageMarker.sectionName }
+            }, "an upload that keeps its earlier upload names no replacement")
+    }
+
     func testAnEditedSeriesKeepsItsEarlierUpload() async throws {
         let harness = try makeReplacementHarness()
         let edited = await uploadThenEdit(harness)
@@ -2469,6 +2522,10 @@ final class BackupSyncRunnerTests: XCTestCase {
         ).runUntilDrained()
 
         XCTAssertTrue(harness.remote.trashCalls.isEmpty, "series edits keep today's behavior until their own model")
+        XCTAssertFalse(
+            try XCTUnwrap(uploader.requests.first { $0.name == "IMG_1.JPG" }).additionalMetadata
+                .contains { $0.name == UploadLineageMarker.sectionName },
+            "a series keeps its earlier upload, so it names no replacement")
         XCTAssertEqual(state(of: edited), .completed)
         XCTAssertTrue(harness.journal.entry(for: edited.source).superseded.isEmpty)
         XCTAssertTrue(harness.journal.entry(for: edited.source).retired.isEmpty)
