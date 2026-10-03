@@ -544,6 +544,14 @@ final class UploadLineageReplacementTests: XCTestCase {
         XCTAssertFalse(server.steps.contains { $0.trashedByBackup.contains(head.nodeID) })
     }
 
+    func testBurstHeadIsNotATargetAtDiscovery() async throws {
+        let head = try seed("head")
+        server.setTags([7], of: head)
+        let result = try await pipeline.resolve(descriptor("next"))
+        XCTAssertEqual(result.decision, .upload)
+        XCTAssertTrue(journal.entry(for: source).allSuperseded.isEmpty)
+    }
+
     func testRAWWithoutTwinKeepsItsMain() async throws {
         try await uniqueResourceKeepsMain(filename: "Unique.DNG", mimeType: "image/x-adobe-dng")
     }

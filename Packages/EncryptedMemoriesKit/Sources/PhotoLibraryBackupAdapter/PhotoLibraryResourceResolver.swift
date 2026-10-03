@@ -269,7 +269,8 @@ public struct PhotoLibraryResourceResolver: BackupResourceResolving {
             photoLibraryCreationDate: info.creationDate,
             // The mapping lookup is expensive (PHCloudIdentifier.h), so only an edit, which can replace another
             // device's photo, pays for it.
-            externalIdentifierIsUnique: info.adjustmentTimestamp != nil
+            // A reverted photo keeps its adjustment timestamp but has no adjustments, so it pays nothing.
+            externalIdentifierIsUnique: info.hasAdjustments
                 && Self.isUniqueCloudIdentifier(cloudIdentifier, localIdentifier: entry.source.identifier),
             materializeWithProgress: primaryMaterializer,
             cleanup: { for url in exportedURLs.urls { tempStore.discard(url) } }

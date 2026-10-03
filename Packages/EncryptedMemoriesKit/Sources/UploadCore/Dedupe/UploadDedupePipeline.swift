@@ -352,7 +352,7 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
             let successors = try await checker.replacingMainLinkIDs(ofReplacedLink: scope.current ?? target)
             guard successors.complete, successors.links.subtracting([target]).isEmpty,
                 let compound = try await checker.compound(ofMainLink: target),
-                compound.externalIdentifier == identifier,
+                compound.externalIdentifier == identifier, !compound.tags.contains(PhotoTag.bursts.rawValue),
                 UploadRemoteReplacementSafety.isSameCaptureSecond(remote: compound.captureDate, local: creationDate),
                 UploadRemoteReplacementSafety.isNewerVersion(
                     localDate: descriptor.photoLibraryEditTime, remoteDate: compound.modificationDate)
