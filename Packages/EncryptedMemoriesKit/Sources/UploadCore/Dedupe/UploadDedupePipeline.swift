@@ -89,6 +89,10 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
         try await checker.remoteContentIndexHealth()
     }
 
+    public func identityRecord(for source: UploadSourceIdentity) -> UploadIdentityRecord? {
+        store.record(for: source)
+    }
+
     public func resolve(_ descriptor: UploadResourceDescriptor) async throws -> UploadPreflightResult {
         let corrected = ProtonPhotoNameCorrection.correctedName(for: descriptor.filename)
         let epoch = try await checker.hashKeyEpoch()
@@ -449,11 +453,9 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
             return UploadReplacementScope(superseded: [], retired: [], current: nil)
         }
         var entry = replacementJournal.entry(for: descriptor.source)
-        // An earlier upload of another client counts as well: the duplicate check proved it was this photo.
-        let provenOutcomes = [UploadIdentityManifestStore.Outcome.uploaded, .duplicateActive].map(\.rawValue)
         // The manifest names the last upload of this photo, also when its bytes did not change.
         var lastUpload: String?
-        if let cached, cached.outcome.map(provenOutcomes.contains) == true,
+        if let cached, cached.provesUpload,
             let link = cached.remoteLinkID, !link.isEmpty
         {
             lastUpload = link

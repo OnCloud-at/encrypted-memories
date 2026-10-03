@@ -808,6 +808,7 @@ public final class PhotoLibraryBackupController {
         guard catalogStore.isOperational() else {
             throw UploadError.backend(L10n.string("backup.error_local_state_unavailable"))
         }
+        try await sync.reconcileLateRendersOnce(engine: engine)
 
         // Enqueue recently added or changed assets first on every pass, including during backfill. A photo
         // saved by another app or edited while the initial full scan runs must not wait for it.

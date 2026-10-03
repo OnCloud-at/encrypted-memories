@@ -236,6 +236,12 @@ public protocol PhotoLibraryCatalogStore: Sendable {
     @discardableResult
     func clearFullScanResumePoint() -> Bool
 
+    // MARK: One-time upgrade reconciliation
+    /// True once the sync driver checked every present row that lists a rendered file against its backup.
+    func hasReconciledLateRenders() -> Bool
+    @discardableResult
+    func markLateRendersReconciled() -> Bool
+
     // MARK: Stable full-scan snapshot
     /// Starts replacing the in-progress scan snapshot. Appends are chunked to avoid one large in-memory
     /// identifier array.
