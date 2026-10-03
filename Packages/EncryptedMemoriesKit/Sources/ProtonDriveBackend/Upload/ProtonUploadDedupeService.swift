@@ -59,6 +59,8 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
         [:]
     private var remoteContentIndexGeneration = 0
     private var lastRemoteContentRefreshAt: Date?
+    /// The one lineage rebuild of this launch for each key epoch; every lineage read waits for it.
+    private var lineageRebuilds: [String: Task<Void, Never>] = [:]
     private static let remoteContentIndexLifetime: TimeInterval = 15
     /// Four metadata requests overlap network latency without producing the unbounded request fan-out
     /// used by the reference client. Decryption and the transactional store update remain serialized.
@@ -278,44 +280,66 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
         let material = try await resolveMaterial()
         try await refreshRemoteContentIndex(material: material)
         guard let lineageIndexStore else { return ([], false) }
+        await prepareLineageIndex(material: material)
         let links = lineageIndexStore.activeMainLinkIDs(forExternalIdentifier: identifier, hashKeyEpoch: material.epoch)
-        let health = lineageIndexStore.health(
-            hashKeyEpoch: material.epoch,
-            contentCheckpoint: contentIndexStore.remoteContentIndexCheckpoint(hashKeyEpoch: material.epoch))
-        return (links, health == .complete)
+        return (links, lineageHealth(material: material) == .complete)
     }
 
     func replacingMainLinkIDs(ofReplacedLink linkID: String) async throws -> (links: Set<String>, complete: Bool) {
         let material = try await resolveMaterial()
         try await refreshRemoteContentIndex(material: material)
         guard let lineageIndexStore else { return ([], false) }
+        await prepareLineageIndex(material: material)
         let links = lineageIndexStore.replacingMainLinkIDs(ofReplacedLink: linkID, hashKeyEpoch: material.epoch)
-        let health = lineageIndexStore.health(
-            hashKeyEpoch: material.epoch,
-            contentCheckpoint: contentIndexStore.remoteContentIndexCheckpoint(hashKeyEpoch: material.epoch))
-        return (links, health == .complete)
+        return (links, lineageHealth(material: material) == .complete)
     }
 
     func externalIdentifier(ofMainLink linkID: String) async throws -> (identifier: String?, complete: Bool) {
         let material = try await resolveMaterial()
         try await refreshRemoteContentIndex(material: material)
         guard let lineageIndexStore else { return (nil, false) }
+        await prepareLineageIndex(material: material)
         let identifier = lineageIndexStore.externalIdentifier(ofMainLink: linkID, hashKeyEpoch: material.epoch)
-        let health = lineageIndexStore.health(
-            hashKeyEpoch: material.epoch,
-            contentCheckpoint: contentIndexStore.remoteContentIndexCheckpoint(hashKeyEpoch: material.epoch))
-        return (identifier, health == .complete)
+        return (identifier, lineageHealth(material: material) == .complete)
     }
 
     func replacedLinkIDs(ofReplacingMain linkID: String) async throws -> (links: Set<String>, complete: Bool) {
         let material = try await resolveMaterial()
         try await refreshRemoteContentIndex(material: material)
         guard let lineageIndexStore else { return ([], false) }
+        await prepareLineageIndex(material: material)
         let links = lineageIndexStore.replacedLinkIDs(ofReplacingMain: linkID, hashKeyEpoch: material.epoch)
-        let health = lineageIndexStore.health(
+        return (links, lineageHealth(material: material) == .complete)
+    }
+
+    /// The lineage index fills only in a full index build. An account indexed before the lineage index existed, or
+    /// one whose lineage checkpoint fell behind, has none, so the first lineage read of a launch rebuilds the index
+    /// once for each key epoch, and every lineage read waits for that rebuild. A store that cannot write never
+    /// rebuilds. A failed rebuild leaves the index incomplete, so the reads stay unproven.
+    private func prepareLineageIndex(material: Material) async {
+        if let rebuild = lineageRebuilds[material.epoch] {
+            await rebuild.value
+            return
+        }
+        guard let lineageIndexStore, lineageIndexStore.acceptsWrites, lineageHealth(material: material) == .incomplete
+        else { return }
+        let rebuild = Task<Void, Never> {
+            do {
+                try await refreshRemoteContentIndex(material: material, rebuildsMissingLineage: true)
+            } catch {
+                DebugLog.log("[Dedupe] lineage index rebuild failed; reads remain incomplete - \(error)")
+            }
+        }
+        lineageRebuilds[material.epoch] = rebuild
+        await rebuild.value
+    }
+
+    /// Read after the lookup: a failed lookup marks the store incomplete.
+    private func lineageHealth(material: Material) -> UploadRemoteLineageIndexHealth {
+        lineageIndexStore?.health(
             hashKeyEpoch: material.epoch,
             contentCheckpoint: contentIndexStore.remoteContentIndexCheckpoint(hashKeyEpoch: material.epoch))
-        return (links, health == .complete)
+            ?? .incomplete
     }
 
     func prepareRemoteIndex(
@@ -415,13 +439,18 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
 
     // MARK: Remote content index
 
-    private func refreshRemoteContentIndex(material: Material) async throws {
-        if let lastRemoteContentRefreshAt,
+    private func refreshRemoteContentIndex(material: Material, rebuildsMissingLineage: Bool = false) async throws {
+        if !rebuildsMissingLineage, let lastRemoteContentRefreshAt,
             Date().timeIntervalSince(lastRemoteContentRefreshAt) < Self.remoteContentIndexLifetime
         {
             return
         }
-        if let remoteContentIndexTask { return try await remoteContentIndexTask.value }
+        if let running = remoteContentIndexTask {
+            try await running.value
+            guard rebuildsMissingLineage else { return }
+            // A rebuild runs after the refreshes that started before it, never beside them.
+            if let newer = remoteContentIndexTask, newer != running { try await newer.value }
+        }
 
         let session = self.session
         let crypto = self.crypto
@@ -434,16 +463,18 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
         let task = Task {
             try await Self.refreshRemoteContentIndex(
                 material: material, session: session, crypto: crypto, store: store,
-                lineageStore: lineageStore, progress: report)
+                lineageStore: lineageStore, rebuildsMissingLineage: rebuildsMissingLineage, progress: report)
         }
         remoteContentIndexTask = task
         do {
             try await task.value
             guard remoteContentIndexGeneration == generation else { throw CancellationError() }
-            remoteContentIndexTask = nil
+            if remoteContentIndexTask == task { remoteContentIndexTask = nil }
             lastRemoteContentRefreshAt = Date()
         } catch {
-            if remoteContentIndexGeneration == generation { remoteContentIndexTask = nil }
+            if remoteContentIndexGeneration == generation, remoteContentIndexTask == task {
+                remoteContentIndexTask = nil
+            }
             throw error
         }
     }
@@ -458,10 +489,15 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
         crypto: DriveCrypto,
         store: any UploadRemoteContentIndexStore,
         lineageStore: UploadRemoteLineageIndexStore?,
+        rebuildsMissingLineage: Bool = false,
         progress: @escaping @Sendable (UploadRemoteIndexPreparationProgress) async -> Void
     ) async throws {
         if let checkpoint = store.remoteContentIndexCheckpoint(hashKeyEpoch: material.epoch),
-            store.hasRemoteAssetIndexCheckpoint(hashKeyEpoch: material.epoch)
+            store.hasRemoteAssetIndexCheckpoint(hashKeyEpoch: material.epoch),
+            !rebuildsMissingLineage
+                || lineageStore.map({
+                    !$0.acceptsWrites || $0.hasCheckpoint(hashKeyEpoch: material.epoch, eventID: checkpoint.eventID)
+                }) ?? true
         {
             try await applyRemoteEvents(
                 from: checkpoint, material: material, session: session, crypto: crypto,
