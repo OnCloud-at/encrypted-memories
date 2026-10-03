@@ -330,7 +330,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
             var burstMemberIDs: [String: [String]]
             var burstEntries: [PhotosListEntry]?
             var authoritativeInventoryFingerprint: String?
-            // Only while photos trashed here may still appear in a listing.
+            // Only while photos trashed here or removed by an event may still appear in a listing.
             var listingRead: LibraryListingRead?
             let listingReadAt = Date()
 
@@ -351,6 +351,15 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                         supportSource = .continuity
                     }
                 }
+                // This load moves the event cursor past these events, while the next listing can still return the
+                // removed files. The waits are saved before the cursor moves, so a relaunch keeps them.
+                let removalsChanged =
+                    if let remoteChanges {
+                        recentlyDeleted.eventsRead(remoteChanges, volumeID: root.volumeID, at: listingReadAt)
+                    } else {
+                        recentlyDeleted.eventsLost()
+                    }
+                if removalsChanged { recentlyDeletedStore.save(recentlyDeleted.persisted) }
                 var entries: [PhotosListEntry]
                 if continuityRecoveryRequired {
                     entries = try await continuityRecovery.fetchInventory(
