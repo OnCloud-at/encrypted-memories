@@ -385,8 +385,8 @@ public final class PhotoLibraryBackupController {
 
     // MARK: - Sync lifecycle
 
-    /// Ordinary foreground pass. Explicit "Back up now" actions use `retryFailedAndSync()` so they
-    /// alone may clear durable retry dates; lifecycle/change-driven calls honor persisted backoff.
+    /// Ordinary foreground pass. Explicit "Back up now" actions use `retryFailedAndSync()` so they alone make
+    /// waiting rows due at once (each reason and its retry count stay); lifecycle/change-driven calls honor backoff.
     public func syncNow() {
         _ = startSync(owner: .foreground)
     }
@@ -436,34 +436,54 @@ public final class PhotoLibraryBackupController {
     /// they are successful policy outcomes reported as aggregate information, not failed work.
     public func failedItems(limit: Int = 200) -> [BackupFailedItem] {
         guard let queueStore else { return [] }
-        let states: [UploadBackupSyncQueueState] = [
-            .failed, .failedPermanent, .sourceMissing, .blockedByDraft, .discovered, .queuedForUpload,
-        ]
+        return Self.problemItems(in: queueStore, limit: limit)
+    }
+
+    /// The same list, read off the main actor: an offline pass gives every photo of a large library a reason, and
+    /// the list must still find the photos the person can fix behind all of them.
+    public func problemItems(limit: Int = 200) async -> [BackupFailedItem] {
+        guard let queueStore else { return [] }
+        return await Task.detached(priority: .utility) { Self.problemItems(in: queueStore, limit: limit) }.value
+    }
+
+    private nonisolated static func problemItems(
+        in queueStore: UploadBackupSyncQueueManifestStore, limit: Int
+    ) -> [BackupFailedItem] {
+        guard limit > 0 else { return [] }
+        // Photos the person can fix come first, so many rows of other kinds never push them out of the list.
+        let order: [BackupIssueCategory] = [.userResolvable, .decision, .automatic, .permanent]
+        var items: [BackupIssueCategory: [BackupFailedItem]] = [:]
+        queueStore.forEachProblemEntry { entry in
+            let item = BackupFailedItem(entry: entry)
+            if items[item.category, default: []].count < limit { items[item.category, default: []].append(item) }
+            return items[.userResolvable, default: []].count < limit
+        }
+        return Array(order.flatMap { items[$0] ?? [] }.prefix(limit))
+    }
+
+    /// Gives `apply` the problem list now and, while a pass runs, again after each `interval`: a photo can get
+    /// another reason during a pass without changing a count, and the list then follows within `interval`.
+    public func followProblemList(
+        limit: Int = 200, interval: Duration = .seconds(5), _ apply: ([BackupFailedItem]) -> Void
+    ) async {
+        apply(await problemItems(limit: limit))
+        while isSyncing {
+            try? await Task.sleep(for: interval)
+            guard !Task.isCancelled else { return }
+            let items = await problemItems(limit: limit)
+            guard !Task.isCancelled else { return }
+            apply(items)
+        }
+    }
+
+    /// Every row the person can resolve, independent of how many rows the list shows.
+    private func userResolvableEntries() -> [UploadBackupSyncQueueEntry] {
         var entries: [UploadBackupSyncQueueEntry] = []
-        for state in states where entries.count < limit {
-            entries += queueStore.entries(
-                in: state,
-                updatedBefore: .distantFuture,
-                limit: limit - entries.count
-            )
+        queueStore?.forEachProblemEntry { entry in
+            if BackupFailedItem(entry: entry).category == .userResolvable { entries.append(entry) }
+            return true
         }
-        return entries.map { entry in
-            let record = BackupIssueRecord.decode(entry.lastError)
-            let issue = record?.kind ?? Self.defaultIssue(for: entry.state)
-            let isPermanent = entry.state == .sourceMissing || entry.state == .failedPermanent
-            return BackupFailedItem(
-                id:
-                    "\(entry.source.kind.rawValue)/\(entry.source.identifier)/\(entry.source.resource.rawValue)#\(entry.revision.rawValue)",
-                filename: entry.originalFilename,
-                reason: record?.detail ?? Self.defaultIssueDetail(for: issue),
-                isPermanent: isPermanent,
-                issue: issue,
-                nextAttemptAt: record?.nextAttemptAt,
-                isRetryable: !isPermanent && issue.isRetryable,
-                source: entry.source,
-                revision: entry.revision
-            )
-        }
+        return entries
     }
 
     /// Hides a permanent item warning without ever changing the backup-success count.
@@ -535,10 +555,23 @@ public final class PhotoLibraryBackupController {
         }
     }
 
-    /// True while at least one failed item can still be retried (i.e. it is not a permanently-gone
-    /// local file), so the detail sheet can offer "try again".
-    public var hasRetryableFailures: Bool {
-        queueStore?.containsAny(in: [.failed, .blockedByDraft, .discovered, .queuedForUpload]) == true
+    /// Re-dates only rows the person can resolve. Automatic backoff and every reason stay intact.
+    public func retryUserResolvableWork() async {
+        guard let queueStore else { return }
+        let now = Date()
+        for entry in userResolvableEntries() {
+            // A row that the runner claimed or changed meanwhile keeps its new state.
+            _ = queueStore.reopenForUserRetry(
+                entry, attempts: entry.state == .failed ? 0 : entry.attempts, updatedAt: now)
+        }
+        guard queueStore.isOperational() else {
+            lastMessage = L10n.string("backup.error_local_state_unavailable")
+            refreshFromQueue()
+            return
+        }
+        await runner?.invalidateRemoteStateForUserRetry()
+        refreshFromQueue()
+        if !isSyncing { _ = startSync(owner: .manual) }
     }
 
     /// Platform adapters report whether an OS background opportunity was accepted. This changes only
@@ -893,6 +926,35 @@ public final class PhotoLibraryBackupController {
                         ).persistedValue, updatedAt: Date()))
             else { return false }
             // Keep the fixture independent of PhotoKit authorization and assets on the simulator.
+            isEnabled = true
+            isUserPaused = false
+            accessState = .denied
+            refreshFromQueue()
+            return true
+        }
+
+        /// Seeds the three native sections without PhotoKit or a network connection.
+        public func installFailedItemsFixtureForTesting(
+            kinds: [BackupIssueKind] = [.network, .accountStorage, .deletedElsewhere, .unsupported]
+        ) -> Bool {
+            guard let queueStore, pendingReplacementJournal != nil else { return false }
+            let retryAt = Date().addingTimeInterval(3_600)
+            for kind in kinds {
+                let state: UploadBackupSyncQueueState =
+                    kind == .deletedElsewhere ? .failedPermanent : kind == .unsupported ? .failed : .discovered
+                let source = UploadSourceIdentity(
+                    kind: .photoLibraryAsset, identifier: "fixture-\(kind.rawValue)")
+                guard
+                    queueStore.upsert(
+                        .init(
+                            source: source, revision: .init(rawValue: 1),
+                            originalFilename: "\(kind.rawValue) fixture.heic", state: state,
+                            lastError: BackupIssueRecord(
+                                kind: kind, detail: "Fixture technical detail",
+                                nextAttemptAt: kind.category == .automatic ? retryAt : nil
+                            ).persistedValue, updatedAt: retryAt))
+                else { return false }
+            }
             isEnabled = true
             isUserPaused = false
             accessState = .denied
@@ -1427,34 +1489,6 @@ public final class PhotoLibraryBackupController {
     /// stays in sync and never pins the display after backup ends, even on cancelled/exiting paths.
     private func updateIdleTimerIfNeeded() {
         idleTimerHook?(isSyncing)
-    }
-
-    private static func defaultIssue(for state: UploadBackupSyncQueueState) -> BackupIssueKind {
-        switch state {
-        case .sourceMissing: .sourceMissing
-        case .blockedByDraft: .remoteDraft
-        case .failedPermanent: .remoteDraftStale
-        case .skippedRemoteDeletion: .remoteDeletion
-        default: .unknown
-        }
-    }
-
-    private static func defaultIssueDetail(for issue: BackupIssueKind) -> String {
-        switch issue {
-        case .network: L10n.string("backup.issue_network")
-        case .deviceStorage: L10n.string("backup.issue_device_storage")
-        case .remoteDraft: L10n.string("backup.issue_remote_draft")
-        case .remoteDraftStale: L10n.string("backup.issue_remote_draft_stale")
-        case .sourceMissing: L10n.string("backup.error_source_missing")
-        case .permission: L10n.string("backup.issue_permission")
-        case .unsupported: L10n.string("backup.issue_unsupported")
-        case .remoteService: L10n.string("backup.issue_remote_service")
-        case .localState: L10n.string("backup.error_local_state_unavailable")
-        case .remoteDeletion: L10n.string("backup.state_skipped_remote_deletion")
-        case .deletedElsewhere: L10n.string("backup.issue_deleted_elsewhere")
-        case .accountStorage: L10n.string("backup.issue_account_storage")
-        case .unknown: L10n.string("backup.fail_reason_generic")
-        }
     }
 
     /// Non-secret debugging hint recorded on the lock (platform + pid); never load-bearing.

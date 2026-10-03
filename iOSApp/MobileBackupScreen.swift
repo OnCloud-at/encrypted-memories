@@ -302,6 +302,7 @@ private struct MobilePhotoBackupSections: View {
                         .frame(maxWidth: .infinity, alignment: .leading)
                     }
                     .buttonStyle(.plain)
+                    .accessibilityIdentifier("backup.waitingItems")
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -481,53 +482,63 @@ private struct MobileFailedBackupSheet: View {
                     }
                 } else {
                     List {
-                        Section {
-                            ForEach(items) { item in
-                                HStack(alignment: .top, spacing: 12) {
-                                    Image(systemName: item.isPermanent ? "trash.slash" : "arrow.clockwise.circle")
-                                        .foregroundStyle(item.isPermanent ? ProtonColor.textWeak : .orange)
-                                        .font(.body)
-                                    VStack(alignment: .leading, spacing: 2) {
-                                        Text(item.filename)
-                                            .font(.subheadline)
-                                            .lineLimit(1)
-                                            .truncationMode(.middle)
-                                        Text(item.reason)
-                                            .font(.caption)
-                                            .foregroundStyle(ProtonColor.textWeak)
-                                            .fixedSize(horizontal: false, vertical: true)
-                                        if let retryDescription = item.retryDescription {
-                                            Text(retryDescription)
-                                                .font(.caption2)
-                                                .foregroundStyle(ProtonColor.textWeak)
+                        ForEach(BackupIssueSection.allCases) { section in
+                            let sectionItems = items.filter { $0.category.section == section }
+                            if !sectionItems.isEmpty {
+                                Section {
+                                    ForEach(sectionItems) { item in
+                                        HStack(alignment: .top, spacing: 12) {
+                                            Image(systemName: item.category.symbolName)
+                                                .foregroundStyle(item.isPermanent ? ProtonColor.textWeak : .orange)
+                                                .font(.body)
+                                            VStack(alignment: .leading, spacing: 2) {
+                                                Text(item.filename)
+                                                    .font(.subheadline)
+                                                    .lineLimit(1)
+                                                    .truncationMode(.middle)
+                                                Text(item.reason)
+                                                    .font(.caption)
+                                                    .foregroundStyle(ProtonColor.textWeak)
+                                                    .fixedSize(horizontal: false, vertical: true)
+                                                if let retryDescription = item.retryDescription {
+                                                    Text(retryDescription)
+                                                        .font(.caption2)
+                                                        .foregroundStyle(ProtonColor.textWeak)
+                                                }
+                                            }
+                                        }
+                                        .padding(.vertical, 2)
+                                        .contentShape(Rectangle())
+                                        .onTapGesture {
+                                            if item.issue == .deletedElsewhere { deletionItem = item }
+                                        }
+                                        .accessibilityElement(children: .combine)
+                                        .accessibilityAddTraits(item.issue == .deletedElsewhere ? .isButton : [])
+                                        .accessibilityIdentifier("backup.failedItem.\(item.filename)")
+                                        .contextMenu {
+                                            if item.issue == .deletedElsewhere {
+                                                deletionActions(for: item, place: "menu")
+                                            }
+                                        }
+                                        .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+                                            if item.issue == .deletedElsewhere {
+                                                deletionActions(for: item, place: "swipe")
+                                            } else if item.isPermanent {
+                                                Button(L10n.string("backup.failed_item_dismiss")) {
+                                                    controller.dismissFailedItem(item)
+                                                    items.removeAll { $0.id == item.id }
+                                                }
+                                                .tint(ProtonColor.textWeak)
+                                                .accessibilityIdentifier(
+                                                    "backup.dismissFailedItem.swipe.\(item.filename)")
+                                            }
                                         }
                                     }
-                                }
-                                .padding(.vertical, 2)
-                                .contentShape(Rectangle())
-                                .onTapGesture {
-                                    if item.issue == .deletedElsewhere { deletionItem = item }
-                                }
-                                .accessibilityElement(children: .combine)
-                                .accessibilityAddTraits(item.issue == .deletedElsewhere ? .isButton : [])
-                                .accessibilityIdentifier("backup.failedItem.\(item.filename)")
-                                .contextMenu {
-                                    if item.issue == .deletedElsewhere { deletionActions(for: item, place: "menu") }
-                                }
-                                .swipeActions(edge: .trailing, allowsFullSwipe: true) {
-                                    if item.issue == .deletedElsewhere {
-                                        deletionActions(for: item, place: "swipe")
-                                    } else if item.isPermanent {
-                                        Button(L10n.string("backup.failed_item_dismiss")) {
-                                            controller.dismissFailedItem(item)
-                                            items.removeAll { $0.id == item.id }
-                                        }
-                                        .tint(ProtonColor.textWeak)
-                                    }
+                                } header: {
+                                    Text(section.localizedTitle)
+                                        .accessibilityIdentifier("backup.issueSection.\(section.rawValue)")
                                 }
                             }
-                        } footer: {
-                            Text(L10n.string("backup.failed_sheet_footer"))
                         }
                     }
                 }
@@ -538,14 +549,15 @@ private struct MobileFailedBackupSheet: View {
                     Button(L10n.string("backup.failed_sheet_done")) { dismiss() }
                 }
                 .mobileVisibilityPriority(.high)
-                if controller.hasRetryableFailures {
+                if items.offersUserRetry {
                     ToolbarItem(placement: .confirmationAction) {
                         Button(L10n.string("backup.failed_sheet_retry")) {
                             Task {
-                                await controller.retryFailedAndSync()
+                                await controller.retryUserResolvableWork()
                                 dismiss()
                             }
                         }
+                        .accessibilityIdentifier("backup.retryUserResolvable.sheet")
                     }
                 }
             }
@@ -560,7 +572,8 @@ private struct MobileFailedBackupSheet: View {
             Button(L10n.string("action.cancel"), role: .cancel) { deletionItem = nil }
         }
         .presentationDetents([.medium, .large])
-        .onAppear { items = controller.failedItems() }
+        // A photo can need the person while the list is open; Try again then appears.
+        .task(id: controller.status.problemListKey) { await controller.followProblemList { items = $0 } }
     }
 
     @ViewBuilder
@@ -580,7 +593,7 @@ private struct MobileFailedBackupSheet: View {
     }
 
     private func refreshAfterDecision(_ item: BackupFailedItem) {
-        items = controller.failedItems().filter { $0.id != item.id || $0.issue == .deletedElsewhere }
         deletionItem = nil
+        Task { items = await controller.problemItems().filter { $0.id != item.id || $0.issue == .deletedElsewhere } }
     }
 }
