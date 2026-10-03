@@ -90,6 +90,15 @@ public struct UploadResourceDescriptor: Sendable {
     /// Set on a secondary of an edited photo that replaces an earlier upload. Only a remote copy that is a related
     /// photo of `mainRemoteLinkID` counts; a copy under the replaced photo moves to the trash with it.
     public let requiresRelatedMatch: Bool
+    /// iCloud identity and edit evidence for remote replacement discovery. Neither value is persisted.
+    public let externalIdentifier: String?
+    public let isEditedPhoto: Bool
+    /// Local adjustment timestamp, distinct from metadata modification and capture dates.
+    /// This optional replacement evidence is never persisted in an operational store.
+    public let photoLibraryEditTime: Date?
+    public let photoLibraryCreationDate: Date?
+    public let externalIdentifierIsUnique: Bool
+    public let originalSHA1Hex: Set<String>
 
     public init(
         source: UploadSourceIdentity,
@@ -101,7 +110,13 @@ public struct UploadResourceDescriptor: Sendable {
         workIntent: LibraryWorkIntent = .userInitiated,
         mainResource: UploadSourceIdentity? = nil,
         mainRemoteLinkID: String? = nil,
-        requiresRelatedMatch: Bool = false
+        requiresRelatedMatch: Bool = false,
+        externalIdentifier: String? = nil,
+        isEditedPhoto: Bool = false,
+        photoLibraryEditTime: Date? = nil,
+        photoLibraryCreationDate: Date? = nil,
+        externalIdentifierIsUnique: Bool = false,
+        originalSHA1Hex: Set<String> = []
     ) {
         self.source = source
         self.fileURL = fileURL
@@ -113,6 +128,12 @@ public struct UploadResourceDescriptor: Sendable {
         self.mainResource = mainResource
         self.mainRemoteLinkID = mainRemoteLinkID
         self.requiresRelatedMatch = requiresRelatedMatch
+        self.externalIdentifier = externalIdentifier
+        self.isEditedPhoto = isEditedPhoto
+        self.photoLibraryEditTime = photoLibraryEditTime
+        self.photoLibraryCreationDate = photoLibraryCreationDate
+        self.externalIdentifierIsUnique = externalIdentifierIsUnique
+        self.originalSHA1Hex = originalSHA1Hex
     }
 
     public func withWorkIntent(_ intent: LibraryWorkIntent) -> UploadResourceDescriptor {
@@ -124,10 +145,27 @@ public struct UploadResourceDescriptor: Sendable {
         copy(mainRemoteLinkID: mainRemoteLinkID, requiresRelatedMatch: requiresRelatedMatch)
     }
 
+    /// Carries the primary's existing metadata into the shared duplicate check.
+    public func withPhotoLibraryIdentity(
+        identifier: String?, edited: Bool, editTime: Date? = nil, creationDate: Date? = nil,
+        isUnique: Bool = false, originalSHA1Hex: Set<String> = []
+    ) -> UploadResourceDescriptor {
+        copy(
+            externalIdentifier: identifier, isEditedPhoto: edited, photoLibraryEditTime: editTime,
+            photoLibraryCreationDate: creationDate, externalIdentifierIsUnique: isUnique,
+            originalSHA1Hex: originalSHA1Hex)
+    }
+
     private func copy(
         workIntent: LibraryWorkIntent? = nil,
         mainRemoteLinkID: String? = nil,
-        requiresRelatedMatch: Bool? = nil
+        requiresRelatedMatch: Bool? = nil,
+        externalIdentifier: String? = nil,
+        isEditedPhoto: Bool? = nil,
+        photoLibraryEditTime: Date? = nil,
+        photoLibraryCreationDate: Date? = nil,
+        externalIdentifierIsUnique: Bool? = nil,
+        originalSHA1Hex: Set<String>? = nil
     ) -> UploadResourceDescriptor {
         UploadResourceDescriptor(
             source: source,
@@ -139,7 +177,13 @@ public struct UploadResourceDescriptor: Sendable {
             workIntent: workIntent ?? self.workIntent,
             mainResource: mainResource,
             mainRemoteLinkID: mainRemoteLinkID ?? self.mainRemoteLinkID,
-            requiresRelatedMatch: requiresRelatedMatch ?? self.requiresRelatedMatch
+            requiresRelatedMatch: requiresRelatedMatch ?? self.requiresRelatedMatch,
+            externalIdentifier: externalIdentifier ?? self.externalIdentifier,
+            isEditedPhoto: isEditedPhoto ?? self.isEditedPhoto,
+            photoLibraryEditTime: photoLibraryEditTime ?? self.photoLibraryEditTime,
+            photoLibraryCreationDate: photoLibraryCreationDate ?? self.photoLibraryCreationDate,
+            externalIdentifierIsUnique: externalIdentifierIsUnique ?? self.externalIdentifierIsUnique,
+            originalSHA1Hex: originalSHA1Hex ?? self.originalSHA1Hex
         )
     }
 }
@@ -635,6 +679,42 @@ public struct UploadFileHasher: UploadHashing {
     }
 }
 
+/// Live evidence for a main and its complete active related-resource list.
+public struct UploadRemoteCompound: Sendable {
+    public struct File: Sendable {
+        public let linkID: String
+        public let contentHash: String
+        public let nameHash: String
+        public let mimeType: String
+
+        public init(linkID: String, contentHash: String, nameHash: String, mimeType: String) {
+            self.linkID = linkID
+            self.contentHash = contentHash
+            self.nameHash = nameHash
+            self.mimeType = mimeType
+        }
+    }
+
+    public let main: File
+    public let related: [File]
+    public let tags: Set<Int>
+    public let externalIdentifier: String?
+    public let captureDate: Date?
+    public let modificationDate: Date?
+
+    public init(
+        main: File, related: [File], tags: Set<Int>, externalIdentifier: String?,
+        captureDate: Date?, modificationDate: Date?
+    ) {
+        self.main = main
+        self.related = related
+        self.tags = tags
+        self.externalIdentifier = externalIdentifier
+        self.captureDate = captureDate
+        self.modificationDate = modificationDate
+    }
+}
+
 /// Proton-keyed identity hashing + the remote duplicate lookup. Implemented in ProtonDriveBackend
 /// (the only layer that can reach the photos root hash key and the authenticated API).
 public protocol UploadDuplicateChecking: Sendable {
@@ -671,6 +751,14 @@ public protocol UploadDuplicateChecking: Sendable {
     /// Complete means complete as of the content index event frontier.
     /// Own uploads recorded through recordUploaded and events newer than the checkpoint are not in these tables yet.
     func replacingMainLinkIDs(ofReplacedLink linkID: String) async throws -> (links: Set<String>, complete: Bool)
+    /// Identity of an active main. A missing identifier is unknown, not evidence of another asset.
+    func externalIdentifier(ofMainLink linkID: String) async throws -> (identifier: String?, complete: Bool)
+    /// Live encrypted iOS.photos modification time. Missing or unreadable metadata is unknown.
+    func modificationDate(ofMainLink linkID: String) async throws -> Date?
+    /// Live complete compound metadata. Missing or unreadable evidence returns nil.
+    func compound(ofMainLink linkID: String) async throws -> UploadRemoteCompound?
+    /// Earlier links named by an active main's lineage. Uses the same completeness boundary as the head reads.
+    func replacedLinkIDs(ofReplacingMain linkID: String) async throws -> (links: Set<String>, complete: Bool)
     /// Brings the persistent remote identity index current before a queue starts resolving items.
     /// Backends without such an index use the default no-op implementation.
     func prepareRemoteIndex(
@@ -694,12 +782,20 @@ public protocol UploadDuplicateChecking: Sendable {
 }
 
 public extension UploadDuplicateChecking {
+    func modificationDate(ofMainLink linkID: String) async throws -> Date? { nil }
+    func compound(ofMainLink linkID: String) async throws -> UploadRemoteCompound? { nil }
     func activeMainLinkIDs(
         forExternalIdentifier identifier: String
     ) async throws -> (links: Set<String>, complete: Bool) {
         ([], false)
     }
     func replacingMainLinkIDs(ofReplacedLink linkID: String) async throws -> (links: Set<String>, complete: Bool) {
+        ([], false)
+    }
+    func externalIdentifier(ofMainLink linkID: String) async throws -> (identifier: String?, complete: Bool) {
+        (nil, false)
+    }
+    func replacedLinkIDs(ofReplacingMain linkID: String) async throws -> (links: Set<String>, complete: Bool) {
         ([], false)
     }
     func nameHashes(forCorrectedNames names: [String]) async throws -> [String] {

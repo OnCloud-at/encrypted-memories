@@ -79,9 +79,10 @@ public struct PhotoLibraryResourceResolver: BackupResourceResolving {
         // modification date must not be the temp file's mtime (that would defeat manifest hash
         // reuse across re-exports), so it uses the asset's stable creation date.
         let captureDate = asset.creationDate ?? asset.modificationDate ?? Date()
+        let cloudIdentifier = cloudIdentifierProvider(entry.source.identifier)
         let additionalMetadata = try PhotoLibraryUploadMetadataBuilder.metadata(
             for: asset,
-            cloudIdentifier: cloudIdentifierProvider(entry.source.identifier)
+            cloudIdentifier: cloudIdentifier
         )
         // Track deferred exports so the runner can release them as soon as the entry settles.
         let exportedURLs = ExportedURLBox()
@@ -264,9 +265,25 @@ public struct PhotoLibraryResourceResolver: BackupResourceResolving {
             additionalMetadata: additionalMetadata,
             captureDate: captureDate,
             secondaries: secondaries,
+            photoLibraryEditTime: info.adjustmentTimestamp,
+            photoLibraryCreationDate: info.creationDate,
+            // The mapping lookup is expensive (PHCloudIdentifier.h), so only an edit, which can replace another
+            // device's photo, pays for it.
+            // A reverted photo keeps its adjustment timestamp but has no adjustments, so it pays nothing.
+            externalIdentifierIsUnique: info.hasAdjustments
+                && Self.isUniqueCloudIdentifier(cloudIdentifier, localIdentifier: entry.source.identifier),
             materializeWithProgress: primaryMaterializer,
             cleanup: { for url in exportedURLs.urls { tempStore.discard(url) } }
         )
+    }
+
+    private static func isUniqueCloudIdentifier(_ identifier: String?, localIdentifier: String) -> Bool {
+        guard let identifier,
+            let cloud = PHCloudIdentifier(archivalStringValue: identifier),
+            let mapping = PHPhotoLibrary.shared().localIdentifierMappings(for: [cloud])[cloud],
+            case .success(let mapped) = mapping
+        else { return false }
+        return mapped == localIdentifier
     }
 
     /// Collects committed export URLs so the whole compound can be discarded in one cleanup call.

@@ -158,7 +158,8 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
             correctedName: corrected, nameHash: nameHash,
             sha1Hex: sha1Hex, sha1Digest: sha1Digest, contentHash: contentHash
         )
-        let replacement = try replacementScope(for: descriptor, cached: cached, sha1Hex: sha1Hex)
+        let replacement = try await replacementScope(
+            for: descriptor, cached: cached, sha1Hex: sha1Hex, nameHash: nameHash, contentHash: contentHash)
         func result(_ decision: UploadDuplicateDecision) -> UploadPreflightResult {
             UploadPreflightResult(identity: identity, decision: decision)
         }
@@ -319,9 +320,122 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
         return result(nameDecision)
     }
 
+    /// Complete lineage reads can discover a live main without a local manifest. Failed or incomplete reads leave
+    /// the existing replacement behavior unchanged. Unedited assets and assets without an iCloud ID use no new read.
+    private func replacementScope(
+        for descriptor: UploadResourceDescriptor,
+        cached: UploadIdentityRecord?,
+        sha1Hex: String, nameHash: String, contentHash: String
+    ) async throws -> UploadReplacementScope {
+        var scope = try localReplacementScope(for: descriptor, cached: cached, sha1Hex: sha1Hex)
+        guard let replacementJournal, descriptor.source.kind == .photoLibraryAsset,
+            descriptor.source.resource == .primary, descriptor.mainRemoteLinkID == nil,
+            let identifier = descriptor.externalIdentifier, !identifier.isEmpty
+        else { return scope }
+        // Runs on every pass, also on a retry whose remote target the journal already holds.
+        scope = try await excludingForeignTargets(
+            from: scope, identifier: identifier, source: descriptor.source, journal: replacementJournal)
+        guard descriptor.isEditedPhoto, descriptor.externalIdentifierIsUnique,
+            let creationDate = descriptor.photoLibraryCreationDate
+        else { return scope }
+
+        // Build every optional fact before changing the local scope or journal.
+        let head: String
+        let ancestors: Set<String>
+        let foreign: Set<String>
+        let candidateVisibility: [String: RemoteLinkVisibility]
+        do {
+            let identity = try await checker.activeMainLinkIDs(forExternalIdentifier: identifier)
+            guard identity.complete, identity.links.count == 1, let target = identity.links.first,
+                !scope.superseded.contains(target), target != scope.current
+            else { return scope }
+            let successors = try await checker.replacingMainLinkIDs(ofReplacedLink: scope.current ?? target)
+            guard successors.complete, successors.links.subtracting([target]).isEmpty,
+                let compound = try await checker.compound(ofMainLink: target),
+                compound.externalIdentifier == identifier, !compound.tags.contains(PhotoTag.bursts.rawValue),
+                UploadRemoteReplacementSafety.isSameCaptureSecond(remote: compound.captureDate, local: creationDate),
+                UploadRemoteReplacementSafety.isNewerVersion(
+                    localDate: descriptor.photoLibraryEditTime, remoteDate: compound.modificationDate)
+            else { return scope }
+            var originals: Set<String> = []
+            for sha1 in descriptor.originalSHA1Hex {
+                originals.insert(try await checker.contentHash(forSHA1Hex: sha1))
+            }
+            guard UploadRemoteReplacementSafety.hasAnchor(compound, originalHashes: originals) else { return scope }
+            let ancestry = try await checker.replacedLinkIDs(ofReplacingMain: target)
+            guard ancestry.complete else { return scope }
+            var candidates = try await duplicates(forNameHash: nameHash)
+            if let content = try await checker.findDuplicate(contentHash: contentHash) { candidates.append(content) }
+            let matches = Set(
+                candidates.filter { $0.linkState == .active && $0.contentHash == contentHash }
+                    .compactMap(\.linkID))
+            let asked = scope.retired.union(scope.superseded).union(ancestry.links).union(matches).union([target])
+            var knownForeign: Set<String> = []
+            for linkID in asked.sorted() {
+                let external = try await checker.externalIdentifier(ofMainLink: linkID)
+                guard external.complete else { return scope }
+                if let remoteIdentifier = external.identifier, remoteIdentifier != identifier {
+                    knownForeign.insert(linkID)
+                }
+            }
+            guard !knownForeign.contains(target) else { return scope }
+            candidateVisibility = try await checker.linkVisibility(of: asked.sorted())
+            try Task.checkCancellation()
+            head = target
+            ancestors = ancestry.links.subtracting(knownForeign)
+            foreign = knownForeign
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            try Task.checkCancellation()
+            return scope
+        }
+        scope.retired.subtract(foreign)
+        if let current = scope.current, foreign.contains(current) { scope.current = nil }
+        try replacementJournal.addRemoteSuperseded(PhotoUID(volumeID: "", nodeID: head), for: descriptor.source)
+        let remoteAncestors = ancestors.subtracting(scope.retired).subtracting(scope.superseded)
+        scope.superseded.insert(head)
+        scope.retired.formUnion(ancestors.subtracting(scope.superseded))
+        scope.knownForeignLinks.formUnion(foreign)
+        scope.liveHeads = [head]
+        scope.candidateVisibility = candidateVisibility
+        scope.remoteAncestors = remoteAncestors
+        return scope
+    }
+
+    /// A locally adopted duplicate can belong to another asset: a known different iCloud identifier proves that, so
+    /// such a photo never becomes a replacement target. Failed or incomplete reads keep the scope unchanged.
+    private func excludingForeignTargets(
+        from scope: UploadReplacementScope, identifier: String, source: UploadSourceIdentity,
+        journal: any EditReplacementJournaling
+    ) async throws -> UploadReplacementScope {
+        guard !scope.superseded.isEmpty else { return scope }
+        var foreign: Set<String> = []
+        do {
+            for linkID in scope.superseded.sorted() {
+                let external = try await checker.externalIdentifier(ofMainLink: linkID)
+                guard external.complete else { return scope }
+                if let remote = external.identifier, remote != identifier { foreign.insert(linkID) }
+            }
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            try Task.checkCancellation()
+            return scope
+        }
+        guard !foreign.isEmpty else { return scope }
+        try journal.settle(foreign, related: [], trashed: false, for: source)
+        var scope = scope
+        scope.superseded.subtract(foreign)
+        scope.retired.subtract(foreign)
+        if let current = scope.current, foreign.contains(current) { scope.current = nil }
+        scope.knownForeignLinks.formUnion(foreign)
+        return scope
+    }
+
     /// A photo-library primary with other bytes than its proven earlier upload was edited. The journal keeps the
     /// earlier photo before the record below forgets it, so the backup can replace it after the upload.
-    private func replacementScope(
+    private func localReplacementScope(
         for descriptor: UploadResourceDescriptor,
         cached: UploadIdentityRecord?,
         sha1Hex: String
@@ -380,13 +494,26 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
             .compactMap(\.linkID)
         var asked = replacement.retired.union(matches)
         if let current = replacement.current { asked.insert(current) }
-        let visibility = try await checker.linkVisibility(of: asked.sorted())
+        let visibility: [String: RemoteLinkVisibility]
+        if let optional = replacement.candidateVisibility {
+            visibility = optional
+        } else {
+            visibility = try await checker.linkVisibility(of: asked.sorted())
+        }
         func isLiveMain(_ linkID: String) -> Bool {
             visibility[linkID].map { $0.isActive && $0.mainPhotoLinkID == nil } ?? false
         }
-        let adoptable = Set(matches.filter(isLiveMain)).subtracting(replacement.superseded)
+        let ownMatches = Set(matches.filter(isLiveMain)).filter {
+            !replacement.knownForeignLinks.contains($0)
+        }
+        let adoptable = ownMatches.subtracting(replacement.superseded.subtracting(replacement.liveHeads))
         let restored = replacement.retired.filter(isLiveMain).subtracting(adoptable)
-        guard replacement.current.map(isLiveMain) == true || !restored.isEmpty || !adoptable.isEmpty else {
+            .subtracting(replacement.remoteAncestors)
+
+        guard
+            replacement.current.map(isLiveMain) == true || !replacement.liveHeads.isEmpty
+                || !restored.isEmpty || !adoptable.isEmpty
+        else {
             // Nothing proves the photo live. Who removed it stays unknown, so the earlier rule applies: the
             // photos of the replacement do not count, and a trashed copy outside them is a deletion by the person.
             // An active copy under a main photo is a related file, such as the hidden original under a replaced
@@ -410,7 +537,8 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
         if !restored.isEmpty {
             try replacementJournal?.unretire(restored, for: descriptor.source)
             for linkID in restored.sorted() {
-                try replacementJournal?.addSuperseded(PhotoUID(volumeID: "", nodeID: linkID), for: descriptor.source)
+                let uid = PhotoUID(volumeID: "", nodeID: linkID)
+                try replacementJournal?.addSuperseded(uid, for: descriptor.source)
             }
         }
         // The photo is in the library, so a trashed or deleted copy of these bytes is an earlier version that the
@@ -792,6 +920,10 @@ private struct UploadReplacementScope {
     /// The photo that showed before this upload: the last upload that the manifest names, else the newest
     /// superseded photo of the journal.
     var current: String?
+    var knownForeignLinks: Set<String> = []
+    var liveHeads: Set<String> = []
+    var remoteAncestors: Set<String> = []
+    var candidateVisibility: [String: RemoteLinkVisibility]?
 
     var isEmpty: Bool { superseded.isEmpty && retired.isEmpty }
 }

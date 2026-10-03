@@ -13,6 +13,8 @@ final class EditScenarioLibrary: UploadBackupAssetCatalog, PhotoLibraryAssetEnum
         let basename: String
         let original: Data
         let pairedVideo: Data?
+        var renderedPairedVideo: Data?
+        var cloudIdentifier: String?
         let captureTime = Date(timeIntervalSince1970: 1_720_000_000)
         var render: Data?
         var adjustmentData: Data?
@@ -41,6 +43,10 @@ final class EditScenarioLibrary: UploadBackupAssetCatalog, PhotoLibraryAssetEnum
                         role: .adjustmentData, originalFilename: "Adjustments.AAE", mimeType: "application/octet-stream"
                     ))
             }
+            if renderedPairedVideo != nil {
+                resources.append(
+                    .init(role: .fullSizePairedVideo, originalFilename: "RenderPair.mp4", mimeType: "video/quicktime"))
+            }
             if pairedVideo != nil {
                 resources.append(
                     .init(role: .pairedVideo, originalFilename: "\(basename).MOV", mimeType: "video/quicktime"))
@@ -50,7 +56,7 @@ final class EditScenarioLibrary: UploadBackupAssetCatalog, PhotoLibraryAssetEnum
                 modificationDate: modificationDate,
                 pixelWidth: 10, pixelHeight: 10, durationSeconds: pairedVideo == nil ? 0 : 1,
                 isLivePhoto: pairedVideo != nil, isVideo: false, resources: resources,
-                cloudIdentifier: "cloud-\(identifier)", hasAdjustments: hasAdjustments,
+                cloudIdentifier: cloudIdentifier ?? "cloud-\(identifier)", hasAdjustments: hasAdjustments,
                 adjustmentTimestamp: adjustmentTimestamp)
         }
     }
@@ -81,6 +87,14 @@ final class EditScenarioLibrary: UploadBackupAssetCatalog, PhotoLibraryAssetEnum
                 identifier: identifier, basename: basename, original: original ?? Data("original-\(identifier)".utf8),
                 pairedVideo: live ? Data("video-\(identifier)".utf8) : nil)
         }
+    }
+
+    func shareCloudIdentifier(_ identifier: String, between assetIDs: [String]) {
+        lock.withLock { for assetID in assetIDs { assets[assetID]?.cloudIdentifier = identifier } }
+    }
+
+    func renderPairedVideo(_ bytes: String, identifier: String = "asset-1") {
+        lock.withLock { assets[identifier]?.renderedPairedVideo = Data(bytes.utf8) }
     }
 
     func edit(
@@ -222,7 +236,11 @@ final class EditScenarioLibrary: UploadBackupAssetCatalog, PhotoLibraryAssetEnum
         return BackupResolvedResource(
             candidate: candidate, descriptor: try descriptor(plan.primary, asset: asset, materialize: true),
             mediaType: plan.primary.mimeType ?? "image/heic", additionalMetadata: metadata,
-            captureDate: asset.captureTime, secondaries: secondaries)
+            captureDate: asset.captureTime, secondaries: secondaries,
+            photoLibraryEditTime: asset.adjustmentTimestamp, photoLibraryCreationDate: asset.info.creationDate,
+            externalIdentifierIsUnique: snapshot.filter {
+                !$0.deleted && $0.info.cloudIdentifier == asset.info.cloudIdentifier
+            }.count == 1)
     }
 
     func descriptor(
@@ -232,6 +250,7 @@ final class EditScenarioLibrary: UploadBackupAssetCatalog, PhotoLibraryAssetEnum
         switch item.role {
         case .fullSizePhoto: bytes = try XCTUnwrap(asset.render)
         case .pairedVideo: bytes = try XCTUnwrap(asset.pairedVideo)
+        case .fullSizePairedVideo: bytes = try XCTUnwrap(asset.renderedPairedVideo)
         case .originalPhoto: bytes = asset.original
         case .adjustmentData: bytes = try XCTUnwrap(asset.adjustmentData)
         default: throw UploadError.backend("The scenario has no bytes for resource \(item.role.rawValue)")
@@ -274,7 +293,7 @@ final class EditScenarioHarness {
     private var backupState: UploadBackupStateManifestStore!
     private(set) var journal: EditReplacementJournalFileStore!
     /// Survives a relaunch like the stored index of a device.
-    private let index: EditScenarioDeviceIndex
+    let index: EditScenarioDeviceIndex
     private var pipeline: UploadDedupePipeline!
     private var runner: BackupSyncRunner!
     private var engine: UploadBackupSyncEngine!
@@ -288,7 +307,8 @@ final class EditScenarioHarness {
 
     init(
         live: Bool = false, basename: String = "IMG_1", server: EditScenarioServer = EditScenarioServer(),
-        library sharedLibrary: EditScenarioLibrary? = nil, clock: BackupTestClock = BackupTestClock()
+        library sharedLibrary: EditScenarioLibrary? = nil, clock: BackupTestClock = BackupTestClock(),
+        staleLineageIndex: Bool = false
     ) throws {
         self.server = server
         self.clock = clock
@@ -302,7 +322,7 @@ final class EditScenarioHarness {
             library.add(live: live, basename: basename)
         }
         checkedSteps = server.steps.count
-        index = EditScenarioDeviceIndex(server: server)
+        index = EditScenarioDeviceIndex(server: server, staleLineage: staleLineageIndex, now: { clock.now })
         try open()
     }
 
@@ -435,7 +455,7 @@ final class EditScenarioHarness {
             store: identities, checker: index, resourceCoordinator: coordinator, replacementJournal: journal,
             now: { [clock] in clock.now })
         let replacement = EditedPhotoReplacement(
-            remote: server, albums: server, relations: server, identities: identities, journal: journal)
+            remote: server, albums: server, relations: index, identities: identities, journal: journal)
         let preflight = UploadBackupPreflightIndex(store: backupState, now: { [clock] in clock.now })
         engine = UploadBackupSyncEngine(
             preflight: preflight, queue: queue, remoteProofResolver: pipeline, now: { [clock] in clock.now })
@@ -702,6 +722,12 @@ final class EditScenarioHarness {
                     resources.contains {
                         $0.contentHash == EditScenarioServer.contentHash(Data(Insecure.SHA1.hash(data: video)))
                     }, "S3 the Live Photo main lacks its active video", file: file, line: line)
+            }
+            if let renderedVideo = asset.renderedPairedVideo {
+                check(
+                    resources.contains {
+                        $0.contentHash == EditScenarioServer.contentHash(Data(Insecure.SHA1.hash(data: renderedVideo)))
+                    }, "S3 the Live Photo main lacks its rendered video", file: file, line: line)
             }
             if links.contains(where: { $0.assetID == asset.identifier && $0.favorite }) {
                 check(main.favorite, "S4 the favorite must move", file: file, line: line)

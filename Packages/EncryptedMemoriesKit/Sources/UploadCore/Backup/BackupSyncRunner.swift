@@ -898,7 +898,7 @@ public actor BackupSyncRunner {
     private func recordUploadEvidence(_ entry: UploadBackupSyncQueueEntry) {
         let replaces =
             entry.source.kind == .photoLibraryAsset && entry.source.resource == .primary
-            ? editReplacement?.journal.entry(for: entry.source).superseded ?? [] : []
+            ? editReplacement?.journal.entry(for: entry.source).allSuperseded ?? [] : []
         events?.recordUploadEvidence(source: entry.source, revision: entry.revision, replaces: replaces)
     }
 
@@ -1295,7 +1295,12 @@ public actor BackupSyncRunner {
                         holdsOriginal: EditedPhotoReplacement.holdsOriginal(
                             editRevision: resolved.candidate.snapshot.editRevision,
                             secondaries: resolved.secondaries.map(\.descriptor.source.resource)
-                        )
+                        ),
+                        externalIdentifier: resolved.descriptor.externalIdentifier,
+                        localEditTime: resolved.photoLibraryEditTime,
+                        localCreationDate: resolved.descriptor.photoLibraryCreationDate,
+                        externalIdentifierIsUnique: resolved.descriptor.externalIdentifierIsUnique,
+                        originalSHA1Hex: resolved.descriptor.originalSHA1Hex
                     )
                     SupportEventTrail.shared.record(
                         Self.supportEventKind(of: outcome), subject: entry.source.identifier)

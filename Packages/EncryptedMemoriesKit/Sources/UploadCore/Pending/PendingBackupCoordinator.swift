@@ -692,7 +692,7 @@ public actor PendingBackupCoordinator {
     private func earlierUploads(of key: PendingSourceKey) -> [PhotoUID] {
         guard key.kind == .photoLibraryAsset, let replacementJournal else { return [] }
         return replacementJournal.entry(for: UploadSourceIdentity(kind: key.kind, identifier: key.identifier))
-            .superseded
+            .allSuperseded
     }
 
     /// The checkmark shows for `checkmarkDuration` after the backup finished, then the tile shows no badge.

@@ -155,6 +155,23 @@ public final class UploadRemoteLineageIndexStore: @unchecked Sendable {
         }
     }
 
+    public func externalIdentifier(ofMainLink linkID: String, hashKeyEpoch: String) -> String? {
+        lock.withLock {
+            linksLocked(
+                "SELECT external_id FROM remote_link_identity WHERE key_epoch=? AND remote_link=? AND is_main=1;",
+                values: [hashKeyEpoch, linkID]
+            ).first
+        }
+    }
+
+    public func replacedLinkIDs(ofReplacingMain linkID: String, hashKeyEpoch: String) -> Set<String> {
+        lock.withLock {
+            linksLocked(
+                "SELECT replaced_link FROM remote_lineage WHERE key_epoch=? AND replacing_link=?;",
+                values: [hashKeyEpoch, linkID])
+        }
+    }
+
     @discardableResult
     public func replaceRows(
         identities: [UploadRemoteLinkIdentityRecord], lineage: [UploadRemoteLineageRecord],

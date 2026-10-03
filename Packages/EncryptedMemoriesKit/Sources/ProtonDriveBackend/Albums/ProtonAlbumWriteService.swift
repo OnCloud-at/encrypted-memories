@@ -795,6 +795,9 @@ struct AlbumPhotoMetadata: Decodable, Sendable {
 
     struct Photo: Decodable, Sendable {
         let relatedPhotoLinkIDs: [String]
+        let hasCompleteRelatedPhotoLinkIDs: Bool
+        let captureTime: Double?
+        let tags: [Int]?
         let activeRevision: Revision?
 
         struct Revision: Decodable, Sendable {
@@ -803,13 +806,19 @@ struct AlbumPhotoMetadata: Decodable, Sendable {
         }
 
         enum CodingKeys: String, CodingKey {
+            case captureTime = "CaptureTime"
+            case tags = "Tags"
             case relatedPhotoLinkIDs = "RelatedPhotosLinkIDs"
             case activeRevision = "ActiveRevision"
         }
 
         init(from decoder: Decoder) throws {
             let values = try decoder.container(keyedBy: CodingKeys.self)
-            relatedPhotoLinkIDs = try values.decodeIfPresent([String].self, forKey: .relatedPhotoLinkIDs) ?? []
+            let related = try values.decodeIfPresent([String].self, forKey: .relatedPhotoLinkIDs)
+            captureTime = try? values.decodeIfPresent(Double.self, forKey: .captureTime)
+            tags = try? values.decodeIfPresent([Int].self, forKey: .tags)
+            hasCompleteRelatedPhotoLinkIDs = related != nil
+            relatedPhotoLinkIDs = related ?? []
             activeRevision = try values.decodeIfPresent(Revision.self, forKey: .activeRevision)
         }
     }

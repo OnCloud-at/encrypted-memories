@@ -110,6 +110,7 @@ public struct BackupResolvedResource: Sendable {
     /// Best local capture-time evidence (file creation date for folder sync, PHAsset creation
     /// date for photo-library assets) - drives the remote timeline placement.
     public let captureDate: Date
+    public let photoLibraryEditTime: Date?
     /// Secondary resources of the compound, uploaded after the primary settles. Empty for plain
     /// files and non-Live photo-library assets.
     public let secondaries: [BackupSecondaryResource]
@@ -130,6 +131,9 @@ public struct BackupResolvedResource: Sendable {
         additionalMetadata: [PhotoUploadAdditionalMetadata] = [],
         captureDate: Date,
         secondaries: [BackupSecondaryResource] = [],
+        photoLibraryEditTime: Date? = nil,
+        photoLibraryCreationDate: Date? = nil,
+        externalIdentifierIsUnique: Bool = false,
         materialize: (@Sendable () async throws -> UploadResourceDescriptor)? = nil,
         materializeWithProgress: (
             @Sendable (BackupResourcePreparationReporter) async throws -> UploadResourceDescriptor
@@ -137,7 +141,23 @@ public struct BackupResolvedResource: Sendable {
         cleanup: (@Sendable () -> Void)? = nil
     ) {
         self.candidate = candidate
-        self.descriptor = descriptor
+        let photos = additionalMetadata.first { $0.name == "iOS.photos" }.flatMap {
+            try? JSONDecoder().decode(PhotoUploadMetadataEncoder.IOSPhotos.self, from: $0.utf8JsonValue)
+        }
+        self.photoLibraryEditTime = photoLibraryEditTime
+        let originalRoles = ["photoKit.originalPhoto.", "photoKit.originalVideo."]
+        let originals = Set(
+            secondaries.compactMap { secondary -> String? in
+                guard originalRoles.contains(where: secondary.descriptor.source.resource.rawValue.hasPrefix),
+                    let digest = secondary.descriptor.precomputedSHA1Digest
+                else { return nil }
+                return UploadContentSHA1.hexString(digest: digest)
+            })
+        self.descriptor = descriptor.withPhotoLibraryIdentity(
+            identifier: photos?.iCloudID ?? candidate.snapshot.externalIdentity?.identifier,
+            edited: candidate.snapshot.editRevision == .unavailable, editTime: photoLibraryEditTime,
+            creationDate: photoLibraryCreationDate, isUnique: externalIdentifierIsUnique,
+            originalSHA1Hex: originals)
         self.mediaType = mediaType
         self.additionalMetadata = additionalMetadata
         self.captureDate = captureDate

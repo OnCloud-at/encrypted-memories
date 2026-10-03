@@ -6,6 +6,9 @@ public struct EditReplacementJournalEntry: Sendable, Equatable, Codable {
     /// Photos that held earlier bytes of this primary. The backup moves them to the trash after the edited photo and
     /// its secondaries are uploaded.
     public var superseded: [PhotoUID]
+    /// Targets discovered only through the optional remote index. An incomplete read must keep these targets. They
+    /// stay out of `superseded`, which earlier app versions read: those versions lack the guards that prove them.
+    public var remoteSuperseded: [String]?
     /// Links the backup already moved to the trash, with their related photos. A trashed copy among them is no
     /// deletion by the person.
     public var retired: [String]
@@ -17,9 +20,10 @@ public struct EditReplacementJournalEntry: Sendable, Equatable, Codable {
 
     public init(
         superseded: [PhotoUID] = [], retired: [String] = [], uploadedEdit: Bool? = nil,
-        retireIntent: [String: [String]]? = nil
+        retireIntent: [String: [String]]? = nil, remoteSuperseded: [String]? = nil
     ) {
         self.superseded = superseded
+        self.remoteSuperseded = remoteSuperseded
         self.retired = retired
         self.uploadedEdit = uploadedEdit
         self.retireIntent = retireIntent
@@ -29,8 +33,15 @@ public struct EditReplacementJournalEntry: Sendable, Equatable, Codable {
     /// replaced photos in earlier builds.
     public var lastUploadWasEdit: Bool { uploadedEdit ?? !retired.isEmpty }
 
+    /// Local and remote targets of the replacement.
+    public var allSuperseded: [PhotoUID] {
+        superseded
+            + (remoteSuperseded ?? []).filter { id in !superseded.contains { $0.nodeID == id } }
+            .map { PhotoUID(volumeID: "", nodeID: $0) }
+    }
+
     public var isEmpty: Bool {
-        superseded.isEmpty && retired.isEmpty && uploadedEdit != true && (retireIntent?.isEmpty ?? true)
+        allSuperseded.isEmpty && retired.isEmpty && uploadedEdit != true && (retireIntent?.isEmpty ?? true)
     }
 }
 
@@ -41,6 +52,8 @@ public protocol EditReplacementJournaling: Sendable {
     /// One in-memory snapshot for admission after a queue reset, without reading each queued source.
     func supersededSourceIdentifiers() -> Set<String>
     func addSuperseded(_ uid: PhotoUID, for source: UploadSourceIdentity) throws
+    /// Adds a target that requires a complete index read before retirement. Existing local targets stay local.
+    func addRemoteSuperseded(_ uid: PhotoUID, for source: UploadSourceIdentity) throws
     /// Records related links before trashing their mains, without retiring active links.
     func prepareToRetire(_ relatedByMain: [String: [String]], for source: UploadSourceIdentity) throws
     /// Clears an earlier intent when a retry confirms that its main is still active.
@@ -169,7 +182,7 @@ public final class EditReplacementJournalFileStore: EditReplacementJournaling, @
         return lock.withLock {
             Set(
                 entries.compactMap { key, entry in
-                    guard !entry.superseded.isEmpty, key.hasPrefix(prefix), key.hasSuffix(suffix) else { return nil }
+                    guard !entry.allSuperseded.isEmpty, key.hasPrefix(prefix), key.hasSuffix(suffix) else { return nil }
                     return String(key.dropFirst(prefix.count).dropLast(suffix.count))
                 })
         }
@@ -179,6 +192,13 @@ public final class EditReplacementJournalFileStore: EditReplacementJournaling, @
         try update(source) { entry in
             guard !entry.superseded.contains(where: { $0.nodeID == uid.nodeID }) else { return }
             entry.superseded.append(uid)
+        }
+    }
+
+    public func addRemoteSuperseded(_ uid: PhotoUID, for source: UploadSourceIdentity) throws {
+        try update(source) { entry in
+            guard !entry.allSuperseded.contains(where: { $0.nodeID == uid.nodeID }) else { return }
+            entry.remoteSuperseded = (entry.remoteSuperseded ?? []) + [uid.nodeID]
         }
     }
 
@@ -202,6 +222,8 @@ public final class EditReplacementJournalFileStore: EditReplacementJournaling, @
     ) throws {
         try update(source) { entry in
             entry.superseded.removeAll { nodeIDs.contains($0.nodeID) }
+            entry.remoteSuperseded?.removeAll(where: nodeIDs.contains)
+            if entry.remoteSuperseded?.isEmpty == true { entry.remoteSuperseded = nil }
             var confirmedRelated = related
             for nodeID in nodeIDs {
                 if trashed { confirmedRelated.formUnion(entry.retireIntent?[nodeID] ?? []) }
@@ -289,8 +311,8 @@ extension EditReplacementJournalFileStore: EditReplacementSupportSource {
         lock.withLock {
             var result = EditReplacementSupportSnapshot()
             for entry in entries.values {
-                if !entry.superseded.isEmpty { result.sourcesWithSupersededEntries += 1 }
-                result.totalSuperseded += entry.superseded.count
+                if !entry.allSuperseded.isEmpty { result.sourcesWithSupersededEntries += 1 }
+                result.totalSuperseded += entry.allSuperseded.count
                 result.totalRetired += entry.retired.count
                 if !(entry.retireIntent?.isEmpty ?? true) { result.rowsWithRetireIntent += 1 }
             }
