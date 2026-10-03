@@ -107,6 +107,21 @@ public struct EditReplacementSupportSnapshot: Codable, Sendable, Equatable {
     public init() {}
 }
 
+/// What the pending grid showed in its latest merge: counts only, no photo or source identifier.
+public struct PendingGridSupportSnapshot: Codable, Sendable, Equatable {
+    public var merges = 0
+    public var lastMergeAt: Date?
+    public var pendingTiles = 0
+    public var localPhotosShown = 0
+    public var remotePhotosListed = 0
+    public var remotePhotosHidden = 0
+    public var anchoredPhotos = 0
+    public var trashedEarlierPhotosHidden = 0
+    public var photosWaitingForTheirTile = 0
+
+    public init() {}
+}
+
 /// Sources expose only allowlisted values. Export never asks them to refresh remote state.
 public protocol LibrarySyncSupportSource: AnyObject, Sendable {
     func librarySyncSupportSnapshot(now: Date) async -> LibrarySyncSupportSnapshot?

@@ -918,6 +918,25 @@ import Testing
             "the Proton photo continues the tile's texture, never the earlier photo's")
     }
 
+    @Test func theSupportReportCountsWhatTheGridHidesWithoutIdentifiers() async {
+        let sources = SupportDiagnosticsSources(trail: SupportEventTrail())
+        let presenter = PendingTimelinePresenter(now: { Date() }, supportSources: sources)
+        let earlier = PhotoUID(volumeID: "vol", nodeID: "earlier")
+        let uploaded = PhotoUID(volumeID: "vol", nodeID: "0-new")
+        presenter.setRemote(TimelineSnapshot(orderedItems: sameSecond(["a", "earlier", "0-new"])))
+        let done = tile("p", second: 10, handoff: uploaded, settled: true, badge: .done, replaces: [earlier])
+        presenter.setPending(pending([done], membership: 1), enabled: true)
+        _ = await settle(presenter)
+
+        let grid = sources.pendingGridSnapshot()
+        #expect(grid.merges >= 1)
+        #expect(grid.pendingTiles == 1)
+        #expect(grid.remotePhotosListed == 3)
+        #expect(grid.remotePhotosHidden == 1)
+        #expect(grid.trashedEarlierPhotosHidden == 1)
+        #expect(grid.lastMergeAt != nil)
+    }
+
     @Test func aTrashedEarlierPhotoStaysHiddenUntilTheListingDropsIt() async {
         let presenter = PendingTimelinePresenter()
         let earlier = PhotoUID(volumeID: "vol", nodeID: "earlier")

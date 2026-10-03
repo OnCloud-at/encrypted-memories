@@ -493,6 +493,15 @@ public actor BackupSyncRunner {
         return queue.claimRunnable(limit: claimLimit, claimedAt: now())
     }
 
+    static func supportEventKind(of outcome: EditedPhotoReplacement.Outcome) -> SupportEventTrail.Kind {
+        switch outcome {
+        case .replaced: .editReplaced
+        case .waiting: .editWaiting
+        case .replacementGone: .editReplacementGone
+        case .kept: .editKept
+        }
+    }
+
     /// The wait before an edit checks again whether it can replace its earlier upload. Each check reads and hashes
     /// the photo again, which is expensive for a video, so the wait doubles from `first` up to six hours. The first
     /// check after an upload usually succeeds, because the retry uploads the missing original.
@@ -1288,6 +1297,8 @@ public actor BackupSyncRunner {
                             secondaries: resolved.secondaries.map(\.descriptor.source.resource)
                         )
                     )
+                    SupportEventTrail.shared.record(
+                        Self.supportEventKind(of: outcome), subject: entry.source.identifier)
                     switch outcome {
                     case .replaced(let retiredAny):
                         if retiredAny { await identityResolver.invalidateCachedRemoteState() }

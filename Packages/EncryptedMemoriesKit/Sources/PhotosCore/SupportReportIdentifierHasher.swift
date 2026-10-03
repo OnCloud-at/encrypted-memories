@@ -2,7 +2,7 @@ import CryptoKit
 import Foundation
 
 /// Create one helper for each report. Its random salt stays private and is never encoded or persisted.
-/// Part 1 exports counts only; later allowlisted identifier fields must use this helper instead of raw values.
+/// Every identifier field of a report must use this helper instead of the raw value.
 public struct SupportReportIdentifierHasher: Sendable {
     private let salt = SymmetricKey(size: .bits256)
 

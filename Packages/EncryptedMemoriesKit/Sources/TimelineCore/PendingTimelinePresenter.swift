@@ -188,6 +188,7 @@ public final class PendingTimelinePresenter {
     private var computeGeneration: UInt64 = 0
     private var presentation = PendingTimelinePresentation.empty
     private var lastMembershipRevision: UInt64?
+    private let supportSources: SupportDiagnosticsSources
 
     public convenience init(replacementLookup: (@Sendable () -> [PendingReplacementHandoff])? = nil) {
         self.init(now: { Date() }, replacementLookup: replacementLookup)
@@ -196,11 +197,13 @@ public final class PendingTimelinePresenter {
     package init(
         now: @escaping @Sendable () -> Date,
         replacementLookup: (@Sendable () -> [PendingReplacementHandoff])? = nil,
-        sleep: @escaping @Sendable (Duration) async throws -> Void = { try await Task.sleep(for: $0) }
+        sleep: @escaping @Sendable (Duration) async throws -> Void = { try await Task.sleep(for: $0) },
+        supportSources: SupportDiagnosticsSources = .shared
     ) {
         self.now = now
         self.sleep = sleep
         self.replacementLookup = replacementLookup
+        self.supportSources = supportSources
     }
 
     public var current: PendingTimelinePresentation { presentation }
@@ -284,6 +287,28 @@ public final class PendingTimelinePresenter {
         }
     }
 
+    /// Counts only: the support report never sees which photos the grid shows or hides.
+    private func publishSupportCounts(_ result: MergeResult) {
+        let listed = remote.items.count
+        let shownRemote = result.snapshot.items.count - result.localUIDs.count
+        let tiles = pending.tiles.count
+        let anchored = anchors.count
+        let trashed = trashedEarlier.count
+        let waiting = waitingForTile.count
+        let time = now()
+        supportSources.publishPendingGrid { grid in
+            grid.merges += 1
+            grid.lastMergeAt = time
+            grid.pendingTiles = tiles
+            grid.localPhotosShown = result.localUIDs.count
+            grid.remotePhotosListed = listed
+            grid.remotePhotosHidden = max(0, listed - shownRemote)
+            grid.anchoredPhotos = anchored
+            grid.trashedEarlierPhotosHidden = trashed
+            grid.photosWaitingForTheirTile = waiting
+        }
+    }
+
     private func apply(_ result: MergeResult, generation: UInt64) {
         guard generation == computeGeneration else { return }
         computeTask = nil
@@ -325,6 +350,7 @@ public final class PendingTimelinePresenter {
                 contentEpochs: contentEpochs, handovers: anchors.mapValues(\.tile)),
             isCanonical: result.localUIDs.isEmpty && anchors.isEmpty && !result.hidesRemote
         )
+        publishSupportCounts(result)
         onFeedUpdate?(result.localUIDs, result.adoptions, result.revised)
         if !result.presentKeys.isEmpty { onRemotePresence?(result.presentKeys) }
         presentLocal = result.presentLocal

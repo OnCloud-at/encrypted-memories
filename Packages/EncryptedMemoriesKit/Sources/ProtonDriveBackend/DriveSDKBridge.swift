@@ -601,15 +601,20 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                 if recentlyDeleted.libraryRefreshed(lists: libraryUIDs.contains) { await reportRecentlyDeleted() }
             }
             librarySupport.lastSuccessfulLoad = .init(timestamp: Date(), sourcePath: supportSource)
+            recordSupportEvent(
+                .libraryLoadSucceeded, sourcePath: supportSource, count: librarySupport.listedPhotoCount)
             return TimelineLoadSnapshot(sections: sections, validationToken: validationToken)
         } catch is TimelineContinuityRecoveryPendingError {
             librarySupport.lastFailedLoad = .init(
                 timestamp: Date(), sourcePath: supportSource, errorKind: .continuityPending)
+            recordSupportEvent(
+                .libraryLoadFailed, sourcePath: supportSource, errorKind: .continuityPending)
             DebugLog.log("timeline: continuity recovery is still converging")
             throw TimelineContinuityRecoveryPendingError()
         } catch {
-            librarySupport.lastFailedLoad = .init(
-                timestamp: Date(), sourcePath: supportSource, errorKind: Self.supportLoadErrorKind(error))
+            let errorKind = Self.supportLoadErrorKind(error)
+            librarySupport.lastFailedLoad = .init(timestamp: Date(), sourcePath: supportSource, errorKind: errorKind)
+            recordSupportEvent(.libraryLoadFailed, sourcePath: supportSource, errorKind: errorKind)
             // A transport error, cancellation, or other invalid observation breaks the quiet window. A future
             // recovery attempt must collect all three qualified full inventories again.
             continuityRecovery.reset()
@@ -639,6 +644,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         let validationToken = store.validationToken()
         guard !items.isEmpty || validationToken != nil else { return nil }
         librarySupport.lastSuccessfulLoad = .init(timestamp: Date(), sourcePath: .cache)
+        recordSupportEvent(.libraryLoadSucceeded, sourcePath: .cache, count: items.count)
         DebugLog.log("timeline: served \(items.count) items from SQLite cache ✓")
         let sections =
             items.isEmpty
@@ -2338,6 +2344,16 @@ extension DriveSDKBridge: LibrarySyncSupportSource {
         }
         result.photosTrashedHereAwaitingLibrary = recentlyDeleted.photosTrashedHereAwaitingLibraryCount
         return result
+    }
+
+    /// A load that ends after shutdown belongs to a signed-out session, so it never reaches the trail that
+    /// `unregisterLibrary` cleared.
+    private func recordSupportEvent(
+        _ kind: SupportEventTrail.Kind, sourcePath: LibrarySyncSupportSnapshot.SourcePath,
+        errorKind: LibrarySyncSupportSnapshot.ErrorKind? = nil, count: Int? = nil
+    ) {
+        guard !isShutDown else { return }
+        SupportEventTrail.shared.record(kind, sourcePath: sourcePath, errorKind: errorKind, count: count)
     }
 
     private static func supportLoadErrorKind(_ error: Error) -> LibrarySyncSupportSnapshot.ErrorKind {
