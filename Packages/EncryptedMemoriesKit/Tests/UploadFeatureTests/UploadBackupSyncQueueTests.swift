@@ -422,7 +422,7 @@ final class UploadBackupSyncQueueTests: XCTestCase {
         XCTAssertEqual(store.makeRetryableWorkEligible(updatedAt: now), 1)
         let retried = try XCTUnwrap(store.entry(for: entry.source, revision: entry.revision))
         XCTAssertEqual(retried.updatedAt, now)
-        XCTAssertEqual(retried.lastError, record.persistedValue)
+        // JSONEncoder fixes no key order, so the stored text can differ; the decoded issue must not.
         XCTAssertEqual(BackupIssueRecord.decode(retried.lastError), record)
         XCTAssertEqual(retried.attempts, 3)
         XCTAssertEqual(retried.state, .discovered)
