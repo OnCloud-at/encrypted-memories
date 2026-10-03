@@ -128,7 +128,7 @@ final class SupportDiagnosticsExporterTests: XCTestCase {
         )
         let text = String(decoding: data, as: UTF8.self)
 
-        XCTAssertTrue(text.contains("\"schemaVersion\" : 1"))
+        XCTAssertTrue(text.contains("\"schemaVersion\" : 2"))
         XCTAssertTrue(text.contains("\"appBuild\""))
         XCTAssertTrue(text.contains("\"appCommit\""))
         XCTAssertTrue(text.contains("serious"))

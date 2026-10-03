@@ -32,10 +32,18 @@ public enum SupportDiagnosticsExporter {
         struct Backup: Codable {
             let queues: [BackupQueueSupportSnapshot]
             let editReplacements: [EditReplacementSupportSnapshot]
+            let pendingGrid: PendingGridSupportSnapshot
+        }
+
+        struct RecentEvents: Codable {
+            let events: [SupportEventTrail.ExportedEvent]
+            /// Older events that the bounded trail no longer holds.
+            let dropped: Int
         }
 
         let librarySync: LibrarySyncSupportSnapshot
         let backup: Backup
+        let recentEvents: RecentEvents
         let schemaVersion: Int
         let generatedAt: Date
         let appVersion: String
@@ -52,20 +60,25 @@ public enum SupportDiagnosticsExporter {
         resourceCoordinator: LibraryResourceCoordinator = .shared,
         diagnostics: PhotoDiagnostics = .shared,
         bundle: Bundle = .main,
-        sources: SupportDiagnosticsSources = .shared
+        sources: SupportDiagnosticsSources = .shared,
+        trail: SupportEventTrail = .shared
     ) async throws -> Data {
         let snapshot = runtimeState.snapshot()
         let metrics = await resourceCoordinator.metrics()
         let buildInfo = AppBuildInfo(bundle: bundle)
         let now = Date()
         let librarySync = await sources.librarySnapshot(now: now)
+        // One salt per report: hashes link the events of one report, never two reports.
+        let trailExport = trail.export(hashingWith: SupportReportIdentifierHasher())
         let report = Report(
             librarySync: librarySync,
             backup: Report.Backup(
                 queues: sources.queueSnapshots(),
-                editReplacements: sources.editReplacementSnapshots()
+                editReplacements: sources.editReplacementSnapshots(),
+                pendingGrid: sources.pendingGridSnapshot()
             ),
-            schemaVersion: 1,
+            recentEvents: Report.RecentEvents(events: trailExport.events, dropped: trailExport.dropped),
+            schemaVersion: 2,
             generatedAt: now,
             appVersion: buildInfo.version ?? "unknown",
             appBuild: buildInfo.build ?? "unknown",

@@ -15,8 +15,12 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
     private let lock = NSLock()
     private let observerLock = NSLock()
     private var changeObserver: (@Sendable (UploadBackupSyncQueueChange) -> Void)?
+    private let supportTrail: SupportEventTrail
 
-    public init?(url: URL, policy: LibraryDatabasePolicy = .conservative) {
+    public init?(
+        url: URL, policy: LibraryDatabasePolicy = .conservative, supportTrail: SupportEventTrail = .shared
+    ) {
+        self.supportTrail = supportTrail
         try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         // This queue can contain the only durable receipt for a remotely committed upload.
         // Open failures must therefore fail closed and leave the database untouched for a
@@ -1143,7 +1147,10 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
             lastError: lastError,
             updatedAt: updatedAt
         )
-        if result { notify(UploadBackupSyncQueueChange(sources: [source])) }
+        if result {
+            recordSupportEvent(source: source, state: state, lastError: lastError)
+            notify(UploadBackupSyncQueueChange(sources: [source]))
+        }
         return result
     }
 
@@ -1162,7 +1169,10 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
             lastError: lastError,
             updatedAt: updatedAt
         )
-        if result { notify(UploadBackupSyncQueueChange(sources: [source])) }
+        if result {
+            recordSupportEvent(source: source, state: .needsRemoteReconciliation, lastError: lastError)
+            notify(UploadBackupSyncQueueChange(sources: [source]))
+        }
         return result
     }
 
@@ -1390,13 +1400,7 @@ extension UploadBackupSyncQueueManifestStore: BackupQueueSupportSource {
             while step == SQLITE_ROW {
                 let state = BackupQueueSupportSnapshot.State(rawValue: columnText(stmt, 0) ?? "") ?? .unknown
                 let resource = Self.supportResourceKind(columnText(stmt, 1) ?? "")
-                let error = columnText(stmt, 2)
-                let reason: BackupQueueSupportSnapshot.Reason
-                if let issue = BackupIssueRecord.decode(error) {
-                    reason = BackupQueueSupportSnapshot.Reason(rawValue: issue.kind.rawValue) ?? .unknown
-                } else {
-                    reason = (error?.isEmpty ?? true) ? .none : .unclassified
-                }
+                let reason = Self.supportReason(columnText(stmt, 2))
                 let count = Int(sqlite3_column_int64(stmt, 3))
                 total += count
                 states[state, default: 0] += count
@@ -1429,6 +1433,37 @@ extension UploadBackupSyncQueueManifestStore: BackupQueueSupportSource {
             }
             return result
         }
+    }
+
+    /// Only the issue kind of a stored error leaves the device, never its text.
+    private static func supportReason(_ error: String?) -> BackupQueueSupportSnapshot.Reason {
+        if let issue = BackupIssueRecord.decode(error) {
+            return BackupQueueSupportSnapshot.Reason(rawValue: issue.kind.rawValue) ?? .unknown
+        }
+        return (error?.isEmpty ?? true) ? .none : .unclassified
+    }
+
+    /// Transitions that end, pause, or retry a row. Steady progress (checking, hashing, uploading) is left out,
+    /// so the bounded trail keeps the events that explain a stuck or failed photo.
+    private func recordSupportEvent(
+        source: UploadSourceIdentity, state: UploadBackupSyncQueueState, lastError: String?
+    ) {
+        let kind: SupportEventTrail.Kind
+        switch state {
+        case .completed: kind = .backupRowCompleted
+        case .alreadyBackedUp: kind = .backupRowAlreadyBackedUp
+        case .skippedRemoteDeletion: kind = .backupRowSkipped
+        case .needsRemoteReconciliation: kind = .backupRowNeedsReconciliation
+        case .failed: kind = .backupRowWaiting
+        case .discovered, .queuedForUpload:
+            guard lastError?.isEmpty == false else { return }
+            kind = .backupRowWaiting
+        case .blockedByDraft, .failedPermanent, .paused, .sourceMissing, .dismissedFailure: kind = .backupRowParked
+        default: return
+        }
+        supportTrail.record(
+            kind, subject: source.identifier, resourceKind: Self.supportResourceKind(source.resource.rawValue),
+            reason: Self.supportReason(lastError))
     }
 
     private static func supportResourceKind(_ raw: String) -> BackupQueueSupportSnapshot.ResourceKind {

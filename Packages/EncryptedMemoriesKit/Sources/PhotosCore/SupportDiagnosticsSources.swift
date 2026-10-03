@@ -14,8 +14,12 @@ public final class SupportDiagnosticsSources: @unchecked Sendable {
     private weak var library: (any LibrarySyncSupportSource)?
     private var queues: [WeakSource] = []
     private var journals: [WeakSource] = []
+    private var pendingGrid = PendingGridSupportSnapshot()
+    private let trail: SupportEventTrail
 
-    public init() {}
+    public init(trail: SupportEventTrail = .shared) {
+        self.trail = trail
+    }
 
     public func registerLibrary(_ source: any LibrarySyncSupportSource) {
         lock.withLock {
@@ -27,12 +31,16 @@ public final class SupportDiagnosticsSources: @unchecked Sendable {
 
     /// An old session cannot clear the newer session's diagnostic sources.
     public func unregisterLibrary(_ source: any LibrarySyncSupportSource) {
-        lock.withLock {
-            guard library === source else { return }
+        let unregistered = lock.withLock {
+            guard library === source else { return false }
             library = nil
             queues.removeAll()
             journals.removeAll()
+            pendingGrid = PendingGridSupportSnapshot()
+            return true
         }
+        // The trail holds identifiers of this account in memory.
+        if unregistered { trail.clear() }
     }
 
     public func registerQueue(_ source: any BackupQueueSupportSource, key: String) {
@@ -47,6 +55,15 @@ public final class SupportDiagnosticsSources: @unchecked Sendable {
             journals.removeAll { $0.value == nil }
             journals.append(WeakSource(key: key, value: source))
         }
+    }
+
+    /// The pending grid replaces its counts after each merge and keeps a running merge count.
+    public func publishPendingGrid(_ update: (inout PendingGridSupportSnapshot) -> Void) {
+        lock.withLock { update(&pendingGrid) }
+    }
+
+    public func pendingGridSnapshot() -> PendingGridSupportSnapshot {
+        lock.withLock { pendingGrid }
     }
 
     public func librarySnapshot(now: Date) async -> LibrarySyncSupportSnapshot {

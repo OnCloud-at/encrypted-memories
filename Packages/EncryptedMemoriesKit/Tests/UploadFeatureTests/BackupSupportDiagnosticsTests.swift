@@ -101,4 +101,45 @@ final class BackupSupportDiagnosticsTests: XCTestCase {
         queue.close()
         XCTAssertFalse(queue.backupSupportSnapshot().isAvailable)
     }
+
+    func testQueueTransitionsThatEndOrStopARowEnterTheTrailWithoutTheirErrorText() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let trail = SupportEventTrail()
+        let queue = try XCTUnwrap(
+            UploadBackupSyncQueueManifestStore(
+                url: directory.appendingPathComponent("queue.sqlite"), supportTrail: trail))
+        defer { queue.close() }
+        let source = UploadSourceIdentity(kind: .photoLibraryAsset, identifier: "private-asset")
+        let revision = UploadBackupRevision(rawValue: 1)
+        let now = Date()
+        XCTAssertTrue(
+            queue.upsert(
+                UploadBackupSyncQueueEntry(
+                    source: source, revision: revision, originalFilename: "private-file.jpg", state: .discovered,
+                    updatedAt: now)))
+        let issue = BackupIssueRecord(kind: .accountStorage, detail: "private-file.jpg is too large").persistedValue
+        for (state, error) in [
+            (UploadBackupSyncQueueState.uploading, nil), (.failedPermanent, issue), (.queuedForUpload, nil),
+            (.completed, nil),
+        ] as [(UploadBackupSyncQueueState, String?)] {
+            XCTAssertTrue(
+                queue.updateState(
+                    source: source, revision: revision, state: state, attempts: nil, lastError: error, updatedAt: now))
+        }
+        let hasher = SupportReportIdentifierHasher()
+        let events = trail.export(hashingWith: hasher).events
+        XCTAssertEqual(events.map(\.kind), [.backupRowParked, .backupRowCompleted])
+        XCTAssertEqual(events.map(\.reason), [.accountStorage, BackupQueueSupportSnapshot.Reason.none])
+        XCTAssertEqual(events.map(\.subject), [hasher.hash("private-asset"), hasher.hash("private-asset")])
+        XCTAssertEqual(events.first?.resourceKind, .primary)
+    }
+
+    func testEveryEditOutcomeHasItsOwnTrailEvent() {
+        XCTAssertEqual(BackupSyncRunner.supportEventKind(of: .replaced(retiredAny: true)), .editReplaced)
+        XCTAssertEqual(BackupSyncRunner.supportEventKind(of: .waiting), .editWaiting)
+        XCTAssertEqual(BackupSyncRunner.supportEventKind(of: .kept), .editKept)
+        XCTAssertEqual(BackupSyncRunner.supportEventKind(of: .replacementGone), .editReplacementGone)
+    }
 }
