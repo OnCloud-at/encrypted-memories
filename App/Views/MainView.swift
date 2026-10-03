@@ -176,8 +176,10 @@ struct MainView: View {
             previewCache: OfflineLibraryManager.shared.previewCache,
             originalsCache: OfflineLibraryManager.shared.originalsCache
         )
-        _timelineModel = State(initialValue: TimelineViewModel(repository: backend, feed: feed, library: backend))
-        _mapClusterModel = State(initialValue: TimelineViewModel(repository: backend, feed: feed, library: backend))
+        _timelineModel = State(
+            initialValue: TimelineViewModel(repository: backend, feed: feed.feedCore, library: backend))
+        _mapClusterModel = State(
+            initialValue: TimelineViewModel(repository: backend, feed: feed.feedCore, library: backend))
         let sidebarVisible = SidebarPersistence.resolvedVisible()
         let width = SidebarPersistence.resolvedWidth()
         initiallyShowsSidebar = sidebarVisible
@@ -233,7 +235,7 @@ struct MainView: View {
             .onAppear {
                 attachOfflineManager()
                 attachPendingGrid()
-                AppMemoryPressureCoordinator.shared.attachFeed(timelineModel.feed)
+                AppMemoryPressureCoordinator.shared.attachFeed(feed)
                 gridProxy.onContentReady = { revision in
                     renderedLibraryRevision = revision
                     timelineModel.markInitialContentReady()
@@ -380,6 +382,7 @@ struct MainView: View {
             if selection == .map, mapClusterPresentation != nil {
                 TimelineView(
                     model: mapClusterModel,
+                    feed: feed,
                     level: $level,
                     gridFillOrder: .topLeading,
                     initialViewportPlacement: .oldest,
@@ -628,6 +631,7 @@ struct MainView: View {
             } else {
                 TimelineView(
                     model: timelineModel,
+                    feed: feed,
                     level: $level,
                     gridFillOrder: gridFillOrder,
                     proxy: gridProxy,
@@ -1058,7 +1062,7 @@ struct MainView: View {
     private func attachPendingGrid() {
         guard let session = model.pendingGrid else { return }
         session.attachFeed(
-            timelineModel.feed.feedCore, imageRequest: PhotoKitPlatformImages.request, fileThumbnails: folderMedia)
+            timelineModel.feed, imageRequest: PhotoKitPlatformImages.request, fileThumbnails: folderMedia)
         session.presenter.onChange = { [timelineModel] presentation in
             timelineModel.setPendingPresentation(presentation)
         }
