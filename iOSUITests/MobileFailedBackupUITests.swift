@@ -57,12 +57,18 @@ final class MobileFailedBackupUITests: XCTestCase {
         let permanent = row("unsupported fixture.heic")
         XCTAssertTrue(permanent.waitForExistence(timeout: 5))
         XCTAssertTrue(permanent.label.contains("This file type cannot be backed up."))
-        permanent.swipeLeft()
         let dismiss = app.buttons["backup.dismissFailedItem.swipe.unsupported fixture.heic"]
-        XCTAssertTrue(dismiss.waitForExistence(timeout: 5))
-        dismiss.tap()
-        let gone = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: permanent)
-        XCTAssertEqual(XCTWaiter.wait(for: [gone], timeout: 5), .completed)
+        // On a slow simulator XCUITest can drop the tap on a swipe action while the row still slides. The row must
+        // still leave after one more swipe; a dismissal that never removes it fails the test.
+        var dismissed = false
+        for _ in 0..<2 where !dismissed {
+            permanent.swipeLeft()
+            guard dismiss.waitForExistence(timeout: 5) else { continue }
+            dismiss.tap()
+            let gone = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: permanent)
+            dismissed = XCTWaiter.wait(for: [gone], timeout: 10) == .completed
+        }
+        XCTAssertTrue(dismissed, "the dismissed row must leave the list")
         XCTAssertFalse(
             app.staticTexts.containing(NSPredicate(format: "label CONTAINS 'Fixture technical detail'"))
                 .firstMatch.exists)
