@@ -75,6 +75,11 @@ public struct AccountStateDamagedError: Error, Equatable {}
 /// Data that is not an account state document at all.
 public struct AccountStateUnreadableError: Error, Equatable {}
 
+/// A document that names a new storage location. No build changes it again at the old location.
+public struct AccountStateMovedError: Error, Equatable {
+    public let location: String
+}
+
 /// The account state that all of the owner's devices agree on: the hidden photos and the account settings.
 ///
 /// Every value is a register that the latest change wins, so two documents always merge to the same result in any
@@ -88,6 +93,7 @@ public struct AccountStateUnreadableError: Error, Equatable {}
 public struct AccountStateDocument: Sendable, Equatable {
     public static let currentFormat = 1
     static let maximumDeviceIDBytes = 256
+    static let maximumLocationBytes = 1_024
 
     public let format: Int
     public private(set) var hiddenRegisters: [PhotoUID: AccountStateRegister<Bool>]
@@ -100,6 +106,8 @@ public struct AccountStateDocument: Sendable, Equatable {
     public private(set) var unreadableSettings: [String: AccountStateJSONValue]
     /// The hidden or settings field when it has the wrong shape.
     public private(set) var damagedFields: [String: AccountStateJSONValue]
+    /// The new storage location, when the owner moved the state. The value is opaque to this module.
+    public private(set) var move: AccountStateRegister<String>?
 
     public init() {
         self.init(format: Self.currentFormat)
@@ -112,7 +120,8 @@ public struct AccountStateDocument: Sendable, Equatable {
         extraFields: [String: AccountStateJSONValue] = [:],
         unreadableHiddenEntries: [AccountStateJSONValue] = [],
         unreadableSettings: [String: AccountStateJSONValue] = [:],
-        damagedFields: [String: AccountStateJSONValue] = [:]
+        damagedFields: [String: AccountStateJSONValue] = [:],
+        move: AccountStateRegister<String>? = nil
     ) {
         self.format = format
         self.hiddenRegisters = hiddenRegisters
@@ -121,6 +130,7 @@ public struct AccountStateDocument: Sendable, Equatable {
         self.unreadableHiddenEntries = unreadableHiddenEntries
         self.unreadableSettings = unreadableSettings
         self.damagedFields = damagedFields
+        self.move = move
     }
 
     /// Whether this build understands the format. A newer document is read-only and counts as unknown state.
@@ -134,6 +144,10 @@ public struct AccountStateDocument: Sendable, Equatable {
     /// Whether this build may rely on, change, merge, and write the document. Anything that shares photos must pause
     /// while it may not.
     public var isUsable: Bool { isSupported && !isDamaged }
+
+    /// The location that replaced this one. Every build reads it, and none changes this document again, so nothing
+    /// is written to the old location after a move.
+    public var movedTo: String? { move?.value }
 
     /// Photos hidden by a readable entry, and photos that a damaged entry names: damage never shows a photo.
     public var hiddenPhotos: Set<PhotoUID> {
@@ -156,7 +170,7 @@ public struct AccountStateDocument: Sendable, Equatable {
         _ photo: PhotoUID, _ isHidden: Bool, at date: Date, deviceID: String,
         nonce: UInt64 = .random(in: .min ... .max)
     ) throws {
-        try requireUsable()
+        try requireWritable()
         guard !photo.volumeID.isEmpty, !photo.nodeID.isEmpty,
             AccountStateJSONValue.isNormalized(photo.volumeID), AccountStateJSONValue.isNormalized(photo.nodeID)
         else { throw AccountStateInvalidChangeError() }
@@ -168,7 +182,7 @@ public struct AccountStateDocument: Sendable, Equatable {
         _ value: Value, for key: AccountSettingKey<Value>, at date: Date, deviceID: String,
         nonce: UInt64 = .random(in: .min ... .max)
     ) throws {
-        try requireUsable()
+        try requireWritable()
         let original = key.encode(value)
         let encoded = original.normalizingStrings()
         // Swift compares text by canonical equivalence; a difference means normalization lost characters.
@@ -182,6 +196,17 @@ public struct AccountStateDocument: Sendable, Equatable {
         settingRegisters[key.name] = AccountStateRegister(value: encoded, stamp: stamp)
     }
 
+    /// Records that the state now lives at another location. The marker survives every merge, and afterwards this
+    /// document accepts no other change.
+    public mutating func markMoved(
+        to location: String, at date: Date, deviceID: String, nonce: UInt64 = .random(in: .min ... .max)
+    ) throws {
+        try requireUsable()
+        guard Self.isValidLocation(location) else { throw AccountStateInvalidChangeError() }
+        let stamp = try Self.stamp(after: move?.stamp, at: date, deviceID: deviceID, nonce: nonce)
+        move = AccountStateRegister(value: location, stamp: stamp)
+    }
+
     /// Both documents combined. Nil when either document is not usable.
     public static func merged(_ lhs: AccountStateDocument, _ rhs: AccountStateDocument) -> AccountStateDocument? {
         guard lhs.isUsable, rhs.isUsable else { return nil }
@@ -191,7 +216,8 @@ public struct AccountStateDocument: Sendable, Equatable {
             settingRegisters: lhs.settingRegisters.merging(rhs.settingRegisters, uniquingKeysWith: winner),
             extraFields: lhs.extraFields.merging(rhs.extraFields) {
                 AccountStateJSONValue.precedes($0, $1) ? $1 : $0
-            }
+            },
+            move: moveWinner(lhs.move, rhs.move)
         )
     }
 
@@ -201,7 +227,7 @@ public struct AccountStateDocument: Sendable, Equatable {
         guard isSupported else { return nil }
         return AccountStateDocument(
             format: format, hiddenRegisters: hiddenRegisters, settingRegisters: settingRegisters,
-            extraFields: extraFields)
+            extraFields: extraFields, move: move)
     }
 
     /// The later register. Two registers with the same stamp and different content only come from damage or
@@ -227,6 +253,18 @@ public struct AccountStateDocument: Sendable, Equatable {
         return extensionOrder(a, b)
     }
 
+    /// A move marker always beats its absence. Of two markers, the later one wins; equal stamps with different
+    /// content fall back to the canonical order, so every device picks the same location.
+    static func moveWinner(
+        _ a: AccountStateRegister<String>?, _ b: AccountStateRegister<String>?
+    ) -> AccountStateRegister<String>? {
+        guard let a else { return b }
+        guard let b else { return a }
+        if a.stamp != b.stamp { return a.stamp > b.stamp ? a : b }
+        if a.value != b.value { return AccountStateJSONValue.precedes(.string(a.value), .string(b.value)) ? b : a }
+        return extensionOrder(a, b)
+    }
+
     private static func extensionOrder<Value>(
         _ a: AccountStateRegister<Value>, _ b: AccountStateRegister<Value>
     ) -> AccountStateRegister<Value> {
@@ -236,6 +274,15 @@ public struct AccountStateDocument: Sendable, Equatable {
     private func requireUsable() throws {
         guard isSupported else { throw AccountStateReadOnlyError(format: format) }
         guard !isDamaged else { throw AccountStateDamagedError() }
+    }
+
+    private func requireWritable() throws {
+        try requireUsable()
+        if let movedTo { throw AccountStateMovedError(location: movedTo) }
+    }
+
+    static func isValidLocation(_ location: String) -> Bool {
+        !location.isEmpty && location.utf8.count <= maximumLocationBytes && AccountStateJSONValue.isNormalized(location)
     }
 
     private static func stamp(
@@ -269,10 +316,11 @@ public struct AccountStateDocument: Sendable, Equatable {
 // MARK: - Encoding
 
 extension AccountStateDocument {
-    private static let knownFields: Set<String> = ["format", "hidden", "settings"]
+    private static let knownFields: Set<String> = ["format", "hidden", "settings", "movedTo"]
     private static let stampKeys: Set<String> = ["time", "device", "nonce"]
     private static let hiddenEntryKeys: Set<String> = stampKeys.union(["volumeID", "nodeID", "value"])
     private static let settingEntryKeys: Set<String> = stampKeys.union(["value"])
+    private static let moveEntryKeys: Set<String> = stampKeys.union(["location"])
 
     /// Reads a document. Only data without a readable format number fails. A newer format is read-only, and
     /// anything else this build cannot read makes the document damaged.
@@ -322,9 +370,16 @@ extension AccountStateDocument {
             damaged["settings"] = wrongShape
         }
 
+        // An unreadable move marker is damage: this build cannot prove that the old location may still be written.
+        var move: AccountStateRegister<String>?
+        if let raw = fields["movedTo"] {
+            if let register = Self.moveEntry(raw) { move = register } else { damaged["movedTo"] = raw }
+        }
+
         self.init(
             format: format, hiddenRegisters: hidden, settingRegisters: settings, extraFields: extra,
-            unreadableHiddenEntries: unreadableHidden, unreadableSettings: unreadableSettings, damagedFields: damaged)
+            unreadableHiddenEntries: unreadableHidden, unreadableSettings: unreadableSettings, damagedFields: damaged,
+            move: move)
     }
 
     /// The document as canonical JSON, so equal documents give equal bytes.
@@ -344,6 +399,7 @@ extension AccountStateDocument {
         fields["format"] = .integer(format)
         fields["hidden"] = .array(hiddenEntries)
         fields["settings"] = .object(settingRegisters.mapValues { Self.entry($0, fields: ["value": $0.value]) })
+        if let move { fields["movedTo"] = Self.entry(move, fields: ["location": .string(move.value)]) }
         return Data(AccountStateJSONValue.object(fields).canonicalBytes)
     }
 
@@ -393,6 +449,14 @@ extension AccountStateDocument {
         let register = AccountStateRegister(
             value: value, stamp: stamp, extensions: extensions(of: raw, known: hiddenEntryKeys))
         return (photo, register)
+    }
+
+    private static func moveEntry(_ raw: AccountStateJSONValue) -> AccountStateRegister<String>? {
+        guard let location = raw["location"]?.stringValue, isValidLocation(location), let stamp = stamp(raw) else {
+            return nil
+        }
+        return AccountStateRegister(
+            value: location, stamp: stamp, extensions: extensions(of: raw, known: moveEntryKeys))
     }
 
     private static func settingEntry(_ raw: AccountStateJSONValue) -> AccountStateRegister<AccountStateJSONValue>? {
