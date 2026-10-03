@@ -148,15 +148,25 @@ final class EditScenarioTests: XCTestCase {
         harness.server.personTrash(main)
         harness.assertSafety()
         let uploads = harness.server.steps.filter { $0.action.hasPrefix("upload") }.count
-        harness.knownDefect =
-            "Defect F1 (#194): an edit after the person trashed the photo uploads again. Without a marker on the "
-            + "server, nothing proves who trashed the photo."
-        try await edit("render-after-person-deletion")
-        await harness.drain()
-        harness.check(
-            harness.server.steps.filter { $0.action.hasPrefix("upload") }.count == uploads,
-            "S5 an edit after the person's deletion uploads nothing until restore")
-        harness.expectKnownDefect(signature: "S5", consequences: [])
+        let entry = try await edit("render-after-person-deletion")
+        harness.clock.advance(by: 5)
+        await harness.pass()
+        XCTAssertEqual(harness.state(of: entry), .discovered)
+        let deferred = try XCTUnwrap(harness.queue.entry(for: entry.source, revision: entry.revision))
+        XCTAssertEqual(
+            BackupIssueRecord.decode(deferred.lastError)?.detail,
+            L10n.string("backup.issue_deletion_check"))
+        XCTAssertEqual(deferred.attempts, 0)
+        // A second check after two minutes still finds nothing, but the bound has not passed: no question yet.
+        harness.clock.advance(by: 120)
+        await harness.pass()
+        XCTAssertEqual(harness.state(of: entry), .discovered)
+        harness.clock.advance(by: 480)
+        await harness.pass()
+        XCTAssertEqual(harness.state(of: entry), .failedPermanent)
+        let parked = try XCTUnwrap(harness.queue.entry(for: entry.source, revision: entry.revision))
+        XCTAssertEqual(BackupIssueRecord.decode(parked.lastError)?.kind, .deletedElsewhere)
+        XCTAssertEqual(harness.server.steps.filter { $0.action.hasPrefix("upload") }.count, uploads)
     }
 
     func testPersonRestoresReplacedMainThenUndoesWithoutAnIdenticalMain() async throws {
@@ -572,20 +582,129 @@ final class EditScenarioTests: XCTestCase {
             }, "An active original-content row must remain under the edit before undo")
         harness.server.personTrash(edited)
         harness.server.relatedLookupFailsForTrashedMain = true
-        harness.knownDefect =
-            "Defect F1 (#194): an undo after the person trashed the photo uploads again. Without a marker on the "
-            + "server, nothing proves who trashed the photo."
+        let uploads = harness.server.steps.filter { $0.action.hasPrefix("upload") }.count
         let undone = try await undo()
-        for _ in 0..<6 {
-            harness.clock.advance(by: 8)
-            await harness.pass()
-        }
+        harness.clock.advance(by: 5)
+        await harness.pass()
+        XCTAssertEqual(harness.state(of: undone), .discovered)
+        harness.clock.advance(by: 600)
+        await harness.pass()
         let row = try XCTUnwrap(harness.queue.entry(for: undone.source, revision: undone.revision))
         XCTAssertTrue(
             harness.server.rejectedTrashedMainLookupIDs.isEmpty,
             "the check must not ask for the related photos of a trashed main")
-        XCTAssertTrue(row.state.isTerminalSuccess, "the row must settle: \(row.state)")
-        harness.expectKnownDefect(signature: "S5 uploaded", consequences: ["S5"])
+        XCTAssertEqual(row.state, .failedPermanent)
+        XCTAssertEqual(BackupIssueRecord.decode(row.lastError)?.kind, .deletedElsewhere)
+        XCTAssertEqual(harness.server.steps.filter { $0.action.hasPrefix("upload") }.count, uploads)
+    }
+
+    func testOtherDeviceReplacesDuringDeletionWaitAndSecondCheckAdopts() async throws {
+        harness = try EditScenarioHarness()
+        let deviceB = try EditScenarioHarness(
+            server: harness.server, library: harness.library, staleLineageIndex: true)
+        defer { try? deviceB.cleanup() }
+        try await harness.enqueue()
+        try await deviceB.enqueue()
+        await harness.drain()
+        await deviceB.drain()
+        harness.clock.advance(by: 200)
+        deviceB.clock.advance(by: 200)
+        _ = try await deviceB.index.activeMainLinkIDs(forExternalIdentifier: "cloud-asset-1")
+        harness.library.edit("device-a-replacement", at: harness.clock.now.addingTimeInterval(-121))
+        try await harness.enqueue()
+        await harness.pass()
+        harness.library.edit("current-edit", at: deviceB.clock.now.addingTimeInterval(-121))
+        let waiting = try await deviceB.enqueue()
+        await deviceB.pass()
+        XCTAssertEqual(deviceB.state(of: waiting), .discovered)
+        XCTAssertNotNil(deviceB.journal.entry(for: waiting.source).deletionCheckStartedAt)
+        try await harness.enqueue()
+        await harness.pass()
+        let uploads = harness.server.steps.filter { $0.action.hasPrefix("upload") }.count
+        deviceB.clock.advance(by: 120)
+        await deviceB.pass()
+        XCTAssertEqual(deviceB.state(of: waiting), .alreadyBackedUp)
+        XCTAssertEqual(harness.server.steps.filter { $0.action.hasPrefix("upload") }.count, uploads)
+        XCTAssertNil(deviceB.journal.entry(for: waiting.source).deletionCheckStartedAt)
+    }
+
+    func testManualRetriesCannotShortenDeletionWaitAndRelaunchKeepsTheBound() async throws {
+        let main = try await firstBackup()
+        harness.server.personTrash(main)
+        let entry = try await edit("deleted-edit")
+        harness.clock.advance(by: 5)
+        await harness.pass()
+        let started = try XCTUnwrap(harness.journal.entry(for: entry.source).deletionCheckStartedAt)
+        for _ in 0..<5 {
+            harness.clock.advance(by: 10)
+            _ = await harness.makeRetryableWorkEligibleNow()
+            await harness.pass()
+            XCTAssertEqual(harness.state(of: entry), .discovered)
+            XCTAssertEqual(harness.journal.entry(for: entry.source).deletionCheckStartedAt, started)
+        }
+        try harness.relaunch()
+        harness.clock.advance(by: 600)
+        await harness.pass()
+        XCTAssertEqual(harness.state(of: entry), .failedPermanent)
+        _ = await harness.makeRetryableWorkEligibleNow()
+        await harness.pass()
+        XCTAssertEqual(harness.state(of: entry), .failedPermanent)
+    }
+
+    func testKeepDeletedAppliesToLaterEditsAndRestoreClearsChoice() async throws {
+        let main = try await firstBackup()
+        harness.server.personTrash(main)
+        let entry = try await edit("deleted-edit")
+        harness.clock.advance(by: 5)
+        await harness.pass()
+        try harness.journal.keepDeleted(for: entry.source)
+        let next = try await edit("later-deleted-edit")
+        harness.clock.advance(by: 5)
+        await harness.pass()
+        XCTAssertEqual(harness.state(of: next), .skippedRemoteDeletion)
+        XCTAssertTrue(harness.journal.entry(for: entry.source).keptDeleted == true)
+        harness.server.personRestore(main)
+        // Until the next pass the earlier rows still read skipped; the pass below backs the photo up and clears them.
+        harness.library.edit("restored-edit", at: harness.clock.now)
+        let restored = try await harness.enqueue()
+        harness.clock.advance(by: 600)
+        await harness.pass()
+        harness.assertSafety()
+        XCTAssertEqual(harness.state(of: restored), .completed)
+        XCTAssertNil(harness.queue.entry(for: next.source, revision: next.revision))
+        XCTAssertNil(harness.journal.entry(for: entry.source).keptDeleted)
+        XCTAssertNil(harness.journal.entry(for: entry.source).deletionCheckStartedAt)
+    }
+
+    func testAParkedRevisionLeavesOnceALaterRevisionIsBackedUp() async throws {
+        let main = try await firstBackup()
+        harness.server.personTrash(main)
+        let parked = try await edit("deleted-edit")
+        harness.clock.advance(by: 5)
+        await harness.pass()
+        harness.clock.advance(by: 600)
+        await harness.pass()
+        XCTAssertEqual(harness.state(of: parked), .failedPermanent)
+        harness.server.personRestore(main)
+        harness.library.edit("edit-after-restore", at: harness.clock.now)
+        let later = try await harness.enqueue()
+        harness.clock.advance(by: 5)
+        await harness.pass()
+        XCTAssertEqual(harness.state(of: later), .completed)
+        XCTAssertNil(harness.queue.entry(for: parked.source, revision: parked.revision), "nothing asks about it")
+    }
+
+    func testRestoreDuringDeletionWaitSettlesWithoutParking() async throws {
+        let main = try await firstBackup()
+        harness.server.personTrash(main)
+        let entry = try await edit("deleted-edit")
+        harness.clock.advance(by: 5)
+        await harness.pass()
+        harness.server.personRestore(main)
+        harness.clock.advance(by: 120)
+        await harness.pass()
+        XCTAssertEqual(harness.state(of: entry), .completed)
+        XCTAssertNil(harness.journal.entry(for: entry.source).deletionCheckStartedAt)
     }
 
     func testServerTrashRestoreAndEmptyTrashRules() async throws {

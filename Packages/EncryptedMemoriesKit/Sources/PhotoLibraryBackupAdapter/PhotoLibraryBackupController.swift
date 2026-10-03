@@ -196,16 +196,18 @@ public final class PhotoLibraryBackupController {
         tagAdder: (any PhotoTagAdding)? = nil,
         editReplacement: EditedPhotoReplacement? = nil,
         pendingStore: PendingBackupManifestStore? = nil,
-        requiresPendingStore: Bool = false
+        requiresPendingStore: Bool = false,
+        replacementJournal: (any EditReplacementJournaling)? = nil
     ) {
         let directory = configuration.accountDataDirectory
+        let journal = editReplacement?.journal ?? replacementJournal
         let pendingRecorder = pendingStore.map {
             PendingBackupEventRecorder(
                 store: $0, replacementLedger: .shared(accountDataDirectory: directory),
-                replacementJournal: editReplacement?.journal)
+                replacementJournal: journal)
         }
         self.pendingRecorder = pendingRecorder
-        pendingReplacementJournal = editReplacement?.journal
+        pendingReplacementJournal = journal
         self.pendingStore = pendingStore
         self.requiresPendingStore = requiresPendingStore
         defaults = configuration.defaults
@@ -463,9 +465,11 @@ public final class PhotoLibraryBackupController {
 
     /// Hides a permanent item warning without ever changing the backup-success count.
     public func dismissFailedItem(_ item: BackupFailedItem) {
-        guard item.isPermanent,
+        guard item.isPermanent, item.issue != .deletedElsewhere,
             let source = item.source,
             let revision = item.revision,
+            BackupIssueRecord.decode(queueStore?.entry(for: source, revision: revision)?.lastError)?.kind
+                != .deletedElsewhere,
             queueStore?.dismissPermanentFailure(
                 source: source,
                 revision: revision,
@@ -473,6 +477,59 @@ public final class PhotoLibraryBackupController {
             ) == true
         else { return }
         refreshFromQueue()
+    }
+
+    public func keepDeleted(_ item: BackupFailedItem) {
+        resolveRemoteDeletion(item, keepDeleted: true)
+    }
+
+    public func backUpAgain(_ item: BackupFailedItem) {
+        if resolveRemoteDeletion(item, keepDeleted: false) { syncNow() }
+    }
+
+    @discardableResult
+    private func resolveRemoteDeletion(_ item: BackupFailedItem, keepDeleted: Bool) -> Bool {
+        guard item.issue == .deletedElsewhere, let source = item.source, let revision = item.revision,
+            let queueStore, let journal = pendingReplacementJournal,
+            let row = queueStore.entry(for: source, revision: revision), row.state == .failedPermanent,
+            BackupIssueRecord.decode(row.lastError)?.kind == .deletedElsewhere
+        else { return false }
+        // The choice is about the photo, so it settles every revision of it that waits for the same question.
+        let parked = queueStore.rows(kind: source.kind, identifiers: [source.identifier]).filter {
+            $0.source == source && $0.state == .failedPermanent
+                && BackupIssueRecord.decode(queueStore.entry(for: source, revision: $0.revision)?.lastError)?.kind
+                    == .deletedElsewhere
+        }.map(\.revision)
+        let newest = parked.max() ?? revision
+        do {
+            if keepDeleted {
+                try journal.keepDeleted(for: source)
+            } else {
+                try journal.backUpAgain(revision: newest, for: source)
+            }
+            for parkedRevision in Set(parked + [revision]) {
+                let reopens = !keepDeleted && parkedRevision == newest
+                let state: UploadBackupSyncQueueState =
+                    keepDeleted ? .skippedRemoteDeletion : reopens ? .discovered : .dismissedFailure
+                guard
+                    queueStore.updateState(
+                        source: source, revision: parkedRevision, state: state, attempts: nil,
+                        lastError: keepDeleted
+                            ? BackupIssueRecord(
+                                kind: .remoteDeletion, detail: L10n.string("backup.state_skipped_remote_deletion")
+                            ).persistedValue : nil,
+                        updatedAt: Date())
+                else { throw UploadError.backend(L10n.string("backup.error_local_state_unavailable")) }
+            }
+            SupportEventTrail.shared.record(
+                keepDeleted ? .backupDeletionKept : .backupDeletionReopened, subject: source.identifier)
+            refreshFromQueue()
+            return true
+        } catch {
+            lastMessage = L10n.string("backup.error_local_state_unavailable")
+            refreshFromQueue()
+            return false
+        }
     }
 
     /// True while at least one failed item can still be retried (i.e. it is not a permanently-gone
@@ -809,6 +866,27 @@ public final class PhotoLibraryBackupController {
     }
 
     #if DEBUG
+        /// Seeds a parked row on the offline UI-test account. It uses the real queue and decision actions.
+        public func installDeletedElsewhereFixtureForTesting() -> Bool {
+            guard let queueStore, pendingReplacementJournal != nil else { return false }
+            let source = UploadSourceIdentity(kind: .photoLibraryAsset, identifier: "fixture-deleted-photo")
+            guard
+                queueStore.upsert(
+                    .init(
+                        source: source, revision: .init(rawValue: 1), originalFilename: "Deleted fixture.heic",
+                        state: .failedPermanent,
+                        lastError: BackupIssueRecord(
+                            kind: .deletedElsewhere, detail: L10n.string("backup.issue_deleted_elsewhere")
+                        ).persistedValue, updatedAt: Date()))
+            else { return false }
+            // Keep the fixture independent of PhotoKit authorization and assets on the simulator.
+            isEnabled = true
+            isUserPaused = false
+            accessState = .denied
+            refreshFromQueue()
+            return true
+        }
+
         internal func setAccessStateForTesting(_ state: PhotoBackupAccessState) {
             accessState = state
         }
@@ -1356,6 +1434,7 @@ public final class PhotoLibraryBackupController {
         case .remoteService: L10n.string("backup.issue_remote_service")
         case .localState: L10n.string("backup.error_local_state_unavailable")
         case .remoteDeletion: L10n.string("backup.state_skipped_remote_deletion")
+        case .deletedElsewhere: L10n.string("backup.issue_deleted_elsewhere")
         case .accountStorage: L10n.string("backup.issue_account_storage")
         case .unknown: L10n.string("backup.fail_reason_generic")
         }

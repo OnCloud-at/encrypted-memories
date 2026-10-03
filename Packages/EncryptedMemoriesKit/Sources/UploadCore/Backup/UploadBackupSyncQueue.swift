@@ -281,6 +281,12 @@ public protocol UploadBackupSyncQueueStore: Sendable {
     /// later return to an earlier revision, for example undoing the edit, must start as new work.
     @discardableResult
     func removeSettledRevisions(of source: UploadSourceIdentity, except revision: UploadBackupRevision) -> Bool
+    /// Removes the rows of earlier revisions that ended without a backup (skipped as deleted, parked, or dismissed)
+    /// once a later revision is backed up: the photo is in Proton Drive again, so they no longer ask or count.
+    @discardableResult
+    func removeUnsavedEarlierRevisions(
+        of source: UploadSourceIdentity, through revision: UploadBackupRevision, except kept: UploadBackupRevision
+    ) -> Bool
     /// Removes every queued revision/resource for the supplied source identifiers. This is used by
     /// live catalog change delivery so a deletion also cancels work already claimed by the runner.
     @discardableResult
@@ -409,6 +415,12 @@ public extension UploadBackupSyncQueueStore {
     func remove(source: UploadSourceIdentity, revision: UploadBackupRevision) -> Bool { false }
 
     func removeSettledRevisions(of source: UploadSourceIdentity, except revision: UploadBackupRevision) -> Bool {
+        true
+    }
+
+    func removeUnsavedEarlierRevisions(
+        of source: UploadSourceIdentity, through revision: UploadBackupRevision, except kept: UploadBackupRevision
+    ) -> Bool {
         true
     }
 

@@ -431,12 +431,14 @@ final class UploadLineageReplacementTests: XCTestCase {
         let head = try seed(
             "newer-lineage", cloudID: nil, replacing: [original.nodeID],
             modificationDate: Date(timeIntervalSince1970: 1_720_000_020))
-        let replacement = try await uploadAfterResolving("older")
 
-        _ = try await settle(replacement)
+        // Nothing with this photo's identity is live, so the older edit waits for the deletion check instead of
+        // uploading a second photo; the newer photo is never a target.
+        let result = try await pipeline.resolve(descriptor("older"))
 
+        XCTAssertEqual(result.decision, .awaitDeletionCheck)
+        XCTAssertFalse(superseded().contains(head.nodeID))
         XCTAssertEqual(server.links.first { $0.uid == head }?.state, .active)
-        XCTAssertEqual(server.links.first { $0.uid == replacement }?.state, .active)
     }
 
     func testRemoteRelatedResourceWithoutTwinKeepsItsMain() async throws {

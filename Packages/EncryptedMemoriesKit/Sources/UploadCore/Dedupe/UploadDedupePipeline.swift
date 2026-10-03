@@ -263,7 +263,7 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
             throw detailedLookupError
         }
 
-        let nameCandidates: [RemotePhotoDuplicate]
+        let nameCandidates: (items: [RemotePhotoDuplicate], provesLive: Bool)
         do {
             nameCandidates = try await candidates(
                 remoteItems, contentHash: contentHash, descriptor: descriptor, replacement: replacement)
@@ -273,51 +273,54 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
         }
         let nameDecision = UploadDuplicateDecisionPolicy.decide(
             primary: .init(source: descriptor.source, nameHash: nameHash, contentHash: contentHash),
-            remoteItems: nameCandidates,
+            remoteItems: nameCandidates.items,
             currentClientUID: currentClientUID
         )
 
-        // The batched name endpoint is both the Proton-native path and the cheap path. Any skip it
-        // proves is already conservative, so return immediately. Only a would-upload item needs the
-        // expensive account-wide content fallback for renamed/copied originals.
-        if nameDecision.uploadsBytes {
-            do {
-                if let found = try await checker.findDuplicate(contentHash: contentHash),
-                    let remoteContent = try await candidates(
-                        [found], contentHash: contentHash, descriptor: descriptor, replacement: replacement
-                    ).first
-                {
-                    let contentDecision = decisionForRemoteContent(
-                        remoteContent,
-                        replacingNameHash: nameDecision == .uploadReplacingDraft ? nameHash : nil
-                    )
-                    try noteRestored(contentDecision, in: replacement, of: descriptor.source)
-                    try persist(contentDecision, in: &record)
-                    if !contentDecision.uploadsBytes {
-                        releasePendingUploadClaims(ownedBy: descriptor)
+        // Finish both passes before asking about deletion: same bytes outside the scope can prove a deletion,
+        // and an active copy under another name can prove the photo live.
+        var decision = nameDecision
+        var provesLive = nameCandidates.provesLive
+        do {
+            if nameDecision.uploadsBytes {
+                if let found = try await checker.findDuplicate(contentHash: contentHash) {
+                    let contentCandidates = try await candidates(
+                        [found], contentHash: contentHash, descriptor: descriptor, replacement: replacement)
+                    provesLive = provesLive || contentCandidates.provesLive
+                    if let remoteContent = contentCandidates.items.first {
+                        decision = decisionForRemoteContent(
+                            remoteContent,
+                            replacingNameHash: nameDecision == .uploadReplacingDraft ? nameHash : nil)
                     }
-                    return result(contentDecision)
                 }
                 try Task.checkCancellation()
-            } catch {
-                releasePendingUploadClaims(ownedBy: descriptor)
-                throw error
             }
-        } else {
-            do {
-                try noteRestored(nameDecision, in: replacement, of: descriptor.source)
-                try persist(nameDecision, in: &record)
-            } catch {
-                releasePendingUploadClaims(ownedBy: descriptor)
-                throw error
+            if decision.uploadsBytes, !replacement.isEmpty, !provesLive,
+                descriptor.source.kind == .photoLibraryAsset, descriptor.source.resource == .primary,
+                descriptor.mainRemoteLinkID == nil, let replacementJournal
+            {
+                let entry = replacementJournal.entry(for: descriptor.source)
+                if entry.keptDeleted == true {
+                    decision = .skip(.deletedRemotely, remoteLinkID: replacement.current)
+                } else if entry.backUpAgainRevision
+                    != (descriptor.backupRevision ?? UploadBackupRevision(date: descriptor.modificationDate))
+                {
+                    // The person's consent covers exactly the version they saw; a later edit of a deleted photo
+                    // asks again, so a consent that outlived its backup can never upload a later deletion.
+                    decision = .awaitDeletionCheck
+                }
             }
+            try noteRestored(decision, in: replacement, of: descriptor.source)
+            if decision != .awaitDeletionCheck {
+                try replacementJournal?.clearDeletionCheck(for: descriptor.source)
+            }
+            try persist(decision, in: &record)
+        } catch {
             releasePendingUploadClaims(ownedBy: descriptor)
-            return result(nameDecision)
+            throw error
         }
-
-        // Both claims stay held: the caller now owns this content/name upload and must settle it via
-        // `recordUploaded` (success) or `uploadDidFail` (anything else).
-        return result(nameDecision)
+        if !decision.uploadsBytes { releasePendingUploadClaims(ownedBy: descriptor) }
+        return result(decision)
     }
 
     /// Complete lineage reads can discover a live main without a local manifest. Failed or incomplete reads leave
@@ -474,20 +477,24 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
         contentHash: String,
         descriptor: UploadResourceDescriptor,
         replacement: UploadReplacementScope
-    ) async throws -> [RemotePhotoDuplicate] {
+    ) async throws -> (items: [RemotePhotoDuplicate], provesLive: Bool) {
         if descriptor.source.resource.isBurstMember {
-            return try await burstMemberCandidates(remoteItems, contentHash: contentHash, descriptor: descriptor)
+            return (
+                try await burstMemberCandidates(remoteItems, contentHash: contentHash, descriptor: descriptor), false
+            )
         }
         if descriptor.requiresRelatedMatch {
             var relatedLinkIDs: Set<String> = []
             if remoteItems.contains(where: { $0.linkState != .draft }), let mainLinkID = descriptor.mainRemoteLinkID {
                 relatedLinkIDs = try await checker.relatedPhotoLinkIDs(ofMainLinkID: mainLinkID)
             }
-            return remoteItems.filter { item in
-                item.linkState == .draft || (item.linkID.map(relatedLinkIDs.contains) ?? false)
-            }
+            return (
+                remoteItems.filter { item in
+                    item.linkState == .draft || (item.linkID.map(relatedLinkIDs.contains) ?? false)
+                }, false
+            )
         }
-        guard !replacement.isEmpty else { return remoteItems }
+        guard !replacement.isEmpty else { return (remoteItems, false) }
         // Only the state of a photo shows that it is still in the library: its current upload is active, the
         // person restored an earlier version, or an active main photo holds these bytes.
         let matches = remoteItems.filter { $0.linkState == .active && $0.contentHash == contentHash }
@@ -507,8 +514,8 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
             !replacement.knownForeignLinks.contains($0)
         }
         let adoptable = ownMatches.subtracting(replacement.superseded.subtracting(replacement.liveHeads))
-        let restored = replacement.retired.filter(isLiveMain).subtracting(adoptable)
-            .subtracting(replacement.remoteAncestors)
+        let liveRetired = replacement.retired.filter(isLiveMain)
+        let restored = liveRetired.subtracting(adoptable).subtracting(replacement.remoteAncestors)
 
         guard
             replacement.current.map(isLiveMain) == true || !replacement.liveHeads.isEmpty
@@ -524,14 +531,19 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
                 matches.filter { visibility[$0].map { $0.isActive && $0.mainPhotoLinkID != nil } ?? false })
             let removed = Set(matches.filter { visibility[$0]?.isActive != true })
             let excluded = replacement.superseded.union(replacement.retired).union(related)
-            return remoteItems.compactMap { item in
-                guard let linkID = item.linkID else { return item }
-                guard !excluded.contains(linkID) else { return nil }
-                guard removed.contains(linkID) else { return item }
-                return RemotePhotoDuplicate(
-                    nameHash: item.nameHash, contentHash: item.contentHash, linkState: .trashed, linkID: linkID,
-                    clientUID: item.clientUID)
-            }
+            return (
+                remoteItems.compactMap { item in
+                    guard let linkID = item.linkID else { return item }
+                    guard !excluded.contains(linkID) else { return nil }
+                    guard removed.contains(linkID) else { return item }
+                    return RemotePhotoDuplicate(
+                        nameHash: item.nameHash, contentHash: item.contentHash, linkState: .trashed, linkID: linkID,
+                        clientUID: item.clientUID)
+                }, false
+            )
+        }
+        if replacement.current.map(isLiveMain) == true || !liveRetired.isEmpty {
+            try replacementJournal?.clearDeletionChoice(for: descriptor.source)
         }
         // A restored earlier version with other bytes is an earlier photo again, so this upload replaces it.
         if !restored.isEmpty {
@@ -545,11 +557,13 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
         // backup replaced, not a deletion by the person. An active copy counts only as a main photo: the hidden
         // original under the photo that this upload replaces, or a related file of a trashed photo, is no backup.
         let scope = replacement.superseded.union(replacement.retired)
-        return remoteItems.filter { item in
-            guard item.linkState != .draft else { return true }
-            guard item.linkState == .active, let linkID = item.linkID else { return false }
-            return item.contentHash == contentHash ? adoptable.contains(linkID) : !scope.contains(linkID)
-        }
+        return (
+            remoteItems.filter { item in
+                guard item.linkState != .draft else { return true }
+                guard item.linkState == .active, let linkID = item.linkID else { return false }
+                return item.contentHash == contentHash ? adoptable.contains(linkID) : !scope.contains(linkID)
+            }, true
+        )
     }
 
     /// An earlier version that the person restored is the photo again: it leaves the retired list.
@@ -650,7 +664,7 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
             record.outcome = UploadIdentityManifestStore.Outcome.duplicateTrashed.rawValue
             record.updatedAt = now()
             try persistRecord(record)
-        default:
+        case .upload, .uploadReplacingDraft, .awaitDeletionCheck, .uploadMissingSecondaries, .skip:
             break
         }
     }

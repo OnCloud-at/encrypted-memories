@@ -147,6 +147,7 @@ public struct BackupStatusPresentation: Sendable, Equatable {
                 case .deviceStorage: "backup.phase_waiting_storage"
                 case .accountStorage: "backup.phase_waiting_account_storage"
                 case .remoteDraft: "backup.phase_waiting_draft"
+                case .deletedElsewhere: "backup.phase_attention"
                 default: "backup.phase_waiting"
                 }
             self.init(

@@ -681,6 +681,35 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
         }
     }
 
+    /// Returns the number of removed rows, or nil when the store failed.
+    private func removeUnsavedEarlierRevisionsUnobserved(
+        of source: UploadSourceIdentity, through revision: UploadBackupRevision, except kept: UploadBackupRevision
+    ) -> Int? {
+        lock.withLock {
+            var stmt: OpaquePointer?
+            guard
+                requireOperational(
+                    sqlite3_prepare_v2(
+                        db,
+                        """
+                        DELETE FROM backup_sync_queue
+                        WHERE source_kind=? AND source_id=? AND resource=? AND revision_us<=? AND revision_us<>?
+                          AND state IN ('skippedRemoteDeletion','failedPermanent','dismissedFailure');
+                        """,
+                        -1, &stmt, nil
+                    ) == SQLITE_OK)
+            else { return nil }
+            defer { sqlite3_finalize(stmt) }
+            bindText(stmt, 1, source.kind.rawValue)
+            bindText(stmt, 2, source.identifier)
+            bindText(stmt, 3, source.resource.rawValue)
+            sqlite3_bind_int64(stmt, 4, revision.rawValue)
+            sqlite3_bind_int64(stmt, 5, kept.rawValue)
+            guard requireOperational(sqlite3_step(stmt) == SQLITE_DONE) else { return nil }
+            return Int(sqlite3_changes(db))
+        }
+    }
+
     @discardableResult
     private func removeSourcesUnobserved(kind: UploadSourceIdentity.Kind, identifiers: [String]) -> Int {
         let identifiers = Array(Set(identifiers))
@@ -1181,6 +1210,17 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
         let result = removeUnobserved(source: source, revision: revision)
         if result { notify(UploadBackupSyncQueueChange(sources: [source])) }
         return result
+    }
+
+    @discardableResult
+    public func removeUnsavedEarlierRevisions(
+        of source: UploadSourceIdentity, through revision: UploadBackupRevision, except kept: UploadBackupRevision
+    ) -> Bool {
+        guard let removed = removeUnsavedEarlierRevisionsUnobserved(of: source, through: revision, except: kept)
+        else { return false }
+        // Most backups remove nothing; only a real change reaches the observers.
+        if removed > 0 { notify(UploadBackupSyncQueueChange(sources: [source])) }
+        return true
     }
 
     @discardableResult

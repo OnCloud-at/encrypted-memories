@@ -57,6 +57,7 @@ struct MobileBackupSettingsLabel: View {
         } label: {
             Label(String(localized: "settings.section_backup"), systemImage: "icloud.and.arrow.up")
         }
+        .accessibilityIdentifier("backup.settings")
         .onAppear { rowModel.ingest(controller.status) }
         .onChange(of: controller.status) { _, status in rowModel.ingest(status) }
         .onDisappear { rowModel.cancel() }
@@ -283,6 +284,7 @@ private struct MobilePhotoBackupSections: View {
                         .frame(maxWidth: .infinity, alignment: .leading)
                     }
                     .buttonStyle(.plain)
+                    .accessibilityIdentifier("backup.failedItems")
                     .transition(.opacity.combined(with: .move(edge: .top)))
                 }
 
@@ -329,6 +331,8 @@ private struct MobilePhotoBackupSections: View {
                 }
                 if let skipped = display.localizedRemoteDeletionDetail {
                     InfoButton(title: L10n.string("backup.remote_deletions_info_title"), message: skipped)
+                        .accessibilityIdentifier("backup.remoteDeletions")
+                        .accessibilityValue(skipped)
                         .transition(.opacity.combined(with: .move(edge: .top)))
                 }
             }
@@ -466,6 +470,7 @@ private struct MobileFailedBackupSheet: View {
     let controller: PhotoLibraryBackupController
     @Environment(\.dismiss) private var dismiss
     @State private var items: [BackupFailedItem] = []
+    @State private var deletionItem: BackupFailedItem?
 
     var body: some View {
         NavigationStack {
@@ -499,8 +504,20 @@ private struct MobileFailedBackupSheet: View {
                                     }
                                 }
                                 .padding(.vertical, 2)
+                                .contentShape(Rectangle())
+                                .onTapGesture {
+                                    if item.issue == .deletedElsewhere { deletionItem = item }
+                                }
+                                .accessibilityElement(children: .combine)
+                                .accessibilityAddTraits(item.issue == .deletedElsewhere ? .isButton : [])
+                                .accessibilityIdentifier("backup.failedItem.\(item.filename)")
+                                .contextMenu {
+                                    if item.issue == .deletedElsewhere { deletionActions(for: item, place: "menu") }
+                                }
                                 .swipeActions(edge: .trailing, allowsFullSwipe: true) {
-                                    if item.isPermanent {
+                                    if item.issue == .deletedElsewhere {
+                                        deletionActions(for: item, place: "swipe")
+                                    } else if item.isPermanent {
                                         Button(L10n.string("backup.failed_item_dismiss")) {
                                             controller.dismissFailedItem(item)
                                             items.removeAll { $0.id == item.id }
@@ -533,7 +550,37 @@ private struct MobileFailedBackupSheet: View {
                 }
             }
         }
+        .confirmationDialog(
+            L10n.string("backup.issue_deleted_elsewhere"),
+            isPresented: Binding(
+                get: { deletionItem != nil }, set: { if !$0 { deletionItem = nil } }),
+            titleVisibility: .visible
+        ) {
+            if let deletionItem { deletionActions(for: deletionItem, place: "dialog") }
+            Button(L10n.string("action.cancel"), role: .cancel) { deletionItem = nil }
+        }
         .presentationDetents([.medium, .large])
         .onAppear { items = controller.failedItems() }
+    }
+
+    @ViewBuilder
+    /// `place` keeps the identifiers of the dialog, swipe, and menu copies of the actions distinct.
+    private func deletionActions(for item: BackupFailedItem, place: String) -> some View {
+        Button(L10n.string("backup.keep_deleted")) {
+            controller.keepDeleted(item)
+            refreshAfterDecision(item)
+        }
+        .keyboardShortcut(.defaultAction)
+        .accessibilityIdentifier("backup.keepDeleted.\(place)")
+        Button(L10n.string("backup.back_up_again")) {
+            controller.backUpAgain(item)
+            refreshAfterDecision(item)
+        }
+        .accessibilityIdentifier("backup.backUpAgain.\(place)")
+    }
+
+    private func refreshAfterDecision(_ item: BackupFailedItem) {
+        items = controller.failedItems().filter { $0.id != item.id || $0.issue == .deletedElsewhere }
+        deletionItem = nil
     }
 }

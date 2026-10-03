@@ -3,10 +3,12 @@ import Foundation
 import MediaByteCache
 import MediaCacheUIKitAdapter
 import MediaFeedCore
+import PhotoLibraryBackupAdapter
 import PhotosCore
 import ProtonAuth
 import ProtonDriveBackend
 import UIKit
+import UploadCore
 
 #if DEBUG
     /// A deterministic, offline account for hosted tests and UI tests. Debug builds only.
@@ -29,6 +31,7 @@ import UIKit
 
         private let runtime: MobileAccountRuntime
         private let cacheDirectory: URL
+        private var backupFixture: PhotoLibraryBackupController?
 
         /// `includesVideo` adds one video as the newest item; the UI tests use it, the hosted tests count photos only.
         init(
@@ -92,7 +95,31 @@ import UIKit
                 thumbnailFeed: feed,
                 albums: AlbumsRepository(
                     catalogBackend: albums, writeBackend: albums, capabilities: MobileFixtureAlbums.capabilities))
+            if ProcessInfo.processInfo.arguments.contains("-EncryptedMemoriesDeletedBackupFixture") {
+                installDeletedBackupFixture()
+            }
             runtime.sessionModel.installIsolatedSession(session)
+        }
+
+        private func installDeletedBackupFixture() {
+            let directory = cacheDirectory.appendingPathComponent("backup", isDirectory: true)
+            do {
+                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                guard let journal = EditReplacementJournalFileStore.shared(accountDataDirectory: directory),
+                    let defaults = UserDefaults(suiteName: "deleted-backup-fixture")
+                else { return }
+                defaults.removePersistentDomain(forName: "deleted-backup-fixture")
+                let controller = PhotoLibraryBackupController(
+                    configuration: .init(
+                        accountDataDirectory: directory, databasePolicy: .conservative, defaults: defaults),
+                    identityResolver: MobileFixtureBackupBackend(), uploader: MobileFixtureBackupBackend(),
+                    replacementJournal: journal)
+                guard controller.installDeletedElsewhereFixtureForTesting() else { return }
+                backupFixture = controller
+                runtime.libraryModel.installIsolatedBackupForTesting(controller)
+            } catch {
+                assertionFailure("The deleted backup fixture could not be installed")
+            }
         }
 
         /// Installs only the library content into an isolated model (no session, no shared runtime): for probes that
@@ -123,6 +150,24 @@ import UIKit
         func removeCache() {
             try? FileManager.default.removeItem(at: cacheDirectory)
         }
+    }
+
+    private struct MobileFixtureBackupBackend: PhotoUploading, UploadIdentityResolving {
+        let capabilities = UploadBackendCapabilities(
+            canUpload: true, supportsCancel: true,
+            supportsPauseResume: false, supportsResumeAcrossRelaunch: false)
+
+        func upload(
+            _ request: PhotoUploadRequest, onProgress: @Sendable @escaping (UploadProgress) -> Void
+        ) async throws -> PhotoUID { throw MobileFixtureError.unavailable }
+        func cancel(token: UUID) async {}
+        func resolve(_ descriptor: UploadResourceDescriptor) async throws -> UploadPreflightResult {
+            throw MobileFixtureError.unavailable
+        }
+        func recordUploaded(
+            _ descriptor: UploadResourceDescriptor, identity: UploadIdentity,
+            remoteVolumeID: String, remoteLinkID: String
+        ) async throws { throw MobileFixtureError.unavailable }
     }
 
     enum MobileFixtureError: Error {
