@@ -56,6 +56,38 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
         await fixture.controller.shutdown()
     }
 
+    /// A list read that started before the person dismissed a row must not bring that row back.
+    func testProblemListReadOvertakenByADismissalIsReadAgain() async throws {
+        let fixture = try makeControllerFixture(prefix: "backup-problem-overtaken")
+        defer { fixture.cleanup() }
+        let queue = try XCTUnwrap(
+            UploadBackupSyncQueueManifestStore(
+                url: fixture.directory.appendingPathComponent(PhotoLibraryBackupController.queueDatabaseFileName)))
+        let entry = UploadBackupSyncQueueEntry(
+            source: .init(kind: .photoLibraryAsset, identifier: "unsupported"),
+            revision: .init(rawValue: 1), originalFilename: "unsupported.heic", state: .failed,
+            lastError: BackupIssueRecord(kind: .unsupported, detail: "").persistedValue, updatedAt: Date())
+        XCTAssertTrue(queue.upsert(entry))
+        let controller = fixture.controller
+        let item = try XCTUnwrap(controller.failedItems().first)
+
+        var reads = 0
+        var shown: [[String]] = []
+        await controller.applyCurrentProblemList(
+            {
+                reads += 1
+                let items = controller.failedItems()
+                // The person dismisses the row while the first read is under way.
+                if reads == 1 { controller.dismissFailedItem(item) }
+                return items
+            },
+            { shown.append($0.map(\.id)) })
+
+        XCTAssertEqual(reads, 2)
+        XCTAssertEqual(shown, [[]], "the read from before the dismissal must not be shown")
+        await controller.shutdown()
+    }
+
     func testFailedItemsOmitFreshRowsAndExplainCameraAndOriginalWaits() async throws {
         let fixture = try makeControllerFixture(prefix: "backup-wait-projection")
         defer { fixture.cleanup() }

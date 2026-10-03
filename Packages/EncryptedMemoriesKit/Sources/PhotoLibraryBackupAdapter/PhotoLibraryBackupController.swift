@@ -466,14 +466,34 @@ public final class PhotoLibraryBackupController {
     public func followProblemList(
         limit: Int = 200, interval: Duration = .seconds(5), _ apply: ([BackupFailedItem]) -> Void
     ) async {
-        apply(await problemItems(limit: limit))
+        await applyCurrentProblemList({ await problemItems(limit: limit) }, apply)
         while isSyncing {
             try? await Task.sleep(for: interval)
             guard !Task.isCancelled else { return }
-            let items = await problemItems(limit: limit)
-            guard !Task.isCancelled else { return }
-            apply(items)
+            await applyCurrentProblemList({ await problemItems(limit: limit) }, apply)
         }
+    }
+
+    /// Counts the person's actions on the problem list, so a read that an action overtakes is not shown.
+    private(set) var problemListChanges: UInt64 = 0
+
+    /// A read that started before the person's action would bring a dismissed row back, so the list reads again.
+    func applyCurrentProblemList(
+        _ read: () async -> [BackupFailedItem], _ apply: ([BackupFailedItem]) -> Void
+    ) async {
+        while !Task.isCancelled {
+            let changes = problemListChanges
+            let items = await read()
+            guard !Task.isCancelled else { return }
+            if changes == problemListChanges {
+                apply(items)
+                return
+            }
+        }
+    }
+
+    func noteProblemListChange() {
+        problemListChanges &+= 1
     }
 
     /// Every row the person can resolve, independent of how many rows the list shows.
@@ -499,6 +519,7 @@ public final class PhotoLibraryBackupController {
                 updatedAt: Date()
             ) == true
         else { return }
+        noteProblemListChange()
         refreshFromQueue()
     }
 
@@ -546,6 +567,7 @@ public final class PhotoLibraryBackupController {
             }
             SupportEventTrail.shared.record(
                 keepDeleted ? .backupDeletionKept : .backupDeletionReopened, subject: source.identifier)
+            noteProblemListChange()
             refreshFromQueue()
             return true
         } catch {
@@ -564,6 +586,7 @@ public final class PhotoLibraryBackupController {
             _ = queueStore.reopenForUserRetry(
                 entry, attempts: entry.state == .failed ? 0 : entry.attempts, updatedAt: now)
         }
+        noteProblemListChange()
         guard queueStore.isOperational() else {
             lastMessage = L10n.string("backup.error_local_state_unavailable")
             refreshFromQueue()
