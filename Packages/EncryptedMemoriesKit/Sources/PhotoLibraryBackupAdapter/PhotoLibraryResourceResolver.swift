@@ -560,7 +560,11 @@ public struct PhotoLibraryResourceResolver: BackupResourceResolving {
         case .accessRestricted, .accessUserDenied:
             return UploadError.permissionDenied(filename)
         case .networkAccessRequired, .networkError, .libraryVolumeOffline, .operationInterrupted:
-            return UploadError.transport(code: nsError.code, message: nsError.localizedDescription)
+            // The original is in iCloud or on an offline library volume: the backup waits and tries again by itself,
+            // so these failures must use a transport code that the runner treats as transient, not burn its attempts.
+            // The PhotoKit code is logged first, because support needs it to tell the four causes apart.
+            logger.notice("PhotoKit read waits: PHPhotosError \(nsError.code, privacy: .public)")
+            return UploadError.transport(code: NSURLErrorCannotLoadFromNetwork, message: nsError.localizedDescription)
         case .notEnoughSpace:
             return BackupTempFileStore.BackupTempFileError.diskBudgetExceeded
         default:
