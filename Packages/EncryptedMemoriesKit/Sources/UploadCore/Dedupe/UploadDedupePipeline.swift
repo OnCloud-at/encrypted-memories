@@ -8,8 +8,11 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
     /// Maximum number of name hashes in one duplicate request.
     public static let protonDuplicateBatchSize = 150
     private static let primeLookupConcurrency = 3
-    /// Maximum number of same-content rows that a root weighs, so a related file listed first hides no main photo.
-    static let rootMatchLimit = 8
+    /// A root reads its same-content rows in one consistent query, so related files listed first hide no main photo,
+    /// and weighs them in batches: each batch costs at most one visibility read, only for links outside the cache.
+    /// The bound keeps a pathological library cheap: past 256 rows the root uploads as its own photo.
+    static let rootMatchBatchSize = 8
+    static let rootMatchBound = 256
 
     private let store: any UploadIdentityStore
     private let hasher: any UploadHashing
@@ -306,16 +309,18 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
         var provesLive = nameCandidates.provesLive
         do {
             if nameDecision.uploadsBytes {
-                let limit = isRoot && replacement.isEmpty ? Self.rootMatchLimit : 1
+                let limit = isRoot && replacement.isEmpty ? Self.rootMatchBound : 1
                 let found = try await checker.findDuplicates(contentHash: contentHash, limit: limit)
-                if !found.isEmpty {
+                for start in stride(from: 0, to: found.count, by: Self.rootMatchBatchSize) {
+                    let batch = Array(found[start..<min(start + Self.rootMatchBatchSize, found.count)])
                     let contentCandidates = try await candidates(
-                        found, contentHash: contentHash, descriptor: descriptor, replacement: replacement)
+                        batch, contentHash: contentHash, descriptor: descriptor, replacement: replacement)
                     provesLive = provesLive || contentCandidates.provesLive
                     if let remoteContent = contentCandidates.items.first {
                         decision = decisionForRemoteContent(
                             remoteContent,
                             replacingNameHash: nameDecision == .uploadReplacingDraft ? nameHash : nil)
+                        break
                     }
                 }
                 try Task.checkCancellation()
@@ -611,7 +616,7 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
     }
 
     /// The manifest row whose remote link this resource may adopt. For a root, a primary row proves no main photo:
-    /// an earlier version stored the related file that a primary adopted. So a root weighs up to `rootMatchLimit`
+    /// an earlier version stored the related file that a primary adopted. So a root weighs up to `rootMatchBound`
     /// rows and takes the first one whose link the server does not name as a related file.
     private func trustedMatch(
         contentHash: String, epoch: String, sha1Hex: String, isRoot: Bool,
@@ -619,15 +624,32 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
     ) async throws -> UploadIdentityRecord? {
         let guardsRoot = isRoot && replacement.isEmpty
         let rows = store.trustedRecords(
-            contentHash: contentHash, hashKeyEpoch: epoch, limit: guardsRoot ? Self.rootMatchLimit : 1
+            contentHash: contentHash, hashKeyEpoch: epoch, limit: guardsRoot ? Self.rootMatchBound : 1
         ).filter { known in
             known.sha1Hex == sha1Hex && known.remoteLinkID != nil
                 && (!isRoot || known.source.resource == .primary)
                 && (replacement.isEmpty || known.source == descriptor.source)
         }
-        guard guardsRoot, !rows.isEmpty else { return rows.first }
-        let related = try await relatedLinks(among: Set(rows.compactMap(\.remoteLinkID)))
-        return rows.first { $0.remoteLinkID.map { !related.contains($0) } ?? false }
+        guard guardsRoot else { return rows.first }
+        // Several sources can name one related link; it is weighed once.
+        var rejected: Set<String> = []
+        var remaining = rows[...]
+        while !remaining.isEmpty {
+            var batch: [UploadIdentityRecord] = []
+            var batchLinks: Set<String> = []
+            while batchLinks.count < Self.rootMatchBatchSize, let row = remaining.popFirst() {
+                guard let linkID = row.remoteLinkID, !rejected.contains(linkID) else { continue }
+                batch.append(row)
+                batchLinks.insert(linkID)
+            }
+            guard !batch.isEmpty else { break }
+            let related = try await relatedLinks(among: batchLinks)
+            if let eligible = batch.first(where: { $0.remoteLinkID.map { !related.contains($0) } ?? false }) {
+                return eligible
+            }
+            rejected.formUnion(related)
+        }
+        return nil
     }
 
     /// The links that the server names as a related file of a main photo. The name and duplicate rows carry no

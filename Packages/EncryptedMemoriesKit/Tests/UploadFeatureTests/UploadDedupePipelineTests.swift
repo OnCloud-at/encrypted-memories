@@ -1128,6 +1128,40 @@ final class UploadDedupePipelineTests: XCTestCase {
         XCTAssertEqual(checker.linkVisibilityCallCount, 1)
     }
 
+    func testAPrimaryAdoptsTheMainPhotoOfTheNinthManifestRowAfterEightRowsNameOneRelatedFile() async throws {
+        hasher.contentSeeds["/photos/IMG_1.HEIC"] = "shared-bytes"
+        for index in 0..<8 {
+            storePrimaryRow(
+                "/old/\(index)/IMG_5.HEIC", linkID: "frame-link", seed: "shared-bytes",
+                updatedAt: Date(timeIntervalSince1970: TimeInterval(index)))
+        }
+        storePrimaryRow(
+            "/copy/IMG_5.HEIC", linkID: "main-link", seed: "shared-bytes", updatedAt: Date(timeIntervalSince1970: 9))
+        checker.linkVisibilityByID["frame-link"] = RemoteLinkVisibility(isActive: true, mainPhotoLinkID: "burst-main")
+        checker.linkVisibilityByID["main-link"] = RemoteLinkVisibility(isActive: true, mainPhotoLinkID: nil)
+
+        let result = try await pipeline.resolve(descriptor())
+
+        XCTAssertEqual(result.decision, .skip(.knownFromManifest, remoteLinkID: "main-link"))
+        XCTAssertEqual(checker.linkVisibilityCallCount, 1, "a batch holds eight distinct links, not eight rows")
+    }
+
+    func testAPrimaryAdoptsTheMainPhotoThatTheContentIndexNamesAfterEightRelatedFiles() async throws {
+        hasher.contentSeeds["/photos/IMG_1.HEIC"] = "shared-bytes"
+        let contentHash = "ch(\(fakeSHA1Hex(seed: "shared-bytes")))"
+        let frames = (0..<8).map { "frame-\($0)" }
+        checker.contentMatchesByContentHash[contentHash] =
+            frames.map { activeRow($0, contentHash: contentHash, name: "IMG_9.HEIC") }
+            + [activeRow("main-link", contentHash: contentHash, name: "IMG_8.HEIC")]
+        checker.relatedLinkIDsByMainLinkID["burst-main"] = Set(frames)
+
+        let result = try await pipeline.resolve(descriptor())
+
+        XCTAssertEqual(result.decision, .skip(.activeDuplicate, remoteLinkID: "main-link"))
+        XCTAssertEqual(checker.contentFindCallCount, 1, "one consistent read of every candidate")
+        XCTAssertEqual(checker.linkVisibilityCallCount, 2, "one read for each batch of candidates")
+    }
+
     /// Plants one active same-content row for each of `count` roots, under their own names.
     private func rootsWithActiveTwins(_ count: Int) -> [UploadResourceDescriptor] {
         (0..<count).map { index in
