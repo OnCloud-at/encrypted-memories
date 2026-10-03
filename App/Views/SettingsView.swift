@@ -773,18 +773,48 @@ private struct PhotoLibraryBackupSection: View {
 }
 
 /// Native macOS presentation over the same shared failed-item and retry contracts as iOS/iPadOS.
+/// An album row opens the same sheet with its last run's photos. That list is read-only: the row's
+/// Sync now is its retry.
 private struct MacFailedBackupSheet: View {
-    let controller: PhotoLibraryBackupController
+    enum Source {
+        case backup(PhotoLibraryBackupController)
+        case album(AlbumSyncController, albumID: String)
+    }
+
+    let source: Source
     @Environment(\.dismiss) private var dismiss
-    @State private var items: [BackupFailedItem] = []
+    @State private var backupItems: [BackupFailedItem] = []
+
+    init(controller: PhotoLibraryBackupController) {
+        source = .backup(controller)
+    }
+
+    init(albumSync: AlbumSyncController, albumID: String) {
+        source = .album(albumSync, albumID: albumID)
+    }
+
+    private var controller: PhotoLibraryBackupController? {
+        if case .backup(let controller) = source { controller } else { nil }
+    }
+
+    private var items: [BackupFailedItem] {
+        switch source {
+        case .backup: backupItems
+        case .album(let albumSync, let albumID):
+            albumSync.selectedAlbums.first { $0.id == albumID }?.problems ?? []
+        }
+    }
 
     var body: some View {
         VStack(spacing: 0) {
             HStack {
-                Text(L10n.string("backup.failed_sheet_title"))
-                    .font(.headline)
+                Text(
+                    controller == nil
+                        ? L10n.string("albumsync.problem_sheet_title") : L10n.string("backup.failed_sheet_title")
+                )
+                .font(.headline)
                 Spacer()
-                if items.offersUserRetry {
+                if let controller, items.offersUserRetry {
                     Button(L10n.string("backup.failed_sheet_retry")) {
                         Task {
                             await controller.retryUserResolvableWork()
@@ -831,27 +861,27 @@ private struct MacFailedBackupSheet: View {
                                             }
                                         }
                                         Spacer(minLength: 8)
-                                        if item.issue == .deletedElsewhere {
+                                        if let controller, item.issue == .deletedElsewhere {
                                             Button(L10n.string("backup.keep_deleted")) {
                                                 controller.keepDeleted(item)
-                                                Task { items = await controller.problemItems() }
+                                                Task { backupItems = await controller.problemItems() }
                                             }
                                             .buttonStyle(.borderless)
                                             .help(L10n.string("backup.keep_deleted"))
                                             Button(L10n.string("backup.back_up_again")) {
                                                 controller.backUpAgain(item)
                                                 Task {
-                                                    items = await controller.problemItems().filter {
+                                                    backupItems = await controller.problemItems().filter {
                                                         $0.id != item.id || $0.issue == .deletedElsewhere
                                                     }
                                                 }
                                             }
                                             .buttonStyle(.borderless)
                                             .help(L10n.string("backup.back_up_again"))
-                                        } else if item.isPermanent {
+                                        } else if let controller, item.isPermanent {
                                             Button {
                                                 controller.dismissFailedItem(item)
-                                                items.removeAll { $0.id == item.id }
+                                                backupItems.removeAll { $0.id == item.id }
                                             } label: {
                                                 Image(systemName: "xmark.circle")
                                             }
@@ -868,17 +898,22 @@ private struct MacFailedBackupSheet: View {
                         }
                     }
                 }
-                Text(L10n.string("backup.failed_sheet_footer"))
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding()
+                if controller != nil {
+                    Text(L10n.string("backup.failed_sheet_footer"))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding()
+                }
             }
         }
         .frame(width: 520, height: 380)
         // A photo can need the person while the list is open; Try again then appears.
-        .task(id: controller.status.problemListKey) { await controller.followProblemList { items = $0 } }
+        .task(id: controller?.status.problemListKey) {
+            guard let controller else { return }
+            await controller.followProblemList { backupItems = $0 }
+        }
     }
 }
 
@@ -887,6 +922,7 @@ private struct MacFailedBackupSheet: View {
 private struct AlbumSyncSection: View {
     let controller: AlbumSyncController
     @State private var showPicker = false
+    @State private var problemListAlbumID: String?
 
     var body: some View {
         if !controller.isAvailable {
@@ -934,6 +970,14 @@ private struct AlbumSyncSection: View {
             .sheet(isPresented: $showPicker) {
                 AlbumPickerSheet(controller: controller)
             }
+            .sheet(
+                isPresented: Binding(
+                    get: { problemListAlbumID != nil }, set: { if !$0 { problemListAlbumID = nil } })
+            ) {
+                if let problemListAlbumID {
+                    MacFailedBackupSheet(albumSync: controller, albumID: problemListAlbumID)
+                }
+            }
             .alert(
                 L10n.string("settings.albumsync_conflict_title"),
                 isPresented: conflictPresented
@@ -973,8 +1017,23 @@ private struct AlbumSyncSection: View {
                     if let count = album.assetCount {
                         Text(L10n.string("settings.albumsync_photo_count \(count)"))
                     }
-                    Text(isActive ? controller.progress.localizedTitle : album.localizedRowStatusDescription)
-                        .foregroundStyle(rowStateColor(album, isActive: isActive))
+                    if !isActive, album.showsProblemList {
+                        // Opens the shared problem list with this album's photos; Sync now is the retry.
+                        Button {
+                            problemListAlbumID = album.id
+                        } label: {
+                            HStack(spacing: 2) {
+                                Text(album.localizedRowStatusDescription)
+                                Image(systemName: "chevron.right").font(.system(size: 9))
+                            }
+                            .foregroundStyle(rowStateColor(album, isActive: isActive))
+                        }
+                        .buttonStyle(.borderless)
+                        .accessibilityIdentifier("albumsync.notInAlbum.\(album.id)")
+                    } else {
+                        Text(isActive ? controller.progress.localizedTitle : album.localizedRowStatusDescription)
+                            .foregroundStyle(rowStateColor(album, isActive: isActive))
+                    }
                 }
                 .font(.system(size: 11).monospacedDigit())
                 .foregroundStyle(.secondary)

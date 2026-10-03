@@ -10,6 +10,10 @@ public struct AlbumSyncAttachPlan: Sendable, Equatable {
     public var missingRemote = 0
     /// Local assets whose only remote copy sits in Proton trash - never attached, never re-uploaded.
     public var trashedRemote = 0
+    /// The local identifiers behind `missingRemote`, in local album order.
+    public var missingRemoteIdentifiers: [String] = []
+    /// The local identifiers behind `trashedRemote`, in local album order.
+    public var trashedRemoteIdentifiers: [String] = []
     /// Distinct local assets that resolved to an already-planned remote link (duplicate content
     /// across the album collapses to one attach).
     public var duplicatesCollapsed = 0
@@ -33,10 +37,12 @@ public enum AlbumSyncPlanner {
         for identifier in orderedLocalIdentifiers {
             guard let link = remoteLinks[identifier] else {
                 plan.missingRemote += 1
+                plan.missingRemoteIdentifiers.append(identifier)
                 continue
             }
             if link.isTrashed {
                 plan.trashedRemote += 1
+                plan.trashedRemoteIdentifiers.append(identifier)
                 continue
             }
             let linkID = link.uid.nodeID

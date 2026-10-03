@@ -32,15 +32,29 @@ public struct AlbumSyncBackupReport: Sendable, Equatable {
     public var sourceMissing = 0
     /// The only remote copy is intentionally deleted/trashed - backup respects that, so does sync.
     public var skippedRemoteDeletion = 0
+    /// The unresolved rows of this run, one per local identifier (newest revision), with their reasons.
+    public var problems: [String: BackupFailedItem] = [:]
+    /// Original filenames by local identifier, so the album list can name photos without a problem row.
+    public var filenames: [String: String] = [:]
 
     public init() {}
 
-    public init(total: Int, backedUp: Int, failed: Int, sourceMissing: Int, skippedRemoteDeletion: Int) {
+    public init(
+        total: Int,
+        backedUp: Int,
+        failed: Int,
+        sourceMissing: Int,
+        skippedRemoteDeletion: Int,
+        problems: [String: BackupFailedItem] = [:],
+        filenames: [String: String] = [:]
+    ) {
         self.total = total
         self.backedUp = backedUp
         self.failed = failed
         self.sourceMissing = sourceMissing
         self.skippedRemoteDeletion = skippedRemoteDeletion
+        self.problems = problems
+        self.filenames = filenames
     }
 }
 

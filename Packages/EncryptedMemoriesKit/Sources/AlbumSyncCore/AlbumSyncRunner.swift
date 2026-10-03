@@ -165,7 +165,8 @@ public actor AlbumSyncRunner {
         let updateBackupProgress: @Sendable (BackupSyncProgress) -> Void = { [weak self] snapshot in
             Task { await self?.applyBackupProgress(snapshot) }
         }
-        _ = try await backup.ensureBackedUp(localIdentifiers: identifiers, onProgress: updateBackupProgress)
+        let backupReport = try await backup.ensureBackedUp(
+            localIdentifiers: identifiers, onProgress: updateBackupProgress)
         try checkStop()
 
         // Build the pure, idempotent attach plan from current members and manifest links.
@@ -214,7 +215,12 @@ public actor AlbumSyncRunner {
             alreadyMember: plan.alreadyMember + attachResult.alreadyMember,
             attachFailed: attachResult.failed,
             unattachable: plan.missingRemote,
-            trashedSkipped: plan.trashedRemote
+            trashedSkipped: plan.trashedRemote,
+            problems: AlbumSyncProblemList.items(
+                missingIdentifiers: plan.missingRemoteIdentifiers,
+                attachFailedIdentifiers: Self.localIdentifiers(
+                    of: attachResult.failedLinkIDs, orderedLocalIdentifiers: identifiers, links: links),
+                backup: backupReport)
         )
         var mapping =
             mappingStore.mapping(localAlbumID: album.id)
@@ -232,6 +238,24 @@ public actor AlbumSyncRunner {
         }
         publish()
         return report
+    }
+
+    /// Maps failed link ids back, in album order, to the local photo that planned each attach:
+    /// the first photo with that link, as in `AlbumSyncPlanner`.
+    static func localIdentifiers(
+        of failedLinkIDs: [String],
+        orderedLocalIdentifiers: [String],
+        links: [String: AlbumSyncRemoteLink]
+    ) -> [String] {
+        var remaining = Set(failedLinkIDs)
+        var result: [String] = []
+        for identifier in orderedLocalIdentifiers where !remaining.isEmpty {
+            guard let link = links[identifier], !link.isTrashed,
+                remaining.remove(link.uid.nodeID) != nil
+            else { continue }
+            result.append(identifier)
+        }
+        return result
     }
 
     private func resolveRemoteAlbum(
