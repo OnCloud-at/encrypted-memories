@@ -457,6 +457,8 @@ final class DeletedPhotoTests: XCTestCase {
             identityResolver: FakeIdentityResolver(), uploader: MockUploader(), replacementJournal: journal)
         XCTAssertTrue(controller.installDeletedElsewhereFixtureForTesting())
         controller.setAccessStateForTesting(.full)
+        // A real scan would ask PhotoKit, which waits for an authorization answer on a machine without access.
+        controller.replacePassBodyForTesting {}
         let item = try XCTUnwrap(controller.failedItems().first)
         XCTAssertFalse(controller.isSyncing)
         controller.backUpAgain(item)

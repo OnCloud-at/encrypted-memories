@@ -180,6 +180,9 @@ public final class PhotoLibraryBackupController {
 
     #if DEBUG
         private var runnerStopOperationForTesting: (@Sendable () async -> Void)?
+        /// Replaces the scan and the drain of a started pass. Package tests have no photo library access, and on a
+        /// machine without an authorization record a real scan waits for an answer that never comes.
+        private var passBodyForTesting: (@Sendable () async -> Void)?
     #endif
 
     /// Platform hook: invoked with `true` when a backup pass is actively running (so the host app may
@@ -634,6 +637,16 @@ public final class PhotoLibraryBackupController {
 
         // The task inherits the main actor, but all heavy phases (`scan`, `runUntilDrained`) are
         // awaits onto other actors/off-actor structs - the main thread stays free for UI.
+        #if DEBUG
+            if let passBody = passBodyForTesting {
+                let task = Task { [weak self] in
+                    await passBody()
+                    await self?.finishSync(runID: runID)
+                }
+                syncTask = task
+                return StartedBackupRun(runID: runID, task: task)
+            }
+        #endif
         let task = Task { [weak self, monitor, tempStore, engine, runner, queueStore, catalogStore, statusSetupTask] in
             await statusSetupTask?.value
             self?.refreshFromQueue()
@@ -889,6 +902,10 @@ public final class PhotoLibraryBackupController {
 
         internal func setAccessStateForTesting(_ state: PhotoBackupAccessState) {
             accessState = state
+        }
+
+        internal func replacePassBodyForTesting(_ body: @escaping @Sendable () async -> Void) {
+            passBodyForTesting = body
         }
 
         @discardableResult
