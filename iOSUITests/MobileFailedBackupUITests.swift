@@ -100,6 +100,7 @@ final class MobileFailedBackupUITests: XCTestCase {
         XCTAssertTrue(retry.waitForExistence(timeout: 5))
         retry.tap()
         let gone = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: retry)
-        XCTAssertEqual(XCTWaiter.wait(for: [gone], timeout: 5), .completed)
+        // While a pass runs, the open list reloads every 5 seconds, so the button can take one reload to go away.
+        XCTAssertEqual(XCTWaiter.wait(for: [gone], timeout: 15), .completed)
     }
 }
