@@ -48,22 +48,19 @@ private final class RecoveryControlledBarrier: @unchecked Sendable {
     private var waiters: [CheckedContinuation<Void, Never>] = []
 
     func wait() async {
-        let entered = lock.withLock {
-            enteredCount += 1
-            return enteredCount
-        }
-        if entered == 1 { firstEntered.signal() }
-        if entered == 2 { secondEntered.signal() }
-
         await withCheckedContinuation { continuation in
-            let resumeNow = lock.withLock {
+            // Count the entry and queue the waiter together, so the entry order is the release order.
+            let (entered, resumeNow) = lock.withLock { () -> (Int, Bool) in
+                enteredCount += 1
                 if releasePermits > 0 {
                     releasePermits -= 1
-                    return true
+                    return (enteredCount, true)
                 }
                 waiters.append(continuation)
-                return false
+                return (enteredCount, false)
             }
+            if entered == 1 { firstEntered.signal() }
+            if entered == 2 { secondEntered.signal() }
             if resumeNow { continuation.resume() }
         }
 
