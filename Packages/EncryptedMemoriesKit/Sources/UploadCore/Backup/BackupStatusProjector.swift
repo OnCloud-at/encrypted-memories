@@ -295,11 +295,15 @@ public actor BackupStatusProjector {
         var candidates: [(Date, BackupIssueKind)] = []
         if let entry = queue.earliestRunnableEntry() {
             let record = BackupIssueRecord.decode(entry.lastError)
-            candidates.append((record?.nextAttemptAt ?? entry.updatedAt, record?.kind ?? .unknown))
+            candidates.append(
+                (
+                    BackupFailedItem.effectiveNextAttempt(record, entry: entry) ?? entry.updatedAt,
+                    record?.kind ?? .unknown
+                ))
         }
         if let entry = queue.earliestEntry(in: .blockedByDraft) {
             let record = BackupIssueRecord.decode(entry.lastError)
-            if let due = record?.nextAttemptAt {
+            if let due = BackupFailedItem.effectiveNextAttempt(record, entry: entry) {
                 candidates.append((due, .remoteDraft))
             }
         }

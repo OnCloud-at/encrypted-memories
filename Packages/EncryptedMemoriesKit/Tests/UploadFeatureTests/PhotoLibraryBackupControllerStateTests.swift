@@ -7,6 +7,339 @@ import XCTest
 
 @MainActor
 final class PhotoLibraryBackupControllerStateTests: XCTestCase {
+    func testFailedItemsClassifyReasonsWithoutDisplayingTechnicalDetails() async throws {
+        let fixture = try makeControllerFixture(prefix: "backup-issue-projection")
+        defer { fixture.cleanup() }
+        let queue = try XCTUnwrap(
+            UploadBackupSyncQueueManifestStore(
+                url: fixture.directory.appendingPathComponent(PhotoLibraryBackupController.queueDatabaseFileName)))
+        let cases: [(BackupIssueKind, UploadBackupSyncQueueState, BackupIssueCategory, String)] = [
+            (.network, .discovered, .automatic, "backup.issue_network"),
+            (.remoteService, .discovered, .automatic, "backup.issue_remote_service"),
+            (.deviceStorage, .discovered, .automatic, "backup.issue_device_storage"),
+            (.remoteDraft, .blockedByDraft, .automatic, "backup.issue_remote_draft"),
+            (.accountStorage, .discovered, .userResolvable, "backup.issue_account_storage"),
+            (.permission, .failed, .userResolvable, "backup.issue_permission"),
+            (.deletedElsewhere, .failedPermanent, .decision, "backup.issue_deleted_elsewhere"),
+            (.remoteDraftStale, .failedPermanent, .permanent, "backup.issue_remote_draft_stale"),
+            (.sourceMissing, .sourceMissing, .permanent, "backup.issue_source_missing"),
+            (.unsupported, .failed, .permanent, "backup.issue_unsupported"),
+            (.unknown, .failed, .userResolvable, "backup.fail_reason_generic"),
+            (.unknown, .discovered, .automatic, "backup.issue_unknown_waiting"),
+            (.remoteService, .failed, .userResolvable, "backup.issue_remote_service"),
+            (.network, .failed, .userResolvable, "backup.issue_network"),
+            (.localState, .failed, .userResolvable, "backup.error_local_state_unavailable"),
+            (.unknown, .failedPermanent, .permanent, "backup.issue_permanent"),
+        ]
+        for (index, testCase) in cases.enumerated() {
+            let (kind, state, category, key) = testCase
+            let entry = UploadBackupSyncQueueEntry(
+                source: .init(kind: .photoLibraryAsset, identifier: "reason-\(index)"),
+                revision: .init(rawValue: 1), originalFilename: "reason-\(index).heic", state: state,
+                lastError: BackupIssueRecord(kind: kind, detail: "PRIVATE SERVER DETAIL").persistedValue,
+                updatedAt: Date())
+            XCTAssertTrue(queue.upsert(entry))
+            let item = try XCTUnwrap(fixture.controller.failedItems().first { $0.source == entry.source })
+            XCTAssertEqual(item.category, category, "\(kind), \(state)")
+            XCTAssertEqual(item.reason, L10n.string(dynamicKey: key), "\(kind), \(state)")
+            XCTAssertEqual(item.technicalDetail, "PRIVATE SERVER DETAIL")
+            XCTAssertFalse(item.reason.contains("PRIVATE"))
+            XCTAssertEqual(item.isPermanent, category == .permanent || state == .failedPermanent)
+        }
+        let unsupported = try XCTUnwrap(fixture.controller.failedItems().first { $0.issue == .unsupported })
+        fixture.controller.dismissFailedItem(unsupported)
+        XCTAssertEqual(
+            queue.entry(for: try XCTUnwrap(unsupported.source), revision: try XCTUnwrap(unsupported.revision))?.state,
+            .dismissedFailure)
+        XCTAssertFalse(fixture.controller.failedItems().contains { $0.id == unsupported.id })
+        XCTAssertEqual(queue.summary().resolved, 0, "dismissal is not a successful backup")
+        await fixture.controller.shutdown()
+    }
+
+    func testFailedItemsOmitFreshRowsAndExplainCameraAndOriginalWaits() async throws {
+        let fixture = try makeControllerFixture(prefix: "backup-wait-projection")
+        defer { fixture.cleanup() }
+        let queue = try XCTUnwrap(
+            UploadBackupSyncQueueManifestStore(
+                url: fixture.directory.appendingPathComponent(PhotoLibraryBackupController.queueDatabaseFileName)))
+        for (id, state) in [("fresh", UploadBackupSyncQueueState.discovered), ("queued", .queuedForUpload)] {
+            XCTAssertTrue(
+                queue.upsert(
+                    .init(
+                        source: .init(kind: .photoLibraryAsset, identifier: id), revision: .init(rawValue: 1),
+                        originalFilename: id, state: state, updatedAt: Date())))
+        }
+        XCTAssertTrue(fixture.controller.failedItems().isEmpty)
+        XCTAssertFalse(fixture.controller.failedItems().offersUserRetry)
+        for key in [
+            "error.upload_source_not_ready", "backup.issue_waiting_original",
+            "The edited photo is waiting for its original resources. Backup will retry automatically.",
+            "Das bearbeitete Foto wartet auf seine Originalressourcen. Das Backup versucht es automatisch erneut.",
+        ] {
+            let record = BackupIssueRecord(kind: .unknown, detail: key, nextAttemptAt: .distantFuture)
+            XCTAssertTrue(
+                queue.upsert(
+                    .init(
+                        source: .init(kind: .photoLibraryAsset, identifier: key), revision: .init(rawValue: 1),
+                        originalFilename: key, state: .discovered, lastError: record.persistedValue,
+                        updatedAt: Date().addingTimeInterval(3_600))))
+        }
+        let items = fixture.controller.failedItems()
+        XCTAssertEqual(items.count, 4)
+        XCTAssertTrue(items.allSatisfy { $0.category == .automatic && $0.retryDescription != nil })
+        XCTAssertEqual(
+            items.first { $0.filename == "error.upload_source_not_ready" }?.reason,
+            L10n.string("backup.issue_source_not_ready"))
+        XCTAssertEqual(
+            items.first { $0.filename == "backup.issue_waiting_original" }?.reason,
+            L10n.string("backup.issue_waiting_original"))
+        XCTAssertTrue(
+            items.filter { $0.filename != "error.upload_source_not_ready" }
+                .allSatisfy { $0.reason == L10n.string("backup.issue_waiting_original") })
+        XCTAssertFalse(fixture.controller.failedItems().offersUserRetry)
+        XCTAssertTrue(fixture.controller.failedItems(limit: 0).isEmpty)
+        await fixture.controller.shutdown()
+    }
+
+    func testUserResolvableRetryPreservesAutomaticDatesAndEveryIssueRecord() async throws {
+        let fixture = try makeControllerFixture(prefix: "backup-scoped-retry")
+        defer { fixture.cleanup() }
+        let queue = try XCTUnwrap(
+            UploadBackupSyncQueueManifestStore(
+                url: fixture.directory.appendingPathComponent(PhotoLibraryBackupController.queueDatabaseFileName)))
+        let future = Date().addingTimeInterval(3_600)
+        let cases: [(String, BackupIssueKind, UploadBackupSyncQueueState)] = [
+            ("network", .network, .discovered), ("draft", .remoteDraft, .blockedByDraft),
+            ("quota", .accountStorage, .discovered), ("permission", .permission, .failed),
+            ("terminal-service", .remoteService, .failed), ("unsupported", .unsupported, .failed),
+            ("decision", .deletedElsewhere, .failedPermanent),
+        ]
+        var entries: [UploadBackupSyncQueueEntry] = []
+        for (id, kind, state) in cases {
+            let entry = UploadBackupSyncQueueEntry(
+                source: .init(kind: .photoLibraryAsset, identifier: id), revision: .init(rawValue: 1),
+                originalFilename: id, state: state, attempts: 8,
+                lastError: BackupIssueRecord(kind: kind, detail: "detail", nextAttemptAt: future).persistedValue,
+                updatedAt: future)
+            XCTAssertTrue(queue.upsert(entry))
+            entries.append(entry)
+        }
+        XCTAssertTrue(fixture.controller.failedItems().offersUserRetry)
+        let beforeRetry = Date()
+        await fixture.controller.retryUserResolvableWork()
+        let afterRetry = Date()
+        for entry in entries {
+            let row = try XCTUnwrap(queue.entry(for: entry.source, revision: entry.revision))
+            XCTAssertEqual(row.lastError, entry.lastError, entry.originalFilename)
+            let isClassB = ["quota", "permission", "terminal-service"].contains(entry.originalFilename)
+            if isClassB {
+                XCTAssertEqual(row.state, .discovered)
+                XCTAssertEqual(row.attempts, entry.state == .failed ? 0 : entry.attempts)
+                XCTAssertGreaterThanOrEqual(row.updatedAt, beforeRetry)
+                XCTAssertLessThanOrEqual(row.updatedAt, afterRetry)
+            } else {
+                // SQLite keeps the date as a double, so compare it within a millisecond.
+                XCTAssertEqual(
+                    row.updatedAt.timeIntervalSince1970, entry.updatedAt.timeIntervalSince1970, accuracy: 0.001)
+                var unchanged = row
+                unchanged.updatedAt = entry.updatedAt
+                XCTAssertEqual(
+                    unchanged, entry, "a scoped retry must not change automatic, decision, or permanent work")
+            }
+        }
+        await fixture.controller.shutdown()
+    }
+
+    func testManyFreshOrPermanentRowsCannotHideAPhotoThePersonCanFix() async throws {
+        let fixture = try makeControllerFixture(prefix: "backup-problem-limit")
+        defer { fixture.cleanup() }
+        let queue = try XCTUnwrap(
+            UploadBackupSyncQueueManifestStore(
+                url: fixture.directory.appendingPathComponent(PhotoLibraryBackupController.queueDatabaseFileName)))
+        let now = Date()
+        for index in 0..<250 {
+            // Newer revisions sort first. Fresh rows have no reason, legacy rows carry an earlier build's message,
+            // and permanent rows are not the person's to fix.
+            XCTAssertTrue(
+                queue.upsert(
+                    UploadBackupSyncQueueEntry(
+                        source: .init(kind: .photoLibraryAsset, identifier: "fresh-\(index)"),
+                        revision: .init(rawValue: 1_000 + Int64(index)), originalFilename: "fresh", state: .discovered,
+                        updatedAt: now)))
+            XCTAssertTrue(
+                queue.upsert(
+                    UploadBackupSyncQueueEntry(
+                        source: .init(kind: .photoLibraryAsset, identifier: "legacy-\(index)"),
+                        revision: .init(rawValue: 2_000 + Int64(index)), originalFilename: "legacy",
+                        state: .discovered, lastError: "An earlier build's message", updatedAt: now)))
+            XCTAssertTrue(
+                queue.upsert(
+                    UploadBackupSyncQueueEntry(
+                        source: .init(kind: .photoLibraryAsset, identifier: "unsupported-\(index)"),
+                        revision: .init(rawValue: 500 + Int64(index)), originalFilename: "unsupported",
+                        state: .failed, attempts: 8,
+                        lastError: BackupIssueRecord(kind: .unsupported, detail: "x").persistedValue,
+                        updatedAt: now)))
+        }
+        let quota = UploadBackupSyncQueueEntry(
+            source: .init(kind: .photoLibraryAsset, identifier: "quota"), revision: .init(rawValue: 1),
+            originalFilename: "quota.heic", state: .discovered,
+            lastError: BackupIssueRecord(
+                kind: .accountStorage, detail: "full", nextAttemptAt: now.addingTimeInterval(21_600)
+            ).persistedValue, updatedAt: now.addingTimeInterval(21_600))
+        XCTAssertTrue(queue.upsert(quota))
+
+        let items = fixture.controller.failedItems()
+        XCTAssertEqual(items.count, 200)
+        XCTAssertFalse(items.contains { $0.filename == "fresh" || $0.filename == "legacy" })
+        XCTAssertEqual(items.first?.filename, "quota.heic", "a photo the person can fix leads the list")
+        XCTAssertTrue(items.offersUserRetry)
+        await fixture.controller.retryUserResolvableWork()
+        let reopened = try XCTUnwrap(queue.entry(for: quota.source, revision: quota.revision))
+        XCTAssertLessThan(reopened.updatedAt, now.addingTimeInterval(60))
+        // The reason stays, but the date the list and the scheduler use is the row's own, earlier date.
+        let item = try XCTUnwrap(fixture.controller.failedItems(limit: 1_000).first { $0.filename == "quota.heic" })
+        XCTAssertLessThan(try XCTUnwrap(item.nextAttemptAt), now.addingTimeInterval(60))
+        await fixture.controller.shutdown()
+    }
+
+    func testAPhotoThePersonCanFixLeadsTheListBehindThousandsOfWaitingPhotos() async throws {
+        let fixture = try makeControllerFixture(prefix: "backup-problem-offline-library")
+        defer { fixture.cleanup() }
+        let queue = try XCTUnwrap(
+            UploadBackupSyncQueueManifestStore(
+                url: fixture.directory.appendingPathComponent(PhotoLibraryBackupController.queueDatabaseFileName)))
+        XCTAssertTrue(
+            queue.upsert(
+                .init(
+                    source: .init(kind: .photoLibraryAsset, identifier: "quota"), revision: .init(rawValue: 1),
+                    originalFilename: "quota.heic", state: .failed, attempts: 8,
+                    lastError: BackupIssueRecord(kind: .accountStorage, detail: "full").persistedValue,
+                    updatedAt: Date())))
+        // An offline pass gives every photo of a large library a reason. Newer revisions sort first.
+        let later = Date().addingTimeInterval(3_600)
+        let offline = BackupIssueRecord(kind: .network, detail: "offline", nextAttemptAt: later).persistedValue
+        XCTAssertTrue(
+            queue.upsertBatch(
+                (0..<2_500).map { index in
+                    UploadBackupSyncQueueEntry(
+                        source: .init(kind: .photoLibraryAsset, identifier: "offline-\(index)"),
+                        revision: .init(rawValue: 1_000 + Int64(index)), originalFilename: "offline",
+                        state: .discovered, lastError: offline, updatedAt: later)
+                }))
+        let items = await fixture.controller.problemItems()
+        XCTAssertEqual(items.count, 200)
+        XCTAssertEqual(items.first?.filename, "quota.heic", "a photo the person can fix leads the list")
+        XCTAssertTrue(items.offersUserRetry)
+    }
+
+    func testAnOpenProblemListFollowsANewReasonWhileAPassRuns() async throws {
+        let fixture = try makeControllerFixture(prefix: "backup-problem-follow")
+        defer { fixture.cleanup() }
+        let queue = try XCTUnwrap(
+            UploadBackupSyncQueueManifestStore(
+                url: fixture.directory.appendingPathComponent(PhotoLibraryBackupController.queueDatabaseFileName)))
+        let pass = Task<Void, Never> {
+            while !Task.isCancelled { await Task.yield() }
+        }
+        XCTAssertTrue(fixture.controller.installSyncRunForTesting(runID: "run", task: pass))
+        let shown = ShownProblemLists()
+        let follow = Task {
+            await fixture.controller.followProblemList(interval: .milliseconds(10)) { shown.lists.append($0) }
+        }
+        while shown.lists.isEmpty { await Task.yield() }
+        XCTAssertFalse(shown.lists[0].offersUserRetry)
+
+        // The pass gives a photo a reason that the person resolves; no count of the status changes.
+        XCTAssertTrue(
+            queue.upsert(
+                .init(
+                    source: .init(kind: .photoLibraryAsset, identifier: "quota"), revision: .init(rawValue: 1),
+                    originalFilename: "quota.heic", state: .discovered,
+                    lastError: BackupIssueRecord(kind: .accountStorage, detail: "full").persistedValue,
+                    updatedAt: Date().addingTimeInterval(3_600))))
+        let deadline = Date().addingTimeInterval(10)
+        while shown.lists.last?.offersUserRetry != true, Date() < deadline {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertEqual(shown.lists.last?.offersUserRetry, true, "Try again appears while the pass runs")
+
+        pass.cancel()
+        await fixture.controller.finishSyncForTesting(runID: "run")
+        await follow.value
+        XCTAssertFalse(fixture.controller.isSyncing, "following ends with the pass")
+        await fixture.controller.shutdown()
+    }
+
+    @MainActor private final class ShownProblemLists {
+        var lists: [[BackupFailedItem]] = []
+    }
+
+    func testAUserRetryLeavesARowThatTheRunnerClaimedMeanwhile() throws {
+        let fixture = try makeControllerFixture(prefix: "backup-retry-race")
+        defer { fixture.cleanup() }
+        let queue = try XCTUnwrap(
+            UploadBackupSyncQueueManifestStore(
+                url: fixture.directory.appendingPathComponent(PhotoLibraryBackupController.queueDatabaseFileName)))
+        let seen = UploadBackupSyncQueueEntry(
+            source: .init(kind: .photoLibraryAsset, identifier: "quota"), revision: .init(rawValue: 1),
+            originalFilename: "quota.heic", state: .failed, attempts: 8,
+            lastError: BackupIssueRecord(kind: .accountStorage, detail: "full").persistedValue, updatedAt: Date())
+        XCTAssertTrue(queue.upsert(seen))
+        XCTAssertTrue(
+            queue.updateState(
+                source: seen.source, revision: seen.revision, state: .uploading, attempts: 8,
+                lastError: seen.lastError, updatedAt: Date()))
+        XCTAssertFalse(queue.reopenForUserRetry(seen, attempts: 0, updatedAt: Date()))
+        XCTAssertEqual(queue.entry(for: seen.source, revision: seen.revision)?.state, .uploading)
+        XCTAssertTrue(
+            queue.updateState(
+                source: seen.source, revision: seen.revision, state: .failed, attempts: 8,
+                lastError: seen.lastError, updatedAt: Date()))
+        let current = try XCTUnwrap(queue.entry(for: seen.source, revision: seen.revision))
+        XCTAssertTrue(queue.reopenForUserRetry(current, attempts: 0, updatedAt: Date()))
+        XCTAssertEqual(queue.entry(for: seen.source, revision: seen.revision)?.state, .discovered)
+        XCTAssertEqual(queue.entry(for: seen.source, revision: seen.revision)?.lastError, seen.lastError)
+    }
+
+    func testAFailedRowOfAnAutomaticCauseNeedsThePerson() throws {
+        let entry = UploadBackupSyncQueueEntry(
+            source: .init(kind: .photoLibraryAsset, identifier: "disk"), revision: .init(rawValue: 1),
+            originalFilename: "disk.heic", state: .failed, attempts: 8,
+            lastError: BackupIssueRecord(kind: .deviceStorage, detail: "full").persistedValue, updatedAt: Date())
+        let item = BackupFailedItem(entry: entry)
+        XCTAssertEqual(item.category, .userResolvable, "the app no longer plans a failed row by itself")
+        XCTAssertEqual(item.reason, L10n.string("backup.issue_device_storage"), "the list names the cause")
+        XCTAssertNil(item.retryDescription, "the list promises no automatic attempt")
+    }
+
+    func testUserResolvableRetryStartsAManualPassWithoutClearingTheSystemIssue() async throws {
+        let fixture = try makeControllerFixture(
+            prefix: "backup-manual-retry", enabled: true, identityResolver: FakeIdentityResolver())
+        defer { fixture.cleanup() }
+        fixture.controller.setAccessStateForTesting(.full)
+        // A real scan would ask PhotoKit, which waits for an authorization answer on a machine without access.
+        fixture.controller.replacePassBodyForTesting {}
+        let queue = try XCTUnwrap(
+            UploadBackupSyncQueueManifestStore(
+                url: fixture.directory.appendingPathComponent(PhotoLibraryBackupController.queueDatabaseFileName)))
+        let issue = BackupIssueRecord(
+            kind: .remoteService, detail: "index unavailable", nextAttemptAt: Date().addingTimeInterval(3_600))
+        XCTAssertTrue(queue.setRuntimeIssue(issue, for: .remoteIndexPreparation))
+        XCTAssertTrue(
+            queue.upsert(
+                .init(
+                    source: .init(kind: .photoLibraryAsset, identifier: "quota"), revision: .init(rawValue: 1),
+                    originalFilename: "quota", state: .discovered,
+                    lastError: BackupIssueRecord(kind: .accountStorage, detail: "quota").persistedValue,
+                    updatedAt: Date().addingTimeInterval(3_600))))
+        await fixture.controller.retryUserResolvableWork()
+        XCTAssertTrue(fixture.controller.isSyncing, "manual intent starts despite the system issue's future date")
+        XCTAssertNotNil(fixture.controller.activeExecutionRunID)
+        XCTAssertEqual(queue.runtimeIssue(for: .remoteIndexPreparation), issue)
+        await fixture.controller.shutdown()
+    }
+
     func testRunnerStopIsRetainedDeduplicatedAndBlocksCompletion() async throws {
         let fixture = try makeControllerFixture(prefix: "photo-backup-runner-stop")
         defer { fixture.cleanup() }
@@ -612,7 +945,9 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
         }
     }
 
-    private func makeControllerFixture(prefix: String, enabled: Bool = false) throws -> ControllerFixture {
+    private func makeControllerFixture(
+        prefix: String, enabled: Bool = false, identityResolver: (any UploadIdentityResolving)? = nil
+    ) throws -> ControllerFixture {
         let suite = "\(prefix)-\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
         if enabled { defaults.set(true, forKey: "photoBackup.enabled.v1") }
@@ -624,7 +959,7 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
                 databasePolicy: .conservative,
                 defaults: defaults
             ),
-            identityResolver: nil,
+            identityResolver: identityResolver,
             uploader: MockUploader()
         )
         return ControllerFixture(
