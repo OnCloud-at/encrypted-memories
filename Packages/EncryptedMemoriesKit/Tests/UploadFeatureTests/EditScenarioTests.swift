@@ -616,6 +616,78 @@ final class EditScenarioTests: XCTestCase {
         deviceB.assertQuiescent()
     }
 
+    func testOlderOfflineEditUploadsNextToANewerEditOfAnotherDevice() async throws {
+        try await divergentOfflineEdits(otherDeviceEditIsNewer: true)
+    }
+
+    func testNewerOfflineEditStillReplacesAnOlderEditOfAnotherDevice() async throws {
+        try await divergentOfflineEdits(otherDeviceEditIsNewer: false)
+    }
+
+    /// Device A edits the photo while offline. Device B edits it as well and backs its edit up first.
+    private func divergentOfflineEdits(otherDeviceEditIsNewer: Bool) async throws {
+        harness = try EditScenarioHarness()
+        // Each device has its own Photos library here. With one shared library, device B's edit would also be the
+        // current version on device A, so device A could not hold an older edit of its own.
+        let deviceB = try EditScenarioHarness(server: harness.server)
+        defer { try? deviceB.cleanup() }
+        try await harness.enqueue()
+        try await deviceB.enqueue()
+        await harness.drain()
+        await deviceB.drain()
+        let original = try harness.liveMain()
+        let source = try harness.library.candidate().snapshot.source
+        XCTAssertEqual(deviceB.identities.record(for: source)?.remoteLinkID, original.nodeID)
+
+        // Two offline edits give the photo on device A a later generation than the single edit on device B, so S6
+        // can compare the versions of both libraries.
+        harness.library.edit("device-a-draft", at: harness.clock.now)
+        let editTimeA = harness.clock.now
+        harness.library.edit("device-a-offline-edit", at: editTimeA)
+        let editTimeB = editTimeA.addingTimeInterval(60)
+        deviceB.library.edit("device-b-edit", at: editTimeB)
+        try await deviceB.enqueue()
+        deviceB.clock.advance(by: 5)
+        await deviceB.pass()
+        let headB = try XCTUnwrap(deviceB.activeMains.first)
+        XCTAssertEqual(deviceB.activeMains.count, 1, "device B's edit must replace the original first")
+        XCTAssertEqual(harness.server.links.first { $0.uid == original }?.state, .trashed)
+        // The server keeps the ModificationTime that Photos set when the person saved the edit.
+        let olderTime = try XCTUnwrap(harness.server.links.first { $0.uid == original }?.modificationDate)
+        harness.server.setModificationDate(otherDeviceEditIsNewer ? editTimeB : olderTime, of: headB.uid)
+        if otherDeviceEditIsNewer {
+            // An answer to an earlier deletion question must not outlive the proof that the photo is live.
+            try harness.journal.keepDeleted(for: source)
+        }
+
+        let steps = harness.server.steps.count
+        let entryA = try await harness.enqueue()
+        harness.clock.advance(by: 5)
+        if otherDeviceEditIsNewer {
+            // The duplicate check itself ends the earlier choice, before any upload succeeds.
+            let decision = try await harness.primaryDecision(for: entryA)
+            XCTAssertTrue(decision.uploadsBytes)
+            XCTAssertNil(harness.journal.entry(for: source).keptDeleted, "a newer version proves the photo live")
+        }
+        await harness.pass()
+        XCTAssertEqual(harness.state(of: entryA), .completed, "device A's edit must upload without a deletion question")
+        let journal = harness.journal.entry(for: source)
+        XCTAssertNil(journal.deletionCheckStartedAt)
+        let headA = try XCTUnwrap(harness.identities.record(for: source)?.remoteLinkID)
+        let trashed = harness.server.steps.dropFirst(steps).flatMap(\.trashedByBackup)
+        if otherDeviceEditIsNewer {
+            XCTAssertNil(journal.keptDeleted, "a newer version on the server proves the photo live")
+            XCTAssertEqual(
+                Set(harness.activeMains.map(\.linkID)), [headA, headB.linkID], "both versions of the photo stay")
+            XCTAssertEqual(trashed, [], "device A must not trash the newer version of device B")
+        } else {
+            XCTAssertEqual(harness.activeMains.map(\.linkID), [headA], "the newer edit replaces the older one")
+            XCTAssertTrue(trashed.contains(headB.linkID), "device A must trash the older version of device B")
+        }
+        XCTAssertFalse(harness.server.links.contains { $0.personDeleted })
+        harness.assertCurrentManifest()
+    }
+
     func testUndoRestoresTheExactEarlierRevision() async throws {
         let original = try await firstBackup()
         let earlierCandidate = try harness.library.candidate()

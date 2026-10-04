@@ -299,6 +299,8 @@ final class EditScenarioHarness {
     private(set) var journal: EditReplacementJournalFileStore!
     /// Survives a relaunch like the stored index of a device.
     let index: EditScenarioDeviceIndex
+    /// Survives a relaunch, so rule U6 still knows which links this device uploaded.
+    let deviceRemote: EditScenarioDeviceRemote
     private var pipeline: UploadDedupePipeline!
     private var runner: BackupSyncRunner!
     private var engine: UploadBackupSyncEngine!
@@ -309,6 +311,7 @@ final class EditScenarioHarness {
     private(set) var lastScan = UploadBackupSyncScanResult()
     private var entries: [UploadBackupSyncQueueEntry] = []
     private var checkedSteps = 0
+    private var checkedRemoteViolations = 0
 
     init(
         live: Bool = false, basename: String = "IMG_1", server: EditScenarioServer = EditScenarioServer(),
@@ -328,6 +331,7 @@ final class EditScenarioHarness {
         }
         checkedSteps = server.steps.count
         index = EditScenarioDeviceIndex(server: server, staleLineage: staleLineageIndex, now: { clock.now })
+        deviceRemote = EditScenarioDeviceRemote(server: server)
         try open()
     }
 
@@ -393,6 +397,7 @@ final class EditScenarioHarness {
                 wasDuplicate = true
             } else {
                 uid = server.seedV105Upload(descriptor, digest: digest, asset: asset, main: main)
+                deviceRemote.recordOwnUpload(uid)
                 wasDuplicate = false
             }
             if item.sourceResource == .primary {
@@ -460,14 +465,14 @@ final class EditScenarioHarness {
             store: identities, checker: index, resourceCoordinator: coordinator, replacementJournal: journal,
             now: { [clock] in clock.now })
         let replacement = EditedPhotoReplacement(
-            remote: server, albums: server, relations: index, identities: identities, journal: journal)
+            remote: deviceRemote, albums: server, relations: index, identities: identities, journal: journal)
         let preflight = UploadBackupPreflightIndex(store: backupState, now: { [clock] in clock.now })
         engine = UploadBackupSyncEngine(
             preflight: preflight, queue: queue, remoteProofResolver: pipeline, now: { [clock] in clock.now })
         runner = BackupSyncRunner(
             queue: queue, preflight: preflight,
             resolver: EditScenarioResolver(library: library, clock: clock), identityResolver: pipeline,
-            uploader: server, editReplacement: replacement,
+            uploader: deviceRemote, editReplacement: replacement,
             resourceCoordinator: coordinator,
             configuration: .init(
                 retry: .init(baseDelay: 1, maxDelay: 8, maxAttempts: 4),
@@ -567,7 +572,11 @@ final class EditScenarioHarness {
     func primaryDecision(for entry: UploadBackupSyncQueueEntry) async throws -> UploadDuplicateDecision {
         let resource = try await library.resolve(entry, now: clock.now)
         let resolved = try XCTUnwrap(resource)
-        return try await pipeline.resolve(resolved.descriptor).decision
+        let decision = try await pipeline.resolve(resolved.descriptor).decision
+        // An upload decision holds its content claim until the attempt settles. This check uploads nothing, so it
+        // settles like a cancelled attempt; otherwise a later resolve of the same bytes waits for it forever.
+        if decision.uploadsBytes { await pipeline.uploadDidFail(resolved.descriptor) }
+        return decision
     }
 
     var activeMains: [EditScenarioServer.Link] {
@@ -629,6 +638,11 @@ final class EditScenarioHarness {
             }
         }
         checkedSteps = steps.count
+        let remoteViolations = deviceRemote.violations
+        for violation in remoteViolations.dropFirst(checkedRemoteViolations) {
+            check(false, violation, file: file, line: line)
+        }
+        checkedRemoteViolations = remoteViolations.count
         // U2: only the asset deleted by the person (S5 state) proves the skip. A person-trashed earlier main alone is no
         // proof.
         let deletedAssets = server.personDeletedAssets

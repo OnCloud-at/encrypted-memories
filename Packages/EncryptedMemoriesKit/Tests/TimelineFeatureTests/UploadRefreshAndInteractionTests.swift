@@ -15,7 +15,7 @@ final class UploadRefreshAndInteractionTests: XCTestCase {
             [section([old])],
             [section([old, new, new])],
         ])
-        let model = TimelineViewModel(repository: repository, feed: makeFeed())
+        let model = TimelineViewModel(repository: repository, feed: makeFeed().feedCore)
 
         await model.load()
         XCTAssertEqual(model.allItems.map(\.uid), [old.uid])
@@ -39,7 +39,7 @@ final class UploadRefreshAndInteractionTests: XCTestCase {
             [section([])],
             [section([uploaded])],
         ])
-        let model = TimelineViewModel(repository: repository, feed: makeFeed())
+        let model = TimelineViewModel(repository: repository, feed: makeFeed().feedCore)
 
         await model.load()
         let result = await model.refreshAfterUpload(uploadedUID: uploaded.uid)
@@ -69,7 +69,7 @@ final class UploadRefreshAndInteractionTests: XCTestCase {
         let a = photo("a", seconds: 1)
         let b = photo("b", seconds: 2)
         let repository = RefreshRepository(timelines: [[section([a, b])], [section([a, b])]])
-        let model = TimelineViewModel(repository: repository, feed: makeFeed())
+        let model = TimelineViewModel(repository: repository, feed: makeFeed().feedCore)
         await model.load()
 
         PhotoDiagnostics.shared.resetForTests()
@@ -88,7 +88,7 @@ final class UploadRefreshAndInteractionTests: XCTestCase {
         let a = photo("a", seconds: 1)
         let b = photo("b", seconds: 2)
         let repository = RefreshRepository(timelines: [[section([a])], [section([a, b])]])
-        let model = TimelineViewModel(repository: repository, feed: makeFeed())
+        let model = TimelineViewModel(repository: repository, feed: makeFeed().feedCore)
         await model.load()
 
         PhotoDiagnostics.shared.resetForTests()
@@ -105,7 +105,7 @@ final class UploadRefreshAndInteractionTests: XCTestCase {
         let a = photo("a", seconds: 1)
         let model = TimelineViewModel(
             repository: RefreshRepository(timelines: [[section([a])]]),
-            feed: makeFeed()
+            feed: makeFeed().feedCore
         )
 
         await model.load()
@@ -118,7 +118,7 @@ final class UploadRefreshAndInteractionTests: XCTestCase {
         let a = photo("a", seconds: 1)
         let repository = RefreshRepository(timelines: [[section([a])]])
         let library = FakeLibrary(sections: [section([photo("raw", seconds: 5)])])
-        let model = TimelineViewModel(repository: repository, feed: makeFeed(), library: library)
+        let model = TimelineViewModel(repository: repository, feed: makeFeed().feedCore, library: library)
         await model.load()
         XCTAssertEqual(repository.cachedCount, 1)  // first visit consulted the on-disk cache once
         let wholeLibraryUIDs = model.wholeLibraryUIDs
@@ -142,7 +142,7 @@ final class UploadRefreshAndInteractionTests: XCTestCase {
         let rawItem = photo("raw", seconds: 5)
         let repository = RefreshRepository(timelines: [[section([a])], [section([a])]])
         let library = FakeLibrary(sections: [section([rawItem])])
-        let model = TimelineViewModel(repository: repository, feed: makeFeed(), library: library)
+        let model = TimelineViewModel(repository: repository, feed: makeFeed().feedCore, library: library)
         await model.load()
 
         // Kick a slow `.all` refresh, then switch to a filtered route before it finishes; the stale `.all`
@@ -173,7 +173,7 @@ final class UploadRefreshAndInteractionTests: XCTestCase {
 
     @MainActor
     func testPendingInventoryVisibilityIsExposedAsRetryableConvergence() async {
-        let model = TimelineViewModel(repository: PendingVisibilityRepository(), feed: makeFeed())
+        let model = TimelineViewModel(repository: PendingVisibilityRepository(), feed: makeFeed().feedCore)
 
         let result = await model.refreshLibrary()
 
@@ -183,7 +183,7 @@ final class UploadRefreshAndInteractionTests: XCTestCase {
 
     @MainActor
     func testGenuineRefreshFailureRemainsTerminal() async {
-        let model = TimelineViewModel(repository: TerminalFailureRepository(), feed: makeFeed())
+        let model = TimelineViewModel(repository: TerminalFailureRepository(), feed: makeFeed().feedCore)
 
         let result = await model.refreshLibrary()
 
@@ -193,7 +193,7 @@ final class UploadRefreshAndInteractionTests: XCTestCase {
 
     @MainActor
     func testScopeLossDuringRefreshRequestsBackendRecovery() async {
-        let model = TimelineViewModel(repository: ScopeLossRepository(), feed: makeFeed())
+        let model = TimelineViewModel(repository: ScopeLossRepository(), feed: makeFeed().feedCore)
 
         let result = await model.refreshLibrary()
 
@@ -205,7 +205,7 @@ final class UploadRefreshAndInteractionTests: XCTestCase {
         let loader = RecordingThumbnailLoader()
         let feed = makeFeed(loader: loader)
         let uploadedUID = PhotoUID(volumeID: "scope-volume", nodeID: "scope-upload")
-        let model = TimelineViewModel(repository: ScopeLossRepository(), feed: feed)
+        let model = TimelineViewModel(repository: ScopeLossRepository(), feed: feed.feedCore)
 
         let result = await model.refreshAfterUpload(uploadedUID: uploadedUID)
         await feed.stopPrefetch()
@@ -230,7 +230,7 @@ final class UploadRefreshAndInteractionTests: XCTestCase {
         for filter in filters {
             let model = TimelineViewModel(
                 repository: RefreshRepository(timelines: [[section([])]]),
-                feed: makeFeed(),
+                feed: makeFeed().feedCore,
                 library: ScopeLossLibrary()
             )
             await model.load()
@@ -244,7 +244,7 @@ final class UploadRefreshAndInteractionTests: XCTestCase {
 
     @MainActor
     func testScopeLossDuringInitialLoadIsExposedToHost() async {
-        let model = TimelineViewModel(repository: ScopeLossRepository(), feed: makeFeed())
+        let model = TimelineViewModel(repository: ScopeLossRepository(), feed: makeFeed().feedCore)
 
         await model.load()
 
@@ -259,7 +259,7 @@ final class UploadRefreshAndInteractionTests: XCTestCase {
         let all = [section([a, b, c])]
         let model = TimelineViewModel(
             repository: RefreshRepository(timelines: [all]),
-            feed: makeFeed(),
+            feed: makeFeed().feedCore,
             library: FakeLibrary(sections: [section([c])])
         )
         await model.load()
@@ -284,7 +284,7 @@ final class UploadRefreshAndInteractionTests: XCTestCase {
         let all = [section([a, b, c])]
         let model = TimelineViewModel(
             repository: RefreshRepository(timelines: [all]),
-            feed: makeFeed(),
+            feed: makeFeed().feedCore,
             library: FakeLibrary(sections: all)
         )
         await model.load()
@@ -307,7 +307,7 @@ final class UploadRefreshAndInteractionTests: XCTestCase {
         let stale = [section([a, b])]
         let model = TimelineViewModel(
             repository: RefreshRepository(timelines: [stale, stale]),
-            feed: makeFeed(),
+            feed: makeFeed().feedCore,
             library: FakeLibrary(sections: stale)
         )
         await model.load()
@@ -329,7 +329,7 @@ final class UploadRefreshAndInteractionTests: XCTestCase {
         let stale = [section([a, b])]
         let model = TimelineViewModel(
             repository: RefreshRepository(timelines: [stale, stale]),
-            feed: makeFeed(),
+            feed: makeFeed().feedCore,
             library: FakeLibrary(sections: stale)
         )
         await model.load()
@@ -353,7 +353,7 @@ final class UploadRefreshAndInteractionTests: XCTestCase {
         let stale = [section([a, b])]
         let model = TimelineViewModel(
             repository: RefreshRepository(timelines: [stale]),
-            feed: makeFeed(),
+            feed: makeFeed().feedCore,
             library: FakeLibrary(sections: stale, delay: .milliseconds(120))
         )
         await model.load()

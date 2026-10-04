@@ -384,6 +384,7 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
         let ancestors: Set<String>
         let foreign: Set<String>
         let candidateVisibility: [String: RemoteLinkVisibility]
+        let replacesHead: Bool
         do {
             let identity = try await checker.activeMainLinkIDs(forExternalIdentifier: identifier)
             guard identity.complete, identity.links.count == 1, let target = identity.links.first,
@@ -393,10 +394,10 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
             guard successors.complete, successors.links.subtracting([target]).isEmpty,
                 let compound = try await checker.compound(ofMainLink: target),
                 compound.externalIdentifier == identifier, !compound.tags.contains(PhotoTag.bursts.rawValue),
-                UploadRemoteReplacementSafety.isSameCaptureSecond(remote: compound.captureDate, local: creationDate),
-                UploadRemoteReplacementSafety.isNewerVersion(
-                    localDate: descriptor.photoLibraryEditTime, remoteDate: compound.modificationDate)
+                UploadRemoteReplacementSafety.isSameCaptureSecond(remote: compound.captureDate, local: creationDate)
             else { return scope }
+            replacesHead = UploadRemoteReplacementSafety.isNewerVersion(
+                localDate: descriptor.photoLibraryEditTime, remoteDate: compound.modificationDate)
             var originals: Set<String> = []
             for sha1 in descriptor.originalSHA1Hex {
                 originals.insert(try await checker.contentHash(forSHA1Hex: sha1))
@@ -429,6 +430,12 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
             throw CancellationError()
         } catch {
             try Task.checkCancellation()
+            return scope
+        }
+        guard replacesHead else {
+            // A version of this photo that is not older than this edit, for example another device's later edit. It
+            // proves the photo live, so nothing asks about a deletion, but it is no target: both versions stay.
+            scope.keptHeads = [head]
             return scope
         }
         scope.retired.subtract(foreign)
@@ -594,7 +601,7 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
         // person restored an earlier version, or an active main photo holds these bytes.
         let matches = remoteItems.filter { $0.linkState == .active && $0.contentHash == contentHash }
             .compactMap(\.linkID)
-        var asked = replacement.retired.union(replacement.gone).union(matches)
+        var asked = replacement.retired.union(replacement.gone).union(matches).union(replacement.keptHeads)
         if let current = replacement.current { asked.insert(current) }
         let visibility: [String: RemoteLinkVisibility]
         if let optional = replacement.candidateVisibility {
@@ -614,10 +621,12 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
         // A gone photo that is in the library again proves the photo live, but the person restored it: it never
         // becomes an earlier version that this upload replaces.
         let liveGone = replacement.gone.filter(isLiveMain)
+        // A newer version of another device proves the photo live only while it is in the library now.
+        let liveKeptHeads = replacement.keptHeads.filter(isLiveMain)
 
         guard
             replacement.current.map(isLiveMain) == true || !replacement.liveHeads.isEmpty
-                || !restored.isEmpty || !adoptable.isEmpty || !liveGone.isEmpty
+                || !liveKeptHeads.isEmpty || !restored.isEmpty || !adoptable.isEmpty || !liveGone.isEmpty
         else {
             // Nothing proves the photo live. Who removed it stays unknown, so the earlier rule applies: the
             // photos of the replacement do not count, and a trashed copy outside them is a deletion by the person.
@@ -641,7 +650,9 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
                 }, false
             )
         }
-        if replacement.current.map(isLiveMain) == true || !liveRetired.isEmpty || !liveGone.isEmpty {
+        if replacement.current.map(isLiveMain) == true || !liveRetired.isEmpty || !liveGone.isEmpty
+            || !liveKeptHeads.isEmpty
+        {
             try replacementJournal?.clearDeletionChoice(for: descriptor.source)
         }
         // A restored earlier version with other bytes is an earlier photo again, so this upload replaces it.
@@ -1150,6 +1161,8 @@ private struct UploadReplacementScope {
     var gone: Set<String> = []
     var knownForeignLinks: Set<String> = []
     var liveHeads: Set<String> = []
+    /// A same-identity head that is not older than this edit. It proves the photo live and is never a target.
+    var keptHeads: Set<String> = []
     var remoteAncestors: Set<String> = []
     var candidateVisibility: [String: RemoteLinkVisibility]?
 

@@ -7,7 +7,7 @@ import TimelineFeature
 import UploadCore
 
 /// Owns the Mac library refresh banner and the four refresh routes: after a manual upload, after a background
-/// backup upload, on a menu request, and on a remote library change. Refresh policy stays in the shared
+/// backup upload, on a menu request, and on a remote library change. Refresh and banner policy stay in the shared
 /// Timeline types; this controller only sequences the Mac host work and publishes the banner state.
 @MainActor
 @Observable
@@ -20,11 +20,13 @@ final class MacLibraryRefreshController {
         let scrollToItem: @MainActor (PhotoUID) -> Void
     }
 
+    private var banner = LibraryRefreshBannerState()
+
     /// A refresh is running. Remote change polling waits while it is set.
-    private(set) var isBusy = false
-    /// The current banner message is a success. Tracked explicitly so the banner never compares localized text.
-    private(set) var succeeded = false
-    private(set) var message: String?
+    var isBusy: Bool { banner.isBusy }
+    /// The tone of the current banner message. Tracked explicitly so the banner never compares localized text.
+    var tone: LibraryRefreshBannerMessage.Tone? { banner.message?.tone }
+    var message: String? { banner.message.map(Self.text(for:)) }
 
     @ObservationIgnored private var uploadTask: Task<Void, Never>?
     @ObservationIgnored private var uploadGeneration: UInt64 = 0
@@ -47,9 +49,7 @@ final class MacLibraryRefreshController {
     /// Refreshes after background backup uploaded new library items. Repeated signals coalesce in the shared
     /// coordinator.
     func scheduleBackupUploadRefresh(host: Host) {
-        isBusy = true
-        succeeded = false
-        message = String(localized: "library.refreshing")
+        banner.beginBackupUploadRefresh()
         Task {
             await backupRefreshCoordinator.request(
                 refresh: { attempt in
@@ -69,19 +69,22 @@ final class MacLibraryRefreshController {
 
     /// Runs one refresh for a remote library change. Returns `.retry` while an upload refresh owns the timeline.
     func performRemoteLibraryRefresh(host: Host) async -> LibraryChangeRefreshOutcome {
-        guard uploadTask == nil, !isBusy else { return .retry }
         // The five-second token-driven comparison is routine synchronization, not user-facing progress. Keep the
         // gate for refresh serialization, but show the shared bottom banner only if the refreshed projection
         // actually schedules thumbnail or GPS work (observed by `backgroundLibraryActivityActive`).
-        isBusy = true
-        defer { isBusy = false }
+        guard uploadTask == nil, banner.beginRemoteRefresh() else { return .retry }
         let result = await host.timelineModel.refreshLibrary()
-        if result.failureReason == .scopeAccessLost { return .terminal }
+        if result.failureReason == .scopeAccessLost {
+            banner.finishRemoteRefresh(succeeded: false)
+            return .terminal
+        }
         OfflineLibraryManager.shared.liveAssetCount = host.timelineModel.allItems.count
         await host.loadAlbums()
         host.model.refreshLibrarySources()
         reconcileNewAssetThumbnails(result.addedUIDs, host: host)
-        return result.errorMessage == nil ? .refreshed : .retry
+        let succeeded = result.errorMessage == nil
+        banner.finishRemoteRefresh(succeeded: succeeded)
+        return succeeded ? .refreshed : .retry
     }
 
     /// Stops a coalesced backup refresh when the library view disappears.
@@ -110,36 +113,16 @@ final class MacLibraryRefreshController {
     }
 
     private func applyBackupUploadRefresh(_ state: TimelineUploadRefreshAttempt) {
-        switch state.decision {
-        case .succeeded:
-            isBusy = false
-            succeeded = true
-            message = String(localized: "library.refreshed")
-            clearMessage(after: .seconds(2))
-        case .retry:
-            message = String(localized: "upload.waiting_for_refresh")
-        case .notYetVisible:
-            isBusy = false
-            message = String(localized: "upload.not_yet_indexed")
-        case .failed:
-            isBusy = false
-            message = String(localized: "library.refresh_failed")
-            clearMessage(after: .seconds(2))
-        case .cancelled:
-            isBusy = false
-            message = nil
-        }
+        scheduleDismissal(banner.applyBackupUploadRefresh(state.decision))
     }
 
     private func runUploadRefresh(_ event: UploadCompletedEvent, generation: UInt64, host: Host) async {
-        isBusy = true
-        succeeded = false
-        message = String(localized: "upload.refreshing_after_upload")
+        banner.beginUploadRefresh()
         let schedule = TimelineRefreshRetrySchedule.uploadDefault.delays
         for (attempt, delay) in schedule.enumerated() {
             guard generation == uploadGeneration, !Task.isCancelled else { return }
             if delay > .zero {
-                message = String(localized: "upload.waiting_for_refresh")
+                banner.waitForUploadRefresh()
                 try? await Task.sleep(for: delay)
             }
             let result = await host.timelineModel.refreshAfterUpload(uploadedUID: event.uploadedUID)
@@ -152,36 +135,23 @@ final class MacLibraryRefreshController {
             }
             logUploadRefresh(uploadedNode: event.uploadedUID.nodeID, attempt: attempt, result: result)
             if let found = result.foundItem {
-                isBusy = false
-                succeeded = true
-                message = String(localized: "upload.uploaded")
+                scheduleDismissal(banner.finishUploadRefresh(found: true))
                 host.scrollToItem(found.uid)
-                clearMessage(after: .seconds(2))
                 return
             }
         }
-        isBusy = false
-        succeeded = false
-        message = String(localized: "upload.not_yet_indexed")
+        scheduleDismissal(banner.finishUploadRefresh(found: false))
     }
 
     private func performManualRefresh(host: Host) async {
-        guard !isBusy else { return }
-        isBusy = true
-        succeeded = false
-        message = String(localized: "library.refreshing")
+        guard banner.beginManualRefresh() else { return }
         let result = await host.timelineModel.refreshLibrary()
         if await recoverBackendAfterScopeAccessLoss(ifNeeded: result, host: host) { return }
         OfflineLibraryManager.shared.liveAssetCount = host.timelineModel.allItems.count
         await host.loadAlbums()
         reconcileNewAssetThumbnails(result.addedUIDs, host: host)
         logUploadRefresh(uploadedNode: "-", attempt: 0, result: result)
-        isBusy = false
-        succeeded = result.errorMessage == nil
-        message =
-            result.errorMessage == nil
-            ? String(localized: "library.refreshed") : String(localized: "library.refresh_failed")
-        clearMessage(after: .seconds(2))
+        scheduleDismissal(banner.finishManualRefresh(succeeded: result.errorMessage == nil))
     }
 
     /// Clears the banner and hands a lost Drive scope to the account model. Returns `true` when recovery ran.
@@ -190,18 +160,28 @@ final class MacLibraryRefreshController {
         host: Host
     ) async -> Bool {
         guard result.failureReason == .scopeAccessLost else { return false }
-        isBusy = false
-        succeeded = false
-        message = nil
+        banner.loseScopeAccess()
         await host.model.recoverBackendAfterScopeAccessLoss()
         return true
     }
 
-    private func clearMessage(after delay: Duration) {
+    private func scheduleDismissal(_ dismissal: LibraryRefreshBannerState.Dismissal?) {
+        guard let dismissal else { return }
         Task { @MainActor in
-            try? await Task.sleep(for: delay)
-            guard !isBusy else { return }
-            message = nil
+            try? await Task.sleep(for: dismissal.delay)
+            banner.dismiss(dismissal)
+        }
+    }
+
+    private static func text(for message: LibraryRefreshBannerMessage) -> String {
+        switch message {
+        case .refreshing: return String(localized: "library.refreshing")
+        case .refreshingAfterUpload: return String(localized: "upload.refreshing_after_upload")
+        case .waitingForRefresh: return String(localized: "upload.waiting_for_refresh")
+        case .refreshed: return String(localized: "library.refreshed")
+        case .uploaded: return String(localized: "upload.uploaded")
+        case .refreshFailed: return String(localized: "library.refresh_failed")
+        case .notYetIndexed: return String(localized: "upload.not_yet_indexed")
         }
     }
 
