@@ -3,6 +3,7 @@ import Foundation
 import PhotosCore
 import ProtonDriveSDK
 import Testing
+import UploadCore
 
 @testable import ProtonDriveBackend
 
@@ -68,6 +69,26 @@ struct SDKAlbumCatalogBackendTests {
         #expect(metadata.fileSize == nil)
         #expect(metadata.pixelWidth == nil)
         #expect(metadata.device == "Camera")
+    }
+
+    @Test func seriesMemberCopyLeavesTheSourceAssetAndAppSectionsBehind() {
+        let revision = FileRevision(
+            uid: SDKRevisionUid(volumeID: "own", nodeID: "member", revisionID: "revision"),
+            state: .active, creationTime: 1, storageSize: 10, claimedSize: 10,
+            claimedDigests: FileContentDigests(sha1: nil, sha1Verified: false),
+            claimedModificationTime: 123, thumbnails: [],
+            claimedAdditionalMetadata: [
+                AdditionalMetadata(name: "Camera", utf8JsonValue: Data(#"{"Device":"iPhone"}"#.utf8)),
+                AdditionalMetadata(name: "iOS.photos", utf8JsonValue: Data(#"{"ICloudID":"cloud"}"#.utf8)),
+                AdditionalMetadata(
+                    name: "EncryptedMemories.lineage",
+                    utf8JsonValue: Data(#"{"V":1,"Reason":"edit","Replaces":["earlier"]}"#.utf8)),
+            ], contentAuthor: nil)
+
+        let source = SDKPhotoMetadataReader.seriesMemberSource(
+            name: "IMG_2.HEIC", mimeType: "image/heic", captureTime: 100, revision: revision)
+
+        #expect(source.additionalMetadata.map(\.name) == ["Camera"], "the copy replaces no earlier upload")
     }
 
     @Test func ownedCatalogMapsSDKMetadataSortsAndKeepsDegradedNodesVisible() async throws {

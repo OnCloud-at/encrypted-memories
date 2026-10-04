@@ -626,6 +626,113 @@ final class UploadLineageReplacementTests: XCTestCase {
         XCTAssertEqual(result.decision, .skip(.activeDuplicate, remoteLinkID: duplicate.nodeID))
     }
 
+    private func editAfterAdopting(cloudID: String?) async throws -> (PhotoUID, UploadLineageMarker?) {
+        let adopted = try seed("original", filename: "IMG_1.HEIC", cloudID: cloudID)
+        let first = try await pipeline.resolve(descriptor("original", filename: "IMG_1.HEIC", edited: false))
+        XCTAssertEqual(first.decision, .skip(.activeDuplicate, remoteLinkID: adopted.nodeID))
+        let relaunched = UploadDedupePipeline(store: identities, checker: server, replacementJournal: journal)
+        let result = try await relaunched.resolve(descriptor("next"))
+        XCTAssertEqual(superseded(), [adopted.nodeID])
+        return (adopted, result.lineage)
+    }
+
+    func testAnAdoptedLinkWithoutItsIdentityIsNotNamed() async throws {
+        let (_, lineage) = try await editAfterAdopting(cloudID: nil)
+
+        XCTAssertNil(lineage, "nothing proves that the adopted copy is this photo")
+    }
+
+    func testAnAdoptedLinkWithItsIdentityIsNamed() async throws {
+        let (adopted, lineage) = try await editAfterAdopting(cloudID: "cloud-asset-1")
+
+        XCTAssertEqual(lineage?.replaces, [adopted.nodeID])
+    }
+
+    func testTheNextEditStillNamesWhatARemoteHeadReplaced() async throws {
+        let ancestor = try seed("ancestral", filename: "Render.JPG", cloudID: nil)
+        let head = try seed("head", replacing: [ancestor.nodeID])
+        let local = descriptor("next")
+        let first = try await pipeline.resolve(local)
+        XCTAssertEqual(first.lineage?.replaces, [head.nodeID, ancestor.nodeID])
+        let replacement = try seed("next", filename: "Winner.JPG", modificationDate: local.photoLibraryEditTime)
+        try await pipeline.recordUploaded(
+            local, identity: first.identity, remoteVolumeID: replacement.volumeID, remoteLinkID: replacement.nodeID)
+        let outcome = try await settle(replacement)
+        XCTAssertEqual(outcome, .replaced(retiredAny: true))
+
+        let relaunched = UploadDedupePipeline(store: identities, checker: server, replacementJournal: journal)
+        let result = try await relaunched.resolve(descriptor("third"))
+
+        // The anchor that the trash took along with the head is a related file, so it never appears.
+        XCTAssertEqual(result.lineage?.replaces, [replacement.nodeID, head.nodeID, ancestor.nodeID])
+    }
+
+    /// Adopts a remote head whose marker names `ancestor`, then edits the photo once.
+    private func editAfterAdoptingAHead() async throws -> (
+        head: PhotoUID, ancestor: PhotoUID, edit: UploadPreflightResult
+    ) {
+        let ancestor = try seed("ancestral", filename: "Ancestor.JPG", cloudID: nil)
+        let head = try seed("head", filename: "IMG_1.JPG", replacing: [ancestor.nodeID])
+        let adopted = try await pipeline.resolve(descriptor("head", filename: "IMG_1.JPG", edited: false))
+        XCTAssertEqual(adopted.decision, .skip(.activeDuplicate, remoteLinkID: head.nodeID))
+        let relaunched = UploadDedupePipeline(store: identities, checker: server, replacementJournal: journal)
+        let edit = try await relaunched.resolve(descriptor("next"))
+        XCTAssertEqual(superseded(), [head.nodeID])
+        return (head, ancestor, edit)
+    }
+
+    func testAnAdoptedHeadKeepsWhatItsMarkerNamedAfterTheNextEdit() async throws {
+        let (head, ancestor, edit) = try await editAfterAdoptingAHead()
+        XCTAssertEqual(edit.lineage?.replaces, [head.nodeID, ancestor.nodeID])
+        let local = descriptor("next")
+        let replacement = try seed("next", filename: "Winner.JPG", modificationDate: local.photoLibraryEditTime)
+        let recorder = UploadDedupePipeline(store: identities, checker: server, replacementJournal: journal)
+        try await recorder.recordUploaded(
+            local, identity: edit.identity, remoteVolumeID: replacement.volumeID, remoteLinkID: replacement.nodeID)
+        let outcome = try await settle(replacement)
+        XCTAssertEqual(outcome, .replaced(retiredAny: true))
+        XCTAssertEqual(server.links.first { $0.uid == head }?.state, .trashed)
+
+        let relaunched = UploadDedupePipeline(store: identities, checker: server, replacementJournal: journal)
+        let result = try await relaunched.resolve(descriptor("third"))
+
+        XCTAssertEqual(result.lineage?.replaces, [replacement.nodeID, head.nodeID, ancestor.nodeID])
+    }
+
+    /// A remote head names a trashed upload of the local bytes.
+    private func trashedNamedCopy() throws -> (head: PhotoUID, named: PhotoUID) {
+        let named = try seed("next", filename: "Render.JPG", cloudID: nil)
+        let head = try seed("head", replacing: [named.nodeID])
+        server.personTrash(named)
+        return (head, named)
+    }
+
+    func testATrashedNamedCopyIsReplacedWhileItsHolderIsActive() async throws {
+        _ = try trashedNamedCopy()
+
+        let result = try await pipeline.resolve(descriptor("next"))
+
+        XCTAssertEqual(result.decision, .upload)
+    }
+
+    func testATrashedNamedCopyIsADeletionOnceItsHolderLeft() async throws {
+        let (head, named) = try trashedNamedCopy()
+        server.personTrash(head)
+
+        let result = try await pipeline.resolve(descriptor("next"))
+
+        XCTAssertEqual(result.decision, .skip(.trashedDuplicate, remoteLinkID: named.nodeID))
+    }
+
+    func testAnAdoptedHeadWithAnIncompleteMarkerReadInheritsNothing() async throws {
+        server.configureLineageIndex(incomplete: .ancestry)
+
+        let (head, _, edit) = try await editAfterAdoptingAHead()
+
+        XCTAssertEqual(edit.lineage?.replaces, [head.nodeID])
+        XCTAssertNil(journal.entry(for: source).inherited, "a partial list never enters the journal")
+    }
+
     func testLocalTargetStillReplacesBesideTwoRemoteHeads() async throws {
         let local = try seed("original", filename: "IMG_1.HEIC")
         try await rememberOriginal(local)

@@ -389,6 +389,13 @@ public struct UploadIdentityRecord: Sendable, Equatable {
     public func isValid(for descriptor: UploadResourceDescriptor, hashKeyEpoch epoch: String) -> Bool {
         isValid(for: descriptor) && hashKeyEpoch == epoch
     }
+
+    /// Whether the remote photo holds this file: this client uploaded it, or the duplicate check found it active.
+    /// An earlier upload of another client counts as well: the duplicate check proved it was this file.
+    public var provesUpload: Bool {
+        outcome == UploadIdentityManifestStore.Outcome.uploaded.rawValue
+            || outcome == UploadIdentityManifestStore.Outcome.duplicateActive.rawValue
+    }
 }
 
 // MARK: - Pipeline seams
@@ -401,8 +408,8 @@ public protocol UploadIdentityStore: Sendable {
     /// content-hash HMAC under the same key epoch, with a trustworthy outcome (`uploaded` or
     /// `duplicateActive`) and a remote link. Source-path and filename independent - this is what
     /// lets a copied folder (or a renamed file) skip re-uploading bytes the account already owns.
-    /// Trashed and deleted outcomes are not trustworthy here.
-    func trustedRecord(contentHash: String, hashKeyEpoch: String) -> UploadIdentityRecord?
+    /// Trashed and deleted outcomes are not trustworthy here. Returns at most `limit` rows.
+    func trustedRecords(contentHash: String, hashKeyEpoch: String, limit: Int) -> [UploadIdentityRecord]
     @discardableResult
     func upsert(_ record: UploadIdentityRecord) -> Bool
     /// Every source whose trustworthy record (`uploaded` or `duplicateActive`) names this remote link. Nil when the
@@ -418,6 +425,10 @@ public protocol UploadIdentityStore: Sendable {
 
 extension UploadIdentityStore {
     public func sources(withRemoteLinkID linkID: String) -> [UploadSourceIdentity]? { nil }
+    /// One row of `trustedRecords`.
+    public func trustedRecord(contentHash: String, hashKeyEpoch: String) -> UploadIdentityRecord? {
+        trustedRecords(contentHash: contentHash, hashKeyEpoch: hashKeyEpoch, limit: 1).first
+    }
 }
 
 /// One active remote photo identity retained by the local content index. The hash is already keyed
@@ -604,7 +615,10 @@ public enum UploadRemoteContentIndexHealth: Sendable, Equatable {
 /// Persistent, platform-neutral cache for account-wide content dedupe. Proton-specific code owns
 /// remote enumeration and event decoding; Core owns the transactional storage contract.
 public protocol UploadRemoteContentIndexStore: Sendable {
-    func remoteContentRecord(contentHash: String, hashKeyEpoch: String) -> UploadRemoteContentIndexRecord?
+    /// At most `limit` indexed links that hold this content.
+    func remoteContentRecords(
+        contentHash: String, hashKeyEpoch: String, limit: Int
+    ) -> [UploadRemoteContentIndexRecord]
     func remoteContentIndexCheckpoint(hashKeyEpoch: String) -> UploadRemoteContentIndexCheckpoint?
     func hasRemoteAssetIndexCheckpoint(hashKeyEpoch: String) -> Bool
     func remoteAssetRecords(
@@ -665,6 +679,13 @@ public protocol UploadRemoteContentIndexStore: Sendable {
     ) -> Bool
     @discardableResult
     func upsertRemoteContentRecord(_ record: UploadRemoteContentIndexRecord) -> Bool
+}
+
+extension UploadRemoteContentIndexStore {
+    /// One record of `remoteContentRecords`.
+    public func remoteContentRecord(contentHash: String, hashKeyEpoch: String) -> UploadRemoteContentIndexRecord? {
+        remoteContentRecords(contentHash: contentHash, hashKeyEpoch: hashKeyEpoch, limit: 1).first
+    }
 }
 
 /// Local content hashing with streaming SHA-1.
@@ -747,6 +768,8 @@ public protocol UploadDuplicateChecking: Sendable {
     /// Optional stronger lookup: an active remote photo with the same content hash, independent
     /// of filename/name hash. Backends that cannot provide a remote content index return nil.
     func findDuplicate(contentHash: String) async throws -> RemotePhotoDuplicate?
+    /// At most `limit` active remote photos with this content hash, so a main photo can pass over a related file.
+    func findDuplicates(contentHash: String, limit: Int) async throws -> [RemotePhotoDuplicate]
     /// Link IDs of the photos that are related photos of `mainLinkID` now: a Live Photo's video, a series'
     /// members. The burst-member dedupe rule uses it, because no duplicate row names a link's main photo.
     func relatedPhotoLinkIDs(ofMainLinkID mainLinkID: String) async throws -> Set<String>
@@ -819,6 +842,9 @@ public extension UploadDuplicateChecking {
         return hashes
     }
     func findDuplicate(contentHash: String) async throws -> RemotePhotoDuplicate? { nil }
+    func findDuplicates(contentHash: String, limit: Int) async throws -> [RemotePhotoDuplicate] {
+        try await findDuplicate(contentHash: contentHash).map { [$0] } ?? []
+    }
     func findExactActiveDuplicates(correctedName: String, sha1Digest: Data) async -> [PhotoUID] { [] }
     func prepareRemoteIndex(
         progress: @escaping @Sendable (UploadRemoteIndexPreparationProgress) async -> Void
@@ -896,9 +922,12 @@ public protocol UploadIdentityResolving: Sendable {
     /// reconciliation. Releases coalescing waiters and invalidates cached duplicate state so all
     /// subsequent work re-queries the server rather than trusting the failed local attempt.
     func remoteCommitNeedsReconciliation(_ descriptor: UploadResourceDescriptor) async
+    /// The manifest record of `source`: the last file that was hashed for it, and the proven outcome of that file.
+    func identityRecord(for source: UploadSourceIdentity) async -> UploadIdentityRecord?
 }
 
 public extension UploadIdentityResolving {
+    func identityRecord(for source: UploadSourceIdentity) async -> UploadIdentityRecord? { nil }
     func revalidateKnownRemote(_ descriptor: UploadResourceDescriptor) async throws -> UploadDuplicateDecision? { nil }
     func remoteAssetProofs(
         for identities: [UploadBackupExternalIdentity]
@@ -923,10 +952,13 @@ public extension UploadIdentityResolving {
 public struct UploadPreflightResult: Sendable, Equatable {
     public let identity: UploadIdentity
     public let decision: UploadDuplicateDecision
+    /// Set when the upload replaces earlier uploads of this photo. The upload carries it to the server.
+    public let lineage: UploadLineageMarker?
 
-    public init(identity: UploadIdentity, decision: UploadDuplicateDecision) {
+    public init(identity: UploadIdentity, decision: UploadDuplicateDecision, lineage: UploadLineageMarker? = nil) {
         self.identity = identity
         self.decision = decision
+        self.lineage = lineage
     }
 }
 
