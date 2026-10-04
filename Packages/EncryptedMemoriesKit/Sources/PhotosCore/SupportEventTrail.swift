@@ -11,6 +11,7 @@ public final class SupportEventTrail: @unchecked Sendable {
         case backupRowCompleted, backupRowAlreadyBackedUp, backupRowWaiting, backupRowParked, backupRowSkipped
         case backupRowNeedsReconciliation
         case editReplaced, editKept, editWaiting, editReplacementGone
+        case backupDeletionKept, backupDeletionReopened
     }
 
     struct Event: Sendable, Equatable {

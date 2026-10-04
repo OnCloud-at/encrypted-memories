@@ -59,6 +59,7 @@ public struct BackupQueueSupportSnapshot: Codable, Sendable, Equatable {
     public enum Reason: String, Codable, Sendable, CaseIterable {
         case none, unclassified, network, deviceStorage, remoteDraft, remoteDraftStale, sourceMissing
         case permission, unsupported, remoteService, localState, remoteDeletion, accountStorage, unknown
+        case deletedElsewhere
     }
 
     public struct StateCount: Codable, Sendable, Equatable {

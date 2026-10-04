@@ -1,11 +1,146 @@
 {
   "sourceLanguage": "en",
   "strings": {
+    "backup.issue_unknown_waiting": {
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Not finished yet." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Noch nicht fertig." } }
+      }
+    },
+    "backup.issue_permanent": {
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "This photo cannot be backed up." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Dieses Foto kann nicht gesichert werden." } }
+      }
+    },
+    "backup.issue_source_not_ready": {
+      "localizations": {
+        "en": {"stringUnit": {"state": "translated", "value": "The camera is still processing this photo."}},
+        "de": {"stringUnit": {"state": "translated", "value": "Die Kamera bearbeitet dieses Foto noch."}}
+      }
+    },
+    "backup.issue_source_missing": {
+      "localizations": {
+        "en": {"stringUnit": {"state": "translated", "value": "This photo is no longer on this device."}},
+        "de": {"stringUnit": {"state": "translated", "value": "Dieses Foto ist nicht mehr auf diesem Gerät."}}
+      }
+    },
+    "backup.section_action_needed": {
+      "localizations": {
+        "en": {"stringUnit": {"state": "translated", "value": "Action needed"}},
+        "de": {"stringUnit": {"state": "translated", "value": "Handlung erforderlich"}}
+      }
+    },
+    "backup.section_continues_by_itself": {
+      "localizations": {
+        "en": {"stringUnit": {"state": "translated", "value": "Continues by itself"}},
+        "de": {"stringUnit": {"state": "translated", "value": "Läuft von selbst weiter"}}
+      }
+    },
+    "backup.section_not_possible": {
+      "localizations": {
+        "en": {"stringUnit": {"state": "translated", "value": "Not possible"}},
+        "de": {"stringUnit": {"state": "translated", "value": "Nicht möglich"}}
+      }
+    },
+    "backup.phase_waiting_proton": {
+      "localizations": {
+        "en": {"stringUnit": {"state": "translated", "value": "Waiting for Proton"}},
+        "de": {"stringUnit": {"state": "translated", "value": "Warten auf Proton"}}
+      }
+    },
+    "backup.phase_not_backed_up %lld": {
+      "extractionState": "manual",
+      "comment": "Backup headline: photos that are not backed up and need the person or cannot be backed up.",
+      "localizations": {
+        "en": {
+          "variations": {
+            "plural": {
+              "one": { "stringUnit": { "state": "translated", "value": "%lld photo not backed up" } },
+              "other": { "stringUnit": { "state": "translated", "value": "%lld photos not backed up" } }
+            }
+          }
+        },
+        "de": {
+          "variations": {
+            "plural": {
+              "one": { "stringUnit": { "state": "translated", "value": "%lld Foto nicht gesichert" } },
+              "other": { "stringUnit": { "state": "translated", "value": "%lld Fotos nicht gesichert" } }
+            }
+          }
+        }
+      }
+    },
+    "backup.issue_deleted_elsewhere" : {
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Die Sicherung dieses Fotos wurde aus Proton Drive entfernt."
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "The backup of this photo was removed from Proton Drive."
+          }
+        }
+      }
+    },
+    "backup.issue_deletion_check" : {
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Prüft, ob dieses Foto noch in Proton Drive ist."
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Checking whether this photo is still in Proton Drive."
+          }
+        }
+      }
+    },
+    "backup.keep_deleted" : {
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Gelöscht lassen"
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Keep Deleted"
+          }
+        }
+      }
+    },
+    "backup.back_up_again" : {
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Erneut sichern"
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Back Up Again"
+          }
+        }
+      }
+    },
+
     "backup.issue_waiting_original": {
       "extractionState": "manual",
       "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "The edited photo is waiting for its original resources. Backup will retry automatically." } },
-        "de": { "stringUnit": { "state": "translated", "value": "Das bearbeitete Foto wartet auf seine Originalressourcen. Das Backup versucht es automatisch erneut." } }
+        "en": { "stringUnit": { "state": "translated", "value": "The edited photo waits for its original." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Das bearbeitete Foto wartet auf sein Original." } }
       }
     },
     "albums.add_busy_message": {
@@ -799,8 +934,8 @@
     "backup.issue_network": {
       "extractionState": "manual",
       "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "The connection was interrupted. Backup will retry when eligible." } },
-        "de": { "stringUnit": { "state": "translated", "value": "Die Verbindung wurde unterbrochen. Das Backup versucht es erneut, sobald es möglich ist." } }
+        "en": { "stringUnit": { "state": "translated", "value": "Connection interrupted." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Verbindung unterbrochen." } }
       }
     },
     "backup.error_needs_free_space %@": {
@@ -812,50 +947,50 @@
     "backup.issue_account_storage": {
       "extractionState": "manual",
       "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "Your Proton storage is full. Free up space or upgrade your plan, then select Back Up Now." } },
-        "de": { "stringUnit": { "state": "translated", "value": "Dein Proton-Speicher ist voll. Gib Speicher frei oder erweitere dein Abo und wähle dann „Jetzt sichern“." } }
+        "en": { "stringUnit": { "state": "translated", "value": "Your Proton storage is full. Free up space or upgrade your plan." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Dein Proton-Speicher ist voll. Gib Speicher frei oder erweitere dein Abo." } }
       }
     },
     "backup.issue_device_storage": {
       "extractionState": "manual",
       "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "Not enough free space on this device to prepare the original." } },
-        "de": { "stringUnit": { "state": "translated", "value": "Auf diesem Gerät ist nicht genug freier Speicher zum Vorbereiten des Originals vorhanden." } }
+        "en": { "stringUnit": { "state": "translated", "value": "Not enough space on this device." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Zu wenig Speicher auf diesem Gerät." } }
       }
     },
     "backup.issue_remote_draft": {
       "extractionState": "manual",
       "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "An incomplete upload in Proton currently blocks this item." } },
-        "de": { "stringUnit": { "state": "translated", "value": "Ein unvollständiger Upload in Proton blockiert dieses Objekt derzeit." } }
+        "en": { "stringUnit": { "state": "translated", "value": "An earlier upload of this photo is still finishing." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Ein früherer Upload dieses Fotos wird noch abgeschlossen." } }
       }
     },
     "backup.issue_remote_draft_stale": {
       "extractionState": "manual",
       "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "An incomplete Proton upload kept blocking this item after repeated checks. You can dismiss this warning without marking the item as backed up." } },
-        "de": { "stringUnit": { "state": "translated", "value": "Ein unvollständiger Proton-Upload blockiert dieses Objekt auch nach wiederholten Prüfungen. Du kannst die Warnung ausblenden, ohne das Objekt als gesichert zu markieren." } }
+        "en": { "stringUnit": { "state": "translated", "value": "An earlier upload of this photo stayed unfinished." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Ein früherer Upload dieses Fotos blieb unvollständig." } }
       }
     },
     "backup.issue_permission": {
       "extractionState": "manual",
       "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "Encrypted Memories no longer has permission to read this item." } },
-        "de": { "stringUnit": { "state": "translated", "value": "Encrypted Memories darf dieses Objekt nicht mehr lesen." } }
+        "en": { "stringUnit": { "state": "translated", "value": "Encrypted Memories may not read this photo. Allow access to all photos in Settings." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Encrypted Memories darf dieses Foto nicht lesen. Erlaube in den Einstellungen den Zugriff auf alle Fotos." } }
       }
     },
     "backup.issue_unsupported": {
       "extractionState": "manual",
       "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "This item uses an unsupported resource format." } },
-        "de": { "stringUnit": { "state": "translated", "value": "Dieses Objekt verwendet ein nicht unterstütztes Ressourcenformat." } }
+        "en": { "stringUnit": { "state": "translated", "value": "This file type cannot be backed up." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Dieser Dateityp kann nicht gesichert werden." } }
       }
     },
     "backup.issue_remote_service": {
       "extractionState": "manual",
       "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "Proton could not complete this operation. The recorded server detail is shown below." } },
-        "de": { "stringUnit": { "state": "translated", "value": "Proton konnte diesen Vorgang nicht abschließen. Das gespeicherte Serverdetail wird unten angezeigt." } }
+        "en": { "stringUnit": { "state": "translated", "value": "Proton cannot take this photo right now." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Proton kann dieses Foto gerade nicht annehmen." } }
       }
     },
     "backup.error_low_space": {
@@ -883,13 +1018,13 @@
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Backup cannot continue safely because its local state is unavailable. Please restart the app."
+            "value": "The backup cannot continue on this device right now. Please restart the app."
           }
         },
         "de": {
           "stringUnit": {
             "state": "translated",
-            "value": "Backup kann nicht sicher fortgesetzt werden, weil der lokale Status nicht verfügbar ist. Bitte starte die App neu."
+            "value": "Das Backup kann auf diesem Gerät gerade nicht weitermachen. Bitte starte die App neu."
           }
         }
       }
@@ -1020,24 +1155,24 @@
       "extractionState": "manual",
       "comment": "Fallback reason for a failed backup item when no specific error message was stored.",
       "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "Backup failed" } },
-        "de": { "stringUnit": { "state": "translated", "value": "Sicherung fehlgeschlagen" } }
+        "en": { "stringUnit": { "state": "translated", "value": "The backup did not succeed." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Die Sicherung ist nicht gelungen." } }
       }
     },
     "backup.failed_sheet_title": {
       "extractionState": "manual",
       "comment": "Title of the sheet listing items that could not be backed up.",
       "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "Not backed up" } },
-        "de": { "stringUnit": { "state": "translated", "value": "Nicht gesichert" } }
+        "en": { "stringUnit": { "state": "translated", "value": "Photos not backed up" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Nicht gesicherte Fotos" } }
       }
     },
     "backup.failed_sheet_footer": {
       "extractionState": "manual",
       "comment": "Explainer under the incomplete-items list: each row states whether and when retry is possible.",
       "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "Retryable items show their next attempt. Items requiring action remain visible until resolved." } },
-        "de": { "stringUnit": { "state": "translated", "value": "Bei erneut versuchbaren Objekten wird der nächste Versuch angezeigt. Objekte mit Handlungsbedarf bleiben sichtbar, bis das Problem behoben ist." } }
+        "en": { "stringUnit": { "state": "translated", "value": "Hiding a notice does not back up the photo." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Ein ausgeblendeter Hinweis sichert das Foto nicht." } }
       }
     },
     "backup.failed_sheet_retry": {

@@ -99,6 +99,8 @@ public struct UploadResourceDescriptor: Sendable {
     public let photoLibraryCreationDate: Date?
     public let externalIdentifierIsUnique: Bool
     public let originalSHA1Hex: Set<String>
+    /// Queue revision for a deletion choice. Runtime only; absent for manual uploads.
+    public let backupRevision: UploadBackupRevision?
 
     public init(
         source: UploadSourceIdentity,
@@ -116,7 +118,8 @@ public struct UploadResourceDescriptor: Sendable {
         photoLibraryEditTime: Date? = nil,
         photoLibraryCreationDate: Date? = nil,
         externalIdentifierIsUnique: Bool = false,
-        originalSHA1Hex: Set<String> = []
+        originalSHA1Hex: Set<String> = [],
+        backupRevision: UploadBackupRevision? = nil
     ) {
         self.source = source
         self.fileURL = fileURL
@@ -134,6 +137,11 @@ public struct UploadResourceDescriptor: Sendable {
         self.photoLibraryCreationDate = photoLibraryCreationDate
         self.externalIdentifierIsUnique = externalIdentifierIsUnique
         self.originalSHA1Hex = originalSHA1Hex
+        self.backupRevision = backupRevision
+    }
+
+    public func withBackupRevision(_ revision: UploadBackupRevision) -> UploadResourceDescriptor {
+        copy(backupRevision: revision)
     }
 
     public func withWorkIntent(_ intent: LibraryWorkIntent) -> UploadResourceDescriptor {
@@ -165,7 +173,8 @@ public struct UploadResourceDescriptor: Sendable {
         photoLibraryEditTime: Date? = nil,
         photoLibraryCreationDate: Date? = nil,
         externalIdentifierIsUnique: Bool? = nil,
-        originalSHA1Hex: Set<String>? = nil
+        originalSHA1Hex: Set<String>? = nil,
+        backupRevision: UploadBackupRevision? = nil
     ) -> UploadResourceDescriptor {
         UploadResourceDescriptor(
             source: source,
@@ -183,7 +192,8 @@ public struct UploadResourceDescriptor: Sendable {
             photoLibraryEditTime: photoLibraryEditTime ?? self.photoLibraryEditTime,
             photoLibraryCreationDate: photoLibraryCreationDate ?? self.photoLibraryCreationDate,
             externalIdentifierIsUnique: externalIdentifierIsUnique ?? self.externalIdentifierIsUnique,
-            originalSHA1Hex: originalSHA1Hex ?? self.originalSHA1Hex
+            originalSHA1Hex: originalSHA1Hex ?? self.originalSHA1Hex,
+            backupRevision: backupRevision ?? self.backupRevision
         )
     }
 }
@@ -286,6 +296,8 @@ public enum UploadDuplicateDecision: Sendable, Equatable {
     /// This installation owns an interrupted remote draft for the name. Upload through Proton's
     /// explicit draft-override path so the stale draft is replaced instead of parking forever.
     case uploadReplacingDraft
+    /// An earlier backup is gone. Check again before asking the person; never upload during this wait.
+    case awaitDeletionCheck
     /// The compound (primary + all secondaries) is already represented remotely; do not upload.
     /// `remoteLinkID` identifies the existing primary when the server/manifest provided it.
     case skip(SkipReason, remoteLinkID: String?)
@@ -297,7 +309,7 @@ public enum UploadDuplicateDecision: Sendable, Equatable {
         switch self {
         case .upload, .uploadReplacingDraft:
             true
-        case .skip, .uploadMissingSecondaries:
+        case .skip, .uploadMissingSecondaries, .awaitDeletionCheck:
             false
         }
     }
