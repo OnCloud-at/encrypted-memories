@@ -629,9 +629,12 @@ final class EditScenarioHarness {
             }
         }
         checkedSteps = steps.count
+        // U2: only the asset deleted by the person (S5 state) proves the skip. A person-trashed earlier main alone is no
+        // proof.
+        let deletedAssets = server.personDeletedAssets
         for entry in entries where state(of: entry) == .skippedRemoteDeletion {
             check(
-                server.links.contains { $0.assetID == entry.source.identifier && $0.personDeleted },
+                deletedAssets[entry.source.identifier] != nil,
                 "U2 skippedRemoteDeletion has no positive person-deletion proof for \(entry.source.identifier)",
                 file: file, line: line)
         }
@@ -639,6 +642,8 @@ final class EditScenarioHarness {
 
     /// U4: `retired` names only links that left the library: a trashed main, or a related file whose main is trashed.
     /// The server never trashes a related file on its own; it stays active under its trashed main.
+    /// U5: `retired` never names a link that the person trashed. A person trash of an earlier main leaves `superseded`
+    /// without entering `retired`.
     func assertRetired(file: StaticString = #filePath, line: UInt = #line) {
         let links = server.links
         for asset in library.snapshot {
@@ -648,6 +653,9 @@ final class EditScenarioHarness {
                 check(
                     link.state != .active || (main.map { $0.state != .active } ?? false),
                     "U4 retired names a link that is still in the library: \(id)", file: file, line: line)
+                check(
+                    !link.personRetired && !link.personDeleted,
+                    "U5 retired names a link that the person trashed: \(id)", file: file, line: line)
             }
         }
     }
@@ -680,8 +688,9 @@ final class EditScenarioHarness {
             summary.waiting + summary.active + summary.blocked + summary.failed == 0, "the queue must drain",
             file: file, line: line)
         let links = server.links
+        let deletedAssets = server.personDeletedAssets
         for asset in library.snapshot {
-            let mains = links.filter {
+            let allMains = links.filter {
                 ($0.assetID == asset.identifier || sharedMains[asset.identifier] == $0.linkID)
                     && $0.mainLinkID == nil && $0.state == .active
                     // An upgrade keeps unrelated legacy mains; exactly one must still hold today's bytes.
@@ -689,7 +698,12 @@ final class EditScenarioHarness {
                         || $0.contentHash
                             == EditScenarioServer.contentHash(Data(Insecure.SHA1.hash(data: asset.current))))
             }
-            if links.contains(where: { $0.assetID == asset.identifier && $0.personDeleted }) {
+            // An earlier version that the person trashed and restored is the person's photo, not a backup, unless it is
+            // the only main left: then an undo adopted it as the backup of the photo.
+            let backups = allMains.filter { !$0.personRetired }
+            let mains = backups.isEmpty ? allMains : backups
+            // S5: a deleted asset has no active main.
+            if deletedAssets[asset.identifier] != nil {
                 check(mains.isEmpty, "S5 a deleted asset has a new active main", file: file, line: line)
                 continue
             }
