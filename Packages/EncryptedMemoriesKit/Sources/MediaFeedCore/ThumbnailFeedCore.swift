@@ -394,8 +394,17 @@ public actor ThumbnailFeedCore {
     private var prefetchDecodeCompleted = 0
     /// UIDs whose thumbnail the backend refused per item (e.g. "no thumbnail"). Quarantined so the
     /// crawl doesn't re-request them every batch; cleared by `startPrefetch` so a fresh crawl
-    /// (new session, timeline refresh) retries them exactly once.
-    private nonisolated let unfetchable = UnfetchableThumbnailBox()
+    /// (new session, timeline refresh) retries them exactly once. A photo that joined moments ago may not be
+    /// downloadable yet; its refusal lapses after `recentJoinRefusalLapse`, so visible demand asks again.
+    private nonisolated let unfetchable: UnfetchableThumbnailBox
+    static let recentJoinRefusalWindow: TimeInterval = 120
+    static let recentJoinRefusalLapse: TimeInterval = 10
+    static let maxRecentJoinRefusalLapses = 5
+    /// The membership last published to this feed. The first one is the baseline; photos that join later are
+    /// recorded in `unfetchable`.
+    private var knownMembership: Set<PhotoUID>?
+    /// Wakes the hosts when a refusal lapses, so an idle grid asks for its visible tiles again.
+    private var refusalLapseWake: (due: Date, task: Task<Void, Never>)?
     private var skippedUnfetchable = 0
     private var lastRepassPercent = -1.0
     /// Cursor + one-shot completion flag for the bounded end-of-crawl disk-coverage re-scan
@@ -471,6 +480,7 @@ public actor ThumbnailFeedCore {
         self.coverageStore = coverageStore
         self.diagnostics = diagnostics
         self.clock = clock
+        self.unfetchable = UnfetchableThumbnailBox(clock: clock)
         self.onDecoded = onDecoded
         self.decoded = DecodedThumbnailCache(costLimit: configuration.decodedMemoryBudgetBytes)
         self.decodePermits = DecodePermitPool(permits: configuration.maxConcurrentDecodes)
@@ -617,7 +627,7 @@ public actor ThumbnailFeedCore {
         else { return nil }
         guard let data = buffer.value else {
             if result.itemErrors[uid] != nil {
-                unfetchable.insert(uid)
+                scheduleRefusalLapseWake(unfetchable.insert(uid))
             } else if result.withheldUIDs.contains(uid) {
                 recordError("thumbnail withheld for \(Self.key(uid)) after an authorization change")
             }
@@ -1338,7 +1348,7 @@ public actor ThumbnailFeedCore {
         guard readAllowed(uid) else { return nil }
         guard let data = box.value else {
             if let reason = result.itemErrors[uid] {
-                unfetchable.insert(uid)
+                scheduleRefusalLapseWake(unfetchable.insert(uid))
                 recordError("thumbnail refused for \(Self.key(uid)): \(reason)")
             } else if result.withheldUIDs.contains(uid) {
                 recordError("thumbnail withheld for \(Self.key(uid)) after an authorization change")
@@ -1371,6 +1381,7 @@ public actor ThumbnailFeedCore {
     }
 
     public func startPrefetch(_ uids: [PhotoUID]) async {
+        refusalWakesAllowed = true
         if let lastSelectedScope, let lastAnalysisScope, let lastRetentionScope {
             await startPrefetch(
                 Self.crawlOrder(
@@ -1382,8 +1393,46 @@ public actor ThumbnailFeedCore {
                 requiringSourceRevision: lastAnalysisScope.revision
             )
         } else {
+            noteMembership(Set(uids))
             await startPrefetch(uids, reporting: Set(uids), requiringSourceRevision: nil)
         }
+    }
+
+    /// Records the photos that joined since the previous membership. The first membership only sets the baseline.
+    private func noteMembership(_ uids: Set<PhotoUID>) {
+        if let knownMembership {
+            unfetchable.noteJoined(uids.subtracting(knownMembership).filter { !$0.isLocalPending })
+        }
+        knownMembership = uids
+    }
+
+    /// False after a stop that drops visible demand, until the feed starts again: a stopped feed, also a load that
+    /// ends after the stop, wakes no host. A refusal still lapses; the next visible request asks again.
+    private var refusalWakesAllowed = true
+
+    private func scheduleRefusalLapseWake(_ due: Date?) {
+        guard let due, refusalWakesAllowed else { return }
+        if let scheduled = refusalLapseWake {
+            guard due < scheduled.due else { return }
+            scheduled.task.cancel()
+        }
+        let delay = max(0, due.timeIntervalSince(clock()))
+        let task = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(delay))
+            guard !Task.isCancelled else { return }
+            await self?.wakeHostsForLapsedRefusal(due)
+        }
+        refusalLapseWake = (due, task)
+    }
+
+    /// Visible grids ask for the lapsed photo again on this wake. Each lapse wakes at most once, and
+    /// `maxRecentJoinRefusalLapses` bounds the lapses of one photo.
+    private func wakeHostsForLapsedRefusal(_ due: Date) {
+        guard refusalLapseWake?.due == due else { return }
+        refusalLapseWake = nil
+        wakeHostsForLocalArrival()
+        // One wake covers every lapse that is due by now, also after a late resume.
+        scheduleRefusalLapseWake(unfetchable.nextLapse(after: max(due, clock())))
     }
 
     /// Background crawl order: the main library grid first, then thumbnails of additional sources, then the
@@ -1478,6 +1527,10 @@ public actor ThumbnailFeedCore {
         if !preservingVisibleDemand {
             visibleDiskDemandInbox.cancel()
             visiblePriorityDemand = nil
+            // A stopped feed wakes no host for a lapsed refusal, also not for a load that ends after the stop.
+            refusalWakesAllowed = false
+            refusalLapseWake?.task.cancel()
+            refusalLapseWake = nil
         }
         flushCheckpointUpdates()
         prefetchGeneration &+= 1
@@ -1626,12 +1679,14 @@ public actor ThumbnailFeedCore {
         if let highestSourceReconciliationRevision {
             guard selectedScope.revision >= highestSourceReconciliationRevision else { return .staleScope }
         }
+        refusalWakesAllowed = true
         highestSourceReconciliationRevision = selectedScope.revision
 
         // Authorization changes immediately even when another reconciliation owns the slow worker/cache
         // boundary. That owner consumes only the newest queued revision, so an older continuation can never
         // overwrite a newer feed state after one of the awaits below.
         thumbnailReadAuthorization.apply(retentionScope)
+        noteMembership(retentionScope.uids)
         // Handed-over photos the scope now covers need no exception any more.
         adoptedAuthorization.subtract(retentionScope.uids)
         let incomingRequest = SourceReconciliationRequest(
@@ -2121,7 +2176,7 @@ public actor ThumbnailFeedCore {
                 } else if !undelivered.isEmpty {
                     let refused = undelivered.filter { result.itemErrors[$0] != nil }
                     prefetchFailedItemError += refused.filter(isReportedForPrefetch).count
-                    unfetchable.formUnion(refused)
+                    scheduleRefusalLapseWake(unfetchable.formUnion(refused))
                     if let first = refused.first, let reason = result.itemErrors[first] {
                         recordError(
                             "thumbnail refused for \(refused.count) item(s), e.g. \(Self.key(first)): \(reason)")
@@ -3560,43 +3615,117 @@ actor DecodePermitPool {
     }
 }
 
+/// Photos whose thumbnail was refused. A refusal holds until the next fresh crawl, except for a photo that joined
+/// the membership moments ago: its refusal lapses after a short delay, a bounded number of times.
 private final class UnfetchableThumbnailBox: @unchecked Sendable {
     private let lock = NSLock()
+    private let clock: @Sendable () -> Date
     private var ids: Set<PhotoUID> = []
+    /// When a held refusal lapses. A lapsed entry stays in `ids` until the next refusal or clear, but no read sees it.
+    private var lapseAt: [PhotoUID: Date] = [:]
+    /// Photos that joined within `recentJoinRefusalWindow`, and how often their refusal lapsed since. A crawl
+    /// clear keeps both, so the bound holds per join and not per crawl.
+    private var joinedAt: [PhotoUID: Date] = [:]
+    private var lapses: [PhotoUID: Int] = [:]
+
+    init(clock: @escaping @Sendable () -> Date) {
+        self.clock = clock
+    }
 
     var count: Int {
-        lock.withLock { ids.count }
+        count(intersecting: nil)
     }
 
     func count(intersecting allowed: Set<PhotoUID>?) -> Int {
-        lock.withLock {
-            guard let allowed else { return ids.count }
-            return ids.intersection(allowed).count
+        let now = clock()
+        return lock.withLock {
+            let held = lapseAt.isEmpty ? ids : ids.filter { lapseAt[$0].map { now < $0 } ?? true }
+            guard let allowed else { return held.count }
+            return held.intersection(allowed).count
         }
     }
 
     func contains(_ uid: PhotoUID) -> Bool {
-        lock.withLock { ids.contains(uid) }
+        let entry = lock.withLock { (held: ids.contains(uid), lapse: lapseAt[uid]) }
+        guard entry.held else { return false }
+        guard let lapse = entry.lapse else { return true }
+        return clock() < lapse
     }
 
-    func insert(_ uid: PhotoUID) {
-        lock.withLock { _ = ids.insert(uid) }
+    /// Returns when the refusal lapses, or nil when it holds until the next fresh crawl.
+    @discardableResult
+    func insert(_ uid: PhotoUID) -> Date? {
+        let now = clock()
+        return lock.withLock { hold(uid, now: now) }
     }
 
-    func formUnion<S: Sequence>(_ sequence: S) where S.Element == PhotoUID {
-        lock.withLock { ids.formUnion(sequence) }
+    /// Returns the earliest lapse among the refused photos, or nil when every refusal holds.
+    @discardableResult
+    func formUnion<S: Sequence>(_ sequence: S) -> Date? where S.Element == PhotoUID {
+        let now = clock()
+        return lock.withLock {
+            sequence.reduce(nil as Date?) { earliest, uid in
+                guard let lapse = hold(uid, now: now) else { return earliest }
+                return min(earliest ?? lapse, lapse)
+            }
+        }
     }
 
     func subtract<S: Sequence>(_ sequence: S) where S.Element == PhotoUID {
-        lock.withLock { ids.subtract(sequence) }
+        lock.withLock {
+            for uid in sequence {
+                ids.remove(uid)
+                lapseAt[uid] = nil
+            }
+        }
     }
 
     func remove(_ uid: PhotoUID) {
-        _ = lock.withLock { ids.remove(uid) }
+        lock.withLock {
+            ids.remove(uid)
+            lapseAt[uid] = nil
+        }
     }
 
     func removeAll() {
-        lock.withLock { ids.removeAll(keepingCapacity: true) }
+        lock.withLock {
+            ids.removeAll(keepingCapacity: true)
+            lapseAt.removeAll(keepingCapacity: true)
+        }
+    }
+
+    /// Records photos that joined the membership now. Joins older than the window are forgotten.
+    func noteJoined<S: Sequence>(_ uids: S) where S.Element == PhotoUID {
+        let now = clock()
+        lock.withLock {
+            let window = ThumbnailFeedCore.recentJoinRefusalWindow
+            for uid in joinedAt.filter({ now.timeIntervalSince($0.value) >= window }).keys {
+                joinedAt[uid] = nil
+                lapses[uid] = nil
+            }
+            for uid in uids where joinedAt[uid] == nil {
+                joinedAt[uid] = now
+            }
+        }
+    }
+
+    /// The first lapse after `date`. Each lapse wakes the hosts at most once.
+    func nextLapse(after date: Date) -> Date? {
+        lock.withLock { lapseAt.values.filter { $0 > date }.min() }
+    }
+
+    private func hold(_ uid: PhotoUID, now: Date) -> Date? {
+        ids.insert(uid)
+        lapseAt[uid] = nil
+        guard let joined = joinedAt[uid],
+            now.timeIntervalSince(joined) < ThumbnailFeedCore.recentJoinRefusalWindow
+        else { return nil }
+        let used = lapses[uid, default: 0]
+        guard used < ThumbnailFeedCore.maxRecentJoinRefusalLapses else { return nil }
+        lapses[uid] = used + 1
+        let lapse = now.addingTimeInterval(ThumbnailFeedCore.recentJoinRefusalLapse)
+        lapseAt[uid] = lapse
+        return lapse
     }
 }
 

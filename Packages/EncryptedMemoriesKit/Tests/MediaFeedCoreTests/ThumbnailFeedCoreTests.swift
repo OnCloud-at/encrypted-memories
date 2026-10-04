@@ -234,6 +234,8 @@ private actor RecordingLoader: ThumbnailBatchLoader {
     private let delayMilliseconds: Int
     /// Withheld on the first request, as after an authorization change during the download; delivered afterwards.
     private var withheldOnce: Set<PhotoUID>
+    /// Refused on the first request, as for a node committed seconds ago; delivered afterwards.
+    private var refusedOnce: [PhotoUID: String]
 
     init(
         payloads: [PhotoUID: Data] = [:],
@@ -241,7 +243,8 @@ private actor RecordingLoader: ThumbnailBatchLoader {
         batchError: String? = nil,
         failAll: Bool = false,
         delayMilliseconds: Int = 0,
-        withheldOnce: Set<PhotoUID> = []
+        withheldOnce: Set<PhotoUID> = [],
+        refusedOnce: [PhotoUID: String] = [:]
     ) {
         self.payloads = payloads
         self.itemErrors = itemErrors
@@ -249,6 +252,7 @@ private actor RecordingLoader: ThumbnailBatchLoader {
         self.failAll = failAll
         self.delayMilliseconds = delayMilliseconds
         self.withheldOnce = withheldOnce
+        self.refusedOnce = refusedOnce
     }
 
     func loadThumbnails(
@@ -264,7 +268,9 @@ private actor RecordingLoader: ThumbnailBatchLoader {
         var errors: [PhotoUID: String] = [:]
         var withheld = Set<PhotoUID>()
         for uid in uids {
-            if withheldOnce.remove(uid) != nil {
+            if let reason = refusedOnce.removeValue(forKey: uid) {
+                errors[uid] = reason
+            } else if withheldOnce.remove(uid) != nil {
                 withheld.insert(uid)
             } else if let data = payloads[uid] {
                 onLoaded(uid, data)
@@ -3035,6 +3041,131 @@ struct ThumbnailFeedCoreTests {
         await feed.startPrefetch([])
         #expect(await feed.decoded(for: uid) == nil)
         #expect(await loader.requestCount() == 2)
+    }
+
+    @Test func refusalOfAJustJoinedPhotoLapsesSoItsTileFills() async throws {
+        let clock = MutableClock(Date(timeIntervalSince1970: 1_000))
+        let old = Self.uid("lapse-old")
+        let joined = Self.uid("lapse-joined")
+        let loader = RecordingLoader(
+            payloads: [joined: Self.pngData(width: 8, height: 8)],
+            refusedOnce: [joined: "no thumbnail for node"]
+        )
+        let feed = await Self.feedWithJoinedPhotos(
+            "lapse", existing: [old], joined: [joined], loader: loader, clock: clock)
+
+        #expect(await feed.decoded(for: joined) == nil)
+        #expect(feed.isKnownUnfetchable(joined))
+        #expect(await feed.decoded(for: joined) == nil, "the refusal holds until it lapses")
+        #expect(await loader.requestCount() == 1)
+
+        clock.advance(ThumbnailFeedCore.recentJoinRefusalLapse)
+        #expect(!feed.isKnownUnfetchable(joined))
+        #expect(await feed.decoded(for: joined) != nil, "the tile fills without a new snapshot")
+        #expect(await loader.requestCount() == 2)
+        await feed.stopPrefetchAndWait()
+    }
+
+    /// A feed without a source graph reports its membership through `startPrefetch`; a photo that joins there also
+    /// gets its refusal lapsed.
+    @Test func refusalOfAPhotoThatJoinedThroughStartPrefetchLapses() async throws {
+        let clock = MutableClock(Date(timeIntervalSince1970: 1_000))
+        let old = Self.uid("prefetch-old")
+        let joined = Self.uid("prefetch-joined")
+        let loader = RecordingLoader(
+            payloads: [old: Self.pngData(width: 8, height: 8), joined: Self.pngData(width: 8, height: 8)],
+            refusedOnce: [joined: "no thumbnail for node"]
+        )
+        let feed = ThumbnailFeedCore(
+            cache: Self.cache("prefetch-join"),
+            loader: loader,
+            configuration: Self.configuration(downloadConcurrencyLimit: 1, batchSize: 1),
+            clock: { clock.read() }
+        )
+        await feed.setPrefetchEnabled(false)
+        await feed.startPrefetch([old])
+        await feed.startPrefetch([old, joined])
+
+        #expect(await feed.decoded(for: joined) == nil)
+        #expect(feed.isKnownUnfetchable(joined))
+        clock.advance(ThumbnailFeedCore.recentJoinRefusalLapse)
+        #expect(!feed.isKnownUnfetchable(joined), "a photo that joined moments ago is asked again")
+        await feed.stopPrefetchAndWait()
+    }
+
+    @Test func refusalOfAnOlderPhotoHoldsUntilTheNextCrawl() async throws {
+        let clock = MutableClock(Date(timeIntervalSince1970: 1_000))
+        let old = Self.uid("hold-old")
+        let aged = Self.uid("hold-aged")
+        let loader = RecordingLoader(itemErrors: [old: "no thumbnail for node", aged: "no thumbnail for node"])
+        let feed = await Self.feedWithJoinedPhotos(
+            "hold", existing: [old], joined: [aged], loader: loader, clock: clock)
+
+        #expect(await feed.decoded(for: old) == nil)
+        // The first refusal of the joined photo comes when its join window has closed.
+        clock.advance(ThumbnailFeedCore.recentJoinRefusalWindow)
+        #expect(await feed.decoded(for: aged) == nil)
+        clock.advance(ThumbnailFeedCore.recentJoinRefusalLapse * 3)
+
+        #expect(feed.isKnownUnfetchable(old))
+        #expect(feed.isKnownUnfetchable(aged))
+        #expect(await feed.decoded(for: old) == nil)
+        #expect(await feed.decoded(for: aged) == nil)
+        #expect(await loader.requestCount() == 2)
+        await feed.stopPrefetchAndWait()
+    }
+
+    @Test func refusalsOfAJustJoinedPhotoLapseABoundedNumberOfTimes() async throws {
+        let clock = MutableClock(Date(timeIntervalSince1970: 1_000))
+        let old = Self.uid("bounded-old")
+        let joined = Self.uid("bounded-joined")
+        let loader = RecordingLoader(itemErrors: [joined: "no thumbnail for node"])
+        let feed = await Self.feedWithJoinedPhotos(
+            "bounded", existing: [old], joined: [joined], loader: loader, clock: clock)
+        let rounds = ThumbnailFeedCore.maxRecentJoinRefusalLapses + 3
+        // Every round stays inside the join window, so only the lapse bound stops the retries.
+        #expect(Double(rounds) * ThumbnailFeedCore.recentJoinRefusalLapse < ThumbnailFeedCore.recentJoinRefusalWindow)
+
+        for _ in 0..<rounds {
+            _ = await feed.decoded(for: joined)
+            // A second visible request before the lapse never reaches the loader.
+            _ = await feed.decoded(for: joined)
+            clock.advance(ThumbnailFeedCore.recentJoinRefusalLapse)
+        }
+
+        #expect(await loader.requestCount() == 1 + ThumbnailFeedCore.maxRecentJoinRefusalLapses)
+        #expect(feed.isKnownUnfetchable(joined))
+        await feed.stopPrefetchAndWait()
+    }
+
+    /// A feed whose source first lists `existing`, then `existing + joined` in a later revision. Prefetch is off,
+    /// so only visible requests reach the loader.
+    private static func feedWithJoinedPhotos(
+        _ name: String,
+        existing: [PhotoUID],
+        joined: [PhotoUID],
+        loader: RecordingLoader,
+        clock: MutableClock
+    ) async -> ThumbnailFeedCore {
+        let feed = ThumbnailFeedCore(
+            cache: Self.cache(name),
+            loader: loader,
+            configuration: Self.configuration(downloadConcurrencyLimit: 1, batchSize: 1),
+            clock: { clock.read() }
+        )
+        await feed.setPrefetchEnabled(false)
+        let source = LibrarySource(id: SourceID("\(name)-source"), capabilities: .readThumbnail)
+        let graph = LibrarySourceGraph()
+        _ = graph.commitSourceSet([source], using: graph.beginSourceSetRefresh())
+        #expect(await feed.bindDerivedDataEpoch(graph.runtimeEpoch))
+        for uids in [existing, existing + joined] {
+            let change = graph.commit(
+                Self.sourceItems(uids), validationToken: nil, using: graph.beginRefresh(source.id)!)!
+            _ = await feed.reconcile(
+                selected: change.selectedScope, analysis: change.analysisScope,
+                retention: change.thumbnailRetentionScope)
+        }
+        return feed
     }
 
     @Test func diagnosticsExplainEveryFailure() async throws {
