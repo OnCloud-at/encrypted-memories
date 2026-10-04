@@ -314,6 +314,7 @@
         /// opening it, and the grid draws the shared selection decorations (blue outline + checkmark badge).
         var selectionMode = false
         var selectedUIDs: Set<PhotoUID> = []
+        private(set) var uploadBadges = PendingUploadBadges.empty
         /// Shared static + on-demand duration/RAW descriptors. The resolver fetches encrypted video duration only
         /// after a resident viewport settles, so metadata cannot outrun thumbnail work while scrolling.
         private lazy var thumbnailOverlayResolver: TimelineThumbnailOverlayResolver = {
@@ -516,6 +517,7 @@
             self.selectionMode = selectionMode
             self.selectedUIDs = selectedUIDs
             // Upload badges change with progress; they never rebuild the item overlays.
+            self.uploadBadges = uploadBadges
             thumbnailOverlayResolver.updateUploadBadges(uploadBadges)
             for handover in pendingHandovers.newHandovers(in: uploadBadges.handovers) {
                 textureCache?.adoptTexture(from: handover.local, to: handover.remote)

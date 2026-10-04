@@ -355,7 +355,7 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
     var decorationsEnabled = false
     private(set) var selectedUIDs: Set<PhotoUID> = []
     private(set) var favoriteUIDs: Set<PhotoUID> = []
-    private var uploadBadges = PendingUploadBadges.empty
+    private(set) var uploadBadges = PendingUploadBadges.empty
     private var contentEpochs = PendingContentEpochTracker()
     private var handovers = PendingHandoverTracker()
     private let uploadBadgeAnimator = GridUploadBadgeAnimator<PhotoUID>()

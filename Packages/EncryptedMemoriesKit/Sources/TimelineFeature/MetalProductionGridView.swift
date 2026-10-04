@@ -227,7 +227,12 @@ struct MetalProductionGridView: NSViewRepresentable {
         }
         host.coordinator.setSelectionMode(selectionMode)
         host.coordinator.setFavorites(favoriteUIDs)
+        let previousBadges = host.coordinator.uploadBadges
         host.coordinator.setUploadBadges(uploadBadges)
+        // VoiceOver hears the pause on every waiting photo, and only there.
+        if MetalGridAccessibilityProvider.badgesChangeLabels(from: previousBadges, to: uploadBadges) {
+            coord.a11y?.invalidate()
+        }
         // Honour a genuine external (+/- / keyboard / programmatic) level change, but ignore a stale `level`
         // binding value left over from a host-led pinch commit - re-driving it would re-anchor at the viewport
         // centre and jump a different photo under the cursor. See `LevelBindingReconciler`.

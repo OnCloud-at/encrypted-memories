@@ -363,14 +363,29 @@ final class MobileLibraryModel {
         client: ProtonClientFacade,
         feed: UIKitThumbnailFeed
     ) {
-        pendingStore = store
-        guard let store,
-            let session = PendingGridSession(
-                store: store,
-                photoBackup: photoBackup,
-                remote: ProtonPendingRemoteEffects(facade: client)
-            )
+        guard
+            let session = startPendingGrid(
+                store: store, photoBackup: photoBackup, remote: ProtonPendingRemoteEffects(facade: client), feed: feed)
         else { return }
+        let albums = client.albums
+        Task { [weak session] in
+            await albums.setPendingAlbumAdds { [weak session] uids, albumID in
+                await session?.addToAlbum(uids, albumID: albumID) ?? false
+            }
+        }
+    }
+
+    /// Shows the pending photos of `photoBackup` in the grid. Without `feed`, their thumbnails do not load.
+    @discardableResult
+    private func startPendingGrid(
+        store: PendingBackupManifestStore?,
+        photoBackup: PhotoLibraryBackupController,
+        remote: any PendingRemoteEffects,
+        feed: UIKitThumbnailFeed?
+    ) -> PendingGridSession? {
+        pendingStore = store
+        guard let store, let session = PendingGridSession(store: store, photoBackup: photoBackup, remote: remote)
+        else { return nil }
         session.presenter.onChange = { [weak self] presentation in
             self?.pendingPresentation = presentation
         }
@@ -384,16 +399,11 @@ final class MobileLibraryModel {
             lastFavoriteIntents = snapshot.favoriteIntents
             pendingFavoriteRevision &+= 1
         }
-        let albums = client.albums
-        Task { [weak session] in
-            await albums.setPendingAlbumAdds { [weak session] uids, albumID in
-                await session?.addToAlbum(uids, albumID: albumID) ?? false
-            }
-        }
-        session.attachFeed(feed.feedCore, imageRequest: PhotoKitPlatformImages.request)
+        if let feed { session.attachFeed(feed.feedCore, imageRequest: PhotoKitPlatformImages.request) }
         pendingGrid = session
         session.setRemote(snapshot)
         session.start()
+        return session
     }
 
     /// Detaches the pending grid from the model. The caller closes the session before the backup controller
@@ -2001,6 +2011,15 @@ final class MobileLibraryModel {
 
         func installIsolatedBackupForTesting(_ controller: PhotoLibraryBackupController) {
             photoBackup = controller
+        }
+
+        /// Also shows the pending photos of `controller` in the grid, without Apple Photos thumbnails.
+        func installIsolatedPendingBackupForTesting(
+            _ controller: PhotoLibraryBackupController, store: PendingBackupManifestStore,
+            remote: any PendingRemoteEffects
+        ) {
+            photoBackup = controller
+            startPendingGrid(store: store, photoBackup: controller, remote: remote, feed: nil)
         }
 
         func installIsolatedAlbumSyncForTesting(_ controller: AlbumSyncController) {
