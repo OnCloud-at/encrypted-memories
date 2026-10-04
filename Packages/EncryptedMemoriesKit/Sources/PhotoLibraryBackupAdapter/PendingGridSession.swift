@@ -174,15 +174,19 @@ public final class PendingGridSession {
         await feed.setLocalThumbnailLoader(nil)
     }
 
-    /// Follows the backup switch and availability of the controller: pending photos show only while backup
-    /// is on and able to run.
+    /// Follows the backup switch, availability, and pause of the controller: pending photos show only while
+    /// backup is on and able to run, and their badges show when the person paused it.
     private func observeBackupState() {
         guard let photoBackup else { return }
-        let enabled = withObservationTracking {
-            photoBackup.isEnabled && photoBackup.isAvailable && photoBackup.accessState.allowsBackup
+        let (enabled, paused) = withObservationTracking {
+            (
+                photoBackup.isEnabled && photoBackup.isAvailable && photoBackup.accessState.allowsBackup,
+                photoBackup.isUserPaused
+            )
         } onChange: { [weak self] in
             Task { @MainActor [weak self] in self?.observeBackupState() }
         }
+        presenter.setBackupPaused(paused)
         setBackupEnabled(enabled)
     }
 

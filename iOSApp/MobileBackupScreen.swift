@@ -316,6 +316,7 @@ private struct MobilePhotoBackupSections: View {
                         }
                     }
                     .font(.footnote)
+                    .accessibilityIdentifier("backup.resume")
                 } else if controller.isSyncing {
                     Button(L10n.string("settings.photos_backup_pause")) {
                         PhotoBackupBackgroundCoordinator.shared.backupPaused()

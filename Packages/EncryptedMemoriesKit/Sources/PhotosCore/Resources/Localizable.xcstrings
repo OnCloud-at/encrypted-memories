@@ -2786,6 +2786,24 @@
         }
       }
     },
+    "a11y.upload_badge.paused": {
+      "extractionState": "manual",
+      "comment": "VoiceOver state of a grid photo that waits for its upload while the person pauses the backup.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Backup paused"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Sicherung pausiert"
+          }
+        }
+      }
+    },
     "a11y.video": {
       "extractionState": "manual",
       "comment": "VoiceOver kind for a video cell.",
