@@ -10,6 +10,8 @@ struct UploadIdentityResolverComposition: Sendable {
     let duplicateChecker: (any UploadDuplicateChecking)?
     /// The upload manifest behind `resolver`. Nil when it is unavailable.
     let identityStore: (any UploadIdentityStore)?
+    /// The content index in the upload manifest. Nil when the manifest is unavailable.
+    let contentIndex: (any UploadRemoteContentIndexStore)?
     /// Earlier uploads of edited photos that the backup replaces. Nil when the upload manifest or the journal is
     /// unavailable.
     let replacementJournal: (any EditReplacementJournaling)?
@@ -42,6 +44,8 @@ public final class ProtonClientFacade {
     public let seriesDissolution: SeriesDissolutionOrchestrator?
     /// Replaces the earlier upload of a photo that was edited in the photo library. Nil while uploads are disabled.
     public let editedPhotoReplacement: EditedPhotoReplacement?
+    /// Finds and merges exact duplicates of the own library. Nil while uploads are disabled.
+    public let exactDuplicates: ExactDuplicateFinder?
     /// The single dedupe resolver for this account, shared by manual uploads and backup sync so both
     /// see the same manifest and remote duplicate view. If the manifest database cannot open,
     /// the bridge supplies a fail-closed resolver; uploads must never silently run without dedupe.
@@ -69,6 +73,7 @@ public final class ProtonClientFacade {
         photoTagAdder: any PhotoTagAdding,
         seriesDissolution: SeriesDissolutionOrchestrator?,
         editedPhotoReplacement: EditedPhotoReplacement?,
+        exactDuplicates: ExactDuplicateFinder?,
         uploadIdentityResolver: (any UploadIdentityResolving)?,
         accountDataDirectory: URL,
         accountDatabasePolicy: LibraryDatabasePolicy,
@@ -85,6 +90,7 @@ public final class ProtonClientFacade {
         self.photoTagAdder = photoTagAdder
         self.seriesDissolution = seriesDissolution
         self.editedPhotoReplacement = editedPhotoReplacement
+        self.exactDuplicates = exactDuplicates
         self.uploadIdentityResolver = uploadIdentityResolver
         self.accountDataDirectory = accountDataDirectory
         self.accountDatabasePolicy = accountDatabasePolicy
@@ -190,6 +196,22 @@ public final class ProtonClientFacade {
                     relations: checker,
                     identities: identities,
                     journal: journal
+                )
+            }(),
+            exactDuplicates: {
+                guard let checker = identityComposition.duplicateChecker,
+                    let index = identityComposition.contentIndex,
+                    let identities = identityComposition.identityStore,
+                    let journal = identityComposition.replacementJournal
+                else { return nil }
+                return ExactDuplicateFinder(
+                    checker: checker,
+                    resolver: identityResolver,
+                    index: index,
+                    identities: identities,
+                    journal: journal,
+                    remote: bridge,
+                    albums: AlbumRepositorySeriesCarryOver(repository: albumsRepo)
                 )
             }(),
             uploadIdentityResolver: identityResolver,

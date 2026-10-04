@@ -2007,6 +2007,7 @@ extension DriveSDKBridge: PhotoUploading {
                 ),
                 duplicateChecker: nil,
                 identityStore: nil,
+                contentIndex: nil,
                 replacementJournal: nil,
                 close: {}
             )
@@ -2040,6 +2041,7 @@ extension DriveSDKBridge: PhotoUploading {
             resolver: ShutdownGatedUploadIdentityResolver(base: pipeline, admission: shutdownGate),
             duplicateChecker: service,
             identityStore: store,
+            contentIndex: store,
             replacementJournal: replacementJournal,
             close: {
                 lineageStore?.close()
@@ -2277,6 +2279,23 @@ extension DriveSDKBridge: PhotoTagAdding {
 }
 
 extension DriveSDKBridge: EditReplacementRemote {}
+
+extension DriveSDKBridge: ExactDuplicateRemote {
+    /// The person merges duplicates, so the duplicates take the person's trash path.
+    func trashDuplicates(_ uids: [PhotoUID]) async throws {
+        try await trash(uids)
+    }
+
+    func restoreDuplicates(_ uids: [PhotoUID]) async throws {
+        try await restore(uids)
+    }
+
+    /// Reads the stored timeline, so ranking the photo to keep costs no request.
+    func captureDates(of uids: [PhotoUID]) async -> [PhotoUID: Date] {
+        let items = (try? await withOpenSession { bridge in bridge.timelineStore?.items(for: uids) ?? [] }) ?? []
+        return Dictionary(items.map { ($0.uid, $0.captureTime) }, uniquingKeysWith: { first, _ in first })
+    }
+}
 
 extension DriveSDKBridge: SeriesDissolutionRemote {
     func ownPhotosVolumeID() async throws -> String {

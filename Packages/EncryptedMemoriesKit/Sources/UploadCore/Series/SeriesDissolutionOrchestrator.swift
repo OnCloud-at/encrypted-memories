@@ -51,6 +51,26 @@ public protocol PhotoCarryOverRemote: Sendable {
     func markFavorite(_ uids: [PhotoUID]) async throws
 }
 
+extension PhotoCarryOverRemote {
+    /// Gives `replacement` the favorite tag and the own albums of the photos in `earlier`, before they leave the
+    /// library. The edit replacement and the duplicate merge share it.
+    public func carryOver(
+        from earlier: [PhotoUID], to replacement: PhotoUID, ownVolumeID: String, albums: any SeriesAlbumCarryOver
+    ) async throws {
+        guard !earlier.isEmpty else { return }
+        let favorites = try await favoriteUIDs(among: earlier + [replacement])
+        if !favorites.contains(replacement), earlier.contains(where: favorites.contains) {
+            try await markFavorite([replacement])
+        }
+        // Every album gets the add: a cached membership of `replacement` can be stale, and an existing membership
+        // counts as success, so a retry adds nothing twice.
+        for albumID in try await albums.ownAlbumIDs(containing: earlier, ownVolumeID: ownVolumeID) {
+            try Task.checkCancellation()
+            try await albums.addPhotos([replacement], toOwnAlbum: albumID)
+        }
+    }
+}
+
 /// Remote reads and the trash write of a series dissolution.
 public protocol SeriesDissolutionRemote: OriginalFileProvider, PhotoCarryOverRemote {
     func source(for member: PhotoUID) async throws -> SeriesMemberSource
@@ -62,18 +82,31 @@ public protocol SeriesDissolutionRemote: OriginalFileProvider, PhotoCarryOverRem
 public protocol SeriesAlbumCarryOver: Sendable {
     /// Every album that contains the photo now, shared albums included.
     func albums(containing uid: PhotoUID) async throws -> [SeriesAlbumReference]
+    /// `albums(containing:)` for many photos with one read where the backend can. A photo in no album maps to an
+    /// empty list.
+    func albums(containing uids: [PhotoUID]) async throws -> [PhotoUID: [SeriesAlbumReference]]
     /// Adds the photos to an album of the account's own library. A shared album is never a valid target.
     /// Succeeds only when every photo is a member afterwards; an existing membership counts as success.
     func addPhotos(_ uids: [PhotoUID], toOwnAlbum albumID: String) async throws
 }
 
 extension SeriesAlbumCarryOver {
+    public func albums(containing uids: [PhotoUID]) async throws -> [PhotoUID: [SeriesAlbumReference]] {
+        var albumsByPhoto: [PhotoUID: [SeriesAlbumReference]] = [:]
+        for uid in uids where albumsByPhoto[uid] == nil {
+            try Task.checkCancellation()
+            albumsByPhoto[uid] = try await albums(containing: uid)
+        }
+        return albumsByPhoto
+    }
+
     /// The albums of the own library that contain any of the photos, each once, in first-seen order. Shared
     /// albums are skipped: their writes cannot address a foreign volume.
     public func ownAlbumIDs(containing uids: [PhotoUID], ownVolumeID: String) async throws -> [String] {
+        let albumsByPhoto = try await albums(containing: uids)
         var albumIDs: [String] = []
         for uid in uids {
-            for album in try await albums(containing: uid)
+            for album in albumsByPhoto[uid] ?? []
             where album.volumeID == ownVolumeID && !albumIDs.contains(album.albumID) {
                 albumIDs.append(album.albumID)
             }
