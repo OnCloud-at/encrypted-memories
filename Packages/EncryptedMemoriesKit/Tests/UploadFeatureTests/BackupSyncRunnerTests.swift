@@ -2577,24 +2577,105 @@ final class BackupSyncRunnerTests: XCTestCase {
             }, "an upload that keeps its earlier upload names no replacement")
     }
 
-    func testAnEditedSeriesKeepsItsEarlierUpload() async throws {
+    /// Uploads the series IMG_1.HEIC with the frames IMG_2.HEIC and IMG_3.HEIC, then edits its main frame: new
+    /// bytes, a new name, and the original becomes a secondary of the edit. The earlier frames stay active rows with
+    /// the same bytes under the earlier main photo.
+    private func uploadSeriesThenEdit(_ harness: ReplacementHarness) async -> UploadBackupSyncQueueEntry {
+        let first = seedLibraryEntry("IMG_1.HEIC")
+        resolver.setBurstMembers(["IMG_2.HEIC", "IMG_3.HEIC"], for: first.source.identifier)
+        _ = await makeRunner(
+            tagAdder: SpyTagAdder(), identityResolver: harness.pipeline, editReplacement: harness.replacement
+        ).runUntilDrained()
+        XCTAssertEqual(uploader.requests.map(\.name), ["IMG_1.HEIC", "IMG_2.HEIC", "IMG_3.HEIC"])
+        for frame in ["IMG_2.HEIC", "IMG_3.HEIC"] {
+            checker.remoteItemsByNameHash["nh(\(frame))"] = [
+                RemotePhotoDuplicate(
+                    nameHash: "nh(\(frame))", contentHash: expectedContentHash(path: "/library/IMG_1#\(frame)"),
+                    linkState: .active, linkID: testUID(frame).nodeID)
+            ]
+        }
+
+        hasher.contentSeeds[first.source.identifier] = "rotated"
+        harness.remote.active = [testUID("IMG_1.HEIC"), testUID("IMG_1.JPG")]
+        resolver.setSecondaries(["IMG_1.HEIC"], for: first.source.identifier)
+        resolver.setSecondaryResource(.photoKit(role: "originalPhoto", ordinal: 0), forName: "IMG_1.HEIC")
+        return seedLibraryEntry("IMG_1.JPG", revisionOffset: 1)
+    }
+
+    func testAnEditedSeriesReplacesItsEarlierSeries() async throws {
         let harness = try makeReplacementHarness()
-        let edited = await uploadThenEdit(harness)
-        resolver.setSecondaries([], for: edited.source.identifier)
-        resolver.setBurstMembers(["IMG_2.HEIC"], for: edited.source.identifier)
+        let edited = await uploadSeriesThenEdit(harness)
+        harness.remote.favorites = [testUID("IMG_1.HEIC")]
 
         _ = await makeRunner(
             tagAdder: SpyTagAdder(), identityResolver: harness.pipeline, editReplacement: harness.replacement
         ).runUntilDrained()
 
-        XCTAssertTrue(harness.remote.trashCalls.isEmpty, "series edits keep today's behavior until their own model")
-        XCTAssertFalse(
-            try XCTUnwrap(uploader.requests.first { $0.name == "IMG_1.JPG" }).additionalMetadata
-                .contains { $0.name == UploadLineageMarker.sectionName },
-            "a series keeps its earlier upload, so it names no replacement")
+        let edit = Array(uploader.uploaded.dropFirst(3))
+        XCTAssertEqual(
+            edit.map(\.request.name), ["IMG_1.JPG", "IMG_1.HEIC", "IMG_2.HEIC", "IMG_3.HEIC"],
+            "the original and every frame upload again under the edited main photo")
+        let main = try XCTUnwrap(edit.first?.uid)
+        XCTAssertEqual(edit.dropFirst().map(\.request.mainPhotoUID), Array(repeating: main, count: 3))
+        XCTAssertEqual(edit.first?.request.tags, [PhotoTag.bursts.rawValue])
+        XCTAssertTrue(
+            try XCTUnwrap(edit.first).request.additionalMetadata.contains {
+                $0.name == UploadLineageMarker.sectionName
+            },
+            "the edited series names the series it replaces")
+        XCTAssertEqual(
+            harness.remote.trashCalls, [[testUID("IMG_1.HEIC")]],
+            "only the earlier main photo moves to the trash; the server hides its frames with it")
+        XCTAssertEqual(harness.remote.favoriteCalls, [[main]])
         XCTAssertEqual(state(of: edited), .completed)
         XCTAssertTrue(harness.journal.entry(for: edited.source).superseded.isEmpty)
-        XCTAssertTrue(harness.journal.entry(for: edited.source).retired.isEmpty)
+    }
+
+    func testAFrameThatThePersonDeletedStaysDeletedWhenTheSeriesIsEdited() async throws {
+        let harness = try makeReplacementHarness()
+        let edited = await uploadSeriesThenEdit(harness)
+        checker.remoteItemsByNameHash["nh(IMG_3.HEIC)"] = [
+            RemotePhotoDuplicate(
+                nameHash: "nh(IMG_3.HEIC)", contentHash: expectedContentHash(path: "/library/IMG_1#IMG_3.HEIC"),
+                linkState: .trashed, linkID: testUID("IMG_3.HEIC").nodeID)
+        ]
+
+        _ = await makeRunner(
+            tagAdder: SpyTagAdder(), identityResolver: harness.pipeline, editReplacement: harness.replacement
+        ).runUntilDrained()
+
+        XCTAssertEqual(
+            uploader.requests.dropFirst(3).map(\.name), ["IMG_1.JPG", "IMG_1.HEIC", "IMG_2.HEIC"],
+            "the deleted frame does not come back with the edit")
+        XCTAssertEqual(harness.remote.trashCalls, [[testUID("IMG_1.HEIC")]])
+        XCTAssertEqual(state(of: edited), .completed)
+    }
+
+    func testUndoingASeriesEditReplacesTheEditedSeries() async throws {
+        let harness = try makeReplacementHarness()
+        let edited = await uploadSeriesThenEdit(harness)
+        _ = await makeRunner(
+            tagAdder: SpyTagAdder(), identityResolver: harness.pipeline, editReplacement: harness.replacement
+        ).runUntilDrained()
+        let editedMain = try XCTUnwrap(uploader.uploaded.first { $0.request.name == "IMG_1.JPG" }?.uid)
+
+        // Undo in Photos: the original bytes and no edit evidence.
+        hasher.contentSeeds[edited.source.identifier] = nil
+        resolver.setSecondaries([], for: edited.source.identifier)
+        resolver.setEditRevision(.revision(UploadBackupRevision(rawValue: 7)), for: edited.source.identifier)
+        harness.remote.active = [editedMain]
+        let undone = seedLibraryEntry("IMG_1.HEIC", revisionOffset: 2)
+        _ = await makeRunner(
+            tagAdder: SpyTagAdder(), identityResolver: harness.pipeline, editReplacement: harness.replacement
+        ).runUntilDrained()
+
+        let undo = Array(uploader.uploaded.dropFirst(7))
+        XCTAssertEqual(undo.map(\.request.name), ["IMG_1.HEIC", "IMG_2.HEIC", "IMG_3.HEIC"])
+        let main = try XCTUnwrap(undo.first?.uid)
+        XCTAssertEqual(undo.dropFirst().map(\.request.mainPhotoUID), [main, main])
+        XCTAssertEqual(harness.remote.trashCalls, [[testUID("IMG_1.HEIC")], [editedMain]])
+        XCTAssertEqual(state(of: undone), .completed)
+        XCTAssertFalse(harness.journal.entry(for: edited.source).lastUploadWasEdit)
     }
 
     func testSeriesUploadsMembersAsRelatedPhotosWithTheBurstsTag() async throws {

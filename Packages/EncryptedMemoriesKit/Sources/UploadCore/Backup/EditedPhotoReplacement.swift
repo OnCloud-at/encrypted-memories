@@ -68,16 +68,16 @@ public struct EditedPhotoReplacement: Sendable {
         return !entry.allSuperseded.isEmpty || !(entry.gone ?? []).isEmpty
     }
 
-    /// True when the next upload of `source` replaces its earlier uploads: no series, and an edit or the undo of an
-    /// edit. A false result keeps every earlier upload, so the upload must not name them as replaced. A compound
+    /// True when the next upload of `source` replaces its earlier uploads: an edit or the undo of an edit, also of a
+    /// series. A false result keeps every earlier upload, so the upload must not name them as replaced. A compound
     /// without its original still names them: `replaceSuperseded` waits for the original before the trash write,
     /// and a reader counts a named link as replaced only after it left the library.
-    public func replacesEarlierUploads(of source: UploadSourceIdentity, edited: Bool, isSeries: Bool) -> Bool {
-        !isSeries && journal.entry(for: source).replacesEarlierUploads(edited: edited)
+    public func replacesEarlierUploads(of source: UploadSourceIdentity, edited: Bool) -> Bool {
+        journal.entry(for: source).replacesEarlierUploads(edited: edited)
     }
 
-    /// Keeps the earlier uploads of `source`. A series keeps today's behavior until its own edit model exists.
-    public func keepSuperseded(of source: UploadSourceIdentity) throws {
+    /// Keeps the earlier uploads of `source`.
+    private func keepSuperseded(of source: UploadSourceIdentity) throws {
         let superseded = journal.entry(for: source).allSuperseded
         guard !superseded.isEmpty else { return }
         try journal.settle(Set(superseded.map(\.nodeID)), related: [], trashed: false, for: source)
@@ -193,8 +193,10 @@ public struct EditedPhotoReplacement: Sendable {
                 linked = try await relations.relatedPhotoLinkIDs(ofMainLinkID: target.nodeID)
             }
             let links = linked.union([target.nodeID])
-            // The trash takes related photos along. A photo that carries the edited photo stays, and so does a
-            // photo that another local source, such as a duplicate in Photos, still counts as its backup.
+            // The trash takes related photos along: the server hides them with their main photo, a restore brings
+            // them back, and a final deletion removes them. They stay active links, so only the main photo moves.
+            // A photo that carries the edited photo stays, and so does a photo that another local source, such as a
+            // duplicate in Photos, still counts as its backup.
             guard !linked.contains(replacement.nodeID), !identities.isNeededElsewhere(links, by: source) else {
                 kept.insert(target.nodeID)
                 continue
@@ -318,7 +320,7 @@ enum UploadRemoteReplacementSafety {
         _ target: UploadRemoteCompound, with replacement: UploadRemoteCompound, originalHashes: Set<String>,
         source: UploadSourceIdentity, identities: any UploadIdentityStore
     ) -> Bool {
-        guard !target.tags.contains(7), hasAnchor(target, originalHashes: originalHashes) else { return false }
+        guard hasAnchor(target, originalHashes: originalHashes) else { return false }
         let files = [replacement.main] + replacement.related
         let retainedOriginals = Set(files.map(\.contentHash)).intersection(originalHashes)
         let anchors = ([target.main] + target.related).filter { retainedOriginals.contains($0.contentHash) }

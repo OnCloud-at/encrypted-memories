@@ -294,6 +294,29 @@ extension DriveSessionStubSuite {
             #expect(lineage.health(hashKeyEpoch: "epoch", contentCheckpoint: checkpoint("one")) == .complete)
         }
 
+        @Test func relatedPhotosOfAMainPhotoNeedTheirList() throws {
+            func metadata(_ photo: String) throws -> [AlbumPhotoMetadata] {
+                let json = #"{"Link":{"LinkID":"main"},"Photo":"# + photo + "}"
+                return [try JSONDecoder().decode(AlbumPhotoMetadata.self, from: Data(json.utf8))]
+            }
+
+            #expect(
+                try ProtonUploadDedupeService.relatedPhotoLinkIDs(
+                    ofMainLinkID: "main", in: metadata(#"{"RelatedPhotosLinkIDs":["frame"]}"#)) == ["frame"])
+            #expect(
+                try ProtonUploadDedupeService.relatedPhotoLinkIDs(
+                    ofMainLinkID: "main", in: metadata(#"{"RelatedPhotosLinkIDs":[]}"#)
+                ).isEmpty)
+            // A response without the list is incomplete. Read as "no related photos", it uploads a frame again.
+            #expect(throws: UploadError.self) {
+                try ProtonUploadDedupeService.relatedPhotoLinkIDs(
+                    ofMainLinkID: "main", in: metadata(#"{"CaptureTime":1}"#))
+            }
+            #expect(throws: UploadError.self) {
+                try ProtonUploadDedupeService.relatedPhotoLinkIDs(ofMainLinkID: "main", in: [])
+            }
+        }
+
         private func checkpoint(_ eventID: String) -> UploadRemoteContentIndexCheckpoint {
             .init(eventID: eventID, refreshedAt: Date())
         }

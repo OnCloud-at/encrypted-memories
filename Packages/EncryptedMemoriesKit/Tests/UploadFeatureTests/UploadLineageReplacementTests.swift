@@ -568,22 +568,60 @@ final class UploadLineageReplacementTests: XCTestCase {
         XCTAssertEqual(server.links.first { $0.uid == head }?.state, .active)
     }
 
-    func testBurstTargetStays() async throws {
+    func testSeriesHeadRetiresWhenEveryFrameHasATwin() async throws {
         let head = try seed("head")
         server.setTags([7], of: head)
+        _ = try seed("frame", filename: "Frame.JPG", main: head)
         let replacement = try await uploadAfterResolving("next")
+        server.setTags([7], of: replacement)
+        let frame = try seed("frame", filename: "Frame.JPG", main: replacement)
+
         let outcome = try await settle(replacement)
-        XCTAssertEqual(outcome, .kept)
-        XCTAssertEqual(server.links.first { $0.uid == head }?.state, .active)
-        XCTAssertFalse(server.steps.contains { $0.trashedByBackup.contains(head.nodeID) })
+
+        XCTAssertEqual(outcome, .replaced(retiredAny: true))
+        XCTAssertEqual(server.links.first { $0.uid == head }?.state, .trashed)
+        XCTAssertEqual(server.links.first { $0.uid == frame }?.mainLinkID, replacement.nodeID)
     }
 
-    func testBurstHeadIsNotATargetAtDiscovery() async throws {
+    func testSeriesHeadStaysWhenAFrameHasNoTwin() async throws {
+        let head = try seed("head")
+        server.setTags([7], of: head)
+        let frame = try seed("frame-deleted-here", filename: "Frame.JPG", main: head)
+        let replacement = try await uploadAfterResolving("next")
+        server.setTags([7], of: replacement)
+
+        let outcome = try await settle(replacement)
+
+        XCTAssertEqual(outcome, .kept, "the earlier series holds a frame that the new series lacks")
+        XCTAssertEqual(server.links.first { $0.uid == head }?.state, .active)
+        XCTAssertEqual(server.links.first { $0.uid == frame }?.state, .active)
+    }
+
+    func testSeriesHeadIsATargetAtDiscovery() async throws {
         let head = try seed("head")
         server.setTags([7], of: head)
         let result = try await pipeline.resolve(descriptor("next"))
         XCTAssertEqual(result.decision, .upload)
-        XCTAssertTrue(journal.entry(for: source).allSuperseded.isEmpty)
+        XCTAssertEqual(superseded(), [head.nodeID])
+    }
+
+    /// Another device replaced the series with a newer edit: it proves the series live, so nothing asks.
+    func testNewerSeriesOfAnotherDeviceProvesThePhotoLive() async throws {
+        let original = try seed("original", filename: "IMG_1.HEIC")
+        try await rememberOriginal(original)
+        server.personTrash(original)
+        let head = try seed(
+            "newer-edit", replacing: [original.nodeID], modificationDate: Date(timeIntervalSince1970: 1_720_000_020))
+        server.setTags([7], of: head)
+        try journal.keepDeleted(for: source)
+
+        let older = descriptor("older-edit")
+        let result = try await pipeline.resolve(older)
+        await pipeline.uploadDidFail(older)
+
+        XCTAssertEqual(result.decision, .upload)
+        XCTAssertFalse(superseded().contains(head.nodeID), "a newer version is never a target")
+        XCTAssertNil(journal.entry(for: source).keptDeleted, "the live series ends the earlier choice")
     }
 
     func testRAWWithoutTwinKeepsItsMain() async throws {
