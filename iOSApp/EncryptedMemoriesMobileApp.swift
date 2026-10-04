@@ -401,7 +401,8 @@ private struct MobileMainTabView: View {
                     context: presentation.context,
                     libraryModel: libraryModel,
                     viewerRouter: viewerRouter,
-                    showsInfoInitially: presentation.showsInfoInitially
+                    showsInfoInitially: presentation.showsInfoInitially,
+                    followsLibraryReplacements: presentation.followsLibraryReplacements
                 )
             }
             .onChange(of: networkMonitor.didRecentlyRestoreConnection) { _, restored in
