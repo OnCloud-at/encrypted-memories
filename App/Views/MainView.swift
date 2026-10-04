@@ -842,10 +842,12 @@ struct MainView: View {
             visualState = .success
         case .hidden:
             message = libraryRefresh.message ?? "\(L10n.string("library.title_activity")) …"
-            visualState =
-                hasUploadMessage
-                ? (libraryRefresh.isBusy ? .working : (libraryRefresh.succeeded ? .success : .failure))
-                : .working
+            // While a refresh runs, the banner shows work, as before; the message decides the colour once it ends.
+            switch hasUploadMessage && !libraryRefresh.isBusy ? libraryRefresh.tone : .working {
+            case .success: visualState = .success
+            case .failure: visualState = .failure
+            case .working, nil: visualState = .working
+            }
         }
         return LibraryActivityBannerOverlay(
             isPresented: connectivityVisible || hasUploadMessage || backgroundVisible,
