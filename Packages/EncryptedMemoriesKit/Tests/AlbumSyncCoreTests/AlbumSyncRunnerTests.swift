@@ -50,6 +50,9 @@ private final class FakeBackupExecutor: AlbumSyncBackupExecuting, @unchecked Sen
     private var _runs: [[String]] = []
     var runs: [[String]] { lock.withLock { _runs } }
     var stopped = false
+    /// The unresolved scratch-queue rows and filenames the next run reports.
+    var problems: [String: BackupFailedItem] = [:]
+    var filenames: [String: String] = [:]
 
     func ensureBackedUp(
         localIdentifiers: [String],
@@ -61,8 +64,9 @@ private final class FakeBackupExecutor: AlbumSyncBackupExecuting, @unchecked Sen
         progress.uploaded = localIdentifiers.count
         onProgress(progress)
         return AlbumSyncBackupReport(
-            total: localIdentifiers.count, backedUp: localIdentifiers.count,
-            failed: 0, sourceMissing: 0, skippedRemoteDeletion: 0
+            total: localIdentifiers.count, backedUp: localIdentifiers.count - problems.count,
+            failed: problems.count, sourceMissing: 0, skippedRemoteDeletion: 0,
+            problems: problems, filenames: filenames
         )
     }
 
@@ -101,6 +105,7 @@ private final class FakeRemoteOps: AlbumSyncRemoteAlbumOps, @unchecked Sendable 
         for photo in photos {
             if failAttachOf.contains(photo.uid.nodeID) {
                 result.failed += 1
+                result.failedLinkIDs.append(photo.uid.nodeID)
                 if result.firstFailureMessage == nil { result.firstFailureMessage = "attach failed" }
             } else if alreadyMemberOf.contains(photo.uid.nodeID) {
                 result.alreadyMember += 1
@@ -417,6 +422,66 @@ private func link(_ id: String, trashed: Bool = false) -> AlbumSyncRemoteLink {
         }
         await gate.open()
         _ = try await first.value
+    }
+
+    @Test func photosWithoutRemoteLinkListTheirBackupReason() async throws {
+        let backup = FakeBackupExecutor()
+        backup.problems = [
+            "b": BackupFailedItem(
+                id: "queue-b", filename: "b.heic", reason: "network reason", isPermanent: false, issue: .network,
+                nextAttemptAt: Date(timeIntervalSinceNow: 600), category: .automatic)
+        ]
+        backup.filenames = ["b": "b.heic", "c": "c.heic"]
+        let (runner, _, _, store) = makeRunner(
+            contents: ["local-1": ["a", "b", "c"]],
+            links: ["a": link("l-a")],
+            backup: backup
+        )
+
+        let report = try await runner.sync(album: album)
+
+        #expect(report.problems.map(\.filename) == ["b.heic", "c.heic"])
+        #expect(report.problems.map(\.reason) == ["network reason", L10n.string("albumsync.issue_not_backed_up")])
+        // Only Sync now runs the album scratch queue again, so no item promises an automatic retry.
+        #expect(report.problems.allSatisfy { $0.category == .userResolvable && $0.nextAttemptAt == nil })
+        #expect(report.problems.count == store.mapping(localAlbumID: album.id)?.lastFailedCount)
+    }
+
+    @Test func attachFailuresAreListedForEachPhoto() async throws {
+        let remote = FakeRemoteOps()
+        remote.failAttachOf = ["l-a", "l-c"]
+        let backup = FakeBackupExecutor()
+        backup.filenames = ["a": "a.heic", "c": "c.heic"]
+        let (runner, _, _, store) = makeRunner(
+            contents: ["local-1": ["a", "b", "c"]],
+            links: ["a": link("l-a"), "b": link("l-b"), "c": link("l-c")],
+            remote: remote,
+            backup: backup
+        )
+
+        let report = try await runner.sync(album: album)
+
+        #expect(report.attachFailed == 2)
+        #expect(report.problems.map(\.source?.identifier) == ["a", "c"])
+        #expect(report.problems.map(\.filename) == ["a.heic", "c.heic"])
+        #expect(report.problems.allSatisfy { $0.reason == L10n.string("albumsync.issue_attach_failed") })
+        #expect(report.problems.count == store.mapping(localAlbumID: album.id)?.lastFailedCount)
+    }
+
+    @Test func laterSuccessfulSyncReportsNoProblems() async throws {
+        let store = makeStore()
+        let failing = FakeRemoteOps()
+        failing.failAttachOf = ["l-a"]
+        let (first, _, _, _) = makeRunner(
+            contents: ["local-1": ["a"]], links: ["a": link("l-a")], remote: failing, store: store)
+        let failed = try await first.sync(album: album)
+        #expect(failed.problems.count == 1)
+
+        let (second, _, _, _) = makeRunner(contents: ["local-1": ["a"]], links: ["a": link("l-a")], store: store)
+        let report = try await second.sync(album: album)
+
+        #expect(report.problems.isEmpty)
+        #expect(report.isFullySynced)
     }
 
     @Test func unavailableMappingStorePreventsRemoteWork() async throws {
