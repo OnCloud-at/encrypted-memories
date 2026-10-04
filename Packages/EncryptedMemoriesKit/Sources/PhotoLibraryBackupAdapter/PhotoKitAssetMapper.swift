@@ -87,8 +87,15 @@ enum PhotoKitAssetMapper {
             resources: resources,
             cloudIdentifier: cloudIdentifier,
             hasAdjustments: asset.hasAdjustments,
-            adjustmentTimestamp: asset.adjustmentTimestamp
+            adjustmentTimestamp: asset.adjustmentTimestamp,
+            livePlaybackOff: livePlaybackOff(subtypes: asset.mediaSubtypes, playbackStyle: asset.playbackStyle)
         )
+    }
+
+    /// A Live Photo that Photos presents as a still image: the person turned its Live effect off. Loop and Bounce
+    /// play as a looping video and stay Live Photos.
+    static func livePlaybackOff(subtypes: PHAssetMediaSubtype, playbackStyle: PHAsset.PlaybackStyle) -> Bool {
+        subtypes.contains(.photoLive) && playbackStyle == .image
     }
 
     /// Maps a PhotoKit chunk with one cloud-identifier query instead of one query per asset.

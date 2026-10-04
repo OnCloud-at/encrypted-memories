@@ -596,6 +596,49 @@ final class EditReplacementTests: XCTestCase {
         XCTAssertEqual(store.record(for: video)?.remoteLinkID, "new-video")
     }
 
+    func testAStillPhotoReplacesItsLivePhotoOnceThePairedVideoIsUploadedAsAPlainFile() async throws {
+        // The Live Photo backup recorded the video as a Live Photo video. With the Live effect off, the new photo
+        // carries the same video again as a plain related file.
+        let liveVideo = row(.livePairedVideo, at: "old-video")
+        let plainVideo = row(.photoKit(role: "pairedVideo", ordinal: 0), at: "new-video")
+        let (old, remote) = supersede("old", related: ["old-video"])
+
+        let outcome = try await makeReplacement(remote).replaceSuperseded(
+            of: asset, with: new, edited: true, holdsOriginal: true)
+
+        XCTAssertEqual(outcome, .replaced(retiredAny: true))
+        XCTAssertEqual(remote.trashCalls, [[old]])
+        XCTAssertNotEqual(store.record(for: liveVideo)?.remoteLinkID, "old-video", "the trashed video proves no backup")
+        XCTAssertEqual(store.record(for: plainVideo)?.remoteLinkID, "new-video")
+    }
+
+    func testALivePhotoReplacesItsStillOnceThePairedVideoIsUploadedAsALivePhotoVideo() async throws {
+        _ = row(.photoKit(role: "pairedVideo", ordinal: 0), at: "old-video")
+        _ = row(.livePairedVideo, at: "new-video")
+        // Turning the Live effect on again undoes the edit that turned it off.
+        try journal.recordUpload(edited: true, for: asset)
+        let (old, remote) = supersede("old", related: ["old-video"])
+
+        let outcome = try await makeReplacement(remote).replaceSuperseded(
+            of: asset, with: new, edited: false, holdsOriginal: true)
+
+        XCTAssertEqual(outcome, .replaced(retiredAny: true))
+        XCTAssertEqual(remote.trashCalls, [[old]])
+    }
+
+    func testAPairedVideoWhoseBothIdentitiesNameTheEarlierPhotoKeepsItWaiting() async throws {
+        _ = row(.livePairedVideo, at: "old-video")
+        _ = row(.photoKit(role: "pairedVideo", ordinal: 0), at: "old-video")
+        let (old, remote) = supersede("old", related: ["old-video"])
+
+        let outcome = try await makeReplacement(remote).replaceSuperseded(
+            of: asset, with: new, edited: true, holdsOriginal: true)
+
+        XCTAssertEqual(outcome, .waiting)
+        XCTAssertTrue(remote.trashCalls.isEmpty, "the video lives only under the earlier photo")
+        XCTAssertEqual(journal.entry(for: asset).superseded, [old])
+    }
+
     func testAWaitingUndoStillReplacesTheEditOnItsNextAttempt() async throws {
         _ = row(.livePairedVideo, at: "old-video")
         try journal.recordUpload(edited: true, for: asset)

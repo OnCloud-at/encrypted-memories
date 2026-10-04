@@ -24,6 +24,7 @@ final class EditScenarioLibrary: UploadBackupAssetCatalog, PhotoLibraryAssetEnum
         var generation = 1
         var deleted = false
         var omitOriginal = false
+        var livePlaybackOff = false
 
         var source: UploadSourceIdentity {
             UploadSourceIdentity(kind: .photoLibraryAsset, identifier: identifier)
@@ -57,7 +58,7 @@ final class EditScenarioLibrary: UploadBackupAssetCatalog, PhotoLibraryAssetEnum
                 pixelWidth: 10, pixelHeight: 10, durationSeconds: pairedVideo == nil ? 0 : 1,
                 isLivePhoto: pairedVideo != nil, isVideo: false, resources: resources,
                 cloudIdentifier: cloudIdentifier ?? "cloud-\(identifier)", hasAdjustments: hasAdjustments,
-                adjustmentTimestamp: adjustmentTimestamp)
+                adjustmentTimestamp: adjustmentTimestamp, livePlaybackOff: livePlaybackOff)
         }
     }
 
@@ -112,6 +113,11 @@ final class EditScenarioLibrary: UploadBackupAssetCatalog, PhotoLibraryAssetEnum
             asset.omitOriginal = omitOriginal
             assets[identifier] = asset
         }
+    }
+
+    /// The Live effect of a Live Photo. Photos records the change as an edit; call `edit` for its rendered file.
+    func setLivePlaybackOff(_ off: Bool, identifier: String = "asset-1") {
+        lock.withLock { assets[identifier]?.livePlaybackOff = off }
     }
 
     func makeOriginalAvailable(_ identifier: String = "asset-1") {
@@ -343,9 +349,11 @@ final class EditScenarioHarness {
     }
 
     /// Seeds the values v1.0.5 wrote, then opens them again with today's stores and runner.
-    convenience init(v105 fixture: V105Fixture, assetCount: Int = 1, live: Bool = false) throws {
+    /// `liveOff` turns the Live effect off before v1.0.5 backs the photo up. v1.0.5 did not read it.
+    convenience init(v105 fixture: V105Fixture, assetCount: Int = 1, live: Bool = false, liveOff: Bool = false) throws {
         try self.init(live: live)
         do {
+            library.setLivePlaybackOff(liveOff)
             if fixture == .unchanged {
                 for number in 2..<max(2, assetCount + 1) {
                     library.add("asset-\(number)", basename: "IMG_\(number)")
@@ -381,7 +389,10 @@ final class EditScenarioHarness {
     }
 
     private func seedV105(_ asset: EditScenarioLibrary.Asset) throws {
-        let plan = try XCTUnwrap(PhotoBackupAssetPlanner.exportPlan(for: asset.info))
+        // v1.0.5 did not read the Live effect, so it planned every Live Photo with its tagged paired video.
+        var info = asset.info
+        info.livePlaybackOff = false
+        let plan = try XCTUnwrap(PhotoBackupAssetPlanner.exportPlan(for: info))
         var main: PhotoUID?
         for item in [plan.primary] + plan.secondaries {
             let descriptor = try library.descriptor(item, asset: asset, materialize: false)
@@ -397,6 +408,12 @@ final class EditScenarioHarness {
                 wasDuplicate = true
             } else {
                 uid = server.seedV105Upload(descriptor, digest: digest, asset: asset, main: main)
+                // v1.0.5 tagged a Live Photo and its paired video like today's runner does.
+                if plan.secondaries.contains(where: { $0.sourceResource == .livePairedVideo }),
+                    item.sourceResource == .primary || item.sourceResource == .livePairedVideo
+                {
+                    server.setTags([PhotoTag.livePhotos.rawValue], of: uid)
+                }
                 deviceRemote.recordOwnUpload(uid)
                 wasDuplicate = false
             }
@@ -424,7 +441,7 @@ final class EditScenarioHarness {
                         remoteVolumeID: volumeID, remoteLinkID: uid.nodeID,
                         outcome: wasDuplicate ? "duplicateActive" : "uploaded", updatedAt: clock.now)))
         }
-        let candidate = try XCTUnwrap(PhotoBackupAssetPlanner.candidate(for: asset.info))
+        let candidate = try XCTUnwrap(PhotoBackupAssetPlanner.candidate(for: info))
         // v1.0.5 PhotoBackupAssetPlan.swift:167-170 uses the date even when the render is absent.
         let revision = UploadBackupRevision(date: asset.modificationDate)
         var revisions: Set<UploadBackupRevision> = [revision]
@@ -442,7 +459,7 @@ final class EditScenarioHarness {
                 UploadBackupSyncQueueEntry(
                     source: asset.source, revision: revision, originalFilename: candidate.originalFilename,
                     state: .completed, updatedAt: clock.now)))
-        var entry = PhotoLibraryCatalogMapper.entry(for: asset.info, observedAt: clock.now)
+        var entry = PhotoLibraryCatalogMapper.entry(for: info, observedAt: clock.now)
         entry.metadataRevision = revision.rawValue
         XCTAssertTrue(catalog.upsertBatch([entry]))
     }

@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import PhotosCore
 import XCTest
@@ -45,6 +46,59 @@ final class EditUpgradeScenarioTests: XCTestCase {
         XCTAssertFalse(harness.journalFileExists)
         harness.assertSafety()
         harness.assertQuiescent()
+    }
+
+    func testV105LivePhotoWithItsLiveEffectOffStaysUntilItsNextEdit() async throws {
+        try await assertV105LiveEffectOffUpgrade(.unchanged)
+    }
+
+    func testV105EditedLivePhotoWithItsLiveEffectOffStaysUntilItsNextEdit() async throws {
+        try await assertV105LiveEffectOffUpgrade(.edited)
+    }
+
+    /// v1.0.5 backed the photo up as a Live Photo. The upgrade uploads, trashes, and asks nothing; the next edit
+    /// replaces the Live Photo with a still photo.
+    private func assertV105LiveEffectOffUpgrade(_ fixture: EditScenarioHarness.V105Fixture) async throws {
+        harness = try EditScenarioHarness(v105: fixture, live: true, liveOff: true)
+        let asset = try XCTUnwrap(harness.library.snapshot.first)
+        let videoHash = EditScenarioServer.contentHash(
+            Data(Insecure.SHA1.hash(data: try XCTUnwrap(asset.pairedVideo))))
+        let legacyMain = try XCTUnwrap(harness.identities.record(for: asset.source)?.remoteLinkID)
+        let legacyVideo = UploadSourceIdentity(
+            kind: .photoLibraryAsset, identifier: asset.identifier, resource: .livePairedVideo)
+        XCTAssertNotNil(harness.identities.record(for: legacyVideo), "v1.0.5 recorded a Live Photo video")
+        XCTAssertEqual(harness.server.links.first { $0.linkID == legacyMain }?.tags, [PhotoTag.livePhotos.rawValue])
+        XCTAssertEqual(harness.catalog.entry(for: asset.identifier)?.livePlaybackOff, false)
+        func serverState() -> [String] { harness.server.links.map { "\($0.linkID) \($0.state) \($0.tags.sorted())" } }
+        let before = serverState()
+
+        let scan = try await harness.fullRescan()
+        XCTAssertEqual(scan.changed, 0, "the Live effect alone must not re-open a photo on upgrade")
+        XCTAssertEqual(scan.discovered, 0)
+        XCTAssertTrue(harness.queue.unsettledRows().isEmpty)
+        // A v1.0.5 edit deduped the original and the video against the first main, so it fails the S3 drain check.
+        await harness.pass()
+
+        XCTAssertTrue(harness.queue.unsettledRows().isEmpty)
+        XCTAssertEqual(uploads, 0)
+        XCTAssertTrue(trashed.isEmpty)
+        XCTAssertEqual(serverState(), before, "the Live Photo stays in Proton until the next edit")
+        XCTAssertTrue(harness.library.resolutions.isEmpty, "No photo bytes should be requested")
+        XCTAssertFalse(harness.journalFileExists)
+        XCTAssertEqual(harness.catalog.entry(for: asset.identifier)?.livePlaybackOff, true)
+
+        harness.library.edit("edit-after-upgrade", at: harness.clock.now)
+        let entry = try await harness.enqueue()
+        await harness.drain()
+
+        XCTAssertEqual(harness.state(of: entry), .completed)
+        XCTAssertEqual(trashed, [legacyMain])
+        let main = try harness.liveMain()
+        let links = harness.server.links
+        XCTAssertEqual(links.first { $0.uid == main }?.tags, [], "the edit backs the photo up as a still")
+        let video = try XCTUnwrap(links.first { $0.mainLinkID == main.nodeID && $0.contentHash == videoHash })
+        XCTAssertEqual(video.tags, [])
+        harness.assertCurrentManifest()
     }
 
     func testNewEditAfterV105TrashesOnlyTheManifestMainAndKeepsTheOriginalMain() async throws {
