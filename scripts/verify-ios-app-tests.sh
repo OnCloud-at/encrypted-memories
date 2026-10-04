@@ -42,6 +42,25 @@ print(max(names, key=rank) if names else "")
 '
 }
 
+# The device that `OS=latest` selects: the simulator with this name on the newest installed iOS runtime.
+resolve_simulator_udid() {
+  xcrun simctl list devices available --json | python3 -c '
+import json, re, sys
+
+name = sys.argv[1]
+best = None
+for runtime, devices in json.load(sys.stdin)["devices"].items():
+    match = re.search(r"\.iOS-([0-9-]+)$", runtime)
+    if not match:
+        continue
+    version = tuple(int(part) for part in match.group(1).split("-"))
+    for device in devices:
+        if device.get("isAvailable") and device["name"] == name and (best is None or version > best[0]):
+            best = (version, device["udid"])
+print(best[1] if best else "")
+' "$1"
+}
+
 if [[ -n "${IOS_TEST_DESTINATION:-}" ]]; then
   DESTINATION="$IOS_TEST_DESTINATION"
 else
@@ -51,6 +70,7 @@ else
     exit 69
   fi
   DESTINATION="platform=iOS Simulator,name=$SIMULATOR_NAME,OS=latest"
+  SIMULATOR_UDID="$(resolve_simulator_udid "$SIMULATOR_NAME")"
 fi
 export DEVELOPER_DIR
 
@@ -74,6 +94,14 @@ xcrun xcodebuild \
   -packageCachePath "$ENCRYPTED_MEMORIES_XCODE_PACKAGE_CACHE" \
   -packageAuthorizationProvider netrc \
   -onlyUsePackageVersionsFromResolvedFile
+
+# Without this, xcodebuild boots a cold simulator on demand and the first test launches the app while the
+# boot still runs; on CI that launch times out ("Failed to get background assertion"). Boot first and wait
+# until the boot, data migration included, is complete.
+if [[ -n "${SIMULATOR_UDID:-}" ]]; then
+  echo "[ios-tests] booting $SIMULATOR_NAME and waiting until it is ready"
+  xcrun simctl bootstatus "$SIMULATOR_UDID" -b
+fi
 
 echo "[ios-tests] scheme: $SCHEME, destination: $DESTINATION"
 xcrun xcodebuild \
