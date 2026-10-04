@@ -85,4 +85,10 @@ struct ShutdownGatedUploadIdentityResolver: UploadIdentityResolving {
             await self.base.remoteCommitNeedsReconciliation(descriptor)
         }
     }
+
+    func identityRecord(for source: UploadSourceIdentity) async -> UploadIdentityRecord? {
+        try? await admission.withAdmission {
+            await self.base.identityRecord(for: source)
+        }
+    }
 }

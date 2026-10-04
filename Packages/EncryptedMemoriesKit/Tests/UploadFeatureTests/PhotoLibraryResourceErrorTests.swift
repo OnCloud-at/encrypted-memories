@@ -21,21 +21,20 @@ final class PhotoLibraryResourceErrorTests: XCTestCase {
     }
 
     func testPhotoKitNetworkFailureRemainsRetryableTransportError() {
-        let native = NSError(
-            domain: PHPhotosErrorDomain,
-            code: PHPhotosError.Code.networkError.rawValue,
-            userInfo: [NSLocalizedDescriptionKey: "offline"]
-        )
+        let codes: [PHPhotosError.Code] = [
+            .networkAccessRequired, .networkError, .libraryVolumeOffline, .operationInterrupted,
+        ]
+        for code in codes {
+            let native = NSError(
+                domain: PHPhotosErrorDomain, code: code.rawValue, userInfo: [NSLocalizedDescriptionKey: "offline"])
 
-        let normalized = PhotoLibraryResourceResolver.normalizedPhotoKitError(
-            native,
-            filename: "IMG_0002.mov"
-        )
+            let normalized = PhotoLibraryResourceResolver.normalizedPhotoKitError(native, filename: "IMG_0002.mov")
 
-        XCTAssertEqual(
-            normalized as? UploadError,
-            .transport(code: PHPhotosError.Code.networkError.rawValue, message: "offline")
-        )
+            XCTAssertEqual(
+                normalized as? UploadError, .transport(code: NSURLErrorCannotLoadFromNetwork, message: "offline"))
+            // Transient: the runner waits and retries without spending the photo's attempts.
+            XCTAssertTrue(BackupSyncRunner.isTransientNetwork(normalized), "\(code) must be transient")
+        }
     }
 
     func testPhotoKitRequestActivityExtendsItsStallDeadline() async throws {

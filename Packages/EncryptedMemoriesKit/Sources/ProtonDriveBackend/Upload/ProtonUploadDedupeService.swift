@@ -140,21 +140,26 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
     }
 
     func findDuplicate(contentHash: String) async throws -> RemotePhotoDuplicate? {
+        try await findDuplicates(contentHash: contentHash, limit: 1).first
+    }
+
+    func findDuplicates(contentHash: String, limit: Int) async throws -> [RemotePhotoDuplicate] {
         let material = try await resolveMaterial()
         try await refreshRemoteContentIndex(material: material)
-        let record = contentIndexStore.remoteContentRecord(
+        let records = contentIndexStore.remoteContentRecords(
             contentHash: contentHash,
-            hashKeyEpoch: material.epoch
+            hashKeyEpoch: material.epoch,
+            limit: limit
         )
         let health = contentIndexStore.remoteContentIndexHealth(hashKeyEpoch: material.epoch)
-        if record == nil, case .degraded(_, let unresolvedCount) = health {
+        if records.isEmpty, case .degraded(_, let unresolvedCount) = health {
             DebugLog.log(
                 "[Dedupe] content miss with incomplete remote metadata; continuing availability-first unresolved=\(unresolvedCount)"
             )
         }
-        return try ProtonRemoteContentIndexLookup.duplicate(
+        return try ProtonRemoteContentIndexLookup.duplicates(
             contentHash: contentHash,
-            record: record,
+            records: records,
             health: health
         )
     }
@@ -1019,18 +1024,25 @@ enum ProtonRemoteContentIndexLookup {
         record: UploadRemoteContentIndexRecord?,
         health: UploadRemoteContentIndexHealth
     ) throws -> RemotePhotoDuplicate? {
-        if let record {
-            return RemotePhotoDuplicate(
+        try duplicates(contentHash: contentHash, records: record.map { [$0] } ?? [], health: health).first
+    }
+
+    static func duplicates(
+        contentHash: String,
+        records: [UploadRemoteContentIndexRecord],
+        health: UploadRemoteContentIndexHealth
+    ) throws -> [RemotePhotoDuplicate] {
+        guard !records.isEmpty || health != .unavailable else {
+            throw UploadError.backend("Remote duplicate index is unavailable")
+        }
+        return records.map { record in
+            RemotePhotoDuplicate(
                 nameHash: "",
                 contentHash: contentHash,
                 linkState: .active,
                 linkID: record.remoteLinkID
             )
         }
-        guard health != .unavailable else {
-            throw UploadError.backend("Remote duplicate index is unavailable")
-        }
-        return nil
     }
 }
 

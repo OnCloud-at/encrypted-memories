@@ -329,6 +329,12 @@ actor PhotoVideoStreamSource {
         return key
     }
 
+    /// The node key of a link, such as the photos root whose key decrypts the names of its photos.
+    func nodeKey(ofLinkID linkID: String) async throws -> UnlockableKey {
+        if let cached = nodeKeyCache[linkID] { return cached }
+        return try await nodeKey(for: fetchLink(linkID))
+    }
+
     private func shareKeyUnlockable() async throws -> UnlockableKey {
         if let shareKey { return shareKey }
         let boot = try await session.getJSON("/drive/shares/\(shareID)", as: ShareBootstrap.self)

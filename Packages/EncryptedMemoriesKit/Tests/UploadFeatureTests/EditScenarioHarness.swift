@@ -12,7 +12,7 @@ final class EditScenarioLibrary: UploadBackupAssetCatalog, PhotoLibraryAssetEnum
         let identifier: String
         let basename: String
         let original: Data
-        let pairedVideo: Data?
+        var pairedVideo: Data?
         var renderedPairedVideo: Data?
         var cloudIdentifier: String?
         let captureTime = Date(timeIntervalSince1970: 1_720_000_000)
@@ -153,6 +153,11 @@ final class EditScenarioLibrary: UploadBackupAssetCatalog, PhotoLibraryAssetEnum
             assets[identifier]?.generation += 1
             assets[identifier]?.render = Data(bytes.utf8)
         }
+    }
+
+    /// Photos stops listing the paired video and leaves the dates alone.
+    func removePairedVideo(_ identifier: String = "asset-1") {
+        lock.withLock { assets[identifier]?.pairedVideo = nil }
     }
 
     /// Metadata drifts without changing the compound bytes or its adjustment data.
@@ -334,8 +339,8 @@ final class EditScenarioHarness {
     }
 
     /// Seeds the values v1.0.5 wrote, then opens them again with today's stores and runner.
-    convenience init(v105 fixture: V105Fixture, assetCount: Int = 1) throws {
-        try self.init()
+    convenience init(v105 fixture: V105Fixture, assetCount: Int = 1, live: Bool = false) throws {
+        try self.init(live: live)
         do {
             if fixture == .unchanged {
                 for number in 2..<max(2, assetCount + 1) {
@@ -492,10 +497,11 @@ final class EditScenarioHarness {
     }
 
     /// A full production catalog scan must classify the old rows before it offers work to the engine.
+    /// Like `PhotoLibraryBackupController.runScanPass`, the one-time reconciliation runs before the scan.
     func fullRescan() async throws -> PhotoLibraryCatalogProgress {
-        let result = try await PhotoLibraryCatalogSync(
-            store: catalog, enumerator: library, now: { [clock] in clock.now }
-        ).run(engine: engine)
+        let sync = PhotoLibraryCatalogSync(store: catalog, enumerator: library, now: { [clock] in clock.now })
+        try await sync.reconcileLateRendersOnce(engine: engine)
+        let result = try await sync.run(engine: engine)
         clock.advance(by: 1)
         return result
     }

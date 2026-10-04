@@ -590,6 +590,34 @@ final class PhotoLibraryCatalogStoreTests: XCTestCase {
         XCTAssertNil(store.entry(for: "late"), "the retired generation must not write the catalog")
     }
 
+    /// The one-time late-render pass starts again after a cancelled pass and does nothing after a complete pass.
+    func testLateRenderReconciliationSetsItsFlagOnlyAfterACompletePass() async throws {
+        let store = try makeStore()
+        let edits = ["a", "b"].map { id in
+            info(
+                id: id,
+                resources: [
+                    .init(role: .originalPhoto, originalFilename: "IMG_\(id).HEIC", mimeType: "image/heic"),
+                    .init(role: .fullSizePhoto, originalFilename: "FullSizeRender.JPG", mimeType: "image/jpeg"),
+                ])
+        }
+        XCTAssertTrue(store.upsertBatch((edits + [photoInfo(id: "c")]).map { entry(from: $0, at: 100) }))
+        let sync = PhotoLibraryCatalogSync(store: store, enumerator: StubEnumerator(infos: []), chunkSize: 1)
+        let engine = ReopeningEnqueuer()
+
+        do {
+            try await Task { try await sync.reconcileLateRendersOnce(engine: engine) }.value
+            XCTFail("the first pass is cancelled after its first page")
+        } catch is CancellationError {}
+        XCTAssertFalse(store.hasReconciledLateRenders())
+
+        try await sync.reconcileLateRendersOnce(engine: engine)
+        XCTAssertTrue(store.hasReconciledLateRenders())
+        try await sync.reconcileLateRendersOnce(engine: engine)
+        XCTAssertEqual(engine.reopened, ["a", "a", "b"], "only edits that list their rendered file, once per pass")
+        XCTAssertEqual(engine.enqueued, ["a", "b"], "re-opened revisions are queued")
+    }
+
     private func runDriver(
         store: any PhotoLibraryCatalogStore,
         enumerator: any PhotoLibraryAssetEnumerator,
@@ -621,6 +649,29 @@ final class PhotoLibraryCatalogStoreTests: XCTestCase {
         private let lock = NSLock()
         private var _enqueued: [String] = []
         var enqueued: [String] { lock.withLock { _enqueued } }
+
+        func enqueue(_ candidate: UploadBackupAssetCandidate) async -> UploadBackupSyncScanResult {
+            lock.withLock { _enqueued.append(candidate.snapshot.source.identifier) }
+            return UploadBackupSyncScanResult()
+        }
+    }
+
+    /// Re-opens every offered revision. Its first call cancels the pass that called it.
+    private final class ReopeningEnqueuer: UploadBackupCandidateEnqueueing, @unchecked Sendable {
+        private let lock = NSLock()
+        private var _reopened: [String] = []
+        private var _enqueued: [String] = []
+        var reopened: [String] { lock.withLock { _reopened } }
+        var enqueued: [String] { lock.withLock { _enqueued } }
+
+        func reopenBackedUpRevisions(_ reopenings: [UploadBackupReopening]) async -> [UploadBackupAssetCandidate] {
+            let isFirstCall = lock.withLock { () -> Bool in
+                defer { _reopened += reopenings.map(\.candidate.snapshot.source.identifier) }
+                return _reopened.isEmpty
+            }
+            if isFirstCall { withUnsafeCurrentTask { $0?.cancel() } }
+            return reopenings.map(\.candidate)
+        }
 
         func enqueue(_ candidate: UploadBackupAssetCandidate) async -> UploadBackupSyncScanResult {
             lock.withLock { _enqueued.append(candidate.snapshot.source.identifier) }
