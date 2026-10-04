@@ -49,6 +49,9 @@ public struct PhotoLibraryCatalogEntry: Sendable, Equatable {
     public var durationSeconds: Double
     public var mediaKind: PhotoLibraryCatalogMediaKind
     public var isLivePhoto: Bool
+    /// The person turned the Live effect of this Live Photo off. The store keeps it in the Live Photo column, so a
+    /// row of an earlier build reads as Live playback on.
+    public var livePlaybackOff: Bool
     public var resources: [PhotoLibraryCatalogResource]
     /// Structural fingerprint (resource roles + names + mime + dimensions + duration + live flag).
     /// A metadata-only change (favourite, album membership) leaves this untouched; the first real
@@ -72,6 +75,7 @@ public struct PhotoLibraryCatalogEntry: Sendable, Equatable {
         durationSeconds: Double,
         mediaKind: PhotoLibraryCatalogMediaKind,
         isLivePhoto: Bool,
+        livePlaybackOff: Bool = false,
         resources: [PhotoLibraryCatalogResource],
         contentFingerprint: Int64,
         metadataRevision: Int64,
@@ -89,6 +93,7 @@ public struct PhotoLibraryCatalogEntry: Sendable, Equatable {
         self.durationSeconds = durationSeconds
         self.mediaKind = mediaKind
         self.isLivePhoto = isLivePhoto
+        self.livePlaybackOff = livePlaybackOff
         self.resources = resources
         self.contentFingerprint = contentFingerprint
         self.metadataRevision = metadataRevision

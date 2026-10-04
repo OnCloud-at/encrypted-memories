@@ -1,7 +1,9 @@
 import Foundation
-import PhotoLibraryBackupAdapter
+import Photos
+import PhotosCore
 import XCTest
 
+@testable import PhotoLibraryBackupAdapter
 @testable import UploadCore
 
 /// Pure planning layer of the PhotoKit adapter: candidate/fingerprint/export decisions over
@@ -162,6 +164,105 @@ final class PhotoBackupPlannerTests: XCTestCase {
         XCTAssertEqual(candidate.snapshot.source.resource, .primary)
         let plan = try XCTUnwrap(PhotoBackupAssetPlanner.exportPlan(for: asset))
         XCTAssertEqual(plan.secondaries.first?.uploadFilename, "IMG_2000.MOV")
+    }
+
+    // MARK: - Live effect
+
+    private let liveResources: [PhotoBackupAssetInfo.Resource] = [
+        .init(role: .originalPhoto, originalFilename: "IMG_2000.HEIC", mimeType: "image/heic"),
+        .init(role: .pairedVideo, originalFilename: "IMG_2000.MOV", mimeType: "video/quicktime"),
+    ]
+
+    private func livePhoto(off: Bool) -> PhotoBackupAssetInfo {
+        var asset = info(live: true, resources: liveResources)
+        asset.livePlaybackOff = off
+        return asset
+    }
+
+    /// The Proton tags that the backup sends with the main photo and with the paired video of `asset`.
+    private func tags(of asset: PhotoBackupAssetInfo) throws -> (main: [Int], video: [Int]) {
+        let plan = try XCTUnwrap(PhotoBackupAssetPlanner.exportPlan(for: asset))
+        let video = try XCTUnwrap(plan.secondaries.first { $0.role == .pairedVideo })
+        let secondary = BackupSecondaryResource(
+            descriptor: UploadResourceDescriptor(
+                source: UploadSourceIdentity(
+                    kind: .photoLibraryAsset, identifier: asset.localIdentifier, resource: video.sourceResource),
+                fileURL: URL(fileURLWithPath: video.uploadFilename), filename: video.uploadFilename, fileSize: 1,
+                modificationDate: now),
+            mediaType: video.mimeType ?? "video/quicktime")
+        return (
+            BackupSyncRunner.primaryTags(for: [secondary]), BackupSyncRunner.secondaryTags(for: video.sourceResource)
+        )
+    }
+
+    func testOnlyALivePhotoThatPhotosShowsAsAStillHasItsLiveEffectOff() {
+        XCTAssertTrue(PhotoKitAssetMapper.livePlaybackOff(subtypes: .photoLive, playbackStyle: .image))
+        XCTAssertFalse(PhotoKitAssetMapper.livePlaybackOff(subtypes: .photoLive, playbackStyle: .livePhoto))
+        XCTAssertFalse(
+            PhotoKitAssetMapper.livePlaybackOff(subtypes: .photoLive, playbackStyle: .videoLooping),
+            "Loop and Bounce stay Live Photos")
+        XCTAssertFalse(PhotoKitAssetMapper.livePlaybackOff(subtypes: [], playbackStyle: .image))
+    }
+
+    func testALivePhotoWithItsLiveEffectOffBacksUpAsAStillWithItsPairedVideo() throws {
+        let asset = livePhoto(off: true)
+        let plan = try XCTUnwrap(PhotoBackupAssetPlanner.exportPlan(for: asset))
+        let video = try XCTUnwrap(plan.secondaries.first)
+
+        XCTAssertEqual(plan.secondaries.count, 1)
+        XCTAssertEqual(video.sourceResource, .photoKit(role: "pairedVideo", ordinal: 0))
+        XCTAssertEqual(video.uploadFilename, "IMG_2000.MOV")
+        XCTAssertEqual(PhotoBackupAssetPlanner.candidate(for: asset)?.snapshot.resourceCount, 2)
+        let tags = try tags(of: asset)
+        XCTAssertEqual(tags.main, [], "a still photo carries no Live Photo tag")
+        XCTAssertEqual(tags.video, [])
+        XCTAssertTrue(
+            EditedPhotoReplacement.isOriginal(video.sourceResource, carriedByPrimary: false),
+            "an edit keeps the paired video as an original")
+    }
+
+    func testALivePhotoWithItsLiveEffectOnKeepsTheLiveTag() throws {
+        let asset = livePhoto(off: false)
+        let video = try XCTUnwrap(PhotoBackupAssetPlanner.exportPlan(for: asset)?.secondaries.first)
+
+        XCTAssertEqual(video.sourceResource, .livePairedVideo)
+        let tags = try tags(of: asset)
+        XCTAssertEqual(tags.main, [PhotoTag.livePhotos.rawValue])
+        XCTAssertEqual(tags.video, [PhotoTag.livePhotos.rawValue])
+    }
+
+    func testTheLiveEffectLeavesTheRevisionAndTheEditEvidenceOfAnUnchangedPhotoAlone() throws {
+        // A photo that v1.0.5 backed up with its Live effect off has these revisions: it must not upload again.
+        let on = try XCTUnwrap(PhotoBackupAssetPlanner.candidate(for: livePhoto(off: false))).snapshot
+        let off = try XCTUnwrap(PhotoBackupAssetPlanner.candidate(for: livePhoto(off: true))).snapshot
+
+        XCTAssertEqual(off.revision, on.revision)
+        XCTAssertEqual(off.editRevision, on.editRevision)
+        XCTAssertEqual(
+            PhotoLibraryCatalogMapper.entry(for: livePhoto(off: true), observedAt: now).contentFingerprint,
+            PhotoLibraryCatalogMapper.entry(for: livePhoto(off: false), observedAt: now).contentFingerprint)
+    }
+
+    func testTurningTheLiveEffectOffOrOnMovesTheRevisionForward() throws {
+        // Photos saves the change like an edit: it moves the modification date and lists the rendered still.
+        let live = livePhoto(off: false)
+        var still = live
+        still.modificationDate = live.modificationDate?.addingTimeInterval(60)
+        still.resources += [render, .init(role: .adjustmentData, originalFilename: "Adjustments.plist")]
+        still.hasAdjustments = true
+        still.adjustmentTimestamp = still.modificationDate
+        still.livePlaybackOff = true
+        var liveAgain = live
+        liveAgain.modificationDate = still.modificationDate?.addingTimeInterval(60)
+        liveAgain.adjustmentTimestamp = liveAgain.modificationDate
+
+        let revisions = try [live, still, liveAgain].map {
+            try XCTUnwrap(PhotoBackupAssetPlanner.candidate(for: $0)).snapshot.revision.rawValue
+        }
+        XCTAssertEqual(revisions, revisions.sorted(), "revisions of one photo order by time")
+        XCTAssertEqual(Set(revisions).count, 3, "each change of the Live effect backs the photo up again")
+        let replayed = PhotoLibraryCatalogMapper.info(for: PhotoLibraryCatalogMapper.entry(for: still, observedAt: now))
+        XCTAssertTrue(replayed.livePlaybackOff, "a replay plans the still photo, not the Live Photo")
     }
 
     func testCatalogRoundTripKeepsTheRevisionOfAnEditWithoutItsRenderedFile() throws {

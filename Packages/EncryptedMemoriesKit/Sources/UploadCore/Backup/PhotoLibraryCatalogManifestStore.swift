@@ -609,7 +609,8 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
         sqlite3_bind_int(stmt, 6, Int32(entry.pixelHeight))
         sqlite3_bind_double(stmt, 7, entry.durationSeconds)
         bindText(stmt, 8, entry.mediaKind.rawValue)
-        sqlite3_bind_int(stmt, 9, entry.isLivePhoto ? 1 : 0)
+        // 2 marks a Live Photo with its Live effect off. The schema stays unchanged: an earlier build reads it as Live.
+        sqlite3_bind_int(stmt, 9, entry.isLivePhoto ? (entry.livePlaybackOff ? 2 : 1) : 0)
         bindText(stmt, 10, resourcesJSON)
         sqlite3_bind_int64(stmt, 11, entry.contentFingerprint)
         sqlite3_bind_int64(stmt, 12, entry.metadataRevision)
@@ -671,6 +672,7 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
             durationSeconds: sqlite3_column_double(stmt, valueOffset + 5),
             mediaKind: mediaKind,
             isLivePhoto: sqlite3_column_int(stmt, valueOffset + 7) != 0,
+            livePlaybackOff: sqlite3_column_int(stmt, valueOffset + 7) == 2,
             resources: resources,
             contentFingerprint: sqlite3_column_int64(stmt, valueOffset + 9),
             metadataRevision: sqlite3_column_int64(stmt, valueOffset + 10),

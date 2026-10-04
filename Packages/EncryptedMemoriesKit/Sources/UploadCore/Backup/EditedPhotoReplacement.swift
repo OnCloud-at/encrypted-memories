@@ -273,8 +273,25 @@ public struct EditedPhotoReplacement: Sendable {
             (identities.sources(withRemoteLinkID: linkID) ?? []).contains { row in
                 row.kind == source.kind && row.identifier == source.identifier
                     && Self.isOriginal(row.resource, carriedByPrimary: primaryIsOriginal)
+                    && !holdsTwin(of: row, outside: linkIDs)
             }
         }
+    }
+
+    /// True when the other identity of the same paired video names a photo outside `linkIDs`. The Live effect picks
+    /// the identity: with the effect on the video is the Live Photo video, with the effect off a plain related file.
+    /// A toggle uploads the video again under its other identity, so the row of the earlier identity stays behind.
+    private func holdsTwin(of row: UploadSourceIdentity, outside linkIDs: Set<String>) -> Bool {
+        let plain = UploadSourceIdentity.Resource.photoKit(role: "pairedVideo", ordinal: 0)
+        let twinResource: UploadSourceIdentity.Resource
+        switch row.resource {
+        case .livePairedVideo: twinResource = plain
+        case plain: twinResource = .livePairedVideo
+        default: return false
+        }
+        let twin = UploadSourceIdentity(kind: row.kind, identifier: row.identifier, resource: twinResource)
+        guard let linkID = identities.record(for: twin)?.remoteLinkID, !linkIDs.contains(linkID) else { return false }
+        return identities.sources(withRemoteLinkID: linkID)?.contains(twin) == true
     }
 
     /// The resources that Photos keeps unchanged through an edit: the original photo or video, a RAW alternate,
