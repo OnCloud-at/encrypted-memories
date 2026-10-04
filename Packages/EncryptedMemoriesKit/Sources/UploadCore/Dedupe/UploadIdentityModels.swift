@@ -389,6 +389,13 @@ public struct UploadIdentityRecord: Sendable, Equatable {
     public func isValid(for descriptor: UploadResourceDescriptor, hashKeyEpoch epoch: String) -> Bool {
         isValid(for: descriptor) && hashKeyEpoch == epoch
     }
+
+    /// Whether the remote photo holds this file: this client uploaded it, or the duplicate check found it active.
+    /// An earlier upload of another client counts as well: the duplicate check proved it was this file.
+    public var provesUpload: Bool {
+        outcome == UploadIdentityManifestStore.Outcome.uploaded.rawValue
+            || outcome == UploadIdentityManifestStore.Outcome.duplicateActive.rawValue
+    }
 }
 
 // MARK: - Pipeline seams
@@ -915,9 +922,12 @@ public protocol UploadIdentityResolving: Sendable {
     /// reconciliation. Releases coalescing waiters and invalidates cached duplicate state so all
     /// subsequent work re-queries the server rather than trusting the failed local attempt.
     func remoteCommitNeedsReconciliation(_ descriptor: UploadResourceDescriptor) async
+    /// The manifest record of `source`: the last file that was hashed for it, and the proven outcome of that file.
+    func identityRecord(for source: UploadSourceIdentity) async -> UploadIdentityRecord?
 }
 
 public extension UploadIdentityResolving {
+    func identityRecord(for source: UploadSourceIdentity) async -> UploadIdentityRecord? { nil }
     func revalidateKnownRemote(_ descriptor: UploadResourceDescriptor) async throws -> UploadDuplicateDecision? { nil }
     func remoteAssetProofs(
         for identities: [UploadBackupExternalIdentity]
@@ -942,10 +952,13 @@ public extension UploadIdentityResolving {
 public struct UploadPreflightResult: Sendable, Equatable {
     public let identity: UploadIdentity
     public let decision: UploadDuplicateDecision
+    /// Set when the upload replaces earlier uploads of this photo. The upload carries it to the server.
+    public let lineage: UploadLineageMarker?
 
-    public init(identity: UploadIdentity, decision: UploadDuplicateDecision) {
+    public init(identity: UploadIdentity, decision: UploadDuplicateDecision, lineage: UploadLineageMarker? = nil) {
         self.identity = identity
         self.decision = decision
+        self.lineage = lineage
     }
 }
 

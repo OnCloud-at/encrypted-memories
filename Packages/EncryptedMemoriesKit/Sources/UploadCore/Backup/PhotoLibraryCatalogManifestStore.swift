@@ -13,6 +13,7 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
     private static let fullScanEpochStartKey = "full_scan_epoch_start"
     private static let fullScanCursorKey = "full_scan_cursor"
     private static let fullScanSnapshotReadyKey = "full_scan_snapshot_ready"
+    private static let reconciledLateRendersKey = "reconciled_late_renders"
     private var db: OpaquePointer?
     private var operationFailed = false
     private let lock = NSLock()
@@ -312,6 +313,15 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
     /// the first real backup pass from mistaking "changed since token" for "entire library known".
     public func hasCompletedFullScan() -> Bool {
         lock.withLock { readInfoValue(Self.completedFullScanKey) == 1 }
+    }
+
+    public func hasReconciledLateRenders() -> Bool {
+        lock.withLock { readInfoValue(Self.reconciledLateRendersKey) == 1 }
+    }
+
+    @discardableResult
+    public func markLateRendersReconciled() -> Bool {
+        lock.withLock { writeInfoValue(Self.reconciledLateRendersKey, 1) }
     }
 
     public func fullScanProgress() -> PhotoLibraryFullScanProgress? {

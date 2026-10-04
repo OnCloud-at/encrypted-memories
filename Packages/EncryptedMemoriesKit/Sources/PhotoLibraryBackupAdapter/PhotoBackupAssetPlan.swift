@@ -205,8 +205,24 @@ public enum PhotoBackupAssetPlanner {
     /// revision differs from the one with the rendered file: the photo re-opens when the rendered file appears,
     /// even when Photos leaves the dates alone.
     static func lacksRender(_ info: PhotoBackupAssetInfo) -> Bool {
+        info.hasAdjustments && !listsRender(info)
+    }
+
+    /// Whether Photos lists the rendered file of an edit.
+    static func listsRender(_ info: PhotoBackupAssetInfo) -> Bool {
         let render: PhotoBackupAssetInfo.Resource.Role = info.isVideo ? .fullSizeVideo : .fullSizePhoto
-        return info.hasAdjustments && !info.resources.contains { $0.role == render }
+        return info.resources.contains { $0.role == render }
+    }
+
+    /// The source under which the plan keeps the original as a related file of the rendered main file. Nil when the
+    /// plan has no such related file.
+    static func originalSecondarySource(for info: PhotoBackupAssetInfo) -> UploadSourceIdentity? {
+        let role: PhotoBackupAssetInfo.Resource.Role = info.isVideo ? .originalVideo : .originalPhoto
+        guard let item = exportPlan(for: info)?.secondaries.first(where: { $0.role == role && $0.ordinal == 0 }) else {
+            return nil
+        }
+        return UploadSourceIdentity(
+            kind: .photoLibraryAsset, identifier: info.localIdentifier, resource: item.sourceResource)
     }
 
     private static func externalIdentity(for info: PhotoBackupAssetInfo) -> UploadBackupExternalIdentity? {
