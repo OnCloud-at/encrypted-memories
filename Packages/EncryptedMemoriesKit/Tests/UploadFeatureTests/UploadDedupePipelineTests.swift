@@ -18,15 +18,17 @@ final class FakeIdentityStore: UploadIdentityStore, @unchecked Sendable {
         lock.withLock { rows[source] }
     }
 
-    func trustedRecord(contentHash: String, hashKeyEpoch: String) -> UploadIdentityRecord? {
+    /// Oldest row first, so a test controls which row the pipeline sees first.
+    func trustedRecords(contentHash: String, hashKeyEpoch: String, limit: Int) -> [UploadIdentityRecord] {
         lock.withLock {
-            rows.values.first { row in
+            let trusted = rows.values.filter { row in
                 row.contentHash == contentHash
                     && row.hashKeyEpoch == hashKeyEpoch
                     && row.remoteLinkID != nil
                     && (row.outcome == UploadIdentityManifestStore.Outcome.uploaded.rawValue
                         || row.outcome == UploadIdentityManifestStore.Outcome.duplicateActive.rawValue)
             }
+            return Array(trusted.sorted { $0.updatedAt < $1.updatedAt }.prefix(limit))
         }
     }
 
@@ -147,6 +149,17 @@ final class FakeChecker: UploadDuplicateChecking, @unchecked Sendable {
         }
     }
 
+    /// Several indexed links per content hash, in this order. Without an entry, the single row above answers.
+    var contentMatchesByContentHash: [String: [RemotePhotoDuplicate]] = [:]
+
+    func findDuplicates(contentHash: String, limit: Int) async throws -> [RemotePhotoDuplicate] {
+        lock.withLock {
+            contentFindCount += 1
+            let single = remoteItemsByContentHash[contentHash].map { [$0] } ?? []
+            return Array((contentMatchesByContentHash[contentHash] ?? single).prefix(limit))
+        }
+    }
+
     var relatedLinkIDsByMainLinkID: [String: Set<String>] = [:]
     /// Answers like the server from state outside the checker, for example the uploads a test made.
     var relatedLinkIDsProvider: (@Sendable (String) -> Set<String>)?
@@ -160,14 +173,23 @@ final class FakeChecker: UploadDuplicateChecking, @unchecked Sendable {
     var linkVisibilityByID: [String: RemoteLinkVisibility?] = [:]
     /// Answers activity from the same state that another fake of the test holds, so both agree like one server.
     var linkActivityProvider: (@Sendable (String) -> Bool)?
+    var linkVisibilityError: Error?
+    private var visibilityReadCount = 0
 
     func linkVisibility(of linkIDs: [String]) async throws -> [String: RemoteLinkVisibility] {
+        let failure = lock.withLock {
+            visibilityReadCount += 1
+            return linkVisibilityError
+        }
+        if let failure { throw failure }
         let provider = lock.withLock { relatedLinkIDsProvider }
         let activity = lock.withLock { linkActivityProvider }
         // The provider answers per main photo, so it can name the main only among the links asked about.
         let provided = Dictionary(uniqueKeysWithValues: Set(linkIDs).map { ($0, provider?($0) ?? []) })
         return lock.withLock {
-            let rows = remoteItemsByNameHash.values.flatMap { $0 } + remoteItemsByContentHash.values
+            let rows =
+                remoteItemsByNameHash.values.flatMap { $0 } + remoteItemsByContentHash.values
+                + contentMatchesByContentHash.values.flatMap { $0 }
             var result: [String: RemoteLinkVisibility] = [:]
             for linkID in linkIDs {
                 if let explicit = linkVisibilityByID[linkID] {
@@ -219,6 +241,7 @@ final class FakeChecker: UploadDuplicateChecking, @unchecked Sendable {
     var invalidateCallCount: Int { lock.withLock { invalidationCount } }
     var contentFindCallCount: Int { lock.withLock { contentFindCount } }
     var exactFindCallCount: Int { lock.withLock { exactFindCount } }
+    var linkVisibilityCallCount: Int { lock.withLock { visibilityReadCount } }
 }
 
 final class UploadDedupePipelineTests: XCTestCase {
@@ -899,6 +922,290 @@ final class UploadDedupePipelineTests: XCTestCase {
         XCTAssertEqual(result.decision, .skip(.activeDuplicate, remoteLinkID: "sdk-existing"))
         XCTAssertEqual(checker.exactFindCallCount, 1)
         XCTAssertEqual(checker.contentFindCallCount, 0)
+    }
+
+    // MARK: - Root eligibility: a main photo never adopts a related file of another photo
+
+    private func activeRow(
+        _ linkID: String, contentHash: String, name: String = "IMG_1.HEIC"
+    ) -> RemotePhotoDuplicate {
+        RemotePhotoDuplicate(nameHash: "nh(\(name))", contentHash: contentHash, linkState: .active, linkID: linkID)
+    }
+
+    func testAPrimaryNeverAdoptsTheManifestRowOfABurstFrame() async throws {
+        hasher.contentSeeds["/photos/IMG_1.HEIC"] = "frame-bytes"
+        let sha1 = fakeSHA1Hex(seed: "frame-bytes")
+        let contentHash = "ch(\(sha1))"
+        // This device uploaded the bytes as a frame of a burst. The content index also names related files.
+        store.upsert(
+            UploadIdentityRecord(
+                source: .file(URL(fileURLWithPath: "/burst/IMG_0001.HEIC"), resource: .burstMember(ordinal: 1)),
+                filename: "IMG_0002.HEIC", correctedName: "IMG_0002.HEIC", fileSize: 1000,
+                modificationDate: Date(timeIntervalSince1970: 1_700_000_000), sha1Hex: sha1,
+                nameHash: "nh(IMG_0002.HEIC)", contentHash: contentHash, hashKeyEpoch: checker.epoch,
+                remoteVolumeID: "vol", remoteLinkID: "frame-link",
+                outcome: UploadIdentityManifestStore.Outcome.uploaded.rawValue, updatedAt: Date()))
+        checker.relatedLinkIDsByMainLinkID["burst-main"] = ["frame-link"]
+        checker.remoteItemsByContentHash[contentHash] = activeRow("frame-link", contentHash: contentHash)
+
+        let d = descriptor()
+        let result = try await pipeline.resolve(d)
+
+        XCTAssertEqual(result.decision, .upload, "a burst frame is no photo of its own")
+        XCTAssertNil(store.record(for: d.source)?.remoteLinkID)
+    }
+
+    func testAPrimaryUploadsWhenItsOnlyNameMatchIsTheOriginalUnderAnEditedPhoto() async throws {
+        let d = descriptor()
+        let contentHash = "ch(\(fakeSHA1Hex(seed: d.fileURL.path)))"
+        checker.remoteItemsByNameHash["nh(IMG_1.HEIC)"] = [activeRow("original-link", contentHash: contentHash)]
+        checker.relatedLinkIDsByMainLinkID["edited-main"] = ["original-link"]
+
+        let result = try await pipeline.resolve(d)
+
+        XCTAssertEqual(result.decision, .upload, "the hidden original under an edit is no backup of this photo")
+        XCTAssertEqual(checker.linkVisibilityCallCount, 1)
+        await pipeline.uploadDidFail(d)
+    }
+
+    func testAPrimaryAdoptsTheMainPhotoWhenARelatedFileHasTheSameBytes() async throws {
+        let d = descriptor()
+        let contentHash = "ch(\(fakeSHA1Hex(seed: d.fileURL.path)))"
+        checker.remoteItemsByNameHash["nh(IMG_1.HEIC)"] = [
+            activeRow("frame-link", contentHash: contentHash), activeRow("main-link", contentHash: contentHash),
+        ]
+        checker.relatedLinkIDsByMainLinkID["burst-main"] = ["frame-link"]
+
+        let result = try await pipeline.resolve(d)
+
+        XCTAssertEqual(result.decision, .skip(.activeDuplicate, remoteLinkID: "main-link"))
+        XCTAssertEqual(checker.linkVisibilityCallCount, 1)
+        XCTAssertEqual(checker.contentFindCallCount, 0)
+    }
+
+    func testAPrimaryUploadsWhenTheContentIndexNamesOnlyARelatedFile() async throws {
+        hasher.contentSeeds["/photos/IMG_1.HEIC"] = "video-bytes"
+        let contentHash = "ch(\(fakeSHA1Hex(seed: "video-bytes")))"
+        checker.remoteItemsByContentHash[contentHash] = activeRow(
+            "video-link", contentHash: contentHash, name: "IMG_9.MOV")
+        checker.relatedLinkIDsByMainLinkID["live-main"] = ["video-link"]
+
+        let d = descriptor()
+        let result = try await pipeline.resolve(d)
+
+        XCTAssertEqual(result.decision, .upload, "a paired video is no photo of its own")
+        XCTAssertEqual(checker.contentFindCallCount, 1)
+        await pipeline.uploadDidFail(d)
+    }
+
+    func testOneResolveReadsTheVisibilityOfALinkOnlyOnce() async throws {
+        let d = descriptor()
+        let contentHash = "ch(\(fakeSHA1Hex(seed: d.fileURL.path)))"
+        checker.remoteItemsByNameHash["nh(IMG_1.HEIC)"] = [activeRow("frame-link", contentHash: contentHash)]
+        checker.remoteItemsByContentHash[contentHash] = activeRow("frame-link", contentHash: contentHash)
+        checker.relatedLinkIDsByMainLinkID["burst-main"] = ["frame-link"]
+
+        let result = try await pipeline.resolve(d)
+
+        XCTAssertEqual(result.decision, .upload)
+        XCTAssertEqual(checker.contentFindCallCount, 1)
+        XCTAssertEqual(checker.linkVisibilityCallCount, 1, "the name rows and the content index name the same link")
+        await pipeline.uploadDidFail(d)
+    }
+
+    func testAPrimaryWithoutAnActiveContentMatchReadsNoVisibility() async throws {
+        let d = descriptor()
+        checker.remoteItemsByNameHash["nh(IMG_1.HEIC)"] = [activeRow("other-photo", contentHash: "other-bytes")]
+
+        let result = try await pipeline.resolve(d)
+
+        XCTAssertEqual(result.decision, .upload)
+        XCTAssertEqual(checker.linkVisibilityCallCount, 0)
+        await pipeline.uploadDidFail(d)
+    }
+
+    func testAFailedVisibilityReadKeepsTheDuplicateDecision() async throws {
+        let d = descriptor()
+        let contentHash = "ch(\(fakeSHA1Hex(seed: d.fileURL.path)))"
+        checker.remoteItemsByNameHash["nh(IMG_1.HEIC)"] = [activeRow("original-link", contentHash: contentHash)]
+        checker.relatedLinkIDsByMainLinkID["edited-main"] = ["original-link"]
+        checker.linkVisibilityError = UploadError.backend("metadata endpoint down")
+
+        let result = try await pipeline.resolve(d)
+
+        XCTAssertEqual(
+            result.decision, .skip(.activeDuplicate, remoteLinkID: "original-link"),
+            "an unproven role keeps the decision of the listing")
+    }
+
+    func testASecondaryStillAdoptsItsCopyUnderItsMainPhotoWithoutAVisibilityRead() async throws {
+        let video = UploadResourceDescriptor(
+            source: .file(URL(fileURLWithPath: "/photos/IMG_1.HEIC"), resource: .livePairedVideo),
+            fileURL: URL(fileURLWithPath: "/photos/IMG_1.MOV"), filename: "IMG_1.MOV", fileSize: 1000,
+            modificationDate: Date(timeIntervalSince1970: 1_700_000_000), mainRemoteLinkID: "live-main")
+        let contentHash = "ch(\(fakeSHA1Hex(seed: "/photos/IMG_1.MOV")))"
+        checker.remoteItemsByNameHash["nh(IMG_1.MOV)"] = [
+            activeRow("video-link", contentHash: contentHash, name: "IMG_1.MOV")
+        ]
+        checker.relatedLinkIDsByMainLinkID["live-main"] = ["video-link"]
+
+        let result = try await pipeline.resolve(video)
+
+        XCTAssertEqual(result.decision, .skip(.activeDuplicate, remoteLinkID: "video-link"))
+        XCTAssertEqual(checker.linkVisibilityCallCount, 0)
+    }
+
+    func testTheSDKFallbackNeverAdoptsARelatedFileForAPrimary() async throws {
+        checker.findError = UploadError.backend("duplicates endpoint down")
+        checker.exactActiveDuplicates = [PhotoUID(volumeID: "vol", nodeID: "frame-link")]
+        checker.linkVisibilityByID["frame-link"] = RemoteLinkVisibility(isActive: true, mainPhotoLinkID: "burst-main")
+
+        do {
+            let result = try await pipeline.resolve(descriptor())
+            XCTFail("expected the lookup error, got \(result.decision)")
+        } catch {
+            // Only a main photo proves the bytes. Without one, the item fails like any failed lookup.
+        }
+        XCTAssertEqual(checker.exactFindCallCount, 1)
+        XCTAssertEqual(checker.linkVisibilityCallCount, 1)
+    }
+
+    /// Stores a trusted primary row of another file with these bytes, as an earlier version wrote it.
+    private func storePrimaryRow(_ path: String, linkID: String, seed: String, updatedAt: Date) {
+        let sha1 = fakeSHA1Hex(seed: seed)
+        store.upsert(
+            UploadIdentityRecord(
+                source: .file(URL(fileURLWithPath: path), resource: .primary),
+                filename: "IMG_5.HEIC", correctedName: "IMG_5.HEIC", fileSize: 1000,
+                modificationDate: Date(timeIntervalSince1970: 1_700_000_000), sha1Hex: sha1,
+                nameHash: "nh(IMG_5.HEIC)", contentHash: "ch(\(sha1))", hashKeyEpoch: checker.epoch,
+                remoteVolumeID: "vol", remoteLinkID: linkID,
+                outcome: UploadIdentityManifestStore.Outcome.duplicateActive.rawValue, updatedAt: updatedAt))
+    }
+
+    func testAPrimaryNeverAdoptsALegacyPrimaryRowThatNamesARelatedFile() async throws {
+        hasher.contentSeeds["/photos/IMG_1.HEIC"] = "frame-bytes"
+        storePrimaryRow("/old/IMG_5.HEIC", linkID: "frame-link", seed: "frame-bytes", updatedAt: Date())
+        checker.linkVisibilityByID["frame-link"] = RemoteLinkVisibility(isActive: true, mainPhotoLinkID: "burst-main")
+
+        let d = descriptor()
+        let result = try await pipeline.resolve(d)
+
+        XCTAssertEqual(result.decision, .upload, "a primary row of an earlier version proves no main photo")
+        XCTAssertNil(store.record(for: d.source)?.remoteLinkID)
+        XCTAssertEqual(checker.linkVisibilityCallCount, 1)
+        await pipeline.uploadDidFail(d)
+    }
+
+    func testAPrimaryAdoptsTheMainPhotoOfALaterManifestRowWhenTheFirstNamesARelatedFile() async throws {
+        hasher.contentSeeds["/photos/IMG_1.HEIC"] = "shared-bytes"
+        storePrimaryRow(
+            "/old/IMG_5.HEIC", linkID: "frame-link", seed: "shared-bytes", updatedAt: Date(timeIntervalSince1970: 1))
+        storePrimaryRow(
+            "/copy/IMG_5.HEIC", linkID: "main-link", seed: "shared-bytes", updatedAt: Date(timeIntervalSince1970: 2))
+        checker.linkVisibilityByID["frame-link"] = RemoteLinkVisibility(isActive: true, mainPhotoLinkID: "burst-main")
+        checker.linkVisibilityByID["main-link"] = RemoteLinkVisibility(isActive: true, mainPhotoLinkID: nil)
+
+        let result = try await pipeline.resolve(descriptor())
+
+        XCTAssertEqual(result.decision, .skip(.knownFromManifest, remoteLinkID: "main-link"))
+        XCTAssertEqual(checker.linkVisibilityCallCount, 1, "one read covers every row")
+    }
+
+    func testAPrimaryAdoptsTheMainPhotoWhenTheContentIndexNamesARelatedFileFirst() async throws {
+        hasher.contentSeeds["/photos/IMG_1.HEIC"] = "shared-bytes"
+        let contentHash = "ch(\(fakeSHA1Hex(seed: "shared-bytes")))"
+        checker.contentMatchesByContentHash[contentHash] = [
+            activeRow("frame-link", contentHash: contentHash, name: "IMG_9.HEIC"),
+            activeRow("main-link", contentHash: contentHash, name: "IMG_8.HEIC"),
+        ]
+        checker.relatedLinkIDsByMainLinkID["burst-main"] = ["frame-link"]
+
+        let result = try await pipeline.resolve(descriptor())
+
+        XCTAssertEqual(result.decision, .skip(.activeDuplicate, remoteLinkID: "main-link"))
+        XCTAssertEqual(checker.contentFindCallCount, 1)
+        XCTAssertEqual(checker.linkVisibilityCallCount, 1)
+    }
+
+    func testAPrimaryAdoptsTheMainPhotoOfTheNinthManifestRowAfterEightRowsNameOneRelatedFile() async throws {
+        hasher.contentSeeds["/photos/IMG_1.HEIC"] = "shared-bytes"
+        for index in 0..<8 {
+            storePrimaryRow(
+                "/old/\(index)/IMG_5.HEIC", linkID: "frame-link", seed: "shared-bytes",
+                updatedAt: Date(timeIntervalSince1970: TimeInterval(index)))
+        }
+        storePrimaryRow(
+            "/copy/IMG_5.HEIC", linkID: "main-link", seed: "shared-bytes", updatedAt: Date(timeIntervalSince1970: 9))
+        checker.linkVisibilityByID["frame-link"] = RemoteLinkVisibility(isActive: true, mainPhotoLinkID: "burst-main")
+        checker.linkVisibilityByID["main-link"] = RemoteLinkVisibility(isActive: true, mainPhotoLinkID: nil)
+
+        let result = try await pipeline.resolve(descriptor())
+
+        XCTAssertEqual(result.decision, .skip(.knownFromManifest, remoteLinkID: "main-link"))
+        XCTAssertEqual(checker.linkVisibilityCallCount, 1, "a batch holds eight distinct links, not eight rows")
+    }
+
+    func testAPrimaryAdoptsTheMainPhotoThatTheContentIndexNamesAfterEightRelatedFiles() async throws {
+        hasher.contentSeeds["/photos/IMG_1.HEIC"] = "shared-bytes"
+        let contentHash = "ch(\(fakeSHA1Hex(seed: "shared-bytes")))"
+        let frames = (0..<8).map { "frame-\($0)" }
+        checker.contentMatchesByContentHash[contentHash] =
+            frames.map { activeRow($0, contentHash: contentHash, name: "IMG_9.HEIC") }
+            + [activeRow("main-link", contentHash: contentHash, name: "IMG_8.HEIC")]
+        checker.relatedLinkIDsByMainLinkID["burst-main"] = Set(frames)
+
+        let result = try await pipeline.resolve(descriptor())
+
+        XCTAssertEqual(result.decision, .skip(.activeDuplicate, remoteLinkID: "main-link"))
+        XCTAssertEqual(checker.contentFindCallCount, 1, "one consistent read of every candidate")
+        XCTAssertEqual(checker.linkVisibilityCallCount, 2, "one read for each batch of candidates")
+    }
+
+    /// Plants one active same-content row for each of `count` roots, under their own names.
+    private func rootsWithActiveTwins(_ count: Int) -> [UploadResourceDescriptor] {
+        (0..<count).map { index in
+            let root = descriptor(path: "/photos/IMG_\(index).HEIC")
+            let contentHash = "ch(\(fakeSHA1Hex(seed: root.fileURL.path)))"
+            checker.remoteItemsByNameHash["nh(IMG_\(index).HEIC)"] = [
+                activeRow("link-\(index)", contentHash: contentHash, name: "IMG_\(index).HEIC")
+            ]
+            return root
+        }
+    }
+
+    func testPrimeReadsTheVisibilityOfTheUpcomingRootsInBatches() async throws {
+        pipeline = UploadDedupePipeline(store: store, hasher: hasher, checker: checker, batchSize: 2)
+        let roots = rootsWithActiveTwins(5)
+        checker.relatedLinkIDsByMainLinkID["burst-main"] = ["link-4"]
+
+        await pipeline.prime(roots)
+        var decisions: [UploadDuplicateDecision] = []
+        for root in roots {
+            decisions.append(try await pipeline.resolve(root).decision)
+        }
+
+        XCTAssertEqual(
+            decisions,
+            (0..<4).map { UploadDuplicateDecision.skip(.activeDuplicate, remoteLinkID: "link-\($0)") } + [.upload],
+            "a related file is still no backup of a root")
+        XCTAssertEqual(checker.linkVisibilityCallCount, 3, "5 roots in batches of 2 cost 3 reads, not 5")
+    }
+
+    func testAFailedPrimeReadKeepsTheDuplicateDecisionsWithoutAReadPerRoot() async throws {
+        pipeline = UploadDedupePipeline(store: store, hasher: hasher, checker: checker, batchSize: 2)
+        let roots = rootsWithActiveTwins(3)
+        checker.linkVisibilityError = UploadError.backend("metadata endpoint down")
+
+        await pipeline.prime(roots)
+        XCTAssertEqual(checker.linkVisibilityCallCount, 2)
+        checker.linkVisibilityError = nil
+        for (index, root) in roots.enumerated() {
+            let result = try await pipeline.resolve(root)
+            XCTAssertEqual(result.decision, .skip(.activeDuplicate, remoteLinkID: "link-\(index)"))
+        }
+
+        XCTAssertEqual(checker.linkVisibilityCallCount, 2, "an unproven role keeps the listing, without a retry")
     }
 
     func testResolveCancellationDuringHashingPropagates() async throws {
