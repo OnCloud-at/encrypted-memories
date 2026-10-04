@@ -1,5 +1,39 @@
 import Foundation
 
+/// Presentation categories do not change queue eligibility or automatic retry policy.
+public enum BackupIssueCategory: String, Sendable, Equatable {
+    case automatic
+    case userResolvable
+    case decision
+    case permanent
+
+    public var section: BackupIssueSection {
+        switch self {
+        case .automatic: .continuesByItself
+        case .userResolvable, .decision: .actionNeeded
+        case .permanent: .notPossible
+        }
+    }
+
+    public var symbolName: String {
+        switch self {
+        case .automatic: "clock.arrow.circlepath"
+        case .userResolvable: "exclamationmark.circle"
+        case .decision: "questionmark.circle"
+        case .permanent: "trash.slash"
+        }
+    }
+}
+
+/// Both native hosts use this order and the same membership rules.
+public enum BackupIssueSection: String, CaseIterable, Sendable, Identifiable {
+    case actionNeeded
+    case continuesByItself
+    case notPossible
+
+    public var id: String { rawValue }
+}
+
 /// Stable, platform-neutral reason why a backup item is not complete. The queue persists this code
 /// alongside the human-readable backend detail so scheduling and UI never have to parse localized
 /// text to decide whether work is retryable or needs the user.
@@ -22,6 +56,15 @@ public enum BackupIssueKind: String, Codable, Sendable, Equatable {
     public init(from decoder: any Decoder) throws {
         let value = try decoder.singleValueContainer().decode(String.self)
         self = Self(rawValue: value) ?? .unknown
+    }
+
+    public var category: BackupIssueCategory {
+        switch self {
+        case .network, .deviceStorage, .remoteDraft, .remoteService: .automatic
+        case .accountStorage, .permission, .localState, .unknown: .userResolvable
+        case .remoteDeletion, .deletedElsewhere: .decision
+        case .remoteDraftStale, .sourceMissing, .unsupported: .permanent
+        }
     }
 
     public var isRetryable: Bool {

@@ -229,6 +229,8 @@ public final class TimelineViewModel {
     /// Successful server mutations are overlaid on every later fetch for this session. This closes the race
     /// where an older in-flight response completed after trash/restore and resurrected an item in a grid.
     @ObservationIgnored private var removals = TimelineRemovalOverlay()
+    /// The last trash or restore projection. The next one waits for it.
+    @ObservationIgnored private var lastCommit: Task<Void, Never>?
 
     /// `change` compares `projection` with the current whole-library snapshot. Without it, the comparison runs here.
     private func updateAllRouteSnapshot(
@@ -464,7 +466,10 @@ public final class TimelineViewModel {
         let uids = Set(items.map(\.uid))
         guard !uids.isEmpty else { return }
         removals.trashed(uids)
+        await afterEarlierCommits { [self] in await projectTrash(items, uids: uids) }
+    }
 
+    private func projectTrash(_ items: [PhotoItem], uids: Set<PhotoUID>) async {
         let all = allRouteSnapshot
         let caches = filterCache
         let cachedRoutes = caches.routesByRecency
@@ -504,7 +509,10 @@ public final class TimelineViewModel {
         let uids = Set(items.map(\.uid))
         guard !uids.isEmpty else { return }
         removals.restored(uids)
+        await afterEarlierCommits { [self] in await projectRestore(items, uids: uids) }
+    }
 
+    private func projectRestore(_ items: [PhotoItem], uids: Set<PhotoUID>) async {
         let all = allRouteSnapshot
         let trash = filterCache.snapshot(for: .trash)
         let result = await Task.detached(priority: .userInitiated) {
@@ -519,6 +527,18 @@ public final class TimelineViewModel {
         }
         if let all = result.0 { updateAllRouteSnapshot(all) }
         publishCurrentRoute()
+    }
+
+    /// Runs `projection` after every earlier trash or restore projection. Each projection reads the snapshot that the
+    /// one before it published, so an earlier change can never overwrite a later one.
+    private func afterEarlierCommits(_ projection: @escaping @MainActor () async -> Void) async {
+        let earlier = lastCommit
+        let commit = Task { @MainActor in
+            await earlier?.value
+            await projection()
+        }
+        lastCommit = commit
+        await commit.value
     }
 
     /// Commits a successful empty-trash request against the Trash route even if the user switched routes while

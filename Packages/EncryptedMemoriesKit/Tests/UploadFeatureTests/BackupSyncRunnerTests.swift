@@ -968,6 +968,11 @@ final class BackupSyncRunnerTests: XCTestCase {
         let row = try XCTUnwrap(queueStore.entry(for: entry.source, revision: entry.revision))
         XCTAssertEqual(row.state, .discovered, "a state that older builds know, never a failure")
         XCTAssertEqual(row.attempts, 0)
+        let issue = try XCTUnwrap(BackupIssueRecord.decode(row.lastError))
+        XCTAssertEqual(issue.kind, .unknown)
+        XCTAssertEqual(issue.detail, "error.upload_source_not_ready")
+        XCTAssertEqual(issue.nextAttemptAt, windowEnd)
+        XCTAssertEqual(BackupFailedItem(entry: row).category, .automatic)
         XCTAssertEqual(row.updatedAt.timeIntervalSince1970, windowEnd.timeIntervalSince1970, accuracy: 0.001)
         XCTAssertEqual(parked.failed, 0)
         XCTAssertTrue(clock.sleeps.isEmpty)
@@ -1253,6 +1258,29 @@ final class BackupSyncRunnerTests: XCTestCase {
             queueStore.entry(for: failed.source, revision: failed.revision)?.attempts, 0,
             "requeue grants a fresh retry budget")
         XCTAssertEqual(state(of: done), .completed, "terminal-success rows are untouched")
+    }
+
+    func testRequeueAndTheDefaultManualRetryKeepTheReason() throws {
+        let reason = BackupIssueRecord(kind: .permission, detail: "denied").persistedValue
+        func seedFailed(_ id: String) -> UploadBackupSyncQueueEntry {
+            var entry = seedEntry(id, state: .failed, attempts: 8)
+            entry.lastError = reason
+            queueStore.upsert(entry)
+            return entry
+        }
+        let requeued = seedFailed("requeued.jpg")
+        XCTAssertEqual(queueStore.requeueFailed(updatedAt: clock.now), 1)
+        let afterRequeue = try XCTUnwrap(queueStore.entry(for: requeued.source, revision: requeued.revision))
+        XCTAssertEqual(afterRequeue.state, .discovered)
+        XCTAssertEqual(afterRequeue.lastError, reason, "the photo keeps its place in the problem list")
+
+        // A store without its own implementation uses the protocol's default.
+        let retried = seedFailed("retried.jpg")
+        let spyQueue = SpyQueueStore(inner: queueStore, log: BackupEventLog())
+        XCTAssertGreaterThan(spyQueue.makeRetryableWorkEligible(updatedAt: clock.now), 0)
+        let afterRetry = try XCTUnwrap(queueStore.entry(for: retried.source, revision: retried.revision))
+        XCTAssertEqual(afterRetry.state, .discovered)
+        XCTAssertEqual(afterRetry.lastError, reason, "Back Up Now keeps the reason")
     }
 
     private func makePipeline(resourceCoordinator: LibraryResourceCoordinator = .shared) -> UploadDedupePipeline {
@@ -1584,6 +1612,22 @@ final class BackupSyncRunnerTests: XCTestCase {
         let recovered = await retry.runUntilDrained()
         XCTAssertNil(queueStore.runtimeIssue(for: .remoteIndexPreparation))
         XCTAssertEqual(recovered.uploaded, 1)
+    }
+
+    func testScopedUserRetryInvalidatesTheRemoteViewWithoutChangingEligibility() async throws {
+        let entry = seedEntry("future-network.jpg")
+        let future = clock.now.addingTimeInterval(600)
+        XCTAssertTrue(
+            queueStore.updateState(
+                source: entry.source, revision: entry.revision, state: .discovered, attempts: 3,
+                lastError: BackupIssueRecord(kind: .network, detail: "offline", nextAttemptAt: future).persistedValue,
+                updatedAt: future))
+        let before = try XCTUnwrap(queueStore.entry(for: entry.source, revision: entry.revision))
+        let log = BackupEventLog()
+        let runner = makeRunner(identityResolver: SpyIdentityResolver(inner: makePipeline(), log: log))
+        await runner.invalidateRemoteStateForUserRetry()
+        XCTAssertEqual(log.events, ["manifest.invalidateCachedRemoteState"])
+        XCTAssertEqual(queueStore.entry(for: entry.source, revision: entry.revision), before)
     }
 
     func testManualRetryClearsPersistedRemoteIndexBackoff() async throws {
@@ -2418,8 +2462,10 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertEqual(waiting.attempts, edited.attempts)
         XCTAssertEqual(waiting.updatedAt.timeIntervalSince(clock.now), 64)
         let issue = try XCTUnwrap(BackupIssueRecord.decode(waiting.lastError))
+        XCTAssertEqual(BackupFailedItem(entry: waiting).category, .automatic)
+        XCTAssertEqual(BackupFailedItem(entry: waiting).reason, L10n.string("backup.issue_waiting_original"))
         XCTAssertEqual(issue.nextAttemptAt, waiting.updatedAt)
-        XCTAssertFalse(issue.detail.isEmpty)
+        XCTAssertEqual(issue.detail, "backup.issue_waiting_original", "the reason does not depend on the language")
         XCTAssertEqual(
             stateStore.record(for: edited.source, revision: UploadBackupRevision(date: resolver.defaultModified))?
                 .isComplete, false,
@@ -2441,6 +2487,26 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertEqual(state(of: edited)?.isTerminalSuccess, true)
         XCTAssertEqual(harness.remote.trashCalls, [[testUID("IMG_1.HEIC")]])
         XCTAssertEqual(uploader.requests.filter { $0.name == "IMG_1.JPG" }.count, 1)
+    }
+
+    func testAnEditThatWaitedInAnEarlierBuildKeepsItsWaitCount() async throws {
+        let harness = try makeReplacementHarness()
+        var edited = await uploadThenEdit(harness, keepsOriginal: false)
+        // An earlier build stored its own sentence as the reason of the wait.
+        edited.lastError =
+            BackupIssueRecord(
+                kind: .unknown,
+                detail: "The edited photo is waiting for its original resources. Backup will retry automatically.",
+                nextAttemptAt: clock.now, automaticRetryAttempt: 2
+            ).persistedValue
+        XCTAssertTrue(queueStore.upsert(edited))
+
+        _ = await makeRunner(identityResolver: harness.pipeline, editReplacement: harness.replacement)
+            .runUntilDrained(mode: .eligibleOnly)
+
+        let waiting = try XCTUnwrap(queueStore.entry(for: edited.source, revision: edited.revision))
+        XCTAssertEqual(waiting.state, .discovered)
+        XCTAssertEqual(BackupIssueRecord.decode(waiting.lastError)?.automaticRetryAttempt, 3)
     }
 
     func testAnEditWaitsWhileItsLivePhotoVideoExistsOnlyUnderTheEarlierMain() async throws {

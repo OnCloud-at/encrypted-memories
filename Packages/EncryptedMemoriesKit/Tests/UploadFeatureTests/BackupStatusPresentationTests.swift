@@ -1,4 +1,5 @@
 import Foundation
+import PhotosCore
 import XCTest
 
 @testable import UploadCore
@@ -13,6 +14,7 @@ final class BackupStatusPresentationTests: XCTestCase {
             filename: "photo.jpg",
             reason: "Retry",
             isPermanent: false,
+            issue: .network,
             nextAttemptAt: Date(timeIntervalSince1970: 1_000)
         )
         XCTAssertNotNil(item.retryDescription)
@@ -214,7 +216,9 @@ final class BackupStatusPresentationTests: XCTestCase {
         let s = status(raw)
         let p = BackupStatusPresentation(s)
 
-        XCTAssertEqual(s.phase, .needsAttention)
+        XCTAssertEqual(s.phase, .waiting)
+        XCTAssertEqual(p.headlineKey, "backup.phase_waiting_proton")
+        XCTAssertEqual(p.accessory, .waiting)
         XCTAssertEqual(s.notBackedUpCount, 1_481, "the backlog remains truthfully unfinished")
         XCTAssertEqual(p.attentionCount, 0, "unfinished work must not be labeled as failed media")
         XCTAssertNil(p.localizedAttention)
@@ -231,8 +235,8 @@ final class BackupStatusPresentationTests: XCTestCase {
         )
         let presentation = BackupStatusPresentation(status)
 
-        XCTAssertEqual(presentation.accessory, .attention)
-        XCTAssertEqual(presentation.headlineKey, "backup.phase_attention")
+        XCTAssertEqual(presentation.accessory, .waiting)
+        XCTAssertEqual(presentation.headlineKey, "backup.phase_waiting")
         XCTAssertNil(presentation.localizedAttention, "scheduler failures do not belong in the per-photo sheet")
         XCTAssertFalse(try XCTUnwrap(presentation.localizedSystemIssue).isEmpty)
     }
@@ -261,6 +265,54 @@ final class BackupStatusPresentationTests: XCTestCase {
         XCTAssertEqual(presentation.waitingCount, 1)
         XCTAssertNotNil(presentation.localizedWaitingDetail)
         XCTAssertNotNil(presentation.localizedRetryDetail)
+    }
+
+    func testWaitingProtonNamesTheCauseAndPreservesItsRetryDate() throws {
+        let retryAt = Date(timeIntervalSince1970: 1_000)
+        var raw = progress(total: 1, waiting: 1)
+        raw.outstanding = .init(count: 1, issue: .remoteService, nextAttemptAt: retryAt)
+        let presentation = BackupStatusPresentation(status(raw))
+        XCTAssertEqual(presentation.headlineKey, "backup.phase_waiting_proton")
+        XCTAssertEqual(presentation.nextAttemptAt, retryAt)
+        XCTAssertEqual(presentation.accessory, .waiting)
+        XCTAssertNil(presentation.localizedAttention)
+        XCTAssertFalse(presentation.localizedHeadline.isEmpty)
+    }
+
+    func testSystemIssuesWithoutRowsKeepIdleAndExplainTheIssue() {
+        var raw = progress()
+        raw.remoteIndexPreparationFailed = true
+        let presentation = BackupStatusPresentation(
+            BackupStatus(progress: raw, isScanning: false, executionOpportunityIssue: .schedulerCapacity))
+        XCTAssertEqual(presentation.headlineKey, "backup.phase_idle")
+        XCTAssertEqual(presentation.accessory, .idle)
+        XCTAssertEqual(presentation.attentionCount, 0)
+        XCTAssertNotNil(presentation.localizedSystemIssue)
+        let schedulerOnly = BackupStatusPresentation(
+            BackupStatus(progress: progress(), isScanning: false, executionOpportunityIssue: .schedulerCapacity))
+        XCTAssertEqual(schedulerOnly.headlineKey, "backup.phase_idle")
+        XCTAssertNotNil(schedulerOnly.localizedSystemIssue)
+    }
+
+    func testFailedHeadlineStatesTheCountAndOffersReasons() {
+        let presentation = BackupStatusPresentation(status(progress(total: 3, uploaded: 1, failed: 2)))
+        XCTAssertEqual(presentation.localizedHeadline, PhotosCore.L10n.string("backup.phase_not_backed_up \(2)"))
+    }
+
+    func testRetryDatesAppearOnlyForAutomaticRowsAndSectionsShareMembership() {
+        let retryAt = Date(timeIntervalSince1970: 1_000)
+        for category in [BackupIssueCategory.automatic, .userResolvable, .decision, .permanent] {
+            let item = BackupFailedItem(
+                id: category.rawValue, filename: "photo", reason: "reason", isPermanent: category == .permanent,
+                nextAttemptAt: retryAt, category: category)
+            XCTAssertEqual(item.retryDescription != nil, category == .automatic)
+            XCTAssertFalse(category.symbolName.isEmpty)
+        }
+        XCTAssertEqual(BackupIssueCategory.automatic.section, .continuesByItself)
+        XCTAssertEqual(BackupIssueCategory.userResolvable.section, .actionNeeded)
+        XCTAssertEqual(BackupIssueCategory.decision.section, .actionNeeded)
+        XCTAssertEqual(BackupIssueCategory.permanent.section, .notPossible)
+        XCTAssertEqual(BackupIssueSection.allCases, [.actionNeeded, .continuesByItself, .notPossible])
     }
 
     func testIdleIsCalmWithNoSubtitle() {
