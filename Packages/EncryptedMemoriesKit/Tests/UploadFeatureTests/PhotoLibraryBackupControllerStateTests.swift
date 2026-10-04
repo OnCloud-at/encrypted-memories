@@ -167,8 +167,10 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             if isClassB {
                 XCTAssertEqual(row.state, .discovered)
                 XCTAssertEqual(row.attempts, entry.state == .failed ? 0 : entry.attempts)
-                XCTAssertGreaterThanOrEqual(row.updatedAt, beforeRetry)
-                XCTAssertLessThanOrEqual(row.updatedAt, afterRetry)
+                // SQLite keeps the date as a double, which can round it a fraction of a microsecond earlier.
+                XCTAssertGreaterThanOrEqual(
+                    row.updatedAt.timeIntervalSince1970, beforeRetry.timeIntervalSince1970 - 0.001)
+                XCTAssertLessThanOrEqual(row.updatedAt.timeIntervalSince1970, afterRetry.timeIntervalSince1970 + 0.001)
             } else {
                 // SQLite keeps the date as a double, so compare it within a millisecond.
                 XCTAssertEqual(
