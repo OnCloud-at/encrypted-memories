@@ -12,9 +12,14 @@ struct AlbumRepositorySeriesCarryOver: SeriesAlbumCarryOver {
     let repository: AlbumsRepository
 
     func albums(containing uid: PhotoUID) async throws -> [SeriesAlbumReference] {
-        let memberships = try await repository.albumMemberships(for: [uid])
-        return (memberships[uid] ?? []).map {
-            SeriesAlbumReference(volumeID: $0.volumeID, albumID: $0.nodeID)
+        try await albums(containing: [uid])[uid] ?? []
+    }
+
+    /// One membership read for all photos; the repository caches it.
+    func albums(containing uids: [PhotoUID]) async throws -> [PhotoUID: [SeriesAlbumReference]] {
+        let memberships = try await repository.albumMemberships(for: uids)
+        return memberships.mapValues { albums in
+            albums.map { SeriesAlbumReference(volumeID: $0.volumeID, albumID: $0.nodeID) }
         }
     }
 

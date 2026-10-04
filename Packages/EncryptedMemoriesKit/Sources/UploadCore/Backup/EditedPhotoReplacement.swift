@@ -212,7 +212,7 @@ public struct EditedPhotoReplacement: Sendable {
         }
         try Task.checkCancellation()
         try journal.clearRetireIntent(Set(active.map(\.nodeID)), for: source)
-        try await carryOver(from: trashable, to: replacement, ownVolumeID: volumeID)
+        try await remote.carryOver(from: trashable, to: replacement, ownVolumeID: volumeID, albums: albums)
         if !trashable.isEmpty {
             // A crash after the trash loses the server's related listing. The intent keeps those links without
             // retiring them until the main's trash is confirmed.
@@ -284,19 +284,6 @@ public struct EditedPhotoReplacement: Sendable {
         let roles = ["alternatePhoto", "pairedVideo"] + (carriedByPrimary ? [] : ["originalPhoto", "originalVideo"])
         return roles.contains { resource.rawValue.hasPrefix("photoKit.\($0).") }
     }
-
-    private func carryOver(from earlier: [PhotoUID], to replacement: PhotoUID, ownVolumeID: String) async throws {
-        guard !earlier.isEmpty else { return }
-        let favorites = try await remote.favoriteUIDs(among: earlier + [replacement])
-        if !favorites.contains(replacement), earlier.contains(where: favorites.contains) {
-            try await remote.markFavorite([replacement])
-        }
-        for albumID in try await albums.ownAlbumIDs(containing: earlier, ownVolumeID: ownVolumeID) {
-            try Task.checkCancellation()
-            // An existing membership counts as success, so a retry adds nothing twice.
-            try await albums.addPhotos([replacement], toOwnAlbum: albumID)
-        }
-    }
 }
 
 /// Conservative ordering for remote heads. Multiple heads need a later resolution flow.
@@ -327,11 +314,7 @@ enum UploadRemoteReplacementSafety {
         guard !anchors.isEmpty else { return false }
         var used: Set<String> = []
         for file in target.related {
-            let twins = files.filter { $0.contentHash == file.contentHash && !used.contains($0.linkID) }
-            if let twin = twins.first {
-                used.insert(twin.linkID)
-                continue
-            }
+            if contentTwin(of: file, among: files, used: &used) != nil { continue }
             guard !files.contains(where: { $0.contentHash == file.contentHash }) else { return false }
             let derived = replacement.related.filter { candidate in
                 guard candidate.nameHash == file.nameHash, candidate.mimeType == file.mimeType,
@@ -348,6 +331,31 @@ enum UploadRemoteReplacementSafety {
             return true
         }
         return target.related.contains { retainedOriginals.contains($0.contentHash) }
+    }
+
+    /// The first file of `files` with the content of `file` that no earlier file took. It counts as taken afterwards,
+    /// so two related files never share one twin.
+    static func contentTwin(
+        of file: UploadRemoteCompound.File, among files: [UploadRemoteCompound.File], used: inout Set<String>
+    ) -> UploadRemoteCompound.File? {
+        guard let twin = files.first(where: { $0.contentHash == file.contentHash && !used.contains($0.linkID) })
+        else { return nil }
+        used.insert(twin.linkID)
+        return twin
+    }
+
+    /// The twin under `kept` of every related file of `duplicate`, by link. Nil when a related file has no twin:
+    /// the trash of `duplicate` would take its only copy along.
+    static func relatedTwins(
+        of duplicate: UploadRemoteCompound, under kept: UploadRemoteCompound
+    ) -> [String: UploadRemoteCompound.File]? {
+        var used: Set<String> = []
+        var twins: [String: UploadRemoteCompound.File] = [:]
+        for file in duplicate.related {
+            guard let twin = contentTwin(of: file, among: kept.related, used: &used) else { return nil }
+            twins[file.linkID] = twin
+        }
+        return twins
     }
 
     static func isEditRole(_ resource: UploadSourceIdentity.Resource) -> Bool {

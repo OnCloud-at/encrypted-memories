@@ -276,35 +276,42 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
         }
     }
 
-    /// Scans without an index: the schema gate forbids a new one, and only a replacement after an edit reads this.
+    /// Scans without an index: the schema gate forbids a new one, and only a replacement after an edit and the merge
+    /// of exact duplicates read this.
     public func sources(withRemoteLinkID linkID: String) -> [UploadSourceIdentity]? {
-        lock.withLock {
+        sources(withRemoteLinkIDs: [linkID])?[linkID]
+    }
+
+    /// One scan for all links: without an index on `remote_link`, each single lookup would scan the table again.
+    public func sources(withRemoteLinkIDs linkIDs: Set<String>) -> [String: [UploadSourceIdentity]]? {
+        guard !linkIDs.isEmpty else { return [:] }
+        return lock.withLock {
             var stmt: OpaquePointer?
             guard
                 sqlite3_prepare_v2(
                     db,
                     """
-                    SELECT source_kind, source_id, resource FROM upload_identity
-                    WHERE remote_link=? AND outcome IN ('uploaded', 'duplicateActive');
+                    SELECT remote_link, source_kind, source_id, resource FROM upload_identity
+                    WHERE remote_link IS NOT NULL AND outcome IN ('uploaded', 'duplicateActive');
                     """,
                     -1, &stmt, nil
                 ) == SQLITE_OK
             else { return nil }
             defer { sqlite3_finalize(stmt) }
-            bindText(stmt, 1, linkID)
-            var sources: [UploadSourceIdentity] = []
+            var sourcesByLink = Dictionary(uniqueKeysWithValues: linkIDs.map { ($0, [UploadSourceIdentity]()) })
             while true {
                 switch sqlite3_step(stmt) {
                 case SQLITE_ROW:
-                    guard let kindRaw = columnText(stmt, 0), let kind = UploadSourceIdentity.Kind(rawValue: kindRaw),
-                        let identifier = columnText(stmt, 1)
+                    guard let linkID = columnText(stmt, 0), linkIDs.contains(linkID) else { continue }
+                    guard let kindRaw = columnText(stmt, 1), let kind = UploadSourceIdentity.Kind(rawValue: kindRaw),
+                        let identifier = columnText(stmt, 2)
                     else { return nil }
-                    sources.append(
+                    sourcesByLink[linkID, default: []].append(
                         UploadSourceIdentity(
                             kind: kind, identifier: identifier,
-                            resource: UploadSourceIdentity.Resource(rawValue: columnText(stmt, 2) ?? "")))
+                            resource: UploadSourceIdentity.Resource(rawValue: columnText(stmt, 3) ?? "")))
                 case SQLITE_DONE:
-                    return sources
+                    return sourcesByLink
                 default:
                     return nil
                 }
@@ -381,6 +388,44 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
             bindOptionalText(stmt, 14, record.outcome)
             sqlite3_bind_double(stmt, 15, record.updatedAt.timeIntervalSince1970)
             return sqlite3_step(stmt) == SQLITE_DONE
+        }
+    }
+
+    /// One transaction, so a crash moves every row or none.
+    @discardableResult
+    public func rebindRemoteLinks(_ moves: [UploadRemoteLinkMove], hashKeyEpoch: String) -> Bool {
+        let valid = moves.filter { !$0.from.isEmpty && !$0.to.isEmpty && $0.from != $0.to }
+        guard !valid.isEmpty else { return true }
+        let now = Date().timeIntervalSince1970
+        return lock.withLock {
+            guard sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK else { return false }
+            var stmt: OpaquePointer?
+            var didWrite =
+                sqlite3_prepare_v2(
+                    db,
+                    """
+                    UPDATE upload_identity SET remote_link=?, outcome='duplicateActive', updated_at=?
+                    WHERE remote_link=? AND content_hash=? AND key_epoch=?
+                      AND outcome IN ('uploaded', 'duplicateActive');
+                    """,
+                    -1, &stmt, nil
+                ) == SQLITE_OK
+            for move in valid where didWrite {
+                sqlite3_reset(stmt)
+                sqlite3_clear_bindings(stmt)
+                bindText(stmt, 1, move.to)
+                sqlite3_bind_double(stmt, 2, now)
+                bindText(stmt, 3, move.from)
+                bindText(stmt, 4, move.contentHash)
+                bindText(stmt, 5, hashKeyEpoch)
+                didWrite = sqlite3_step(stmt) == SQLITE_DONE
+            }
+            sqlite3_finalize(stmt)
+            guard didWrite, sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK else {
+                sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
+                return false
+            }
+            return true
         }
     }
 
@@ -886,6 +931,41 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
                 return false
             }
             return true
+        }
+    }
+
+    public func remoteContentDuplicateGroups(hashKeyEpoch: String) -> [String: [String]]? {
+        lock.withLock {
+            var stmt: OpaquePointer?
+            guard
+                sqlite3_prepare_v2(
+                    db,
+                    """
+                    SELECT content_hash, remote_link FROM remote_content_index
+                    WHERE key_epoch=? AND content_hash IN (
+                      SELECT content_hash FROM remote_content_index WHERE key_epoch=?
+                      GROUP BY content_hash HAVING COUNT(DISTINCT remote_link) > 1
+                    )
+                    ORDER BY content_hash, remote_link;
+                    """,
+                    -1, &stmt, nil
+                ) == SQLITE_OK
+            else { return nil }
+            defer { sqlite3_finalize(stmt) }
+            bindText(stmt, 1, hashKeyEpoch)
+            bindText(stmt, 2, hashKeyEpoch)
+            var groups: [String: [String]] = [:]
+            while true {
+                switch sqlite3_step(stmt) {
+                case SQLITE_ROW:
+                    guard let contentHash = columnText(stmt, 0), let linkID = columnText(stmt, 1) else { return nil }
+                    groups[contentHash, default: []].append(linkID)
+                case SQLITE_DONE:
+                    return groups
+                default:
+                    return nil
+                }
+            }
         }
     }
 

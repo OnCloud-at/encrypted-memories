@@ -415,28 +415,77 @@ public protocol UploadIdentityStore: Sendable {
     /// Every source whose trustworthy record (`uploaded` or `duplicateActive`) names this remote link. Nil when the
     /// store cannot tell, so a caller never trashes a photo that another source may still need.
     func sources(withRemoteLinkID linkID: String) -> [UploadSourceIdentity]?
+    /// `sources(withRemoteLinkID:)` for many links at once. A link that no row names maps to an empty list. Nil when
+    /// the store cannot tell for any link.
+    func sources(withRemoteLinkIDs linkIDs: Set<String>) -> [String: [UploadSourceIdentity]]?
     /// Forgets the remote links and outcomes of the rows of `source` (every resource) that name one of `linkIDs`,
     /// after the backup moved those photos to the trash. The rows keep their hashes, so the next check of such a
     /// resource asks the server again instead of taking a trashed photo as its backup. Rows of other sources stay:
     /// a photo restored from the trash can be their backup. False when the write fails.
     @discardableResult
     func forgetRemoteLinks(_ linkIDs: Set<String>, of source: UploadSourceIdentity) -> Bool
+    /// Moves every row of the current key epoch that names `move.from` with the content `move.contentHash` to
+    /// `move.to` as `duplicateActive`, before the merge of exact duplicates trashes `move.from`. A second call
+    /// finds no such row and changes nothing. False when the write fails.
+    @discardableResult
+    func rebindRemoteLinks(_ moves: [UploadRemoteLinkMove], hashKeyEpoch: String) -> Bool
+}
+
+/// One manifest move of the duplicate merge: rows that name `from` with this content name `to` afterwards.
+public struct UploadRemoteLinkMove: Sendable, Equatable {
+    public var from: String
+    public var to: String
+    public var contentHash: String
+
+    public init(from: String, to: String, contentHash: String) {
+        self.from = from
+        self.to = to
+        self.contentHash = contentHash
+    }
 }
 
 extension UploadIdentityStore {
     public func sources(withRemoteLinkID linkID: String) -> [UploadSourceIdentity]? { nil }
-    /// One row of `trustedRecords`.
-    public func trustedRecord(contentHash: String, hashKeyEpoch: String) -> UploadIdentityRecord? {
-        trustedRecords(contentHash: contentHash, hashKeyEpoch: hashKeyEpoch, limit: 1).first
+    public func sources(withRemoteLinkIDs linkIDs: Set<String>) -> [String: [UploadSourceIdentity]]? {
+        var sourcesByLink: [String: [UploadSourceIdentity]] = [:]
+        for linkID in linkIDs {
+            guard let sources = sources(withRemoteLinkID: linkID) else { return nil }
+            sourcesByLink[linkID] = sources
+        }
+        return sourcesByLink
+    }
+    /// A store that cannot move rows keeps every duplicate.
+    public func rebindRemoteLinks(_ moves: [UploadRemoteLinkMove], hashKeyEpoch: String) -> Bool { false }
+
+    /// True when a row that `isCovered` does not accept names one of `linkIDs`, or when the store cannot tell. A
+    /// trash of such a link would take away the backup of another local source.
+    public func isNeededElsewhere(
+        _ linkIDs: Set<String>, except isCovered: (UploadSourceIdentity, String) -> Bool
+    ) -> Bool {
+        isNeededElsewhere(linkIDs, except: isCovered) { sources(withRemoteLinkID: $0) }
+    }
+
+    /// `isNeededElsewhere(_:except:)` over the rows that `sources` returns, for example one snapshot of
+    /// `sources(withRemoteLinkIDs:)`. A link that `sources` cannot answer counts as needed.
+    func isNeededElsewhere(
+        _ linkIDs: Set<String>, except isCovered: (UploadSourceIdentity, String) -> Bool,
+        sources: (String) -> [UploadSourceIdentity]?
+    ) -> Bool {
+        linkIDs.contains { linkID in
+            guard let rows = sources(linkID) else { return true }
+            return rows.contains { !isCovered($0, linkID) }
+        }
     }
 
     /// True when another local source, such as a duplicate in Photos, still counts one of `linkIDs` as its backup,
     /// or when the store cannot tell. Such a photo never goes to the trash for `source`.
-    func isNeededElsewhere(_ linkIDs: Set<String>, by source: UploadSourceIdentity) -> Bool {
-        linkIDs.contains { linkID in
-            guard let owners = self.sources(withRemoteLinkID: linkID) else { return true }
-            return owners.contains { $0.kind != source.kind || $0.identifier != source.identifier }
-        }
+    public func isNeededElsewhere(_ linkIDs: Set<String>, by source: UploadSourceIdentity) -> Bool {
+        isNeededElsewhere(linkIDs) { row, _ in row.kind == source.kind && row.identifier == source.identifier }
+    }
+
+    /// One row of `trustedRecords`.
+    public func trustedRecord(contentHash: String, hashKeyEpoch: String) -> UploadIdentityRecord? {
+        trustedRecords(contentHash: contentHash, hashKeyEpoch: hashKeyEpoch, limit: 1).first
     }
 }
 
@@ -688,6 +737,9 @@ public protocol UploadRemoteContentIndexStore: Sendable {
     ) -> Bool
     @discardableResult
     func upsertRemoteContentRecord(_ record: UploadRemoteContentIndexRecord) -> Bool
+    /// Every indexed content hash of this key epoch that two or more links hold, with those links sorted. Nil when
+    /// the read fails.
+    func remoteContentDuplicateGroups(hashKeyEpoch: String) -> [String: [String]]?
 }
 
 extension UploadRemoteContentIndexStore {
@@ -825,7 +877,27 @@ public protocol UploadDuplicateChecking: Sendable {
     func hashKeyEpoch() async throws -> String
 }
 
+extension RemoteLinkVisibility {
+    /// A main photo in the library: active, and no related file of another photo.
+    public var isActiveMain: Bool { isActive && mainPhotoLinkID == nil }
+}
+
 public extension UploadDuplicateChecking {
+    /// `linkVisibility(of:)` in requests of at most `batchSize` links, the limit of Proton's metadata endpoint. A
+    /// failed request fails the whole read.
+    func linkVisibility(
+        batching linkIDs: [String], batchSize: Int = UploadDedupePipeline.protonDuplicateBatchSize
+    ) async throws -> [String: RemoteLinkVisibility] {
+        var visibility: [String: RemoteLinkVisibility] = [:]
+        let size = max(1, batchSize)
+        for start in stride(from: 0, to: linkIDs.count, by: size) {
+            try Task.checkCancellation()
+            let chunk = Array(linkIDs[start..<min(start + size, linkIDs.count)])
+            visibility.merge(try await linkVisibility(of: chunk)) { _, new in new }
+        }
+        return visibility
+    }
+
     func modificationDate(ofMainLink linkID: String) async throws -> Date? { nil }
     func compound(ofMainLink linkID: String) async throws -> UploadRemoteCompound? { nil }
     func activeMainLinkIDs(

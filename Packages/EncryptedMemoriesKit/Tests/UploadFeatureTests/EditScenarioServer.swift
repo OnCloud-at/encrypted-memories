@@ -68,6 +68,7 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
     private var failCompoundRead = false
     private var cancelCompoundRead = false
     private var failRelatedLookupForTrashedMain = false
+    private var healthOverride: UploadRemoteContentIndexHealth?
     private var rejectedRelatedLookups: [String] = []
     private var proofLookups: [[UploadBackupExternalIdentity]] = []
     let uploadGate = EditScenarioUploadGate()
@@ -144,6 +145,19 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
         set { lock.withLock { pendingTrashAfterCompoundRead = newValue } }
     }
     private var pendingTrashAfterCompoundRead: String?
+
+    /// Another device trashes this main right after the next duplicate trash, for example by its own merge.
+    var trashAfterDuplicateTrash: String? {
+        get { lock.withLock { pendingTrashAfterDuplicateTrash } }
+        set { lock.withLock { pendingTrashAfterDuplicateTrash = newValue } }
+    }
+    private var pendingTrashAfterDuplicateTrash: String?
+
+    /// The album read of this photo answers these albums, as a stale membership cache does.
+    func reportStaleAlbums(_ albums: Set<SeriesAlbumReference>, of uid: PhotoUID) {
+        lock.withLock { staleAlbums[uid.nodeID] = albums }
+    }
+    private var staleAlbums: [String: Set<SeriesAlbumReference>] = [:]
 
     func compound(ofMainLink linkID: String) async throws -> UploadRemoteCompound? {
         let compound = try readCompound(ofMainLink: linkID)
@@ -388,7 +402,15 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
     }
 
     func remoteContentIndexHealth() async throws -> UploadRemoteContentIndexHealth {
-        lock.withLock { .complete(indexedCount: table.values.filter { $0.state == .active }.count) }
+        lock.withLock {
+            healthOverride ?? .complete(indexedCount: table.values.filter { $0.state == .active }.count)
+        }
+    }
+
+    /// The index state that the next health checks report. Nil reports a complete index.
+    var indexHealth: UploadRemoteContentIndexHealth? {
+        get { lock.withLock { healthOverride } }
+        set { lock.withLock { healthOverride = newValue } }
     }
 
     func ownPhotosVolumeID() async throws -> String { "vol" }
@@ -410,7 +432,7 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
 
     func albums(containing uid: PhotoUID) async throws -> [SeriesAlbumReference] {
         lock.withLock {
-            (table[uid.nodeID]?.albums ?? []).sorted {
+            (staleAlbums[uid.nodeID] ?? table[uid.nodeID]?.albums ?? []).sorted {
                 ($0.volumeID, $0.albumID) < ($1.volumeID, $1.albumID)
             }
         }
@@ -541,6 +563,22 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
         }
     }
 
+    /// Seeds one link that another device uploaded, with its own asset.
+    func seedLink(
+        digest: Data, main: PhotoUID? = nil, captureTime: Date = Date(timeIntervalSince1970: 1_720_000_000)
+    ) -> PhotoUID {
+        lock.withLock {
+            let id = String(format: "link-%04d", nextID)
+            nextID += 1
+            table[id] = Link(
+                linkID: id, nameHash: "nh(\(id))", contentHash: Self.contentHash(digest), state: .active,
+                mainLinkID: main?.nodeID, captureTime: captureTime, assetID: "asset-\(main?.nodeID ?? id)",
+                generation: 0, isOriginal: false)
+            record("other device upload \(id)")
+            return PhotoUID(volumeID: "vol", nodeID: id)
+        }
+    }
+
     /// Seeds an earlier device's trashed copy from real uploaded content, without a local journal entry.
     func addHistoricalTrashedCopy(of uid: PhotoUID) throws {
         try lock.withLock {
@@ -552,6 +590,59 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
                 state: .trashed, mainLinkID: nil, captureTime: original.captureTime,
                 assetID: original.assetID, generation: 0, isOriginal: true)
             record("earlier device trashed \(id)")
+        }
+    }
+}
+
+extension EditScenarioServer: ExactDuplicateRemote {
+    /// The person's trash: only main photos, and a related file never leaves without an active copy elsewhere.
+    func trashDuplicates(_ uids: [PhotoUID]) async throws {
+        try lock.withLock {
+            if failTrash {
+                failTrash = false
+                record("failed duplicate trash")
+                throw UploadError.backend("The scenario trash write failed once")
+            }
+            var violations: [String] = []
+            let targets = Set(uids.map(\.nodeID))
+            for uid in uids {
+                guard let target = table[uid.nodeID], target.state == .active else { continue }
+                if target.mainLinkID != nil {
+                    violations.append("The duplicate trash targeted related file \(target.linkID)")
+                }
+                for file in table.values where file.mainLinkID == target.linkID && file.state == .active {
+                    let preserved = table.values.contains { copy in
+                        guard copy.state == .active, copy.contentHash == file.contentHash,
+                            let holderID = copy.mainLinkID, !targets.contains(holderID)
+                        else { return false }
+                        return table[holderID]?.state == .active && table[holderID]?.mainLinkID == nil
+                    }
+                    if !preserved {
+                        violations.append("The duplicate trash lost related file \(file.linkID)")
+                    }
+                }
+                table[uid.nodeID]?.state = .trashed
+                table[uid.nodeID]?.personDeleted = true
+            }
+            record("duplicate trash \(uids.map(\.nodeID))", violations: violations)
+            if let other = pendingTrashAfterDuplicateTrash {
+                pendingTrashAfterDuplicateTrash = nil
+                table[other]?.state = .trashed
+                table[other]?.personDeleted = true
+                record("other device trash \(other)")
+            }
+        }
+    }
+
+    func restoreDuplicates(_ uids: [PhotoUID]) async throws {
+        for uid in uids { personRestore(uid) }
+    }
+
+    func captureDates(of uids: [PhotoUID]) async -> [PhotoUID: Date] {
+        lock.withLock {
+            var dates: [PhotoUID: Date] = [:]
+            for uid in uids { dates[uid] = table[uid.nodeID]?.captureTime }
+            return dates
         }
     }
 }

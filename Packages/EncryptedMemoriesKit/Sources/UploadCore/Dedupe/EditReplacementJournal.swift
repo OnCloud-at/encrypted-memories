@@ -82,6 +82,21 @@ public struct EditReplacementJournalEntry: Sendable, Equatable, Codable {
             .map { PhotoUID(volumeID: "", nodeID: $0) }
     }
 
+    /// Every link that the entry names: targets, retired links, related links of an intent, proven links, and the
+    /// uploads that they replaced.
+    public var namedLinkIDs: Set<String> {
+        var links = Set(allSuperseded.map(\.nodeID)).union(retired).union(proven ?? [])
+        for (main, related) in retireIntent ?? [:] {
+            links.insert(main)
+            links.formUnion(related)
+        }
+        for (main, replaced) in inherited ?? [:] {
+            links.insert(main)
+            links.formUnion(replaced)
+        }
+        return links
+    }
+
     public var isEmpty: Bool {
         allSuperseded.isEmpty && retired.isEmpty && uploadedEdit != true && (retireIntent?.isEmpty ?? true)
             && (gone?.isEmpty ?? true) && keptDeleted != true && backUpAgainRevision == nil
@@ -118,10 +133,15 @@ public protocol EditReplacementJournaling: Sendable {
     func recordUpload(edited: Bool, for source: UploadSourceIdentity) throws
     /// Removes photos from `retired`: the person restored them, so they are in the library again.
     func unretire(_ nodeIDs: Set<String>, for source: UploadSourceIdentity) throws
+    /// True when an entry names one of `linkIDs`. The edit replacement still owns such a link, so the merge of exact
+    /// duplicates leaves it.
+    func namesAnyLink(_ linkIDs: Set<String>) -> Bool
 }
 
 extension EditReplacementJournaling {
     public func supersededSourceIdentifiers() -> Set<String> { [] }
+    /// A journal that cannot list its links protects every link.
+    public func namesAnyLink(_ linkIDs: Set<String>) -> Bool { true }
 }
 
 /// A log of JSON lines in the account data directory, so the sign-out purge removes it with the other stores. Each
@@ -228,6 +248,11 @@ public final class EditReplacementJournalFileStore: EditReplacementJournaling, @
 
     public func entry(for source: UploadSourceIdentity) -> EditReplacementJournalEntry {
         lock.withLock { entries[Self.key(source)] ?? EditReplacementJournalEntry() }
+    }
+
+    public func namesAnyLink(_ linkIDs: Set<String>) -> Bool {
+        guard !linkIDs.isEmpty else { return false }
+        return lock.withLock { entries.values.contains { !$0.namedLinkIDs.isDisjoint(with: linkIDs) } }
     }
 
     public func supersededSourceIdentifiers() -> Set<String> {
