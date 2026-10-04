@@ -26,6 +26,10 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
         let generation: Int
         let isOriginal: Bool
         var personDeleted = false
+        /// The person trashed this main as an earlier version while a newer main stayed. A restore keeps the flag.
+        var personRetired = false
+        /// The person restored this main from the trash. It is in the library by the person's choice.
+        var personRestored = false
         var externalIdentity: UploadBackupExternalIdentity?
         var replacedLinkIDs: Set<String> = []
         var modificationDate: Date?
@@ -52,6 +56,8 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
     let capabilities = UploadBackendCapabilities.sdkUploader
     private let lock = NSLock()
     private var table: [String: Link] = [:]
+    /// S5 state: the assets that the person deleted, with the earlier active mains that the deleting trash left.
+    private var deletedAssets: [String: Set<String>] = [:]
     private var history: [Step] = []
     private var nextID = 1
     private var failTrash = false
@@ -68,6 +74,7 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
     private let ownAlbumIDs: Set<String> = ["own-album"]
 
     var links: [Link] { lock.withLock { orderedLinks() } }
+    var personDeletedAssets: [String: Set<String>] { lock.withLock { deletedAssets } }
     var steps: [Step] { lock.withLock { history } }
     var remoteProofLookups: [[UploadBackupExternalIdentity]] { lock.withLock { proofLookups } }
     func noteProofLookup(_ identities: [UploadBackupExternalIdentity]) {
@@ -244,7 +251,7 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
             nextID += 1
             let main = request.mainPhotoUID?.nodeID
             var violations: [String] = []
-            if main == nil && table.values.contains(where: { $0.assetID == assetID && $0.personDeleted }) {
+            if main == nil && deletedAssets[assetID] != nil {
                 violations.append("S5 uploaded \(id) after the person deleted \(assetID)")
             }
             if let main, table[main]?.state != .active {
@@ -431,6 +438,10 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
                 if target.mainLinkID != nil || replacements.isEmpty {
                     violations.append("S6 backup trash targeted something other than an earlier asset main")
                 }
+                if target.personRetired {
+                    violations.append(
+                        "S7 backup trash targeted \(target.linkID), which the person trashed as an earlier version")
+                }
                 let originals = table.values.filter {
                     ($0.linkID == target.linkID || $0.mainLinkID == target.linkID) && $0.isOriginal
                         && $0.state == .active
@@ -455,14 +466,28 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
         }
     }
 
+    /// S5: the asset is deleted by the person when a person trash leaves no newer active main of the asset and no main
+    /// that the person restored. A person trash of an earlier main while a newer main stays active retires that
+    /// main and leaves the asset in the library.
     func personTrash(_ uid: PhotoUID) {
         lock.withLock {
+            guard let target = table[uid.nodeID] else { return }
             table[uid.nodeID]?.state = .trashed
             table[uid.nodeID]?.personDeleted = true
+            let remaining = table.values.filter {
+                $0.assetID == target.assetID && $0.mainLinkID == nil && $0.state == .active
+            }
+            if target.mainLinkID == nil, remaining.contains(where: { $0.generation > target.generation }) {
+                table[uid.nodeID]?.personRetired = true
+            } else if !remaining.contains(where: { $0.personRetired || $0.personRestored }) {
+                // Earlier mains that wait for their original stay; the person kept no version in the library.
+                deletedAssets[target.assetID] = Set(remaining.map(\.linkID))
+            }
             record("person trash \(uid.nodeID)")
         }
     }
 
+    /// A restore ends the S5 deletion of the asset. It keeps `personRetired`.
     func personRestore(_ uid: PhotoUID) {
         lock.withLock {
             guard let restored = table[uid.nodeID], restored.state == .trashed else { return }
@@ -470,7 +495,17 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
             for id in Array(table.keys) where table[id]?.assetID == restored.assetID {
                 table[id]?.personDeleted = false
             }
+            table[uid.nodeID]?.personRestored = true
+            deletedAssets[restored.assetID] = nil
             record("person restore \(uid.nodeID)")
+        }
+    }
+
+    /// The lineage marker of another app version: `uid` names the earlier mains that its upload replaced.
+    func markReplaces(_ replaced: Set<String>, by uid: PhotoUID) {
+        lock.withLock {
+            table[uid.nodeID]?.replacedLinkIDs.formUnion(replaced)
+            record("lineage marker \(uid.nodeID) replaces \(replaced.sorted())")
         }
     }
 

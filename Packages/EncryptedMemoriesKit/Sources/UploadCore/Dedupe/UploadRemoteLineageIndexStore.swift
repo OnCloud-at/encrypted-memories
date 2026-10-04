@@ -123,6 +123,11 @@ public final class UploadRemoteLineageIndexStore: @unchecked Sendable {
         }
     }
 
+    /// False after a write failure or close; a rebuild then cannot fill the index.
+    public var acceptsWrites: Bool {
+        lock.withLock { db != nil && !writesDisabled }
+    }
+
     public func hasCheckpoint(hashKeyEpoch: String, eventID: String) -> Bool {
         lock.withLock { !writesDisabled && checkpointLocked(hashKeyEpoch: hashKeyEpoch) == eventID }
     }

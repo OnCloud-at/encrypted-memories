@@ -1,8 +1,8 @@
 import Foundation
 import GridCore
-import MediaCache
+import MediaFeedCore
+import Observation
 import PhotosCore
-import TimelineCore
 
 public struct TimelineRefreshResult: Sendable, Equatable {
     public let uploadedUID: PhotoUID?
@@ -165,7 +165,7 @@ public final class TimelineViewModel {
     }
 
     /// Upload badges of the whole-library grid, and "Nicht gesichert" badges in the trash.
-    var pendingUploadBadges: PendingUploadBadges {
+    public var pendingUploadBadges: PendingUploadBadges {
         switch filter {
         case .all: pendingPresentation.uploadBadges
         case .trash: pendingTrash.badges
@@ -181,7 +181,7 @@ public final class TimelineViewModel {
 
     private let repository: PhotosRepository
     private let library: PhotoLibraryProvider?
-    public let feed: ThumbnailFeed
+    public let feed: ThumbnailFeedCore
 
     /// The active filter/album. `.all` is the whole library (fast SDK path); others use direct REST.
     public private(set) var filter: PhotoFilter = .all {
@@ -192,7 +192,7 @@ public final class TimelineViewModel {
         }
     }
 
-    public init(repository: PhotosRepository, feed: ThumbnailFeed, library: PhotoLibraryProvider? = nil) {
+    public init(repository: PhotosRepository, feed: ThumbnailFeedCore, library: PhotoLibraryProvider? = nil) {
         self.repository = repository
         self.library = library
         self.feed = feed

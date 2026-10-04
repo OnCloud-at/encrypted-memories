@@ -98,9 +98,27 @@
                 """)
         }
 
+        /// Drops the kept images of photos whose content can differ from their last showing, such as the tile of
+        /// a second edit that reuses the UID of the first. The next request loads them again.
+        public func forget(_ uids: [PhotoUID]) {
+            for uid in uids {
+                cache.remove(forKey: Self.key(uid))
+                // A load that started before keeps its result out of the cache and away from the page.
+                forgottenGenerations[uid, default: 0] &+= 1
+            }
+        }
+
+        /// Counts `forget` calls per photo, so a load can tell that its bytes may belong to an earlier content.
+        private var forgottenGenerations: [PhotoUID: UInt64] = [:]
+
+        private func generation(of uid: PhotoUID) -> UInt64 {
+            forgottenGenerations[uid] ?? 0
+        }
+
         /// Loads a bounded display image from cache, preview bytes, or original bytes.
         /// Cancellation prevents an obsolete page from publishing its decode.
         public func displayImage(for uid: PhotoUID, maxPixelSize: Int) async -> DisplayImage? {
+            let startGeneration = generation(of: uid)
             currentPageUID = uid
             let key = Self.key(uid)
             // Avoid reusing a thumbnail-sized decode for a later full-screen request.
@@ -137,6 +155,7 @@
                     let px = image.size.applying(CGAffineTransform(scaleX: image.scale, y: image.scale))
                     let cost = Int(px.width * px.height) * 4
                     let source = "originalFallbackStream"
+                    guard generation(of: uid) == startGeneration else { return nil }
                     cache.set(
                         CachedDisplayImage(image: image, source: source, cost: cost, decodedCap: maxPixelSize),
                         forKey: key,
@@ -188,6 +207,7 @@
             let decodeMs = (CACurrentMediaTime() - decodeStart) * 1000
             let px = image.size.applying(CGAffineTransform(scaleX: image.scale, y: image.scale))
             let cost = Int(px.width * px.height) * 4
+            guard generation(of: uid) == startGeneration else { return nil }
             cache.set(
                 CachedDisplayImage(image: image, source: source, cost: cost, decodedCap: maxPixelSize), forKey: key,
                 cost: cost)
@@ -204,6 +224,7 @@
 
         /// Loads the original image tier, decoded off-main to the same bounded display size as previews.
         public func originalImage(for uid: PhotoUID, maxPixelSize: Int) async -> DisplayImage? {
+            let startGeneration = generation(of: uid)
             currentPageUID = uid
             let key = Self.key(uid)
             // Reuse original-backed decodes only when they satisfy this request's size.
@@ -219,6 +240,7 @@
                 guard !Task.isCancelled else { return nil }
                 let px = image.size.applying(CGAffineTransform(scaleX: image.scale, y: image.scale))
                 let cost = Int(px.width * px.height) * 4
+                guard generation(of: uid) == startGeneration else { return nil }
                 cache.set(
                     CachedDisplayImage(image: image, source: "original", cost: cost, decodedCap: maxPixelSize),
                     forKey: key,
@@ -265,6 +287,7 @@
             let decodeMs = (CACurrentMediaTime() - decodeStart) * 1000
             let px = image.size.applying(CGAffineTransform(scaleX: image.scale, y: image.scale))
             let cost = Int(px.width * px.height) * 4
+            guard generation(of: uid) == startGeneration else { return nil }
             cache.set(
                 CachedDisplayImage(image: image, source: "original", cost: cost, decodedCap: maxPixelSize), forKey: key,
                 cost: cost)

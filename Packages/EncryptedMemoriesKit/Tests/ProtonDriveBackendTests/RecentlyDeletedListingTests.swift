@@ -236,6 +236,106 @@ struct RecentlyDeletedListingTests {
         #expect(identities.lagging(in: library, now: library.readAt) == [photo])
     }
 
+    // MARK: - Library listings that lag behind a removal that an event showed
+
+    @Test func aRemovalThatAnEarlierRefreshReadKeepsALaterLaggingListingFromShowingThePhoto() {
+        let photo = PhotoUID(volumeID: "volume", nodeID: "removed-elsewhere")
+        var identities = RecentlyDeletedIdentities(listing: nil)
+
+        // The first refresh reads the removal and commits; its cursor moves past the event.
+        _ = identities.eventsRead(.init(removed: ["removed-elsewhere"]), volumeID: "volume", at: Self.trashTime)
+        let first = Self.read([photo], after: 0)
+        let firstChanged = identities.libraryAccepted(first, now: first.readAt)
+        #expect(!firstChanged, "the wait was saved when the events were read")
+        #expect(identities.hasPhotosAwaitingLibrary, "the lagging listing still returns it")
+        // A second event starts a refresh whose events no longer contain the removal; its listing still lags.
+        _ = identities.eventsRead(.init(), volumeID: "volume", at: Self.trashTime.addingTimeInterval(40))
+        let second = Self.read([photo], after: 40)
+        #expect(identities.lagging(in: second, now: second.readAt) == [photo])
+        _ = identities.libraryAccepted(second, now: second.readAt)
+
+        let caughtUp = Self.read([], after: 90)
+        #expect(identities.lagging(in: caughtUp, now: caughtUp.readAt).isEmpty)
+        _ = identities.libraryAccepted(caughtUp, now: caughtUp.readAt)
+        #expect(!identities.hasPhotosAwaitingLibrary)
+        #expect(identities.photosTrashedHereAwaitingLibraryCount == 0, "it was not trashed here")
+        #expect(identities.persisted == RecentlyDeletedIdentities(listing: nil).persisted, "the ended wait leaves")
+    }
+
+    @Test func aRemovalKeepsItsWaitAcrossARelaunch() throws {
+        let directory = try Self.directory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let photo = PhotoUID(volumeID: "volume", nodeID: "removed-elsewhere")
+        var identities = RecentlyDeletedIdentities(listing: nil)
+        let read = identities.eventsRead(.init(removed: ["removed-elsewhere"]), volumeID: "volume", at: Self.trashTime)
+        #expect(read, "a new wait must be saved before the cursor moves")
+        let store = RecentlyDeletedListingStore(directory: directory, accountUID: "account", keyPassword: "secret")
+        store.save(identities.persisted)
+
+        var relaunched = RecentlyDeletedIdentities(persisted: try #require(store.load()))
+        _ = relaunched.eventsRead(.init(), volumeID: "volume", at: Self.trashTime.addingTimeInterval(60))
+        let lagging = Self.read([photo], after: 60)
+        #expect(relaunched.lagging(in: lagging, now: lagging.readAt) == [photo])
+        let relaunchChanged = relaunched.libraryAccepted(lagging, now: lagging.readAt)
+        #expect(!relaunchChanged, "nothing changed since the save")
+    }
+
+    @Test func lostEventsEndTheWaitOfARemovalSoARestoreElsewhereShows() {
+        let photo = PhotoUID(volumeID: "volume", nodeID: "photo")
+        var identities = RecentlyDeletedIdentities(listing: nil)
+        _ = identities.eventsRead(.init(removed: ["photo"]), volumeID: "volume", at: Self.trashTime)
+
+        let lost = identities.eventsLost()
+
+        #expect(lost, "the cleared wait must be saved")
+        #expect(!identities.hasPhotosAwaitingLibrary)
+        let lostAgain = identities.eventsLost()
+        #expect(!lostAgain)
+        let listed = Self.read([photo], after: 30)
+        #expect(identities.lagging(in: listed, now: listed.readAt).isEmpty)
+    }
+
+    @Test func anEventThatShowsTheRemovedFileActiveAgainEndsTheWaitAtOnce() {
+        let photo = PhotoUID(volumeID: "volume", nodeID: "photo")
+        var identities = RecentlyDeletedIdentities(listing: nil)
+        _ = identities.eventsRead(.init(removed: ["photo"]), volumeID: "volume", at: Self.trashTime)
+
+        // A refresh that reads the restore and is discarded later must not hide the photo on the next try.
+        let restoredRead = identities.eventsRead(
+            .init(active: ["photo"]), volumeID: "volume", at: Self.trashTime.addingTimeInterval(30))
+        #expect(restoredRead, "the ended wait must be saved")
+
+        #expect(!identities.hasPhotosAwaitingLibrary)
+        let listed = Self.read([photo], after: 40)
+        #expect(identities.lagging(in: listed, now: listed.readAt).isEmpty)
+    }
+
+    @Test func aRemovedFileRestoredHereIsNoLongerLeftOut() {
+        let photo = PhotoUID(volumeID: "volume", nodeID: "photo")
+        var identities = RecentlyDeletedIdentities(listing: nil)
+        _ = identities.eventsRead(.init(removed: ["photo"]), volumeID: "volume", at: Self.trashTime)
+
+        identities.restored([photo])
+
+        #expect(!identities.hasPhotosAwaitingLibrary)
+        let listed = Self.read([photo], after: 10)
+        #expect(identities.lagging(in: listed, now: listed.readAt).isEmpty)
+    }
+
+    @Test func aRemovalReadAgainByARetriedRefreshWaitsFromItsFirstRead() {
+        let photo = PhotoUID(volumeID: "volume", nodeID: "photo")
+        var identities = RecentlyDeletedIdentities(listing: nil)
+        _ = identities.eventsRead(.init(removed: ["photo"]), volumeID: "volume", at: Self.trashTime)
+        // A discarded refresh keeps the cursor, so the retry reads the same removal again.
+        let retry = Self.trashTime.addingTimeInterval(500)
+        _ = identities.eventsRead(.init(removed: ["photo"]), volumeID: "volume", at: retry)
+
+        let later = Self.read([photo], after: RecentlyDeletedIdentities.libraryLagLimit)
+        #expect(identities.lagging(in: later, now: later.readAt).isEmpty, "the age counts from the first read")
+        _ = identities.libraryAccepted(later, now: later.readAt)
+        #expect(!identities.hasPhotosAwaitingLibrary)
+    }
+
     @Test func aFileOfAnEarlierBuildOpensWithoutPhotosAwaitingTheLibrary() throws {
         let directory = try Self.directory()
         defer { try? FileManager.default.removeItem(at: directory) }

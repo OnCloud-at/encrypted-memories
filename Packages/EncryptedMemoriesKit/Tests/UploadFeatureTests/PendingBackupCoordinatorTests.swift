@@ -1204,9 +1204,11 @@ private final class CountingPendingJournal: EditReplacementJournaling, @unchecke
     func clearDeletionChoice(for source: UploadSourceIdentity) throws {}
     func addSuperseded(_ uid: PhotoUID, for source: UploadSourceIdentity) throws {}
     func addRemoteSuperseded(_ uid: PhotoUID, for source: UploadSourceIdentity) throws {}
+    func addProven(_ nodeID: String, inherited: [String], for source: UploadSourceIdentity) throws {}
     func prepareToRetire(_ relatedByMain: [String: [String]], for source: UploadSourceIdentity) throws {}
     func clearRetireIntent(_ nodeIDs: Set<String>, for source: UploadSourceIdentity) throws {}
     func settle(_ nodeIDs: Set<String>, related: Set<String>, trashed: Bool, for source: UploadSourceIdentity) throws {}
+    func settleGone(_ nodeIDs: Set<String>, for source: UploadSourceIdentity) throws {}
     func recordUpload(edited: Bool, for source: UploadSourceIdentity) throws {}
     func unretire(_ nodeIDs: Set<String>, for source: UploadSourceIdentity) throws {}
 }

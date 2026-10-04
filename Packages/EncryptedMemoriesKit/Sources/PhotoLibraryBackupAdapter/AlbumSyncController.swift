@@ -48,8 +48,12 @@ public final class AlbumSyncController {
         public var state: State
         /// Photos of the last run that could not be backed up or attached.
         public var needsAttentionCount: Int
+        /// The last run's photo list with reasons. Empty before the first run of this build.
+        public var problems: [BackupFailedItem] = []
 
         public var hasNeedsAttention: Bool { needsAttentionCount > 0 }
+        /// The row opens the shared problem list only when that list has photos.
+        public var showsProblemList: Bool { hasNeedsAttention && !problems.isEmpty }
 
         /// Shared en/de wording (PhotosCore catalog) - platforms never re-invent these states.
         public var localizedStateDescription: String {
@@ -69,7 +73,7 @@ public final class AlbumSyncController {
         /// not cleanly synced, even when `lastSyncedAt` is recent.
         public var localizedRowStatusDescription: String {
             hasNeedsAttention
-                ? L10n.string("albumsync.detail_needs_attention \(needsAttentionCount)")
+                ? L10n.string("albumsync.detail_not_in_album \(needsAttentionCount)")
                 : localizedStateDescription
         }
     }
@@ -104,6 +108,7 @@ public final class AlbumSyncController {
     private let remoteLinkLookup: (any AlbumSyncRemoteLinkLookup)?
     private let localSource = PhotoKitAlbumSource()
     private let mappingStore: AlbumSyncMappingStore?
+    private let lastRunStore: AlbumSyncLastRunStore
     private let changeMonitor: PhotoLibraryChangeMonitor
     private var syncTask: Task<Void, Never>?
     private var changeDebounceTask: Task<Void, Never>?
@@ -136,6 +141,7 @@ public final class AlbumSyncController {
             policy: configuration.databasePolicy
         )
         self.mappingStore = mappingStore
+        lastRunStore = AlbumSyncLastRunStore(directory: directory)
 
         let lookup = UploadManifestRemoteLinkLookup(
             manifestURL: directory.appendingPathComponent(UploadIdentityManifestStore.databaseFileName),
@@ -164,6 +170,10 @@ public final class AlbumSyncController {
         }
 
         reloadSelection()
+        Task { [weak self, lastRunStore] in
+            await lastRunStore.load()
+            self?.reloadSelection()
+        }
         startObservingChangesIfNeeded(scheduleCatchUp: true)
         if let runner {
             Task {
@@ -354,7 +364,9 @@ public final class AlbumSyncController {
         syncTask = Task { [weak self] in
             while let album = self?.dequeueNextAlbum() {
                 do {
-                    _ = try await runner.sync(album: album, resolution: .automatic)
+                    let report = try await runner.sync(album: album, resolution: .automatic)
+                    // Only a finished run replaces the list; a stopped or failed run keeps the previous one.
+                    self?.lastRunStore.record(report.problems, albumID: album.id)
                     self?.remoteAlbumsChangedDuringBatch = true
                 } catch let error as AlbumSyncError {
                     switch error {
@@ -481,7 +493,8 @@ public final class AlbumSyncController {
                 title: liveAlbum?.title ?? selection.title,
                 assetCount: liveAlbum?.assetCount,
                 state: state,
-                needsAttentionCount: mapping?.lastFailedCount ?? 0
+                needsAttentionCount: mapping?.lastFailedCount ?? 0,
+                problems: lastRunStore.items(albumID: selection.localAlbumID)
             )
         }
     }
@@ -504,4 +517,36 @@ public final class AlbumSyncController {
     private func reportMappingStoreUnavailable() {
         lastMessage = AlbumSyncError.mappingStoreUnavailable.errorDescription
     }
+
+    #if DEBUG
+        /// Seeds one synced album whose last run left photos outside the Proton album, on the offline
+        /// UI-test account. It uses the real mapping store and last-run file, without PhotoKit or a network.
+        public func installNotInAlbumFixtureForTesting(albumID: String, title: String) -> Bool {
+            guard let mappingStore, mappingStore.isOperational() else { return false }
+            let items = AlbumSyncProblemList.items(
+                missingIdentifiers: ["fixture-network"],
+                attachFailedIdentifiers: ["fixture-attach"],
+                backup: AlbumSyncBackupReport(
+                    total: 2, backedUp: 1, failed: 1, sourceMissing: 0, skippedRemoteDeletion: 0,
+                    problems: [
+                        "fixture-network": BackupFailedItem(
+                            id: "fixture-network", filename: "network fixture.heic",
+                            reason: L10n.string("backup.issue_network"), isPermanent: false, issue: .network)
+                    ],
+                    filenames: ["fixture-attach": "attach fixture.heic"]))
+            let now = Date()
+            guard
+                mappingStore.addSelection(AlbumSyncSelection(localAlbumID: albumID, title: title, addedAt: now)),
+                mappingStore.upsert(
+                    AlbumSyncMapping(
+                        localAlbumID: albumID, remoteAlbumID: "fixture-remote-album", title: title, createdAt: now,
+                        lastSyncedAt: now, lastFailedCount: items.count))
+            else { return false }
+            lastRunStore.record(items, albumID: albumID)
+            // Keep the fixture independent of PhotoKit authorization on the simulator.
+            accessState = .denied
+            reloadSelection()
+            return true
+        }
+    #endif
 }

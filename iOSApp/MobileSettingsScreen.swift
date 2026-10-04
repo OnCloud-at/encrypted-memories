@@ -177,6 +177,7 @@ struct MobileSettingsScreen: View {
                                 String(localized: "settings.albumsync_title"), systemImage: "rectangle.stack.badge.plus"
                             )
                         }
+                        .accessibilityIdentifier("albumsync.settings")
                     }
                 }
             }

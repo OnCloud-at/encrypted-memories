@@ -258,6 +258,189 @@ final class EditScenarioTests: XCTestCase {
             }, "the edited main holds the original as an active related file")
     }
 
+    /// The person trashes the earlier main while the edit waits for its original. The edit then completes without a
+    /// trash of its own, so the earlier main is gone, not retired. No `decorate`: a gone main keeps no favorite (S4).
+    private func personTrashesTheWaitingEarlierMain() async throws -> (PhotoUID, UploadBackupSyncQueueEntry) {
+        harness = try EditScenarioHarness()
+        try await harness.enqueue()
+        await harness.drain()
+        let earlier = try harness.liveMain()
+        let entry = try await edit("render-while-earlier-waits", omitOriginal: true)
+        harness.clock.advance(by: 5)
+        await harness.pass()
+        let waiting = try XCTUnwrap(harness.queue.entry(for: entry.source, revision: entry.revision))
+        XCTAssertTrue(harness.journal.entry(for: entry.source).superseded.contains(earlier))
+        harness.server.personTrash(earlier)
+        harness.assertSafety()
+        harness.library.makeOriginalAvailable()
+        try harness.relaunch()
+        harness.clock.advance(by: waiting.updatedAt.timeIntervalSince(harness.clock.now) + 1)
+        await harness.drain()
+        XCTAssertEqual(harness.state(of: entry)?.isTerminalSuccess, true)
+        XCTAssertEqual(harness.journal.entry(for: entry.source).gone, [earlier.nodeID])
+        XCTAssertFalse(harness.journal.entry(for: entry.source).retired.contains(earlier.nodeID))
+        return (earlier, entry)
+    }
+
+    func testPersonTrashesTheWaitingEarlierMainRestoresItThenEditsAgain() async throws {
+        let (earlier, _) = try await personTrashesTheWaitingEarlierMain()
+        let edited = try harness.liveMain()
+        harness.server.personRestore(earlier)
+        harness.assertSafety()
+        try await edit("render-after-restore")
+        await harness.drain()
+        XCTAssertEqual(
+            harness.server.links.first { $0.uid == earlier }?.state, .active, "the person's restored photo stays")
+        XCTAssertEqual(harness.server.links.first { $0.uid == edited }?.state, .trashed)
+    }
+
+    /// The person restored the earlier photo, so the photo is in the library: trashing the edit and editing again backs
+    /// up the new edit without a deletion question.
+    func testRestoredEarlierMainKeepsThePhotoLiveAfterThePersonTrashesTheEdit() async throws {
+        let (earlier, _) = try await personTrashesTheWaitingEarlierMain()
+        let edited = try harness.liveMain()
+        harness.server.personRestore(earlier)
+        harness.server.personTrash(edited)
+        harness.assertSafety()
+        let entry = try await edit("render-after-restore-and-trash")
+        harness.clock.advance(by: 5)
+        await harness.pass()
+        XCTAssertEqual(harness.state(of: entry)?.isTerminalSuccess, true, "the photo is live, so the edit backs up")
+        XCTAssertNil(harness.journal.entry(for: entry.source).deletionCheckStartedAt)
+        XCTAssertEqual(
+            harness.server.links.first { $0.uid == earlier }?.state, .active, "the person's restored photo stays")
+    }
+
+    /// A choice to keep the photo deleted ends when the person restores the earlier photo: the photo is live again.
+    func testRestoredEarlierMainEndsAnEarlierChoiceToKeepThePhotoDeleted() async throws {
+        let (earlier, entry) = try await personTrashesTheWaitingEarlierMain()
+        let edited = try harness.liveMain()
+        harness.server.personTrash(edited)
+        try harness.journal.keepDeleted(for: entry.source)
+        harness.server.personRestore(earlier)
+        harness.assertSafety()
+        let next = try await edit("render-after-kept-deleted")
+        harness.clock.advance(by: 5)
+        // The duplicate check itself ends the choice, before any upload succeeds. This check uploads nothing, so no
+        // pass follows: the pipeline keeps its claim on these bytes until an upload settles.
+        let decision = try await harness.primaryDecision(for: next)
+        XCTAssertTrue(decision.uploadsBytes)
+        XCTAssertNil(harness.journal.entry(for: entry.source).keptDeleted, "the live photo ends the earlier choice")
+    }
+
+    /// An undo adopts the restored photo as the backup of the photo. A later edit still never trashes it.
+    func testRestoredEarlierMainAdoptedByAnUndoStaysThroughTheNextEdit() async throws {
+        let (earlier, _) = try await personTrashesTheWaitingEarlierMain()
+        harness.server.personRestore(earlier)
+        harness.assertSafety()
+        try await undo()
+        await harness.drain()
+        XCTAssertEqual(harness.server.links.first { $0.uid == earlier }?.state, .active)
+        let next = try await edit("render-after-adopting-undo")
+        await harness.drain()
+        XCTAssertEqual(
+            harness.server.links.first { $0.uid == earlier }?.state, .active, "the person's restored photo stays")
+        XCTAssertFalse(
+            harness.journal.entry(for: next.source).superseded.contains { $0.nodeID == earlier.nodeID },
+            "a kept photo leaves the replacement")
+        harness.assertRetired()
+    }
+
+    func testPersonTrashesTheWaitingEarlierMainThenTheEditThenUndoes() async throws {
+        let (_, entry) = try await personTrashesTheWaitingEarlierMain()
+        try harness.server.personTrash(harness.liveMain())
+        harness.assertSafety()
+        let uploads = harness.server.steps.filter { $0.action.hasPrefix("upload") }.count
+        let undone = try await undo()
+        harness.clock.advance(by: 5)
+        await harness.pass()
+        // The trashed earlier main has the bytes of the undo, but its author is unknown: the backup asks.
+        XCTAssertEqual(harness.state(of: undone), .discovered)
+        let deferred = try XCTUnwrap(harness.queue.entry(for: undone.source, revision: undone.revision))
+        XCTAssertEqual(
+            BackupIssueRecord.decode(deferred.lastError)?.detail,
+            L10n.string("backup.issue_deletion_check"))
+        XCTAssertNotNil(harness.journal.entry(for: entry.source).deletionCheckStartedAt)
+        XCTAssertEqual(harness.server.steps.filter { $0.action.hasPrefix("upload") }.count, uploads)
+    }
+
+    private enum LineageMarker {
+        case none
+        /// The other device's upload names the earlier main that its backup trashed. A marker names what an upload
+        /// replaces, not who trashed it, so it proves no backup trash either.
+        case otherDevice
+        /// Only the waiting upload of this device names the earlier main. That is no proof of a backup trash.
+        case ownUpload
+    }
+
+    func testSecondDeviceRetiresTheWaitingEarlierMainWithAMarkerOfTheOtherDevice() async throws {
+        try await secondDeviceRetiresTheWaitingEarlierMain(marker: .otherDevice)
+    }
+
+    func testSecondDeviceRetiresTheWaitingEarlierMainWithoutLineageProof() async throws {
+        try await secondDeviceRetiresTheWaitingEarlierMain(marker: .none)
+    }
+
+    func testSecondDeviceRetiresTheWaitingEarlierMainWithOnlyTheOwnMarker() async throws {
+        try await secondDeviceRetiresTheWaitingEarlierMain(marker: .ownUpload)
+    }
+
+    /// Two devices with their own libraries share one server. Device B edits the photo with other render bytes and
+    /// its backup trashes the earlier main while the edit of device A waits for its original.
+    private func secondDeviceRetiresTheWaitingEarlierMain(marker: LineageMarker) async throws {
+        harness = try EditScenarioHarness()
+        let deviceB = try EditScenarioHarness(server: harness.server)
+        defer { try? deviceB.cleanup() }
+        // Both discover before either uploads, so both manifests name the earlier main.
+        try await harness.enqueue()
+        try await deviceB.enqueue()
+        await harness.drain()
+        await deviceB.drain()
+        let earlier = try harness.liveMain()
+        let source = try harness.library.candidate().snapshot.source
+        XCTAssertEqual(deviceB.identities.record(for: source)?.remoteLinkID, earlier.nodeID)
+
+        let entry = try await edit("device-a-render", omitOriginal: true)
+        harness.clock.advance(by: 5)
+        await harness.pass()
+        let waiting = try XCTUnwrap(harness.queue.entry(for: entry.source, revision: entry.revision))
+        XCTAssertTrue(harness.journal.entry(for: source).superseded.contains(earlier))
+
+        deviceB.library.edit("device-b-render", at: deviceB.clock.now)
+        let editB = try await deviceB.enqueue()
+        deviceB.clock.advance(by: 5)
+        await deviceB.pass()
+        XCTAssertEqual(deviceB.state(of: editB), .completed)
+        XCTAssertEqual(harness.server.links.first { $0.uid == earlier }?.state, .trashed)
+        XCTAssertTrue(deviceB.journal.entry(for: source).retired.contains(earlier.nodeID))
+        XCTAssertFalse(harness.server.links.contains { $0.personDeleted })
+        func main(rendering bytes: String) throws -> PhotoUID {
+            let hash = EditScenarioServer.contentHash(Data(Insecure.SHA1.hash(data: Data(bytes.utf8))))
+            return try XCTUnwrap(harness.activeMains.first { $0.contentHash == hash }).uid
+        }
+        switch marker {
+        case .none: break
+        case .otherDevice: try harness.server.markReplaces([earlier.nodeID], by: main(rendering: "device-b-render"))
+        case .ownUpload: try harness.server.markReplaces([earlier.nodeID], by: main(rendering: "device-a-render"))
+        }
+
+        harness.library.makeOriginalAvailable()
+        try harness.relaunch()
+        harness.clock.advance(by: waiting.updatedAt.timeIntervalSince(harness.clock.now) + 1)
+        await harness.pass()
+        harness.clock.advance(by: 5)
+        await harness.pass()
+        // Both edits stay active mains, so the passes skip the quiescence check of one main.
+        XCTAssertEqual(harness.state(of: entry)?.isTerminalSuccess, true)
+        let settled = harness.journal.entry(for: source)
+        XCTAssertFalse(settled.superseded.contains(earlier))
+        // Only this device's intent proves its own trash; any other trash has an unknown author.
+        XCTAssertEqual(settled.gone, [earlier.nodeID], "without proof the author of the trash is unknown")
+        XCTAssertFalse(settled.retired.contains(earlier.nodeID))
+        XCTAssertEqual(harness.server.links.first { $0.uid == earlier }?.state, .trashed)
+        harness.assertRetired()
+    }
+
     func testFailedTrashThenRelaunch() async throws {
         let earlier = try await firstBackup(live: true)
         let entry = try await edit("render-one")
