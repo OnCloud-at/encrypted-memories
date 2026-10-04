@@ -1,12 +1,15 @@
 import AppKit
 import DesignSystem
 import GridCore
+import MediaCache
 import PhotosCore
 import SwiftUI
 import TimelineCore
 
 public struct TimelineView: View {
     @State private var model: TimelineViewModel
+    /// The AppKit thumbnail feed that wraps `model.feed`; the Metal grid draws its images.
+    private let feed: ThumbnailFeed
     @Binding private var level: Int
     /// Leading overlap of the floating sidebar (0 when collapsed). The grid lays its tiles out past this inset
     /// itself, but the SwiftUI placeholder/empty/error states are plain centered views - without this they'd
@@ -46,6 +49,7 @@ public struct TimelineView: View {
 
     public init(
         model: TimelineViewModel,
+        feed: ThumbnailFeed,
         level: Binding<Int>? = nil,
         gridProfile: GridLevelProfile = TimelineGridProfiles.productionDefaultProfile,
         gridFillOrder: GridFillOrder = .newestBottomTrailing,
@@ -70,6 +74,7 @@ public struct TimelineView: View {
         onOpen: @escaping (PhotoItem, [PhotoItem]) -> Void = { _, _ in }
     ) {
         _model = State(initialValue: model)
+        self.feed = feed
         _level = level ?? .constant(gridProfile.defaultLevel)
         self.gridProfile = gridProfile
         self.gridFillOrder = gridFillOrder
@@ -135,7 +140,7 @@ public struct TimelineView: View {
                             allItems: displayedItems,
                             dataRevision: gridDataRevision,
                             sourceRevision: model.gridSourceRevision,
-                            feed: model.feed,
+                            feed: feed,
                             level: $level,
                             routeScrollGeneration: routeScrollGeneration,
                             routeInitialScrollAnchor: routeInitialScrollAnchor,

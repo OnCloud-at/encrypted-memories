@@ -1,5 +1,6 @@
 import Foundation
 import PhotosCore
+import UploadCore
 
 // MARK: - Local albums
 
@@ -113,18 +114,28 @@ public struct AlbumSyncAttachResult: Sendable, Equatable {
     public var alreadyMember: Int
     public var failed: Int
     public var firstFailureMessage: String?
+    /// Remote link ids of the photos that could not be attached, one per failure.
+    public var failedLinkIDs: [String]
 
-    public init(attached: Int = 0, alreadyMember: Int = 0, failed: Int = 0, firstFailureMessage: String? = nil) {
+    public init(
+        attached: Int = 0,
+        alreadyMember: Int = 0,
+        failed: Int = 0,
+        firstFailureMessage: String? = nil,
+        failedLinkIDs: [String] = []
+    ) {
         self.attached = attached
         self.alreadyMember = alreadyMember
         self.failed = failed
         self.firstFailureMessage = firstFailureMessage
+        self.failedLinkIDs = failedLinkIDs
     }
 
     public static func += (lhs: inout AlbumSyncAttachResult, rhs: AlbumSyncAttachResult) {
         lhs.attached += rhs.attached
         lhs.alreadyMember += rhs.alreadyMember
         lhs.failed += rhs.failed
+        lhs.failedLinkIDs += rhs.failedLinkIDs
         if lhs.firstFailureMessage == nil { lhs.firstFailureMessage = rhs.firstFailureMessage }
     }
 }
@@ -227,6 +238,8 @@ public struct AlbumSyncReport: Sendable, Equatable {
     public let attachFailed: Int
     public let unattachable: Int
     public let trashedSkipped: Int
+    /// One item for each photo that is not in the Proton album after this run, with its reason.
+    public let problems: [BackupFailedItem]
 
     public init(
         remoteAlbumID: String,
@@ -235,7 +248,8 @@ public struct AlbumSyncReport: Sendable, Equatable {
         alreadyMember: Int,
         attachFailed: Int,
         unattachable: Int,
-        trashedSkipped: Int
+        trashedSkipped: Int,
+        problems: [BackupFailedItem] = []
     ) {
         self.remoteAlbumID = remoteAlbumID
         self.totalAssets = totalAssets
@@ -244,6 +258,7 @@ public struct AlbumSyncReport: Sendable, Equatable {
         self.attachFailed = attachFailed
         self.unattachable = unattachable
         self.trashedSkipped = trashedSkipped
+        self.problems = problems
     }
 
     public var isFullySynced: Bool { attachFailed == 0 && unattachable == 0 }

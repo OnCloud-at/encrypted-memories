@@ -1800,6 +1800,60 @@
         }
       }
     },
+    "albumsync.detail_not_in_album %lld": {
+      "extractionState": "manual",
+      "comment": "Album sync row status: photos of the last run that are not in the Proton album. Tapping it lists them with reasons.",
+      "localizations": {
+        "en": {
+          "variations": {
+            "plural": {
+              "one": { "stringUnit": { "state": "translated", "value": "%lld photo not in the album" } },
+              "other": { "stringUnit": { "state": "translated", "value": "%lld photos not in the album" } }
+            }
+          }
+        },
+        "de": {
+          "variations": {
+            "plural": {
+              "one": { "stringUnit": { "state": "translated", "value": "%lld Foto nicht im Album" } },
+              "other": { "stringUnit": { "state": "translated", "value": "%lld Fotos nicht im Album" } }
+            }
+          }
+        }
+      }
+    },
+    "albumsync.problem_sheet_title": {
+      "extractionState": "manual",
+      "comment": "Title of the list of photos that the last album sync could not put into the Proton album.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Photos not in the album" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Fotos nicht im Album" } }
+      }
+    },
+    "albumsync.issue_attach_failed": {
+      "extractionState": "manual",
+      "comment": "Reason for one photo: it is backed up, but adding it to the Proton album failed. Sync now tries again.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Could not be added to the Proton album." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Konnte nicht zum Proton-Album hinzugefügt werden." } }
+      }
+    },
+    "albumsync.issue_not_backed_up": {
+      "extractionState": "manual",
+      "comment": "Reason for one photo: it is not backed up yet, so it cannot be in the Proton album. Sync now tries again.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Not backed up yet." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Noch nicht gesichert." } }
+      }
+    },
+    "albumsync.issue_photo_fallback": {
+      "extractionState": "manual",
+      "comment": "Name shown for a photo in the album problem list when its filename is unknown.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Photo" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Foto" } }
+      }
+    },
     "albumsync.error_name_conflict": {
       "extractionState": "manual",
       "comment": "Album sync error: a Proton album with the same name already exists and the user has not decided yet whether to use it.",

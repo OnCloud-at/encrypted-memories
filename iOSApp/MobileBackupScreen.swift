@@ -467,11 +467,38 @@ private struct MobilePhotoBackupSections: View {
 /// Tapping "N nicht gesichert" opens this: a plain-language list of exactly which files failed and
 /// why. Deleted-from-device files are marked permanent (retrying can't help and no retry is offered
 /// for them); everything else can be retried here and is also auto-retried on the next app launch.
-private struct MobileFailedBackupSheet: View {
-    let controller: PhotoLibraryBackupController
+/// An album row opens the same sheet with its last run's photos. That list is read-only: the row's
+/// Sync now is its retry.
+struct MobileFailedBackupSheet: View {
+    enum Source {
+        case backup(PhotoLibraryBackupController)
+        case album(AlbumSyncController, albumID: String)
+    }
+
+    let source: Source
     @Environment(\.dismiss) private var dismiss
-    @State private var items: [BackupFailedItem] = []
+    @State private var backupItems: [BackupFailedItem] = []
     @State private var deletionItem: BackupFailedItem?
+
+    init(controller: PhotoLibraryBackupController) {
+        source = .backup(controller)
+    }
+
+    init(albumSync: AlbumSyncController, albumID: String) {
+        source = .album(albumSync, albumID: albumID)
+    }
+
+    private var controller: PhotoLibraryBackupController? {
+        if case .backup(let controller) = source { controller } else { nil }
+    }
+
+    private var items: [BackupFailedItem] {
+        switch source {
+        case .backup: backupItems
+        case .album(let albumSync, let albumID):
+            albumSync.selectedAlbums.first { $0.id == albumID }?.problems ?? []
+        }
+    }
 
     var body: some View {
         NavigationStack {
@@ -510,23 +537,23 @@ private struct MobileFailedBackupSheet: View {
                                         .padding(.vertical, 2)
                                         .contentShape(Rectangle())
                                         .onTapGesture {
-                                            if item.issue == .deletedElsewhere { deletionItem = item }
+                                            if offersDecision(item) { deletionItem = item }
                                         }
                                         .accessibilityElement(children: .combine)
-                                        .accessibilityAddTraits(item.issue == .deletedElsewhere ? .isButton : [])
+                                        .accessibilityAddTraits(offersDecision(item) ? .isButton : [])
                                         .accessibilityIdentifier("backup.failedItem.\(item.filename)")
                                         .contextMenu {
-                                            if item.issue == .deletedElsewhere {
+                                            if offersDecision(item) {
                                                 deletionActions(for: item, place: "menu")
                                             }
                                         }
                                         .swipeActions(edge: .trailing, allowsFullSwipe: true) {
-                                            if item.issue == .deletedElsewhere {
+                                            if offersDecision(item) {
                                                 deletionActions(for: item, place: "swipe")
-                                            } else if item.isPermanent {
+                                            } else if item.isPermanent, let controller {
                                                 Button(L10n.string("backup.failed_item_dismiss")) {
                                                     controller.dismissFailedItem(item)
-                                                    items.removeAll { $0.id == item.id }
+                                                    backupItems.removeAll { $0.id == item.id }
                                                 }
                                                 .tint(ProtonColor.textWeak)
                                                 .accessibilityIdentifier(
@@ -543,13 +570,16 @@ private struct MobileFailedBackupSheet: View {
                     }
                 }
             }
-            .mobileNavigationTitle(L10n.string("backup.failed_sheet_title"))
+            .mobileNavigationTitle(
+                controller == nil
+                    ? L10n.string("albumsync.problem_sheet_title") : L10n.string("backup.failed_sheet_title")
+            )
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button(L10n.string("backup.failed_sheet_done")) { dismiss() }
                 }
                 .mobileVisibilityPriority(.high)
-                if items.offersUserRetry {
+                if let controller, items.offersUserRetry {
                     ToolbarItem(placement: .confirmationAction) {
                         Button(L10n.string("backup.failed_sheet_retry")) {
                             Task {
@@ -573,27 +603,39 @@ private struct MobileFailedBackupSheet: View {
         }
         .presentationDetents([.medium, .large])
         // A photo can need the person while the list is open; Try again then appears.
-        .task(id: controller.status.problemListKey) { await controller.followProblemList { items = $0 } }
+        .task(id: controller?.status.problemListKey) {
+            guard let controller else { return }
+            await controller.followProblemList { backupItems = $0 }
+        }
+    }
+
+    /// Only the backup list offers the deleted-elsewhere decision; the album list is read-only.
+    private func offersDecision(_ item: BackupFailedItem) -> Bool {
+        controller != nil && item.issue == .deletedElsewhere
     }
 
     @ViewBuilder
     /// `place` keeps the identifiers of the dialog, swipe, and menu copies of the actions distinct.
     private func deletionActions(for item: BackupFailedItem, place: String) -> some View {
-        Button(L10n.string("backup.keep_deleted")) {
-            controller.keepDeleted(item)
-            refreshAfterDecision(item)
+        if let controller {
+            Button(L10n.string("backup.keep_deleted")) {
+                controller.keepDeleted(item)
+                refreshAfterDecision(item, controller: controller)
+            }
+            .keyboardShortcut(.defaultAction)
+            .accessibilityIdentifier("backup.keepDeleted.\(place)")
+            Button(L10n.string("backup.back_up_again")) {
+                controller.backUpAgain(item)
+                refreshAfterDecision(item, controller: controller)
+            }
+            .accessibilityIdentifier("backup.backUpAgain.\(place)")
         }
-        .keyboardShortcut(.defaultAction)
-        .accessibilityIdentifier("backup.keepDeleted.\(place)")
-        Button(L10n.string("backup.back_up_again")) {
-            controller.backUpAgain(item)
-            refreshAfterDecision(item)
-        }
-        .accessibilityIdentifier("backup.backUpAgain.\(place)")
     }
 
-    private func refreshAfterDecision(_ item: BackupFailedItem) {
+    private func refreshAfterDecision(_ item: BackupFailedItem, controller: PhotoLibraryBackupController) {
         deletionItem = nil
-        Task { items = await controller.problemItems().filter { $0.id != item.id || $0.issue == .deletedElsewhere } }
+        Task {
+            backupItems = await controller.problemItems().filter { $0.id != item.id || $0.issue == .deletedElsewhere }
+        }
     }
 }

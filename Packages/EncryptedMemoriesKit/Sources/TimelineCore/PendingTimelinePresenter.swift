@@ -94,6 +94,9 @@ public struct PendingTimelinePresentation: Sendable {
     public let uploadBadges: PendingUploadBadges
     /// True when no pending photo shows; hosts can then use their canonical snapshot directly.
     public let isCanonical: Bool
+    /// Earlier photo -> the photo that shows in its place: an edited photo -> the tile of its edit, and the tile
+    /// of an edit -> the Proton photo that took it over. An open viewer follows these steps.
+    public let replacements: [PhotoUID: PhotoUID]
 
     public var items: [PhotoItem] { snapshot.items }
 
@@ -104,7 +107,8 @@ public struct PendingTimelinePresentation: Sendable {
         localUIDs: Set<PhotoUID>,
         favoriteIntents: [PhotoUID: Bool],
         uploadBadges: PendingUploadBadges,
-        isCanonical: Bool
+        isCanonical: Bool,
+        replacements: [PhotoUID: PhotoUID] = [:]
     ) {
         self.revision = revision
         self.membershipRevision = membershipRevision
@@ -113,6 +117,7 @@ public struct PendingTimelinePresentation: Sendable {
         self.favoriteIntents = favoriteIntents
         self.uploadBadges = uploadBadges
         self.isCanonical = isCanonical
+        self.replacements = replacements
     }
 
     public static let empty = PendingTimelinePresentation(
@@ -348,13 +353,27 @@ public final class PendingTimelinePresenter {
             uploadBadges: PendingUploadBadges(
                 base: result.baseBadges, progress: Self.progress(of: shown, gridUIDs: result.presentLocal),
                 contentEpochs: contentEpochs, handovers: anchors.mapValues(\.tile)),
-            isCanonical: result.localUIDs.isEmpty && anchors.isEmpty && !result.hidesRemote
+            isCanonical: result.localUIDs.isEmpty && anchors.isEmpty && !result.hidesRemote,
+            replacements: Self.viewerReplacements(result.replacedBy, anchors: anchors, shown: result.snapshot)
         )
         publishSupportCounts(result)
         onFeedUpdate?(result.localUIDs, result.adoptions, result.revised)
         if !result.presentKeys.isEmpty { onRemotePresence?(result.presentKeys) }
         presentLocal = result.presentLocal
         onChange?(presentation)
+    }
+
+    /// Replaced photos -> their replacements, plus the tile of each edit -> the Proton photo that took it over.
+    /// A plain upload is left out: its Proton photo continues the same picture, so a viewer keeps the pending page.
+    private static func viewerReplacements(
+        _ replacedBy: [PhotoUID: PhotoUID], anchors: [PhotoUID: Anchor], shown: TimelineSnapshot
+    ) -> [PhotoUID: PhotoUID] {
+        var result = replacedBy
+        for (remote, anchor) in anchors where anchor.key.uid != anchor.tile {
+            // A second edit anchors a newer Proton photo to the same tile; the one that shows wins.
+            if result[anchor.tile] == nil || shown.index(of: remote) != nil { result[anchor.tile] = remote }
+        }
+        return result
     }
 
     /// The person restored these Proton photos from the trash: they show at once, even while the listing lags.
@@ -404,7 +423,8 @@ public final class PendingTimelinePresenter {
             localUIDs: presentation.localUIDs,
             favoriteIntents: presentation.favoriteIntents,
             uploadBadges: badges,
-            isCanonical: presentation.isCanonical
+            isCanonical: presentation.isCanonical,
+            replacements: presentation.replacements
         )
         onChange?(presentation)
     }
@@ -427,7 +447,8 @@ public final class PendingTimelinePresenter {
             localUIDs: presentation.localUIDs,
             favoriteIntents: presentation.favoriteIntents,
             uploadBadges: badges,
-            isCanonical: presentation.isCanonical
+            isCanonical: presentation.isCanonical,
+            replacements: presentation.replacements
         )
         onChange?(presentation)
     }
@@ -475,6 +496,8 @@ public final class PendingTimelinePresenter {
         let revisions: [PhotoUID: UploadBackupRevision]
         /// Visible local photos whose content revision changed since the last merge.
         let revised: [PhotoUID]
+        /// Each replaced Proton photo -> the photo that shows in its place.
+        let replacedBy: [PhotoUID: PhotoUID]
     }
 
     /// Nil when a newer merge cancelled this one.
@@ -562,7 +585,8 @@ public final class PendingTimelinePresenter {
                 presentKeys: presentKeys, newAnchors: newAnchors, tileKeys: replacements.tileKeys,
                 trashedEarlier: replacements.trashedEarlier, waitingForTile: replacements.waitingForTile,
                 heldTileDeadlines: replacements.heldTileDeadlines, hidesRemote: false, adoptions: adoptions,
-                baseBadges: baseBadges, presentLocal: presentLocal, revisions: revisions, revised: revised)
+                baseBadges: baseBadges, presentLocal: presentLocal, revisions: revisions, revised: revised,
+                replacedBy: replacements.replacedBy)
         }
         guard !Task.isCancelled else { return nil }
 
@@ -634,7 +658,8 @@ public final class PendingTimelinePresenter {
             baseBadges: baseBadges,
             presentLocal: presentLocal,
             revisions: revisions,
-            revised: revised
+            revised: revised,
+            replacedBy: replacements.replacedBy
         )
     }
 
@@ -664,6 +689,8 @@ public final class PendingTimelinePresenter {
         var waitingForTile: [Replacement: Date] = [:]
         var heldEarlier: [PhotoItem] = []
         var heldTileDeadlines: [Date] = []
+        /// Each replaced Proton photo -> the photo that shows in its place.
+        var replacedBy: [PhotoUID: PhotoUID] = [:]
     }
 
     private nonisolated static func replacements(
@@ -676,11 +703,17 @@ public final class PendingTimelinePresenter {
             if input.now.timeIntervalSince(since) < trashedHideLimit { result.hidden.insert(uid) }
         }
         for uid in input.trashedEarlier.keys where input.remote.index(of: uid) != nil { noteTrashed(uid) }
-        func note(_ replacement: Replacement, current: PhotoUID?, earlier: [PhotoUID], settled: Bool) {
+        func note(
+            _ replacement: Replacement, current: PhotoUID?, replacing: PhotoUID, earlier: [PhotoUID], settled: Bool
+        ) {
             let earlier = earlier.compactMap { resolve($0, photosVolume: photosVolume) }.filter { $0 != current }
             let listed = earlier.compactMap { input.remote.index(of: $0).map { input.remote.items[$0] } }
             let replaced = listed.lazy.map(\.uid).filter { input.restored[$0]?.contains(replacement) != true }
             if settled { replaced.forEach(noteTrashed) } else { result.hidden.formUnion(replaced) }
+            // The evidence, not the listing, decides: a viewer still shows an earlier photo that the listing dropped.
+            for uid in earlier where uid != replacing && input.restored[uid]?.contains(replacement) != true {
+                if result.replacedBy[uid] == nil { result.replacedBy[uid] = replacing }
+            }
             if let key = input.tileKeys[replacement.key] ?? result.tileKeys[replacement.key]
                 ?? listed.map({ input.anchors[$0.uid]?.key ?? $0 }).min(by: TimelineOrder.areInIncreasingOrder)
             {
@@ -690,7 +723,7 @@ public final class PendingTimelinePresenter {
         for tile in tiles {
             note(
                 Replacement(tile), current: tile.handoff.flatMap { resolve($0, photosVolume: photosVolume) },
-                earlier: tile.replaces, settled: tile.isSettled)
+                replacing: tile.item.uid, earlier: tile.replaces, settled: tile.isSettled)
         }
         let represented = Set(tiles.map(Replacement.init))
         let tilesByKey = Dictionary(tiles.map { ($0.key, $0) }, uniquingKeysWith: { first, _ in first })
@@ -711,10 +744,10 @@ public final class PendingTimelinePresenter {
                 if listedHandoff == nil {
                     for record in records where tile.revision.map({ record.evidence.revision < $0 }) == true {
                         if let remote = resolve(record.remote, photosVolume: photosVolume),
-                            input.remote.index(of: remote) != nil,
                             input.restored[remote]?.contains(Replacement(tile)) != true
                         {
-                            result.hidden.insert(remote)
+                            if input.remote.index(of: remote) != nil { result.hidden.insert(remote) }
+                            result.replacedBy[remote] = tile.item.uid
                         }
                     }
                 }
@@ -723,7 +756,8 @@ public final class PendingTimelinePresenter {
                     guard !represented.contains(replacement) else { continue }
                     // Only settled records keep their ancestors hidden after acknowledgment.
                     note(
-                        replacement, current: current, earlier: record.evidence.replaces ?? [], settled: record.settled)
+                        replacement, current: current, replacing: tile.item.uid,
+                        earlier: record.evidence.replaces ?? [], settled: record.settled)
                 }
                 continue
             }
@@ -758,7 +792,7 @@ public final class PendingTimelinePresenter {
             for ancestor in ancestors {
                 note(
                     Replacement(key: key, revision: ancestor.evidence.revision), current: representative,
-                    earlier: ancestor.evidence.replaces ?? [], settled: ancestor.settled)
+                    replacing: representative, earlier: ancestor.evidence.replaces ?? [], settled: ancestor.settled)
             }
         }
         return result

@@ -974,6 +974,12 @@ public actor BackupSyncRunner {
         defer {
             inFlightTokens[key] = nil
         }
+        // An upload that keeps its earlier uploads names none of them as replaced. An edit that waits for its
+        // original still names them, because a reader counts only a named link outside the library as replaced.
+        let replacesEarlierUploads =
+            editReplacement?.replacesEarlierUploads(
+                of: entry.source, edited: Self.isEdited(resolved), isSeries: Self.isSeries(resolved)) == true
+        let lineage = replacesEarlierUploads ? preflightResult.lineage : nil
 
         let request = PhotoUploadRequest(
             queueItemID: UUID(),
@@ -985,7 +991,7 @@ public actor BackupSyncRunner {
             captureTime: resolved.captureDate,
             modificationDate: resolved.descriptor.modificationDate,
             tags: Self.primaryTags(for: resolved.secondaries),
-            additionalMetadata: resolved.additionalMetadata
+            additionalMetadata: resolved.additionalMetadata + (lineage.map { [$0.additionalMetadata] } ?? [])
         )
         .applying(identity: preflightResult.identity)
         .replacingExistingDraft(preflightResult.decision == .uploadReplacingDraft)
@@ -1138,6 +1144,21 @@ public actor BackupSyncRunner {
         case sourceChanged
     }
 
+    /// A series keeps its earlier uploads until its own edit model exists.
+    private static func isSeries(_ resolved: BackupResolvedResource) -> Bool {
+        resolved.secondaries.contains(where: { $0.descriptor.source.resource.isBurstMember })
+    }
+
+    private static func isEdited(_ resolved: BackupResolvedResource) -> Bool {
+        resolved.candidate.snapshot.editRevision == .unavailable
+    }
+
+    private static func holdsOriginal(_ resolved: BackupResolvedResource) -> Bool {
+        EditedPhotoReplacement.holdsOriginal(
+            editRevision: resolved.candidate.snapshot.editRevision,
+            secondaries: resolved.secondaries.map(\.descriptor.source.resource))
+    }
+
     /// Uploads/dedupes any secondary resources, then - and only then - marks the compound backed
     /// up. Partial secondary failure records honest pending state and retries the whole entry;
     /// the primary is never re-uploaded (its manifest row short-circuits the next pass).
@@ -1150,7 +1171,7 @@ public actor BackupSyncRunner {
         workIntent: LibraryWorkIntent
     ) async {
         var persistedState = state
-        let isSeries = resolved.secondaries.contains(where: { $0.descriptor.source.resource.isBurstMember })
+        let isSeries = Self.isSeries(resolved)
         // An edit that replaces an earlier upload uploads its secondaries under the edited photo again: their
         // earlier copies are related photos of the earlier photo and move to the trash with it.
         let replacesEarlierUpload = !isSeries && editReplacement?.isReplacing(entry.source) == true
@@ -1300,11 +1321,8 @@ public actor BackupSyncRunner {
                     let outcome = try await editReplacement.replaceSuperseded(
                         of: entry.source,
                         with: primaryUID,
-                        edited: resolved.candidate.snapshot.editRevision == .unavailable,
-                        holdsOriginal: EditedPhotoReplacement.holdsOriginal(
-                            editRevision: resolved.candidate.snapshot.editRevision,
-                            secondaries: resolved.secondaries.map(\.descriptor.source.resource)
-                        ),
+                        edited: Self.isEdited(resolved),
+                        holdsOriginal: Self.holdsOriginal(resolved),
                         externalIdentifier: resolved.descriptor.externalIdentifier,
                         localEditTime: resolved.photoLibraryEditTime,
                         localCreationDate: resolved.descriptor.photoLibraryCreationDate,

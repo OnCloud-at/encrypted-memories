@@ -81,7 +81,7 @@ public final class PhotoViewerModel {
     }
 
     private let feed: ThumbnailFeed
-    private let pageIndex: ViewerPageIndex
+    private var pageIndex: ViewerPageIndex
     private let media: FullMediaProvider
     private let originalByteStreamer: (any OriginalByteStreamProvider)?
     private let streamer: VideoStreamProvider?
@@ -329,6 +329,20 @@ public final class PhotoViewerModel {
         index = resolved
         loadCurrent()
         return true
+    }
+
+    /// Swaps photos that the backup replaced in `timeline` for their replacement. The open page reloads only when
+    /// its own photo was replaced; see `ViewerReplacementFollow`.
+    public func followReplacements(_ replacements: [PhotoUID: PhotoUID], in timeline: TimelineSnapshot) {
+        guard
+            let followed = ViewerReplacementFollow.follow(
+                items, pages: pageIndex, current: index, replacements: replacements, timeline: timeline)
+        else { return }
+        let replacesCurrent = items.indices.contains(index) && followed.items[followed.current].uid != items[index].uid
+        items = followed.items
+        pageIndex = followed.pages
+        index = followed.current
+        if replacesCurrent { loadCurrent() }
     }
 
     /// Contextual keyboard/button navigation. A visible burst/series filmstrip is a nested selection, so

@@ -60,10 +60,20 @@ public struct EditedPhotoReplacement: Sendable {
         return secondaries.contains { resource in originals.contains { resource.rawValue.hasPrefix($0) } }
     }
 
-    /// True while an edit of `source` waits to replace its earlier upload. Its secondaries must then upload under
-    /// the edited photo, because their earlier copies move to the trash with the earlier photo.
+    /// True while an edit of `source` waits to replace its earlier upload, or while a gone earlier photo of it can be
+    /// in the library. Its secondaries must then upload under the edited photo: their earlier copies move to the trash
+    /// with the earlier photo, or belong to the person's photo that the backup never touches.
     public func isReplacing(_ source: UploadSourceIdentity) -> Bool {
-        !journal.entry(for: source).allSuperseded.isEmpty
+        let entry = journal.entry(for: source)
+        return !entry.allSuperseded.isEmpty || !(entry.gone ?? []).isEmpty
+    }
+
+    /// True when the next upload of `source` replaces its earlier uploads: no series, and an edit or the undo of an
+    /// edit. A false result keeps every earlier upload, so the upload must not name them as replaced. A compound
+    /// without its original still names them: `replaceSuperseded` waits for the original before the trash write,
+    /// and a reader counts a named link as replaced only after it left the library.
+    public func replacesEarlierUploads(of source: UploadSourceIdentity, edited: Bool, isSeries: Bool) -> Bool {
+        !isSeries && journal.entry(for: source).replacesEarlierUploads(edited: edited)
     }
 
     /// Keeps the earlier uploads of `source`. A series keeps today's behavior until its own edit model exists.
@@ -121,7 +131,7 @@ public struct EditedPhotoReplacement: Sendable {
         let unknown = remoteTargets.subtracting(provenCompounds.keys)
         superseded.removeAll { unknown.contains($0.nodeID) }
         // Other bytes of a photo that is unedited now and was unedited before are no edit, so both photos stay.
-        guard !superseded.isEmpty, edited || entry.lastUploadWasEdit else {
+        guard !superseded.isEmpty, entry.replacesEarlierUploads(edited: edited) else {
             try keepSuperseded(of: source)
             try recordUpload(of: source, edited: edited)
             return .kept
@@ -138,7 +148,12 @@ public struct EditedPhotoReplacement: Sendable {
         // The edit was undone and the earlier photo is the current one again.
         var kept = Set(superseded.map(\.nodeID).filter { $0 == replacement.nodeID }).union(unknown)
         var waiting: Set<String> = []
-        let targets = superseded.map(resolved).filter { $0.nodeID != replacement.nodeID }
+        // A gone photo is the person's: the backup never trashes it, also after the person restored it.
+        let protected = Set(entry.gone ?? [])
+        kept.formUnion(superseded.map(\.nodeID).filter(protected.contains))
+        let targets = superseded.map(resolved).filter {
+            $0.nodeID != replacement.nodeID && !protected.contains($0.nodeID)
+        }
         let active = try await remote.activeUIDs(among: targets)
         var trashable: [PhotoUID] = []
         var related = Set(
@@ -202,18 +217,31 @@ public struct EditedPhotoReplacement: Sendable {
             try journal.prepareToRetire(intent, for: source)
             try await remote.trashReplaced(trashable)
         }
-        let retired = Set(targets.map(\.nodeID)).subtracting(kept).subtracting(waiting)
+        // An earlier photo that left the library counts as retired only with proof that this backup trashed it: the
+        // intent this device wrote before its trash. A marker of another upload names what it replaces, not who
+        // trashed it. Without proof the person may have trashed it, so it is gone: the backup never trashes it
+        // again, and its trash is no deletion proof.
+        var retired = Set(trashable.map(\.nodeID))
+        var gone: Set<String> = []
+        for target in targets where !active.contains(target) {
+            if entry.retireIntent?[target.nodeID] != nil {
+                retired.insert(target.nodeID)
+            } else {
+                gone.insert(target.nodeID)
+            }
+        }
         // A row that names a trashed photo no longer proves a backup. Related links from an earlier intent join
         // confirmed retired links, so a retry after a failed manifest write forgets them too.
-        let trashedLinks = retired.union(related).union(journal.entry(for: source).retired)
+        let trashedLinks = retired.union(gone).union(related).union(journal.entry(for: source).retired)
         guard identities.forgetRemoteLinks(trashedLinks, of: source) else {
             throw UploadError.backend("Upload identity manifest could not be updated")
         }
         try journal.settle(retired, related: related, trashed: true, for: source)
+        try journal.settleGone(gone, for: source)
         try journal.settle(kept, related: [], trashed: false, for: source)
         if !waiting.isEmpty { return try await waitingOutcome(of: source, for: replacement, edited: edited) }
         try recordUpload(of: source, edited: edited)
-        return retired.isEmpty ? .kept : .replaced(retiredAny: true)
+        return retired.isEmpty && gone.isEmpty ? .kept : .replaced(retiredAny: true)
     }
 
     /// Earlier photos wait only for a photo that is in the library. When the photo that would replace them left it,

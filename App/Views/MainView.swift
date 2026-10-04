@@ -36,6 +36,8 @@ struct MainView: View {
     @State private var timelineModel: TimelineViewModel
     @State private var mapClusterModel: TimelineViewModel
     @State private var viewerModel: PhotoViewerModel?
+    /// Set when the viewer opens: only a viewer of the whole library without search or filter follows replacements.
+    @State private var viewerFollowsReplacements = false
     @State private var level: Int = 3  // 0 is largest; 5 is the densest overview.
     @State private var temporalMode: TimelineTemporalMode = .allPhotos
     /// Library filters of the Mediathek, shared with iPhone and iPad through `LibraryRefinementMenuContent`.
@@ -176,8 +178,10 @@ struct MainView: View {
             previewCache: OfflineLibraryManager.shared.previewCache,
             originalsCache: OfflineLibraryManager.shared.originalsCache
         )
-        _timelineModel = State(initialValue: TimelineViewModel(repository: backend, feed: feed, library: backend))
-        _mapClusterModel = State(initialValue: TimelineViewModel(repository: backend, feed: feed, library: backend))
+        _timelineModel = State(
+            initialValue: TimelineViewModel(repository: backend, feed: feed.feedCore, library: backend))
+        _mapClusterModel = State(
+            initialValue: TimelineViewModel(repository: backend, feed: feed.feedCore, library: backend))
         let sidebarVisible = SidebarPersistence.resolvedVisible()
         let width = SidebarPersistence.resolvedWidth()
         initiallyShowsSidebar = sidebarVisible
@@ -233,7 +237,7 @@ struct MainView: View {
             .onAppear {
                 attachOfflineManager()
                 attachPendingGrid()
-                AppMemoryPressureCoordinator.shared.attachFeed(timelineModel.feed)
+                AppMemoryPressureCoordinator.shared.attachFeed(feed)
                 gridProxy.onContentReady = { revision in
                     renderedLibraryRevision = revision
                     timelineModel.markInitialContentReady()
@@ -249,6 +253,7 @@ struct MainView: View {
             // Split out of this chain: inline, the added handlers exceed the type-checker's time budget.
             .applying { searchDiscoveryLifecycle($0) }
             .applying { mapAndPlacesLifecycle($0) }
+            .applying { viewerFollowLifecycle($0) }
             .task(id: temporalProjectionRequestID) {
                 await rebuildTemporalProjection()
             }
@@ -380,6 +385,7 @@ struct MainView: View {
             if selection == .map, mapClusterPresentation != nil {
                 TimelineView(
                     model: mapClusterModel,
+                    feed: feed,
                     level: $level,
                     gridFillOrder: .topLeading,
                     initialViewportPlacement: .oldest,
@@ -628,6 +634,7 @@ struct MainView: View {
             } else {
                 TimelineView(
                     model: timelineModel,
+                    feed: feed,
                     level: $level,
                     gridFillOrder: gridFillOrder,
                     proxy: gridProxy,
@@ -647,7 +654,9 @@ struct MainView: View {
                     dragOutProvider: media,
                     onDragOutFailed: { dragOutFailureMessage = $0.localizedMessage },
                     onSelectionChange: { selectedUIDs = $0 },
-                    onOpen: { item, items in openPhoto(item, items, proxy: nil) }
+                    onOpen: { item, items in
+                        openPhoto(item, items, proxy: nil, followsReplacements: showsUnfilteredLibrary)
+                    }
                 )
                 .transition(.opacity)
             }
@@ -842,10 +851,12 @@ struct MainView: View {
             visualState = .success
         case .hidden:
             message = libraryRefresh.message ?? "\(L10n.string("library.title_activity")) …"
-            visualState =
-                hasUploadMessage
-                ? (libraryRefresh.isBusy ? .working : (libraryRefresh.succeeded ? .success : .failure))
-                : .working
+            // While a refresh runs, the banner shows work, as before; the message decides the colour once it ends.
+            switch hasUploadMessage && !libraryRefresh.isBusy ? libraryRefresh.tone : .working {
+            case .success: visualState = .success
+            case .failure: visualState = .failure
+            case .working, nil: visualState = .working
+            }
         }
         return LibraryActivityBannerOverlay(
             isPresented: connectivityVisible || hasUploadMessage || backgroundVisible,
@@ -953,7 +964,10 @@ struct MainView: View {
         mapClusterPresentation == nil ? gridProxy : mapClusterGridProxy
     }
 
-    private func openPhoto(_ item: PhotoItem, _ items: [PhotoItem], proxy: GridProxy<PhotoUID>? = nil) {
+    private func openPhoto(
+        _ item: PhotoItem, _ items: [PhotoItem], proxy: GridProxy<PhotoUID>? = nil, followsReplacements: Bool = false
+    ) {
+        viewerFollowsReplacements = followsReplacements
         // Need the cell's on-screen frame and a thumbnail to fly; otherwise just open directly.
         let sourceProxy = proxy ?? activeGridProxy
         guard let cell = sourceProxy.windowFrameForItem?(item.uid), let img = feed.memoryImage(for: item.uid) else {
@@ -1058,7 +1072,7 @@ struct MainView: View {
     private func attachPendingGrid() {
         guard let session = model.pendingGrid else { return }
         session.attachFeed(
-            timelineModel.feed.feedCore, imageRequest: PhotoKitPlatformImages.request, fileThumbnails: folderMedia)
+            timelineModel.feed, imageRequest: PhotoKitPlatformImages.request, fileThumbnails: folderMedia)
         session.presenter.onChange = { [timelineModel] presentation in
             timelineModel.setPendingPresentation(presentation)
         }
@@ -1254,6 +1268,14 @@ struct MainView: View {
     /// Filters apply to the Mediathek only; albums and smart collections keep their own contents.
     private var activeRefinement: TimelineRefinement {
         selection == .all ? refinement : .all
+    }
+
+    /// The grid shows the whole library without a search, a suggestion, or a filter.
+    private var showsUnfilteredLibrary: Bool {
+        selection == .all
+            && committedSearchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && committedSuggestionMatches == nil
+            && !activeRefinement.isActive
     }
 
     private var showsTemporalBrowser: Bool {
@@ -1871,6 +1893,17 @@ struct MainView: View {
                 OfflineLibraryManager.shared.pauseMapAndPlaces()
                 Task { await NativePlaceNameResolver.shared.cancelPending() }
             }
+        }
+    }
+
+    /// An open library viewer follows a photo that the backup replaced, such as an edit in Apple Photos. Other
+    /// routes keep their collection: the trash must never turn a deleted photo into its live edit, and a
+    /// replacement need not match a search or a filter.
+    private func viewerFollowLifecycle<Content: View>(_ view: Content) -> some View {
+        view.onChange(of: timelineModel.pendingPresentation.revision) { _, _ in
+            guard viewerFollowsReplacements, selection == .all else { return }
+            let presentation = timelineModel.pendingPresentation
+            viewerModel?.followReplacements(presentation.replacements, in: presentation.snapshot)
         }
     }
 
