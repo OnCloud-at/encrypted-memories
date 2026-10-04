@@ -69,8 +69,14 @@ else
     echo "[ios-tests] no available iPhone simulator; install an iOS runtime or set IOS_TEST_DESTINATION." >&2
     exit 69
   fi
-  DESTINATION="platform=iOS Simulator,name=$SIMULATOR_NAME,OS=latest"
   SIMULATOR_UDID="$(resolve_simulator_udid "$SIMULATOR_NAME")"
+  if [[ -n "$SIMULATOR_UDID" ]]; then
+    # The booted device and the tested device must be the same, also when two simulators share the name.
+    DESTINATION="platform=iOS Simulator,id=$SIMULATOR_UDID"
+  else
+    echo "[ios-tests] no device ID for $SIMULATOR_NAME; xcodebuild boots the simulator itself."
+    DESTINATION="platform=iOS Simulator,name=$SIMULATOR_NAME,OS=latest"
+  fi
 fi
 export DEVELOPER_DIR
 
@@ -100,7 +106,11 @@ xcrun xcodebuild \
 # until the boot, data migration included, is complete.
 if [[ -n "${SIMULATOR_UDID:-}" ]]; then
   echo "[ios-tests] booting $SIMULATOR_NAME and waiting until it is ready"
-  xcrun simctl bootstatus "$SIMULATOR_UDID" -b
+  # macOS has no `timeout`; perl's alarm ends a boot that hangs after 10 minutes.
+  if ! perl -e 'alarm shift; exec @ARGV' 600 xcrun simctl bootstatus "$SIMULATOR_UDID" -b; then
+    echo "[ios-tests] the simulator did not finish booting within 10 minutes." >&2
+    exit 1
+  fi
 fi
 
 echo "[ios-tests] scheme: $SCHEME, destination: $DESTINATION"
