@@ -138,7 +138,26 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
         }
     }
 
+    /// The person trashes this main right after its compound read, before any later read of the same pass.
+    var trashAfterCompoundRead: String? {
+        get { lock.withLock { pendingTrashAfterCompoundRead } }
+        set { lock.withLock { pendingTrashAfterCompoundRead = newValue } }
+    }
+    private var pendingTrashAfterCompoundRead: String?
+
     func compound(ofMainLink linkID: String) async throws -> UploadRemoteCompound? {
+        let compound = try readCompound(ofMainLink: linkID)
+        lock.withLock {
+            guard pendingTrashAfterCompoundRead == linkID else { return }
+            pendingTrashAfterCompoundRead = nil
+            table[linkID]?.state = .trashed
+            table[linkID]?.personDeleted = true
+            record("person trash \(linkID) after its compound read")
+        }
+        return compound
+    }
+
+    private func readCompound(ofMainLink linkID: String) throws -> UploadRemoteCompound? {
         try lock.withLock {
             if cancelCompoundRead { throw CancellationError() }
             if failCompoundRead { throw UploadError.backend("The scenario compound read failed") }
@@ -688,5 +707,73 @@ final class EditScenarioDeviceIndex: UploadDuplicateChecking, @unchecked Sendabl
     }
     func remoteContentIndexHealth() async throws -> UploadRemoteContentIndexHealth {
         try await server.remoteContentIndexHealth()
+    }
+}
+
+/// The uploads and backup trash of one device. U6: the backup never trashes a head that this device did not upload.
+/// One exception holds: this device uploaded a later version of the same asset. A device adopts the upload of
+/// another device and replaces it with its own edit, and the proven remote path replaces another device's older
+/// edit; both trash only a head with an earlier ModificationTime than the active upload of this device.
+final class EditScenarioDeviceRemote: PhotoUploading, EditReplacementRemote, @unchecked Sendable {
+    private let server: EditScenarioServer
+    private let lock = NSLock()
+    private var ownUploads: Set<String> = []
+    private var recordedViolations: [String] = []
+
+    init(server: EditScenarioServer) { self.server = server }
+
+    var capabilities: UploadBackendCapabilities { server.capabilities }
+    var violations: [String] { lock.withLock { recordedViolations } }
+
+    /// A link that this device seeded as an earlier app version counts as its own upload.
+    func recordOwnUpload(_ uid: PhotoUID) {
+        lock.withLock { _ = ownUploads.insert(uid.nodeID) }
+    }
+
+    func upload(
+        _ request: PhotoUploadRequest,
+        onProgress: @Sendable @escaping (UploadProgress) -> Void
+    ) async throws -> PhotoUID {
+        let uid = try await server.upload(request, onProgress: onProgress)
+        recordOwnUpload(uid)
+        return uid
+    }
+
+    func cancel(token: UUID) async { await server.cancel(token: token) }
+    func pause(token: UUID) async throws { try await server.pause(token: token) }
+    func resume(token: UUID) async throws { try await server.resume(token: token) }
+    func ensureRemoteCapacity(forBytes bytes: Int64, filename: String) async throws {
+        try await server.ensureRemoteCapacity(forBytes: bytes, filename: filename)
+    }
+
+    func ownPhotosVolumeID() async throws -> String { try await server.ownPhotosVolumeID() }
+    func activeUIDs(among uids: [PhotoUID]) async throws -> Set<PhotoUID> {
+        try await server.activeUIDs(among: uids)
+    }
+    func favoriteUIDs(among uids: [PhotoUID]) async throws -> Set<PhotoUID> {
+        try await server.favoriteUIDs(among: uids)
+    }
+    func markFavorite(_ uids: [PhotoUID]) async throws { try await server.markFavorite(uids) }
+
+    func trashReplaced(_ uids: [PhotoUID]) async throws {
+        let links = server.links
+        lock.withLock {
+            for uid in uids {
+                guard let target = links.first(where: { $0.linkID == uid.nodeID }), target.state == .active,
+                    !ownUploads.contains(target.linkID)
+                else { continue }
+                let laterOwnUpload = links.contains { own in
+                    ownUploads.contains(own.linkID) && own.state == .active && own.mainLinkID == nil
+                        && own.assetID == target.assetID
+                        && (own.modificationDate ?? .distantPast) > (target.modificationDate ?? .distantFuture)
+                }
+                if !laterOwnUpload {
+                    recordedViolations.append(
+                        "U6 backup trashed \(target.linkID), which this device did not upload and which is not older "
+                            + "than its own upload")
+                }
+            }
+        }
+        try await server.trashReplaced(uids)
     }
 }

@@ -112,6 +112,38 @@ final class UploadLineageReplacementTests: XCTestCase {
         XCTAssertEqual(superseded(), [head.nodeID])
     }
 
+    /// Another device's newer edit proves the photo live: the older edit uploads next to it and asks nothing.
+    func testNewerHeadOfAnotherDeviceProvesThePhotoLiveWithoutBecomingATarget() async throws {
+        let original = try seed("original", filename: "IMG_1.HEIC")
+        try await rememberOriginal(original)
+        server.personTrash(original)
+        let head = try seed(
+            "newer-edit", replacing: [original.nodeID], modificationDate: Date(timeIntervalSince1970: 1_720_000_020))
+        try journal.keepDeleted(for: source)
+
+        let older = descriptor("older-edit")
+        let result = try await pipeline.resolve(older)
+        await pipeline.uploadDidFail(older)
+
+        XCTAssertEqual(result.decision, .upload)
+        XCTAssertFalse(superseded().contains(head.nodeID), "a newer version is never a target")
+        XCTAssertNil(journal.entry(for: source).keptDeleted, "the live photo ends the earlier choice")
+    }
+
+    /// A newer version that the person trashes during the check proves nothing, so the deletion check stays.
+    func testNewerHeadTrashedDuringTheCheckProvesNothing() async throws {
+        let original = try seed("original", filename: "IMG_1.HEIC")
+        try await rememberOriginal(original)
+        server.personTrash(original)
+        let head = try seed(
+            "newer-edit", replacing: [original.nodeID], modificationDate: Date(timeIntervalSince1970: 1_720_000_020))
+        server.trashAfterCompoundRead = head.nodeID
+
+        let result = try await pipeline.resolve(descriptor("older-edit"))
+
+        XCTAssertEqual(result.decision, .awaitDeletionCheck)
+    }
+
     func testDifferentIdentityWithEditedBytesIsNotAdoptedOrTrashed() async throws {
         let head = try seed("head")
         let other = try seed("next", filename: "Render.JPG", cloudID: "other-asset")
