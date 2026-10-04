@@ -12,6 +12,19 @@ public struct UploadBackupAssetCandidate: Sendable, Equatable {
     }
 }
 
+/// A candidate whose backed-up revision can lack a file that the asset lists now, such as a late rendered file.
+public struct UploadBackupReopening: Sendable, Equatable {
+    public let candidate: UploadBackupAssetCandidate
+    /// The source under which a backup with the late file as main file keeps the former main file. Nil when the
+    /// asset lists no such file.
+    public let formerMain: UploadSourceIdentity?
+
+    public init(candidate: UploadBackupAssetCandidate, formerMain: UploadSourceIdentity?) {
+        self.candidate = candidate
+        self.formerMain = formerMain
+    }
+}
+
 public protocol UploadBackupAssetCatalog: Sendable {
     func candidates() -> AsyncThrowingStream<UploadBackupAssetCandidate, any Error>
 }
@@ -23,9 +36,18 @@ public protocol UploadBackupCandidateEnqueueing: Sendable {
     func enqueue(_ candidate: UploadBackupAssetCandidate) async throws -> UploadBackupSyncScanResult
     @discardableResult
     func enqueueBatch(_ candidates: [UploadBackupAssetCandidate]) async throws -> UploadBackupSyncScanResult
+    /// Re-opens the backed-up revision of each candidate, unless its backup already holds the file that the asset now
+    /// lists. Returns the candidates whose revision is pending work.
+    @discardableResult
+    func reopenBackedUpRevisions(_ reopenings: [UploadBackupReopening]) async throws -> [UploadBackupAssetCandidate]
 }
 
 public extension UploadBackupCandidateEnqueueing {
+    @discardableResult
+    func reopenBackedUpRevisions(_ reopenings: [UploadBackupReopening]) async throws -> [UploadBackupAssetCandidate] {
+        []
+    }
+
     func enqueueBatch(_ candidates: [UploadBackupAssetCandidate]) async throws -> UploadBackupSyncScanResult {
         var result = UploadBackupSyncScanResult()
         for candidate in candidates {
@@ -182,6 +204,46 @@ public actor UploadBackupSyncEngine: UploadBackupCandidateEnqueueing {
             throw UploadError.backend("Backup queue could not persist an asset batch")
         }
         return result
+    }
+
+    /// A complete revision becomes pending work again; its settled queue row goes away, so the next `enqueueBatch`
+    /// queues the upload. A revision whose backup already holds the late file as main file, or that has no state,
+    /// keeps the usual classification.
+    @discardableResult
+    public func reopenBackedUpRevisions(
+        _ reopenings: [UploadBackupReopening]
+    ) async throws -> [UploadBackupAssetCandidate] {
+        var pending: [UploadBackupAssetCandidate] = []
+        let kept = Set(try withoutExcludedSources(reopenings.map(\.candidate)).map(\.snapshot.source))
+        for reopening in reopenings where kept.contains(reopening.candidate.snapshot.source) {
+            let snapshot = reopening.candidate.snapshot
+            if await backupHoldsLateMain(snapshot.source, formerMain: reopening.formerMain) { continue }
+            try Task.checkCancellation()
+            guard try await preflight.reopen(snapshot) else { continue }
+            pending.append(reopening.candidate)
+            try Task.checkCancellation()
+            let row = queue.entry(for: snapshot.source, revision: snapshot.revision)
+            guard queue.isOperational() else { throw UploadError.backend("Backup queue could not be read") }
+            guard let row, row.state == .completed || row.state == .alreadyBackedUp else { continue }
+            guard queue.remove(source: snapshot.source, revision: snapshot.revision) else {
+                throw UploadError.backend("Backup queue could not re-open an asset")
+            }
+        }
+        return pending
+    }
+
+    /// The manifest proves that the backup holds the late file as main file: the main file has a proven upload, and
+    /// the former main file, which such a backup keeps as a related file, has other bytes. A backup with the former
+    /// main file as main file has no such related record, or the same bytes in both records. Without proof, the
+    /// revision re-opens; the duplicate check then keeps an upload that is already there.
+    private func backupHoldsLateMain(_ source: UploadSourceIdentity, formerMain: UploadSourceIdentity?) async -> Bool {
+        guard let remoteProofResolver, let formerMain,
+            let main = await remoteProofResolver.identityRecord(for: source), main.provesUpload,
+            let former = await remoteProofResolver.identityRecord(for: formerMain)
+        else {
+            return false
+        }
+        return former.sha1Hex != main.sha1Hex
     }
 
     private func prepare(

@@ -271,6 +271,18 @@ public actor UploadBackupPreflightIndex {
         }
     }
 
+    /// Marks a complete state of this exact revision pending again: its backup lacks a file. Returns whether the
+    /// revision is pending work. A revision without a state keeps the usual classification.
+    public func reopen(_ snapshot: UploadBackupAssetSnapshot) throws -> Bool {
+        guard let lookup = store.lookupBatch([snapshot]).first, lookup.succeeded else {
+            throw UploadError.backend("Backup state could not be read")
+        }
+        guard let direct = lookup.directRecord else { return false }
+        guard direct.isComplete else { return true }
+        try markPending(snapshot)
+        return true
+    }
+
     /// Forgets every earlier state of the asset. An edit replaced its earlier upload, so a later return to an
     /// earlier state, for example undoing the edit, is no longer backed up and must pass the duplicate check.
     public func forgetEarlierStates(of snapshot: UploadBackupAssetSnapshot) throws {
