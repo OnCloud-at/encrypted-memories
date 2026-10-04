@@ -400,6 +400,81 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
         }
     }
 
+    /// Streams the rows that keep the backup incomplete, newest revision first, until `body` returns false.
+    /// A waiting row counts only when its text is an issue record; an older build's message is no problem.
+    /// `body` runs under the store's lock and must not call the store.
+    public func forEachProblemEntry(_ body: (UploadBackupSyncQueueEntry) -> Bool) {
+        lock.withLock {
+            var stmt: OpaquePointer?
+            guard
+                requireOperational(
+                    sqlite3_prepare_v2(
+                        db,
+                        """
+                        SELECT source_kind, source_id, resource, revision_us, original_filename, byte_count,
+                               state, attempts, last_error, updated_at, remote_commit_reconciliation
+                        FROM backup_sync_queue
+                        WHERE state IN ('failed', 'failedPermanent', 'sourceMissing', 'blockedByDraft')
+                           OR (state IN ('discovered', 'queuedForUpload') AND substr(last_error, 1, ?) = ?)
+                        ORDER BY revision_us DESC, updated_at ASC;
+                        """,
+                        -1, &stmt, nil
+                    ) == SQLITE_OK)
+            else { return }
+            defer { sqlite3_finalize(stmt) }
+            sqlite3_bind_int64(stmt, 1, Int64(BackupIssueRecord.storagePrefix.count))
+            bindText(stmt, 2, BackupIssueRecord.storagePrefix)
+            var stepResult = sqlite3_step(stmt)
+            while stepResult == SQLITE_ROW {
+                guard let source = sourceFromColumns(stmt, kindColumn: 0, idColumn: 1, resourceColumn: 2) else {
+                    operationFailed = true
+                    return
+                }
+                let revision = UploadBackupRevision(rawValue: sqlite3_column_int64(stmt, 3))
+                guard let entry = row(stmt, source: source, revision: revision, offset: 4) else { return }
+                guard body(entry) else { return }
+                stepResult = sqlite3_step(stmt)
+            }
+            _ = requireOperational(stepResult == SQLITE_DONE)
+        }
+    }
+
+    /// Makes one row due now only while it still has the state and reason the caller saw, so a row that the
+    /// runner claimed or changed meanwhile is left alone. Returns whether the row was reopened.
+    public func reopenForUserRetry(
+        _ entry: UploadBackupSyncQueueEntry, attempts: Int, updatedAt: Date
+    ) -> Bool {
+        let changed: Int? = lock.withLock {
+            var stmt: OpaquePointer?
+            guard
+                requireOperational(
+                    sqlite3_prepare_v2(
+                        db,
+                        """
+                        UPDATE backup_sync_queue SET state = 'discovered', attempts = ?, updated_at = ?
+                        WHERE source_kind = ? AND source_id = ? AND resource = ? AND revision_us = ?
+                          AND state = ? AND last_error IS ?;
+                        """,
+                        -1, &stmt, nil
+                    ) == SQLITE_OK)
+            else { return nil }
+            defer { sqlite3_finalize(stmt) }
+            sqlite3_bind_int(stmt, 1, Int32(attempts))
+            sqlite3_bind_double(stmt, 2, updatedAt.timeIntervalSince1970)
+            bindText(stmt, 3, entry.source.kind.rawValue)
+            bindText(stmt, 4, entry.source.identifier)
+            bindText(stmt, 5, entry.source.resource.rawValue)
+            sqlite3_bind_int64(stmt, 6, entry.revision.rawValue)
+            bindText(stmt, 7, entry.state.rawValue)
+            bindNullableText(stmt, 8, entry.lastError)
+            guard requireOperational(sqlite3_step(stmt) == SQLITE_DONE) else { return nil }
+            return Int(sqlite3_changes(db))
+        }
+        guard let changed else { return false }
+        if changed > 0 { notify(UploadBackupSyncQueueChange(sources: [entry.source])) }
+        return changed > 0
+    }
+
     public func entries(
         in state: UploadBackupSyncQueueState,
         updatedBefore: Date,
@@ -426,7 +501,7 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
             defer { sqlite3_finalize(stmt) }
             bindText(stmt, 1, state.rawValue)
             sqlite3_bind_double(stmt, 2, updatedBefore.timeIntervalSince1970)
-            sqlite3_bind_int(stmt, 3, Int32(clampedLimit))
+            sqlite3_bind_int(stmt, 3, Int32(clamping: clampedLimit))
             var entries: [UploadBackupSyncQueueEntry] = []
             var stepResult = sqlite3_step(stmt)
             while stepResult == SQLITE_ROW {
@@ -483,6 +558,7 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
     /// Resets every parked `.failed` row back to runnable with a fresh retry budget. Called when
     /// the user explicitly asks to back up again (or re-enables backup), so a manual "back up now"
     /// actually retries the items behind a "needs attention" state instead of being a no-op.
+    /// The reason stays, so the photo keeps its place in the problem list until the runner tries it again.
     @discardableResult
     private func requeueFailedUnobserved(updatedAt: Date) -> Int {
         lock.withLock {
@@ -493,7 +569,7 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
                         db,
                         """
                         UPDATE backup_sync_queue
-                        SET state = 'discovered', attempts = 0, last_error = NULL, updated_at = ?
+                        SET state = 'discovered', attempts = 0, updated_at = ?
                         WHERE state = 'failed';
                         """,
                         -1, &stmt, nil
@@ -523,7 +599,6 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
                             ELSE state
                           END,
                           attempts = CASE WHEN state = 'failed' THEN 0 ELSE attempts END,
-                          last_error = NULL,
                           updated_at = ?
                         WHERE state IN (
                           'failed', 'blockedByDraft', 'discovered', 'queuedForUpload',
