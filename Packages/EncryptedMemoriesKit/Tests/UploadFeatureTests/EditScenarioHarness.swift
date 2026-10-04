@@ -550,6 +550,10 @@ final class EditScenarioHarness {
         assertQuiescent(file: file, line: line)
     }
 
+    func makeRetryableWorkEligibleNow() async -> Int {
+        await runner.makeRetryableWorkEligibleNow()
+    }
+
     func state(of entry: UploadBackupSyncQueueEntry) -> UploadBackupSyncQueueState? {
         queue.entry(for: entry.source, revision: entry.revision)?.state
     }
