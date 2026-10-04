@@ -303,10 +303,10 @@ public actor PendingBackupCoordinator {
         let hidden = Set(tile.replaces.map(\.nodeID))
         guard !hidden.isEmpty, let identities, let relations else { return nil }
         let target: PhotoUID?
-        if let earlier = store.latestHandoffs(for: [key])[key] {
-            target =
-                earlier.kind == .uploaded && earlier.revision < revision && hidden.contains(earlier.remote.nodeID)
-                ? earlier.remote : nil
+        // A stored handoff of this or a later revision is the edit's own commit, whose event has not arrived yet; the
+        // journal still names the earlier upload. The store trashes the commit after it.
+        if let earlier = store.latestHandoffs(for: [key])[key], earlier.revision < revision {
+            target = earlier.kind == .uploaded && hidden.contains(earlier.remote.nodeID) ? earlier.remote : nil
         } else {
             target = newestEarlierMain(of: key, among: tile.replaces)
         }

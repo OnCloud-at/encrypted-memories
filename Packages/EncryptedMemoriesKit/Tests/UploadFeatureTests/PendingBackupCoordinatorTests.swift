@@ -1165,6 +1165,26 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         XCTAssertEqual(effects.trashed, [[earlier], [committed]])
     }
 
+    // Mutation: keep the store's handoff of the deleted revision as the answer in `hiddenEarlierUpload`; only the
+    // commit goes to the trash and the earlier upload stays in the library.
+    func testAnEditWhoseCommitIsStoredButNotYetSeenStillTrashesTheEarlierUpload() async throws {
+        try await startPendingEdit()
+        // The upload of the edit committed and its handoff is durable, but its event has not reached the grid yet.
+        let committed = PhotoUID(volumeID: "vol", nodeID: "link-edit")
+        XCTAssertEqual(
+            store.recordHandoff(
+                PendingHandoff(key: key("p"), revision: edit, remote: committed, kind: .uploaded, createdAt: date)),
+            .recorded)
+
+        await coordinator.exclude([key("p").localUID])
+
+        let deadline = ContinuousClock.now + .seconds(5)
+        while effects.trashed.count < 2, ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(5)) }
+        XCTAssertEqual(
+            Set(effects.trashed.flatMap { $0 }), [earlier, committed],
+            "the person deleted the photo, so neither the earlier upload nor the edit stays in the library")
+    }
+
     // Mutation: return the handoff's photo in `hiddenEarlierUpload` before the `isNeededElsewhere` guard.
     func testDeletingAnUnfinishedEditKeepsAHandedOffEarlierUploadThatAnotherSourceNeeds() async throws {
         let identities = FakeIdentityStore()
