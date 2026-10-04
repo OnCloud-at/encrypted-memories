@@ -62,6 +62,8 @@ struct RecentlyDeletedListingStore: Sendable {
         let trashedHere: [TrashedHereRecord]
         /// Absent in files of earlier builds.
         let awaitingLibrary: [AwaitingLibraryRecord]?
+        /// Files that events showed as removed and a listing may still return. Absent in files of earlier builds.
+        let removedElsewhere: [AwaitingLibraryRecord]?
     }
 
     private let url: URL
@@ -89,14 +91,23 @@ struct RecentlyDeletedListingStore: Sendable {
                     uid: PhotoUID(volumeID: $0.volumeID, nodeID: $0.nodeID), item: $0.item?.item,
                     misses: $0.misses)
             },
-            trashedAwaitingLibrary: Dictionary(
-                (contents.awaitingLibrary ?? []).map {
-                    (
-                        PhotoUID(volumeID: $0.volumeID, nodeID: $0.nodeID),
-                        Date(timeIntervalSinceReferenceDate: $0.trashedAt)
-                    )
-                },
-                uniquingKeysWith: max))
+            trashedAwaitingLibrary: Self.waits(contents.awaitingLibrary),
+            removedElsewhereAwaitingLibrary: Self.waits(contents.removedElsewhere))
+    }
+
+    private static func waits(_ records: [AwaitingLibraryRecord]?) -> [PhotoUID: Date] {
+        Dictionary(
+            (records ?? []).map {
+                (PhotoUID(volumeID: $0.volumeID, nodeID: $0.nodeID), Date(timeIntervalSinceReferenceDate: $0.trashedAt))
+            },
+            uniquingKeysWith: max)
+    }
+
+    private static func records(_ waits: [PhotoUID: Date]) -> [AwaitingLibraryRecord] {
+        waits.sorted { $0.key.nodeID < $1.key.nodeID }.map {
+            AwaitingLibraryRecord(
+                volumeID: $0.key.volumeID, nodeID: $0.key.nodeID, trashedAt: $0.value.timeIntervalSinceReferenceDate)
+        }
     }
 
     /// Best effort: a failed write only means that the next offline launch shows an older listing.
@@ -108,11 +119,8 @@ struct RecentlyDeletedListingStore: Sendable {
                     volumeID: $0.uid.volumeID, nodeID: $0.uid.nodeID, item: $0.item.map(Record.init),
                     misses: $0.misses)
             },
-            awaitingLibrary: persisted.trashedAwaitingLibrary.sorted { $0.key.nodeID < $1.key.nodeID }.map {
-                AwaitingLibraryRecord(
-                    volumeID: $0.key.volumeID, nodeID: $0.key.nodeID,
-                    trashedAt: $0.value.timeIntervalSinceReferenceDate)
-            })
+            awaitingLibrary: Self.records(persisted.trashedAwaitingLibrary),
+            removedElsewhere: Self.records(persisted.removedElsewhereAwaitingLibrary))
         guard let plaintext = try? JSONEncoder().encode(contents),
             let sealed = try? AES.GCM.seal(plaintext, using: key).combined
         else { return }
@@ -169,6 +177,11 @@ struct RecentlyDeletedIdentities: Sendable, Equatable {
     /// listing lags behind a trash; without this, a refresh would bring them back into the library and into the
     /// stored timeline, and a relaunch would show them until the listing caught up.
     private var trashedAwaitingLibrary: [PhotoUID: Date] = [:]
+    /// Files that volume events showed as removed, with the moment a refresh first read that event. A refresh that
+    /// commits moves the event cursor past the event, so a later refresh, also after a relaunch, no longer sees it
+    /// while the listing can still return the file. They end like a trash here; `libraryLagLimit` bounds the age, and
+    /// every accepted listing prunes them, so only the removals of the last `libraryLagLimit` stay.
+    private var removedElsewhereAwaitingLibrary: [PhotoUID: Date] = [:]
     /// A photo that a library listing still returns this long after the trash was restored elsewhere.
     static let libraryLagLimit: TimeInterval = 600
     private var listingStarts: UInt64 = 0
@@ -189,6 +202,7 @@ struct RecentlyDeletedIdentities: Sendable, Equatable {
         var listing: [PhotoItem]?
         var trashedHere: [TrashedHere] = []
         var trashedAwaitingLibrary: [PhotoUID: Date] = [:]
+        var removedElsewhereAwaitingLibrary: [PhotoUID: Date] = [:]
     }
 
     init(listing: [PhotoItem]?) {
@@ -203,6 +217,7 @@ struct RecentlyDeletedIdentities: Sendable, Equatable {
             if entry.misses > 0 { trashedHereMisses[entry.uid] = entry.misses }
         }
         trashedAwaitingLibrary = persisted.trashedAwaitingLibrary
+        removedElsewhereAwaitingLibrary = persisted.removedElsewhereAwaitingLibrary
     }
 
     var persisted: Persisted {
@@ -211,7 +226,8 @@ struct RecentlyDeletedIdentities: Sendable, Equatable {
             trashedHere: trashedHere.map {
                 .init(uid: $0, item: trashedHereItems[$0], misses: trashedHereMisses[$0] ?? 0)
             },
-            trashedAwaitingLibrary: trashedAwaitingLibrary)
+            trashedAwaitingLibrary: trashedAwaitingLibrary,
+            removedElsewhereAwaitingLibrary: removedElsewhereAwaitingLibrary)
     }
 
     /// What Recently Deleted shows and stores: the last listing and the photos trashed here that it lacks.
@@ -293,7 +309,35 @@ struct RecentlyDeletedIdentities: Sendable, Equatable {
         restoredHere.removeAll { moved.contains($0) }
         restoredListedByLibrary.subtract(moved)
         restoredHere.append(contentsOf: uids)
-        for uid in uids { trashedAwaitingLibrary[uid] = nil }
+        for uid in uids {
+            trashedAwaitingLibrary[uid] = nil
+            removedElsewhereAwaitingLibrary[uid] = nil
+        }
+    }
+
+    /// Called with the volume events that a refresh read, before it reads the listing and before the refresh moves
+    /// its event cursor. A file that the events show as active again leaves at once; a removed file waits from the
+    /// first refresh that read its removal. Returns whether the persisted state changed, so the caller saves it
+    /// before the cursor moves past these events.
+    mutating func eventsRead(_ changes: TimelineRemoteEventChanges, volumeID: String, at now: Date) -> Bool {
+        let before = removedElsewhereAwaitingLibrary
+        for nodeID in changes.active {
+            removedElsewhereAwaitingLibrary[PhotoUID(volumeID: volumeID, nodeID: nodeID)] = nil
+        }
+        for nodeID in changes.removed {
+            let uid = PhotoUID(volumeID: volumeID, nodeID: nodeID)
+            if removedElsewhereAwaitingLibrary[uid] == nil { removedElsewhereAwaitingLibrary[uid] = now }
+        }
+        return removedElsewhereAwaitingLibrary != before
+    }
+
+    /// Called when a refresh cannot read the events since its cursor. A restore elsewhere is then unknown, and no
+    /// later event would end the wait, so a removed file shows again as soon as a listing returns it. Returns whether
+    /// the persisted state changed.
+    mutating func eventsLost() -> Bool {
+        guard !removedElsewhereAwaitingLibrary.isEmpty else { return false }
+        removedElsewhereAwaitingLibrary = [:]
+        return true
     }
 
     /// The trash is empty now; restored photos keep their thumbnails until the library lists them again.
@@ -305,29 +349,29 @@ struct RecentlyDeletedIdentities: Sendable, Equatable {
         trashedHereMisses = [:]
     }
 
-    var hasPhotosAwaitingLibrary: Bool { !trashedAwaitingLibrary.isEmpty }
+    var hasPhotosAwaitingLibrary: Bool { !trashedAwaitingLibrary.isEmpty || !removedElsewhereAwaitingLibrary.isEmpty }
 
-    /// The photos trashed here that a library listing still returns; the caller leaves them out.
+    /// The photos trashed here or removed by an event that a listing still returns; the caller leaves them out.
     func lagging(in read: LibraryListingRead, now: Date) -> Set<PhotoUID> {
-        Set(
-            trashedAwaitingLibrary.lazy
-                .filter { read.listed.contains($0.key) && !read.restoredElsewhere.contains($0.key) }
-                .filter { Self.awaitsLibrary(trashedAt: $0.value, now: now) }
-                .map(\.key))
+        let waits = { (wait: (key: PhotoUID, value: Date)) in
+            read.listed.contains(wait.key) && !read.restoredElsewhere.contains(wait.key)
+                && Self.awaitsLibrary(trashedAt: wait.value, now: now)
+        }
+        return Set(trashedAwaitingLibrary.filter(waits).keys).union(removedElsewhereAwaitingLibrary.filter(waits).keys)
     }
 
     /// Called once the library of a refresh is accepted; a discarded refresh must not end a wait. Ends the wait of a
     /// photo that another device restored, that waited `libraryLagLimit`, or that was trashed before the listing
     /// and that the listing no longer returns. Returns whether the persisted state changed.
     mutating func libraryAccepted(_ read: LibraryListingRead, now: Date) -> Bool {
-        let before = trashedAwaitingLibrary
-        trashedAwaitingLibrary = trashedAwaitingLibrary.filter { uid, trashedAt in
-            guard Self.awaitsLibrary(trashedAt: trashedAt, now: now), !read.restoredElsewhere.contains(uid) else {
-                return false
-            }
-            return read.listed.contains(uid) || trashedAt > read.readAt
+        let before = (trashedAwaitingLibrary, removedElsewhereAwaitingLibrary)
+        let waits = { (wait: (key: PhotoUID, value: Date)) in
+            Self.awaitsLibrary(trashedAt: wait.value, now: now) && !read.restoredElsewhere.contains(wait.key)
+                && (read.listed.contains(wait.key) || wait.value > read.readAt)
         }
-        return trashedAwaitingLibrary != before
+        trashedAwaitingLibrary = trashedAwaitingLibrary.filter(waits)
+        removedElsewhereAwaitingLibrary = removedElsewhereAwaitingLibrary.filter(waits)
+        return trashedAwaitingLibrary != before.0 || removedElsewhereAwaitingLibrary != before.1
     }
 
     /// A clock that moved back behind the trash ends the wait too, so it cannot outlast `libraryLagLimit`.
