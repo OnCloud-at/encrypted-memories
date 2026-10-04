@@ -23,6 +23,10 @@ public struct EditReplacementJournalEntry: Sendable, Equatable, Codable {
     public var proven: [String]?
     /// The uploads that a proven remote photo replaced, by that photo, as its lineage named them.
     public var inherited: [String: [String]]?
+    /// Earlier mains that left the library without a trash by a backup, for example by the person. The backup
+    /// never trashes them again, and a trashed copy among them is no deletion proof. Nil in journals of earlier
+    /// builds.
+    public var gone: [String]?
 
     /// The person's deletion choice and a wait that survives queue retries and process death.
     public var keptDeleted: Bool?
@@ -33,13 +37,15 @@ public struct EditReplacementJournalEntry: Sendable, Equatable, Codable {
         superseded: [PhotoUID] = [], retired: [String] = [], uploadedEdit: Bool? = nil,
         retireIntent: [String: [String]]? = nil, remoteSuperseded: [String]? = nil,
         keptDeleted: Bool? = nil, backUpAgainRevision: UploadBackupRevision? = nil,
-        deletionCheckStartedAt: Date? = nil, proven: [String]? = nil, inherited: [String: [String]]? = nil
+        deletionCheckStartedAt: Date? = nil, proven: [String]? = nil, inherited: [String: [String]]? = nil,
+        gone: [String]? = nil
     ) {
         self.superseded = superseded
         self.remoteSuperseded = remoteSuperseded
         self.retired = retired
         self.uploadedEdit = uploadedEdit
         self.retireIntent = retireIntent
+        self.gone = gone
         self.keptDeleted = keptDeleted
         self.backUpAgainRevision = backUpAgainRevision
         self.deletionCheckStartedAt = deletionCheckStartedAt
@@ -78,7 +84,8 @@ public struct EditReplacementJournalEntry: Sendable, Equatable, Codable {
 
     public var isEmpty: Bool {
         allSuperseded.isEmpty && retired.isEmpty && uploadedEdit != true && (retireIntent?.isEmpty ?? true)
-            && keptDeleted != true && backUpAgainRevision == nil && deletionCheckStartedAt == nil
+            && (gone?.isEmpty ?? true) && keptDeleted != true && backUpAgainRevision == nil
+            && deletionCheckStartedAt == nil
     }
 }
 
@@ -105,6 +112,8 @@ public protocol EditReplacementJournaling: Sendable {
     func clearRetireIntent(_ nodeIDs: Set<String>, for source: UploadSourceIdentity) throws
     /// Removes the photos from `superseded`. With `trashed` true they and `related` join `retired`.
     func settle(_ nodeIDs: Set<String>, related: Set<String>, trashed: Bool, for source: UploadSourceIdentity) throws
+    /// Removes the photos from `superseded` and records them in `gone`, never in `retired`: no backup trashed them.
+    func settleGone(_ nodeIDs: Set<String>, for source: UploadSourceIdentity) throws
     /// Records whether the upload that the backup finished for `source` was an edit.
     func recordUpload(edited: Bool, for source: UploadSourceIdentity) throws
     /// Removes photos from `retired`: the person restored them, so they are in the library again.
@@ -299,6 +308,22 @@ public final class EditReplacementJournalFileStore: EditReplacementJournaling, @
             for linkID in ordered where !entry.retired.contains(linkID) {
                 entry.retired.append(linkID)
             }
+        }
+    }
+
+    public func settleGone(_ nodeIDs: Set<String>, for source: UploadSourceIdentity) throws {
+        guard !nodeIDs.isEmpty else { return }
+        try update(source) { entry in
+            entry.superseded.removeAll { nodeIDs.contains($0.nodeID) }
+            entry.remoteSuperseded?.removeAll(where: nodeIDs.contains)
+            if entry.remoteSuperseded?.isEmpty == true { entry.remoteSuperseded = nil }
+            for nodeID in nodeIDs { entry.retireIntent?[nodeID] = nil }
+            if entry.retireIntent?.isEmpty == true { entry.retireIntent = nil }
+            var gone = entry.gone ?? []
+            for linkID in nodeIDs.sorted() where !gone.contains(linkID) && !entry.retired.contains(linkID) {
+                gone.append(linkID)
+            }
+            entry.gone = gone.isEmpty ? nil : gone
         }
     }
 

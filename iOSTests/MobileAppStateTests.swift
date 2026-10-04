@@ -151,6 +151,30 @@ private actor ViewerOriginalLoadProbe: FullMediaProvider, OriginalByteStreamProv
     var isPresented = true
 }
 
+/// Holds each preview until the test releases it, so a test can act while a load runs.
+private actor HeldPreviewProbe: FullMediaProvider {
+    private var previews: [Data]
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+    private(set) var requests = 0
+
+    init(previews: [Data]) { self.previews = previews }
+
+    func preview(for uid: PhotoUID) async throws -> Data {
+        requests += 1
+        await withCheckedContinuation { waiters.append($0) }
+        return previews.removeFirst()
+    }
+
+    func release() {
+        guard !waiters.isEmpty else { return }
+        waiters.removeFirst().resume()
+    }
+
+    func originalData(for uid: PhotoUID, onProgress: @escaping @Sendable (Double) -> Void) async throws -> Data {
+        throw CancellationError()
+    }
+}
+
 private struct ViewerImagePageProbe: View {
     let visibility: ViewerPageVisibility
     let store: UIKitViewerImageStore
@@ -371,6 +395,30 @@ private func waitUntil(
             throw error
         }
         await provider.finish()
+    }
+
+    /// A second edit can reuse the UID of the first one's tile. A load that started before `forget` must neither
+    /// return nor keep the first edit's picture.
+    @Test func aLoadThatStartedBeforeForgetKeepsNoImage() async throws {
+        let first = try #require(makeViewerImage(size: CGSize(width: 120, height: 80), color: .red).pngData())
+        let second = try #require(makeViewerImage(size: CGSize(width: 120, height: 80), color: .blue).pngData())
+        let provider = HeldPreviewProbe(previews: [first, second])
+        let store = UIKitViewerImageStore(thumbnailProvider: { _ in nil }, media: provider)
+        let tile = uid("reused-tile")
+
+        let early = Task { await store.displayImage(for: tile, maxPixelSize: 512) }
+        try await waitUntil { await provider.requests == 1 }
+        store.forget([tile])
+        await provider.release()
+        let earlyImage = await early.value
+        #expect(earlyImage == nil, "a load from before forget must not show the earlier picture")
+
+        let fresh = Task { await store.displayImage(for: tile, maxPixelSize: 512) }
+        try await waitUntil { await provider.requests == 2 }
+        await provider.release()
+        let freshImage = await fresh.value
+        #expect(freshImage != nil)
+        #expect(await provider.requests == 2, "nothing was kept from the earlier load")
     }
 
     @Test func livePhotoPreloadsMotionOnlyWhenItsPageBecomesCurrent() async throws {

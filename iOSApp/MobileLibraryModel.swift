@@ -1951,6 +1951,10 @@ final class MobileLibraryModel {
             photoBackup = controller
         }
 
+        func installIsolatedAlbumSyncForTesting(_ controller: AlbumSyncController) {
+            albumSync = controller
+        }
+
         /// Installs the real source runtime for bound-feed lifecycle regression tests.
         func installIsolatedSourceAnalysisForTests(_ runtime: LibrarySourceAnalysisRuntime) {
             sourceAnalysis.install(runtime)
