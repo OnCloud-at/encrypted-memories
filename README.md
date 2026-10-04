@@ -347,7 +347,9 @@ The test targets cover module and import boundaries, encrypted persistence, medi
 
 ## License
 
-Encrypted Memories is available under the permissive [MIT License](LICENSE). You may use, copy, modify, distribute, sublicense, and sell the original project source under its terms.
+Encrypted Memories is available under the [GNU Affero General Public License v3.0](LICENSE) (AGPL-3.0). You may use, study, modify, and share it. When you distribute a modified version, or offer it to users over a network, you must publish its complete source code under the same license.
+
+Releases up to and including 1.0.5 were published under the MIT License.
 
 The software is provided without warranty or a support obligation. Dependencies and optional model artifacts retain their respective license terms.
 
