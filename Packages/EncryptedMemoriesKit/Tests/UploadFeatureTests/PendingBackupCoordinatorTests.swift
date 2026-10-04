@@ -43,6 +43,8 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         checkmarkDuration: Duration = .seconds(60),
         uncheckedAdmissionLimit: Int = 64,
         replacementJournal: (any EditReplacementJournaling)? = nil,
+        identities: (any UploadIdentityStore)? = nil,
+        relations: (any UploadDuplicateChecking)? = nil,
         sourceKind: UploadSourceIdentity.Kind = .photoLibraryAsset,
         membershipInterval: Duration = .zero,
         sleep: @Sendable @escaping (Duration) async throws -> Void = { try await Task.sleep(for: $0) }
@@ -54,6 +56,8 @@ final class PendingBackupCoordinatorTests: XCTestCase {
             effects: effects,
             recorder: recorder,
             replacementJournal: replacementJournal,
+            identities: identities,
+            relations: relations,
             configuration: .init(
                 membershipInterval: membershipInterval,
                 progressInterval: .milliseconds(1),
@@ -131,9 +135,12 @@ final class PendingBackupCoordinatorTests: XCTestCase {
                     source: source(id), revision: edit, originalFilename: "\(id).heic", state: state, updatedAt: date)))
     }
 
-    private func makeJournalCoordinator() throws -> EditReplacementJournalFileStore {
+    private func makeJournalCoordinator(
+        identities: (any UploadIdentityStore)? = nil,
+        relations: (any UploadDuplicateChecking)? = nil
+    ) throws -> EditReplacementJournalFileStore {
         let journal = try XCTUnwrap(EditReplacementJournalFileStore(accountDataDirectory: directory))
-        coordinator = makeCoordinator(replacementJournal: journal)
+        coordinator = makeCoordinator(replacementJournal: journal, identities: identities, relations: relations)
         return journal
     }
 
@@ -1006,6 +1013,355 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         XCTAssertEqual(effects.order.suffix(2), ["restore", "return"])
     }
 
+    /// An edit uploads while its tile hides the earlier upload of this device. The tile of that upload retired,
+    /// so only the store still knows its handoff.
+    private func startPendingEdit(
+        earlierKind: PendingHandoffKind = .uploaded,
+        identities: (any UploadIdentityStore)? = FakeIdentityStore(),
+        relations: (any UploadDuplicateChecking)? = FakeChecker()
+    ) async throws {
+        await coordinator.close()
+        let journal = try makeJournalCoordinator(identities: identities, relations: relations)
+        try journal.addSuperseded(earlier, for: source("p"))
+        enqueue("p", state: .completed)
+        enqueueEdit("p", state: .uploading)
+        XCTAssertEqual(
+            store.recordHandoff(
+                PendingHandoff(key: key("p"), revision: revision, remote: earlier, kind: earlierKind, createdAt: date)),
+            .recorded)
+        XCTAssertTrue(store.acknowledgeHandoffs([(key("p"), revision)]))
+        recorder.recordUploadEvidence(source: source("p"), revision: edit, replaces: [earlier])
+        await coordinator.start()
+        await waitForSnapshot("the edit hides the earlier upload") { [earlier, edit] in
+            $0.tiles.first?.revision == edit && $0.tiles.first?.replaces == [earlier]
+        }
+    }
+
+    func testDeletingAnUnfinishedEditMovesTheHiddenEarlierUploadToTheTrash() async throws {
+        try await startPendingEdit()
+
+        await coordinator.exclude([key("p").localUID])
+
+        XCTAssertEqual(effects.trashed, [[earlier]], "the photo the person deleted is the earlier upload")
+        let state = try XCTUnwrap(store.sourceState(for: key("p")))
+        XCTAssertEqual(state.remote, earlier)
+        XCTAssertTrue(state.remoteTrashed)
+        let snapshot = await coordinator.currentSnapshot()
+        XCTAssertTrue(snapshot.tiles.isEmpty)
+    }
+
+    func testDeletingAnUnfinishedEditKeepsAnEarlierPhotoThatAnotherUploadOwns() async throws {
+        // The journal and the manifest would allow the trash; the handoff that the store keeps decides.
+        try await startPendingEdit(earlierKind: .deduplicated, identities: FakeIdentityStore())
+
+        await coordinator.exclude([key("p").localUID])
+
+        XCTAssertTrue(effects.trashed.isEmpty, "a mapped photo can belong to another photo of the library")
+        XCTAssertNil(store.sourceState(for: key("p"))?.remote)
+    }
+
+    /// An edit uploads weeks after the earlier upload, whose handoff the store pruned. Only the journal and the
+    /// tile name the earlier upload.
+    private func startPendingEditWithoutHandoff(
+        identities: (any UploadIdentityStore)?,
+        relations: (any UploadDuplicateChecking)? = FakeChecker()
+    ) async throws {
+        await coordinator.close()
+        let journal = try makeJournalCoordinator(identities: identities, relations: relations)
+        try journal.addSuperseded(earlier, for: source("p"))
+        enqueue("p", state: .completed)
+        enqueueEdit("p", state: .uploading)
+        XCTAssertTrue(store.latestHandoffs(for: [key("p")]).isEmpty)
+        recorder.recordUploadEvidence(source: source("p"), revision: edit, replaces: [earlier])
+        await coordinator.start()
+        await waitForSnapshot("the edit hides the earlier upload") { [earlier, edit] in
+            $0.tiles.first?.revision == edit && $0.tiles.first?.replaces == [earlier]
+        }
+    }
+
+    private func identityRow(_ id: String, linkID: String) -> UploadIdentityRecord {
+        UploadIdentityRecord(
+            source: source(id), filename: "\(id).heic", correctedName: "\(id).heic", fileSize: 1,
+            modificationDate: date, sha1Hex: "sha-\(id)", nameHash: "name-\(id)", contentHash: "content-\(id)",
+            hashKeyEpoch: "epoch", remoteVolumeID: earlier.volumeID, remoteLinkID: linkID,
+            outcome: UploadIdentityManifestStore.Outcome.uploaded.rawValue, updatedAt: date)
+    }
+
+    // Mutation: return nil instead of `newestEarlierMain` when the store has no handoff; nothing is trashed.
+    // Mutation: skip `forgetRemoteLinks` in `exclude`; the manifest keeps the trashed photo.
+    func testDeletingAnEditWithoutAHandoffMovesTheEarlierUploadOfTheJournalToTheTrash() async throws {
+        let identities = FakeIdentityStore()
+        identities.upsert(identityRow("p", linkID: earlier.nodeID))
+        try await startPendingEditWithoutHandoff(identities: identities)
+
+        await coordinator.exclude([key("p").localUID])
+
+        XCTAssertEqual(effects.trashed, [[earlier]], "the photo the person deleted is the earlier upload")
+        let state = try XCTUnwrap(store.sourceState(for: key("p")))
+        XCTAssertEqual(state.remote, earlier)
+        XCTAssertTrue(state.remoteTrashed)
+        XCTAssertNil(
+            identities.record(for: source("p"))?.remoteLinkID,
+            "a return to the backup must not count the trashed photo as the backup of the source")
+    }
+
+    // Mutation: drop the `isNeededElsewhere` guard in `hiddenEarlierUpload`; the delete records the shared photo.
+    func testDeletingAnEditWithoutAHandoffKeepsAnEarlierUploadThatAnotherSourceNeeds() async throws {
+        let identities = FakeIdentityStore()
+        identities.upsert(identityRow("duplicate", linkID: earlier.nodeID))
+        try await startPendingEditWithoutHandoff(identities: identities)
+
+        await coordinator.exclude([key("p").localUID])
+
+        XCTAssertTrue(effects.trashed.isEmpty, "a duplicate in Photos still counts the photo as its backup")
+        XCTAssertNil(store.sourceState(for: key("p"))?.remote)
+        XCTAssertEqual(store.sourceState(for: key("p"))?.desired, .excluded)
+    }
+
+    // Mutation: let `isNeededElsewhere` return false for an unknown lookup; the delete records the photo.
+    func testDeletingAnEditWithoutAHandoffKeepsTheEarlierUploadWhenTheManifestCannotTell() async throws {
+        try await startPendingEditWithoutHandoff(identities: UnreadableIdentityStore())
+
+        await coordinator.exclude([key("p").localUID])
+
+        XCTAssertTrue(effects.trashed.isEmpty)
+        XCTAssertNil(store.sourceState(for: key("p"))?.remote)
+        XCTAssertEqual(store.sourceState(for: key("p"))?.desired, .excluded)
+    }
+
+    // Mutation: return nil from `newestEarlierMain`; the restore has no photo to bring back.
+    func testRestoringAnEditWithoutAHandoffBringsTheEarlierUploadBack() async throws {
+        try await startPendingEditWithoutHandoff(identities: FakeIdentityStore())
+        await coordinator.exclude([key("p").localUID])
+
+        await coordinator.restore([key("p").localUID])
+
+        XCTAssertEqual(effects.restored, [[earlier]])
+        XCTAssertEqual(effects.order.suffix(2), ["restore", "return"])
+        XCTAssertEqual(effects.returned, [[key("p")]])
+    }
+
+    // Mutation: drop the source-state lookup in `restoreSources(ofRemote:)`; the source stays deleted.
+    func testRestoringTheEarlierUploadFromTheProtonTrashRestoresAnEditWithoutAHandoff() async throws {
+        try await startPendingEditWithoutHandoff(identities: FakeIdentityStore())
+        await coordinator.exclude([key("p").localUID])
+
+        await coordinator.restoreSources(ofRemote: [earlier])
+
+        XCTAssertNotEqual(store.sourceState(for: key("p"))?.desired, .excluded)
+        XCTAssertEqual(effects.returned, [[key("p")]])
+    }
+
+    func testAnEditThatCommitsAfterItsDeleteFollowsTheEarlierUploadToTheTrash() async throws {
+        try await startPendingEdit()
+        await coordinator.exclude([key("p").localUID])
+        XCTAssertEqual(effects.trashed, [[earlier]])
+
+        let committed = PhotoUID(volumeID: "vol", nodeID: "link-edit")
+        let outcome = recorder.recordHandoff(source: source("p"), revision: edit, remote: committed, kind: .uploaded)
+        XCTAssertEqual(outcome, .excludedRemoteNeedsTrash)
+        let deadline = ContinuousClock.now + .seconds(5)
+        while effects.trashed.count < 2, ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(5)) }
+        XCTAssertEqual(effects.trashed, [[earlier], [committed]])
+    }
+
+    // Mutation: return the handoff's photo in `hiddenEarlierUpload` before the `isNeededElsewhere` guard.
+    func testDeletingAnUnfinishedEditKeepsAHandedOffEarlierUploadThatAnotherSourceNeeds() async throws {
+        let identities = FakeIdentityStore()
+        identities.upsert(identityRow("duplicate", linkID: earlier.nodeID))
+        try await startPendingEdit(identities: identities)
+
+        await coordinator.exclude([key("p").localUID])
+
+        XCTAssertTrue(effects.trashed.isEmpty, "a duplicate in Photos still counts the photo as its backup")
+        XCTAssertNil(store.sourceState(for: key("p"))?.remote)
+        XCTAssertEqual(store.sourceState(for: key("p"))?.desired, .excluded)
+    }
+
+    // Mutation: return the handoff's photo in `hiddenEarlierUpload` before the `isNeededElsewhere` guard.
+    func testDeletingAnUnfinishedEditKeepsAHandedOffEarlierUploadWhenTheManifestCannotTell() async throws {
+        try await startPendingEdit(identities: UnreadableIdentityStore())
+
+        await coordinator.exclude([key("p").localUID])
+
+        XCTAssertTrue(effects.trashed.isEmpty)
+        XCTAssertNil(store.sourceState(for: key("p"))?.remote)
+    }
+
+    // Mutation: check only `[target.nodeID]` in `hiddenEarlierUpload`; the shared related file is trashed.
+    func testDeletingAnEditKeepsTheEarlierUploadWhenARelatedFileIsAnotherSourcesBackup() async throws {
+        let identities = FakeIdentityStore()
+        identities.upsert(identityRow("duplicate", linkID: "link-related"))
+        let relations = FakeChecker()
+        relations.relatedLinkIDsByMainLinkID[earlier.nodeID] = ["link-related"]
+        try await startPendingEdit(identities: identities, relations: relations)
+
+        await coordinator.exclude([key("p").localUID])
+
+        XCTAssertTrue(effects.trashed.isEmpty, "the trash would take the related file of another photo with it")
+        let state = try XCTUnwrap(store.sourceState(for: key("p")))
+        XCTAssertEqual(state.desired, .excluded)
+        XCTAssertNil(state.remote, "the delete records no photo for the trash")
+        XCTAssertFalse(state.needsRemoteTrash)
+    }
+
+    // Mutation: treat a failed lookup in `hiddenEarlierUpload` as no related files; the photo is trashed.
+    func testDeletingAnEditKeepsTheEarlierUploadWhenTheRelatedFilesCannotBeRead() async throws {
+        let relations = FakeChecker()
+        relations.relatedLookupError = URLError(.notConnectedToInternet)
+        try await startPendingEdit(relations: relations)
+
+        await coordinator.exclude([key("p").localUID])
+
+        XCTAssertTrue(effects.trashed.isEmpty)
+        let state = try XCTUnwrap(store.sourceState(for: key("p")))
+        XCTAssertEqual(state.desired, .excluded)
+        XCTAssertNil(state.remote, "an unknown related file keeps the photo instead of deferring the delete")
+        XCTAssertFalse(state.needsRemoteTrash)
+        XCTAssertEqual(relations.relatedLookups, [earlier.nodeID], "one lookup, no retry")
+    }
+
+    // Mutation: drop the action token check in `exclude`; the held delete deletes the restored photo again.
+    func testARestoreDuringTheLookupOfADeleteStands() async throws {
+        let identities = FakeIdentityStore()
+        identities.upsert(identityRow("p", linkID: earlier.nodeID))
+        let relations = FakeChecker()
+        let gate = LookupGate()
+        relations.relatedLookupGate = { await gate.pass() }
+        try await startPendingEdit(identities: identities, relations: relations)
+        let coordinator: PendingBackupCoordinator = self.coordinator
+        let uid = key("p").localUID
+        let held = Task { await coordinator.exclude([uid]) }
+        await gate.entered()
+
+        let deleted = await coordinator.exclude([uid])
+        XCTAssertTrue(deleted)
+        XCTAssertEqual(effects.trashed, [[earlier]])
+        let restored = await coordinator.restore([uid])
+        XCTAssertTrue(restored)
+        gate.open()
+        let heldResult = await held.value
+
+        XCTAssertTrue(heldResult)
+        XCTAssertNotEqual(store.sourceState(for: key("p"))?.desired, .excluded, "the restore is the last decision")
+        XCTAssertEqual(effects.trashed, [[earlier]], "the restored photo stays")
+        XCTAssertEqual(effects.restored, [[earlier]])
+    }
+
+    // Mutation: forget the links in `hiddenEarlierUpload` again; the abandoned delete erases the manifest row.
+    func testADeleteThatEndsDuringItsLookupKeepsTheManifest() async throws {
+        let identities = FakeIdentityStore()
+        identities.upsert(identityRow("p", linkID: earlier.nodeID))
+        let relations = FakeChecker()
+        let gate = LookupGate()
+        relations.relatedLookupGate = { await gate.pass() }
+        try await startPendingEdit(identities: identities, relations: relations)
+        let coordinator: PendingBackupCoordinator = self.coordinator
+        let uid = key("p").localUID
+        let held = Task { await coordinator.exclude([uid]) }
+        await gate.entered()
+
+        await coordinator.close()
+        gate.open()
+        let heldResult = await held.value
+
+        XCTAssertFalse(heldResult)
+        XCTAssertEqual(identities.record(for: source("p"))?.remoteLinkID, earlier.nodeID)
+        XCTAssertNotEqual(store.sourceState(for: key("p"))?.desired, .excluded)
+        XCTAssertTrue(effects.trashed.isEmpty)
+    }
+
+    // Mutation: drop the `keepRemote` call in `exclude`; the photo goes to the trash while the manifest counts it.
+    func testDeletingAnEditKeepsTheEarlierUploadWhenTheManifestCannotForgetIt() async throws {
+        let identities = FakeIdentityStore()
+        identities.upsert(identityRow("p", linkID: earlier.nodeID))
+        identities.rejectNextForget()
+        try await startPendingEdit(identities: identities)
+
+        await coordinator.exclude([key("p").localUID])
+
+        XCTAssertTrue(effects.trashed.isEmpty)
+        XCTAssertEqual(identities.record(for: source("p"))?.remoteLinkID, earlier.nodeID)
+        let state = try XCTUnwrap(store.sourceState(for: key("p")))
+        XCTAssertEqual(state.desired, .excluded)
+        XCTAssertNil(state.remote, "the delete keeps the photo instead of deferring")
+        XCTAssertFalse(state.needsRemoteTrash)
+        XCTAssertTrue(state.listedInTrash)
+    }
+
+    // Mutation: drop the early return for a pending trash in `PendingBackupManifestStore.recordHandoff`; the
+    // commit takes over the state's photo, and the earlier upload never goes to the trash.
+    func testAnEditThatCommitsBeforeTheEarlierTrashIsSentTrashesBothPhotos() async throws {
+        let committed = PhotoUID(volumeID: "vol", nodeID: "link-edit")
+        let commit = PendingHandoff(key: key("p"), revision: edit, remote: committed, kind: .uploaded, createdAt: date)
+        let manifest = try XCTUnwrap(store)
+        try await startPendingEdit()
+        // The edit commits after the delete is stored and before the trash of the earlier upload is sent.
+        effects.onVolumeLookup = { _ = manifest.recordHandoff(commit) }
+
+        await coordinator.exclude([key("p").localUID])
+
+        let deadline = ContinuousClock.now + .seconds(5)
+        while effects.trashed.count < 2, ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(5)) }
+        XCTAssertEqual(effects.trashed, [[earlier], [committed]])
+        let state = try XCTUnwrap(store.sourceState(for: key("p")))
+        XCTAssertEqual(state.remote, committed)
+        XCTAssertTrue(state.remoteTrashed)
+        XCTAssertFalse(state.needsRemoteTrash)
+    }
+
+    /// Only the earlier upload of a deleted edit needs the related-files check. The delete of an uploaded photo
+    /// trashes it as before, even when another source shares it, and asks the server nothing.
+    /// Mutation: check the related files before every trash in `performRemote`; the server is asked, and the shared
+    /// photo stays.
+    func testDeletingAnUploadedPhotoMakesNoRelatedLookup() async throws {
+        await coordinator.close()
+        let identities = FakeIdentityStore()
+        identities.upsert(identityRow("duplicate", linkID: "link-sent"))
+        let relations = FakeChecker()
+        _ = try makeJournalCoordinator(identities: identities, relations: relations)
+        enqueue("sent", state: .uploading)
+        await coordinator.start()
+        recorder.recordHandoff(
+            source: source("sent"), revision: revision, remote: PhotoUID(volumeID: "", nodeID: "link-sent"),
+            kind: .uploaded)
+        await waitForSnapshot("handoff known") { $0.tiles.first?.handoff != nil }
+
+        await coordinator.exclude([PhotoUID(localPending: .photoLibrary, identifier: "sent")])
+
+        XCTAssertEqual(effects.trashed, [[PhotoUID(volumeID: "photos-volume", nodeID: "link-sent")]])
+        XCTAssertEqual(store.sourceState(for: key("sent"))?.remoteTrashed, true)
+        XCTAssertTrue(relations.relatedLookups.isEmpty, "an ordinary delete makes no server call per photo")
+    }
+
+    func testRestoringADeletedEditBringsTheEarlierUploadBackBeforeTheBackupSeesIt() async throws {
+        try await startPendingEdit()
+        await coordinator.exclude([key("p").localUID])
+
+        await coordinator.restore([key("p").localUID])
+
+        XCTAssertEqual(effects.restored, [[earlier]])
+        XCTAssertEqual(effects.order.suffix(2), ["restore", "return"])
+        XCTAssertEqual(effects.returned, [[key("p")]])
+    }
+
+    func testRestoringAfterAnUndoInPhotosBringsTheEarlierUploadBack() async throws {
+        try await startPendingEdit()
+        await coordinator.exclude([key("p").localUID])
+
+        // The person reverts the edit in Photos while the photo is deleted in the app.
+        let undo = UploadBackupRevision(rawValue: edit.rawValue + 1)
+        XCTAssertTrue(
+            queue.upsert(
+                UploadBackupSyncQueueEntry(
+                    source: source("p"), revision: undo, originalFilename: "p.heic", state: .discovered,
+                    updatedAt: date)))
+        await coordinator.restore([key("p").localUID])
+
+        XCTAssertEqual(effects.restored, [[earlier]], "the earlier upload holds the reverted bytes again")
+        XCTAssertEqual(effects.order.suffix(2), ["restore", "return"])
+    }
+
     func testRetryableActionFailureKeepsTheAction() async throws {
         enqueue("album", state: .uploading)
         effects.albumResult = .retry
@@ -1053,6 +1409,7 @@ private final class FakePendingEffects: PendingBackupEffects, @unchecked Sendabl
     private var _removed: [[String]] = []
     private var _returned: [[PendingSourceKey]] = []
     private var _trashed: [[PhotoUID]] = []
+    private var _restored: [[PhotoUID]] = []
     private var _favorites: [PhotoUID] = []
     private var _removeSucceeds = true
     private var _albumResult = PendingEffectResult.done
@@ -1064,6 +1421,7 @@ private final class FakePendingEffects: PendingBackupEffects, @unchecked Sendabl
     var removed: [[String]] { lock.withLock { _removed } }
     var returned: [[PendingSourceKey]] { lock.withLock { _returned } }
     var trashed: [[PhotoUID]] { lock.withLock { _trashed } }
+    var restored: [[PhotoUID]] { lock.withLock { _restored } }
     var favorites: [PhotoUID] { lock.withLock { _favorites } }
     var removeSucceeds: Bool {
         get { lock.withLock { _removeSucceeds } }
@@ -1094,7 +1452,21 @@ private final class FakePendingEffects: PendingBackupEffects, @unchecked Sendabl
         return true
     }
 
-    func photosVolumeID() async -> String? { "photos-volume" }
+    /// Runs once at the next volume lookup, which comes after a delete is stored and before its trash is sent.
+    var onVolumeLookup: (@Sendable () -> Void)? {
+        get { lock.withLock { _onVolumeLookup } }
+        set { lock.withLock { _onVolumeLookup = newValue } }
+    }
+    private var _onVolumeLookup: (@Sendable () -> Void)?
+
+    func photosVolumeID() async -> String? {
+        let hook = lock.withLock {
+            defer { _onVolumeLookup = nil }
+            return _onVolumeLookup
+        }
+        hook?()
+        return "photos-volume"
+    }
 
     func trashRemote(_ uids: [PhotoUID]) async -> PendingBatchEffectResult {
         lock.withLock {
@@ -1105,7 +1477,10 @@ private final class FakePendingEffects: PendingBackupEffects, @unchecked Sendabl
     }
 
     func restoreRemote(_ uids: [PhotoUID]) async -> PendingBatchEffectResult {
-        lock.withLock { _order.append("restore") }
+        lock.withLock {
+            _restored.append(uids)
+            _order.append("restore")
+        }
         return .done
     }
 
@@ -1187,6 +1562,49 @@ private final class CountingPendingQueue: UploadBackupSyncQueueObserving, @unche
         lock.withLock { reads += identifiers.count }
         return pending.filter { identifiers.contains($0.source.identifier) }
     }
+}
+
+/// Holds the first related-files lookup until the test opens the gate; later lookups pass.
+private final class LookupGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var holds = 1
+    private let enteredStream: AsyncStream<Void>
+    private let enteredContinuation: AsyncStream<Void>.Continuation
+    private let openStream: AsyncStream<Void>
+    private let openContinuation: AsyncStream<Void>.Continuation
+
+    init() {
+        (enteredStream, enteredContinuation) = AsyncStream.makeStream(of: Void.self)
+        (openStream, openContinuation) = AsyncStream.makeStream(of: Void.self)
+    }
+
+    func pass() async {
+        let held = lock.withLock { () -> Bool in
+            defer { holds -= 1 }
+            return holds > 0
+        }
+        guard held else { return }
+        enteredContinuation.yield()
+        for await _ in openStream { return }
+    }
+
+    /// Returns once the held lookup waits at the gate.
+    func entered() async {
+        for await _ in enteredStream { return }
+    }
+
+    func open() {
+        openContinuation.finish()
+    }
+}
+
+/// An identity manifest that cannot tell which sources name a remote photo.
+private struct UnreadableIdentityStore: UploadIdentityStore {
+    func record(for source: UploadSourceIdentity) -> UploadIdentityRecord? { nil }
+    func trustedRecords(contentHash: String, hashKeyEpoch: String, limit: Int) -> [UploadIdentityRecord] { [] }
+    func upsert(_ record: UploadIdentityRecord) -> Bool { false }
+    func sources(withRemoteLinkID linkID: String) -> [UploadSourceIdentity]? { nil }
+    func forgetRemoteLinks(_ linkIDs: Set<String>, of source: UploadSourceIdentity) -> Bool { false }
 }
 
 private final class CountingPendingJournal: EditReplacementJournaling, @unchecked Sendable {

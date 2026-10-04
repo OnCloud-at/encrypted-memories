@@ -140,6 +140,11 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
                 else { return false }
                 guard let state = sourceStateLocked(handoff.key), state.desired == .excluded else { return true }
                 outcome = .excludedRemoteNeedsTrash
+                // The delete of an unfinished edit still owes the trash of the earlier upload. That photo stays the
+                // state's photo; its completed trash moves on to this handoff, see `completeEffect`.
+                if state.needsRemoteTrash, let pending = state.remote, pending.nodeID != handoff.remote.nodeID {
+                    return true
+                }
                 return execute(
                     """
                     UPDATE source_state
@@ -182,24 +187,27 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
         return lock.withLock {
             var result: [PendingSourceKey: PendingHandoff] = [:]
             for key in keys {
-                var stmt: OpaquePointer?
-                guard
-                    prepare(
-                        """
-                        SELECT source_kind, source_id, revision_us, remote_volume_id, remote_link_id, kind,
-                               created_at, acknowledged
-                        FROM handoff WHERE source_kind=? AND source_id=?
-                        ORDER BY created_at DESC, revision_us DESC LIMIT 1;
-                        """, &stmt)
-                else { return result }
-                bindKey(stmt, key)
-                if sqlite3_step(stmt) == SQLITE_ROW, let handoff = handoffRow(stmt) {
-                    result[key] = handoff
-                }
-                sqlite3_finalize(stmt)
+                result[key] = latestHandoffLocked(key)
             }
             return result
         }
+    }
+
+    private func latestHandoffLocked(_ key: PendingSourceKey) -> PendingHandoff? {
+        var stmt: OpaquePointer?
+        guard
+            prepare(
+                """
+                SELECT source_kind, source_id, revision_us, remote_volume_id, remote_link_id, kind,
+                       created_at, acknowledged
+                FROM handoff WHERE source_kind=? AND source_id=?
+                ORDER BY created_at DESC, revision_us DESC LIMIT 1;
+                """, &stmt)
+        else { return nil }
+        defer { sqlite3_finalize(stmt) }
+        bindKey(stmt, key)
+        guard sqlite3_step(stmt) == SQLITE_ROW else { return nil }
+        return handoffRow(stmt)
     }
 
     /// The handoff whose Proton photo is `remote`, for a restore from the Proton trash.
@@ -235,7 +243,7 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
     @discardableResult
     public func pruneAcknowledgedHandoffs(olderThan cutoff: Date) -> Bool {
         lock.withLock {
-            // An unfinished action still needs its source's Proton photo.
+            // An unfinished action still needs its source's Proton photo, and so does an unfinished trash.
             execute(
                 """
                 DELETE FROM handoff
@@ -243,6 +251,11 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
                   AND NOT EXISTS (
                     SELECT 1 FROM pending_action a
                     WHERE a.source_kind=handoff.source_kind AND a.source_id=handoff.source_id AND a.failed=0
+                  )
+                  AND NOT EXISTS (
+                    SELECT 1 FROM source_state s
+                    WHERE s.source_kind=handoff.source_kind AND s.source_id=handoff.source_id
+                      AND s.needs_remote_trash=1
                   );
                 """
             ) { sqlite3_bind_double($0, 1, cutoff.timeIntervalSince1970) }
@@ -324,10 +337,10 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
             let committed = transaction {
                 for request in requests {
                     let previous = sourceStateLocked(request.key)
-                    // A commit whose event has not reached the coordinator yet is already durable here.
-                    let durable =
-                        request.remote == nil
-                        ? request.revision.flatMap { handoffLocked(request.key, revision: $0)?.remote } : nil
+                    // A commit of the deleted revision is already durable here, even when its event has not reached
+                    // the coordinator yet. The earlier upload that the coordinator sends for an edit goes first: the
+                    // completed trash of that photo moves on to the latest handoff, see `completeEffect`.
+                    let durable = request.revision.flatMap { handoffLocked(request.key, revision: $0)?.remote }
                     let remote = request.remote ?? durable ?? previous?.remote
                     // A photo that this path trashed stays trashed, unless a restore of it may already have
                     // happened. Otherwise a known remote photo must go to the Proton trash.
@@ -379,6 +392,43 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
         }
     }
 
+    /// Takes back the trash of `remote` that `exclude` wrote for `generation`, so that photo stays: the delete of an
+    /// unfinished edit chose an earlier upload, and the identity manifest could not give it up. A commit of the
+    /// deleted revision still goes to the trash. Returns the current state, or nil when the write failed.
+    public func keepRemote(
+        _ remote: PhotoUID,
+        of key: PendingSourceKey,
+        generation: Int64,
+        revision: UploadBackupRevision?,
+        at date: Date
+    ) -> PendingSourceState? {
+        lock.withLock {
+            let durable = revision.flatMap { handoffLocked(key, revision: $0)?.remote }
+            guard
+                execute(
+                    """
+                    UPDATE source_state
+                    SET needs_remote_trash=?, remote_volume_id=?, remote_link_id=?, remote_trashed=0, listed_in_trash=?,
+                        updated_at=?
+                    WHERE source_kind=? AND source_id=? AND generation=? AND desired='excluded' AND needs_remote_trash=1
+                      AND remote_op IS NULL AND remote_link_id=?;
+                    """,
+                    bind: { stmt in
+                        sqlite3_bind_int(stmt, 1, durable == nil ? 0 : 1)
+                        bindOptionalText(stmt, 2, durable?.volumeID)
+                        bindOptionalText(stmt, 3, durable?.nodeID)
+                        // Like `exclude`: a state without a photo for the trash lists its entry in "Zuletzt gelöscht".
+                        sqlite3_bind_int(stmt, 4, durable == nil ? 1 : 0)
+                        sqlite3_bind_double(stmt, 5, date.timeIntervalSince1970)
+                        bindKey(stmt, key, from: 6)
+                        sqlite3_bind_int64(stmt, 8, generation)
+                        bindText(stmt, 9, remote.nodeID)
+                    })
+            else { return nil }
+            return sourceStateLocked(key)
+        }
+    }
+
     /// Writes desired = included for excluded sources in one transaction and returns the new states.
     /// Sources without a row were never excluded and are skipped.
     public func include(_ keys: [PendingSourceKey], at date: Date) -> [PendingSourceState]? {
@@ -419,24 +469,33 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
     /// Marks one effect done for the generation that performed it. A completion always re-reads the current
     /// desired state: a trash that finishes after a restore schedules the remote restore, and a restore that
     /// finishes after a new delete schedules the trash again. Stale generations therefore never undo a newer
-    /// decision. An included source without due effects is deleted.
+    /// decision. An included source without due effects is deleted. `remoteLinkID` names the photo that the
+    /// effect handled; a trash of a photo that a later commit replaced leaves the trash of the new photo due.
+    /// A finished trash of an excluded source moves on to its latest handoff when that names another photo: the
+    /// edit of a deleted photo can commit before the trash of the earlier upload is sent.
     @discardableResult
     public func completeEffect(
         _ effect: PendingSourceEffect,
         for key: PendingSourceKey,
         generation: Int64,
+        remoteLinkID: String? = nil,
         at date: Date
     ) -> Bool {
         lock.withLock {
             transaction {
                 guard let state = sourceStateLocked(key) else { return true }
                 var sql: String
+                var movesOn = false
                 switch effect {
                 case .queueSync:
                     // A newer generation wrote its own queue sync request; keep it.
                     guard state.generation == generation else { return true }
                     sql = "UPDATE source_state SET needs_queue_sync=0, attempts=0, updated_at=?"
+                case .remoteTrash where remoteLinkID != nil && remoteLinkID != state.remote?.nodeID:
+                    // A later decision chose another photo for the trash; that trash stays due.
+                    sql = "UPDATE source_state SET remote_op=NULL, attempts=0, updated_at=?"
                 case .remoteTrash:
+                    movesOn = true
                     sql = """
                         UPDATE source_state SET needs_remote_trash=0, remote_trashed=1, listed_in_trash=0, remote_op=NULL,
                           needs_remote_restore=CASE WHEN desired='included' THEN 1 ELSE 0 END, attempts=0, updated_at=?
@@ -454,6 +513,26 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
                     bindKey(stmt, key, from: 2)
                 }
                 guard updated else { return false }
+                if movesOn, state.desired == .excluded, let latest = latestHandoffLocked(key),
+                    latest.remote.nodeID != state.remote?.nodeID
+                {
+                    guard
+                        execute(
+                            """
+                            UPDATE source_state
+                            SET needs_remote_trash=1, needs_remote_restore=0, remote_volume_id=?, remote_link_id=?,
+                                remote_trashed=0, listed_in_trash=0, attempts=0, next_attempt_at=?, updated_at=?
+                            WHERE source_kind=? AND source_id=? AND desired='excluded';
+                            """,
+                            bind: { stmt in
+                                bindText(stmt, 1, latest.remote.volumeID)
+                                bindText(stmt, 2, latest.remote.nodeID)
+                                sqlite3_bind_double(stmt, 3, date.timeIntervalSince1970)
+                                sqlite3_bind_double(stmt, 4, date.timeIntervalSince1970)
+                                bindKey(stmt, key, from: 5)
+                            })
+                    else { return false }
+                }
                 return execute(
                     """
                     DELETE FROM source_state

@@ -56,6 +56,10 @@ public actor PendingBackupCoordinator {
     private let recorder: PendingBackupEventRecorder?
     /// The earlier uploads of edited photo-library sources. Nil when edits keep their earlier uploads.
     private let replacementJournal: (any EditReplacementJournaling)?
+    /// Tells whether another local source counts an earlier upload as its backup. Nil when that is unknown.
+    private let identities: (any UploadIdentityStore)?
+    /// Names the related files that move to the Proton trash with a main photo. Nil when that is unknown.
+    private let relations: (any UploadDuplicateChecking)?
     private let configuration: Configuration
     private let now: @Sendable () -> Date
     private let sleep: @Sendable (Duration) async throws -> Void
@@ -79,6 +83,8 @@ public actor PendingBackupCoordinator {
     private var liveProgress: [PendingSourceKey: (revision: UploadBackupRevision, step: Int)] = [:]
     private var retiring: [PendingSourceKey: UploadBackupRevision] = [:]
     private var actions: [PendingAction] = []
+    /// The newest delete or restore of each source, see `nextActionToken(for:)`.
+    private var actionTokens: [PendingSourceKey: UInt64] = [:]
     private var excludedAccessible = Set<PendingSourceKey>() {
         didSet { excludedListsCache = nil }
     }
@@ -129,6 +135,8 @@ public actor PendingBackupCoordinator {
         effects: any PendingBackupEffects,
         recorder: PendingBackupEventRecorder?,
         replacementJournal: (any EditReplacementJournaling)? = nil,
+        identities: (any UploadIdentityStore)? = nil,
+        relations: (any UploadDuplicateChecking)? = nil,
         configuration: Configuration = Configuration(),
         now: @Sendable @escaping () -> Date = { Date() },
         sleep: @Sendable @escaping (Duration) async throws -> Void = { try await Task.sleep(for: $0) }
@@ -139,6 +147,8 @@ public actor PendingBackupCoordinator {
         self.effects = effects
         self.recorder = recorder
         self.replacementJournal = replacementJournal
+        self.identities = identities
+        self.relations = relations
         self.configuration = configuration
         self.now = now
         self.sleep = sleep
@@ -229,24 +239,108 @@ public actor PendingBackupCoordinator {
         guard !closed else { return false }
         let keys = uids.compactMap(PendingSourceKey.init(localUID:))
         guard !keys.isEmpty else { return true }
-        let requests = keys.map { key in
+        let tokens = Dictionary(keys.map { ($0, nextActionToken(for: $0)) }, uniquingKeysWith: { _, last in last })
+        var requests: [PendingExclusionRequest] = []
+        var earlierLinks: [PendingSourceKey: Set<String>] = [:]
+        for key in keys {
             let revision = tilesByKey[key]?.revision ?? rows[key]?.revision
-            return PendingExclusionRequest(
-                key: key,
-                presentation: metadata[key],
-                remote: handoffs[key].flatMap { $0.revision == revision ? $0.remote : nil },
-                revision: revision
-            )
+            var remote = handoffs[key].flatMap { $0.revision == revision ? $0.remote : nil }
+            if remote == nil {
+                let earlier = await hiddenEarlierUpload(of: key, before: revision)
+                guard !closed else { return false }
+                remote = earlier?.target
+                earlierLinks[key] = earlier?.links
+            }
+            requests.append(
+                PendingExclusionRequest(key: key, presentation: metadata[key], remote: remote, revision: revision))
         }
-        guard let states = store.exclude(requests, at: now()) else { return false }
+        // A delete or restore of the same source during a lookup is the person's later decision, and it stands.
+        requests.removeAll { actionTokens[$0.key] != tokens[$0.key] }
+        guard !requests.isEmpty else { return true }
+        let date = now()
+        guard var states = store.exclude(requests, at: date) else { return false }
+        // The manifest gives up the earlier upload only after the delete is stored. When it cannot, the photo stays.
+        for request in requests {
+            guard let links = earlierLinks[request.key], let target = request.remote,
+                let index = states.firstIndex(where: { $0.key == request.key }),
+                identities?.forgetRemoteLinks(
+                    links, of: UploadSourceIdentity(kind: request.key.kind, identifier: request.key.identifier))
+                    != true,
+                states[index].needsRemoteTrash,
+                let kept = store.keepRemote(
+                    target, of: request.key, generation: states[index].generation, revision: request.revision, at: date)
+            else { continue }
+            states[index] = kept
+        }
+        let excluded = requests.map(\.key)
         recorder?.replacementLedger.dropSources(requests.map { ($0.key, $0.revision) })
         for state in states { sourceStates[state.key] = state }
-        dirty.formUnion(keys)
-        excludedAccessible.formUnion(keys.filter { metadata[$0] != nil })
+        dirty.formUnion(excluded)
+        excludedAccessible.formUnion(excluded.filter { metadata[$0] != nil })
         listsDirty = true
         publishMembership(force: true)
         await reconcile()
         return true
+    }
+
+    /// The earlier upload that the tile of an unfinished edit hides. Deleting the tile deletes the photo, so that
+    /// upload goes to the Proton trash as the person's deletion. Only this device's own upload of the source
+    /// qualifies. The handoff of an earlier revision is acknowledged and no longer in memory, so the store answers.
+    /// The store prunes acknowledged handoffs after `acknowledgedHandoffRetention`, and edits usually come later;
+    /// without a handoff, the journal names the earlier uploads of the source.
+    ///
+    /// The trash moves the photo with its related files, so none of them may be another local source's backup.
+    /// The earlier photo stays when another source counts one of them as its backup, and when the identity manifest
+    /// or the server cannot name them. The photo is active, because the journal superseded it and the tile hides
+    /// it, so the server can answer; a failed lookup keeps the photo and never defers the delete. The lookup changes
+    /// nothing: `exclude` lets the manifest forget the returned links once the delete is stored, so a return of the
+    /// source to the backup does not count them as its backup.
+    private func hiddenEarlierUpload(
+        of key: PendingSourceKey,
+        before revision: UploadBackupRevision?
+    ) async -> (target: PhotoUID, links: Set<String>)? {
+        guard let revision, let tile = tilesByKey[key], tile.revision == revision else { return nil }
+        let hidden = Set(tile.replaces.map(\.nodeID))
+        guard !hidden.isEmpty, let identities, let relations else { return nil }
+        let target: PhotoUID?
+        if let earlier = store.latestHandoffs(for: [key])[key] {
+            target =
+                earlier.kind == .uploaded && earlier.revision < revision && hidden.contains(earlier.remote.nodeID)
+                ? earlier.remote : nil
+        } else {
+            target = newestEarlierMain(of: key, among: tile.replaces)
+        }
+        guard let target,
+            let related = try? await relations.relatedPhotoLinkIDs(ofMainLinkID: target.nodeID)
+        else { return nil }
+        // The tile can change during the lookup; only the photo that it still hides is the person's deletion.
+        guard let current = tilesByKey[key], current.revision == revision,
+            current.replaces.contains(where: { $0.nodeID == target.nodeID })
+        else { return nil }
+        let source = UploadSourceIdentity(kind: key.kind, identifier: key.identifier)
+        let links = related.union([target.nodeID])
+        guard !identities.isNeededElsewhere(links, by: source) else { return nil }
+        return (target, links)
+    }
+
+    /// Starts a new person action for `key`. A delete that awaits a lookup drops its decision for the source when
+    /// a later delete or restore of the source took a newer token meanwhile.
+    private func nextActionToken(for key: PendingSourceKey) -> UInt64 {
+        actionTokens[key, default: 0] &+= 1
+        return actionTokens[key, default: 0]
+    }
+
+    /// The newest photo among `hidden` that the journal still names as an earlier main of the source: the backup
+    /// has not trashed it, and the person has not either. A target that only the remote index found is not proven
+    /// to be this source's photo.
+    private func newestEarlierMain(of key: PendingSourceKey, among hidden: [PhotoUID]) -> PhotoUID? {
+        guard key.kind == .photoLibraryAsset, let replacementJournal else { return nil }
+        let mains = replacementJournal.entry(for: UploadSourceIdentity(kind: key.kind, identifier: key.identifier))
+            .superseded
+        guard let newest = hidden.last(where: { uid in mains.contains { $0.nodeID == uid.nodeID } }) else {
+            return nil
+        }
+        return mains.last { $0.nodeID == newest.nodeID }
     }
 
     /// Restores deleted or excluded pending photos: they return to the backup and to the grid. A Proton
@@ -256,6 +350,7 @@ public actor PendingBackupCoordinator {
         guard !closed else { return false }
         let keys = uids.compactMap(PendingSourceKey.init(localUID:))
         guard !keys.isEmpty else { return true }
+        for key in keys { _ = nextActionToken(for: key) }
         guard let states = store.include(keys, at: now()) else { return false }
         // Only the person's return starts a new attempt; a queue reload cannot clear the block.
         for key in keys { recorder?.replacementLedger.readmit(key) }
@@ -270,8 +365,12 @@ public actor PendingBackupCoordinator {
     /// Restores the sources behind Proton photos that the person restored from the Proton trash, when a
     /// pending delete had moved them there.
     public func restoreSources(ofRemote uids: [PhotoUID]) async {
-        let keys = store.handoffs(forRemoteLinkIDs: uids.map(\.nodeID))
-            .map(\.key)
+        let linkIDs = Set(uids.map(\.nodeID))
+        // The earlier upload of a deleted edit can have no handoff left; the delete recorded it as its photo.
+        let deleted = sourceStates.values.filter { state in
+            state.remote.map { linkIDs.contains($0.nodeID) } == true
+        }.map(\.key)
+        let keys = Set(store.handoffs(forRemoteLinkIDs: Array(linkIDs)).map(\.key) + deleted)
             .filter { sourceStates[$0]?.desired == .excluded }
         guard !keys.isEmpty else { return }
         await restore(keys.map(\.localUID))
@@ -1010,6 +1109,13 @@ public actor PendingBackupCoordinator {
         finish(effect, dispatched, at: date) { state in
             Self.normalized(state.remote, volume: volume).map { !result.retry.contains($0) } ?? true
         }
+        // A finished trash can leave the trash of a later commit due, see `PendingBackupManifestStore.completeEffect`.
+        let movedOn = dispatched.contains { dispatchedState in
+            guard let state = sourceStates[dispatchedState.key] else { return false }
+            return state.needsRemoteTrash && state.remoteOperation == nil
+                && state.remote?.nodeID != dispatchedState.remote?.nodeID
+        }
+        if effect == .remoteTrash, movedOn { reconcileAgain = true }
     }
 
     private func finish(_ effect: PendingSourceEffect, _ states: [PendingSourceState], succeeded: Bool, at date: Date) {
@@ -1024,7 +1130,8 @@ public actor PendingBackupCoordinator {
     ) {
         for state in states {
             if succeeded(state) {
-                _ = store.completeEffect(effect, for: state.key, generation: state.generation, at: date)
+                _ = store.completeEffect(
+                    effect, for: state.key, generation: state.generation, remoteLinkID: state.remote?.nodeID, at: date)
             } else {
                 _ = store.deferEffects(for: state.key, at: date)
             }

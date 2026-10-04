@@ -429,6 +429,15 @@ extension UploadIdentityStore {
     public func trustedRecord(contentHash: String, hashKeyEpoch: String) -> UploadIdentityRecord? {
         trustedRecords(contentHash: contentHash, hashKeyEpoch: hashKeyEpoch, limit: 1).first
     }
+
+    /// True when another local source, such as a duplicate in Photos, still counts one of `linkIDs` as its backup,
+    /// or when the store cannot tell. Such a photo never goes to the trash for `source`.
+    func isNeededElsewhere(_ linkIDs: Set<String>, by source: UploadSourceIdentity) -> Bool {
+        linkIDs.contains { linkID in
+            guard let owners = self.sources(withRemoteLinkID: linkID) else { return true }
+            return owners.contains { $0.kind != source.kind || $0.identifier != source.identifier }
+        }
+    }
 }
 
 /// One active remote photo identity retained by the local content index. The hash is already keyed

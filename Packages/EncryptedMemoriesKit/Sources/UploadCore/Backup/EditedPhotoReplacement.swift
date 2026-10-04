@@ -31,8 +31,8 @@ public struct EditedPhotoReplacement: Sendable {
 
     let remote: any EditReplacementRemote
     let albums: any SeriesAlbumCarryOver
-    let relations: any UploadDuplicateChecking
-    let identities: any UploadIdentityStore
+    public let relations: any UploadDuplicateChecking
+    public let identities: any UploadIdentityStore
     public let journal: any EditReplacementJournaling
 
     public init(
@@ -195,7 +195,7 @@ public struct EditedPhotoReplacement: Sendable {
             let links = linked.union([target.nodeID])
             // The trash takes related photos along. A photo that carries the edited photo stays, and so does a
             // photo that another local source, such as a duplicate in Photos, still counts as its backup.
-            guard !linked.contains(replacement.nodeID), !isNeededElsewhere(links, by: source) else {
+            guard !linked.contains(replacement.nodeID), !identities.isNeededElsewhere(links, by: source) else {
                 kept.insert(target.nodeID)
                 continue
             }
@@ -259,13 +259,6 @@ public struct EditedPhotoReplacement: Sendable {
     private func recordUpload(of source: UploadSourceIdentity, edited: Bool) throws {
         guard source.kind == .photoLibraryAsset else { return }
         try journal.recordUpload(edited: edited, for: source)
-    }
-
-    private func isNeededElsewhere(_ linkIDs: Set<String>, by source: UploadSourceIdentity) -> Bool {
-        linkIDs.contains { linkID in
-            guard let sources = identities.sources(withRemoteLinkID: linkID) else { return true }
-            return sources.contains { $0.kind != source.kind || $0.identifier != source.identifier }
-        }
     }
 
     /// True when a row of `source` with an original resource still names one of `linkIDs`: the new compound did not
