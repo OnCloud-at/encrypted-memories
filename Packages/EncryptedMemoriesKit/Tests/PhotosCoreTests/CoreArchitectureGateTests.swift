@@ -131,9 +131,10 @@ final class CoreArchitectureGateTests: XCTestCase {
         CoreTargetRule(
             name: "TimelineCore",
             // UploadCore: photos that the backup has not uploaded yet are part of the timeline (pending grid).
+            // Observation: the shared `@Observable` library model (`TimelineViewModel`) for macOS and iOS.
             allowedImports: [
-                "CoreGraphics", "Foundation", "GridCore", "MediaFeedCore", "MediaLocationCore", "PhotosCore",
-                "UploadCore",
+                "CoreGraphics", "Foundation", "GridCore", "MediaFeedCore", "MediaLocationCore", "Observation",
+                "PhotosCore", "UploadCore",
             ],
             expectedDependencies: ["GridCore", "MediaFeedCore", "MediaLocationCore", "PhotosCore", "UploadCore"],
             extraForbiddenTokens: []

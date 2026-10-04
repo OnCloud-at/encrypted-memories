@@ -15,7 +15,7 @@ import TimelineCore
         let new = photo("new", month: 2)
         let model = TimelineViewModel(
             repository: VisibleContentRepository(timelines: [[section([old, new])]]),
-            feed: makeVisibleContentFeed())
+            feed: makeVisibleContentFeed().feedCore)
         await model.load()
         #expect(model.presentationItems.map(\.uid) == [old.uid, new.uid])
         await model.showTransientItems([old, new], sectionID: "cluster")
@@ -34,7 +34,7 @@ import TimelineCore
         let new = photo("new", month: 2)
         let sections = [section([old, new])]
         let model = TimelineViewModel(
-            repository: VisibleContentRepository(timelines: [sections]), feed: makeVisibleContentFeed(),
+            repository: VisibleContentRepository(timelines: [sections]), feed: makeVisibleContentFeed().feedCore,
             library: VisibleContentLibrary(timelines: [filter: [sections]]))
         await model.load()
         await model.select(filter)
@@ -77,7 +77,7 @@ import TimelineCore
                 [section([old])],
                 [section([new])],
             ]),
-            feed: makeVisibleContentFeed()
+            feed: makeVisibleContentFeed().feedCore
         )
         await model.load()
 
@@ -107,7 +107,7 @@ import TimelineCore
         let february = photo("feb", month: 2)
         let model = TimelineViewModel(
             repository: VisibleContentRepository(timelines: [[section([january, february])]]),
-            feed: makeVisibleContentFeed()
+            feed: makeVisibleContentFeed().feedCore
         )
         await model.load()
 
@@ -130,7 +130,7 @@ import TimelineCore
                 [section([a, b, c])],
                 [section([a, replacement, c])],
             ]),
-            feed: makeVisibleContentFeed()
+            feed: makeVisibleContentFeed().feedCore
         )
         await model.load()
 
@@ -160,7 +160,7 @@ import TimelineCore
         )
         let model = TimelineViewModel(
             repository: VisibleContentRepository(timelines: [[section([all])]]),
-            feed: makeVisibleContentFeed(),
+            feed: makeVisibleContentFeed().feedCore,
             library: library
         )
 
@@ -187,7 +187,7 @@ import TimelineCore
                 timelines: [[section([all])]],
                 cachedDelay: .milliseconds(120)
             ),
-            feed: makeVisibleContentFeed(),
+            feed: makeVisibleContentFeed().feedCore,
             library: VisibleContentLibrary(timelines: [favoriteFilter: [[section([favorite])]]])
         )
 
@@ -210,7 +210,7 @@ import TimelineCore
         )
         let model = TimelineViewModel(
             repository: repository,
-            feed: makeVisibleContentFeed()
+            feed: makeVisibleContentFeed().feedCore
         )
 
         let load = Task { await model.load() }
@@ -240,7 +240,7 @@ import TimelineCore
             cached: [],
             remote: [section([remote])]
         )
-        let model = TimelineViewModel(repository: repository, feed: makeVisibleContentFeed())
+        let model = TimelineViewModel(repository: repository, feed: makeVisibleContentFeed().feedCore)
 
         let load = Task { await model.load() }
         await repository.waitUntilRemoteRequested()
@@ -270,7 +270,7 @@ import TimelineCore
             burstMemberIDs: ["same", "burst-peer"]
         )
         let repository = MetadataStartupRepository(cached: [section([cached])], remote: [section([enriched])])
-        let enrichedModel = TimelineViewModel(repository: repository, feed: makeVisibleContentFeed())
+        let enrichedModel = TimelineViewModel(repository: repository, feed: makeVisibleContentFeed().feedCore)
 
         await enrichedModel.load()
 
@@ -291,7 +291,7 @@ import TimelineCore
             persistedToken: "event-7",
             currentToken: "event-7"
         )
-        let model = TimelineViewModel(repository: repository, feed: makeVisibleContentFeed())
+        let model = TimelineViewModel(repository: repository, feed: makeVisibleContentFeed().feedCore)
 
         await model.load()
 
@@ -312,7 +312,7 @@ import TimelineCore
             persistedToken: "event-7",
             currentToken: "event-8"
         )
-        let model = TimelineViewModel(repository: repository, feed: makeVisibleContentFeed())
+        let model = TimelineViewModel(repository: repository, feed: makeVisibleContentFeed().feedCore)
 
         await model.load()
 
@@ -325,7 +325,7 @@ import TimelineCore
         let remote = photo("remote", month: 1)
         let model = TimelineViewModel(
             repository: MetadataStartupRepository(cached: [], remote: [section([remote])]),
-            feed: makeVisibleContentFeed())
+            feed: makeVisibleContentFeed().feedCore)
         await model.load()
         let canonicalRevision = model.gridSourceRevision
         #expect(canonicalRevision % 4 == 0)
@@ -353,7 +353,7 @@ import TimelineCore
 
     @Test func aLibraryWithoutProtonPhotosStillShowsPendingPhotos() async {
         let model = TimelineViewModel(
-            repository: MetadataStartupRepository(cached: [], remote: []), feed: makeVisibleContentFeed())
+            repository: MetadataStartupRepository(cached: [], remote: []), feed: makeVisibleContentFeed().feedCore)
         await model.load()
         guard case .empty = model.state else {
             Issue.record("expected an empty Proton library")

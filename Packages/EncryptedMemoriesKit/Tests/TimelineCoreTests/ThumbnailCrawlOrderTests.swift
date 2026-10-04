@@ -1,8 +1,7 @@
 import Foundation
 import PhotosCore
 import Testing
-
-@testable import MediaCache
+import TimelineCore
 
 /// Proves the background crawl order is newest to oldest.
 @Suite("Thumbnail crawl order")
