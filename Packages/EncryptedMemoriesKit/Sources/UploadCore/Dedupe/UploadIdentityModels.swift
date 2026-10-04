@@ -933,10 +933,13 @@ public extension UploadIdentityResolving {
 public struct UploadPreflightResult: Sendable, Equatable {
     public let identity: UploadIdentity
     public let decision: UploadDuplicateDecision
+    /// Set when the upload replaces earlier uploads of this photo. The upload carries it to the server.
+    public let lineage: UploadLineageMarker?
 
-    public init(identity: UploadIdentity, decision: UploadDuplicateDecision) {
+    public init(identity: UploadIdentity, decision: UploadDuplicateDecision, lineage: UploadLineageMarker? = nil) {
         self.identity = identity
         self.decision = decision
+        self.lineage = lineage
     }
 }
 

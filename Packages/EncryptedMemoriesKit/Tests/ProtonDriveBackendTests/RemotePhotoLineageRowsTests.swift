@@ -1,4 +1,5 @@
 import Foundation
+import UploadCore
 import XCTest
 
 @testable import ProtonDriveBackend
@@ -23,6 +24,15 @@ final class RemotePhotoLineageRowsTests: XCTestCase {
                 link.fileProperties?.activeRevision?.xAttr, "armored", "the content index still reads it")
             XCTAssertNil(link.fileProperties?.activeRevision?.photo, "the role stays unknown")
         }
+    }
+
+    func testTheIndexReadsTheMarkerThatAReplacingUploadWrites() throws {
+        let written = try XCTUnwrap(UploadLineageMarker(reason: .edit, replaces: ["old", "older"]))
+        let marker = try JSONSerialization.jsonObject(with: written.additionalMetadata.utf8JsonValue)
+        let rows = try rows(marker: marker)
+        XCTAssertEqual(rows.lineage.map(\.replacedLinkID).sorted(), ["old", "older"])
+        XCTAssertEqual(Set(rows.lineage.map(\.replacingLinkID)), ["main"])
+        XCTAssertEqual(rows.unresolvedLinkIDs, [])
     }
 
     func testMissingMarkerIsIgnored() throws {
