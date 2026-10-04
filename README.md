@@ -349,6 +349,8 @@ The test targets cover module and import boundaries, encrypted persistence, medi
 
 Encrypted Memories is available under the [GNU Affero General Public License v3.0](LICENSE) (AGPL-3.0). You may use, study, modify, and share it. When you distribute a modified version, or offer it to users over a network, you must publish its complete source code under the same license.
 
+Additional permission under GNU AGPL version 3 section 7: if you distribute this program or a work based on it through an application store or a similar platform whose terms add restrictions (for example Apple's App Store), the licensors grant you permission to do so, provided that the Corresponding Source stays available under this license.
+
 Releases up to and including 1.0.5 were published under the MIT License.
 
 The software is provided without warranty or a support obligation. Dependencies and optional model artifacts retain their respective license terms.

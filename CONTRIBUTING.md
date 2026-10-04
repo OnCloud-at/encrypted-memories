@@ -7,6 +7,7 @@ Thank you for helping improve Encrypted Memories. Keep each pull request focused
 - Search existing issues and pull requests.
 - Open an issue before a large feature or architecture change.
 - Never include credentials, private user data, signing files, or local build output.
+- You license your contribution under the project's license: the AGPL-3.0 with the additional permission for application stores that the README states.
 - PR authors never set app versions, build numbers, release tags, or release notes. Maintainers own releases.
 - Coding agents also follow `AGENTS.md`.
 
