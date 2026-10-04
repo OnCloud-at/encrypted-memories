@@ -167,8 +167,19 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
     func relatedPhotoLinkIDs(ofMainLinkID mainLinkID: String) async throws -> Set<String> {
         let context = try await resolveMaterial().context
         let metadata = try await session.fetchAlbumPhotoMetadata(volumeID: context.volumeID, linkIDs: [mainLinkID])
-        // A response without the main photo cannot prove "not related", and that answer uploads bytes.
-        guard let main = metadata.first(where: { $0.link.linkID == mainLinkID }) else {
+        return try Self.relatedPhotoLinkIDs(ofMainLinkID: mainLinkID, in: metadata)
+    }
+
+    /// A response without the main photo or its related list cannot prove "not related", and that answer uploads
+    /// bytes. Proton always sends the list, also when it is empty.
+    static func relatedPhotoLinkIDs(
+        ofMainLinkID mainLinkID: String, in metadata: [AlbumPhotoMetadata]
+    ) throws
+        -> Set<String>
+    {
+        guard let main = metadata.first(where: { $0.link.linkID == mainLinkID }),
+            main.photo?.hasCompleteRelatedPhotoLinkIDs == true
+        else {
             throw UploadError.backend("Related photos of the main photo are unavailable")
         }
         return Set(main.relatedPhotoLinkIDs)

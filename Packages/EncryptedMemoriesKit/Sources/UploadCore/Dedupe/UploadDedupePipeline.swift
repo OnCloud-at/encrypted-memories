@@ -124,7 +124,8 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
         // before that check existed still skips. A local check needs the sources that uploaded a link, and
         // `sources(withRemoteLinkID:)` scans the manifest without an index; once per hit that is quadratic in the
         // library size. Close the gap when the manifest has an indexed reverse lookup by remote link.
-        if let cached, hmacReusable, !requiresRelatedMatch,
+        // A frame of a replacing series edit skips it too: its row can name its copy under the replaced main photo.
+        if let cached, hmacReusable, !descriptor.requiresRelatedMatch,
             let outcome = cached.outcome.flatMap(UploadIdentityManifestStore.Outcome.init(rawValue:)),
             outcome == .uploaded || (outcome == .duplicateActive && !isBurstMember),
             let remoteLink = cached.remoteLinkID,
@@ -393,7 +394,7 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
             let successors = try await checker.replacingMainLinkIDs(ofReplacedLink: scope.current ?? target)
             guard successors.complete, successors.links.subtracting([target]).isEmpty,
                 let compound = try await checker.compound(ofMainLink: target),
-                compound.externalIdentifier == identifier, !compound.tags.contains(PhotoTag.bursts.rawValue),
+                compound.externalIdentifier == identifier,
                 UploadRemoteReplacementSafety.isSameCaptureSecond(remote: compound.captureDate, local: creationDate)
             else { return scope }
             replacesHead = UploadRemoteReplacementSafety.isNewerVersion(

@@ -965,6 +965,28 @@ final class UploadDedupePipelineTests: XCTestCase {
         XCTAssertNil(store.record(for: d.source)?.remoteLinkID)
     }
 
+    func testAFrameOfAReplacingSeriesEditNeverSkipsByItsRowUnderTheEarlierMain() async throws {
+        let path = "/burst/IMG_0001.HEIC"
+        let frame = UploadResourceDescriptor(
+            source: .file(URL(fileURLWithPath: path), resource: .burstMember(ordinal: 1)),
+            fileURL: URL(fileURLWithPath: path + "#IMG_0002.HEIC"), filename: "IMG_0002.HEIC", fileSize: 1000,
+            modificationDate: Date(timeIntervalSince1970: 1_700_000_000))
+        let first = try await pipeline.resolve(frame.relatedTo(mainRemoteLinkID: "earlier-main"))
+        XCTAssertEqual(first.decision, .upload)
+        try await pipeline.recordUploaded(
+            frame, identity: first.identity, remoteVolumeID: "vol", remoteLinkID: "frame-under-earlier-main")
+
+        let settled = try await pipeline.resolve(frame.relatedTo(mainRemoteLinkID: "earlier-main"))
+        XCTAssertEqual(settled.decision, .skip(.knownFromManifest, remoteLinkID: "frame-under-earlier-main"))
+
+        // The edit of the main frame replaces the series: the frame belongs under the edited main photo now.
+        let replacing = frame.relatedTo(mainRemoteLinkID: "edited-main", requiresRelatedMatch: true)
+        let result = try await pipeline.resolve(replacing)
+
+        XCTAssertEqual(result.decision, .upload, "the row names the copy under the replaced main photo")
+        await pipeline.uploadDidFail(replacing)
+    }
+
     func testAPrimaryUploadsWhenItsOnlyNameMatchIsTheOriginalUnderAnEditedPhoto() async throws {
         let d = descriptor()
         let contentHash = "ch(\(fakeSHA1Hex(seed: d.fileURL.path)))"

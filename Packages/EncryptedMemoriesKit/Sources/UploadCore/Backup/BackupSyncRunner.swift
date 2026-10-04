@@ -977,8 +977,7 @@ public actor BackupSyncRunner {
         // An upload that keeps its earlier uploads names none of them as replaced. An edit that waits for its
         // original still names them, because a reader counts only a named link outside the library as replaced.
         let replacesEarlierUploads =
-            editReplacement?.replacesEarlierUploads(
-                of: entry.source, edited: Self.isEdited(resolved), isSeries: Self.isSeries(resolved)) == true
+            editReplacement?.replacesEarlierUploads(of: entry.source, edited: Self.isEdited(resolved)) == true
         let lineage = replacesEarlierUploads ? preflightResult.lineage : nil
 
         let request = PhotoUploadRequest(
@@ -1144,7 +1143,7 @@ public actor BackupSyncRunner {
         case sourceChanged
     }
 
-    /// A series keeps its earlier uploads until its own edit model exists.
+    /// A series uploads its frames as related photos of its main photo.
     private static func isSeries(_ resolved: BackupResolvedResource) -> Bool {
         resolved.secondaries.contains(where: { $0.descriptor.source.resource.isBurstMember })
     }
@@ -1174,7 +1173,7 @@ public actor BackupSyncRunner {
         let isSeries = Self.isSeries(resolved)
         // An edit that replaces an earlier upload uploads its secondaries under the edited photo again: their
         // earlier copies are related photos of the earlier photo and move to the trash with it.
-        let replacesEarlierUpload = !isSeries && editReplacement?.isReplacing(entry.source) == true
+        let replacesEarlierUpload = editReplacement?.isReplacing(entry.source) == true
         if !resolved.secondaries.isEmpty {
             if persistedState != .uploading {
                 guard let nextState = transition(entry, from: persistedState, to: .uploading) else { return }
@@ -1315,54 +1314,50 @@ public actor BackupSyncRunner {
                         throw UploadError.backend("Backup queue could not be updated")
                     }
                 }
-                if isSeries {
-                    try editReplacement.keepSuperseded(of: entry.source)
-                } else {
-                    let outcome = try await editReplacement.replaceSuperseded(
-                        of: entry.source,
-                        with: primaryUID,
-                        edited: Self.isEdited(resolved),
-                        holdsOriginal: Self.holdsOriginal(resolved),
-                        externalIdentifier: resolved.descriptor.externalIdentifier,
-                        localEditTime: resolved.photoLibraryEditTime,
-                        localCreationDate: resolved.descriptor.photoLibraryCreationDate,
-                        externalIdentifierIsUnique: resolved.descriptor.externalIdentifierIsUnique,
-                        originalSHA1Hex: resolved.descriptor.originalSHA1Hex
-                    )
-                    SupportEventTrail.shared.record(
-                        Self.supportEventKind(of: outcome), subject: entry.source.identifier)
-                    switch outcome {
-                    case .replaced(let retiredAny):
-                        if retiredAny { await identityResolver.invalidateCachedRemoteState() }
-                    case .waiting:
-                        // Some earlier mains may have retired while another still protects an original resource.
-                        await identityResolver.invalidateCachedRemoteState()
-                        try await preflight.markPending(resolved.candidate.snapshot)
-                        // The key, not a sentence: a new language or new copy keeps the same count.
-                        let detail = "backup.issue_waiting_original"
-                        let earlier = BackupIssueRecord.decode(entry.lastError)
-                        let waits =
-                            BackupFailedItem.isWaitingForOriginal(earlier?.detail)
-                            ? (earlier?.automaticRetryAttempt ?? 0) + 1 : 0
-                        let eligibleAt = now().addingTimeInterval(
-                            Self.waitingReplacementDelay(afterWaits: waits, first: min(180, longestRegularRetryWait)))
-                        deferSource(
-                            entry, from: persistedState, until: eligibleAt,
-                            issue: BackupIssueRecord(
-                                kind: .unknown, detail: detail, nextAttemptAt: eligibleAt,
-                                automaticRetryAttempt: waits
-                            ))
-                        return
-                    case .replacementGone:
-                        // The person removed the photo that the earlier ones waited for. Like every deletion in
-                        // Proton, it stays out of the backup until a restore.
-                        finish(
-                            entry, from: persistedState, as: .skippedRemoteDeletion,
-                            message: L10n.string("backup.state_skipped_remote_deletion"), resolved: resolved)
-                        return
-                    case .kept:
-                        break
-                    }
+                let outcome = try await editReplacement.replaceSuperseded(
+                    of: entry.source,
+                    with: primaryUID,
+                    edited: Self.isEdited(resolved),
+                    holdsOriginal: Self.holdsOriginal(resolved),
+                    externalIdentifier: resolved.descriptor.externalIdentifier,
+                    localEditTime: resolved.photoLibraryEditTime,
+                    localCreationDate: resolved.descriptor.photoLibraryCreationDate,
+                    externalIdentifierIsUnique: resolved.descriptor.externalIdentifierIsUnique,
+                    originalSHA1Hex: resolved.descriptor.originalSHA1Hex
+                )
+                SupportEventTrail.shared.record(
+                    Self.supportEventKind(of: outcome), subject: entry.source.identifier)
+                switch outcome {
+                case .replaced(let retiredAny):
+                    if retiredAny { await identityResolver.invalidateCachedRemoteState() }
+                case .waiting:
+                    // Some earlier mains may have retired while another still protects an original resource.
+                    await identityResolver.invalidateCachedRemoteState()
+                    try await preflight.markPending(resolved.candidate.snapshot)
+                    // The key, not a sentence: a new language or new copy keeps the same count.
+                    let detail = "backup.issue_waiting_original"
+                    let earlier = BackupIssueRecord.decode(entry.lastError)
+                    let waits =
+                        BackupFailedItem.isWaitingForOriginal(earlier?.detail)
+                        ? (earlier?.automaticRetryAttempt ?? 0) + 1 : 0
+                    let eligibleAt = now().addingTimeInterval(
+                        Self.waitingReplacementDelay(afterWaits: waits, first: min(180, longestRegularRetryWait)))
+                    deferSource(
+                        entry, from: persistedState, until: eligibleAt,
+                        issue: BackupIssueRecord(
+                            kind: .unknown, detail: detail, nextAttemptAt: eligibleAt,
+                            automaticRetryAttempt: waits
+                        ))
+                    return
+                case .replacementGone:
+                    // The person removed the photo that the earlier ones waited for. Like every deletion in
+                    // Proton, it stays out of the backup until a restore.
+                    finish(
+                        entry, from: persistedState, as: .skippedRemoteDeletion,
+                        message: L10n.string("backup.state_skipped_remote_deletion"), resolved: resolved)
+                    return
+                case .kept:
+                    break
                 }
                 events?.settleUploadEvidence(
                     source: entry.source, revision: entry.revision,
