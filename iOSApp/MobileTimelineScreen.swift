@@ -549,10 +549,12 @@ struct MobileTimelineScreen: View {
         if !hasProjectionCriteria {
             guard let index = model.gridIndex(of: item.uid) else { return }  // O(1), not an O(n) firstIndex scan
             viewerRouter.presentation = MobileViewerPresentation(
-                index: index, items: model.gridItems, context: ViewerCollectionContext(filter: .all)
+                index: index, items: model.gridItems, context: ViewerCollectionContext(filter: .all),
+                followsLibraryReplacements: true
             )
         } else {
-            // While searching, the viewer pages through the filtered result set to match macOS.
+            // While searching, the viewer pages through the filtered result set to match macOS. A replacement need
+            // not match the search, so this viewer keeps its photos.
             let items = visibleItems
             guard let index = items.firstIndex(where: { $0.uid == item.uid }) else { return }
             viewerRouter.presentation = MobileViewerPresentation(
@@ -743,6 +745,8 @@ struct MobileViewerPresentation: Identifiable {
     let items: [PhotoItem]
     let context: ViewerCollectionContext
     var showsInfoInitially = false
+    /// The whole-library viewer follows photos that the backup replaced; other collections keep their photos.
+    var followsLibraryReplacements = false
 }
 
 /// A successful viewer mutation removes the current item from the collection that opened it. Filtered grids

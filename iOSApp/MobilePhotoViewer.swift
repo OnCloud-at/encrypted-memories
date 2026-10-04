@@ -12,6 +12,7 @@ import PhotoViewerCore
 import PhotoViewerUIKitAdapter
 import PhotosCore
 import SwiftUI
+import TimelineCore
 import UIKit
 import VisionKit
 
@@ -21,12 +22,16 @@ import VisionKit
 struct MobilePhotoViewer: View {
     @AppStorage(AppSettingsKey.mapAndPlacesEnabled) private var mapAndPlacesEnabled =
         AppSettingsDefault.mapAndPlacesEnabled
-    let items: [PhotoItem]
+    @State private var items: [PhotoItem]
+    /// Changes whenever `items` changes, so the pager compares one number instead of the whole collection.
+    @State private var itemsRevision = 0
     let startIndex: Int
     let context: ViewerCollectionContext
     let libraryModel: MobileLibraryModel
     let viewerRouter: MobileViewerRouter
-    private let pageIndex: ViewerPageIndex
+    /// True for a library viewer: it follows a photo that the backup replaced, such as an edit in Apple Photos.
+    let followsLibraryReplacements: Bool
+    @State private var pageIndex: ViewerPageIndex
 
     @Environment(\.dismiss) private var dismiss
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -75,15 +80,17 @@ struct MobilePhotoViewer: View {
         context: ViewerCollectionContext,
         libraryModel: MobileLibraryModel,
         viewerRouter: MobileViewerRouter,
-        showsInfoInitially: Bool = false
+        showsInfoInitially: Bool = false,
+        followsLibraryReplacements: Bool = false
     ) {
         _showInfo = State(initialValue: showsInfoInitially)
-        self.items = items
+        _items = State(initialValue: items)
         self.startIndex = startIndex
         self.context = context
         self.libraryModel = libraryModel
         self.viewerRouter = viewerRouter
-        self.pageIndex = ViewerPageIndex(orderedUIDs: items.map(\.uid))
+        self.followsLibraryReplacements = followsLibraryReplacements
+        _pageIndex = State(initialValue: ViewerPageIndex(orderedUIDs: items.map(\.uid)))
         _index = State(initialValue: min(max(startIndex, 0), max(items.count - 1, 0)))
         _titleMetadataCoordinator = State(
             initialValue: ViewerTitleMetadataCoordinator(
@@ -130,7 +137,9 @@ struct MobilePhotoViewer: View {
                 // so the photo rotated displaced in a corner and snapped to centre only afterwards (a rebuild via
                 // `.id` was a hard cut instead). UIPageViewController participates in the size transition and keeps
                 // the current page centred through the whole rotation - the Photos-app behavior.
-                MobileViewerPager(count: items.count, index: $index) { i, isCurrent in
+                MobileViewerPager(
+                    count: items.count, revision: itemsRevision, id: { items[$0].uid }, index: $index
+                ) { i, isCurrent in
                     let item = items[i]
                     MobileViewerPage(
                         item: item,
@@ -217,6 +226,7 @@ struct MobilePhotoViewer: View {
             titleMetadataCoordinator.cancelAll()
             metadataRequestGeneration &+= 1
         }
+        .onChange(of: libraryModel.pendingPresentation.revision) { _, _ in followLibraryReplacements() }
         // A native inspector: a trailing column beside the media in regular iPad windows, the familiar sheet in
         // compact widths. The immersive viewer, its pager and its gestures stay mounted in both cases.
         .inspector(isPresented: $showInfo) {
@@ -756,6 +766,23 @@ struct MobilePhotoViewer: View {
         index = selected
     }
 
+    /// Swaps photos that the backup replaced for their replacement; see `ViewerReplacementFollow`.
+    private func followLibraryReplacements() {
+        guard followsLibraryReplacements else { return }
+        let presentation = libraryModel.pendingPresentation
+        guard
+            let followed = ViewerReplacementFollow.follow(
+                items, pages: pageIndex, current: index, replacements: presentation.replacements,
+                timeline: presentation.snapshot)
+        else { return }
+        // A returning UID, such as the tile of a second edit, must not show the image of its last showing.
+        imageStore.forget(followed.arrived)
+        items = followed.items
+        itemsRevision &+= 1
+        pageIndex = followed.pages
+        index = followed.current
+    }
+
     /// Hardware-keyboard parity with the macOS viewer: arrow keys page, Escape closes. The buttons render
     /// nothing; they only register shortcuts for the presented viewer.
     private var keyboardCommands: some View {
@@ -854,6 +881,9 @@ struct MobilePhotoViewer: View {
 /// pages keep their bounded load/teardown behavior (current page only).
 private struct MobileViewerPager<Page: View>: UIViewControllerRepresentable {
     let count: Int
+    /// Changes when the collection changes. A page keeps its controller while its photo stays in the collection.
+    let revision: Int
+    let id: (Int) -> PhotoUID
     @Binding var index: Int
     @ViewBuilder let page: (Int, Bool) -> Page
 
@@ -872,8 +902,11 @@ private struct MobileViewerPager<Page: View>: UIViewControllerRepresentable {
 
     func updateUIViewController(_ pvc: UIPageViewController, context: Context) {
         context.coordinator.parent = self
+        // A page that left the collection shifts the later pages. Kept pages move to their new index with their state,
+        // such as zoom or playback; setting the visible page again makes the pager ask for fresh neighbours.
+        let collectionChanged = context.coordinator.remapPagesIfCollectionChanged()
         // An external index change jumps to that page; user swipes return through the delegate.
-        if let visible = (pvc.viewControllers?.first as? HostedPage)?.pageIndex, visible != index {
+        if let visible = (pvc.viewControllers?.first as? HostedPage)?.pageIndex, collectionChanged || visible != index {
             pvc.setViewControllers(
                 [context.coordinator.pageController(at: index)],
                 direction: visible < index ? .forward : .reverse, animated: false)
@@ -885,9 +918,11 @@ private struct MobileViewerPager<Page: View>: UIViewControllerRepresentable {
 
     /// Hosts one page and remembers which index it shows (the pager's data source is index-based).
     final class HostedPage: UIHostingController<AnyView> {
-        let pageIndex: Int
-        init(index: Int, root: AnyView) {
+        var pageIndex: Int
+        let pageID: PhotoUID
+        init(index: Int, id: PhotoUID, root: AnyView) {
             self.pageIndex = index
+            self.pageID = id
             super.init(rootView: root)
             // The outer SwiftUI layout accounts for device safe areas and the inspector column.
             // A nested page must not apply the pager's cached safe area a second time.
@@ -904,12 +939,34 @@ private struct MobileViewerPager<Page: View>: UIViewControllerRepresentable {
         /// by UIPageViewController while on screen; we only lose SwiftUI-state reuse, and the viewer store's
         /// cache makes a re-created page's image instant.
         private var live: [Int: HostedPage] = [:]
+        private var revision: Int
 
-        init(parent: MobileViewerPager) { self.parent = parent }
+        init(parent: MobileViewerPager) {
+            self.parent = parent
+            revision = parent.revision
+        }
+
+        /// Moves each live page to the new index of its photo and drops the pages whose photo left; true when the
+        /// collection changed. Only the few live pages are looked up, near their old index first.
+        func remapPagesIfCollectionChanged() -> Bool {
+            guard parent.revision != revision else { return false }
+            revision = parent.revision
+            var remapped: [Int: HostedPage] = [:]
+            for page in live.values {
+                guard
+                    let i = ViewerReplacementFollow.newIndex(
+                        of: page.pageID, near: page.pageIndex, count: parent.count, uidAt: parent.id)
+                else { continue }
+                page.pageIndex = i
+                remapped[i] = page
+            }
+            live = remapped
+            return true
+        }
 
         func pageController(at i: Int) -> HostedPage {
             if let vc = live[i] { return vc }
-            let vc = HostedPage(index: i, root: AnyView(parent.page(i, i == parent.index)))
+            let vc = HostedPage(index: i, id: parent.id(i), root: AnyView(parent.page(i, i == parent.index)))
             live[i] = vc
             live = live.filter { abs($0.key - i) <= 2 }
             return vc
@@ -1658,6 +1715,7 @@ private struct MobileVideoPage: View {
     @State private var playbackSourceIdentity: ObjectIdentifier?
     @State private var playbackSourceRevision: UInt64?
     @State private var playbackActivity: LibraryRuntimeActivityRegistration?
+    @State private var holdsVideoAudio = false
 
     private var sourceIdentity: ObjectIdentifier? {
         guard let facade = libraryModel.facade else { return nil }
@@ -1971,6 +2029,10 @@ private struct MobileVideoPage: View {
             )
             streamingAsset = streaming  // retain the resource loader for the player's lifetime
             playbackActivity = activity
+            if !holdsVideoAudio {
+                VideoAudioSession.begin()
+                holdsVideoAudio = true
+            }
             playbackAttachment = attachment
             playbackSourceIdentity = requestedSourceIdentity
             playbackSourceRevision = requestedSourceRevision
@@ -2003,6 +2065,10 @@ private struct MobileVideoPage: View {
         streamingAsset = nil
         playbackActivity?.end()
         playbackActivity = nil
+        if holdsVideoAudio {
+            VideoAudioSession.end()
+            holdsVideoAudio = false
+        }
         playbackTime = 0
         playbackDuration = 0
         playbackIsPlaying = false
@@ -2069,6 +2135,10 @@ private struct MobileVideoPage: View {
         streamingAsset = nil
         playbackActivity?.end()
         playbackActivity = nil
+        if holdsVideoAudio {
+            VideoAudioSession.end()
+            holdsVideoAudio = false
+        }
         playbackIsPlaying = false
         playbackIntendsToPlay = false
         playbackIsBuffering = false

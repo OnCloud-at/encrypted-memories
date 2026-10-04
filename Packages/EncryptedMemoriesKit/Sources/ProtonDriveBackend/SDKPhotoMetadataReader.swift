@@ -45,7 +45,8 @@ enum SDKPhotoMetadataReader {
     }
 
     /// `iOS.photos` identifies the source asset of the series compound. The copy is a new photo without a
-    /// source asset, so that section stays behind; every other section travels unchanged.
+    /// source asset, so that section stays behind. The `EncryptedMemories.` sections describe the earlier photo,
+    /// for example the uploads that it replaced, so they stay behind as well. Every other section travels unchanged.
     static func seriesMemberSource(
         name: String, mimeType: String, captureTime: TimeInterval, revision: FileRevision
     ) -> SeriesMemberSource {
@@ -58,7 +59,7 @@ enum SDKPhotoMetadataReader {
                 $0.isFinite ? Date(timeIntervalSince1970: $0) : nil
             } ?? captureDate,
             additionalMetadata: (revision.claimedAdditionalMetadata ?? [])
-                .filter { $0.name != "iOS.photos" }
+                .filter { $0.name != "iOS.photos" && !$0.name.hasPrefix("EncryptedMemories.") }
                 .map { PhotoUploadAdditionalMetadata(name: $0.name, utf8JsonValue: $0.utf8JsonValue) }
         )
     }

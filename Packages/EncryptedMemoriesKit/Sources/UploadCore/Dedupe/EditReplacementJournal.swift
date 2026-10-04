@@ -17,6 +17,12 @@ public struct EditReplacementJournalEntry: Sendable, Equatable, Codable {
     public var uploadedEdit: Bool?
     /// Related links by earlier main, recorded before its trash. Nil in journals of earlier builds.
     public var retireIntent: [String: [String]]?
+    /// Main links of `superseded`, `remoteSuperseded`, and `retired` that are proven earlier uploads of this photo:
+    /// its own uploads, and links with its iCloud identifier. Only these links appear in the lineage marker. Nil in
+    /// journals of earlier builds, so their links stay unnamed.
+    public var proven: [String]?
+    /// The uploads that a proven remote photo replaced, by that photo, as its lineage named them.
+    public var inherited: [String: [String]]?
 
     /// The person's deletion choice and a wait that survives queue retries and process death.
     public var keptDeleted: Bool?
@@ -27,7 +33,7 @@ public struct EditReplacementJournalEntry: Sendable, Equatable, Codable {
         superseded: [PhotoUID] = [], retired: [String] = [], uploadedEdit: Bool? = nil,
         retireIntent: [String: [String]]? = nil, remoteSuperseded: [String]? = nil,
         keptDeleted: Bool? = nil, backUpAgainRevision: UploadBackupRevision? = nil,
-        deletionCheckStartedAt: Date? = nil
+        deletionCheckStartedAt: Date? = nil, proven: [String]? = nil, inherited: [String: [String]]? = nil
     ) {
         self.superseded = superseded
         self.remoteSuperseded = remoteSuperseded
@@ -37,11 +43,31 @@ public struct EditReplacementJournalEntry: Sendable, Equatable, Codable {
         self.keptDeleted = keptDeleted
         self.backUpAgainRevision = backUpAgainRevision
         self.deletionCheckStartedAt = deletionCheckStartedAt
+        self.proven = proven
+        self.inherited = inherited
     }
 
     /// Without the flag, a photo that already replaced an earlier upload counts as edited: only edits and undos
     /// replaced photos in earlier builds.
     public var lastUploadWasEdit: Bool { uploadedEdit ?? !retired.isEmpty }
+
+    /// Other bytes replace the earlier uploads only as an edit or as the undo of an edit.
+    public func replacesEarlierUploads(edited: Bool) -> Bool { edited || lastUploadWasEdit }
+
+    /// The proven earlier uploads, newest first: the links that the next upload replaces, then the retired links.
+    /// The uploads that a remote photo replaced follow it as one group without inner order. Empty when no proven link
+    /// waits for its replacement. Related links and unproven links, such as an adopted copy without an iCloud
+    /// identifier, never appear: a missing name only costs another device its proof, a wrong name costs a photo.
+    public func replacementHistory(excluding foreign: Set<String>) -> [[String]] {
+        let proven = Set(proven ?? [])
+        func groups(_ links: [String]) -> [[String]] {
+            links.reversed().filter { proven.contains($0) && !foreign.contains($0) }.flatMap { link in
+                [[link]] + (inherited?[link].map { [$0.filter { !foreign.contains($0) }] } ?? [])
+            }
+        }
+        let replaced = groups(allSuperseded.map(\.nodeID))
+        return replaced.isEmpty ? [] : replaced + groups(retired)
+    }
 
     /// Local and remote targets of the replacement.
     public var allSuperseded: [PhotoUID] {
@@ -70,6 +96,9 @@ public protocol EditReplacementJournaling: Sendable {
     func addSuperseded(_ uid: PhotoUID, for source: UploadSourceIdentity) throws
     /// Adds a target that requires a complete index read before retirement. Existing local targets stay local.
     func addRemoteSuperseded(_ uid: PhotoUID, for source: UploadSourceIdentity) throws
+    /// Marks a superseded main as a proven earlier upload, with the uploads that it replaced. Call it after the link
+    /// joins the targets: an entry without targets keeps no proof.
+    func addProven(_ nodeID: String, inherited: [String], for source: UploadSourceIdentity) throws
     /// Records related links before trashing their mains, without retiring active links.
     func prepareToRetire(_ relatedByMain: [String: [String]], for source: UploadSourceIdentity) throws
     /// Clears an earlier intent when a retry confirms that its main is still active.
@@ -218,6 +247,16 @@ public final class EditReplacementJournalFileStore: EditReplacementJournaling, @
         }
     }
 
+    public func addProven(_ nodeID: String, inherited: [String], for source: UploadSourceIdentity) throws {
+        try update(source) { entry in
+            if entry.proven?.contains(nodeID) != true { entry.proven = (entry.proven ?? []) + [nodeID] }
+            guard !inherited.isEmpty else { return }
+            var byLink = entry.inherited ?? [:]
+            byLink[nodeID] = inherited.sorted()
+            entry.inherited = byLink
+        }
+    }
+
     public func prepareToRetire(_ relatedByMain: [String: [String]], for source: UploadSourceIdentity) throws {
         try update(source) { entry in
             var intent = entry.retireIntent ?? [:]
@@ -237,6 +276,8 @@ public final class EditReplacementJournalFileStore: EditReplacementJournaling, @
         _ nodeIDs: Set<String>, related: Set<String>, trashed: Bool, for source: UploadSourceIdentity
     ) throws {
         try update(source) { entry in
+            // The journal added its targets in the order of their history.
+            let mains = entry.allSuperseded.map(\.nodeID).filter(nodeIDs.contains)
             entry.superseded.removeAll { nodeIDs.contains($0.nodeID) }
             entry.remoteSuperseded?.removeAll(where: nodeIDs.contains)
             if entry.remoteSuperseded?.isEmpty == true { entry.remoteSuperseded = nil }
@@ -246,8 +287,16 @@ public final class EditReplacementJournalFileStore: EditReplacementJournaling, @
                 entry.retireIntent?[nodeID] = nil
             }
             if entry.retireIntent?.isEmpty == true { entry.retireIntent = nil }
-            guard trashed else { return }
-            for linkID in nodeIDs.union(confirmedRelated).sorted() where !entry.retired.contains(linkID) {
+            guard trashed else {
+                // A kept link is no replaced upload, and a foreign one never was one.
+                entry.proven?.removeAll(where: nodeIDs.contains)
+                if entry.proven?.isEmpty == true { entry.proven = nil }
+                for nodeID in nodeIDs { entry.inherited?[nodeID] = nil }
+                if entry.inherited?.isEmpty == true { entry.inherited = nil }
+                return
+            }
+            let ordered = mains + nodeIDs.subtracting(mains).sorted() + confirmedRelated.subtracting(nodeIDs).sorted()
+            for linkID in ordered where !entry.retired.contains(linkID) {
                 entry.retired.append(linkID)
             }
         }
