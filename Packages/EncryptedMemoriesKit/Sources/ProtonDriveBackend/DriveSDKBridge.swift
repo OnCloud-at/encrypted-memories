@@ -37,6 +37,8 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     /// A timeline refresh replaces it atomically; a lookup miss fetches once to cover a newly-arrived burst.
     private var burstCatalogEntries: [PhotosListEntry]?
     private var burstCatalogLookup: [String: [String]] = [:]
+    /// The related files of a series that the viewer checked for a frame type, so a reopen reads no metadata again.
+    private var burstFrameVerdicts = BurstFrameVerdicts()
     /// Account-scoped single flight for authoritative enumeration. Actor reentrancy alone does not serialize
     /// work across awaits; without this, foreground lifecycle, upload refresh and a second Mac window can all
     /// enumerate the same 20k-item library concurrently.
@@ -330,7 +332,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
             var burstMemberIDs: [String: [String]]
             var burstEntries: [PhotosListEntry]?
             var authoritativeInventoryFingerprint: String?
-            // Only while photos trashed here may still appear in a listing.
+            // Only while photos trashed here or removed by an event may still appear in a listing.
             var listingRead: LibraryListingRead?
             let listingReadAt = Date()
 
@@ -351,6 +353,15 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                         supportSource = .continuity
                     }
                 }
+                // This load moves the event cursor past these events, while the next listing can still return the
+                // removed files. The waits are saved before the cursor moves, so a relaunch keeps them.
+                let removalsChanged =
+                    if let remoteChanges {
+                        recentlyDeleted.eventsRead(remoteChanges, volumeID: root.volumeID, at: listingReadAt)
+                    } else {
+                        recentlyDeleted.eventsLost()
+                    }
+                if removalsChanged { recentlyDeletedStore.save(recentlyDeleted.persisted) }
                 var entries: [PhotosListEntry]
                 if continuityRecoveryRequired {
                     entries = try await continuityRecovery.fetchInventory(
@@ -829,10 +840,8 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         do {
             let context = try await photosShareContext()
             var resolved = 0
-            let batchSize = UploadDedupePipeline.protonDuplicateBatchSize
-            for start in stride(from: 0, to: unknown.count, by: batchSize) {
+            for batch in Self.metadataBatches(unknown) {
                 try Task.checkCancellation()
-                let batch = Array(unknown[start..<min(start + batchSize, unknown.count)])
                 let links = try await ProtonRequestContext.$priority.withValue(.maintenance) {
                     try await driveSession.fetchPhotoLinksMetadata(
                         shareID: context.shareID,
@@ -841,9 +850,8 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                 }
                 let volumeID = batch[0].volumeID
                 let evidence = Dictionary(
-                    uniqueKeysWithValues: links.compactMap { link -> (PhotoUID, String)? in
-                        guard let nodeID = link.linkID, let mimeType = link.mimeType else { return nil }
-                        return (PhotoUID(volumeID: volumeID, nodeID: nodeID), mimeType)
+                    uniqueKeysWithValues: Self.mimeTypes(in: links).map { nodeID, mimeType in
+                        (PhotoUID(volumeID: volumeID, nodeID: nodeID), mimeType)
                     }
                 )
                 let result = timelineStore?.recordMediaTypeEvidence(evidence, publishRevision: false)
@@ -863,6 +871,39 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         } catch {
             DebugLog.log("timeline: media-type reconciliation paused after a recoverable failure - \(error)")
         }
+    }
+
+    /// Splits links into the web client's `fetch_metadata` batch size, which every metadata read stays within.
+    private static func metadataBatches<Element>(_ items: [Element]) -> [[Element]] {
+        let size = UploadDedupePipeline.protonDuplicateBatchSize
+        return stride(from: 0, to: items.count, by: size).map { Array(items[$0..<min($0 + size, items.count)]) }
+    }
+
+    /// The MIME types that a `fetch_metadata` batch names, by link ID.
+    private static func mimeTypes(in links: [AlbumPhotoLinkBody]) -> [String: String] {
+        Dictionary(
+            links.compactMap { link -> (String, String)? in
+                guard let linkID = link.linkID, let mimeType = link.mimeType else { return nil }
+                return (linkID, mimeType)
+            },
+            uniquingKeysWith: { first, _ in first }
+        )
+    }
+
+    /// The MIME type and the decrypted name of each link that a `fetch_metadata` batch names, by link ID. A name that
+    /// does not decrypt stays unknown.
+    private static func relatedFiles(
+        in links: [AlbumPhotoLinkBody], rootKey: UnlockableKey?, crypto: DriveCrypto
+    ) -> [String: BurstFrameVerdicts.RelatedFile] {
+        Dictionary(
+            links.compactMap { link -> (String, BurstFrameVerdicts.RelatedFile)? in
+                guard let linkID = link.linkID else { return nil }
+                var name: String?
+                if let armored = link.name, let rootKey { name = try? crypto.decryptName(armored, parent: rootKey) }
+                return (linkID, BurstFrameVerdicts.RelatedFile(mimeType: link.mimeType, name: name))
+            },
+            uniquingKeysWith: { first, _ in first }
+        )
     }
 
     /// A listing without the given photos: its sections, and the burst entries that the burst catalog reads. A kept
@@ -1629,9 +1670,37 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
             burstEntries = fetched
             lookup = fetchedLookup
         }
-        guard let memberIDs = lookup[uid.nodeID], memberIDs.count > 1 else { return [] }
+        guard let relatedIDs = lookup[uid.nodeID], relatedIDs.count > 1 else { return [] }
 
         let entriesByID = Dictionary(burstEntries.map { ($0.linkID, $0) }, uniquingKeysWith: { first, _ in first })
+        // Related files outside the bursts listing can be frames of another Proton client or the adjustment data of
+        // an edit. One metadata read per open tells them apart by name and type; a reopen reuses the verdicts.
+        let keySource = try? await fileSource()
+        let checked = await BurstFrameVerdicts.frames(
+            of: relatedIDs,
+            listed: Set(entriesByID.keys),
+            verdicts: burstFrameVerdicts
+        ) { [driveSession, crypto, keySource, shareID = photosShareID, rootLinkID = root.nodeID] linkIDs in
+            guard let shareID, let keySource else { throw DriveBridgeError.noPhotosShare }
+            var links: [AlbumPhotoLinkBody] = []
+            for batch in Self.metadataBatches(linkIDs) {
+                links += try await ProtonRequestContext.$priority.withValue(.userInitiated) {
+                    try await driveSession.fetchPhotoLinksMetadata(shareID: shareID, linkIDs: batch)
+                }
+            }
+            // Photos are children of the photos root, whose key decrypts their names. The stream source caches it.
+            var rootKey: UnlockableKey?
+            if links.contains(where: { $0.name != nil }) {
+                rootKey = try await ProtonRequestContext.$priority.withValue(.userInitiated) {
+                    try await keySource.nodeKey(ofLinkID: rootLinkID)
+                }
+            }
+            return Self.relatedFiles(in: links, rootKey: rootKey, crypto: crypto)
+        }
+        burstFrameVerdicts.merge(checked.verdicts)
+        let memberIDs = checked.frames
+        guard memberIDs.count > 1 else { return [] }
+
         let anchorEntry =
             entriesByID[uid.nodeID]
             ?? burstEntries.first { entry in

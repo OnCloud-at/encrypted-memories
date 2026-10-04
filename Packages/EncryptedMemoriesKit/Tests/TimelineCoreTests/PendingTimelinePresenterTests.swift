@@ -918,6 +918,66 @@ import Testing
             "the Proton photo continues the tile's texture, never the earlier photo's")
     }
 
+    @Test func anEditPublishesEachReplacementStepForAnOpenViewer() async {
+        let presenter = PendingTimelinePresenter()
+        let listed = sameSecond(["a", "earlier", "z"])
+        presenter.setRemote(TimelineSnapshot(orderedItems: listed))
+        let earlier = PhotoUID(volumeID: "vol", nodeID: "earlier")
+        let uploaded = PhotoUID(volumeID: "vol", nodeID: "0-new")
+        let edit = tile("p", second: 10, handoff: uploaded, badge: .uploading(step: 10), replaces: [earlier])
+        presenter.setPending(pending([edit], membership: 1), enabled: true)
+        let pendingEdit = await settle(presenter)
+
+        #expect(pendingEdit.replacements == [earlier: edit.item.uid], "the tile of the edit replaces the earlier photo")
+
+        presenter.setRemote(TimelineSnapshot(orderedItems: listed + [remote("0-new", second: 10)]))
+        let uploadedEdit = await settle(presenter)
+
+        #expect(uploadedEdit.replacements[earlier] == edit.item.uid)
+        #expect(uploadedEdit.replacements[edit.item.uid] == uploaded, "the Proton photo of the edit replaces its tile")
+    }
+
+    @Test func anEditStillReplacesTheEarlierPhotoAfterTheListingDropsItUnlessItWasRestored() async {
+        let presenter = PendingTimelinePresenter()
+        presenter.setRemote(TimelineSnapshot(orderedItems: sameSecond(["a", "z"])))
+        let earlier = PhotoUID(volumeID: "vol", nodeID: "earlier")
+        let uploaded = PhotoUID(volumeID: "vol", nodeID: "0-new")
+        let edit = tile("p", second: 10, handoff: uploaded, badge: .uploading(step: 10), replaces: [earlier])
+        presenter.setPending(pending([edit], membership: 1), enabled: true)
+
+        #expect(await settle(presenter).replacements[earlier] == edit.item.uid, "an open viewer still shows it")
+
+        presenter.showRestored([earlier])
+
+        #expect(await settle(presenter).replacements[earlier] == nil, "a restored photo keeps its own page")
+    }
+
+    @Test func aRemoteFirstEditReplacesTheEarlierPhotoAfterTheListingDropsIt() async throws {
+        let harness = try EditPendingHarness(date: base)
+        defer { harness.closeStores() }
+        let clock = TestClock(base)
+        let presenter = PendingTimelinePresenter(
+            now: { clock.now },
+            replacementLookup: { [ledger = harness.recorder.replacementLedger] in
+                ledger.replacementHandoffs()
+            })
+        let earlier = remote("earlier", second: 10)
+        let uploaded = remote("edit", second: 10)
+        presenter.setRemote(TimelineSnapshot(orderedItems: [earlier]))
+        _ = await settle(presenter)
+        harness.recorder.recordUploadEvidence(
+            source: harness.source, revision: UploadBackupRevision(rawValue: 1), replaces: [earlier.uid])
+        harness.handoff(revision: 1, remote: uploaded.uid)
+        presenter.setRemote(TimelineSnapshot(orderedItems: [uploaded]))
+        _ = await settle(presenter)
+        clock.now = base.addingTimeInterval(PendingTimelinePresenter.tileWaitLimit + 1)
+        presenter.setPending(pending([], membership: 1), enabled: true)
+        let presentation = await settle(presenter)
+
+        #expect(presentation.items.map(\.uid) == [uploaded.uid])
+        #expect(presentation.replacements[earlier.uid] == uploaded.uid, "an open viewer follows the edit")
+    }
+
     @Test func theSupportReportCountsWhatTheGridHidesWithoutIdentifiers() async {
         let sources = SupportDiagnosticsSources(trail: SupportEventTrail())
         let presenter = PendingTimelinePresenter(now: { Date() }, supportSources: sources)
@@ -1148,6 +1208,7 @@ import Testing
         #expect(after.items.map(\.uid) == [uploaded, remotes[0].uid], "the Proton photo takes the tile's place")
         #expect(after.localUIDs.isEmpty)
         #expect(after.uploadBadges[uploaded] == .uploading(step: 10), "a still-uploading source keeps its progress")
+        #expect(after.replacements.isEmpty, "a plain upload continues the same picture; an open viewer keeps its page")
         #expect(presence == [PendingSourceKey(kind: .photoLibraryAsset, identifier: "p")])
 
         // Grids let the Proton photo draw the pending tile's texture, once.

@@ -8,6 +8,7 @@ import SwiftUI
 struct MobileAlbumSyncScreen: View {
     @State var controller: AlbumSyncController
     @State private var showPicker = false
+    @State private var problemListAlbumID: String?
 
     var body: some View {
         List {
@@ -43,6 +44,14 @@ struct MobileAlbumSyncScreen: View {
         }
         .sheet(isPresented: $showPicker) {
             MobileAlbumPickerSheet(controller: controller)
+        }
+        .sheet(
+            isPresented: Binding(
+                get: { problemListAlbumID != nil }, set: { if !$0 { problemListAlbumID = nil } })
+        ) {
+            if let problemListAlbumID {
+                MobileFailedBackupSheet(albumSync: controller, albumID: problemListAlbumID)
+            }
         }
         .alert(
             L10n.string("settings.albumsync_conflict_title"),
@@ -110,8 +119,23 @@ struct MobileAlbumSyncScreen: View {
                     if let count = album.assetCount {
                         Text(L10n.string("settings.albumsync_photo_count \(count)"))
                     }
-                    Text(isActive ? controller.progress.localizedTitle : album.localizedRowStatusDescription)
-                        .foregroundStyle(stateColor(album, isActive: isActive))
+                    if !isActive, album.showsProblemList {
+                        // Opens the shared problem list with this album's photos; Sync now is the retry.
+                        Button {
+                            problemListAlbumID = album.id
+                        } label: {
+                            HStack(spacing: 4) {
+                                Text(album.localizedRowStatusDescription)
+                                Image(systemName: "chevron.right").font(.caption2)
+                            }
+                            .foregroundStyle(stateColor(album, isActive: isActive))
+                        }
+                        .buttonStyle(.borderless)
+                        .accessibilityIdentifier("albumsync.notInAlbum.\(album.id)")
+                    } else {
+                        Text(isActive ? controller.progress.localizedTitle : album.localizedRowStatusDescription)
+                            .foregroundStyle(stateColor(album, isActive: isActive))
+                    }
                 }
                 .font(.footnote.monospacedDigit())
                 .foregroundStyle(.secondary)

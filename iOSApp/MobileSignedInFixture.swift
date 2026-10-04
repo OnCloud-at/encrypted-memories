@@ -1,4 +1,5 @@
 import AlbumCore
+import AlbumSyncCore
 import Foundation
 import MediaByteCache
 import MediaCacheUIKitAdapter
@@ -32,6 +33,7 @@ import UploadCore
         private let runtime: MobileAccountRuntime
         private let cacheDirectory: URL
         private var backupFixture: PhotoLibraryBackupController?
+        private var albumSyncFixture: AlbumSyncController?
 
         /// `includesVideo` adds one video as the newest item; the UI tests use it, the hosted tests count photos only.
         init(
@@ -100,7 +102,32 @@ import UploadCore
             } else if ProcessInfo.processInfo.arguments.contains("-EncryptedMemoriesFailedBackupFixture") {
                 installDeletedBackupFixture(failedItems: true)
             }
+            if ProcessInfo.processInfo.arguments.contains("-EncryptedMemoriesAlbumSyncReasonsFixture") {
+                installAlbumSyncReasonsFixture()
+            }
             runtime.sessionModel.installIsolatedSession(session)
+        }
+
+        static let albumSyncFixtureAlbumID = "fixture-album-sync"
+
+        /// One synced album whose last run left two photos outside the Proton album.
+        private func installAlbumSyncReasonsFixture() {
+            let directory = cacheDirectory.appendingPathComponent("albumsync", isDirectory: true)
+            do {
+                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                let controller = AlbumSyncController(
+                    configuration: .init(accountDataDirectory: directory, databasePolicy: .conservative),
+                    identityResolver: MobileFixtureBackupBackend(), uploader: MobileFixtureBackupBackend(),
+                    remoteOps: MobileFixtureAlbumSyncRemoteOps())
+                guard
+                    controller.installNotInAlbumFixtureForTesting(
+                        albumID: Self.albumSyncFixtureAlbumID, title: "Fixture Album Sync")
+                else { return }
+                albumSyncFixture = controller
+                runtime.libraryModel.installIsolatedAlbumSyncForTesting(controller)
+            } catch {
+                assertionFailure("The album sync fixture could not be installed")
+            }
         }
 
         private func installDeletedBackupFixture(failedItems: Bool = false) {
@@ -187,6 +214,16 @@ import UploadCore
             _ descriptor: UploadResourceDescriptor, identity: UploadIdentity,
             remoteVolumeID: String, remoteLinkID: String
         ) async throws { throw MobileFixtureError.unavailable }
+    }
+
+    /// Remote album operations of an offline account: every call fails.
+    private struct MobileFixtureAlbumSyncRemoteOps: AlbumSyncRemoteAlbumOps {
+        func listAlbums() async throws -> [AlbumSyncRemoteAlbum] { throw MobileFixtureError.unavailable }
+        func createAlbum(name: String) async throws -> String { throw MobileFixtureError.unavailable }
+        func childMainLinkIDs(albumID: String) async throws -> Set<String> { throw MobileFixtureError.unavailable }
+        func attach(_ photos: [AlbumSyncAttachCandidate], albumID: String) async throws -> AlbumSyncAttachResult {
+            throw MobileFixtureError.unavailable
+        }
     }
 
     enum MobileFixtureError: Error {
