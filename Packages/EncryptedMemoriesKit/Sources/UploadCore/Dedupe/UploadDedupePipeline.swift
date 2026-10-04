@@ -379,7 +379,8 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
             let matches = Set(
                 candidates.filter { $0.linkState == .active && $0.contentHash == contentHash }
                     .compactMap(\.linkID))
-            let asked = scope.retired.union(scope.superseded).union(ancestry.links).union(matches).union([target])
+            let asked = scope.retired.union(scope.superseded).union(scope.gone).union(ancestry.links).union(matches)
+                .union([target])
             var knownForeign: Set<String> = []
             for linkID in asked.sorted() {
                 let external = try await checker.externalIdentifier(ofMainLink: linkID)
@@ -401,6 +402,7 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
             return scope
         }
         scope.retired.subtract(foreign)
+        scope.gone.subtract(foreign)
         if let current = scope.current, foreign.contains(current) { scope.current = nil }
         try replacementJournal.addRemoteSuperseded(PhotoUID(volumeID: "", nodeID: head), for: descriptor.source)
         // The next edit finds its own upload instead of this head, so the journal keeps what the head replaced.
@@ -509,7 +511,7 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
         }
         return UploadReplacementScope(
             superseded: Set(entry.superseded.map(\.nodeID)), retired: Set(entry.retired),
-            current: lastUpload ?? entry.superseded.last?.nodeID)
+            current: lastUpload ?? entry.superseded.last?.nodeID, gone: Set(entry.gone ?? []))
     }
 
     /// What a replacing upload names: the proven earlier uploads of the journal, newest first. Links of other photos
@@ -557,7 +559,7 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
         // person restored an earlier version, or an active main photo holds these bytes.
         let matches = remoteItems.filter { $0.linkState == .active && $0.contentHash == contentHash }
             .compactMap(\.linkID)
-        var asked = replacement.retired.union(matches)
+        var asked = replacement.retired.union(replacement.gone).union(matches)
         if let current = replacement.current { asked.insert(current) }
         let visibility: [String: RemoteLinkVisibility]
         if let optional = replacement.candidateVisibility {
@@ -574,21 +576,25 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
         let adoptable = ownMatches.subtracting(replacement.superseded.subtracting(replacement.liveHeads))
         let liveRetired = replacement.retired.filter(isLiveMain)
         let restored = liveRetired.subtracting(adoptable).subtracting(replacement.remoteAncestors)
+        // A gone photo that is in the library again proves the photo live, but the person restored it: it never
+        // becomes an earlier version that this upload replaces.
+        let liveGone = replacement.gone.filter(isLiveMain)
 
         guard
             replacement.current.map(isLiveMain) == true || !replacement.liveHeads.isEmpty
-                || !restored.isEmpty || !adoptable.isEmpty
+                || !restored.isEmpty || !adoptable.isEmpty || !liveGone.isEmpty
         else {
             // Nothing proves the photo live. Who removed it stays unknown, so the earlier rule applies: the
             // photos of the replacement do not count, and a trashed copy outside them is a deletion by the person.
             // An active copy under a main photo is a related file, such as the hidden original under a replaced
             // photo. It is no backup. The states above name those copies without a lookup of the related photos
             // of a main photo that may be in the trash or gone. A copy that left the library after the listing
-            // named it active was a main photo, so it counts as a deletion by the person.
+            // named it active was a main photo, so it counts as a deletion by the person. A gone earlier photo
+            // left without a known author, so its trash is no deletion proof either.
             let related = Set(
                 matches.filter { visibility[$0].map { $0.isActive && $0.mainPhotoLinkID != nil } ?? false })
             let removed = Set(matches.filter { visibility[$0]?.isActive != true })
-            let excluded = replacement.superseded.union(replacement.retired).union(related)
+            let excluded = replacement.superseded.union(replacement.retired).union(replacement.gone).union(related)
             return (
                 remoteItems.compactMap { item in
                     guard let linkID = item.linkID else { return item }
@@ -600,7 +606,7 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
                 }, false
             )
         }
-        if replacement.current.map(isLiveMain) == true || !liveRetired.isEmpty {
+        if replacement.current.map(isLiveMain) == true || !liveRetired.isEmpty || !liveGone.isEmpty {
             try replacementJournal?.clearDeletionChoice(for: descriptor.source)
         }
         // A restored earlier version with other bytes is an earlier photo again, so this upload replaces it.
@@ -614,7 +620,7 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
         // The photo is in the library, so a trashed or deleted copy of these bytes is an earlier version that the
         // backup replaced, not a deletion by the person. An active copy counts only as a main photo: the hidden
         // original under the photo that this upload replaces, or a related file of a trashed photo, is no backup.
-        let scope = replacement.superseded.union(replacement.retired)
+        let scope = replacement.superseded.union(replacement.retired).union(replacement.gone)
         // Lineage contract: the guard above proves an active holder, and only an inactive named link drops out here.
         return (
             remoteItems.filter { item in
@@ -986,17 +992,19 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
     }
 }
 
-/// The earlier uploads of one primary that an edit replaces (`superseded`) or already replaced (`retired`).
+/// The earlier uploads of one primary that an edit replaces (`superseded`) or already replaced (`retired`), and the
+/// earlier uploads that left the library without a known author (`gone`).
 private struct UploadReplacementScope {
     var superseded: Set<String>
     var retired: Set<String>
     /// The photo that showed before this upload: the last upload that the manifest names, else the newest
     /// superseded photo of the journal.
     var current: String?
+    var gone: Set<String> = []
     var knownForeignLinks: Set<String> = []
     var liveHeads: Set<String> = []
     var remoteAncestors: Set<String> = []
     var candidateVisibility: [String: RemoteLinkVisibility]?
 
-    var isEmpty: Bool { superseded.isEmpty && retired.isEmpty }
+    var isEmpty: Bool { superseded.isEmpty && retired.isEmpty && gone.isEmpty }
 }
