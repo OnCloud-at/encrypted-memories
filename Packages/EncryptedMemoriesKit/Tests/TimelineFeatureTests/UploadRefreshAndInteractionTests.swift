@@ -277,6 +277,30 @@ final class UploadRefreshAndInteractionTests: XCTestCase {
     }
 
     @MainActor
+    func testOverlappingTrashAndRestoreBothReachTheLibrary() async {
+        let a = photo("a", seconds: 1)
+        let b = photo("b", seconds: 2)
+        let c = photo("c", seconds: 3)
+        let all = [section([a, b, c])]
+        let model = TimelineViewModel(
+            repository: RefreshRepository(timelines: [all]),
+            feed: makeFeed(),
+            library: FakeLibrary(sections: all)
+        )
+        await model.load()
+        await model.commitTrash([b])
+        for _ in 0..<20 {
+            // The person trashes one photo and restores another before the first change is shown.
+            async let trashed: Void = model.commitTrash([c])
+            async let restored: Void = model.commitRestore([b])
+            _ = await (trashed, restored)
+            XCTAssertEqual(model.wholeLibraryUIDs, [a.uid, b.uid], "an earlier change must not overwrite a later one")
+            await model.commitRestore([c])
+            await model.commitTrash([b])
+        }
+    }
+
+    @MainActor
     func testTrashFromAlbumUpdatesWholeLibraryAndRejectsStaleRefreshes() async {
         let a = photo("a", seconds: 1)
         let b = photo("b", seconds: 2)

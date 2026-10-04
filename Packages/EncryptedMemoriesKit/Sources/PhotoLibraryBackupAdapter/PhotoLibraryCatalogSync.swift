@@ -304,6 +304,40 @@ public struct PhotoLibraryCatalogSync: Sendable {
         return progress
     }
 
+    /// Runs once per catalog. An earlier build can store an entry that lists a late rendered file next to a backup
+    /// with the original as main photo; the scan then sees no change. This pass offers each stored edit that lists its
+    /// rendered file to `reopenBackedUpRevisions` and queues the revisions it re-opens. It reads only local stores.
+    /// The flag is set only after the last page, so a cancelled pass starts again.
+    public func reconcileLateRendersOnce(engine: any UploadBackupCandidateEnqueueing) async throws {
+        guard !store.hasReconciledLateRenders() else { return }
+        var cursor: String?
+        while true {
+            try Task.checkCancellation()
+            let page = store.presentEntries(afterLocalIdentifier: cursor, limit: chunkSize)
+            guard store.isOperational() else {
+                throw UploadError.backend("Photo library catalog could not be read")
+            }
+            guard let last = page.last else { break }
+            let reopenings = page.compactMap { entry -> UploadBackupReopening? in
+                let info = PhotoLibraryCatalogMapper.info(for: entry)
+                // The catalog keeps no adjustment state; a listed rendered file next to the original marks the edit.
+                guard PhotoBackupAssetPlanner.listsRender(info),
+                    let formerMain = PhotoBackupAssetPlanner.originalSecondarySource(for: info),
+                    let candidate = PhotoBackupAssetPlanner.candidate(for: info)
+                else { return nil }
+                return UploadBackupReopening(candidate: candidate, formerMain: formerMain)
+            }
+            if !reopenings.isEmpty {
+                let pending = try await engine.reopenBackedUpRevisions(reopenings)
+                if !pending.isEmpty { _ = try await engine.enqueueBatch(pending) }
+            }
+            cursor = last.localIdentifier
+        }
+        guard store.markLateRendersReconciled() else {
+            throw UploadError.backend("Photo library catalog could not be updated")
+        }
+    }
+
     /// Classifies + enqueues one chunk, then durably advances the catalog. Queue rows are written
     /// before the catalog (`upsertBatch`) so a crash re-yields the asset rather than stranding it.
     private func ingest(
@@ -319,6 +353,7 @@ public struct PhotoLibraryCatalogSync: Sendable {
             throw UploadError.backend("Photo library catalog classification was incomplete")
         }
         var candidates: [UploadBackupAssetCandidate] = []
+        var reopened: [UploadBackupReopening] = []
         candidates.reserveCapacity(entries.count)
         for (info, change) in zip(chunk, changes) {
             progress.scanned += 1
@@ -330,12 +365,31 @@ public struct PhotoLibraryCatalogSync: Sendable {
             }
             if let candidate = PhotoBackupAssetPlanner.candidate(for: info) {
                 candidates.append(candidate)
+                if change == .changed, rendersLate(info) {
+                    reopened.append(
+                        UploadBackupReopening(
+                            candidate: candidate,
+                            formerMain: PhotoBackupAssetPlanner.originalSecondarySource(for: info)))
+                }
             }
         }
+        guard store.isOperational() else {
+            throw UploadError.backend("Photo library catalog could not be read")
+        }
+        if !reopened.isEmpty { try await engine.reopenBackedUpRevisions(reopened) }
         _ = try await engine.enqueueBatch(candidates)
         try Task.checkCancellation()
         guard store.upsertBatch(entries) else {
             throw UploadError.backend("Photo library catalog could not be updated")
         }
+    }
+
+    /// An edit whose rendered file Photos lists only now. When Photos leaves the dates alone, its revision can
+    /// equal one that an earlier build recorded as complete with the original as main photo.
+    private func rendersLate(_ info: PhotoBackupAssetInfo) -> Bool {
+        guard PhotoBackupAssetPlanner.listsRender(info), let stored = store.entry(for: info.localIdentifier) else {
+            return false
+        }
+        return !PhotoBackupAssetPlanner.listsRender(PhotoLibraryCatalogMapper.info(for: stored))
     }
 }

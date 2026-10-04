@@ -225,7 +225,7 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
         }
     }
 
-    public func trustedRecord(contentHash: String, hashKeyEpoch: String) -> UploadIdentityRecord? {
+    public func trustedRecords(contentHash: String, hashKeyEpoch: String, limit: Int) -> [UploadIdentityRecord] {
         lock.withLock {
             var stmt: OpaquePointer?
             guard
@@ -238,38 +238,41 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
                     WHERE content_hash=? AND key_epoch=?
                       AND remote_link IS NOT NULL
                       AND outcome IN ('uploaded', 'duplicateActive')
-                    LIMIT 1;
+                    LIMIT ?;
                     """,
                     -1, &stmt, nil
                 ) == SQLITE_OK
-            else { return nil }
+            else { return [] }
             defer { sqlite3_finalize(stmt) }
             bindText(stmt, 1, contentHash)
             bindText(stmt, 2, hashKeyEpoch)
-            guard sqlite3_step(stmt) == SQLITE_ROW,
-                let kindRaw = columnText(stmt, 0),
-                let kind = UploadSourceIdentity.Kind(rawValue: kindRaw),
-                let identifier = columnText(stmt, 1),
-                let resourceRaw = columnText(stmt, 2)
-            else {
-                return nil
+            sqlite3_bind_int64(stmt, 3, Int64(max(0, limit)))
+            var records: [UploadIdentityRecord] = []
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                guard let kindRaw = columnText(stmt, 0),
+                    let kind = UploadSourceIdentity.Kind(rawValue: kindRaw),
+                    let identifier = columnText(stmt, 1),
+                    let resourceRaw = columnText(stmt, 2)
+                else { continue }
+                let resource = UploadSourceIdentity.Resource(rawValue: resourceRaw)
+                records.append(
+                    UploadIdentityRecord(
+                        source: UploadSourceIdentity(kind: kind, identifier: identifier, resource: resource),
+                        filename: columnText(stmt, 3) ?? "",
+                        correctedName: columnText(stmt, 4) ?? "",
+                        fileSize: sqlite3_column_int64(stmt, 5),
+                        modificationDate: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 6)),
+                        sha1Hex: columnText(stmt, 7) ?? "",
+                        nameHash: columnText(stmt, 8) ?? "",
+                        contentHash: contentHash,
+                        hashKeyEpoch: hashKeyEpoch,
+                        remoteVolumeID: columnText(stmt, 9),
+                        remoteLinkID: columnText(stmt, 10),
+                        outcome: columnText(stmt, 11),
+                        updatedAt: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 12))
+                    ))
             }
-            let resource = UploadSourceIdentity.Resource(rawValue: resourceRaw)
-            return UploadIdentityRecord(
-                source: UploadSourceIdentity(kind: kind, identifier: identifier, resource: resource),
-                filename: columnText(stmt, 3) ?? "",
-                correctedName: columnText(stmt, 4) ?? "",
-                fileSize: sqlite3_column_int64(stmt, 5),
-                modificationDate: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 6)),
-                sha1Hex: columnText(stmt, 7) ?? "",
-                nameHash: columnText(stmt, 8) ?? "",
-                contentHash: contentHash,
-                hashKeyEpoch: hashKeyEpoch,
-                remoteVolumeID: columnText(stmt, 9),
-                remoteLinkID: columnText(stmt, 10),
-                outcome: columnText(stmt, 11),
-                updatedAt: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 12))
-            )
+            return records
         }
     }
 
@@ -383,28 +386,35 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
 
     // MARK: UploadRemoteContentIndexStore
 
-    public func remoteContentRecord(
+    public func remoteContentRecords(
         contentHash: String,
-        hashKeyEpoch: String
-    ) -> UploadRemoteContentIndexRecord? {
+        hashKeyEpoch: String,
+        limit: Int
+    ) -> [UploadRemoteContentIndexRecord] {
         lock.withLock {
             var stmt: OpaquePointer?
             guard
                 sqlite3_prepare_v2(
                     db,
-                    "SELECT remote_link FROM remote_content_index WHERE key_epoch=? AND content_hash=? LIMIT 1;",
+                    "SELECT remote_link FROM remote_content_index WHERE key_epoch=? AND content_hash=? LIMIT ?;",
                     -1, &stmt, nil
                 ) == SQLITE_OK
-            else { return nil }
+            else { return [] }
             defer { sqlite3_finalize(stmt) }
             bindText(stmt, 1, hashKeyEpoch)
             bindText(stmt, 2, contentHash)
-            guard sqlite3_step(stmt) == SQLITE_ROW, let remoteLinkID = columnText(stmt, 0) else { return nil }
-            return UploadRemoteContentIndexRecord(
-                contentHash: contentHash,
-                hashKeyEpoch: hashKeyEpoch,
-                remoteLinkID: remoteLinkID
-            )
+            sqlite3_bind_int64(stmt, 3, Int64(max(0, limit)))
+            var records: [UploadRemoteContentIndexRecord] = []
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                guard let remoteLinkID = columnText(stmt, 0) else { continue }
+                records.append(
+                    UploadRemoteContentIndexRecord(
+                        contentHash: contentHash,
+                        hashKeyEpoch: hashKeyEpoch,
+                        remoteLinkID: remoteLinkID
+                    ))
+            }
+            return records
         }
     }
 

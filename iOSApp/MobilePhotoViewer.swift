@@ -1715,6 +1715,7 @@ private struct MobileVideoPage: View {
     @State private var playbackSourceIdentity: ObjectIdentifier?
     @State private var playbackSourceRevision: UInt64?
     @State private var playbackActivity: LibraryRuntimeActivityRegistration?
+    @State private var holdsVideoAudio = false
 
     private var sourceIdentity: ObjectIdentifier? {
         guard let facade = libraryModel.facade else { return nil }
@@ -2028,6 +2029,10 @@ private struct MobileVideoPage: View {
             )
             streamingAsset = streaming  // retain the resource loader for the player's lifetime
             playbackActivity = activity
+            if !holdsVideoAudio {
+                VideoAudioSession.begin()
+                holdsVideoAudio = true
+            }
             playbackAttachment = attachment
             playbackSourceIdentity = requestedSourceIdentity
             playbackSourceRevision = requestedSourceRevision
@@ -2060,6 +2065,10 @@ private struct MobileVideoPage: View {
         streamingAsset = nil
         playbackActivity?.end()
         playbackActivity = nil
+        if holdsVideoAudio {
+            VideoAudioSession.end()
+            holdsVideoAudio = false
+        }
         playbackTime = 0
         playbackDuration = 0
         playbackIsPlaying = false
@@ -2126,6 +2135,10 @@ private struct MobileVideoPage: View {
         streamingAsset = nil
         playbackActivity?.end()
         playbackActivity = nil
+        if holdsVideoAudio {
+            VideoAudioSession.end()
+            holdsVideoAudio = false
+        }
         playbackIsPlaying = false
         playbackIntendsToPlay = false
         playbackIsBuffering = false

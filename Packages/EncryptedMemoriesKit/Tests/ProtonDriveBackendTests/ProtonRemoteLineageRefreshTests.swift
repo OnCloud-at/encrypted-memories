@@ -57,6 +57,62 @@ extension DriveSessionStubSuite {
             }
         }
 
+        /// An account indexed before the lineage index existed has a content checkpoint and no lineage checkpoint.
+        /// A lineage read then asks for one full build, which fills both indexes at the same event.
+        @Test func aLineageReadRebuildsAMissingOrBehindLineageIndexUnlessItCannotWrite() async throws {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            for mode in ["missing", "behind", "current", "failed"] {
+                let content = try #require(
+                    UploadIdentityManifestStore(url: directory.appendingPathComponent("content-\(mode).sqlite")))
+                defer { content.close() }
+                let lineage = try #require(
+                    UploadRemoteLineageIndexStore(url: directory.appendingPathComponent("\(mode).sqlite")))
+                defer { lineage.close() }
+                if mode != "missing" {
+                    #expect(
+                        lineage.replaceRows(
+                            identities: [], lineage: [], hashKeyEpoch: "epoch",
+                            eventID: mode == "current" ? "one" : "older", unresolvedRemoteLinkIDs: []))
+                }
+                if mode == "failed" {
+                    #expect(
+                        !lineage.replaceRows(
+                            identities: [
+                                .init(
+                                    hashKeyEpoch: "wrong", remoteLinkID: "bad", externalIdentifier: "cloud",
+                                    isMain: true)
+                            ],
+                            lineage: [], hashKeyEpoch: "epoch", eventID: "one", unresolvedRemoteLinkIDs: []))
+                    #expect(!lineage.acceptsWrites)
+                }
+                #expect(
+                    content.replaceRemoteContentIndex(
+                        [.init(contentHash: "hash", hashKeyEpoch: "epoch", remoteLinkID: "main")],
+                        unresolvedIssues: [], hashKeyEpoch: "epoch", checkpoint: checkpoint("one")))
+                StubURLProtocol.reset()
+                routeEmptyEvents(from: "one", to: "two")
+                StubURLProtocol.route("GET /drive/volumes/vol1/events/latest", json: #"{"Code":1000,"EventID":"two"}"#)
+                StubURLProtocol.route("GET /drive/volumes/vol1/photos", json: #"{"Code":1000,"Photos":[]}"#)
+
+                try await refresh(content: content, lineage: lineage, rebuildsMissingLineage: true)
+
+                let paths = StubURLProtocol.requests().map(\.path)
+                let contentCheckpoint = content.remoteContentIndexCheckpoint(hashKeyEpoch: "epoch")
+                #expect(contentCheckpoint?.eventID == "two", "\(mode)")
+                if mode == "missing" || mode == "behind" {
+                    #expect(!paths.contains("/drive/volumes/vol1/events/one"), "\(mode): \(paths)")
+                    #expect(paths.contains { $0.hasPrefix("/drive/volumes/vol1/photos") }, "\(mode): \(paths)")
+                    #expect(
+                        lineage.health(hashKeyEpoch: "epoch", contentCheckpoint: contentCheckpoint) == .complete,
+                        "\(mode)")
+                } else {
+                    #expect(paths == ["/drive/volumes/vol1/events/one"], "\(mode): \(paths)")
+                }
+            }
+        }
+
         @Test func lineageWriteFailureDisablesFurtherWritesWhileContentKeepsRefreshing() async throws {
             let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -249,7 +305,8 @@ extension DriveSessionStubSuite {
         }
 
         private func refresh(
-            content: UploadIdentityManifestStore, lineage: UploadRemoteLineageIndexStore?
+            content: UploadIdentityManifestStore, lineage: UploadRemoteLineageIndexStore?,
+            rebuildsMissingLineage: Bool = false
         ) async throws {
             let session = DriveSession(
                 session: ProtonSession(uid: "test-uid", accessToken: "at", refreshToken: "rt", keyPassword: "kp"),
@@ -261,7 +318,8 @@ extension DriveSessionStubSuite {
                     context: .init(volumeID: "vol1", shareID: "share1", rootLinkID: "root1"),
                     rootKey: .init(armored: "", passphrase: ""), hashKey: Data(), epoch: "epoch"),
                 session: session, crypto: DriveCrypto(addressKeys: [], signers: []),
-                store: content, lineageStore: lineage, progress: { _ in })
+                store: content, lineageStore: lineage, rebuildsMissingLineage: rebuildsMissingLineage,
+                progress: { _ in })
         }
     }
 }

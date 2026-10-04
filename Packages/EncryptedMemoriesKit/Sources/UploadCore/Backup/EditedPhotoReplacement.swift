@@ -66,6 +66,14 @@ public struct EditedPhotoReplacement: Sendable {
         !journal.entry(for: source).allSuperseded.isEmpty
     }
 
+    /// True when the next upload of `source` replaces its earlier uploads: no series, and an edit or the undo of an
+    /// edit. A false result keeps every earlier upload, so the upload must not name them as replaced. A compound
+    /// without its original still names them: `replaceSuperseded` waits for the original before the trash write,
+    /// and a reader counts a named link as replaced only after it left the library.
+    public func replacesEarlierUploads(of source: UploadSourceIdentity, edited: Bool, isSeries: Bool) -> Bool {
+        !isSeries && journal.entry(for: source).replacesEarlierUploads(edited: edited)
+    }
+
     /// Keeps the earlier uploads of `source`. A series keeps today's behavior until its own edit model exists.
     public func keepSuperseded(of source: UploadSourceIdentity) throws {
         let superseded = journal.entry(for: source).allSuperseded
@@ -121,7 +129,7 @@ public struct EditedPhotoReplacement: Sendable {
         let unknown = remoteTargets.subtracting(provenCompounds.keys)
         superseded.removeAll { unknown.contains($0.nodeID) }
         // Other bytes of a photo that is unedited now and was unedited before are no edit, so both photos stay.
-        guard !superseded.isEmpty, edited || entry.lastUploadWasEdit else {
+        guard !superseded.isEmpty, entry.replacesEarlierUploads(edited: edited) else {
             try keepSuperseded(of: source)
             try recordUpload(of: source, edited: edited)
             return .kept
