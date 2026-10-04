@@ -203,7 +203,8 @@ public struct PendingSourceState: Sendable, Equatable {
 public struct PendingExclusionRequest: Sendable, Equatable {
     public let key: PendingSourceKey
     public let presentation: PendingPresentationMetadata?
-    /// The committed Proton photo of the source, when a handoff exists.
+    /// The committed Proton photo of the deleted revision, when a handoff exists. For an unfinished edit, the
+    /// earlier upload that its tile hides.
     public let remote: PhotoUID?
     /// The revision the person deleted. The store also looks up a durable handoff of this revision, so a
     /// commit whose event has not reached the coordinator yet still goes to the trash.

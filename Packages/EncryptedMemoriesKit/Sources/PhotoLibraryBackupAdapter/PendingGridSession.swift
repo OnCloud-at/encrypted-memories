@@ -84,7 +84,9 @@ public final class PendingGridSession {
             metadataProvider: SessionMetadata(photos: metadata, files: files?.metadata),
             effects: SessionEffects(photoBackup: photoBackup, files: files, remote: remote, volume: volume),
             recorder: recorder,
-            replacementJournal: photoBackup.pendingReplacementJournal
+            replacementJournal: photoBackup.pendingReplacementJournal,
+            identities: photoBackup.pendingIdentities,
+            relations: photoBackup.pendingRelations
         )
         presenter = PendingTimelinePresenter(replacementLookup: { [ledger = recorder.replacementLedger] in
             ledger.replacementHandoffs()

@@ -163,8 +163,18 @@ final class FakeChecker: UploadDuplicateChecking, @unchecked Sendable {
     var relatedLinkIDsByMainLinkID: [String: Set<String>] = [:]
     /// Answers like the server from state outside the checker, for example the uploads a test made.
     var relatedLinkIDsProvider: (@Sendable (String) -> Set<String>)?
+    /// Fails every related-files lookup, like a server that does not answer.
+    var relatedLookupError: Error?
+    /// Runs inside every related-files lookup, so a test can hold the caller there.
+    var relatedLookupGate: (@Sendable () async -> Void)?
+
+    /// The main photos whose related files a caller asked for, in order.
+    private(set) var relatedLookups: [String] = []
 
     func relatedPhotoLinkIDs(ofMainLinkID mainLinkID: String) async throws -> Set<String> {
+        lock.withLock { relatedLookups.append(mainLinkID) }
+        if let gate = lock.withLock({ relatedLookupGate }) { await gate() }
+        if let error = lock.withLock({ relatedLookupError }) { throw error }
         let provided = lock.withLock { relatedLinkIDsProvider }?(mainLinkID) ?? []
         return lock.withLock { relatedLinkIDsByMainLinkID[mainLinkID] ?? [] }.union(provided)
     }

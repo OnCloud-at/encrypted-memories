@@ -125,6 +125,10 @@ public final class PhotoLibraryBackupController {
     public let pendingRecorder: PendingBackupEventRecorder?
     /// The earlier uploads of edited photos, so the pending grid shows an edit in place of its earlier photo.
     public let pendingReplacementJournal: (any EditReplacementJournaling)?
+    /// The identity manifest of the edit replacement, so a delete never trashes a photo that another source needs.
+    public let pendingIdentities: (any UploadIdentityStore)?
+    /// The server lookup of related files, so a delete never trashes a related file that another source needs.
+    public let pendingRelations: (any UploadDuplicateChecking)?
     private let pendingStore: PendingBackupManifestStore?
     private let requiresPendingStore: Bool
     private let queueStore: UploadBackupSyncQueueManifestStore?
@@ -211,6 +215,8 @@ public final class PhotoLibraryBackupController {
         }
         self.pendingRecorder = pendingRecorder
         pendingReplacementJournal = journal
+        pendingIdentities = editReplacement?.identities
+        pendingRelations = editReplacement?.relations
         self.pendingStore = pendingStore
         self.requiresPendingStore = requiresPendingStore
         defaults = configuration.defaults
@@ -332,6 +338,21 @@ public final class PhotoLibraryBackupController {
             PhotoBackupAssetPlanner.candidate(for: PhotoLibraryCatalogMapper.info(for: $0))
         }
         guard catalogStore.isOperational() else { return false }
+        // The restore is the person's answer for an edit whose earlier upload a delete moved to the trash. When
+        // that upload left the trash for good, the edit must not ask whether the photo was deleted elsewhere.
+        // Without the record the person is asked; the restore still succeeds.
+        if let journal = pendingReplacementJournal {
+            for candidate in candidates
+            where !journal.entry(for: candidate.snapshot.source).allSuperseded.isEmpty {
+                try? journal.backUpAgain(revision: candidate.snapshot.revision, for: candidate.snapshot.source)
+            }
+        }
+        // A delete moved the Proton photo of a restored source to the trash, which the person can empty. The
+        // duplicate check verifies the photo again instead of trusting the backup state from before the delete.
+        for candidate in candidates
+        where stateStore?.removeRecords(for: candidate.snapshot.source, keeping: []) != true {
+            return false
+        }
         do {
             _ = try await engine.enqueueBatch(candidates)
         } catch {

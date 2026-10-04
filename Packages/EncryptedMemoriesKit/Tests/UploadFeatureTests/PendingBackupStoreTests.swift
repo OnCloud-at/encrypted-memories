@@ -139,6 +139,93 @@ final class PendingBackupStoreTests: XCTestCase {
         XCTAssertEqual(state?.needsRemoteTrash, true, "the committed photo must still go to the trash")
     }
 
+    // Mutation: prefer the durable handoff over `request.remote` in `exclude`; the earlier upload never goes to the
+    // trash.
+    func testDeleteOfAnEditTrashesTheHiddenEarlierUploadAndThenItsOwnCommit() throws {
+        let edit = UploadBackupRevision(rawValue: 4)
+        let earlier = PhotoUID(volumeID: "vol", nodeID: "link-earlier")
+        XCTAssertEqual(
+            store.recordHandoff(
+                PendingHandoff(key: key, revision: edit, remote: remote, kind: .uploaded, createdAt: date)),
+            .recorded)
+
+        // The coordinator sends the earlier upload because the event of the edit's commit has not arrived yet.
+        let state = try XCTUnwrap(
+            store.exclude(
+                [PendingExclusionRequest(key: key, presentation: presentation(), remote: earlier, revision: edit)],
+                at: date)
+        ).first
+        XCTAssertEqual(state?.remote, earlier, "the photo that the tile shows goes to the trash first")
+        XCTAssertEqual(state?.needsRemoteTrash, true)
+
+        XCTAssertTrue(
+            store.completeEffect(.remoteTrash, for: key, generation: 1, remoteLinkID: earlier.nodeID, at: date))
+        let next = try XCTUnwrap(store.sourceState(for: key))
+        XCTAssertEqual(next.remote, remote, "the committed edit follows the earlier upload to the trash")
+        XCTAssertTrue(next.needsRemoteTrash)
+    }
+
+    // Mutation: drop the early return for a pending trash in `recordHandoff`; the earlier upload is never trashed.
+    // Mutation: drop the `needs_remote_trash` condition in `pruneAcknowledgedHandoffs`; the edit is never trashed.
+    func testEditThatCommitsBeforeTheEarlierTrashIsSentKeepsBothTrashesDue() throws {
+        let earlier = PhotoUID(volumeID: "vol", nodeID: "link-earlier")
+        let edit = UploadBackupRevision(rawValue: 4)
+        _ = store.exclude(
+            [PendingExclusionRequest(key: key, presentation: presentation(), remote: earlier, revision: edit)],
+            at: date)
+        XCTAssertEqual(
+            store.recordHandoff(
+                PendingHandoff(key: key, revision: edit, remote: remote, kind: .uploaded, createdAt: date)),
+            .excludedRemoteNeedsTrash)
+        let waiting = try XCTUnwrap(store.sourceState(for: key))
+        XCTAssertEqual(waiting.remote, earlier, "the trash of the earlier upload stays owed")
+        XCTAssertTrue(waiting.needsRemoteTrash)
+        XCTAssertTrue(store.acknowledgeHandoffs([(key, edit)]))
+        XCTAssertTrue(store.pruneAcknowledgedHandoffs(olderThan: date.addingTimeInterval(1)))
+
+        XCTAssertTrue(
+            store.completeEffect(.remoteTrash, for: key, generation: 1, remoteLinkID: earlier.nodeID, at: date))
+        let next = try XCTUnwrap(store.sourceState(for: key))
+        XCTAssertEqual(next.remote, remote)
+        XCTAssertTrue(next.needsRemoteTrash)
+        XCTAssertFalse(next.remoteTrashed)
+
+        XCTAssertTrue(
+            store.completeEffect(.remoteTrash, for: key, generation: 1, remoteLinkID: remote.nodeID, at: date))
+        let done = try XCTUnwrap(store.sourceState(for: key))
+        XCTAssertTrue(done.remoteTrashed)
+        XCTAssertFalse(done.needsRemoteTrash)
+    }
+
+    func testEditThatCommitsWhileItsEarlierUploadMovesToTheTrashStillGoesToTheTrash() throws {
+        let earlier = PhotoUID(volumeID: "vol", nodeID: "link-earlier")
+        let excluded = try XCTUnwrap(
+            store.exclude(
+                [
+                    PendingExclusionRequest(
+                        key: key, presentation: presentation(), remote: earlier,
+                        revision: UploadBackupRevision(rawValue: 4))
+                ],
+                at: date)
+        )
+        XCTAssertEqual(store.beginRemoteOperation(.remoteTrash, for: excluded), [key])
+        XCTAssertEqual(
+            store.recordHandoff(
+                PendingHandoff(
+                    key: key, revision: UploadBackupRevision(rawValue: 4), remote: remote, kind: .uploaded,
+                    createdAt: date)),
+            .excludedRemoteNeedsTrash)
+
+        // The trash of the earlier upload confirms after the edit committed.
+        XCTAssertTrue(
+            store.completeEffect(.remoteTrash, for: key, generation: 1, remoteLinkID: earlier.nodeID, at: date))
+        let state = try XCTUnwrap(store.sourceState(for: key))
+        XCTAssertEqual(state.remote, remote)
+        XCTAssertTrue(state.needsRemoteTrash, "the committed edit must still go to the trash")
+        XCTAssertNil(state.remoteOperation)
+        XCTAssertEqual(store.dueSourceStates(by: date).map(\.key), [key])
+    }
+
     func testUndoDuringATrashRequestRestoresEvenAfterACrash() throws {
         let excluded = try XCTUnwrap(
             store.exclude([PendingExclusionRequest(key: key, presentation: presentation(), remote: remote)], at: date)

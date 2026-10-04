@@ -562,4 +562,87 @@ final class DeletedPhotoTests: XCTestCase {
         await controller.shutdown()
         queue.close()
     }
+
+    /// Restoring a deleted pending edit is the person's answer: when its earlier upload left the Proton trash for
+    /// good, the edit backs up without asking. A photo without an earlier upload records nothing.
+    @MainActor
+    func testRestoringADeletedEditConsentsToItsBackup() async throws {
+        let suite = "deletion-restore-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        func info(_ id: String) -> PhotoBackupAssetInfo {
+            PhotoBackupAssetInfo(
+                localIdentifier: id, creationDate: date, modificationDate: date.addingTimeInterval(60),
+                pixelWidth: 4032, pixelHeight: 3024, durationSeconds: 0, isLivePhoto: false, isVideo: false,
+                resources: [.init(role: .originalPhoto, originalFilename: "\(id).heic", mimeType: "image/heic")])
+        }
+        let plain = UploadSourceIdentity(kind: .photoLibraryAsset, identifier: "plain-photo")
+        let catalog = try XCTUnwrap(
+            PhotoLibraryCatalogManifestStore(
+                url: directory.appendingPathComponent(PhotoLibraryCatalogManifestStore.databaseFileName)))
+        for id in [source.identifier, plain.identifier] {
+            _ = catalog.upsert(PhotoLibraryCatalogMapper.entry(for: info(id), observedAt: date))
+        }
+        catalog.close()
+        try addEarlierUpload()
+        let controller = PhotoLibraryBackupController(
+            configuration: .init(accountDataDirectory: directory, databasePolicy: .conservative, defaults: defaults),
+            identityResolver: FakeIdentityResolver(), uploader: MockUploader(), replacementJournal: journal)
+
+        let returned = await controller.returnToBackup(identifiers: [source.identifier, plain.identifier])
+
+        XCTAssertTrue(returned)
+        let entry = PhotoLibraryCatalogMapper.entry(for: info(source.identifier), observedAt: date)
+        let edit = try XCTUnwrap(PhotoBackupAssetPlanner.candidate(for: PhotoLibraryCatalogMapper.info(for: entry)))
+        XCTAssertEqual(journal.entry(for: source).backUpAgainRevision, edit.snapshot.revision)
+        XCTAssertTrue(journal.entry(for: plain).isEmpty, "an unedited photo needs no answer")
+        await controller.shutdown()
+    }
+
+    /// The person deletes a backed-up photo, empties the Proton trash, and restores the photo in the app. The
+    /// backup state from before the delete must not settle the restored photo as backed up.
+    /// Mutation: drop the `removeRecords` loop in `returnToBackup`; the stale completed record stays.
+    @MainActor
+    func testRestoringADeletedPhotoForgetsItsBackupStateFromBeforeTheDelete() async throws {
+        let suite = "deletion-restore-state-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let info = PhotoBackupAssetInfo(
+            localIdentifier: source.identifier, creationDate: date, modificationDate: date,
+            pixelWidth: 4032, pixelHeight: 3024, durationSeconds: 0, isLivePhoto: false, isVideo: false,
+            resources: [.init(role: .originalPhoto, originalFilename: "photo.heic", mimeType: "image/heic")])
+        let catalog = try XCTUnwrap(
+            PhotoLibraryCatalogManifestStore(
+                url: directory.appendingPathComponent(PhotoLibraryCatalogManifestStore.databaseFileName)))
+        let entry = PhotoLibraryCatalogMapper.entry(for: info, observedAt: date)
+        _ = catalog.upsert(entry)
+        catalog.close()
+        let candidate = try XCTUnwrap(
+            PhotoBackupAssetPlanner.candidate(for: PhotoLibraryCatalogMapper.info(for: entry)))
+        let state = try XCTUnwrap(
+            UploadBackupStateManifestStore(
+                url: directory.appendingPathComponent(PhotoLibraryBackupController.stateDatabaseFileName)))
+        defer { state.close() }
+        XCTAssertTrue(
+            state.upsert(
+                UploadBackupAssetRecord(
+                    source: candidate.snapshot.source, revision: candidate.snapshot.revision,
+                    resourceCount: candidate.snapshot.resourceCount, pendingResourceCount: 0, updatedAt: date)))
+        let controller = PhotoLibraryBackupController(
+            configuration: .init(accountDataDirectory: directory, databasePolicy: .conservative, defaults: defaults),
+            identityResolver: FakeIdentityResolver(), uploader: MockUploader(), replacementJournal: journal)
+
+        let returned = await controller.returnToBackup(identifiers: [source.identifier])
+
+        XCTAssertTrue(returned)
+        let queue = try XCTUnwrap(
+            UploadBackupSyncQueueManifestStore(
+                url: directory.appendingPathComponent(PhotoLibraryBackupController.queueDatabaseFileName)))
+        defer { queue.close() }
+        let row = try XCTUnwrap(queue.entry(for: candidate.snapshot.source, revision: candidate.snapshot.revision))
+        XCTAssertNotEqual(
+            row.state, .alreadyBackedUp,
+            "the duplicate check must verify the photo again instead of trusting the state from before the delete")
+        await controller.shutdown()
+    }
 }
