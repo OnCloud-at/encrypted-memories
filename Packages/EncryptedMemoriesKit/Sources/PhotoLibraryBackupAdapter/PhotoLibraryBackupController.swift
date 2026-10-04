@@ -1007,6 +1007,32 @@ public final class PhotoLibraryBackupController {
             return true
         }
 
+        /// Seeds one photo that waits for its upload while the person paused the backup, without PhotoKit or a
+        /// network connection. Passes after a resume do nothing, so the photo keeps waiting in the grid.
+        public func installPausedBackupFixtureForTesting() -> Bool {
+            guard let queueStore, let catalogStore, pendingRecorder != nil else { return false }
+            let date = Date(timeIntervalSince1970: 1_781_352_000)  // 13 June 2026: after every fixture photo
+            let info = PhotoBackupAssetInfo(
+                localIdentifier: "fixture-paused-photo", creationDate: date, modificationDate: date,
+                pixelWidth: 160, pixelHeight: 160, durationSeconds: 0, isLivePhoto: false, isVideo: false,
+                resources: [
+                    .init(role: .originalPhoto, originalFilename: "Paused fixture.heic", mimeType: "image/heic")
+                ])
+            let source = UploadSourceIdentity(kind: .photoLibraryAsset, identifier: info.localIdentifier)
+            guard catalogStore.upsertBatch([PhotoLibraryCatalogMapper.entry(for: info, observedAt: date)]),
+                queueStore.upsert(
+                    .init(
+                        source: source, revision: .init(rawValue: 1), originalFilename: "Paused fixture.heic",
+                        state: .queuedForUpload, updatedAt: date))
+            else { return false }
+            passBodyForTesting = {}
+            isEnabled = true
+            isUserPaused = true
+            accessState = .full
+            refreshFromQueue()
+            return true
+        }
+
         internal func setAccessStateForTesting(_ state: PhotoBackupAccessState) {
             accessState = state
         }

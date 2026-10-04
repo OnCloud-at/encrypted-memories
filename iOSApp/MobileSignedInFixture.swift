@@ -101,6 +101,8 @@ import UploadCore
                 installDeletedBackupFixture()
             } else if ProcessInfo.processInfo.arguments.contains("-EncryptedMemoriesFailedBackupFixture") {
                 installDeletedBackupFixture(failedItems: true)
+            } else if ProcessInfo.processInfo.arguments.contains("-EncryptedMemoriesPausedBackupFixture") {
+                installPausedBackupFixture()
             }
             if ProcessInfo.processInfo.arguments.contains("-EncryptedMemoriesAlbumSyncReasonsFixture") {
                 installAlbumSyncReasonsFixture()
@@ -168,6 +170,29 @@ import UploadCore
             }
         }
 
+        /// One Apple Photos photo that waits for its upload in the grid while the person paused the backup.
+        private func installPausedBackupFixture() {
+            let directory = cacheDirectory.appendingPathComponent("paused-backup", isDirectory: true)
+            do {
+                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                guard let defaults = UserDefaults(suiteName: "paused-backup-fixture"),
+                    let store = PendingGridSession.openStore(accountDataDirectory: directory, policy: .conservative)
+                else { return }
+                defaults.removePersistentDomain(forName: "paused-backup-fixture")
+                let controller = PhotoLibraryBackupController(
+                    configuration: .init(
+                        accountDataDirectory: directory, databasePolicy: .conservative, defaults: defaults),
+                    identityResolver: MobileFixtureBackupBackend(), uploader: MobileFixtureBackupBackend(),
+                    pendingStore: store, requiresPendingStore: true)
+                guard controller.installPausedBackupFixtureForTesting() else { return }
+                backupFixture = controller
+                runtime.libraryModel.installIsolatedPendingBackupForTesting(
+                    controller, store: store, remote: MobileFixturePendingRemoteEffects())
+            } catch {
+                assertionFailure("The paused backup fixture could not be installed")
+            }
+        }
+
         /// Installs only the library content into an isolated model (no session, no shared runtime): for probes that
         /// host one production screen in a test window.
         func install(into model: MobileLibraryModel) {
@@ -214,6 +239,14 @@ import UploadCore
             _ descriptor: UploadResourceDescriptor, identity: UploadIdentity,
             remoteVolumeID: String, remoteLinkID: String
         ) async throws { throw MobileFixtureError.unavailable }
+    }
+
+    /// Proton effects of pending photos on an offline account: every call waits for a retry.
+    private struct MobileFixturePendingRemoteEffects: PendingRemoteEffects {
+        func trash(_ uids: [PhotoUID]) async -> PendingBatchEffectResult { .init(retry: Set(uids)) }
+        func restore(_ uids: [PhotoUID]) async -> PendingBatchEffectResult { .init(retry: Set(uids)) }
+        func setFavorite(_ uid: PhotoUID, favorite: Bool) async -> PendingEffectResult { .retry }
+        func addToAlbum(_ uid: PhotoUID, albumID: String) async -> PendingEffectResult { .retry }
     }
 
     /// Remote album operations of an offline account: every call fails.
