@@ -103,6 +103,21 @@ public struct BackupStatus: Sendable, Equatable {
         totalConsidered.map { max(0, $0 - skippedRemoteDeletions) }
     }
     public var needsAttentionCount: Int { failed + sourceMissing }
+    /// Changes when a photo can enter or leave the problem list, never on transfer progress alone, so an open
+    /// list reloads only when its content can differ.
+    public var problemListKey: ProblemListKey {
+        ProblemListKey(
+            phase: phase,
+            counts: [failed, sourceMissing, waitingRetry, dismissedFailures, skippedRemoteDeletions, outstandingCount],
+            issue: outstandingIssue, nextAttemptAt: nextAttemptAt)
+    }
+
+    public struct ProblemListKey: Sendable, Equatable {
+        let phase: Phase
+        let counts: [Int]
+        let issue: BackupIssueKind?
+        let nextAttemptAt: Date?
+    }
     /// Every item that is not currently proven present in Proton Drive. Intentional remote deletions are
     /// excluded because the backup policy has already settled them successfully.
     public var notBackedUpCount: Int {
@@ -176,9 +191,7 @@ public struct BackupStatus: Sendable, Equatable {
         totalConsidered = progress.total
         fractionCompleted = progress.total > 0 ? progress.fraction : nil
 
-        if progress.remoteIndexPreparationFailed {
-            phase = .needsAttention
-        } else if progress.isRunning && (progress.hasOutstandingWork || progress.paused > 0 || isPreparingRemoteIndex) {
+        if progress.isRunning && (progress.hasOutstandingWork || progress.paused > 0 || isPreparingRemoteIndex) {
             // `waiting` lumps not-yet-examined `discovered` rows with confirmed `queuedForUpload`
             // ones; the unexamined part is `waiting - uploadQueued`. During a first pass over an
             // already-backed-up library almost everything is being checked (and turns out already

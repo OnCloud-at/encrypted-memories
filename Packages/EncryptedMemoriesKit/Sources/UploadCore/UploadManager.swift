@@ -947,6 +947,9 @@ public actor UploadManager: UploadManaging {
                 )
             )
 
+        case .awaitDeletionCheck:
+            throw UploadError.backend(L10n.string("backup.issue_deletion_check"))
+
         case .uploadMissingSecondaries:
             // Manual uploads are single-resource compounds. The primary is already represented.
             return .noUpload(.skipped(.primaryAlreadyPresent))

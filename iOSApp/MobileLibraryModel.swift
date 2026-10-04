@@ -1947,6 +1947,10 @@ final class MobileLibraryModel {
             loadState = .contentReady(count: projection.snapshot.items.count)
         }
 
+        func installIsolatedBackupForTesting(_ controller: PhotoLibraryBackupController) {
+            photoBackup = controller
+        }
+
         /// Installs the real source runtime for bound-feed lifecycle regression tests.
         func installIsolatedSourceAnalysisForTests(_ runtime: LibrarySourceAnalysisRuntime) {
             sourceAnalysis.install(runtime)

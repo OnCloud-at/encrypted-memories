@@ -784,13 +784,14 @@ private struct MacFailedBackupSheet: View {
                 Text(L10n.string("backup.failed_sheet_title"))
                     .font(.headline)
                 Spacer()
-                if controller.hasRetryableFailures {
+                if items.offersUserRetry {
                     Button(L10n.string("backup.failed_sheet_retry")) {
                         Task {
-                            await controller.retryFailedAndSync()
+                            await controller.retryUserResolvableWork()
                             dismiss()
                         }
                     }
+                    .accessibilityIdentifier("backup.retryUserResolvable.sheet")
                 }
                 Button(L10n.string("backup.failed_sheet_done")) { dismiss() }
                     .keyboardShortcut(.cancelAction)
@@ -806,37 +807,66 @@ private struct MacFailedBackupSheet: View {
                 )
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
-                List(items) { item in
-                    HStack(alignment: .top, spacing: 10) {
-                        Image(systemName: item.isPermanent ? "trash.slash" : "arrow.clockwise.circle")
-                            .foregroundStyle(item.isPermanent ? Color.secondary : Color.orange)
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(item.filename)
-                                .lineLimit(1)
-                                .truncationMode(.middle)
-                            Text(item.reason)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                                .fixedSize(horizontal: false, vertical: true)
-                            if let retryDescription = item.retryDescription {
-                                Text(retryDescription)
-                                    .font(.caption2)
-                                    .foregroundStyle(.secondary)
+                List {
+                    ForEach(BackupIssueSection.allCases) { section in
+                        let sectionItems = items.filter { $0.category.section == section }
+                        if !sectionItems.isEmpty {
+                            Section {
+                                ForEach(sectionItems) { item in
+                                    HStack(alignment: .top, spacing: 10) {
+                                        Image(systemName: item.category.symbolName)
+                                            .foregroundStyle(item.isPermanent ? Color.secondary : Color.orange)
+                                        VStack(alignment: .leading, spacing: 2) {
+                                            Text(item.filename)
+                                                .lineLimit(1)
+                                                .truncationMode(.middle)
+                                            Text(item.reason)
+                                                .font(.caption)
+                                                .foregroundStyle(.secondary)
+                                                .fixedSize(horizontal: false, vertical: true)
+                                            if let retryDescription = item.retryDescription {
+                                                Text(retryDescription)
+                                                    .font(.caption2)
+                                                    .foregroundStyle(.secondary)
+                                            }
+                                        }
+                                        Spacer(minLength: 8)
+                                        if item.issue == .deletedElsewhere {
+                                            Button(L10n.string("backup.keep_deleted")) {
+                                                controller.keepDeleted(item)
+                                                Task { items = await controller.problemItems() }
+                                            }
+                                            .buttonStyle(.borderless)
+                                            .help(L10n.string("backup.keep_deleted"))
+                                            Button(L10n.string("backup.back_up_again")) {
+                                                controller.backUpAgain(item)
+                                                Task {
+                                                    items = await controller.problemItems().filter {
+                                                        $0.id != item.id || $0.issue == .deletedElsewhere
+                                                    }
+                                                }
+                                            }
+                                            .buttonStyle(.borderless)
+                                            .help(L10n.string("backup.back_up_again"))
+                                        } else if item.isPermanent {
+                                            Button {
+                                                controller.dismissFailedItem(item)
+                                                items.removeAll { $0.id == item.id }
+                                            } label: {
+                                                Image(systemName: "xmark.circle")
+                                            }
+                                            .buttonStyle(.borderless)
+                                            .help(L10n.string("backup.failed_item_dismiss"))
+                                        }
+                                    }
+                                    .padding(.vertical, 2)
+                                }
+                            } header: {
+                                Text(section.localizedTitle)
+                                    .accessibilityIdentifier("backup.issueSection.\(section.rawValue)")
                             }
-                        }
-                        Spacer(minLength: 8)
-                        if item.isPermanent {
-                            Button {
-                                controller.dismissFailedItem(item)
-                                items.removeAll { $0.id == item.id }
-                            } label: {
-                                Image(systemName: "xmark.circle")
-                            }
-                            .buttonStyle(.borderless)
-                            .help(L10n.string("backup.failed_item_dismiss"))
                         }
                     }
-                    .padding(.vertical, 2)
                 }
                 Text(L10n.string("backup.failed_sheet_footer"))
                     .font(.caption)
@@ -847,7 +877,8 @@ private struct MacFailedBackupSheet: View {
             }
         }
         .frame(width: 520, height: 380)
-        .onAppear { items = controller.failedItems() }
+        // A photo can need the person while the list is open; Try again then appears.
+        .task(id: controller.status.problemListKey) { await controller.followProblemList { items = $0 } }
     }
 }
 

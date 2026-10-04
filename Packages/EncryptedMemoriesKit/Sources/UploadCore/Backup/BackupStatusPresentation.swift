@@ -144,9 +144,11 @@ public struct BackupStatusPresentation: Sendable, Equatable {
             let headlineKey =
                 switch status.outstandingIssue {
                 case .network: "backup.phase_waiting_network"
+                case .remoteService: "backup.phase_waiting_proton"
                 case .deviceStorage: "backup.phase_waiting_storage"
                 case .accountStorage: "backup.phase_waiting_account_storage"
                 case .remoteDraft: "backup.phase_waiting_draft"
+                case .deletedElsewhere: "backup.phase_attention"
                 default: "backup.phase_waiting"
                 }
             self.init(
@@ -197,10 +199,7 @@ public struct BackupStatusPresentation: Sendable, Equatable {
         if status.remoteContentIndexHealth.shouldWarn {
             degradedDedupeUnresolvedCount = status.remoteContentIndexHealth.unresolvedCount
         }
-        if status.executionOpportunityIssue != nil, !isActive, status.phase != .paused {
-            headlineKey = "backup.phase_attention"
-            accessory = .attention
-        }
+        remoteIndexPreparationFailed = status.remoteIndexPreparationFailed
     }
 
     // MARK: - Localized accessors (finite key sets; no dynamic-key lookups)
@@ -212,6 +211,7 @@ public struct BackupStatusPresentation: Sendable, Equatable {
         case "backup.phase_uploading": return L10n.string("backup.phase_uploading")
         case "backup.phase_paused": return L10n.string("backup.phase_paused")
         case "backup.phase_waiting": return L10n.string("backup.phase_waiting")
+        case "backup.phase_waiting_proton": return L10n.string("backup.phase_waiting_proton")
         case "backup.phase_waiting_network": return L10n.string("backup.phase_waiting_network")
         case "backup.phase_waiting_storage": return L10n.string("backup.phase_waiting_storage")
         case "backup.phase_waiting_account_storage": return L10n.string("backup.phase_waiting_account_storage")
@@ -221,7 +221,9 @@ public struct BackupStatusPresentation: Sendable, Equatable {
             return L10n.string("backup.phase_completed_with_remote_deletions")
         case "backup.phase_completed_with_omissions":
             return L10n.string("backup.phase_completed_with_omissions")
-        case "backup.phase_attention": return L10n.string("backup.phase_attention")
+        case "backup.phase_attention":
+            return attentionCount > 0
+                ? L10n.string("backup.phase_not_backed_up \(attentionCount)") : L10n.string("backup.phase_attention")
         default: return L10n.string("backup.phase_idle")
         }
     }

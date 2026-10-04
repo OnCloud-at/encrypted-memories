@@ -399,12 +399,33 @@ final class UploadBackupSyncQueueTests: XCTestCase {
         for id in ["failed", "draft", "waiting", "upload"] {
             let entry = try XCTUnwrap(store.entry(for: source(id), revision: revision(1)))
             XCTAssertEqual(entry.updatedAt, now)
-            XCTAssertNil(entry.lastError)
+            XCTAssertEqual(entry.lastError, "old", "manual retry must preserve the reason")
         }
         for id in ["deleted", "missing", "permanent", "dismissed", "done"] {
             let entry = try XCTUnwrap(store.entry(for: source(id), revision: revision(1)))
             XCTAssertEqual(entry.updatedAt, future, "non-retryable and successful rows must not move")
         }
+    }
+
+    func testManualRetryKeepsTheEncodedIssueAndNextAttempt() throws {
+        let store = try XCTUnwrap(
+            UploadBackupSyncQueueManifestStore(
+                url: tempDir.appendingPathComponent(UploadBackupSyncQueueManifestStore.databaseFileName)))
+        let future = Date(timeIntervalSince1970: 10_000)
+        let record = BackupIssueRecord(
+            kind: .network, detail: "transport detail", nextAttemptAt: future, automaticRetryAttempt: 6)
+        let entry = UploadBackupSyncQueueEntry(
+            source: source("network-record"), revision: revision(1), originalFilename: "network.heic",
+            state: .discovered, attempts: 3, lastError: record.persistedValue, updatedAt: future)
+        XCTAssertTrue(store.upsert(entry))
+        let now = Date(timeIntervalSince1970: 500)
+        XCTAssertEqual(store.makeRetryableWorkEligible(updatedAt: now), 1)
+        let retried = try XCTUnwrap(store.entry(for: entry.source, revision: entry.revision))
+        XCTAssertEqual(retried.updatedAt, now)
+        // JSONEncoder fixes no key order, so the stored text can differ; the decoded issue must not.
+        XCTAssertEqual(BackupIssueRecord.decode(retried.lastError), record)
+        XCTAssertEqual(retried.attempts, 3)
+        XCTAssertEqual(retried.state, .discovered)
     }
 
     func testPermanentFailureCanBeDismissedWithoutBecomingBackedUp() throws {
