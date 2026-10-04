@@ -192,6 +192,27 @@ final class EditReplacementTests: XCTestCase {
             reopened.entry(for: asset), EditReplacementJournalEntry(superseded: [], retired: ["a", "a-video"]))
     }
 
+    func testTheReplacementHistoryNamesProvenMainsNewestFirstAndSurvivesARelaunch() throws {
+        try journal.addSuperseded(PhotoUID(volumeID: "vol", nodeID: "z-old"), for: asset)
+        try journal.addSuperseded(PhotoUID(volumeID: "vol", nodeID: "a-new"), for: asset)
+        try journal.addProven("z-old", inherited: [], for: asset)
+        try journal.addProven("a-new", inherited: ["ancestor"], for: asset)
+        try journal.settle(["z-old", "a-new"], related: ["b-video"], trashed: true, for: asset)
+        try journal.addSuperseded(PhotoUID(volumeID: "vol", nodeID: "edit"), for: asset)
+        try journal.addProven("edit", inherited: [], for: asset)
+
+        let reopened = try XCTUnwrap(EditReplacementJournalFileStore(accountDataDirectory: directory))
+        XCTAssertEqual(reopened.entry(for: asset).retired, ["z-old", "a-new", "b-video"])
+        XCTAssertEqual(
+            reopened.entry(for: asset).replacementHistory(excluding: []),
+            [["edit"], ["a-new"], ["ancestor"], ["z-old"]],
+            "newest first, with what a remote photo replaced, and without related files")
+
+        try reopened.settle(["edit"], related: [], trashed: false, for: asset)
+        XCTAssertEqual(reopened.entry(for: asset).replacementHistory(excluding: []), [], "a kept link names nothing")
+        XCTAssertFalse(reopened.entry(for: asset).proven?.contains("edit") == true)
+    }
+
     func testAJournalFromAnEarlierBuildDecodesWithoutARetireIntent() throws {
         let encoded = Data(
             #"{"photoLibraryAsset|asset-1|primary":{"superseded":[],"retired":["old"],"uploadedEdit":true}}"#.utf8)

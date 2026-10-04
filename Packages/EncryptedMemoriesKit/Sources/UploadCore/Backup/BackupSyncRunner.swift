@@ -201,6 +201,11 @@ public actor BackupSyncRunner {
         return changed + (hadRemoteIndexIssue && clearedRemoteIndexIssue ? 1 : 0)
     }
 
+    /// Invalidates the remote view without changing queue eligibility or runtime backoff.
+    public func invalidateRemoteStateForUserRetry() async {
+        await identityResolver.invalidateCachedRemoteState()
+    }
+
     /// Ask the current pass to wind down: no new work starts, in-flight uploads are cancelled,
     /// and every touched row is reverted to a runnable state for the next pass after settlement.
     public func stop() async {
@@ -969,6 +974,12 @@ public actor BackupSyncRunner {
         defer {
             inFlightTokens[key] = nil
         }
+        // An upload that keeps its earlier uploads names none of them as replaced. An edit that waits for its
+        // original still names them, because a reader counts only a named link outside the library as replaced.
+        let replacesEarlierUploads =
+            editReplacement?.replacesEarlierUploads(
+                of: entry.source, edited: Self.isEdited(resolved), isSeries: Self.isSeries(resolved)) == true
+        let lineage = replacesEarlierUploads ? preflightResult.lineage : nil
 
         let request = PhotoUploadRequest(
             queueItemID: UUID(),
@@ -980,7 +991,7 @@ public actor BackupSyncRunner {
             captureTime: resolved.captureDate,
             modificationDate: resolved.descriptor.modificationDate,
             tags: Self.primaryTags(for: resolved.secondaries),
-            additionalMetadata: resolved.additionalMetadata
+            additionalMetadata: resolved.additionalMetadata + (lineage.map { [$0.additionalMetadata] } ?? [])
         )
         .applying(identity: preflightResult.identity)
         .replacingExistingDraft(preflightResult.decision == .uploadReplacingDraft)
@@ -1133,6 +1144,21 @@ public actor BackupSyncRunner {
         case sourceChanged
     }
 
+    /// A series keeps its earlier uploads until its own edit model exists.
+    private static func isSeries(_ resolved: BackupResolvedResource) -> Bool {
+        resolved.secondaries.contains(where: { $0.descriptor.source.resource.isBurstMember })
+    }
+
+    private static func isEdited(_ resolved: BackupResolvedResource) -> Bool {
+        resolved.candidate.snapshot.editRevision == .unavailable
+    }
+
+    private static func holdsOriginal(_ resolved: BackupResolvedResource) -> Bool {
+        EditedPhotoReplacement.holdsOriginal(
+            editRevision: resolved.candidate.snapshot.editRevision,
+            secondaries: resolved.secondaries.map(\.descriptor.source.resource))
+    }
+
     /// Uploads/dedupes any secondary resources, then - and only then - marks the compound backed
     /// up. Partial secondary failure records honest pending state and retries the whole entry;
     /// the primary is never re-uploaded (its manifest row short-circuits the next pass).
@@ -1145,7 +1171,7 @@ public actor BackupSyncRunner {
         workIntent: LibraryWorkIntent
     ) async {
         var persistedState = state
-        let isSeries = resolved.secondaries.contains(where: { $0.descriptor.source.resource.isBurstMember })
+        let isSeries = Self.isSeries(resolved)
         // An edit that replaces an earlier upload uploads its secondaries under the edited photo again: their
         // earlier copies are related photos of the earlier photo and move to the trash with it.
         let replacesEarlierUpload = !isSeries && editReplacement?.isReplacing(entry.source) == true
@@ -1295,11 +1321,8 @@ public actor BackupSyncRunner {
                     let outcome = try await editReplacement.replaceSuperseded(
                         of: entry.source,
                         with: primaryUID,
-                        edited: resolved.candidate.snapshot.editRevision == .unavailable,
-                        holdsOriginal: EditedPhotoReplacement.holdsOriginal(
-                            editRevision: resolved.candidate.snapshot.editRevision,
-                            secondaries: resolved.secondaries.map(\.descriptor.source.resource)
-                        ),
+                        edited: Self.isEdited(resolved),
+                        holdsOriginal: Self.holdsOriginal(resolved),
                         externalIdentifier: resolved.descriptor.externalIdentifier,
                         localEditTime: resolved.photoLibraryEditTime,
                         localCreationDate: resolved.descriptor.photoLibraryCreationDate,
@@ -1315,9 +1338,12 @@ public actor BackupSyncRunner {
                         // Some earlier mains may have retired while another still protects an original resource.
                         await identityResolver.invalidateCachedRemoteState()
                         try await preflight.markPending(resolved.candidate.snapshot)
-                        let detail = L10n.string("backup.issue_waiting_original")
+                        // The key, not a sentence: a new language or new copy keeps the same count.
+                        let detail = "backup.issue_waiting_original"
                         let earlier = BackupIssueRecord.decode(entry.lastError)
-                        let waits = earlier?.detail == detail ? (earlier?.automaticRetryAttempt ?? 0) + 1 : 0
+                        let waits =
+                            BackupFailedItem.isWaitingForOriginal(earlier?.detail)
+                            ? (earlier?.automaticRetryAttempt ?? 0) + 1 : 0
                         let eligibleAt = now().addingTimeInterval(
                             Self.waitingReplacementDelay(afterWaits: waits, first: min(180, longestRegularRetryWait)))
                         deferSource(
@@ -1793,7 +1819,10 @@ public actor BackupSyncRunner {
             let recheck =
                 drainMode == .waitForScheduledRetries
                 ? min(until, now().addingTimeInterval(configuration.oneShotSourceRecheckInterval)) : until
-            deferSource(entry, from: oldState, until: recheck)
+            deferSource(
+                entry, from: oldState, until: recheck,
+                issue: BackupIssueRecord(
+                    kind: .unknown, detail: "error.upload_source_not_ready", nextAttemptAt: recheck))
             return
         }
         let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription

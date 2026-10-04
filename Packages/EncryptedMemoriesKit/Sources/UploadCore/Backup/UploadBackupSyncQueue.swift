@@ -402,7 +402,7 @@ public extension UploadBackupSyncQueueStore {
                     revision: entry.revision,
                     state: target,
                     attempts: state == .failed ? 0 : nil,
-                    lastError: nil,
+                    lastError: entry.lastError,
                     updatedAt: updatedAt
                 ) {
                     changed += 1

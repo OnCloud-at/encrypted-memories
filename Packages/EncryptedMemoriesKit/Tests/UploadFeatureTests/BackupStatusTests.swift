@@ -271,4 +271,28 @@ final class BackupStatusTests: XCTestCase {
         done.skippedDuplicates = 1
         XCTAssertEqual(BackupStatus(manualUploadCheck: done).phase, .completed)
     }
+
+    func testTheProblemListReloadsForNewProblemsButNotForTransferProgress() {
+        var status = BackupStatus()
+        status.phase = .uploading
+        status.activeTransfer = BackupActiveTransferProgress(
+            activeItemCount: 1, completedBytes: 10, totalBytes: 100, completedItemEquivalents: 0.1)
+        let key = status.problemListKey
+        status.activeTransfer = BackupActiveTransferProgress(
+            activeItemCount: 1, completedBytes: 90, totalBytes: 100, completedItemEquivalents: 0.9)
+        status.activeExecutionItemEquivalents = 0.9
+        status.uploaded += 1
+        status.currentItemName = "next.heic"
+        XCTAssertEqual(status.problemListKey, key)
+
+        var waiting = status
+        waiting.outstandingCount = 1
+        XCTAssertNotEqual(waiting.problemListKey, key, "a photo starts to wait with a reason")
+        var failed = status
+        failed.failed = 1
+        XCTAssertNotEqual(failed.problemListKey, key, "a photo needs the person")
+        var cause = status
+        cause.outstandingIssue = .accountStorage
+        XCTAssertNotEqual(cause.problemListKey, key, "the reason of a wait changes")
+    }
 }

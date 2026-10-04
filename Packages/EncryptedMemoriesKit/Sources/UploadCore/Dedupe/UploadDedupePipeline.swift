@@ -89,6 +89,10 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
         try await checker.remoteContentIndexHealth()
     }
 
+    public func identityRecord(for source: UploadSourceIdentity) -> UploadIdentityRecord? {
+        store.record(for: source)
+    }
+
     public func resolve(_ descriptor: UploadResourceDescriptor) async throws -> UploadPreflightResult {
         let corrected = ProtonPhotoNameCorrection.correctedName(for: descriptor.filename)
         let epoch = try await checker.hashKeyEpoch()
@@ -161,7 +165,9 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
         let replacement = try await replacementScope(
             for: descriptor, cached: cached, sha1Hex: sha1Hex, nameHash: nameHash, contentHash: contentHash)
         func result(_ decision: UploadDuplicateDecision) -> UploadPreflightResult {
-            UploadPreflightResult(identity: identity, decision: decision)
+            UploadPreflightResult(
+                identity: identity, decision: decision,
+                lineage: decision.uploadsBytes ? lineage(of: replacement, for: descriptor) : nil)
         }
 
         // Persist the identity before the remote check so a crash never re-pays the hashing.
@@ -337,7 +343,8 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
         else { return scope }
         // Runs on every pass, also on a retry whose remote target the journal already holds.
         scope = try await excludingForeignTargets(
-            from: scope, identifier: identifier, source: descriptor.source, journal: replacementJournal)
+            from: scope, identifier: identifier, isUnique: descriptor.externalIdentifierIsUnique,
+            source: descriptor.source, journal: replacementJournal)
         guard descriptor.isEditedPhoto, descriptor.externalIdentifierIsUnique,
             let creationDate = descriptor.photoLibraryCreationDate
         else { return scope }
@@ -396,6 +403,8 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
         scope.retired.subtract(foreign)
         if let current = scope.current, foreign.contains(current) { scope.current = nil }
         try replacementJournal.addRemoteSuperseded(PhotoUID(volumeID: "", nodeID: head), for: descriptor.source)
+        // The next edit finds its own upload instead of this head, so the journal keeps what the head replaced.
+        try replacementJournal.addProven(head, inherited: ancestors.sorted(), for: descriptor.source)
         let remoteAncestors = ancestors.subtracting(scope.retired).subtracting(scope.superseded)
         scope.superseded.insert(head)
         scope.retired.formUnion(ancestors.subtracting(scope.superseded))
@@ -408,17 +417,25 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
 
     /// A locally adopted duplicate can belong to another asset: a known different iCloud identifier proves that, so
     /// such a photo never becomes a replacement target. Failed or incomplete reads keep the scope unchanged.
+    /// The same identifier of a unique asset proves the link for the lineage marker. Without that proof the marker
+    /// leaves the link out, which is the safe side: another device then keeps the trashed photo as a deletion.
     private func excludingForeignTargets(
-        from scope: UploadReplacementScope, identifier: String, source: UploadSourceIdentity,
+        from scope: UploadReplacementScope, identifier: String, isUnique: Bool, source: UploadSourceIdentity,
         journal: any EditReplacementJournaling
     ) async throws -> UploadReplacementScope {
         guard !scope.superseded.isEmpty else { return scope }
         var foreign: Set<String> = []
+        var proven: [String] = []
         do {
             for linkID in scope.superseded.sorted() {
                 let external = try await checker.externalIdentifier(ofMainLink: linkID)
                 guard external.complete else { return scope }
-                if let remote = external.identifier, remote != identifier { foreign.insert(linkID) }
+                guard let remote = external.identifier else { continue }
+                if remote != identifier {
+                    foreign.insert(linkID)
+                } else if isUnique {
+                    proven.append(linkID)
+                }
             }
         } catch is CancellationError {
             throw CancellationError()
@@ -426,6 +443,10 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
             try Task.checkCancellation()
             return scope
         }
+        // An adopted head never reaches the discovery below, so the journal keeps what its marker named here.
+        var inherited: [String: [String]] = [:]
+        for linkID in proven { inherited[linkID] = try await inheritedLinks(of: linkID, identifier: identifier) }
+        for linkID in proven { try journal.addProven(linkID, inherited: inherited[linkID] ?? [], for: source) }
         guard !foreign.isEmpty else { return scope }
         try journal.settle(foreign, related: [], trashed: false, for: source)
         var scope = scope
@@ -434,6 +455,27 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
         if let current = scope.current, foreign.contains(current) { scope.current = nil }
         scope.knownForeignLinks.formUnion(foreign)
         return scope
+    }
+
+    /// What the marker of a proven link named, without links of other photos. Empty after a failed or incomplete
+    /// read, so the journal never keeps a partial list.
+    private func inheritedLinks(of linkID: String, identifier: String) async throws -> [String] {
+        do {
+            let ancestry = try await checker.replacedLinkIDs(ofReplacingMain: linkID)
+            guard ancestry.complete else { return [] }
+            var inherited: [String] = []
+            for ancestor in ancestry.links.sorted() {
+                let external = try await checker.externalIdentifier(ofMainLink: ancestor)
+                guard external.complete else { return [] }
+                if external.identifier.map({ $0 == identifier }) ?? true { inherited.append(ancestor) }
+            }
+            return inherited
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            try Task.checkCancellation()
+            return []
+        }
     }
 
     /// A photo-library primary with other bytes than its proven earlier upload was edited. The journal keeps the
@@ -449,11 +491,9 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
             return UploadReplacementScope(superseded: [], retired: [], current: nil)
         }
         var entry = replacementJournal.entry(for: descriptor.source)
-        // An earlier upload of another client counts as well: the duplicate check proved it was this photo.
-        let provenOutcomes = [UploadIdentityManifestStore.Outcome.uploaded, .duplicateActive].map(\.rawValue)
         // The manifest names the last upload of this photo, also when its bytes did not change.
         var lastUpload: String?
-        if let cached, cached.outcome.map(provenOutcomes.contains) == true,
+        if let cached, cached.provesUpload,
             let link = cached.remoteLinkID, !link.isEmpty
         {
             lastUpload = link
@@ -462,10 +502,28 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
                 try replacementJournal.addSuperseded(uid, for: descriptor.source)
                 entry.superseded.append(uid)
             }
+            // Only an own upload proves itself. An adopted duplicate needs its iCloud identifier.
+            if cached.sha1Hex != sha1Hex, cached.outcome == UploadIdentityManifestStore.Outcome.uploaded.rawValue {
+                try replacementJournal.addProven(link, inherited: [], for: descriptor.source)
+            }
         }
         return UploadReplacementScope(
             superseded: Set(entry.superseded.map(\.nodeID)), retired: Set(entry.retired),
             current: lastUpload ?? entry.superseded.last?.nodeID)
+    }
+
+    /// What a replacing upload names: the proven earlier uploads of the journal, newest first. Links of other photos
+    /// never appear. The backup attaches it only when its replacement policy replaces earlier uploads.
+    private func lineage(
+        of scope: UploadReplacementScope, for descriptor: UploadResourceDescriptor
+    )
+        -> UploadLineageMarker?
+    {
+        guard !scope.isEmpty, descriptor.source.resource == .primary, let replacementJournal else { return nil }
+        let entry = replacementJournal.entry(for: descriptor.source)
+        return UploadLineageMarker(
+            reason: descriptor.isEditedPhoto ? .edit : .undo,
+            history: entry.replacementHistory(excluding: scope.knownForeignLinks))
     }
 
     /// The remote rows that can prove this resource. A burst member and a secondary of a replacing edit count
@@ -557,6 +615,7 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
         // backup replaced, not a deletion by the person. An active copy counts only as a main photo: the hidden
         // original under the photo that this upload replaces, or a related file of a trashed photo, is no backup.
         let scope = replacement.superseded.union(replacement.retired)
+        // Lineage contract: the guard above proves an active holder, and only an inactive named link drops out here.
         return (
             remoteItems.filter { item in
                 guard item.linkState != .draft else { return true }
