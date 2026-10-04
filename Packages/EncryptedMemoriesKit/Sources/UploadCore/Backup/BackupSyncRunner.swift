@@ -201,6 +201,11 @@ public actor BackupSyncRunner {
         return changed + (hadRemoteIndexIssue && clearedRemoteIndexIssue ? 1 : 0)
     }
 
+    /// Invalidates the remote view without changing queue eligibility or runtime backoff.
+    public func invalidateRemoteStateForUserRetry() async {
+        await identityResolver.invalidateCachedRemoteState()
+    }
+
     /// Ask the current pass to wind down: no new work starts, in-flight uploads are cancelled,
     /// and every touched row is reverted to a runnable state for the next pass after settlement.
     public func stop() async {
@@ -1315,9 +1320,12 @@ public actor BackupSyncRunner {
                         // Some earlier mains may have retired while another still protects an original resource.
                         await identityResolver.invalidateCachedRemoteState()
                         try await preflight.markPending(resolved.candidate.snapshot)
-                        let detail = L10n.string("backup.issue_waiting_original")
+                        // The key, not a sentence: a new language or new copy keeps the same count.
+                        let detail = "backup.issue_waiting_original"
                         let earlier = BackupIssueRecord.decode(entry.lastError)
-                        let waits = earlier?.detail == detail ? (earlier?.automaticRetryAttempt ?? 0) + 1 : 0
+                        let waits =
+                            BackupFailedItem.isWaitingForOriginal(earlier?.detail)
+                            ? (earlier?.automaticRetryAttempt ?? 0) + 1 : 0
                         let eligibleAt = now().addingTimeInterval(
                             Self.waitingReplacementDelay(afterWaits: waits, first: min(180, longestRegularRetryWait)))
                         deferSource(
@@ -1793,7 +1801,10 @@ public actor BackupSyncRunner {
             let recheck =
                 drainMode == .waitForScheduledRetries
                 ? min(until, now().addingTimeInterval(configuration.oneShotSourceRecheckInterval)) : until
-            deferSource(entry, from: oldState, until: recheck)
+            deferSource(
+                entry, from: oldState, until: recheck,
+                issue: BackupIssueRecord(
+                    kind: .unknown, detail: "error.upload_source_not_ready", nextAttemptAt: recheck))
             return
         }
         let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription

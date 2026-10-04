@@ -97,11 +97,13 @@ import UploadCore
                     catalogBackend: albums, writeBackend: albums, capabilities: MobileFixtureAlbums.capabilities))
             if ProcessInfo.processInfo.arguments.contains("-EncryptedMemoriesDeletedBackupFixture") {
                 installDeletedBackupFixture()
+            } else if ProcessInfo.processInfo.arguments.contains("-EncryptedMemoriesFailedBackupFixture") {
+                installDeletedBackupFixture(failedItems: true)
             }
             runtime.sessionModel.installIsolatedSession(session)
         }
 
-        private func installDeletedBackupFixture() {
+        private func installDeletedBackupFixture(failedItems: Bool = false) {
             let directory = cacheDirectory.appendingPathComponent("backup", isDirectory: true)
             do {
                 try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -114,7 +116,24 @@ import UploadCore
                         accountDataDirectory: directory, databasePolicy: .conservative, defaults: defaults),
                     identityResolver: MobileFixtureBackupBackend(), uploader: MobileFixtureBackupBackend(),
                     replacementJournal: journal)
-                guard controller.installDeletedElsewhereFixtureForTesting() else { return }
+                let installed: Bool
+                if failedItems {
+                    let arguments = ProcessInfo.processInfo.arguments
+                    let kinds: [BackupIssueKind]
+                    if arguments.contains("-EncryptedMemoriesNetworkOnlyBackupFixture") {
+                        kinds = [.network]
+                    } else if arguments.contains("-EncryptedMemoriesAccountStorageOnlyBackupFixture") {
+                        kinds = [.accountStorage]
+                    } else if arguments.contains("-EncryptedMemoriesNoUserResolvableBackupFixture") {
+                        kinds = [.network, .deletedElsewhere, .unsupported]
+                    } else {
+                        kinds = [.network, .accountStorage, .deletedElsewhere, .unsupported]
+                    }
+                    installed = controller.installFailedItemsFixtureForTesting(kinds: kinds)
+                } else {
+                    installed = controller.installDeletedElsewhereFixtureForTesting()
+                }
+                guard installed else { return }
                 backupFixture = controller
                 runtime.libraryModel.installIsolatedBackupForTesting(controller)
             } catch {
