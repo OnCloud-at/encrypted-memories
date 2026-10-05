@@ -23,6 +23,14 @@ struct AlbumRepositorySeriesCarryOver: SeriesAlbumCarryOver {
         }
     }
 
+    /// Bypasses the repository's membership cache and refreshes it.
+    func currentAlbums(containing uids: [PhotoUID]) async throws -> [PhotoUID: [SeriesAlbumReference]] {
+        let memberships = try await repository.currentAlbumMemberships(for: uids)
+        return memberships.mapValues { albums in
+            albums.map { SeriesAlbumReference(volumeID: $0.volumeID, albumID: $0.nodeID) }
+        }
+    }
+
     func addPhotos(_ uids: [PhotoUID], toOwnAlbum albumID: String) async throws {
         guard !uids.isEmpty else { return }
         try await repository.addPhotos(uids, to: albumID)

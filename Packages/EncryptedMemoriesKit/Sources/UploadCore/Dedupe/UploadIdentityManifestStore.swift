@@ -1006,9 +1006,16 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
                 sqlite3_prepare_v2(
                     db,
                     """
+                    WITH related(remote_link) AS (
+                      SELECT l.remote_link FROM remote_asset_index_link l
+                      JOIN remote_asset_index a ON a.key_epoch=l.key_epoch AND a.external_id=l.external_id
+                        AND a.revision_us=l.revision_us
+                      WHERE l.key_epoch=?1 AND l.remote_link != a.primary_link
+                    )
                     SELECT content_hash, MAX(size) FROM upload_identity
                     WHERE key_epoch=?1 AND size > 0 AND content_hash IN (
-                      SELECT content_hash FROM remote_content_index WHERE key_epoch=?1
+                      SELECT content_hash FROM remote_content_index
+                      WHERE key_epoch=?1 AND remote_link NOT IN (SELECT remote_link FROM related)
                       GROUP BY content_hash HAVING COUNT(DISTINCT remote_link) > 1
                     )
                     GROUP BY content_hash;

@@ -167,6 +167,54 @@ extension DriveSessionStubSuite {
             #expect(!later.contains { $0.hasPrefix("/drive/volumes/vol1/photos") }, "the rebuild runs once")
         }
 
+        /// A merge trashes main photos while the library check runs. The trash is a later event than the build, so the
+        /// staged build stays and resumes where it stopped; a full invalidation still discards it.
+        @Test func aTrashOfMainPhotosKeepsTheStagedBuildAndTheBuildResumes() async throws {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let content = try #require(
+                UploadIdentityManifestStore(url: directory.appendingPathComponent("content.sqlite")))
+            defer { content.close() }
+            var hasher = SHA256()
+            for id in ["a", "b"] {
+                hasher.update(data: Data(id.utf8))
+                hasher.update(data: Data([0]))
+            }
+            let fingerprint = hasher.finalize().map { String(format: "%02x", $0) }.joined()
+            let build = try #require(
+                content.beginRemoteContentIndexBuild(
+                    hashKeyEpoch: "epoch", eventID: "e1", sourceFingerprint: fingerprint, total: 2, updatedAt: Date()))
+            #expect(
+                content.appendRemoteContentIndexBuild(
+                    records: ["a", "b"].map { .init(contentHash: "same", hashKeyEpoch: "epoch", remoteLinkID: $0) },
+                    unresolvedIssues: [], externalIdentities: [], hashKeyEpoch: "epoch", buildID: build.buildID,
+                    nextCursor: 2, updatedAt: Date()))
+            let service = makeService(content: content, lineage: nil)
+
+            await service.remoteMainsChangedHere()
+
+            #expect(content.remoteContentIndexBuildCheckpoint(hashKeyEpoch: "epoch")?.cursor == 2)
+            StubURLProtocol.reset()
+            StubURLProtocol.route("GET /drive/volumes/vol1/events/latest", json: #"{"Code":1000,"EventID":"e1"}"#)
+            StubURLProtocol.route(
+                "GET /drive/volumes/vol1/photos",
+                json: #"{"Code":1000,"Photos":[{"LinkID":"a","CaptureTime":1,"Tags":[],"RelatedPhotos":[]},"#
+                    + #"{"LinkID":"b","CaptureTime":2,"Tags":[],"RelatedPhotos":[]}]}"#)
+            try await service.prepareRemoteIndex { _ in }
+            let paths = StubURLProtocol.requests().map(\.path)
+            #expect(!paths.contains { $0.contains("fetch_metadata") }, "the build resumes after its rows: \(paths)")
+            #expect(content.remoteContentIndexCheckpoint(hashKeyEpoch: "epoch")?.eventID == "e1")
+            #expect(content.remoteContentDuplicateGroups(hashKeyEpoch: "epoch") == ["same": ["a", "b"]])
+
+            let second = try #require(
+                content.beginRemoteContentIndexBuild(
+                    hashKeyEpoch: "epoch", eventID: "e2", sourceFingerprint: fingerprint, total: 2, updatedAt: Date()))
+            #expect(second.cursor == 0)
+            await service.invalidateCachedRemoteState()
+            #expect(content.remoteContentIndexBuildCheckpoint(hashKeyEpoch: "epoch") == nil)
+        }
+
         @Test func lineageWriteFailureDisablesFurtherWritesWhileContentKeepsRefreshing() async throws {
             let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -622,7 +670,7 @@ extension DriveSessionStubSuite {
         }
 
         private func makeService(
-            content: UploadIdentityManifestStore, lineage: UploadRemoteLineageIndexStore
+            content: UploadIdentityManifestStore, lineage: UploadRemoteLineageIndexStore?
         ) -> ProtonUploadDedupeService {
             ProtonUploadDedupeService(
                 session: makeSession(), crypto: DriveCrypto(addressKeys: [], signers: []),

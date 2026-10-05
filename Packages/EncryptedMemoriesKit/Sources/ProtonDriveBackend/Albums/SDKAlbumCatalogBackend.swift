@@ -392,7 +392,7 @@ struct SDKAlbumCatalogBackend: AlbumCatalogBackend {
         return result
     }
 
-    /// The sharing state and the claimed file size of each photo. One node read for each photo,
+    /// The sharing state, the claimed file size, and the albums of each photo. One node read for each photo,
     /// `maximumConcurrentNodeLoads` at once. A missing node fails the read, because absence proves nothing.
     func nodeFacts(of photoUIDs: [PhotoUID]) async throws -> [PhotoUID: ExactDuplicateNodeFacts] {
         try await withAdmission {
@@ -405,7 +405,8 @@ struct SDKAlbumCatalogBackend: AlbumCatalogBackend {
                 switch node {
                 case .photo(let photo):
                     fact = .init(
-                        isShared: photo.isShared || photo.isSharedByUrl, byteSize: photo.activeRevision.claimedSize)
+                        isShared: photo.isShared || photo.isSharedByUrl, byteSize: photo.activeRevision.claimedSize,
+                        albums: photo.albumUids.map { SeriesAlbumReference(volumeID: $0.volumeID, albumID: $0.nodeID) })
                 case .file(let file):
                     fact = .init(
                         isShared: file.isShared || file.isSharedByUrl, byteSize: file.activeRevision.claimedSize)

@@ -19,10 +19,13 @@ public struct ExactDuplicateNodeFacts: Sendable, Equatable {
     public let isShared: Bool
     /// The size of the photo's file in bytes, as its uploader stated it. Nil when the node has none.
     public let byteSize: Int64?
+    /// Every album that contains the photo, shared albums included.
+    public let albums: [SeriesAlbumReference]
 
-    public init(isShared: Bool, byteSize: Int64?) {
+    public init(isShared: Bool, byteSize: Int64?, albums: [SeriesAlbumReference] = []) {
         self.isShared = isShared
         self.byteSize = byteSize
+        self.albums = albums
     }
 }
 
@@ -61,11 +64,17 @@ public struct ExactDuplicateRankingPage: Sendable, Equatable {
     public let groupCount: Int
     /// The size of one copy of each group in bytes, from the node reads of the ranking.
     public let byteSizes: [String: Int64]
+    /// The shared members of each ranked group. A trash would end their sharing.
+    public let shared: [String: Set<PhotoUID>]
 
-    public init(members: [String: [PhotoUID]], groupCount: Int, byteSizes: [String: Int64] = [:]) {
+    public init(
+        members: [String: [PhotoUID]], groupCount: Int, byteSizes: [String: Int64] = [:],
+        shared: [String: Set<PhotoUID>] = [:]
+    ) {
         self.members = members
         self.groupCount = groupCount
         self.byteSizes = byteSizes
+        self.shared = shared
     }
 }
 
@@ -193,7 +202,7 @@ public struct ExactDuplicateFinder: Sendable {
 
     /// Visibility reads that run at once. Each reads up to `UploadDedupePipeline.protonDuplicateBatchSize` links.
     static let visibilityConcurrency = 4
-    /// Groups whose facts the ranking reads at once. Each group reads its albums and its node facts.
+    /// Groups whose facts the ranking reads at once. One node read for each member gives its albums and its facts.
     static let rankingConcurrency = 4
     /// Groups in one page of the ranking.
     static let rankingPageSize = 24
@@ -329,9 +338,9 @@ public struct ExactDuplicateFinder: Sendable {
         guard !groups.isEmpty else { return }
         let start = ContinuousClock.now
         let members = groups.flatMap(\.members)
-        let shared: (volumeID: String, favorites: Set<PhotoUID>)
+        let context: (volumeID: String, favorites: Set<PhotoUID>)
         do {
-            shared = try await rankingContext.value(for: members, remote: remote)
+            context = try await rankingContext.value(for: members, remote: remote)
         } catch {
             log("[Duplicates] ranking without favorites; every group keeps its fallback order")
             await ranked(ExactDuplicateRankingPage(members: [:], groupCount: groups.count))
@@ -346,41 +355,43 @@ public struct ExactDuplicateFinder: Sendable {
             let facts = await groupFacts(of: page)
             var order: [String: [PhotoUID]] = [:]
             var sizes: [String: Int64] = [:]
+            var sharedMembers: [String: Set<PhotoUID>] = [:]
             for group in page {
                 guard let read = facts[group.contentHash] else {
                     failed += 1
                     continue
                 }
-                if let size = group.members.lazy.compactMap({ read.nodes[$0]?.byteSize }).first(where: { $0 > 0 }) {
+                let shared = Set(group.members.filter { read[$0]?.isShared == true })
+                if !shared.isEmpty { sharedMembers[group.contentHash] = shared }
+                if let size = group.members.lazy.compactMap({ read[$0]?.byteSize }).first(where: { $0 > 0 }) {
                     sizes[group.contentHash] = size
                 }
                 var memberFacts: [PhotoUID: ExactDuplicateKeepFacts] = [:]
                 for member in group.members {
                     memberFacts[member] = ExactDuplicateKeepFacts(
-                        isInOwnAlbum: (read.albums[member] ?? []).contains { $0.volumeID == shared.volumeID },
-                        isFavorite: shared.favorites.contains(member),
+                        isInOwnAlbum: (read[member]?.albums ?? []).contains { $0.volumeID == context.volumeID },
+                        isFavorite: context.favorites.contains(member),
                         isNamedByManifest: !(owners?[member.nodeID] ?? []).isEmpty,
-                        captureDate: dates[member], isShared: read.nodes[member]?.isShared == true)
+                        captureDate: dates[member], isShared: shared.contains(member))
                 }
                 order[group.contentHash] = Self.keepOrder(group.members, facts: memberFacts)
             }
             guard !Task.isCancelled else { return }
-            await ranked(ExactDuplicateRankingPage(members: order, groupCount: page.count, byteSizes: sizes))
+            await ranked(
+                ExactDuplicateRankingPage(
+                    members: order, groupCount: page.count, byteSizes: sizes, shared: sharedMembers))
         }
         log(
             "[Duplicates] ranking groups=\(groups.count) members=\(members.count) failedGroups=\(failed) "
-                + "albumReads=\(groups.count) nodeReads=\(groups.count) "
+                + "nodeReads=\(members.count) "
                 + "duration=\(start.duration(to: .now))")
     }
 
-    private typealias GroupFacts = (
-        albums: [PhotoUID: [SeriesAlbumReference]], nodes: [PhotoUID: ExactDuplicateNodeFacts]
-    )
+    private typealias GroupFacts = [PhotoUID: ExactDuplicateNodeFacts]
 
-    /// The albums and the node facts of the members of each group, `rankingConcurrency` groups at once. A group whose
-    /// read failed is missing.
+    /// The node facts of the members of each group, albums included, `rankingConcurrency` groups at once: one node
+    /// read for each member. A group whose read failed is missing.
     private func groupFacts(of groups: [ExactDuplicateGroup]) async -> [String: GroupFacts] {
-        let albums = albums
         let remote = remote
         return await withTaskGroup(of: (String, GroupFacts?).self) { taskGroup in
             var next = 0
@@ -391,9 +402,7 @@ public struct ExactDuplicateFinder: Sendable {
                 next += 1
                 taskGroup.addTask {
                     do {
-                        async let memberAlbums = albums.albums(containing: group.members)
-                        async let nodes = remote.nodeFacts(of: group.members)
-                        return (group.contentHash, (try await memberAlbums, try await nodes))
+                        return (group.contentHash, try await remote.nodeFacts(of: group.members))
                     } catch {
                         return (group.contentHash, nil)
                     }
@@ -601,9 +610,10 @@ public struct ExactDuplicateFinder: Sendable {
         var trashing: [(index: Int, plan: PlannedMerge)] = []
         for (index, plan) in writes where !Task.isCancelled {
             do {
+                // The albums of the duplicates are read fresh: a cached read can predate an album added since.
                 try await remote.carryOver(
-                    from: plan.trashable, to: plan.kept, ownVolumeID: plan.volumeID, albums: albums,
-                    favorites: favorites)
+                    from: plan.trashable, to: plan.kept, ownVolumeID: plan.volumeID,
+                    albums: CurrentAlbumCarryOver(base: albums), favorites: favorites)
                 // The carry-over added the kept photo to these albums. A retry finds the kept photo as their cover.
                 let trashedLinks = Set(plan.trashable.map(\.nodeID))
                 for (albumID, cover) in covers.sorted(by: { $0.key < $1.key }) where trashedLinks.contains(cover) {
@@ -625,12 +635,13 @@ public struct ExactDuplicateFinder: Sendable {
             try await remote.trashDuplicates(trashing.flatMap(\.plan.trashable))
         } catch {
             // A failed trash can still have moved some photos.
-            await resolver.invalidateCachedRemoteState()
+            await resolver.remoteMainsChangedHere()
             for (index, _) in trashing { results[index] = .failure(error) }
             return
         }
-        // The backup's cached remote state names the trashed links as active backups.
-        await resolver.invalidateCachedRemoteState()
+        // The backup's cached remote state names the trashed links as active backups. A running library check keeps
+        // going: the trash is a later event, which the refresh after the check applies.
+        await resolver.remoteMainsChangedHere()
         // The carry-over can have tagged a kept photo as favorite.
         rankingContext.invalidate()
         var restored = false
@@ -641,7 +652,7 @@ public struct ExactDuplicateFinder: Sendable {
                 results[index] = .failure(error)
             }
         }
-        if restored { await resolver.invalidateCachedRemoteState() }
+        if restored { await resolver.remoteMainsChangedHere() }
     }
 
     /// Reads `kept` after the trash. When `kept` left the library meanwhile, restores the duplicates of this group

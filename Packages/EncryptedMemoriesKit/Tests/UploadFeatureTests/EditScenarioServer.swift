@@ -73,6 +73,7 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
     private var nodeSizes: [String: Int64] = [:]
     private var missingNodes: Set<String> = []
     private var covers: [String: String] = [:]
+    private var failCoverWrite = false
     typealias IndexProgress = @Sendable (UploadRemoteIndexPreparationProgress) async -> Void
     typealias IndexBuild = @Sendable (@escaping IndexProgress) async throws -> Void
     private var indexBuildOverride: IndexBuild?
@@ -751,7 +752,10 @@ extension EditScenarioServer: ExactDuplicateRemote {
                     (
                         $0,
                         ExactDuplicateNodeFacts(
-                            isShared: sharedLinks.contains($0.nodeID), byteSize: nodeSizes[$0.nodeID])
+                            isShared: sharedLinks.contains($0.nodeID), byteSize: nodeSizes[$0.nodeID],
+                            albums: (table[$0.nodeID]?.albums ?? []).sorted {
+                                ($0.volumeID, $0.albumID) < ($1.volumeID, $1.albumID)
+                            })
                     )
                 })
         }
@@ -778,8 +782,15 @@ extension EditScenarioServer: ExactDuplicateRemote {
         }
     }
 
+    /// The next cover write fails.
+    func failNextCoverWrite() { lock.withLock { failCoverWrite = true } }
+
     func setCover(_ uid: PhotoUID, ofOwnAlbum albumID: String) async throws {
         try lock.withLock {
+            if failCoverWrite {
+                failCoverWrite = false
+                throw UploadError.backend("The scenario cover write failed")
+            }
             guard ownAlbumIDs.contains(albumID),
                 table[uid.nodeID]?.albums.contains(.init(volumeID: "vol", albumID: albumID)) == true
             else { throw UploadError.backend("The scenario cover is no member of the own album") }

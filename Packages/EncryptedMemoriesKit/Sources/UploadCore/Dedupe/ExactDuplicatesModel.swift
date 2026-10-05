@@ -83,6 +83,8 @@ public final class ExactDuplicatesModel {
         public internal(set) var isKeptChosen = false
         /// The size of one copy in bytes. Nil until the manifest or a node read of the ranking knows it.
         public internal(set) var byteSize: Int64?
+        /// The members that the person shares, as the ranking read them. Empty before the ranking.
+        public internal(set) var sharedMembers: Set<PhotoUID> = []
         /// The photos that a merge moves to Recently Deleted.
         public var duplicateCount: Int { members.count - 1 }
 
@@ -112,13 +114,21 @@ public final class ExactDuplicatesModel {
             return true
         }
 
-        /// Takes the ranked order. The photo to keep follows it unless the person chose one.
-        mutating func rank(_ order: [PhotoUID]) {
+        /// Takes the ranked order. The photo to keep follows it unless the person chose one. With `keepsShown`, the
+        /// photo that the screen already shows as kept stays, unless another member is shared and it is not: a merge
+        /// keeps every shared member, so the shared one is kept and shown.
+        mutating func rank(_ order: [PhotoUID], shared: Set<PhotoUID>, keepsShown: Bool) {
             let current = Set(members)
             let ranked = order.filter(current.contains)
             members = ranked + members.filter { !ranked.contains($0) }
+            sharedMembers = shared.intersection(current)
             isRanked = true
-            if !isKeptChosen { kept = members[0] }
+            guard !isKeptChosen else { return }
+            if !keepsShown {
+                kept = members[0]
+            } else if !sharedMembers.contains(kept), let firstShared = members.first(where: sharedMembers.contains) {
+                kept = firstShared
+            }
         }
     }
 
@@ -166,6 +176,12 @@ public final class ExactDuplicatesModel {
     private var phase = Phase.idle
     /// The last build failed, or it finished without an index.
     private var buildFailed = false
+    /// The service stopped the last build, for example for a full refresh. The check restarts, after a merge at once.
+    @ObservationIgnored private var checkInterrupted = false
+    /// The check restarted after an interruption in this load. A further interruption waits for a merge or a load.
+    @ObservationIgnored private var restartedAfterInterruption = false
+    /// The build finished during a merge with a changed index; the screen reads the groups again after the merge.
+    @ObservationIgnored private var rescanAfterMerge = false
     private var scannedDuplicateCount: Int?
     private var loadGeneration = 0
     /// The one build of this model. A load while it runs waits for it, and a closed screen leaves it running: the
@@ -343,6 +359,9 @@ public final class ExactDuplicatesModel {
         loadGeneration += 1
         let generation = loadGeneration
         phase = .loading
+        restartedAfterInterruption = false
+        checkInterrupted = false
+        rescanAfterMerge = false
         stopRanking()
         guard await scan(generation: generation) else { return }
         async let ranked: Void = rank(around: 0)
@@ -424,9 +443,12 @@ public final class ExactDuplicatesModel {
             return ranking
         }
         let token = UUID()
-        rankingToken = token
         rankingWorkerToken = token
-        rankingProgress = ExactDuplicateScanProgress(completed: 0, total: wanted.count)
+        // During a merge its own progress row stays; the scroll ranking runs without one.
+        if !isMerging {
+            rankingToken = token
+            rankingProgress = ExactDuplicateScanProgress(completed: 0, total: wanted.count)
+        }
         let task = Task { [weak self] in
             guard let self else { return }
             await self.drainRankingQueue(token: token)
@@ -475,14 +497,15 @@ public final class ExactDuplicatesModel {
     }
 
     /// Takes the ranked order and the size of each group in `page`. Only the ranking of `token` counts its progress.
-    private func apply(_ page: ExactDuplicateRankingPage, token: UUID?) {
+    /// `keepsShown` keeps the photo that the screen shows as kept, as a merge does.
+    private func apply(_ page: ExactDuplicateRankingPage, token: UUID?, keepsShown: Bool = false) {
         if let token, token == rankingToken, let progress = rankingProgress {
             rankingProgress = ExactDuplicateScanProgress(
                 completed: min(progress.completed + page.groupCount, progress.total), total: progress.total)
         }
         for (id, order) in page.members {
             guard let index = groups.firstIndex(where: { $0.id == id }) else { continue }
-            groups[index].rank(order)
+            groups[index].rank(order, shared: page.shared[id] ?? [], keepsShown: keepsShown)
         }
         for (id, size) in page.byteSizes {
             guard let index = groups.firstIndex(where: { $0.id == id }), groups[index].byteSize == nil else { continue }
@@ -495,6 +518,16 @@ public final class ExactDuplicatesModel {
         do {
             changed = try await buildIndex()
             buildFailed = false
+            checkInterrupted = false
+        } catch is CancellationError where !Task.isCancelled {
+            // The service stopped the build; nothing failed. The check starts again: after a merge, or now once.
+            guard generation == loadGeneration else { return }
+            checkInterrupted = true
+            if !isMerging, !restartedAfterInterruption {
+                restartedAfterInterruption = true
+                await buildAndRescan(generation: generation)
+            }
+            return
         } catch {
             guard generation == loadGeneration else { return }
             buildFailed = true
@@ -502,10 +535,16 @@ public final class ExactDuplicatesModel {
             if !isMerging, groups.isEmpty, !isComplete { phase = .failed }
             return
         }
-        guard generation == loadGeneration, !isMerging else { return }
+        guard generation == loadGeneration else { return }
         if changed {
-            guard await scan(generation: generation) else { return }
+            guard !isMerging, await scan(generation: generation) else {
+                // A merge holds the list; the groups are read again after it.
+                if isMerging { rescanAfterMerge = true }
+                return
+            }
             await rank(around: 0)
+        } else if isMerging {
+            return
         } else if case .indexing = coverage {
             // The build finished and left no index: waiting longer cannot help, a retry can.
             buildFailed = true
@@ -559,9 +598,11 @@ public final class ExactDuplicatesModel {
         groups[index].isKeptChosen = true
     }
 
+    /// Merges one group and keeps exactly the photo that the screen shows as kept.
     public func merge(groupID: String) async {
-        guard canMerge, let group = groups.first(where: { $0.id == groupID }) else { return }
-        await merge([group])
+        guard canMerge, let index = groups.firstIndex(where: { $0.id == groupID }) else { return }
+        groups[index].isKeptChosen = true
+        await merge([groups[index]])
     }
 
     public func mergeAll() async {
@@ -576,15 +617,15 @@ public final class ExactDuplicatesModel {
     private func merge(_ requested: [Group]) async {
         isMerging = true
         notice = nil
-        // The photo to keep needs the facts of its group: a shared photo or one in an album ranks first. Merge All
-        // reads the groups that nobody scrolled to page by page, with progress.
-        let unranked = requested.filter { !$0.isRanked }.map(\.scanGroup)
+        // Merge All reads the groups that nobody scrolled to page by page, with progress. The photo that the screen
+        // shows as kept stays, unless only another member is shared.
+        let unranked = requested.filter { !$0.isRanked && !$0.isKeptChosen }.map(\.scanGroup)
         if !unranked.isEmpty {
             let token = UUID()
             rankingToken = token
             rankingProgress = ExactDuplicateScanProgress(completed: 0, total: unranked.count)
             let apply: @Sendable (ExactDuplicateRankingPage) async -> Void = { [weak self] page in
-                await self?.apply(page, token: token)
+                await self?.apply(page, token: token, keepsShown: true)
             }
             await finder.rankMembers(of: unranked, ranked: apply)
             if rankingToken == token { rankingProgress = nil }
@@ -623,7 +664,20 @@ public final class ExactDuplicatesModel {
         if !trashed.isEmpty { await didTrash(trashed) }
         isMerging = false
         notice = Self.notice(kept: kept, keptPhotoUnreadable: keptPhotoUnreadable, failed: failed)
-        if stale { await load() }
+        if stale {
+            await load()
+            return
+        }
+        let generation = loadGeneration
+        if rescanAfterMerge {
+            rescanAfterMerge = false
+            if await scan(generation: generation) { await rank(around: 0) }
+        }
+        if checkInterrupted, !isComplete, indexBuild == nil {
+            // The check was stopped while the merge ran. It starts again and shows its progress.
+            checkInterrupted = false
+            Task { await self.buildAndRescan(generation: generation) }
+        }
     }
 
     /// One reason only: a failure first, then the unreadable photo to keep, then the kept duplicates.

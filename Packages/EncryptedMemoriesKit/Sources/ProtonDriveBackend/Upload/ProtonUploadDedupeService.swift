@@ -67,6 +67,8 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
         [:]
     private var remoteContentIndexGeneration = 0
     private var lastRemoteContentRefreshAt: Date?
+    /// Counts the trashes and restores of main photos on this device. A refresh that ran across one is not current.
+    private var remoteMainsChangedCount = 0
     /// The key epochs whose missing lineage index this launch rebuilt.
     private var rebuiltLineageEpochs: Set<String> = []
     private static let remoteContentIndexLifetime: TimeInterval = 15
@@ -390,6 +392,13 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
         )
     }
 
+    /// A running build keeps going and a staged build stays: its rows predate the trash, and the trash is an event
+    /// after the build's event, so the refresh after the build applies it. Until then no refresh counts as current.
+    func remoteMainsChangedHere() async {
+        remoteMainsChangedCount += 1
+        lastRemoteContentRefreshAt = nil
+    }
+
     func invalidateCachedRemoteState() async {
         remoteContentIndexGeneration += 1
         lastRemoteContentRefreshAt = nil
@@ -464,9 +473,11 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
             return
         }
         if let running = remoteContentIndexTask {
+            let leftBefore = remoteMainsChangedCount
             try await running.value
-            guard rebuildsMissingLineage else { return }
-            // A rebuild runs after the refreshes that started before it, never beside them.
+            guard rebuildsMissingLineage || remoteMainsChangedCount != leftBefore else { return }
+            // A rebuild, and a refresh after a trash during the running one, run after the refreshes that started
+            // before them, never beside them.
             if let newer = remoteContentIndexTask, newer != running { try await newer.value }
         }
 
@@ -475,6 +486,7 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
         let store = self.contentIndexStore
         let lineageStore = self.lineageIndexStore
         let generation = remoteContentIndexGeneration
+        let leftAtStart = remoteMainsChangedCount
         let report: @Sendable (UploadRemoteIndexPreparationProgress) async -> Void = { [weak self] value in
             await self?.emitRemoteIndexProgress(value)
         }
@@ -488,7 +500,7 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
             try await task.value
             guard remoteContentIndexGeneration == generation else { throw CancellationError() }
             if remoteContentIndexTask == task { remoteContentIndexTask = nil }
-            lastRemoteContentRefreshAt = Date()
+            if remoteMainsChangedCount == leftAtStart { lastRemoteContentRefreshAt = Date() }
         } catch {
             if remoteContentIndexGeneration == generation, remoteContentIndexTask == task {
                 remoteContentIndexTask = nil
