@@ -70,6 +70,7 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
     private var failRelatedLookupForTrashedMain = false
     private var healthOverride: UploadRemoteContentIndexHealth?
     private var sharedLinks: Set<String> = []
+    private var nodeSizes: [String: Int64] = [:]
     private var missingNodes: Set<String> = []
     private var covers: [String: String] = [:]
     typealias IndexProgress = @Sendable (UploadRemoteIndexPreparationProgress) async -> Void
@@ -186,7 +187,7 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
         var favorites = 0
         /// Photos whose album membership was read, one for each photo.
         var albumMembers = 0
-        /// Photos whose sharing state was read, one for each photo.
+        /// Photos whose node was read for its sharing state and size, one for each photo.
         var sharingMembers = 0
         var albumListings = 0
     }
@@ -739,15 +740,25 @@ extension EditScenarioServer: ExactDuplicateRemote {
         }
     }
 
-    func sharedUIDs(among uids: [PhotoUID]) async throws -> Set<PhotoUID> {
+    func nodeFacts(of uids: [PhotoUID]) async throws -> [PhotoUID: ExactDuplicateNodeFacts] {
         try lock.withLock {
             counted.sharingMembers += uids.count
             if uids.contains(where: { missingNodes.contains($0.nodeID) }) {
                 throw UploadError.backend("The scenario node is missing")
             }
-            return Set(uids.filter { sharedLinks.contains($0.nodeID) })
+            return Dictionary(
+                uniqueKeysWithValues: uids.map {
+                    (
+                        $0,
+                        ExactDuplicateNodeFacts(
+                            isShared: sharedLinks.contains($0.nodeID), byteSize: nodeSizes[$0.nodeID])
+                    )
+                })
         }
     }
+
+    /// The node of the photo states this file size.
+    func setNodeSize(_ size: Int64, of uid: PhotoUID) { lock.withLock { nodeSizes[uid.nodeID] = size } }
 
     /// The person shares the photo with other people or by a link.
     func share(_ uid: PhotoUID) { lock.withLock { _ = sharedLinks.insert(uid.nodeID) } }

@@ -6034,6 +6034,22 @@
         "de": { "stringUnit": { "state": "translated", "value": "Es ist mit anderen geteilt." } }
       }
     },
+    "duplicates.group_frees %@": {
+      "comment": "Next to the copy count of one group: the space that merging the group frees. %@ is a formatted size.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Frees %@" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Gibt %@ frei" } }
+      }
+    },
+    "duplicates.total_frees %@": {
+      "comment": "Below the group count: the space that merging all groups found so far frees. %@ is a formatted size.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Merging all frees %@" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Alle zusammenführen gibt %@ frei" } }
+      }
+    },
     "duplicates.still_checking": {
       "localizations": {
         "en": { "stringUnit": { "state": "translated", "value": "Still checking your library. More duplicates can appear." } },

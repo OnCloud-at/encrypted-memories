@@ -135,16 +135,32 @@ public struct ExactDuplicatesView<Cover: View>: View {
                 statusRows
             } header: {
                 if let count = model.groupCountText {
-                    Text(count).accessibilityIdentifier("duplicates.groupCount")
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(count).accessibilityIdentifier("duplicates.groupCount")
+                        if let freed = model.totalFreedText {
+                            Text(freed)
+                                .monospacedDigit()
+                                .accessibilityIdentifier("duplicates.totalFreed")
+                        }
+                    }
                 }
             }
             ForEach(Array(model.groups.enumerated()), id: \.element.id) { index, group in
                 Section {
                     ExactDuplicateMembers(model: model, group: group, groupIndex: index, accent: accent, cover: cover)
                         .accessibilityIdentifier("duplicates.group.\(index)")
+                        // Only the groups that the person scrolls to read their facts.
+                        .onAppear { model.groupAppeared(group.id) }
                 } header: {
-                    HStack {
+                    HStack(alignment: .firstTextBaseline) {
                         Text(L10n.string("duplicates.group_title \(group.members.count)"))
+                        if let freed = group.freedText {
+                            Text(freed)
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
+                                .monospacedDigit()
+                                .accessibilityIdentifier("duplicates.freed.\(index)")
+                        }
                         Spacer()
                         Button(L10n.string("duplicates.merge")) {
                             Task { await model.merge(groupID: group.id) }

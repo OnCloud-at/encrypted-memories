@@ -81,8 +81,18 @@ public final class ExactDuplicatesModel {
         public internal(set) var isRanked = false
         /// The person tapped the photo to keep, so the ranking no longer changes it.
         public internal(set) var isKeptChosen = false
+        /// The size of one copy in bytes. Nil until the manifest or a node read of the ranking knows it.
+        public internal(set) var byteSize: Int64?
         /// The photos that a merge moves to Recently Deleted.
         public var duplicateCount: Int { members.count - 1 }
+
+        /// The space that the merge frees: the copies hold the same bytes, so one size for each duplicate.
+        public var freedBytes: Int64? { byteSize.map { $0 * Int64(duplicateCount) } }
+
+        /// The short text of `freedBytes`, for example "Frees 4.2 MB". Nil while the size is unknown.
+        public var freedText: String? {
+            freedBytes.map { L10n.string("duplicates.group_frees \(ExactDuplicatesModel.byteText($0))") }
+        }
 
         /// The short text of `keptReason`, for example below the group.
         public var keptReasonMessage: String? {
@@ -163,6 +173,12 @@ public final class ExactDuplicatesModel {
     @ObservationIgnored private var indexBuild: Task<Bool, any Error>?
     /// The ranking of the last load. A new load cancels it.
     @ObservationIgnored private var ranking: Task<Void, Never>?
+    /// The groups that wait for the ranking, in the order the screen showed them.
+    @ObservationIgnored private var rankingQueue: [String] = []
+    /// The groups that the ranking of this load has read or queued. A failed group waits for the next load or a merge.
+    @ObservationIgnored private var rankingRequested: Set<String> = []
+    /// Identifies the running scroll ranking. A merge shows its own progress, so it never owns this ranking.
+    @ObservationIgnored private var rankingWorkerToken: UUID?
     /// Identifies the ranking whose progress the screen shows.
     @ObservationIgnored private var rankingToken = UUID()
     @ObservationIgnored private let finder: any ExactDuplicateMerging
@@ -277,6 +293,24 @@ public final class ExactDuplicatesModel {
         return L10n.string("duplicates.check_failed")
     }
 
+    /// The space that merging every group shown frees, counting the groups whose size is known. It grows while the
+    /// check finds groups and while sizes become known.
+    public var totalFreedBytes: Int64 { groups.reduce(0) { $0 + ($1.freedBytes ?? 0) } }
+
+    /// The short text of `totalFreedBytes`. Nil while no size is known.
+    public var totalFreedText: String? {
+        let total = totalFreedBytes
+        return total > 0 ? L10n.string("duplicates.total_frees \(Self.byteText(total))") : nil
+    }
+
+    /// The system's file byte format, for example "4.2 MB".
+    nonisolated static func byteText(_ bytes: Int64) -> String {
+        bytes.formatted(.byteCount(style: .file))
+    }
+
+    /// The groups in one page of the ranking. The screen ranks the page that it shows and the page after it.
+    nonisolated static let rankingPageSize = 24
+
     /// The number of groups found, for example "1,545 Groups". Nil without a group.
     public var groupCountText: String? {
         groups.isEmpty ? nil : L10n.string("duplicates.group_count \(groups.count)")
@@ -295,18 +329,25 @@ public final class ExactDuplicatesModel {
     public var mergeAllTitle: String { L10n.string("duplicates.merge_all_title \(duplicateCount)") }
     public var mergeAllMessage: String { L10n.string("duplicates.merge_all_message \(duplicateCount)") }
 
-    /// Reads the groups and shows them, then ranks their members and builds the content index or brings it up to
-    /// date, both at once. Reads the groups again when the index changed. A choice of the person stays while its
-    /// photo is still a member.
+    /// Reads the groups and shows them, then ranks the first two pages and builds the content index or brings it up
+    /// to date, both at once. Reads the groups again when the index changed. A choice of the person and the ranking of
+    /// a group with the same members stay, so a screen that opens again reads nothing for them.
     public func load() async {
         guard !isMerging else { return }
         loadGeneration += 1
         let generation = loadGeneration
         phase = .loading
+        stopRanking()
         guard await scan(generation: generation) else { return }
-        async let ranked: Void = rank(generation: generation)
+        async let ranked: Void = rank(around: 0)
         async let built: Void = buildAndRescan(generation: generation)
         _ = await (ranked, built)
+    }
+
+    /// The screen shows the group. Ranks its page and the page after it, unless they are ranked.
+    public func groupAppeared(_ groupID: String) {
+        guard let index = groups.firstIndex(where: { $0.id == groupID }) else { return }
+        _ = requestRanking(around: index)
     }
 
     /// Reads the groups and shows them in the fallback order. A group with the same members keeps its ranking and the
@@ -325,12 +366,14 @@ public final class ExactDuplicatesModel {
                 if let same = earlier[group.id], Set(same.members) == Set(group.members) {
                     var kept = same
                     kept.scanGroup = group
+                    kept.byteSize = scan.byteSizes[group.id] ?? same.byteSize
                     return kept
                 }
                 let members = fallback[group.id] ?? group.members
                 let choice = earlier[group.id].flatMap { $0.isKeptChosen && members.contains($0.kept) ? $0.kept : nil }
                 var shown = Group(scanGroup: group, members: members, kept: choice ?? members[0])
                 shown.isKeptChosen = choice != nil
+                shown.byteSize = scan.byteSizes[group.id] ?? earlier[group.id]?.byteSize
                 return shown
             }
             coverage = scan.coverage
@@ -348,44 +391,96 @@ public final class ExactDuplicatesModel {
         scanProgress = progress
     }
 
-    /// Ranks every group that has no ranking yet. A new load cancels the ranking of the earlier one.
-    private func rank(generation: Int) async {
-        ranking?.cancel()
-        let token = UUID()
-        rankingToken = token
-        let pending = groups.filter { !$0.isRanked }.map(\.scanGroup)
-        guard !pending.isEmpty else {
-            rankingProgress = nil
-            return
-        }
-        rankingProgress = ExactDuplicateScanProgress(completed: 0, total: pending.count)
-        let finder = finder
-        let apply: @Sendable (ExactDuplicateRankingPage) async -> Void = { [weak self] page in
-            await self?.apply(page, generation: generation, token: token)
-        }
-        let task = Task { await finder.rankMembers(of: pending, ranked: apply) }
-        ranking = task
+    /// Ranks the page of the group at `index` and the page after it, and waits for that ranking.
+    private func rank(around index: Int) async {
+        guard let task = requestRanking(around: index) else { return }
         await withTaskCancellationHandler {
             await task.value
         } onCancel: {
             task.cancel()
         }
+    }
+
+    /// Queues the unranked groups of two pages from the page of `index`. Returns the ranking that reads them.
+    private func requestRanking(around index: Int) -> Task<Void, Never>? {
+        let size = Self.rankingPageSize
+        let start = index / size * size
+        let wanted = groups[start..<min(start + 2 * size, groups.count)]
+            .filter { !$0.isRanked && !rankingRequested.contains($0.id) }.map(\.id)
+        guard !wanted.isEmpty else { return ranking }
+        rankingRequested.formUnion(wanted)
+        rankingQueue += wanted
+        if let ranking {
+            if rankingToken == rankingWorkerToken, let progress = rankingProgress {
+                rankingProgress = ExactDuplicateScanProgress(
+                    completed: progress.completed, total: progress.total + wanted.count)
+            }
+            return ranking
+        }
+        let token = UUID()
+        rankingToken = token
+        rankingWorkerToken = token
+        rankingProgress = ExactDuplicateScanProgress(completed: 0, total: wanted.count)
+        let task = Task { [weak self] in
+            guard let self else { return }
+            await self.drainRankingQueue(token: token)
+        }
+        ranking = task
+        return task
+    }
+
+    /// Ranks the queued groups page by page until the queue is empty or the ranking is cancelled.
+    private func drainRankingQueue(token: UUID) async {
+        let finder = finder
+        while !Task.isCancelled, !rankingQueue.isEmpty {
+            let ids = Array(rankingQueue.prefix(Self.rankingPageSize))
+            rankingQueue.removeFirst(ids.count)
+            let page = ids.compactMap { id in groups.first { $0.id == id && !$0.isRanked }?.scanGroup }
+            if page.count < ids.count {
+                apply(ExactDuplicateRankingPage(members: [:], groupCount: ids.count - page.count), token: token)
+            }
+            guard !page.isEmpty else { continue }
+            let apply: @Sendable (ExactDuplicateRankingPage) async -> Void = { [weak self] ranked in
+                await self?.apply(ranked, token: token)
+            }
+            await finder.rankMembers(of: page, ranked: apply)
+        }
+        guard rankingWorkerToken == token else { return }
+        if Task.isCancelled {
+            // A closed screen stops the ranking. Groups that it did not rank can be requested again.
+            let ranked = Set(groups.filter(\.isRanked).map(\.id))
+            rankingRequested.formIntersection(ranked)
+        }
+        ranking = nil
+        rankingQueue = []
+        rankingWorkerToken = nil
         if rankingToken == token { rankingProgress = nil }
     }
 
-    /// Takes the ranked order of each group in `page`. `generation` nil applies the page in every case. Only the
-    /// ranking of `token` counts its progress.
-    private func apply(_ page: ExactDuplicateRankingPage, generation: Int?, token: UUID? = nil) {
-        if let generation {
-            guard generation == loadGeneration else { return }
-            if token == rankingToken, let progress = rankingProgress {
-                rankingProgress = ExactDuplicateScanProgress(
-                    completed: min(progress.completed + page.groupCount, progress.total), total: progress.total)
-            }
+    /// Stops the ranking. A group that it did not read can be requested again.
+    private func stopRanking() {
+        ranking?.cancel()
+        ranking = nil
+        rankingQueue = []
+        rankingRequested = []
+        rankingWorkerToken = nil
+        rankingToken = UUID()
+        rankingProgress = nil
+    }
+
+    /// Takes the ranked order and the size of each group in `page`. Only the ranking of `token` counts its progress.
+    private func apply(_ page: ExactDuplicateRankingPage, token: UUID?) {
+        if let token, token == rankingToken, let progress = rankingProgress {
+            rankingProgress = ExactDuplicateScanProgress(
+                completed: min(progress.completed + page.groupCount, progress.total), total: progress.total)
         }
         for (id, order) in page.members {
             guard let index = groups.firstIndex(where: { $0.id == id }) else { continue }
             groups[index].rank(order)
+        }
+        for (id, size) in page.byteSizes {
+            guard let index = groups.firstIndex(where: { $0.id == id }), groups[index].byteSize == nil else { continue }
+            groups[index].byteSize = size
         }
     }
 
@@ -404,7 +499,7 @@ public final class ExactDuplicatesModel {
         guard generation == loadGeneration, !isMerging else { return }
         if changed {
             guard await scan(generation: generation) else { return }
-            await rank(generation: generation)
+            await rank(around: 0)
         } else if case .indexing = coverage {
             // The build finished and left no index: waiting longer cannot help, a retry can.
             buildFailed = true
@@ -475,13 +570,18 @@ public final class ExactDuplicatesModel {
     private func merge(_ requested: [Group]) async {
         isMerging = true
         notice = nil
-        // The photo to keep needs the facts of its group: a shared photo or one in an album ranks first.
+        // The photo to keep needs the facts of its group: a shared photo or one in an album ranks first. Merge All
+        // reads the groups that nobody scrolled to page by page, with progress.
         let unranked = requested.filter { !$0.isRanked }.map(\.scanGroup)
         if !unranked.isEmpty {
+            let token = UUID()
+            rankingToken = token
+            rankingProgress = ExactDuplicateScanProgress(completed: 0, total: unranked.count)
             let apply: @Sendable (ExactDuplicateRankingPage) async -> Void = { [weak self] page in
-                await self?.apply(page, generation: nil)
+                await self?.apply(page, token: token)
             }
             await finder.rankMembers(of: unranked, ranked: apply)
+            if rankingToken == token { rankingProgress = nil }
         }
         let selected = requested.compactMap { request in groups.first { $0.id == request.id } }
         var trashed: [PhotoUID] = []

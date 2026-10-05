@@ -2372,9 +2372,9 @@ extension DriveSDKBridge: ExactDuplicateRemote {
     }
 
     /// Reads the node of each photo, so only the members of the groups that the screen ranks or merges cost a read.
-    func sharedUIDs(among uids: [PhotoUID]) async throws -> Set<PhotoUID> {
-        guard !uids.isEmpty else { return [] }
-        return try await makeAlbumCatalogBackend().sharedUIDs(among: uids)
+    func nodeFacts(of uids: [PhotoUID]) async throws -> [PhotoUID: ExactDuplicateNodeFacts] {
+        guard !uids.isEmpty else { return [:] }
+        return try await makeAlbumCatalogBackend().nodeFacts(of: uids)
     }
 }
 

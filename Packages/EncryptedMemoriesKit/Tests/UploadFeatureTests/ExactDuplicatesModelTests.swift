@@ -306,6 +306,125 @@ final class ExactDuplicatesModelTests: XCTestCase {
         XCTAssertEqual(completeModel.content, .noDuplicates, "the complete index still answers")
     }
 
+    // MARK: - Freed space
+
+    func testEachGroupAndTheTotalShowTheFreedSpaceInTheSystemByteFormat() async {
+        let finder = FakeDuplicateFinder(
+            scans: [.init(groups: [groupA, groupB], coverage: .complete, byteSizes: ["A": 1_000_000])])
+        let (model, _) = makeModel(finder)
+        await model.load()
+        let a = model.groups.first { $0.id == "A" }
+        XCTAssertEqual(a?.freedBytes, 2_000_000, "one size for each of the two duplicates")
+        XCTAssertEqual(
+            a?.freedText,
+            L10n.string("duplicates.group_frees \(Int64(2_000_000).formatted(.byteCount(style: .file)))"))
+        XCTAssertNil(model.groups.first { $0.id == "B" }?.freedText, "an unknown size shows nothing")
+        XCTAssertEqual(model.totalFreedBytes, 2_000_000)
+        XCTAssertEqual(
+            model.totalFreedText,
+            L10n.string("duplicates.total_frees \(Int64(2_000_000).formatted(.byteCount(style: .file)))"))
+    }
+
+    func testTheTotalGrowsWhileTheCheckFindsGroupsAndSizes() async {
+        let finder = FakeDuplicateFinder(scans: [
+            .init(groups: [groupA], coverage: .indexing, byteSizes: ["A": 100]),
+            .init(groups: [groupA, groupB], coverage: .complete, byteSizes: ["A": 100]),
+        ])
+        finder.buildChanged = true
+        finder.rankSizes = ["B": 50]
+        finder.buildGate.close()
+        let (model, _) = makeModel(finder)
+        let load = Task { await model.load() }
+        await waitUntil({ finder.buildGate.hasWaiters }, "the load builds the index")
+        XCTAssertEqual(model.totalFreedBytes, 200)
+        finder.buildGate.open()
+        await load.value
+        XCTAssertEqual(model.totalFreedBytes, 250, "the new group and the size from the ranking add up")
+        XCTAssertEqual(model.groups.first { $0.id == "B" }?.freedBytes, 50)
+    }
+
+    func testNoGroupHasASizeWhenNothingKnowsIt() async {
+        let (model, _) = makeModel(FakeDuplicateFinder(scans: [.init(groups: [groupA], coverage: .complete)]))
+        await model.load()
+        XCTAssertNil(model.groups.first?.byteSize)
+        XCTAssertEqual(model.totalFreedBytes, 0)
+        XCTAssertNil(model.totalFreedText)
+    }
+
+    // MARK: - Ranking only what the screen shows
+
+    private func manyGroups(_ count: Int) -> [ExactDuplicateGroup] {
+        (0..<count).map { index in
+            ExactDuplicateGroup(
+                contentHash: String(format: "G%04d", index), hashKeyEpoch: "e",
+                members: [
+                    PhotoUID(volumeID: "v", nodeID: "g\(index)-1"), PhotoUID(volumeID: "v", nodeID: "g\(index)-2"),
+                ])
+        }
+    }
+
+    func testOpeningRanksTwoPagesAndScrollingRanksTheShownPageAndTheNext() async {
+        let groups = manyGroups(1_500)
+        let finder = FakeDuplicateFinder(scans: [.init(groups: groups, coverage: .complete)])
+        let (model, _) = makeModel(finder)
+        await model.load()
+        let size = ExactDuplicatesModel.rankingPageSize
+        XCTAssertEqual(Set(finder.rankedGroups.joined()), Set(groups.prefix(2 * size).map(\.id)))
+        XCTAssertEqual(model.groups.filter(\.isRanked).count, 2 * size)
+
+        model.groupAppeared(groups[5 * size + 3].id)
+        await waitUntil({ model.groups.filter(\.isRanked).count == 4 * size }, "the shown pages rank")
+        let expected = groups.prefix(2 * size).map(\.id) + groups[(5 * size)..<(7 * size)].map(\.id)
+        XCTAssertEqual(Set(finder.rankedGroups.joined()), Set(expected))
+        XCTAssertEqual(finder.rankedGroups.joined().count, 4 * size, "no group is read twice")
+    }
+
+    func testScrollingStillRanksAfterAMergeRanAlongsideTheScrollRanking() async {
+        let groups = manyGroups(100)
+        let finder = FakeDuplicateFinder(scans: [.init(groups: groups, coverage: .complete)])
+        let (model, _) = makeModel(finder)
+        await model.load()
+        finder.rankGate.close()
+        model.groupAppeared(groups[50].id)
+        await waitUntil({ finder.rankGate.hasWaiters }, "scrolling ranks")
+        let merge = Task { await model.merge(groupID: groups[90].id) }
+        for _ in 0..<2_000 where finder.rankedGroups.count < 3 { try? await Task.sleep(for: .milliseconds(1)) }
+        finder.rankGate.open()
+        await merge.value
+        await waitUntil({ model.rankingLine == nil }, "the scroll ranking finishes")
+
+        model.groupAppeared(groups[98].id)
+        await waitUntil(
+            { model.groups.first { $0.id == groups[98].id }?.isRanked == true }, "scrolling ranks after the merge")
+    }
+
+    func testAScreenThatOpensAgainReadsNothingForUnchangedGroups() async {
+        let finder = FakeDuplicateFinder(scans: [.init(groups: manyGroups(60), coverage: .complete)])
+        let (model, _) = makeModel(finder)
+        await model.load()
+        let reads = finder.rankCalls
+        await model.load()
+        XCTAssertEqual(finder.rankCalls, reads, "the ranked facts stay for the session")
+    }
+
+    func testMergeAllReadsTheGroupsThatNobodyScrolledToWithProgress() async {
+        let groups = manyGroups(60)
+        let finder = FakeDuplicateFinder(scans: [.init(groups: groups, coverage: .complete)])
+        let (model, _) = makeModel(finder)
+        await model.load()
+        let size = ExactDuplicatesModel.rankingPageSize
+        finder.rankGate.close()
+        let merge = Task { await model.mergeAll() }
+        await waitUntil({ finder.rankGate.hasWaiters }, "Merge All reads the remaining groups")
+        XCTAssertEqual(finder.rankedGroups.last?.count, 60 - 2 * size)
+        XCTAssertEqual(
+            model.rankingLine?.detail,
+            L10n.string("duplicates.ranking_progress \(0.formatted()) \((60 - 2 * size).formatted())"))
+        finder.rankGate.open()
+        await merge.value
+        XCTAssertEqual(finder.batches.last?.count, 60)
+    }
+
     func testTheEntryCountScansWithoutRanking() async {
         let finder = FakeDuplicateFinder(scans: [.init(groups: [groupA, groupB], coverage: .complete)])
         let (model, _) = makeModel(finder)
@@ -499,6 +618,8 @@ private final class FakeDuplicateFinder: ExactDuplicateMerging, @unchecked Senda
     var fallback: [String: [PhotoUID]] = [:]
     /// Groups whose facts cannot be read.
     var unreadableGroups: Set<String> = []
+    /// Sizes that the node reads of the ranking report.
+    var rankSizes: [String: Int64] = [:]
     /// Holds the scan while it is closed.
     let scanGate = BuildGate()
     /// Holds the ranking while it is closed.
@@ -569,7 +690,8 @@ private final class FakeDuplicateFinder: ExactDuplicateMerging, @unchecked Senda
             for group in groups where !unreadableGroups.contains(group.id) {
                 members[group.id] = ranked[group.id] ?? group.members
             }
-            return ExactDuplicateRankingPage(members: members, groupCount: groups.count)
+            let sizes = rankSizes.filter { size in groups.contains { $0.id == size.key } }
+            return ExactDuplicateRankingPage(members: members, groupCount: groups.count, byteSizes: sizes)
         }
         await report(page)
     }

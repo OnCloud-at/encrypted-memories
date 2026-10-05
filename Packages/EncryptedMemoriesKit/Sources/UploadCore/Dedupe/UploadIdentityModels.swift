@@ -757,6 +757,9 @@ public protocol UploadRemoteContentIndexStore: Sendable {
     /// Every indexed content hash of this key epoch that two or more links hold, with those links sorted. Links that
     /// the remote asset index proves to be related files of another photo are left out. Nil when the read fails.
     func remoteContentDuplicateGroups(hashKeyEpoch: String) -> [String: [String]]?
+    /// The file size in bytes that the upload manifest records for each content hash of this key epoch that two or
+    /// more indexed links hold. A hash without a manifest row is missing. Nil when the read fails.
+    func remoteContentDuplicateSizes(hashKeyEpoch: String) -> [String: Int64]?
 }
 
 extension UploadRemoteContentIndexStore {

@@ -2,6 +2,7 @@ import AlbumCore
 import Foundation
 import PhotosCore
 import ProtonDriveSDK
+import UploadCore
 
 /// Narrow testable surface over the SDK actor. Keeping the protocol here avoids leaking SDK types
 /// into AlbumCore while allowing catalog/cancellation/partial-result behavior to be tested without
@@ -391,25 +392,29 @@ struct SDKAlbumCatalogBackend: AlbumCatalogBackend {
         return result
     }
 
-    /// The photos among `photoUIDs` that the person shares with other people or by a link. One node read for each
-    /// photo, `maximumConcurrentNodeLoads` at once. A missing node fails the read, because absence proves nothing.
-    func sharedUIDs(among photoUIDs: [PhotoUID]) async throws -> Set<PhotoUID> {
+    /// The sharing state and the claimed file size of each photo. One node read for each photo,
+    /// `maximumConcurrentNodeLoads` at once. A missing node fails the read, because absence proves nothing.
+    func nodeFacts(of photoUIDs: [PhotoUID]) async throws -> [PhotoUID: ExactDuplicateNodeFacts] {
         try await withAdmission {
             let uniqueUIDs = Array(Set(photoUIDs))
             let sdkUIDs = uniqueUIDs.map { SDKNodeUid(volumeID: $0.volumeID, nodeID: $0.nodeID) }
             let nodes = try await self.loadNodes(sdkUIDs)
-            var shared = Set<PhotoUID>()
+            var facts: [PhotoUID: ExactDuplicateNodeFacts] = [:]
             for (sdkUID, node) in nodes {
-                let isShared: Bool
+                let fact: ExactDuplicateNodeFacts
                 switch node {
-                case .photo(let photo): isShared = photo.isShared || photo.isSharedByUrl
-                case .file(let file): isShared = file.isShared || file.isSharedByUrl
+                case .photo(let photo):
+                    fact = .init(
+                        isShared: photo.isShared || photo.isSharedByUrl, byteSize: photo.activeRevision.claimedSize)
+                case .file(let file):
+                    fact = .init(
+                        isShared: file.isShared || file.isSharedByUrl, byteSize: file.activeRevision.claimedSize)
                 case .album, .folder: throw SDKAlbumCatalogError.unexpectedPhotoNode(Self.identifier(sdkUID))
                 case nil: throw SDKAlbumCatalogError.missingNode(Self.identifier(sdkUID))
                 }
-                if isShared { shared.insert(PhotoUID(volumeID: sdkUID.volumeID, nodeID: sdkUID.nodeID)) }
+                facts[PhotoUID(volumeID: sdkUID.volumeID, nodeID: sdkUID.nodeID)] = fact
             }
-            return shared
+            return facts
         }
     }
 

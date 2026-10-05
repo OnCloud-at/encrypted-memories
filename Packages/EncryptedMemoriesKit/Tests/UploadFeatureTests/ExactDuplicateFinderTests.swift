@@ -69,13 +69,15 @@ final class ExactDuplicateFinderTests: XCTestCase {
     /// A manifest row of a local source that counts `link` as its backup.
     @discardableResult
     private func row(
-        _ identifier: String, names link: String, contentHash: String, epoch rowEpoch: String? = nil
+        _ identifier: String, names link: String, contentHash: String, epoch rowEpoch: String? = nil,
+        fileSize: Int64 = 10
     ) -> UploadSourceIdentity {
         let source = UploadSourceIdentity(kind: .photoLibraryAsset, identifier: identifier)
         XCTAssertTrue(
             store.upsert(
                 UploadIdentityRecord(
-                    source: source, filename: "\(identifier).JPG", correctedName: "\(identifier).JPG", fileSize: 10,
+                    source: source, filename: "\(identifier).JPG", correctedName: "\(identifier).JPG",
+                    fileSize: fileSize,
                     modificationDate: date(0), sha1Hex: "sha1", nameHash: "nh", contentHash: contentHash,
                     hashKeyEpoch: rowEpoch ?? epoch, remoteVolumeID: "vol", remoteLinkID: link,
                     outcome: UploadIdentityManifestStore.Outcome.uploaded.rawValue, updatedAt: date(0))))
@@ -313,8 +315,11 @@ final class ExactDuplicateFinderTests: XCTestCase {
     }
 
     @MainActor
-    func testTheScreenShows1500GroupsBeforeTheRankingReadsAnyNode() async throws {
-        server.seedLinks(digests: (0..<1_500).flatMap { [digest("group-\($0)"), digest("group-\($0)")] })
+    func testTheScreenShows1500GroupsAndTheirSizesBeforeAnyNodeLoadAndRanksOnlyTheShownPages() async throws {
+        let links = server.seedLinks(digests: (0..<1_500).flatMap { [digest("group-\($0)"), digest("group-\($0)")] })
+        for index in 0..<1_500 {
+            row("asset-\(index)", names: links[index * 2].nodeID, contentHash: hash("group-\(index)"), fileSize: 1_000)
+        }
         indexServer()
         let remote = FavoritesGatedRemote(base: server)
         let finder = ExactDuplicateFinder(
@@ -333,20 +338,58 @@ final class ExactDuplicateFinderTests: XCTestCase {
         XCTAssertEqual(beforeRanking.albumMembers, 0, "no node load before the groups show")
         XCTAssertEqual(beforeRanking.sharingMembers, 0, "no node load before the groups show")
         XCTAssertNotNil(model.rankingLine)
+        XCTAssertEqual(model.totalFreedBytes, 1_500_000, "the manifest knows every size before any node load")
 
         remote.gate.open()
         await load.value
         let reads = server.readCounts
-        XCTAssertTrue(model.groups.allSatisfy(\.isRanked))
+        let pages = 2 * ExactDuplicatesModel.rankingPageSize
+        XCTAssertEqual(model.groups.filter(\.isRanked).count, pages, "the shown page and the page after it")
         XCTAssertNil(model.rankingLine)
-        XCTAssertEqual(reads.favorites, 1, "one favorites listing serves every group")
-        XCTAssertEqual(reads.albumMembers, 3_000)
-        XCTAssertEqual(reads.sharingMembers, 3_000)
+        XCTAssertEqual(reads.favorites, 1)
+        XCTAssertEqual(reads.albumMembers, pages * 2)
+        XCTAssertEqual(reads.sharingMembers, pages * 2)
+
+        model.groupAppeared(model.groups[500].id)
+        for _ in 0..<5_000 where model.groups.filter(\.isRanked).count < 2 * pages {
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        XCTAssertEqual(model.groups.filter(\.isRanked).count, 2 * pages, "scrolling ranks two more pages")
+        XCTAssertEqual(server.readCounts.favorites, 1, "one favorites listing serves every page")
+        XCTAssertEqual(server.readCounts.sharingMembers, 2 * pages * 2)
+
+        await model.load()
+        XCTAssertEqual(server.readCounts.sharingMembers, 2 * pages * 2, "an unchanged group keeps its facts")
+        XCTAssertEqual(server.readCounts.albumMembers, 2 * pages * 2)
+        XCTAssertEqual(model.groups.filter(\.isRanked).count, 2 * pages)
         print(
             "[Duplicates timing] firstGroups=\(start.duration(to: published)) "
                 + "ranking=\(published.duration(to: clock.now)) visibilityRequests=\(reads.visibility) "
                 + "favoritesListings=\(reads.favorites) albumReads=\(reads.albumMembers) "
                 + "sharingReads=\(reads.sharingMembers)")
+    }
+
+    @MainActor
+    func testEachGroupShowsTheSpaceItsMergeFreesFromTheManifestOrTheNodeAndNoneWhenUnknown() async throws {
+        let manifest = (0..<3).map { _ in server.seedLink(digest: digest("manifest")) }
+        let node = (0..<2).map { _ in server.seedLink(digest: digest("node")) }
+        _ = (0..<2).map { _ in server.seedLink(digest: digest("unknown")) }
+        row("asset-1", names: manifest[0].nodeID, contentHash: hash("manifest"), fileSize: 4_000)
+        server.setNodeSize(1_500, of: node[1])
+        indexServer()
+
+        let scan = try await finder.duplicateGroups()
+        XCTAssertEqual(scan.byteSizes, [hash("manifest"): 4_000], "the scan reads sizes from the manifest only")
+
+        let model = ExactDuplicatesModel(finder: finder)
+        await model.load()
+        let sizes = Dictionary(uniqueKeysWithValues: model.groups.map { ($0.id, $0.freedBytes) })
+        XCTAssertEqual(sizes[hash("manifest")], 8_000, "two duplicates of 4,000 bytes")
+        XCTAssertEqual(sizes[hash("node")], 1_500, "the node read of the ranking gives the size")
+        XCTAssertEqual(sizes[hash("unknown")] ?? nil, nil, "no size until it is known")
+        XCTAssertEqual(model.totalFreedBytes, 9_500)
+        let unknown = try XCTUnwrap(model.groups.first { $0.id == hash("unknown") })
+        XCTAssertNil(unknown.freedText)
     }
 
     func testRelatedFilesOfAProvenCompoundAreNoCandidates() throws {
@@ -864,7 +907,9 @@ private final class FavoritesGatedRemote: ExactDuplicateRemote, @unchecked Senda
     func trashDuplicates(_ uids: [PhotoUID]) async throws { try await base.trashDuplicates(uids) }
     func restoreDuplicates(_ uids: [PhotoUID]) async throws { try await base.restoreDuplicates(uids) }
     func captureDates(of uids: [PhotoUID]) async -> [PhotoUID: Date] { await base.captureDates(of: uids) }
-    func sharedUIDs(among uids: [PhotoUID]) async throws -> Set<PhotoUID> { try await base.sharedUIDs(among: uids) }
+    func nodeFacts(of uids: [PhotoUID]) async throws -> [PhotoUID: ExactDuplicateNodeFacts] {
+        try await base.nodeFacts(of: uids)
+    }
     func ownPhotosVolumeID() async throws -> String { try await base.ownPhotosVolumeID() }
     func activeUIDs(among uids: [PhotoUID]) async throws -> Set<PhotoUID> { try await base.activeUIDs(among: uids) }
     func markFavorite(_ uids: [PhotoUID]) async throws { try await base.markFavorite(uids) }

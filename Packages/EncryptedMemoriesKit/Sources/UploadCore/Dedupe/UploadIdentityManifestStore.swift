@@ -999,6 +999,40 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
         }
     }
 
+    public func remoteContentDuplicateSizes(hashKeyEpoch: String) -> [String: Int64]? {
+        lock.withLock {
+            var stmt: OpaquePointer?
+            guard
+                sqlite3_prepare_v2(
+                    db,
+                    """
+                    SELECT content_hash, MAX(size) FROM upload_identity
+                    WHERE key_epoch=?1 AND size > 0 AND content_hash IN (
+                      SELECT content_hash FROM remote_content_index WHERE key_epoch=?1
+                      GROUP BY content_hash HAVING COUNT(DISTINCT remote_link) > 1
+                    )
+                    GROUP BY content_hash;
+                    """,
+                    -1, &stmt, nil
+                ) == SQLITE_OK
+            else { return nil }
+            defer { sqlite3_finalize(stmt) }
+            bindText(stmt, 1, hashKeyEpoch)
+            var sizes: [String: Int64] = [:]
+            while true {
+                switch sqlite3_step(stmt) {
+                case SQLITE_ROW:
+                    guard let contentHash = columnText(stmt, 0) else { return nil }
+                    sizes[contentHash] = sqlite3_column_int64(stmt, 1)
+                case SQLITE_DONE:
+                    return sizes
+                default:
+                    return nil
+                }
+            }
+        }
+    }
+
     /// Row count - surfaced for tests and a future cache-status UI.
     public func count() -> Int {
         lock.withLock {

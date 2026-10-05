@@ -109,7 +109,7 @@
         func duplicateGroups(
             progress: @escaping @Sendable (ExactDuplicateScanProgress) async -> Void
         ) async throws -> ExactDuplicateScan {
-            ExactDuplicateScan(groups: groups, coverage: coverage)
+            ExactDuplicateScan(groups: groups, coverage: coverage, byteSizes: ["A": 4_200_000, "B": 18_400_000])
         }
 
         func prepareIndex(
