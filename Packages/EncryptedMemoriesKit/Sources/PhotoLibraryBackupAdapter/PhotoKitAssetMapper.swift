@@ -75,6 +75,7 @@ enum PhotoKitAssetMapper {
                 mimeType: UTType(resource.uniformTypeIdentifier)?.preferredMIMEType
             )
         }
+        let isVideo = asset.mediaType == .video
         return PhotoBackupAssetInfo(
             localIdentifier: asset.localIdentifier,
             creationDate: asset.creationDate,
@@ -83,19 +84,22 @@ enum PhotoKitAssetMapper {
             pixelHeight: asset.pixelHeight,
             durationSeconds: asset.duration,
             isLivePhoto: asset.mediaSubtypes.contains(.photoLive),
-            isVideo: asset.mediaType == .video,
+            isVideo: isVideo,
             resources: resources,
             cloudIdentifier: cloudIdentifier,
             hasAdjustments: asset.hasAdjustments,
             adjustmentTimestamp: asset.adjustmentTimestamp,
-            livePlaybackOff: livePlaybackOff(subtypes: asset.mediaSubtypes, playbackStyle: asset.playbackStyle)
+            livePlaybackOff: livePlaybackOff(isVideo: isVideo, resources: resources, playbackStyle: asset.playbackStyle)
         )
     }
 
-    /// A Live Photo that Photos presents as a still image: the person turned its Live effect off. Loop and Bounce
-    /// play as a looping video and stay Live Photos.
-    static func livePlaybackOff(subtypes: PHAssetMediaSubtype, playbackStyle: PHAsset.PlaybackStyle) -> Bool {
-        subtypes.contains(.photoLive) && playbackStyle == .image
+    /// A Live Photo that Photos presents as a still image: the person turned its Live effect off. Photos then drops
+    /// `.photoLive` from the subtypes but still lists the paired video. Loop and Bounce play as a looping video and stay
+    /// Live Photos.
+    static func livePlaybackOff(
+        isVideo: Bool, resources: [PhotoBackupAssetInfo.Resource], playbackStyle: PHAsset.PlaybackStyle
+    ) -> Bool {
+        !isVideo && playbackStyle == .image && resources.contains { $0.role == .pairedVideo }
     }
 
     /// Maps a PhotoKit chunk with one cloud-identifier query instead of one query per asset.

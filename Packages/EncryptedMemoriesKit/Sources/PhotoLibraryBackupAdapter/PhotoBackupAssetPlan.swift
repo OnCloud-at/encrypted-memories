@@ -61,8 +61,9 @@ public struct PhotoBackupAssetInfo: Sendable, Equatable {
     public var hasAdjustments: Bool
     /// When the photo was last edited or reverted (`PHAsset.adjustmentTimestamp`); nil for a photo never edited.
     public var adjustmentTimestamp: Date?
-    /// The person turned the Live effect off in Photos (`playbackStyle == .image` on a `.photoLive` asset). The photo
-    /// backs up as a still photo: its paired video stays a related original file without the Live Photo tag.
+    /// The person turned the Live effect off in Photos (`playbackStyle == .image` on a photo that lists a paired video).
+    /// Photos then drops `.photoLive`, so `isLivePhoto` is false. The photo backs up as a still photo: its paired video
+    /// stays a related original file without the Live Photo tag.
     public var livePlaybackOff: Bool
 
     public init(
@@ -314,7 +315,11 @@ public enum PhotoBackupAssetPlanner {
                     sourceResource: sourceResource(for: resource, livePlaybackOff: info.livePlaybackOff)
                 ))
         }
-        return PhotoBackupExportPlan(primary: primary, secondaries: secondaries)
+        // Related files upload in this order, and Proton lists the newest related file first. The Live Photo video
+        // uploads last, so that apps that take the first related file as the motion get the video.
+        let liveVideo = secondaries.filter { $0.sourceResource == .livePairedVideo }
+        secondaries.removeAll { $0.sourceResource == .livePairedVideo }
+        return PhotoBackupExportPlan(primary: primary, secondaries: secondaries + liveVideo)
     }
 
     private static func normalizedResources(

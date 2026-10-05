@@ -1,9 +1,10 @@
 import CryptoKit
 import Foundation
-import PhotoLibraryBackupAdapter
+import Photos
 import PhotosCore
 import XCTest
 
+@testable import PhotoLibraryBackupAdapter
 @testable import UploadCore
 
 /// A mutable library resolves the current revision, even when the queue contains an earlier scan.
@@ -52,13 +53,17 @@ final class EditScenarioLibrary: UploadBackupAssetCatalog, PhotoLibraryAssetEnum
                 resources.append(
                     .init(role: .pairedVideo, originalFilename: "\(basename).MOV", mimeType: "video/quicktime"))
             }
+            // With the Live effect off, Photos drops `.photoLive` and presents a still, but still lists the paired video.
+            let playbackStyle: PHAsset.PlaybackStyle = pairedVideo != nil && !livePlaybackOff ? .livePhoto : .image
             return PhotoBackupAssetInfo(
                 localIdentifier: identifier, creationDate: captureTime,
                 modificationDate: modificationDate,
                 pixelWidth: 10, pixelHeight: 10, durationSeconds: pairedVideo == nil ? 0 : 1,
-                isLivePhoto: pairedVideo != nil, isVideo: false, resources: resources,
+                isLivePhoto: playbackStyle == .livePhoto, isVideo: false, resources: resources,
                 cloudIdentifier: cloudIdentifier ?? "cloud-\(identifier)", hasAdjustments: hasAdjustments,
-                adjustmentTimestamp: adjustmentTimestamp, livePlaybackOff: livePlaybackOff)
+                adjustmentTimestamp: adjustmentTimestamp,
+                livePlaybackOff: PhotoKitAssetMapper.livePlaybackOff(
+                    isVideo: false, resources: resources, playbackStyle: playbackStyle))
         }
     }
 

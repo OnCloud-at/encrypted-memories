@@ -39,6 +39,8 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     private var burstCatalogLookup: [String: [String]] = [:]
     /// The related files of a series that the viewer checked for a frame type, so a reopen reads no metadata again.
     private var burstFrameVerdicts = BurstFrameVerdicts()
+    /// The types of related files that chose the motion of a Live Photo, so a refresh reads no metadata again.
+    private var livePhotoMotionLinks = LivePhotoMotionLinks()
     /// Account-scoped single flight for authoritative enumeration. Actor reentrancy alone does not serialize
     /// work across awaits; without this, foreground lifecycle, upload refresh and a second Mac window can all
     /// enumerate the same 20k-item library concurrently.
@@ -412,10 +414,14 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                     unlistedUploads.isEmpty ? [] : try await filesTheListingMustShow(unlistedUploads)
                 burstMemberIDs = Self.burstMemberLookup(from: entries)
                 burstEntries = entries
+                let motionTypes = try await livePhotoMotionTypes(
+                    for: entries.lazy.filter(\.isLivePhoto).map(\.relatedLinkIDs), evidence: mediaTypeEvidence)
+                if !motionTypes.complete { enrichmentComplete = false }
                 sections = Self.group(
                     entries,
                     volumeID: root.volumeID,
                     mediaTypeOverrides: mediaTypeEvidence,
+                    motionTypes: motionTypes.types,
                     sectionID: "all"
                 )
                 reconciliationItems = sections.flatMap(\.items)
@@ -458,11 +464,15 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                         DebugLog.log("timeline: video tag enrichment skipped - \(error)")
                     }
                 }
-                let livePhotoVideoIDs: [String: String]
+                var livePhotoVideoIDs: [String: String] = [:]
                 if let lives = enrichment.livePhotos.value {
-                    livePhotoVideoIDs = lives
+                    let motionTypes = try await livePhotoMotionTypes(for: lives.values, evidence: mediaTypeEvidence)
+                    if !motionTypes.complete { enrichmentComplete = false }
+                    for (linkID, related) in lives {
+                        livePhotoVideoIDs[linkID] =
+                            LivePhotoMotionLinks.motion(among: related, mimeTypes: motionTypes.types).linkID
+                    }
                 } else {
-                    livePhotoVideoIDs = [:]
                     enrichmentComplete = false
                     if let error = enrichment.livePhotos.errorDescription {
                         DebugLog.log("timeline: live-photo tag enrichment skipped - \(error)")
@@ -1370,21 +1380,11 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         case .tag(let tag):
             let root = try await resolvePhotosRoot()
             let entries = try await driveSession.fetchPhotosList(volumeID: root.volumeID, tag: tag.rawValue)
-            return withoutPhotosTrashedHere(
-                Self.group(
-                    entries,
-                    volumeID: root.volumeID,
-                    mediaTypeOverrides: timelineStore?.mediaTypeEvidence(volumeID: root.volumeID) ?? [:]
-                ))
+            return try await withoutPhotosTrashedHere(filteredSections(entries, volumeID: root.volumeID))
         case .album(let id, _):
             let root = try await resolvePhotosRoot()
             let entries = try await driveSession.fetchAlbumPhotos(volumeID: root.volumeID, albumLinkID: id)
-            return withoutPhotosTrashedHere(
-                Self.group(
-                    entries,
-                    volumeID: root.volumeID,
-                    mediaTypeOverrides: timelineStore?.mediaTypeEvidence(volumeID: root.volumeID) ?? [:]
-                ))
+            return try await withoutPhotosTrashedHere(filteredSections(entries, volumeID: root.volumeID))
         case .sharedAlbum(let volumeID, let nodeID, _):
             // Shared albums live on another user's volume, so the owned-volume HTTP album route cannot list
             // them. The SDK catalog adapter is the only content source; it proves identity and capture time only.
@@ -1595,11 +1595,42 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         }
     }
 
-    /// Builds timeline sections from direct-listing entries (tag filters + album contents).
+    /// Sections of a tag filter or an album. A failed type read leaves a Live Photo with several related files without
+    /// its motion; the next open reads again.
+    private func filteredSections(_ entries: [PhotosListEntry], volumeID: String) async throws -> [TimelineSection] {
+        let evidence = timelineStore?.mediaTypeEvidence(volumeID: volumeID) ?? [:]
+        let motionTypes = try await livePhotoMotionTypes(
+            for: entries.lazy.filter(\.isLivePhoto).map(\.relatedLinkIDs), evidence: evidence)
+        return Self.group(entries, volumeID: volumeID, mediaTypeOverrides: evidence, motionTypes: motionTypes.types)
+    }
+
+    /// The types that choose the motion of Live Photos with these related files (`LivePhotoMotionLinks.types`), with one
+    /// metadata read per 150 related files that need a type. `complete` is false when a read failed.
+    private func livePhotoMotionTypes(
+        for related: some Sequence<[String]>, evidence: [String: String]
+    ) async throws -> (types: [String: String], complete: Bool) {
+        let answer = try await livePhotoMotionLinks.types(for: related, evidence: evidence) {
+            [driveSession, photosShareID] linkIDs in
+            guard let shareID = photosShareID else { throw DriveBridgeError.noPhotosShare }
+            var types: [String: String] = [:]
+            for batch in Self.metadataBatches(linkIDs) {
+                try Task.checkCancellation()
+                let links = try await driveSession.fetchPhotoLinksMetadata(shareID: shareID, linkIDs: batch)
+                types.merge(Self.mimeTypes(in: links)) { first, _ in first }
+            }
+            return types
+        }
+        livePhotoMotionLinks.record(answer.read)
+        return (answer.types, answer.complete)
+    }
+
+    /// Builds timeline sections from direct-listing entries (tag filters + album contents). `motionTypes` holds the
+    /// types that choose the motion of a Live Photo with several related files.
     static func group(
         _ entries: [PhotosListEntry],
         volumeID: String,
         mediaTypeOverrides: [String: String] = [:],
+        motionTypes: [String: String] = [:],
         sectionID: String = "filtered"
     ) -> [TimelineSection] {
         let burstMemberIDs = burstMemberLookup(from: entries)
@@ -1610,6 +1641,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                     from: e,
                     volumeID: volumeID,
                     mediaTypeOverride: mediaTypeOverrides[e.linkID],
+                    motionTypes: motionTypes,
                     burstMemberIDs: burstMemberIDs[e.linkID] ?? []
                 )
             }
@@ -1845,6 +1877,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         from entry: PhotosListEntry,
         volumeID: String,
         mediaTypeOverride: String? = nil,
+        motionTypes: [String: String] = [:],
         burstMemberIDs: [String] = []
     ) -> PhotoItem {
         let mediaType =
@@ -1855,12 +1888,16 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         tags.remove(.videos)
         if isVideo { tags.insert(.videos) }
         if burstMemberIDs.count > 1 { tags.insert(.bursts) }
+        // A Live Photo whose related files hold no video shows no Live control. An unknown motion keeps the tag.
+        let motion: LivePhotoMotion =
+            entry.isLivePhoto
+            ? LivePhotoMotionLinks.motion(among: entry.relatedLinkIDs, mimeTypes: motionTypes) : .noVideo
         return PhotoItem(
             uid: PhotoUID(volumeID: volumeID, nodeID: entry.linkID),
             captureTime: Date(timeIntervalSince1970: entry.captureTime),
             mediaType: mediaType,
-            isLivePhoto: entry.isLivePhoto,
-            relatedVideoID: entry.isLivePhoto ? entry.relatedVideoLinkID : nil,
+            isLivePhoto: motion != .noVideo,
+            relatedVideoID: motion.linkID,
             tags: tags,
             burstMemberIDs: burstMemberIDs
         )
