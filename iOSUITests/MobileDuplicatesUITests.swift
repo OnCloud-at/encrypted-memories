@@ -56,7 +56,7 @@ final class MobileDuplicatesUITests: XCTestCase {
         openDuplicates(fixture: "-EncryptedMemoriesDuplicatesCheckingFixture")
 
         XCTAssertTrue(app.staticTexts["Checking Your Library"].waitForExistence(timeout: 10))
-        XCTAssertTrue(app.staticTexts["Duplicates appear here when the check is done."].exists)
+        XCTAssertTrue(app.staticTexts["Duplicates appear here when it is done."].exists)
         let progress = app.descendants(matching: .any).matching(identifier: "duplicates.checkProgress").firstMatch
         XCTAssertTrue(progress.waitForExistence(timeout: 5), "the check shows its progress")
         XCTAssertTrue(
