@@ -84,6 +84,9 @@ public actor BackupSyncRunner {
     private let resourceCoordinator: LibraryResourceCoordinator
     private let configuration: Configuration
     private let throttleInputs: @Sendable () -> BackupThrottleInputs
+    /// Pushed runtime changes, such as a new network path. A change that makes the backup wait for Wi-Fi stops the
+    /// transfers that already run, so their bytes do not continue on cellular data.
+    private let runtimeChanges: (@Sendable () -> AsyncStream<LibraryRuntimeSnapshot>)?
     private let clock: any BackupSchedulerClock
     private let now: @Sendable () -> Date
 
@@ -154,6 +157,7 @@ public actor BackupSyncRunner {
         resourceCoordinator: LibraryResourceCoordinator = .shared,
         configuration: Configuration = Configuration(),
         throttleInputs: @Sendable @escaping () -> BackupThrottleInputs = { .unconstrained },
+        runtimeChanges: (@Sendable () -> AsyncStream<LibraryRuntimeSnapshot>)? = nil,
         clock: any BackupSchedulerClock = BackupContinuousClock(),
         events: (any BackupItemEventSink)? = nil,
         now: @Sendable @escaping () -> Date = { Date() }
@@ -169,6 +173,7 @@ public actor BackupSyncRunner {
         self.resourceCoordinator = resourceCoordinator
         self.configuration = configuration
         self.throttleInputs = throttleInputs
+        self.runtimeChanges = runtimeChanges
         self.clock = clock
         self.now = now
     }
@@ -289,6 +294,8 @@ public actor BackupSyncRunner {
             removedSources = []
             emitProgress()
         }
+        let runtimeWatch = watchRuntimeChanges()
+        defer { runtimeWatch?.cancel() }
 
         // Crash recovery first: anything still marked active predates this run and must become
         // runnable again before this runner atomically claims new work.
@@ -467,6 +474,29 @@ public actor BackupSyncRunner {
     }
 
     // MARK: - Scheduling
+
+    private func watchRuntimeChanges() -> Task<Void, Never>? {
+        guard let runtimeChanges else { return nil }
+        let changes = runtimeChanges()
+        return Task { [weak self] in
+            for await _ in changes {
+                guard let self else { return }
+                await self.stopTransfersThatMustWaitForWiFi()
+            }
+        }
+    }
+
+    /// Cancels the running transfers through the stop path, without ending the pass. Each row returns to the queue
+    /// without an attempt, and the next wave waits for Wi-Fi.
+    private func stopTransfersThatMustWaitForWiFi() async {
+        guard isRunning, !inFlightJoins.isEmpty, throttleInputs().waitsForWiFi else { return }
+        let joins = Array(inFlightJoins.values)
+        await withTaskGroup(of: Void.self) { group in
+            for join in joins {
+                group.addTask { await join.cancelAndJoin() }
+            }
+        }
+    }
 
     private func setRemoteIndexPreparation(
         _ value: UploadRemoteIndexPreparationProgress,

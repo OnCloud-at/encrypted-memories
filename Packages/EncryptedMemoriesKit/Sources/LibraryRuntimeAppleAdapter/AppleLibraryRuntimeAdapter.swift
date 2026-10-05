@@ -117,19 +117,31 @@ public final class AppleLibraryRuntimeAdapter {
             isSatisfied: path.status == .satisfied,
             isConstrained: path.isConstrained,
             isExpensive: path.isExpensive,
-            usesOtherInterface: path.usesInterfaceType(.other),
-            availableInterfaces: Set(
-                path.availableInterfaces.map { interface -> LibraryNetworkInterfaceKind in
-                    switch interface.type {
-                    case .wifi: .wifi
-                    case .cellular: .cellular
-                    case .wiredEthernet: .wiredEthernet
-                    case .loopback: .loopback
-                    case .other: .other
-                    @unknown default: .other
-                    }
-                })
+            usedInterfaces: Set(
+                LibraryNetworkInterfaceKind.allCases.filter { path.usesInterfaceType(interfaceType(for: $0)) }),
+            availableInterfaces: Set(path.availableInterfaces.map { interfaceKind(for: $0.type) })
         )
+    }
+
+    private nonisolated static func interfaceKind(for type: NWInterface.InterfaceType) -> LibraryNetworkInterfaceKind {
+        switch type {
+        case .wifi: .wifi
+        case .cellular: .cellular
+        case .wiredEthernet: .wiredEthernet
+        case .loopback: .loopback
+        case .other: .other
+        @unknown default: .other
+        }
+    }
+
+    private nonisolated static func interfaceType(for kind: LibraryNetworkInterfaceKind) -> NWInterface.InterfaceType {
+        switch kind {
+        case .wifi: .wifi
+        case .cellular: .cellular
+        case .wiredEthernet: .wiredEthernet
+        case .loopback: .loopback
+        case .other: .other
+        }
     }
 
     private func installMemoryPressureSource() {

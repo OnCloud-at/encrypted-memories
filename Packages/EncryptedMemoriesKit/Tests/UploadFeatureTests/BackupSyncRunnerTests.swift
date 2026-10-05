@@ -853,6 +853,50 @@ final class NetworkChangingUploader: PhotoUploading, @unchecked Sendable {
     func cancel(token: UUID) async { await inner.cancel(token: token) }
 }
 
+final class BackupProgressBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var progress: BackupSyncProgress?
+
+    var value: BackupSyncProgress? { lock.withLock { progress } }
+    func set(_ progress: BackupSyncProgress) { lock.withLock { self.progress = progress } }
+}
+
+/// A transfer that runs until it is cancelled, and reports when it started.
+final class RunningUntilCancelledUploader: PhotoUploading, @unchecked Sendable {
+    let capabilities = UploadBackendCapabilities.sdkUploader
+    let started = BackupUploadTestLatch()
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<PhotoUID, Error>?
+    private var cancellationCount = 0
+    private var recorded: [PhotoUploadRequest] = []
+
+    var cancellations: Int { lock.withLock { cancellationCount } }
+    var requests: [PhotoUploadRequest] { lock.withLock { recorded } }
+
+    func upload(
+        _ request: PhotoUploadRequest,
+        onProgress: @Sendable @escaping (UploadProgress) -> Void
+    ) async throws -> PhotoUID {
+        onProgress(UploadProgress(phase: .uploading, fraction: 0))
+        return try await withCheckedThrowingContinuation { continuation in
+            lock.withLock {
+                recorded.append(request)
+                self.continuation = continuation
+            }
+            Task { await started.signal() }
+        }
+    }
+
+    func cancel(token: UUID) async {
+        let continuation: CheckedContinuation<PhotoUID, Error>? = lock.withLock {
+            cancellationCount += 1
+            defer { self.continuation = nil }
+            return self.continuation
+        }
+        continuation?.resume(throwing: CancellationError())
+    }
+}
+
 actor BackupUploadTestLatch {
     private var signaled = false
     private var waiters: [CheckedContinuation<Void, Never>] = []
@@ -1447,6 +1491,49 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertFalse(resumed.isWaitingForWiFi)
     }
 
+    /// The system does not always mark the new path expensive, for example a VPN over cellular data after Wi-Fi
+    /// dropped. The pushed network change itself stops the transfer that runs.
+    func testRunningTransferStopsWhenThePushedNetworkMakesTheBackupWaitForWiFi() async throws {
+        let due = seedEntry("wifi-dropped-mid-transfer.jpg")
+        let runtime = LibraryRuntimeState(
+            initial: LibraryRuntimeSnapshot(
+                network: LibraryNetworkState(path: LibraryNetworkPath(isSatisfied: true, availableInterfaces: [.wifi])))
+        )
+        let running = RunningUntilCancelledUploader()
+        let runner = makeRunner(
+            uploader: running,
+            throttleInputs: { BackupThrottleInputs(runtime: runtime.snapshot(), usesMobileData: false) },
+            runtimeChanges: { runtime.updates() }
+        )
+        let finished = expectation(description: "the pass ends")
+        let progressBox = BackupProgressBox()
+        let pass = Task {
+            progressBox.set(await runner.runUntilDrained(mode: .eligibleOnly))
+            finished.fulfill()
+        }
+        await running.started.wait()
+
+        runtime.update {
+            $0.network = LibraryNetworkState(
+                path: LibraryNetworkPath(
+                    isSatisfied: true, usedInterfaces: [.other], availableInterfaces: [.other, .cellular]))
+        }
+        await fulfillment(of: [finished], timeout: 5)
+        // Without the reaction the transfer would run on; end it so the failure reports instead of hanging.
+        if progressBox.value == nil { await runner.stop() }
+        await pass.value
+
+        XCTAssertEqual(running.cancellations, 1, "the pushed change cancels the transfer")
+        let row = try XCTUnwrap(queueStore.entry(for: due.source, revision: due.revision))
+        XCTAssertEqual(row.state, .queuedForUpload)
+        XCTAssertEqual(row.attempts, 0)
+        XCTAssertNil(BackupIssueRecord.decode(row.lastError))
+        let progress = try XCTUnwrap(progressBox.value)
+        XCTAssertTrue(progress.isPausedByPolicy)
+        XCTAssertTrue(progress.isWaitingForWiFi)
+        XCTAssertEqual(progress.failed, 0)
+    }
+
     func testBackupUploadsLetTheSystemRefuseCellularDataOnlyWhileMobileDataIsOff() async throws {
         let wiFiOnly = seedEntry("wifi-only.jpg")
         _ = await makeRunner(throttleInputs: { BackupThrottleInputs(usesMobileData: false) }).runUntilDrained()
@@ -1563,7 +1650,8 @@ final class BackupSyncRunnerTests: XCTestCase {
         uploadStallPollInterval: TimeInterval = 5,
         resourceCoordinator: LibraryResourceCoordinator = .shared,
         events: (any BackupItemEventSink)? = nil,
-        throttleInputs: @Sendable @escaping () -> BackupThrottleInputs = { .unconstrained }
+        throttleInputs: @Sendable @escaping () -> BackupThrottleInputs = { .unconstrained },
+        runtimeChanges: (@Sendable () -> AsyncStream<LibraryRuntimeSnapshot>)? = nil
     ) -> BackupSyncRunner {
         BackupSyncRunner(
             queue: queue ?? queueStore,
@@ -1581,6 +1669,7 @@ final class BackupSyncRunnerTests: XCTestCase {
                 throttle: throttle
             ),
             throttleInputs: throttleInputs,
+            runtimeChanges: runtimeChanges,
             clock: clock,
             events: events,
             now: { [clock] in clock!.now }

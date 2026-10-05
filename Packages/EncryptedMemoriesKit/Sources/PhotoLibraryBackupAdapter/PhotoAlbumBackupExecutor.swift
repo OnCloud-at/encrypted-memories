@@ -166,7 +166,8 @@ public final class PhotoAlbumBackupExecutor: AlbumSyncBackupExecuting, @unchecke
             resolver: resourceResolver,
             identityResolver: identityResolver,
             uploader: uploader,
-            throttleInputs: { AppleBackupRuntimeSignals.current() }
+            throttleInputs: BackupRuntimeSignalSource.apple.current,
+            runtimeChanges: BackupRuntimeSignalSource.apple.updates
         )
         lock.withLock { activeRunner = runner }
         defer { lock.withLock { activeRunner = nil } }
