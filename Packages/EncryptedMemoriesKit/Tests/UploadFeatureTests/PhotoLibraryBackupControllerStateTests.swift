@@ -921,6 +921,23 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
         await fixture.controller.shutdown()
     }
 
+    /// The excluded list checks its photos again on every activation, also while no pass may start.
+    func testActivationTellsThePendingGridWhileBackupIsPaused() async throws {
+        let fixture = try makeControllerFixture(prefix: "photo-backup-activation-pending")
+        defer { fixture.cleanup() }
+        fixture.controller.setEnabledForTesting()
+        fixture.controller.setAccessStateForTesting(.full)
+        fixture.controller.pauseBackup()
+        var changes = 0
+        fixture.controller.onLibraryChange = { changes += 1 }
+
+        fixture.controller.applicationDidBecomeActive()
+
+        XCTAssertEqual(changes, 1)
+        XCTAssertFalse(fixture.controller.isSyncing)
+        await fixture.controller.shutdown()
+    }
+
     func testActivationKeepsTheRunningPass() async throws {
         let fixture = try makeControllerFixture(prefix: "photo-backup-activation-running", enabled: true)
         defer { fixture.cleanup() }
