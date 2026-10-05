@@ -12,3 +12,23 @@ public enum AppleBackupRuntimeSignals {
         )
     }
 }
+
+/// Where a backup controller reads its runtime signals: the current throttle inputs and a stream that fires when
+/// they may have changed. Production uses the one shared Apple runtime state; tests inject both.
+public struct BackupRuntimeSignalSource: Sendable {
+    public var current: @Sendable () -> BackupThrottleInputs
+    public var updates: @Sendable () -> AsyncStream<LibraryRuntimeSnapshot>
+
+    public init(
+        current: @escaping @Sendable () -> BackupThrottleInputs,
+        updates: @escaping @Sendable () -> AsyncStream<LibraryRuntimeSnapshot>
+    ) {
+        self.current = current
+        self.updates = updates
+    }
+
+    public static let apple = BackupRuntimeSignalSource(
+        current: { AppleBackupRuntimeSignals.current() },
+        updates: { LibraryRuntimeState.shared.updates() }
+    )
+}

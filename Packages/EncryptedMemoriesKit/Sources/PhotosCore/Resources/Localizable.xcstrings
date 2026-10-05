@@ -927,8 +927,8 @@
     "settings.backup_use_mobile_data_footer": {
       "extractionState": "manual",
       "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "Includes Personal Hotspot. Viewing photos is not affected." } },
-        "de": { "stringUnit": { "state": "translated", "value": "Gilt auch für den persönlichen Hotspot. Das Ansehen von Fotos ist nicht betroffen." } }
+        "en": { "stringUnit": { "state": "translated", "value": "Applies to backups, also on Personal Hotspot. Viewing photos is not affected." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Gilt für Sicherungen, auch über den persönlichen Hotspot. Das Ansehen von Fotos ist nicht betroffen." } }
       }
     },
     "backup.phase_waiting_account_storage": {

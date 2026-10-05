@@ -967,6 +967,122 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
         XCTAssertFalse(defaults.bool(forKey: "photoBackup.userPaused.v1"))
     }
 
+    // MARK: - Waiting for Wi-Fi
+
+    func testWiFiReturningDuringTheScanStartsTheNextPassAtOnce() async throws {
+        let signals = FakeBackupRuntimeSignals(waitsForWiFi: true)
+        let fixture = try makeWiFiWaitFixture(prefix: "backup-wifi-returns", signals: signals)
+        defer { fixture.cleanup() }
+        let controller = fixture.controller
+        let scans = PassCounter()
+        controller.replaceScanForTesting {
+            // The runner already found the cellular network; Wi-Fi returns while this pass still scans.
+            if scans.increment() == 1 {
+                await signals.waitUntilRead()
+                signals.setWaitsForWiFi(false)
+            }
+        }
+
+        controller.syncNow()
+
+        let restarted = await waitUntil { scans.count >= 2 }
+        XCTAssertTrue(restarted, "the next pass must not wait for the fallback timer")
+        let settled = await waitUntil { scans.count >= 2 && !controller.isSyncing }
+        XCTAssertTrue(settled)
+        XCTAssertNotEqual(controller.status.phase, .waitingForWiFi, "the status must not stay on Wi-Fi")
+        await controller.shutdown()
+    }
+
+    func testWiFiWaitDoesNotStretchTheFallback() async throws {
+        let signals = FakeBackupRuntimeSignals(waitsForWiFi: true)
+        let fixture = try makeWiFiWaitFixture(prefix: "backup-wifi-fallback", signals: signals)
+        defer { fixture.cleanup() }
+        let controller = fixture.controller
+        let scans = PassCounter()
+        controller.replaceScanForTesting { _ = scans.increment() }
+
+        for pass in 1...8 {
+            controller.syncNow()
+            let finished = await waitUntil {
+                scans.count == pass && !controller.isSyncing && controller.isAutoResumeScheduledForTesting
+            }
+            XCTAssertTrue(finished, "pass \(pass)")
+        }
+
+        let waiting = await waitUntil { controller.status.phase == .waitingForWiFi }
+        XCTAssertTrue(waiting)
+        let wakeAt = try XCTUnwrap(controller.nextAutomaticAttemptAt)
+        XCTAssertLessThanOrEqual(
+            wakeAt.timeIntervalSinceNow, 31, "eight Wi-Fi waits are no failures and keep the shortest fallback")
+        await controller.shutdown()
+    }
+
+    func testNetworkChangeEndsTheWiFiWaitWithANewPass() async throws {
+        try await assertWiFiWaitEnds(prefix: "backup-wifi-network") { _, signals in signals.announceChange() }
+    }
+
+    func testTurningMobileDataOnEndsTheWiFiWaitWithANewPass() async throws {
+        try await assertWiFiWaitEnds(prefix: "backup-wifi-setting") { controller, _ in
+            controller.mobileDataSettingDidChange()
+        }
+    }
+
+    private func assertWiFiWaitEnds(
+        prefix: String,
+        _ end: (PhotoLibraryBackupController, FakeBackupRuntimeSignals) -> Void
+    ) async throws {
+        let signals = FakeBackupRuntimeSignals(waitsForWiFi: true)
+        let fixture = try makeWiFiWaitFixture(prefix: prefix, signals: signals)
+        defer { fixture.cleanup() }
+        let controller = fixture.controller
+        let scans = PassCounter()
+        controller.replaceScanForTesting { _ = scans.increment() }
+
+        controller.syncNow()
+        let waiting = await waitUntil {
+            !controller.isSyncing && controller.isAutoResumeScheduledForTesting
+                && controller.status.phase == .waitingForWiFi
+        }
+        XCTAssertTrue(waiting, "the pass ends waiting for Wi-Fi")
+        end(controller, signals)
+        XCTAssertEqual(scans.count, 1, "nothing starts while the wait holds")
+
+        signals.setWaitsForWiFi(false)
+        end(controller, signals)
+
+        let restarted = await waitUntil { scans.count >= 2 }
+        XCTAssertTrue(restarted, "the end of the wait starts a pass without the fallback timer")
+        await controller.shutdown()
+    }
+
+    /// A backup with one runnable row whose scan never touches PhotoKit; only the runner drains.
+    private func makeWiFiWaitFixture(prefix: String, signals: FakeBackupRuntimeSignals) throws -> ControllerFixture {
+        let fixture = try makeControllerFixture(
+            prefix: prefix, identityResolver: FakeIdentityResolver(), runtimeSignals: signals.source)
+        fixture.controller.setEnabledForTesting()
+        fixture.controller.setAccessStateForTesting(.full)
+        let queue = try XCTUnwrap(
+            UploadBackupSyncQueueManifestStore(
+                url: fixture.directory.appendingPathComponent(PhotoLibraryBackupController.queueDatabaseFileName)))
+        XCTAssertTrue(
+            queue.upsert(
+                .init(
+                    source: .init(kind: .fileURL, identifier: "waiting-photo"), revision: .init(rawValue: 1),
+                    originalFilename: "waiting-photo.jpg", state: .discovered,
+                    updatedAt: Date().addingTimeInterval(-60))))
+        queue.close()
+        return fixture
+    }
+
+    private func waitUntil(timeout: Duration = .seconds(5), _ predicate: () -> Bool) async -> Bool {
+        let deadline = ContinuousClock.now.advanced(by: timeout)
+        while ContinuousClock.now < deadline {
+            if predicate() { return true }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        return predicate()
+    }
+
     private struct ControllerFixture {
         let controller: PhotoLibraryBackupController
         let defaults: UserDefaults
@@ -980,7 +1096,8 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
     }
 
     private func makeControllerFixture(
-        prefix: String, enabled: Bool = false, identityResolver: (any UploadIdentityResolving)? = nil
+        prefix: String, enabled: Bool = false, identityResolver: (any UploadIdentityResolving)? = nil,
+        runtimeSignals: BackupRuntimeSignalSource = .apple
     ) throws -> ControllerFixture {
         let suite = "\(prefix)-\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
@@ -991,7 +1108,8 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             configuration: .init(
                 accountDataDirectory: directory,
                 databasePolicy: .conservative,
-                defaults: defaults
+                defaults: defaults,
+                runtimeSignals: runtimeSignals
             ),
             identityResolver: identityResolver,
             uploader: MockUploader()
@@ -1138,6 +1256,58 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             let waiters = releaseWaiters
             releaseWaiters.removeAll()
             waiters.forEach { $0.resume() }
+        }
+    }
+}
+
+/// Injected runtime signals: the test decides when the network is cellular with mobile data off, and when it changes.
+private final class FakeBackupRuntimeSignals: @unchecked Sendable {
+    private let lock = NSLock()
+    private var waitsForWiFi: Bool
+    private var reads = 0
+    private var continuations: [AsyncStream<LibraryRuntimeSnapshot>.Continuation] = []
+
+    init(waitsForWiFi: Bool) { self.waitsForWiFi = waitsForWiFi }
+
+    var source: BackupRuntimeSignalSource {
+        BackupRuntimeSignalSource(
+            current: { self.read() },
+            updates: { AsyncStream { continuation in self.lock.withLock { self.continuations.append(continuation) } } }
+        )
+    }
+
+    func setWaitsForWiFi(_ value: Bool) { lock.withLock { waitsForWiFi = value } }
+
+    func announceChange() {
+        let continuations = lock.withLock { self.continuations }
+        continuations.forEach { $0.yield(LibraryRuntimeSnapshot()) }
+    }
+
+    func waitUntilRead(timeout: Duration = .seconds(5)) async {
+        let deadline = ContinuousClock.now.advanced(by: timeout)
+        while lock.withLock({ reads == 0 }), ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+    }
+
+    private func read() -> BackupThrottleInputs {
+        lock.withLock {
+            reads += 1
+            return BackupThrottleInputs(isNetworkExpensive: waitsForWiFi, usesMobileData: !waitsForWiFi)
+        }
+    }
+}
+
+private final class PassCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = 0
+
+    var count: Int { lock.withLock { value } }
+
+    func increment() -> Int {
+        lock.withLock {
+            value += 1
+            return value
         }
     }
 }
