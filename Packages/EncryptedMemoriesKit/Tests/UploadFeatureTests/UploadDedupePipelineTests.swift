@@ -1020,6 +1020,42 @@ final class UploadDedupePipelineTests: XCTestCase {
         XCTAssertEqual(next.decision, .skip(.knownFromManifest, remoteLinkID: "kept-video"))
     }
 
+    func testAResolveThatConfirmsTheLinkItReadKeepsTheLinkThatAMergeMovedItsRowTo() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rebind-confirm-race-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let manifest = try XCTUnwrap(
+            UploadIdentityManifestStore(
+                url: directory.appendingPathComponent(UploadIdentityManifestStore.databaseFileName)))
+        let store = RebindBeforeNextWriteStore(base: manifest)
+        let pipeline = UploadDedupePipeline(store: store, hasher: hasher, checker: checker)
+        let path = "/photos/IMG_1.HEIC"
+        let video = UploadResourceDescriptor(
+            source: .file(URL(fileURLWithPath: path), resource: .livePairedVideo),
+            fileURL: URL(fileURLWithPath: path + "#IMG_1.MOV"), filename: "IMG_1.MOV", fileSize: 1000,
+            modificationDate: Date(timeIntervalSince1970: 1_700_000_000))
+        let first = try await pipeline.resolve(video.relatedTo(mainRemoteLinkID: "duplicate-main"))
+        XCTAssertEqual(first.decision, .upload)
+        try await pipeline.recordUploaded(
+            video, identity: first.identity, remoteVolumeID: "vol", remoteLinkID: "duplicate-video")
+        // The server still lists the copy under the duplicate as active, so the resolve confirms the link it read.
+        checker.remoteItemsByNameHash[first.identity.nameHash] = [
+            activeRow("duplicate-video", contentHash: first.identity.contentHash, name: "IMG_1.MOV")
+        ]
+        checker.relatedLinkIDsByMainLinkID["duplicate-main"] = ["duplicate-video"]
+
+        // A merge of exact duplicates moves the row to the copy under the kept photo after this resolve read it.
+        store.rebindBeforeNextWrite(
+            [UploadRemoteLinkMove(from: "duplicate-video", to: "kept-video", contentHash: first.identity.contentHash)],
+            hashKeyEpoch: checker.epoch)
+        let confirming = video.relatedTo(mainRemoteLinkID: "duplicate-main", requiresRelatedMatch: true)
+        let raced = try await pipeline.resolve(confirming)
+
+        XCTAssertEqual(raced.decision, .skip(.activeDuplicate, remoteLinkID: "duplicate-video"))
+        XCTAssertEqual(manifest.record(for: video.source)?.remoteLinkID, "kept-video")
+    }
+
     func testAPrimaryUploadsWhenItsOnlyNameMatchIsTheOriginalUnderAnEditedPhoto() async throws {
         let d = descriptor()
         let contentHash = "ch(\(fakeSHA1Hex(seed: d.fileURL.path)))"

@@ -366,7 +366,9 @@ public struct ExactDuplicateFinder: Sendable {
     /// duplicates of every group, and the backup drops its cached remote state once. `favorites` holds the favorites
     /// among the trashed and the kept photos. A group whose carry-over or row move fails takes no part in the trash.
     /// A failed trash fails every group that took part: their rows already name `kept`, which holds the same bytes,
-    /// so a retry finds them moved and writes them no second time.
+    /// so a retry finds them moved and writes them no second time. Known gap: after a failed or cancelled trash, no
+    /// group reads its kept photo again, so a merge on another device that trashed that kept photo at the same moment
+    /// is not undone here.
     private func write(
         _ writes: [(index: Int, plan: PlannedMerge)], favorites: Set<PhotoUID>,
         into results: inout [Result<ExactDuplicateMergeOutcome, any Error>?]

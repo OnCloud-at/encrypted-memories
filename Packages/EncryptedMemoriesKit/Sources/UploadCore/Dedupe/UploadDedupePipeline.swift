@@ -852,7 +852,7 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
             record.outcome = UploadIdentityManifestStore.Outcome.duplicateActive.rawValue
             record.remoteLinkID = remoteLinkID
             record.updatedAt = now()
-            try persistRecord(record)
+            try persistRecord(record, readFrom: cached)
         case .skip(.trashedDuplicate, _):
             record.outcome = UploadIdentityManifestStore.Outcome.duplicateTrashed.rawValue
             record.updatedAt = now()
