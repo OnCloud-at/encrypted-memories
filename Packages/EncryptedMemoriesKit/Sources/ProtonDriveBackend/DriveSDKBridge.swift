@@ -416,12 +416,11 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                 burstEntries = entries
                 let motions = try await livePhotoMotions(
                     of: Self.livePhotos(in: entries), volumeID: root.volumeID, evidence: mediaTypeEvidence)
-                if !motions.complete { enrichmentComplete = false }
                 sections = Self.group(
                     entries,
                     volumeID: root.volumeID,
                     mediaTypeOverrides: mediaTypeEvidence,
-                    motions: motions.motions,
+                    motions: motions,
                     sectionID: "all"
                 )
                 reconciliationItems = sections.flatMap(\.items)
@@ -464,12 +463,10 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                         DebugLog.log("timeline: video tag enrichment skipped - \(error)")
                     }
                 }
-                var livePhotoVideoIDs: [String: String] = [:]
+                var liveMotions: [String: LivePhotoMotion] = [:]
                 if let lives = enrichment.livePhotos.value {
-                    let motions = try await livePhotoMotions(
+                    liveMotions = try await livePhotoMotions(
                         of: lives, volumeID: root.volumeID, evidence: mediaTypeEvidence)
-                    if !motions.complete { enrichmentComplete = false }
-                    livePhotoVideoIDs = motions.motions.compactMapValues(\.linkID)
                 } else {
                     enrichmentComplete = false
                     if let error = enrichment.livePhotos.errorDescription {
@@ -491,7 +488,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                     items,
                     videoNodeIDs: videoNodeIDs,
                     mediaTypeOverrides: mediaTypeEvidence,
-                    livePhotoVideoIDs: livePhotoVideoIDs,
+                    livePhotoMotions: liveMotions,
                     burstMemberIDs: burstMemberIDs
                 )
                 reconciliationItems = sections.flatMap(\.items)
@@ -1603,7 +1600,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         let evidence = timelineStore?.mediaTypeEvidence(volumeID: volumeID) ?? [:]
         let motions = try await livePhotoMotions(
             of: Self.livePhotos(in: entries), volumeID: volumeID, evidence: evidence)
-        return Self.group(entries, volumeID: volumeID, mediaTypeOverrides: evidence, motions: motions.motions)
+        return Self.group(entries, volumeID: volumeID, mediaTypeOverrides: evidence, motions: motions)
     }
 
     /// The related files of each Live Photo in `entries` in listing order, by link ID.
@@ -1615,10 +1612,11 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
 
     /// The motion of each of these Live Photos (`LivePhotoMotionLinks.motions`). A motion that this rule stored with the
     /// timeline holds without a read; the related files that still need a type are read in metadata batches, a few at a
-    /// time. `complete` is false when a read failed.
+    /// time. A failed read leaves those motions unknown without holding back the timeline cache: an unknown motion saves
+    /// no related video, so the next refresh reads exactly those photos again.
     private func livePhotoMotions(
         of livePhotos: [String: [String]], volumeID: String, evidence: [String: String]
-    ) async throws -> (motions: [String: LivePhotoMotion], complete: Bool) {
+    ) async throws -> [String: LivePhotoMotion] {
         let stored = LivePhotoMotionLinks.storedMotions(of: livePhotos, volumeID: volumeID, in: timelineStore)
         let answer = try await livePhotoMotionLinks.motions(of: livePhotos, stored: stored, evidence: evidence) {
             [driveSession, photosShareID] linkIDs in
@@ -1633,7 +1631,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
             return batches.reduce(into: [:]) { types, batch in types.merge(batch) { first, _ in first } }
         }
         livePhotoMotionLinks.record(answer.read)
-        return (answer.motions, answer.complete)
+        return answer.motions
     }
 
     /// Reads `linkIDs` in metadata batches, at most `ProtonUploadDedupeService.remoteMetadataRequestConcurrency` at a
@@ -1867,10 +1865,11 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
 
     // MARK: - Mapping
 
-    private static func group(
+    /// Builds timeline sections from the SDK timeline. `livePhotoMotions` holds the motion of each Live Photo.
+    static func group(
         _ items: [PhotoTimelineItem], videoNodeIDs: Set<String> = [],
         mediaTypeOverrides: [String: String] = [:],
-        livePhotoVideoIDs: [String: String] = [:],
+        livePhotoMotions: [String: LivePhotoMotion] = [:],
         burstMemberIDs: [String: [String]] = [:]
     ) -> [TimelineSection] {
         let photos =
@@ -1881,7 +1880,8 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                     mediaTypeOverrides[nodeID]
                     ?? (videoNodeIDs.contains(nodeID) ? "video/quicktime" : "image/jpeg")
                 let isVideo = mediaType.hasPrefix("video/")
-                let relatedVideo = livePhotoVideoIDs[nodeID]  // a live photo's paired video link, if any
+                let motion = livePhotoMotions[nodeID] ?? .noVideo
+                let relatedVideo = motion.linkID  // a live photo's paired video link, if any
                 let burstMembers = burstMemberIDs[nodeID] ?? []
                 var tags: Set<LibraryPhotoTag> = []
                 if isVideo { tags.insert(.videos) }
@@ -1891,7 +1891,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                     uid: PhotoUID(volumeID: item.nodeUid.volumeID, nodeID: nodeID),
                     captureTime: Date(timeIntervalSince1970: item.captureTime),
                     mediaType: mediaType,
-                    isLivePhoto: relatedVideo != nil,
+                    isLivePhoto: motion.showsLiveControl,
                     relatedVideoID: relatedVideo,
                     tags: tags,
                     burstMemberIDs: burstMembers)
@@ -1927,7 +1927,6 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         tags.remove(.videos)
         if isVideo { tags.insert(.videos) }
         if burstMemberIDs.count > 1 { tags.insert(.bursts) }
-        // A Live Photo whose related files hold no video shows no Live control. An unknown motion keeps the tag.
         let motion: LivePhotoMotion =
             entry.isLivePhoto
             ? motion ?? LivePhotoMotionLinks.motion(among: entry.relatedLinkIDs, mimeTypes: [:]) : .noVideo
@@ -1935,7 +1934,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
             uid: PhotoUID(volumeID: volumeID, nodeID: entry.linkID),
             captureTime: Date(timeIntervalSince1970: entry.captureTime),
             mediaType: mediaType,
-            isLivePhoto: motion != .noVideo,
+            isLivePhoto: motion.showsLiveControl,
             relatedVideoID: motion.linkID,
             tags: tags,
             burstMemberIDs: burstMemberIDs
