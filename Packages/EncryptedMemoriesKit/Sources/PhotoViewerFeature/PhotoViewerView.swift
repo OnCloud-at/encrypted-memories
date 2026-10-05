@@ -194,7 +194,10 @@ private final class PlayerLayerHostView: NSView {
 
 /// Full-screen photo/video viewer: shows the best available image sharp (no blur) with a native progress
 /// indicator while the full original downloads, then pinch-to-zoom + two-finger pan.
-public struct PhotoViewerView: View {
+///
+/// A viewer of a small set of photos, such as a group of duplicates, passes an `accessory`: the viewer then shows a
+/// filmstrip of its photos with the accessory below it, on one glass panel at the bottom.
+public struct PhotoViewerView<Accessory: View>: View {
     @State private var model: PhotoViewerModel
     private let onClose: () -> Void
     private let onPinchDismissBegan: () -> Void
@@ -203,6 +206,7 @@ public struct PhotoViewerView: View {
     /// True while the shared zoom overlay renders the shrink-to-cell transition. This view hides its own
     /// background and image but stays mounted and hit-testable for the pinch gesture.
     private let isDismissing: Bool
+    private let accessory: Accessory
 
     private let mediaTransition = ViewerMediaTransitionStyle.standard
 
@@ -212,7 +216,8 @@ public struct PhotoViewerView: View {
         onPinchDismissBegan: @escaping () -> Void = {},
         onPinchDismissChanged: @escaping (CGFloat) -> Void = { _ in },
         onPinchDismissEnded: @escaping (Bool) -> Void = { _ in },
-        isDismissing: Bool = false
+        isDismissing: Bool = false,
+        @ViewBuilder accessory: () -> Accessory
     ) {
         _model = State(initialValue: model)
         self.onClose = onClose
@@ -220,7 +225,11 @@ public struct PhotoViewerView: View {
         self.onPinchDismissChanged = onPinchDismissChanged
         self.onPinchDismissEnded = onPinchDismissEnded
         self.isDismissing = isDismissing
+        self.accessory = accessory()
     }
+
+    /// True when the host passed an accessory, so the viewer shows the filmstrip of its photos.
+    private var showsItemFilmstrip: Bool { Accessory.self != EmptyView.self }
 
     public var body: some View {
         ZStack {
@@ -299,8 +308,37 @@ public struct PhotoViewerView: View {
                 if model.hasBurstFilmstrip, !isDismissing {
                     // Only the filmstrip follows the width, so a resize evaluates it alone.
                     ViewerWidthReader { burstFilmstrip(areaWidth: $0) }
+                } else if showsItemFilmstrip, !isDismissing {
+                    ViewerWidthReader { itemFilmstrip(areaWidth: $0) }
                 }
             }
+    }
+
+    /// The photos of this viewer in a filmstrip, with the host's accessory below it.
+    private func itemFilmstrip(areaWidth: CGFloat) -> some View {
+        let width = min(max(areaWidth - 40, 320), 640)
+        let count = model.items.count
+        let itemSide = burstFilmstripItemSide(panelWidth: width, itemCount: count)
+        let needsScroller = burstFilmstripNeedsScroller(panelWidth: width, itemCount: count, itemSide: itemSide)
+        return VStack(spacing: 10) {
+            BurstFilmstripView(
+                items: model.items,
+                selectedUID: model.baseCurrent.uid,
+                feed: model.thumbnailFeed,
+                itemSide: itemSide,
+                showsHorizontalScroller: needsScroller,
+                onSelect: { index in
+                    guard model.items.indices.contains(index) else { return }
+                    model.selectPage(uid: model.items[index].uid)
+                }
+            )
+            .frame(height: itemSide + (needsScroller ? 18 : 0))
+            accessory
+        }
+        .padding(12)
+        .frame(width: width)
+        .glassEffect(in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .padding(.bottom, 16)
     }
 
     @ViewBuilder private var content: some View {
@@ -524,6 +562,23 @@ public struct PhotoViewerView: View {
         case .previous: model.previousInContext()
         case .next: model.nextInContext()
         }
+    }
+}
+
+extension PhotoViewerView where Accessory == EmptyView {
+    /// A viewer without an accessory: the library, an album, or another collection.
+    public init(
+        model: PhotoViewerModel,
+        onClose: @escaping () -> Void,
+        onPinchDismissBegan: @escaping () -> Void = {},
+        onPinchDismissChanged: @escaping (CGFloat) -> Void = { _ in },
+        onPinchDismissEnded: @escaping (Bool) -> Void = { _ in },
+        isDismissing: Bool = false
+    ) {
+        self.init(
+            model: model, onClose: onClose, onPinchDismissBegan: onPinchDismissBegan,
+            onPinchDismissChanged: onPinchDismissChanged, onPinchDismissEnded: onPinchDismissEnded,
+            isDismissing: isDismissing, accessory: { EmptyView() })
     }
 }
 

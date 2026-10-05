@@ -11,6 +11,7 @@ import SwiftUI
 import TimelineCore
 import TimelineUIKitFeature
 import UIKit
+import UploadCore
 
 enum MobileTimelineSurface: Equatable {
     case library
@@ -747,6 +748,14 @@ struct MobileViewerPresentation: Identifiable {
     var showsInfoInitially = false
     /// The whole-library viewer follows photos that the backup replaced; other collections keep their photos.
     var followsLibraryReplacements = false
+    /// A group of duplicates: the viewer shows the merge tools instead of the library actions.
+    var duplicateGroup: MobileDuplicateViewerGroup?
+}
+
+/// The group of duplicates that a viewer shows, and the model that keeps and merges its photos.
+struct MobileDuplicateViewerGroup {
+    let model: ExactDuplicatesModel
+    let groupID: String
 }
 
 /// A successful viewer mutation removes the current item from the collection that opened it. Filtered grids

@@ -14,6 +14,7 @@ import PhotosCore
 import SwiftUI
 import TimelineCore
 import UIKit
+import UploadCore
 import VisionKit
 
 /// Native full-screen photo/video viewer. Paging + chrome live here (pure presentation); the media decoding,
@@ -31,6 +32,8 @@ struct MobilePhotoViewer: View {
     let viewerRouter: MobileViewerRouter
     /// True for a library viewer: it follows a photo that the backup replaced, such as an edit in Apple Photos.
     let followsLibraryReplacements: Bool
+    /// A group of duplicates: the bottom bar keeps a copy and merges the group instead of the library actions.
+    let duplicateGroup: MobileDuplicateViewerGroup?
     @State private var pageIndex: ViewerPageIndex
 
     @Environment(\.dismiss) private var dismiss
@@ -81,7 +84,8 @@ struct MobilePhotoViewer: View {
         libraryModel: MobileLibraryModel,
         viewerRouter: MobileViewerRouter,
         showsInfoInitially: Bool = false,
-        followsLibraryReplacements: Bool = false
+        followsLibraryReplacements: Bool = false,
+        duplicateGroup: MobileDuplicateViewerGroup? = nil
     ) {
         _showInfo = State(initialValue: showsInfoInitially)
         _items = State(initialValue: items)
@@ -90,6 +94,7 @@ struct MobilePhotoViewer: View {
         self.libraryModel = libraryModel
         self.viewerRouter = viewerRouter
         self.followsLibraryReplacements = followsLibraryReplacements
+        self.duplicateGroup = duplicateGroup
         _pageIndex = State(initialValue: ViewerPageIndex(orderedUIDs: items.map(\.uid)))
         _index = State(initialValue: min(max(startIndex, 0), max(items.count - 1, 0)))
         _titleMetadataCoordinator = State(
@@ -323,21 +328,53 @@ struct MobilePhotoViewer: View {
     @ToolbarContentBuilder private var viewerToolbar: some ToolbarContent {
         ToolbarItem(placement: .principal) { viewerTitleView }
         viewerCloseItem
-        viewerMoreActions
-        ToolbarItem(placement: .bottomBar) { viewerShareButton }
-            .mobileVisibilityPriority(.high)
-        ToolbarSpacer(.flexible, placement: .bottomBar)
-        ToolbarItemGroup(placement: .bottomBar) {
-            // Shared photos cannot carry the account's favorite tag; the context is fixed for the presentation.
-            if context.allowsFavorites { viewerFavoriteButton }
-            viewerAlbumButton
-            viewerInfoButton
+        if let duplicateGroup {
+            duplicateToolbar(duplicateGroup)
+        } else {
+            viewerMoreActions
+            ToolbarItem(placement: .bottomBar) { viewerShareButton }
+                .mobileVisibilityPriority(.high)
+            ToolbarSpacer(.flexible, placement: .bottomBar)
+            ToolbarItemGroup(placement: .bottomBar) {
+                // Shared photos cannot carry the account's favorite tag; the context is fixed for the presentation.
+                if context.allowsFavorites { viewerFavoriteButton }
+                viewerAlbumButton
+                viewerInfoButton
+            }
+            // Favorite, Album, and Info are the first to leave a compressed bar; the overflow menu keeps their titles.
+            .mobileVisibilityPriority(.low)
+            ToolbarSpacer(.flexible, placement: .bottomBar)
+            ToolbarItem(placement: .bottomBar) { viewerMutationButton }
+                .mobileVisibilityPriority(.high)
         }
-        // Favorite, Album, and Info are the first to leave a compressed bar; the overflow menu keeps their titles.
-        .mobileVisibilityPriority(.low)
+    }
+
+    /// The merge tools of a group of duplicates, like Apple Photos: Keep This Copy for the photo shown, and Merge,
+    /// which merges the group with the photo shown as kept and closes the viewer.
+    @ToolbarContentBuilder
+    private func duplicateToolbar(_ group: MobileDuplicateViewerGroup) -> some ToolbarContent {
+        ToolbarItem(placement: .bottomBar) {
+            let uid = currentBaseItem?.uid
+            let isKept = uid != nil && group.model.group(withID: group.groupID)?.kept == uid
+            Button(uid.map { group.model.keepTitle(for: $0, inGroup: group.groupID) } ?? "") {
+                guard let uid else { return }
+                group.model.keep(uid, inGroup: group.groupID)
+            }
+            .disabled(uid == nil || isKept || group.model.isMerging)
+            .accessibilityIdentifier("duplicates.viewer.keep")
+        }
+        .mobileVisibilityPriority(.high)
         ToolbarSpacer(.flexible, placement: .bottomBar)
-        ToolbarItem(placement: .bottomBar) { viewerMutationButton }
-            .mobileVisibilityPriority(.high)
+        ToolbarItem(placement: .bottomBar) {
+            Button(L10n.string("duplicates.merge")) {
+                dismiss()
+                Task { await group.model.merge(groupID: group.groupID) }
+            }
+            .buttonStyle(.glassProminent)
+            .disabled(!group.model.canMerge || group.model.group(withID: group.groupID) == nil)
+            .accessibilityIdentifier("duplicates.viewer.merge")
+        }
+        .mobileVisibilityPriority(.high)
     }
 
     /// Close is the primary navigation control: it stays at the top of a vertical bar and never overflows.

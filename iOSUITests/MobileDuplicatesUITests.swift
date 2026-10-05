@@ -72,8 +72,12 @@ final class MobileDuplicatesUITests: XCTestCase {
         for dark in [false, true] {
             openDuplicates(fixture: "-EncryptedMemoriesDuplicatesFixture", dark: dark)
             XCTAssertTrue(group(1).waitForExistence(timeout: 10))
-            XCTAssertTrue(app.staticTexts["2 Groups"].waitForExistence(timeout: 5), "the screen counts the groups")
+            XCTAssertTrue(
+                app.staticTexts["4 identical copies"].waitForExistence(timeout: 5), "the screen counts every copy")
             keepScreenshot("duplicates-ios-groups-\(dark ? "dark" : "light")")
+            member(0, 1).tap()
+            XCTAssertTrue(app.buttons["duplicates.viewer.merge"].waitForExistence(timeout: 10))
+            keepScreenshot("duplicates-ios-viewer-\(dark ? "dark" : "light")")
             app.terminate()
 
             openDuplicates(fixture: "-EncryptedMemoriesDuplicatesCheckingFixture", dark: dark)
@@ -114,19 +118,66 @@ final class MobileDuplicatesUITests: XCTestCase {
         XCTAssertTrue(app.staticTexts["No Duplicates"].waitForExistence(timeout: 5))
     }
 
-    func testTappingAnotherPhotoKeepsItInsteadOfTheRankedOne() {
+    private func member(_ group: Int, _ index: Int) -> XCUIElement {
+        app.buttons["duplicates.member.\(group).\(index)"]
+    }
+
+    private func waitUntil(_ element: XCUIElement, _ predicate: String, _ message: String) {
+        let expectation = XCTNSPredicateExpectation(predicate: NSPredicate(format: predicate), object: element)
+        XCTAssertEqual(XCTWaiter.wait(for: [expectation], timeout: 10), .completed, message)
+    }
+
+    func testTappingAPhotoOpensItWithItsGroupAndKeepsItThere() {
         openDuplicates()
-        let ranked = app.buttons["duplicates.member.0.0"]
-        let other = app.buttons["duplicates.member.0.1"]
+        let ranked = member(0, 0)
+        let other = member(0, 1)
         XCTAssertTrue(other.waitForExistence(timeout: 5))
         XCTAssertTrue(ranked.isSelected, "the ranked photo is kept first")
         XCTAssertFalse(other.isSelected)
+        XCTAssertTrue(other.label.hasPrefix("Copy 2 of 2"), "each copy says its position, got \(other.label)")
 
         other.tap()
 
-        let selected = XCTNSPredicateExpectation(predicate: NSPredicate(format: "isSelected == true"), object: other)
-        XCTAssertEqual(XCTWaiter.wait(for: [selected], timeout: 10), .completed, "the tapped photo is kept")
+        let keep = app.buttons["duplicates.viewer.keep"]
+        XCTAssertTrue(keep.waitForExistence(timeout: 10), "a tap opens the photo with the merge tools")
+        XCTAssertEqual(keep.label, "Keep This Copy")
+        keep.tap()
+        waitUntil(keep, "label == 'Kept'", "the shown photo is kept")
+
+        app.buttons["Close"].firstMatch.tap()
+        XCTAssertTrue(other.waitForExistence(timeout: 10))
+        waitUntil(other, "isSelected == true", "the list keeps the photo chosen in the viewer")
         XCTAssertFalse(ranked.isSelected)
-        XCTAssertEqual(other.label, "Photo to keep")
+        XCTAssertTrue(other.label.contains(", kept"), "the kept copy says so, got \(other.label)")
+    }
+
+    func testMergeInTheViewerMergesTheGroupAndClosesTheViewer() {
+        openDuplicates()
+        let other = member(0, 1)
+        XCTAssertTrue(other.waitForExistence(timeout: 5))
+        other.tap()
+        let merge = app.buttons["duplicates.viewer.merge"]
+        XCTAssertTrue(merge.waitForExistence(timeout: 10))
+
+        merge.tap()
+
+        waitUntilGone(merge, "the viewer closes")
+        waitUntilGone(group(1), "the merged group leaves the list")
+        XCTAssertTrue(group(0).exists, "the other group stays")
+    }
+
+    func testTheContextMenuKeepsAnotherPhoto() {
+        openDuplicates()
+        let other = member(0, 1)
+        XCTAssertTrue(other.waitForExistence(timeout: 5))
+
+        other.press(forDuration: 1.2)
+        let byIdentifier = app.buttons["duplicates.keepMenu"].firstMatch
+        let keep = byIdentifier.waitForExistence(timeout: 5) ? byIdentifier : app.buttons["Keep This Copy"].firstMatch
+        XCTAssertTrue(keep.waitForExistence(timeout: 5), "the context menu offers Keep This Copy")
+        keep.tap()
+
+        waitUntil(other, "isSelected == true", "the photo from the context menu is kept")
+        XCTAssertFalse(member(0, 0).isSelected)
     }
 }

@@ -16,6 +16,8 @@ public protocol ExactDuplicateMerging: Sendable {
     ) async throws -> Bool
     /// The members of each group in an order that needs no request.
     func fallbackMembers(of groups: [ExactDuplicateGroup]) async -> [String: [PhotoUID]]
+    /// The capture dates of `members` that the device already knows, without a request. Unknown photos are left out.
+    func captureDates(of members: [PhotoUID]) async -> [PhotoUID: Date]
     /// Ranks the members of each group, page by page. A group whose facts cannot be read is not in its page.
     func rankMembers(
         of groups: [ExactDuplicateGroup], ranked: @escaping @Sendable (ExactDuplicateRankingPage) async -> Void
@@ -28,6 +30,61 @@ public protocol ExactDuplicateMerging: Sendable {
 }
 
 extension ExactDuplicateFinder: ExactDuplicateMerging {}
+
+extension ExactDuplicateMerging {
+    /// Without a local timeline, no date is known.
+    public func captureDates(of members: [PhotoUID]) async -> [PhotoUID: Date] { [:] }
+}
+
+/// A fact of one copy that the screens show as a small badge, in the order of the ranking.
+public enum ExactDuplicateBadge: CaseIterable, Equatable, Sendable {
+    case shared
+    /// In one of the person's own albums.
+    case album
+    case favorite
+    /// A local source of this device counts the copy as its backup.
+    case backedUpHere
+
+    /// The spoken name of the badge.
+    public var title: String {
+        switch self {
+        case .shared: L10n.string("duplicates.badge_shared")
+        case .album: L10n.string("duplicates.badge_album")
+        case .favorite: L10n.string("duplicates.badge_favorite")
+        case .backedUpHere: L10n.string("duplicates.badge_backed_up_here")
+        }
+    }
+
+    func applies(to facts: ExactDuplicateKeepFacts) -> Bool {
+        switch self {
+        case .shared: facts.isShared
+        case .album: facts.isInOwnAlbum
+        case .favorite: facts.isFavorite
+        case .backedUpHere: facts.isNamedByManifest
+        }
+    }
+}
+
+/// Why the copy that a merge keeps stays instead of another copy.
+public enum ExactDuplicateStayReason: Equatable, Sendable {
+    /// The kept copy has this fact and another copy has not.
+    case badge(ExactDuplicateBadge)
+    /// No other copy is older, and another copy is newer.
+    case oldest
+    /// No fact sets the kept copy apart.
+    case identical
+
+    public var text: String {
+        switch self {
+        case .badge(.shared): L10n.string("duplicates.stays_shared")
+        case .badge(.album): L10n.string("duplicates.stays_album")
+        case .badge(.favorite): L10n.string("duplicates.stays_favorite")
+        case .badge(.backedUpHere): L10n.string("duplicates.stays_backed_up_here")
+        case .oldest: L10n.string("duplicates.stays_oldest")
+        case .identical: L10n.string("duplicates.stays_any")
+        }
+    }
+}
 
 /// One short message after a merge that did not move every duplicate to Recently Deleted.
 public enum ExactDuplicateMergeNotice: Equatable, Sendable {
@@ -85,13 +142,29 @@ public final class ExactDuplicatesModel {
         public internal(set) var byteSize: Int64?
         /// The members that the person shares, as the ranking read them. Empty before the ranking.
         public internal(set) var sharedMembers: Set<PhotoUID> = []
+        /// The facts of each member, as the ranking read them. Empty before the ranking.
+        public internal(set) var memberFacts: [PhotoUID: ExactDuplicateKeepFacts] = [:]
+        /// The size of a member in bytes where its own node states one. Copies of other bytes can differ in size.
+        public internal(set) var memberByteSizes: [PhotoUID: Int64] = [:]
+        /// The capture dates that the device knows, without a request.
+        public internal(set) var captureDates: [PhotoUID: Date] = [:]
         /// The photos that a merge moves to Recently Deleted.
         public var duplicateCount: Int { members.count - 1 }
 
-        /// The space that the merge frees: the copies hold the same bytes, so one size for each duplicate.
-        public var freedBytes: Int64? { byteSize.map { $0 * Int64(duplicateCount) } }
+        /// The size of `member` in bytes: its own size, else the size of one copy. Nil while unknown.
+        public func byteSize(of member: PhotoUID) -> Int64? { memberByteSizes[member] ?? byteSize }
 
-        /// The short text of `freedBytes`, for example "Frees 4.2 MB". Nil while the size is unknown.
+        /// The space that the merge frees: the sizes of every member except the kept one. Nil while one is unknown.
+        public var freedBytes: Int64? {
+            var total: Int64 = 0
+            for member in members where member != kept {
+                guard let size = byteSize(of: member) else { return nil }
+                total += size
+            }
+            return total
+        }
+
+        /// The short text of `freedBytes`, for example "Merge frees 4.2 MB". Nil while the size is unknown.
         public var freedText: String? {
             freedBytes.map { L10n.string("duplicates.group_frees \(ExactDuplicatesModel.byteText($0))") }
         }
@@ -99,6 +172,58 @@ public final class ExactDuplicatesModel {
         /// The short text of `keptReason`, for example below the group.
         public var keptReasonMessage: String? {
             keptReason.map { ExactDuplicateMergeNotice.keptDuplicates(count: duplicateCount, reason: $0).message }
+        }
+
+        /// The badges of `member`, in the order of the ranking. Empty before the ranking read its facts.
+        public func badges(of member: PhotoUID) -> [ExactDuplicateBadge] {
+            guard let facts = memberFacts[member] else { return [] }
+            return ExactDuplicateBadge.allCases.filter { $0.applies(to: facts) }
+        }
+
+        /// Why the kept member stays: the first fact in the order of the ranking that it has and another member
+        /// has not, then the oldest capture date. Nil before the ranking read the facts of the kept member.
+        public var stayReason: ExactDuplicateStayReason? {
+            guard isRanked, let keptFacts = memberFacts[kept] else { return nil }
+            let others = members.filter { $0 != kept }.map { memberFacts[$0] }
+            for badge in ExactDuplicateBadge.allCases where badge.applies(to: keptFacts) {
+                if others.contains(where: { other in !(other.map { badge.applies(to: $0) } ?? false) }) {
+                    return .badge(badge)
+                }
+            }
+            if let date = keptFacts.captureDate {
+                let dates = others.compactMap { $0?.captureDate }
+                if !dates.contains(where: { $0 < date }), dates.contains(where: { $0 > date }) { return .oldest }
+            }
+            return .identical
+        }
+
+        /// One line below the group: why the kept member stays and what the merge frees. Before the ranking only
+        /// the freed space; nil while neither is known.
+        public var footerText: String? {
+            let parts = [stayReason?.text, freedText].compactMap { $0 }
+            return parts.isEmpty ? nil : parts.joined(separator: " · ")
+        }
+
+        /// The capture day of the group in the system's numeric date format, or the first and the last day joined
+        /// when the members differ. Nil while no date is known.
+        public var dateText: String? {
+            let days = Set(members.compactMap { captureDates[$0] }.map { Calendar.current.startOfDay(for: $0) })
+            guard let first = days.min(), let last = days.max() else { return nil }
+            let text = { (day: Date) in day.formatted(date: .numeric, time: .omitted) }
+            return first == last ? text(first) : L10n.string("duplicates.dates \(text(first)) \(text(last))")
+        }
+
+        /// The title above the group: its date, else its number of copies.
+        public var title: String { dateText ?? L10n.string("duplicates.group_title \(members.count)") }
+
+        /// The spoken label of `member`: its position, whether it is kept, its badges, and its size.
+        public func accessibilityLabel(of member: PhotoUID) -> String {
+            guard let position = members.firstIndex(of: member) else { return "" }
+            var parts = [L10n.string("duplicates.member_label \(position + 1) \(members.count)")]
+            if member == kept { parts.append(L10n.string("duplicates.member_kept")) }
+            parts += badges(of: member).map(\.title)
+            if let size = byteSize(of: member) { parts.append(ExactDuplicatesModel.byteText(size)) }
+            return parts.joined(separator: ", ")
         }
 
         /// Drops the photos that a merge moved to Recently Deleted. False when fewer than two members remain.
@@ -117,11 +242,19 @@ public final class ExactDuplicatesModel {
         /// Takes the ranked order. The photo to keep follows it unless the person chose one. With `keepsShown`, the
         /// photo that the screen already shows as kept stays, unless another member is shared and it is not: a merge
         /// keeps every shared member, so the shared one is kept and shown.
-        mutating func rank(_ order: [PhotoUID], shared: Set<PhotoUID>, keepsShown: Bool) {
+        mutating func rank(
+            _ order: [PhotoUID], shared: Set<PhotoUID>, facts: [PhotoUID: ExactDuplicateKeepFacts] = [:],
+            sizes: [PhotoUID: Int64] = [:], keepsShown: Bool
+        ) {
             let current = Set(members)
             let ranked = order.filter(current.contains)
             members = ranked + members.filter { !ranked.contains($0) }
             sharedMembers = shared.intersection(current)
+            memberFacts = facts.filter { current.contains($0.key) }
+            memberByteSizes.merge(sizes.filter { current.contains($0.key) }) { _, new in new }
+            for (member, fact) in memberFacts {
+                if let date = fact.captureDate { captureDates[member] = date }
+            }
             isRanked = true
             guard !isKeptChosen else { return }
             if !keepsShown {
@@ -319,20 +452,15 @@ public final class ExactDuplicatesModel {
     /// check finds groups and while sizes become known.
     public var totalFreedBytes: Int64 { groups.reduce(0) { $0 + ($1.freedBytes ?? 0) } }
 
-    /// The short text of `totalFreedBytes`. Nil while no size is known.
+    /// The short text of `totalFreedBytes`. Merged duplicates wait in Recently Deleted, so the line says that the
+    /// space is free only after that. Nil while no size is known.
     public var totalFreedText: String? {
         let total = totalFreedBytes
         return total > 0 ? L10n.string("duplicates.total_frees \(Self.byteText(total))") : nil
     }
 
-    /// One line below the total: merged duplicates wait in Recently Deleted, so the space is free only after that.
-    /// Nil without a total.
-    public var totalFreedNote: String? {
-        totalFreedText == nil ? nil : L10n.string("duplicates.freed_when_emptied")
-    }
-
     /// The system's file byte format, for example "4.2 MB".
-    nonisolated static func byteText(_ bytes: Int64) -> String {
+    nonisolated public static func byteText(_ bytes: Int64) -> String {
         bytes.formatted(.byteCount(style: .file))
     }
 
@@ -344,10 +472,17 @@ public final class ExactDuplicatesModel {
     /// appearance.
     nonisolated static let maximumQueuedPages = 4
 
-    /// The number of groups found, for example "1,545 Groups". Nil without a group.
-    public var groupCountText: String? {
-        groups.isEmpty ? nil : L10n.string("duplicates.group_count \(groups.count)")
+    /// Every copy of every group shown, kept copies included.
+    public var copyCount: Int { groups.reduce(0) { $0 + $1.members.count } }
+
+    /// The number of copies shown, for example "14 identical copies". Nil without a group.
+    public var copyCountText: String? {
+        groups.isEmpty ? nil : L10n.string("duplicates.copy_count \(copyCount)")
     }
+
+    /// The title and the text of the explanation beside `copyCountText`.
+    public var infoTitle: String { L10n.string("duplicates.info_title") }
+    public var infoMessage: String { L10n.string("duplicates.info_message") }
 
     /// The photos that Merge All moves to Recently Deleted.
     public var duplicateCount: Int { groups.reduce(0) { $0 + $1.duplicateCount } }
@@ -359,8 +494,19 @@ public final class ExactDuplicatesModel {
 
     public var canMerge: Bool { !isMerging && phase != .loading && !groups.isEmpty }
 
-    public var mergeAllTitle: String { L10n.string("duplicates.merge_all_title \(duplicateCount)") }
+    public var mergeAllTitle: String { L10n.string("duplicates.merge_all_title \(copyCount)") }
     public var mergeAllMessage: String { L10n.string("duplicates.merge_all_message \(duplicateCount)") }
+    /// The confirming button of the Merge All dialog.
+    public var mergeAllConfirmTitle: String { L10n.string("duplicates.merge_all_confirm \(copyCount)") }
+
+    /// The group with `id`. Nil after a merge removed it.
+    public func group(withID id: String) -> Group? { groups.first { $0.id == id } }
+
+    /// The title of the action that keeps `member`: "Keep This Copy", or "Kept" when a merge keeps it already.
+    public func keepTitle(for member: PhotoUID, inGroup groupID: String) -> String {
+        group(withID: groupID)?.kept == member
+            ? L10n.string("duplicates.kept") : L10n.string("duplicates.keep_this_copy")
+    }
 
     /// Reads the groups and shows them, then ranks the first two pages and builds the content index or brings it up
     /// to date, both at once. Reads the groups again when the index changed. A choice of the person and the ranking of
@@ -427,13 +573,18 @@ public final class ExactDuplicatesModel {
         do {
             let scan = try await finder.duplicateGroups(progress: report)
             let fallback = await finder.fallbackMembers(of: scan.groups)
+            let dates = await finder.captureDates(of: scan.groups.flatMap(\.members))
             guard generation == loadGeneration, !isMerging else { return false }
             let earlier = Dictionary(groups.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
             groups = scan.groups.map { group in
+                let groupDates = Dictionary(
+                    group.members.compactMap { member in dates[member].map { (member, $0) } },
+                    uniquingKeysWith: { first, _ in first })
                 if let same = earlier[group.id], Set(same.members) == Set(group.members) {
                     var kept = same
                     kept.scanGroup = group
                     kept.byteSize = scan.byteSizes[group.id] ?? same.byteSize
+                    kept.captureDates.merge(groupDates) { _, new in new }
                     return kept
                 }
                 let members = fallback[group.id] ?? group.members
@@ -441,6 +592,7 @@ public final class ExactDuplicatesModel {
                 var shown = Group(scanGroup: group, members: members, kept: choice ?? members[0])
                 shown.isKeptChosen = choice != nil
                 shown.byteSize = scan.byteSizes[group.id] ?? earlier[group.id]?.byteSize
+                shown.captureDates = groupDates
                 return shown
             }
             coverage = scan.coverage
@@ -559,7 +711,9 @@ public final class ExactDuplicatesModel {
         }
         for (id, order) in page.members {
             guard let index = groups.firstIndex(where: { $0.id == id }) else { continue }
-            groups[index].rank(order, shared: page.shared[id] ?? [], keepsShown: keepsShown)
+            groups[index].rank(
+                order, shared: page.shared[id] ?? [], facts: page.facts[id] ?? [:],
+                sizes: page.memberByteSizes[id] ?? [:], keepsShown: keepsShown)
         }
         for (id, size) in page.byteSizes {
             guard let index = groups.firstIndex(where: { $0.id == id }), groups[index].byteSize == nil else { continue }

@@ -108,8 +108,12 @@ import UploadCore
                 installAlbumSyncReasonsFixture()
             }
             if ProcessInfo.processInfo.arguments.contains("-EncryptedMemoriesDuplicatesFixture") {
+                let items = sections.prefix(2).flatMap { $0.items.prefix(2) }
                 runtime.libraryModel.installIsolatedDuplicatesForTesting(
-                    MobileFixtureDuplicates(groups: sections.prefix(2).map { $0.items.prefix(2).map(\.uid) }))
+                    MobileFixtureDuplicates(
+                        groups: sections.prefix(2).map { $0.items.prefix(2).map(\.uid) },
+                        captureDates: Dictionary(
+                            items.map { ($0.uid, $0.captureTime) }, uniquingKeysWith: { first, _ in first })))
             } else if ProcessInfo.processInfo.arguments.contains("-EncryptedMemoriesDuplicatesCheckingFixture") {
                 runtime.libraryModel.installIsolatedDuplicatesForTesting(
                     MobileFixtureDuplicates(groups: [], checking: true))
@@ -268,35 +272,59 @@ import UploadCore
 
     /// Groups of exact copies in memory. A merge keeps the chosen photo and moves the other copies to Trash.
     /// `checking` leaves the library check running: its index is not built, and its build stays at 1,234 of 15,000.
+    /// The first copy of each group is a favorite in an own album, so the screen shows badges and a reason.
     final class MobileFixtureDuplicates: ExactDuplicateMerging, @unchecked Sendable {
         private let lock = NSLock()
         private var groups: [ExactDuplicateGroup]
         private let checking: Bool
+        private let dates: [PhotoUID: Date]
 
-        init(groups members: [[PhotoUID]], checking: Bool = false) {
+        init(groups members: [[PhotoUID]], checking: Bool = false, captureDates: [PhotoUID: Date] = [:]) {
             groups = members.enumerated().map { index, members in
                 ExactDuplicateGroup(contentHash: "fixture-copies-\(index)", hashKeyEpoch: "fixture", members: members)
             }
             self.checking = checking
+            dates = captureDates
         }
 
         func duplicateGroups(
             progress: @escaping @Sendable (ExactDuplicateScanProgress) async -> Void
         ) async throws -> ExactDuplicateScan {
-            ExactDuplicateScan(groups: lock.withLock { groups }, coverage: checking ? .indexing : .complete)
+            let groups = lock.withLock { groups }
+            let sizes: [Int64] = [5_200_000, 387_000]
+            return ExactDuplicateScan(
+                groups: groups, coverage: checking ? .indexing : .complete,
+                byteSizes: Dictionary(
+                    groups.enumerated().map { ($1.id, sizes[$0 % sizes.count]) },
+                    uniquingKeysWith: { first, _ in first }))
         }
 
         func fallbackMembers(of groups: [ExactDuplicateGroup]) async -> [String: [PhotoUID]] {
             Dictionary(uniqueKeysWithValues: groups.map { ($0.id, $0.members) })
         }
 
+        func captureDates(of members: [PhotoUID]) async -> [PhotoUID: Date] {
+            dates.filter { members.contains($0.key) }
+        }
+
         func rankMembers(
             of groups: [ExactDuplicateGroup], ranked: @escaping @Sendable (ExactDuplicateRankingPage) async -> Void
         ) async {
+            let facts = groups.map { group in
+                let memberFacts = group.members.enumerated().map { index, member in
+                    (
+                        member,
+                        ExactDuplicateKeepFacts(
+                            isInOwnAlbum: index == 0, isFavorite: index == 0, isNamedByManifest: false,
+                            captureDate: dates[member])
+                    )
+                }
+                return (group.id, Dictionary(memberFacts, uniquingKeysWith: { first, _ in first }))
+            }
             await ranked(
                 ExactDuplicateRankingPage(
                     members: Dictionary(uniqueKeysWithValues: groups.map { ($0.id, $0.members) }),
-                    groupCount: groups.count))
+                    groupCount: groups.count, facts: Dictionary(uniqueKeysWithValues: facts)))
         }
 
         func prepareIndex(

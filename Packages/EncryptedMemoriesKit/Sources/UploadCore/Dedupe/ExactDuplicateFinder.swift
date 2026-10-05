@@ -66,15 +66,22 @@ public struct ExactDuplicateRankingPage: Sendable, Equatable {
     public let byteSizes: [String: Int64]
     /// The shared members of each ranked group. A trash would end their sharing.
     public let shared: [String: Set<PhotoUID>]
+    /// The facts of each member of each ranked group, as the ranking read them for the order.
+    public let facts: [String: [PhotoUID: ExactDuplicateKeepFacts]]
+    /// The size of each member of each ranked group in bytes, where its node states one.
+    public let memberByteSizes: [String: [PhotoUID: Int64]]
 
     public init(
         members: [String: [PhotoUID]], groupCount: Int, byteSizes: [String: Int64] = [:],
-        shared: [String: Set<PhotoUID>] = [:]
+        shared: [String: Set<PhotoUID>] = [:], facts: [String: [PhotoUID: ExactDuplicateKeepFacts]] = [:],
+        memberByteSizes: [String: [PhotoUID: Int64]] = [:]
     ) {
         self.members = members
         self.groupCount = groupCount
         self.byteSizes = byteSizes
         self.shared = shared
+        self.facts = facts
+        self.memberByteSizes = memberByteSizes
     }
 }
 
@@ -310,6 +317,11 @@ public struct ExactDuplicateFinder: Sendable {
             uniquingKeysWith: { first, _ in first })
     }
 
+    /// The capture dates of `members` that the device already knows, without a request. Unknown photos are left out.
+    public func captureDates(of members: [PhotoUID]) async -> [PhotoUID: Date] {
+        await remote.captureDates(of: members)
+    }
+
     /// The members of each group by content hash, the photo to keep first. A group whose facts could not be read is
     /// left out, so it keeps its fallback order.
     public func rankedMembers(of groups: [ExactDuplicateGroup]) async -> [String: [PhotoUID]] {
@@ -346,6 +358,8 @@ public struct ExactDuplicateFinder: Sendable {
             var order: [String: [PhotoUID]] = [:]
             var sizes: [String: Int64] = [:]
             var sharedMembers: [String: Set<PhotoUID>] = [:]
+            var pageFacts: [String: [PhotoUID: ExactDuplicateKeepFacts]] = [:]
+            var memberSizes: [String: [PhotoUID: Int64]] = [:]
             for group in page {
                 guard let read = facts[group.contentHash] else {
                     failed += 1
@@ -356,6 +370,12 @@ public struct ExactDuplicateFinder: Sendable {
                 if let size = group.members.lazy.compactMap({ read[$0]?.byteSize }).first(where: { $0 > 0 }) {
                     sizes[group.contentHash] = size
                 }
+                let known = group.members.compactMap { member in
+                    read[member]?.byteSize.flatMap { $0 > 0 ? (member, $0) : nil }
+                }
+                if !known.isEmpty {
+                    memberSizes[group.contentHash] = Dictionary(known, uniquingKeysWith: { first, _ in first })
+                }
                 var memberFacts: [PhotoUID: ExactDuplicateKeepFacts] = [:]
                 for member in group.members {
                     memberFacts[member] = ExactDuplicateKeepFacts(
@@ -365,11 +385,13 @@ public struct ExactDuplicateFinder: Sendable {
                         captureDate: dates[member], isShared: shared.contains(member))
                 }
                 order[group.contentHash] = Self.keepOrder(group.members, facts: memberFacts)
+                pageFacts[group.contentHash] = memberFacts
             }
             guard !Task.isCancelled else { return }
             await ranked(
                 ExactDuplicateRankingPage(
-                    members: order, groupCount: page.count, byteSizes: sizes, shared: sharedMembers))
+                    members: order, groupCount: page.count, byteSizes: sizes, shared: sharedMembers,
+                    facts: pageFacts, memberByteSizes: memberSizes))
         }
         log(
             "[Duplicates] ranking groups=\(groups.count) members=\(members.count) failedGroups=\(failed) "

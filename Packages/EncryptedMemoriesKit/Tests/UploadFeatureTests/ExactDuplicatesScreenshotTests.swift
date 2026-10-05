@@ -27,6 +27,7 @@
                 ExactDuplicateGroup(contentHash: "B", hashKeyEpoch: "e", members: Array(members[3..<5])),
             ]
             let states: [(String, ScreenshotFinder)] = [
+                ("groups", ScreenshotFinder(groups: groups, coverage: .complete, build: .none)),
                 ("checking", ScreenshotFinder(groups: [], coverage: .indexing, build: .counted)),
                 ("ranking", ScreenshotFinder(groups: groups, coverage: .complete, build: .counted, holdsRanking: true)),
                 (
@@ -54,21 +55,28 @@
         }
 
         private func host(model: ExactDuplicatesModel) -> (NSWindow, NSView) {
-            let view = ExactDuplicatesView(model: model, confirmsMergeAll: .constant(false), accent: .accentColor) {
-                uid in
-                RoundedRectangle(cornerRadius: 8)
-                    .fill(Color(hue: Double(abs(uid.nodeID.hashValue % 100)) / 100, saturation: 0.45, brightness: 0.8))
-                    .frame(width: 120, height: 120)
+            let view = ExactDuplicatesView(
+                model: model, confirmsMergeAll: .constant(false), accent: .accentColor, cornerRadius: 6,
+                onOpen: { _, _ in }
+            ) { uid in
+                RoundedRectangle(cornerRadius: 6)
+                    .fill(Color(hue: Self.hue(of: uid), saturation: 0.45, brightness: 0.8))
+                    .frame(width: 132, height: 132)
             }
-            .frame(width: 720, height: 520)
+            .frame(width: 1400, height: 900)
             // The Mac route draws the window background behind the screen, as `MacDuplicatesView` does.
             .background(Color(nsColor: .windowBackgroundColor))
             let host = NSHostingView(rootView: view)
-            host.frame = NSRect(x: 0, y: 0, width: 720, height: 520)
+            host.frame = NSRect(x: 0, y: 0, width: 1400, height: 900)
             let window = NSWindow(contentRect: host.frame, styleMask: [.titled], backing: .buffered, defer: false)
             window.contentView = host
             window.orderFrontRegardless()
             return (window, host)
+        }
+
+        /// A stable color for each photo, so the copies of a group look alike between runs.
+        private static func hue(of uid: PhotoUID) -> Double {
+            Double(uid.nodeID.unicodeScalars.reduce(0) { $0 + Int($1.value) } % 100) / 100
         }
 
         private func capture(_ host: NSView, to url: URL) throws {
@@ -125,6 +133,19 @@
             Dictionary(uniqueKeysWithValues: groups.map { ($0.id, $0.members) })
         }
 
+        /// Group A on one day, group B on two days.
+        func captureDates(of members: [PhotoUID]) async -> [PhotoUID: Date] {
+            let day = Date(timeIntervalSince1970: 1_749_456_000)
+            var dates: [PhotoUID: Date] = [:]
+            for group in groups {
+                for (index, member) in group.members.enumerated() where members.contains(member) {
+                    let offset = group.id == "B" ? Double(index) * 86_400 * 5 : Double(index) * 60
+                    dates[member] = day.addingTimeInterval(offset)
+                }
+            }
+            return dates
+        }
+
         func rankMembers(
             of groups: [ExactDuplicateGroup], ranked: @escaping @Sendable (ExactDuplicateRankingPage) async -> Void
         ) async {
@@ -133,10 +154,25 @@
                 try? await Task.sleep(for: .seconds(3_600))
                 return
             }
-            await ranked(
-                ExactDuplicateRankingPage(
-                    members: Dictionary(uniqueKeysWithValues: groups.map { ($0.id, $0.members) }),
-                    groupCount: groups.count))
+            // The first copy of A is a favorite in an album and backed up here; the second copy of B is shared.
+            let facts: [String: [PhotoUID: ExactDuplicateKeepFacts]] = Dictionary(
+                uniqueKeysWithValues: groups.map { group in
+                    let memberFacts = group.members.enumerated().map { index, member in
+                        (
+                            member,
+                            ExactDuplicateKeepFacts(
+                                isInOwnAlbum: group.id == "A" && index == 0, isFavorite: group.id == "A" && index == 0,
+                                isNamedByManifest: group.id == "A" && index == 0, captureDate: nil,
+                                isShared: group.id == "B" && index == 1)
+                        )
+                    }
+                    return (group.id, Dictionary(uniqueKeysWithValues: memberFacts))
+                })
+            let order = Dictionary(
+                uniqueKeysWithValues: groups.map { group in
+                    (group.id, group.id == "B" ? Array(group.members.reversed()) : group.members)
+                })
+            await ranked(ExactDuplicateRankingPage(members: order, groupCount: groups.count, facts: facts))
         }
 
         func merge(
