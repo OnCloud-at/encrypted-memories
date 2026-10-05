@@ -195,9 +195,9 @@ private final class PlayerLayerHostView: NSView {
 /// Full-screen photo/video viewer: shows the best available image sharp (no blur) with a native progress
 /// indicator while the full original downloads, then pinch-to-zoom + two-finger pan.
 ///
-/// A viewer of a small set of photos, such as a group of duplicates, passes an `accessory`: the viewer then shows a
-/// filmstrip of its photos with the accessory below it, on one glass panel at the bottom.
-public struct PhotoViewerView<Accessory: View>: View {
+/// A viewer of a small set of photos, such as a group of duplicates, shows a filmstrip of its photos at the bottom,
+/// in the style of the burst filmstrip.
+public struct PhotoViewerView: View {
     @State private var model: PhotoViewerModel
     private let onClose: () -> Void
     private let onPinchDismissBegan: () -> Void
@@ -206,7 +206,8 @@ public struct PhotoViewerView<Accessory: View>: View {
     /// True while the shared zoom overlay renders the shrink-to-cell transition. This view hides its own
     /// background and image but stays mounted and hit-testable for the pinch gesture.
     private let isDismissing: Bool
-    private let accessory: Accessory
+    /// Shows the photos of this viewer in a filmstrip, for a small set of photos such as a group of duplicates.
+    private let showsItemFilmstrip: Bool
 
     private let mediaTransition = ViewerMediaTransitionStyle.standard
 
@@ -217,7 +218,7 @@ public struct PhotoViewerView<Accessory: View>: View {
         onPinchDismissChanged: @escaping (CGFloat) -> Void = { _ in },
         onPinchDismissEnded: @escaping (Bool) -> Void = { _ in },
         isDismissing: Bool = false,
-        @ViewBuilder accessory: () -> Accessory
+        showsItemFilmstrip: Bool = false
     ) {
         _model = State(initialValue: model)
         self.onClose = onClose
@@ -225,11 +226,8 @@ public struct PhotoViewerView<Accessory: View>: View {
         self.onPinchDismissChanged = onPinchDismissChanged
         self.onPinchDismissEnded = onPinchDismissEnded
         self.isDismissing = isDismissing
-        self.accessory = accessory()
+        self.showsItemFilmstrip = showsItemFilmstrip
     }
-
-    /// True when the host passed an accessory, so the viewer shows the filmstrip of its photos.
-    private var showsItemFilmstrip: Bool { Accessory.self != EmptyView.self }
 
     public var body: some View {
         ZStack {
@@ -314,31 +312,14 @@ public struct PhotoViewerView<Accessory: View>: View {
             }
     }
 
-    /// The photos of this viewer in a filmstrip, with the host's accessory below it.
+    /// The photos of this viewer in the filmstrip panel of a burst. The title bar already shows the position.
     private func itemFilmstrip(areaWidth: CGFloat) -> some View {
-        let width = min(max(areaWidth - 40, 320), 640)
-        let count = model.items.count
-        let itemSide = burstFilmstripItemSide(panelWidth: width, itemCount: count)
-        let needsScroller = burstFilmstripNeedsScroller(panelWidth: width, itemCount: count, itemSide: itemSide)
-        return VStack(spacing: 10) {
-            BurstFilmstripView(
-                items: model.items,
-                selectedUID: model.baseCurrent.uid,
-                feed: model.thumbnailFeed,
-                itemSide: itemSide,
-                showsHorizontalScroller: needsScroller,
-                onSelect: { index in
-                    guard model.items.indices.contains(index) else { return }
-                    model.selectPage(uid: model.items[index].uid)
-                }
-            )
-            .frame(height: itemSide + (needsScroller ? 18 : 0))
-            accessory
-        }
-        .padding(12)
-        .frame(width: width)
-        .glassEffect(in: RoundedRectangle(cornerRadius: 18, style: .continuous))
-        .padding(.bottom, 16)
+        filmstripPanel(
+            items: model.items, selectedUID: model.baseCurrent.uid, title: nil, areaWidth: areaWidth,
+            onSelect: { index in
+                guard model.items.indices.contains(index) else { return }
+                model.selectPage(uid: model.items[index].uid)
+            })
     }
 
     @ViewBuilder private var content: some View {
@@ -431,24 +412,37 @@ public struct PhotoViewerView<Accessory: View>: View {
     }
 
     private func burstFilmstrip(areaWidth: CGFloat) -> some View {
-        let width = max(areaWidth - 40, 320)
-        let itemSide = burstFilmstripItemSide(panelWidth: width, itemCount: model.burstItems.count)
-        let needsScroller = burstFilmstripNeedsScroller(
-            panelWidth: width, itemCount: model.burstItems.count, itemSide: itemSide)
         let position = (model.burstIndex ?? 0) + 1
         let total = max(model.burstItems.count, 1)
+        return filmstripPanel(
+            items: model.burstItems, selectedUID: model.current.uid,
+            title: L10n.string("viewer.burst_badge \(position) \(total)"), areaWidth: areaWidth,
+            onSelect: { model.selectBurstIndex($0) })
+    }
+
+    /// The glass filmstrip panel at the bottom of the viewer, with an optional title above the photos.
+    private func filmstripPanel(
+        items: [PhotoItem], selectedUID: PhotoUID, title: String?, areaWidth: CGFloat,
+        onSelect: @escaping (Int) -> Void
+    ) -> some View {
+        let width = max(areaWidth - 40, 320)
+        let itemSide = burstFilmstripItemSide(panelWidth: width, itemCount: items.count)
+        let needsScroller = burstFilmstripNeedsScroller(
+            panelWidth: width, itemCount: items.count, itemSide: itemSide)
         return VStack(alignment: .leading, spacing: 8) {
-            Text(L10n.string("viewer.burst_badge \(position) \(total)"))
-                .font(.system(size: 12, weight: .semibold))
-                .foregroundStyle(.primary)
-                .padding(.horizontal, 2)
+            if let title {
+                Text(title)
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(.primary)
+                    .padding(.horizontal, 2)
+            }
             BurstFilmstripView(
-                items: model.burstItems,
-                selectedUID: model.current.uid,
+                items: items,
+                selectedUID: selectedUID,
                 feed: model.thumbnailFeed,
                 itemSide: itemSide,
                 showsHorizontalScroller: needsScroller,
-                onSelect: { model.selectBurstIndex($0) }
+                onSelect: onSelect
             )
             .frame(height: itemSide + (needsScroller ? 18 : 0))
             .accessibilityLabel(Text(L10n.string("viewer.burst_filmstrip_label")))
@@ -562,23 +556,6 @@ public struct PhotoViewerView<Accessory: View>: View {
         case .previous: model.previousInContext()
         case .next: model.nextInContext()
         }
-    }
-}
-
-extension PhotoViewerView where Accessory == EmptyView {
-    /// A viewer without an accessory: the library, an album, or another collection.
-    public init(
-        model: PhotoViewerModel,
-        onClose: @escaping () -> Void,
-        onPinchDismissBegan: @escaping () -> Void = {},
-        onPinchDismissChanged: @escaping (CGFloat) -> Void = { _ in },
-        onPinchDismissEnded: @escaping (Bool) -> Void = { _ in },
-        isDismissing: Bool = false
-    ) {
-        self.init(
-            model: model, onClose: onClose, onPinchDismissBegan: onPinchDismissBegan,
-            onPinchDismissChanged: onPinchDismissChanged, onPinchDismissEnded: onPinchDismissEnded,
-            isDismissing: isDismissing, accessory: { EmptyView() })
     }
 }
 

@@ -328,59 +328,57 @@ struct MobilePhotoViewer: View {
     @ToolbarContentBuilder private var viewerToolbar: some ToolbarContent {
         ToolbarItem(placement: .principal) { viewerTitleView }
         viewerCloseItem
-        if let duplicateGroup {
-            duplicateToolbar(duplicateGroup)
-        } else {
-            viewerMoreActions
-            ToolbarItem(placement: .bottomBar) { viewerShareButton }
-                .mobileVisibilityPriority(.high)
-            ToolbarSpacer(.flexible, placement: .bottomBar)
-            ToolbarItemGroup(placement: .bottomBar) {
-                // Shared photos cannot carry the account's favorite tag; the context is fixed for the presentation.
-                if context.allowsFavorites { viewerFavoriteButton }
-                viewerAlbumButton
-                viewerInfoButton
-            }
-            // Favorite, Album, and Info are the first to leave a compressed bar; the overflow menu keeps their titles.
-            .mobileVisibilityPriority(.low)
-            ToolbarSpacer(.flexible, placement: .bottomBar)
-            ToolbarItem(placement: .bottomBar) { viewerMutationButton }
-                .mobileVisibilityPriority(.high)
-        }
-    }
-
-    /// The merge tools of a group of duplicates, like Apple Photos: Keep This Copy for the photo shown, and Merge,
-    /// which merges the group with the photo shown as kept and closes the viewer.
-    @ToolbarContentBuilder
-    private func duplicateToolbar(_ group: MobileDuplicateViewerGroup) -> some ToolbarContent {
+        viewerMoreActions
+        // A group of duplicates keeps this toolbar: Keep This Copy takes the place of Share, which stays in the
+        // more-actions menu, and Merge takes the place of the mutation.
         ToolbarItem(placement: .bottomBar) {
-            let uid = currentBaseItem?.uid
-            let isKept = uid != nil && group.model.group(withID: group.groupID)?.kept == uid
-            Button(uid.map { group.model.keepTitle(for: $0, inGroup: group.groupID) } ?? "") {
-                guard let uid else { return }
-                group.model.keep(uid, inGroup: group.groupID)
-            }
-            .disabled(uid == nil || isKept || group.model.isMerging)
-            .accessibilityIdentifier("duplicates.viewer.keep")
+            if let duplicateGroup { duplicateKeepButton(duplicateGroup) } else { viewerShareButton }
         }
         .mobileVisibilityPriority(.high)
         ToolbarSpacer(.flexible, placement: .bottomBar)
+        ToolbarItemGroup(placement: .bottomBar) {
+            // Shared photos cannot carry the account's favorite tag; the context is fixed for the presentation.
+            if context.allowsFavorites { viewerFavoriteButton }
+            viewerAlbumButton
+            viewerInfoButton
+        }
+        // Favorite, Album, and Info are the first to leave a compressed bar; the overflow menu keeps their titles.
+        .mobileVisibilityPriority(.low)
+        ToolbarSpacer(.flexible, placement: .bottomBar)
         ToolbarItem(placement: .bottomBar) {
-            Button {
-                dismiss()
-                Task { await group.model.merge(groupID: group.groupID) }
-            } label: {
-                // The bars keep a dark scheme over the photo; the label stays white on the tinted glass.
-                Text(L10n.string("duplicates.merge"))
-                    .fontWeight(.semibold)
-                    .foregroundStyle(.white)
-            }
-            .buttonStyle(.glassProminent)
-            .tint(ProtonColor.primary)
-            .disabled(!group.model.canMerge || group.model.group(withID: group.groupID) == nil)
-            .accessibilityIdentifier("duplicates.viewer.merge")
+            if let duplicateGroup { duplicateMergeButton(duplicateGroup) } else { viewerMutationButton }
         }
         .mobileVisibilityPriority(.high)
+    }
+
+    /// Keeps the photo shown when its group is merged. "Kept" with a filled checkmark once a merge keeps it.
+    private func duplicateKeepButton(_ group: MobileDuplicateViewerGroup) -> some View {
+        let uid = currentBaseItem?.uid
+        let isKept = uid != nil && group.model.group(withID: group.groupID)?.kept == uid
+        let title = uid.map { group.model.keepTitle(for: $0, inGroup: group.groupID) } ?? ""
+        return Button {
+            guard let uid else { return }
+            group.model.keep(uid, inGroup: group.groupID)
+        } label: {
+            Label(title, systemImage: isKept ? "checkmark.circle.fill" : "checkmark.circle")
+        }
+        .disabled(uid == nil || isKept || group.model.isMerging)
+        .accessibilityLabel(title)
+        .accessibilityIdentifier("duplicates.viewer.keep")
+    }
+
+    /// Merges the group with the photo shown as kept, like Merge in Apple Photos, and closes the viewer.
+    private func duplicateMergeButton(_ group: MobileDuplicateViewerGroup) -> some View {
+        let title = L10n.string("duplicates.merge")
+        return Button {
+            dismiss()
+            Task { await group.model.merge(groupID: group.groupID) }
+        } label: {
+            Label(title, systemImage: "arrow.triangle.merge")
+        }
+        .disabled(!group.model.canMerge || group.model.group(withID: group.groupID) == nil)
+        .accessibilityLabel(title)
+        .accessibilityIdentifier("duplicates.viewer.merge")
     }
 
     /// Close is the primary navigation control: it stays at the top of a vertical bar and never overflows.

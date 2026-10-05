@@ -441,27 +441,16 @@ struct MainView: View {
 
             // Keep the viewer mounted during interactive dismissal so its pinch gesture remains active.
             if let viewerModel, zoom == nil || zoom?.interactive == true {
-                Group {
-                    if let duplicates, let group = duplicateViewerGroup,
-                        group.viewer == ObjectIdentifier(viewerModel)
-                    {
-                        // A group of duplicates: its photos in a filmstrip with the merge tools below them.
-                        PhotoViewerView(model: viewerModel, onClose: { closePhoto() }) {
-                            ExactDuplicateViewerActions(
-                                model: duplicates, groupID: group.groupID, current: viewerModel.baseCurrent.uid,
-                                onMerge: { self.viewerModel = nil })
-                        }
-                    } else {
-                        PhotoViewerView(
-                            model: viewerModel,
-                            onClose: { closePhoto() },
-                            onPinchDismissBegan: beginInteractiveDismiss,
-                            onPinchDismissChanged: updateInteractiveDismiss,
-                            onPinchDismissEnded: { endInteractiveDismiss(shouldClose: $0) },
-                            isDismissing: zoom?.interactive == true
-                        )
-                    }
-                }
+                PhotoViewerView(
+                    model: viewerModel,
+                    onClose: { closePhoto() },
+                    onPinchDismissBegan: beginInteractiveDismiss,
+                    onPinchDismissChanged: updateInteractiveDismiss,
+                    onPinchDismissEnded: { endInteractiveDismiss(shouldClose: $0) },
+                    isDismissing: zoom?.interactive == true,
+                    // A group of duplicates shows its photos in the filmstrip of the viewer.
+                    showsItemFilmstrip: duplicateViewerGroup?.viewer == ObjectIdentifier(viewerModel)
+                )
                 // Keep the viewer beside the floating sidebar. The inset matches the zoom overlay's content rect.
                 .padding(.leading, leadingObstructionInset)
                 .animation(Self.sidebarAnimation, value: leadingObstructionInset)  // slide with the sidebar toggle
@@ -1659,6 +1648,43 @@ struct MainView: View {
         }
     }
 
+    /// The merge tools of a group of duplicates in the viewer toolbar, as one glass group before the photo actions:
+    /// Keep This Copy for the photo shown, and Merge, which merges the group with the photo shown as kept.
+    @ToolbarContentBuilder
+    private func duplicateViewerToolbar(_ viewerModel: PhotoViewerModel) -> some ToolbarContent {
+        if let duplicates, let group = duplicateViewerGroup, group.viewer == ObjectIdentifier(viewerModel) {
+            let uid = viewerModel.baseCurrent.uid
+            let isKept = duplicates.group(withID: group.groupID)?.kept == uid
+            let keepTitle = duplicates.keepTitle(for: uid, inGroup: group.groupID)
+            let mergeTitle = L10n.string("duplicates.merge")
+            ToolbarItemGroup(placement: .primaryAction) {
+                Button {
+                    duplicates.keep(uid, inGroup: group.groupID)
+                } label: {
+                    Label(keepTitle, systemImage: isKept ? "checkmark.circle.fill" : "checkmark.circle")
+                        .labelStyle(.iconOnly)
+                }
+                .help(keepTitle)
+                .accessibilityLabel(keepTitle)
+                .disabled(isKept || duplicates.isMerging)
+                .accessibilityIdentifier("duplicates.viewer.keep")
+
+                Button {
+                    closePhoto()
+                    Task { await duplicates.merge(groupID: group.groupID) }
+                } label: {
+                    Label(mergeTitle, systemImage: "arrow.triangle.merge")
+                        .labelStyle(.iconOnly)
+                }
+                .help(mergeTitle)
+                .accessibilityLabel(mergeTitle)
+                .disabled(!duplicates.canMerge || duplicates.group(withID: group.groupID) == nil)
+                .accessibilityIdentifier("duplicates.viewer.merge")
+            }
+            ToolbarSpacer(.fixed, placement: .primaryAction)
+        }
+    }
+
     /// Opens `uid` in the viewer with the other photos of its group of duplicates, without the zoom from a grid cell.
     private func openDuplicate(_ uid: PhotoUID, inGroup groupID: String) {
         guard let members = duplicates?.group(withID: groupID)?.members else { return }
@@ -2203,6 +2229,7 @@ struct MainView: View {
                 .padding(.horizontal, 16)
                 // The system toolbar supplies the single glass background for the principal item.
             }
+            duplicateViewerToolbar(viewerModel)
             ToolbarItemGroup(placement: .primaryAction) {
                 Button {
                     viewerModel.toggleInfo()

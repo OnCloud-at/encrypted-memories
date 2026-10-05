@@ -78,6 +78,15 @@ final class MobileDuplicatesUITests: XCTestCase {
             member(0, 1).tap()
             XCTAssertTrue(app.buttons["duplicates.viewer.merge"].waitForExistence(timeout: 10))
             keepScreenshot("duplicates-ios-viewer-\(dark ? "dark" : "light")")
+            // The same viewer as the library opens it, for comparison.
+            app.buttons["Close"].firstMatch.tap()
+            app.buttons["Library"].firstMatch.tap()
+            let photo = app.descendants(matching: .any).matching(NSPredicate(format: "label BEGINSWITH 'Photo, '"))
+                .firstMatch
+            XCTAssertTrue(photo.waitForExistence(timeout: 20))
+            photo.tap()
+            XCTAssertTrue(app.buttons["Close"].waitForExistence(timeout: 10))
+            keepScreenshot("library-ios-viewer-\(dark ? "dark" : "light")")
             app.terminate()
 
             openDuplicates(fixture: "-EncryptedMemoriesDuplicatesCheckingFixture", dark: dark)
@@ -141,6 +150,9 @@ final class MobileDuplicatesUITests: XCTestCase {
         let keep = app.buttons["duplicates.viewer.keep"]
         XCTAssertTrue(keep.waitForExistence(timeout: 10), "a tap opens the photo with the merge tools")
         XCTAssertEqual(keep.label, "Keep This Copy")
+        for action in ["Favorite", "Info"] {
+            XCTAssertTrue(app.buttons[action].firstMatch.exists, "the viewer keeps the library action \(action)")
+        }
         keep.tap()
         waitUntil(keep, "label == 'Kept'", "the shown photo is kept")
 
@@ -164,6 +176,21 @@ final class MobileDuplicatesUITests: XCTestCase {
         waitUntilGone(merge, "the viewer closes")
         waitUntilGone(group(1), "the merged group leaves the list")
         XCTAssertTrue(group(0).exists, "the other group stays")
+    }
+
+    func testSwipingDownClosesTheViewerOfAGroupLikeTheLibraryViewer() {
+        openDuplicates()
+        let other = member(0, 1)
+        XCTAssertTrue(other.waitForExistence(timeout: 5))
+        other.tap()
+        let close = app.buttons["Close"]
+        XCTAssertTrue(close.waitForExistence(timeout: 10), "the viewer opened")
+
+        let middle = app.windows.firstMatch.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.4))
+        middle.press(forDuration: 0.05, thenDragTo: middle.withOffset(CGVector(dx: 0, dy: 400)))
+
+        waitUntilGone(close, "swiping down closes the viewer")
+        XCTAssertTrue(group(0).waitForExistence(timeout: 10), "the duplicates return")
     }
 
     func testTheContextMenuKeepsAnotherPhoto() {

@@ -61,14 +61,11 @@
             }
         }
 
-        /// The shared viewer of a group with its filmstrip and Keep This Copy and Merge, on the copy that is not kept.
-        func testRenderTheViewerOfAGroupWithItsMergeTools() async throws {
+        /// The shared viewer of a group of duplicates with its filmstrip, next to the same viewer as the library opens
+        /// it. The window toolbar with Keep This Copy and Merge belongs to the app and is not part of this render.
+        func testRenderTheViewerOfAGroupNextToTheLibraryViewer() async throws {
             let directory = try outputDirectory()
             let members = (0..<3).map { PhotoUID(volumeID: "v", nodeID: "photo-\($0)") }
-            let group = ExactDuplicateGroup(contentHash: "A", hashKeyEpoch: "e", members: members)
-            let duplicates = ExactDuplicatesModel(
-                finder: ScreenshotFinder(groups: [group], coverage: .complete, build: .none))
-            await duplicates.load()
             let items = members.map {
                 PhotoItem(uid: $0, captureTime: Date(timeIntervalSince1970: 1_749_456_000), mediaType: "image/png")
             }
@@ -76,29 +73,29 @@
                 .appendingPathComponent("duplicates-viewer-\(UUID().uuidString)", isDirectory: true)
             try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
             defer { try? FileManager.default.removeItem(at: root) }
-            let viewer = PhotoViewerModel(
-                items: items, index: 1,
-                feed: ThumbnailFeed(
-                    cache: ThumbnailCache(namespace: "duplicates-viewer-\(UUID().uuidString)", rootDirectory: root),
-                    loader: ColorThumbnails()),
-                media: ColorMedia())
-            let view = PhotoViewerView(model: viewer, onClose: {}) {
-                ExactDuplicateViewerActions(
-                    model: duplicates, groupID: "A", current: viewer.baseCurrent.uid, onMerge: {})
-            }
-            .frame(width: 1400, height: 900)
-            let host = NSHostingView(rootView: view)
-            host.frame = NSRect(x: 0, y: 0, width: 1400, height: 900)
-            let window = NSWindow(contentRect: host.frame, styleMask: [.titled], backing: .buffered, defer: false)
-            window.contentView = host
-            window.orderFrontRegardless()
-            defer { window.orderOut(nil) }
-            for appearance in [NSAppearance.Name.aqua, .darkAqua] {
-                window.appearance = NSAppearance(named: appearance)
-                try await Task.sleep(for: .milliseconds(1_500))
-                let url = directory.appendingPathComponent(
-                    "duplicates-macos-viewer-\(appearance == .aqua ? "light" : "dark").png")
-                try capture(host, to: url)
+            for (name, isGroup) in [("library", false), ("group", true)] {
+                let viewer = PhotoViewerModel(
+                    items: items, index: 1,
+                    feed: ThumbnailFeed(
+                        cache: ThumbnailCache(namespace: "duplicates-viewer-\(UUID().uuidString)", rootDirectory: root),
+                        loader: ColorThumbnails()),
+                    media: ColorMedia())
+                let view = PhotoViewerView(model: viewer, onClose: {}, showsItemFilmstrip: isGroup)
+                    .frame(width: 1400, height: 900)
+                let host = NSHostingView(rootView: view)
+                host.frame = NSRect(x: 0, y: 0, width: 1400, height: 900)
+                let window = NSWindow(contentRect: host.frame, styleMask: [.titled], backing: .buffered, defer: false)
+                window.contentView = host
+                window.orderFrontRegardless()
+                for appearance in [NSAppearance.Name.aqua, .darkAqua] {
+                    window.appearance = NSAppearance(named: appearance)
+                    try await Task.sleep(for: .milliseconds(1_500))
+                    let url = directory.appendingPathComponent(
+                        "duplicates-macos-viewer-\(name)-\(appearance == .aqua ? "light" : "dark").png")
+                    try capture(host, to: url)
+                }
+                window.orderOut(nil)
+                viewer.stop()
             }
         }
 
