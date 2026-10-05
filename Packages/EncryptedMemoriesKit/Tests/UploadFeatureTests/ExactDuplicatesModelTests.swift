@@ -562,6 +562,9 @@ final class ExactDuplicatesModelTests: XCTestCase {
         XCTAssertEqual(model.keepTitle(for: a2, inGroup: "A"), L10n.string("duplicates.keep_this_copy"))
         model.keep(a2, inGroup: "A")
         XCTAssertEqual(model.keepTitle(for: a2, inGroup: "A"), L10n.string("duplicates.kept"))
+        let group = model.groups[0]
+        XCTAssertEqual(group.keepTitle(for: a2), L10n.string("duplicates.kept"), "a row reads its title from its group")
+        XCTAssertEqual(group.keepTitle(for: a1), L10n.string("duplicates.keep_this_copy"))
     }
 
     // MARK: - Ranking only what the screen shows

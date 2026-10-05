@@ -216,6 +216,11 @@ public final class ExactDuplicatesModel {
         /// The title above the group: its date, else its number of copies.
         public var title: String { dateText ?? L10n.string("duplicates.group_title \(members.count)") }
 
+        /// The title of the action that keeps `member`: "Keep This Copy", or "Kept" when a merge keeps it already.
+        public func keepTitle(for member: PhotoUID) -> String {
+            kept == member ? L10n.string("duplicates.kept") : L10n.string("duplicates.keep_this_copy")
+        }
+
         /// The spoken label of `member`: its position, whether it is kept, its badges, and its size.
         public func accessibilityLabel(of member: PhotoUID) -> String {
             guard let position = members.firstIndex(of: member) else { return "" }
@@ -507,8 +512,7 @@ public final class ExactDuplicatesModel {
 
     /// The title of the action that keeps `member`: "Keep This Copy", or "Kept" when a merge keeps it already.
     public func keepTitle(for member: PhotoUID, inGroup groupID: String) -> String {
-        group(withID: groupID)?.kept == member
-            ? L10n.string("duplicates.kept") : L10n.string("duplicates.keep_this_copy")
+        group(withID: groupID)?.keepTitle(for: member) ?? L10n.string("duplicates.keep_this_copy")
     }
 
     /// Reads the groups and shows them, then ranks the first two pages and builds the content index or brings it up

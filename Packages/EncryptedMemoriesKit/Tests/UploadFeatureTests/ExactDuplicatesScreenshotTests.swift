@@ -99,6 +99,61 @@
             }
         }
 
+        /// The Mac route in a window with its toolbar: the screen runs under the toolbar and starts below it, as the
+        /// route of the app lays it out. Rendered at the top and scrolled down, with the check still running.
+        func testRenderTheListUnderTheWindowToolbar() async throws {
+            let directory = try outputDirectory()
+            let groups = (0..<40).map { index in
+                ExactDuplicateGroup(
+                    contentHash: index.isMultiple(of: 2) ? "A\(index)" : "B\(index)", hashKeyEpoch: "e",
+                    members: (0..<(index.isMultiple(of: 3) ? 3 : 2)).map {
+                        PhotoUID(volumeID: "v", nodeID: "photo-\(index)-\($0)")
+                    })
+            }
+            let finder = ScreenshotFinder(groups: groups, coverage: .complete, build: .counted)
+            let model = ExactDuplicatesModel(finder: finder)
+            let controller = NSHostingController(rootView: ToolbarRoute(model: model))
+            controller.sceneBridgingOptions = [.toolbars, .title]
+            let window = NSWindow(contentViewController: controller)
+            window.styleMask = [.titled, .closable, .resizable, .fullSizeContentView]
+            window.titlebarAppearsTransparent = true
+            window.titleVisibility = .hidden
+            window.toolbarStyle = .unified
+            window.setContentSize(NSSize(width: 1400, height: 900))
+            window.orderFrontRegardless()
+            defer { window.orderOut(nil) }
+            for _ in 0..<300 where !finder.isSettled(model) { try await Task.sleep(for: .milliseconds(10)) }
+            for appearance in [NSAppearance.Name.aqua, .darkAqua] {
+                window.appearance = NSAppearance(named: appearance)
+                let style = appearance == .aqua ? "light" : "dark"
+                for (place, offset) in [("top", CGFloat(0)), ("scrolled", 1_400)] {
+                    if let scroll = Self.tallestScrollView(in: controller.view) {
+                        scroll.contentView.scroll(to: NSPoint(x: 0, y: offset - scroll.contentInsets.top))
+                        scroll.reflectScrolledClipView(scroll.contentView)
+                    }
+                    try await Task.sleep(for: .milliseconds(800))
+                    let url = directory.appendingPathComponent("duplicates-macos-toolbar-\(place)-\(style).png")
+                    let capture = Process()
+                    capture.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
+                    capture.arguments = ["-x", "-o", "-l", "\(window.windowNumber)", url.path]
+                    try capture.run()
+                    capture.waitUntilExit()
+                    XCTAssertEqual(capture.terminationStatus, 0, place)
+                }
+            }
+        }
+
+        /// The scroll view of the list: the tallest one, not a row of copies.
+        private static func tallestScrollView(in view: NSView) -> NSScrollView? {
+            var found: [NSScrollView] = []
+            func visit(_ view: NSView) {
+                if let scroll = view as? NSScrollView { found.append(scroll) }
+                view.subviews.forEach(visit)
+            }
+            visit(view)
+            return found.max { $0.frame.height < $1.frame.height }
+        }
+
         private func host(model: ExactDuplicatesModel) -> (NSWindow, NSView) {
             let view = ExactDuplicatesView(
                 model: model, confirmsMergeAll: .constant(false), accent: .accentColor, cornerRadius: 6,
@@ -130,6 +185,45 @@
             host.cacheDisplay(in: host.bounds, to: bitmap)
             let data = try XCTUnwrap(bitmap.representation(using: .png, properties: [:]))
             try data.write(to: url)
+        }
+    }
+
+    /// The Duplicates route as the Mac app lays it out: the screen runs under the window toolbar, and its scroll content
+    /// starts below the toolbar height that the safe area reports.
+    private struct ToolbarRoute: View {
+        let model: ExactDuplicatesModel
+        @State private var topInset: CGFloat = 0
+
+        var body: some View {
+            ZStack {
+                ExactDuplicatesView(
+                    model: model, confirmsMergeAll: .constant(false), accent: .accentColor, cornerRadius: 6,
+                    onOpen: { _, _ in }
+                ) { uid in
+                    RoundedRectangle(cornerRadius: 6)
+                        .fill(Color(hue: Double(uid.nodeID.count % 7) / 7, saturation: 0.45, brightness: 0.8))
+                        .frame(width: 132, height: 132)
+                }
+                .contentMargins(.top, topInset, for: .scrollContent)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(Color(nsColor: .windowBackgroundColor))
+                .ignoresSafeArea()
+            }
+            .background(
+                GeometryReader { geometry in
+                    Color.clear
+                        .onAppear { topInset = geometry.safeAreaInsets.top }
+                        .onChange(of: geometry.safeAreaInsets.top) { _, new in topInset = new }
+                }
+            )
+            .toolbar {
+                ToolbarItem(placement: .navigation) {
+                    Text(L10n.string("duplicates.title")).font(.headline).fixedSize().padding(.horizontal, 12)
+                }
+                ToolbarItem(placement: .primaryAction) {
+                    Button(L10n.string("duplicates.merge_all")) {}
+                }
+            }
         }
     }
 

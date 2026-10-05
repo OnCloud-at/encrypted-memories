@@ -97,45 +97,17 @@ public struct ExactDuplicatesView<Cover: View>: View {
             }
             .frame(maxWidth: Self.readableWidth)
         case .groups:
-            groupList
+            // Progress of the check changes this view often; the list compares equal and keeps its rows.
+            ExactDuplicatesGroupList(
+                model: model, accent: accent, cornerRadius: cornerRadius, reduceMotion: reduceMotion, onOpen: onOpen,
+                cover: cover
+            )
+            .equatable()
         }
     }
 
-    /// The shared progress row. Without its title, the surrounding view shows the title.
     private func progressRow(_ line: ExactDuplicatesModel.ProgressLine, showsTitle: Bool = true) -> some View {
-        ActivityProgressRow(
-            title: showsTitle ? line.title : nil, detail: line.detail, fraction: line.fraction,
-            showsIndeterminateProgress: true
-        )
-        .tint(accent)
-    }
-
-    /// The state of the check and of the ranking above the groups: progress rows while they run, one line after a check
-    /// that could not read every photo, and a retry when the check stopped.
-    @ViewBuilder private var statusRows: some View {
-        if let line = model.checkLine {
-            progressRow(line).accessibilityIdentifier("duplicates.checkProgress")
-        }
-        if let note = model.stillCheckingNote {
-            Label(note, systemImage: "hourglass")
-                .font(.footnote)
-                .foregroundStyle(.secondary)
-        }
-        if let line = model.rankingLine {
-            progressRow(line).accessibilityIdentifier("duplicates.rankingProgress")
-        }
-        if let note = model.uncheckedNote {
-            Label(note, systemImage: "exclamationmark.circle")
-                .font(.footnote)
-                .foregroundStyle(.secondary)
-                .accessibilityIdentifier("duplicates.unchecked")
-        }
-        if let note = model.checkFailedNote {
-            Label(note, systemImage: "exclamationmark.icloud")
-                .font(.footnote)
-                .foregroundStyle(.secondary)
-            Button(L10n.string("action.retry")) { Task { await model.load() } }
-        }
+        ExactDuplicatesProgressRow(line: line, showsTitle: showsTitle, accent: accent)
     }
 
     @ViewBuilder private var retryButton: some View {
@@ -146,9 +118,126 @@ public struct ExactDuplicatesView<Cover: View>: View {
             retry
         #endif
     }
+}
 
-    /// The count of the copies with its explanation, and the space that merging all frees.
-    @ViewBuilder private var summary: some View {
+/// One progress line of the screen. Without its title, the surrounding view shows the title.
+private struct ExactDuplicatesProgressRow: View {
+    let line: ExactDuplicatesModel.ProgressLine
+    var showsTitle = true
+    let accent: Color
+
+    var body: some View {
+        ActivityProgressRow(
+            title: showsTitle ? line.title : nil, detail: line.detail, fraction: line.fraction,
+            showsIndeterminateProgress: true
+        )
+        .tint(accent)
+    }
+}
+
+/// The groups: a native inset grouped list on iPhone and iPad, and a lazy column on the Mac. A macOS `List` with one
+/// section per group diffed every row of its outline on the main thread for each change of the model, so a library
+/// with 1,500 groups stopped scrolling for seconds. Both containers show the same parts of each group.
+///
+/// Only the groups and whether a merge can start make this list evaluate again; the progress rows and the summary
+/// observe the model on their own, and each part of a group redraws only when its group changes.
+private struct ExactDuplicatesGroupList<Cover: View>: View, Equatable {
+    let model: ExactDuplicatesModel
+    let accent: Color
+    let cornerRadius: CGFloat
+    let reduceMotion: Bool
+    let onOpen: (PhotoUID, String) -> Void
+    let cover: (PhotoUID) -> Cover
+
+    nonisolated static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.model === rhs.model && lhs.accent == rhs.accent && lhs.cornerRadius == rhs.cornerRadius
+            && lhs.reduceMotion == rhs.reduceMotion
+    }
+
+    var body: some View {
+        let canMerge = model.canMerge
+        let groups = IndexedGroups(base: model.groups)
+        #if os(iOS)
+            List {
+                Section {
+                    ExactDuplicatesStatusRows(model: model, accent: accent)
+                } header: {
+                    ExactDuplicatesSummary(model: model)
+                }
+                ForEach(groups, id: \.element.id) { index, group in
+                    Section {
+                        part(.members, of: group, at: index, canMerge: canMerge)
+                    } header: {
+                        part(.header, of: group, at: index, canMerge: canMerge)
+                    } footer: {
+                        part(.footer, of: group, at: index, canMerge: canMerge)
+                    }
+                }
+            }
+            .listStyle(.insetGrouped)
+            .refreshable { await model.load() }
+        #else
+            // Apple Photos keeps the groups in a calm column; a wide window adds margins instead of long rows. The
+            // headers scroll with their groups, so none of them stays under the window toolbar.
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 0) {
+                    VStack(alignment: .leading, spacing: 12) {
+                        ExactDuplicatesSummary(model: model)
+                        ExactDuplicatesStatusRows(model: model, accent: accent)
+                    }
+                    .padding(.bottom, 10)
+                    ForEach(groups, id: \.element.id) { index, group in
+                        VStack(alignment: .leading, spacing: 10) {
+                            Divider()
+                            part(.header, of: group, at: index, canMerge: canMerge)
+                                .padding(.top, 8)
+                            part(.members, of: group, at: index, canMerge: canMerge)
+                            part(.footer, of: group, at: index, canMerge: canMerge)
+                                .font(.subheadline)
+                        }
+                        .padding(.bottom, 14)
+                    }
+                }
+                .padding(.horizontal, 24)
+                .padding(.vertical, 12)
+                .frame(maxWidth: 880, alignment: .leading)
+                .frame(maxWidth: .infinity)
+            }
+        #endif
+    }
+
+    private func part(
+        _ part: ExactDuplicateGroupPart<Cover>.Part, of group: ExactDuplicatesModel.Group, at index: Int,
+        canMerge: Bool
+    ) -> some View {
+        let model = model
+        return ExactDuplicateGroupPart(
+            part: part, group: group, index: index, canMerge: canMerge, accent: accent, cornerRadius: cornerRadius,
+            reduceMotion: reduceMotion,
+            actions: ExactDuplicateGroupActions(
+                open: onOpen,
+                keep: { model.keep($0, inGroup: $1) },
+                merge: { groupID in Task { await model.merge(groupID: groupID) } },
+                appeared: { model.groupAppeared($0) }),
+            cover: cover
+        )
+        .equatable()
+    }
+}
+
+/// The groups with their positions, without copying them.
+private struct IndexedGroups: RandomAccessCollection {
+    let base: [ExactDuplicatesModel.Group]
+    var startIndex: Int { base.startIndex }
+    var endIndex: Int { base.endIndex }
+    subscript(position: Int) -> (offset: Int, element: ExactDuplicatesModel.Group) { (position, base[position]) }
+}
+
+/// The count of the copies with its explanation, and the space that merging all frees.
+private struct ExactDuplicatesSummary: View {
+    let model: ExactDuplicatesModel
+
+    var body: some View {
         if let count = model.copyCountText {
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 6) {
@@ -169,49 +258,94 @@ public struct ExactDuplicatesView<Cover: View>: View {
             .textCase(nil)
         }
     }
+}
 
-    private var groupList: some View {
-        let list = List {
-            Section {
-                statusRows
-            } header: {
-                summary
-            }
-            ForEach(Array(model.groups.enumerated()), id: \.element.id) { index, group in
-                Section {
-                    ExactDuplicateMembers(
-                        model: model, group: group, groupIndex: index, accent: accent, cornerRadius: cornerRadius,
-                        onOpen: onOpen, cover: cover
-                    )
-                    .accessibilityIdentifier("duplicates.group.\(index)")
-                    // Only the groups that the person scrolls to read their facts.
-                    .onAppear { model.groupAppeared(group.id) }
-                    .animation(factsAnimation, value: group.isRanked)
-                    .animation(factsAnimation, value: group.kept)
-                } header: {
-                    groupHeader(group, index: index)
-                } footer: {
-                    groupFooter(group, index: index)
-                        .animation(factsAnimation, value: group.isRanked)
-                }
-            }
+/// The state of the check and of the ranking above the groups: progress rows while they run, one line after a check
+/// that could not read every photo, and a retry when the check stopped.
+private struct ExactDuplicatesStatusRows: View {
+    let model: ExactDuplicatesModel
+    let accent: Color
+
+    var body: some View {
+        if let line = model.checkLine {
+            ExactDuplicatesProgressRow(line: line, accent: accent).accessibilityIdentifier("duplicates.checkProgress")
         }
-        #if os(iOS)
-            return list.listStyle(.insetGrouped).refreshable { await model.load() }
-        #else
-            // Apple Photos keeps the groups in a calm column; a wide window adds margins instead of long rows.
-            return list.listStyle(.inset)
-                .frame(maxWidth: 880)
-                .frame(maxWidth: .infinity)
-        #endif
+        if let note = model.stillCheckingNote {
+            Label(note, systemImage: "hourglass")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+        }
+        if let line = model.rankingLine {
+            ExactDuplicatesProgressRow(line: line, accent: accent).accessibilityIdentifier("duplicates.rankingProgress")
+        }
+        if let note = model.uncheckedNote {
+            Label(note, systemImage: "exclamationmark.circle")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+                .accessibilityIdentifier("duplicates.unchecked")
+        }
+        if let note = model.checkFailedNote {
+            Label(note, systemImage: "exclamationmark.icloud")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+            Button(L10n.string("action.retry")) { Task { await model.load() } }
+        }
+    }
+}
+
+/// What a group can ask of the model. The parts of a group call these instead of reading the model, so a change of
+/// another group never evaluates them again.
+private struct ExactDuplicateGroupActions {
+    let open: (PhotoUID, String) -> Void
+    let keep: (PhotoUID, String) -> Void
+    let merge: (String) -> Void
+    let appeared: (String) -> Void
+}
+
+/// One part of a group, shared by both containers: its header with the date and Merge, its copies, or its footer.
+/// It depends only on its own group, so it redraws when that group changes and stays when another one does.
+private struct ExactDuplicateGroupPart<Cover: View>: View, Equatable {
+    enum Part { case header, members, footer }
+
+    let part: Part
+    let group: ExactDuplicatesModel.Group
+    let index: Int
+    let canMerge: Bool
+    let accent: Color
+    let cornerRadius: CGFloat
+    let reduceMotion: Bool
+    let actions: ExactDuplicateGroupActions
+    let cover: (PhotoUID) -> Cover
+
+    nonisolated static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.part == rhs.part && lhs.group == rhs.group && lhs.index == rhs.index && lhs.canMerge == rhs.canMerge
+            && lhs.accent == rhs.accent && lhs.cornerRadius == rhs.cornerRadius && lhs.reduceMotion == rhs.reduceMotion
     }
 
     /// The facts of a group arrive without a progress row; its badges, its reason, and a moved checkmark fade in.
     /// Without motion, they appear at once.
     private var factsAnimation: Animation? { reduceMotion ? nil : .default }
 
+    var body: some View {
+        switch part {
+        case .header: header
+        case .members:
+            ExactDuplicateMembers(
+                group: group, groupIndex: index, accent: accent, cornerRadius: cornerRadius, actions: actions,
+                cover: cover
+            )
+            .accessibilityIdentifier("duplicates.group.\(index)")
+            // Only the groups that the person scrolls to read their facts.
+            .onAppear { actions.appeared(group.id) }
+            .animation(factsAnimation, value: group.isRanked)
+            .animation(factsAnimation, value: group.kept)
+        case .footer:
+            footer.animation(factsAnimation, value: group.isRanked)
+        }
+    }
+
     /// The capture date of the group and its Merge button, like a group of Duplicates in Apple Photos.
-    private func groupHeader(_ group: ExactDuplicatesModel.Group, index: Int) -> some View {
+    private var header: some View {
         HStack(alignment: .center) {
             Text(group.title)
                 .font(.headline)
@@ -220,20 +354,18 @@ public struct ExactDuplicatesView<Cover: View>: View {
                 .lineLimit(1)
                 .accessibilityIdentifier("duplicates.date.\(index)")
             Spacer(minLength: 12)
-            Button(L10n.string("duplicates.merge")) {
-                Task { await model.merge(groupID: group.id) }
-            }
-            .buttonStyle(.bordered)
-            .buttonBorderShape(.capsule)
-            .controlSize(.small)
-            .disabled(!model.canMerge)
-            .accessibilityIdentifier("duplicates.merge.\(index)")
+            Button(L10n.string("duplicates.merge")) { actions.merge(group.id) }
+                .buttonStyle(.bordered)
+                .buttonBorderShape(.capsule)
+                .controlSize(.small)
+                .disabled(!canMerge)
+                .accessibilityIdentifier("duplicates.merge.\(index)")
         }
         .textCase(nil)
     }
 
     /// Why the checked copy stays and what the merge frees, and after a merge why duplicates stayed.
-    @ViewBuilder private func groupFooter(_ group: ExactDuplicatesModel.Group, index: Int) -> some View {
+    @ViewBuilder private var footer: some View {
         if group.footerText != nil || group.keptReasonMessage != nil {
             VStack(alignment: .leading, spacing: 2) {
                 if let footer = group.footerText {
@@ -253,12 +385,11 @@ public struct ExactDuplicatesView<Cover: View>: View {
 
 /// The copies of one group, side by side. A tap or click opens the photo; the context menu keeps it.
 private struct ExactDuplicateMembers<Cover: View>: View {
-    let model: ExactDuplicatesModel
     let group: ExactDuplicatesModel.Group
     let groupIndex: Int
     let accent: Color
     let cornerRadius: CGFloat
-    let onOpen: (PhotoUID, String) -> Void
+    let actions: ExactDuplicateGroupActions
     let cover: (PhotoUID) -> Cover
 
     var body: some View {
@@ -266,11 +397,11 @@ private struct ExactDuplicateMembers<Cover: View>: View {
             HStack(spacing: 10) {
                 ForEach(Array(group.members.enumerated()), id: \.element) { index, uid in
                     let isKept = uid == group.kept
-                    let keepTitle = model.keepTitle(for: uid, inGroup: group.id)
+                    let keepTitle = group.keepTitle(for: uid)
                     member(uid, isKept: isKept, keepTitle: keepTitle)
                         .accessibilityLabel(group.accessibilityLabel(of: uid))
                         .accessibilityAddTraits(isKept ? .isSelected : [])
-                        .accessibilityAction(named: Text(keepTitle)) { model.keep(uid, inGroup: group.id) }
+                        .accessibilityAction(named: Text(keepTitle)) { actions.keep(uid, group.id) }
                         .accessibilityIdentifier("duplicates.member.\(groupIndex).\(index)")
                 }
             }
@@ -285,7 +416,7 @@ private struct ExactDuplicateMembers<Cover: View>: View {
         let tile = ExactDuplicateTile(
             group: group, member: uid, accent: accent, cornerRadius: cornerRadius, cover: cover(uid))
         let keep = Button {
-            model.keep(uid, inGroup: group.id)
+            actions.keep(uid, group.id)
         } label: {
             Label(keepTitle, systemImage: "checkmark.circle")
         }
@@ -299,13 +430,13 @@ private struct ExactDuplicateMembers<Cover: View>: View {
             } label: {
                 tile
             } primaryAction: {
-                onOpen(uid, group.id)
+                actions.open(uid, group.id)
             }
             .menuStyle(.button)
             .buttonStyle(.plain)
         #else
             Button {
-                onOpen(uid, group.id)
+                actions.open(uid, group.id)
             } label: {
                 tile
             }
