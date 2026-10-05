@@ -414,14 +414,14 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                     unlistedUploads.isEmpty ? [] : try await filesTheListingMustShow(unlistedUploads)
                 burstMemberIDs = Self.burstMemberLookup(from: entries)
                 burstEntries = entries
-                let motionTypes = try await livePhotoMotionTypes(
-                    for: entries.lazy.filter(\.isLivePhoto).map(\.relatedLinkIDs), evidence: mediaTypeEvidence)
-                if !motionTypes.complete { enrichmentComplete = false }
+                let motions = try await livePhotoMotions(
+                    of: Self.livePhotos(in: entries), volumeID: root.volumeID, evidence: mediaTypeEvidence)
+                if !motions.complete { enrichmentComplete = false }
                 sections = Self.group(
                     entries,
                     volumeID: root.volumeID,
                     mediaTypeOverrides: mediaTypeEvidence,
-                    motionTypes: motionTypes.types,
+                    motions: motions.motions,
                     sectionID: "all"
                 )
                 reconciliationItems = sections.flatMap(\.items)
@@ -466,12 +466,10 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                 }
                 var livePhotoVideoIDs: [String: String] = [:]
                 if let lives = enrichment.livePhotos.value {
-                    let motionTypes = try await livePhotoMotionTypes(for: lives.values, evidence: mediaTypeEvidence)
-                    if !motionTypes.complete { enrichmentComplete = false }
-                    for (linkID, related) in lives {
-                        livePhotoVideoIDs[linkID] =
-                            LivePhotoMotionLinks.motion(among: related, mimeTypes: motionTypes.types).linkID
-                    }
+                    let motions = try await livePhotoMotions(
+                        of: lives, volumeID: root.volumeID, evidence: mediaTypeEvidence)
+                    if !motions.complete { enrichmentComplete = false }
+                    livePhotoVideoIDs = motions.motions.compactMapValues(\.linkID)
                 } else {
                     enrichmentComplete = false
                     if let error = enrichment.livePhotos.errorDescription {
@@ -955,6 +953,10 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     private func writeTimelineCache(_ sections: [TimelineSection], validationToken: String?) -> Bool {
         guard let store = timelineStore else { return false }
         let result = store.save(sections.flatMap(\.items), validationToken: validationToken)
+        // Every load that saves chose its Live Photo motions with this rule; the next load trusts them.
+        if result.succeeded, !store.markRelatedVideosChosen(by: LivePhotoMotionLinks.rule) {
+            DebugLog.log("timeline: Live Photo motion mark not saved; the next load reads the types again")
+        }
         if result.succeeded, result.sweptRows > 0 { timelineLostPhotos = true }
         if !result.succeeded {
             DebugLog.log("timeline: cache save failed - validation token not published")
@@ -1599,38 +1601,75 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     /// its motion; the next open reads again.
     private func filteredSections(_ entries: [PhotosListEntry], volumeID: String) async throws -> [TimelineSection] {
         let evidence = timelineStore?.mediaTypeEvidence(volumeID: volumeID) ?? [:]
-        let motionTypes = try await livePhotoMotionTypes(
-            for: entries.lazy.filter(\.isLivePhoto).map(\.relatedLinkIDs), evidence: evidence)
-        return Self.group(entries, volumeID: volumeID, mediaTypeOverrides: evidence, motionTypes: motionTypes.types)
+        let motions = try await livePhotoMotions(
+            of: Self.livePhotos(in: entries), volumeID: volumeID, evidence: evidence)
+        return Self.group(entries, volumeID: volumeID, mediaTypeOverrides: evidence, motions: motions.motions)
     }
 
-    /// The types that choose the motion of Live Photos with these related files (`LivePhotoMotionLinks.types`), with one
-    /// metadata read per 150 related files that need a type. `complete` is false when a read failed.
-    private func livePhotoMotionTypes(
-        for related: some Sequence<[String]>, evidence: [String: String]
-    ) async throws -> (types: [String: String], complete: Bool) {
-        let answer = try await livePhotoMotionLinks.types(for: related, evidence: evidence) {
+    /// The related files of each Live Photo in `entries` in listing order, by link ID.
+    private static func livePhotos(in entries: [PhotosListEntry]) -> [String: [String]] {
+        Dictionary(
+            entries.lazy.filter(\.isLivePhoto).map { ($0.linkID, $0.relatedLinkIDs) },
+            uniquingKeysWith: { first, _ in first })
+    }
+
+    /// The motion of each of these Live Photos (`LivePhotoMotionLinks.motions`). A motion that this rule stored with the
+    /// timeline holds without a read; the related files that still need a type are read in metadata batches, a few at a
+    /// time. `complete` is false when a read failed.
+    private func livePhotoMotions(
+        of livePhotos: [String: [String]], volumeID: String, evidence: [String: String]
+    ) async throws -> (motions: [String: LivePhotoMotion], complete: Bool) {
+        let stored = LivePhotoMotionLinks.storedMotions(of: livePhotos, volumeID: volumeID, in: timelineStore)
+        let answer = try await livePhotoMotionLinks.motions(of: livePhotos, stored: stored, evidence: evidence) {
             [driveSession, photosShareID] linkIDs in
             guard let shareID = photosShareID else { throw DriveBridgeError.noPhotosShare }
-            var types: [String: String] = [:]
-            for batch in Self.metadataBatches(linkIDs) {
-                try Task.checkCancellation()
-                let links = try await driveSession.fetchPhotoLinksMetadata(shareID: shareID, linkIDs: batch)
-                types.merge(Self.mimeTypes(in: links)) { first, _ in first }
+            let start = Date()
+            let batches = try await Self.concurrentMetadataBatches(linkIDs) { batch in
+                Self.mimeTypes(in: try await driveSession.fetchPhotoLinksMetadata(shareID: shareID, linkIDs: batch))
             }
-            return types
+            DebugLog.log(
+                "timeline: read the type of \(linkIDs.count) Live Photo related files in \(batches.count) requests, "
+                    + "\(Int(Date().timeIntervalSince(start) * 1000)) ms; \(stored.count) stored motions held")
+            return batches.reduce(into: [:]) { types, batch in types.merge(batch) { first, _ in first } }
         }
         livePhotoMotionLinks.record(answer.read)
-        return (answer.types, answer.complete)
+        return (answer.motions, answer.complete)
     }
 
-    /// Builds timeline sections from direct-listing entries (tag filters + album contents). `motionTypes` holds the
-    /// types that choose the motion of a Live Photo with several related files.
+    /// Reads `linkIDs` in metadata batches, at most `ProtonUploadDedupeService.remoteMetadataRequestConcurrency` at a
+    /// time. The answers keep the batch order. The first failure cancels the other batches and ends the read.
+    static func concurrentMetadataBatches<Answer: Sendable>(
+        _ linkIDs: [String], read: @escaping @Sendable (_ batch: [String]) async throws -> Answer
+    ) async throws -> [Answer] {
+        let batches = metadataBatches(linkIDs)
+        return try await withThrowingTaskGroup(of: (Int, Answer).self) { group in
+            var next = 0
+            func submitNext() {
+                guard next < batches.count else { return }
+                let index = next
+                next += 1
+                group.addTask {
+                    try Task.checkCancellation()
+                    return (index, try await read(batches[index]))
+                }
+            }
+            for _ in 0..<min(ProtonUploadDedupeService.remoteMetadataRequestConcurrency, batches.count) { submitNext() }
+            var answers = [Answer?](repeating: nil, count: batches.count)
+            while let (index, answer) = try await group.next() {
+                answers[index] = answer
+                submitNext()
+            }
+            return answers.compactMap { $0 }
+        }
+    }
+
+    /// Builds timeline sections from direct-listing entries (tag filters + album contents). `motions` holds the motion
+    /// of each Live Photo with several related files.
     static func group(
         _ entries: [PhotosListEntry],
         volumeID: String,
         mediaTypeOverrides: [String: String] = [:],
-        motionTypes: [String: String] = [:],
+        motions: [String: LivePhotoMotion] = [:],
         sectionID: String = "filtered"
     ) -> [TimelineSection] {
         let burstMemberIDs = burstMemberLookup(from: entries)
@@ -1641,7 +1680,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                     from: e,
                     volumeID: volumeID,
                     mediaTypeOverride: mediaTypeOverrides[e.linkID],
-                    motionTypes: motionTypes,
+                    motion: motions[e.linkID],
                     burstMemberIDs: burstMemberIDs[e.linkID] ?? []
                 )
             }
@@ -1877,7 +1916,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         from entry: PhotosListEntry,
         volumeID: String,
         mediaTypeOverride: String? = nil,
-        motionTypes: [String: String] = [:],
+        motion: LivePhotoMotion? = nil,
         burstMemberIDs: [String] = []
     ) -> PhotoItem {
         let mediaType =
@@ -1891,7 +1930,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         // A Live Photo whose related files hold no video shows no Live control. An unknown motion keeps the tag.
         let motion: LivePhotoMotion =
             entry.isLivePhoto
-            ? LivePhotoMotionLinks.motion(among: entry.relatedLinkIDs, mimeTypes: motionTypes) : .noVideo
+            ? motion ?? LivePhotoMotionLinks.motion(among: entry.relatedLinkIDs, mimeTypes: [:]) : .noVideo
         return PhotoItem(
             uid: PhotoUID(volumeID: volumeID, nodeID: entry.linkID),
             captureTime: Date(timeIntervalSince1970: entry.captureTime),

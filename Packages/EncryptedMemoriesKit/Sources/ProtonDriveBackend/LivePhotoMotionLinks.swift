@@ -1,4 +1,5 @@
 import Foundation
+import PhotosCore
 
 /// The motion of a Live Photo, chosen among its related files.
 enum LivePhotoMotion: Equatable, Sendable {
@@ -32,17 +33,35 @@ struct LivePhotoMotionLinks: Sendable {
         return .noVideo
     }
 
-    /// The types that choose the motion of Live Photos with these related files: `evidence`, the types read earlier in
-    /// this session, and one `fetch` of the related files that neither holds. A Live Photo with one related file needs
-    /// no read. `read` holds the answer for this session: a link without a type in the answer is no video. A failed
-    /// read leaves `complete` false and its files unread, so the next refresh reads them again.
-    func types(
-        for related: some Sequence<[String]>, evidence: [String: String],
+    /// Names this motion rule in the stored timeline. A change of the rule changes the name, so the next refresh reads
+    /// the types again instead of trusting motions that an earlier rule chose.
+    static let rule = "liveMotion.firstRelatedVideo.1"
+
+    /// The motions in the stored timeline that still hold for these Live Photos (link ID to related files): this rule
+    /// chose them, and the stored video is still one of the related files of the photo. A Live Photo with one related
+    /// file needs none. An edit uploads a new photo, so its stored row does not exist yet.
+    static func storedMotions(
+        of livePhotos: [String: [String]], volumeID: String, in store: TimelineMetadataStore?
+    ) -> [String: String] {
+        let several = livePhotos.filter { $0.value.count > 1 }
+        guard let store, !several.isEmpty else { return [:] }
+        let uids = several.keys.sorted().map { PhotoUID(volumeID: volumeID, nodeID: $0) }
+        return store.relatedVideoIDs(for: uids, chosenBy: rule).filter { several[$0.key]?.contains($0.value) == true }
+    }
+
+    /// The motion of each of these Live Photos (link ID to related files in listing order). A `stored` motion holds
+    /// without a read. The other photos with several related files use `evidence`, the types read earlier in this
+    /// session, and one `fetch` of the related files that neither holds. `read` holds the answer for this session: a
+    /// link without a type in the answer is no video. A failed read leaves `complete` false and its files unread, so the
+    /// next refresh reads them again.
+    func motions(
+        of livePhotos: [String: [String]], stored: [String: String], evidence: [String: String],
         fetch: (_ linkIDs: [String]) async throws -> [String: String]
-    ) async throws -> (types: [String: String], read: [String: String], complete: Bool) {
+    ) async throws -> (motions: [String: LivePhotoMotion], read: [String: String], complete: Bool) {
         var seen = Set<String>()
-        let unread = related.filter { $0.count > 1 }.joined().filter {
-            evidence[$0] == nil && mimeTypes[$0] == nil && seen.insert($0).inserted
+        let unread = livePhotos.keys.sorted().flatMap { linkID -> [String] in
+            guard let related = livePhotos[linkID], related.count > 1, stored[linkID] == nil else { return [] }
+            return related.filter { evidence[$0] == nil && mimeTypes[$0] == nil && seen.insert($0).inserted }
         }
         var read: [String: String] = [:]
         var complete = true
@@ -57,11 +76,15 @@ struct LivePhotoMotionLinks: Sendable {
                 DebugLog.log("timeline: type of \(unread.count) Live Photo related files unread - \(error)")
             }
         }
-        let known = mimeTypes.merging(read) { _, read in read }
-        return (evidence.merging(known) { evidence, _ in evidence }, read, complete)
+        let types = evidence.merging(mimeTypes.merging(read) { _, read in read }) { evidence, _ in evidence }
+        let motions = livePhotos.reduce(into: [String: LivePhotoMotion]()) { motions, photo in
+            motions[photo.key] =
+                stored[photo.key].map(LivePhotoMotion.video) ?? Self.motion(among: photo.value, mimeTypes: types)
+        }
+        return (motions, read, complete)
     }
 
-    /// Keeps the `read` answer of `types(for:evidence:fetch:)` for this session.
+    /// Keeps the `read` answer of `motions(of:stored:evidence:fetch:)` for this session.
     mutating func record(_ read: [String: String]) {
         mimeTypes.merge(read) { _, read in read }
     }
