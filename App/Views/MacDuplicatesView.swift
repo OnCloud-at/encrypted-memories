@@ -15,6 +15,8 @@ struct MacDuplicatesView: View {
     @Binding var confirmsMergeAll: Bool
     /// True once the library shows a photo, so the viewer can open it.
     let canOpen: (PhotoUID) -> Bool
+    /// Changes when the library shows other photos; `canOpen` reads a library that is not observed.
+    let libraryRevision: UInt64
     /// Opens a photo and the ID of its group in the viewer.
     let onOpen: (PhotoUID, String) -> Void
 
@@ -33,7 +35,7 @@ struct MacDuplicatesView: View {
     var body: some View {
         ExactDuplicatesView(
             model: model, confirmsMergeAll: $confirmsMergeAll, accent: .accentColor, cornerRadius: Self.cornerRadius,
-            canOpen: canOpen, onOpen: onOpen
+            canOpen: canOpen, libraryRevision: libraryRevision, onOpen: onOpen
         ) { uid in
             ExactDuplicateThumbnail(
                 uid: uid, side: Self.thumbnailSide, cornerRadius: Self.cornerRadius, thumbnails: thumbnails)

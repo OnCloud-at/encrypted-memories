@@ -397,6 +397,7 @@ struct MainView: View {
                     topInset: topBarInset,
                     confirmsMergeAll: $confirmsDuplicateMergeAll,
                     canOpen: { timelineModel.allLibraryItem(matching: $0) != nil },
+                    libraryRevision: timelineModel.wholeLibraryRevision,
                     onOpen: { openDuplicate($0, inGroup: $1) }
                 )
                 .padding(.leading, leadingObstructionInset)

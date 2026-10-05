@@ -353,3 +353,132 @@
         }
     }
 #endif
+
+#if os(macOS)
+    import Observation
+
+    /// The thumbnail of a copy loads its image again after the shared tier dropped it while the tile was on screen.
+    @MainActor
+    final class ExactDuplicateThumbnailTests: XCTestCase {
+        func testATileLoadsItsImageAgainAfterTheTierDroppedIt() async throws {
+            let tier = FakeTier()
+            let uid = PhotoUID(volumeID: "v", nodeID: "photo")
+            let thumbnails = ExactDuplicateThumbnails(read: { tier.image(for: $0) }, load: { await tier.load($0) })
+            let host = NSHostingView(
+                rootView: ExactDuplicateThumbnail(uid: uid, side: 60, cornerRadius: 6, thumbnails: thumbnails))
+            host.frame = NSRect(x: 0, y: 0, width: 60, height: 60)
+            let window = NSWindow(contentRect: host.frame, styleMask: [.titled], backing: .buffered, defer: false)
+            window.contentView = host
+            window.orderFrontRegardless()
+            defer { window.orderOut(nil) }
+            for _ in 0..<200 where tier.loads < 1 { try await Task.sleep(for: .milliseconds(10)) }
+            XCTAssertEqual(tier.loads, 1, "the tile loads its image")
+
+            tier.evict(uid)
+
+            for _ in 0..<200 where tier.loads < 2 { try await Task.sleep(for: .milliseconds(10)) }
+            XCTAssertEqual(tier.loads, 2, "the tile loads the dropped image again")
+            XCTAssertTrue(tier.holds(uid))
+        }
+
+        func testATileWithoutAThumbnailDoesNotLoadInALoop() async throws {
+            let tier = FakeTier(hasThumbnails: false)
+            let uid = PhotoUID(volumeID: "v", nodeID: "photo")
+            let thumbnails = ExactDuplicateThumbnails(read: { tier.image(for: $0) }, load: { await tier.load($0) })
+            let host = NSHostingView(
+                rootView: ExactDuplicateThumbnail(uid: uid, side: 60, cornerRadius: 6, thumbnails: thumbnails))
+            host.frame = NSRect(x: 0, y: 0, width: 60, height: 60)
+            let window = NSWindow(contentRect: host.frame, styleMask: [.titled], backing: .buffered, defer: false)
+            window.contentView = host
+            window.orderFrontRegardless()
+            defer { window.orderOut(nil) }
+            try await Task.sleep(for: .milliseconds(500))
+            XCTAssertEqual(tier.loads, 1, "a photo without a thumbnail loads once")
+        }
+    }
+
+    /// The shared decoded tier: it holds images, loads them, and can drop them under memory pressure. Observed, so a
+    /// dropped image redraws the tile, as a change of its group does in the app.
+    @MainActor
+    @Observable
+    private final class FakeTier {
+        private var held: Set<PhotoUID> = []
+        private(set) var loads = 0
+        private let hasThumbnails: Bool
+
+        init(hasThumbnails: Bool = true) { self.hasThumbnails = hasThumbnails }
+
+        func image(for uid: PhotoUID) -> Image? { held.contains(uid) ? Image(systemName: "photo") : nil }
+        func holds(_ uid: PhotoUID) -> Bool { held.contains(uid) }
+        func evict(_ uid: PhotoUID) { held.remove(uid) }
+
+        func load(_ uid: PhotoUID) async {
+            loads += 1
+            if hasThumbnails { held.insert(uid) }
+        }
+    }
+#endif
+
+#if os(macOS)
+    /// A copy that was not ready reads its readiness again when the library shows other photos, also when the host
+    /// reads a library that is not observed.
+    @MainActor
+    final class ExactDuplicatesReadinessTests: XCTestCase {
+        func testALibraryRevisionReadsTheReadinessOfTheCopiesAgain() async throws {
+            let members = (0..<2).map { PhotoUID(volumeID: "v", nodeID: "photo-\($0)") }
+            let finder = ScreenshotFinder(
+                groups: [ExactDuplicateGroup(contentHash: "A", hashKeyEpoch: "e", members: members)],
+                coverage: .complete, build: .none)
+            let model = ExactDuplicatesModel(finder: finder)
+            let library = UnobservedLibrary()
+            let revision = LibraryRevision()
+            let host = NSHostingView(rootView: ReadinessHost(model: model, library: library, revision: revision))
+            host.frame = NSRect(x: 0, y: 0, width: 600, height: 400)
+            let window = NSWindow(contentRect: host.frame, styleMask: [.titled], backing: .buffered, defer: false)
+            window.contentView = host
+            window.orderFrontRegardless()
+            defer { window.orderOut(nil) }
+            for _ in 0..<300 where library.reads == 0 { try await Task.sleep(for: .milliseconds(10)) }
+            XCTAssertGreaterThan(library.reads, 0, "the copies ask whether they can open")
+            try await Task.sleep(for: .milliseconds(200))
+            let before = library.reads
+
+            library.shows = true
+            revision.value &+= 1
+
+            for _ in 0..<200 where library.reads == before { try await Task.sleep(for: .milliseconds(10)) }
+            XCTAssertGreaterThan(library.reads, before, "a new library revision reads the readiness again")
+        }
+    }
+
+    /// A library whose changes the screen does not observe, as the whole-library snapshot of the Mac timeline.
+    @MainActor
+    private final class UnobservedLibrary {
+        var shows = false
+        private(set) var reads = 0
+
+        func canOpen(_ uid: PhotoUID) -> Bool {
+            reads += 1
+            return shows
+        }
+    }
+
+    @MainActor
+    @Observable
+    private final class LibraryRevision {
+        var value: UInt64 = 0
+    }
+
+    private struct ReadinessHost: View {
+        let model: ExactDuplicatesModel
+        let library: UnobservedLibrary
+        let revision: LibraryRevision
+
+        var body: some View {
+            ExactDuplicatesView(
+                model: model, confirmsMergeAll: .constant(false), accent: .accentColor, cornerRadius: 6,
+                canOpen: { library.canOpen($0) }, libraryRevision: revision.value, onOpen: { _, _ in },
+                cover: { _ in Color.teal.frame(width: 60, height: 60) })
+        }
+    }
+#endif

@@ -113,7 +113,9 @@ import UploadCore
                     MobileFixtureDuplicates(
                         groups: sections.prefix(2).map { $0.items.prefix(2).map(\.uid) },
                         captureDates: Dictionary(
-                            items.map { ($0.uid, $0.captureTime) }, uniquingKeysWith: { first, _ in first })))
+                            items.map { ($0.uid, $0.captureTime) }, uniquingKeysWith: { first, _ in first }),
+                        rescanDropsLastGroup: ProcessInfo.processInfo.arguments.contains(
+                            "-EncryptedMemoriesDuplicatesRescanDropsGroup")))
             } else if ProcessInfo.processInfo.arguments.contains("-EncryptedMemoriesDuplicatesLargeFixture") {
                 // 1,500 groups of two or three library photos, for the scrolling and memory measurement.
                 let items = sections.flatMap(\.items)
@@ -289,19 +291,30 @@ import UploadCore
         private var groups: [ExactDuplicateGroup]
         private let checking: Bool
         private let dates: [PhotoUID: Date]
+        /// A scan after the count of the Collections entry and the first load of the screen leaves out the last
+        /// group, so a UI test sees whether the screen scanned again.
+        private let rescanDropsLastGroup: Bool
+        private var scans = 0
 
-        init(groups members: [[PhotoUID]], checking: Bool = false, captureDates: [PhotoUID: Date] = [:]) {
+        init(
+            groups members: [[PhotoUID]], checking: Bool = false, captureDates: [PhotoUID: Date] = [:],
+            rescanDropsLastGroup: Bool = false
+        ) {
             groups = members.enumerated().map { index, members in
                 ExactDuplicateGroup(contentHash: "fixture-copies-\(index)", hashKeyEpoch: "fixture", members: members)
             }
             self.checking = checking
             dates = captureDates
+            self.rescanDropsLastGroup = rescanDropsLastGroup
         }
 
         func duplicateGroups(
             progress: @escaping @Sendable (ExactDuplicateScanProgress) async -> Void
         ) async throws -> ExactDuplicateScan {
-            let groups = lock.withLock { groups }
+            let groups = lock.withLock {
+                scans += 1
+                return rescanDropsLastGroup && scans > 2 ? Array(groups.dropLast()) : groups
+            }
             let sizes: [Int64] = [5_200_000, 387_000]
             return ExactDuplicateScan(
                 groups: groups, coverage: checking ? .indexing : .complete,

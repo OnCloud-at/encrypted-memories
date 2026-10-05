@@ -509,6 +509,8 @@ final class MobileLibraryModel {
                 onProgress: onProgress
             )
         }
+        // The main photo of a series can be a copy in a group of duplicates; it leaves the Duplicates screen at once.
+        duplicates?.didTrashElsewhere(seriesUIDs)
         // The standalone copies are new library photos; the refresh brings them into the timeline.
         refreshAfterLocalUpload()
     }

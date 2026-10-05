@@ -30,6 +30,8 @@ public struct ExactDuplicateThumbnail: View {
     private let thumbnails: ExactDuplicateThumbnails
     /// Counts the loads of this tile, so it draws again after one. It holds no image.
     @State private var loads = 0
+    /// Counts the times the shared tier lost the image of this tile, so the tile loads it again.
+    @State private var evictions = 0
 
     public init(uid: PhotoUID, side: CGFloat, cornerRadius: CGFloat, thumbnails: ExactDuplicateThumbnails) {
         self.uid = uid
@@ -38,9 +40,15 @@ public struct ExactDuplicateThumbnail: View {
         self.thumbnails = thumbnails
     }
 
+    private struct LoadKey: Equatable {
+        let uid: PhotoUID
+        let evictions: Int
+    }
+
     public var body: some View {
         _ = loads
         let image = thumbnails.read(uid)
+        let isMissing = image == nil
         return ZStack {
             Rectangle().fill(.quaternary)
             if let image {
@@ -51,11 +59,16 @@ public struct ExactDuplicateThumbnail: View {
         }
         .frame(width: side, height: side)
         .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
-        .task(id: uid) {
+        .task(id: LoadKey(uid: uid, evictions: evictions)) {
             guard thumbnails.read(uid) == nil else { return }
             await thumbnails.load(uid)
             guard !Task.isCancelled else { return }
             loads &+= 1
+        }
+        // Memory pressure can drop the image while the tile shows it; the next draw without it loads it again. A
+        // photo without a thumbnail never had an image here, so it does not load in a loop.
+        .onChange(of: isMissing) { wasMissing, missing in
+            if missing, !wasMissing { evictions &+= 1 }
         }
     }
 }

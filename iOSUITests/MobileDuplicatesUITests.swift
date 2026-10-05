@@ -16,11 +16,11 @@ final class MobileDuplicatesUITests: XCTestCase {
         XCTAssertTrue(group(1).waitForExistence(timeout: 10))
     }
 
-    private func openDuplicates(fixture: String, dark: Bool = false) {
+    private func openDuplicates(fixture: String, dark: Bool = false, extra: [String] = []) {
         app.launchArguments =
             [
                 "-EncryptedMemoriesUITestFixture", fixture, "-AppleLanguages", "(en)", "-AppleLocale", "en_US",
-            ] + (dark ? ["-EncryptedMemoriesDarkAppearance"] : [])
+            ] + (dark ? ["-EncryptedMemoriesDarkAppearance"] : []) + extra
         app.launch()
         // The iOS 26 and 27 tab bars do not always expose a tab bar element; the tab is a button in both.
         let collections = app.buttons["Collections"].firstMatch
@@ -203,6 +203,36 @@ final class MobileDuplicatesUITests: XCTestCase {
 
         waitUntilGone(close, "swiping down closes the viewer")
         XCTAssertTrue(group(0).waitForExistence(timeout: 10), "the duplicates return")
+    }
+
+    /// Closing the viewer returns to the list as it was; only opening the screen and pulling to refresh scan again.
+    func testClosingTheViewerDoesNotScanTheLibraryAgain() {
+        openDuplicates(
+            fixture: "-EncryptedMemoriesDuplicatesFixture", extra: ["-EncryptedMemoriesDuplicatesRescanDropsGroup"])
+        XCTAssertTrue(group(1).waitForExistence(timeout: 10))
+        let other = member(0, 1)
+        XCTAssertTrue(other.waitForExistence(timeout: 5))
+        other.tap()
+        let close = app.buttons["Close"].firstMatch
+        XCTAssertTrue(close.waitForExistence(timeout: 10), "the viewer opened")
+
+        close.tap()
+
+        XCTAssertTrue(group(0).waitForExistence(timeout: 10))
+        // A scan after the viewer would drop the last group of this fixture.
+        let dropped = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: group(1))
+        XCTAssertEqual(XCTWaiter.wait(for: [dropped], timeout: 4), .timedOut, "the list did not scan again")
+    }
+
+    func testPullToRefreshScansTheLibraryAgain() {
+        openDuplicates(
+            fixture: "-EncryptedMemoriesDuplicatesFixture", extra: ["-EncryptedMemoriesDuplicatesRescanDropsGroup"])
+        XCTAssertTrue(group(1).waitForExistence(timeout: 10))
+
+        let top = app.windows.firstMatch.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.3))
+        top.press(forDuration: 0.05, thenDragTo: top.withOffset(CGVector(dx: 0, dy: 400)))
+
+        waitUntilGone(group(1), "a refresh scans again and the fixture drops the last group")
     }
 
     func testTheContextMenuKeepsAnotherPhoto() {

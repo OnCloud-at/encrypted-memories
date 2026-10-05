@@ -13,16 +13,18 @@ public struct ExactDuplicatesView<Cover: View>: View {
     private let accent: Color
     private let cornerRadius: CGFloat
     private let canOpen: (PhotoUID) -> Bool
+    private let libraryRevision: UInt64
     private let onOpen: (PhotoUID, String) -> Void
     private let cover: (PhotoUID) -> Cover
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     /// `accent` colors the checkmark and the border of the photo to keep and the progress indicator.
     /// `cornerRadius` is the corner radius of `cover`. `canOpen` tells whether the library shows a photo yet, so
-    /// the viewer can open it; `onOpen` receives a photo and the ID of its group.
+    /// the viewer can open it; a host whose library is not observed passes a `libraryRevision` that changes with the
+    /// photos it shows, so a copy that was not ready redraws. `onOpen` receives a photo and the ID of its group.
     public init(
         model: ExactDuplicatesModel, confirmsMergeAll: Binding<Bool>, accent: Color, cornerRadius: CGFloat,
-        canOpen: @escaping (PhotoUID) -> Bool = { _ in true },
+        canOpen: @escaping (PhotoUID) -> Bool = { _ in true }, libraryRevision: UInt64 = 0,
         onOpen: @escaping (PhotoUID, String) -> Void, @ViewBuilder cover: @escaping (PhotoUID) -> Cover
     ) {
         self.model = model
@@ -30,6 +32,7 @@ public struct ExactDuplicatesView<Cover: View>: View {
         self.accent = accent
         self.cornerRadius = cornerRadius
         self.canOpen = canOpen
+        self.libraryRevision = libraryRevision
         self.onOpen = onOpen
         self.cover = cover
     }
@@ -104,7 +107,7 @@ public struct ExactDuplicatesView<Cover: View>: View {
             // Progress of the check changes this view often; the list compares equal and keeps its rows.
             ExactDuplicatesGroupList(
                 model: model, accent: accent, cornerRadius: cornerRadius, reduceMotion: reduceMotion, canOpen: canOpen,
-                onOpen: onOpen, cover: cover
+                libraryRevision: libraryRevision, onOpen: onOpen, cover: cover
             )
             .equatable()
         }
@@ -152,6 +155,7 @@ private struct ExactDuplicatesGroupList<Cover: View>: View, Equatable {
     let cornerRadius: CGFloat
     let reduceMotion: Bool
     let canOpen: (PhotoUID) -> Bool
+    let libraryRevision: UInt64
     let onOpen: (PhotoUID, String) -> Void
     let cover: (PhotoUID) -> Cover
     #if os(iOS)
@@ -160,7 +164,7 @@ private struct ExactDuplicatesGroupList<Cover: View>: View, Equatable {
 
     nonisolated static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.model === rhs.model && lhs.accent == rhs.accent && lhs.cornerRadius == rhs.cornerRadius
-            && lhs.reduceMotion == rhs.reduceMotion
+            && lhs.reduceMotion == rhs.reduceMotion && lhs.libraryRevision == rhs.libraryRevision
     }
 
     /// The margin of the cards, and of their content inside them, as the inset grouped list uses it.
@@ -240,7 +244,7 @@ private struct ExactDuplicatesGroupList<Cover: View>: View, Equatable {
         let model = model
         return ExactDuplicateGroupPart(
             part: part, group: group, index: index, canMerge: canMerge, accent: accent, cornerRadius: cornerRadius,
-            reduceMotion: reduceMotion,
+            reduceMotion: reduceMotion, libraryRevision: libraryRevision,
             actions: ExactDuplicateGroupActions(
                 canOpen: canOpen,
                 open: onOpen,
@@ -397,12 +401,15 @@ private struct ExactDuplicateGroupPart<Cover: View>: View, Equatable {
     let accent: Color
     let cornerRadius: CGFloat
     let reduceMotion: Bool
+    /// Changes when the library shows other photos, so whether a copy can open is read again.
+    let libraryRevision: UInt64
     let actions: ExactDuplicateGroupActions
     let cover: (PhotoUID) -> Cover
 
     nonisolated static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.part == rhs.part && lhs.group == rhs.group && lhs.index == rhs.index && lhs.canMerge == rhs.canMerge
             && lhs.accent == rhs.accent && lhs.cornerRadius == rhs.cornerRadius && lhs.reduceMotion == rhs.reduceMotion
+            && lhs.libraryRevision == rhs.libraryRevision
     }
 
     /// The facts of a group arrive without a progress row; its badges, its reason, and a moved checkmark fade in.
@@ -413,9 +420,10 @@ private struct ExactDuplicateGroupPart<Cover: View>: View, Equatable {
         switch part {
         case .header: header
         case .members:
+            // Readiness is a value of the copies, so they redraw when the library shows a copy that was not ready.
             ExactDuplicateMembers(
-                group: group, groupIndex: index, accent: accent, cornerRadius: cornerRadius, actions: actions,
-                cover: cover
+                group: group, groupIndex: index, ready: Set(group.members.filter(actions.canOpen)), accent: accent,
+                cornerRadius: cornerRadius, actions: actions, cover: cover
             )
             .accessibilityIdentifier("duplicates.group.\(index)")
             // Only the groups that the person scrolls to read their facts.
@@ -470,6 +478,8 @@ private struct ExactDuplicateGroupPart<Cover: View>: View, Equatable {
 private struct ExactDuplicateMembers<Cover: View>: View {
     let group: ExactDuplicatesModel.Group
     let groupIndex: Int
+    /// The copies that the library shows, so the viewer can open them.
+    let ready: Set<PhotoUID>
     let accent: Color
     let cornerRadius: CGFloat
     let actions: ExactDuplicateGroupActions
@@ -513,7 +523,7 @@ private struct ExactDuplicateMembers<Cover: View>: View {
     /// A tap or click opens the photo; a long press or a secondary click offers Keep This Copy.
     @ViewBuilder private func member(_ uid: PhotoUID, isKept: Bool, keepTitle: String) -> some View {
         // Right after launch the library may not show a copy yet; its tile shows that it is not ready.
-        let isReady = actions.canOpen(uid)
+        let isReady = ready.contains(uid)
         let open = { if isReady { actions.open(uid, group.id) } }
         let tile = ExactDuplicateTile(
             group: group, member: uid, accent: accent, cornerRadius: cornerRadius, isReady: isReady,
