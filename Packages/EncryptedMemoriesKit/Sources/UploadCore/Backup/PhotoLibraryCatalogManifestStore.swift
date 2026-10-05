@@ -609,8 +609,10 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
         sqlite3_bind_int(stmt, 6, Int32(entry.pixelHeight))
         sqlite3_bind_double(stmt, 7, entry.durationSeconds)
         bindText(stmt, 8, entry.mediaKind.rawValue)
-        // 2 marks a Live Photo with its Live effect off. The schema stays unchanged: an earlier build reads it as Live.
-        sqlite3_bind_int(stmt, 9, entry.isLivePhoto ? (entry.livePlaybackOff ? 2 : 1) : 0)
+        // The Live Photo column holds two flags without a schema change: bit 1 is `isLivePhoto` (`.photoLive`), bit 2 is
+        // `livePlaybackOff`. Photos drops `.photoLive` when the Live effect is off, so such a photo stores 2. An earlier
+        // build reads every non-zero value as a Live Photo.
+        sqlite3_bind_int(stmt, 9, (entry.isLivePhoto ? 1 : 0) | (entry.livePlaybackOff ? 2 : 0))
         bindText(stmt, 10, resourcesJSON)
         sqlite3_bind_int64(stmt, 11, entry.contentFingerprint)
         sqlite3_bind_int64(stmt, 12, entry.metadataRevision)
@@ -671,8 +673,8 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
             pixelHeight: Int(sqlite3_column_int(stmt, valueOffset + 4)),
             durationSeconds: sqlite3_column_double(stmt, valueOffset + 5),
             mediaKind: mediaKind,
-            isLivePhoto: sqlite3_column_int(stmt, valueOffset + 7) != 0,
-            livePlaybackOff: sqlite3_column_int(stmt, valueOffset + 7) == 2,
+            isLivePhoto: sqlite3_column_int(stmt, valueOffset + 7) & 1 != 0,
+            livePlaybackOff: sqlite3_column_int(stmt, valueOffset + 7) & 2 != 0,
             resources: resources,
             contentFingerprint: sqlite3_column_int64(stmt, valueOffset + 9),
             metadataRevision: sqlite3_column_int64(stmt, valueOffset + 10),

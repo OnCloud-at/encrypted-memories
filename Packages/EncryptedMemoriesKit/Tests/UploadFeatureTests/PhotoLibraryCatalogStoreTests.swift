@@ -112,40 +112,44 @@ final class PhotoLibraryCatalogStoreTests: XCTestCase {
         XCTAssertEqual(store.entry(for: "cloud")?.cloudIdentifier, "icloud-stable")
     }
 
-    func testAV105LivePhotoRowReadsAsLiveUntilAScanRecordsThatItsLiveEffectIsOff() throws {
+    func testAV105RowOfALiveOffPhotoKeepsItsLiveEffectOffAfterAScanWithoutASchemaChange() throws {
         let url = tempDir.appendingPathComponent(PhotoLibraryCatalogManifestStore.databaseFileName)
         let resources: [PhotoBackupAssetInfo.Resource] = [
             .init(role: .originalPhoto, originalFilename: "IMG_L.HEIC", mimeType: "image/heic"),
             .init(role: .pairedVideo, originalFilename: "IMG_L.MOV", mimeType: "video/quicktime"),
         ]
-        var still = info(id: "L", live: true, resources: resources)
+        // Photos drops `.photoLive` when the Live effect is off and still lists the paired video.
+        var still = info(id: "L", live: false, resources: resources)
         still.livePlaybackOff = true
-        // v1.0.5 did not read the Live effect. It wrote the Live Photo flag of every Live Photo as 1.
+        // v1.0.5 did not read the Live effect: it wrote 0 for this photo.
         var v105 = still
         v105.livePlaybackOff = false
         do {
             let store = try XCTUnwrap(PhotoLibraryCatalogManifestStore(url: url))
             XCTAssertEqual(store.upsert(entry(from: v105, at: 10)), .inserted)
+            let on = info(id: "on", live: true, resources: resources)
+            XCTAssertEqual(store.upsert(entry(from: on, at: 10)), .inserted)
             store.close()
         }
-        XCTAssertEqual(liveColumn(url: url, id: "L"), 1)
+        XCTAssertEqual(liveColumn(url: url, id: "L"), 0)
+        XCTAssertEqual(liveColumn(url: url, id: "on"), 1)
 
         let store = try XCTUnwrap(PhotoLibraryCatalogManifestStore(url: url))
-        let legacy = try XCTUnwrap(store.entry(for: "L"))
-        XCTAssertTrue(legacy.isLivePhoto)
-        XCTAssertFalse(legacy.livePlaybackOff, "a row of an earlier build reads as Live playback on")
-        XCTAssertTrue(PhotoLibraryPendingMetadataProvider.metadata(for: legacy).isLivePhoto)
-
         let scanned = entry(from: still, at: 20)
         XCTAssertEqual(store.classifyBatch([scanned]), [.unchanged], "the Live effect alone does not re-open a photo")
         XCTAssertTrue(store.upsertBatch([scanned]))
         let recorded = try XCTUnwrap(store.entry(for: "L"))
-        XCTAssertTrue(recorded.isLivePhoto, "an earlier build reads the new value as a Live Photo")
+        XCTAssertFalse(recorded.isLivePhoto, "the fingerprint keeps the value of v1.0.5")
         XCTAssertTrue(recorded.livePlaybackOff)
         XCTAssertFalse(PhotoLibraryPendingMetadataProvider.metadata(for: recorded).isLivePhoto)
-        XCTAssertTrue(PhotoLibraryCatalogMapper.info(for: recorded).livePlaybackOff)
+        XCTAssertTrue(PhotoLibraryCatalogMapper.info(for: recorded).livePlaybackOff, "a replay plans the still photo")
+        XCTAssertEqual(PhotoLibraryCatalogMapper.info(for: recorded), PhotoLibraryCatalogMapper.info(for: scanned))
+        let live = try XCTUnwrap(store.entry(for: "on"))
+        XCTAssertTrue(live.isLivePhoto)
+        XCTAssertFalse(live.livePlaybackOff)
+        XCTAssertTrue(PhotoLibraryPendingMetadataProvider.metadata(for: live).isLivePhoto)
         store.close()
-        XCTAssertEqual(liveColumn(url: url, id: "L"), 2)
+        XCTAssertEqual(liveColumn(url: url, id: "L"), 2, "v1.0.5 reads any value other than 0 as a Live Photo")
     }
 
     private func liveColumn(url: URL, id: String) -> Int? {

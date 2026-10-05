@@ -173,9 +173,12 @@ final class PhotoBackupPlannerTests: XCTestCase {
         .init(role: .pairedVideo, originalFilename: "IMG_2000.MOV", mimeType: "video/quicktime"),
     ]
 
+    /// The shape that Photos reports: with the Live effect off, the subtypes lack `.photoLive`, the playback style is
+    /// `.image`, and the paired video is still listed.
     private func livePhoto(off: Bool) -> PhotoBackupAssetInfo {
-        var asset = info(live: true, resources: liveResources)
-        asset.livePlaybackOff = off
+        var asset = info(live: !off, resources: liveResources)
+        asset.livePlaybackOff = PhotoKitAssetMapper.livePlaybackOff(
+            isVideo: false, resources: liveResources, playbackStyle: off ? .image : .livePhoto)
         return asset
     }
 
@@ -195,13 +198,19 @@ final class PhotoBackupPlannerTests: XCTestCase {
         )
     }
 
-    func testOnlyALivePhotoThatPhotosShowsAsAStillHasItsLiveEffectOff() {
-        XCTAssertTrue(PhotoKitAssetMapper.livePlaybackOff(subtypes: .photoLive, playbackStyle: .image))
-        XCTAssertFalse(PhotoKitAssetMapper.livePlaybackOff(subtypes: .photoLive, playbackStyle: .livePhoto))
-        XCTAssertFalse(
-            PhotoKitAssetMapper.livePlaybackOff(subtypes: .photoLive, playbackStyle: .videoLooping),
-            "Loop and Bounce stay Live Photos")
-        XCTAssertFalse(PhotoKitAssetMapper.livePlaybackOff(subtypes: [], playbackStyle: .image))
+    func testOnlyAPhotoWithAPairedVideoThatPhotosShowsAsAStillHasItsLiveEffectOff() {
+        func off(
+            _ playbackStyle: PHAsset.PlaybackStyle, video: Bool = false,
+            resources: [PhotoBackupAssetInfo.Resource]? = nil
+        ) -> Bool {
+            PhotoKitAssetMapper.livePlaybackOff(
+                isVideo: video, resources: resources ?? liveResources, playbackStyle: playbackStyle)
+        }
+        XCTAssertTrue(off(.image), "Photos drops .photoLive with the Live effect off and keeps the paired video")
+        XCTAssertFalse(off(.livePhoto))
+        XCTAssertFalse(off(.videoLooping), "Loop and Bounce stay Live Photos")
+        XCTAssertFalse(off(.image, resources: [liveResources[0]]), "a still photo without a paired video")
+        XCTAssertFalse(off(.video, video: true), "a video is no Live Photo")
     }
 
     func testALivePhotoWithItsLiveEffectOffBacksUpAsAStillWithItsPairedVideo() throws {
@@ -232,15 +241,45 @@ final class PhotoBackupPlannerTests: XCTestCase {
     }
 
     func testTheLiveEffectLeavesTheRevisionAndTheEditEvidenceOfAnUnchangedPhotoAlone() throws {
-        // A photo that v1.0.5 backed up with its Live effect off has these revisions: it must not upload again.
-        let on = try XCTUnwrap(PhotoBackupAssetPlanner.candidate(for: livePhoto(off: false))).snapshot
-        let off = try XCTUnwrap(PhotoBackupAssetPlanner.candidate(for: livePhoto(off: true))).snapshot
+        // v1.0.5 did not read the Live effect of a photo that it backed up with the effect off. Today's revisions of
+        // that photo must match, or it uploads again.
+        let today = livePhoto(off: true)
+        var v105 = today
+        v105.livePlaybackOff = false
+        let earlier = try XCTUnwrap(PhotoBackupAssetPlanner.candidate(for: v105)).snapshot
+        let current = try XCTUnwrap(PhotoBackupAssetPlanner.candidate(for: today)).snapshot
 
-        XCTAssertEqual(off.revision, on.revision)
-        XCTAssertEqual(off.editRevision, on.editRevision)
+        XCTAssertTrue(today.livePlaybackOff)
+        XCTAssertEqual(current.revision, earlier.revision)
+        XCTAssertEqual(current.editRevision, earlier.editRevision)
         XCTAssertEqual(
-            PhotoLibraryCatalogMapper.entry(for: livePhoto(off: true), observedAt: now).contentFingerprint,
-            PhotoLibraryCatalogMapper.entry(for: livePhoto(off: false), observedAt: now).contentFingerprint)
+            PhotoLibraryCatalogMapper.entry(for: today, observedAt: now).contentFingerprint,
+            PhotoLibraryCatalogMapper.entry(for: v105, observedAt: now).contentFingerprint)
+    }
+
+    func testTheLivePhotoVideoUploadsAfterEveryOtherRelatedFile() throws {
+        // Proton lists the newest related file first; an app that plays the first one must get the video.
+        let resources: [PhotoBackupAssetInfo.Resource] = [
+            .init(role: .originalPhoto, originalFilename: "IMG_2000.HEIC", mimeType: "image/heic"),
+            .init(role: .fullSizePhoto, originalFilename: "FullSizeRender.heic", mimeType: "image/heic"),
+            .init(role: .pairedVideo, originalFilename: "IMG_2000.MOV", mimeType: "video/quicktime"),
+            .init(role: .fullSizePairedVideo, originalFilename: "FullSizeRender.mov", mimeType: "video/quicktime"),
+            .init(role: .adjustmentData, originalFilename: "Adjustments.plist"),
+            .init(role: .other, originalFilename: "Other.dat"),
+        ]
+        let live = try XCTUnwrap(PhotoBackupAssetPlanner.exportPlan(for: info(live: true, resources: resources)))
+        XCTAssertEqual(
+            live.secondaries.map(\.role),
+            [.originalPhoto, .fullSizePairedVideo, .adjustmentData, .other, .pairedVideo])
+        XCTAssertEqual(live.secondaries.last?.sourceResource, .livePairedVideo)
+
+        var still = info(live: false, resources: resources)
+        still.livePlaybackOff = true
+        let plan = try XCTUnwrap(PhotoBackupAssetPlanner.exportPlan(for: still))
+        XCTAssertEqual(
+            plan.secondaries.map(\.role),
+            [.originalPhoto, .fullSizePairedVideo, .pairedVideo, .adjustmentData, .other],
+            "a still photo keeps its related files in role order")
     }
 
     func testTurningTheLiveEffectOffOrOnMovesTheRevisionForward() throws {
@@ -251,6 +290,7 @@ final class PhotoBackupPlannerTests: XCTestCase {
         still.resources += [render, .init(role: .adjustmentData, originalFilename: "Adjustments.plist")]
         still.hasAdjustments = true
         still.adjustmentTimestamp = still.modificationDate
+        still.isLivePhoto = false
         still.livePlaybackOff = true
         var liveAgain = live
         liveAgain.modificationDate = still.modificationDate?.addingTimeInterval(60)

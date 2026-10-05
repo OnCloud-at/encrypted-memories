@@ -56,8 +56,9 @@ final class EditUpgradeScenarioTests: XCTestCase {
         try await assertV105LiveEffectOffUpgrade(.edited)
     }
 
-    /// v1.0.5 backed the photo up as a Live Photo. The upgrade uploads, trashes, and asks nothing; the next edit
-    /// replaces the Live Photo with a still photo.
+    /// The photo has the shape that Photos reports with the Live effect off: no `.photoLive`, a still playback style, and
+    /// a listed paired video. v1.0.5 backed it up as a Live Photo. The upgrade uploads, trashes, and asks nothing; the
+    /// next edit replaces the Live Photo with a still photo.
     private func assertV105LiveEffectOffUpgrade(_ fixture: EditScenarioHarness.V105Fixture) async throws {
         harness = try EditScenarioHarness(v105: fixture, live: true, liveOff: true)
         let asset = try XCTUnwrap(harness.library.snapshot.first)
@@ -68,6 +69,8 @@ final class EditUpgradeScenarioTests: XCTestCase {
             kind: .photoLibraryAsset, identifier: asset.identifier, resource: .livePairedVideo)
         XCTAssertNotNil(harness.identities.record(for: legacyVideo), "v1.0.5 recorded a Live Photo video")
         XCTAssertEqual(harness.server.links.first { $0.linkID == legacyMain }?.tags, [PhotoTag.livePhotos.rawValue])
+        XCTAssertFalse(asset.info.isLivePhoto)
+        XCTAssertTrue(asset.info.livePlaybackOff)
         XCTAssertEqual(harness.catalog.entry(for: asset.identifier)?.livePlaybackOff, false)
         func serverState() -> [String] { harness.server.links.map { "\($0.linkID) \($0.state) \($0.tags.sorted())" } }
         let before = serverState()
@@ -86,6 +89,15 @@ final class EditUpgradeScenarioTests: XCTestCase {
         XCTAssertTrue(harness.library.resolutions.isEmpty, "No photo bytes should be requested")
         XCTAssertFalse(harness.journalFileExists)
         XCTAssertEqual(harness.catalog.entry(for: asset.identifier)?.livePlaybackOff, true)
+
+        // A metadata change, such as a favorite, moves the modification date. Only an edit replaces the photo.
+        harness.library.changeModificationDate()
+        _ = try await harness.fullRescan()
+        await harness.pass()
+        XCTAssertTrue(harness.queue.unsettledRows().isEmpty)
+        XCTAssertEqual(uploads, 0)
+        XCTAssertTrue(trashed.isEmpty)
+        XCTAssertEqual(serverState(), before, "a metadata change keeps the Live Photo in Proton")
 
         harness.library.edit("edit-after-upgrade", at: harness.clock.now)
         let entry = try await harness.enqueue()
