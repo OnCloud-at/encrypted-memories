@@ -87,7 +87,15 @@ public final class PhotoLibraryBackupController {
     /// Durable user "pause": no passes run and no auto-resume fires until the user resumes. Distinct
     /// from a policy pause (thermal/battery, transient) and from `isEnabled` (the whole feature off).
     public private(set) var isUserPaused: Bool
-    public private(set) var status = BackupStatus()
+    public private(set) var status = BackupStatus() {
+        didSet {
+            let waits = status.phase == .waitingForWiFi
+            if waits != isWaitingForWiFi { isWaitingForWiFi = waits }
+        }
+    }
+    /// The backup waits because mobile data is off for backups. Changes only with that state, so observers of the
+    /// grid badges do not follow every progress tick.
+    public private(set) var isWaitingForWiFi = false
     public private(set) var isSyncing = false
     public private(set) var lastMessage: String?
     /// Exact Core-derived eligibility time for the next automatic attempt. Platform schedulers may
@@ -169,6 +177,8 @@ public final class PhotoLibraryBackupController {
     /// One date-driven wake for the earliest eligible queue item. Replaces the old fixed 45-second
     /// poll, which repeatedly started empty runs for draft-blocked rows.
     private var autoResumeTask: Task<Void, Never>?
+    /// Follows the shared runtime network signal, so a backup that waits for Wi-Fi resumes on Wi-Fi or Ethernet.
+    private var networkObservationTask: Task<Void, Never>?
     private var consecutiveNoProgressRuns = 0
     private var backedUpAtRunStart = 0
     private var lastObservedUploadedCount: Int?
@@ -311,6 +321,7 @@ public final class PhotoLibraryBackupController {
                 self?.resumeEnabledBackupAfterLaunch()
             }
         }
+        startObservingNetwork()
     }
 
     // MARK: - Pending grid
@@ -410,6 +421,12 @@ public final class PhotoLibraryBackupController {
     /// waiting rows due at once (each reason and its retry count stay); lifecycle/change-driven calls honor backoff.
     public func syncNow() {
         _ = startSync(owner: .foreground)
+    }
+
+    /// The "Use Cellular Data" setting changed. A backup that waits for Wi-Fi starts again when the wait no longer
+    /// holds; the setting itself persists in the shared defaults that every upload path reads.
+    public func mobileDataSettingDidChange() {
+        resumeIfWiFiWaitEnded()
     }
 
     /// Runs a pass when the app becomes active. An edit in Photos while this app was in the background may reach
@@ -1134,6 +1151,8 @@ public final class PhotoLibraryBackupController {
         statusRefreshTask = nil
         autoResumeTask?.cancel()
         autoResumeTask = nil
+        networkObservationTask?.cancel()
+        networkObservationTask = nil
         instantEnqueueTask?.cancel()
         let activeSync = syncTask
         let activeStatusSetup = statusSetupTask
@@ -1209,6 +1228,24 @@ public final class PhotoLibraryBackupController {
         monitor.startObserving { [weak self] in
             Task { @MainActor in self?.scheduleChangeDrivenSync() }
         }
+    }
+
+    /// Uses the one shared runtime signal; it adds no second network monitor.
+    private func startObservingNetwork() {
+        let updates = LibraryRuntimeState.shared.updates()
+        networkObservationTask = Task { @MainActor [weak self] in
+            for await _ in updates {
+                guard let self, !Task.isCancelled else { return }
+                self.resumeIfWiFiWaitEnded()
+            }
+        }
+    }
+
+    private func resumeIfWiFiWaitEnded() {
+        guard !isShuttingDown, status.phase == .waitingForWiFi,
+            status.endsWiFiWait(for: AppleBackupRuntimeSignals.current())
+        else { return }
+        syncNow()
     }
 
     private func scheduleChangeDrivenSync() {

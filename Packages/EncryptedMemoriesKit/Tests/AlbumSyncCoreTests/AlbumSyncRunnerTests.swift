@@ -653,3 +653,15 @@ private final class ProgressBox: @unchecked Sendable {
         return sqlite3_step(statement) == SQLITE_ROW ? Int(sqlite3_column_int64(statement, 0)) : -1
     }
 }
+
+@Suite struct AlbumSyncWaitingForWiFiTests {
+    @Test func backupPhaseSaysWaitingForWiFiOnlyWhileTheBackupWaits() {
+        var progress = AlbumSyncProgress()
+        progress.phase = .backingUp
+        #expect(progress.localizedTitle == L10n.string("albumsync.phase_backing_up"))
+        progress.isWaitingForWiFi = true
+        #expect(progress.localizedTitle == L10n.string("backup.phase_waiting_wifi"))
+        progress.phase = .attaching
+        #expect(progress.localizedTitle == L10n.string("albumsync.phase_attaching"))
+    }
+}

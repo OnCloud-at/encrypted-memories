@@ -175,13 +175,14 @@ public final class PendingGridSession {
     }
 
     /// Follows the backup switch, availability, and pause of the controller: pending photos show only while
-    /// backup is on and able to run, and their badges show when the person paused it.
+    /// backup is on and able to run, and their badges show the pause when the person paused it or the backup
+    /// waits for Wi-Fi.
     private func observeBackupState() {
         guard let photoBackup else { return }
         let (enabled, paused) = withObservationTracking {
             (
                 photoBackup.isEnabled && photoBackup.isAvailable && photoBackup.accessState.allowsBackup,
-                photoBackup.isUserPaused
+                photoBackup.isUserPaused || photoBackup.isWaitingForWiFi
             )
         } onChange: { [weak self] in
             Task { @MainActor [weak self] in self?.observeBackupState() }

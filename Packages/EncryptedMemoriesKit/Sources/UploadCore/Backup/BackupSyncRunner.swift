@@ -308,8 +308,10 @@ public actor BackupSyncRunner {
                 progress.isRunning = false
                 return progress
             }
-            guard configuration.throttle.maxConcurrentItems(for: throttleInputs()) > 0 else {
+            let inputs = throttleInputs()
+            guard configuration.throttle.maxConcurrentItems(for: inputs) > 0 else {
                 progress.isPausedByPolicy = true
+                progress.isWaitingForWiFi = inputs.waitsForWiFi
                 progress.isRunning = false
                 return progress
             }
@@ -376,8 +378,10 @@ public actor BackupSyncRunner {
             // (never stall - a single in-flight item keeps making progress and probes recovery).
             let limit = policyLimit == 0 ? 0 : max(1, policyLimit - networkErrorStreak)
             if limit == 0 {
-                if !progress.isPausedByPolicy {
+                // A wave that already started finishes first: the limit applies only to the next wave.
+                if !progress.isPausedByPolicy || progress.isWaitingForWiFi != throttleSnapshot.waitsForWiFi {
                     progress.isPausedByPolicy = true
+                    progress.isWaitingForWiFi = throttleSnapshot.waitsForWiFi
                     emitProgress()
                 }
                 if mode == .eligibleOnly { break }
@@ -390,6 +394,7 @@ public actor BackupSyncRunner {
             }
             if progress.isPausedByPolicy {
                 progress.isPausedByPolicy = false
+                progress.isWaitingForWiFi = false
                 emitProgress()
             }
 
@@ -448,8 +453,10 @@ public actor BackupSyncRunner {
         // final snapshot should come from the durable state regardless.
         if queue.isOperational() {
             let wasPausedByPolicy = progress.isPausedByPolicy
+            let wasWaitingForWiFi = progress.isWaitingForWiFi
             progress = BackupSyncProgress(summary: queue.summary(), isRunning: false)
             progress.isPausedByPolicy = wasPausedByPolicy
+            progress.isWaitingForWiFi = wasWaitingForWiFi
         } else {
             // Preserve the last trustworthy counters. The controller exposes the unavailable store;
             // replacing this with an empty summary would falsely look like a completed backup.
@@ -2018,6 +2025,7 @@ public actor BackupSyncRunner {
             isRunning: previous.isRunning
         )
         progress.isPausedByPolicy = previous.isPausedByPolicy
+        progress.isWaitingForWiFi = previous.isWaitingForWiFi
         progress.remoteIndexPreparation = previous.remoteIndexPreparation
         progress.remoteIndexPreparationFailed = previous.remoteIndexPreparationFailed
         progress.remoteIndexPreparationIssue = previous.remoteIndexPreparationIssue

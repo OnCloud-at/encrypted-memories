@@ -43,4 +43,27 @@ final class MobilePausedBackupUITests: XCTestCase {
         XCTAssertTrue(waiting.waitForExistence(timeout: 10), "the waiting photo left the grid")
         XCTAssertFalse(tile(labelContaining: "Backup paused").exists, "the photo still says that the backup is paused")
     }
+
+    func testCellularDataSwitchIsOnByDefaultAndCanBeTurnedOff() {
+        let settings = app.buttons["Proton Account and Settings"]
+        XCTAssertTrue(settings.waitForExistence(timeout: 60))
+        settings.tap()
+        let backup = app.buttons["backup.settings"]
+        XCTAssertTrue(backup.waitForExistence(timeout: 10))
+        backup.tap()
+
+        let cellular = app.switches["backup.useMobileData"]
+        XCTAssertTrue(cellular.waitForExistence(timeout: 10), "the backup settings offer no cellular data switch")
+        XCTAssertEqual(cellular.label, "Use Cellular Data")
+        XCTAssertEqual(cellular.value as? String, "1", "the backup uses cellular data by default")
+        cellular.coordinate(withNormalizedOffset: CGVector(dx: 0.9, dy: 0.5)).tap()
+        XCTAssertTrue(wait(for: cellular, "value == '0'"), "the switch does not turn off")
+        cellular.coordinate(withNormalizedOffset: CGVector(dx: 0.9, dy: 0.5)).tap()
+        XCTAssertTrue(wait(for: cellular, "value == '1'"))
+    }
+
+    private func wait(for element: XCUIElement, _ predicate: String, timeout: TimeInterval = 5) -> Bool {
+        let expectation = XCTNSPredicateExpectation(predicate: NSPredicate(format: predicate), object: element)
+        return XCTWaiter.wait(for: [expectation], timeout: timeout) == .completed
+    }
 }

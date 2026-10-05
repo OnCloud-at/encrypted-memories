@@ -321,6 +321,7 @@ public actor AlbumSyncRunner {
         guard progress.phase == .backingUp else { return }
         progress.backedUp = snapshot.backedUp
         progress.backupFailed = snapshot.failed
+        progress.isWaitingForWiFi = snapshot.isPausedByPolicy && snapshot.isWaitingForWiFi
         publish()
     }
 
