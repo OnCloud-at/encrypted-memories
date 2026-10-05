@@ -200,6 +200,16 @@ Reviewed GitHub Actions workflows own Apple distribution.
 PR authors never set app versions, build numbers, release tags, or release notes.
 A maintainer publishes a GitHub Release after its tagged commit passes the pull request checks.
 
+Three channels exist. Each one is a separate owner action:
+
+| Channel | Owner action | Result |
+|---|---|---|
+| Internal TestFlight | Publish a prerelease such as `v1.2.0-beta.1` | Both builds reach the internal group. |
+| External TestFlight | Run `External TestFlight` with a published release tag | The same builds reach the internal and the external group; no new build. |
+| App Store | Publish a stable release such as `v1.2.0` | Both apps enter App Review. |
+
+An internal beta can stay internal. An external beta is always an internal beta, too.
+
 - A prerelease tag such as `v1.2.0-beta.1` or `v1.2.0-rc.1` builds iOS and macOS. It publishes both builds only to internal TestFlight.
 - A stable tag such as `v1.2.0` builds both apps. It creates the platform versions when necessary, updates both localizations, submits each platform to App Review, and selects automatic release after approval.
 - Keep beta releases and their notes as history. Publish a separate stable release after testing; even when it targets the same commit, it gets new iOS and macOS builds. Do not rename beta tags.
@@ -254,6 +264,9 @@ It refuses equal or newer active versions and unsafe states.
 The manual `External TestFlight` workflow runs from `main` with one published release tag.
 It reuses the release's existing iOS and macOS builds. It never rebuilds or uploads them.
 Stable and prerelease release tags can be promoted externally.
+It also adds both builds to the internal group, so a promoted stable release reaches internal testers, too.
+It submits both builds to Beta App Review and enables the public link of the external group.
+The job summary shows the public link. A rerun after Beta App Review is safe and enables the link when Apple refused it before.
 
 Owner action: `Actions` → `External TestFlight` → `Run workflow` from `main` → enter the published release tag.
 GitHub then pauses at the configured `testflight-external` approval gate. Approve that deployment to continue.
