@@ -95,7 +95,7 @@ final class ExactDuplicatesModelTests: XCTestCase {
         XCTAssertEqual(model.groups.first?.isRanked, false)
     }
 
-    func testTheGroupsShowBeforeTheRankingAndTheRankingShowsItsProgress() async {
+    func testTheGroupsShowBeforeTheRankingAndTheRankingRunsWithoutAProgressRow() async {
         let finder = FakeDuplicateFinder(scans: [.init(groups: [groupA, groupB], coverage: .complete)])
         finder.fallback = ["A": [a2, a1, a3]]
         finder.ranked = ["A": [a3, a1, a2]]
@@ -107,17 +107,47 @@ final class ExactDuplicatesModelTests: XCTestCase {
         XCTAssertEqual(model.content, .groups, "the list never waits for the ranking")
         XCTAssertEqual(model.groups.first?.kept, a2, "the fallback order chooses the photo to keep until then")
         XCTAssertEqual(model.copyCountText, L10n.string("duplicates.copy_count \(5)"), "every copy, kept ones too")
-        XCTAssertEqual(model.rankingLine?.title, L10n.string("duplicates.ranking_title"))
-        XCTAssertEqual(
-            model.rankingLine?.detail, L10n.string("duplicates.ranking_progress \(0.formatted()) \(2.formatted())"))
-        XCTAssertEqual(model.rankingLine?.fraction, 0)
+        XCTAssertNil(model.rankingLine, "the ranking of the shown groups runs silently")
         XCTAssertTrue(model.canMerge)
 
         finder.rankGate.open()
         await load.value
         XCTAssertEqual(model.groups.first?.members, [a3, a1, a2])
-        XCTAssertEqual(model.groups.first?.kept, a3)
+        XCTAssertEqual(model.groups.first?.kept, a3, "a checkmark that nobody chose moves once to the ranked photo")
         XCTAssertNil(model.rankingLine)
+    }
+
+    func testScrollingRanksTheShownGroupsWithoutAProgressRow() async {
+        let groups = manyGroups(100)
+        let finder = FakeDuplicateFinder(scans: [.init(groups: groups, coverage: .complete)])
+        let (model, _) = makeModel(finder)
+        await model.load()
+        finder.rankGate.close()
+        model.groupAppeared(groups[80].id)
+        await waitUntil({ finder.rankGate.hasWaiters }, "scrolling ranks")
+
+        XCTAssertNil(model.rankingLine, "the ranking of the groups on screen shows no progress row")
+
+        finder.rankGate.open()
+        await waitUntil({ model.groups.first { $0.id == groups[80].id }?.isRanked == true }, "the facts arrive")
+        XCTAssertNil(model.rankingLine)
+    }
+
+    func testAChosenCheckmarkStaysWhenTheFactsArrive() async {
+        let finder = FakeDuplicateFinder(scans: [.init(groups: [groupA], coverage: .complete)])
+        finder.fallback = ["A": [a1, a2, a3]]
+        finder.ranked = ["A": [a3, a1, a2]]
+        finder.rankGate.close()
+        let (model, _) = makeModel(finder)
+        let load = Task { await model.load() }
+        await waitUntil({ finder.rankGate.hasWaiters }, "the load ranks the groups")
+        model.keep(a2, inGroup: "A")
+
+        finder.rankGate.open()
+        await load.value
+
+        XCTAssertEqual(model.groups.first?.members, [a3, a1, a2], "the ranked order arrives")
+        XCTAssertEqual(model.groups.first?.kept, a2, "the photo that the person chose stays checked")
     }
 
     func testAGroupWhoseFactsCannotBeReadKeepsItsFallbackOrderAndTheOthersAreRanked() async {
@@ -657,7 +687,8 @@ final class ExactDuplicatesModelTests: XCTestCase {
         for _ in 0..<2_000 where finder.rankedGroups.count < 3 { try? await Task.sleep(for: .milliseconds(1)) }
         finder.rankGate.open()
         await merge.value
-        await waitUntil({ model.rankingLine == nil }, "the scroll ranking finishes")
+        await waitUntil(
+            { model.groups.first { $0.id == groups[50].id }?.isRanked == true }, "the scroll ranking finishes")
 
         model.groupAppeared(groups[98].id)
         await waitUntil(

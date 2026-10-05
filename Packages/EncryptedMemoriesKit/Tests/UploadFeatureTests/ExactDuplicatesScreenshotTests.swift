@@ -1,5 +1,8 @@
 #if os(macOS)
     import AppKit
+    import MediaByteCache
+    import MediaCache
+    import PhotoViewerFeature
     import PhotosCore
     import SwiftUI
     import XCTest
@@ -29,7 +32,8 @@
             let states: [(String, ScreenshotFinder)] = [
                 ("groups", ScreenshotFinder(groups: groups, coverage: .complete, build: .none)),
                 ("checking", ScreenshotFinder(groups: [], coverage: .indexing, build: .counted)),
-                ("ranking", ScreenshotFinder(groups: groups, coverage: .complete, build: .counted, holdsRanking: true)),
+                // Merge All waits for the facts of groups that nobody scrolled to; only then a progress row shows.
+                ("merging", ScreenshotFinder(groups: groups, coverage: .complete, build: .counted, holdsRanking: true)),
                 (
                     "unchecked",
                     ScreenshotFinder(groups: groups, coverage: .incomplete(unresolvedCount: 12), build: .none)
@@ -40,6 +44,9 @@
                 let model = ExactDuplicatesModel(finder: finder)
                 let (window, host) = host(model: model)
                 for _ in 0..<200 where !finder.isSettled(model) {
+                    if finder.holdsRanking, model.content == .groups, !model.isMerging {
+                        Task { await model.mergeAll() }
+                    }
                     try await Task.sleep(for: .milliseconds(10))
                 }
                 XCTAssertTrue(finder.isSettled(model), name)
@@ -51,6 +58,47 @@
                     try capture(host, to: url)
                 }
                 window.orderOut(nil)
+            }
+        }
+
+        /// The shared viewer of a group with its filmstrip and Keep This Copy and Merge, on the copy that is not kept.
+        func testRenderTheViewerOfAGroupWithItsMergeTools() async throws {
+            let directory = try outputDirectory()
+            let members = (0..<3).map { PhotoUID(volumeID: "v", nodeID: "photo-\($0)") }
+            let group = ExactDuplicateGroup(contentHash: "A", hashKeyEpoch: "e", members: members)
+            let duplicates = ExactDuplicatesModel(
+                finder: ScreenshotFinder(groups: [group], coverage: .complete, build: .none))
+            await duplicates.load()
+            let items = members.map {
+                PhotoItem(uid: $0, captureTime: Date(timeIntervalSince1970: 1_749_456_000), mediaType: "image/png")
+            }
+            let root = FileManager.default.temporaryDirectory
+                .appendingPathComponent("duplicates-viewer-\(UUID().uuidString)", isDirectory: true)
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: root) }
+            let viewer = PhotoViewerModel(
+                items: items, index: 1,
+                feed: ThumbnailFeed(
+                    cache: ThumbnailCache(namespace: "duplicates-viewer-\(UUID().uuidString)", rootDirectory: root),
+                    loader: ColorThumbnails()),
+                media: ColorMedia())
+            let view = PhotoViewerView(model: viewer, onClose: {}) {
+                ExactDuplicateViewerActions(
+                    model: duplicates, groupID: "A", current: viewer.baseCurrent.uid, onMerge: {})
+            }
+            .frame(width: 1400, height: 900)
+            let host = NSHostingView(rootView: view)
+            host.frame = NSRect(x: 0, y: 0, width: 1400, height: 900)
+            let window = NSWindow(contentRect: host.frame, styleMask: [.titled], backing: .buffered, defer: false)
+            window.contentView = host
+            window.orderFrontRegardless()
+            defer { window.orderOut(nil) }
+            for appearance in [NSAppearance.Name.aqua, .darkAqua] {
+                window.appearance = NSAppearance(named: appearance)
+                try await Task.sleep(for: .milliseconds(1_500))
+                let url = directory.appendingPathComponent(
+                    "duplicates-macos-viewer-\(appearance == .aqua ? "light" : "dark").png")
+                try capture(host, to: url)
             }
         }
 
@@ -85,6 +133,36 @@
             host.cacheDisplay(in: host.bounds, to: bitmap)
             let data = try XCTUnwrap(bitmap.representation(using: .png, properties: [:]))
             try data.write(to: url)
+        }
+    }
+
+    /// A plain color image for each photo, as PNG bytes.
+    private func colorPNG(for uid: PhotoUID, side: Int) -> Data {
+        let hue = Double(uid.nodeID.unicodeScalars.reduce(0) { $0 + Int($1.value) } % 100) / 100
+        let image = NSImage(size: NSSize(width: side, height: side), flipped: false) { rect in
+            NSColor(calibratedHue: hue, saturation: 0.45, brightness: 0.8, alpha: 1).setFill()
+            rect.fill()
+            return true
+        }
+        guard let tiff = image.tiffRepresentation, let bitmap = NSBitmapImageRep(data: tiff),
+            let png = bitmap.representation(using: .png, properties: [:])
+        else { return Data() }
+        return png
+    }
+
+    private struct ColorThumbnails: ThumbnailBatchLoader {
+        func loadThumbnails(
+            for uids: [PhotoUID], onLoaded: @Sendable @escaping (PhotoUID, Data) -> Void
+        ) async -> ThumbnailBatchLoadResult {
+            for uid in uids { onLoaded(uid, colorPNG(for: uid, side: 256)) }
+            return .delivered
+        }
+    }
+
+    private struct ColorMedia: FullMediaProvider {
+        func preview(for uid: PhotoUID) async throws -> Data { colorPNG(for: uid, side: 1_200) }
+        func originalData(for uid: PhotoUID, onProgress: @escaping @Sendable (Double) -> Void) async throws -> Data {
+            colorPNG(for: uid, side: 1_200)
         }
     }
 

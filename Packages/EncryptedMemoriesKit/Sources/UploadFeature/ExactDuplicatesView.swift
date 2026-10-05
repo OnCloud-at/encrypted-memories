@@ -14,6 +14,7 @@ public struct ExactDuplicatesView<Cover: View>: View {
     private let cornerRadius: CGFloat
     private let onOpen: (PhotoUID, String) -> Void
     private let cover: (PhotoUID) -> Cover
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     /// `accent` colors the checkmark and the border of the photo to keep and the progress indicator.
     /// `cornerRadius` is the corner radius of `cover`. `onOpen` receives a photo and the ID of its group.
@@ -185,10 +186,13 @@ public struct ExactDuplicatesView<Cover: View>: View {
                     .accessibilityIdentifier("duplicates.group.\(index)")
                     // Only the groups that the person scrolls to read their facts.
                     .onAppear { model.groupAppeared(group.id) }
+                    .animation(factsAnimation, value: group.isRanked)
+                    .animation(factsAnimation, value: group.kept)
                 } header: {
                     groupHeader(group, index: index)
                 } footer: {
                     groupFooter(group, index: index)
+                        .animation(factsAnimation, value: group.isRanked)
                 }
             }
         }
@@ -201,6 +205,10 @@ public struct ExactDuplicatesView<Cover: View>: View {
                 .frame(maxWidth: .infinity)
         #endif
     }
+
+    /// The facts of a group arrive without a progress row; its badges, its reason, and a moved checkmark fade in.
+    /// Without motion, they appear at once.
+    private var factsAnimation: Animation? { reduceMotion ? nil : .default }
 
     /// The capture date of the group and its Merge button, like a group of Duplicates in Apple Photos.
     private func groupHeader(_ group: ExactDuplicatesModel.Group, index: Int) -> some View {

@@ -372,7 +372,10 @@ final class ExactDuplicateFinderTests: XCTestCase {
         let clock = ContinuousClock()
         let start = clock.now
         let load = Task { await model.load() }
-        for _ in 0..<5_000 where model.rankingLine == nil { try await Task.sleep(for: .milliseconds(1)) }
+        for _ in 0..<5_000 {
+            if await remote.gate.hasWaiters { break }
+            try await Task.sleep(for: .milliseconds(1))
+        }
         let published = clock.now
 
         XCTAssertEqual(model.content, .groups)
@@ -380,7 +383,7 @@ final class ExactDuplicateFinderTests: XCTestCase {
         let beforeRanking = server.readCounts
         XCTAssertEqual(beforeRanking.albumMembers, 0, "no node load before the groups show")
         XCTAssertEqual(beforeRanking.sharingMembers, 0, "no node load before the groups show")
-        XCTAssertNotNil(model.rankingLine)
+        XCTAssertNil(model.rankingLine, "the ranking of the shown pages runs silently")
         XCTAssertEqual(model.totalFreedBytes, 1_500_000, "the manifest knows every size before any node load")
 
         remote.gate.open()
@@ -1042,6 +1045,8 @@ private final class FavoritesGatedRemote: ExactDuplicateRemote, @unchecked Senda
 private actor FinderGate {
     private var isOpen = false
     private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    var hasWaiters: Bool { !waiters.isEmpty }
 
     func pass() async {
         guard !isOpen else { return }

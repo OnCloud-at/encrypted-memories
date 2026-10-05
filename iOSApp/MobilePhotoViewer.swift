@@ -366,11 +366,17 @@ struct MobilePhotoViewer: View {
         .mobileVisibilityPriority(.high)
         ToolbarSpacer(.flexible, placement: .bottomBar)
         ToolbarItem(placement: .bottomBar) {
-            Button(L10n.string("duplicates.merge")) {
+            Button {
                 dismiss()
                 Task { await group.model.merge(groupID: group.groupID) }
+            } label: {
+                // The bars keep a dark scheme over the photo; the label stays white on the tinted glass.
+                Text(L10n.string("duplicates.merge"))
+                    .fontWeight(.semibold)
+                    .foregroundStyle(.white)
             }
             .buttonStyle(.glassProminent)
+            .tint(ProtonColor.primary)
             .disabled(!group.model.canMerge || group.model.group(withID: group.groupID) == nil)
             .accessibilityIdentifier("duplicates.viewer.merge")
         }

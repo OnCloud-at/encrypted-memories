@@ -306,6 +306,9 @@ public final class ExactDuplicatesModel {
     public private(set) var rankingProgress: ExactDuplicateScanProgress?
     /// The message of the last merge, until the person dismisses it.
     public private(set) var notice: ExactDuplicateMergeNotice?
+    /// A merge waits for the facts of groups that nobody scrolled to. Only this ranking shows its progress; the
+    /// ranking of the groups on screen runs silently, and its facts simply appear.
+    private var isRankingForMerge = false
     private var phase = Phase.idle
     /// The last build failed, or it finished without an index.
     private var buildFailed = false
@@ -420,9 +423,9 @@ public final class ExactDuplicatesModel {
         }
     }
 
-    /// The line of a running ranking, for example "40 of 1,545 groups". Nil while no ranking runs.
+    /// The line of the ranking that a merge waits for, for example "40 of 1,545 groups". Nil while no merge waits.
     public var rankingLine: ProgressLine? {
-        guard let rankingProgress, rankingProgress.total > 0 else { return nil }
+        guard isRankingForMerge, let rankingProgress, rankingProgress.total > 0 else { return nil }
         let completed = rankingProgress.completed.formatted()
         let total = rankingProgress.total.formatted()
         return ProgressLine(
@@ -832,10 +835,12 @@ public final class ExactDuplicatesModel {
             let token = UUID()
             rankingToken = token
             rankingProgress = ExactDuplicateScanProgress(completed: 0, total: unranked.count)
+            isRankingForMerge = true
             let apply: @Sendable (ExactDuplicateRankingPage) async -> Void = { [weak self] page in
                 await self?.apply(page, token: token, keepsShown: true)
             }
             await finder.rankMembers(of: unranked, ranked: apply)
+            isRankingForMerge = false
             if rankingToken == token { rankingProgress = nil }
         }
         let selected = requested.compactMap { request in groups.first { $0.id == request.id } }
