@@ -418,6 +418,89 @@ final class ExactDuplicatesModelTests: XCTestCase {
         XCTAssertEqual(finder.rankedGroups.joined().count, 4 * size, "no group is read twice")
     }
 
+    func testABurstOfAllSectionsRanksOnlyAroundTheLastOneWithOneRanking() async {
+        let groups = manyGroups(1_500)
+        let finder = FakeDuplicateFinder(scans: [.init(groups: groups, coverage: .complete)])
+        let (model, _) = makeModel(finder)
+        await model.load()
+        let size = ExactDuplicatesModel.rankingPageSize
+
+        // The macOS list shows every section in one update.
+        for group in groups { model.groupAppeared(group.id) }
+        let lastPage = (groups.count - 1) / size * size
+        let expected = groups.prefix(2 * size).map(\.id) + groups[lastPage...].map(\.id)
+        await waitUntil({ model.groups.filter(\.isRanked).count == expected.count }, "the last shown page ranks")
+        try? await Task.sleep(for: ExactDuplicatesModel.appearancePause * 3)
+        XCTAssertEqual(Set(finder.rankedGroups.joined()), Set(expected))
+        XCTAssertEqual(finder.rankedGroups.joined().count, expected.count, "no group is read twice")
+        XCTAssertEqual(finder.maximumConcurrentRankings, 1, "one ranking at a time")
+        XCTAssertNil(model.rankingLine, "the ranking finished")
+    }
+
+    func testAScrollThatStopsAcrossTwoPagesRanksAroundTheFirstAndTheLastShownGroup() async {
+        let groups = manyGroups(1_500)
+        let finder = FakeDuplicateFinder(scans: [.init(groups: groups, coverage: .complete)])
+        let (model, _) = makeModel(finder)
+        await model.load()
+        let size = ExactDuplicatesModel.rankingPageSize
+
+        // The scroll stops with the end of page 2 and the start of page 3 visible.
+        for index in (3 * size - 3)...(3 * size) { model.groupAppeared(groups[index].id) }
+        await waitUntil({ model.groups.filter(\.isRanked).count == 5 * size }, "pages 2, 3, and 4 rank")
+        XCTAssertEqual(Set(finder.rankedGroups.joined()), Set(groups.prefix(5 * size).map(\.id)))
+        XCTAssertTrue(model.groups[3 * size - 3].isRanked, "the first shown group ranks")
+    }
+
+    func testAClosedScreenStopsTheRankingAndRanksNoGroupItShowedBefore() async {
+        let groups = manyGroups(1_500)
+        let finder = FakeDuplicateFinder(scans: [.init(groups: groups, coverage: .complete)])
+        let (model, _) = makeModel(finder)
+        await model.load()
+        let size = ExactDuplicatesModel.rankingPageSize
+        finder.rankGate.close()
+        model.groupAppeared(groups[10 * size].id)
+        await waitUntil({ finder.rankGate.hasWaiters }, "page 10 ranks")
+        model.groupAppeared(groups[20 * size].id)
+
+        model.screenDisappeared()
+        finder.rankGate.open()
+        try? await Task.sleep(for: ExactDuplicatesModel.appearancePause * 3)
+        await waitUntil({ model.rankingLine == nil }, "the ranking stops")
+        let requested = Set(finder.rankedGroups.joined())
+        XCTAssertFalse(requested.contains(groups[11 * size].id), "the running ranking reads no further page")
+        XCTAssertFalse(requested.contains(groups[20 * size].id), "a group shown before the close does not rank")
+    }
+
+    func testTheRankingQueueKeepsTheNewestPagesAndAnOlderPageRanksWhenShownAgain() async {
+        let groups = manyGroups(1_500)
+        let finder = FakeDuplicateFinder(scans: [.init(groups: groups, coverage: .complete)])
+        let (model, _) = makeModel(finder)
+        await model.load()
+        let size = ExactDuplicatesModel.rankingPageSize
+        func progress(_ total: Int) -> String {
+            L10n.string("duplicates.ranking_progress \(0.formatted()) \(total.formatted())")
+        }
+        finder.rankGate.close()
+        model.groupAppeared(groups[10 * size].id)
+        await waitUntil({ finder.rankGate.hasWaiters }, "page 10 ranks")
+        model.groupAppeared(groups[20 * size].id)
+        await waitUntil({ model.rankingLine?.detail == progress(4 * size) }, "pages 20 and 21 wait")
+        model.groupAppeared(groups[30 * size].id)
+        // Pages 11, 20, 21, 30, and 31 exceed the queue; page 11 gives way.
+        await waitUntil({ model.rankingLine?.detail == progress(5 * size) }, "pages 30 and 31 wait")
+        finder.rankGate.open()
+        await waitUntil({ model.rankingLine == nil }, "the ranking finishes")
+        let ranked = Set(model.groups.filter(\.isRanked).map(\.id))
+        for page in [0, 1, 10, 20, 21, 30, 31] {
+            XCTAssertTrue(
+                groups[(page * size)..<((page + 1) * size)].allSatisfy { ranked.contains($0.id) }, "page \(page)")
+        }
+        XCTAssertFalse(ranked.contains(groups[11 * size].id), "the oldest queued page gave way")
+
+        model.groupAppeared(groups[11 * size].id)
+        await waitUntil({ model.groups[11 * size].isRanked }, "page 11 ranks when shown again")
+    }
+
     func testScrollingStillRanksAfterAMergeRanAlongsideTheScrollRanking() async {
         let groups = manyGroups(100)
         let finder = FakeDuplicateFinder(scans: [.init(groups: groups, coverage: .complete)])
@@ -719,6 +802,8 @@ private final class FakeDuplicateFinder: ExactDuplicateMerging, @unchecked Senda
     private var _batches: [[String]] = []
     private var _buildCalls = 0
     private var _rankedGroups: [[String]] = []
+    private var _activeRankings = 0
+    private var _maximumConcurrentRankings = 0
     var scanProgress: [ExactDuplicateScanProgress] = []
     var fallback: [String: [PhotoUID]] = [:]
     /// Groups whose facts cannot be read.
@@ -752,6 +837,7 @@ private final class FakeDuplicateFinder: ExactDuplicateMerging, @unchecked Senda
     var batches: [[String]] { lock.withLock { _batches } }
     var buildCalls: Int { lock.withLock { _buildCalls } }
     var rankedGroups: [[String]] { lock.withLock { _rankedGroups } }
+    var maximumConcurrentRankings: Int { lock.withLock { _maximumConcurrentRankings } }
 
     func duplicateGroups(
         progress: @escaping @Sendable (ExactDuplicateScanProgress) async -> Void
@@ -791,7 +877,10 @@ private final class FakeDuplicateFinder: ExactDuplicateMerging, @unchecked Senda
         lock.withLock {
             _rankCalls += 1
             _rankedGroups.append(groups.map(\.id))
+            _activeRankings += 1
+            _maximumConcurrentRankings = max(_maximumConcurrentRankings, _activeRankings)
         }
+        defer { lock.withLock { _activeRankings -= 1 } }
         await rankGate.pass()
         let page = lock.withLock { () -> ExactDuplicateRankingPage in
             guard rankError == nil else { return ExactDuplicateRankingPage(members: [:], groupCount: groups.count) }

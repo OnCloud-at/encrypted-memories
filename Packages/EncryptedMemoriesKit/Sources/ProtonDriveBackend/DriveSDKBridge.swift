@@ -1639,25 +1639,11 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     static func concurrentMetadataBatches<Answer: Sendable>(
         _ linkIDs: [String], read: @escaping @Sendable (_ batch: [String]) async throws -> Answer
     ) async throws -> [Answer] {
-        let batches = metadataBatches(linkIDs)
-        return try await withThrowingTaskGroup(of: (Int, Answer).self) { group in
-            var next = 0
-            func submitNext() {
-                guard next < batches.count else { return }
-                let index = next
-                next += 1
-                group.addTask {
-                    try Task.checkCancellation()
-                    return (index, try await read(batches[index]))
-                }
-            }
-            for _ in 0..<min(ProtonUploadDedupeService.remoteMetadataRequestConcurrency, batches.count) { submitNext() }
-            var answers = [Answer?](repeating: nil, count: batches.count)
-            while let (index, answer) = try await group.next() {
-                answers[index] = answer
-                submitNext()
-            }
-            return answers.compactMap { $0 }
+        try await BoundedConcurrency.throwingMap(
+            metadataBatches(linkIDs), limit: ProtonUploadDedupeService.remoteMetadataRequestConcurrency
+        ) { batch in
+            try Task.checkCancellation()
+            return try await read(batch)
         }
     }
 

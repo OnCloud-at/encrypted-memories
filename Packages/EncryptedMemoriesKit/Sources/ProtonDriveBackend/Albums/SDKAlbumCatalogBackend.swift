@@ -477,37 +477,14 @@ struct SDKAlbumCatalogBackend: AlbumCatalogBackend {
     }
 
     private func loadNodes(_ uids: [SDKNodeUid]) async throws -> [(SDKNodeUid, DriveNode?)] {
-        guard !uids.isEmpty else { return [] }
-        return try await withThrowingTaskGroup(
-            of: (Int, SDKNodeUid, DriveNode?).self,
-            returning: [(SDKNodeUid, DriveNode?)].self
-        ) { group in
-            var nextIndex = 0
-            var ordered = [(SDKNodeUid, DriveNode?)?](repeating: nil, count: uids.count)
-
-            func addNext() {
-                guard nextIndex < uids.count else { return }
-                let index = nextIndex
-                let uid = uids[index]
-                nextIndex += 1
-                group.addTask {
-                    let node = try await SDKCancellableOperation.run { token in
-                        try await client.getNode(nodeUid: uid, cancellationToken: token)
-                    } cancel: { token in
-                        try? await client.cancelGetNode(cancellationToken: token)
-                    }
-                    return (index, uid, node)
-                }
+        let client = client
+        return try await BoundedConcurrency.throwingMap(uids, limit: maximumConcurrentNodeLoads) { uid in
+            let node = try await SDKCancellableOperation.run { token in
+                try await client.getNode(nodeUid: uid, cancellationToken: token)
+            } cancel: { token in
+                try? await client.cancelGetNode(cancellationToken: token)
             }
-
-            for _ in 0..<min(maximumConcurrentNodeLoads, uids.count) {
-                addNext()
-            }
-            while let (index, uid, node) = try await group.next() {
-                ordered[index] = (uid, node)
-                addNext()
-            }
-            return ordered.compactMap { $0 }
+            return (uid, node)
         }
     }
 

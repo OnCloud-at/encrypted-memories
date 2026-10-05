@@ -831,32 +831,17 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
         links.reserveCapacity(ids.count)
         var endpointFailureIDs: Set<String> = []
 
-        await withTaskGroup(of: ([AlbumPhotoLinkBody], [String]).self) { group in
-            var nextChunk = 0
-
-            func submitNext() {
-                guard nextChunk < chunks.count else { return }
-                let chunk = chunks[nextChunk]
-                nextChunk += 1
-                group.addTask {
-                    do {
-                        try Task.checkCancellation()
-                        return (try await session.fetchPhotoLinksMetadata(shareID: shareID, linkIDs: chunk), [])
-                    } catch {
-                        return ([], chunk)
-                    }
-                }
+        let reads = await BoundedConcurrency.map(chunks, limit: Self.remoteMetadataRequestConcurrency) { chunk in
+            Task.isCancelled ? nil : try? await session.fetchPhotoLinksMetadata(shareID: shareID, linkIDs: chunk)
+        }
+        // A failed or unstarted chunk becomes endpoint failures; the targeted re-fetch below tries it once more.
+        for (chunk, read) in zip(chunks, reads) {
+            guard let batch = read ?? nil else {
+                endpointFailureIDs.formUnion(chunk)
+                continue
             }
-
-            for _ in 0..<min(Self.remoteMetadataRequestConcurrency, chunks.count) {
-                submitNext()
-            }
-            while let (batch, failedIDs) = await group.next() {
-                for link in batch {
-                    if let id = link.linkID { links[id] = link }
-                }
-                endpointFailureIDs.formUnion(failedIDs)
-                submitNext()
+            for link in batch {
+                if let id = link.linkID { links[id] = link }
             }
         }
 
