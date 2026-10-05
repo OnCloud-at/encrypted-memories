@@ -183,6 +183,9 @@ public final class PhotoLibraryBackupController {
     private var autoResumeTask: Task<Void, Never>?
     /// Follows the shared runtime network signal, so a backup that waits for Wi-Fi resumes on Wi-Fi or Ethernet.
     private var networkObservationTask: Task<Void, Never>?
+    /// Tells the pending grid that the catalog took in changes of the photo library, or that the app became active,
+    /// so the excluded list shows only photos that still exist. Set by `PendingGridSession`.
+    @ObservationIgnored var onLibraryChange: (@MainActor () -> Void)?
     /// The runner ended the current pass waiting for Wi-Fi. Reset when a pass starts.
     private var passWaitedForWiFi = false
     private var consecutiveNoProgressRuns = 0
@@ -443,6 +446,7 @@ public final class PhotoLibraryBackupController {
     /// Runs a pass when the app becomes active. An edit in Photos while this app was in the background may reach
     /// the app without a change notification; the pass reads the persistent change history since its last run.
     public func applicationDidBecomeActive() {
+        onLibraryChange?()
         guard isEnabled, !isUserPaused, !isSyncing else { return }
         syncNow()
     }
@@ -938,6 +942,7 @@ public final class PhotoLibraryBackupController {
             let targeted = Array(Set(changes.changedIdentifiers + changes.deletedIdentifiers))
             if !targeted.isEmpty {
                 _ = try await sync.run(engine: engine, identifiers: targeted)
+                await noteLibraryChange()
             }
         }
 
@@ -948,6 +953,7 @@ public final class PhotoLibraryBackupController {
                 }
             }
             _ = try await sync.run(engine: engine, identifiers: nil)
+            await noteLibraryChange()
         }
     }
 
@@ -1262,6 +1268,10 @@ public final class PhotoLibraryBackupController {
 
     // MARK: - Change-driven incremental sync (foreground sessions)
 
+    private func noteLibraryChange() {
+        onLibraryChange?()
+    }
+
     private func startObservingChanges() {
         monitor.startObserving { [weak self] in
             Task { @MainActor in self?.scheduleChangeDrivenSync() }
@@ -1339,7 +1349,7 @@ public final class PhotoLibraryBackupController {
         else { return }
         startPreparedInstantWork(
             prepare: { await Self.prepareChangesOffMainActor(monitor) },
-            consume: { prepared in
+            consume: { [weak self] prepared in
                 // An expired token is covered by the current pass's full scan. This path never
                 // commits a token; the active pass remains its sole owner.
                 guard !prepared.changes.requiresFullRescan else { return }
@@ -1352,6 +1362,7 @@ public final class PhotoLibraryBackupController {
                     }
                 )
                 _ = try? await sync.run(engine: engine, identifiers: targeted)
+                await self?.noteLibraryChange()
             }
         )
     }

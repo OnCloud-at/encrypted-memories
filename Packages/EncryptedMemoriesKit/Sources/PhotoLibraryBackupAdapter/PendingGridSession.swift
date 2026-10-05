@@ -196,6 +196,10 @@ public final class PendingGridSession {
         started = true
         observeBackupState()
         let coordinator = self.coordinator
+        // Photos deleted in Apple Photos, or files deleted from a watched folder, leave the excluded list.
+        photoBackup?.onLibraryChange = {
+            Task { await coordinator.noteLibraryChanged() }
+        }
         snapshotTask = Task { [weak self] in
             await coordinator.start()
             for await snapshot in coordinator.snapshots {
@@ -312,6 +316,7 @@ public final class PendingGridSession {
     public func close() async {
         snapshotTask?.cancel()
         snapshotTask = nil
+        photoBackup?.onLibraryChange = nil
         await coordinator.close()
         presenter.reset()
         pendingSnapshot = .empty

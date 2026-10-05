@@ -47,6 +47,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         relations: (any UploadDuplicateChecking)? = nil,
         sourceKind: UploadSourceIdentity.Kind = .photoLibraryAsset,
         membershipInterval: Duration = .zero,
+        libraryChangeDelay: Duration = .zero,
         sleep: @Sendable @escaping (Duration) async throws -> Void = { try await Task.sleep(for: $0) }
     ) -> PendingBackupCoordinator {
         PendingBackupCoordinator(
@@ -63,7 +64,8 @@ final class PendingBackupCoordinatorTests: XCTestCase {
                 progressInterval: .milliseconds(1),
                 doneLinger: .milliseconds(20),
                 checkmarkDuration: checkmarkDuration,
-                uncheckedAdmissionLimit: uncheckedAdmissionLimit
+                uncheckedAdmissionLimit: uncheckedAdmissionLimit,
+                libraryChangeDelay: libraryChangeDelay
             ),
             now: { [date] in date },
             sleep: sleep
@@ -908,6 +910,72 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         XCTAssertEqual(snapshot.excludedTiles.map(\.item.uid), [uid])
     }
 
+    // MARK: - Excluded list follows the library
+
+    /// The person excludes two photos, opens the excluded list, deletes both photos in Apple Photos, and returns to
+    /// the app. Both leave the list without a relaunch; a photo that still exists stays.
+    func testPhotosDeletedInApplePhotosLeaveTheExcludedListAfterALibraryChange() async throws {
+        for (offset, id) in ["first", "second", "kept"].enumerated() {
+            enqueue(id, state: .queuedForUpload, captureOffset: TimeInterval(offset))
+        }
+        await coordinator.start()
+        let uids = ["first", "second", "kept"].map { PhotoUID(localPending: .photoLibrary, identifier: $0) }
+        await coordinator.exclude(uids)
+        var snapshot = await coordinator.currentSnapshot()
+        XCTAssertEqual(Set(snapshot.excludedTiles.map(\.item.uid)), Set(uids))
+
+        metadata.remove(key("first"))
+        metadata.remove(key("second"))
+        await coordinator.noteLibraryChanged()
+
+        let kept = PhotoUID(localPending: .photoLibrary, identifier: "kept")
+        snapshot = await waitForSnapshot("the deleted photos leave the excluded list") {
+            $0.excludedTiles.map(\.item.uid) == [kept]
+        }
+        XCTAssertEqual(snapshot.trashTiles.map(\.item.uid), [kept], "\"Recently Deleted\" drops them as well")
+    }
+
+    func testABurstOfLibraryChangesSharesOneCheck() async throws {
+        await coordinator.close()
+        let gate = PendingMembershipSleepGate()
+        let delay = Duration.seconds(3600)
+        coordinator = makeCoordinator(libraryChangeDelay: delay) { duration in
+            if duration == delay { await gate.wait() } else { try await Task.sleep(for: duration) }
+        }
+        enqueue("gone", state: .queuedForUpload)
+        await coordinator.start()
+        await coordinator.exclude([PhotoUID(localPending: .photoLibrary, identifier: "gone")])
+        let readsBefore = metadata.reads(of: key("gone"))
+        metadata.remove(key("gone"))
+
+        for _ in 0..<50 { await coordinator.noteLibraryChanged() }
+        await gate.release()
+
+        await waitForSnapshot("the check ran") { $0.excludedTiles.isEmpty }
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertEqual(metadata.reads(of: key("gone")) - readsBefore, 1, "a burst of changes shares one check")
+    }
+
+    func testALibraryChangeDuringACheckRunsOneMoreCheck() async throws {
+        enqueue("late", state: .queuedForUpload)
+        await coordinator.start()
+        await coordinator.exclude([PhotoUID(localPending: .photoLibrary, identifier: "late")])
+        let readsBefore = metadata.reads(of: key("late"))
+        let gate = LookupGate()
+        metadata.fetchGate = { await gate.pass() }
+
+        await coordinator.noteLibraryChanged()
+        await gate.entered()
+        // The photo is deleted while the first check reads; that check still saw it.
+        metadata.remove(key("late"))
+        for _ in 0..<3 { await coordinator.noteLibraryChanged() }
+        gate.open()
+
+        await waitForSnapshot("the second check drops the photo") { $0.excludedTiles.isEmpty }
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertEqual(metadata.reads(of: key("late")) - readsBefore, 2, "changes during a check share one more check")
+    }
+
     func testProgressTicksKeepTheTrashListUntilAPhotoExpires() async throws {
         await coordinator.close()
         let clock = MutableClock(date)
@@ -1403,6 +1471,18 @@ private final class FakePendingMetadata: PendingSourceMetadataProviding, @unchec
     private let lock = NSLock()
     private var values: [PendingSourceKey: PendingPresentationMetadata] = [:]
     private var requested = Set<PendingSourceKey>()
+    private var readCounts: [PendingSourceKey: Int] = [:]
+    private var gate: (@Sendable () async -> Void)?
+
+    /// Runs after a read took its answer and before it returns.
+    var fetchGate: (@Sendable () async -> Void)? {
+        get { lock.withLock { gate } }
+        set { lock.withLock { gate = newValue } }
+    }
+
+    func reads(of key: PendingSourceKey) -> Int {
+        lock.withLock { readCounts[key, default: 0] }
+    }
 
     func wasRequested(_ key: PendingSourceKey) -> Bool {
         lock.withLock { requested.contains(key) }
@@ -1417,10 +1497,13 @@ private final class FakePendingMetadata: PendingSourceMetadataProviding, @unchec
     }
 
     func metadata(for keys: [PendingSourceKey]) async -> [PendingSourceKey: PendingPresentationMetadata] {
-        lock.withLock {
+        let (answer, gate) = lock.withLock {
             requested.formUnion(keys)
-            return values.filter { keys.contains($0.key) }
+            for key in Set(keys) { readCounts[key, default: 0] += 1 }
+            return (values.filter { keys.contains($0.key) }, gate)
         }
+        await gate?()
+        return answer
     }
 }
 

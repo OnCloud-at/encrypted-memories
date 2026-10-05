@@ -599,6 +599,39 @@ final class DeletedPhotoTests: XCTestCase {
         await controller.shutdown()
     }
 
+    /// "Back Up Again" on an excluded photo that was deleted in Apple Photos meanwhile succeeds and queues nothing,
+    /// so the restore ends and the entry leaves the excluded list.
+    @MainActor
+    func testReturningAPhotoDeletedInApplePhotosQueuesNothing() async throws {
+        let suite = "deletion-return-gone-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let info = PhotoBackupAssetInfo(
+            localIdentifier: source.identifier, creationDate: date, modificationDate: date,
+            pixelWidth: 4032, pixelHeight: 3024, durationSeconds: 0, isLivePhoto: false, isVideo: false,
+            resources: [.init(role: .originalPhoto, originalFilename: "photo.heic", mimeType: "image/heic")])
+        let catalog = try XCTUnwrap(
+            PhotoLibraryCatalogManifestStore(
+                url: directory.appendingPathComponent(PhotoLibraryCatalogManifestStore.databaseFileName)))
+        _ = catalog.upsert(PhotoLibraryCatalogMapper.entry(for: info, observedAt: date))
+        XCTAssertTrue(catalog.markRemoved([source.identifier], removedAt: date.addingTimeInterval(60)).succeeded)
+        catalog.close()
+        let controller = PhotoLibraryBackupController(
+            configuration: .init(accountDataDirectory: directory, databasePolicy: .conservative, defaults: defaults),
+            identityResolver: FakeIdentityResolver(), uploader: MockUploader(), replacementJournal: journal)
+
+        let returned = await controller.returnToBackup(identifiers: [source.identifier])
+
+        XCTAssertTrue(returned, "a photo that is gone needs nothing, so the restore completes")
+        let queue = try XCTUnwrap(
+            UploadBackupSyncQueueManifestStore(
+                url: directory.appendingPathComponent(PhotoLibraryBackupController.queueDatabaseFileName)))
+        defer { queue.close() }
+        XCTAssertTrue(queue.rows(kind: .photoLibraryAsset, identifiers: [source.identifier]).isEmpty)
+        XCTAssertFalse(controller.isSyncing)
+        await controller.shutdown()
+    }
+
     /// The person deletes a backed-up photo, empties the Proton trash, and restores the photo in the app. The
     /// backup state from before the delete must not settle the restored photo as backed up.
     /// Mutation: drop the `removeRecords` loop in `returnToBackup`; the stale completed record stays.

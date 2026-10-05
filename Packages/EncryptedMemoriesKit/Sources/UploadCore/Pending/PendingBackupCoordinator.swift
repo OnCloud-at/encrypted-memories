@@ -26,6 +26,9 @@ public actor PendingBackupCoordinator {
         /// "Zuletzt gelöscht" keeps deleted pending photos as long as the Proton trash keeps photos.
         public var trashRetention: TimeInterval
         public var acknowledgedHandoffRetention: TimeInterval
+        /// How long a change of the photo library waits before the excluded photos are checked again. A burst of
+        /// changes, such as a large import, shares one check.
+        public var libraryChangeDelay: Duration
 
         public init(
             membershipInterval: Duration = .seconds(1),
@@ -34,7 +37,8 @@ public actor PendingBackupCoordinator {
             checkmarkDuration: Duration = .seconds(1),
             uncheckedAdmissionLimit: Int = 64,
             trashRetention: TimeInterval = 30 * 24 * 60 * 60,
-            acknowledgedHandoffRetention: TimeInterval = 7 * 24 * 60 * 60
+            acknowledgedHandoffRetention: TimeInterval = 7 * 24 * 60 * 60,
+            libraryChangeDelay: Duration = .milliseconds(500)
         ) {
             self.membershipInterval = membershipInterval
             self.progressInterval = progressInterval
@@ -43,6 +47,7 @@ public actor PendingBackupCoordinator {
             self.uncheckedAdmissionLimit = uncheckedAdmissionLimit
             self.trashRetention = trashRetention
             self.acknowledgedHandoffRetention = acknowledgedHandoffRetention
+            self.libraryChangeDelay = libraryChangeDelay
         }
     }
 
@@ -127,6 +132,10 @@ public actor PendingBackupCoordinator {
     private var actionsRunning = false
     private var actionsAgain = false
     private var actionTimer: Task<Void, Never>?
+    /// The check of the excluded photos that a library change started, and whether a change arrived while it read.
+    private var excludedCheckTask: Task<Void, Never>?
+    private var excludedCheckReading = false
+    private var excludedCheckAgain = false
 
     public init(
         store: PendingBackupManifestStore,
@@ -226,6 +235,7 @@ public actor PendingBackupCoordinator {
         progressPublishTask?.cancel()
         reconcileTimer?.cancel()
         actionTimer?.cancel()
+        excludedCheckTask?.cancel()
         snapshotContinuation.finish()
     }
 
@@ -464,6 +474,34 @@ public actor PendingBackupCoordinator {
             dirty.insert(key)
         }
         scheduleMembershipPublish()
+    }
+
+    /// The photo library or a watched folder changed, or the app became active. Excluded photos that no longer
+    /// exist leave the excluded list. Changes during the delay share one check; changes during a check run one more.
+    public func noteLibraryChanged() {
+        guard started, !closed else { return }
+        if excludedCheckReading { excludedCheckAgain = true }
+        guard excludedCheckTask == nil else { return }
+        let delay = configuration.libraryChangeDelay
+        excludedCheckTask = Task { [weak self, sleep] in
+            if delay > .zero { try? await sleep(delay) }
+            await self?.checkExcludedAfterLibraryChange()
+        }
+    }
+
+    private func checkExcludedAfterLibraryChange() async {
+        guard !Task.isCancelled, !closed else { return }
+        excludedCheckReading = true
+        excludedCheckAgain = false
+        await refreshExcludedAccessibility()
+        excludedCheckReading = false
+        excludedCheckTask = nil
+        guard !closed else { return }
+        scheduleMembershipPublish()
+        if excludedCheckAgain {
+            excludedCheckAgain = false
+            noteLibraryChanged()
+        }
     }
 
     // MARK: - Queue and runner events
@@ -865,11 +903,18 @@ public actor PendingBackupCoordinator {
     private func refreshExcludedAccessibility() async {
         let excluded = sourceStates.values.filter { $0.desired == .excluded }.map(\.key)
         guard !excluded.isEmpty else {
-            excludedAccessible = []
+            if !excludedAccessible.isEmpty {
+                excludedAccessible = []
+                listsDirty = true
+            }
             return
         }
         let accessible = await metadataProvider.metadata(for: excluded)
-        excludedAccessible = Set(accessible.keys)
+        guard !closed else { return }
+        // A photo excluded during the read keeps the answer that its exclusion stored.
+        let checked = excludedAccessible.subtracting(excluded).union(accessible.keys)
+        guard checked != excludedAccessible else { return }
+        excludedAccessible = checked
         listsDirty = true
     }
 
