@@ -12,6 +12,9 @@ public enum SupportDiagnosticsExporter {
             let networkReachable: Bool
             let networkConstrained: Bool
             let networkExpensive: Bool
+            /// Interface types only, for example ["cellular", "other"]; never names or addresses.
+            let networkUsedInterfaces: [String]
+            let networkAvailableInterfaces: [String]
             let executionOpportunity: String
             let visibleMediaDemand: Bool
             let activeUserInteraction: Bool
@@ -93,6 +96,8 @@ public enum SupportDiagnosticsExporter {
                 networkReachable: snapshot.network.isReachable,
                 networkConstrained: snapshot.network.isConstrained,
                 networkExpensive: snapshot.network.isExpensive,
+                networkUsedInterfaces: snapshot.network.usedInterfaces.map(\.rawValue).sorted(),
+                networkAvailableInterfaces: snapshot.network.availableInterfaces.map(\.rawValue).sorted(),
                 executionOpportunity: String(describing: snapshot.executionOpportunity),
                 visibleMediaDemand: snapshot.hasVisibleMediaDemand,
                 activeUserInteraction: snapshot.hasActiveUserInteraction,

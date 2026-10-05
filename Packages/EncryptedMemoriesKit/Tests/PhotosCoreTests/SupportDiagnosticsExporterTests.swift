@@ -116,7 +116,9 @@ final class SupportDiagnosticsExporterTests: XCTestCase {
                 thermalLevel: .serious,
                 memoryHeadroom: .constrained,
                 isLowPowerMode: true,
-                network: LibraryNetworkState(isReachable: false, isConstrained: true, isExpensive: true)
+                network: LibraryNetworkState(
+                    isReachable: false, isConstrained: true, isExpensive: true,
+                    usedInterfaces: [.other], availableInterfaces: [.other, .cellular])
             ))
         let coordinator = LibraryResourceCoordinator(runtimeState: runtime)
 
@@ -134,6 +136,38 @@ final class SupportDiagnosticsExporterTests: XCTestCase {
         XCTAssertTrue(text.contains("serious"))
         XCTAssertFalse(text.contains("/private/photo"))
         XCTAssertFalse(text.contains("user content"))
+        let runtimeSection = try XCTUnwrap(
+            (try JSONSerialization.jsonObject(with: data) as? [String: Any])?["runtime"] as? [String: Any])
+        XCTAssertEqual(runtimeSection["networkUsedInterfaces"] as? [String], ["other"])
+        XCTAssertEqual(runtimeSection["networkAvailableInterfaces"] as? [String], ["cellular", "other"])
+    }
+
+    /// The VPN rule needs the used and available interface types from the owner's device. Types only.
+    func testResourceStateEventCarriesTheNetworkInterfaceTypes() async throws {
+        let diagnostics = PhotoDiagnostics.shared
+        diagnostics.resetForTests()
+        defer { diagnostics.resetForTests() }
+        let runtime = LibraryRuntimeState()
+        let coordinator = LibraryResourceCoordinator(runtimeState: runtime)
+        await coordinator.startObserving()
+
+        runtime.update {
+            $0.network = LibraryNetworkState(
+                path: LibraryNetworkPath(
+                    isSatisfied: true, usedInterfaces: [.other], availableInterfaces: [.other, .cellular]))
+        }
+
+        var event: SupportDiagnosticEvent?
+        let deadline = Date().addingTimeInterval(2)
+        while event == nil, Date() < deadline {
+            event = diagnostics.supportSnapshot().events.last {
+                $0.category == "ResourceState" && $0.fields["networkAvailableInterfaces"] == "cellular,other"
+            }
+            if event == nil { try await Task.sleep(for: .milliseconds(5)) }
+        }
+        let fields = try XCTUnwrap(event?.fields)
+        XCTAssertEqual(fields["networkInterfaces"], "other")
+        XCTAssertEqual(fields["networkExpensive"], "true")
     }
 
     func testMLIndexQuantumExportsOnlyTechnicalAllowlistedFields() {

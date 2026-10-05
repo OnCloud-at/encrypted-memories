@@ -610,8 +610,8 @@ public final class PhotoDiagnostics: @unchecked Sendable {
         switch event {
         case "ResourceState":
             allowedFields = [
-                "execution", "headroom", "lowPower", "memory", "networkConstrained",
-                "networkExpensive", "networkReachable", "recoveryPending", "thermal",
+                "execution", "headroom", "lowPower", "memory", "networkAvailableInterfaces", "networkConstrained",
+                "networkExpensive", "networkInterfaces", "networkReachable", "recoveryPending", "thermal",
                 "userInteraction", "visibleDemand",
             ]
         case "ResourcePermit":

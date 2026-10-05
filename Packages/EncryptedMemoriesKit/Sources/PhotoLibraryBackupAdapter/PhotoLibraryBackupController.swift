@@ -298,6 +298,7 @@ public final class PhotoLibraryBackupController {
                 editReplacement: editReplacement,
                 configuration: .init(retry: retryPolicy),
                 throttleInputs: runtimeSignals.current,
+                runtimeChanges: runtimeSignals.updates,
                 events: pendingRecorder
             )
         } else {

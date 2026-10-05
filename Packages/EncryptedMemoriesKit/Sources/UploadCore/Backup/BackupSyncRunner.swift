@@ -84,6 +84,9 @@ public actor BackupSyncRunner {
     private let resourceCoordinator: LibraryResourceCoordinator
     private let configuration: Configuration
     private let throttleInputs: @Sendable () -> BackupThrottleInputs
+    /// Pushed runtime changes, such as a new network path. A change that makes the backup wait for Wi-Fi stops the
+    /// transfers that already run, so their bytes do not continue on cellular data.
+    private let runtimeChanges: (@Sendable () -> AsyncStream<LibraryRuntimeSnapshot>)?
     private let clock: any BackupSchedulerClock
     private let now: @Sendable () -> Date
 
@@ -154,6 +157,7 @@ public actor BackupSyncRunner {
         resourceCoordinator: LibraryResourceCoordinator = .shared,
         configuration: Configuration = Configuration(),
         throttleInputs: @Sendable @escaping () -> BackupThrottleInputs = { .unconstrained },
+        runtimeChanges: (@Sendable () -> AsyncStream<LibraryRuntimeSnapshot>)? = nil,
         clock: any BackupSchedulerClock = BackupContinuousClock(),
         events: (any BackupItemEventSink)? = nil,
         now: @Sendable @escaping () -> Date = { Date() }
@@ -169,6 +173,7 @@ public actor BackupSyncRunner {
         self.resourceCoordinator = resourceCoordinator
         self.configuration = configuration
         self.throttleInputs = throttleInputs
+        self.runtimeChanges = runtimeChanges
         self.clock = clock
         self.now = now
     }
@@ -289,6 +294,8 @@ public actor BackupSyncRunner {
             removedSources = []
             emitProgress()
         }
+        let runtimeWatch = watchRuntimeChanges()
+        defer { runtimeWatch?.cancel() }
 
         // Crash recovery first: anything still marked active predates this run and must become
         // runnable again before this runner atomically claims new work.
@@ -467,6 +474,29 @@ public actor BackupSyncRunner {
     }
 
     // MARK: - Scheduling
+
+    private func watchRuntimeChanges() -> Task<Void, Never>? {
+        guard let runtimeChanges else { return nil }
+        let changes = runtimeChanges()
+        return Task { [weak self] in
+            for await _ in changes {
+                guard let self else { return }
+                await self.stopTransfersThatMustWaitForWiFi()
+            }
+        }
+    }
+
+    /// Cancels the running transfers through the stop path, without ending the pass. Each row returns to the queue
+    /// without an attempt, and the next wave waits for Wi-Fi.
+    private func stopTransfersThatMustWaitForWiFi() async {
+        guard isRunning, !inFlightJoins.isEmpty, throttleInputs().waitsForWiFi else { return }
+        let joins = Array(inFlightJoins.values)
+        await withTaskGroup(of: Void.self) { group in
+            for join in joins {
+                group.addTask { await join.cancelAndJoin() }
+            }
+        }
+    }
 
     private func setRemoteIndexPreparation(
         _ value: UploadRemoteIndexPreparationProgress,
@@ -764,7 +794,11 @@ public actor BackupSyncRunner {
             return
         } catch {
             let current = queue.entry(for: entry.source, revision: entry.revision)?.state ?? persistedState
-            if stopRequested { revert(entry, from: current) } else { retryOrPark(entry, from: current, error: error) }
+            if stopRequested || failedWhileWaitingForWiFi() {
+                revert(entry, from: current)
+            } else {
+                retryOrPark(entry, from: current, error: error)
+            }
             return
         }
 
@@ -911,6 +945,21 @@ public actor BackupSyncRunner {
         }
     }
 
+    /// Reads the network right before a transfer. The claim can be minutes earlier, for example while an original
+    /// downloads from iCloud, and the device can have left Wi-Fi meanwhile. A transfer that must wait for Wi-Fi does
+    /// not start; its row returns to the queue without spending an attempt, and the pass then waits for Wi-Fi.
+    private func transferNetwork() throws -> BackupThrottleInputs {
+        let inputs = throttleInputs()
+        guard !inputs.waitsForWiFi else { throw CancellationError() }
+        return inputs
+    }
+
+    /// A transfer that fails while the backup must wait for Wi-Fi is not the photo's fault: the system refuses the
+    /// bytes on cellular data, or the network changed under the transfer. The row waits for Wi-Fi like a stop.
+    private func failedWhileWaitingForWiFi() -> Bool {
+        throttleInputs().waitsForWiFi
+    }
+
     private func recordUploadEvidence(_ entry: UploadBackupSyncQueueEntry) {
         let replaces =
             entry.source.kind == .photoLibraryAsset && entry.source.resource == .primary
@@ -972,6 +1021,7 @@ public actor BackupSyncRunner {
         }
         // Materialization can take a while; an exclusion saved meanwhile must still stop the transfer.
         guard await admitsTransfer(for: entry.source) else { throw CancellationError() }
+        let network = try transferNetwork()
         let key = Self.key(entry)
         guard transition(entry, from: state, to: .uploading) != nil else {
             throw UploadError.backend("Backup queue could not enter uploading state")
@@ -987,7 +1037,7 @@ public actor BackupSyncRunner {
             editReplacement?.replacesEarlierUploads(of: entry.source, edited: Self.isEdited(resolved)) == true
         let lineage = replacesEarlierUploads ? preflightResult.lineage : nil
 
-        let request = PhotoUploadRequest(
+        var request = PhotoUploadRequest(
             queueItemID: UUID(),
             cancellationToken: token,
             fileURL: descriptor.fileURL,
@@ -1001,6 +1051,7 @@ public actor BackupSyncRunner {
         )
         .applying(identity: preflightResult.identity)
         .replacingExistingDraft(preflightResult.decision == .uploadReplacingDraft)
+        request.allowsExpensiveNetwork = network.usesMobileData
 
         let uid = try await uploadWithWatchdog(
             request,
@@ -1595,7 +1646,7 @@ public actor BackupSyncRunner {
             } catch is CancellationError {
                 return .cancelled
             } catch {
-                if stopRequested { return .cancelled }
+                if stopRequested || failedWhileWaitingForWiFi() { return .cancelled }
                 lastError = error
             }
         }
@@ -1645,11 +1696,12 @@ public actor BackupSyncRunner {
         totalResourceCount: Int
     ) async throws -> PhotoUID {
         guard await admitsTransfer(for: descriptor.source) else { throw CancellationError() }
+        let network = try transferNetwork()
         let token = UUID()
         let tokenKey = "\(entryKey)#\(descriptor.source.resource.rawValue)"
         inFlightTokens[tokenKey] = token
         defer { inFlightTokens[tokenKey] = nil }
-        let request = PhotoUploadRequest(
+        var request = PhotoUploadRequest(
             queueItemID: UUID(),
             cancellationToken: token,
             fileURL: descriptor.fileURL,
@@ -1664,6 +1716,7 @@ public actor BackupSyncRunner {
         )
         .applying(identity: identity)
         .replacingExistingDraft(replacingDraft)
+        request.allowsExpensiveNetwork = network.usesMobileData
         return try await uploadWithWatchdog(
             request,
             progressKey: entryKey,

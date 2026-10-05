@@ -98,7 +98,8 @@ final class FolderBackupController {
                 resolver: FileBackupResourceResolver(),
                 identityResolver: identityResolver,
                 uploader: facade.photoUploader,
-                throttleInputs: { AppleBackupRuntimeSignals.current() },
+                throttleInputs: BackupRuntimeSignalSource.apple.current,
+                runtimeChanges: BackupRuntimeSignalSource.apple.updates,
                 events: pendingRecorder
             )
         } else {

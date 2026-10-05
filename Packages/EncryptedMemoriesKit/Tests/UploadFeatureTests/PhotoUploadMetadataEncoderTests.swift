@@ -51,6 +51,12 @@ final class PhotoUploadMetadataEncoderTests: XCTestCase {
         let applied = request.applying(identity: identity)
         XCTAssertEqual(applied.name, "photo-corrected.heic")
         XCTAssertEqual(applied.additionalMetadata, [metadata])
+        XCTAssertTrue(applied.allowsExpensiveNetwork, "uploads keep every network by default")
+
+        var wiFiOnly = request
+        wiFiOnly.allowsExpensiveNetwork = false
+        XCTAssertFalse(wiFiOnly.applying(identity: identity).allowsExpensiveNetwork)
+        XCTAssertFalse(wiFiOnly.replacingExistingDraft(true).allowsExpensiveNetwork)
     }
 
     private func json(_ metadata: PhotoUploadAdditionalMetadata) throws -> [String: Any] {

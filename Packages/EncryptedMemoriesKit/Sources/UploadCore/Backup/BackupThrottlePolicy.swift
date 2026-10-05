@@ -47,6 +47,7 @@ public struct BackupThrottleInputs: Sendable, Equatable {
     }
 
     /// Maps the shared runtime snapshot of a platform adapter, so every backup upload path reads the same signals.
+    /// Before the first network path, the network may be cellular: with mobile data off, the backup waits for it.
     public init(runtime snapshot: LibraryRuntimeSnapshot, usesMobileData: Bool) {
         let thermal: BackupThermalLevel =
             switch snapshot.thermalLevel {
@@ -60,7 +61,7 @@ public struct BackupThrottleInputs: Sendable, Equatable {
             isLowPowerMode: snapshot.isLowPowerMode,
             isNetworkAvailable: snapshot.network.isReachable,
             isNetworkConstrained: snapshot.network.isConstrained,
-            isNetworkExpensive: snapshot.network.isExpensive,
+            isNetworkExpensive: snapshot.network.isExpensive || (!snapshot.network.isDetermined && !usesMobileData),
             usesMobileData: usesMobileData
         )
     }

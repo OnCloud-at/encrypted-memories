@@ -7,14 +7,17 @@ final class SDKHttpClient: HttpClientProtocol, @unchecked Sendable {
     private let driveSession: DriveSession
     private let urlSession: URLSession
     private let requestGovernor: ProtonRequestGovernor
+    private let expensiveUploadAccess: ExpensiveUploadAccess?
 
     init(
         driveSession: DriveSession,
         requestGovernor: ProtonRequestGovernor,
+        expensiveUploadAccess: ExpensiveUploadAccess? = nil,
         urlProtocolClasses: [AnyClass]? = nil
     ) {
         self.driveSession = driveSession
         self.requestGovernor = requestGovernor
+        self.expensiveUploadAccess = expensiveUploadAccess
         let cfg = URLSessionConfiguration.default
         cfg.requestCachePolicy = .reloadIgnoringLocalCacheData
         // Test seam: lets unit tests intercept requests with a URLProtocol stub (never set in production).
@@ -72,10 +75,7 @@ final class SDKHttpClient: HttpClientProtocol, @unchecked Sendable {
         guard let requestURL = Self.httpsURL(url) else {
             return .failure(Self.invalidURL("Invalid storage upload URL"))
         }
-        var req = URLRequest(url: requestURL)
-        req.httpMethod = method
-        applyHeaders(&req, headers: headers)  // storage URLs are token-authed; no session headers
-        req.httpBodyStream = content.input
+        let req = storageUploadRequest(method: method, url: requestURL, headers: headers, body: content.input)
 
         let streamError = ErrorBox()
         content.onStreamError = { streamError.set($0) }
@@ -113,6 +113,17 @@ final class SDKHttpClient: HttpClientProtocol, @unchecked Sendable {
         }
     }
 
+    func storageUploadRequest(
+        method: String, url: URL, headers: [(String, [String])], body: InputStream
+    ) -> URLRequest {
+        var req = URLRequest(url: url)
+        req.httpMethod = method
+        applyHeaders(&req, headers: headers)  // storage URLs are token-authed; no session headers
+        req.httpBodyStream = body
+        applyExpensiveNetworkAccess(&req)
+        return req
+    }
+
     // MARK: Small upload (absolute url, buffered)
 
     /// Sends one complete multipart upload to the Drive API. SDK 0.29.1 buffers a small file from byte
@@ -136,6 +147,7 @@ final class SDKHttpClient: HttpClientProtocol, @unchecked Sendable {
         applyAuthAndHeaders(&req, headers: headers)
         req.httpBody = content
         Self.applyDriveAcceptHeader(&req)
+        applyExpensiveNetworkAccess(&req)
 
         // Redirects are refused: following one would replay the authenticated body against a
         // Location the trusted-host check above never saw. The 3xx status reaches the SDK unchanged.
@@ -279,6 +291,11 @@ final class SDKHttpClient: HttpClientProtocol, @unchecked Sendable {
         if request.value(forHTTPHeaderField: "Accept") == nil {
             request.setValue("application/vnd.protonmail.v1+json", forHTTPHeaderField: "Accept")
         }
+    }
+
+    /// Upload bytes only. API calls, downloads, and sign-in keep every network.
+    private func applyExpensiveNetworkAccess(_ req: inout URLRequest) {
+        req.allowsExpensiveNetworkAccess = expensiveUploadAccess?.allowsExpensiveNetworkAccess ?? true
     }
 
     private func applyAuthAndHeaders(_ req: inout URLRequest, headers: [(String, [String])]) {

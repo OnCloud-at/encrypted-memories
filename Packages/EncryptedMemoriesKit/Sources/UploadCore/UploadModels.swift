@@ -499,6 +499,9 @@ public struct PhotoUploadRequest: Sendable {
     /// core may only know the primary's link id (duplicate-check rows carry no volume), and the
     /// transport layer resolves the account's single photos volume for it.
     public let mainPhotoUID: PhotoUID?
+    /// False when this backup upload must not use cellular data or Personal Hotspot. The transport then lets the
+    /// system refuse the bytes on such a network. Uploads that the person starts keep the default.
+    public var allowsExpensiveNetwork = true
 
     public init(
         queueItemID: UploadQueueItemID,
@@ -533,7 +536,7 @@ public struct PhotoUploadRequest: Sendable {
     /// The same request with the dedupe pipeline's findings applied: the Proton-corrected name
     /// (what actually gets hashed remotely) and the integrity digest.
     public func applying(identity: UploadIdentity) -> PhotoUploadRequest {
-        PhotoUploadRequest(
+        var request = PhotoUploadRequest(
             queueItemID: queueItemID,
             cancellationToken: cancellationToken,
             fileURL: fileURL,
@@ -548,10 +551,12 @@ public struct PhotoUploadRequest: Sendable {
             overrideExistingDraft: overrideExistingDraft,
             mainPhotoUID: mainPhotoUID
         )
+        request.allowsExpensiveNetwork = allowsExpensiveNetwork
+        return request
     }
 
     public func replacingExistingDraft(_ shouldReplace: Bool) -> PhotoUploadRequest {
-        PhotoUploadRequest(
+        var request = PhotoUploadRequest(
             queueItemID: queueItemID,
             cancellationToken: cancellationToken,
             fileURL: fileURL,
@@ -566,6 +571,8 @@ public struct PhotoUploadRequest: Sendable {
             overrideExistingDraft: shouldReplace,
             mainPhotoUID: mainPhotoUID
         )
+        request.allowsExpensiveNetwork = allowsExpensiveNetwork
+        return request
     }
 }
 
