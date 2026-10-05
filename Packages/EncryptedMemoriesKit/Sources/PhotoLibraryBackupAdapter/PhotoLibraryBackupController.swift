@@ -56,15 +56,18 @@ public final class PhotoLibraryBackupController {
         public var accountDataDirectory: URL
         public var databasePolicy: LibraryDatabasePolicy
         public var defaults: UserDefaults
+        public var runtimeSignals: BackupRuntimeSignalSource
 
         public init(
             accountDataDirectory: URL,
             databasePolicy: LibraryDatabasePolicy,
-            defaults: UserDefaults = .standard
+            defaults: UserDefaults = .standard,
+            runtimeSignals: BackupRuntimeSignalSource = .apple
         ) {
             self.accountDataDirectory = accountDataDirectory
             self.databasePolicy = databasePolicy
             self.defaults = defaults
+            self.runtimeSignals = runtimeSignals
         }
     }
 
@@ -87,7 +90,15 @@ public final class PhotoLibraryBackupController {
     /// Durable user "pause": no passes run and no auto-resume fires until the user resumes. Distinct
     /// from a policy pause (thermal/battery, transient) and from `isEnabled` (the whole feature off).
     public private(set) var isUserPaused: Bool
-    public private(set) var status = BackupStatus()
+    public private(set) var status = BackupStatus() {
+        didSet {
+            let waits = status.phase == .waitingForWiFi
+            if waits != isWaitingForWiFi { isWaitingForWiFi = waits }
+        }
+    }
+    /// The backup waits because mobile data is off for backups. Changes only with that state, so observers of the
+    /// grid badges do not follow every progress tick.
+    public private(set) var isWaitingForWiFi = false
     public private(set) var isSyncing = false
     public private(set) var lastMessage: String?
     /// Exact Core-derived eligibility time for the next automatic attempt. Platform schedulers may
@@ -142,6 +153,7 @@ public final class PhotoLibraryBackupController {
     private let tempStore: BackupTempFileStore
     private let monitor: PhotoLibraryChangeMonitor
     private let defaults: UserDefaults
+    private let runtimeSignals: BackupRuntimeSignalSource
     private let retryPolicy: BackupRetryPolicy
     private var statusSetupTask: Task<Void, Never>?
     private var syncTask: Task<Void, Never>?
@@ -169,6 +181,10 @@ public final class PhotoLibraryBackupController {
     /// One date-driven wake for the earliest eligible queue item. Replaces the old fixed 45-second
     /// poll, which repeatedly started empty runs for draft-blocked rows.
     private var autoResumeTask: Task<Void, Never>?
+    /// Follows the shared runtime network signal, so a backup that waits for Wi-Fi resumes on Wi-Fi or Ethernet.
+    private var networkObservationTask: Task<Void, Never>?
+    /// The runner ended the current pass waiting for Wi-Fi. Reset when a pass starts.
+    private var passWaitedForWiFi = false
     private var consecutiveNoProgressRuns = 0
     private var backedUpAtRunStart = 0
     private var lastObservedUploadedCount: Int?
@@ -187,6 +203,8 @@ public final class PhotoLibraryBackupController {
         /// Replaces the scan and the drain of a started pass. Package tests have no photo library access, and on a
         /// machine without an authorization record a real scan waits for an answer that never comes.
         private var passBodyForTesting: (@Sendable () async -> Void)?
+        /// Replaces only the PhotoKit scan of a started pass; the runner still drains the queue.
+        private var scanBodyForTesting: (@Sendable () async -> Void)?
     #endif
 
     /// Platform hook: invoked with `true` when a backup pass is actively running (so the host app may
@@ -220,6 +238,8 @@ public final class PhotoLibraryBackupController {
         self.pendingStore = pendingStore
         self.requiresPendingStore = requiresPendingStore
         defaults = configuration.defaults
+        let runtimeSignals = configuration.runtimeSignals
+        self.runtimeSignals = runtimeSignals
         let retryPolicy = BackupRetryPolicy()
         self.retryPolicy = retryPolicy
         accessState = PhotoLibraryAuthorization.currentState()
@@ -277,7 +297,7 @@ public final class PhotoLibraryBackupController {
                 tagAdder: tagAdder,
                 editReplacement: editReplacement,
                 configuration: .init(retry: retryPolicy),
-                throttleInputs: { AppleBackupRuntimeSignals.current() },
+                throttleInputs: runtimeSignals.current,
                 events: pendingRecorder
             )
         } else {
@@ -311,6 +331,7 @@ public final class PhotoLibraryBackupController {
                 self?.resumeEnabledBackupAfterLaunch()
             }
         }
+        startObservingNetwork()
     }
 
     // MARK: - Pending grid
@@ -410,6 +431,12 @@ public final class PhotoLibraryBackupController {
     /// waiting rows due at once (each reason and its retry count stay); lifecycle/change-driven calls honor backoff.
     public func syncNow() {
         _ = startSync(owner: .foreground)
+    }
+
+    /// The "Use Cellular Data" setting changed. A backup that waits for Wi-Fi starts again when the wait no longer
+    /// holds; the setting itself persists in the shared defaults that every upload path reads.
+    public func mobileDataSettingDidChange() {
+        resumeIfWiFiWaitEnded()
     }
 
     /// Runs a pass when the app becomes active. An edit in Photos while this app was in the background may reach
@@ -699,6 +726,7 @@ public final class PhotoLibraryBackupController {
         instantEnqueueTask?.cancel()
         instantEnqueueTask = nil
         isSyncing = true
+        passWaitedForWiFi = false
         backedUpAtRunStart = lastProjectedProgress.backedUp
         updateIdleTimerIfNeeded()
         isScanning = false
@@ -711,6 +739,11 @@ public final class PhotoLibraryBackupController {
         startHeartbeat(runID: runID)
         startStatusRefresh()
         let statusSetupTask = self.statusSetupTask
+        #if DEBUG
+            let scanBody = scanBodyForTesting
+        #else
+            let scanBody: (@Sendable () async -> Void)? = nil
+        #endif
 
         // The task inherits the main actor, but all heavy phases (`scan`, `runUntilDrained`) are
         // awaits onto other actors/off-actor structs - the main thread stays free for UI.
@@ -724,7 +757,8 @@ public final class PhotoLibraryBackupController {
                 return StartedBackupRun(runID: runID, task: task)
             }
         #endif
-        let task = Task { [weak self, monitor, tempStore, engine, runner, queueStore, catalogStore, statusSetupTask] in
+        let task = Task {
+            [weak self, monitor, tempStore, engine, runner, queueStore, catalogStore, statusSetupTask, scanBody] in
             await statusSetupTask?.value
             self?.refreshFromQueue()
             // Scan and reconcile run concurrently. Reconcile drains existing work and newly enqueued
@@ -732,25 +766,29 @@ public final class PhotoLibraryBackupController {
             self?.beginScanPhase()
             let scanDone = BackupScanSignal()
             let workIntent: LibraryWorkIntent = owner == .manual ? .userInitiated : .automatic
-            async let reconcile: Void = Self.reconcileWhileScanning(
+            async let reconcile: Bool = Self.reconcileWhileScanning(
                 runner: runner,
                 scanDone: scanDone,
                 workIntent: workIntent
             )
             do {
-                try await Self.replayCatalogIfQueueNeedsRecovery(
-                    catalogStore: catalogStore,
-                    queueStore: queueStore,
-                    engine: engine
-                )
-                let preparedChanges = await Self.prepareChangesOffMainActor(monitor)
-                try await self?.runScanPass(
-                    engine: engine,
-                    runner: runner,
-                    catalogStore: catalogStore,
-                    changes: preparedChanges.changes
-                )
-                monitor.commit(preparedChanges)
+                if let scanBody {
+                    await scanBody()
+                } else {
+                    try await Self.replayCatalogIfQueueNeedsRecovery(
+                        catalogStore: catalogStore,
+                        queueStore: queueStore,
+                        engine: engine
+                    )
+                    let preparedChanges = await Self.prepareChangesOffMainActor(monitor)
+                    try await self?.runScanPass(
+                        engine: engine,
+                        runner: runner,
+                        catalogStore: catalogStore,
+                        changes: preparedChanges.changes
+                    )
+                    monitor.commit(preparedChanges)
+                }
             } catch is CancellationError {
                 // The one-shot completion signal below releases the reconcile loop cleanly.
             } catch {
@@ -759,8 +797,9 @@ public final class PhotoLibraryBackupController {
             self?.finishScanPhase()
 
             await scanDone.markDone()
-            await reconcile  // drains the tail enqueued during the scan, then returns
+            let waitedForWiFi = await reconcile  // drains the tail enqueued during the scan, then returns
             tempStore.sweep()  // every export is re-derivable; nothing to keep between passes
+            self?.passWaitedForWiFi = waitedForWiFi
             await self?.finishSync(runID: runID)
         }
         syncTask = task
@@ -840,28 +879,33 @@ public final class PhotoLibraryBackupController {
     /// has signalled completion AND nothing runnable remains. Runs concurrently with the scan, so a
     /// slow or resuming scan never delays uploads. Static + the heavy work is on the runner actor, so
     /// it never touches the main thread and does not depend on the controller's lifetime.
+    /// Returns true when the last drain ended waiting for Wi-Fi. This is the runner's own result: the projected
+    /// status can still miss the runner's last callback when the pass completes.
     private static func reconcileWhileScanning(
         runner: BackupSyncRunner,
         scanDone: BackupScanSignal,
         workIntent: LibraryWorkIntent
-    ) async {
+    ) async -> Bool {
         while !Task.isCancelled {
             let progress = await runner.runUntilDrained(mode: .eligibleOnly, workIntent: workIntent)
-            guard await runner.isQueueOperational() else { return }
+            guard await runner.isQueueOperational() else { return false }
             // A failed remote index cannot safely dedupe anything, and a closed runtime policy has
             // no eligible transport. End this pass and let the controller's typed retry scheduler
             // choose the next attempt instead of hammering either condition four times per second.
-            if progress.remoteIndexPreparationFailed || progress.isPausedByPolicy { return }
+            if progress.remoteIndexPreparationFailed || progress.isPausedByPolicy {
+                return progress.isPausedByPolicy && progress.isWaitingForWiFi
+            }
             if await scanDone.isDone() {
                 // The scan may have enqueued rows between our last claim and its done-signal; one more
                 // drain guarantees they upload before we return.
-                await runner.runUntilDrained(mode: .eligibleOnly, workIntent: workIntent)
-                return
+                let tail = await runner.runUntilDrained(mode: .eligibleOnly, workIntent: workIntent)
+                return tail.isPausedByPolicy && tail.isWaitingForWiFi
             }
             // Yield the CPU and let the scan enqueue more before the next drain (no hot empty spin).
             // A cancelled sleep drops straight out via the loop condition; no busy loop on stop.
             try? await Task.sleep(nanoseconds: 250_000_000)
         }
+        return false
     }
 
     /// Runs the scan phase through the persistent catalog driver. `nonisolated` keeps SQLite and
@@ -1033,8 +1077,17 @@ public final class PhotoLibraryBackupController {
             return true
         }
 
+        /// Turns the backup on without the launch resume, which reads the real photo library authorization again.
+        internal func setEnabledForTesting() {
+            isEnabled = true
+        }
+
         internal func setAccessStateForTesting(_ state: PhotoBackupAccessState) {
             accessState = state
+        }
+
+        internal func replaceScanForTesting(_ body: @escaping @Sendable () async -> Void) {
+            scanBodyForTesting = body
         }
 
         internal func replacePassBodyForTesting(_ body: @escaping @Sendable () async -> Void) {
@@ -1110,6 +1163,7 @@ public final class PhotoLibraryBackupController {
         }
 
         internal var isRetiringInstantWorkForTesting: Bool { isRetiringInstantWork }
+        internal var isAutoResumeScheduledForTesting: Bool { autoResumeTask != nil }
 
         internal func retireInstantWorkForTesting() async {
             guard !isRetiringInstantWork else { return }
@@ -1134,6 +1188,8 @@ public final class PhotoLibraryBackupController {
         statusRefreshTask = nil
         autoResumeTask?.cancel()
         autoResumeTask = nil
+        networkObservationTask?.cancel()
+        networkObservationTask = nil
         instantEnqueueTask?.cancel()
         let activeSync = syncTask
         let activeStatusSetup = statusSetupTask
@@ -1209,6 +1265,24 @@ public final class PhotoLibraryBackupController {
         monitor.startObserving { [weak self] in
             Task { @MainActor in self?.scheduleChangeDrivenSync() }
         }
+    }
+
+    /// Uses the one shared runtime signal; it adds no second network monitor.
+    private func startObservingNetwork() {
+        let updates = runtimeSignals.updates()
+        networkObservationTask = Task { @MainActor [weak self] in
+            for await _ in updates {
+                guard let self, !Task.isCancelled else { return }
+                self.resumeIfWiFiWaitEnded()
+            }
+        }
+    }
+
+    private func resumeIfWiFiWaitEnded() {
+        guard !isShuttingDown, status.phase == .waitingForWiFi,
+            status.endsWiFiWait(for: runtimeSignals.current())
+        else { return }
+        syncNow()
     }
 
     private func scheduleChangeDrivenSync() {
@@ -1470,14 +1544,30 @@ public final class PhotoLibraryBackupController {
             lastMessage = L10n.string("backup.error_local_state_unavailable")
             return
         }
-        let finalProgress = finalProjection?.progress ?? lastProjectedProgress
+        var finalProgress = finalProjection?.progress ?? lastProjectedProgress
+        let waitedForWiFi = passWaitedForWiFi
+        if waitedForWiFi {
+            // The runner's last callback can reach the projector after this projection; keep its Wi-Fi wait.
+            finalProgress.isPausedByPolicy = true
+            finalProgress.isWaitingForWiFi = true
+        }
         let currentBackedUp = finalProgress.backedUp
         if currentBackedUp > backedUpAtRunStart {
             consecutiveNoProgressRuns = 0
-        } else {
+        } else if !waitedForWiFi {
+            // A Wi-Fi wait is a setting, not a failure: it must not stretch the fallback during a long wait.
             consecutiveNoProgressRuns = min(16, consecutiveNoProgressRuns + 1)
         }
-        if shouldRestart { syncNow() } else { scheduleAutoResumeIfOutstanding(progress: finalProgress) }
+        // Wi-Fi or Ethernet returned, or the setting was turned on, while this pass still ran (for example during
+        // its scan). Start the next pass now instead of keeping "Waiting for Wi-Fi" until the fallback.
+        let wiFiWaitEnded = waitedForWiFi && !runtimeSignals.current().waitsForWiFi
+        if shouldRestart {
+            syncNow()
+        } else if wiFiWaitEnded, startSync(owner: .foreground) != nil {
+            return
+        } else {
+            scheduleAutoResumeIfOutstanding(progress: finalProgress)
+        }
     }
 
     /// Schedules exactly one wake at the queue's earliest typed eligibility date. If an

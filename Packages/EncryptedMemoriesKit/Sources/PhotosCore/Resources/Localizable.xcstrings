@@ -903,6 +903,34 @@
         "de": { "stringUnit": { "state": "translated", "value": "Warten auf eine stabile Verbindung" } }
       }
     },
+    "backup.phase_waiting_wifi": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Waiting for Wi-Fi" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Wartet auf WLAN" } }
+      }
+    },
+    "backup.detail_waiting_wifi": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Cellular data is off for backups." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Mobile Daten sind für Sicherungen aus." } }
+      }
+    },
+    "settings.backup_use_mobile_data": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Use Cellular Data" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Mobile Daten verwenden" } }
+      }
+    },
+    "settings.backup_use_mobile_data_footer": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Applies to backups, also on Personal Hotspot. Viewing photos is not affected." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Gilt für Sicherungen, auch über den persönlichen Hotspot. Das Ansehen von Fotos ist nicht betroffen." } }
+      }
+    },
     "backup.phase_waiting_account_storage": {
       "extractionState": "manual",
       "localizations": {

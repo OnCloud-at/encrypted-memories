@@ -1224,6 +1224,75 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertTrue(uploader.requests.isEmpty)
     }
 
+    func testMobileDataOffHoldsExpensiveNetworkWithoutSpendingRetryBudget() async throws {
+        let due = seedEntry("cellular.jpg")
+        let runner = makeRunner(throttleInputs: {
+            BackupThrottleInputs(isNetworkExpensive: true, usesMobileData: false)
+        })
+
+        let progress = await runner.runUntilDrained(mode: .eligibleOnly)
+
+        XCTAssertTrue(progress.isPausedByPolicy)
+        XCTAssertTrue(progress.isWaitingForWiFi)
+        XCTAssertEqual(state(of: due), .discovered)
+        XCTAssertEqual(queueStore.entry(for: due.source, revision: due.revision)?.attempts, 0)
+        XCTAssertEqual(resolver.resolveCount(for: due.source.identifier), 0)
+        XCTAssertTrue(uploader.requests.isEmpty)
+        XCTAssertEqual(BackupStatus(progress: progress, isScanning: false).phase, .waitingForWiFi)
+    }
+
+    func testMobileDataOnKeepsBackingUpOnExpensiveNetwork() async throws {
+        let due = seedEntry("cellular-allowed.jpg")
+        let runner = makeRunner(throttleInputs: {
+            BackupThrottleInputs(isNetworkExpensive: true, usesMobileData: true)
+        })
+
+        let progress = await runner.runUntilDrained(mode: .eligibleOnly)
+
+        XCTAssertFalse(progress.isPausedByPolicy)
+        XCTAssertFalse(progress.isWaitingForWiFi)
+        XCTAssertEqual(state(of: due), .completed)
+        XCTAssertEqual(uploader.requests.map(\.name), ["cellular-allowed.jpg"])
+        XCTAssertNotEqual(BackupStatus(progress: progress, isScanning: false).phase, .waitingForWiFi)
+    }
+
+    func testRunningWaveFinishesThenNoNewUploadStartsOnExpensiveNetwork() async throws {
+        let first = seedEntry("a-first.jpg")
+        let second = seedEntry("b-second.jpg")
+        let inputs = BackupThrottleSequence([
+            .unconstrained,
+            BackupThrottleInputs(),
+            BackupThrottleInputs(isNetworkExpensive: true, usesMobileData: false),
+        ])
+
+        let progress = await makeRunner(
+            throttle: BackupThrottlePolicy(baseConcurrency: 1),
+            throttleInputs: { inputs.next() }
+        ).runUntilDrained(mode: .eligibleOnly)
+
+        let states = [state(of: first), state(of: second)]
+        XCTAssertEqual(states.filter { $0 == .completed }.count, 1, "the started upload finishes")
+        XCTAssertEqual(states.filter { $0 == .discovered }.count, 1, "no new upload starts")
+        XCTAssertEqual(uploader.requests.count, 1)
+        XCTAssertTrue(progress.isWaitingForWiFi)
+    }
+
+    func testDrainResumesByItselfWhenWiFiReturns() async throws {
+        let due = seedEntry("resume-on-wifi.jpg")
+        let inputs = BackupThrottleSequence([
+            BackupThrottleInputs(isNetworkExpensive: true, usesMobileData: false),
+            BackupThrottleInputs(isNetworkExpensive: true, usesMobileData: false),
+            .unconstrained,
+        ])
+
+        let progress = await makeRunner(throttleInputs: { inputs.next() }).runUntilDrained()
+
+        XCTAssertEqual(state(of: due), .completed)
+        XCTAssertFalse(clock.sleeps.isEmpty, "the pass waited instead of failing")
+        XCTAssertFalse(progress.isPausedByPolicy)
+        XCTAssertFalse(progress.isWaitingForWiFi)
+    }
+
     func testSustainedDiskPressureEndsPassRunnableNotFailed() async throws {
         // The volume stays full for the whole pass: no item can ever export.
         let a = seedEntry("a.jpg")

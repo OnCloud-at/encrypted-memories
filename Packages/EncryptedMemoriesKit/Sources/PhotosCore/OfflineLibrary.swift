@@ -35,6 +35,8 @@ public enum AppSettingsKey {
     /// a photo-backup pass is doing work; background execution is governed separately by BGTask.
     public static let keepDisplayAwakeDuringForegroundBackup =
         "EncryptedMemories.keepDisplayAwakeDuringForegroundBackup"
+    /// Lets the backup upload on cellular data and Personal Hotspot. Viewing and downloading are not affected.
+    public static let backupUsesMobileData = "EncryptedMemories.backupUsesMobileData"
 }
 
 public enum AppSettingsDefault {
@@ -50,6 +52,18 @@ public enum AppSettingsDefault {
     public static let offlineOriginalsCapGB = 5.0
     /// Auto-lock remains enabled unless the user explicitly opts in for a large foreground import.
     public static let keepDisplayAwakeDuringForegroundBackup = false
+    /// On by default, so the backup keeps running on cellular data after the update.
+    public static let backupUsesMobileData = true
+}
+
+/// One preference gate for every backup upload on an expensive network.
+public enum BackupMobileDataPolicy {
+    public static func isEnabled(defaults: UserDefaults = .standard) -> Bool {
+        guard defaults.object(forKey: AppSettingsKey.backupUsesMobileData) != nil else {
+            return AppSettingsDefault.backupUsesMobileData
+        }
+        return defaults.bool(forKey: AppSettingsKey.backupUsesMobileData)
+    }
 }
 
 /// One preference gate for every outbound original-media copy.

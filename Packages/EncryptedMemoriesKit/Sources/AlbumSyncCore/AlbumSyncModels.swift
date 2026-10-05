@@ -191,6 +191,8 @@ public struct AlbumSyncProgress: Sendable, Equatable {
     /// Local assets whose only remote copy the user trashed on Proton - respected, not attached.
     public var trashedSkipped = 0
     public var message: String?
+    /// The backup phase waits because mobile data is off for backups on an expensive network.
+    public var isWaitingForWiFi = false
 
     public init() {}
 
@@ -200,7 +202,8 @@ public struct AlbumSyncProgress: Sendable, Equatable {
         switch phase {
         case .idle: L10n.string("albumsync.phase_idle")
         case .scanningLocal: L10n.string("albumsync.phase_scanning")
-        case .backingUp: L10n.string("albumsync.phase_backing_up")
+        case .backingUp:
+            isWaitingForWiFi ? L10n.string("backup.phase_waiting_wifi") : L10n.string("albumsync.phase_backing_up")
         case .checkingAlbum: L10n.string("albumsync.phase_checking")
         case .attaching: L10n.string("albumsync.phase_attaching")
         case .completed: L10n.string("albumsync.phase_completed")

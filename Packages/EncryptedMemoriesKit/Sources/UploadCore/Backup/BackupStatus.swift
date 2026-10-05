@@ -46,6 +46,9 @@ public struct BackupStatus: Sendable, Equatable {
         case uploading
         /// A running pass is held by policy (thermal/power) or items are user-paused.
         case paused
+        /// Mobile data is off for backups and the device is online on cellular data or Personal Hotspot. Uploads
+        /// resume on Wi-Fi or Ethernet. Deliberately distinct from any offline state.
+        case waitingForWiFi
         /// Work remains but nothing runs right now (interrupted pass, draft re-checks pending).
         case waiting
         /// Everything considered is settled and nothing failed.
@@ -93,6 +96,9 @@ public struct BackupStatus: Sendable, Equatable {
     public var executionOpportunityIssue: BackupExecutionOpportunityIssue?
 
     public init() {}
+
+    /// The one SF Symbol for `waitingForWiFi` on every platform. It must never be an offline symbol.
+    public static let waitingForWiFiSymbolName = "antenna.radiowaves.left.and.right.slash"
 
     /// The only number UI may call "backed up".
     public var backedUp: Int { uploaded + alreadyBackedUp }
@@ -191,6 +197,13 @@ public struct BackupStatus: Sendable, Equatable {
         totalConsidered = progress.total
         fractionCompleted = progress.total > 0 ? progress.fraction : nil
 
+        // The policy pause names its reason when only the mobile-data setting holds the backup. It outranks
+        // item failures so the person sees why the rest waits; the failure count stays in the row.
+        if progress.isPausedByPolicy, progress.isWaitingForWiFi, progress.hasOutstandingWork {
+            phase = .waitingForWiFi
+            return
+        }
+
         if progress.isRunning && (progress.hasOutstandingWork || progress.paused > 0 || isPreparingRemoteIndex) {
             // `waiting` lumps not-yet-examined `discovered` rows with confirmed `queuedForUpload`
             // ones; the unexamined part is `waiting - uploadQueued`. During a first pass over an
@@ -255,6 +268,7 @@ public struct BackupStatus: Sendable, Equatable {
         case .checking: "backup.phase_checking"
         case .uploading: "backup.phase_uploading"
         case .paused: "backup.phase_paused"
+        case .waitingForWiFi: "backup.phase_waiting_wifi"
         case .waiting: "backup.phase_waiting"
         case .completed:
             dismissedFailures > 0 ? "backup.phase_completed_with_omissions" : "backup.phase_completed"
@@ -269,6 +283,7 @@ public struct BackupStatus: Sendable, Equatable {
         case .checking: L10n.string("backup.phase_checking")
         case .uploading: L10n.string("backup.phase_uploading")
         case .paused: L10n.string("backup.phase_paused")
+        case .waitingForWiFi: L10n.string("backup.phase_waiting_wifi")
         case .waiting: L10n.string("backup.phase_waiting")
         case .completed:
             dismissedFailures > 0
@@ -283,6 +298,8 @@ public struct BackupStatus: Sendable, Equatable {
         switch phase {
         case .idle, .scanning, .paused:
             return nil
+        case .waitingForWiFi:
+            return L10n.string("backup.detail_waiting_wifi")
         case .checking:
             if isPreparingRemoteIndex {
                 if let completed = remoteIndexCompleted, let total = remoteIndexTotal, total > 0 {
@@ -307,6 +324,12 @@ public struct BackupStatus: Sendable, Equatable {
             }
             return L10n.string("backup.detail_attention \(needsAttentionCount)")
         }
+    }
+
+    /// True when a pass should start because the Wi-Fi wait no longer holds: the device left the expensive network,
+    /// or the person turned mobile data on. The pass then derives the honest state again.
+    public func endsWiFiWait(for inputs: BackupThrottleInputs) -> Bool {
+        phase == .waitingForWiFi && !inputs.waitsForWiFi
     }
 
     /// Scaled units let a continued-processing task advance within one large item while preserving

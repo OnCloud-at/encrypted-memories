@@ -217,6 +217,8 @@ private struct BackupSettingsTab: View {
                 Text("settings.backup_folders_section")
             }
 
+            BackupMobileDataSection { photoBackup?.mobileDataSettingDidChange() }
+
             // Show manual-upload status only while it is actionable or contains results.
             if let uploadCoordinator {
                 let manualStatus = BackupStatus(manualUploadCheck: uploadCoordinator.preparationStatus)
@@ -239,6 +241,10 @@ private struct BackupSettingsTab: View {
     private var folderSyncStatus: some View {
         let status = backup.status
         HStack(alignment: .firstTextBaseline) {
+            if status.phase == .waitingForWiFi {
+                Image(systemName: BackupStatus.waitingForWiFiSymbolName)
+                    .foregroundStyle(.secondary)
+            }
             VStack(alignment: .leading, spacing: 2) {
                 Text(status.localizedTitle)
                     .font(.system(size: 12, weight: .medium))
@@ -592,6 +598,13 @@ private struct PhotoLibraryBackupSection: View {
                             .contentTransition(.opacity)
                         subtitleSlot(display)
                         transferSlot(display)
+                        if let reason = display.localizedWaitingForWiFiDetail {
+                            Text(reason)
+                                .font(.caption)
+                                .foregroundStyle(ProtonColor.textWeak)
+                                .fixedSize(horizontal: false, vertical: true)
+                                .transition(.opacity.combined(with: .move(edge: .top)))
+                        }
                         if let retry = display.localizedRetryDetail {
                             Text(retry)
                                 .font(.caption)
@@ -758,6 +771,9 @@ private struct PhotoLibraryBackupSection: View {
                 .foregroundStyle(.secondary)
         case .waiting:
             Image(systemName: "clock.arrow.circlepath")
+                .foregroundStyle(.secondary)
+        case .waitingForWiFi:
+            Image(systemName: BackupStatus.waitingForWiFiSymbolName)
                 .foregroundStyle(.secondary)
         case .notice:
             Image(systemName: "info.circle")
