@@ -1,11 +1,18 @@
 import CryptoKit
 import Foundation
 import ProtonAuth
+import ProtonCoreCryptoGoInterface
+import ProtonCoreCryptoPatchedGoImplementation
 import SQLite3
 import Testing
 import UploadCore
 
 @testable import ProtonDriveBackend
+
+/// The gopenpgp implementation is process-global and injected once (the apps do the same at startup).
+private let lineageCryptoReady: Void = {
+    injectDefaultCryptoImplementation()
+}()
 
 extension DriveSessionStubSuite {
     @Suite struct ProtonRemoteLineageRefreshTests {
@@ -248,6 +255,183 @@ extension DriveSessionStubSuite {
             #expect(!StubURLProtocol.requests().contains { $0.path.contains("/photos") })
         }
 
+        /// One failed metadata read during a build left a link unresolved. The next event apply reads it again, so the
+        /// index becomes complete without a full build.
+        @Test func aRepairCompletesTheIndexAfterOneFailedRead() async throws {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let content = try #require(
+                UploadIdentityManifestStore(url: directory.appendingPathComponent("content.sqlite")))
+            defer { content.close() }
+            let lineage = try #require(
+                UploadRemoteLineageIndexStore(url: directory.appendingPathComponent("lineage.sqlite")))
+            defer { lineage.close() }
+            let keys = try LineageKeys()
+            #expect(
+                content.replaceRemoteContentIndex(
+                    [], unresolvedIssues: [], hashKeyEpoch: "epoch", checkpoint: checkpoint("one")))
+            #expect(
+                lineage.replaceRows(
+                    identities: [], lineage: [], hashKeyEpoch: "epoch", eventID: "one",
+                    unresolvedRemoteLinkIDs: ["photo", "trashed"]))
+            StubURLProtocol.reset()
+            routeEmptyEvents(from: "one", to: "two")
+            try routeMetadata([
+                try keys.activePhoto(
+                    "photo",
+                    attributes: #"{"iOS.photos":{"ICloudID":"cloud"},"#
+                        + #""EncryptedMemories.lineage":{"V":1,"Reason":"edit","Replaces":["old"]}}"#),
+                ["LinkID": "trashed", "Type": 2, "State": 2],
+            ])
+
+            try await refresh(content: content, lineage: lineage, rootKey: keys.root)
+
+            #expect(lineage.health(hashKeyEpoch: "epoch", contentCheckpoint: checkpoint("two")) == .complete)
+            #expect(lineage.activeMainLinkIDs(forExternalIdentifier: "cloud", hashKeyEpoch: "epoch") == ["photo"])
+            #expect(lineage.replacingMainLinkIDs(ofReplacedLink: "old", hashKeyEpoch: "epoch") == ["photo"])
+            #expect(try metadataRequestLinkIDs().sorted() == ["photo", "trashed"])
+        }
+
+        /// A link that fails again stays unresolved, and a later sweep reads it again.
+        @Test func aLinkThatFailsAgainStaysAndALaterSweepRetriesIt() async throws {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let content = try #require(
+                UploadIdentityManifestStore(url: directory.appendingPathComponent("content.sqlite")))
+            defer { content.close() }
+            let url = directory.appendingPathComponent("lineage.sqlite")
+            let keys = try LineageKeys()
+            #expect(
+                content.replaceRemoteContentIndex(
+                    [], unresolvedIssues: [], hashKeyEpoch: "epoch", checkpoint: checkpoint("one")))
+            do {
+                let lineage = try #require(UploadRemoteLineageIndexStore(url: url))
+                defer { lineage.close() }
+                #expect(
+                    lineage.replaceRows(
+                        identities: [], lineage: [], hashKeyEpoch: "epoch", eventID: "one",
+                        unresolvedRemoteLinkIDs: ["photo", "unreadable"]))
+                StubURLProtocol.reset()
+                routeEmptyEvents(from: "one", to: "two")
+                StubURLProtocol.route(
+                    "POST /drive/shares/share1/links/fetch_metadata", status: 422,
+                    json: #"{"Code":2000,"Error":"failed"}"#)
+                try await refresh(content: content, lineage: lineage, rootKey: keys.root)
+                #expect(lineage.hasCheckpoint(hashKeyEpoch: "epoch", eventID: "two"))
+                #expect(lineage.health(hashKeyEpoch: "epoch", contentCheckpoint: checkpoint("two")) == .incomplete)
+                #expect(Set(try metadataRequestLinkIDs()) == ["photo", "unreadable"])
+            }
+            // The next launch starts a new sweep. The readable link resolves; the unreadable one stays.
+            let lineage = try #require(UploadRemoteLineageIndexStore(url: url))
+            defer { lineage.close() }
+            StubURLProtocol.reset()
+            routeEmptyEvents(from: "two", to: "three")
+            try routeMetadata([
+                try keys.activePhoto("photo", attributes: #"{"iOS.photos":{"ICloudID":"cloud"}}"#),
+                [
+                    "LinkID": "unreadable", "Type": 2, "State": 1, "NodeKey": "broken", "NodePassphrase": "broken",
+                    "XAttr": "broken", "FileProperties": ["ActiveRevision": ["Photo": [:] as [String: Any]]],
+                ],
+            ])
+            try await refresh(content: content, lineage: lineage, rootKey: keys.root)
+            #expect(Set(try metadataRequestLinkIDs()) == ["photo", "unreadable"])
+            #expect(lineage.activeMainLinkIDs(forExternalIdentifier: "cloud", hashKeyEpoch: "epoch") == ["photo"])
+            #expect(lineage.health(hashKeyEpoch: "epoch", contentCheckpoint: checkpoint("three")) == .incomplete)
+            let reopened = try #require(UploadRemoteLineageIndexStore(url: url))
+            defer { reopened.close() }
+            #expect(
+                reopened.unresolvedLinkIDsForRepair(hashKeyEpoch: "epoch", limit: 10, sweepInterval: 0)
+                    == ["unreadable"])
+        }
+
+        /// Proton sends state 3 for a link that is deleted for good. Such a link leaves the index, from an event and
+        /// from a repair read. State 4 (restoring) and unknown states stay unresolved.
+        @Test func aDeletedLinkStateDoesNotBlockTheIndex() async throws {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let content = try #require(
+                UploadIdentityManifestStore(url: directory.appendingPathComponent("content.sqlite")))
+            defer { content.close() }
+            let lineage = try #require(
+                UploadRemoteLineageIndexStore(url: directory.appendingPathComponent("lineage.sqlite")))
+            defer { lineage.close() }
+            #expect(
+                content.replaceRemoteContentIndex(
+                    [], unresolvedIssues: [], hashKeyEpoch: "epoch", checkpoint: checkpoint("one")))
+            #expect(
+                lineage.replaceRows(
+                    identities: [
+                        .init(hashKeyEpoch: "epoch", remoteLinkID: "event", externalIdentifier: "cloud", isMain: true)
+                    ],
+                    lineage: [], hashKeyEpoch: "epoch", eventID: "one", unresolvedRemoteLinkIDs: ["read"]))
+            StubURLProtocol.reset()
+            StubURLProtocol.route(
+                "GET /drive/volumes/vol1/events/one",
+                json: #"""
+                    {"Code":1000,"EventID":"two","More":0,"Refresh":0,"Events":[
+                        {"EventType":2,"ContextShareID":"share1","Link":{"LinkID":"event","Type":2,"State":3}}
+                    ]}
+                    """#)
+            try routeMetadata([["LinkID": "read", "Type": 2, "State": 3]])
+            try await refresh(content: content, lineage: lineage)
+            #expect(lineage.health(hashKeyEpoch: "epoch", contentCheckpoint: checkpoint("two")) == .complete)
+            #expect(lineage.activeMainLinkIDs(forExternalIdentifier: "cloud", hashKeyEpoch: "epoch").isEmpty)
+
+            StubURLProtocol.route(
+                "GET /drive/volumes/vol1/events/two",
+                json: #"""
+                    {"Code":1000,"EventID":"three","More":0,"Refresh":0,"Events":[
+                        {"EventType":2,"ContextShareID":"share1","Link":{"LinkID":"restoring","Type":2,"State":4}}
+                    ]}
+                    """#)
+            try await refresh(content: content, lineage: lineage)
+            #expect(lineage.health(hashKeyEpoch: "epoch", contentCheckpoint: checkpoint("three")) == .incomplete)
+        }
+
+        /// A large backlog never stalls a pass: one repair reads one metadata window, the next pass continues the
+        /// sweep, and a finished sweep waits for its interval.
+        @Test func oneRepairReadsABoundedShareOfTheBacklog() async throws {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let content = try #require(
+                UploadIdentityManifestStore(url: directory.appendingPathComponent("content.sqlite")))
+            defer { content.close() }
+            let lineage = try #require(
+                UploadRemoteLineageIndexStore(url: directory.appendingPathComponent("lineage.sqlite")))
+            defer { lineage.close() }
+            let backlog = (0..<601).map { String(format: "link%04d", $0) }
+            #expect(
+                content.replaceRemoteContentIndex(
+                    [], unresolvedIssues: [], hashKeyEpoch: "epoch", checkpoint: checkpoint("one")))
+            #expect(
+                lineage.replaceRows(
+                    identities: [], lineage: [], hashKeyEpoch: "epoch", eventID: "one",
+                    unresolvedRemoteLinkIDs: Set(backlog)))
+            StubURLProtocol.reset()
+            try routeMetadata([])
+            routeEmptyEvents(from: "one", to: "two")
+
+            try await refresh(content: content, lineage: lineage)
+            #expect(Set(try metadataRequestLinkIDs()) == Set(backlog.prefix(600)))
+            #expect(StubURLProtocol.requests().filter { $0.path.contains("fetch_metadata") }.count <= 8)
+
+            StubURLProtocol.reset()
+            try routeMetadata([])
+            routeEmptyEvents(from: "two", to: "three")
+            try await refresh(content: content, lineage: lineage)
+            #expect(try metadataRequestLinkIDs() == ["link0600", "link0600"])
+
+            StubURLProtocol.reset()
+            routeEmptyEvents(from: "three", to: "four")
+            try await refresh(content: content, lineage: lineage)
+            #expect(try metadataRequestLinkIDs().isEmpty)
+            #expect(lineage.health(hashKeyEpoch: "epoch", contentCheckpoint: checkpoint("four")) == .incomplete)
+        }
+
         @Test func contentPageFailureKeepsBothCheckpointsAndRows() async throws {
             let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -327,9 +511,48 @@ extension DriveSessionStubSuite {
                 json: #"{"Code":1000,"EventID":"\#(to)","More":0,"Refresh":0,"Events":[]}"#)
         }
 
+        private func routeMetadata(_ links: [[String: Any]]) throws {
+            let body = try JSONSerialization.data(withJSONObject: ["Code": 1000, "Links": links])
+            StubURLProtocol.route(
+                "POST /drive/shares/share1/links/fetch_metadata", json: String(decoding: body, as: UTF8.self))
+        }
+
+        /// Every link ID in the metadata requests, in request order, including retries.
+        private func metadataRequestLinkIDs() throws -> [String] {
+            try StubURLProtocol.requests().filter { $0.path.contains("fetch_metadata") }.flatMap { request in
+                let body = try #require(request.body)
+                let json = try #require(try JSONSerialization.jsonObject(with: body) as? [String: Any])
+                return try #require(json["LinkIDs"] as? [String])
+            }
+        }
+
+        /// A photos root key and one photo node key, so a repair can decrypt the attributes of an active photo.
+        private struct LineageKeys {
+            let crypto = DriveCrypto(addressKeys: [], signers: [])
+            let root: UnlockableKey
+            private let node: UnlockableKey
+
+            init() throws {
+                _ = lineageCryptoReady
+                root = UnlockableKey(
+                    armored: try crypto.generateLockedNodeKey(passphrase: "root-pass"), passphrase: "root-pass")
+                node = UnlockableKey(
+                    armored: try crypto.generateLockedNodeKey(passphrase: "node-pass"), passphrase: "node-pass")
+            }
+
+            func activePhoto(_ linkID: String, attributes: String) throws -> [String: Any] {
+                [
+                    "LinkID": linkID, "Type": 2, "State": 1, "NodeKey": node.armored,
+                    "NodePassphrase": try crypto.encrypt(text: node.passphrase, to: root),
+                    "XAttr": try crypto.encrypt(text: attributes, to: node),
+                    "FileProperties": ["ActiveRevision": ["Photo": [:] as [String: Any]]],
+                ]
+            }
+        }
+
         private func refresh(
             content: UploadIdentityManifestStore, lineage: UploadRemoteLineageIndexStore?,
-            rebuildsMissingLineage: Bool = false
+            rebuildsMissingLineage: Bool = false, rootKey: UnlockableKey = .init(armored: "", passphrase: "")
         ) async throws {
             let session = DriveSession(
                 session: ProtonSession(uid: "test-uid", accessToken: "at", refreshToken: "rt", keyPassword: "kp"),
@@ -339,7 +562,7 @@ extension DriveSessionStubSuite {
             try await ProtonUploadDedupeService.refreshRemoteContentIndex(
                 material: .init(
                     context: .init(volumeID: "vol1", shareID: "share1", rootLinkID: "root1"),
-                    rootKey: .init(armored: "", passphrase: ""), hashKey: Data(), epoch: "epoch"),
+                    rootKey: rootKey, hashKey: Data(), epoch: "epoch"),
                 session: session, crypto: DriveCrypto(addressKeys: [], signers: []),
                 store: content, lineageStore: lineage, rebuildsMissingLineage: rebuildsMissingLineage,
                 progress: { _ in })

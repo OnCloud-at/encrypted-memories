@@ -67,6 +67,10 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
     private static let remoteMetadataRequestConcurrency = 4
     private static let remoteMetadataWindow =
         UploadDedupePipeline.protonDuplicateBatchSize * remoteMetadataRequestConcurrency
+    /// One repair reads at most one metadata window of unresolved lineage links. A full sweep repeats after the
+    /// interval.
+    private static let lineageRepairLimit = remoteMetadataWindow
+    private static let lineageRepairSweepInterval: TimeInterval = 5 * 60
 
     init(
         session: DriveSession,
@@ -663,6 +667,10 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
         let eventLineageStore = lineageStore.flatMap {
             $0.hasCheckpoint(hashKeyEpoch: material.epoch, eventID: checkpoint.eventID) ? $0 : nil
         }
+        if let eventLineageStore {
+            await repairUnresolvedLineage(
+                store: eventLineageStore, eventID: eventID, material: material, session: session, crypto: crypto)
+        }
         while true {
             try Task.checkCancellation()
             let page = try await session.fetchVolumeEvents(
@@ -708,7 +716,7 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
             )
             for event in relevant where event.eventType != 0 {
                 if event.linkType == nil || event.linkType == 2,
-                    let state = event.linkState, state != 0 && state != 1 && state != 2
+                    let state = event.linkState, RemotePhotoLineageRows.isUnknown(state: state)
                 {
                     rows.lineageRows.unresolvedLinkIDs.insert(event.linkID)
                 }
@@ -746,6 +754,43 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
             eventID = page.eventID
             if !page.hasMore { return }
         }
+    }
+
+    /// Reads a bounded share of the unresolved lineage links again, so one failed read does not keep the index
+    /// incomplete until the next full build. A link that reads now gets its rows, a link that is no longer an active
+    /// photo leaves the index, and a link that fails again stays for a later sweep. The lineage index stays passive:
+    /// nothing here throws into the content refresh.
+    private static func repairUnresolvedLineage(
+        store: UploadRemoteLineageIndexStore,
+        eventID: String,
+        material: Material,
+        session: DriveSession,
+        crypto: DriveCrypto
+    ) async {
+        let ids = store.unresolvedLinkIDsForRepair(
+            hashKeyEpoch: material.epoch, limit: lineageRepairLimit, sweepInterval: lineageRepairSweepInterval)
+        guard !ids.isEmpty,
+            let fetched = try? await fetchLinks(ids: ids, shareID: material.context.shareID, session: session),
+            let rows = try? makeIndexRows(
+                links: fetched.links,
+                expectedActiveFileIDs: Set(ids),
+                endpointFailureIDs: fetched.endpointFailureIDs,
+                material: material,
+                crypto: crypto,
+                generation: eventID
+            )
+        else { return }
+        let lineage = rows.lineageRows
+        guard
+            store.applyChanges(
+                identities: lineage.identities, lineage: lineage.lineage, removingRemoteLinkIDs: ids,
+                hashKeyEpoch: material.epoch, expectedEventID: eventID, eventID: eventID,
+                unresolvedRemoteLinkIDs: lineage.unresolvedLinkIDs)
+        else {
+            DebugLog.log("[Dedupe] lineage repair could not be saved; reads remain incomplete")
+            return
+        }
+        DebugLog.log("[Dedupe] lineage repair links=\(ids.count) unresolved=\(lineage.unresolvedLinkIDs.count)")
     }
 
     private struct RemoteMetadataFetch {
@@ -876,7 +921,7 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
                 continue
             }
             if link.type == nil || link.type == 2,
-                let state = link.state, state != 0 && state != 1 && state != 2
+                let state = link.state, RemotePhotoLineageRows.isUnknown(state: state)
             {
                 lineageRows.unresolvedLinkIDs.insert(id)
             }

@@ -64,6 +64,28 @@ final class UploadRemoteLineageIndexStoreTests: XCTestCase {
         XCTAssertEqual(store.replacingMainLinkIDs(ofReplacedLink: "old", hashKeyEpoch: "epoch"), ["new"])
     }
 
+    func testRepairSweepReadsBoundedBatchesInOrderAndWaitsAfterItsEnd() throws {
+        let store = try XCTUnwrap(UploadRemoteLineageIndexStore(url: url))
+        defer { store.close() }
+        XCTAssertTrue(
+            store.replaceRows(
+                identities: [], lineage: [], hashKeyEpoch: "epoch", eventID: "one",
+                unresolvedRemoteLinkIDs: ["a", "b", "c", "d", "e"]))
+        let start = Date(timeIntervalSince1970: 1000)
+        func next(_ offset: TimeInterval) -> [String] {
+            store.unresolvedLinkIDsForRepair(
+                hashKeyEpoch: "epoch", limit: 2, sweepInterval: 60, now: start.addingTimeInterval(offset))
+        }
+        XCTAssertEqual(next(0), ["a", "b"])
+        XCTAssertEqual(next(1), ["c", "d"])
+        XCTAssertEqual(next(2), ["e"])
+        XCTAssertEqual(next(3), [], "a finished sweep waits for its interval")
+        XCTAssertEqual(next(62), ["a", "b"])
+        XCTAssertTrue(
+            store.unresolvedLinkIDsForRepair(hashKeyEpoch: "other", limit: 2, sweepInterval: 60, now: start).isEmpty)
+        XCTAssertEqual(store.health(hashKeyEpoch: "epoch", contentCheckpoint: checkpoint("one")), .incomplete)
+    }
+
     func testEventRefreshDeletesNamedOwnersAndPreservesOtherLineage() throws {
         let store = try XCTUnwrap(UploadRemoteLineageIndexStore(url: url))
         defer { store.close() }
