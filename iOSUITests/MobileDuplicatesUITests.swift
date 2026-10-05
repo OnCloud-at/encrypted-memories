@@ -81,8 +81,7 @@ final class MobileDuplicatesUITests: XCTestCase {
             // The same viewer as the library opens it, for comparison.
             app.buttons["Close"].firstMatch.tap()
             app.buttons["Library"].firstMatch.tap()
-            let photo = app.descendants(matching: .any).matching(NSPredicate(format: "label BEGINSWITH 'Photo, '"))
-                .firstMatch
+            let photo = libraryPhotoBelowTheBars()
             XCTAssertTrue(photo.waitForExistence(timeout: 20))
             photo.tap()
             XCTAssertTrue(app.buttons["Close"].waitForExistence(timeout: 10))
@@ -94,6 +93,19 @@ final class MobileDuplicatesUITests: XCTestCase {
             keepScreenshot("duplicates-ios-checking-\(dark ? "dark" : "light")")
             app.terminate()
         }
+    }
+
+    /// A grid photo whose frame lies completely below the top bars. The first grid photo can sit partly under them,
+    /// and a tap there scrolls the grid instead of opening the photo.
+    private func libraryPhotoBelowTheBars() -> XCUIElement {
+        let photos = app.descendants(matching: .any).matching(NSPredicate(format: "label BEGINSWITH 'Photo, '"))
+        XCTAssertTrue(photos.firstMatch.waitForExistence(timeout: 20))
+        let window = app.windows.firstMatch.frame
+        for index in 0..<min(photos.count, 40) {
+            let photo = photos.element(boundBy: index)
+            if photo.frame.minY > window.minY + 160, photo.frame.maxY < window.maxY - 160 { return photo }
+        }
+        return photos.firstMatch
     }
 
     private func keepScreenshot(_ name: String) {
