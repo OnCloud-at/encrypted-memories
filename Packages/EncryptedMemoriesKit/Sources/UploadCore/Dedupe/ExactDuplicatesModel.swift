@@ -328,6 +328,9 @@ public final class ExactDuplicatesModel {
     /// A merge waits for the facts of groups that nobody scrolled to. Only this ranking shows its progress; the
     /// ranking of the groups on screen runs silently, and its facts simply appear.
     private var isRankingForMerge = false
+    /// The groups whose photo to keep a running merge already read. A ranking that lands meanwhile never moves their
+    /// checkmark, so the screen shows the photo that the merge keeps.
+    @ObservationIgnored private var mergingGroupIDs: Set<String> = []
     private var phase = Phase.idle
     /// The last build failed, or it finished without an index.
     private var buildFailed = false
@@ -527,6 +530,60 @@ public final class ExactDuplicatesModel {
     /// The title of the action that keeps `member`: "Keep This Copy", or "Kept" when a merge keeps it already.
     public func keepTitle(for member: PhotoUID, inGroup groupID: String) -> String {
         group(withID: groupID)?.keepTitle(for: member) ?? L10n.string("duplicates.keep_this_copy")
+    }
+
+    // MARK: - The viewer of a group
+
+    /// The symbol of the action that keeps `member`: a filled checkmark once a merge keeps it.
+    public func keepSymbol(for member: PhotoUID, inGroup groupID: String) -> String {
+        group(withID: groupID)?.kept == member ? "checkmark.circle.fill" : "checkmark.circle"
+    }
+
+    /// The person can keep `member` instead: it is a member, not kept yet, and no merge runs.
+    public func canKeep(_ member: PhotoUID, inGroup groupID: String) -> Bool {
+        guard !isMerging, let group = group(withID: groupID) else { return false }
+        return group.members.contains(member) && group.kept != member
+    }
+
+    /// The title and the symbol of the action that merges a group.
+    public var mergeTitle: String { L10n.string("duplicates.merge") }
+    public var mergeSymbol: String { "arrow.triangle.merge" }
+
+    /// The group can be merged now: it is still shown and no merge or load runs.
+    public func canMerge(groupID: String) -> Bool {
+        canMerge && group(withID: groupID) != nil
+    }
+
+    /// The photos to show in the viewer when the person opens `member`: the members of its group that `item` finds,
+    /// in the order of the group, and the position of `member` among them. Nil while `item` does not find `member`,
+    /// for example right after launch before the library shows it.
+    public func viewerItems(
+        opening member: PhotoUID, inGroup groupID: String, item: (PhotoUID) -> PhotoItem?
+    ) -> (items: [PhotoItem], index: Int)? {
+        guard let members = group(withID: groupID)?.members, members.contains(member) else { return nil }
+        let items = members.compactMap(item)
+        guard let index = items.firstIndex(where: { $0.uid == member }) else { return nil }
+        return (items, index)
+    }
+
+    /// The person moved photos to Recently Deleted elsewhere, for example in the viewer. They leave their groups at
+    /// once; a group with fewer than two copies left leaves the list, and a trashed checked copy hands the checkmark
+    /// to the next copy.
+    public func didTrashElsewhere(_ uids: [PhotoUID]) {
+        let trashed = Set(uids)
+        guard groups.contains(where: { group in group.members.contains(where: trashed.contains) }) else { return }
+        var updated = groups
+        for index in updated.indices.reversed() where updated[index].members.contains(where: trashed.contains) {
+            let reason = updated[index].keptReason
+            let keptLeft = trashed.contains(updated[index].kept)
+            if !updated[index].remove(Array(trashed), keptReason: reason) {
+                updated.remove(at: index)
+            } else if keptLeft {
+                // The chosen photo is gone; the next copy is kept until the person chooses again.
+                updated[index].isKeptChosen = false
+            }
+        }
+        groups = updated
     }
 
     /// Reads the groups and shows them, then ranks the first two pages and builds the content index or brings it up
@@ -736,9 +793,11 @@ public final class ExactDuplicatesModel {
         var changed = false
         for (id, order) in page.members {
             guard let index = positions[id] else { continue }
+            let shownKept = updated[index].kept
             updated[index].rank(
                 order, shared: page.shared[id] ?? [], facts: page.facts[id] ?? [:],
                 sizes: page.memberByteSizes[id] ?? [:], keepsShown: keepsShown)
+            if mergingGroupIDs.contains(id) { updated[index].kept = shownKept }
             changed = true
         }
         for (id, size) in page.byteSizes {
@@ -878,6 +937,7 @@ public final class ExactDuplicatesModel {
         let current = groups
         let currentPositions = Self.positions(of: current)
         let selected = requested.compactMap { request in currentPositions[request.id].map { current[$0] } }
+        mergingGroupIDs = Set(selected.map(\.id))
         var trashed: [PhotoUID] = []
         var kept: [PhotoUID: ExactDuplicateKeepReason] = [:]
         var keptPhotoUnreadable = false
@@ -912,6 +972,7 @@ public final class ExactDuplicatesModel {
         }
         if updated != groups { groups = updated }
         if !trashed.isEmpty { await didTrash(trashed) }
+        mergingGroupIDs = []
         isMerging = false
         notice = Self.notice(kept: kept, keptPhotoUnreadable: keptPhotoUnreadable, failed: failed)
         if stale {

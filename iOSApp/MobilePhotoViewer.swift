@@ -354,29 +354,29 @@ struct MobilePhotoViewer: View {
     /// Keeps the photo shown when its group is merged. "Kept" with a filled checkmark once a merge keeps it.
     private func duplicateKeepButton(_ group: MobileDuplicateViewerGroup) -> some View {
         let uid = currentBaseItem?.uid
-        let isKept = uid != nil && group.model.group(withID: group.groupID)?.kept == uid
         let title = uid.map { group.model.keepTitle(for: $0, inGroup: group.groupID) } ?? ""
+        let symbol = uid.map { group.model.keepSymbol(for: $0, inGroup: group.groupID) } ?? "checkmark.circle"
         return Button {
             guard let uid else { return }
             group.model.keep(uid, inGroup: group.groupID)
         } label: {
-            Label(title, systemImage: isKept ? "checkmark.circle.fill" : "checkmark.circle")
+            Label(title, systemImage: symbol)
         }
-        .disabled(uid == nil || isKept || group.model.isMerging)
+        .disabled(!(uid.map { group.model.canKeep($0, inGroup: group.groupID) } ?? false))
         .accessibilityLabel(title)
         .accessibilityIdentifier("duplicates.viewer.keep")
     }
 
     /// Merges the group with the photo shown as kept, like Merge in Apple Photos, and closes the viewer.
     private func duplicateMergeButton(_ group: MobileDuplicateViewerGroup) -> some View {
-        let title = L10n.string("duplicates.merge")
+        let title = group.model.mergeTitle
         return Button {
             dismiss()
             Task { await group.model.merge(groupID: group.groupID) }
         } label: {
-            Label(title, systemImage: "arrow.triangle.merge")
+            Label(title, systemImage: group.model.mergeSymbol)
         }
-        .disabled(!group.model.canMerge || group.model.group(withID: group.groupID) == nil)
+        .disabled(!group.model.canMerge(groupID: group.groupID))
         .accessibilityLabel(title)
         .accessibilityIdentifier("duplicates.viewer.merge")
     }

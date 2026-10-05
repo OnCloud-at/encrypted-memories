@@ -472,6 +472,8 @@ final class MobileLibraryModel {
         }
         guard !split.remote.isEmpty else { return }
         try await removeFromVisibleLibrary(Set(split.remote)) { try await backend.trash(split.remote) }
+        // A copy trashed in the viewer of a group, or anywhere else, leaves the Duplicates screen at once.
+        duplicates?.didTrashElsewhere(split.remote)
     }
 
     private func offerUndo(forDeleted uids: [PhotoUID]) {

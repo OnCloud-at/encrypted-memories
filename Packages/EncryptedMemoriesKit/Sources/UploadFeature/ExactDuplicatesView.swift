@@ -12,20 +12,24 @@ public struct ExactDuplicatesView<Cover: View>: View {
     @Binding private var confirmsMergeAll: Bool
     private let accent: Color
     private let cornerRadius: CGFloat
+    private let canOpen: (PhotoUID) -> Bool
     private let onOpen: (PhotoUID, String) -> Void
     private let cover: (PhotoUID) -> Cover
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     /// `accent` colors the checkmark and the border of the photo to keep and the progress indicator.
-    /// `cornerRadius` is the corner radius of `cover`. `onOpen` receives a photo and the ID of its group.
+    /// `cornerRadius` is the corner radius of `cover`. `canOpen` tells whether the library shows a photo yet, so
+    /// the viewer can open it; `onOpen` receives a photo and the ID of its group.
     public init(
         model: ExactDuplicatesModel, confirmsMergeAll: Binding<Bool>, accent: Color, cornerRadius: CGFloat,
+        canOpen: @escaping (PhotoUID) -> Bool = { _ in true },
         onOpen: @escaping (PhotoUID, String) -> Void, @ViewBuilder cover: @escaping (PhotoUID) -> Cover
     ) {
         self.model = model
         _confirmsMergeAll = confirmsMergeAll
         self.accent = accent
         self.cornerRadius = cornerRadius
+        self.canOpen = canOpen
         self.onOpen = onOpen
         self.cover = cover
     }
@@ -99,8 +103,8 @@ public struct ExactDuplicatesView<Cover: View>: View {
         case .groups:
             // Progress of the check changes this view often; the list compares equal and keeps its rows.
             ExactDuplicatesGroupList(
-                model: model, accent: accent, cornerRadius: cornerRadius, reduceMotion: reduceMotion, onOpen: onOpen,
-                cover: cover
+                model: model, accent: accent, cornerRadius: cornerRadius, reduceMotion: reduceMotion, canOpen: canOpen,
+                onOpen: onOpen, cover: cover
             )
             .equatable()
         }
@@ -147,6 +151,7 @@ private struct ExactDuplicatesGroupList<Cover: View>: View, Equatable {
     let accent: Color
     let cornerRadius: CGFloat
     let reduceMotion: Bool
+    let canOpen: (PhotoUID) -> Bool
     let onOpen: (PhotoUID, String) -> Void
     let cover: (PhotoUID) -> Cover
     #if os(iOS)
@@ -237,6 +242,7 @@ private struct ExactDuplicatesGroupList<Cover: View>: View, Equatable {
             part: part, group: group, index: index, canMerge: canMerge, accent: accent, cornerRadius: cornerRadius,
             reduceMotion: reduceMotion,
             actions: ExactDuplicateGroupActions(
+                canOpen: canOpen,
                 open: onOpen,
                 keep: { model.keep($0, inGroup: $1) },
                 merge: { groupID in Task { await model.merge(groupID: groupID) } },
@@ -371,6 +377,8 @@ private struct ExactDuplicatesStatusRows: View {
 /// What a group can ask of the model. The parts of a group call these instead of reading the model, so a change of
 /// another group never evaluates them again.
 private struct ExactDuplicateGroupActions {
+    /// The library shows the photo, so the viewer can open it.
+    let canOpen: (PhotoUID) -> Bool
     let open: (PhotoUID, String) -> Void
     let keep: (PhotoUID, String) -> Void
     let merge: (String) -> Void
@@ -504,8 +512,12 @@ private struct ExactDuplicateMembers<Cover: View>: View {
 
     /// A tap or click opens the photo; a long press or a secondary click offers Keep This Copy.
     @ViewBuilder private func member(_ uid: PhotoUID, isKept: Bool, keepTitle: String) -> some View {
+        // Right after launch the library may not show a copy yet; its tile shows that it is not ready.
+        let isReady = actions.canOpen(uid)
+        let open = { if isReady { actions.open(uid, group.id) } }
         let tile = ExactDuplicateTile(
-            group: group, member: uid, accent: accent, cornerRadius: cornerRadius, cover: cover(uid))
+            group: group, member: uid, accent: accent, cornerRadius: cornerRadius, isReady: isReady,
+            cover: cover(uid))
         let keep = Button {
             actions.keep(uid, group.id)
         } label: {
@@ -521,14 +533,12 @@ private struct ExactDuplicateMembers<Cover: View>: View {
             } label: {
                 tile
             } primaryAction: {
-                actions.open(uid, group.id)
+                open()
             }
             .menuStyle(.button)
             .buttonStyle(.plain)
         #else
-            Button {
-                actions.open(uid, group.id)
-            } label: {
+            Button(action: open) {
                 tile
             }
             .buttonStyle(.plain)
@@ -544,6 +554,8 @@ private struct ExactDuplicateTile<Cover: View>: View {
     let member: PhotoUID
     let accent: Color
     let cornerRadius: CGFloat
+    /// The library shows the copy, so the viewer can open it.
+    let isReady: Bool
     let cover: Cover
 
     /// Apple Photos shows at most two badges on a small thumbnail; the rest is a count.
@@ -552,6 +564,9 @@ private struct ExactDuplicateTile<Cover: View>: View {
     var body: some View {
         let isKept = member == group.kept
         cover
+            .overlay {
+                if !isReady { ProgressView().controlSize(.small) }
+            }
             .overlay(alignment: .bottomLeading) { badges }
             .overlay(alignment: .bottomTrailing) {
                 if let size = group.byteSize(of: member) {

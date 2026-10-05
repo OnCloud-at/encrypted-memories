@@ -206,8 +206,9 @@ public struct PhotoViewerView: View {
     /// True while the shared zoom overlay renders the shrink-to-cell transition. This view hides its own
     /// background and image but stays mounted and hit-testable for the pinch gesture.
     private let isDismissing: Bool
-    /// Shows the photos of this viewer in a filmstrip, for a small set of photos such as a group of duplicates.
-    private let showsItemFilmstrip: Bool
+    /// The spoken name of a filmstrip of the photos of this viewer, for a small set of photos such as a group of
+    /// duplicates. Nil shows no such filmstrip.
+    private let itemFilmstripLabel: String?
 
     private let mediaTransition = ViewerMediaTransitionStyle.standard
 
@@ -218,7 +219,7 @@ public struct PhotoViewerView: View {
         onPinchDismissChanged: @escaping (CGFloat) -> Void = { _ in },
         onPinchDismissEnded: @escaping (Bool) -> Void = { _ in },
         isDismissing: Bool = false,
-        showsItemFilmstrip: Bool = false
+        itemFilmstripLabel: String? = nil
     ) {
         _model = State(initialValue: model)
         self.onClose = onClose
@@ -226,7 +227,7 @@ public struct PhotoViewerView: View {
         self.onPinchDismissChanged = onPinchDismissChanged
         self.onPinchDismissEnded = onPinchDismissEnded
         self.isDismissing = isDismissing
-        self.showsItemFilmstrip = showsItemFilmstrip
+        self.itemFilmstripLabel = itemFilmstripLabel
     }
 
     public var body: some View {
@@ -306,16 +307,16 @@ public struct PhotoViewerView: View {
                 if model.hasBurstFilmstrip, !isDismissing {
                     // Only the filmstrip follows the width, so a resize evaluates it alone.
                     ViewerWidthReader { burstFilmstrip(areaWidth: $0) }
-                } else if showsItemFilmstrip, !isDismissing {
-                    ViewerWidthReader { itemFilmstrip(areaWidth: $0) }
+                } else if let itemFilmstripLabel, !isDismissing {
+                    ViewerWidthReader { itemFilmstrip(areaWidth: $0, label: itemFilmstripLabel) }
                 }
             }
     }
 
     /// The photos of this viewer in the filmstrip panel of a burst. The title bar already shows the position.
-    private func itemFilmstrip(areaWidth: CGFloat) -> some View {
+    private func itemFilmstrip(areaWidth: CGFloat, label: String) -> some View {
         filmstripPanel(
-            items: model.items, selectedUID: model.baseCurrent.uid, title: nil, areaWidth: areaWidth,
+            items: model.items, selectedUID: model.baseCurrent.uid, title: nil, label: label, areaWidth: areaWidth,
             onSelect: { index in
                 guard model.items.indices.contains(index) else { return }
                 model.selectPage(uid: model.items[index].uid)
@@ -416,13 +417,15 @@ public struct PhotoViewerView: View {
         let total = max(model.burstItems.count, 1)
         return filmstripPanel(
             items: model.burstItems, selectedUID: model.current.uid,
-            title: L10n.string("viewer.burst_badge \(position) \(total)"), areaWidth: areaWidth,
+            title: L10n.string("viewer.burst_badge \(position) \(total)"),
+            label: L10n.string("viewer.burst_filmstrip_label"), areaWidth: areaWidth,
             onSelect: { model.selectBurstIndex($0) })
     }
 
-    /// The glass filmstrip panel at the bottom of the viewer, with an optional title above the photos.
+    /// The glass filmstrip panel at the bottom of the viewer, with an optional title above the photos and the spoken
+    /// name `label`.
     private func filmstripPanel(
-        items: [PhotoItem], selectedUID: PhotoUID, title: String?, areaWidth: CGFloat,
+        items: [PhotoItem], selectedUID: PhotoUID, title: String?, label: String, areaWidth: CGFloat,
         onSelect: @escaping (Int) -> Void
     ) -> some View {
         let width = max(areaWidth - 40, 320)
@@ -445,7 +448,7 @@ public struct PhotoViewerView: View {
                 onSelect: onSelect
             )
             .frame(height: itemSide + (needsScroller ? 18 : 0))
-            .accessibilityLabel(Text(L10n.string("viewer.burst_filmstrip_label")))
+            .accessibilityLabel(Text(label))
         }
         .padding(.horizontal, 12)
         .padding(.top, 10)

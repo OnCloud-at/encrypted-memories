@@ -463,6 +463,75 @@ final class ExactDuplicatesModelTests: XCTestCase {
         XCTAssertEqual(model.groups[0].kept, a2)
     }
 
+    // MARK: - The viewer of a group
+
+    func testARankingThatLandsDuringAMergeKeepsTheCheckmarkThatTheMergeKeeps() async {
+        let groups = manyGroups(60)
+        let late = groups[50]
+        let finder = FakeDuplicateFinder(scans: [.init(groups: groups, coverage: .complete)])
+        let (model, _) = makeModel(finder)
+        await model.load()
+        // Merge All cannot read the facts of the late group; a scroll ranking reads them while the merge runs.
+        finder.unreadableGroups = [late.id]
+        finder.mergeGate.close()
+        let merge = Task { await model.mergeAll() }
+        await waitUntil({ finder.mergeGate.hasWaiters }, "the merge runs")
+        let shownKept = model.groups.first { $0.id == late.id }?.kept
+        finder.unreadableGroups = []
+        finder.ranked = [late.id: Array(late.members.reversed())]
+
+        model.groupAppeared(late.id)
+        await waitUntil({ model.groups.first { $0.id == late.id }?.isRanked == true }, "the late facts arrive")
+
+        XCTAssertEqual(
+            model.groups.first { $0.id == late.id }?.kept, shownKept, "the screen shows what the merge keeps")
+        finder.mergeGate.open()
+        await merge.value
+        XCTAssertEqual(finder.merges.first { $0.group == late.id }?.kept, shownKept)
+    }
+
+    func testAPhotoTrashedElsewhereLeavesItsGroupAndASingleCopyLeavesTheList() async {
+        let finder = FakeDuplicateFinder(scans: [.init(groups: [groupA, groupB], coverage: .complete)])
+        let (model, log) = makeModel(finder)
+        await model.load()
+        model.keep(a2, inGroup: "A")
+
+        model.didTrashElsewhere([a2, b1])
+
+        XCTAssertEqual(model.groups.map(\.id), ["A"], "group B has one copy left")
+        XCTAssertEqual(model.groups[0].members, [a1, a3])
+        XCTAssertEqual(model.groups[0].kept, a1, "the next copy takes the checkmark of the trashed one")
+        XCTAssertFalse(model.groups[0].isKeptChosen)
+        XCTAssertTrue(log.calls.isEmpty, "the library already removed the photos")
+        XCTAssertTrue(finder.merges.isEmpty)
+    }
+
+    func testTheViewerActionsFollowTheGroup() async {
+        let (model, _) = makeModel(FakeDuplicateFinder(scans: [.init(groups: [groupA], coverage: .complete)]))
+        await model.load()
+        XCTAssertFalse(model.canKeep(a1, inGroup: "A"), "the kept copy is kept already")
+        XCTAssertEqual(model.keepSymbol(for: a1, inGroup: "A"), "checkmark.circle.fill")
+        XCTAssertTrue(model.canKeep(a2, inGroup: "A"))
+        XCTAssertEqual(model.keepSymbol(for: a2, inGroup: "A"), "checkmark.circle")
+        XCTAssertFalse(model.canKeep(b1, inGroup: "A"), "only a member can be kept")
+        XCTAssertTrue(model.canMerge(groupID: "A"))
+        XCTAssertFalse(model.canMerge(groupID: "gone"))
+        XCTAssertEqual(model.mergeTitle, L10n.string("duplicates.merge"))
+    }
+
+    func testTheViewerOpensTheMembersThatTheLibraryShowsAndWaitsForTheTappedOne() async {
+        let (model, _) = makeModel(FakeDuplicateFinder(scans: [.init(groups: [groupA], coverage: .complete)]))
+        await model.load()
+        let shown = [a1, a3].map { PhotoItem(uid: $0, captureTime: date(0), mediaType: "image/jpeg") }
+        let item = { (uid: PhotoUID) in shown.first { $0.uid == uid } }
+
+        let opened = model.viewerItems(opening: a3, inGroup: "A", item: item)
+        XCTAssertEqual(opened?.items.map(\.uid), [a1, a3], "a copy that the library does not show yet stays out")
+        XCTAssertEqual(opened?.index, 1)
+        XCTAssertNil(model.viewerItems(opening: a2, inGroup: "A", item: item), "the tapped copy is not ready")
+        XCTAssertNil(model.viewerItems(opening: b1, inGroup: "A", item: item))
+    }
+
     // MARK: - Facts of each copy
 
     private func date(_ offset: TimeInterval) -> Date { Date(timeIntervalSince1970: 1_700_000_000 + offset) }

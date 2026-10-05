@@ -6006,6 +6006,13 @@
         }
       }
     },
+    "duplicates.viewer_filmstrip_label": {
+      "comment": "Spoken name of the filmstrip of the copies of a group in the photo viewer.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Identical copies" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Identische Kopien" } }
+      }
+    },
     "duplicates.info_title": {
       "comment": "Title of the explanation beside the copy count.",
       "localizations": {

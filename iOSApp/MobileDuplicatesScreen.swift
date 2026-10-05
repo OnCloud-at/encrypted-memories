@@ -23,7 +23,8 @@ struct MobileDuplicatesScreen: View {
     var body: some View {
         ExactDuplicatesView(
             model: model, confirmsMergeAll: $confirmsMergeAll, accent: ProtonColor.primary,
-            cornerRadius: Self.cornerRadius, onOpen: { openPhoto($0, groupID: $1) }
+            cornerRadius: Self.cornerRadius, canOpen: { libraryModel.snapshot.item(for: $0) != nil },
+            onOpen: { openPhoto($0, groupID: $1) }
         ) { uid in
             ExactDuplicateThumbnail(
                 uid: uid, side: Self.thumbnailSide, cornerRadius: Self.cornerRadius, thumbnails: thumbnails)
@@ -47,11 +48,11 @@ struct MobileDuplicatesScreen: View {
 
     /// Opens `uid` with the other photos of its group that the library shows.
     private func openPhoto(_ uid: PhotoUID, groupID: String) {
-        guard let members = model.group(withID: groupID)?.members else { return }
-        let items = members.compactMap { libraryModel.snapshot.item(for: $0) }
-        guard let index = items.firstIndex(where: { $0.uid == uid }) else { return }
+        let snapshot = libraryModel.snapshot
+        guard let opened = model.viewerItems(opening: uid, inGroup: groupID, item: { snapshot.item(for: $0) })
+        else { return }
         viewerRouter.presentation = MobileViewerPresentation(
-            index: index, items: items, context: .library,
+            index: opened.index, items: opened.items, context: .library,
             duplicateGroup: MobileDuplicateViewerGroup(model: model, groupID: groupID))
     }
 }

@@ -13,6 +13,8 @@ struct MacDuplicatesView: View {
     /// The height of the window toolbar that floats over this view.
     let topInset: CGFloat
     @Binding var confirmsMergeAll: Bool
+    /// True once the library shows a photo, so the viewer can open it.
+    let canOpen: (PhotoUID) -> Bool
     /// Opens a photo and the ID of its group in the viewer.
     let onOpen: (PhotoUID, String) -> Void
 
@@ -31,7 +33,7 @@ struct MacDuplicatesView: View {
     var body: some View {
         ExactDuplicatesView(
             model: model, confirmsMergeAll: $confirmsMergeAll, accent: .accentColor, cornerRadius: Self.cornerRadius,
-            onOpen: onOpen
+            canOpen: canOpen, onOpen: onOpen
         ) { uid in
             ExactDuplicateThumbnail(
                 uid: uid, side: Self.thumbnailSide, cornerRadius: Self.cornerRadius, thumbnails: thumbnails)

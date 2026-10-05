@@ -80,8 +80,10 @@
                         cache: ThumbnailCache(namespace: "duplicates-viewer-\(UUID().uuidString)", rootDirectory: root),
                         loader: ColorThumbnails()),
                     media: ColorMedia())
-                let view = PhotoViewerView(model: viewer, onClose: {}, showsItemFilmstrip: isGroup)
-                    .frame(width: 1400, height: 900)
+                let view = PhotoViewerView(
+                    model: viewer, onClose: {}, itemFilmstripLabel: isGroup ? "Identical copies" : nil
+                )
+                .frame(width: 1400, height: 900)
                 let host = NSHostingView(rootView: view)
                 host.frame = NSRect(x: 0, y: 0, width: 1400, height: 900)
                 let window = NSWindow(contentRect: host.frame, styleMask: [.titled], backing: .buffered, defer: false)
