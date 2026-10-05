@@ -199,6 +199,8 @@ private struct MobilePhotoBackupSections: View {
                 Text(String(localized: "settings.photos_backup_background_note"))
             }
 
+            BackupMobileDataSection { controller.mobileDataSettingDidChange() }
+
             Section {
                 Toggle(isOn: $keepDisplayAwake) {
                     VStack(alignment: .leading, spacing: 2) {
@@ -242,6 +244,15 @@ private struct MobilePhotoBackupSections: View {
                     .animation(.easeInOut(duration: 0.2), value: display.headlineKey)
 
                 statusDetails(display)
+
+                if let reason = display.localizedWaitingForWiFiDetail {
+                    Text(reason)
+                        .font(.caption)
+                        .foregroundStyle(ProtonColor.textWeak)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .transition(.opacity.combined(with: .move(edge: .top)))
+                }
 
                 if let retry = display.localizedRetryDetail {
                     Text(retry)
@@ -431,6 +442,9 @@ private struct MobilePhotoBackupSections: View {
                 .foregroundStyle(ProtonColor.textWeak)
         case .waiting:
             Image(systemName: "clock.arrow.circlepath")
+                .foregroundStyle(ProtonColor.textWeak)
+        case .waitingForWiFi:
+            Image(systemName: BackupStatus.waitingForWiFiSymbolName)
                 .foregroundStyle(ProtonColor.textWeak)
         case .notice:
             Image(systemName: "info.circle")

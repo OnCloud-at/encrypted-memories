@@ -21,6 +21,8 @@ public struct BackupStatusPresentation: Sendable, Equatable {
         case attention
         case paused
         case waiting
+        /// Mobile data is off for backups. Hosts show `BackupStatus.waitingForWiFiSymbolName`, never an offline symbol.
+        case waitingForWiFi
         case notice
     }
 
@@ -140,6 +142,14 @@ public struct BackupStatusPresentation: Sendable, Equatable {
                 backedUp: status.backedUp, total: backupTarget,
                 skippedRemoteDeletions: status.skippedRemoteDeletions)
 
+        case .waitingForWiFi:
+            self.init(
+                headlineKey: "backup.phase_waiting_wifi", isActive: false, accessory: .waitingForWiFi,
+                progressFraction: status.fractionCompleted,
+                backedUp: status.backedUp, total: backupTarget,
+                attentionCount: status.needsAttentionCount,
+                skippedRemoteDeletions: status.skippedRemoteDeletions)
+
         case .waiting:
             let headlineKey =
                 switch status.outstandingIssue {
@@ -210,6 +220,7 @@ public struct BackupStatusPresentation: Sendable, Equatable {
         case "backup.phase_checking": return L10n.string("backup.phase_checking")
         case "backup.phase_uploading": return L10n.string("backup.phase_uploading")
         case "backup.phase_paused": return L10n.string("backup.phase_paused")
+        case "backup.phase_waiting_wifi": return L10n.string("backup.phase_waiting_wifi")
         case "backup.phase_waiting": return L10n.string("backup.phase_waiting")
         case "backup.phase_waiting_proton": return L10n.string("backup.phase_waiting_proton")
         case "backup.phase_waiting_network": return L10n.string("backup.phase_waiting_network")
@@ -238,6 +249,11 @@ public struct BackupStatusPresentation: Sendable, Equatable {
     public var localizedAttention: String? {
         guard attentionCount > 0 else { return nil }
         return L10n.string("backup.progress_attention \(attentionCount)")
+    }
+
+    /// Why the backup waits, where the row has room for a second line.
+    public var localizedWaitingForWiFiDetail: String? {
+        accessory == .waitingForWiFi ? L10n.string("backup.detail_waiting_wifi") : nil
     }
 
     public var localizedWaitingDetail: String? {

@@ -18,6 +18,7 @@ import PhotosCore
         static func installFixtureIfRequested(into runtime: MobileAccountRuntime) async {
             guard isRequested, fixture == nil else { return }
             UserDefaults.standard.removeObject(forKey: AppSettingsKey.mapAndPlacesEnabled)
+            UserDefaults.standard.removeObject(forKey: AppSettingsKey.backupUsesMobileData)
             for await isChecking in runtime.sessionModel.$isCheckingSession.values where !isChecking {
                 break
             }

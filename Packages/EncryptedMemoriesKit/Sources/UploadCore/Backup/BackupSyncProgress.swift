@@ -66,6 +66,9 @@ public struct BackupSyncProgress: Sendable, Equatable {
     /// True while the throttle policy holds the running pass at zero concurrency
     /// (e.g. critical thermal pressure) - "paused", not "working".
     public var isPausedByPolicy = false
+    /// True while that policy pause holds only because mobile data is off for backups on an expensive network.
+    /// The device is online; the status says "Waiting for Wi-Fi", never "offline".
+    public var isWaitingForWiFi = false
     /// Remote duplicate-index preparation runs before item work so a large encrypted metadata
     /// refresh is visible and resumable instead of looking like a frozen backup counter.
     public var remoteIndexPreparation: UploadRemoteIndexPreparationProgress?
