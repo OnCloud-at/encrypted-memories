@@ -142,6 +142,12 @@ public struct ExactDuplicatesView<Cover: View>: View {
                                 .monospacedDigit()
                                 .accessibilityIdentifier("duplicates.totalFreed")
                         }
+                        if let note = model.totalFreedNote {
+                            Text(note)
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
+                                .accessibilityIdentifier("duplicates.totalFreedNote")
+                        }
                     }
                 }
             }

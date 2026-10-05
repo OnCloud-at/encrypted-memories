@@ -303,6 +303,12 @@ public final class ExactDuplicatesModel {
         return total > 0 ? L10n.string("duplicates.total_frees \(Self.byteText(total))") : nil
     }
 
+    /// One line below the total: merged duplicates wait in Recently Deleted, so the space is free only after that.
+    /// Nil without a total.
+    public var totalFreedNote: String? {
+        totalFreedText == nil ? nil : L10n.string("duplicates.freed_when_emptied")
+    }
+
     /// The system's file byte format, for example "4.2 MB".
     nonisolated static func byteText(_ bytes: Int64) -> String {
         bytes.formatted(.byteCount(style: .file))

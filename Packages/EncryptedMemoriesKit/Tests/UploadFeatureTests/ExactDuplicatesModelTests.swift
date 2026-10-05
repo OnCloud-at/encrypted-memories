@@ -323,6 +323,9 @@ final class ExactDuplicatesModelTests: XCTestCase {
         XCTAssertEqual(
             model.totalFreedText,
             L10n.string("duplicates.total_frees \(Int64(2_000_000).formatted(.byteCount(style: .file)))"))
+        XCTAssertEqual(
+            model.totalFreedNote, L10n.string("duplicates.freed_when_emptied"),
+            "the space is free only after Recently Deleted is emptied")
     }
 
     func testTheTotalGrowsWhileTheCheckFindsGroupsAndSizes() async {
@@ -349,6 +352,7 @@ final class ExactDuplicatesModelTests: XCTestCase {
         XCTAssertNil(model.groups.first?.byteSize)
         XCTAssertEqual(model.totalFreedBytes, 0)
         XCTAssertNil(model.totalFreedText)
+        XCTAssertNil(model.totalFreedNote, "no note without a total")
     }
 
     // MARK: - Ranking only what the screen shows

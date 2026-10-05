@@ -6042,6 +6042,13 @@
         "de": { "stringUnit": { "state": "translated", "value": "Gibt %@ frei" } }
       }
     },
+    "duplicates.freed_when_emptied": {
+      "comment": "Footer line below the space that merging all groups frees: merged duplicates wait in Recently Deleted.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Space is freed when Recently Deleted is emptied." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Der Speicher wird frei, wenn „Zuletzt gelöscht“ geleert ist." } }
+      }
+    },
     "duplicates.total_frees %@": {
       "comment": "Below the group count: the space that merging all groups found so far frees. %@ is a formatted size.",
       "extractionState": "manual",
