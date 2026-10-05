@@ -43,6 +43,7 @@ public struct ExactDuplicatesView<Cover: View>: View {
                 Text(model.notice?.message ?? "")
             }
             .task { await model.load() }
+            .onDisappear { model.screenDisappeared() }
     }
 
     @ViewBuilder private var content: some View {

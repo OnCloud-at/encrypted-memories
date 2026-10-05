@@ -437,6 +437,40 @@ final class ExactDuplicatesModelTests: XCTestCase {
         XCTAssertNil(model.rankingLine, "the ranking finished")
     }
 
+    func testAScrollThatStopsAcrossTwoPagesRanksAroundTheFirstAndTheLastShownGroup() async {
+        let groups = manyGroups(1_500)
+        let finder = FakeDuplicateFinder(scans: [.init(groups: groups, coverage: .complete)])
+        let (model, _) = makeModel(finder)
+        await model.load()
+        let size = ExactDuplicatesModel.rankingPageSize
+
+        // The scroll stops with the end of page 2 and the start of page 3 visible.
+        for index in (3 * size - 3)...(3 * size) { model.groupAppeared(groups[index].id) }
+        await waitUntil({ model.groups.filter(\.isRanked).count == 5 * size }, "pages 2, 3, and 4 rank")
+        XCTAssertEqual(Set(finder.rankedGroups.joined()), Set(groups.prefix(5 * size).map(\.id)))
+        XCTAssertTrue(model.groups[3 * size - 3].isRanked, "the first shown group ranks")
+    }
+
+    func testAClosedScreenStopsTheRankingAndRanksNoGroupItShowedBefore() async {
+        let groups = manyGroups(1_500)
+        let finder = FakeDuplicateFinder(scans: [.init(groups: groups, coverage: .complete)])
+        let (model, _) = makeModel(finder)
+        await model.load()
+        let size = ExactDuplicatesModel.rankingPageSize
+        finder.rankGate.close()
+        model.groupAppeared(groups[10 * size].id)
+        await waitUntil({ finder.rankGate.hasWaiters }, "page 10 ranks")
+        model.groupAppeared(groups[20 * size].id)
+
+        model.screenDisappeared()
+        finder.rankGate.open()
+        try? await Task.sleep(for: ExactDuplicatesModel.appearancePause * 3)
+        await waitUntil({ model.rankingLine == nil }, "the ranking stops")
+        let requested = Set(finder.rankedGroups.joined())
+        XCTAssertFalse(requested.contains(groups[11 * size].id), "the running ranking reads no further page")
+        XCTAssertFalse(requested.contains(groups[20 * size].id), "a group shown before the close does not rank")
+    }
+
     func testTheRankingQueueKeepsTheNewestPagesAndAnOlderPageRanksWhenShownAgain() async {
         let groups = manyGroups(1_500)
         let finder = FakeDuplicateFinder(scans: [.init(groups: groups, coverage: .complete)])

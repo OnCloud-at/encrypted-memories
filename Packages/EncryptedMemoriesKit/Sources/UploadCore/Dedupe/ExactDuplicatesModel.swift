@@ -193,8 +193,8 @@ public final class ExactDuplicatesModel {
     @ObservationIgnored private var rankingQueue: [String] = []
     /// The groups that the ranking of this load has read or queued. A failed group waits for the next load or a merge.
     @ObservationIgnored private var rankingRequested: Set<String> = []
-    /// The last group that the screen showed, until the pause after it ranks its pages.
-    @ObservationIgnored private var appearedGroupID: String?
+    /// The groups that the screen showed since the last pause, until the pause after them ranks their pages.
+    @ObservationIgnored private var appearedGroupIDs: Set<String> = []
     /// Counts the groups shown, so the pause restarts while the screen keeps showing groups.
     @ObservationIgnored private var appearances = 0
     /// Waits for the pause after the last group shown. One at a time.
@@ -380,11 +380,11 @@ public final class ExactDuplicatesModel {
         _ = await (ranked, built)
     }
 
-    /// The screen shows the group. After a short pause without another group shown, ranks the page of the last group
-    /// shown and the page after it, unless they are ranked. A list that shows many sections at once, as on macOS,
-    /// ranks around the last one only.
+    /// The screen shows the group. After a short pause without another group shown, ranks the pages of the first and
+    /// of the last group shown since the last pause, each with the page after it, unless they are ranked. A list that
+    /// shows many sections at once, as on macOS, ranks around those two only.
     public func groupAppeared(_ groupID: String) {
-        appearedGroupID = groupID
+        appearedGroupIDs.insert(groupID)
         appearances &+= 1
         guard appearanceFollower == nil else { return }
         appearanceFollower = Task { [weak self] in await self?.followAppearances() }
@@ -399,9 +399,22 @@ public final class ExactDuplicatesModel {
             if Task.isCancelled { return }
         }
         appearanceFollower = nil
-        guard let groupID = appearedGroupID, let index = groups.firstIndex(where: { $0.id == groupID }) else { return }
-        appearedGroupID = nil
-        _ = requestRanking(around: index)
+        let shown = groups.indices.filter { appearedGroupIDs.contains(groups[$0].id) }
+        appearedGroupIDs = []
+        guard let first = shown.first, let last = shown.last else { return }
+        _ = requestRanking(around: [first, last])
+    }
+
+    /// The screen went away. Stops waiting for the groups shown and stops the scroll ranking; a merge keeps running.
+    public func screenDisappeared() {
+        stopFollowingAppearances()
+        ranking?.cancel()
+    }
+
+    private func stopFollowingAppearances() {
+        appearanceFollower?.cancel()
+        appearanceFollower = nil
+        appearedGroupIDs = []
     }
 
     /// Reads the groups and shows them in the fallback order. A group with the same members keeps its ranking and the
@@ -447,7 +460,7 @@ public final class ExactDuplicatesModel {
 
     /// Ranks the page of the group at `index` and the page after it, and waits for that ranking.
     private func rank(around index: Int) async {
-        guard let task = requestRanking(around: index) else { return }
+        guard let task = requestRanking(around: [index]) else { return }
         await withTaskCancellationHandler {
             await task.value
         } onCancel: {
@@ -455,17 +468,24 @@ public final class ExactDuplicatesModel {
         }
     }
 
-    /// Queues the unranked groups of two pages from the page of `index`. Returns the ranking that reads them.
-    private func requestRanking(around index: Int) -> Task<Void, Never>? {
+    /// Queues the unranked groups of two pages from the page of each of `indices`. Returns the ranking that reads them.
+    private func requestRanking(around indices: [Int]) -> Task<Void, Never>? {
         let size = Self.rankingPageSize
-        let start = index / size * size
-        let wanted = groups[start..<min(start + 2 * size, groups.count)]
-            .filter { !$0.isRanked && !rankingRequested.contains($0.id) }.map(\.id)
+        var wanted: [String] = []
+        for index in indices {
+            let start = index / size * size
+            for group in groups[start..<min(start + 2 * size, groups.count)]
+            where !group.isRanked && !rankingRequested.contains(group.id) && !wanted.contains(group.id) {
+                wanted.append(group.id)
+            }
+        }
         guard !wanted.isEmpty else { return ranking }
         rankingRequested.formUnion(wanted)
         rankingQueue += wanted
-        // The oldest queued groups give way; the screen requests them again when it shows them again.
-        let dropped = rankingQueue.prefix(max(0, rankingQueue.count - Self.maximumQueuedPages * size))
+        // The oldest queued groups give way, never those of this request; the screen requests them again when it
+        // shows them again.
+        let kept = max(Self.maximumQueuedPages * size, wanted.count)
+        let dropped = rankingQueue.prefix(max(0, rankingQueue.count - kept))
         rankingRequested.subtract(dropped)
         rankingQueue.removeFirst(dropped.count)
         if let ranking {
@@ -520,9 +540,7 @@ public final class ExactDuplicatesModel {
 
     /// Stops the ranking. A group that it did not read can be requested again.
     private func stopRanking() {
-        appearanceFollower?.cancel()
-        appearanceFollower = nil
-        appearedGroupID = nil
+        stopFollowingAppearances()
         ranking?.cancel()
         ranking = nil
         rankingQueue = []

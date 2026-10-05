@@ -60,6 +60,24 @@ struct BoundedConcurrencyTests {
         #expect(probe.active == 0, "every item ended before the call returned")
     }
 
+    @Test func progressCountsNoItemAfterTheFirstFailure() async {
+        let reports = ConcurrencyProbe()
+        let report: @Sendable (Int) async -> Void = { reports.record($0) }
+        _ = try? await BoundedConcurrency.throwingMap(Array(0..<6), limit: 3, progress: report) { item in
+            switch item {
+            case 0:
+                return item
+            case 1:
+                try await Task.sleep(for: .milliseconds(20))
+                throw ProbeError()
+            default:
+                try await Task.sleep(for: .seconds(30))
+                return item
+            }
+        }
+        #expect(reports.recorded == [1])
+    }
+
     @Test func cancellingTheCallerCancelsEveryItemAndStartsNoOther() async {
         let probe = ConcurrencyProbe()
         let started = Gate()

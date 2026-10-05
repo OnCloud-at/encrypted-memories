@@ -17,7 +17,8 @@ public enum BoundedConcurrency {
     }
 
     /// One answer for each item, in order. The first failure cancels the other items and is thrown once every running
-    /// item has ended. A cancelled caller gets `CancellationError` unless an item failed first.
+    /// item has ended; `progress` counts no item after it. A cancelled caller gets `CancellationError` unless an item
+    /// failed first.
     public static func throwingMap<Item: Sendable, Value: Sendable>(
         _ items: [Item], limit: Int, progress: (@Sendable (_ finished: Int) async -> Void)? = nil,
         _ operation: @escaping @Sendable (Item) async throws -> Value
@@ -57,7 +58,8 @@ public enum BoundedConcurrency {
                     state.stop()
                 }
                 startNext()
-                await progress?(finished)
+                // After a failure the other items only end; the run reports no further progress.
+                if firstFailure == nil { await progress?(finished) }
             }
             return (state.finish(), firstFailure)
         } onCancel: {
