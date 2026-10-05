@@ -19,6 +19,14 @@ enum ProtonPhotoHMAC {
 
 // MARK: - Duplicate service
 
+/// The SDK's exact duplicate query, the only SDK call of the duplicate service.
+protocol SDKPhotoDuplicatesClient: Sendable {
+    func findPhotoDuplicates(name: String, sha1: Data, cancellationToken: UUID) async throws -> [SDKNodeUid]
+    func cancelFindPhotoDuplicates(cancellationToken: UUID) async throws
+}
+
+extension EncryptedMemoriesClient: SDKPhotoDuplicatesClient {}
+
 enum ProtonUploadDedupeError: LocalizedError {
     /// The photos root link carried no `FolderProperties.NodeHashKey` - without it no
     /// Proton-compatible identity can be computed, so dedupe (and upload preflight) must fail
@@ -40,7 +48,7 @@ enum ProtonUploadDedupeError: LocalizedError {
 actor ProtonUploadDedupeService: UploadDuplicateChecking {
     private let session: DriveSession
     private let crypto: DriveCrypto
-    private let photosClient: EncryptedMemoriesClient
+    private let photosClient: any SDKPhotoDuplicatesClient
     private let contentIndexStore: any UploadRemoteContentIndexStore
     private let lineageIndexStore: UploadRemoteLineageIndexStore?
     private let contextProvider: @Sendable () async throws -> PhotosShareContext
@@ -59,8 +67,8 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
         [:]
     private var remoteContentIndexGeneration = 0
     private var lastRemoteContentRefreshAt: Date?
-    /// The one lineage rebuild of this launch for each key epoch; every lineage read waits for it.
-    private var lineageRebuilds: [String: Task<Void, Never>] = [:]
+    /// The key epochs whose missing lineage index this launch rebuilt.
+    private var rebuiltLineageEpochs: Set<String> = []
     private static let remoteContentIndexLifetime: TimeInterval = 15
     /// Four metadata requests overlap network latency without producing the unbounded request fan-out
     /// used by the reference client. Decryption and the transactional store update remain serialized.
@@ -75,11 +83,13 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
     init(
         session: DriveSession,
         crypto: DriveCrypto,
-        photosClient: EncryptedMemoriesClient,
+        photosClient: any SDKPhotoDuplicatesClient,
         contentIndexStore: any UploadRemoteContentIndexStore,
         lineageIndexStore: UploadRemoteLineageIndexStore? = nil,
+        material: Material? = nil,
         contextProvider: @Sendable @escaping () async throws -> PhotosShareContext
     ) {
+        self.material = material
         self.session = session
         self.crypto = crypto
         self.photosClient = photosClient
@@ -300,7 +310,6 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
         let material = try await resolveMaterial()
         try await refreshRemoteContentIndex(material: material)
         guard let lineageIndexStore else { return ([], false) }
-        await prepareLineageIndex(material: material)
         let links = lineageIndexStore.activeMainLinkIDs(forExternalIdentifier: identifier, hashKeyEpoch: material.epoch)
         return (links, lineageHealth(material: material) == .complete)
     }
@@ -309,7 +318,6 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
         let material = try await resolveMaterial()
         try await refreshRemoteContentIndex(material: material)
         guard let lineageIndexStore else { return ([], false) }
-        await prepareLineageIndex(material: material)
         let links = lineageIndexStore.replacingMainLinkIDs(ofReplacedLink: linkID, hashKeyEpoch: material.epoch)
         return (links, lineageHealth(material: material) == .complete)
     }
@@ -318,7 +326,6 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
         let material = try await resolveMaterial()
         try await refreshRemoteContentIndex(material: material)
         guard let lineageIndexStore else { return (nil, false) }
-        await prepareLineageIndex(material: material)
         let identifier = lineageIndexStore.externalIdentifier(ofMainLink: linkID, hashKeyEpoch: material.epoch)
         return (identifier, lineageHealth(material: material) == .complete)
     }
@@ -327,31 +334,19 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
         let material = try await resolveMaterial()
         try await refreshRemoteContentIndex(material: material)
         guard let lineageIndexStore else { return ([], false) }
-        await prepareLineageIndex(material: material)
         let links = lineageIndexStore.replacedLinkIDs(ofReplacingMain: linkID, hashKeyEpoch: material.epoch)
         return (links, lineageHealth(material: material) == .complete)
     }
 
     /// The lineage index fills only in a full index build. An account indexed before the lineage index existed, or
-    /// one whose lineage checkpoint fell behind, has none, so the first lineage read of a launch rebuilds the index
-    /// once for each key epoch, and every lineage read waits for that rebuild. A store that cannot write never
-    /// rebuilds. A failed rebuild leaves the index incomplete, so the reads stay unproven.
-    private func prepareLineageIndex(material: Material) async {
-        if let rebuild = lineageRebuilds[material.epoch] {
-            await rebuild.value
-            return
-        }
-        guard let lineageIndexStore, lineageIndexStore.acceptsWrites, lineageHealth(material: material) == .incomplete
-        else { return }
-        let rebuild = Task<Void, Never> {
-            do {
-                try await refreshRemoteContentIndex(material: material, rebuildsMissingLineage: true)
-            } catch {
-                DebugLog.log("[Dedupe] lineage index rebuild failed; reads remain incomplete - \(error)")
-            }
-        }
-        lineageRebuilds[material.epoch] = rebuild
-        await rebuild.value
+    /// one whose lineage checkpoint fell behind, has none. The index preparation of the backup and of Duplicates then
+    /// rebuilds the index once in each launch for each key epoch, with the progress of a content build. A photo's
+    /// resolve never starts that build: it reads the incomplete lineage index, which keeps its reads unproven. A store
+    /// that cannot write never rebuilds.
+    private func rebuildsMissingLineage(material: Material) -> Bool {
+        guard let lineageIndexStore, lineageIndexStore.acceptsWrites, !rebuiltLineageEpochs.contains(material.epoch)
+        else { return false }
+        return lineageHealth(material: material) == .incomplete
     }
 
     /// Read after the lookup: a failed lookup marks the store incomplete.
@@ -373,7 +368,10 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
         if let checkpoint = contentIndexStore.remoteContentIndexBuildCheckpoint(hashKeyEpoch: material.epoch) {
             await progress(.init(phase: .indexing, completed: checkpoint.cursor, total: checkpoint.total))
         }
-        try await refreshRemoteContentIndex(material: material)
+        let rebuildsLineage = rebuildsMissingLineage(material: material)
+        try await refreshRemoteContentIndex(material: material, rebuildsMissingLineage: rebuildsLineage)
+        // A failed rebuild throws above and runs again with the next preparation.
+        if rebuildsLineage { rebuiltLineageEpochs.insert(material.epoch) }
         guard contentIndexStore.remoteContentIndexHealth(hashKeyEpoch: material.epoch) != .unavailable else {
             throw UploadError.backend("Remote duplicate index is unavailable")
         }

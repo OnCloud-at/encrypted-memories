@@ -5,13 +5,21 @@ import PhotosCore
 /// The reads and the merge that the Duplicates screens need. `ExactDuplicateFinder` serves the signed-in account;
 /// tests and the offline UI-test account supply their own.
 public protocol ExactDuplicateMerging: Sendable {
-    func duplicateGroups() async throws -> ExactDuplicateScan
+    /// The groups, read from the content index. Reports how many candidate photos the visibility read covered.
+    func duplicateGroups(
+        progress: @escaping @Sendable (ExactDuplicateScanProgress) async -> Void
+    ) async throws -> ExactDuplicateScan
     /// Builds the content index when none exists, or brings it up to date, and reports the progress of the build.
     /// True when the index changed.
     func prepareIndex(
         progress: @escaping @Sendable (UploadRemoteIndexPreparationProgress) async -> Void
     ) async throws -> Bool
-    func rankedMembers(of groups: [ExactDuplicateGroup]) async throws -> [String: [PhotoUID]]
+    /// The members of each group in an order that needs no request.
+    func fallbackMembers(of groups: [ExactDuplicateGroup]) async -> [String: [PhotoUID]]
+    /// Ranks the members of each group, page by page. A group whose facts cannot be read is not in its page.
+    func rankMembers(
+        of groups: [ExactDuplicateGroup], ranked: @escaping @Sendable (ExactDuplicateRankingPage) async -> Void
+    ) async
     /// Merges each group, keeping its photo. One result for each group, in order. After a cancellation, the groups
     /// without an outcome fail with `CancellationError`.
     func merge(
@@ -43,6 +51,7 @@ public enum ExactDuplicateMergeNotice: Equatable, Sendable {
         case .keptDuplicates(_, .relatedFileWithoutTwin): L10n.string("duplicates.kept_reason_related_file")
         case .keptDuplicates(_, .pendingEditReplacement): L10n.string("duplicates.kept_reason_pending_edit")
         case .keptDuplicates(_, .neededByLocalSource): L10n.string("duplicates.kept_reason_needed_here")
+        case .keptDuplicates(_, .shared): L10n.string("duplicates.kept_reason_shared")
         case .keptDuplicates(_, .unreadable): L10n.string("duplicates.kept_reason_unreadable")
         case .keptPhotoUnreadable: L10n.string("duplicates.kept_photo_unreadable")
         case .failed: L10n.string("duplicates.merge_failed_message")
@@ -52,6 +61,9 @@ public enum ExactDuplicateMergeNotice: Equatable, Sendable {
 
 /// The shared state of the Duplicates screens on iOS, iPadOS, and macOS: the groups, the photo to keep in each
 /// group, and the merges. The platform views only render it and forward taps.
+///
+/// A load shows the groups as soon as the scan returns, in an order that needs no request. The ranking then reads the
+/// facts of the groups page by page, and the content index builds or refreshes at the same time.
 @MainActor
 @Observable
 public final class ExactDuplicatesModel {
@@ -65,6 +77,10 @@ public final class ExactDuplicatesModel {
         public internal(set) var kept: PhotoUID
         /// Why the last merge of this group left duplicates in the library. Nil before a merge.
         public internal(set) var keptReason: ExactDuplicateKeepReason?
+        /// False while `members` holds the fallback order, before the ranking read the facts of the group.
+        public internal(set) var isRanked = false
+        /// The person tapped the photo to keep, so the ranking no longer changes it.
+        public internal(set) var isKeptChosen = false
         /// The photos that a merge moves to Recently Deleted.
         public var duplicateCount: Int { members.count - 1 }
 
@@ -85,13 +101,22 @@ public final class ExactDuplicatesModel {
             keptReason = reason
             return true
         }
+
+        /// Takes the ranked order. The photo to keep follows it unless the person chose one.
+        mutating func rank(_ order: [PhotoUID]) {
+            let current = Set(members)
+            let ranked = order.filter(current.contains)
+            members = ranked + members.filter { !ranked.contains($0) }
+            isRanked = true
+            if !isKeptChosen { kept = members[0] }
+        }
     }
 
     public enum Content: Equatable, Sendable {
         case loading
         case failed(String)
         case noDuplicates
-        /// No group yet, and the content index still misses photos.
+        /// No group yet, and the content index still builds.
         case stillChecking
         case groups
     }
@@ -103,25 +128,43 @@ public final class ExactDuplicatesModel {
         case counted(completed: Int, total: Int)
     }
 
+    /// One titled progress line: a short title, a count line when the total is known, and the completed fraction.
+    public struct ProgressLine: Equatable, Sendable {
+        public let title: String
+        public let detail: String?
+        /// Nil while the total is unknown.
+        public let fraction: Double?
+    }
+
     private enum Phase: Equatable {
         case idle, loading, loaded
         case failed
     }
 
     public private(set) var groups: [Group] = []
-    /// False while the content index misses photos, so more duplicates can appear later.
-    public private(set) var isComplete = true
+    /// How much of the library the content index covered at the last scan.
+    public private(set) var coverage = ExactDuplicateCoverage.complete
     public private(set) var isMerging = false
     /// The progress of the content index build. Nil while no build runs.
     public private(set) var checkProgress: CheckProgress?
+    /// The visibility read of the scan while the screen loads. Nil outside a scan.
+    public private(set) var scanProgress: ExactDuplicateScanProgress?
+    /// The groups that the ranking has covered, of all groups that it ranks. Nil while no ranking runs.
+    public private(set) var rankingProgress: ExactDuplicateScanProgress?
     /// The message of the last merge, until the person dismisses it.
     public private(set) var notice: ExactDuplicateMergeNotice?
     private var phase = Phase.idle
+    /// The last build failed, or it finished without an index.
+    private var buildFailed = false
     private var scannedDuplicateCount: Int?
     private var loadGeneration = 0
     /// The one build of this model. A load while it runs waits for it, and a closed screen leaves it running: the
     /// backup uses the same build, and the build resumes from its checkpoint.
     @ObservationIgnored private var indexBuild: Task<Bool, any Error>?
+    /// The ranking of the last load. A new load cancels it.
+    @ObservationIgnored private var ranking: Task<Void, Never>?
+    /// Identifies the ranking whose progress the screen shows.
+    @ObservationIgnored private var rankingToken = UUID()
     @ObservationIgnored private let finder: any ExactDuplicateMerging
     /// Called with the photos that a merge moved to Recently Deleted, so the library stops showing them.
     @ObservationIgnored private let didTrash: @MainActor ([PhotoUID]) async -> Void
@@ -133,35 +176,110 @@ public final class ExactDuplicatesModel {
         self.didTrash = didTrash
     }
 
+    /// False while the content index misses photos, so more duplicates can appear later.
+    public var isComplete: Bool { coverage.isComplete }
+
+    private var isBuilding: Bool { checkProgress != nil }
+
     public var content: Content {
         switch phase {
         case .idle, .loading: groups.isEmpty ? .loading : .groups
         case .failed: groups.isEmpty ? .failed(L10n.string("duplicates.load_failed")) : .groups
         case .loaded:
-            if !groups.isEmpty { .groups } else if isComplete { .noDuplicates } else { .stillChecking }
+            if !groups.isEmpty {
+                .groups
+            } else if case .indexing = coverage {
+                .stillChecking
+            } else if !isComplete, isBuilding {
+                .stillChecking
+            } else {
+                // A finished check never waits: photos that could not be read get one line instead.
+                .noDuplicates
+            }
         }
     }
 
     /// The text of `.noDuplicates` and `.stillChecking`.
     public var emptyStateCopy: PhotoFilterEmptyStateCopy {
-        guard content == .stillChecking else { return PhotoFilter.duplicates.emptyStateCopy }
-        return PhotoFilterEmptyStateCopy(
-            title: L10n.string("duplicates.checking_title"), description: L10n.string("duplicates.checking_wait"),
-            systemImage: "hourglass")
+        switch content {
+        case .stillChecking:
+            PhotoFilterEmptyStateCopy(
+                title: L10n.string("duplicates.checking_title"), description: L10n.string("duplicates.checking_wait"),
+                systemImage: "hourglass")
+        case .noDuplicates where uncheckedNote != nil:
+            PhotoFilterEmptyStateCopy(
+                title: PhotoFilter.duplicates.emptyStateCopy.title, description: uncheckedNote ?? "",
+                systemImage: PhotoFilter.duplicates.emptyStateCopy.systemImage)
+        default:
+            PhotoFilter.duplicates.emptyStateCopy
+        }
     }
 
     /// The title of `.loading`.
     public var loadingTitle: String { L10n.string("duplicates.loading") }
 
+    /// The line of `.loading`: the visibility read of the scan, counted when its total is known.
+    public var loadingLine: ProgressLine {
+        guard let scanProgress, scanProgress.total > 0 else {
+            return ProgressLine(title: loadingTitle, detail: nil, fraction: nil)
+        }
+        return ProgressLine(
+            title: loadingTitle,
+            detail: Self.photoCount(scanProgress.completed, of: scanProgress.total),
+            fraction: Double(scanProgress.completed) / Double(scanProgress.total))
+    }
+
     /// The counted progress of the library check, for example "1,234 of 15,000 photos". Nil without a total.
     public var checkProgressText: String? {
         guard case .counted(let completed, let total) = checkProgress else { return nil }
-        return L10n.string("duplicates.checking_progress \(completed.formatted()) \(total.formatted())")
+        return Self.photoCount(completed, of: total)
     }
 
-    /// The note while the library is still being checked. Nil once every photo was checked.
+    /// The line of a running library check. Nil while no build runs, and for a quick refresh of a complete index.
+    public var checkLine: ProgressLine? {
+        switch checkProgress {
+        case .counted(let completed, let total):
+            ProgressLine(
+                title: L10n.string("duplicates.checking_title"), detail: checkProgressText,
+                fraction: Double(completed) / Double(total))
+        case .indeterminate where !isComplete:
+            ProgressLine(title: L10n.string("duplicates.checking_title"), detail: nil, fraction: nil)
+        case .indeterminate, nil:
+            nil
+        }
+    }
+
+    /// The line of a running ranking, for example "40 of 1,545 groups". Nil while no ranking runs.
+    public var rankingLine: ProgressLine? {
+        guard let rankingProgress, rankingProgress.total > 0 else { return nil }
+        let completed = rankingProgress.completed.formatted()
+        let total = rankingProgress.total.formatted()
+        return ProgressLine(
+            title: L10n.string("duplicates.ranking_title"),
+            detail: L10n.string("duplicates.ranking_progress \(completed) \(total)"),
+            fraction: Double(rankingProgress.completed) / Double(rankingProgress.total))
+    }
+
+    /// The note while the library is still being checked and groups are shown. Nil once the check finished.
     public var stillCheckingNote: String? {
-        phase == .loaded && !isComplete ? L10n.string("duplicates.still_checking") : nil
+        phase == .loaded && !isComplete && isBuilding ? L10n.string("duplicates.still_checking") : nil
+    }
+
+    /// One line after a finished check that could not read some photos. A retry cannot read them, so it has none.
+    public var uncheckedNote: String? {
+        guard phase == .loaded, !isBuilding, case .incomplete(let count) = coverage, count > 0 else { return nil }
+        return L10n.string("duplicates.unchecked \(count)")
+    }
+
+    /// The check stopped without an index while groups are shown. A retry can finish it.
+    public var checkFailedNote: String? {
+        guard phase == .loaded, !isBuilding, buildFailed, case .indexing = coverage else { return nil }
+        return L10n.string("duplicates.check_failed")
+    }
+
+    /// The number of groups found, for example "1,545 Groups". Nil without a group.
+    public var groupCountText: String? {
+        groups.isEmpty ? nil : L10n.string("duplicates.group_count \(groups.count)")
     }
 
     /// The photos that Merge All moves to Recently Deleted.
@@ -177,48 +295,120 @@ public final class ExactDuplicatesModel {
     public var mergeAllTitle: String { L10n.string("duplicates.merge_all_title \(duplicateCount)") }
     public var mergeAllMessage: String { L10n.string("duplicates.merge_all_message \(duplicateCount)") }
 
-    /// Reads the groups and ranks their members, then builds the content index or brings it up to date, and reads
-    /// the groups again when the index changed. A choice of the person stays while its photo is still a member.
+    /// Reads the groups and shows them, then ranks their members and builds the content index or brings it up to
+    /// date, both at once. Reads the groups again when the index changed. A choice of the person stays while its
+    /// photo is still a member.
     public func load() async {
         guard !isMerging else { return }
         loadGeneration += 1
         let generation = loadGeneration
         phase = .loading
         guard await scan(generation: generation) else { return }
-        let changed: Bool
-        do {
-            changed = try await buildIndex()
-        } catch {
-            // The groups already shown stay. Without them, the person can try again.
-            if generation == loadGeneration, !isMerging, groups.isEmpty, !isComplete { phase = .failed }
-            return
-        }
-        guard changed, generation == loadGeneration, !isMerging else { return }
-        await scan(generation: generation)
+        async let ranked: Void = rank(generation: generation)
+        async let built: Void = buildAndRescan(generation: generation)
+        _ = await (ranked, built)
     }
 
-    /// Reads and ranks the groups. False when the read failed or a newer load replaced this one.
-    @discardableResult
+    /// Reads the groups and shows them in the fallback order. A group with the same members keeps its ranking and the
+    /// choice of the person. False when the read failed or a newer load replaced this one.
     private func scan(generation: Int) async -> Bool {
+        let report: @Sendable (ExactDuplicateScanProgress) async -> Void = { [weak self] progress in
+            await self?.showScan(progress, generation: generation)
+        }
+        defer { if generation == loadGeneration { scanProgress = nil } }
         do {
-            let scan = try await finder.duplicateGroups()
-            let ranked = try await finder.rankedMembers(of: scan.groups)
+            let scan = try await finder.duplicateGroups(progress: report)
+            let fallback = await finder.fallbackMembers(of: scan.groups)
             guard generation == loadGeneration, !isMerging else { return false }
             let earlier = Dictionary(groups.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
             groups = scan.groups.map { group in
-                let members = ranked[group.id] ?? group.members
-                let choice = earlier[group.id].flatMap { members.contains($0.kept) ? $0.kept : nil }
-                // The reason of the last merge stays while the group still has the same members.
-                let reason = earlier[group.id].flatMap { Set($0.members) == Set(members) ? $0.keptReason : nil }
-                return Group(scanGroup: group, members: members, kept: choice ?? members[0], keptReason: reason)
+                if let same = earlier[group.id], Set(same.members) == Set(group.members) {
+                    var kept = same
+                    kept.scanGroup = group
+                    return kept
+                }
+                let members = fallback[group.id] ?? group.members
+                let choice = earlier[group.id].flatMap { $0.isKeptChosen && members.contains($0.kept) ? $0.kept : nil }
+                var shown = Group(scanGroup: group, members: members, kept: choice ?? members[0])
+                shown.isKeptChosen = choice != nil
+                return shown
             }
-            isComplete = scan.coverage.isComplete
+            coverage = scan.coverage
             phase = .loaded
             return true
         } catch {
             guard generation == loadGeneration else { return false }
             phase = .failed
             return false
+        }
+    }
+
+    private func showScan(_ progress: ExactDuplicateScanProgress, generation: Int) {
+        guard generation == loadGeneration, phase == .loading else { return }
+        scanProgress = progress
+    }
+
+    /// Ranks every group that has no ranking yet. A new load cancels the ranking of the earlier one.
+    private func rank(generation: Int) async {
+        ranking?.cancel()
+        let token = UUID()
+        rankingToken = token
+        let pending = groups.filter { !$0.isRanked }.map(\.scanGroup)
+        guard !pending.isEmpty else {
+            rankingProgress = nil
+            return
+        }
+        rankingProgress = ExactDuplicateScanProgress(completed: 0, total: pending.count)
+        let finder = finder
+        let apply: @Sendable (ExactDuplicateRankingPage) async -> Void = { [weak self] page in
+            await self?.apply(page, generation: generation, token: token)
+        }
+        let task = Task { await finder.rankMembers(of: pending, ranked: apply) }
+        ranking = task
+        await withTaskCancellationHandler {
+            await task.value
+        } onCancel: {
+            task.cancel()
+        }
+        if rankingToken == token { rankingProgress = nil }
+    }
+
+    /// Takes the ranked order of each group in `page`. `generation` nil applies the page in every case. Only the
+    /// ranking of `token` counts its progress.
+    private func apply(_ page: ExactDuplicateRankingPage, generation: Int?, token: UUID? = nil) {
+        if let generation {
+            guard generation == loadGeneration else { return }
+            if token == rankingToken, let progress = rankingProgress {
+                rankingProgress = ExactDuplicateScanProgress(
+                    completed: min(progress.completed + page.groupCount, progress.total), total: progress.total)
+            }
+        }
+        for (id, order) in page.members {
+            guard let index = groups.firstIndex(where: { $0.id == id }) else { continue }
+            groups[index].rank(order)
+        }
+    }
+
+    private func buildAndRescan(generation: Int) async {
+        let changed: Bool
+        do {
+            changed = try await buildIndex()
+            buildFailed = false
+        } catch {
+            guard generation == loadGeneration else { return }
+            buildFailed = true
+            // The groups already shown stay. Without them, the person can try again.
+            if !isMerging, groups.isEmpty, !isComplete { phase = .failed }
+            return
+        }
+        guard generation == loadGeneration, !isMerging else { return }
+        if changed {
+            guard await scan(generation: generation) else { return }
+            await rank(generation: generation)
+        } else if case .indexing = coverage {
+            // The build finished and left no index: waiting longer cannot help, a retry can.
+            buildFailed = true
+            if groups.isEmpty { phase = .failed }
         }
     }
 
@@ -248,10 +438,14 @@ public final class ExactDuplicatesModel {
         }
     }
 
+    private static func photoCount(_ completed: Int, of total: Int) -> String {
+        L10n.string("duplicates.checking_progress \(completed.formatted()) \(total.formatted())")
+    }
+
     /// Counts the duplicates for the entry without ranking them, once, before the screen has loaded.
     public func loadCountIfNeeded() async {
         guard phase == .idle, scannedDuplicateCount == nil else { return }
-        guard let scan = try? await finder.duplicateGroups(), phase == .idle else { return }
+        guard let scan = try? await finder.duplicateGroups(progress: { _ in }), phase == .idle else { return }
         scannedDuplicateCount = scan.groups.reduce(0) { $0 + $1.members.count - 1 }
     }
 
@@ -261,6 +455,7 @@ public final class ExactDuplicatesModel {
             groups[index].members.contains(uid)
         else { return }
         groups[index].kept = uid
+        groups[index].isKeptChosen = true
     }
 
     public func merge(groupID: String) async {
@@ -277,9 +472,18 @@ public final class ExactDuplicatesModel {
         notice = nil
     }
 
-    private func merge(_ selected: [Group]) async {
+    private func merge(_ requested: [Group]) async {
         isMerging = true
         notice = nil
+        // The photo to keep needs the facts of its group: a shared photo or one in an album ranks first.
+        let unranked = requested.filter { !$0.isRanked }.map(\.scanGroup)
+        if !unranked.isEmpty {
+            let apply: @Sendable (ExactDuplicateRankingPage) async -> Void = { [weak self] page in
+                await self?.apply(page, generation: nil)
+            }
+            await finder.rankMembers(of: unranked, ranked: apply)
+        }
+        let selected = requested.compactMap { request in groups.first { $0.id == request.id } }
         var trashed: [PhotoUID] = []
         var kept: [PhotoUID: ExactDuplicateKeepReason] = [:]
         var keptPhotoUnreadable = false
@@ -331,7 +535,7 @@ public final class ExactDuplicatesModel {
         in reasons: some Collection<ExactDuplicateKeepReason>
     ) -> ExactDuplicateKeepReason? {
         let order: [ExactDuplicateKeepReason] = [
-            .relatedFileWithoutTwin, .pendingEditReplacement, .neededByLocalSource, .unreadable,
+            .relatedFileWithoutTwin, .pendingEditReplacement, .neededByLocalSource, .shared, .unreadable,
         ]
         return order.first(where: reasons.contains)
     }

@@ -280,8 +280,23 @@ import UploadCore
             self.checking = checking
         }
 
-        func duplicateGroups() async throws -> ExactDuplicateScan {
+        func duplicateGroups(
+            progress: @escaping @Sendable (ExactDuplicateScanProgress) async -> Void
+        ) async throws -> ExactDuplicateScan {
             ExactDuplicateScan(groups: lock.withLock { groups }, coverage: checking ? .indexing : .complete)
+        }
+
+        func fallbackMembers(of groups: [ExactDuplicateGroup]) async -> [String: [PhotoUID]] {
+            Dictionary(uniqueKeysWithValues: groups.map { ($0.id, $0.members) })
+        }
+
+        func rankMembers(
+            of groups: [ExactDuplicateGroup], ranked: @escaping @Sendable (ExactDuplicateRankingPage) async -> Void
+        ) async {
+            await ranked(
+                ExactDuplicateRankingPage(
+                    members: Dictionary(uniqueKeysWithValues: groups.map { ($0.id, $0.members) }),
+                    groupCount: groups.count))
         }
 
         func prepareIndex(
@@ -291,10 +306,6 @@ import UploadCore
             await progress(.init(phase: .indexing, completed: 1_234, total: 15_000))
             try await Task.sleep(for: .seconds(3_600))
             return false
-        }
-
-        func rankedMembers(of groups: [ExactDuplicateGroup]) async throws -> [String: [PhotoUID]] {
-            Dictionary(uniqueKeysWithValues: groups.map { ($0.id, $0.members) })
         }
 
         func merge(

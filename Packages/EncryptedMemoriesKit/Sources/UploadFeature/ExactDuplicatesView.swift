@@ -1,3 +1,4 @@
+import DesignSystemCore
 import PhotosCore
 import SwiftUI
 import UploadCore
@@ -47,8 +48,12 @@ public struct ExactDuplicatesView<Cover: View>: View {
     @ViewBuilder private var content: some View {
         switch model.content {
         case .loading:
+            let line = model.loadingLine
             ContentUnavailableView {
-                ProgressView(model.loadingTitle).tint(accent)
+                Label(line.title, systemImage: "square.on.square")
+            } actions: {
+                progressRow(line, showsTitle: false)
+                    .frame(maxWidth: 320)
             }
             .accessibilityIdentifier("duplicates.loading")
         case .failed(let message):
@@ -67,28 +72,51 @@ public struct ExactDuplicatesView<Cover: View>: View {
             } description: {
                 Text(copy.description)
             } actions: {
-                checkProgress.frame(maxWidth: 320)
+                if let line = model.checkLine {
+                    progressRow(line, showsTitle: false)
+                        .frame(maxWidth: 320)
+                        .accessibilityIdentifier("duplicates.checkProgress")
+                }
             }
         case .groups:
             groupList
         }
     }
 
-    /// The progress of the library check: counted while the build knows its total, otherwise indeterminate.
-    @ViewBuilder private var checkProgress: some View {
-        switch model.checkProgress {
-        case .counted(let completed, let total):
-            ProgressView(value: Double(completed), total: Double(total)) {
-                EmptyView()
-            } currentValueLabel: {
-                Text(model.checkProgressText ?? "").monospacedDigit()
-            }
-            .tint(accent)
-            .accessibilityIdentifier("duplicates.checkProgress")
-        case .indeterminate:
-            ProgressView().tint(accent).accessibilityIdentifier("duplicates.checkProgress")
-        case nil:
-            EmptyView()
+    /// The shared progress row. Without its title, the surrounding view shows the title.
+    private func progressRow(_ line: ExactDuplicatesModel.ProgressLine, showsTitle: Bool = true) -> some View {
+        ActivityProgressRow(
+            title: showsTitle ? line.title : nil, detail: line.detail, fraction: line.fraction,
+            showsIndeterminateProgress: true
+        )
+        .tint(accent)
+    }
+
+    /// The state of the check and of the ranking above the groups: progress rows while they run, one line after a check
+    /// that could not read every photo, and a retry when the check stopped.
+    @ViewBuilder private var statusRows: some View {
+        if let line = model.checkLine {
+            progressRow(line).accessibilityIdentifier("duplicates.checkProgress")
+        }
+        if let note = model.stillCheckingNote {
+            Label(note, systemImage: "hourglass")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+        }
+        if let line = model.rankingLine {
+            progressRow(line).accessibilityIdentifier("duplicates.rankingProgress")
+        }
+        if let note = model.uncheckedNote {
+            Label(note, systemImage: "exclamationmark.circle")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+                .accessibilityIdentifier("duplicates.unchecked")
+        }
+        if let note = model.checkFailedNote {
+            Label(note, systemImage: "exclamationmark.icloud")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+            Button(L10n.string("action.retry")) { Task { await model.load() } }
         }
     }
 
@@ -103,12 +131,11 @@ public struct ExactDuplicatesView<Cover: View>: View {
 
     private var groupList: some View {
         let list = List {
-            if let note = model.stillCheckingNote {
-                Section {
-                    Label(note, systemImage: "hourglass")
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                    checkProgress
+            Section {
+                statusRows
+            } header: {
+                if let count = model.groupCountText {
+                    Text(count).accessibilityIdentifier("duplicates.groupCount")
                 }
             }
             ForEach(Array(model.groups.enumerated()), id: \.element.id) { index, group in

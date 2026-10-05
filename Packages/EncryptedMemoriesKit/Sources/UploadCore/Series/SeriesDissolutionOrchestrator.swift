@@ -99,9 +99,17 @@ public protocol SeriesAlbumCarryOver: Sendable {
     /// Adds the photos to an album of the account's own library. A shared album is never a valid target.
     /// Succeeds only when every photo is a member afterwards; an existing membership counts as success.
     func addPhotos(_ uids: [PhotoUID], toOwnAlbum albumID: String) async throws
+    /// The link ID of the cover photo of each album of the account's own library that has one, by album ID.
+    func ownAlbumCovers() async throws -> [String: String]
+    /// Makes `uid`, a member of the album, the cover of an album of the account's own library.
+    func setCover(_ uid: PhotoUID, ofOwnAlbum albumID: String) async throws
 }
 
 extension SeriesAlbumCarryOver {
+    /// Backends without album covers report none.
+    public func ownAlbumCovers() async throws -> [String: String] { [:] }
+    public func setCover(_ uid: PhotoUID, ofOwnAlbum albumID: String) async throws {}
+
     public func albums(containing uids: [PhotoUID]) async throws -> [PhotoUID: [SeriesAlbumReference]] {
         var albumsByPhoto: [PhotoUID: [SeriesAlbumReference]] = [:]
         for uid in uids where albumsByPhoto[uid] == nil {

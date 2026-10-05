@@ -5961,6 +5961,79 @@
         }
       }
     },
+    "duplicates.group_count %lld": {
+      "comment": "Header above the groups of identical photos: the number of groups found.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "variations": {
+            "plural": {
+              "one": { "stringUnit": { "state": "translated", "value": "%lld Group" } },
+              "other": { "stringUnit": { "state": "translated", "value": "%lld Groups" } }
+            }
+          }
+        },
+        "de": {
+          "variations": {
+            "plural": {
+              "one": { "stringUnit": { "state": "translated", "value": "%lld Gruppe" } },
+              "other": { "stringUnit": { "state": "translated", "value": "%lld Gruppen" } }
+            }
+          }
+        }
+      }
+    },
+    "duplicates.unchecked %lld": {
+      "comment": "One line after a finished library check that could not read some photos.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "variations": {
+            "plural": {
+              "one": { "stringUnit": { "state": "translated", "value": "%lld photo could not be checked." } },
+              "other": { "stringUnit": { "state": "translated", "value": "%lld photos could not be checked." } }
+            }
+          }
+        },
+        "de": {
+          "variations": {
+            "plural": {
+              "one": { "stringUnit": { "state": "translated", "value": "%lld Foto konnte nicht geprüft werden." } },
+              "other": { "stringUnit": { "state": "translated", "value": "%lld Fotos konnten nicht geprüft werden." } }
+            }
+          }
+        }
+      }
+    },
+    "duplicates.check_failed": {
+      "comment": "Line above the groups when the library check stopped before it finished.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "The library check did not finish." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Die Prüfung der Mediathek wurde nicht abgeschlossen." } }
+      }
+    },
+    "duplicates.ranking_title": {
+      "comment": "Title while the screen reads which photo of each group to keep.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Choosing Photos to Keep" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Zu behaltende Fotos werden gewählt" } }
+      }
+    },
+    "duplicates.ranking_progress %@ %@": {
+      "comment": "Progress of choosing the photos to keep. First %@: groups done, second: all groups, both formatted numbers.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "%1$@ of %2$@ groups" } },
+        "de": { "stringUnit": { "state": "translated", "value": "%1$@ von %2$@ Gruppen" } }
+      }
+    },
+    "duplicates.kept_reason_shared": {
+      "comment": "Why a merge left a duplicate in the library: the person shares it.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "It is shared with others." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Es ist mit anderen geteilt." } }
+      }
+    },
     "duplicates.still_checking": {
       "localizations": {
         "en": { "stringUnit": { "state": "translated", "value": "Still checking your library. More duplicates can appear." } },

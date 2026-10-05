@@ -16,10 +16,11 @@ final class MobileDuplicatesUITests: XCTestCase {
         XCTAssertTrue(group(1).waitForExistence(timeout: 10))
     }
 
-    private func openDuplicates(fixture: String) {
-        app.launchArguments = [
-            "-EncryptedMemoriesUITestFixture", fixture, "-AppleLanguages", "(en)", "-AppleLocale", "en_US",
-        ]
+    private func openDuplicates(fixture: String, dark: Bool = false) {
+        app.launchArguments =
+            [
+                "-EncryptedMemoriesUITestFixture", fixture, "-AppleLanguages", "(en)", "-AppleLocale", "en_US",
+            ] + (dark ? ["-EncryptedMemoriesDarkAppearance"] : [])
         app.launch()
         // The iOS 26 and 27 tab bars do not always expose a tab bar element; the tab is a button in both.
         let collections = app.buttons["Collections"].firstMatch
@@ -64,6 +65,29 @@ final class MobileDuplicatesUITests: XCTestCase {
                 || (progress.value as? String)?.contains("1,234 of 15,000 photos") == true,
             "the progress counts the checked photos")
         XCTAssertFalse(app.staticTexts["No Duplicates"].exists)
+    }
+
+    /// Keeps a screenshot of the groups and of the running library check in light and dark for the visual review.
+    func testScreenshotsOfTheGroupsAndTheLibraryCheck() {
+        for dark in [false, true] {
+            openDuplicates(fixture: "-EncryptedMemoriesDuplicatesFixture", dark: dark)
+            XCTAssertTrue(group(1).waitForExistence(timeout: 10))
+            XCTAssertTrue(app.staticTexts["2 Groups"].waitForExistence(timeout: 5), "the screen counts the groups")
+            keepScreenshot("duplicates-ios-groups-\(dark ? "dark" : "light")")
+            app.terminate()
+
+            openDuplicates(fixture: "-EncryptedMemoriesDuplicatesCheckingFixture", dark: dark)
+            XCTAssertTrue(app.staticTexts["Checking Your Library"].waitForExistence(timeout: 10))
+            keepScreenshot("duplicates-ios-checking-\(dark ? "dark" : "light")")
+            app.terminate()
+        }
+    }
+
+    private func keepScreenshot(_ name: String) {
+        let attachment = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
+        attachment.name = name
+        attachment.lifetime = .keepAlways
+        add(attachment)
     }
 
     func testMergeRemovesTheGroupFromDuplicates() {

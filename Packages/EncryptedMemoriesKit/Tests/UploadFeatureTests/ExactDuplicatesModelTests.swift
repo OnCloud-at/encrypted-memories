@@ -45,17 +45,25 @@ final class ExactDuplicatesModelTests: XCTestCase {
         XCTAssertFalse(model.canMerge)
     }
 
-    func testAnEmptyScanOfAnIndexThatIsNotCompleteSaysItIsStillChecking() async {
-        for coverage in [ExactDuplicateCoverage.indexing, .incomplete(unresolvedCount: 3)] {
-            let (model, _) = makeModel(FakeDuplicateFinder(scans: [.init(groups: [], coverage: coverage)]))
-            await model.load()
-            XCTAssertEqual(model.content, .stillChecking, "\(coverage)")
-            XCTAssertEqual(model.emptyStateCopy.title, L10n.string("duplicates.checking_title"), "\(coverage)")
-            XCTAssertFalse(model.canMerge)
+    func testAFinishedCheckNeverWaitsAndNamesThePhotosItCouldNotRead() async {
+        let (incomplete, _) = makeModel(
+            FakeDuplicateFinder(scans: [.init(groups: [], coverage: .incomplete(unresolvedCount: 3))]))
+        await incomplete.load()
+        XCTAssertEqual(incomplete.content, .noDuplicates, "a finished check shows its result")
+        XCTAssertEqual(incomplete.emptyStateCopy.title, L10n.string("duplicates.none_title"))
+        XCTAssertEqual(incomplete.emptyStateCopy.description, L10n.string("duplicates.unchecked \(3)"))
+        XCTAssertNil(incomplete.checkFailedNote, "a retry cannot read those photos")
+
+        let (unbuilt, _) = makeModel(FakeDuplicateFinder(scans: [.init(groups: [], coverage: .indexing)]))
+        await unbuilt.load()
+        guard case .failed = unbuilt.content else {
+            return XCTFail("a build that left no index offers a retry, got \(unbuilt.content)")
         }
+
         let (complete, _) = makeModel(FakeDuplicateFinder(scans: [.init(groups: [], coverage: .complete)]))
         await complete.load()
         XCTAssertEqual(complete.emptyStateCopy, PhotoFilter.duplicates.emptyStateCopy)
+        XCTAssertNil(complete.uncheckedNote)
     }
 
     func testAFailedScanShowsAShortReasonAndKeepsShownGroups() async {
@@ -75,21 +83,128 @@ final class ExactDuplicatesModelTests: XCTestCase {
         XCTAssertEqual(model.content, .groups, "a failed refresh must not hide the groups already shown")
     }
 
-    func testAFailedRankingFailsTheLoad() async {
+    func testAFailedRankingKeepsTheFallbackOrderAndShowsTheGroups() async {
         let finder = FakeDuplicateFinder(scans: [.init(groups: [groupA], coverage: .complete)])
         finder.rankError = URLError(.timedOut)
+        finder.fallback = ["A": [a2, a1, a3]]
         let (model, _) = makeModel(finder)
         await model.load()
-        guard case .failed = model.content else { return XCTFail("expected a failure, got \(model.content)") }
-        XCTAssertTrue(model.groups.isEmpty)
+        XCTAssertEqual(model.content, .groups)
+        XCTAssertEqual(model.groups.first?.members, [a2, a1, a3])
+        XCTAssertEqual(model.groups.first?.kept, a2)
+        XCTAssertEqual(model.groups.first?.isRanked, false)
     }
 
-    func testAnIncompleteOrIndexingScanShowsTheStillCheckingNoteWithItsGroups() async {
+    func testTheGroupsShowBeforeTheRankingAndTheRankingShowsItsProgress() async {
+        let finder = FakeDuplicateFinder(scans: [.init(groups: [groupA, groupB], coverage: .complete)])
+        finder.fallback = ["A": [a2, a1, a3]]
+        finder.ranked = ["A": [a3, a1, a2]]
+        finder.rankGate.close()
+        let (model, _) = makeModel(finder)
+        let load = Task { await model.load() }
+        await waitUntil({ finder.rankGate.hasWaiters }, "the load ranks the groups")
+
+        XCTAssertEqual(model.content, .groups, "the list never waits for the ranking")
+        XCTAssertEqual(model.groups.first?.kept, a2, "the fallback order chooses the photo to keep until then")
+        XCTAssertEqual(model.groupCountText, L10n.string("duplicates.group_count \(2)"))
+        XCTAssertEqual(model.rankingLine?.title, L10n.string("duplicates.ranking_title"))
+        XCTAssertEqual(
+            model.rankingLine?.detail, L10n.string("duplicates.ranking_progress \(0.formatted()) \(2.formatted())"))
+        XCTAssertEqual(model.rankingLine?.fraction, 0)
+        XCTAssertTrue(model.canMerge)
+
+        finder.rankGate.open()
+        await load.value
+        XCTAssertEqual(model.groups.first?.members, [a3, a1, a2])
+        XCTAssertEqual(model.groups.first?.kept, a3)
+        XCTAssertNil(model.rankingLine)
+    }
+
+    func testAGroupWhoseFactsCannotBeReadKeepsItsFallbackOrderAndTheOthersAreRanked() async {
+        let finder = FakeDuplicateFinder(scans: [.init(groups: [groupA, groupB], coverage: .complete)])
+        finder.fallback = ["A": [a2, a1, a3], "B": [b2, b1]]
+        finder.ranked = ["A": [a3, a1, a2], "B": [b1, b2]]
+        finder.unreadableGroups = ["A"]
+        let (model, _) = makeModel(finder)
+        await model.load()
+        XCTAssertEqual(model.content, .groups)
+        XCTAssertEqual(model.groups.map(\.kept), [a2, b1])
+        XCTAssertEqual(model.groups.map(\.isRanked), [false, true])
+    }
+
+    func testAMergeReadsTheFactsOfAnUnrankedGroupFirstAndKeepsAChoice() async {
+        let finder = FakeDuplicateFinder(scans: [.init(groups: [groupA, groupB], coverage: .complete)])
+        finder.fallback = ["A": [a2, a1, a3], "B": [b2, b1]]
+        finder.ranked = ["A": [a3, a1, a2], "B": [b1, b2]]
+        finder.unreadableGroups = ["A", "B"]
+        let (model, _) = makeModel(finder)
+        await model.load()
+        finder.unreadableGroups = []
+        model.keep(b2, inGroup: "B")
+
+        await model.mergeAll()
+
+        XCTAssertEqual(finder.rankedGroups.last.map(Set.init), ["A", "B"], "the merge ranks its own groups first")
+        XCTAssertEqual(
+            finder.merges, [.init(group: "A", kept: a3), .init(group: "B", kept: b2)],
+            "the ranking chooses the photo to keep, and the choice of the person stays")
+    }
+
+    func testTheScanShowsATitledCountedProgress() async {
+        let finder = FakeDuplicateFinder(scans: [.init(groups: [groupA], coverage: .complete)])
+        finder.scanProgress = [.init(completed: 150, total: 3_180)]
+        finder.scanGate.close()
+        let (model, _) = makeModel(finder)
+        let load = Task { await model.load() }
+        await waitUntil({ finder.scanGate.hasWaiters }, "the load scans")
+
+        XCTAssertEqual(model.content, .loading)
+        XCTAssertEqual(model.loadingLine.title, L10n.string("duplicates.loading"))
+        XCTAssertEqual(
+            model.loadingLine.detail,
+            L10n.string("duplicates.checking_progress \(150.formatted()) \(3_180.formatted())"))
+        XCTAssertEqual(model.loadingLine.fraction ?? 0, 150.0 / 3_180.0, accuracy: 0.0001)
+        finder.scanGate.open()
+        await load.value
+        XCTAssertNil(model.scanProgress)
+    }
+
+    func testARebuildOfACompleteIndexShowsItsProgressAboveTheGroups() async {
+        let finder = FakeDuplicateFinder(scans: [.init(groups: [groupA], coverage: .complete)])
+        finder.buildProgress = [.init(phase: .indexing, completed: 10_000, total: 51_220)]
+        finder.buildGate.close()
+        let (model, _) = makeModel(finder)
+        let load = Task { await model.load() }
+        await waitUntil({ finder.buildGate.hasWaiters }, "the load builds the index")
+
+        XCTAssertEqual(model.content, .groups)
+        XCTAssertEqual(model.checkLine?.title, L10n.string("duplicates.checking_title"))
+        XCTAssertEqual(model.checkLine?.detail, model.checkProgressText)
+        XCTAssertNil(model.stillCheckingNote, "a complete index finds every group already")
+        finder.buildGate.open()
+        await load.value
+        XCTAssertNil(model.checkLine)
+    }
+
+    func testAnIncompleteOrIndexingScanShowsTheStillCheckingNoteWithItsGroupsWhileTheCheckRuns() async {
         for coverage in [ExactDuplicateCoverage.indexing, .incomplete(unresolvedCount: 3)] {
-            let (model, _) = makeModel(FakeDuplicateFinder(scans: [.init(groups: [groupA], coverage: coverage)]))
-            await model.load()
+            let finder = FakeDuplicateFinder(scans: [.init(groups: [groupA], coverage: coverage)])
+            finder.buildGate.close()
+            let (model, _) = makeModel(finder)
+            let load = Task { await model.load() }
+            await waitUntil({ finder.buildGate.hasWaiters }, "the load builds the index")
             XCTAssertEqual(model.content, .groups, "\(coverage)")
             XCTAssertNotNil(model.stillCheckingNote, "\(coverage)")
+            finder.buildGate.open()
+            await load.value
+            XCTAssertNil(model.stillCheckingNote, "no waiting text after the check: \(coverage)")
+            if case .incomplete = coverage {
+                XCTAssertEqual(model.uncheckedNote, L10n.string("duplicates.unchecked \(3)"))
+                XCTAssertNil(model.checkFailedNote)
+            } else {
+                XCTAssertEqual(model.checkFailedNote, L10n.string("duplicates.check_failed"))
+                XCTAssertNil(model.uncheckedNote)
+            }
         }
         let (complete, _) = makeModel(FakeDuplicateFinder(scans: [.init(groups: [groupA], coverage: .complete)]))
         await complete.load()
@@ -379,6 +494,15 @@ private final class FakeDuplicateFinder: ExactDuplicateMerging, @unchecked Senda
     private var _merges: [Merge] = []
     private var _batches: [[String]] = []
     private var _buildCalls = 0
+    private var _rankedGroups: [[String]] = []
+    var scanProgress: [ExactDuplicateScanProgress] = []
+    var fallback: [String: [PhotoUID]] = [:]
+    /// Groups whose facts cannot be read.
+    var unreadableGroups: Set<String> = []
+    /// Holds the scan while it is closed.
+    let scanGate = BuildGate()
+    /// Holds the ranking while it is closed.
+    let rankGate = BuildGate()
     var buildProgress: [UploadRemoteIndexPreparationProgress] = []
     var buildChanged = false
     var buildError: Error?
@@ -397,12 +521,24 @@ private final class FakeDuplicateFinder: ExactDuplicateMerging, @unchecked Senda
     var merges: [Merge] { lock.withLock { _merges } }
     var batches: [[String]] { lock.withLock { _batches } }
     var buildCalls: Int { lock.withLock { _buildCalls } }
+    var rankedGroups: [[String]] { lock.withLock { _rankedGroups } }
 
-    func duplicateGroups() async throws -> ExactDuplicateScan {
-        try lock.withLock {
+    func duplicateGroups(
+        progress: @escaping @Sendable (ExactDuplicateScanProgress) async -> Void
+    ) async throws -> ExactDuplicateScan {
+        let steps = lock.withLock { scanProgress }
+        for step in steps { await progress(step) }
+        await scanGate.pass()
+        return try lock.withLock {
             _scanCalls += 1
             if let scanError { throw scanError }
             return scans.count > 1 ? scans.removeFirst() : scans[0]
+        }
+    }
+
+    func fallbackMembers(of groups: [ExactDuplicateGroup]) async -> [String: [PhotoUID]] {
+        lock.withLock {
+            Dictionary(uniqueKeysWithValues: groups.map { ($0.id, fallback[$0.id] ?? $0.members) })
         }
     }
 
@@ -419,12 +555,23 @@ private final class FakeDuplicateFinder: ExactDuplicateMerging, @unchecked Senda
         return changed
     }
 
-    func rankedMembers(of groups: [ExactDuplicateGroup]) async throws -> [String: [PhotoUID]] {
-        try lock.withLock {
+    func rankMembers(
+        of groups: [ExactDuplicateGroup], ranked report: @escaping @Sendable (ExactDuplicateRankingPage) async -> Void
+    ) async {
+        lock.withLock {
             _rankCalls += 1
-            if let rankError { throw rankError }
-            return ranked
+            _rankedGroups.append(groups.map(\.id))
         }
+        await rankGate.pass()
+        let page = lock.withLock { () -> ExactDuplicateRankingPage in
+            guard rankError == nil else { return ExactDuplicateRankingPage(members: [:], groupCount: groups.count) }
+            var members: [String: [PhotoUID]] = [:]
+            for group in groups where !unreadableGroups.contains(group.id) {
+                members[group.id] = ranked[group.id] ?? group.members
+            }
+            return ExactDuplicateRankingPage(members: members, groupCount: groups.count)
+        }
+        await report(page)
     }
 
     func merge(_ group: ExactDuplicateGroup, keeping kept: PhotoUID) async throws -> ExactDuplicateMergeOutcome {

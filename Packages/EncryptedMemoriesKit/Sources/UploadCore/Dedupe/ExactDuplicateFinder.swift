@@ -9,6 +9,8 @@ public protocol ExactDuplicateRemote: PhotoCarryOverRemote {
     func restoreDuplicates(_ uids: [PhotoUID]) async throws
     /// The capture dates that the device already knows, without a request. Unknown photos are left out.
     func captureDates(of uids: [PhotoUID]) async -> [PhotoUID: Date]
+    /// The subset of `uids` that the person shares with other people or by a link. A trash ends that sharing.
+    func sharedUIDs(among uids: [PhotoUID]) async throws -> Set<PhotoUID>
 }
 
 /// Two or more main photos of the own library with the same bytes.
@@ -25,6 +27,29 @@ public struct ExactDuplicateGroup: Sendable, Equatable, Identifiable {
         self.contentHash = contentHash
         self.hashKeyEpoch = hashKeyEpoch
         self.members = members
+    }
+}
+
+/// How far the scan has read the state of the candidate photos.
+public struct ExactDuplicateScanProgress: Sendable, Equatable {
+    public let completed: Int
+    public let total: Int
+
+    public init(completed: Int, total: Int) {
+        self.completed = completed
+        self.total = total
+    }
+}
+
+/// The members of some groups in the order of the photo to keep, with the number of groups that the page covers.
+/// A group whose facts could not be read is not in `members` and keeps its fallback order.
+public struct ExactDuplicateRankingPage: Sendable, Equatable {
+    public let members: [String: [PhotoUID]]
+    public let groupCount: Int
+
+    public init(members: [String: [PhotoUID]], groupCount: Int) {
+        self.members = members
+        self.groupCount = groupCount
     }
 }
 
@@ -60,6 +85,8 @@ public enum ExactDuplicateKeepReason: String, Sendable, Equatable {
     case pendingEditReplacement
     /// A local source counts the photo as its backup, and the manifest cannot move that row to the kept photo.
     case neededByLocalSource
+    /// The person shares the photo. A trash would end that sharing.
+    case shared
 }
 
 public enum ExactDuplicateSkipReason: String, Sendable, Equatable {
@@ -85,13 +112,18 @@ public enum ExactDuplicateMergeOutcome: Sendable, Equatable {
 
 /// The facts that rank the members of a group for the photo to keep.
 public struct ExactDuplicateKeepFacts: Sendable, Equatable {
+    /// The person shares the photo with other people or by a link.
+    public var isShared: Bool
     public var isInOwnAlbum: Bool
     public var isFavorite: Bool
     /// A local source of this device counts the photo as its backup.
     public var isNamedByManifest: Bool
     public var captureDate: Date?
 
-    public init(isInOwnAlbum: Bool, isFavorite: Bool, isNamedByManifest: Bool, captureDate: Date?) {
+    public init(
+        isInOwnAlbum: Bool, isFavorite: Bool, isNamedByManifest: Bool, captureDate: Date?, isShared: Bool = false
+    ) {
+        self.isShared = isShared
         self.isInOwnAlbum = isInOwnAlbum
         self.isFavorite = isFavorite
         self.isNamedByManifest = isNamedByManifest
@@ -115,6 +147,8 @@ public struct ExactDuplicateFinder: Sendable {
     let journal: any EditReplacementJournaling
     let remote: any ExactDuplicateRemote
     let albums: any SeriesAlbumCarryOver
+    /// Receives the duration and the request count of each phase, never an identifier.
+    let log: @Sendable (String) -> Void
 
     public init(
         checker: any UploadDuplicateChecking,
@@ -123,7 +157,8 @@ public struct ExactDuplicateFinder: Sendable {
         identities: any UploadIdentityStore,
         journal: any EditReplacementJournaling,
         remote: any ExactDuplicateRemote,
-        albums: any SeriesAlbumCarryOver
+        albums: any SeriesAlbumCarryOver,
+        log: @escaping @Sendable (String) -> Void = { _ in }
     ) {
         self.checker = checker
         self.resolver = resolver
@@ -132,20 +167,41 @@ public struct ExactDuplicateFinder: Sendable {
         self.journal = journal
         self.remote = remote
         self.albums = albums
+        self.log = log
     }
+
+    /// Visibility reads that run at once. Each reads up to `UploadDedupePipeline.protonDuplicateBatchSize` links.
+    static let visibilityConcurrency = 4
+    /// Groups whose facts the ranking reads at once. Each group reads its albums and its sharing state.
+    static let rankingConcurrency = 4
+    /// Groups in one page of the ranking.
+    static let rankingPageSize = 24
 
     /// The groups of the current key epoch, largest first. The scan reads the index as it is: `prepareIndex` builds
     /// it, and the scan reports `.indexing` until a build has finished. The coverage comes from the local index, so a
     /// running build never holds the scan.
     public func duplicateGroups() async throws -> ExactDuplicateScan {
+        try await duplicateGroups(progress: { _ in })
+    }
+
+    /// `duplicateGroups()` that reports how many candidate photos the visibility read has covered.
+    public func duplicateGroups(
+        progress: @escaping @Sendable (ExactDuplicateScanProgress) async -> Void
+    ) async throws -> ExactDuplicateScan {
+        let start = ContinuousClock.now
         let epoch = try await checker.hashKeyEpoch()
         let coverage = coverage(hashKeyEpoch: epoch)
+        // Known related files, such as Live Photo videos and originals, never are members.
         guard let candidates = index.remoteContentDuplicateGroups(hashKeyEpoch: epoch) else {
             throw UploadError.backend("Upload identity manifest could not be read")
         }
         guard !candidates.isEmpty else { return ExactDuplicateScan(groups: [], coverage: coverage) }
         let volumeID = try await remote.ownPhotosVolumeID()
-        let visibility = try await checker.linkVisibility(batching: Set(candidates.values.joined()).sorted())
+        let links = Set(candidates.values.joined()).sorted()
+        let (visibility, requests) = try await visibility(of: links, progress: progress)
+        log(
+            "[Duplicates] scan candidates=\(candidates.count) links=\(links.count) visibilityRequests=\(requests) "
+                + "duration=\(start.duration(to: .now))")
         let groups = candidates.compactMap { contentHash, links -> ExactDuplicateGroup? in
             let members = links.filter { visibility[$0]?.isActiveMain == true }.sorted()
             guard members.count > 1 else { return nil }
@@ -157,6 +213,37 @@ public struct ExactDuplicateFinder: Sendable {
             $0.members.count != $1.members.count ? $0.members.count > $1.members.count : $0.contentHash < $1.contentHash
         }
         return ExactDuplicateScan(groups: sorted, coverage: coverage)
+    }
+
+    /// Reads the visibility of `links` in batches, `visibilityConcurrency` at once. Returns the request count too.
+    private func visibility(
+        of links: [String], progress: @escaping @Sendable (ExactDuplicateScanProgress) async -> Void
+    ) async throws -> ([String: RemoteLinkVisibility], Int) {
+        let size = UploadDedupePipeline.protonDuplicateBatchSize
+        let batches = stride(from: 0, to: links.count, by: size).map { Array(links[$0..<min($0 + size, links.count)]) }
+        await progress(ExactDuplicateScanProgress(completed: 0, total: links.count))
+        let checker = checker
+        return try await withThrowingTaskGroup(of: [String: RemoteLinkVisibility].self) { group in
+            var next = 0
+            var completed = 0
+            var visibility: [String: RemoteLinkVisibility] = [:]
+            func addNext() {
+                guard next < batches.count else { return }
+                let batch = batches[next]
+                next += 1
+                group.addTask { try await checker.linkVisibility(of: batch) }
+            }
+            for _ in 0..<min(Self.visibilityConcurrency, batches.count) { addNext() }
+            while let read = try await group.next() {
+                visibility.merge(read) { _, new in new }
+                completed += 1
+                await progress(
+                    ExactDuplicateScanProgress(
+                        completed: min(completed * size, links.count), total: links.count))
+                addNext()
+            }
+            return (visibility, batches.count)
+        }
     }
 
     /// Builds the content index when none exists, or brings it up to date, with the build of the backup. While the
@@ -186,37 +273,123 @@ public struct ExactDuplicateFinder: Sendable {
         }
     }
 
-    /// The members of each group by content hash, the photo to keep first. One favorites listing, one album
-    /// membership read, and one manifest scan serve all groups.
-    public func rankedMembers(of groups: [ExactDuplicateGroup]) async throws -> [String: [PhotoUID]] {
-        let members = groups.flatMap(\.members)
-        guard !members.isEmpty else { return [:] }
-        let volumeID = try await remote.ownPhotosVolumeID()
-        let favorites = try await remote.favoriteUIDs(among: members)
-        let dates = await remote.captureDates(of: members)
-        let memberAlbums = try await albums.albums(containing: members)
-        let owners = identities.sources(withRemoteLinkIDs: Set(members.map(\.nodeID)))
+    /// The members of each group in an order that needs no request: the earliest capture date that the device knows,
+    /// then the smallest link ID. The screens show it until the ranking has read the facts of the group.
+    public func fallbackMembers(of groups: [ExactDuplicateGroup]) async -> [String: [PhotoUID]] {
+        let dates = await remote.captureDates(of: groups.flatMap(\.members))
         var facts: [PhotoUID: ExactDuplicateKeepFacts] = [:]
-        for member in members {
-            facts[member] = ExactDuplicateKeepFacts(
-                isInOwnAlbum: (memberAlbums[member] ?? []).contains { $0.volumeID == volumeID },
-                isFavorite: favorites.contains(member),
-                isNamedByManifest: !(owners?[member.nodeID] ?? []).isEmpty,
-                captureDate: dates[member])
+        for (uid, date) in dates {
+            facts[uid] = ExactDuplicateKeepFacts(
+                isInOwnAlbum: false, isFavorite: false, isNamedByManifest: false, captureDate: date)
         }
         return Dictionary(
             groups.map { ($0.contentHash, Self.keepOrder($0.members, facts: facts)) },
             uniquingKeysWith: { first, _ in first })
     }
 
-    /// Ranks the photo to keep first: a photo in an own album, a favorite, a photo that a local source of this device
-    /// counts as its backup, the earliest capture date, and then the smallest link ID. A missing fact ranks last.
+    /// The members of each group by content hash, the photo to keep first. A group whose facts could not be read is
+    /// left out, so it keeps its fallback order.
+    public func rankedMembers(of groups: [ExactDuplicateGroup]) async -> [String: [PhotoUID]] {
+        let collected = RankingCollector()
+        await rankMembers(of: groups) { await collected.add($0.members) }
+        return await collected.members
+    }
+
+    /// Ranks the members of each group, page by page, and hands each page to `ranked`. One favorites listing, one
+    /// local date read, and one manifest scan serve all groups; each group reads the albums and the sharing state of
+    /// its own members, `rankingConcurrency` groups at once. A failed read leaves only its group in the fallback
+    /// order. Stops after a cancellation.
+    public func rankMembers(
+        of groups: [ExactDuplicateGroup], ranked: @escaping @Sendable (ExactDuplicateRankingPage) async -> Void
+    ) async {
+        guard !groups.isEmpty else { return }
+        let start = ContinuousClock.now
+        let members = groups.flatMap(\.members)
+        let shared: (volumeID: String, favorites: Set<PhotoUID>)
+        do {
+            shared = (try await remote.ownPhotosVolumeID(), try await remote.favoriteUIDs(among: members))
+        } catch {
+            log("[Duplicates] ranking without favorites; every group keeps its fallback order")
+            await ranked(ExactDuplicateRankingPage(members: [:], groupCount: groups.count))
+            return
+        }
+        let dates = await remote.captureDates(of: members)
+        let owners = identities.sources(withRemoteLinkIDs: Set(members.map(\.nodeID)))
+        var failed = 0
+        for pageStart in stride(from: 0, to: groups.count, by: Self.rankingPageSize) {
+            guard !Task.isCancelled else { return }
+            let page = Array(groups[pageStart..<min(pageStart + Self.rankingPageSize, groups.count)])
+            let facts = await groupFacts(of: page)
+            var order: [String: [PhotoUID]] = [:]
+            for group in page {
+                guard let read = facts[group.contentHash] else {
+                    failed += 1
+                    continue
+                }
+                var memberFacts: [PhotoUID: ExactDuplicateKeepFacts] = [:]
+                for member in group.members {
+                    memberFacts[member] = ExactDuplicateKeepFacts(
+                        isInOwnAlbum: (read.albums[member] ?? []).contains { $0.volumeID == shared.volumeID },
+                        isFavorite: shared.favorites.contains(member),
+                        isNamedByManifest: !(owners?[member.nodeID] ?? []).isEmpty,
+                        captureDate: dates[member], isShared: read.shared.contains(member))
+                }
+                order[group.contentHash] = Self.keepOrder(group.members, facts: memberFacts)
+            }
+            guard !Task.isCancelled else { return }
+            await ranked(ExactDuplicateRankingPage(members: order, groupCount: page.count))
+        }
+        log(
+            "[Duplicates] ranking groups=\(groups.count) members=\(members.count) failedGroups=\(failed) "
+                + "favoritesListings=1 albumReads=\(groups.count) sharingReads=\(groups.count) "
+                + "duration=\(start.duration(to: .now))")
+    }
+
+    /// The albums and the sharing state of the members of each group, `rankingConcurrency` groups at once. A group
+    /// whose read failed is missing.
+    private func groupFacts(
+        of groups: [ExactDuplicateGroup]
+    ) async -> [String: (albums: [PhotoUID: [SeriesAlbumReference]], shared: Set<PhotoUID>)] {
+        let albums = albums
+        let remote = remote
+        return await withTaskGroup(
+            of: (String, (albums: [PhotoUID: [SeriesAlbumReference]], shared: Set<PhotoUID>)?).self
+        ) { taskGroup in
+            var next = 0
+            var facts: [String: (albums: [PhotoUID: [SeriesAlbumReference]], shared: Set<PhotoUID>)] = [:]
+            func addNext() {
+                guard next < groups.count else { return }
+                let group = groups[next]
+                next += 1
+                taskGroup.addTask {
+                    do {
+                        async let memberAlbums = albums.albums(containing: group.members)
+                        async let shared = remote.sharedUIDs(among: group.members)
+                        return (group.contentHash, (try await memberAlbums, try await shared))
+                    } catch {
+                        return (group.contentHash, nil)
+                    }
+                }
+            }
+            for _ in 0..<min(Self.rankingConcurrency, groups.count) { addNext() }
+            while let (contentHash, read) = await taskGroup.next() {
+                facts[contentHash] = read
+                addNext()
+            }
+            return facts
+        }
+    }
+
+    /// Ranks the photo to keep first: a shared photo, a photo in an own album, a favorite, a photo that a local source
+    /// of this device counts as its backup, the earliest capture date, and then the smallest link ID. A missing fact
+    /// ranks last.
     public static func keepOrder(_ members: [PhotoUID], facts: [PhotoUID: ExactDuplicateKeepFacts]) -> [PhotoUID] {
         members.sorted { lhs, rhs in
             let left = facts[lhs]
             let right = facts[rhs]
             for (l, r) in [
-                (left?.isInOwnAlbum, right?.isInOwnAlbum), (left?.isFavorite, right?.isFavorite),
+                (left?.isShared, right?.isShared), (left?.isInOwnAlbum, right?.isInOwnAlbum),
+                (left?.isFavorite, right?.isFavorite),
                 (left?.isNamedByManifest, right?.isNamedByManifest),
             ] where (l ?? false) != (r ?? false) {
                 return l ?? false
@@ -287,7 +460,9 @@ public struct ExactDuplicateFinder: Sendable {
                 do {
                     let favorites = try await remote.favoriteUIDs(
                         among: writes.flatMap { $0.plan.trashable + [$0.plan.kept] })
-                    await write(writes, favorites: favorites, into: &results)
+                    // One album listing serves every group: an own album whose cover leaves gets the kept photo.
+                    let covers = try await albums.ownAlbumCovers()
+                    await write(writes, favorites: favorites, covers: covers, into: &results)
                 } catch {
                     for (index, _) in writes { results[index] = .failure(error) }
                 }
@@ -329,8 +504,14 @@ public struct ExactDuplicateFinder: Sendable {
         else { return .skipped(.keptUnreadable) }
 
         var plan = PlannedMerge(kept: kept, contentHash: group.contentHash, epoch: epoch, volumeID: volumeID)
+        // A trash ends the sharing of a photo, so a shared duplicate stays. Only the members of this group are read.
+        let shared = try await remote.sharedUIDs(among: active)
         for member in active where member != kept {
             try Task.checkCancellation()
+            guard !shared.contains(member) else {
+                plan.keptDuplicates[member] = .shared
+                continue
+            }
             guard let compound = try await checker.compound(ofMainLink: member.nodeID),
                 compound.main.contentHash == group.contentHash
             else {
@@ -377,15 +558,16 @@ public struct ExactDuplicateFinder: Sendable {
         }
     }
 
-    /// Carries the favorite tag and the own albums over and moves the rows, group by group. One trash then takes the
-    /// duplicates of every group, and the backup drops its cached remote state once. `favorites` holds the favorites
-    /// among the trashed and the kept photos. A group whose carry-over or row move fails takes no part in the trash.
+    /// Carries the favorite tag, the own albums, and the album covers over and moves the rows, group by group. One
+    /// trash then takes the duplicates of every group, and the backup drops its cached remote state once. `favorites`
+    /// holds the favorites among the trashed and the kept photos; `covers` holds the cover link of each own album. A
+    /// group whose carry-over or row move fails takes no part in the trash.
     /// A failed trash fails every group that took part: their rows already name `kept`, which holds the same bytes,
     /// so a retry finds them moved and writes them no second time. Known gap: after a failed or cancelled trash, no
     /// group reads its kept photo again, so a merge on another device that trashed that kept photo at the same moment
     /// is not undone here.
     private func write(
-        _ writes: [(index: Int, plan: PlannedMerge)], favorites: Set<PhotoUID>,
+        _ writes: [(index: Int, plan: PlannedMerge)], favorites: Set<PhotoUID>, covers: [String: String],
         into results: inout [Result<ExactDuplicateMergeOutcome, any Error>?]
     ) async {
         var trashing: [(index: Int, plan: PlannedMerge)] = []
@@ -394,6 +576,12 @@ public struct ExactDuplicateFinder: Sendable {
                 try await remote.carryOver(
                     from: plan.trashable, to: plan.kept, ownVolumeID: plan.volumeID, albums: albums,
                     favorites: favorites)
+                // The carry-over added the kept photo to these albums. A retry finds the kept photo as their cover.
+                let trashedLinks = Set(plan.trashable.map(\.nodeID))
+                for (albumID, cover) in covers.sorted(by: { $0.key < $1.key }) where trashedLinks.contains(cover) {
+                    try Task.checkCancellation()
+                    try await albums.setCover(plan.kept, ofOwnAlbum: albumID)
+                }
                 // The rows move before the trash: the kept photo holds the same bytes, and after the trash only the
                 // trashed links would name the related files that a retry has to move.
                 guard identities.rebindRemoteLinks(plan.moves, hashKeyEpoch: plan.epoch) else {
@@ -457,5 +645,14 @@ public struct ExactDuplicateFinder: Sendable {
                 try await Task.sleep(for: keptReadRetryDelay)
             }
         }
+    }
+}
+
+/// Collects the pages of a ranking.
+private actor RankingCollector {
+    private(set) var members: [String: [PhotoUID]] = [:]
+
+    func add(_ page: [String: [PhotoUID]]) {
+        members.merge(page) { _, new in new }
     }
 }

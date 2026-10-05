@@ -2370,6 +2370,12 @@ extension DriveSDKBridge: ExactDuplicateRemote {
         let items = (try? await withOpenSession { bridge in bridge.timelineStore?.items(for: uids) ?? [] }) ?? []
         return Dictionary(items.map { ($0.uid, $0.captureTime) }, uniquingKeysWith: { first, _ in first })
     }
+
+    /// Reads the node of each photo, so only the members of the groups that the screen ranks or merges cost a read.
+    func sharedUIDs(among uids: [PhotoUID]) async throws -> Set<PhotoUID> {
+        guard !uids.isEmpty else { return [] }
+        return try await makeAlbumCatalogBackend().sharedUIDs(among: uids)
+    }
 }
 
 extension DriveSDKBridge: SeriesDissolutionRemote {

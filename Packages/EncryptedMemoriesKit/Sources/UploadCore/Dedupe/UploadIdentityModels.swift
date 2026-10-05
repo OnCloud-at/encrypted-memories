@@ -754,8 +754,8 @@ public protocol UploadRemoteContentIndexStore: Sendable {
     ) -> Bool
     @discardableResult
     func upsertRemoteContentRecord(_ record: UploadRemoteContentIndexRecord) -> Bool
-    /// Every indexed content hash of this key epoch that two or more links hold, with those links sorted. Nil when
-    /// the read fails.
+    /// Every indexed content hash of this key epoch that two or more links hold, with those links sorted. Links that
+    /// the remote asset index proves to be related files of another photo are left out. Nil when the read fails.
     func remoteContentDuplicateGroups(hashKeyEpoch: String) -> [String: [String]]?
 }
 

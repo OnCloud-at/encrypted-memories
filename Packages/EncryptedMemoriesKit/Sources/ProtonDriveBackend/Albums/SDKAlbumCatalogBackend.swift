@@ -391,6 +391,28 @@ struct SDKAlbumCatalogBackend: AlbumCatalogBackend {
         return result
     }
 
+    /// The photos among `photoUIDs` that the person shares with other people or by a link. One node read for each
+    /// photo, `maximumConcurrentNodeLoads` at once. A missing node fails the read, because absence proves nothing.
+    func sharedUIDs(among photoUIDs: [PhotoUID]) async throws -> Set<PhotoUID> {
+        try await withAdmission {
+            let uniqueUIDs = Array(Set(photoUIDs))
+            let sdkUIDs = uniqueUIDs.map { SDKNodeUid(volumeID: $0.volumeID, nodeID: $0.nodeID) }
+            let nodes = try await self.loadNodes(sdkUIDs)
+            var shared = Set<PhotoUID>()
+            for (sdkUID, node) in nodes {
+                let isShared: Bool
+                switch node {
+                case .photo(let photo): isShared = photo.isShared || photo.isSharedByUrl
+                case .file(let file): isShared = file.isShared || file.isSharedByUrl
+                case .album, .folder: throw SDKAlbumCatalogError.unexpectedPhotoNode(Self.identifier(sdkUID))
+                case nil: throw SDKAlbumCatalogError.missingNode(Self.identifier(sdkUID))
+                }
+                if isShared { shared.insert(PhotoUID(volumeID: sdkUID.volumeID, nodeID: sdkUID.nodeID)) }
+            }
+            return shared
+        }
+    }
+
     private func withAdmission<T: Sendable>(
         _ operation: @escaping @Sendable () async throws -> T
     ) async throws -> T {

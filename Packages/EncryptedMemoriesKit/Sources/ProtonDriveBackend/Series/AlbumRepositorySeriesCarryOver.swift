@@ -27,4 +27,16 @@ struct AlbumRepositorySeriesCarryOver: SeriesAlbumCarryOver {
         guard !uids.isEmpty else { return }
         try await repository.addPhotos(uids, to: albumID)
     }
+
+    /// One fresh catalog read. The listing holds only albums of the account's own library.
+    func ownAlbumCovers() async throws -> [String: String] {
+        let albums = try await repository.listAlbums()
+        return Dictionary(
+            albums.compactMap { album in album.coverPhotoID.map { (album.id, $0) } },
+            uniquingKeysWith: { first, _ in first })
+    }
+
+    func setCover(_ uid: PhotoUID, ofOwnAlbum albumID: String) async throws {
+        try await repository.setAlbumCover(albumID: albumID, photoUID: uid)
+    }
 }
