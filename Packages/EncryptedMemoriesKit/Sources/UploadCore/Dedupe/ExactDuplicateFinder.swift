@@ -134,24 +134,12 @@ public struct ExactDuplicateFinder: Sendable {
         self.albums = albums
     }
 
-    /// The groups of the current key epoch, largest first. An index that is not built yet is not built here: the
-    /// backup builds it, and the scan reports `.indexing` until then.
+    /// The groups of the current key epoch, largest first. The scan reads the index as it is: `prepareIndex` builds
+    /// it, and the scan reports `.indexing` until a build has finished. The coverage comes from the local index, so a
+    /// running build never holds the scan.
     public func duplicateGroups() async throws -> ExactDuplicateScan {
         let epoch = try await checker.hashKeyEpoch()
-        var coverage = ExactDuplicateCoverage.indexing
-        if index.remoteContentIndexCheckpoint(hashKeyEpoch: epoch) != nil {
-            do {
-                switch try await checker.remoteContentIndexHealth() {
-                case .complete: coverage = .complete
-                case .degraded(_, let unresolved): coverage = .incomplete(unresolvedCount: unresolved)
-                case .unavailable: coverage = .indexing
-                }
-            } catch is CancellationError {
-                throw CancellationError()
-            } catch {
-                try Task.checkCancellation()
-            }
-        }
+        let coverage = coverage(hashKeyEpoch: epoch)
         guard let candidates = index.remoteContentDuplicateGroups(hashKeyEpoch: epoch) else {
             throw UploadError.backend("Upload identity manifest could not be read")
         }
@@ -169,6 +157,33 @@ public struct ExactDuplicateFinder: Sendable {
             $0.members.count != $1.members.count ? $0.members.count > $1.members.count : $0.contentHash < $1.contentHash
         }
         return ExactDuplicateScan(groups: sorted, coverage: coverage)
+    }
+
+    /// Builds the content index when none exists, or brings it up to date, with the build of the backup. While the
+    /// backup builds the index, this waits for that build and reports its progress; it never starts a second one.
+    /// True when the index changed, so a new scan can find other groups. The build runs through the backup's resolver,
+    /// so the sign-out waits for it like for a backup build.
+    public func prepareIndex(
+        progress: @escaping @Sendable (UploadRemoteIndexPreparationProgress) async -> Void
+    ) async throws -> Bool {
+        let epoch = try await checker.hashKeyEpoch()
+        let before = (index.remoteContentIndexCheckpoint(hashKeyEpoch: epoch)?.eventID, indexHealth(epoch))
+        try await resolver.prepareRemoteIndex(progress: progress)
+        let after = (index.remoteContentIndexCheckpoint(hashKeyEpoch: epoch)?.eventID, indexHealth(epoch))
+        return before != after
+    }
+
+    private func indexHealth(_ epoch: String) -> UploadRemoteContentIndexHealth {
+        index.remoteContentIndexHealth(hashKeyEpoch: epoch)
+    }
+
+    private func coverage(hashKeyEpoch epoch: String) -> ExactDuplicateCoverage {
+        guard index.remoteContentIndexCheckpoint(hashKeyEpoch: epoch) != nil else { return .indexing }
+        switch indexHealth(epoch) {
+        case .complete: return .complete
+        case .degraded(_, let unresolved): return .incomplete(unresolvedCount: unresolved)
+        case .unavailable: return .indexing
+        }
     }
 
     /// The members of each group by content hash, the photo to keep first. One favorites listing, one album

@@ -47,18 +47,48 @@ public struct ExactDuplicatesView<Cover: View>: View {
     @ViewBuilder private var content: some View {
         switch model.content {
         case .loading:
-            ProgressView().tint(accent)
+            ContentUnavailableView {
+                ProgressView(model.loadingTitle).tint(accent)
+            }
+            .accessibilityIdentifier("duplicates.loading")
         case .failed(let message):
             ContentUnavailableView {
                 Label(message, systemImage: "exclamationmark.icloud")
             } actions: {
                 retryButton
             }
-        case .noDuplicates, .stillChecking:
+        case .noDuplicates:
             let copy = model.emptyStateCopy
             ContentUnavailableView(copy.title, systemImage: copy.systemImage, description: Text(copy.description))
+        case .stillChecking:
+            let copy = model.emptyStateCopy
+            ContentUnavailableView {
+                Label(copy.title, systemImage: copy.systemImage)
+            } description: {
+                Text(copy.description)
+            } actions: {
+                checkProgress.frame(maxWidth: 320)
+            }
         case .groups:
             groupList
+        }
+    }
+
+    /// The progress of the library check: counted while the build knows its total, otherwise indeterminate.
+    @ViewBuilder private var checkProgress: some View {
+        switch model.checkProgress {
+        case .counted(let completed, let total):
+            ProgressView(value: Double(completed), total: Double(total)) {
+                EmptyView()
+            } currentValueLabel: {
+                Text(model.checkProgressText ?? "").monospacedDigit()
+            }
+            .tint(accent)
+            .accessibilityIdentifier("duplicates.checkProgress")
+        case .indeterminate:
+            ProgressView().tint(accent).accessibilityIdentifier("duplicates.checkProgress")
+        case nil:
+            EmptyView()
         }
     }
 
@@ -78,6 +108,7 @@ public struct ExactDuplicatesView<Cover: View>: View {
                     Label(note, systemImage: "hourglass")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
+                    checkProgress
                 }
             }
             ForEach(Array(model.groups.enumerated()), id: \.element.id) { index, group in

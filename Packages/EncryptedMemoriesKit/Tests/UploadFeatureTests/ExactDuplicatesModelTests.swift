@@ -96,6 +96,101 @@ final class ExactDuplicatesModelTests: XCTestCase {
         XCTAssertNil(complete.stillCheckingNote)
     }
 
+    // MARK: - The library check
+
+    /// Waits until `condition` holds, for at most two seconds.
+    private func waitUntil(_ condition: () -> Bool, _ message: String) async {
+        for _ in 0..<2_000 where !condition() { try? await Task.sleep(for: .milliseconds(1)) }
+        XCTAssertTrue(condition(), message)
+    }
+
+    func testAnEmptyIndexThatIsStillBuildingSaysThatDuplicatesAppearWhenTheCheckIsDone() async {
+        let finder = FakeDuplicateFinder(scans: [.init(groups: [], coverage: .indexing)])
+        finder.buildGate.close()
+        let (model, _) = makeModel(finder)
+        let load = Task { await model.load() }
+        await waitUntil({ finder.buildGate.hasWaiters }, "the load builds the index")
+
+        XCTAssertEqual(model.content, .stillChecking)
+        XCTAssertEqual(model.emptyStateCopy.title, L10n.string("duplicates.checking_title"))
+        XCTAssertEqual(model.emptyStateCopy.description, L10n.string("duplicates.checking_wait"))
+        XCTAssertNotEqual(
+            model.emptyStateCopy.description, L10n.string("duplicates.still_checking"),
+            "more duplicates can only appear when some are shown")
+        XCTAssertEqual(model.checkProgress, .indeterminate)
+        finder.buildGate.open()
+        await load.value
+    }
+
+    func testTheCheckShowsTheProgressOfTheBuild() async {
+        let finder = FakeDuplicateFinder(scans: [.init(groups: [], coverage: .indexing)])
+        finder.buildProgress = [.init(phase: .loading), .init(phase: .indexing, completed: 1_234, total: 15_000)]
+        finder.buildGate.close()
+        let (model, _) = makeModel(finder)
+        let load = Task { await model.load() }
+        await waitUntil({ finder.buildGate.hasWaiters }, "the load builds the index")
+
+        XCTAssertEqual(model.checkProgress, .counted(completed: 1_234, total: 15_000))
+        XCTAssertEqual(
+            model.checkProgressText,
+            L10n.string("duplicates.checking_progress \(1_234.formatted()) \(15_000.formatted())"))
+        finder.buildGate.open()
+        await load.value
+        XCTAssertNil(model.checkProgress, "no progress once the build finished")
+        XCTAssertNil(model.checkProgressText)
+    }
+
+    func testAFinishedBuildLoadsTheGroupsWithoutARefresh() async {
+        let finder = FakeDuplicateFinder(scans: [
+            .init(groups: [], coverage: .indexing), .init(groups: [groupA], coverage: .complete),
+        ])
+        finder.buildChanged = true
+        let (model, _) = makeModel(finder)
+        await model.load()
+        XCTAssertEqual(finder.buildCalls, 1)
+        XCTAssertEqual(model.content, .groups)
+        XCTAssertEqual(model.groups.map(\.id), ["A"])
+        XCTAssertNil(model.stillCheckingNote)
+    }
+
+    func testABuildThatChangedNothingScansOnceAndACompleteEmptyIndexHasNoDuplicates() async {
+        let finder = FakeDuplicateFinder(scans: [.init(groups: [], coverage: .complete)])
+        let (model, _) = makeModel(finder)
+        await model.load()
+        XCTAssertEqual(finder.buildCalls, 1, "a complete index is brought up to date")
+        XCTAssertEqual(finder.scanCalls, 1)
+        XCTAssertEqual(model.content, .noDuplicates)
+        XCTAssertEqual(model.emptyStateCopy.title, L10n.string("duplicates.none_title"))
+    }
+
+    func testALoadWhileTheIndexBuildsWaitsForThatBuildInsteadOfStartingASecondOne() async {
+        let finder = FakeDuplicateFinder(scans: [.init(groups: [], coverage: .indexing)])
+        finder.buildGate.close()
+        let (model, _) = makeModel(finder)
+        let first = Task { await model.load() }
+        await waitUntil({ finder.buildGate.hasWaiters }, "the load builds the index")
+        let second = Task { await model.load() }
+        await waitUntil({ finder.scanCalls == 2 }, "the second load scans")
+        finder.buildGate.open()
+        await first.value
+        await second.value
+        XCTAssertEqual(finder.buildCalls, 1)
+    }
+
+    func testAFailedBuildWithoutGroupsOffersARetryAndKeepsACompleteIndex() async {
+        let building = FakeDuplicateFinder(scans: [.init(groups: [], coverage: .indexing)])
+        building.buildError = URLError(.notConnectedToInternet)
+        let (model, _) = makeModel(building)
+        await model.load()
+        guard case .failed = model.content else { return XCTFail("expected a failure, got \(model.content)") }
+
+        let complete = FakeDuplicateFinder(scans: [.init(groups: [], coverage: .complete)])
+        complete.buildError = URLError(.notConnectedToInternet)
+        let (completeModel, _) = makeModel(complete)
+        await completeModel.load()
+        XCTAssertEqual(completeModel.content, .noDuplicates, "the complete index still answers")
+    }
+
     func testTheEntryCountScansWithoutRanking() async {
         let finder = FakeDuplicateFinder(scans: [.init(groups: [groupA, groupB], coverage: .complete)])
         let (model, _) = makeModel(finder)
@@ -283,6 +378,12 @@ private final class FakeDuplicateFinder: ExactDuplicateMerging, @unchecked Senda
     private var _rankCalls = 0
     private var _merges: [Merge] = []
     private var _batches: [[String]] = []
+    private var _buildCalls = 0
+    var buildProgress: [UploadRemoteIndexPreparationProgress] = []
+    var buildChanged = false
+    var buildError: Error?
+    /// Holds the build while it is closed.
+    let buildGate = BuildGate()
     var ranked: [String: [PhotoUID]] = [:]
     var outcomes: [String: ExactDuplicateMergeOutcome] = [:]
     var mergeErrors: [String: Error] = [:]
@@ -295,6 +396,7 @@ private final class FakeDuplicateFinder: ExactDuplicateMerging, @unchecked Senda
     var rankCalls: Int { lock.withLock { _rankCalls } }
     var merges: [Merge] { lock.withLock { _merges } }
     var batches: [[String]] { lock.withLock { _batches } }
+    var buildCalls: Int { lock.withLock { _buildCalls } }
 
     func duplicateGroups() async throws -> ExactDuplicateScan {
         try lock.withLock {
@@ -302,6 +404,19 @@ private final class FakeDuplicateFinder: ExactDuplicateMerging, @unchecked Senda
             if let scanError { throw scanError }
             return scans.count > 1 ? scans.removeFirst() : scans[0]
         }
+    }
+
+    func prepareIndex(
+        progress: @escaping @Sendable (UploadRemoteIndexPreparationProgress) async -> Void
+    ) async throws -> Bool {
+        let (steps, error, changed) = lock.withLock {
+            _buildCalls += 1
+            return (buildProgress, buildError, buildChanged)
+        }
+        for step in steps { await progress(step) }
+        await buildGate.pass()
+        if let error { throw error }
+        return changed
     }
 
     func rankedMembers(of groups: [ExactDuplicateGroup]) async throws -> [String: [PhotoUID]] {
@@ -334,5 +449,35 @@ private final class FakeDuplicateFinder: ExactDuplicateMerging, @unchecked Senda
             }
         }
         return results
+    }
+}
+
+/// Lets callers pass while open and holds them while closed.
+private final class BuildGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var isOpen = true
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    var hasWaiters: Bool { lock.withLock { !waiters.isEmpty } }
+
+    func close() { lock.withLock { isOpen = false } }
+
+    func open() {
+        let held = lock.withLock {
+            isOpen = true
+            defer { waiters = [] }
+            return waiters
+        }
+        held.forEach { $0.resume() }
+    }
+
+    func pass() async {
+        await withCheckedContinuation { continuation in
+            let passes = lock.withLock {
+                if !isOpen { waiters.append(continuation) }
+                return isOpen
+            }
+            if passes { continuation.resume() }
+        }
     }
 }

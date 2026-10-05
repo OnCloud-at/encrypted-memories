@@ -6,6 +6,11 @@ import PhotosCore
 /// tests and the offline UI-test account supply their own.
 public protocol ExactDuplicateMerging: Sendable {
     func duplicateGroups() async throws -> ExactDuplicateScan
+    /// Builds the content index when none exists, or brings it up to date, and reports the progress of the build.
+    /// True when the index changed.
+    func prepareIndex(
+        progress: @escaping @Sendable (UploadRemoteIndexPreparationProgress) async -> Void
+    ) async throws -> Bool
     func rankedMembers(of groups: [ExactDuplicateGroup]) async throws -> [String: [PhotoUID]]
     /// Merges each group, keeping its photo. One result for each group, in order. After a cancellation, the groups
     /// without an outcome fail with `CancellationError`.
@@ -91,6 +96,13 @@ public final class ExactDuplicatesModel {
         case groups
     }
 
+    /// How far the library check has come while the content index builds.
+    public enum CheckProgress: Equatable, Sendable {
+        /// The build reads the library and knows no total yet.
+        case indeterminate
+        case counted(completed: Int, total: Int)
+    }
+
     private enum Phase: Equatable {
         case idle, loading, loaded
         case failed
@@ -100,11 +112,16 @@ public final class ExactDuplicatesModel {
     /// False while the content index misses photos, so more duplicates can appear later.
     public private(set) var isComplete = true
     public private(set) var isMerging = false
+    /// The progress of the content index build. Nil while no build runs.
+    public private(set) var checkProgress: CheckProgress?
     /// The message of the last merge, until the person dismisses it.
     public private(set) var notice: ExactDuplicateMergeNotice?
     private var phase = Phase.idle
     private var scannedDuplicateCount: Int?
     private var loadGeneration = 0
+    /// The one build of this model. A load while it runs waits for it, and a closed screen leaves it running: the
+    /// backup uses the same build, and the build resumes from its checkpoint.
+    @ObservationIgnored private var indexBuild: Task<Bool, any Error>?
     @ObservationIgnored private let finder: any ExactDuplicateMerging
     /// Called with the photos that a merge moved to Recently Deleted, so the library stops showing them.
     @ObservationIgnored private let didTrash: @MainActor ([PhotoUID]) async -> Void
@@ -129,8 +146,17 @@ public final class ExactDuplicatesModel {
     public var emptyStateCopy: PhotoFilterEmptyStateCopy {
         guard content == .stillChecking else { return PhotoFilter.duplicates.emptyStateCopy }
         return PhotoFilterEmptyStateCopy(
-            title: L10n.string("duplicates.checking_title"), description: L10n.string("duplicates.still_checking"),
+            title: L10n.string("duplicates.checking_title"), description: L10n.string("duplicates.checking_wait"),
             systemImage: "hourglass")
+    }
+
+    /// The title of `.loading`.
+    public var loadingTitle: String { L10n.string("duplicates.loading") }
+
+    /// The counted progress of the library check, for example "1,234 of 15,000 photos". Nil without a total.
+    public var checkProgressText: String? {
+        guard case .counted(let completed, let total) = checkProgress else { return nil }
+        return L10n.string("duplicates.checking_progress \(completed.formatted()) \(total.formatted())")
     }
 
     /// The note while the library is still being checked. Nil once every photo was checked.
@@ -151,16 +177,33 @@ public final class ExactDuplicatesModel {
     public var mergeAllTitle: String { L10n.string("duplicates.merge_all_title \(duplicateCount)") }
     public var mergeAllMessage: String { L10n.string("duplicates.merge_all_message \(duplicateCount)") }
 
-    /// Reads the groups and ranks their members. A choice of the person stays while its photo is still a member.
+    /// Reads the groups and ranks their members, then builds the content index or brings it up to date, and reads
+    /// the groups again when the index changed. A choice of the person stays while its photo is still a member.
     public func load() async {
         guard !isMerging else { return }
         loadGeneration += 1
         let generation = loadGeneration
         phase = .loading
+        guard await scan(generation: generation) else { return }
+        let changed: Bool
+        do {
+            changed = try await buildIndex()
+        } catch {
+            // The groups already shown stay. Without them, the person can try again.
+            if generation == loadGeneration, !isMerging, groups.isEmpty, !isComplete { phase = .failed }
+            return
+        }
+        guard changed, generation == loadGeneration, !isMerging else { return }
+        await scan(generation: generation)
+    }
+
+    /// Reads and ranks the groups. False when the read failed or a newer load replaced this one.
+    @discardableResult
+    private func scan(generation: Int) async -> Bool {
         do {
             let scan = try await finder.duplicateGroups()
             let ranked = try await finder.rankedMembers(of: scan.groups)
-            guard generation == loadGeneration else { return }
+            guard generation == loadGeneration, !isMerging else { return false }
             let earlier = Dictionary(groups.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
             groups = scan.groups.map { group in
                 let members = ranked[group.id] ?? group.members
@@ -171,9 +214,37 @@ public final class ExactDuplicatesModel {
             }
             isComplete = scan.coverage.isComplete
             phase = .loaded
+            return true
         } catch {
-            guard generation == loadGeneration else { return }
+            guard generation == loadGeneration else { return false }
             phase = .failed
+            return false
+        }
+    }
+
+    /// Runs the build of the content index, or waits for the build that already runs.
+    private func buildIndex() async throws -> Bool {
+        if let indexBuild { return try await indexBuild.value }
+        let finder = finder
+        let report: @Sendable (UploadRemoteIndexPreparationProgress) async -> Void = { [weak self] progress in
+            await self?.show(progress)
+        }
+        let build = Task { try await finder.prepareIndex(progress: report) }
+        indexBuild = build
+        checkProgress = .indeterminate
+        defer {
+            indexBuild = nil
+            checkProgress = nil
+        }
+        return try await build.value
+    }
+
+    private func show(_ progress: UploadRemoteIndexPreparationProgress) {
+        guard indexBuild != nil, progress.phase != .ready else { return }
+        if let total = progress.total, total > 0 {
+            checkProgress = .counted(completed: min(progress.completed, total), total: total)
+        } else {
+            checkProgress = .indeterminate
         }
     }
 

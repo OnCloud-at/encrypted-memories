@@ -5974,6 +5974,28 @@
         "de": { "stringUnit": { "state": "translated", "value": "Mediathek wird geprüft" } }
       }
     },
+    "duplicates.checking_wait": {
+      "comment": "Line below the title while no group was found yet and the library check still runs.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Duplicates appear here when the check is done." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Duplikate erscheinen hier, sobald die Prüfung fertig ist." } }
+      }
+    },
+    "duplicates.checking_progress %@ %@": {
+      "extractionState": "manual",
+      "comment": "Progress of the library check. First %@: photos checked, second: all photos, both formatted numbers.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "%1$@ of %2$@ photos" } },
+        "de": { "stringUnit": { "state": "translated", "value": "%1$@ von %2$@ Fotos" } }
+      }
+    },
+    "duplicates.loading": {
+      "comment": "Title while the Duplicates screen reads the groups.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Loading Duplicates" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Duplikate werden geladen" } }
+      }
+    },
     "duplicates.none_title": {
       "localizations": {
         "en": { "stringUnit": { "state": "translated", "value": "No Duplicates" } },

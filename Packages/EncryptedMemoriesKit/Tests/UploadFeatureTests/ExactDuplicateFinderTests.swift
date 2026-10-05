@@ -140,19 +140,72 @@ final class ExactDuplicateFinderTests: XCTestCase {
         XCTAssertEqual(unbuilt.coverage, .indexing)
         XCTAssertEqual(unbuilt.groups, expected)
 
-        indexServer()
-        server.indexHealth = .degraded(indexedCount: 2, unresolvedCount: 3)
+        let records = server.links.map {
+            UploadRemoteContentIndexRecord(contentHash: $0.contentHash, hashKeyEpoch: epoch, remoteLinkID: $0.linkID)
+        }
+        let issues = (1...3).map {
+            UploadRemoteContentIndexIssue(
+                remoteLinkID: "unreadable-\($0)", reason: .decryptFailure, firstObservedAt: date(0),
+                lastObservedAt: date(0), lastRepairAttemptAt: nil, indexGeneration: "event-1")
+        }
+        XCTAssertTrue(
+            store.replaceRemoteContentIndex(
+                records, unresolvedIssues: issues, hashKeyEpoch: epoch,
+                checkpoint: .init(eventID: "event-1", refreshedAt: Date())))
         let degraded = try await finder.duplicateGroups()
         XCTAssertEqual(degraded.coverage, .incomplete(unresolvedCount: 3))
         XCTAssertEqual(degraded.groups, expected)
 
-        server.indexHealth = .unavailable
-        let unavailableCoverage = try await finder.duplicateGroups().coverage
-        XCTAssertEqual(unavailableCoverage, .indexing)
-
-        server.indexHealth = nil
+        indexServer()
         let completeCoverage = try await finder.duplicateGroups().coverage
         XCTAssertEqual(completeCoverage, .complete)
+    }
+
+    func testTheScanReadsTheCoverageFromTheIndexAndNeverWaitsForTheBuildOfTheBackup() async throws {
+        let first = server.seedLink(digest: digest("a"))
+        let second = server.seedLink(digest: digest("a"))
+        indexServer()
+        // The health read of the backend refreshes the index first, so it waits for a running build of the backup.
+        server.indexHealth = .unavailable
+
+        let scan = try await finder.duplicateGroups()
+
+        XCTAssertEqual(scan.coverage, .complete)
+        XCTAssertEqual(scan.groups.map(\.members), [[first, second]])
+        XCTAssertEqual(server.indexBuilds, 0, "a scan builds nothing")
+    }
+
+    func testPrepareIndexBuildsAMissingIndexWithTheBuildOfTheBackupAndTheNextScanFindsTheGroups() async throws {
+        let first = server.seedLink(digest: digest("a"))
+        let second = server.seedLink(digest: digest("a"))
+        let records = server.links.map {
+            UploadRemoteContentIndexRecord(contentHash: $0.contentHash, hashKeyEpoch: epoch, remoteLinkID: $0.linkID)
+        }
+        let unbuilt = try await finder.duplicateGroups()
+        XCTAssertEqual(unbuilt, ExactDuplicateScan(groups: [], coverage: .indexing))
+        let store = try XCTUnwrap(store)
+        server.indexBuild = { [epoch] progress in
+            await progress(.init(phase: .indexing, completed: 1, total: 2))
+            _ = store.replaceRemoteContentIndex(
+                records, unresolvedIssues: [], hashKeyEpoch: epoch,
+                checkpoint: .init(eventID: "event-1", refreshedAt: Date()))
+            await progress(.init(phase: .ready))
+        }
+        let reported = ProgressLog()
+
+        let changed = try await finder.prepareIndex { await reported.append($0) }
+
+        XCTAssertTrue(changed)
+        XCTAssertEqual(server.indexBuilds, 1, "the backup's build runs through its resolver")
+        let steps = await reported.steps
+        XCTAssertEqual(steps, [.init(phase: .indexing, completed: 1, total: 2), .init(phase: .ready)])
+        let built = try await finder.duplicateGroups()
+        XCTAssertEqual(built.coverage, .complete)
+        XCTAssertEqual(built.groups.map(\.members), [[first, second]])
+
+        server.indexBuild = nil
+        let unchanged = try await finder.prepareIndex { _ in }
+        XCTAssertFalse(unchanged, "a build that changes nothing needs no new scan")
     }
 
     // MARK: - Keep order
@@ -649,6 +702,11 @@ final class ExactDuplicateFinderTests: XCTestCase {
 }
 
 /// Counts the reads of the manifest rows that name a remote link.
+private actor ProgressLog {
+    private(set) var steps: [UploadRemoteIndexPreparationProgress] = []
+    func append(_ step: UploadRemoteIndexPreparationProgress) { steps.append(step) }
+}
+
 private final class CountingIdentityStore: UploadIdentityStore, @unchecked Sendable {
     struct Reads: Equatable {
         var single = 0

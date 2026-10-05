@@ -6,17 +6,21 @@ final class MobileDuplicatesUITests: XCTestCase {
     override func setUp() {
         continueAfterFailure = false
         app = XCUIApplication()
-        app.launchArguments = [
-            "-EncryptedMemoriesUITestFixture", "-EncryptedMemoriesDuplicatesFixture",
-            "-AppleLanguages", "(en)", "-AppleLocale", "en_US",
-        ]
-        app.launch()
     }
 
     override func tearDown() { app.terminate() }
 
     /// Opens Duplicates with the two fixture groups.
     private func openDuplicates() {
+        openDuplicates(fixture: "-EncryptedMemoriesDuplicatesFixture")
+        XCTAssertTrue(group(1).waitForExistence(timeout: 10))
+    }
+
+    private func openDuplicates(fixture: String) {
+        app.launchArguments = [
+            "-EncryptedMemoriesUITestFixture", fixture, "-AppleLanguages", "(en)", "-AppleLocale", "en_US",
+        ]
+        app.launch()
         // The iOS 26 and 27 tab bars do not always expose a tab bar element; the tab is a button in both.
         let collections = app.buttons["Collections"].firstMatch
         XCTAssertTrue(collections.waitForExistence(timeout: 60))
@@ -27,8 +31,6 @@ final class MobileDuplicatesUITests: XCTestCase {
         for _ in 0..<4 where !entry.waitForExistence(timeout: 3) { app.swipeUp() }
         XCTAssertTrue(entry.waitForExistence(timeout: 10))
         entry.tap()
-
-        XCTAssertTrue(group(1).waitForExistence(timeout: 10))
     }
 
     private func group(_ index: Int) -> XCUIElement {
@@ -47,6 +49,21 @@ final class MobileDuplicatesUITests: XCTestCase {
             return matches.element(boundBy: index)
         }
         return matches.firstMatch
+    }
+
+    func testTheLibraryCheckShowsItsTitleAndProgressWhileNoDuplicateIsFound() {
+        openDuplicates(fixture: "-EncryptedMemoriesDuplicatesCheckingFixture")
+
+        XCTAssertTrue(app.staticTexts["Checking Your Library"].waitForExistence(timeout: 10))
+        XCTAssertTrue(app.staticTexts["Duplicates appear here when the check is done."].exists)
+        let progress = app.descendants(matching: .any).matching(identifier: "duplicates.checkProgress").firstMatch
+        XCTAssertTrue(progress.waitForExistence(timeout: 5), "the check shows its progress")
+        XCTAssertTrue(
+            app.descendants(matching: .any).matching(NSPredicate(format: "label CONTAINS '1,234 of 15,000 photos'"))
+                .firstMatch.exists
+                || (progress.value as? String)?.contains("1,234 of 15,000 photos") == true,
+            "the progress counts the checked photos")
+        XCTAssertFalse(app.staticTexts["No Duplicates"].exists)
     }
 
     func testMergeRemovesTheGroupFromDuplicates() {

@@ -69,6 +69,10 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
     private var cancelCompoundRead = false
     private var failRelatedLookupForTrashedMain = false
     private var healthOverride: UploadRemoteContentIndexHealth?
+    typealias IndexProgress = @Sendable (UploadRemoteIndexPreparationProgress) async -> Void
+    typealias IndexBuild = @Sendable (@escaping IndexProgress) async throws -> Void
+    private var indexBuildOverride: IndexBuild?
+    private var indexBuildCount = 0
     private var rejectedRelatedLookups: [String] = []
     private var proofLookups: [[UploadBackupExternalIdentity]] = []
     let uploadGate = EditScenarioUploadGate()
@@ -440,6 +444,25 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
             healthOverride ?? .complete(indexedCount: table.values.filter { $0.state == .active }.count)
         }
     }
+
+    func prepareRemoteIndex(
+        progress: @escaping @Sendable (UploadRemoteIndexPreparationProgress) async -> Void
+    ) async throws {
+        let build = lock.withLock {
+            indexBuildCount += 1
+            return indexBuildOverride
+        }
+        guard let build else { return await progress(.init(phase: .ready)) }
+        try await build(progress)
+    }
+
+    /// Runs in place of the backend's index build. Nil reports a ready index at once.
+    var indexBuild: IndexBuild? {
+        get { lock.withLock { indexBuildOverride } }
+        set { lock.withLock { indexBuildOverride = newValue } }
+    }
+
+    var indexBuilds: Int { lock.withLock { indexBuildCount } }
 
     /// The index state that the next health checks report. Nil reports a complete index.
     var indexHealth: UploadRemoteContentIndexHealth? {
