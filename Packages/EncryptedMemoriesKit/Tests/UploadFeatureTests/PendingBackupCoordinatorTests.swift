@@ -976,6 +976,76 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         XCTAssertEqual(metadata.reads(of: key("late")) - readsBefore, 2, "changes during a check share one more check")
     }
 
+    /// While backup is paused no pass updates the catalog, so the catalog still lists a photo deleted in Apple
+    /// Photos. The thumbnail loader reports it gone; the photo leaves the list and an activation does not return it.
+    func testAnExcludedPhotoReportedMissingLeavesTheListWhileTheCatalogStillListsIt() async throws {
+        enqueue("gone", state: .queuedForUpload)
+        enqueue("kept", state: .queuedForUpload, captureOffset: 1)
+        await coordinator.start()
+        let gone = PhotoUID(localPending: .photoLibrary, identifier: "gone")
+        let kept = PhotoUID(localPending: .photoLibrary, identifier: "kept")
+        await coordinator.exclude([gone, kept])
+
+        await coordinator.noteSourcesMissing([gone])
+
+        var snapshot = await waitForSnapshot("the missing photo leaves the excluded list") {
+            $0.excludedTiles.map(\.item.uid) == [kept]
+        }
+        XCTAssertEqual(snapshot.trashTiles.map(\.item.uid), [kept])
+        let readsBefore = metadata.reads(of: key("gone"))
+        await coordinator.noteLibraryChanged()
+        let deadline = ContinuousClock.now + .seconds(5)
+        while metadata.reads(of: key("gone")) == readsBefore, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        try await Task.sleep(for: .milliseconds(100))
+        snapshot = await coordinator.currentSnapshot()
+        XCTAssertEqual(snapshot.excludedTiles.map(\.item.uid), [kept], "the stale catalog must not return the photo")
+    }
+
+    func testAPhotoExcludedDuringACheckKeepsItsEntry() async throws {
+        enqueue("first", state: .queuedForUpload)
+        enqueue("second", state: .queuedForUpload, captureOffset: 1)
+        await coordinator.start()
+        let first = PhotoUID(localPending: .photoLibrary, identifier: "first")
+        let second = PhotoUID(localPending: .photoLibrary, identifier: "second")
+        await coordinator.exclude([first])
+        let gate = LookupGate()
+        metadata.fetchGate = { await gate.pass() }
+
+        await coordinator.noteLibraryChanged()
+        await gate.entered()
+        await coordinator.exclude([second])
+        gate.open()
+
+        // The check publishes only a changed list, so the test waits for it to end.
+        try await Task.sleep(for: .milliseconds(200))
+        let snapshot = await coordinator.currentSnapshot()
+        XCTAssertEqual(
+            Set(snapshot.excludedTiles.map(\.item.uid)), [first, second],
+            "a check that started before the exclusion must not drop the photo")
+    }
+
+    func testClosingStopsAPendingCheck() async throws {
+        await coordinator.close()
+        let gate = PendingMembershipSleepGate()
+        let delay = Duration.seconds(3600)
+        coordinator = makeCoordinator(libraryChangeDelay: delay) { duration in
+            if duration == delay { await gate.wait() } else { try await Task.sleep(for: duration) }
+        }
+        enqueue("photo", state: .queuedForUpload)
+        await coordinator.start()
+        await coordinator.exclude([PhotoUID(localPending: .photoLibrary, identifier: "photo")])
+        let readsBefore = metadata.reads(of: key("photo"))
+
+        await coordinator.noteLibraryChanged()
+        await coordinator.close()
+        await gate.release()
+
+        try await Task.sleep(for: .milliseconds(200))
+        XCTAssertEqual(metadata.reads(of: key("photo")), readsBefore, "a closed coordinator reads nothing")
+    }
+
     func testProgressTicksKeepTheTrashListUntilAPhotoExpires() async throws {
         await coordinator.close()
         let clock = MutableClock(date)

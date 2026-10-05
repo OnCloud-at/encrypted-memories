@@ -93,6 +93,9 @@ public actor PendingBackupCoordinator {
     private var excludedAccessible = Set<PendingSourceKey>() {
         didSet { excludedListsCache = nil }
     }
+    /// Excluded sources that Apple Photos reported gone. The catalog still lists them until a backup pass runs, which
+    /// never happens while backup is paused, so a check of the excluded list must not show them again.
+    private var excludedMissing = Set<PendingSourceKey>()
     /// The trash and excluded lists as last built, when they were built, and the moment the oldest trash entry
     /// leaves the trash list. Progress ticks publish several times a second; the lists change only with the two
     /// properties above or with the clock.
@@ -286,6 +289,7 @@ public actor PendingBackupCoordinator {
         recorder?.replacementLedger.dropSources(requests.map { ($0.key, $0.revision) })
         for state in states { sourceStates[state.key] = state }
         dirty.formUnion(excluded)
+        excludedMissing.subtract(excluded)
         excludedAccessible.formUnion(excluded.filter { metadata[$0] != nil })
         listsDirty = true
         publishMembership(force: true)
@@ -364,6 +368,7 @@ public actor PendingBackupCoordinator {
         guard let states = store.include(keys, at: now()) else { return false }
         // Only the person's return starts a new attempt; a queue reload cannot clear the block.
         for key in keys { recorder?.replacementLedger.readmit(key) }
+        excludedMissing.subtract(keys)
         for state in states { sourceStates[state.key] = state }
         dirty.formUnion(keys)
         listsDirty = true
@@ -461,9 +466,20 @@ public actor PendingBackupCoordinator {
 
     /// The platform found these local photos gone (deleted in Apple Photos before their upload). Their tiles
     /// leave the grid like any inaccessible source; an upload that still finishes shows as a Proton photo.
+    /// Excluded photos leave the excluded list, also while backup is paused and no pass updates the catalog.
     public func noteSourcesMissing(_ uids: [PhotoUID]) {
         guard !closed else { return }
-        let keys = uids.compactMap(PendingSourceKey.init(localUID:)).filter { tilesByKey[$0] != nil }
+        let reported = uids.compactMap(PendingSourceKey.init(localUID:))
+        let excluded = reported.filter { sourceStates[$0]?.desired == .excluded }
+        if !excluded.isEmpty {
+            excludedMissing.formUnion(excluded)
+            if !excludedAccessible.isDisjoint(with: excluded) {
+                excludedAccessible.subtract(excluded)
+                listsDirty = true
+                scheduleMembershipPublish()
+            }
+        }
+        let keys = reported.filter { tilesByKey[$0] != nil }
         guard !keys.isEmpty else { return }
         recorder?.replacementLedger.dropSources(keys.map { ($0, tilesByKey[$0]?.revision ?? rows[$0]?.revision) })
         for key in keys {
@@ -912,7 +928,7 @@ public actor PendingBackupCoordinator {
         let accessible = await metadataProvider.metadata(for: excluded)
         guard !closed else { return }
         // A photo excluded during the read keeps the answer that its exclusion stored.
-        let checked = excludedAccessible.subtracting(excluded).union(accessible.keys)
+        let checked = excludedAccessible.subtracting(excluded).union(accessible.keys).subtracting(excludedMissing)
         guard checked != excludedAccessible else { return }
         excludedAccessible = checked
         listsDirty = true
