@@ -432,6 +432,79 @@ extension DriveSessionStubSuite {
             #expect(lineage.health(hashKeyEpoch: "epoch", contentCheckpoint: checkpoint("four")) == .incomplete)
         }
 
+        /// Proton leaves a link that is deleted for good out of the metadata response. Two repair reads one sweep
+        /// interval apart that both leave it out settle it, and the index can become complete.
+        @Test func aLinkLeftOutOfTwoRepairReadsLeavesTheIndex() async throws {
+            let fixture = try RepairFixture(unresolved: ["gone"])
+            defer { fixture.close() }
+            try routeMetadata([])
+            try await fixture.refresh(to: "two")
+            #expect(fixture.lineage.health(hashKeyEpoch: "epoch", contentCheckpoint: checkpoint("two")) == .incomplete)
+
+            fixture.clock.advance(ProtonUploadDedupeService.lineageRepairSweepInterval)
+            try await fixture.refresh(to: "three")
+            #expect(try metadataRequestLinkIDs().filter { $0 == "gone" }.count == 4, "two reads with one retry each")
+            #expect(fixture.lineage.health(hashKeyEpoch: "epoch", contentCheckpoint: checkpoint("three")) == .complete)
+        }
+
+        @Test func aLinkLeftOutOnceAndThenReturnedGetsItsRows() async throws {
+            let fixture = try RepairFixture(unresolved: ["photo"])
+            defer { fixture.close() }
+            try routeMetadata([])
+            try await fixture.refresh(to: "two")
+            fixture.clock.advance(ProtonUploadDedupeService.lineageRepairSweepInterval)
+            try routeMetadata([
+                try fixture.keys.activePhoto("photo", attributes: #"{"iOS.photos":{"ICloudID":"cloud"}}"#)
+            ])
+            try await fixture.refresh(to: "three")
+            #expect(
+                fixture.lineage.activeMainLinkIDs(forExternalIdentifier: "cloud", hashKeyEpoch: "epoch") == ["photo"])
+            #expect(fixture.lineage.health(hashKeyEpoch: "epoch", contentCheckpoint: checkpoint("three")) == .complete)
+        }
+
+        /// A failed request proves nothing about a link: it neither counts as an omission nor settles one.
+        @Test func aFailedRequestNeverSettlesALink() async throws {
+            let fixture = try RepairFixture(unresolved: ["photo"])
+            defer { fixture.close() }
+            try routeMetadata([])
+            try await fixture.refresh(to: "two")
+            for next in ["three", "four"] {
+                fixture.clock.advance(ProtonUploadDedupeService.lineageRepairSweepInterval)
+                StubURLProtocol.route(
+                    "POST /drive/shares/share1/links/fetch_metadata", status: 422,
+                    json: #"{"Code":2000,"Error":"failed"}"#)
+                try await fixture.refresh(to: next)
+                #expect(
+                    fixture.lineage.health(hashKeyEpoch: "epoch", contentCheckpoint: checkpoint(next)) == .incomplete)
+            }
+            #expect(try metadataRequestLinkIDs().filter { $0 == "photo" }.count == 6)
+        }
+
+        /// The repair runs after the events, so a hanging or failing repair read never holds them back.
+        @Test func eventsApplyWhileTheRepairReadHangs() async throws {
+            let fixture = try RepairFixture(unresolved: ["photo"])
+            defer { fixture.close() }
+            StubURLProtocol.hang("POST /drive/shares/share1/links/fetch_metadata")
+            StubURLProtocol.route(
+                "GET /drive/volumes/vol1/events/one",
+                json: #"""
+                    {"Code":1000,"EventID":"two","More":0,"Refresh":0,"Events":[
+                        {"EventType":0,"Link":{"LinkID":"removed"}}
+                    ]}
+                    """#)
+            let refresh = Task { try await fixture.refresh(to: "two", routesEvents: false) }
+            for _ in 0..<500 {
+                if StubURLProtocol.requests().contains(where: { $0.path.contains("fetch_metadata") }) { break }
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            #expect(StubURLProtocol.requests().contains { $0.path.contains("fetch_metadata") })
+            #expect(fixture.content.remoteContentIndexCheckpoint(hashKeyEpoch: "epoch")?.eventID == "two")
+            #expect(fixture.lineage.hasCheckpoint(hashKeyEpoch: "epoch", eventID: "two"))
+            refresh.cancel()
+            _ = await refresh.result
+            #expect(fixture.lineage.health(hashKeyEpoch: "epoch", contentCheckpoint: checkpoint("two")) == .incomplete)
+        }
+
         @Test func contentPageFailureKeepsBothCheckpointsAndRows() async throws {
             let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -511,6 +584,60 @@ extension DriveSessionStubSuite {
                 json: #"{"Code":1000,"EventID":"\#(to)","More":0,"Refresh":0,"Events":[]}"#)
         }
 
+        private final class ManualClock: @unchecked Sendable {
+            private let lock = NSLock()
+            private var value = Date(timeIntervalSince1970: 1_000_000)
+            var now: Date { lock.withLock { value } }
+            func advance(_ seconds: TimeInterval) { lock.withLock { value += seconds } }
+        }
+
+        /// A content and a lineage index at event "one" with unresolved lineage links, and a clock for the sweeps.
+        private struct RepairFixture: Sendable {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            let clock = ManualClock()
+            let keys: LineageKeys
+            let content: UploadIdentityManifestStore
+            let lineage: UploadRemoteLineageIndexStore
+
+            init(unresolved: Set<String>) throws {
+                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                keys = try LineageKeys()
+                content = try #require(
+                    UploadIdentityManifestStore(url: directory.appendingPathComponent("content.sqlite")))
+                let clock = clock
+                lineage = try #require(
+                    UploadRemoteLineageIndexStore(
+                        url: directory.appendingPathComponent("lineage.sqlite"), clock: { clock.now }))
+                #expect(
+                    content.replaceRemoteContentIndex(
+                        [], unresolvedIssues: [], hashKeyEpoch: "epoch",
+                        checkpoint: .init(eventID: "one", refreshedAt: Date())))
+                #expect(
+                    lineage.replaceRows(
+                        identities: [], lineage: [], hashKeyEpoch: "epoch", eventID: "one",
+                        unresolvedRemoteLinkIDs: unresolved))
+                StubURLProtocol.reset()
+            }
+
+            /// Applies empty events from the current checkpoint to `next`, with the repair after them.
+            func refresh(to next: String, routesEvents: Bool = true) async throws {
+                let current = content.remoteContentIndexCheckpoint(hashKeyEpoch: "epoch")?.eventID ?? ""
+                if routesEvents {
+                    StubURLProtocol.route(
+                        "GET /drive/volumes/vol1/events/\(current)",
+                        json: #"{"Code":1000,"EventID":"\#(next)","More":0,"Refresh":0,"Events":[]}"#)
+                }
+                try await ProtonRemoteLineageRefreshTests.refresh(
+                    content: content, lineage: lineage, rootKey: keys.root)
+            }
+
+            func close() {
+                content.close()
+                lineage.close()
+                try? FileManager.default.removeItem(at: directory)
+            }
+        }
+
         private func routeMetadata(_ links: [[String: Any]]) throws {
             let body = try JSONSerialization.data(withJSONObject: ["Code": 1000, "Links": links])
             StubURLProtocol.route(
@@ -527,7 +654,7 @@ extension DriveSessionStubSuite {
         }
 
         /// A photos root key and one photo node key, so a repair can decrypt the attributes of an active photo.
-        private struct LineageKeys {
+        private struct LineageKeys: Sendable {
             let crypto = DriveCrypto(addressKeys: [], signers: [])
             let root: UnlockableKey
             private let node: UnlockableKey
@@ -551,6 +678,14 @@ extension DriveSessionStubSuite {
         }
 
         private func refresh(
+            content: UploadIdentityManifestStore, lineage: UploadRemoteLineageIndexStore?,
+            rebuildsMissingLineage: Bool = false, rootKey: UnlockableKey = .init(armored: "", passphrase: "")
+        ) async throws {
+            try await Self.refresh(
+                content: content, lineage: lineage, rebuildsMissingLineage: rebuildsMissingLineage, rootKey: rootKey)
+        }
+
+        fileprivate static func refresh(
             content: UploadIdentityManifestStore, lineage: UploadRemoteLineageIndexStore?,
             rebuildsMissingLineage: Bool = false, rootKey: UnlockableKey = .init(armored: "", passphrase: "")
         ) async throws {

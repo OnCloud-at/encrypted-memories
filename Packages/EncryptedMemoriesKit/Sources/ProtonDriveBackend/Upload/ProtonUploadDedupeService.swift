@@ -68,9 +68,9 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
     private static let remoteMetadataWindow =
         UploadDedupePipeline.protonDuplicateBatchSize * remoteMetadataRequestConcurrency
     /// One repair reads at most one metadata window of unresolved lineage links. A full sweep repeats after the
-    /// interval.
+    /// interval, and a link that two reads this far apart do not find leaves the index as gone.
     private static let lineageRepairLimit = remoteMetadataWindow
-    private static let lineageRepairSweepInterval: TimeInterval = 5 * 60
+    static let lineageRepairSweepInterval: TimeInterval = 5 * 60
 
     init(
         session: DriveSession,
@@ -667,10 +667,6 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
         let eventLineageStore = lineageStore.flatMap {
             $0.hasCheckpoint(hashKeyEpoch: material.epoch, eventID: checkpoint.eventID) ? $0 : nil
         }
-        if let eventLineageStore {
-            await repairUnresolvedLineage(
-                store: eventLineageStore, eventID: eventID, material: material, session: session, crypto: crypto)
-        }
         while true {
             try Task.checkCancellation()
             let page = try await session.fetchVolumeEvents(
@@ -752,14 +748,20 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
                 DebugLog.log("[Dedupe] lineage index changes could not be saved; reads remain incomplete")
             }
             eventID = page.eventID
-            if !page.hasMore { return }
+            if !page.hasMore { break }
+        }
+        // After the events: a repair backlog never delays them, and it writes only at the checkpoint they reached.
+        if let eventLineageStore, eventLineageStore.hasCheckpoint(hashKeyEpoch: material.epoch, eventID: eventID) {
+            await repairUnresolvedLineage(
+                store: eventLineageStore, eventID: eventID, material: material, session: session, crypto: crypto)
         }
     }
 
     /// Reads a bounded share of the unresolved lineage links again, so one failed read does not keep the index
     /// incomplete until the next full build. A link that reads now gets its rows, a link that is no longer an active
-    /// photo leaves the index, and a link that fails again stays for a later sweep. The lineage index stays passive:
-    /// nothing here throws into the content refresh.
+    /// photo leaves the index, and a link that fails again stays for a later sweep. A link that successful responses
+    /// leave out in two sweeps is deleted for good and leaves the index; a failed request never settles a link. The
+    /// lineage index stays passive: nothing here throws into the content refresh.
     private static func repairUnresolvedLineage(
         store: UploadRemoteLineageIndexStore,
         eventID: String,
@@ -781,16 +783,24 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
             )
         else { return }
         let lineage = rows.lineageRows
+        let endpointFailures = Set(ids).intersection(fetched.endpointFailureIDs)
+        let omitted = Set(ids.filter { fetched.links[$0] == nil }).subtracting(endpointFailures)
+        let gone = store.linksOmittedTwice(
+            omitted: omitted, returned: Set(fetched.links.keys).intersection(ids), hashKeyEpoch: material.epoch,
+            interval: lineageRepairSweepInterval)
+        let unresolved = lineage.unresolvedLinkIDs.subtracting(gone)
         guard
             store.applyChanges(
                 identities: lineage.identities, lineage: lineage.lineage, removingRemoteLinkIDs: ids,
                 hashKeyEpoch: material.epoch, expectedEventID: eventID, eventID: eventID,
-                unresolvedRemoteLinkIDs: lineage.unresolvedLinkIDs)
+                unresolvedRemoteLinkIDs: unresolved)
         else {
             DebugLog.log("[Dedupe] lineage repair could not be saved; reads remain incomplete")
             return
         }
-        DebugLog.log("[Dedupe] lineage repair links=\(ids.count) unresolved=\(lineage.unresolvedLinkIDs.count)")
+        DebugLog.log(
+            "[Dedupe] lineage repair links=\(ids.count) unresolved=\(unresolved.count) "
+                + "endpointFailure=\(endpointFailures.count) omitted=\(omitted.count - gone.count) gone=\(gone.count)")
     }
 
     private struct RemoteMetadataFetch {
