@@ -197,6 +197,8 @@ It refuses equal or newer active versions or unsafe states.
 
 The manual `External TestFlight` workflow runs from `main` with one published release tag.
 It reuses existing builds and never rebuilds or uploads.
+It also adds the builds to the internal group, so an external beta is always an internal beta, too.
+It enables the public link of the external group and shows the link in the job summary.
 It uses the `testflight-external` environment.
 `TESTFLIGHT_EXTERNAL_GROUP_NAME` optionally overrides `External Testers`.
 Stable and prerelease release tags can be promoted externally.
