@@ -6073,8 +6073,8 @@
     "duplicates.checking_wait": {
       "comment": "Line below the title while no group was found yet and the library check still runs.",
       "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "Duplicates appear here when the check is done." } },
-        "de": { "stringUnit": { "state": "translated", "value": "Duplikate erscheinen hier, sobald die Prüfung fertig ist." } }
+        "en": { "stringUnit": { "state": "translated", "value": "Duplicates appear here when it is done." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Danach erscheinen hier die Duplikate." } }
       }
     },
     "duplicates.checking_progress %@ %@": {
