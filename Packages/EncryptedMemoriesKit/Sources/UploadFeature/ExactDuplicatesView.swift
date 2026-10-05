@@ -259,32 +259,51 @@ private struct ExactDuplicateMembers<Cover: View>: View {
                 ForEach(Array(group.members.enumerated()), id: \.element) { index, uid in
                     let isKept = uid == group.kept
                     let keepTitle = model.keepTitle(for: uid, inGroup: group.id)
-                    Button {
-                        onOpen(uid, group.id)
-                    } label: {
-                        ExactDuplicateTile(
-                            group: group, member: uid, accent: accent, cornerRadius: cornerRadius, cover: cover(uid))
-                    }
-                    .buttonStyle(.plain)
-                    .contextMenu {
-                        Button {
-                            model.keep(uid, inGroup: group.id)
-                        } label: {
-                            Label(keepTitle, systemImage: "checkmark.circle")
-                        }
-                        .disabled(isKept)
-                        .accessibilityIdentifier("duplicates.keepMenu")
-                    }
-                    .accessibilityLabel(group.accessibilityLabel(of: uid))
-                    .accessibilityAddTraits(isKept ? .isSelected : [])
-                    .accessibilityAction(named: Text(keepTitle)) { model.keep(uid, inGroup: group.id) }
-                    .accessibilityIdentifier("duplicates.member.\(groupIndex).\(index)")
+                    member(uid, isKept: isKept, keepTitle: keepTitle)
+                        .accessibilityLabel(group.accessibilityLabel(of: uid))
+                        .accessibilityAddTraits(isKept ? .isSelected : [])
+                        .accessibilityAction(named: Text(keepTitle)) { model.keep(uid, inGroup: group.id) }
+                        .accessibilityIdentifier("duplicates.member.\(groupIndex).\(index)")
                 }
             }
             .padding(.vertical, 4)
         }
         .scrollIndicators(.hidden)
         .accessibilityElement(children: .contain)
+    }
+
+    /// A tap or click opens the photo; a long press or a secondary click offers Keep This Copy.
+    @ViewBuilder private func member(_ uid: PhotoUID, isKept: Bool, keepTitle: String) -> some View {
+        let tile = ExactDuplicateTile(
+            group: group, member: uid, accent: accent, cornerRadius: cornerRadius, cover: cover(uid))
+        let keep = Button {
+            model.keep(uid, inGroup: group.id)
+        } label: {
+            Label(keepTitle, systemImage: "checkmark.circle")
+        }
+        .disabled(isKept)
+        .accessibilityIdentifier("duplicates.keepMenu")
+        #if os(iOS)
+            // A context menu inside a List row becomes the menu of the whole row, so a long press on any copy showed
+            // the menu of the first one. A menu with a primary action belongs to its own copy.
+            Menu {
+                keep
+            } label: {
+                tile
+            } primaryAction: {
+                onOpen(uid, group.id)
+            }
+            .menuStyle(.button)
+            .buttonStyle(.plain)
+        #else
+            Button {
+                onOpen(uid, group.id)
+            } label: {
+                tile
+            }
+            .buttonStyle(.plain)
+            .contextMenu { keep }
+        #endif
     }
 }
 
