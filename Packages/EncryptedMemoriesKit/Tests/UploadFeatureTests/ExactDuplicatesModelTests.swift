@@ -416,6 +416,53 @@ final class ExactDuplicatesModelTests: XCTestCase {
         XCTAssertNil(model.totalFreedText)
     }
 
+    // MARK: - One change for each page
+
+    func testARankedPagePublishesOneChangeForAllItsGroups() async {
+        let groupC = ExactDuplicateGroup(contentHash: "C", hashKeyEpoch: "e", members: [b1, a1])
+        let finder = FakeDuplicateFinder(scans: [.init(groups: [groupA, groupB, groupC], coverage: .complete)])
+        finder.ranked = ["A": [a3, a1, a2], "B": [b2, b1], "C": [a1, b1]]
+        finder.rankSizes = ["A": 10, "B": 20, "C": 30]
+        finder.rankGate.close()
+        let (model, _) = makeModel(finder)
+        let load = Task { await model.load() }
+        await waitUntil({ finder.rankGate.hasWaiters }, "the load ranks the groups")
+        let before = model.groupChanges
+
+        finder.rankGate.open()
+        await load.value
+
+        XCTAssertEqual(model.groups.filter(\.isRanked).count, 3, "the page ranked every group")
+        XCTAssertEqual(model.groupChanges - before, 1, "the screen sees one change for the whole page")
+    }
+
+    func testARankedPageLeavesTheOtherGroupsUnchanged() async {
+        let finder = FakeDuplicateFinder(scans: [.init(groups: [groupA, groupB], coverage: .complete)])
+        finder.unreadableGroups = ["B"]
+        finder.ranked = ["A": [a3, a1, a2]]
+        finder.facts = ["A": [a3: facts(favorite: true)]]
+        finder.rankGate.close()
+        let (model, _) = makeModel(finder)
+        let load = Task { await model.load() }
+        await waitUntil({ finder.rankGate.hasWaiters }, "the load ranks the groups")
+        let unchanged = model.groups.first { $0.id == "B" }
+
+        finder.rankGate.open()
+        await load.value
+
+        XCTAssertEqual(model.groups.first { $0.id == "A" }?.kept, a3, "the page ranked group A")
+        XCTAssertEqual(model.groups.first { $0.id == "B" }, unchanged, "the row of group B has nothing to redraw")
+    }
+
+    func testKeepingAnotherCopyPublishesOneChange() async {
+        let (model, _) = makeModel(FakeDuplicateFinder(scans: [.init(groups: [groupA], coverage: .complete)]))
+        await model.load()
+        let before = model.groupChanges
+        model.keep(a2, inGroup: "A")
+        XCTAssertEqual(model.groupChanges - before, 1)
+        XCTAssertEqual(model.groups[0].kept, a2)
+    }
+
     // MARK: - Facts of each copy
 
     private func date(_ offset: TimeInterval) -> Date { Date(timeIntervalSince1970: 1_700_000_000 + offset) }
@@ -654,19 +701,20 @@ final class ExactDuplicatesModelTests: XCTestCase {
         let (model, _) = makeModel(finder)
         await model.load()
         let size = ExactDuplicatesModel.rankingPageSize
-        func progress(_ total: Int) -> String {
-            L10n.string("duplicates.ranking_progress \(0.formatted()) \(total.formatted())")
+        // The scroll ranking shows no progress row, so the test reads the queue that the model keeps for it.
+        func progress(_ total: Int) -> ExactDuplicateScanProgress {
+            ExactDuplicateScanProgress(completed: 0, total: total)
         }
         finder.rankGate.close()
         model.groupAppeared(groups[10 * size].id)
         await waitUntil({ finder.rankGate.hasWaiters }, "page 10 ranks")
         model.groupAppeared(groups[20 * size].id)
-        await waitUntil({ model.rankingLine?.detail == progress(4 * size) }, "pages 20 and 21 wait")
+        await waitUntil({ model.rankingProgress == progress(4 * size) }, "pages 20 and 21 wait")
         model.groupAppeared(groups[30 * size].id)
         // Pages 11, 20, 21, 30, and 31 exceed the queue; page 11 gives way.
-        await waitUntil({ model.rankingLine?.detail == progress(5 * size) }, "pages 30 and 31 wait")
+        await waitUntil({ model.rankingProgress == progress(5 * size) }, "pages 30 and 31 wait")
         finder.rankGate.open()
-        await waitUntil({ model.rankingLine == nil }, "the ranking finishes")
+        await waitUntil({ model.rankingProgress == nil }, "the ranking finishes")
         let ranked = Set(model.groups.filter(\.isRanked).map(\.id))
         for page in [0, 1, 10, 20, 21, 30, 31] {
             XCTAssertTrue(

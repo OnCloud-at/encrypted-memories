@@ -135,9 +135,10 @@ private struct ExactDuplicatesProgressRow: View {
     }
 }
 
-/// The groups: a native inset grouped list on iPhone and iPad, and a lazy column on the Mac. A macOS `List` with one
-/// section per group diffed every row of its outline on the main thread for each change of the model, so a library
-/// with 1,500 groups stopped scrolling for seconds. Both containers show the same parts of each group.
+/// The groups in one lazy column on every platform: rounded cards on the grouped background on iPhone and iPad, as an
+/// inset grouped list draws them, and a calm column with dividers on the Mac. A `List` with one section per group
+/// compared every row on the main thread for each change of the model; on the Mac 1,500 groups stopped scrolling for
+/// seconds, and on iPhone and iPad the list kept every section in memory and redrew more than the shown rows.
 ///
 /// Only the groups and whether a merge can start make this list evaluate again; the progress rows and the summary
 /// observe the model on their own, and each part of a group redraws only when its group changes.
@@ -148,62 +149,83 @@ private struct ExactDuplicatesGroupList<Cover: View>: View, Equatable {
     let reduceMotion: Bool
     let onOpen: (PhotoUID, String) -> Void
     let cover: (PhotoUID) -> Cover
+    #if os(iOS)
+        @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    #endif
 
     nonisolated static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.model === rhs.model && lhs.accent == rhs.accent && lhs.cornerRadius == rhs.cornerRadius
             && lhs.reduceMotion == rhs.reduceMotion
     }
 
+    /// The margin of the cards, and of their content inside them, as the inset grouped list uses it.
+    private var margin: CGFloat {
+        #if os(iOS)
+            horizontalSizeClass == .regular ? 20 : 16
+        #else
+            24
+        #endif
+    }
+
     var body: some View {
         let canMerge = model.canMerge
         let groups = IndexedGroups(base: model.groups)
-        #if os(iOS)
-            List {
-                Section {
-                    ExactDuplicatesStatusRows(model: model, accent: accent)
-                } header: {
+        let list = ScrollView {
+            LazyVStack(alignment: .leading, spacing: 0) {
+                VStack(alignment: .leading, spacing: 12) {
                     ExactDuplicatesSummary(model: model)
+                        .padding(.horizontal, DuplicatesLayout.cards ? margin : 0)
+                    ExactDuplicatesStatusRows(model: model, accent: accent, margin: margin)
                 }
+                .padding(.bottom, DuplicatesLayout.cards ? 0 : 10)
                 ForEach(groups, id: \.element.id) { index, group in
-                    Section {
-                        part(.members, of: group, at: index, canMerge: canMerge)
-                    } header: {
-                        part(.header, of: group, at: index, canMerge: canMerge)
-                    } footer: {
-                        part(.footer, of: group, at: index, canMerge: canMerge)
-                    }
+                    section(group, at: index, canMerge: canMerge)
                 }
             }
-            .listStyle(.insetGrouped)
-            .refreshable { await model.load() }
+            .padding(.horizontal, DuplicatesLayout.cards ? margin : 24)
+            .padding(.vertical, 12)
+            // A wide window or iPad adds margins instead of long rows.
+            .frame(maxWidth: DuplicatesLayout.maxWidth, alignment: .leading)
+            .frame(maxWidth: .infinity)
+        }
+        #if os(iOS)
+            return
+                list
+                .background(ProtonColor.groupedBackground.ignoresSafeArea())
+                .refreshable { await model.load() }
         #else
-            // Apple Photos keeps the groups in a calm column; a wide window adds margins instead of long rows. The
-            // headers scroll with their groups, so none of them stays under the window toolbar.
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 0) {
-                    VStack(alignment: .leading, spacing: 12) {
-                        ExactDuplicatesSummary(model: model)
-                        ExactDuplicatesStatusRows(model: model, accent: accent)
-                    }
-                    .padding(.bottom, 10)
-                    ForEach(groups, id: \.element.id) { index, group in
-                        VStack(alignment: .leading, spacing: 10) {
-                            Divider()
-                            part(.header, of: group, at: index, canMerge: canMerge)
-                                .padding(.top, 8)
-                            part(.members, of: group, at: index, canMerge: canMerge)
-                            part(.footer, of: group, at: index, canMerge: canMerge)
-                                .font(.subheadline)
-                        }
-                        .padding(.bottom, 14)
-                    }
-                }
-                .padding(.horizontal, 24)
-                .padding(.vertical, 12)
-                .frame(maxWidth: 880, alignment: .leading)
-                .frame(maxWidth: .infinity)
-            }
+            return list
         #endif
+    }
+
+    /// One group: its header, its copies, and its footer. The headers scroll with their groups, so none of them
+    /// stays under the bars.
+    @ViewBuilder
+    private func section(_ group: ExactDuplicatesModel.Group, at index: Int, canMerge: Bool) -> some View {
+        if DuplicatesLayout.cards {
+            VStack(alignment: .leading, spacing: 8) {
+                part(.header, of: group, at: index, canMerge: canMerge)
+                    .padding(.horizontal, margin)
+                part(.members, of: group, at: index, canMerge: canMerge)
+                    .padding(.horizontal, margin)
+                    .padding(.vertical, 15)
+                    .duplicatesCard()
+                part(.footer, of: group, at: index, canMerge: canMerge)
+                    .font(.footnote)
+                    .padding(.horizontal, margin)
+            }
+            .padding(.top, 16)
+        } else {
+            VStack(alignment: .leading, spacing: 10) {
+                Divider()
+                part(.header, of: group, at: index, canMerge: canMerge)
+                    .padding(.top, 8)
+                part(.members, of: group, at: index, canMerge: canMerge)
+                part(.footer, of: group, at: index, canMerge: canMerge)
+                    .font(.subheadline)
+            }
+            .padding(.bottom, 14)
+        }
     }
 
     private func part(
@@ -225,6 +247,37 @@ private struct ExactDuplicatesGroupList<Cover: View>: View, Equatable {
     }
 }
 
+/// The look of the column per platform: the inset grouped cards of iPhone and iPad, or the Mac column.
+private enum DuplicatesLayout {
+    #if os(iOS)
+        static let cards = true
+        static let maxWidth: CGFloat = .infinity
+        /// The titles of the summary and of each group, as the headers of an inset grouped list show them.
+        static let titleFont = Font.headline
+        static let titleStyle = HierarchicalShapeStyle.secondary
+        static let cardRadius: CGFloat = 26
+    #else
+        static let cards = false
+        static let maxWidth: CGFloat = 880
+        static let titleFont = Font.headline
+        static let titleStyle = HierarchicalShapeStyle.primary
+        static let cardRadius: CGFloat = 0
+    #endif
+}
+
+extension View {
+    /// A rounded card on the grouped background, as an inset grouped list draws a section.
+    fileprivate func duplicatesCard() -> some View {
+        #if os(iOS)
+            background(
+                ProtonColor.groupedCard,
+                in: RoundedRectangle(cornerRadius: DuplicatesLayout.cardRadius, style: .continuous))
+        #else
+            self
+        #endif
+    }
+}
+
 /// The groups with their positions, without copying them.
 private struct IndexedGroups: RandomAccessCollection {
     let base: [ExactDuplicatesModel.Group]
@@ -242,6 +295,8 @@ private struct ExactDuplicatesSummary: View {
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 6) {
                     Text(count)
+                        .font(DuplicatesLayout.titleFont)
+                        .foregroundStyle(DuplicatesLayout.titleStyle)
                         .monospacedDigit()
                         .accessibilityIdentifier("duplicates.copyCount")
                     InfoButton(title: model.infoTitle, message: model.infoMessage)
@@ -265,8 +320,28 @@ private struct ExactDuplicatesSummary: View {
 private struct ExactDuplicatesStatusRows: View {
     let model: ExactDuplicatesModel
     let accent: Color
+    let margin: CGFloat
+
+    private var hasRows: Bool {
+        model.checkLine != nil || model.stillCheckingNote != nil || model.rankingLine != nil
+            || model.uncheckedNote != nil || model.checkFailedNote != nil
+    }
 
     var body: some View {
+        if hasRows {
+            if DuplicatesLayout.cards {
+                VStack(alignment: .leading, spacing: 12) { rows }
+                    .padding(.horizontal, margin)
+                    .padding(.vertical, 12)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .duplicatesCard()
+            } else {
+                VStack(alignment: .leading, spacing: 12) { rows }
+            }
+        }
+    }
+
+    @ViewBuilder private var rows: some View {
         if let line = model.checkLine {
             ExactDuplicatesProgressRow(line: line, accent: accent).accessibilityIdentifier("duplicates.checkProgress")
         }
@@ -348,8 +423,8 @@ private struct ExactDuplicateGroupPart<Cover: View>: View, Equatable {
     private var header: some View {
         HStack(alignment: .center) {
             Text(group.title)
-                .font(.headline)
-                .foregroundStyle(.primary)
+                .font(DuplicatesLayout.titleFont)
+                .foregroundStyle(DuplicatesLayout.titleStyle)
                 .monospacedDigit()
                 .lineLimit(1)
                 .accessibilityIdentifier("duplicates.date.\(index)")
@@ -391,8 +466,12 @@ private struct ExactDuplicateMembers<Cover: View>: View {
     let cornerRadius: CGFloat
     let actions: ExactDuplicateGroupActions
     let cover: (PhotoUID) -> Cover
+    /// The width of the copies and of the space for them. The row scrolls only when the copies are wider.
+    @State private var contentWidth: CGFloat = 0
+    @State private var availableWidth: CGFloat = 0
 
     var body: some View {
+        // A row that fits never takes a scroll gesture: a vertical one over it scrolls the list, not the row.
         ScrollView(.horizontal) {
             HStack(spacing: 10) {
                 ForEach(Array(group.members.enumerated()), id: \.element) { index, uid in
@@ -406,8 +485,20 @@ private struct ExactDuplicateMembers<Cover: View>: View {
                 }
             }
             .padding(.vertical, 4)
+            .onGeometryChange(for: CGFloat.self) {
+                $0.size.width
+            } action: {
+                contentWidth = $0
+            }
         }
         .scrollIndicators(.hidden)
+        .scrollBounceBehavior(.basedOnSize, axes: [.horizontal, .vertical])
+        .scrollDisabled(contentWidth <= availableWidth + 0.5)
+        .onGeometryChange(for: CGFloat.self) {
+            $0.size.width
+        } action: {
+            availableWidth = $0
+        }
         .accessibilityElement(children: .contain)
     }
 

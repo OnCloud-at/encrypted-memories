@@ -114,6 +114,17 @@ import UploadCore
                         groups: sections.prefix(2).map { $0.items.prefix(2).map(\.uid) },
                         captureDates: Dictionary(
                             items.map { ($0.uid, $0.captureTime) }, uniquingKeysWith: { first, _ in first })))
+            } else if ProcessInfo.processInfo.arguments.contains("-EncryptedMemoriesDuplicatesLargeFixture") {
+                // 1,500 groups of two or three library photos, for the scrolling and memory measurement.
+                let items = sections.flatMap(\.items)
+                let groups = (0..<1_500).map { index in
+                    (0..<(index.isMultiple(of: 3) ? 3 : 2)).map { items[(index * 3 + $0) % items.count].uid }
+                }
+                runtime.libraryModel.installIsolatedDuplicatesForTesting(
+                    MobileFixtureDuplicates(
+                        groups: groups,
+                        captureDates: Dictionary(
+                            items.map { ($0.uid, $0.captureTime) }, uniquingKeysWith: { first, _ in first })))
             } else if ProcessInfo.processInfo.arguments.contains("-EncryptedMemoriesDuplicatesCheckingFixture") {
                 runtime.libraryModel.installIsolatedDuplicatesForTesting(
                     MobileFixtureDuplicates(groups: [], checking: true))
@@ -304,7 +315,9 @@ import UploadCore
         }
 
         func captureDates(of members: [PhotoUID]) async -> [PhotoUID: Date] {
-            dates.filter { members.contains($0.key) }
+            Dictionary(
+                members.compactMap { member in dates[member].map { (member, $0) } },
+                uniquingKeysWith: { first, _ in first })
         }
 
         func rankMembers(

@@ -10,7 +10,6 @@ import UploadFeature
 struct MacDuplicatesView: View {
     let model: ExactDuplicatesModel
     let thumbnailFeed: ThumbnailFeed
-    let sourceAnalysisRevision: UInt64
     /// The height of the window toolbar that floats over this view.
     let topInset: CGFloat
     @Binding var confirmsMergeAll: Bool
@@ -21,15 +20,21 @@ struct MacDuplicatesView: View {
     private static let thumbnailSide: CGFloat = 132
     private static let cornerRadius: CGFloat = 6
 
+    /// The thumbnails come from the bounded decoded tier of the shared feed; the screen keeps none of its own.
+    private var thumbnails: ExactDuplicateThumbnails {
+        let feed = thumbnailFeed
+        return ExactDuplicateThumbnails(
+            read: { uid in feed.memoryImage(for: uid).map { Image(nsImage: $0) } },
+            load: { uid in _ = await feed.feedCore.visibleDecoded(for: uid) })
+    }
+
     var body: some View {
         ExactDuplicatesView(
             model: model, confirmsMergeAll: $confirmsMergeAll, accent: .accentColor, cornerRadius: Self.cornerRadius,
             onOpen: onOpen
         ) { uid in
-            AlbumSidebarCover(
-                coverUID: uid, fallbackSystemImage: "photo", thumbnailFeed: thumbnailFeed,
-                sourceAnalysisRevision: sourceAnalysisRevision, size: Self.thumbnailSide
-            )
+            ExactDuplicateThumbnail(
+                uid: uid, side: Self.thumbnailSide, cornerRadius: Self.cornerRadius, thumbnails: thumbnails)
         }
         .contentMargins(.top, topInset, for: .scrollContent)
         .frame(maxWidth: .infinity, maxHeight: .infinity)

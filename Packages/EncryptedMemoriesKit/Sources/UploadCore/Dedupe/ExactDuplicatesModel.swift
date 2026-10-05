@@ -299,7 +299,21 @@ public final class ExactDuplicatesModel {
         case failed
     }
 
-    public private(set) var groups: [Group] = []
+    /// The groups shown. Each write publishes one change to the screens, so work that changes many groups, such as a
+    /// ranked page or a merge, changes a copy and writes it back once.
+    public private(set) var groups: [Group] {
+        get {
+            access(keyPath: \.groups)
+            return groupStorage
+        }
+        set {
+            withMutation(keyPath: \.groups) { groupStorage = newValue }
+            groupChanges &+= 1
+        }
+    }
+    @ObservationIgnored private var groupStorage: [Group] = []
+    /// How many changes `groups` published. Tests read it.
+    @ObservationIgnored private(set) var groupChanges = 0
     /// How much of the library the content index covered at the last scan.
     public private(set) var coverage = ExactDuplicateCoverage.complete
     public private(set) var isMerging = false
@@ -716,16 +730,28 @@ public final class ExactDuplicatesModel {
             rankingProgress = ExactDuplicateScanProgress(
                 completed: min(progress.completed + page.groupCount, progress.total), total: progress.total)
         }
+        // The whole page is one change of the screen, not one change for each of its groups.
+        var updated = groups
+        let positions = Self.positions(of: updated)
+        var changed = false
         for (id, order) in page.members {
-            guard let index = groups.firstIndex(where: { $0.id == id }) else { continue }
-            groups[index].rank(
+            guard let index = positions[id] else { continue }
+            updated[index].rank(
                 order, shared: page.shared[id] ?? [], facts: page.facts[id] ?? [:],
                 sizes: page.memberByteSizes[id] ?? [:], keepsShown: keepsShown)
+            changed = true
         }
         for (id, size) in page.byteSizes {
-            guard let index = groups.firstIndex(where: { $0.id == id }), groups[index].byteSize == nil else { continue }
-            groups[index].byteSize = size
+            guard let index = positions[id], updated[index].byteSize == nil else { continue }
+            updated[index].byteSize = size
+            changed = true
         }
+        if changed { groups = updated }
+    }
+
+    /// The position of each group by its ID.
+    private static func positions(of groups: [Group]) -> [String: Int] {
+        Dictionary(groups.indices.map { (groups[$0].id, $0) }, uniquingKeysWith: { first, _ in first })
     }
 
     private func buildAndRescan(generation: Int) async {
@@ -809,8 +835,10 @@ public final class ExactDuplicatesModel {
         guard !isMerging, let index = groups.firstIndex(where: { $0.id == groupID }),
             groups[index].members.contains(uid)
         else { return }
-        groups[index].kept = uid
-        groups[index].isKeptChosen = true
+        var group = groups[index]
+        group.kept = uid
+        group.isKeptChosen = true
+        groups[index] = group
     }
 
     /// Merges one group and keeps exactly the photo that the screen shows as kept.
@@ -847,13 +875,17 @@ public final class ExactDuplicatesModel {
             isRankingForMerge = false
             if rankingToken == token { rankingProgress = nil }
         }
-        let selected = requested.compactMap { request in groups.first { $0.id == request.id } }
+        let current = groups
+        let currentPositions = Self.positions(of: current)
+        let selected = requested.compactMap { request in currentPositions[request.id].map { current[$0] } }
         var trashed: [PhotoUID] = []
         var kept: [PhotoUID: ExactDuplicateKeepReason] = [:]
         var keptPhotoUnreadable = false
         var failed = false
         var stale = false
         let results = await finder.merge(selected.map { ($0.scanGroup, $0.kept) })
+        // The outcome of every group is one change of the screen.
+        var updated = groups
         for (group, result) in zip(selected, results) {
             do {
                 switch try result.get() {
@@ -861,10 +893,10 @@ public final class ExactDuplicatesModel {
                     trashed += moved
                     kept.merge(keptDuplicates) { first, _ in first }
                     // A group with a duplicate left keeps its reason, so the person can keep another photo instead.
-                    if let index = groups.firstIndex(where: { $0.id == group.id }),
-                        !groups[index].remove(moved, keptReason: Self.firstReason(in: keptDuplicates.values))
+                    if let index = updated.firstIndex(where: { $0.id == group.id }),
+                        !updated[index].remove(moved, keptReason: Self.firstReason(in: keptDuplicates.values))
                     {
-                        groups.remove(at: index)
+                        updated.remove(at: index)
                     }
                 case .skipped(.keptUnreadable):
                     keptPhotoUnreadable = true
@@ -878,6 +910,7 @@ public final class ExactDuplicatesModel {
                 failed = true
             }
         }
+        if updated != groups { groups = updated }
         if !trashed.isEmpty { await didTrash(trashed) }
         isMerging = false
         notice = Self.notice(kept: kept, keptPhotoUnreadable: keptPhotoUnreadable, failed: failed)

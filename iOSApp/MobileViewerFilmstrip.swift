@@ -255,37 +255,12 @@ struct MobileViewerFilmstrip: UIViewRepresentable {
 /// Loads one thumbnail for a view that is on screen, and keeps trying until the image exists.
 ///
 /// A single feed request can return no image: series members are not library items, so their bytes may still
-/// be on the way when the cell appears. The loader asks with visible priority, then waits for the feed's
-/// arrival wake or for a bounded backoff, whichever comes first, and asks again. Cancelling the task ends it.
+/// be on the way when the cell appears. The shared feed core asks with visible priority and waits for its arrival
+/// wake or a bounded backoff (`ThumbnailFeedCore.visibleDecoded`). Cancelling the task ends it.
 enum MobileThumbnailArrival {
-    private static let firstRetryDelay: Duration = .seconds(1)
-    private static let longestRetryDelay: Duration = .seconds(16)
-
     static func image(for uid: PhotoUID, feed: UIKitThumbnailFeed) async -> UIImage? {
-        var delay = firstRetryDelay
-        while !Task.isCancelled {
-            // The wait starts before the request, so an arrival during the request already ends it.
-            let wait = Task { try? await Task.sleep(for: delay) }
-            let registration = feed.setOnCacheArrivalWake { wait.cancel() }
-            defer { registration.end() }
-            await feed.requestPriority(uid, priority: .visibleNow)
-            if let image = await feed.image(for: uid) {
-                wait.cancel()
-                return image
-            }
-            // The feed proved that this photo has no thumbnail. Another request cannot change that.
-            if feed.isKnownUnfetchable(uid) {
-                wait.cancel()
-                return nil
-            }
-            await withTaskCancellationHandler {
-                _ = await wait.value
-            } onCancel: {
-                wait.cancel()
-            }
-            delay = min(delay * 2, longestRetryDelay)
-        }
-        return nil
+        guard await feed.feedCore.visibleDecoded(for: uid) != nil, !Task.isCancelled else { return nil }
+        return await feed.image(for: uid)
     }
 }
 

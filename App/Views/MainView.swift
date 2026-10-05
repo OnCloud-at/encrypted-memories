@@ -394,7 +394,6 @@ struct MainView: View {
                 MacDuplicatesView(
                     model: duplicates,
                     thumbnailFeed: feed,
-                    sourceAnalysisRevision: model.sourceAnalysisRevision,
                     topInset: topBarInset,
                     confirmsMergeAll: $confirmsDuplicateMergeAll,
                     onOpen: { openDuplicate($0, inGroup: $1) }

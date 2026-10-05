@@ -81,6 +81,56 @@
             print(report)
         }
 
+        /// A vertical scroll over the copies of a group scrolls the list, for a row that fits and for a row that
+        /// is wider than the column and scrolls sideways.
+        func testAVerticalScrollOverTheCopiesScrollsTheList() async throws {
+            let path = ProcessInfo.processInfo.environment["DUPLICATES_PERF_DIR"]
+            try XCTSkipIf(path == nil, "Set DUPLICATES_PERF_DIR to drive the list.")
+            let groups = (0..<60).map { index in
+                ExactDuplicateGroup(
+                    contentHash: String(format: "G%04d", index), hashKeyEpoch: "e",
+                    members: (0..<(index == 1 ? 9 : 3)).map { PhotoUID(volumeID: "v", nodeID: "g\(index)-\($0)") })
+            }
+            let model = ExactDuplicatesModel(finder: ChurnFinder(groups: groups))
+            let (window, host) = Self.host(model: model)
+            defer { window.orderOut(nil) }
+            for _ in 0..<1_000 where model.content != .groups { try await Task.sleep(for: .milliseconds(5)) }
+            try await Task.sleep(for: .milliseconds(300))
+            host.layoutSubtreeIfNeeded()
+            let list = try XCTUnwrap(Self.tallestScrollView(in: host))
+            var rows: [NSScrollView] = []
+            func visit(_ view: NSView) {
+                if let scroll = view as? NSScrollView, scroll !== list { rows.append(scroll) }
+                view.subviews.forEach(visit)
+            }
+            visit(host)
+            let fitting = try XCTUnwrap(rows.first { ($0.documentView?.frame.width ?? 0) <= $0.frame.width + 1 })
+            let wide = try XCTUnwrap(rows.first { ($0.documentView?.frame.width ?? 0) > $0.frame.width + 1 })
+            for (name, row) in [("fitting", fitting), ("wide", wide)] {
+                let listBefore = list.contentView.bounds.origin.y
+                let rowBefore = row.contentView.bounds.origin
+                // A trackpad gesture: continuous events with a began, changed, and ended phase.
+                let phases: [NSEvent.Phase] = [.began, .changed, .changed, .changed, .changed, .ended]
+                for phase in phases {
+                    let event = try XCTUnwrap(
+                        CGEvent(
+                            scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 2,
+                            wheel1: phase == .ended ? 0 : -40, wheel2: 0, wheel3: 0))
+                    event.setIntegerValueField(.scrollWheelEventIsContinuous, value: 1)
+                    event.setIntegerValueField(.scrollWheelEventScrollPhase, value: Int64(phase.rawValue))
+                    row.scrollWheel(with: try XCTUnwrap(NSEvent(cgEvent: event)))
+                    try await Task.sleep(for: .milliseconds(30))
+                    XCTAssertEqual(
+                        row.contentView.bounds.origin.y, rowBefore.y, "\(name): the row does not move up or down")
+                }
+                XCTAssertGreaterThan(list.contentView.bounds.origin.y, listBefore, "\(name): the list scrolls")
+                XCTAssertEqual(
+                    row.contentView.bounds.origin.y, rowBefore.y, "\(name): the row does not move up or down")
+                list.contentView.scroll(to: .zero)
+                list.reflectScrolledClipView(list.contentView)
+            }
+        }
+
         private static func ms(_ duration: Duration) -> Int {
             Int(duration.components.seconds * 1_000 + duration.components.attoseconds / 1_000_000_000_000_000)
         }
