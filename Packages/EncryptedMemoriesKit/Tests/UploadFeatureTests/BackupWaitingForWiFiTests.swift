@@ -57,6 +57,17 @@ final class BackupWaitingForWiFiTests: XCTestCase {
         XCTAssertFalse(BackupThrottleInputs(runtime: snapshot, usesMobileData: true).waitsForWiFi)
     }
 
+    func testUnknownNetworkWaitsOnlyWhileMobileDataIsOff() {
+        let snapshot = LibraryRuntimeSnapshot(network: .undetermined)
+
+        XCTAssertTrue(
+            BackupThrottleInputs(runtime: snapshot, usesMobileData: false).waitsForWiFi,
+            "before the first network path, the device may be on cellular data")
+        let allowed = BackupThrottleInputs(runtime: snapshot, usesMobileData: true)
+        XCTAssertFalse(allowed.waitsForWiFi)
+        XCTAssertFalse(allowed.isNetworkExpensive, "with the setting on, nothing changes")
+    }
+
     func testSettingIsOnByDefaultAndPersistsWhenTurnedOff() throws {
         let suite = "BackupWaitingForWiFiTests.\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))

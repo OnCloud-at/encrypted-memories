@@ -102,17 +102,34 @@ public final class AppleLibraryRuntimeAdapter {
     }
 
     private func installNetworkMonitor() {
-        networkMonitor.pathUpdateHandler = { [weak self] path in
-            let state = LibraryNetworkState(
-                isReachable: path.status == .satisfied,
-                isConstrained: path.isConstrained,
-                isExpensive: path.isExpensive
-            )
-            Task { @MainActor [weak self] in
-                self?.runtimeState.update { $0.network = state }
-            }
+        // The state is lock-protected. Updating it here, in path order, keeps a busy main thread (for example while
+        // the app returns to the foreground) from letting the backup read the previous network.
+        let runtimeState = runtimeState
+        networkMonitor.pathUpdateHandler = { path in
+            let state = LibraryNetworkState(path: Self.networkPath(path))
+            runtimeState.update { $0.network = state }
         }
         networkMonitor.start(queue: networkQueue)
+    }
+
+    private nonisolated static func networkPath(_ path: NWPath) -> LibraryNetworkPath {
+        LibraryNetworkPath(
+            isSatisfied: path.status == .satisfied,
+            isConstrained: path.isConstrained,
+            isExpensive: path.isExpensive,
+            usesOtherInterface: path.usesInterfaceType(.other),
+            availableInterfaces: Set(
+                path.availableInterfaces.map { interface -> LibraryNetworkInterfaceKind in
+                    switch interface.type {
+                    case .wifi: .wifi
+                    case .cellular: .cellular
+                    case .wiredEthernet: .wiredEthernet
+                    case .loopback: .loopback
+                    case .other: .other
+                    @unknown default: .other
+                    }
+                })
+        )
     }
 
     private func installMemoryPressureSource() {

@@ -15,11 +15,71 @@ public struct LibraryNetworkState: Sendable, Equatable {
     public var isReachable: Bool
     public var isConstrained: Bool
     public var isExpensive: Bool
+    /// False until the platform reported its first network path. The other values are then only defaults.
+    public var isDetermined: Bool
 
-    public init(isReachable: Bool = true, isConstrained: Bool = false, isExpensive: Bool = false) {
+    public init(
+        isReachable: Bool = true, isConstrained: Bool = false, isExpensive: Bool = false, isDetermined: Bool = true
+    ) {
         self.isReachable = isReachable
         self.isConstrained = isConstrained
         self.isExpensive = isExpensive
+        self.isDetermined = isDetermined
+    }
+
+    /// The process state before the first network path arrives.
+    public static let undetermined = LibraryNetworkState(isDetermined: false)
+
+    public init(path: LibraryNetworkPath) {
+        self.init(
+            isReachable: path.isSatisfied,
+            isConstrained: path.isConstrained,
+            isExpensive: Self.isExpensive(path)
+        )
+    }
+
+    /// Cellular data and Personal Hotspot are expensive. A VPN runs over a tunnel interface (`.other`) that can hide
+    /// the expensive cellular link below it, so a tunnel counts as expensive when cellular is its only physical
+    /// interface: no Wi-Fi and no wired Ethernet.
+    public static func isExpensive(_ path: LibraryNetworkPath) -> Bool {
+        if path.isExpensive { return true }
+        let interfaces = path.availableInterfaces
+        return path.usesOtherInterface && interfaces.contains(.cellular)
+            && !interfaces.contains(.wifi) && !interfaces.contains(.wiredEthernet)
+    }
+}
+
+/// Platform-neutral kind of a network interface, mapped from `NWInterface.InterfaceType`.
+public enum LibraryNetworkInterfaceKind: Sendable, Hashable {
+    case wifi
+    case cellular
+    case wiredEthernet
+    case loopback
+    case other
+}
+
+/// The facts of one network path that the network decision needs. The Apple adapter fills it from `NWPath`.
+public struct LibraryNetworkPath: Sendable, Equatable {
+    public var isSatisfied: Bool
+    public var isConstrained: Bool
+    /// The system's own expensive flag of the path.
+    public var isExpensive: Bool
+    /// The path uses an interface of kind `.other`, for example the tunnel of a VPN.
+    public var usesOtherInterface: Bool
+    public var availableInterfaces: Set<LibraryNetworkInterfaceKind>
+
+    public init(
+        isSatisfied: Bool,
+        isConstrained: Bool = false,
+        isExpensive: Bool = false,
+        usesOtherInterface: Bool = false,
+        availableInterfaces: Set<LibraryNetworkInterfaceKind> = []
+    ) {
+        self.isSatisfied = isSatisfied
+        self.isConstrained = isConstrained
+        self.isExpensive = isExpensive
+        self.usesOtherInterface = usesOtherInterface
+        self.availableInterfaces = availableInterfaces
     }
 }
 
@@ -94,7 +154,8 @@ public struct LibraryRuntimeSnapshot: Sendable, Equatable {
 /// One process-wide state source. Synchronous feature gates read `snapshot()` without an actor hop;
 /// actor clients consume a newest-only stream. Session invalidation is atomic with the state reset.
 public final class LibraryRuntimeState: @unchecked Sendable {
-    public static let shared = LibraryRuntimeState()
+    /// Starts without a network path: a backup that must not use mobile data waits until the first path arrives.
+    public static let shared = LibraryRuntimeState(initial: LibraryRuntimeSnapshot(network: .undetermined))
 
     private let lock = NSLock()
     private var current: LibraryRuntimeSnapshot

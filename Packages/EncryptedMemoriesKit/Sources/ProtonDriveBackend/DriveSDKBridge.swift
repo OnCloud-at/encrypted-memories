@@ -22,6 +22,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     private let uploadClientUID: String
     private let driveSession: DriveSession
     private let requestGovernor = ProtonRequestGovernor()
+    private let expensiveUploadAccess = ExpensiveUploadAccess()
     private nonisolated let sharedAlbumSnapshotCache = SDKSharedAlbumSnapshotCache()
     private var photosRoot: SDKNodeUid?
     private var photosShareID: String?
@@ -178,7 +179,9 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         )
         self.photosClient = try await EncryptedMemoriesClient(
             configuration: config,
-            httpClient: SDKHttpClient(driveSession: driveSession, requestGovernor: requestGovernor),
+            httpClient: SDKHttpClient(
+                driveSession: driveSession, requestGovernor: requestGovernor,
+                expensiveUploadAccess: expensiveUploadAccess),
             accountClient: accountClient,
             logCallback: { _ in },
             featureFlagProviderCallback: { _, completion in completion(false) },
@@ -2138,6 +2141,8 @@ extension DriveSDKBridge: PhotoUploading {
     ) async throws -> PhotoUID {
         guard !isShutDown else { throw CancellationError() }
         try Task.checkCancellation()
+        expensiveUploadAccess.begin(allowsExpensiveNetwork: request.allowsExpensiveNetwork)
+        defer { expensiveUploadAccess.end(allowsExpensiveNetwork: request.allowsExpensiveNetwork) }
         onProgress(UploadProgress(phase: .preparing))
         let isVideo = request.mediaType.hasPrefix("video/")
         let thumbnails = await UploadMediaProcessor.thumbnails(for: request.fileURL, isVideo: isVideo)

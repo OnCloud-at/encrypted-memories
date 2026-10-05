@@ -811,6 +811,48 @@ final class StallOnceUploader: PhotoUploading, @unchecked Sendable {
     }
 }
 
+/// The runtime network of a test, changed while the runner works.
+final class BackupNetworkBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var inputs: BackupThrottleInputs
+
+    init(_ inputs: BackupThrottleInputs) { self.inputs = inputs }
+
+    var current: BackupThrottleInputs { lock.withLock { inputs } }
+    func set(_ inputs: BackupThrottleInputs) { lock.withLock { self.inputs = inputs } }
+}
+
+/// Calls `onUpload` when a transfer starts, for example to leave Wi-Fi under it. Then it fails with `failure`, or
+/// uploads through `inner`.
+final class NetworkChangingUploader: PhotoUploading, @unchecked Sendable {
+    let capabilities = UploadBackendCapabilities.sdkUploader
+    private let inner: MockUploader
+    private let failure: (any Error)?
+    private let onUpload: @Sendable () -> Void
+    private let lock = NSLock()
+    private var recorded: [PhotoUploadRequest] = []
+
+    init(inner: MockUploader, failure: (any Error)? = nil, onUpload: @escaping @Sendable () -> Void) {
+        self.inner = inner
+        self.failure = failure
+        self.onUpload = onUpload
+    }
+
+    var requests: [PhotoUploadRequest] { lock.withLock { recorded } }
+
+    func upload(
+        _ request: PhotoUploadRequest,
+        onProgress: @Sendable @escaping (UploadProgress) -> Void
+    ) async throws -> PhotoUID {
+        lock.withLock { recorded.append(request) }
+        onUpload()
+        if let failure { throw failure }
+        return try await inner.upload(request, onProgress: onProgress)
+    }
+
+    func cancel(token: UUID) async { await inner.cancel(token: token) }
+}
+
 actor BackupUploadTestLatch {
     private var signaled = false
     private var waiters: [CheckedContinuation<Void, Never>] = []
@@ -1259,8 +1301,10 @@ final class BackupSyncRunnerTests: XCTestCase {
     func testRunningWaveFinishesThenNoNewUploadStartsOnExpensiveNetwork() async throws {
         let first = seedEntry("a-first.jpg")
         let second = seedEntry("b-second.jpg")
+        // Samples: the pass start, the first wave, the first transfer, then the next wave on cellular data.
         let inputs = BackupThrottleSequence([
             .unconstrained,
+            BackupThrottleInputs(),
             BackupThrottleInputs(),
             BackupThrottleInputs(isNetworkExpensive: true, usesMobileData: false),
         ])
@@ -1291,6 +1335,129 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertFalse(clock.sleeps.isEmpty, "the pass waited instead of failing")
         XCTAssertFalse(progress.isPausedByPolicy)
         XCTAssertFalse(progress.isWaitingForWiFi)
+    }
+
+    /// The device leaves Wi-Fi after the pass claimed a new photo, for example while the photo is prepared. The
+    /// claim saw Wi-Fi; the transfer must not start on cellular data.
+    func testPhotoClaimedOnWiFiDoesNotUploadAfterTheDeviceLeavesWiFi() async throws {
+        let due = seedEntry("left-wifi.jpg")
+        let network = BackupNetworkBox(BackupThrottleInputs(usesMobileData: false))
+        let preparing = SourceRemovedDuringResolveResolver(inner: resolver)
+        preparing.onResolve = { _ in
+            network.set(BackupThrottleInputs(isNetworkExpensive: true, usesMobileData: false))
+        }
+
+        let progress = await makeRunner(resolver: preparing, throttleInputs: { network.current })
+            .runUntilDrained(mode: .eligibleOnly)
+
+        XCTAssertEqual(preparing.cleanupCount, 1, "the photo was claimed and prepared")
+        XCTAssertTrue(uploader.requests.isEmpty, "no backup bytes on cellular data")
+        XCTAssertEqual(state(of: due), .discovered)
+        XCTAssertEqual(queueStore.entry(for: due.source, revision: due.revision)?.attempts, 0)
+        XCTAssertTrue(progress.isPausedByPolicy)
+        XCTAssertTrue(progress.isWaitingForWiFi)
+        XCTAssertEqual(BackupStatus(progress: progress, isScanning: false).phase, .waitingForWiFi)
+    }
+
+    /// The Live Photo's photo uploaded on Wi-Fi; its video must not follow on cellular data.
+    func testLivePhotoVideoWaitsForWiFiWhenTheDeviceLeavesWiFiAfterThePhoto() async throws {
+        let entry = seedEntry("left-wifi-live.heic")
+        resolver.setSecondaries(["left-wifi-live.mov"], for: entry.source.identifier)
+        let network = BackupNetworkBox(BackupThrottleInputs(usesMobileData: false))
+        let leaving = NetworkChangingUploader(inner: uploader) {
+            network.set(BackupThrottleInputs(isNetworkExpensive: true, usesMobileData: false))
+        }
+
+        let progress = await makeRunner(uploader: leaving, throttleInputs: { network.current })
+            .runUntilDrained(mode: .eligibleOnly)
+
+        XCTAssertEqual(leaving.requests.map(\.name), ["left-wifi-live.heic"])
+        let row = try XCTUnwrap(queueStore.entry(for: entry.source, revision: entry.revision))
+        XCTAssertFalse(row.state.isTerminalSuccess)
+        XCTAssertEqual(row.attempts, 0)
+        XCTAssertTrue(progress.isWaitingForWiFi)
+
+        network.set(BackupThrottleInputs(usesMobileData: false))
+        _ = await makeRunner(uploader: leaving, throttleInputs: { network.current }).runUntilDrained(
+            mode: .eligibleOnly)
+        XCTAssertEqual(state(of: entry)?.isTerminalSuccess, true)
+        XCTAssertEqual(
+            leaving.requests.map(\.name), ["left-wifi-live.heic", "left-wifi-live.mov"],
+            "on Wi-Fi only the missing video uploads")
+        XCTAssertEqual(leaving.requests.map(\.allowsExpensiveNetwork), [false, false])
+    }
+
+    /// The system refuses the bytes once the device is on cellular data. Whatever error the transport reports, the
+    /// photo waits for Wi-Fi: no attempt, no retry delay.
+    func testTransferRefusedAfterTheDeviceLeftWiFiWaitsWithoutAnAttempt() async throws {
+        let due = seedEntry("refused.jpg")
+        let row = try await runTransferThatLosesWiFi(failure: UploadError.backend("upload failed"), entry: due)
+        XCTAssertEqual(row.attempts, 0, "the photo is fine; the network is not allowed")
+        XCTAssertNil(BackupIssueRecord.decode(row.lastError))
+    }
+
+    func testTransferRefusedForCellularDataResumesAsSoonAsWiFiReturns() async throws {
+        let due = seedEntry("not-connected.jpg")
+        let row = try await runTransferThatLosesWiFi(failure: URLError(.notConnectedToInternet), entry: due)
+        XCTAssertEqual(row.attempts, 0)
+        XCTAssertNil(
+            BackupIssueRecord.decode(row.lastError)?.nextAttemptAt, "no network retry delay after Wi-Fi returns")
+        XCTAssertLessThanOrEqual(row.updatedAt, clock.now)
+    }
+
+    private func runTransferThatLosesWiFi(
+        failure: any Error, entry: UploadBackupSyncQueueEntry
+    ) async throws -> UploadBackupSyncQueueEntry {
+        let network = BackupNetworkBox(BackupThrottleInputs(usesMobileData: false))
+        let refusing = NetworkChangingUploader(inner: uploader, failure: failure) {
+            network.set(BackupThrottleInputs(isNetworkExpensive: true, usesMobileData: false))
+        }
+
+        let progress = await makeRunner(uploader: refusing, throttleInputs: { network.current })
+            .runUntilDrained(mode: .eligibleOnly)
+
+        XCTAssertEqual(refusing.requests.map(\.allowsExpensiveNetwork), [false])
+        XCTAssertTrue(progress.isWaitingForWiFi)
+        XCTAssertEqual(progress.failed, 0)
+        let row = try XCTUnwrap(queueStore.entry(for: entry.source, revision: entry.revision))
+        XCTAssertEqual(row.state, .queuedForUpload, "runnable again, with its duplicate check done")
+        return row
+    }
+
+    /// The process network state before its first path: on cellular data, a backup with mobile data off must wait.
+    func testBackupWaitsForTheFirstNetworkPathWhileMobileDataIsOff() async throws {
+        let due = seedEntry("before-first-path.jpg")
+        let runtime = LibraryRuntimeState(initial: LibraryRuntimeSnapshot(network: .undetermined))
+        let inputs: @Sendable () -> BackupThrottleInputs = {
+            BackupThrottleInputs(runtime: runtime.snapshot(), usesMobileData: false)
+        }
+
+        let waiting = await makeRunner(throttleInputs: inputs).runUntilDrained(mode: .eligibleOnly)
+
+        XCTAssertTrue(uploader.requests.isEmpty)
+        XCTAssertTrue(waiting.isWaitingForWiFi)
+        XCTAssertEqual(state(of: due), .discovered)
+
+        runtime.update {
+            $0.network = LibraryNetworkState(path: LibraryNetworkPath(isSatisfied: true, availableInterfaces: [.wifi]))
+        }
+        let resumed = await makeRunner(throttleInputs: inputs).runUntilDrained(mode: .eligibleOnly)
+
+        XCTAssertEqual(state(of: due), .completed)
+        XCTAssertFalse(resumed.isWaitingForWiFi)
+    }
+
+    func testBackupUploadsLetTheSystemRefuseCellularDataOnlyWhileMobileDataIsOff() async throws {
+        let wiFiOnly = seedEntry("wifi-only.jpg")
+        _ = await makeRunner(throttleInputs: { BackupThrottleInputs(usesMobileData: false) }).runUntilDrained()
+        XCTAssertEqual(state(of: wiFiOnly), .completed)
+
+        let anyNetwork = seedEntry("any-network.jpg")
+        _ = await makeRunner(throttleInputs: { BackupThrottleInputs(usesMobileData: true) }).runUntilDrained()
+        XCTAssertEqual(state(of: anyNetwork), .completed)
+
+        XCTAssertEqual(uploader.requests.map(\.name), ["wifi-only.jpg", "any-network.jpg"])
+        XCTAssertEqual(uploader.requests.map(\.allowsExpensiveNetwork), [false, true])
     }
 
     func testSustainedDiskPressureEndsPassRunnableNotFailed() async throws {
