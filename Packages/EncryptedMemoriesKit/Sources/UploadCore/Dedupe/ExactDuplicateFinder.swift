@@ -256,27 +256,17 @@ public struct ExactDuplicateFinder: Sendable {
         let batches = stride(from: 0, to: links.count, by: size).map { Array(links[$0..<min($0 + size, links.count)]) }
         await progress(ExactDuplicateScanProgress(completed: 0, total: links.count))
         let checker = checker
-        return try await withThrowingTaskGroup(of: [String: RemoteLinkVisibility].self) { group in
-            var next = 0
-            var completed = 0
-            var visibility: [String: RemoteLinkVisibility] = [:]
-            func addNext() {
-                guard next < batches.count else { return }
-                let batch = batches[next]
-                next += 1
-                group.addTask { try await checker.linkVisibility(of: batch) }
-            }
-            for _ in 0..<min(Self.visibilityConcurrency, batches.count) { addNext() }
-            while let read = try await group.next() {
-                visibility.merge(read) { _, new in new }
-                completed += 1
-                await progress(
-                    ExactDuplicateScanProgress(
-                        completed: min(completed * size, links.count), total: links.count))
-                addNext()
-            }
-            return (visibility, batches.count)
+        let report: @Sendable (Int) async -> Void = { completed in
+            await progress(
+                ExactDuplicateScanProgress(completed: min(completed * size, links.count), total: links.count))
         }
+        let reads = try await BoundedConcurrency.throwingMap(
+            batches, limit: Self.visibilityConcurrency, progress: report
+        ) {
+            try await checker.linkVisibility(of: $0)
+        }
+        let visibility = reads.reduce(into: [String: RemoteLinkVisibility]()) { $0.merge($1) { _, new in new } }
+        return (visibility, batches.count)
     }
 
     /// Builds the content index when none exists, or brings it up to date, with the build of the backup. While the
@@ -393,28 +383,14 @@ public struct ExactDuplicateFinder: Sendable {
     /// read for each member. A group whose read failed is missing.
     private func groupFacts(of groups: [ExactDuplicateGroup]) async -> [String: GroupFacts] {
         let remote = remote
-        return await withTaskGroup(of: (String, GroupFacts?).self) { taskGroup in
-            var next = 0
-            var facts: [String: GroupFacts] = [:]
-            func addNext() {
-                guard next < groups.count else { return }
-                let group = groups[next]
-                next += 1
-                taskGroup.addTask {
-                    do {
-                        return (group.contentHash, try await remote.nodeFacts(of: group.members))
-                    } catch {
-                        return (group.contentHash, nil)
-                    }
-                }
-            }
-            for _ in 0..<min(Self.rankingConcurrency, groups.count) { addNext() }
-            while let (contentHash, read) = await taskGroup.next() {
-                facts[contentHash] = read
-                addNext()
-            }
-            return facts
+        let reads = await BoundedConcurrency.map(groups, limit: Self.rankingConcurrency) { group in
+            try? await remote.nodeFacts(of: group.members)
         }
+        var facts: [String: GroupFacts] = [:]
+        for (group, read) in zip(groups, reads) {
+            if let read = read ?? nil { facts[group.contentHash] = read }
+        }
+        return facts
     }
 
     /// Ranks the photo to keep first: a shared photo, a photo in an own album, a favorite, a photo that a local source
