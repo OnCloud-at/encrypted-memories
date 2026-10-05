@@ -49,7 +49,7 @@ class FakeAppStoreConnectClient
     localization_lock_conflicts: 0, # how many localization writes raise a 409 whatsNew lock
     localization_lock_codes: ["STATE_ERROR"], # error codes carried by simulated whatsNew lock errors
     localization_conflict_transitions_to_submitted: false, # whether the conflict also moves versions to WAITING_FOR_REVIEW
-    public_link_error_status: nil # HTTP status that a public link change of a beta group raises
+    public_link_error_status: nil # HTTP status (or :transport) that a public link change of a beta group raises
   )
     @version_state = version_state
     @release_type = release_type
@@ -323,6 +323,7 @@ class FakeAppStoreConnectClient
       end
     end
     if (match = %r{\A/v1/betaGroups/([^/]+)\z}.match(path)) && body.dig(:data, :attributes, :publicLinkEnabled)
+      raise AppStoreConnect::TransportError, "Simulated connection reset" if @public_link_error_status == :transport
       if @public_link_error_status
         raise AppStoreConnect::APIError.new(
           "Simulated public link refusal",
@@ -1287,6 +1288,45 @@ class AppStoreConnectTest < Minitest::Test
       method == :post && path == "/v1/betaAppReviewSubmissions"
     end
     assert_equal 2, review_posts
+  end
+
+  def test_external_distribution_succeeds_when_the_public_link_request_fails_in_transport
+    Dir.mktmpdir do |directory|
+      summary = File.join(directory, "summary")
+      client = FakeAppStoreConnectClient.new(public_link_error_status: :transport)
+      manager = AppStoreConnect::ReleaseManager.new(
+        client: client, app_id: "6805117080", output_path: nil, summary_path: summary
+      )
+
+      distribute_external(manager)
+
+      assert_includes File.read(summary), "The beta was submitted, but the public TestFlight link could not be enabled"
+    end
+  end
+
+  def test_external_distribution_refuses_several_internal_groups
+    client = FakeAppStoreConnectClient.new(groups: [
+      @client.send(:group, "Internal Testers", true),
+      @client.send(:group, "Team", true).merge("id" => "group-team"),
+      @client.send(:group, "External Testers", false)
+    ])
+    manager = AppStoreConnect::ReleaseManager.new(
+      client: client, app_id: "6805117080", output_path: nil, summary_path: nil
+    )
+
+    error = assert_raises(AppStoreConnect::Error) { distribute_external(manager) }
+
+    assert_match(/exactly one internal TestFlight group/, error.message)
+  end
+
+  def test_external_distribution_keeps_mobile_builds_off_the_mac_in_the_internal_group
+    distribute_external(@manager)
+
+    internal_patch = @client.calls.find do |method, path, _body|
+      method == :patch && path == "/v1/betaGroups/group-internal"
+    end
+    refute_nil internal_patch
+    assert_equal false, internal_patch.last.dig(:data, :attributes, :iosBuildsAvailableForAppleSiliconMac)
   end
 
   def distribute_external(manager)

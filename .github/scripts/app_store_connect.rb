@@ -615,8 +615,14 @@ module AppStoreConnect
         raise Error, "Create an internal TestFlight group before distributing to external testers"
       end
       # An external beta is always an internal beta, too. A stable release reaches no internal group on its own.
-      internal_group = find_or_create_group(name: nil, internal: true)
+      internal_groups = beta_groups.select { |candidate| candidate.dig("attributes", "isInternalGroup") == true }
+      if internal_groups.length > 1
+        names = internal_groups.map { |candidate| candidate.dig("attributes", "name") }.compact.join(", ")
+        raise Error, "External TestFlight needs exactly one internal TestFlight group; found #{names}"
+      end
+      internal_group = internal_groups.first
       group = find_or_create_group(name: group_name, internal: false)
+      disable_mobile_builds_on_other_platforms(internal_group)
       disable_mobile_builds_on_other_platforms(group)
 
       with_current_builds(builds, version: version, build_number: build_number) do |current|
@@ -650,11 +656,14 @@ module AppStoreConnect
         write_output("public_link", link)
         append_summary("Public TestFlight link: #{link}")
       end
-    rescue APIError => error
-      append_summary(
-        "The public TestFlight link could not be enabled (HTTP #{error.status}). Run this workflow again after " \
-        "Beta App Review approves the build."
-      )
+    rescue Error => error
+      advice =
+        if error.is_a?(APIError) && [409, 422].include?(error.status)
+          "Run this workflow again after Beta App Review approves the build."
+        else
+          "Check the API key role and the external group in App Store Connect, then run this workflow again."
+        end
+      append_summary("The beta was submitted, but the public TestFlight link could not be enabled: #{error.message} #{advice}")
     end
 
     # Apple can list a build and still answer HTTP 404 for its id for a short time, and Apple
