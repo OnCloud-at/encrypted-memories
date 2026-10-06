@@ -376,7 +376,7 @@ enum MobileMediaExporter {
 
         // Two selected photos can share an original Proton name. Reserve a unique path before writing
         // so concurrent exports cannot overwrite each other.
-        let names = ExportNames()
+        let names = UniqueNames()
         let removeLocationWhenSharing = PrivacyExportPolicy.isEnabled()
 
         let maxConcurrent = 2
@@ -436,7 +436,7 @@ enum MobileMediaExporter {
     private static func export(
         _ item: PhotoItem,
         backend: any OriginalFileProvider & PhotoMetadataProvider,
-        names: ExportNames,
+        names: UniqueNames,
         into directory: URL,
         removeLocationWhenSharing: Bool
     ) async -> ItemExport {
@@ -482,32 +482,6 @@ enum MobileMediaExporter {
         formatter.dateFormat = "yyyyMMdd-HHmmss"
         return formatter
     }()
-}
-
-/// Serialises on-disk name assignment across the concurrent export/save tasks so two files that resolve to
-/// the same original name (a real collision, e.g. two `IMG_0001.HEIC`) get `IMG_0001 2.HEIC` etc. instead of
-/// clobbering each other's temp URL. Case-insensitive to match the (typically case-insensitive) filesystem.
-/// Mirrors macOS `MainView.uniqueName`.
-actor ExportNames {
-    private var used: Set<String> = []
-
-    func unique(_ name: String) -> String {
-        if reserve(name) { return name }
-        let ns = name as NSString
-        let base = ns.deletingPathExtension
-        let ext = ns.pathExtension
-        var n = 2
-        while true {
-            let candidate = ext.isEmpty ? "\(base) \(n)" : "\(base) \(n).\(ext)"
-            if reserve(candidate) { return candidate }
-            n += 1
-        }
-    }
-
-    /// Records `name` and returns true if it was free; false if already taken.
-    private func reserve(_ name: String) -> Bool {
-        used.insert(name.lowercased()).inserted
-    }
 }
 
 /// A stable UIKit presentation host for the native activity controller.

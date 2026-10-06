@@ -361,11 +361,13 @@ public protocol SizedOriginalFileProvider: Sendable {
 
 /// Serialises on-disk name assignment so two items resolving to the same original name
 /// (`IMG_0001.HEIC` twice) get `IMG_0001 2.HEIC` etc. Case-insensitive to match the typical
-/// filesystem. Mirrors `iOSApp/MobileSelectionSupport.swift`'s `ExportNames`.
-actor UniqueNames {
+/// filesystem.
+public actor UniqueNames {
     private var used: Set<String> = []
 
-    func unique(_ name: String) -> String {
+    public init() {}
+
+    public func unique(_ name: String) -> String {
         if reserve(name) { return name }
         let ns = name as NSString
         let base = ns.deletingPathExtension

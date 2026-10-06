@@ -139,6 +139,16 @@ public enum OriginalExportWriter {
         success = true
     }
 
+    /// Writes `data` to `destination` through a staging directory on the destination volume, so the destination
+    /// receives only a complete file. An existing file at `destination` is replaced.
+    public static func writeData(_ data: Data, to destination: URL) throws {
+        let stagingDirectory = try stagingDirectory(for: destination)
+        defer { try? FileManager.default.removeItem(at: stagingDirectory) }
+        let stagedFile = stagingDirectory.appendingPathComponent(destination.lastPathComponent)
+        try data.write(to: stagedFile, options: .atomic)
+        try installCompletedFile(stagedFile, at: destination)
+    }
+
     /// A sandbox-safe staging directory on the destination volume.
     ///
     /// A save panel authorizes the selected file but not sibling files with generated names. Foundation's
