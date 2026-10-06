@@ -64,6 +64,17 @@ enum SDKPhotoMetadataReader {
         )
     }
 
+    /// The metadata that the Info panel shows, with the capture time, as the Duplicates screen compares copies.
+    /// A file node has no capture time.
+    static func fingerprint(
+        captureTime: TimeInterval?, name: Result<String, ProtonDriveSDKDriveError>, mimeType: String,
+        revision: FileRevision
+    ) -> ExactDuplicateFingerprint {
+        ExactDuplicateFingerprint(
+            captureTime: captureTime.flatMap { $0.isFinite ? Date(timeIntervalSince1970: $0) : nil },
+            metadata: metadata(name: name, mimeType: mimeType, revision: revision))
+    }
+
     static func metadata(
         name: Result<String, ProtonDriveSDKDriveError>, mimeType: String, revision: FileRevision
     ) -> PhotoMetadata {

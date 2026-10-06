@@ -317,6 +317,35 @@ final class ExactDuplicateFinderTests: XCTestCase {
         XCTAssertEqual(albums.reads, CountingAlbums.Reads(single: 0, batch: 0))
     }
 
+    func testTheRankingPageCarriesTheMetadataOfEveryMemberAndAReadWithoutAMemberRanksNothing() async throws {
+        let first = server.seedLink(digest: digest("a"))
+        let second = server.seedLink(digest: digest("a"))
+        let third = server.seedLink(digest: digest("a"))
+        server.setFingerprint(described, of: first)
+        server.setFingerprint(bare, of: second)
+        indexServer()
+        let group = try await onlyGroup()
+
+        let pages = PageCollector()
+        await finder.rankMembers(of: [group]) { await pages.add($0) }
+        let collected = await pages.pages
+        let page = try XCTUnwrap(collected.first)
+        XCTAssertEqual(
+            page.fingerprints[group.id], [first: described, second: bare, third: ExactDuplicateFingerprint()])
+
+        // A read that leaves a member out proves nothing about its metadata, so the group keeps its fallback order.
+        let partial = ExactDuplicateFinder(
+            checker: server, resolver: UploadDedupePipeline(store: store, checker: server, replacementJournal: journal),
+            index: store, identities: store, journal: journal, remote: MemberDroppingRemote(base: server, drop: third),
+            albums: server)
+        let partialPages = PageCollector()
+        await partial.rankMembers(of: [group]) { await partialPages.add($0) }
+        let partialCollected = await partialPages.pages
+        let partialPage = try XCTUnwrap(partialCollected.first)
+        XCTAssertNil(partialPage.members[group.id])
+        XCTAssertNil(partialPage.fingerprints[group.id])
+    }
+
     func testASharedMemberIsKeptFirstAndAMissingNodeLeavesOnlyItsGroupInTheFallbackOrder() async throws {
         let album = server.seedLink(digest: digest("a"), captureTime: date(0))
         let shared = server.seedLink(digest: digest("a"), captureTime: date(5))
@@ -1016,6 +1045,83 @@ final class ExactDuplicateFinderTests: XCTestCase {
         XCTAssertEqual(server.steps.count, stepsBefore)
         XCTAssertEqual(violations, [])
     }
+
+    // MARK: - Metadata
+
+    private var described: ExactDuplicateFingerprint {
+        ExactDuplicateFingerprint(
+            captureTime: Date(timeIntervalSince1970: 1_720_000_000), latitude: 10.5, longitude: -20.25,
+            device: "Test Camera", pixelWidth: 4000, pixelHeight: 3000, mimeType: "image/heic")
+    }
+
+    /// An upload that carries only the capture time and the type, without location, camera, and dimensions.
+    private var bare: ExactDuplicateFingerprint {
+        ExactDuplicateFingerprint(captureTime: Date(timeIntervalSince1970: 1_720_000_000), mimeType: "image/heic")
+    }
+
+    @MainActor
+    func testThreeCopiesWhereOneLacksMetadataOfferOnlyTheTwoWithMetadata() async throws {
+        let poorer = server.seedLink(digest: digest("a"))
+        let first = server.seedLink(digest: digest("a"))
+        let second = server.seedLink(digest: digest("a"))
+        server.setFingerprint(bare, of: poorer)
+        server.setFingerprint(described, of: first)
+        server.setFingerprint(described, of: second)
+        indexServer()
+        let fallback = await finder.fallbackMembers(of: try await finder.duplicateGroups().groups)
+        XCTAssertEqual(fallback.values.first?.first, poorer, "before the ranking the poorer copy is checked")
+        let model = ExactDuplicatesModel(finder: finder)
+
+        await model.load()
+
+        XCTAssertEqual(model.groups.count, 1)
+        let group = try XCTUnwrap(model.groups.first)
+        XCTAssertEqual(Set(group.members), [first, second], "the copy without metadata is not offered")
+        XCTAssertNotEqual(group.kept, poorer)
+        XCTAssertEqual(group.scanGroup.fingerprint, described)
+        XCTAssertEqual(model.copyCount, 2)
+
+        await model.mergeAll()
+
+        XCTAssertEqual(server.links.first { $0.linkID == poorer.nodeID }?.state, .active, "the poorer copy stays")
+        let active = [first, second].filter { uid in server.links.first { $0.linkID == uid.nodeID }?.state == .active }
+        XCTAssertEqual(active, [group.kept], "one of the two equal copies moves to Recently Deleted")
+        XCTAssertEqual(violations, [])
+    }
+
+    func testAMergeLeavesACopyWhoseMetadataDifferFromTheKeptPhoto() async throws {
+        let kept = server.seedLink(digest: digest("a"))
+        let equal = server.seedLink(digest: digest("a"))
+        let changed = server.seedLink(digest: digest("a"))
+        for uid in [kept, equal, changed] { server.setFingerprint(described, of: uid) }
+        indexServer()
+        let group = try await onlyGroup()
+        // The metadata of one copy changed after the screen read them.
+        server.setFingerprint(bare, of: changed)
+
+        let outcome = try await finder.merge(group, keeping: kept)
+
+        XCTAssertEqual(outcome, .merged(kept: kept, trashed: [equal], keptDuplicates: [changed: .differentDetails]))
+        XCTAssertEqual(server.links.first { $0.linkID == changed.nodeID }?.state, .active)
+        XCTAssertEqual(violations, [])
+    }
+
+    func testAMergeWritesNothingWhenTheKeptPhotoChangedItsMetadata() async throws {
+        let kept = server.seedLink(digest: digest("a"))
+        let duplicate = server.seedLink(digest: digest("a"))
+        for uid in [kept, duplicate] { server.setFingerprint(described, of: uid) }
+        indexServer()
+        let scanned = try await onlyGroup()
+        let shown = try XCTUnwrap(scanned.split(by: [kept: described, duplicate: described]).first)
+        // Both copies changed alike, so they still match each other, but no longer what the screen offered.
+        for uid in [kept, duplicate] { server.setFingerprint(bare, of: uid) }
+        let stepsBefore = server.steps.count
+
+        let outcome = try await finder.merge(shown, keeping: kept)
+
+        XCTAssertEqual(outcome, .skipped(.keptDetailsChanged))
+        XCTAssertEqual(server.steps.count, stepsBefore, "the merge writes nothing")
+    }
 }
 
 /// Counts the reads of the manifest rows that name a remote link.
@@ -1039,6 +1145,23 @@ private final class FavoritesGatedRemote: ExactDuplicateRemote, @unchecked Senda
         await gate.pass()
         return try await base.favoriteUIDs(among: uids)
     }
+}
+
+/// Leaves one photo out of every node read.
+private struct MemberDroppingRemote: ExactDuplicateRemote {
+    let base: EditScenarioServer
+    let drop: PhotoUID
+
+    func trashDuplicates(_ uids: [PhotoUID]) async throws { try await base.trashDuplicates(uids) }
+    func restoreDuplicates(_ uids: [PhotoUID]) async throws { try await base.restoreDuplicates(uids) }
+    func captureDates(of uids: [PhotoUID]) async -> [PhotoUID: Date] { await base.captureDates(of: uids) }
+    func nodeFacts(of uids: [PhotoUID]) async throws -> [PhotoUID: ExactDuplicateNodeFacts] {
+        try await base.nodeFacts(of: uids).filter { $0.key != drop }
+    }
+    func ownPhotosVolumeID() async throws -> String { try await base.ownPhotosVolumeID() }
+    func activeUIDs(among uids: [PhotoUID]) async throws -> Set<PhotoUID> { try await base.activeUIDs(among: uids) }
+    func markFavorite(_ uids: [PhotoUID]) async throws { try await base.markFavorite(uids) }
+    func favoriteUIDs(among uids: [PhotoUID]) async throws -> Set<PhotoUID> { try await base.favoriteUIDs(among: uids) }
 }
 
 /// Holds callers until it opens.

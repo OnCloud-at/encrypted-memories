@@ -110,6 +110,7 @@ public enum ExactDuplicateMergeNotice: Equatable, Sendable {
         case .keptDuplicates(_, .neededByLocalSource): L10n.string("duplicates.kept_reason_needed_here")
         case .keptDuplicates(_, .shared): L10n.string("duplicates.kept_reason_shared")
         case .keptDuplicates(_, .unreadable): L10n.string("duplicates.kept_reason_unreadable")
+        case .keptDuplicates(_, .differentDetails): L10n.string("duplicates.kept_reason_different_details")
         case .keptPhotoUnreadable: L10n.string("duplicates.kept_photo_unreadable")
         case .failed: L10n.string("duplicates.merge_failed_message")
         }
@@ -236,12 +237,35 @@ public final class ExactDuplicatesModel {
             let remaining = members.filter { !trashed.contains($0) }
             guard remaining.count > 1 else { return false }
             members = remaining
-            scanGroup = ExactDuplicateGroup(
-                contentHash: scanGroup.contentHash, hashKeyEpoch: scanGroup.hashKeyEpoch,
-                members: scanGroup.members.filter { !trashed.contains($0) })
+            scanGroup = scanGroup.keeping(remaining)
             if !remaining.contains(kept) { kept = remaining[0] }
             keptReason = reason
             return true
+        }
+
+        /// The parts of this group whose members have equal metadata, two or more, as `ExactDuplicateGroup.split`
+        /// forms them. The part with the photo shown as kept comes first and keeps the ID and the person's choice.
+        /// Every other part keeps its first member until the ranking orders it.
+        func parts(by fingerprints: [PhotoUID: ExactDuplicateFingerprint]) -> [Group] {
+            let split = scanGroup.split(by: fingerprints, keepingIDWith: kept)
+            return (split.filter { $0.id == id } + split.filter { $0.id != id }).map { part in
+                var group = self
+                group.scanGroup = part
+                // Mostly every copy has the same metadata, and the group stays whole.
+                guard part.members.count < members.count else { return group }
+                let current = Set(part.members)
+                group.members = members.filter(current.contains)
+                group.sharedMembers = sharedMembers.intersection(current)
+                group.memberFacts = memberFacts.filter { current.contains($0.key) }
+                group.memberByteSizes = memberByteSizes.filter { current.contains($0.key) }
+                group.captureDates = captureDates.filter { current.contains($0.key) }
+                if part.id != id { group.keptReason = nil }
+                if !current.contains(kept) {
+                    group.kept = group.members[0]
+                    group.isKeptChosen = false
+                }
+                return group
+            }
         }
 
         /// Takes the ranked order. The photo to keep follows it unless the person chose one. With `keepsShown`, the
@@ -349,6 +373,9 @@ public final class ExactDuplicatesModel {
     @ObservationIgnored private var ranking: Task<Void, Never>?
     /// The groups that wait for the ranking, in the order the screen showed them.
     @ObservationIgnored private var rankingQueue: [String] = []
+    /// The metadata of each copy that a ranking read. A screen that opens again splits its groups at once by them.
+    /// A merge that finds other metadata drops those of its group.
+    @ObservationIgnored private var knownFingerprints: [PhotoUID: ExactDuplicateFingerprint] = [:]
     /// The groups that the ranking of this load has read or queued. A failed group waits for the next load or a merge.
     @ObservationIgnored private var rankingRequested: Set<String> = []
     /// The groups that the screen showed since the last pause, until the pause after them ranks their pages.
@@ -654,25 +681,39 @@ public final class ExactDuplicatesModel {
             let dates = await finder.captureDates(of: scan.groups.flatMap(\.members))
             guard generation == loadGeneration, !isMerging else { return false }
             let earlier = Dictionary(groups.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
-            groups = scan.groups.map { group in
-                let groupDates = Dictionary(
-                    group.members.compactMap { member in dates[member].map { (member, $0) } },
-                    uniquingKeysWith: { first, _ in first })
-                if let same = earlier[group.id], Set(same.members) == Set(group.members) {
-                    var kept = same
-                    kept.scanGroup = group
-                    kept.byteSize = scan.byteSizes[group.id] ?? same.byteSize
-                    kept.captureDates.merge(groupDates) { _, new in new }
-                    return kept
+            var shown: [Group] = []
+            shown.reserveCapacity(scan.groups.count)
+            for scanned in scan.groups {
+                let order = fallback[scanned.id] ?? scanned.members
+                for group in knownParts(of: scanned, earlier: earlier) {
+                    let groupDates = Dictionary(
+                        group.members.compactMap { member in dates[member].map { (member, $0) } },
+                        uniquingKeysWith: { first, _ in first })
+                    let size = scan.byteSizes[group.contentHash]
+                    // A group keeps its ranking and the person's choice while its members and metadata stay.
+                    if let same = earlier[group.id], Set(same.members) == Set(group.members),
+                        same.scanGroup.fingerprint == group.fingerprint
+                    {
+                        var kept = same
+                        kept.scanGroup = group
+                        kept.byteSize = size ?? same.byteSize
+                        kept.captureDates.merge(groupDates) { _, new in new }
+                        shown.append(kept)
+                        continue
+                    }
+                    let members =
+                        group.members.count == order.count ? order : order.filter(Set(group.members).contains)
+                    let choice = earlier[group.id].flatMap {
+                        $0.isKeptChosen && members.contains($0.kept) ? $0.kept : nil
+                    }
+                    var new = Group(scanGroup: group, members: members, kept: choice ?? members[0])
+                    new.isKeptChosen = choice != nil
+                    new.byteSize = size ?? earlier[group.id]?.byteSize
+                    new.captureDates = groupDates
+                    shown.append(new)
                 }
-                let members = fallback[group.id] ?? group.members
-                let choice = earlier[group.id].flatMap { $0.isKeptChosen && members.contains($0.kept) ? $0.kept : nil }
-                var shown = Group(scanGroup: group, members: members, kept: choice ?? members[0])
-                shown.isKeptChosen = choice != nil
-                shown.byteSize = scan.byteSizes[group.id] ?? earlier[group.id]?.byteSize
-                shown.captureDates = groupDates
-                return shown
             }
+            groups = shown
             coverage = scan.coverage
             phase = .loaded
             return true
@@ -681,6 +722,15 @@ public final class ExactDuplicatesModel {
             phase = .failed
             return false
         }
+    }
+
+    /// The parts of a scanned group by the metadata that a ranking read already, so a screen that opens again reads
+    /// nothing for them. The whole group while the metadata of a member are unknown.
+    private func knownParts(of scanned: ExactDuplicateGroup, earlier: [String: Group]) -> [ExactDuplicateGroup] {
+        guard !knownFingerprints.isEmpty, scanned.members.allSatisfy({ knownFingerprints[$0] != nil }) else {
+            return [scanned]
+        }
+        return scanned.split(by: knownFingerprints, keepingIDWith: earlier[scanned.id]?.kept)
     }
 
     private func showScan(_ progress: ExactDuplicateScanProgress, generation: Int) {
@@ -780,7 +830,9 @@ public final class ExactDuplicatesModel {
         rankingProgress = nil
     }
 
-    /// Takes the ranked order and the size of each group in `page`. Only the ranking of `token` counts its progress.
+    /// Takes the ranked order, the size, and the metadata of each group in `page`. Only copies with equal metadata
+    /// stay one group: a group splits in place, and leaves when no two copies match. The part with the photo shown
+    /// as kept keeps the group's ID and the person's choice. Only the ranking of `token` counts its progress.
     /// `keepsShown` keeps the photo that the screen shows as kept, as a merge does.
     private func apply(_ page: ExactDuplicateRankingPage, token: UUID?, keepsShown: Bool = false) {
         if let token, token == rankingToken, let progress = rankingProgress {
@@ -791,20 +843,30 @@ public final class ExactDuplicatesModel {
         var updated = groups
         let positions = Self.positions(of: updated)
         var changed = false
-        for (id, order) in page.members {
-            guard let index = positions[id] else { continue }
-            let shownKept = updated[index].kept
-            updated[index].rank(
-                order, shared: page.shared[id] ?? [], facts: page.facts[id] ?? [:],
-                sizes: page.memberByteSizes[id] ?? [:], keepsShown: keepsShown)
-            if mergingGroupIDs.contains(id) { updated[index].kept = shownKept }
-            changed = true
-        }
+        // The sizes first, so the parts of a split group take them.
         for (id, size) in page.byteSizes {
             guard let index = positions[id], updated[index].byteSize == nil else { continue }
             updated[index].byteSize = size
             changed = true
         }
+        var replacements: [Int: [Group]] = [:]
+        for (id, order) in page.members {
+            guard let index = positions[id] else { continue }
+            let shownKept = updated[index].kept
+            let fingerprints = page.fingerprints[id] ?? [:]
+            knownFingerprints.merge(fingerprints) { _, new in new }
+            var parts = updated[index].parts(by: fingerprints)
+            for position in parts.indices {
+                let showsKept = parts[position].kept == shownKept
+                parts[position].rank(
+                    order, shared: page.shared[id] ?? [], facts: page.facts[id] ?? [:],
+                    sizes: page.memberByteSizes[id] ?? [:], keepsShown: keepsShown && showsKept)
+                if showsKept, mergingGroupIDs.contains(parts[position].id) { parts[position].kept = shownKept }
+            }
+            replacements[index] = parts
+            changed = true
+        }
+        if !replacements.isEmpty { updated = updated.indices.flatMap { replacements[$0] ?? [updated[$0]] } }
         if changed { groups = updated }
     }
 
@@ -904,24 +966,28 @@ public final class ExactDuplicatesModel {
     public func merge(groupID: String) async {
         guard canMerge, let index = groups.firstIndex(where: { $0.id == groupID }) else { return }
         groups[index].isKeptChosen = true
-        await merge([groups[index]])
+        await merge([groups[index]], all: false)
     }
 
     public func mergeAll() async {
         guard canMerge else { return }
-        await merge(groups)
+        await merge(groups, all: true)
     }
 
     public func dismissNotice() {
         notice = nil
     }
 
-    private func merge(_ requested: [Group]) async {
+    /// Merges `requested`. Every group reads the metadata of its copies first, because only copies with equal
+    /// metadata merge. With `all`, every part of a requested group merges; otherwise a group that split or changed
+    /// its kept photo meanwhile stays, so the person sees it first. A group whose metadata could not be read stays,
+    /// and the merge reports a failure.
+    private func merge(_ requested: [Group], all: Bool) async {
         isMerging = true
         notice = nil
-        // Merge All reads the groups that nobody scrolled to page by page, with progress. The photo that the screen
-        // shows as kept stays, unless only another member is shared.
-        let unranked = requested.filter { !$0.isRanked && !$0.isKeptChosen }.map(\.scanGroup)
+        // The groups that nobody scrolled to rank page by page, with progress. The photo that the screen shows as kept
+        // stays, unless only another member is shared.
+        let unranked = requested.filter { !$0.isRanked }.map(\.scanGroup)
         if !unranked.isEmpty {
             let token = UUID()
             rankingToken = token
@@ -934,14 +1000,20 @@ public final class ExactDuplicatesModel {
             isRankingForMerge = false
             if rankingToken == token { rankingProgress = nil }
         }
-        let current = groups
-        let currentPositions = Self.positions(of: current)
-        let selected = requested.compactMap { request in currentPositions[request.id].map { current[$0] } }
+        let requestedHashes = Set(requested.map(\.scanGroup.contentHash))
+        let requestedByID = Dictionary(requested.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        let candidates = groups.filter { group in
+            if all { return requestedHashes.contains(group.scanGroup.contentHash) }
+            guard let request = requestedByID[group.id] else { return false }
+            return Set(request.members) == Set(group.members) && request.kept == group.kept
+        }
+        // Never a group whose metadata are unknown.
+        let selected = candidates.filter { $0.isRanked && $0.scanGroup.fingerprint != nil }
         mergingGroupIDs = Set(selected.map(\.id))
         var trashed: [PhotoUID] = []
         var kept: [PhotoUID: ExactDuplicateKeepReason] = [:]
         var keptPhotoUnreadable = false
-        var failed = false
+        var failed = selected.count < candidates.count
         var stale = false
         let results = await finder.merge(selected.map { ($0.scanGroup, $0.kept) })
         // The outcome of every group is one change of the screen.
@@ -952,6 +1024,11 @@ public final class ExactDuplicatesModel {
                 case .merged(_, let moved, let keptDuplicates):
                     trashed += moved
                     kept.merge(keptDuplicates) { first, _ in first }
+                    if keptDuplicates.values.contains(.differentDetails) {
+                        // The metadata changed since the ranking read them; a new scan reads them again.
+                        forgetFingerprints(of: group)
+                        stale = true
+                    }
                     // A group with a duplicate left keeps its reason, so the person can keep another photo instead.
                     if let index = updated.firstIndex(where: { $0.id == group.id }),
                         !updated[index].remove(moved, keptReason: Self.firstReason(in: keptDuplicates.values))
@@ -962,6 +1039,7 @@ public final class ExactDuplicatesModel {
                     keptPhotoUnreadable = true
                 case .skipped:
                     // The library changed since the scan; a new scan shows what is left.
+                    forgetFingerprints(of: group)
                     stale = true
                 }
             } catch is CancellationError {
@@ -991,6 +1069,10 @@ public final class ExactDuplicatesModel {
         }
     }
 
+    private func forgetFingerprints(of group: Group) {
+        for member in group.scanGroup.members { knownFingerprints[member] = nil }
+    }
+
     /// One reason only: a failure first, then the unreadable photo to keep, then the kept duplicates.
     private static func notice(
         kept: [PhotoUID: ExactDuplicateKeepReason], keptPhotoUnreadable: Bool, failed: Bool
@@ -1006,7 +1088,8 @@ public final class ExactDuplicatesModel {
         in reasons: some Collection<ExactDuplicateKeepReason>
     ) -> ExactDuplicateKeepReason? {
         let order: [ExactDuplicateKeepReason] = [
-            .relatedFileWithoutTwin, .pendingEditReplacement, .neededByLocalSource, .shared, .unreadable,
+            .differentDetails, .relatedFileWithoutTwin, .pendingEditReplacement, .neededByLocalSource, .shared,
+            .unreadable,
         ]
         return order.first(where: reasons.contains)
     }

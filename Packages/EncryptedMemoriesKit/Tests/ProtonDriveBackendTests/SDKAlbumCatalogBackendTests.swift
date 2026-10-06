@@ -51,6 +51,38 @@ struct SDKAlbumCatalogBackendTests {
         #expect(metadata.modificationTime == Date(timeIntervalSince1970: 123))
     }
 
+    @Test func duplicateNodeFactsCarryTheMetadataThatTheInfoPanelShows() async throws {
+        let client = FakeSDKPhotoCatalogClient()
+        let described = photoNode(
+            id: "described", albumIDs: [], captureTime: 1_700_000_000,
+            additionalMetadata: [
+                AdditionalMetadata(name: "Media", utf8JsonValue: Data(#"{"Width":4000,"Height":3000}"#.utf8)),
+                AdditionalMetadata(name: "Camera", utf8JsonValue: Data(#"{"Device":"Test Camera"}"#.utf8)),
+                AdditionalMetadata(
+                    name: "Location", utf8JsonValue: Data(#"{"Latitude":10.5,"Longitude":-20.25}"#.utf8)),
+            ])
+        let bare = photoNode(id: "bare", albumIDs: [], captureTime: 1_700_000_000)
+        await client.configureNodes([
+            described.uid.sdkCompatibleIdentifier: DriveNode(photoNode: described),
+            bare.uid.sdkCompatibleIdentifier: DriveNode(photoNode: bare),
+        ])
+        let describedUID = PhotoUID(volumeID: "volume", nodeID: "described")
+        let bareUID = PhotoUID(volumeID: "volume", nodeID: "bare")
+
+        let facts = try await SDKAlbumCatalogBackend(client: client).nodeFacts(of: [describedUID, bareUID])
+
+        let captureTime = Date(timeIntervalSince1970: 1_700_000_000)
+        #expect(
+            facts[describedUID]?.fingerprint
+                == ExactDuplicateFingerprint(
+                    captureTime: captureTime, latitude: 10.5, longitude: -20.25, device: "Test Camera",
+                    pixelWidth: 4000, pixelHeight: 3000, mimeType: "image/jpeg"))
+        #expect(
+            facts[bareUID]?.fingerprint == ExactDuplicateFingerprint(captureTime: captureTime, mimeType: "image/jpeg"),
+            "an upload without metadata has only its capture time and type")
+        #expect(facts[describedUID]?.fingerprint != facts[bareUID]?.fingerprint)
+    }
+
     @Test func malformedOptionalSDKSectionDoesNotDiscardAvailableMetadata() {
         let revision = FileRevision(
             uid: SDKRevisionUid(volumeID: "foreign", nodeID: "photo", revisionID: "revision"),
@@ -776,7 +808,10 @@ private func albumNode(
     )
 }
 
-private func photoNode(id: String, albumIDs: [SDKNodeUid], volumeID: String = "volume") -> PhotoNode {
+private func photoNode(
+    id: String, albumIDs: [SDKNodeUid], volumeID: String = "volume", captureTime: TimeInterval = 1,
+    additionalMetadata: [AdditionalMetadata]? = nil
+) -> PhotoNode {
     let uid = SDKNodeUid(volumeID: volumeID, nodeID: id)
     let revision = FileRevision(
         uid: SDKRevisionUid(volumeID: volumeID, nodeID: id, revisionID: "revision"),
@@ -787,7 +822,7 @@ private func photoNode(id: String, albumIDs: [SDKNodeUid], volumeID: String = "v
         claimedDigests: FileContentDigests(sha1: nil, sha1Verified: false),
         claimedModificationTime: nil,
         thumbnails: [],
-        claimedAdditionalMetadata: nil,
+        claimedAdditionalMetadata: additionalMetadata,
         contentAuthor: nil
     )
     return PhotoNode(
@@ -807,7 +842,7 @@ private func photoNode(id: String, albumIDs: [SDKNodeUid], volumeID: String = "v
         directRole: .inherited,
         membership: nil,
         errors: [],
-        captureTime: 1,
+        captureTime: captureTime,
         albumUids: albumIDs
     )
 }
