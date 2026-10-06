@@ -712,7 +712,7 @@ public actor ThumbnailCache {
     /// function returns, so a change during the caller's first measurement still produces a signal.
     public nonisolated static func diskChanges(
         of caches: [ThumbnailCache],
-        interval: Duration = .seconds(5)
+        interval: Duration = .seconds(10)
     ) -> AsyncStream<Void> {
         let sources = caches.map { $0.diskChanges() }
         let (merged, mergedContinuation) = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
