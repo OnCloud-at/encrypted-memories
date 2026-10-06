@@ -97,6 +97,7 @@ import UploadCore
                 thumbnailFeed: feed,
                 albums: AlbumsRepository(
                     catalogBackend: albums, writeBackend: albums, capabilities: MobileFixtureAlbums.capabilities))
+            runtime.libraryModel.settleIsolatedLibraryForTesting()
             if ProcessInfo.processInfo.arguments.contains("-EncryptedMemoriesDeletedBackupFixture") {
                 installDeletedBackupFixture()
             } else if ProcessInfo.processInfo.arguments.contains("-EncryptedMemoriesFailedBackupFixture") {

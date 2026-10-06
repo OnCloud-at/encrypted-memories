@@ -32,6 +32,12 @@ struct MobileSearchLandingContent {
 struct MobileSearchLandingScreen: View {
     @Environment(MobileLibraryModel.self) private var libraryModel
     let content: MobileSearchLandingContent
+    /// While the keyboard is up, the search field floats above it outside every safe area region: the keyboard
+    /// region ends at the keyboard top, so without this margin the last 56 pt of the list stay under the field.
+    /// The margin covers the field and its gap to the keyboard. With the keyboard down, the field sits in the
+    /// tab bar, and the margin only adds space after the last row. The field does not shrink with smaller text, so
+    /// the margin never goes below 56 pt.
+    @ScaledMetric(relativeTo: .body) private var searchFieldClearance: CGFloat = 56
 
     private var discovery: SmartSearchDiscoveryModel? { content.discovery }
 
@@ -68,6 +74,7 @@ struct MobileSearchLandingScreen: View {
             .padding(.top, 12)
             .padding(.bottom, 24)
         }
+        .contentMargins(.bottom, max(56, searchFieldClearance), for: .scrollContent)
         .scrollDismissesKeyboard(.interactively)
         .background(ProtonColor.backgroundNorm)
     }

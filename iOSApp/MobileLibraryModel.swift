@@ -2008,6 +2008,13 @@ final class MobileLibraryModel {
             loadState = .contentReady(count: projection.snapshot.items.count)
         }
 
+        /// Settles the installed library like a completed initial load and reads its favorites, so search
+        /// suggestions compute as they do for a signed-in account.
+        func settleIsolatedLibraryForTesting() {
+            initialLibraryLoadSettled = true
+            loadFavoritesIfNeeded()
+        }
+
         func installIsolatedDuplicatesForTesting(_ finder: any ExactDuplicateMerging) {
             duplicates = makeDuplicatesModel(finder)
         }
