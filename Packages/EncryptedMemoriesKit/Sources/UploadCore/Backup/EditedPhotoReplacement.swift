@@ -17,7 +17,8 @@ public protocol EditReplacementRemote: PhotoCarryOverRemote {
 ///
 /// An earlier photo stays when the new compound does not hold the original, when an original resource of the photo
 /// lives only under the earlier photo, when another local source still needs it or one of its related photos, or
-/// when it carries the new photo. Other bytes replace the earlier photo only as an edit or as the undo of an edit.
+/// when it carries the new photo, or when nothing proves it an upload of this photo, like an adopted copy. Other bytes
+/// replace the earlier photo only as an edit or as the undo of an edit.
 public struct EditedPhotoReplacement: Sendable {
     public enum Outcome: Sendable, Equatable {
         case replaced(retiredAny: Bool)
@@ -190,6 +191,12 @@ public struct EditedPhotoReplacement: Sendable {
                     continue
                 }
             } else {
+                // Only an upload of this photo proves itself. An adopted copy without proof can be another device's
+                // upload whose related files, such as a Live Photo video, exist only there.
+                guard (entry.proven ?? []).contains(target.nodeID) else {
+                    kept.insert(target.nodeID)
+                    continue
+                }
                 linked = try await relations.relatedPhotoLinkIDs(ofMainLinkID: target.nodeID)
             }
             let links = linked.union([target.nodeID])
@@ -212,7 +219,9 @@ public struct EditedPhotoReplacement: Sendable {
         }
         try Task.checkCancellation()
         try journal.clearRetireIntent(Set(active.map(\.nodeID)), for: source)
-        try await remote.carryOver(from: trashable, to: replacement, ownVolumeID: volumeID, albums: albums)
+        // A cached membership can miss an album that another device added; the trash would lose it.
+        try await remote.carryOver(
+            from: trashable, to: replacement, ownVolumeID: volumeID, albums: CurrentAlbumCarryOver(base: albums))
         if !trashable.isEmpty {
             // A crash after the trash loses the server's related listing. The intent keeps those links without
             // retiring them until the main's trash is confirmed.
