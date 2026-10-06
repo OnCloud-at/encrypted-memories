@@ -139,6 +139,33 @@ final class MobileDuplicatesUITests: XCTestCase {
         XCTAssertTrue(app.staticTexts["No Duplicates"].waitForExistence(timeout: 5))
     }
 
+    func testStopEndsMergeAllAfterTheRunningBatchAndKeepsTheOtherGroups() {
+        openDuplicates(
+            fixture: "-EncryptedMemoriesDuplicatesLargeFixture", extra: ["-EncryptedMemoriesDuplicatesSlowMerge"])
+        XCTAssertTrue(group(0).waitForExistence(timeout: 30))
+        let mergeAll = app.buttons["duplicates.mergeAll"]
+        XCTAssertTrue(mergeAll.waitForExistence(timeout: 5))
+        mergeAll.tap()
+        let confirm = dialogButton("duplicates.mergeAll.dialog")
+        XCTAssertTrue(confirm.waitForExistence(timeout: 10))
+        confirm.tap()
+
+        XCTAssertTrue(app.staticTexts["Merging Duplicates"].waitForExistence(timeout: 30), "the progress row shows")
+        let stop = app.buttons["duplicates.stopMerge"]
+        XCTAssertTrue(stop.waitForExistence(timeout: 5))
+        stop.tap()
+
+        let notice = app.staticTexts
+            .matching(
+                NSPredicate(format: "label BEGINSWITH 'Merging stopped.' AND label ENDSWITH 'groups were merged.'")
+            )
+            .firstMatch
+        XCTAssertTrue(notice.waitForExistence(timeout: 20), "the notice counts the merged groups")
+        app.alerts.buttons["OK"].firstMatch.tap()
+        XCTAssertTrue(group(0).waitForExistence(timeout: 5), "the groups that did not merge stay")
+        XCTAssertFalse(app.buttons["duplicates.stopMerge"].exists)
+    }
+
     private func member(_ group: Int, _ index: Int) -> XCUIElement {
         app.buttons["duplicates.member.\(group).\(index)"]
     }

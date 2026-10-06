@@ -76,6 +76,22 @@ final class LocalizationTests: XCTestCase {
         XCTAssertEqual(try loadCatalog(packageCatalog).sourceLanguage, "en")
     }
 
+    func testMergeAllProgressTextsAreEnglishAndGerman() throws {
+        let texts: [(String, String, String)] = [
+            ("duplicates.merging_title", "Merging Duplicates", "Duplikate werden zusammengeführt"),
+            ("duplicates.ranking_progress %@ %@", "%1$@ of %2$@ groups", "%1$@ von %2$@ Gruppen"),
+            ("duplicates.stop", "Stop", "Stop"),
+            (
+                "duplicates.merge_stopped %@ %@", "Merging stopped. %1$@ of %2$@ groups were merged.",
+                "Zusammenführen gestoppt. %1$@ von %2$@ Gruppen wurden zusammengeführt."
+            ),
+        ]
+        for (key, english, german) in texts {
+            XCTAssertEqual(try localizedValue(key, language: "en", in: packageCatalog), english, key)
+            XCTAssertEqual(try localizedValue(key, language: "de", in: packageCatalog), german, key)
+        }
+    }
+
     func testSharedLibraryTitleLivesInCore() throws {
         XCTAssertEqual(try localizedValue("library.title", language: "en", in: packageCatalog), "Library")
         XCTAssertEqual(try localizedValue("library.title", language: "de", in: packageCatalog), "Mediathek")

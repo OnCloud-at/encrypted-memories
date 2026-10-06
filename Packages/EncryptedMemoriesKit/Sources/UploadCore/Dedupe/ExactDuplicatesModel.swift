@@ -96,15 +96,20 @@ public enum ExactDuplicateMergeNotice: Equatable, Sendable {
     case keptPhotoUnreadable
     /// A merge failed, for example without a connection.
     case failed
+    /// Merge All stopped, because the person stopped it or a whole batch failed. `merged` of `total` groups merged.
+    case stopped(merged: Int, total: Int)
 
     public var title: String {
         switch self {
         case .keptDuplicates(let count, _): L10n.string("duplicates.kept_title \(count)")
         case .keptPhotoUnreadable: L10n.string("duplicates.not_merged_title")
         case .failed: L10n.string("duplicates.merge_failed_title")
+        case .stopped(let merged, let total):
+            L10n.string("duplicates.merge_stopped \(merged.formatted()) \(total.formatted())")
         }
     }
 
+    /// Empty when the title says everything.
     public var message: String {
         switch self {
         case .keptDuplicates(_, .relatedFileWithoutTwin): L10n.string("duplicates.kept_reason_related_file")
@@ -115,6 +120,7 @@ public enum ExactDuplicateMergeNotice: Equatable, Sendable {
         case .keptDuplicates(_, .differentDetails): L10n.string("duplicates.kept_reason_different_details")
         case .keptPhotoUnreadable: L10n.string("duplicates.kept_photo_unreadable")
         case .failed: L10n.string("duplicates.merge_failed_message")
+        case .stopped: ""
         }
     }
 }
@@ -345,9 +351,28 @@ public final class ExactDuplicatesModel {
     public private(set) var rankingProgress: ExactDuplicateScanProgress?
     /// The message of the last merge, until the person dismisses it.
     public private(set) var notice: ExactDuplicateMergeNotice?
+    /// The groups that Merge All handled in its batches, of all groups that it merges. Nil outside Merge All and while
+    /// Merge All still ranks.
+    public private(set) var mergeAllProgress: ExactDuplicateScanProgress?
+    /// Merge All runs, from its ranking to its last batch.
+    public private(set) var isMergingAll = false
+    /// The person stopped Merge All. The running batch finishes first.
+    public private(set) var isStoppingMergeAll = false
     /// A merge waits for the facts of groups that nobody scrolled to. Only this ranking shows its progress; the
     /// ranking of the groups on screen runs silently, and its facts simply appear.
     private var isRankingForMerge = false
+    /// Merge All starts no further batch until `resumeMerging()`, for example while the app is in the background.
+    @ObservationIgnored private var isMergePaused = false
+    /// Merge All waits here while it is paused.
+    @ObservationIgnored private var mergeResumers: [CheckedContinuation<Void, Never>] = []
+    /// A batch of a merge is with the finder.
+    @ObservationIgnored private var isMergeBatchRunning = false
+    /// They wait until the running batch finished.
+    @ObservationIgnored private var batchWaiters: [CheckedContinuation<Void, Never>] = []
+    /// The ranking that Merge All waits for. Stop and a pause cancel it.
+    @ObservationIgnored private var mergeRanking: Task<Void, Never>?
+    /// A pause cancelled the ranking of Merge All; it ranks the remaining groups after the pause.
+    @ObservationIgnored private var mergeRankingInterrupted = false
     /// The groups whose photo to keep a running merge already read. A ranking that lands meanwhile never moves their
     /// checkmark, so the screen shows the photo that the merge keeps.
     @ObservationIgnored private var mergingGroupIDs: Set<String> = []
@@ -479,6 +504,20 @@ public final class ExactDuplicatesModel {
             fraction: Double(rankingProgress.completed) / Double(rankingProgress.total))
     }
 
+    /// The line of Merge All, for example "320 of 1,404 groups". Nil outside Merge All and while it still ranks.
+    public var mergeAllLine: ProgressLine? {
+        guard let mergeAllProgress, mergeAllProgress.total > 0 else { return nil }
+        let completed = mergeAllProgress.completed.formatted()
+        let total = mergeAllProgress.total.formatted()
+        return ProgressLine(
+            title: L10n.string("duplicates.merging_title"),
+            detail: L10n.string("duplicates.ranking_progress \(completed) \(total)"),
+            fraction: Double(mergeAllProgress.completed) / Double(mergeAllProgress.total))
+    }
+
+    /// The person can stop Merge All: it runs and was not stopped yet.
+    public var canStopMergeAll: Bool { isMergingAll && !isStoppingMergeAll }
+
     /// The note while the library is still being checked and groups are shown. Nil once the check finished.
     public var stillCheckingNote: String? {
         phase == .loaded && !isComplete && isBuilding ? L10n.string("duplicates.still_checking") : nil
@@ -519,6 +558,9 @@ public final class ExactDuplicatesModel {
     /// The pages that wait for the ranking at most. Older pages that the screen scrolled past wait for their next
     /// appearance.
     nonisolated static let maximumQueuedPages = 4
+    /// The groups that Merge All hands to the finder at once. The screen shows the outcome of each batch before the
+    /// next one starts, and Stop waits for the running batch only.
+    nonisolated static let mergeBatchSize = 25
 
     /// Every copy of every group shown, kept copies included.
     public var copyCount: Int { groups.reduce(0) { $0 + $1.members.count } }
@@ -1005,9 +1047,56 @@ public final class ExactDuplicatesModel {
         await merge([groups[index]], all: false)
     }
 
+    /// Merges every group shown, batch by batch, with progress. The screen shows the outcome of each batch before the
+    /// next one starts. The run stops after the running batch when the person stops it, and after a batch in which no
+    /// group merged, for example without a connection. A run does not survive the app: it never resumes after a quit.
     public func mergeAll() async {
         guard canMerge else { return }
         await merge(groups, all: true)
+    }
+
+    /// Stops Merge All. The running batch finishes; a running ranking stops, and then nothing merges. The groups that
+    /// did not merge stay.
+    public func stopMergeAll() {
+        guard canStopMergeAll else { return }
+        isStoppingMergeAll = true
+        mergeRanking?.cancel()
+        // A paused run wakes up to stop.
+        wakeMergeResumers()
+    }
+
+    /// Merge All starts no further batch until `resumeMerging()`, and its ranking stops until then. Returns when no
+    /// batch of a merge runs any more, so the platform can hold the app awake until then.
+    public func pauseMerging() async {
+        if isMergingAll {
+            isMergePaused = true
+            if let mergeRanking {
+                mergeRankingInterrupted = true
+                mergeRanking.cancel()
+                await mergeRanking.value
+            }
+        }
+        while isMergeBatchRunning {
+            await withCheckedContinuation { batchWaiters.append($0) }
+        }
+    }
+
+    /// Continues a paused Merge All.
+    public func resumeMerging() {
+        isMergePaused = false
+        wakeMergeResumers()
+    }
+
+    private func wakeMergeResumers() {
+        let resumers = mergeResumers
+        mergeResumers = []
+        resumers.forEach { $0.resume() }
+    }
+
+    private func waitWhileMergePaused() async {
+        while isMergePaused, !isStoppingMergeAll {
+            await withCheckedContinuation { mergeResumers.append($0) }
+        }
     }
 
     public func dismissNotice() {
@@ -1018,9 +1107,10 @@ public final class ExactDuplicatesModel {
     /// metadata merge. With `all`, every part of a requested group merges; otherwise a group that split or changed
     /// its kept photo meanwhile stays, so the person sees it first. A group whose metadata could not be read stays,
     /// and the merge reports a failure. A group that was not ranked and whose photo the person did not choose follows
-    /// its ranking.
+    /// its ranking. With `all`, the groups merge in batches with progress, and the run can stop.
     private func merge(_ requested: [Group], all: Bool) async {
         isMerging = true
+        isMergingAll = all
         notice = nil
         // The groups that nobody scrolled to rank page by page, with progress. The merge keeps the copy that the rule
         // ranks first in such a group, as every device does: the person saw no preselection there, only the order
@@ -1031,10 +1121,7 @@ public final class ExactDuplicatesModel {
             rankingToken = token
             rankingProgress = ExactDuplicateScanProgress(completed: 0, total: unranked.count)
             isRankingForMerge = true
-            let apply: @Sendable (ExactDuplicateRankingPage) async -> Void = { [weak self] page in
-                await self?.apply(page, token: token)
-            }
-            await finder.rankMembers(of: unranked, ranked: apply)
+            await rankForMerge(unranked, token: token)
             isRankingForMerge = false
             if rankingToken == token { rankingProgress = nil }
         }
@@ -1049,53 +1136,92 @@ public final class ExactDuplicatesModel {
         // Never a group whose metadata are unknown.
         let selected = candidates.filter { $0.isRanked && $0.scanGroup.fingerprint != nil }
         mergingGroupIDs = Set(selected.map(\.id))
-        var trashed: [PhotoUID] = []
         var kept: [PhotoUID: ExactDuplicateKeepReason] = [:]
         var keptPhotoUnreadable = false
         var failed = selected.count < candidates.count
         var stale = false
-        let results = await finder.merge(
-            selected.map {
-                ExactDuplicateMergeRequest(
-                    group: $0.scanGroup, kept: $0.kept, isKeptChosen: $0.isKeptChosen)
-            })
-        // The outcome of every group is one change of the screen.
-        var updated = groups
-        for (group, result) in zip(selected, results) {
-            do {
-                switch try result.get() {
-                case .merged(_, let moved, let keptDuplicates):
-                    trashed += moved
-                    kept.merge(keptDuplicates) { first, _ in first }
-                    if keptDuplicates.values.contains(.differentDetails) {
-                        // The metadata changed since the ranking read them; a new scan reads them again.
+        var stopped = false
+        var mergedGroups = 0
+        var handled = 0
+        if all { mergeAllProgress = ExactDuplicateScanProgress(completed: 0, total: selected.count) }
+        while handled < selected.count {
+            if all {
+                await waitWhileMergePaused()
+                // A stop during the ranking merges nothing.
+                if isStoppingMergeAll {
+                    stopped = true
+                    break
+                }
+            }
+            let batch = selected[handled..<min(handled + Self.mergeBatchSize, selected.count)]
+            handled += batch.count
+            isMergeBatchRunning = true
+            let results = await finder.merge(
+                batch.map {
+                    ExactDuplicateMergeRequest(
+                        group: $0.scanGroup, kept: $0.kept, isKeptChosen: $0.isKeptChosen)
+                })
+            isMergeBatchRunning = false
+            let waiters = batchWaiters
+            batchWaiters = []
+            waiters.forEach { $0.resume() }
+            // The outcome of every group of the batch is one change of the screen.
+            var updated = groups
+            var trashed: [PhotoUID] = []
+            for (group, result) in zip(batch, results) {
+                do {
+                    switch try result.get() {
+                    case .merged(_, let moved, let keptDuplicates):
+                        mergedGroups += 1
+                        trashed += moved
+                        kept.merge(keptDuplicates) { first, _ in first }
+                        if keptDuplicates.values.contains(.differentDetails) {
+                            // The metadata changed since the ranking read them; a new scan reads them again.
+                            forgetFingerprints(of: group)
+                            stale = true
+                        }
+                        // A group with a duplicate left keeps its reason, so the person can keep another photo instead.
+                        if let index = updated.firstIndex(where: { $0.id == group.id }),
+                            !updated[index].remove(moved, keptReason: Self.firstReason(in: keptDuplicates.values))
+                        {
+                            updated.remove(at: index)
+                        }
+                    case .skipped(.keptUnreadable):
+                        keptPhotoUnreadable = true
+                    case .skipped:
+                        // The library changed since the scan; a new scan shows what is left.
                         forgetFingerprints(of: group)
                         stale = true
                     }
-                    // A group with a duplicate left keeps its reason, so the person can keep another photo instead.
-                    if let index = updated.firstIndex(where: { $0.id == group.id }),
-                        !updated[index].remove(moved, keptReason: Self.firstReason(in: keptDuplicates.values))
-                    {
-                        updated.remove(at: index)
-                    }
-                case .skipped(.keptUnreadable):
-                    keptPhotoUnreadable = true
-                case .skipped:
-                    // The library changed since the scan; a new scan shows what is left.
-                    forgetFingerprints(of: group)
-                    stale = true
+                } catch is CancellationError {
+                    break
+                } catch {
+                    failed = true
                 }
-            } catch is CancellationError {
+            }
+            if updated != groups { groups = updated }
+            if !trashed.isEmpty { await didTrash(trashed) }
+            guard all else { continue }
+            mergeAllProgress = ExactDuplicateScanProgress(completed: handled, total: selected.count)
+            // No group of the batch merged, for example without a connection: the next batch would fail, too.
+            if !results.isEmpty, !results.contains(where: { (try? $0.get()) != nil }), handled < selected.count {
+                stopped = true
                 break
-            } catch {
-                failed = true
             }
         }
-        if updated != groups { groups = updated }
-        if !trashed.isEmpty { await didTrash(trashed) }
+        // A stop before the ranking reported a page leaves no group to merge, and the run still ends as stopped.
+        if all, isStoppingMergeAll, mergedGroups < candidates.count { stopped = true }
         mergingGroupIDs = []
         isMerging = false
-        notice = Self.notice(kept: kept, keptPhotoUnreadable: keptPhotoUnreadable, failed: failed)
+        isMergingAll = false
+        isStoppingMergeAll = false
+        isMergePaused = false
+        mergeAllProgress = nil
+        wakeMergeResumers()
+        notice =
+            stopped
+            ? .stopped(merged: mergedGroups, total: candidates.count)
+            : Self.notice(kept: kept, keptPhotoUnreadable: keptPhotoUnreadable, failed: failed)
         if stale {
             await load()
             return
@@ -1109,6 +1235,30 @@ public final class ExactDuplicatesModel {
             // The check was stopped while the merge ran. It starts again and shows its progress.
             checkInterrupted = false
             Task { await self.buildAndRescan(generation: generation) }
+        }
+    }
+
+    /// Ranks `unranked` for a merge. A pause cancels the ranking; after the pause, the groups that it did not rank
+    /// rank again. A stop ends it.
+    private func rankForMerge(_ unranked: [ExactDuplicateGroup], token: UUID) async {
+        let finder = finder
+        let apply: @Sendable (ExactDuplicateRankingPage) async -> Void = { [weak self] page in
+            await self?.apply(page, token: token)
+        }
+        var pending = unranked
+        while !pending.isEmpty {
+            await waitWhileMergePaused()
+            if isStoppingMergeAll { return }
+            mergeRankingInterrupted = false
+            let page = pending
+            let task = Task { await finder.rankMembers(of: page, ranked: apply) }
+            mergeRanking = task
+            await task.value
+            mergeRanking = nil
+            // Only a pause ranks again; a group whose facts cannot be read stays unranked.
+            guard mergeRankingInterrupted, !isStoppingMergeAll else { return }
+            let unrankedIDs = Set(groups.filter { !$0.isRanked }.map(\.id))
+            pending = pending.filter { unrankedIDs.contains($0.id) }
         }
     }
 
