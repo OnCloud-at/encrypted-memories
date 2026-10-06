@@ -76,11 +76,11 @@ final class ExactDuplicateFinderTests: XCTestCase {
     @discardableResult
     private func row(
         _ identifier: String, names link: String, contentHash: String, epoch rowEpoch: String? = nil,
-        fileSize: Int64 = 10
+        fileSize: Int64 = 10, in manifest: UploadIdentityManifestStore? = nil
     ) -> UploadSourceIdentity {
         let source = UploadSourceIdentity(kind: .photoLibraryAsset, identifier: identifier)
         XCTAssertTrue(
-            store.upsert(
+            (manifest ?? store).upsert(
                 UploadIdentityRecord(
                     source: source, filename: "\(identifier).JPG", correctedName: "\(identifier).JPG",
                     fileSize: fileSize,
@@ -88,6 +88,11 @@ final class ExactDuplicateFinderTests: XCTestCase {
                     hashKeyEpoch: rowEpoch ?? epoch, remoteVolumeID: "vol", remoteLinkID: link,
                     outcome: UploadIdentityManifestStore.Outcome.uploaded.rawValue, updatedAt: date(0))))
         return source
+    }
+
+    /// Requests whose photo to keep the person chose, so the merge keeps it as named.
+    private func chosen(_ pairs: [(ExactDuplicateGroup, PhotoUID)]) -> [ExactDuplicateMergeRequest] {
+        pairs.map { ExactDuplicateMergeRequest(group: $0.0, kept: $0.1, isKeptChosen: true) }
     }
 
     private var violations: [String] { server.steps.flatMap(\.violations) }
@@ -218,7 +223,7 @@ final class ExactDuplicateFinderTests: XCTestCase {
 
     // MARK: - Keep order
 
-    func testKeepOrderRanksOwnAlbumThenFavoriteThenManifestThenCaptureDateThenLinkID() {
+    func testKeepOrderRanksOwnAlbumThenFavoriteThenCaptureDateThenLinkIDAndNeverTheManifest() {
         let small = PhotoUID(volumeID: "vol", nodeID: "link-0001")
         let large = PhotoUID(volumeID: "vol", nodeID: "link-0002")
         func facts(
@@ -237,8 +242,8 @@ final class ExactDuplicateFinderTests: XCTestCase {
             kept(facts(manifest: true, captured: date(0)), facts(favorite: true, captured: date(9))), large,
             "a favorite outranks the manifest and the capture date")
         XCTAssertEqual(
-            kept(facts(captured: date(0)), facts(manifest: true, captured: date(9))), large,
-            "the photo that this device backs up outranks the capture date")
+            kept(facts(captured: date(0)), facts(manifest: true, captured: date(9))), small,
+            "the photo that this device backs up does not rank: other devices back up other copies")
         XCTAssertEqual(kept(facts(captured: date(9)), facts(captured: date(0))), large, "the earliest capture wins")
         XCTAssertEqual(kept(facts(), facts(captured: date(9))), large, "a known capture date outranks a missing one")
         XCTAssertEqual(kept(facts(captured: date(0)), facts(captured: date(0))), small, "the smallest link ID decides")
@@ -257,7 +262,7 @@ final class ExactDuplicateFinderTests: XCTestCase {
         let group = try await onlyGroup()
         let ranked = await finder.rankedMembers(of: [group])
 
-        XCTAssertEqual(ranked, [hash("a"): [album, favorite, manifest, earliest]])
+        XCTAssertEqual(ranked, [hash("a"): [album, favorite, earliest, manifest]])
     }
 
     func testTheRankingReadsOneNodeForEachMemberAndTheMergeReadsTheManifestOnce() async throws {
@@ -525,7 +530,7 @@ final class ExactDuplicateFinderTests: XCTestCase {
         server.loseNode(duplicate)
         let stepsBefore = server.steps.count
 
-        let results = await finder.merge([(group, kept)])
+        let results = await finder.merge(chosen([(group, kept)]))
 
         guard case .failure = results[0] else { return XCTFail("expected a failure, got \(results[0])") }
         XCTAssertEqual(server.steps.count, stepsBefore, "no favorite, album, cover, or trash write")
@@ -541,7 +546,7 @@ final class ExactDuplicateFinderTests: XCTestCase {
         indexServer()
         server.failNextCoverWrite()
 
-        let results = await finder.merge([(try await onlyGroup(), kept)])
+        let results = await finder.merge(chosen([(try await onlyGroup(), kept)]))
 
         guard case .failure = results[0] else { return XCTFail("expected a failure, got \(results[0])") }
         XCTAssertFalse(server.steps.contains { $0.action.hasPrefix("duplicate trash") }, "nothing is trashed")
@@ -848,7 +853,9 @@ final class ExactDuplicateFinderTests: XCTestCase {
 
         let outcomes = await withTaskGroup(of: Result<ExactDuplicateMergeOutcome, any Error>.self) { tasks in
             for finder in finders {
-                tasks.addTask { await finder.merge([(group, kept)])[0] }
+                tasks.addTask {
+                    await finder.merge([ExactDuplicateMergeRequest(group: group, kept: kept, isKeptChosen: true)])[0]
+                }
             }
             var outcomes: [Result<ExactDuplicateMergeOutcome, any Error>] = []
             for await outcome in tasks { outcomes.append(outcome) }
@@ -899,7 +906,8 @@ final class ExactDuplicateFinderTests: XCTestCase {
         server.trashAfterDuplicateTrash = kept.nodeID
         let stopping = TrashStoppingRemote(base: server)
         let first = finder(remote: stopping)
-        let merge = Task { await first.merge([(group, kept)]) }
+        let requests = chosen([(group, kept)])
+        let merge = Task { await first.merge(requests) }
         for _ in 0..<5_000 {
             if await stopping.gate.hasWaiters { break }
             try await Task.sleep(for: .milliseconds(1))
@@ -982,7 +990,7 @@ final class ExactDuplicateFinderTests: XCTestCase {
         server.failingVisibilityReadsAfterDuplicateTrash = ExactDuplicateFinder.keptReadAttempts
         var finder = finder()
         finder.keptReadRetryDelay = .zero
-        let results = await finder.merge(groups.map { ($0, $0.members.contains(keptA) ? keptA : keptB) })
+        let results = await finder.merge(chosen(groups.map { ($0, $0.members.contains(keptA) ? keptA : keptB) }))
         XCTAssertTrue(
             results.allSatisfy { (try? $0.get()) == nil }, "the merge cannot tell whether the kept photos stayed")
         // The person empties the trash, so the server no longer knows the trashed duplicates. Another device trashes
@@ -1235,7 +1243,7 @@ final class ExactDuplicateFinderTests: XCTestCase {
         let finder = finder(identities: identities)
         let readsBefore = server.readCounts
 
-        let results = await finder.merge(groups.map { ($0, $0.members[0]) })
+        let results = await finder.merge(chosen(groups.map { ($0, $0.members[0]) }))
 
         XCTAssertEqual(
             results.map { try? $0.get() },
@@ -1288,7 +1296,7 @@ final class ExactDuplicateFinderTests: XCTestCase {
         let (groups, sources) = try await threeGroups()
         let (resolver, log) = loggingResolver()
 
-        let results = await finder(resolver: resolver).merge(groups.map { ($0, $0.members[0]) })
+        let results = await finder(resolver: resolver).merge(chosen(groups.map { ($0, $0.members[0]) }))
 
         XCTAssertEqual(
             results.map { try? $0.get() },
@@ -1307,7 +1315,7 @@ final class ExactDuplicateFinderTests: XCTestCase {
         let (resolver, log) = loggingResolver()
         server.failNextTrash()
 
-        let results = await finder(resolver: resolver).merge(groups.map { ($0, $0.members[0]) })
+        let results = await finder(resolver: resolver).merge(chosen(groups.map { ($0, $0.members[0]) }))
 
         for (index, group) in groups.enumerated() {
             XCTAssertThrowsError(try results[index].get())
@@ -1319,7 +1327,7 @@ final class ExactDuplicateFinderTests: XCTestCase {
         XCTAssertEqual(invalidations(in: log), 1)
         let movedRows = sources.map { store.record(for: $0) }
 
-        let retry = await finder(resolver: resolver).merge(groups.map { ($0, $0.members[0]) })
+        let retry = await finder(resolver: resolver).merge(chosen(groups.map { ($0, $0.members[0]) }))
 
         XCTAssertEqual(
             retry.map { try? $0.get() },
@@ -1336,7 +1344,7 @@ final class ExactDuplicateFinderTests: XCTestCase {
         // Another device keeps the duplicate of the second group and trashes its kept photo meanwhile.
         server.trashAfterDuplicateTrash = groups[1].members[0].nodeID
 
-        let results = await finder(resolver: resolver).merge(groups.map { ($0, $0.members[0]) })
+        let results = await finder(resolver: resolver).merge(chosen(groups.map { ($0, $0.members[0]) }))
 
         XCTAssertEqual(try? results[1].get(), .skipped(.keptLeftLibraryDuringMerge))
         XCTAssertEqual(state(of: groups[1].members[1]), .active, "one copy stays")
@@ -1359,7 +1367,7 @@ final class ExactDuplicateFinderTests: XCTestCase {
         let (groups, sources) = try await threeGroups()
         server.failNextFavoritesRead()
 
-        let results = await finder.merge(groups.map { ($0, $0.members[0]) })
+        let results = await finder.merge(chosen(groups.map { ($0, $0.members[0]) }))
 
         for (index, group) in groups.enumerated() {
             XCTAssertThrowsError(try results[index].get())
@@ -1609,6 +1617,291 @@ final class ExactDuplicateFinderTests: XCTestCase {
         XCTAssertEqual(outcome, .skipped(.keptDetailsChanged))
         XCTAssertEqual(server.steps.count, stepsBefore, "the merge writes nothing")
     }
+
+    // MARK: - The same copy on every device
+
+    /// One device of the person over the shared server: its own manifest, journal, and backup dedupe. Its timeline
+    /// does not know the capture dates of `unknownDates`.
+    private func device(
+        _ index: Int, unknownDates: Set<PhotoUID> = []
+    ) throws -> (finder: ExactDuplicateFinder, manifest: UploadIdentityManifestStore) {
+        let folder = directory.appendingPathComponent("device-\(index)", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let manifest = try XCTUnwrap(
+            UploadIdentityManifestStore(
+                url: folder.appendingPathComponent(UploadIdentityManifestStore.databaseFileName)))
+        let journal = try XCTUnwrap(EditReplacementJournalFileStore(accountDataDirectory: folder))
+        let records = server.links.map {
+            UploadRemoteContentIndexRecord(contentHash: $0.contentHash, hashKeyEpoch: epoch, remoteLinkID: $0.linkID)
+        }
+        XCTAssertTrue(
+            manifest.replaceRemoteContentIndex(
+                records, unresolvedIssues: [], hashKeyEpoch: epoch,
+                checkpoint: .init(eventID: "event-1", refreshedAt: Date())))
+        let finder = ExactDuplicateFinder(
+            checker: server,
+            resolver: UploadDedupePipeline(store: manifest, checker: server, replacementJournal: journal),
+            index: manifest, identities: manifest, journal: journal,
+            mergeJournal: ExactDuplicateMergeJournalFileStore(accountDataDirectory: folder),
+            remote: TimelineDatesRemote(base: server, unknown: unknownDates), albums: server)
+        return (finder, manifest)
+    }
+
+    private func activeMains(_ contentHash: String) -> [PhotoUID] {
+        server.links.filter { $0.contentHash == contentHash && $0.state == .active && $0.mainLinkID == nil }.map(\.uid)
+    }
+
+    @MainActor
+    func testTenDevicesThatMergeAllAtOnceKeepTheSameCopyOfEveryGroup() async throws {
+        let decorated = (0..<10).map { _ in server.seedLink(digest: digest("a")) }
+        let plain = (0..<10).map { _ in server.seedLink(digest: digest("b")) }
+        try await server.markFavorite([decorated[7]])
+        try await server.addPhotos([decorated[4]], toOwnAlbum: "own-album")
+        for uid in plain { server.setFingerprint(described, of: uid) }
+        let trashed = TrashedByDevice()
+        var models: [ExactDuplicatesModel] = []
+        for index in 0..<10 {
+            // Every device backed up another copy, and half of the timelines miss the date of the first plain copy.
+            let device = try device(index, unknownDates: index.isMultiple(of: 2) ? [] : [plain[0]])
+            row("asset-a\(index)", names: decorated[index].nodeID, contentHash: hash("a"), in: device.manifest)
+            row("asset-b\(index)", names: plain[index].nodeID, contentHash: hash("b"), in: device.manifest)
+            let model = ExactDuplicatesModel(finder: device.finder) { trashed.add($0) }
+            await model.load()
+            models.append(model)
+        }
+        let expected = [hash("a"): decorated[4], hash("b"): plain[0]]
+        for (index, model) in models.enumerated() {
+            let shown = Dictionary(
+                model.groups.map { ($0.scanGroup.contentHash, $0.kept) }, uniquingKeysWith: { first, _ in first })
+            XCTAssertEqual(shown, expected, "device \(index) preselects the same copies")
+        }
+
+        await withTaskGroup(of: Void.self) { merges in
+            for model in models { merges.addTask { await model.mergeAll() } }
+        }
+
+        XCTAssertEqual(activeMains(hash("a")), [decorated[4]], "exactly the copy that every device kept stays")
+        XCTAssertEqual(activeMains(hash("b")), [plain[0]], "exactly the copy that every device kept stays")
+        XCTAssertTrue(trashed.uids.isDisjoint(with: expected.values), "no device trashes the copy that another keeps")
+        let keptLink = try XCTUnwrap(server.links.first { $0.linkID == decorated[4].nodeID })
+        XCTAssertTrue(keptLink.favorite, "the favorite moved to the kept copy")
+        XCTAssertEqual(keptLink.albums, [.init(volumeID: "vol", albumID: "own-album")])
+        XCTAssertEqual(violations, [])
+    }
+
+    @MainActor
+    func testMergeAllKeepsTheRulesCopyOfGroupsThatNobodyScrolledToOnEveryDeviceInOnePress() async throws {
+        // More groups than the screen ranks when it opens, so the last ones show only the order that needs no request.
+        let pairs = (0..<60).map { index in
+            (server.seedLink(digest: digest("group-\(index)")), server.seedLink(digest: digest("group-\(index)")))
+        }
+        try await server.markFavorite(pairs.map(\.1))
+        var models: [ExactDuplicatesModel] = []
+        for index in 0..<3 {
+            let device = try device(index)
+            let model = ExactDuplicatesModel(finder: device.finder)
+            await model.load()
+            models.append(model)
+        }
+        for model in models {
+            let unranked = model.groups.filter { !$0.isRanked }
+            XCTAssertFalse(unranked.isEmpty, "some groups wait for their ranking")
+            XCTAssertTrue(unranked.allSatisfy { $0.kept == $0.members[0] && !pairs.map(\.1).contains($0.kept) })
+        }
+
+        await withTaskGroup(of: Void.self) { merges in
+            for model in models { merges.addTask { await model.mergeAll() } }
+        }
+
+        for (index, pair) in pairs.enumerated() {
+            XCTAssertEqual(activeMains(hash("group-\(index)")), [pair.1], "group \(index) keeps its favorite only")
+        }
+        for (index, model) in models.enumerated() {
+            XCTAssertEqual(model.groups.map(\.id), [], "device \(index) merged every group in one press")
+        }
+        XCTAssertEqual(violations, [])
+    }
+
+    /// More groups than the screen ranks when it opens, two copies each, the second one a favorite. The fallback
+    /// order checks the first copy; the rule ranks the favorite first.
+    @MainActor
+    private func groupsBeyondTheRankedPages() async throws -> Set<PhotoUID> {
+        let pairs = (0..<60).map { index in
+            (server.seedLink(digest: digest("group-\(index)")), server.seedLink(digest: digest("group-\(index)")))
+        }
+        try await server.markFavorite(pairs.map(\.1))
+        indexServer()
+        return Set(pairs.map(\.1))
+    }
+
+    @MainActor
+    func testASingleMergeOfAnUnrankedGroupKeepsTheRulesCopyInOnePress() async throws {
+        let favorites = try await groupsBeyondTheRankedPages()
+        let model = ExactDuplicatesModel(finder: finder)
+        await model.load()
+        let unranked = model.groups.filter { !$0.isRanked }
+        XCTAssertGreaterThanOrEqual(unranked.count, 2)
+        let header = unranked[0]
+        let viewer = unranked[1]
+        XCTAssertFalse(favorites.contains(header.kept), "the screen checks the fallback copy")
+        XCTAssertFalse(favorites.contains(viewer.kept), "the screen checks the fallback copy")
+
+        await model.merge(groupID: header.id)
+        await model.merge(containing: viewer.members[1])
+
+        for group in [header, viewer] {
+            let favorite = try XCTUnwrap(group.members.first(where: favorites.contains))
+            XCTAssertEqual(activeMains(group.scanGroup.contentHash), [favorite], "one press keeps the rule's copy")
+            XCTAssertNil(model.group(withID: group.id))
+        }
+        XCTAssertNil(model.notice)
+        XCTAssertEqual(violations, [])
+    }
+
+    @MainActor
+    func testAFailedSingleMergeOfAnUnrankedGroupLetsMergeAllMergeItInOnePress() async throws {
+        let favorites = try await groupsBeyondTheRankedPages()
+        let model = ExactDuplicatesModel(finder: finder)
+        await model.load()
+        let group = try XCTUnwrap(model.groups.first { !$0.isRanked })
+        server.failNextFavoritesRead()
+
+        await model.merge(groupID: group.id)
+
+        XCTAssertEqual(model.notice, .failed)
+        XCTAssertEqual(Set(activeMains(group.scanGroup.contentHash)), Set(group.members), "nothing moved")
+
+        await model.mergeAll()
+
+        XCTAssertEqual(model.groups.map(\.id), [], "every group merged in one press")
+        XCTAssertEqual(Set(server.links.filter { $0.state == .active }.map(\.uid)), favorites)
+        XCTAssertEqual(violations, [])
+    }
+
+    func testTheMergeReadsTheDatesOfTheDeviceOnlyForPhotosWithoutACaptureTime() async throws {
+        let dated = (0..<2).map { _ in server.seedLink(digest: digest("a")) }
+        let undated = (0..<2).map { _ in server.seedLink(digest: digest("b")) }
+        for uid in dated { server.setFingerprint(described, of: uid) }
+        indexServer()
+        let groups = try await finder.duplicateGroups().groups
+        let remote = DateReadCountingRemote(base: server)
+        let finder = ExactDuplicateFinder(
+            checker: server, resolver: UploadDedupePipeline(store: store, checker: server, replacementJournal: journal),
+            index: store, identities: store, journal: journal, mergeJournal: mergeJournal, remote: remote,
+            albums: server)
+
+        let results = await finder.merge(
+            groups.map { ExactDuplicateMergeRequest(group: $0, kept: $0.members[0], isKeptChosen: false) })
+
+        XCTAssertEqual(try results.map { try $0.get() }.count, 2)
+        XCTAssertEqual(activeMains(hash("a")), [dated[0]])
+        XCTAssertEqual(activeMains(hash("b")), [undated[0]])
+        XCTAssertEqual(remote.asked, [Set(undated)], "the nodes state the capture time of the other photos")
+    }
+
+    func testAMergeOfPreselectedPhotosReadsTheFavoritesOnceAndCarriesThemOver() async throws {
+        let kept = server.seedLink(digest: digest("a"))
+        let favorite = server.seedLink(digest: digest("a"))
+        let otherKept = server.seedLink(digest: digest("b"))
+        let otherDuplicate = server.seedLink(digest: digest("b"))
+        try await server.addPhotos([kept], toOwnAlbum: "own-album")
+        try await server.markFavorite([favorite])
+        indexServer()
+        let groups = try await finder.duplicateGroups().groups
+        let readsBefore = server.readCounts.favorites
+
+        let results = await finder.merge(
+            groups.map { ExactDuplicateMergeRequest(group: $0, kept: $0.members[0], isKeptChosen: false) })
+
+        XCTAssertEqual(
+            try results.map { try $0.get() }.sorted { "\($0)" < "\($1)" },
+            [
+                .merged(kept: kept, trashed: [favorite], keptDuplicates: [:]),
+                .merged(kept: otherKept, trashed: [otherDuplicate], keptDuplicates: [:]),
+            ].sorted { "\($0)" < "\($1)" })
+        XCTAssertEqual(server.readCounts.favorites - readsBefore, 1, "the check and the carry-over share one listing")
+        XCTAssertEqual(server.links.first { $0.linkID == kept.nodeID }?.favorite, true, "the favorite moved")
+        XCTAssertEqual(violations, [])
+    }
+
+    @MainActor
+    func testAFavoriteSetAfterTheScreenRankedMakesTheMergeSkipTheGroupInsteadOfTrashingTheNewFirstCopy() async throws {
+        let first = server.seedLink(digest: digest("a"))
+        let second = server.seedLink(digest: digest("a"))
+        let otherFirst = server.seedLink(digest: digest("b"))
+        let otherSecond = server.seedLink(digest: digest("b"))
+        indexServer()
+        let model = ExactDuplicatesModel(finder: finder)
+        await model.load()
+        let single = try XCTUnwrap(model.groups.first { $0.members.contains(first) })
+        XCTAssertEqual(single.kept, first)
+        XCTAssertEqual(model.groups.first { $0.members.contains(otherFirst) }?.kept, otherFirst)
+        // Another device marks the second copies as favorites after this screen ranked.
+        try await server.markFavorite([second, otherSecond])
+
+        await model.merge(groupID: single.id)
+
+        XCTAssertFalse(server.steps.contains { $0.action.hasPrefix("duplicate trash") }, "the merge trashes nothing")
+        XCTAssertEqual(activeMains(hash("a")), [first, second])
+        XCTAssertEqual(
+            model.groups.first { $0.members.contains(first) }?.kept, second,
+            "the screen reads the group again and checks the favorite")
+
+        await model.mergeAll()
+
+        XCTAssertEqual(activeMains(hash("a")), [second])
+        XCTAssertEqual(activeMains(hash("b")), [otherFirst, otherSecond], "Merge All skips the other changed group")
+        XCTAssertEqual(model.groups.first { $0.members.contains(otherFirst) }?.kept, otherSecond)
+
+        await model.mergeAll()
+
+        XCTAssertEqual(activeMains(hash("b")), [otherSecond])
+        XCTAssertEqual(violations, [])
+    }
+
+    func testAPreselectedPhotoThatNoLongerRanksFirstIsSkippedAndAChosenOneIsKept() async throws {
+        let first = server.seedLink(digest: digest("a"))
+        let second = server.seedLink(digest: digest("a"))
+        indexServer()
+        let group = try await onlyGroup()
+        try await server.markFavorite([second])
+        let stepsBefore = server.steps.count
+
+        let preselected = try await finder.merge(group, keeping: first, isKeptChosen: false)
+
+        XCTAssertEqual(preselected, .skipped(.preselectionChanged))
+        XCTAssertEqual(server.steps.count, stepsBefore, "the merge writes nothing")
+
+        let chosen = try await finder.merge(group, keeping: first, isKeptChosen: true)
+
+        XCTAssertEqual(chosen, .merged(kept: first, trashed: [second], keptDuplicates: [:]))
+        XCTAssertEqual(server.links.first { $0.linkID == first.nodeID }?.favorite, true)
+    }
+
+    @MainActor
+    func testACopyThatThePersonChoseIsKeptEvenWhenTheRuleRanksAnotherFirst() async throws {
+        let favorite = server.seedLink(digest: digest("a"))
+        let chosen = server.seedLink(digest: digest("a"))
+        let otherFavorite = server.seedLink(digest: digest("b"))
+        let otherChosen = server.seedLink(digest: digest("b"))
+        try await server.markFavorite([favorite, otherFavorite])
+        indexServer()
+        let model = ExactDuplicatesModel(finder: finder)
+        await model.load()
+        XCTAssertEqual(model.group(containing: chosen)?.kept, favorite)
+        XCTAssertEqual(model.group(containing: otherChosen)?.kept, otherFavorite)
+        model.keep(chosen)
+        model.keep(otherChosen)
+
+        // The viewer merges one group, Merge All the other.
+        await model.merge(containing: chosen)
+        await model.mergeAll()
+
+        XCTAssertEqual(activeMains(hash("a")), [chosen])
+        XCTAssertEqual(activeMains(hash("b")), [otherChosen])
+        XCTAssertEqual(server.links.first { $0.linkID == chosen.nodeID }?.favorite, true, "the favorite moved")
+        XCTAssertEqual(violations, [])
+    }
 }
 
 /// Counts the reads of the manifest rows that name a remote link.
@@ -1656,6 +1949,25 @@ private final class TrashStoppingRemote: ExactDuplicateRemote, @unchecked Sendab
     func favoriteUIDs(among uids: [PhotoUID]) async throws -> Set<PhotoUID> { try await base.favoriteUIDs(among: uids) }
 }
 
+/// The server as one device reads it: its timeline does not know the capture dates of `unknown`.
+private struct TimelineDatesRemote: ExactDuplicateRemote {
+    let base: EditScenarioServer
+    let unknown: Set<PhotoUID>
+
+    func trashDuplicates(_ uids: [PhotoUID]) async throws { try await base.trashDuplicates(uids) }
+    func restoreDuplicates(_ uids: [PhotoUID]) async throws { try await base.restoreDuplicates(uids) }
+    func captureDates(of uids: [PhotoUID]) async -> [PhotoUID: Date] {
+        await base.captureDates(of: uids).filter { !unknown.contains($0.key) }
+    }
+    func nodeFacts(of uids: [PhotoUID]) async throws -> [PhotoUID: ExactDuplicateNodeFacts] {
+        try await base.nodeFacts(of: uids)
+    }
+    func ownPhotosVolumeID() async throws -> String { try await base.ownPhotosVolumeID() }
+    func activeUIDs(among uids: [PhotoUID]) async throws -> Set<PhotoUID> { try await base.activeUIDs(among: uids) }
+    func markFavorite(_ uids: [PhotoUID]) async throws { try await base.markFavorite(uids) }
+    func favoriteUIDs(among uids: [PhotoUID]) async throws -> Set<PhotoUID> { try await base.favoriteUIDs(among: uids) }
+}
+
 /// Runs `before` right before each trash, for example the trash of another device.
 private struct BeforeTrashRemote: ExactDuplicateRemote {
     let base: EditScenarioServer
@@ -1667,6 +1979,31 @@ private struct BeforeTrashRemote: ExactDuplicateRemote {
     }
     func restoreDuplicates(_ uids: [PhotoUID]) async throws { try await base.restoreDuplicates(uids) }
     func captureDates(of uids: [PhotoUID]) async -> [PhotoUID: Date] { await base.captureDates(of: uids) }
+    func nodeFacts(of uids: [PhotoUID]) async throws -> [PhotoUID: ExactDuplicateNodeFacts] {
+        try await base.nodeFacts(of: uids)
+    }
+    func ownPhotosVolumeID() async throws -> String { try await base.ownPhotosVolumeID() }
+    func activeUIDs(among uids: [PhotoUID]) async throws -> Set<PhotoUID> { try await base.activeUIDs(among: uids) }
+    func markFavorite(_ uids: [PhotoUID]) async throws { try await base.markFavorite(uids) }
+    func favoriteUIDs(among uids: [PhotoUID]) async throws -> Set<PhotoUID> { try await base.favoriteUIDs(among: uids) }
+}
+
+/// Records the photos whose dates the device is asked for.
+private final class DateReadCountingRemote: ExactDuplicateRemote, @unchecked Sendable {
+    let base: EditScenarioServer
+    private let lock = NSLock()
+    private var _asked: [Set<PhotoUID>] = []
+
+    init(base: EditScenarioServer) { self.base = base }
+
+    var asked: [Set<PhotoUID>] { lock.withLock { _asked } }
+
+    func trashDuplicates(_ uids: [PhotoUID]) async throws { try await base.trashDuplicates(uids) }
+    func restoreDuplicates(_ uids: [PhotoUID]) async throws { try await base.restoreDuplicates(uids) }
+    func captureDates(of uids: [PhotoUID]) async -> [PhotoUID: Date] {
+        lock.withLock { _asked.append(Set(uids)) }
+        return await base.captureDates(of: uids)
+    }
     func nodeFacts(of uids: [PhotoUID]) async throws -> [PhotoUID: ExactDuplicateNodeFacts] {
         try await base.nodeFacts(of: uids)
     }
@@ -1705,6 +2042,13 @@ private actor FinderBarrier {
         waiters.forEach { $0.resume() }
         waiters = []
     }
+}
+
+/// The photos that the merges of all devices moved to Recently Deleted.
+@MainActor
+private final class TrashedByDevice {
+    private(set) var uids: Set<PhotoUID> = []
+    func add(_ trashed: [PhotoUID]) { uids.formUnion(trashed) }
 }
 
 /// Leaves one photo out of every node read.

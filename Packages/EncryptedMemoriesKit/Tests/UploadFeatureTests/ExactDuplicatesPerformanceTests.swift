@@ -228,9 +228,7 @@
                     groupCount: groups.count, facts: facts, fingerprints: fingerprints))
         }
 
-        func merge(
-            _ requests: [(group: ExactDuplicateGroup, kept: PhotoUID)]
-        ) async -> [Result<ExactDuplicateMergeOutcome, any Error>] {
+        func merge(_ requests: [ExactDuplicateMergeRequest]) async -> [Result<ExactDuplicateMergeOutcome, any Error>] {
             requests.map { _ in .failure(CancellationError()) }
         }
     }

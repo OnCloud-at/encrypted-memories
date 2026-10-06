@@ -162,7 +162,7 @@ final class ExactDuplicatesModelTests: XCTestCase {
         XCTAssertEqual(model.groups.map(\.isRanked), [false, true])
     }
 
-    func testMergeAllReadsTheFactsOfAnUnrankedGroupButKeepsThePhotoShownAsKept() async {
+    func testMergeAllReadsTheFactsOfAnUnrankedGroupAndKeepsTheFirstRankedOrTheChosenPhoto() async {
         let finder = FakeDuplicateFinder(scans: [.init(groups: [groupA, groupB], coverage: .complete)])
         finder.fallback = ["A": [a2, a1, a3], "B": [b2, b1]]
         finder.ranked = ["A": [a3, a1, a2], "B": [b1, b2]]
@@ -170,7 +170,7 @@ final class ExactDuplicatesModelTests: XCTestCase {
         let (model, _) = makeModel(finder)
         await model.load()
         finder.unreadableGroups = []
-        model.keep(b1, inGroup: "B")
+        model.keep(b2, inGroup: "B")
 
         await model.mergeAll()
 
@@ -178,8 +178,9 @@ final class ExactDuplicatesModelTests: XCTestCase {
             finder.rankedGroups.last, ["A", "B"],
             "Merge All reads the facts and the metadata of every unranked group first, a chosen one too")
         XCTAssertEqual(
-            finder.merges, [.init(group: "A", kept: a2), .init(group: "B", kept: b1)],
-            "the merge keeps the photo that the screen showed as kept")
+            finder.merges, [.init(group: "A", kept: a3), .init(group: "B", kept: b2)],
+            "the merge keeps the copy that ranks first, as every device does, unless the person chose another")
+        XCTAssertEqual(finder.choices, ["A": false, "B": true], "the ranked copy stays a preselection")
     }
 
     func testMergeAllKeepsASharedMemberInsteadOfTheShownPhotoAndShowsIt() async {
@@ -200,7 +201,7 @@ final class ExactDuplicatesModelTests: XCTestCase {
         await merge.value
     }
 
-    func testMergingOneGroupKeepsExactlyThePhotoShownAsKept() async {
+    func testMergingOneUnrankedGroupKeepsTheCopyThatTheRuleRanksFirst() async {
         let finder = FakeDuplicateFinder(scans: [.init(groups: [groupA], coverage: .complete)])
         finder.fallback = ["A": [a2, a1, a3]]
         finder.ranked = ["A": [a3, a1, a2]]
@@ -213,7 +214,10 @@ final class ExactDuplicatesModelTests: XCTestCase {
 
         await model.merge(groupID: "A")
 
-        XCTAssertEqual(finder.merges, [.init(group: "A", kept: a2)], "the checkmark is the photo that stays")
+        XCTAssertEqual(
+            finder.merges, [.init(group: "A", kept: a3)],
+            "the person saw no ranking, so the copy that every device ranks first stays")
+        XCTAssertEqual(finder.choices, ["A": false], "the ranked copy stays a preselection")
         XCTAssertEqual(finder.rankCalls, ranksBefore + 1, "the merge reads the metadata of the copies first")
         XCTAssertEqual(model.notice, nil)
     }
@@ -485,16 +489,21 @@ final class ExactDuplicatesModelTests: XCTestCase {
         finder.mergeGate.close()
         let merge = Task { await model.mergeAll() }
         await waitUntil({ finder.mergeGate.hasWaiters }, "the merge runs")
-        XCTAssertEqual(model.groups.first { $0.id == late.id }?.kept, shownKept, "Merge All keeps the shown photo")
+        // The person saw no ranking of the late group, so Merge All keeps the copy that its own ranking puts first.
+        let mergeKept = late.members.last
+        XCTAssertNotEqual(mergeKept, shownKept)
+        XCTAssertEqual(model.groups.first { $0.id == late.id }?.kept, mergeKept, "Merge All keeps the first copy")
 
+        // The held scroll ranking lands with another order.
+        finder.ranked = [late.id: late.members]
         finder.holdGate.open()
         await waitUntil({ finder.activeRankings == 0 }, "the scroll ranking lands")
 
         XCTAssertEqual(
-            model.groups.first { $0.id == late.id }?.kept, shownKept, "the screen shows what the merge keeps")
+            model.groups.first { $0.id == late.id }?.kept, mergeKept, "the screen shows what the merge keeps")
         finder.mergeGate.open()
         await merge.value
-        XCTAssertEqual(finder.merges.first { $0.group == late.id }?.kept, shownKept)
+        XCTAssertEqual(finder.merges.first { $0.group == late.id }?.kept, mergeKept)
     }
 
     func testAPhotoTrashedElsewhereLeavesItsGroupAndASingleCopyLeavesTheList() async {
@@ -556,7 +565,7 @@ final class ExactDuplicatesModelTests: XCTestCase {
     ) -> ExactDuplicatesModel.Group {
         let pair = ExactDuplicateGroup(contentHash: "P", hashKeyEpoch: "e", members: [a1, a2])
         var group = ExactDuplicatesModel.Group(scanGroup: pair, members: [a1, a2], kept: a1)
-        group.rank([a1, a2], shared: [], facts: [a1: first, a2: second], keepsShown: false)
+        group.rank([a1, a2], shared: [], facts: [a1: first, a2: second])
         return group
     }
 
@@ -586,7 +595,7 @@ final class ExactDuplicatesModelTests: XCTestCase {
             (facts(shared: true, album: true), facts(album: true), .badge(.shared)),
             (facts(album: true, favorite: true), facts(favorite: true), .badge(.album)),
             (facts(favorite: true, backedUp: true), facts(backedUp: true), .badge(.favorite)),
-            (facts(backedUp: true, date: late), facts(date: early), .badge(.backedUpHere)),
+            (facts(backedUp: true, date: early), facts(date: late), .oldest),
             (facts(favorite: true, date: early), facts(favorite: true, date: late), .oldest),
             (facts(album: true, date: early), facts(album: true, date: early), .identical),
             (facts(date: early), facts(), .identical),
@@ -594,6 +603,21 @@ final class ExactDuplicatesModelTests: XCTestCase {
         for (index, (first, second, reason)) in cases.enumerated() {
             XCTAssertEqual(rankedPair(first, second).stayReason, reason, "case \(index)")
         }
+    }
+
+    func testTheStayReasonNeverNamesTheBackupOfThisDevice() {
+        let early = date(0)
+        let late = date(60)
+        for kept in [facts(backedUp: true), facts(backedUp: true, date: early), facts(backedUp: true, date: late)] {
+            for other in [facts(), facts(date: early), facts(date: late), facts(backedUp: true)] {
+                let reason = rankedPair(kept, other).stayReason
+                XCTAssertNotEqual(reason, .badge(.backedUpHere), "\(kept) against \(other)")
+                XCTAssertNotEqual(reason?.text, "Stays: backed up from this device")
+            }
+        }
+        XCTAssertEqual(rankedPair(facts(backedUp: true), facts()).stayReason, .identical)
+        let badges = rankedPair(facts(backedUp: true), facts()).badges(of: a1)
+        XCTAssertEqual(badges, [.backedUpHere], "the badge stays as information")
     }
 
     func testAChosenCopyWithoutAnAdvantageStaysBecauseTheCopiesAreIdentical() {
@@ -989,6 +1013,28 @@ final class ExactDuplicatesModelTests: XCTestCase {
         XCTAssertEqual(Set(log.calls.first ?? []), [a2, a3, b2])
     }
 
+    func testEveryMergeTellsTheFinderWhetherThePersonChoseThePhotoToKeep() async {
+        let groupC = ExactDuplicateGroup(
+            contentHash: "C", hashKeyEpoch: "e",
+            members: [PhotoUID(volumeID: "v", nodeID: "c1"), PhotoUID(volumeID: "v", nodeID: "c2")])
+        let finder = FakeDuplicateFinder(scans: [.init(groups: [groupA, groupB, groupC], coverage: .complete)])
+        finder.outcomes = ["A": .skipped(.keptLeftLibrary), "B": .skipped(.keptLeftLibrary)]
+        let (model, _) = makeModel(finder)
+        await model.load()
+
+        await model.merge(groupID: "A")
+        XCTAssertEqual(finder.choices, ["A": false], "the screen preselected the photo")
+        XCTAssertEqual(model.group(withID: "A")?.isKeptChosen, false, "a merge makes no choice of the person")
+
+        model.keep(a2, inGroup: "A")
+        await model.merge(containing: a2)
+        XCTAssertEqual(finder.choices, ["A": true], "the viewer merges the photo that the person chose")
+
+        model.keep(b2, inGroup: "B")
+        await model.mergeAll()
+        XCTAssertEqual(finder.choices, ["A": true, "B": true, "C": false])
+    }
+
     func testMergeAllHandsEveryGroupToTheFinderInOneBatch() async {
         let finder = FakeDuplicateFinder(scans: [.init(groups: [groupA, groupB], coverage: .complete)])
         let (model, _) = makeModel(finder)
@@ -1307,6 +1353,7 @@ private final class FakeDuplicateFinder: ExactDuplicateMerging, @unchecked Senda
     private var _scanCalls = 0
     private var _rankCalls = 0
     private var _merges: [Merge] = []
+    private var _choices: [String: Bool] = [:]
     private var _batches: [[String]] = []
     private var _buildCalls = 0
     private var _rankedGroups: [[String]] = []
@@ -1355,6 +1402,8 @@ private final class FakeDuplicateFinder: ExactDuplicateMerging, @unchecked Senda
     var scanCalls: Int { lock.withLock { _scanCalls } }
     var rankCalls: Int { lock.withLock { _rankCalls } }
     var merges: [Merge] { lock.withLock { _merges } }
+    /// Whether the person chose the photo to keep, by group, as the last merge of the group told.
+    var choices: [String: Bool] { lock.withLock { _choices } }
     var batches: [[String]] { lock.withLock { _batches } }
     var buildCalls: Int { lock.withLock { _buildCalls } }
     var rankedGroups: [[String]] { lock.withLock { _rankedGroups } }
@@ -1448,10 +1497,11 @@ private final class FakeDuplicateFinder: ExactDuplicateMerging, @unchecked Senda
         }
     }
 
-    func merge(
-        _ requests: [(group: ExactDuplicateGroup, kept: PhotoUID)]
-    ) async -> [Result<ExactDuplicateMergeOutcome, any Error>] {
-        lock.withLock { _batches.append(requests.map(\.group.id)) }
+    func merge(_ requests: [ExactDuplicateMergeRequest]) async -> [Result<ExactDuplicateMergeOutcome, any Error>] {
+        lock.withLock {
+            _batches.append(requests.map(\.group.id))
+            for request in requests { _choices[request.group.id] = request.isKeptChosen }
+        }
         await mergeGate.pass()
         var results: [Result<ExactDuplicateMergeOutcome, any Error>] = []
         for request in requests {

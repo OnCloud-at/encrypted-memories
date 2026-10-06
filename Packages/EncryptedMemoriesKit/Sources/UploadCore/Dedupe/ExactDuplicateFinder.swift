@@ -162,6 +162,24 @@ public enum ExactDuplicateSkipReason: String, Sendable, Equatable {
     case keptLeftLibraryDuringMerge
     /// The metadata of the photo to keep changed since the screen read them.
     case keptDetailsChanged
+    /// The screen preselected the photo to keep, and another copy ranks first by the server facts of now, for example
+    /// after a favorite was set on another device.
+    case preselectionChanged
+}
+
+/// One group to merge and the photo to keep.
+public struct ExactDuplicateMergeRequest: Sendable {
+    public let group: ExactDuplicateGroup
+    public let kept: PhotoUID
+    /// The person chose `kept`. Otherwise the screen preselected it by `ExactDuplicateFinder.keepOrder`, and the merge
+    /// keeps it only while it still ranks first.
+    public let isKeptChosen: Bool
+
+    public init(group: ExactDuplicateGroup, kept: PhotoUID, isKeptChosen: Bool) {
+        self.group = group
+        self.kept = kept
+        self.isKeptChosen = isKeptChosen
+    }
 }
 
 public enum ExactDuplicateMergeOutcome: Sendable, Equatable {
@@ -175,7 +193,8 @@ public struct ExactDuplicateKeepFacts: Sendable, Equatable {
     public var isShared: Bool
     public var isInOwnAlbum: Bool
     public var isFavorite: Bool
-    /// A local source of this device counts the photo as its backup.
+    /// A local source of this device counts the photo as its backup. Only information: another device counts other
+    /// copies, so this fact never ranks.
     public var isNamedByManifest: Bool
     public var captureDate: Date?
 
@@ -412,11 +431,9 @@ public struct ExactDuplicateFinder: Sendable {
                 fingerprints[group.id] = read.mapValues(\.fingerprint)
                 var memberFacts: [PhotoUID: ExactDuplicateKeepFacts] = [:]
                 for member in group.members {
-                    memberFacts[member] = ExactDuplicateKeepFacts(
-                        isInOwnAlbum: (read[member]?.albums ?? []).contains { $0.volumeID == context.volumeID },
-                        isFavorite: context.favorites.contains(member),
-                        isNamedByManifest: !(owners?[member.nodeID] ?? []).isEmpty,
-                        captureDate: dates[member], isShared: shared.contains(member))
+                    memberFacts[member] = Self.keepFacts(
+                        of: member, node: read[member], ownVolumeID: context.volumeID, favorites: context.favorites,
+                        knownDate: dates[member], isNamedByManifest: !(owners?[member.nodeID] ?? []).isEmpty)
                 }
                 order[group.id] = Self.keepOrder(group.members, facts: memberFacts)
                 pageFacts[group.id] = memberFacts
@@ -449,9 +466,21 @@ public struct ExactDuplicateFinder: Sendable {
         return facts
     }
 
-    /// Ranks the photo to keep first: a shared photo, a photo in an own album, a favorite, a photo that a local source
-    /// of this device counts as its backup, the earliest capture date, and then the smallest link ID. A missing fact
-    /// ranks last.
+    /// The facts that rank `member`, from its node read and the favorites. The capture time of the node counts, so
+    /// every device reads the same date; `knownDate`, the date that this device knows, serves only a node without one.
+    static func keepFacts(
+        of member: PhotoUID, node: ExactDuplicateNodeFacts?, ownVolumeID: String, favorites: Set<PhotoUID>,
+        knownDate: Date?, isNamedByManifest: Bool = false
+    ) -> ExactDuplicateKeepFacts {
+        ExactDuplicateKeepFacts(
+            isInOwnAlbum: (node?.albums ?? []).contains { $0.volumeID == ownVolumeID },
+            isFavorite: favorites.contains(member), isNamedByManifest: isNamedByManifest,
+            captureDate: node?.fingerprint.captureTime ?? knownDate, isShared: node?.isShared == true)
+    }
+
+    /// Ranks the photo to keep first: a shared photo, a photo in an own album, a favorite, the earliest capture date,
+    /// and then the smallest link ID. A missing fact ranks last. Every device reads these facts the same from the
+    /// server, so every device ranks the same copy first. Whether this device backed a copy up does not count.
     public static func keepOrder(_ members: [PhotoUID], facts: [PhotoUID: ExactDuplicateKeepFacts]) -> [PhotoUID] {
         members.sorted { lhs, rhs in
             let left = facts[lhs]
@@ -459,7 +488,6 @@ public struct ExactDuplicateFinder: Sendable {
             for (l, r) in [
                 (left?.isShared, right?.isShared), (left?.isInOwnAlbum, right?.isInOwnAlbum),
                 (left?.isFavorite, right?.isFavorite),
-                (left?.isNamedByManifest, right?.isNamedByManifest),
             ] where (l ?? false) != (r ?? false) {
                 return l ?? false
             }
@@ -488,8 +516,11 @@ public struct ExactDuplicateFinder: Sendable {
     /// the trash, the merge restores the duplicates, so one copy always stays. A merge records its trash in
     /// `mergeJournal` first: after a failed trash, a failed read, or the end of the process, the next scan or merge
     /// reads `kept` again.
-    public func merge(_ group: ExactDuplicateGroup, keeping kept: PhotoUID) async throws -> ExactDuplicateMergeOutcome {
-        try await merge([(group, kept)])[0].get()
+    /// With `isKeptChosen` false, `kept` is a preselection: the merge keeps it only while it ranks first.
+    public func merge(
+        _ group: ExactDuplicateGroup, keeping kept: PhotoUID, isKeptChosen: Bool = true
+    ) async throws -> ExactDuplicateMergeOutcome {
+        try await merge([ExactDuplicateMergeRequest(group: group, kept: kept, isKeptChosen: isKeptChosen)])[0].get()
     }
 
     /// Merges each group like `merge(_:keeping:)`, with one manifest scan, one favorites listing, and one trash for
@@ -499,16 +530,36 @@ public struct ExactDuplicateFinder: Sendable {
     /// group, and then one trash takes the duplicates of every group. Each group holds its outcome or its error; a
     /// failed trash fails every group that it should have taken. After a cancellation, no further group writes, and
     /// every group without an outcome fails with `CancellationError`.
+    ///
+    /// A preselected photo to keep is ranked again with the favorites of now, from one listing for every such group:
+    /// the ranking of the screen can predate a favorite set since. A failed listing fails every group. The carry-over
+    /// uses the same listing when it covers every photo that it writes.
     public func merge(
-        _ requests: [(group: ExactDuplicateGroup, kept: PhotoUID)]
+        _ requests: [ExactDuplicateMergeRequest]
     ) async -> [Result<ExactDuplicateMergeOutcome, any Error>] {
         await resolvePendingMerges()
         var results = [Result<ExactDuplicateMergeOutcome, any Error>?](repeating: nil, count: requests.count)
+        var favorites: Set<PhotoUID> = []
+        var favoritesRead: Set<PhotoUID> = []
+        let preselected = requests.filter { !$0.isKeptChosen }.flatMap(\.group.members)
+        if !preselected.isEmpty, !Task.isCancelled {
+            do {
+                favorites = try await remote.favoriteUIDs(among: preselected)
+                favoritesRead = Set(preselected)
+            } catch {
+                return requests.map { _ in .failure(error) }
+            }
+        }
         var plans: [(index: Int, plan: PlannedMerge)] = []
         for (index, request) in requests.enumerated() where !Task.isCancelled {
             do {
-                switch try await plan(request.group, keeping: request.kept) {
-                case .skipped(let reason): results[index] = .success(.skipped(reason))
+                switch try await plan(
+                    request.group, keeping: request.kept, rankingFavorites: request.isKeptChosen ? nil : favorites)
+                {
+                case .skipped(let reason):
+                    results[index] = .success(.skipped(reason))
+                    // The screen ranks the group again and must not take the favorites that it holds.
+                    if reason == .preselectionChanged { rankingContext.invalidate() }
                 case .planned(let plan): plans.append((index, plan))
                 }
             } catch {
@@ -530,8 +581,10 @@ public struct ExactDuplicateFinder: Sendable {
             let writes = plans.filter { !$0.plan.trashable.isEmpty }
             if !writes.isEmpty {
                 do {
-                    let favorites = try await remote.favoriteUIDs(
-                        among: writes.flatMap { $0.plan.trashable + [$0.plan.kept] })
+                    let written = writes.flatMap { $0.plan.trashable + [$0.plan.kept] }
+                    let favorites =
+                        favoritesRead.isSuperset(of: written)
+                        ? favorites.intersection(written) : try await remote.favoriteUIDs(among: written)
                     // One album listing serves every group: an own album whose cover leaves gets the kept photo.
                     let covers = try await albums.ownAlbumCovers()
                     await write(writes, favorites: favorites, covers: covers, into: &results)
@@ -569,8 +622,11 @@ public struct ExactDuplicateFinder: Sendable {
         case planned(PlannedMerge)
     }
 
-    /// Reads the server state of the group again: the key, the members in the library, and each compound.
-    private func plan(_ group: ExactDuplicateGroup, keeping kept: PhotoUID) async throws -> MergePlan {
+    /// Reads the server state of the group again: the key, the members in the library, and each compound. With
+    /// `rankingFavorites`, `kept` is a preselection, and the active members are ranked again with these favorites.
+    private func plan(
+        _ group: ExactDuplicateGroup, keeping kept: PhotoUID, rankingFavorites: Set<PhotoUID>?
+    ) async throws -> MergePlan {
         guard group.members.contains(kept) else { return .skipped(.keptNotInGroup) }
         let epoch = try await checker.hashKeyEpoch()
         guard epoch == group.hashKeyEpoch else { return .skipped(.keyChanged) }
@@ -590,6 +646,23 @@ public struct ExactDuplicateFinder: Sendable {
         // screen reads the group again.
         guard let keptFingerprint = facts[kept]?.fingerprint else { return .skipped(.keptUnreadable) }
         if let shown = group.fingerprint, shown != keptFingerprint { return .skipped(.keptDetailsChanged) }
+        // Every device ranks the same server facts, so every device that keeps the preselection keeps the same copy.
+        // When another copy ranks first now, the screen reads the group again.
+        if let favorites = rankingFavorites {
+            // The node states the capture time of a photo. Only a node without one needs the date that this device
+            // knows.
+            let undated = active.filter { facts[$0]?.fingerprint.captureTime == nil }
+            let dates = undated.isEmpty ? [:] : await remote.captureDates(of: undated)
+            let ranking = Dictionary(
+                uniqueKeysWithValues: active.map {
+                    (
+                        $0,
+                        Self.keepFacts(
+                            of: $0, node: facts[$0], ownVolumeID: volumeID, favorites: favorites, knownDate: dates[$0])
+                    )
+                })
+            guard Self.keepOrder(active, facts: ranking).first == kept else { return .skipped(.preselectionChanged) }
+        }
         // A trash ends the sharing of a photo, so a shared duplicate stays.
         let shared = Set(facts.filter(\.value.isShared).keys)
         for member in active where member != kept {
