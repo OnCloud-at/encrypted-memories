@@ -455,6 +455,11 @@ final class OfflineLibraryManager {
         }
     }
 
+    /// Signals changes of the three media caches that Settings measures, through the shared coalesced signal.
+    func cacheDiskChanges() -> AsyncStream<Void> {
+        ThumbnailCache.diskChanges(of: [cache, previewCache, originalsCache])
+    }
+
     /// Clears the full-resolution originals cache when retention is disabled. Thumbnail and preview caches
     /// and the account key remain available to the grid.
     func purgeOriginalsCache() async {

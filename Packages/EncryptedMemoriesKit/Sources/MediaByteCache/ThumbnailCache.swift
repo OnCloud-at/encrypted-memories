@@ -499,6 +499,8 @@ public actor ThumbnailCache {
             return writerGeneration.isCurrent(generation)
         }
         let evictionTarget = ThumbnailCacheDiskCapPolicy.evictionTarget(capBytes: capBytes)
+        var evicted = false
+        defer { if evicted { diskUsage.notifyChange() } }
         for entry in entries.sorted(by: { $0.modified < $1.modified }) {  // oldest first
             if total <= evictionTarget { break }
             let removed =
@@ -515,6 +517,7 @@ public actor ThumbnailCache {
                 diskUsage.invalidate()
                 return false
             }
+            evicted = true
             total -= entry.size
         }
         if sizesKnown { diskUsage.finishScan(total: total, token: scan) } else { diskUsage.invalidate() }
@@ -696,6 +699,43 @@ public actor ThumbnailCache {
     }
 
     // MARK: - Stats
+
+    /// Signals each change of the encrypted disk contents: a stored blob, an eviction, a removal, or a clear.
+    /// The stream keeps at most one pending signal, so a write burst reaches a slow reader as one element.
+    public nonisolated func diskChanges() -> AsyncStream<Void> {
+        diskUsage.changes()
+    }
+
+    /// Signals disk changes of any of `caches`, at most once per `interval`. The first change arrives at once;
+    /// later changes inside the interval collapse into one trailing signal, so a reader that measures the
+    /// directories on each element never scans once per written blob. The subscription starts before this
+    /// function returns, so a change during the caller's first measurement still produces a signal.
+    public nonisolated static func diskChanges(
+        of caches: [ThumbnailCache],
+        interval: Duration = .seconds(10)
+    ) -> AsyncStream<Void> {
+        let sources = caches.map { $0.diskChanges() }
+        let (merged, mergedContinuation) = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
+        let (output, outputContinuation) = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
+        let task = Task.detached(priority: .utility) {
+            await withTaskGroup(of: Void.self) { group in
+                for source in sources {
+                    group.addTask {
+                        for await _ in source { mergedContinuation.yield() }
+                    }
+                }
+                group.addTask {
+                    for await _ in merged {
+                        outputContinuation.yield()
+                        try? await Task.sleep(for: interval)
+                    }
+                }
+            }
+            outputContinuation.finish()
+        }
+        outputContinuation.onTermination = { _ in task.cancel() }
+        return output
+    }
 
     /// The automatic disk-cap pass's cached byte estimate, or `nil` when unknown (forces the next pass to
     /// enumerate the directory). Test-only visibility into `enforceByteCap`'s enumeration-skip behavior.
@@ -897,6 +937,8 @@ package final class ThumbnailCacheDiskUsage: @unchecked Sendable {
     private var knownBytes: Int64?
     private var invalidations: UInt64 = 0
     private var cumulativeAddedBytes: Int64 = 0
+    private var observers: [UInt64: AsyncStream<Void>.Continuation] = [:]
+    private var nextObserverID: UInt64 = 0
 
     package init() {}
 
@@ -907,6 +949,7 @@ package final class ThumbnailCacheDiskUsage: @unchecked Sendable {
             cumulativeAddedBytes += bytes
             if let current = knownBytes { knownBytes = current + bytes }
         }
+        notifyChange()
     }
 
     package func invalidate() {
@@ -914,6 +957,7 @@ package final class ThumbnailCacheDiskUsage: @unchecked Sendable {
             invalidations &+= 1
             knownBytes = nil
         }
+        notifyChange()
     }
 
     /// The directory was emptied; a scan still in flight must not overwrite the zero.
@@ -922,6 +966,28 @@ package final class ThumbnailCacheDiskUsage: @unchecked Sendable {
             invalidations &+= 1
             knownBytes = 0
         }
+        notifyChange()
+    }
+
+    /// A stream that receives one element after each change of the directory contents.
+    package func changes() -> AsyncStream<Void> {
+        let (stream, continuation) = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
+        let id = lock.withLock {
+            nextObserverID &+= 1
+            observers[nextObserverID] = continuation
+            return nextObserverID
+        }
+        continuation.onTermination = { [weak self] _ in
+            guard let self else { return }
+            _ = lock.withLock { observers.removeValue(forKey: id) }
+        }
+        return stream
+    }
+
+    /// Signals a change that the byte bookkeeping above does not report itself, for example a cap-pass eviction.
+    package func notifyChange() {
+        let current = lock.withLock { Array(observers.values) }
+        for continuation in current { continuation.yield() }
     }
 
     package func beginScan() -> ScanToken {
