@@ -45,9 +45,55 @@ public struct BackupResourcePreparationReporter: Sendable {
     }
 }
 
+/// A resource whose upload descriptor can be materialized late. Primary and secondary resources share
+/// one implementation: a progress materializer wins, a plain one runs without progress, and without
+/// either the descriptor is already readable.
+public protocol BackupResourceMaterializing: Sendable {
+    var descriptor: UploadResourceDescriptor { get }
+    var materializeWithProgress:
+        (@Sendable (BackupResourcePreparationReporter) async throws -> UploadResourceDescriptor)?
+    { get }
+}
+
+public extension BackupResourceMaterializing {
+    func materializedDescriptor() async throws -> UploadResourceDescriptor {
+        try await materializedDescriptor(onPreparationProgress: { _ in })
+    }
+
+    func materializedDescriptor(
+        onPreparationProgress: @escaping BackupResourcePreparationHandler
+    ) async throws -> UploadResourceDescriptor {
+        if let materializeWithProgress {
+            return try await materializeWithProgress(BackupResourcePreparationReporter(onPreparationProgress))
+        }
+        return descriptor
+    }
+
+    var hasDeferredMaterialization: Bool {
+        materializeWithProgress != nil
+    }
+}
+
+extension BackupResourceMaterializing {
+    static func materializer(
+        _ materialize: (@Sendable () async throws -> UploadResourceDescriptor)?,
+        withProgress materializeWithProgress: (
+            @Sendable (BackupResourcePreparationReporter) async throws -> UploadResourceDescriptor
+        )?
+    ) -> (@Sendable (BackupResourcePreparationReporter) async throws -> UploadResourceDescriptor)? {
+        if let materializeWithProgress {
+            return materializeWithProgress
+        }
+        if let materialize {
+            return { _ in try await materialize() }
+        }
+        return nil
+    }
+}
+
 /// One secondary resource of a compound (a Live Photo's paired video): uploaded after the
 /// primary with `mainPhotoUID` pointing at it, deduped through the same pipeline.
-public struct BackupSecondaryResource: Sendable {
+public struct BackupSecondaryResource: BackupResourceMaterializing {
     /// `descriptor.source.resource` must be a secondary role (e.g. `.livePairedVideo`).
     public let descriptor: UploadResourceDescriptor
     public let mediaType: String
@@ -69,37 +115,14 @@ public struct BackupSecondaryResource: Sendable {
         self.descriptor = descriptor
         self.mediaType = mediaType
         self.additionalMetadata = additionalMetadata
-        if let materializeWithProgress {
-            self.materializeWithProgress = materializeWithProgress
-        } else if let materialize {
-            self.materializeWithProgress = { _ in try await materialize() }
-        } else {
-            self.materializeWithProgress = nil
-        }
-    }
-
-    public func materializedDescriptor() async throws -> UploadResourceDescriptor {
-        try await materializedDescriptor(onPreparationProgress: { _ in })
-    }
-
-    public func materializedDescriptor(
-        onPreparationProgress: @escaping BackupResourcePreparationHandler
-    ) async throws -> UploadResourceDescriptor {
-        if let materializeWithProgress {
-            return try await materializeWithProgress(BackupResourcePreparationReporter(onPreparationProgress))
-        }
-        return descriptor
-    }
-
-    public var hasDeferredMaterialization: Bool {
-        materializeWithProgress != nil
+        self.materializeWithProgress = Self.materializer(materialize, withProgress: materializeWithProgress)
     }
 }
 
 /// A queue entry rematerialized into everything the pipeline and uploader need. The queue stores
 /// only identities and revisions; adapters rebuild the concrete resource when work actually runs
 /// (after a relaunch the original export/URL may be gone, so this is the resume seam).
-public struct BackupResolvedResource: Sendable {
+public struct BackupResolvedResource: BackupResourceMaterializing {
     /// Snapshot of the source revision recorded after a successful backup.
     /// It can be newer than the queued revision when the source changed after scanning.
     public let candidate: UploadBackupAssetCandidate
@@ -162,31 +185,8 @@ public struct BackupResolvedResource: Sendable {
         self.additionalMetadata = additionalMetadata
         self.captureDate = captureDate
         self.secondaries = secondaries
-        if let materializeWithProgress {
-            self.materializeWithProgress = materializeWithProgress
-        } else if let materialize {
-            self.materializeWithProgress = { _ in try await materialize() }
-        } else {
-            self.materializeWithProgress = nil
-        }
+        self.materializeWithProgress = Self.materializer(materialize, withProgress: materializeWithProgress)
         self.cleanup = cleanup
-    }
-
-    public func materializedDescriptor() async throws -> UploadResourceDescriptor {
-        try await materializedDescriptor(onPreparationProgress: { _ in })
-    }
-
-    public func materializedDescriptor(
-        onPreparationProgress: @escaping BackupResourcePreparationHandler
-    ) async throws -> UploadResourceDescriptor {
-        if let materializeWithProgress {
-            return try await materializeWithProgress(BackupResourcePreparationReporter(onPreparationProgress))
-        }
-        return descriptor
-    }
-
-    public var hasDeferredMaterialization: Bool {
-        materializeWithProgress != nil
     }
 }
 

@@ -2,8 +2,8 @@ import AVFoundation
 import CoreGraphics
 import Foundation
 import ImageIO
+import PhotosCore
 import ProtonDriveSDK
-import UniformTypeIdentifiers
 
 /// Generates the encrypted-thumbnail inputs the SDK upload requires. All work is CPU/IO bound and is
 /// only ever called off the main thread (from the upload backend). Best-effort: if a thumbnail can't
@@ -75,23 +75,9 @@ enum UploadMediaProcessor {
         let scaled = downscale(image, maxPixel: maxPixel) ?? image
         let encodedImage = opaqueCopyIfNeeded(scaled) ?? scaled
         for quality in compressionQualities {
-            let data = NSMutableData()
-            guard
-                let destination = CGImageDestinationCreateWithData(
-                    data,
-                    UTType.jpeg.identifier as CFString,
-                    1,
-                    nil
-                )
-            else { return nil }
-            CGImageDestinationAddImage(
-                destination,
-                encodedImage,
-                [kCGImageDestinationLossyCompressionQuality: quality] as CFDictionary
-            )
-            guard CGImageDestinationFinalize(destination) else { return nil }
-            if data.length <= maxBytes {
-                return data as Data
+            guard let data = JPEGEncoding.data(from: encodedImage, quality: quality) else { return nil }
+            if data.count <= maxBytes {
+                return data
             }
         }
         return nil
