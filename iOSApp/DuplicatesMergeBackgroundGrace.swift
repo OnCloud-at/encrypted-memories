@@ -21,9 +21,11 @@ final class DuplicatesMergeBackgroundGrace {
         identifier = UIApplication.shared.beginBackgroundTask(withName: "Merge duplicates") { [weak self] in
             self?.end(generation: generation)
         }
+        // The pause applies now, so a return to the app before the task below runs still continues the merge.
         // Without the grace window, the merge still pauses and continues when the app is active again.
+        model.pauseMerging()
         Task { [weak self] in
-            await model.pauseMerging()
+            await model.runningMergeWorkEnded()
             self?.end(generation: generation)
         }
     }

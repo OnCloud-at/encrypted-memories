@@ -1185,8 +1185,9 @@ final class ExactDuplicatesModelTests: XCTestCase {
         let merge = Task { await model.mergeAll() }
         await waitUntil({ finder.mergeGate.hasWaiters }, "the first batch runs")
         let paused = TrashLog()
+        model.pauseMerging()
         let pause = Task {
-            await model.pauseMerging()
+            await model.runningMergeWorkEnded()
             paused.calls.append([])
         }
         try? await Task.sleep(for: .milliseconds(20))
@@ -1202,6 +1203,22 @@ final class ExactDuplicatesModelTests: XCTestCase {
         model.resumeMerging()
         await merge.value
         XCTAssertEqual(finder.batches.count, 3)
+        XCTAssertNil(model.notice)
+    }
+
+    func testAResumeRightAfterThePauseKeepsMergeAllRunning() async {
+        let (model, finder, _) = await loadedModel(groups: 60)
+        finder.mergeGate.close()
+        let merge = Task { await model.mergeAll() }
+        await waitUntil({ finder.mergeGate.hasWaiters }, "the first batch runs")
+        // The app goes to the background and is active again before the running batch ends.
+        model.pauseMerging()
+        let wait = Task { await model.runningMergeWorkEnded() }
+        model.resumeMerging()
+        finder.mergeGate.open()
+        await wait.value
+        await merge.value
+        XCTAssertEqual(finder.batches.count, 3, "the merge continues after a quick return")
         XCTAssertNil(model.notice)
     }
 
