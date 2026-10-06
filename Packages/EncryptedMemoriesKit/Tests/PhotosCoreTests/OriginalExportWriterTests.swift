@@ -136,6 +136,34 @@ import Testing
         #expect(try FileManager.default.contentsOfDirectory(atPath: directory.path) == ["Export.zip"])
     }
 
+    @Test func writeDataWritesTheBytesAndReplacesAnExistingFile() throws {
+        let directory = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let destination = directory.appendingPathComponent("Support.json")
+
+        try OriginalExportWriter.writeData(Data("first".utf8), to: destination)
+        #expect(try Data(contentsOf: destination) == Data("first".utf8))
+
+        try OriginalExportWriter.writeData(Data("second".utf8), to: destination)
+        #expect(try Data(contentsOf: destination) == Data("second".utf8))
+        #expect(try FileManager.default.contentsOfDirectory(atPath: directory.path) == ["Support.json"])
+    }
+
+    @Test func writeDataLeavesNoStagingDirectory() throws {
+        let directory = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let destination = directory.appendingPathComponent("Support.json")
+        let staging = try OriginalExportWriter.stagingDirectory(for: destination)
+        let stagingParent = staging.deletingLastPathComponent()
+        try FileManager.default.removeItem(at: staging)
+        let before = Set(try FileManager.default.contentsOfDirectory(atPath: stagingParent.path))
+
+        try OriginalExportWriter.writeData(Data("report".utf8), to: destination)
+
+        let after = Set(try FileManager.default.contentsOfDirectory(atPath: stagingParent.path))
+        #expect(after.subtracting(before).isEmpty)
+    }
+
     @Test func failedArchiveExportRemovesThePartialArchive() async throws {
         let directory = try makeDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
