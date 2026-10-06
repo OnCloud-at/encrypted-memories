@@ -136,6 +136,20 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
     func applyNextRestoreThenFail() { lock.withLock { failRestoreAfterApplying = true } }
     private var failRestoreAfterApplying = false
 
+    /// A duplicate restore that names one of these links fails and moves nothing back.
+    var refusedRestores: Set<String> {
+        get { lock.withLock { refusedRestoreLinks } }
+        set { lock.withLock { refusedRestoreLinks = newValue } }
+    }
+    private var refusedRestoreLinks: Set<String> = []
+
+    /// A link that left the trash keeps the time of its last trash in its visibility, like a stale field.
+    var reportsTrashTimeOfRestoredLinks: Bool {
+        get { lock.withLock { staleTrashTime } }
+        set { lock.withLock { staleTrashTime = newValue } }
+    }
+    private var staleTrashTime = false
+
     /// The server clock in seconds since 1970, from the device clock at the start. Every trash of a person or a merge
     /// stamps it on the trashed link.
     var serverTime: Int64 {
@@ -475,7 +489,7 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
                 guard let link = table[linkID], link.state != .deleted else { continue }
                 result[linkID] = RemoteLinkVisibility(
                     isActive: link.state == .active, mainPhotoLinkID: link.mainLinkID,
-                    trashTime: link.state == .trashed ? link.trashTime : nil)
+                    trashTime: link.state == .trashed || staleTrashTime ? link.trashTime : nil)
             }
             return result
         }
@@ -777,6 +791,10 @@ extension EditScenarioServer: ExactDuplicateRemote {
     }
 
     func restoreDuplicates(_ uids: [PhotoUID]) async throws {
+        try lock.withLock {
+            guard uids.contains(where: { refusedRestoreLinks.contains($0.nodeID) }) else { return }
+            throw UploadError.backend("The scenario restore was refused")
+        }
         for uid in uids { personRestore(uid) }
         try lock.withLock {
             guard failRestoreAfterApplying else { return }

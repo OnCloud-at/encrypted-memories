@@ -746,8 +746,9 @@ public struct ExactDuplicateFinder: Sendable {
     }
 
     /// Checks the merges that a failed trash, a failed read, or the end of the process left in `mergeJournal`, with one
-    /// read of all their links. A failed read ends the check, so an offline scan waits for one read and its retries; the
-    /// merges then stay for the next scan or merge.
+    /// read of all their links. A failed read or a connection failure ends the check, so an offline scan waits for one
+    /// read and its retries; the merges then stay for the next scan or merge. Any other failure of one merge leaves the
+    /// checks of the next merges running.
     private func resolvePendingMerges() async {
         guard let pending = mergeJournal.pendingMerges() else {
             log("[Duplicates] the merge journal cannot be read")
@@ -781,10 +782,28 @@ public struct ExactDuplicateFinder: Sendable {
     /// A trash of the kept photo this many server seconds after the trash of the merge is a later deletion, for
     /// example by the person, and no part of a merge on another device. The merge leaves it in the trash.
     static let concurrentTrashWindow: Int64 = 3600
+    /// The same window when only the device clock dates the trash of the merge, because the server no longer knows
+    /// the trashed duplicates. A device clock can be off by hours, and a too-short window would leave the last copy in
+    /// the trash. The cost: when the person deletes the kept photo on purpose within this window after the merge, and
+    /// the duplicates left the trash already, the kept photo comes back.
+    static let deviceClockTrashWindow: Int64 = 24 * 3600
+
+    /// True when the check of the pending merges cannot go on: the connection failed, or the check was cancelled. Each
+    /// later merge would wait for the same reads. Any other failure belongs to one merge.
+    static func endsPendingChecks(_ error: any Error) -> Bool {
+        if error is CancellationError || error is URLError || BackupSyncRunner.isTransientNetwork(error) {
+            return true
+        }
+        switch error as? UploadError {
+        case .retryableBackend, .transport, .cancelled: return true
+        default: return false
+        }
+    }
 
     /// Checks `intents` with one read of all their links, and removes the finished ones from `mergeJournal` with one
     /// write. Returns the check of each intent by key; an intent without a check did not run. Throws when the read
-    /// fails, and every intent stays. `stopAtFirstFailure` ends the checks after the first one that throws.
+    /// fails, and every intent stays. `stopAtFirstFailure` ends the checks after the first one that throws for a
+    /// reason in `endsPendingChecks`.
     private func resolve(
         _ intents: [ExactDuplicateMergeIntent], restored: inout Bool, stopAtFirstFailure: Bool
     ) async throws -> [String: Result<MergeResolution, any Error>] {
@@ -798,7 +817,7 @@ public struct ExactDuplicateFinder: Sendable {
                 finished.append(intent)
             } catch {
                 checks[intent.key] = .failure(error)
-                if stopAtFirstFailure { break }
+                if stopAtFirstFailure, Self.endsPendingChecks(error) { break }
             }
         }
         if !finished.isEmpty, !mergeJournal.clear(finished) {
@@ -811,6 +830,9 @@ public struct ExactDuplicateFinder: Sendable {
     /// library meanwhile, restores the duplicates that are not in the library and moves their rows back. When none of
     /// them comes back, restores the kept photo. `restored` turns true once a restore was needed. Throws while no read
     /// confirms an active copy.
+    /// The person can delete the kept photo for good on its own while the duplicates are still in the trash. The server
+    /// then no longer knows the kept photo, and that looks like a trash of another merge at the same moment, so the
+    /// duplicates come back.
     private func resolve(
         _ intent: ExactDuplicateMergeIntent, visibility read: [String: RemoteLinkVisibility], restored: inout Bool
     ) async throws -> MergeResolution {
@@ -853,16 +875,18 @@ public struct ExactDuplicateFinder: Sendable {
         return .restored
     }
 
-    /// True when the server trashed `kept` more than `concurrentTrashWindow` after the trash of the merge: the latest
-    /// trash time of the members, or `trashedAt` when the server no longer knows them. Without both times, the merge
-    /// cannot tell and restores a copy.
+    /// True when the server trashed `kept` more than `concurrentTrashWindow` after the latest trash time of the members
+    /// in the trash, or more than `deviceClockTrashWindow` after `trashedAt` when no member is in the trash. A member in
+    /// the library can carry the time of an earlier trash, so it dates nothing. Without both times, the merge cannot
+    /// tell and restores a copy.
     private func isLaterDeletion(
         of kept: String, in visibility: [String: RemoteLinkVisibility], after trashed: [String], trashedAt: Int64?
     ) -> Bool {
-        guard let keptTrash = visibility[kept]?.trashTime,
-            let mergeTrash = trashed.compactMap({ visibility[$0]?.trashTime }).max() ?? trashedAt
-        else { return false }
-        return keptTrash > mergeTrash + Self.concurrentTrashWindow
+        guard let keptTrash = visibility[kept]?.trashTime else { return false }
+        let memberTrash = trashed.compactMap { visibility[$0].flatMap { $0.isActive ? nil : $0.trashTime } }.max()
+        if let memberTrash { return keptTrash > memberTrash + Self.concurrentTrashWindow }
+        guard let trashedAt else { return false }
+        return keptTrash > trashedAt + Self.deviceClockTrashWindow
     }
 
     /// Restores `links`. Its answer decides nothing: a restore can apply before its answer fails, and the server's

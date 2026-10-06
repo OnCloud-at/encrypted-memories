@@ -989,7 +989,7 @@ final class ExactDuplicateFinderTests: XCTestCase {
         // the first kept photo at the time of the merge; the person deletes the second one long after it.
         server.personEmptyTrash()
         server.personTrash(keptA)
-        server.serverTime += 2 * ExactDuplicateFinder.concurrentTrashWindow
+        server.serverTime += 2 * ExactDuplicateFinder.deviceClockTrashWindow
         server.personTrash(keptB)
 
         _ = try await finder.duplicateGroups()
@@ -1092,6 +1092,128 @@ final class ExactDuplicateFinderTests: XCTestCase {
         XCTAssertEqual(state(of: kept), .trashed, "the person's deletion stays")
         XCTAssertEqual(state(of: duplicate), .trashed)
         XCTAssertEqual(restores, [])
+    }
+
+    /// A pending merge of `kept` and `duplicate`, recorded at the device time `trashedAt`.
+    private func pendingIntent(
+        kept: PhotoUID, duplicate: PhotoUID, seed: String, trashedAt: Int64?
+    ) -> ExactDuplicateMergeIntent {
+        ExactDuplicateMergeIntent(
+            volumeID: "vol", kept: kept.nodeID, contentHash: hash(seed), hashKeyEpoch: epoch,
+            members: [
+                .init(
+                    link: duplicate.nodeID,
+                    moves: [.init(from: duplicate.nodeID, to: kept.nodeID, contentHash: hash(seed))])
+            ],
+            trashedAt: trashedAt)
+    }
+
+    func testAPendingMergeWhoseRestoreIsRefusedLeavesTheNextMergeChecked() async throws {
+        let keptA = server.seedLink(digest: digest("a"))
+        let duplicateA = server.seedLink(digest: digest("a"))
+        let keptB = server.seedLink(digest: digest("b"))
+        let duplicateB = server.seedLink(digest: digest("b"))
+        indexServer()
+        // Both merges trashed their duplicate, and another device trashed both kept photos at the same moment.
+        for link in [duplicateA, keptA, duplicateB, keptB] { server.personTrash(link) }
+        let first = pendingIntent(kept: keptA, duplicate: duplicateA, seed: "a", trashedAt: server.serverTime)
+        let second = pendingIntent(kept: keptB, duplicate: duplicateB, seed: "b", trashedAt: server.serverTime)
+        XCTAssertTrue(mergeJournal.record([first, second]))
+        server.refusedRestores = [duplicateA.nodeID, keptA.nodeID]
+        var finder = finder()
+        finder.keptReadRetryDelay = .zero
+
+        _ = try await finder.duplicateGroups()
+
+        XCTAssertEqual(state(of: duplicateB), .active, "the second merge restores its duplicate")
+        XCTAssertEqual(state(of: keptA), .trashed)
+        XCTAssertEqual(mergeJournal.pendingMerges(), [first], "the refused merge waits for the next scan")
+    }
+
+    func testAJournalThatCannotBeReadStaysAndTakesNoWrite() throws {
+        let kept = server.seedLink(digest: digest("a"))
+        let duplicate = server.seedLink(digest: digest("a"))
+        let pending = pendingIntent(kept: kept, duplicate: duplicate, seed: "a", trashedAt: nil)
+        XCTAssertTrue(mergeJournal.record([pending]))
+        let file = directory.appendingPathComponent(ExactDuplicateMergeJournalFileStore.fileName)
+        let saved = try Data(contentsOf: file)
+        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: file.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path) }
+        let other = pendingIntent(kept: duplicate, duplicate: kept, seed: "a", trashedAt: nil)
+
+        XCTAssertEqual(mergeJournal.prepareForWrites(), .unavailable)
+        XCTAssertNil(mergeJournal.pendingMerges())
+        XCTAssertFalse(mergeJournal.record([other]))
+        XCTAssertFalse(mergeJournal.clear([pending]))
+
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+        XCTAssertEqual(try Data(contentsOf: file), saved, "the pending merge stays in its file")
+        XCTAssertEqual(
+            try FileManager.default.contentsOfDirectory(atPath: directory.path).filter {
+                $0.hasPrefix("exact-duplicate-merge-intents-v1.unreadable-")
+            }, [], "nothing moved aside")
+    }
+
+    func testADeviceClockHoursOffStillRestoresTheLastCopyOfAConcurrentTrash() async throws {
+        var pending: [(kept: PhotoUID, intent: ExactDuplicateMergeIntent)] = []
+        for (seed, offset) in [("a", -2 * Int64(3600)), ("b", 2 * Int64(3600))] {
+            let kept = server.seedLink(digest: digest(seed))
+            let duplicate = server.seedLink(digest: digest(seed))
+            pending.append(
+                (kept, pendingIntent(kept: kept, duplicate: duplicate, seed: seed, trashedAt: server.serverTime + offset)))
+        }
+        indexServer()
+        // The merges trashed their duplicates, and the person emptied the trash: the server no longer knows them.
+        // Another device trashed each kept photo at the moment of the merge, by server time.
+        for (_, intent) in pending { server.personTrash(PhotoUID(volumeID: "vol", nodeID: intent.members[0].link)) }
+        server.personEmptyTrash()
+        for (kept, _) in pending { server.personTrash(kept) }
+        XCTAssertTrue(mergeJournal.record(pending.map(\.intent)))
+
+        _ = try await finder.duplicateGroups()
+
+        for (kept, _) in pending {
+            XCTAssertEqual(state(of: kept), .active, "the last copy comes back, whichever way the device clock is off")
+        }
+        XCTAssertEqual(mergeJournal.pendingMerges(), [])
+    }
+
+    func testAStaleTrashTimeOfADuplicateInTheLibraryDatesNoMerge() async throws {
+        let kept = server.seedLink(digest: digest("a"))
+        let restoredDuplicate = server.seedLink(digest: digest("a"))
+        let purgedDuplicate = server.seedLink(digest: digest("a"))
+        indexServer()
+        // The person trashed and restored one duplicate long before the merge; its visibility keeps that trash time.
+        server.reportsTrashTimeOfRestoredLinks = true
+        server.serverTime -= 2 * ExactDuplicateFinder.deviceClockTrashWindow
+        server.personTrash(restoredDuplicate)
+        server.personRestore(restoredDuplicate)
+        server.serverTime += 2 * ExactDuplicateFinder.deviceClockTrashWindow
+        // The merge trashed the other duplicate, which left the trash; the trash of the restored one failed. Another
+        // device trashed the kept photo at the same moment.
+        server.personTrash(purgedDuplicate)
+        server.personEmptyTrash()
+        server.personTrash(kept)
+        let moves = [restoredDuplicate, purgedDuplicate].map {
+            UploadRemoteLinkMove(from: $0.nodeID, to: kept.nodeID, contentHash: hash("a"))
+        }
+        let intent = ExactDuplicateMergeIntent(
+            volumeID: "vol", kept: kept.nodeID, contentHash: hash("a"), hashKeyEpoch: epoch,
+            members: [
+                .init(link: purgedDuplicate.nodeID, moves: [moves[1]]),
+                .init(link: restoredDuplicate.nodeID, moves: [moves[0]]),
+            ],
+            trashedAt: server.serverTime)
+        XCTAssertTrue(mergeJournal.record([intent]))
+        // The row of the restored duplicate moved to the kept photo before the trash.
+        let source = row("asset-1", names: kept.nodeID, contentHash: hash("a"))
+
+        _ = try await finder.duplicateGroups()
+
+        XCTAssertEqual(
+            store.record(for: source)?.remoteLinkID, restoredDuplicate.nodeID,
+            "the row moves to the duplicate in the library, not to the trashed kept photo")
+        XCTAssertEqual(mergeJournal.pendingMerges(), [])
     }
 
     /// The restores of the merge.

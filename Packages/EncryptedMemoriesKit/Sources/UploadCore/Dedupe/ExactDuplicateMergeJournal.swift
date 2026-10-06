@@ -27,9 +27,10 @@ public struct ExactDuplicateMergeIntent: Sendable, Equatable, Codable {
 /// Whether a merge can record its trash.
 public enum ExactDuplicateMergeJournalState: Sendable, Equatable {
     case ready
-    /// The journal file could not be read. It moved aside under another name, and a new file starts.
+    /// The journal file held no intents that decode. It moved aside under another name, and a new file starts.
     case replacedUnreadable
-    /// The journal can be neither read nor written. A merge must not start its writes.
+    /// The journal could not be read or written, for example after an I/O error. It stays as it is, and a merge must
+    /// not start its writes.
     case unavailable
 }
 
@@ -59,15 +60,18 @@ public final class ExactDuplicateMergeJournalFileStore: ExactDuplicateMergeJourn
     }
 
     public func pendingMerges() -> [ExactDuplicateMergeIntent]? {
-        Self.lock.withLock { read() }
+        Self.lock.withLock { read().intents }
     }
 
-    /// Moves an unreadable file aside, so a damaged file never blocks every later merge. The moved file stays in the
-    /// account folder for diagnostics.
+    /// Moves a file that does not decode aside, so a damaged file never blocks every later merge. The moved file stays
+    /// in the account folder for diagnostics. A file that cannot be read stays, because it can hold intents.
     public func prepareForWrites() -> ExactDuplicateMergeJournalState {
         Self.lock.withLock {
             var state = ExactDuplicateMergeJournalState.ready
-            if read() == nil {
+            switch read() {
+            case .absent, .decoded: break
+            case .unavailable: return .unavailable
+            case .damaged:
                 let aside = url.deletingLastPathComponent().appendingPathComponent(
                     "exact-duplicate-merge-intents-v1.unreadable-\(UUID().uuidString).json")
                 guard (try? FileManager.default.moveItem(at: url, to: aside)) != nil else { return .unavailable }
@@ -90,21 +94,62 @@ public final class ExactDuplicateMergeJournalFileStore: ExactDuplicateMergeJourn
         return update { $0.removeAll { keys.contains($0.key) } }
     }
 
-    private func read() -> [ExactDuplicateMergeIntent]? {
-        guard FileManager.default.fileExists(atPath: url.path) else { return [] }
-        guard let data = try? Data(contentsOf: url) else { return nil }
-        return try? JSONDecoder().decode([ExactDuplicateMergeIntent].self, from: data)
+    private enum Read {
+        /// No file: no merge waits.
+        case absent
+        case decoded([ExactDuplicateMergeIntent])
+        /// The file was read and does not decode.
+        case damaged
+        /// The file could not be read. It can hold intents.
+        case unavailable
+
+        var intents: [ExactDuplicateMergeIntent]? {
+            switch self {
+            case .absent: []
+            case .decoded(let intents): intents
+            case .damaged, .unavailable: nil
+            }
+        }
     }
 
+    /// Reads the file directly: a failed lookup of `fileExists` also reports a missing file.
+    private func read() -> Read {
+        let data: Data
+        do {
+            data = try Data(contentsOf: url)
+        } catch {
+            return Self.isMissingFile(error) ? .absent : .unavailable
+        }
+        guard let intents = try? JSONDecoder().decode([ExactDuplicateMergeIntent].self, from: data) else {
+            return .damaged
+        }
+        return .decoded(intents)
+    }
+
+    private static func isMissingFile(_ error: any Error) -> Bool {
+        let error = error as NSError
+        if error.domain == NSCocoaErrorDomain,
+            [NSFileReadNoSuchFileError, NSFileNoSuchFileError].contains(error.code)
+        {
+            return true
+        }
+        return error.domain == NSPOSIXErrorDomain && error.code == Int(ENOENT)
+    }
+
+    /// Writes only after a read that found no file or decoded it, so a failed read never replaces pending intents.
     private func update(_ change: (inout [ExactDuplicateMergeIntent]) -> Void) -> Bool {
         Self.lock.withLock {
-            guard var intents = read() else { return false }
+            guard var intents = read().intents else { return false }
             let before = intents
             change(&intents)
             guard intents != before else { return true }
             guard !intents.isEmpty else {
-                return (try? FileManager.default.removeItem(at: url)) != nil
-                    || !FileManager.default.fileExists(atPath: url.path)
+                do {
+                    try FileManager.default.removeItem(at: url)
+                    return true
+                } catch {
+                    return Self.isMissingFile(error)
+                }
             }
             guard let data = try? JSONEncoder().encode(intents) else { return false }
             return (try? data.write(to: url, options: .atomic)) != nil
