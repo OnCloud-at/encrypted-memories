@@ -54,7 +54,7 @@
             window.titleVisibility = .hidden
             window.toolbarStyle = .unified
             window.setContentSize(NSSize(width: 1_080, height: 720))
-            window.orderFrontRegardless()
+            Self.showUnseen(window)
             defer { window.orderOut(nil) }
             try await Task.sleep(for: .milliseconds(1_000))
             XCTAssertTrue(viewer.hasBurstFilmstrip || itemFilmstripLabel != nil)
@@ -86,7 +86,7 @@
                 rootView: PhotoViewerView(model: viewer, onClose: {}, itemFilmstripLabel: itemFilmstripLabel))
             let window = NSWindow(contentViewController: controller)
             window.styleMask = [.titled, .resizable]
-            window.orderFrontRegardless()
+            Self.showUnseen(window)
             defer { window.orderOut(nil) }
             var widths: [CGFloat] = []
             for width in [1_080.0, 1_300] {
@@ -96,6 +96,14 @@
                 widths.append(controller.sizeThatFits(in: NSSize(width: 0, height: 720)).width)
             }
             return widths
+        }
+
+        /// Puts `window` on screen, so AppKit lays it out like the library window, but invisible and without taking
+        /// clicks: the test runs while the person works on this Mac.
+        private static func showUnseen(_ window: NSWindow) {
+            window.alphaValue = 0
+            window.ignoresMouseEvents = true
+            window.orderFrontRegardless()
         }
 
         private func makeFeed() throws -> ThumbnailFeed {
