@@ -936,7 +936,7 @@ final class ExactDuplicatesModelTests: XCTestCase {
             L10n.string("duplicates.ranking_progress \(0.formatted()) \((60 - 2 * size).formatted())"))
         finder.rankGate.open()
         await merge.value
-        XCTAssertEqual(finder.batches.last?.count, 60)
+        XCTAssertEqual(finder.batches.flatMap { $0 }.count, 60)
     }
 
     func testTheEntryCountScansWithoutRanking() async {
@@ -1041,6 +1041,164 @@ final class ExactDuplicatesModelTests: XCTestCase {
         await model.load()
         await model.mergeAll()
         XCTAssertEqual(finder.batches, [["A", "B"]], "the finder reads the facts that the groups share once")
+    }
+
+    // MARK: - Merge All in batches
+
+    /// A loaded model with `count` groups. Merge All ranks the groups after the first two pages itself.
+    private func loadedModel(groups count: Int) async -> (ExactDuplicatesModel, FakeDuplicateFinder, TrashLog) {
+        let finder = FakeDuplicateFinder(scans: [.init(groups: manyGroups(count), coverage: .complete)])
+        let (model, log) = makeModel(finder)
+        await model.load()
+        return (model, finder, log)
+    }
+
+    private func mergeAllLineDetail(_ completed: Int, of total: Int) -> String {
+        L10n.string("duplicates.ranking_progress \(completed.formatted()) \(total.formatted())")
+    }
+
+    func testMergeAllHandsTheGroupsToTheFinderInBatchesInTheirOrder() async {
+        let (model, finder, log) = await loadedModel(groups: 60)
+        let ids = model.groups.map(\.id)
+        await model.mergeAll()
+        let size = ExactDuplicatesModel.mergeBatchSize
+        XCTAssertEqual(size, 25)
+        XCTAssertEqual(finder.batches, [Array(ids[0..<25]), Array(ids[25..<50]), Array(ids[50..<60])])
+        XCTAssertEqual(log.calls.count, 3, "the library stops showing the photos of each batch")
+        XCTAssertEqual(model.content, .noDuplicates)
+        XCTAssertNil(model.notice)
+        XCTAssertNil(model.mergeAllLine)
+        XCTAssertFalse(model.isMergingAll)
+    }
+
+    func testMergeAllShowsItsProgressAndTheOutcomeOfEachBatchBeforeTheNext() async {
+        let (model, finder, log) = await loadedModel(groups: 60)
+        finder.mergeGate.close()
+        let merge = Task { await model.mergeAll() }
+        await waitUntil({ finder.mergeGate.hasWaiters }, "the first batch runs")
+        XCTAssertEqual(model.mergeAllLine?.title, L10n.string("duplicates.merging_title"))
+        XCTAssertEqual(model.mergeAllLine?.detail, mergeAllLineDetail(0, of: 60))
+        XCTAssertEqual(model.mergeAllLine?.fraction, 0)
+        XCTAssertTrue(model.canStopMergeAll)
+
+        finder.mergeGate.open()
+        finder.mergeGate.close()
+        await waitUntil({ finder.batches.count == 2 && finder.mergeGate.hasWaiters }, "the second batch runs")
+        XCTAssertEqual(model.mergeAllLine?.detail, mergeAllLineDetail(25, of: 60))
+        XCTAssertEqual(model.mergeAllLine?.fraction ?? 0, 25.0 / 60.0, accuracy: 0.0001)
+        XCTAssertEqual(model.groups.count, 35, "the first batch left the list before the second started")
+        XCTAssertEqual(log.calls.count, 1)
+
+        finder.mergeGate.open()
+        await merge.value
+        XCTAssertNil(model.mergeAllLine)
+        XCTAssertFalse(model.canStopMergeAll)
+    }
+
+    func testStopLetsTheRunningBatchFinishAndKeepsTheOtherGroups() async {
+        let (model, finder, log) = await loadedModel(groups: 60)
+        finder.mergeGate.close()
+        let merge = Task { await model.mergeAll() }
+        await waitUntil({ finder.mergeGate.hasWaiters }, "the first batch runs")
+        model.stopMergeAll()
+        XCTAssertFalse(model.canStopMergeAll, "Stop works once")
+        XCTAssertTrue(model.isMerging, "the running batch finishes")
+
+        finder.mergeGate.open()
+        await merge.value
+        XCTAssertEqual(finder.batches.count, 1)
+        XCTAssertEqual(model.groups.count, 35)
+        XCTAssertEqual(log.calls.count, 1, "the running batch merged")
+        XCTAssertEqual(model.notice, .stopped(merged: 25, total: 60))
+        XCTAssertFalse(model.isMerging)
+        XCTAssertTrue(model.canMerge, "Merge All can start again")
+    }
+
+    func testStopWhileMergeAllRanksMergesNothing() async {
+        let (model, finder, log) = await loadedModel(groups: 100)
+        finder.rankGate.close()
+        let merge = Task { await model.mergeAll() }
+        await waitUntil({ finder.rankGate.hasWaiters }, "Merge All ranks")
+        XCTAssertNotNil(model.rankingLine)
+        XCTAssertTrue(model.canStopMergeAll, "Stop is offered while Merge All ranks")
+        model.stopMergeAll()
+        finder.rankGate.open()
+        await merge.value
+        XCTAssertEqual(finder.cancelledRankings, 1, "Stop ends the ranking")
+        XCTAssertTrue(finder.batches.isEmpty)
+        XCTAssertTrue(log.calls.isEmpty)
+        XCTAssertEqual(model.groups.count, 100)
+        XCTAssertEqual(model.notice, .stopped(merged: 0, total: 100))
+        XCTAssertNil(model.rankingLine)
+    }
+
+    func testABatchInWhichNoGroupMergedStopsMergeAll() async {
+        let (model, finder, log) = await loadedModel(groups: 75)
+        let ids = model.groups.map(\.id)
+        for id in ids[25..<50] { finder.mergeErrors[id] = URLError(.notConnectedToInternet) }
+        await model.mergeAll()
+        XCTAssertEqual(finder.batches.count, 2, "no batch follows a batch that failed completely")
+        XCTAssertEqual(model.groups.count, 50)
+        XCTAssertEqual(log.calls.count, 1)
+        XCTAssertEqual(model.notice, .stopped(merged: 25, total: 75))
+    }
+
+    func testOneFailedGroupDoesNotStopMergeAll() async {
+        let (model, finder, _) = await loadedModel(groups: 60)
+        finder.mergeErrors[model.groups[3].id] = URLError(.notConnectedToInternet)
+        await model.mergeAll()
+        XCTAssertEqual(finder.batches.count, 3)
+        XCTAssertEqual(model.groups.count, 1)
+        XCTAssertEqual(model.notice, .failed)
+    }
+
+    func testTheStoppedNoticeCountsTheMergedGroupsOfAllGroups() {
+        let notice = ExactDuplicateMergeNotice.stopped(merged: 320, total: 1_404)
+        XCTAssertEqual(
+            notice.title, L10n.string("duplicates.merge_stopped \(320.formatted()) \(1_404.formatted())"))
+        XCTAssertEqual(notice.message, "", "the title says everything")
+    }
+
+    func testAPauseWaitsForTheRunningBatchAndMergeAllContinuesAfterIt() async {
+        let (model, finder, _) = await loadedModel(groups: 60)
+        finder.mergeGate.close()
+        let merge = Task { await model.mergeAll() }
+        await waitUntil({ finder.mergeGate.hasWaiters }, "the first batch runs")
+        let paused = TrashLog()
+        let pause = Task {
+            await model.pauseMerging()
+            paused.calls.append([])
+        }
+        try? await Task.sleep(for: .milliseconds(20))
+        XCTAssertTrue(paused.calls.isEmpty, "the pause waits for the running batch")
+
+        finder.mergeGate.open()
+        await pause.value
+        XCTAssertEqual(paused.calls.count, 1)
+        try? await Task.sleep(for: .milliseconds(20))
+        XCTAssertEqual(finder.batches.count, 1, "no batch starts during the pause")
+        XCTAssertEqual(model.mergeAllLine?.detail, mergeAllLineDetail(25, of: 60))
+
+        model.resumeMerging()
+        await merge.value
+        XCTAssertEqual(finder.batches.count, 3)
+        XCTAssertNil(model.notice)
+    }
+
+    func testMergingOneGroupShowsNoMergeAllProgressAndCannotStop() async {
+        let (model, finder, _) = await loadedModel(groups: 60)
+        let id = model.groups[0].id
+        finder.mergeGate.close()
+        let merge = Task { await model.merge(groupID: id) }
+        await waitUntil({ finder.mergeGate.hasWaiters }, "the merge runs")
+        XCTAssertNil(model.mergeAllLine)
+        XCTAssertFalse(model.canStopMergeAll)
+        model.stopMergeAll()
+        finder.mergeGate.open()
+        await merge.value
+        XCTAssertEqual(finder.batches, [[id]])
+        XCTAssertEqual(model.groups.count, 59)
+        XCTAssertNil(model.notice)
     }
 
     func testAKeptDuplicateGivesOneShortReasonAndTheGroupStaysWithIt() async {
@@ -1359,6 +1517,7 @@ private final class FakeDuplicateFinder: ExactDuplicateMerging, @unchecked Senda
     private var _rankedGroups: [[String]] = []
     private var _activeRankings = 0
     private var _maximumConcurrentRankings = 0
+    private var _cancelledRankings = 0
     var scanProgress: [ExactDuplicateScanProgress] = []
     var fallback: [String: [PhotoUID]] = [:]
     /// Groups whose facts cannot be read.
@@ -1409,6 +1568,8 @@ private final class FakeDuplicateFinder: ExactDuplicateMerging, @unchecked Senda
     var rankedGroups: [[String]] { lock.withLock { _rankedGroups } }
     var maximumConcurrentRankings: Int { lock.withLock { _maximumConcurrentRankings } }
     var activeRankings: Int { lock.withLock { _activeRankings } }
+    /// The rankings that were cancelled while they waited at `rankGate`.
+    var cancelledRankings: Int { lock.withLock { _cancelledRankings } }
 
     func duplicateGroups(
         progress: @escaping @Sendable (ExactDuplicateScanProgress) async -> Void
@@ -1458,6 +1619,7 @@ private final class FakeDuplicateFinder: ExactDuplicateMerging, @unchecked Senda
         defer { lock.withLock { _activeRankings -= 1 } }
         let held = lock.withLock { !heldGroups.isDisjoint(with: groups.map(\.id)) }
         await rankGate.pass()
+        if Task.isCancelled { lock.withLock { _cancelledRankings += 1 } }
         if held { await holdGate.pass() }
         let page = lock.withLock { () -> ExactDuplicateRankingPage in
             guard rankError == nil else { return ExactDuplicateRankingPage(members: [:], groupCount: groups.count) }

@@ -6320,6 +6320,28 @@
         "de": { "stringUnit": { "state": "translated", "value": "Zusammenführen fehlgeschlagen" } }
       }
     },
+    "duplicates.merging_title": {
+      "comment": "Progress title while Merge All merges the groups of duplicates.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Merging Duplicates" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Duplikate werden zusammengeführt" } }
+      }
+    },
+    "duplicates.stop": {
+      "comment": "Button that stops Merge All after the running batch.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Stop" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Stop" } }
+      }
+    },
+    "duplicates.merge_stopped %@ %@": {
+      "comment": "Message after Merge All stopped. First %@: merged groups, second: all groups, both formatted numbers.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Merging stopped. %1$@ of %2$@ groups were merged." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Zusammenführen gestoppt. %1$@ von %2$@ Gruppen wurden zusammengeführt." } }
+      }
+    },
     "duplicates.merge_failed_message": {
       "localizations": {
         "en": { "stringUnit": { "state": "translated", "value": "Check your connection and try again." } },
