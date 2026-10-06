@@ -649,7 +649,10 @@ public struct ExactDuplicateFinder: Sendable {
         // Every device ranks the same server facts, so every device that keeps the preselection keeps the same copy.
         // When another copy ranks first now, the screen reads the group again.
         if let favorites = rankingFavorites {
-            let dates = await remote.captureDates(of: active)
+            // The node states the capture time of a photo. Only a node without one needs the date that this device
+            // knows.
+            let undated = active.filter { facts[$0]?.fingerprint.captureTime == nil }
+            let dates = undated.isEmpty ? [:] : await remote.captureDates(of: undated)
             let ranking = Dictionary(
                 uniqueKeysWithValues: active.map {
                     (

@@ -201,7 +201,7 @@ final class ExactDuplicatesModelTests: XCTestCase {
         await merge.value
     }
 
-    func testMergingOneGroupKeepsExactlyThePhotoShownAsKept() async {
+    func testMergingOneUnrankedGroupKeepsTheCopyThatTheRuleRanksFirst() async {
         let finder = FakeDuplicateFinder(scans: [.init(groups: [groupA], coverage: .complete)])
         finder.fallback = ["A": [a2, a1, a3]]
         finder.ranked = ["A": [a3, a1, a2]]
@@ -214,7 +214,10 @@ final class ExactDuplicatesModelTests: XCTestCase {
 
         await model.merge(groupID: "A")
 
-        XCTAssertEqual(finder.merges, [.init(group: "A", kept: a2)], "the checkmark is the photo that stays")
+        XCTAssertEqual(
+            finder.merges, [.init(group: "A", kept: a3)],
+            "the person saw no ranking, so the copy that every device ranks first stays")
+        XCTAssertEqual(finder.choices, ["A": false], "the ranked copy stays a preselection")
         XCTAssertEqual(finder.rankCalls, ranksBefore + 1, "the merge reads the metadata of the copies first")
         XCTAssertEqual(model.notice, nil)
     }
@@ -562,7 +565,7 @@ final class ExactDuplicatesModelTests: XCTestCase {
     ) -> ExactDuplicatesModel.Group {
         let pair = ExactDuplicateGroup(contentHash: "P", hashKeyEpoch: "e", members: [a1, a2])
         var group = ExactDuplicatesModel.Group(scanGroup: pair, members: [a1, a2], kept: a1)
-        group.rank([a1, a2], shared: [], facts: [a1: first, a2: second], keepsShown: false)
+        group.rank([a1, a2], shared: [], facts: [a1: first, a2: second])
         return group
     }
 
