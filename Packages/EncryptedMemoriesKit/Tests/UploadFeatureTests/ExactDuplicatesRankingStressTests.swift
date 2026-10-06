@@ -38,8 +38,9 @@ final class ExactDuplicatesRankingStressTests: XCTestCase {
         let native = StressNativeNodeReads()
         let finder = ExactDuplicateFinder(
             checker: server, resolver: UploadDedupePipeline(store: store, checker: server, replacementJournal: journal),
-            index: store, identities: store, journal: journal, remote: StressRankingRemote(native: native),
-            albums: server)
+            index: store, identities: store, journal: journal,
+            mergeJournal: ExactDuplicateMergeJournalFileStore(accountDataDirectory: directory),
+            remote: StressRankingRemote(native: native), albums: server)
         let groups = (0..<Self.groupCount).map { index in
             ExactDuplicateGroup(
                 contentHash: String(format: "h%05d", index), hashKeyEpoch: "e",

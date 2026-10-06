@@ -29,14 +29,20 @@ final class ExactDuplicateFinderTests: XCTestCase {
 
     private var finder: ExactDuplicateFinder { finder() }
 
+    /// A new store of the journal file for each finder, as after a new launch.
+    private var mergeJournal: ExactDuplicateMergeJournalFileStore {
+        ExactDuplicateMergeJournalFileStore(accountDataDirectory: directory)
+    }
+
     private func finder(
         resolver: (any UploadIdentityResolving)? = nil, identities: (any UploadIdentityStore)? = nil,
-        albums: (any SeriesAlbumCarryOver)? = nil
+        albums: (any SeriesAlbumCarryOver)? = nil, remote: (any ExactDuplicateRemote)? = nil
     ) -> ExactDuplicateFinder {
         ExactDuplicateFinder(
             checker: server,
             resolver: resolver ?? UploadDedupePipeline(store: store, checker: server, replacementJournal: journal),
-            index: store, identities: identities ?? store, journal: journal, remote: server, albums: albums ?? server)
+            index: store, identities: identities ?? store, journal: journal, mergeJournal: mergeJournal,
+            remote: remote ?? server, albums: albums ?? server)
     }
 
     private func digest(_ seed: String) -> Data {
@@ -336,8 +342,8 @@ final class ExactDuplicateFinderTests: XCTestCase {
         // A read that leaves a member out proves nothing about its metadata, so the group keeps its fallback order.
         let partial = ExactDuplicateFinder(
             checker: server, resolver: UploadDedupePipeline(store: store, checker: server, replacementJournal: journal),
-            index: store, identities: store, journal: journal, remote: MemberDroppingRemote(base: server, drop: third),
-            albums: server)
+            index: store, identities: store, journal: journal, mergeJournal: mergeJournal,
+            remote: MemberDroppingRemote(base: server, drop: third), albums: server)
         let partialPages = PageCollector()
         await partial.rankMembers(of: [group]) { await partialPages.add($0) }
         let partialCollected = await partialPages.pages
@@ -396,7 +402,8 @@ final class ExactDuplicateFinderTests: XCTestCase {
         let remote = FavoritesGatedRemote(base: server)
         let finder = ExactDuplicateFinder(
             checker: server, resolver: UploadDedupePipeline(store: store, checker: server, replacementJournal: journal),
-            index: store, identities: store, journal: journal, remote: remote, albums: server)
+            index: store, identities: store, journal: journal, mergeJournal: mergeJournal, remote: remote,
+            albums: server)
         let model = ExactDuplicatesModel(finder: finder)
         let clock = ContinuousClock()
         let start = clock.now
@@ -733,6 +740,183 @@ final class ExactDuplicateFinderTests: XCTestCase {
         } catch is CancellationError {}
 
         XCTAssertEqual(server.readCounts.visibility - readsBefore, 2, "the members and one read of the kept photo")
+    }
+
+    func testAFailedTrashThatMovedThePhotosRestoresTheDuplicateWhenAnotherDeviceTrashedTheKeptPhoto() async throws {
+        let kept = server.seedLink(digest: digest("a"))
+        let duplicate = server.seedLink(digest: digest("a"))
+        let source = row("asset-1", names: duplicate.nodeID, contentHash: hash("a"))
+        let keptSource = row("asset-2", names: kept.nodeID, contentHash: hash("a"))
+        indexServer()
+        let group = try await onlyGroup()
+        // The other device keeps `duplicate` and trashes `kept`. The trash of this device moves `duplicate`, and its
+        // answer fails.
+        server.trashAfterDuplicateTrash = kept.nodeID
+        server.applyNextTrashThenFail()
+
+        let outcome = try await finder.merge(group, keeping: kept)
+
+        XCTAssertEqual(outcome, .skipped(.keptLeftLibraryDuringMerge))
+        XCTAssertEqual(state(of: duplicate), .active, "one copy stays")
+        XCTAssertEqual(state(of: kept), .trashed, "the merge of the other device stays")
+        XCTAssertEqual(restores, ["person restore \(duplicate.nodeID)"])
+        XCTAssertEqual(store.record(for: source)?.remoteLinkID, duplicate.nodeID, "the row moves back")
+        XCTAssertEqual(store.record(for: keptSource)?.remoteLinkID, duplicate.nodeID, "no row names a trashed photo")
+        XCTAssertEqual(violations, [])
+    }
+
+    func testAFailedTrashThatMovedThePhotosFailsTheGroupWhileTheKeptPhotoStays() async throws {
+        let kept = server.seedLink(digest: digest("a"))
+        let duplicate = server.seedLink(digest: digest("a"))
+        let source = row("asset-1", names: duplicate.nodeID, contentHash: hash("a"))
+        indexServer()
+        let group = try await onlyGroup()
+        server.applyNextTrashThenFail()
+
+        do {
+            _ = try await finder.merge(group, keeping: kept)
+            XCTFail("The failed trash must surface")
+        } catch {}
+
+        XCTAssertEqual(state(of: duplicate), .trashed)
+        XCTAssertEqual(state(of: kept), .active)
+        XCTAssertEqual(store.record(for: source)?.remoteLinkID, kept.nodeID)
+        let stepsBefore = server.steps.count
+        _ = try await finder.duplicateGroups()
+        XCTAssertEqual(server.steps.count, stepsBefore, "the next scan writes nothing")
+        XCTAssertEqual(restores, [])
+    }
+
+    func testTheNextScanRestoresTheDuplicateWhenTheProcessEndedBetweenTheTrashAndItsCheck() async throws {
+        let kept = server.seedLink(digest: digest("a"))
+        let duplicate = server.seedLink(digest: digest("a"))
+        let source = row("asset-1", names: duplicate.nodeID, contentHash: hash("a"))
+        let keptSource = row("asset-2", names: kept.nodeID, contentHash: hash("a"))
+        indexServer()
+        let group = try await onlyGroup()
+        server.trashAfterDuplicateTrash = kept.nodeID
+        let stopping = TrashStoppingRemote(base: server)
+        let first = finder(remote: stopping)
+        let merge = Task { await first.merge([(group, kept)]) }
+        for _ in 0..<5_000 {
+            if await stopping.gate.hasWaiters { break }
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        let stopped = await stopping.gate.hasWaiters
+        XCTAssertTrue(stopped, "the trash moved the photos")
+        XCTAssertEqual(state(of: duplicate), .trashed)
+        XCTAssertEqual(state(of: kept), .trashed)
+
+        // The process ends here. The next launch reads the same files with a new finder.
+        _ = try await finder().duplicateGroups()
+
+        XCTAssertEqual(state(of: duplicate), .active, "one copy stays")
+        XCTAssertEqual(state(of: kept), .trashed)
+        XCTAssertEqual(store.record(for: source)?.remoteLinkID, duplicate.nodeID, "the row moves back")
+        XCTAssertEqual(store.record(for: keptSource)?.remoteLinkID, duplicate.nodeID, "no row names a trashed photo")
+        XCTAssertEqual(restores, ["person restore \(duplicate.nodeID)"])
+        stopping.gate.open()
+        _ = await merge.value
+        XCTAssertEqual(state(of: duplicate), .active)
+        XCTAssertEqual(store.record(for: source)?.remoteLinkID, duplicate.nodeID)
+        XCTAssertEqual(violations, [])
+    }
+
+    func testTheNextScanRestoresTheDuplicateWhenEveryReadOfTheKeptPhotoAfterTheTrashFailed() async throws {
+        let kept = server.seedLink(digest: digest("a"))
+        let duplicate = server.seedLink(digest: digest("a"))
+        let source = row("asset-1", names: duplicate.nodeID, contentHash: hash("a"))
+        indexServer()
+        let group = try await onlyGroup()
+        server.trashAfterDuplicateTrash = kept.nodeID
+        server.failingVisibilityReadsAfterDuplicateTrash = ExactDuplicateFinder.keptReadAttempts
+        var finder = finder()
+        finder.keptReadRetryDelay = .zero
+
+        do {
+            _ = try await finder.merge(group, keeping: kept)
+            XCTFail("The merge cannot tell whether the kept photo stayed")
+        } catch {}
+        XCTAssertEqual(state(of: duplicate), .trashed)
+        XCTAssertEqual(state(of: kept), .trashed)
+
+        _ = try await finder.duplicateGroups()
+
+        XCTAssertEqual(state(of: duplicate), .active, "one copy stays")
+        XCTAssertEqual(store.record(for: source)?.remoteLinkID, duplicate.nodeID, "the row moves back")
+        let stepsBefore = server.steps.count
+        _ = try await finder.duplicateGroups()
+        XCTAssertEqual(server.steps.count, stepsBefore, "the resolved merge is no longer pending")
+        XCTAssertEqual(restores, ["person restore \(duplicate.nodeID)"])
+        XCTAssertEqual(violations, [])
+    }
+
+    func testARestoreWhoseAnswerFailsAfterItMovedTheDuplicateBackStillMovesTheRowsBack() async throws {
+        let kept = server.seedLink(digest: digest("a"))
+        let duplicate = server.seedLink(digest: digest("a"))
+        let source = row("asset-1", names: duplicate.nodeID, contentHash: hash("a"))
+        indexServer()
+        let group = try await onlyGroup()
+        server.trashAfterDuplicateTrash = kept.nodeID
+        server.applyNextRestoreThenFail()
+
+        let outcome = try await finder.merge(group, keeping: kept)
+
+        XCTAssertEqual(outcome, .skipped(.keptLeftLibraryDuringMerge))
+        XCTAssertEqual(state(of: duplicate), .active, "one copy stays")
+        XCTAssertEqual(store.record(for: source)?.remoteLinkID, duplicate.nodeID, "the row moves back")
+        XCTAssertEqual(violations, [])
+    }
+
+    func testAPendingMergeRestoresTheKeptPhotoWhenNoDuplicateCanComeBack() async throws {
+        let kept = server.seedLink(digest: digest("a"))
+        let duplicate = server.seedLink(digest: digest("a"))
+        let source = row("asset-1", names: duplicate.nodeID, contentHash: hash("a"))
+        indexServer()
+        let group = try await onlyGroup()
+        server.failingVisibilityReadsAfterDuplicateTrash = ExactDuplicateFinder.keptReadAttempts
+        var finder = finder()
+        finder.keptReadRetryDelay = .zero
+        do {
+            _ = try await finder.merge(group, keeping: kept)
+            XCTFail("The merge cannot tell whether the kept photo stayed")
+        } catch {}
+        // The trashed duplicate leaves the trash for good, and another device trashes the kept photo meanwhile.
+        server.personEmptyTrash()
+        server.personTrash(kept)
+
+        _ = try await finder.duplicateGroups()
+
+        XCTAssertEqual(state(of: kept), .active, "the last copy comes back")
+        XCTAssertEqual(store.record(for: source)?.remoteLinkID, kept.nodeID, "the row names the active copy")
+        XCTAssertEqual(restores, ["person restore \(kept.nodeID)"])
+    }
+
+    func testAPendingMergeLeavesAKeptPhotoThatThePersonTrashedLongAfterTheMerge() async throws {
+        let kept = server.seedLink(digest: digest("a"))
+        let duplicate = server.seedLink(digest: digest("a"))
+        indexServer()
+        let group = try await onlyGroup()
+        server.failingVisibilityReadsAfterDuplicateTrash = ExactDuplicateFinder.keptReadAttempts
+        var finder = finder()
+        finder.keptReadRetryDelay = .zero
+        do {
+            _ = try await finder.merge(group, keeping: kept)
+            XCTFail("The merge cannot tell whether the kept photo stayed")
+        } catch {}
+        server.serverTime += 2 * 3600
+        server.personTrash(kept)
+
+        _ = try await finder.duplicateGroups()
+
+        XCTAssertEqual(state(of: kept), .trashed, "the person's deletion stays")
+        XCTAssertEqual(state(of: duplicate), .trashed)
+        XCTAssertEqual(restores, [])
+    }
+
+    /// The restores of the merge.
+    private var restores: [String] {
+        server.steps.map(\.action).filter { $0.hasPrefix("person restore") }
     }
 
     func testMergeAllReadsTheManifestAndTheFavoritesOnceAndTheServerStateOfEveryGroup() async throws {
@@ -1145,6 +1329,28 @@ private final class FavoritesGatedRemote: ExactDuplicateRemote, @unchecked Senda
         await gate.pass()
         return try await base.favoriteUIDs(among: uids)
     }
+}
+
+/// Holds the merge after its trash moved the photos, like a process that ends there.
+private final class TrashStoppingRemote: ExactDuplicateRemote, @unchecked Sendable {
+    let base: EditScenarioServer
+    let gate = FinderGate()
+
+    init(base: EditScenarioServer) { self.base = base }
+
+    func trashDuplicates(_ uids: [PhotoUID]) async throws {
+        try await base.trashDuplicates(uids)
+        await gate.pass()
+    }
+    func restoreDuplicates(_ uids: [PhotoUID]) async throws { try await base.restoreDuplicates(uids) }
+    func captureDates(of uids: [PhotoUID]) async -> [PhotoUID: Date] { await base.captureDates(of: uids) }
+    func nodeFacts(of uids: [PhotoUID]) async throws -> [PhotoUID: ExactDuplicateNodeFacts] {
+        try await base.nodeFacts(of: uids)
+    }
+    func ownPhotosVolumeID() async throws -> String { try await base.ownPhotosVolumeID() }
+    func activeUIDs(among uids: [PhotoUID]) async throws -> Set<PhotoUID> { try await base.activeUIDs(among: uids) }
+    func markFavorite(_ uids: [PhotoUID]) async throws { try await base.markFavorite(uids) }
+    func favoriteUIDs(among uids: [PhotoUID]) async throws -> Set<PhotoUID> { try await base.favoriteUIDs(among: uids) }
 }
 
 /// Leaves one photo out of every node read.
