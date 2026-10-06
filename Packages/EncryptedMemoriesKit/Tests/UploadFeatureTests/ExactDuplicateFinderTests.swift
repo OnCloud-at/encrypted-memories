@@ -276,6 +276,47 @@ final class ExactDuplicateFinderTests: XCTestCase {
         XCTAssertEqual(identities.reads, CountingIdentityStore.Reads(single: 0, batch: 2))
     }
 
+    func testTheRankingPageCarriesTheFactsAndTheSizeOfEachMemberFromTheSameReads() async throws {
+        let album = server.seedLink(digest: digest("a"), captureTime: date(5))
+        let manifest = server.seedLink(digest: digest("a"), captureTime: date(0))
+        let shared = server.seedLink(digest: digest("a"), captureTime: date(9))
+        try await server.markFavorite([album])
+        try await server.addPhotos([album], toOwnAlbum: "own-album")
+        server.share(shared)
+        server.setNodeSize(4_200, of: album)
+        server.setNodeSize(4_300, of: shared)
+        row("asset-1", names: manifest.nodeID, contentHash: hash("a"))
+        indexServer()
+        let identities = CountingIdentityStore(base: store)
+        let albums = CountingAlbums(base: server)
+        let finder = finder(identities: identities, albums: albums)
+        let group = try await onlyGroup()
+        let favoritesBefore = server.readCounts.favorites
+
+        let pages = PageCollector()
+        await finder.rankMembers(of: [group]) { await pages.add($0) }
+
+        let collected = await pages.pages
+        let page = try XCTUnwrap(collected.first)
+        let facts = try XCTUnwrap(page.facts[hash("a")])
+        XCTAssertEqual(
+            facts[album],
+            ExactDuplicateKeepFacts(
+                isInOwnAlbum: true, isFavorite: true, isNamedByManifest: false, captureDate: date(5)))
+        XCTAssertEqual(
+            facts[manifest],
+            ExactDuplicateKeepFacts(
+                isInOwnAlbum: false, isFavorite: false, isNamedByManifest: true, captureDate: date(0)))
+        XCTAssertEqual(facts[shared]?.isShared, true)
+        XCTAssertEqual(
+            page.memberByteSizes[hash("a")], [album: 4_200, shared: 4_300], "a node without a size has none")
+        XCTAssertEqual(server.readCounts.sharingMembers, 3, "still one node read for each member")
+        XCTAssertEqual(server.readCounts.albumMembers, 0)
+        XCTAssertEqual(server.readCounts.favorites - favoritesBefore, 1, "one favorites listing")
+        XCTAssertEqual(identities.reads, CountingIdentityStore.Reads(single: 0, batch: 1))
+        XCTAssertEqual(albums.reads, CountingAlbums.Reads(single: 0, batch: 0))
+    }
+
     func testASharedMemberIsKeptFirstAndAMissingNodeLeavesOnlyItsGroupInTheFallbackOrder() async throws {
         let album = server.seedLink(digest: digest("a"), captureTime: date(0))
         let shared = server.seedLink(digest: digest("a"), captureTime: date(5))
@@ -331,7 +372,10 @@ final class ExactDuplicateFinderTests: XCTestCase {
         let clock = ContinuousClock()
         let start = clock.now
         let load = Task { await model.load() }
-        for _ in 0..<5_000 where model.rankingLine == nil { try await Task.sleep(for: .milliseconds(1)) }
+        for _ in 0..<5_000 {
+            if await remote.gate.hasWaiters { break }
+            try await Task.sleep(for: .milliseconds(1))
+        }
         let published = clock.now
 
         XCTAssertEqual(model.content, .groups)
@@ -339,7 +383,7 @@ final class ExactDuplicateFinderTests: XCTestCase {
         let beforeRanking = server.readCounts
         XCTAssertEqual(beforeRanking.albumMembers, 0, "no node load before the groups show")
         XCTAssertEqual(beforeRanking.sharingMembers, 0, "no node load before the groups show")
-        XCTAssertNotNil(model.rankingLine)
+        XCTAssertNil(model.rankingLine, "the ranking of the shown pages runs silently")
         XCTAssertEqual(model.totalFreedBytes, 1_500_000, "the manifest knows every size before any node load")
 
         remote.gate.open()
@@ -1002,6 +1046,8 @@ private actor FinderGate {
     private var isOpen = false
     private var waiters: [CheckedContinuation<Void, Never>] = []
 
+    var hasWaiters: Bool { !waiters.isEmpty }
+
     func pass() async {
         guard !isOpen else { return }
         await withCheckedContinuation { waiters.append($0) }
@@ -1014,6 +1060,11 @@ private actor FinderGate {
         waiters.forEach { $0.resume() }
         waiters = []
     }
+}
+
+private actor PageCollector {
+    private(set) var pages: [ExactDuplicateRankingPage] = []
+    func add(_ page: ExactDuplicateRankingPage) { pages.append(page) }
 }
 
 private actor ProgressLog {

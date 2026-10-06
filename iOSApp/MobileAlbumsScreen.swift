@@ -52,7 +52,7 @@ struct MobileCollectionsScreen: View {
                 if let duplicates = model.duplicates {
                     Section(String(localized: "collections.section_utilities")) {
                         NavigationLink {
-                            MobileDuplicatesScreen(model: duplicates)
+                            MobileDuplicatesScreen(model: duplicates, feed: model.thumbnailFeed)
                         } label: {
                             MobileCollectionRow(systemImage: "square.on.square", title: L10n.string("duplicates.title"))
                         }

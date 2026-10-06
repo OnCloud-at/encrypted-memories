@@ -5897,43 +5897,66 @@
       }
     },
     "duplicates.merge_all_title %lld": {
-      "comment": "Confirmation title of Merge All. The count is the photos that move to Recently Deleted.",
+      "comment": "Confirmation title of Merge All. The count is every copy of every group, kept copies included.",
       "extractionState": "manual",
       "localizations": {
         "en": {
           "variations": {
             "plural": {
-              "one": { "stringUnit": { "state": "translated", "value": "Merge %lld Duplicate?" } },
-              "other": { "stringUnit": { "state": "translated", "value": "Merge %lld Duplicates?" } }
+              "one": { "stringUnit": { "state": "translated", "value": "Merge %lld Exact Copy?" } },
+              "other": { "stringUnit": { "state": "translated", "value": "Merge %lld Exact Copies?" } }
             }
           }
         },
         "de": {
           "variations": {
             "plural": {
-              "one": { "stringUnit": { "state": "translated", "value": "%lld Duplikat zusammenführen?" } },
-              "other": { "stringUnit": { "state": "translated", "value": "%lld Duplikate zusammenführen?" } }
+              "one": { "stringUnit": { "state": "translated", "value": "%lld exakte Kopie zusammenführen?" } },
+              "other": { "stringUnit": { "state": "translated", "value": "%lld exakte Kopien zusammenführen?" } }
             }
           }
         }
       }
     },
     "duplicates.merge_all_message %lld": {
+      "comment": "Confirmation message of Merge All. The count is the photos that move to Recently Deleted.",
       "extractionState": "manual",
       "localizations": {
         "en": {
           "variations": {
             "plural": {
-              "one": { "stringUnit": { "state": "translated", "value": "%lld photo moves to Recently Deleted. You can restore it there." } },
-              "other": { "stringUnit": { "state": "translated", "value": "%lld photos move to Recently Deleted. You can restore them there." } }
+              "one": { "stringUnit": { "state": "translated", "value": "The copies are identical. One photo of each group stays, with its favorites and albums. %lld photo moves to Recently Deleted." } },
+              "other": { "stringUnit": { "state": "translated", "value": "The copies are identical. One photo of each group stays, with its favorites and albums. %lld photos move to Recently Deleted." } }
             }
           }
         },
         "de": {
           "variations": {
             "plural": {
-              "one": { "stringUnit": { "state": "translated", "value": "%lld Foto wird in „Zuletzt gelöscht“ bewegt. Du kannst es dort wiederherstellen." } },
-              "other": { "stringUnit": { "state": "translated", "value": "%lld Fotos werden in „Zuletzt gelöscht“ bewegt. Du kannst sie dort wiederherstellen." } }
+              "one": { "stringUnit": { "state": "translated", "value": "Die Kopien sind identisch. Ein Foto jeder Gruppe bleibt, mit Favoriten und Alben. %lld Foto kommt in „Zuletzt gelöscht“." } },
+              "other": { "stringUnit": { "state": "translated", "value": "Die Kopien sind identisch. Ein Foto jeder Gruppe bleibt, mit Favoriten und Alben. %lld Fotos kommen in „Zuletzt gelöscht“." } }
+            }
+          }
+        }
+      }
+    },
+    "duplicates.merge_all_confirm %lld": {
+      "comment": "Confirming button of Merge All. The count is every copy of every group, kept copies included.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "variations": {
+            "plural": {
+              "one": { "stringUnit": { "state": "translated", "value": "Merge %lld Exact Copy" } },
+              "other": { "stringUnit": { "state": "translated", "value": "Merge %lld Exact Copies" } }
+            }
+          }
+        },
+        "de": {
+          "variations": {
+            "plural": {
+              "one": { "stringUnit": { "state": "translated", "value": "%lld exakte Kopie zusammenführen" } },
+              "other": { "stringUnit": { "state": "translated", "value": "%lld exakte Kopien zusammenführen" } }
             }
           }
         }
@@ -5961,26 +5984,55 @@
         }
       }
     },
-    "duplicates.group_count %lld": {
-      "comment": "Header above the groups of identical photos: the number of groups found.",
+    "duplicates.copy_count %lld": {
+      "comment": "Below the Duplicates title: every copy of every group shown, kept copies included.",
       "extractionState": "manual",
       "localizations": {
         "en": {
           "variations": {
             "plural": {
-              "one": { "stringUnit": { "state": "translated", "value": "%lld Group" } },
-              "other": { "stringUnit": { "state": "translated", "value": "%lld Groups" } }
+              "one": { "stringUnit": { "state": "translated", "value": "%lld identical copy" } },
+              "other": { "stringUnit": { "state": "translated", "value": "%lld identical copies" } }
             }
           }
         },
         "de": {
           "variations": {
             "plural": {
-              "one": { "stringUnit": { "state": "translated", "value": "%lld Gruppe" } },
-              "other": { "stringUnit": { "state": "translated", "value": "%lld Gruppen" } }
+              "one": { "stringUnit": { "state": "translated", "value": "%lld identische Kopie" } },
+              "other": { "stringUnit": { "state": "translated", "value": "%lld identische Kopien" } }
             }
           }
         }
+      }
+    },
+    "duplicates.viewer_filmstrip_label": {
+      "comment": "Spoken name of the filmstrip of the copies of a group in the photo viewer.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Identical copies" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Identische Kopien" } }
+      }
+    },
+    "duplicates.info_title": {
+      "comment": "Title of the explanation beside the copy count.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Identical Copies" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Identische Kopien" } }
+      }
+    },
+    "duplicates.info_message": {
+      "comment": "The explanation beside the copy count.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "These copies are identical down to the last byte, including location, date, and all other details. Merging keeps one photo with its favorites and albums and moves the other copies to Recently Deleted." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Diese Kopien sind bis aufs letzte Byte gleich, auch Ort, Datum und alle anderen Angaben. Zusammenführen behält ein Foto mit seinen Favoriten und Alben und legt die anderen Kopien in „Zuletzt gelöscht“." } }
+      }
+    },
+    "duplicates.dates %@ %@": {
+      "comment": "Group header when the copies have different capture days: the first and the last day.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "%1$@ and %2$@" } },
+        "de": { "stringUnit": { "state": "translated", "value": "%1$@ und %2$@" } }
       }
     },
     "duplicates.unchecked %lld": {
@@ -6013,10 +6065,10 @@
       }
     },
     "duplicates.ranking_title": {
-      "comment": "Title while the screen reads which photo of each group to keep.",
+      "comment": "Progress title while the screen reads the albums, favorites, and sharing state of the groups.",
       "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "Choosing Photos to Keep" } },
-        "de": { "stringUnit": { "state": "translated", "value": "Zu behaltende Fotos werden gewählt" } }
+        "en": { "stringUnit": { "state": "translated", "value": "Checking albums and favorites" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Alben und Favoriten werden geprüft" } }
       }
     },
     "duplicates.ranking_progress %@ %@": {
@@ -6035,26 +6087,19 @@
       }
     },
     "duplicates.group_frees %@": {
-      "comment": "Next to the copy count of one group: the space that merging the group frees. %@ is a formatted size.",
+      "comment": "Below one group: the space that merging the group frees. %@ is a formatted size.",
       "extractionState": "manual",
       "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "Frees %@" } },
-        "de": { "stringUnit": { "state": "translated", "value": "Gibt %@ frei" } }
-      }
-    },
-    "duplicates.freed_when_emptied": {
-      "comment": "Footer line below the space that merging all groups frees: merged duplicates wait in Recently Deleted.",
-      "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "Space is freed when Recently Deleted is emptied." } },
-        "de": { "stringUnit": { "state": "translated", "value": "Der Speicher wird frei, wenn „Zuletzt gelöscht“ geleert ist." } }
+        "en": { "stringUnit": { "state": "translated", "value": "Merge frees %@" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Zusammenführen gibt %@ frei" } }
       }
     },
     "duplicates.total_frees %@": {
-      "comment": "Below the group count: the space that merging all groups found so far frees. %@ is a formatted size.",
+      "comment": "Below the copy count: the space that merging all groups found so far frees. %@ is a formatted size.",
       "extractionState": "manual",
       "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "Merging all frees %@" } },
-        "de": { "stringUnit": { "state": "translated", "value": "Alle zusammenführen gibt %@ frei" } }
+        "en": { "stringUnit": { "state": "translated", "value": "Merging all frees %@ once Recently Deleted is emptied." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Alle zusammenführen gibt %@ frei, sobald „Zuletzt gelöscht“ geleert ist." } }
       }
     },
     "duplicates.still_checking": {
@@ -6092,6 +6137,13 @@
         "de": { "stringUnit": { "state": "translated", "value": "Duplikate werden geladen" } }
       }
     },
+    "duplicates.loading_message": {
+      "comment": "One sentence below the title while the Duplicates screen loads.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Looking for identical copies in your library." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Identische Kopien in deiner Mediathek werden gesucht." } }
+      }
+    },
     "duplicates.none_title": {
       "localizations": {
         "en": { "stringUnit": { "state": "translated", "value": "No Duplicates" } },
@@ -6100,8 +6152,8 @@
     },
     "duplicates.none_message": {
       "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "Your library has no exact copies." } },
-        "de": { "stringUnit": { "state": "translated", "value": "Deine Mediathek enthält keine exakten Kopien." } }
+        "en": { "stringUnit": { "state": "translated", "value": "Your library has no identical copies." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Deine Mediathek enthält keine identischen Kopien." } }
       }
     },
     "duplicates.load_failed": {
@@ -6111,23 +6163,98 @@
       }
     },
     "duplicates.member_kept": {
-      "comment": "Accessibility label of the photo that a merge keeps.",
+      "comment": "Spoken after the position of the copy that a merge keeps.",
       "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "Photo to keep" } },
-        "de": { "stringUnit": { "state": "translated", "value": "Foto, das bleibt" } }
+        "en": { "stringUnit": { "state": "translated", "value": "kept" } },
+        "de": { "stringUnit": { "state": "translated", "value": "bleibt" } }
       }
     },
-    "duplicates.member_duplicate": {
-      "comment": "Accessibility label of a photo that a merge moves to Recently Deleted.",
+    "duplicates.member_label %lld %lld": {
+      "comment": "Spoken label of one copy: its position in the group and the number of copies.",
+      "extractionState": "manual",
       "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "Duplicate" } },
-        "de": { "stringUnit": { "state": "translated", "value": "Duplikat" } }
+        "en": { "stringUnit": { "state": "translated", "value": "Copy %1$lld of %2$lld" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Kopie %1$lld von %2$lld" } }
       }
     },
-    "duplicates.member_hint": {
+    "duplicates.keep_this_copy": {
+      "comment": "Keeps this copy when the group is merged.",
       "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "Keeps this photo instead." } },
-        "de": { "stringUnit": { "state": "translated", "value": "Behält stattdessen dieses Foto." } }
+        "en": { "stringUnit": { "state": "translated", "value": "Keep This Copy" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Diese behalten" } }
+      }
+    },
+    "duplicates.kept": {
+      "comment": "Shown instead of Keep This Copy when a merge keeps this copy already.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Kept" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Bleibt" } }
+      }
+    },
+    "duplicates.badge_shared": {
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Shared with others" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Mit anderen geteilt" } }
+      }
+    },
+    "duplicates.badge_album": {
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "In one of your albums" } },
+        "de": { "stringUnit": { "state": "translated", "value": "In einem deiner Alben" } }
+      }
+    },
+    "duplicates.badge_favorite": {
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Favorite" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Favorit" } }
+      }
+    },
+    "duplicates.badge_backed_up_here": {
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Backed up from this device" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Von diesem Gerät gesichert" } }
+      }
+    },
+    "duplicates.stays_shared": {
+      "comment": "Why the checked copy stays.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Stays: shared with others" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Bleibt: mit anderen geteilt" } }
+      }
+    },
+    "duplicates.stays_album": {
+      "comment": "Why the checked copy stays.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Stays: in one of your albums" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Bleibt: in einem deiner Alben" } }
+      }
+    },
+    "duplicates.stays_favorite": {
+      "comment": "Why the checked copy stays.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Stays: favorite" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Bleibt: Favorit" } }
+      }
+    },
+    "duplicates.stays_backed_up_here": {
+      "comment": "Why the checked copy stays.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Stays: backed up from this device" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Bleibt: von diesem Gerät gesichert" } }
+      }
+    },
+    "duplicates.stays_oldest": {
+      "comment": "Why the checked copy stays.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Stays: oldest copy" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Bleibt: älteste Kopie" } }
+      }
+    },
+    "duplicates.stays_any": {
+      "comment": "No fact sets the checked copy apart.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Any copy can stay, they are identical." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Jede Kopie kann bleiben, sie sind identisch." } }
       }
     },
     "duplicates.kept_title %lld": {

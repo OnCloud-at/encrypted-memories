@@ -65,6 +65,8 @@ struct MainView: View {
     /// The Duplicates route of this account. Nil while the account cannot merge duplicates.
     @State private var duplicates: ExactDuplicatesModel?
     @State private var confirmsDuplicateMergeAll = false
+    /// The group of duplicates whose photos the open viewer shows, with the merge tools below them.
+    @State private var duplicateViewerGroup: DuplicateViewerGroup?
     @State private var mapClusterPageIndex = 0
     @State private var mapClusterRouteGeneration = 0
     @State private var routeScrollGeneration = 0
@@ -392,9 +394,11 @@ struct MainView: View {
                 MacDuplicatesView(
                     model: duplicates,
                     thumbnailFeed: feed,
-                    sourceAnalysisRevision: model.sourceAnalysisRevision,
                     topInset: topBarInset,
-                    confirmsMergeAll: $confirmsDuplicateMergeAll
+                    confirmsMergeAll: $confirmsDuplicateMergeAll,
+                    canOpen: { timelineModel.allLibraryItem(matching: $0) != nil },
+                    libraryRevision: timelineModel.wholeLibraryRevision,
+                    onOpen: { openDuplicate($0, inGroup: $1) }
                 )
                 .padding(.leading, leadingObstructionInset)
                 .animation(Self.sidebarAnimation, value: leadingObstructionInset)
@@ -444,7 +448,10 @@ struct MainView: View {
                     onPinchDismissBegan: beginInteractiveDismiss,
                     onPinchDismissChanged: updateInteractiveDismiss,
                     onPinchDismissEnded: { endInteractiveDismiss(shouldClose: $0) },
-                    isDismissing: zoom?.interactive == true
+                    isDismissing: zoom?.interactive == true,
+                    // A group of duplicates shows its photos in the filmstrip of the viewer.
+                    itemFilmstripLabel: viewerGroup(of: viewerModel) == nil
+                        ? nil : L10n.string("duplicates.viewer_filmstrip_label")
                 )
                 // Keep the viewer beside the floating sidebar. The inset matches the zoom overlay's content rect.
                 .padding(.leading, leadingObstructionInset)
@@ -1057,6 +1064,8 @@ struct MainView: View {
     }
 
     private func viewerReturnTarget(for vm: PhotoViewerModel) -> (item: PhotoItem, cell: CGRect)? {
+        // The Duplicates list covers the grid, so a viewer opened from it closes without a zoom into a hidden cell.
+        guard viewerGroup(of: vm) == nil else { return nil }
         let preferredProxy = activeGridProxy
         for item in vm.gridReturnCandidates {
             if let cell = preferredProxy.windowFrameForItem?(item.uid) { return (item, cell) }
@@ -1643,6 +1652,63 @@ struct MainView: View {
         }
     }
 
+    /// The merge tools of a group of duplicates in the viewer toolbar, as one glass group before the photo actions:
+    /// Keep This Copy for the photo shown, and Merge, which merges the group with the photo shown as kept.
+    @ToolbarContentBuilder
+    private func duplicateViewerToolbar(_ viewerModel: PhotoViewerModel) -> some ToolbarContent {
+        if let duplicates, let group = viewerGroup(of: viewerModel) {
+            let uid = viewerModel.baseCurrent.uid
+            let keepTitle = duplicates.keepTitle(for: uid, inGroup: group.groupID)
+            let mergeTitle = duplicates.mergeTitle
+            ToolbarItemGroup(placement: .primaryAction) {
+                Button {
+                    duplicates.keep(uid, inGroup: group.groupID)
+                } label: {
+                    Label(keepTitle, systemImage: duplicates.keepSymbol(for: uid, inGroup: group.groupID))
+                        .labelStyle(.iconOnly)
+                }
+                .help(keepTitle)
+                .accessibilityLabel(keepTitle)
+                .disabled(!duplicates.canKeep(uid, inGroup: group.groupID))
+                .accessibilityIdentifier("duplicates.viewer.keep")
+
+                Button {
+                    closePhoto()
+                    Task { await duplicates.merge(groupID: group.groupID) }
+                } label: {
+                    Label(mergeTitle, systemImage: duplicates.mergeSymbol)
+                        .labelStyle(.iconOnly)
+                }
+                .help(mergeTitle)
+                .accessibilityLabel(mergeTitle)
+                .disabled(!duplicates.canMerge(groupID: group.groupID))
+                .accessibilityIdentifier("duplicates.viewer.merge")
+            }
+            ToolbarSpacer(.fixed, placement: .primaryAction)
+        }
+    }
+
+    /// Opens `uid` in the viewer with the other photos of its group of duplicates, without the zoom from a grid cell.
+    private func openDuplicate(_ uid: PhotoUID, inGroup groupID: String) {
+        guard let members = duplicates?.group(withID: groupID)?.members else { return }
+        let found = Dictionary(
+            timelineModel.allLibraryItems(matching: Set(members)).map { ($0.uid, $0) },
+            uniquingKeysWith: { first, _ in first })
+        guard let opened = duplicates?.viewerItems(opening: uid, inGroup: groupID, item: { found[$0] }) else { return }
+        let viewer = makeViewer(opened.items[opened.index], opened.items)
+        viewerFollowsReplacements = false
+        zoom = nil
+        viewerModel = viewer
+        duplicateViewerGroup = DuplicateViewerGroup(groupID: groupID, viewer: viewer)
+    }
+
+    /// The group of duplicates that `viewer` shows. Nil for a viewer opened anywhere else, also after the viewer of a
+    /// group closed and a new viewer took its memory.
+    private func viewerGroup(of viewer: PhotoViewerModel) -> DuplicateViewerGroup? {
+        guard let group = duplicateViewerGroup, group.viewer === viewer else { return nil }
+        return group
+    }
+
     /// Builds the Duplicates route for this account, or leaves it when the account cannot merge duplicates.
     private func installDuplicates() async {
         duplicates = facade.exactDuplicates.map { finder in
@@ -1690,6 +1756,8 @@ struct MainView: View {
             do {
                 try await backend.trash(uids)
                 await timelineModel.commitTrash(items)
+                // A copy trashed in the viewer of a group, or anywhere else, leaves the Duplicates screen at once.
+                duplicates?.didTrashElsewhere(uids)
                 if mapClusterPresentation != nil { await mapClusterModel.commitTrash(items) }
                 await OfflineLibraryManager.shared.reconcileLocations(
                     items: timelineModel.wholeLibraryItemsForViewer,
@@ -1949,6 +2017,12 @@ struct MainView: View {
             let presentation = timelineModel.pendingPresentation
             viewerModel?.followReplacements(presentation.replacements, in: presentation.snapshot)
         }
+        // Every path that closes or replaces the viewer of a group ends its group.
+        .onChange(of: viewerModel.map(ObjectIdentifier.init)) { _, _ in
+            if let group = duplicateViewerGroup, group.viewer == nil || group.viewer !== viewerModel {
+                duplicateViewerGroup = nil
+            }
+        }
     }
 
     private func updateSearchActivity() {
@@ -2172,6 +2246,7 @@ struct MainView: View {
                 .padding(.horizontal, 16)
                 // The system toolbar supplies the single glass background for the principal item.
             }
+            duplicateViewerToolbar(viewerModel)
             ToolbarItemGroup(placement: .primaryAction) {
                 Button {
                     viewerModel.toggleInfo()
@@ -2749,4 +2824,11 @@ private extension View {
     func applying<Transformed: View>(_ transform: (Self) -> Transformed) -> Transformed {
         transform(self)
     }
+}
+
+/// The group of duplicates that one viewer shows. It holds the viewer weakly and compares it by identity, so a viewer
+/// opened elsewhere never shows the merge tools, even when it reuses the memory of a closed one.
+private struct DuplicateViewerGroup {
+    let groupID: String
+    weak var viewer: PhotoViewerModel?
 }

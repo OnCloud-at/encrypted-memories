@@ -472,6 +472,8 @@ final class MobileLibraryModel {
         }
         guard !split.remote.isEmpty else { return }
         try await removeFromVisibleLibrary(Set(split.remote)) { try await backend.trash(split.remote) }
+        // A copy trashed in the viewer of a group, or anywhere else, leaves the Duplicates screen at once.
+        duplicates?.didTrashElsewhere(split.remote)
     }
 
     private func offerUndo(forDeleted uids: [PhotoUID]) {
@@ -507,6 +509,8 @@ final class MobileLibraryModel {
                 onProgress: onProgress
             )
         }
+        // The main photo of a series can be a copy in a group of duplicates; it leaves the Duplicates screen at once.
+        duplicates?.didTrashElsewhere(seriesUIDs)
         // The standalone copies are new library photos; the refresh brings them into the timeline.
         refreshAfterLocalUpload()
     }

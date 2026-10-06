@@ -599,6 +599,31 @@ struct ThumbnailFeedCoreTests {
         #expect(await loader.recordedPriorities == [.visibleNow])
     }
 
+    @Test func visibleDecodedLoadsTheShownThumbnailIntoTheSharedDecodedTier() async throws {
+        let uid = Self.uid("visible-decoded")
+        let loader = RecordingLoader(payloads: [uid: Self.pngData(width: 24, height: 24)], delayMilliseconds: 0)
+        let feed = ThumbnailFeedCore(
+            cache: Self.cache("visible-decoded"), loader: loader, configuration: Self.configuration())
+
+        #expect(await feed.visibleDecoded(for: uid) != nil)
+        #expect(feed.memoryDecoded(for: uid) != nil, "the image stays in the bounded decoded tier, not in a view")
+    }
+
+    @Test func visibleDecodedStopsWithoutAnImageWhenTheViewLeaves() async throws {
+        let uid = Self.uid("visible-decoded-cancel")
+        let loader = RecordingLoader(payloads: [:], delayMilliseconds: 0)
+        let feed = ThumbnailFeedCore(
+            cache: Self.cache("visible-decoded-cancel"), loader: loader, configuration: Self.configuration())
+        let load = Task { await feed.visibleDecoded(for: uid) }
+        try await Task.sleep(for: .milliseconds(100))
+        let start = ContinuousClock.now
+
+        load.cancel()
+
+        #expect(await load.value == nil)
+        #expect(start.duration(to: .now) < .milliseconds(500), "the backoff ends with the view")
+    }
+
     @Test func concurrentDirectRequestsForSameUIDShareOneLoaderCall() async throws {
         let uid = Self.uid("direct-coalesced")
         let loader = RecordingLoader(

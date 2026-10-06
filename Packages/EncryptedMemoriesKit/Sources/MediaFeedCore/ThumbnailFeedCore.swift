@@ -3875,3 +3875,42 @@ private final class ImagesAvailableWakeBox: @unchecked Sendable {
         for callback in current { callback() }
     }
 }
+
+extension ThumbnailFeedCore {
+    private static let visibleRetryFirstDelay: Duration = .seconds(1)
+    private static let visibleRetryLongestDelay: Duration = .seconds(16)
+
+    /// Loads one thumbnail for a view that is on screen into the decoded tier, and keeps trying until it exists.
+    ///
+    /// A single request can return no image while the bytes are still on the way. This asks with visible priority,
+    /// then waits for the arrival wake or a bounded backoff, whichever comes first, and asks again. It returns nil
+    /// for a photo that has no thumbnail, and ends when the caller's task is cancelled, for example when the view
+    /// leaves the screen. Every platform loads its on-screen thumbnails through this one loop.
+    public nonisolated func visibleDecoded(for uid: PhotoUID) async -> DecodedThumbnail? {
+        var delay = Self.visibleRetryFirstDelay
+        while !Task.isCancelled {
+            // The wait starts before the request, so an arrival during the request already ends it.
+            let pause = delay
+            let wait = Task<Void, Never> { try? await Task.sleep(for: pause) }
+            let registration = setOnCacheArrivalWake { wait.cancel() }
+            defer { registration.end() }
+            _ = await requestPriority(uid, priority: .visibleNow)
+            if let image = await decoded(for: uid) {
+                wait.cancel()
+                return image
+            }
+            // The feed proved that this photo has no thumbnail. Another request cannot change that.
+            if isKnownUnfetchable(uid) {
+                wait.cancel()
+                return nil
+            }
+            await withTaskCancellationHandler {
+                _ = await wait.value
+            } onCancel: {
+                wait.cancel()
+            }
+            delay = min(delay * 2, Self.visibleRetryLongestDelay)
+        }
+        return nil
+    }
+}

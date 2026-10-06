@@ -403,7 +403,8 @@ private struct MobileMainTabView: View {
                     libraryModel: libraryModel,
                     viewerRouter: viewerRouter,
                     showsInfoInitially: presentation.showsInfoInitially,
-                    followsLibraryReplacements: presentation.followsLibraryReplacements
+                    followsLibraryReplacements: presentation.followsLibraryReplacements,
+                    duplicateGroup: presentation.duplicateGroup
                 )
             }
             .onChange(of: networkMonitor.didRecentlyRestoreConnection) { _, restored in

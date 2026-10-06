@@ -299,7 +299,11 @@ let package = Package(
             ]),
         .testTarget(
             name: "UploadFeatureTests",
-            dependencies: ["UploadCore", "UploadFeature", "PhotosCore", "PhotoLibraryBackupAdapter"]),
+            dependencies: [
+                "UploadCore", "UploadFeature", "PhotosCore", "PhotoLibraryBackupAdapter",
+                // The Duplicates screenshots render the shared viewer with its merge tools.
+                "PhotoViewerFeature", "MediaCache", "MediaByteCache",
+            ]),
         .target(
             name: "MapCore", dependencies: ["PhotosCore", "MediaLocationCore"],
             swiftSettings: disableDynamicActorIsolation),
