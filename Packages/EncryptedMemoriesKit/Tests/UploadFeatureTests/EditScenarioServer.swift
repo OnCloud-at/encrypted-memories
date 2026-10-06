@@ -136,12 +136,13 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
     func applyNextRestoreThenFail() { lock.withLock { failRestoreAfterApplying = true } }
     private var failRestoreAfterApplying = false
 
-    /// The server clock in seconds. Every trash of a person or a merge stamps it on the trashed link.
+    /// The server clock in seconds since 1970, from the device clock at the start. Every trash of a person or a merge
+    /// stamps it on the trashed link.
     var serverTime: Int64 {
         get { lock.withLock { clock } }
         set { lock.withLock { clock = newValue } }
     }
-    private var clock: Int64 = 1_700_000_000
+    private var clock = Int64(Date().timeIntervalSince1970)
 
     /// The next favorites read fails.
     func failNextFavoritesRead() { lock.withLock { failFavoritesRead = true } }

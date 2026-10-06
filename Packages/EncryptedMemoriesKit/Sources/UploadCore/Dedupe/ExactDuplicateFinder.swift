@@ -557,9 +557,10 @@ public struct ExactDuplicateFinder: Sendable {
         /// The trashable members with their moves, as `mergeJournal` records them.
         var members: [ExactDuplicateMergeIntent.Member] = []
 
-        var intent: ExactDuplicateMergeIntent {
+        func intent(trashedAt: Int64) -> ExactDuplicateMergeIntent {
             ExactDuplicateMergeIntent(
-                volumeID: volumeID, kept: kept.nodeID, contentHash: contentHash, hashKeyEpoch: epoch, members: members)
+                volumeID: volumeID, kept: kept.nodeID, contentHash: contentHash, hashKeyEpoch: epoch, members: members,
+                trashedAt: trashedAt)
         }
     }
 
@@ -660,6 +661,15 @@ public struct ExactDuplicateFinder: Sendable {
         _ writes: [(index: Int, plan: PlannedMerge)], favorites: Set<PhotoUID>, covers: [String: String],
         into results: inout [Result<ExactDuplicateMergeOutcome, any Error>?]
     ) async {
+        // The trash needs its record, so the merge writes nothing while the journal cannot take one.
+        switch mergeJournal.prepareForWrites() {
+        case .ready: break
+        case .replacedUnreadable: log("[Duplicates] the unreadable merge journal moved aside; a new one starts")
+        case .unavailable:
+            let error = UploadError.backend("Duplicate merge journal could not be updated")
+            for (index, _) in writes { results[index] = .failure(error) }
+            return
+        }
         var trashing: [(index: Int, plan: PlannedMerge)] = []
         for (index, plan) in writes where !Task.isCancelled {
             do {
@@ -686,7 +696,8 @@ public struct ExactDuplicateFinder: Sendable {
         guard !trashing.isEmpty, !Task.isCancelled else { return }
         // The record survives a failed answer and the end of the process, so a later scan or merge restores a copy of
         // a group whose kept photo left the library during the trash.
-        let intents = trashing.map(\.plan.intent)
+        let trashedAt = Int64(Date().timeIntervalSince1970)
+        let intents = trashing.map { $0.plan.intent(trashedAt: trashedAt) }
         mergesInFlight.insert(intents)
         defer { mergesInFlight.remove(intents) }
         guard mergeJournal.record(intents) else {
@@ -707,27 +718,36 @@ public struct ExactDuplicateFinder: Sendable {
         // The carry-over can have tagged a kept photo as favorite.
         rankingContext.invalidate()
         var restored = false
-        for (index, plan) in trashing {
-            do {
-                switch try await resolve(plan.intent, restored: &restored) {
-                case .restored:
-                    results[index] = .success(.skipped(.keptLeftLibraryDuringMerge))
-                case .kept(let duplicatesLeft):
-                    // Devices that merge the same group trash the same links. The trash of a device that comes second
-                    // can fail for links that are in the trash already, while the group holds its outcome.
-                    let merged = ExactDuplicateMergeOutcome.merged(
-                        kept: plan.kept, trashed: plan.trashable, keptDuplicates: plan.keptDuplicates)
-                    results[index] = trashError.flatMap { duplicatesLeft ? .failure($0) : nil } ?? .success(merged)
-                }
-            } catch {
+        let checks: [String: Result<MergeResolution, any Error>]
+        do {
+            checks = try await resolve(intents, restored: &restored, stopAtFirstFailure: false)
+        } catch {
+            for (index, _) in trashing { results[index] = .failure(trashError ?? error) }
+            return
+        }
+        for ((index, plan), intent) in zip(trashing, intents) {
+            switch checks[intent.key] ?? .failure(CancellationError()) {
+            case .success(.restored):
+                results[index] = .success(.skipped(.keptLeftLibraryDuringMerge))
+            case .success(.kept(let duplicatesLeft)):
+                // Devices that merge the same group trash the same links. The trash of a device that comes second can
+                // fail for links that are in the trash already, while the group holds its outcome.
+                let merged = ExactDuplicateMergeOutcome.merged(
+                    kept: plan.kept, trashed: plan.trashable, keptDuplicates: plan.keptDuplicates)
+                results[index] = trashError.flatMap { duplicatesLeft ? .failure($0) : nil } ?? .success(merged)
+            case .success(.gone):
+                results[index] = .failure(
+                    trashError ?? UploadError.backend("No copy of the merged duplicates is on the server"))
+            case .failure(let error):
                 results[index] = .failure(trashError ?? error)
             }
         }
         if restored { await resolver.remoteMainsChangedHere() }
     }
 
-    /// Checks the merges that a failed trash, a failed read, or the end of the process left in `mergeJournal`. A
-    /// merge whose read fails stays for the next scan or merge.
+    /// Checks the merges that a failed trash, a failed read, or the end of the process left in `mergeJournal`, with one
+    /// read of all their links. A failed read ends the check, so an offline scan waits for one read and its retries; the
+    /// merges then stay for the next scan or merge.
     private func resolvePendingMerges() async {
         guard let pending = mergeJournal.pendingMerges() else {
             log("[Duplicates] the merge journal cannot be read")
@@ -736,12 +756,13 @@ public struct ExactDuplicateFinder: Sendable {
         let waiting = pending.filter { !mergesInFlight.contains($0) }
         guard !waiting.isEmpty else { return }
         var restored = false
-        for intent in waiting where !Task.isCancelled {
-            do {
-                _ = try await resolve(intent, restored: &restored)
-            } catch {
+        do {
+            let checks = try await resolve(waiting, restored: &restored, stopAtFirstFailure: true)
+            if checks.values.contains(where: { (try? $0.get()) == nil }) {
                 log("[Duplicates] a merge waits for the check of its kept photo")
             }
+        } catch {
+            log("[Duplicates] \(waiting.count) merges wait for the check of their kept photos")
         }
         if restored { await resolver.remoteMainsChangedHere() }
     }
@@ -753,24 +774,58 @@ public struct ExactDuplicateFinder: Sendable {
         case kept(duplicatesLeft: Bool)
         /// The kept photo left the library during the merge. The duplicates are back, and their rows moved back.
         case restored
+        /// The server knows none of the links of the merge anymore. Nothing is left to restore.
+        case gone
     }
 
     /// A trash of the kept photo this many server seconds after the trash of the merge is a later deletion, for
     /// example by the person, and no part of a merge on another device. The merge leaves it in the trash.
     static let concurrentTrashWindow: Int64 = 3600
 
-    /// Reads the kept photo of `intent` after the trash and removes `intent` from `mergeJournal` once the group has an
-    /// active copy. When the kept photo left the library meanwhile, restores the duplicates that are not in the library
-    /// and moves their rows back. When none of them comes back, restores the kept photo. `restored` turns true once a
-    /// restore was needed. Throws while no read confirms an active copy; `intent` then stays.
-    private func resolve(_ intent: ExactDuplicateMergeIntent, restored: inout Bool) async throws -> MergeResolution {
+    /// Checks `intents` with one read of all their links, and removes the finished ones from `mergeJournal` with one
+    /// write. Returns the check of each intent by key; an intent without a check did not run. Throws when the read
+    /// fails, and every intent stays. `stopAtFirstFailure` ends the checks after the first one that throws.
+    private func resolve(
+        _ intents: [ExactDuplicateMergeIntent], restored: inout Bool, stopAtFirstFailure: Bool
+    ) async throws -> [String: Result<MergeResolution, any Error>] {
+        let links = Set(intents.flatMap { [$0.kept] + $0.members.map(\.link) }).sorted()
+        let visibility = try await readAfterTrash(links)
+        var checks: [String: Result<MergeResolution, any Error>] = [:]
+        var finished: [ExactDuplicateMergeIntent] = []
+        for intent in intents where !Task.isCancelled {
+            do {
+                checks[intent.key] = .success(try await resolve(intent, visibility: visibility, restored: &restored))
+                finished.append(intent)
+            } catch {
+                checks[intent.key] = .failure(error)
+                if stopAtFirstFailure { break }
+            }
+        }
+        if !finished.isEmpty, !mergeJournal.clear(finished) {
+            log("[Duplicates] the merge journal could not be updated; the next scan checks the merges again")
+        }
+        return checks
+    }
+
+    /// Checks the kept photo of `intent` in `visibility`, which was read after the trash. When the kept photo left the
+    /// library meanwhile, restores the duplicates that are not in the library and moves their rows back. When none of
+    /// them comes back, restores the kept photo. `restored` turns true once a restore was needed. Throws while no read
+    /// confirms an active copy.
+    private func resolve(
+        _ intent: ExactDuplicateMergeIntent, visibility read: [String: RemoteLinkVisibility], restored: inout Bool
+    ) async throws -> MergeResolution {
         let kept = intent.kept
         let trashed = intent.members.map(\.link)
-        var visibility = try await readAfterTrash([kept] + trashed)
+        var visibility = read
+        guard ([kept] + trashed).contains(where: { visibility[$0] != nil }) else {
+            log("[Duplicates] every photo of a merge left the server; its check ends")
+            return .gone
+        }
         // A merge on another device can keep another member and trash `kept` at the same moment. Each device reads
         // `kept` after its own trash, so at least one of them sees the other trash and restores its duplicates.
-        if visibility[kept]?.isActiveMain == true || isLaterDeletion(of: kept, in: visibility, after: trashed) {
-            _ = mergeJournal.clear([intent])
+        if visibility[kept]?.isActiveMain == true
+            || isLaterDeletion(of: kept, in: visibility, after: trashed, trashedAt: intent.trashedAt)
+        {
             return .kept(duplicatesLeft: trashed.contains { visibility[$0]?.isActive == true })
         }
         restored = true
@@ -783,7 +838,6 @@ public struct ExactDuplicateFinder: Sendable {
             guard try await readAfterTrash([kept])[kept]?.isActiveMain == true else {
                 throw UploadError.backend("No copy of the merged duplicates is in the library")
             }
-            _ = mergeJournal.clear([intent])
             return .kept(duplicatesLeft: false)
         }
         // The rows move back to the restored duplicates. Rows that named `kept` before the merge move to the first
@@ -796,17 +850,17 @@ public struct ExactDuplicateFinder: Sendable {
         guard identities.rebindRemoteLinks(movesBack, hashKeyEpoch: intent.hashKeyEpoch) else {
             throw UploadError.backend("Upload identity manifest could not be updated")
         }
-        _ = mergeJournal.clear([intent])
         return .restored
     }
 
-    /// True when the server trashed `kept` more than `concurrentTrashWindow` after the trashed members. Without both
-    /// times, the merge cannot tell and restores a copy.
+    /// True when the server trashed `kept` more than `concurrentTrashWindow` after the trash of the merge: the latest
+    /// trash time of the members, or `trashedAt` when the server no longer knows them. Without both times, the merge
+    /// cannot tell and restores a copy.
     private func isLaterDeletion(
-        of kept: String, in visibility: [String: RemoteLinkVisibility], after trashed: [String]
+        of kept: String, in visibility: [String: RemoteLinkVisibility], after trashed: [String], trashedAt: Int64?
     ) -> Bool {
         guard let keptTrash = visibility[kept]?.trashTime,
-            let mergeTrash = trashed.compactMap({ visibility[$0]?.trashTime }).max()
+            let mergeTrash = trashed.compactMap({ visibility[$0]?.trashTime }).max() ?? trashedAt
         else { return false }
         return keptTrash > mergeTrash + Self.concurrentTrashWindow
     }

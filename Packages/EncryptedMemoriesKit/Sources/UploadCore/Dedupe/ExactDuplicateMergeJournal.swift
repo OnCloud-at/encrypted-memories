@@ -16,13 +16,27 @@ public struct ExactDuplicateMergeIntent: Sendable, Equatable, Codable {
     public let contentHash: String
     public let hashKeyEpoch: String
     public let members: [Member]
+    /// The device clock at the trash, in seconds since 1970. It dates the trash of the merge when the server no longer
+    /// knows the trashed members, for example after the person emptied the trash. Nil in records without the time.
+    public let trashedAt: Int64?
 
     /// One intent for each group: the kept photo and the content of the group.
     var key: String { kept + "|" + contentHash }
 }
 
+/// Whether a merge can record its trash.
+public enum ExactDuplicateMergeJournalState: Sendable, Equatable {
+    case ready
+    /// The journal file could not be read. It moved aside under another name, and a new file starts.
+    case replacedUnreadable
+    /// The journal can be neither read nor written. A merge must not start its writes.
+    case unavailable
+}
+
 /// The merges that wait for the check of their kept photo.
 public protocol ExactDuplicateMergeJournaling: Sendable {
+    /// Makes sure that the next `record` can succeed, before the merge writes anything else.
+    func prepareForWrites() -> ExactDuplicateMergeJournalState
     /// Nil when the journal cannot be read.
     func pendingMerges() -> [ExactDuplicateMergeIntent]?
     /// Records `intents` in place of earlier intents of the same groups. False when the write failed.
@@ -46,6 +60,24 @@ public final class ExactDuplicateMergeJournalFileStore: ExactDuplicateMergeJourn
 
     public func pendingMerges() -> [ExactDuplicateMergeIntent]? {
         Self.lock.withLock { read() }
+    }
+
+    /// Moves an unreadable file aside, so a damaged file never blocks every later merge. The moved file stays in the
+    /// account folder for diagnostics.
+    public func prepareForWrites() -> ExactDuplicateMergeJournalState {
+        Self.lock.withLock {
+            var state = ExactDuplicateMergeJournalState.ready
+            if read() == nil {
+                let aside = url.deletingLastPathComponent().appendingPathComponent(
+                    "exact-duplicate-merge-intents-v1.unreadable-\(UUID().uuidString).json")
+                guard (try? FileManager.default.moveItem(at: url, to: aside)) != nil else { return .unavailable }
+                state = .replacedUnreadable
+            }
+            guard FileManager.default.isWritableFile(atPath: url.deletingLastPathComponent().path) else {
+                return .unavailable
+            }
+            return state
+        }
     }
 
     public func record(_ intents: [ExactDuplicateMergeIntent]) -> Bool {
