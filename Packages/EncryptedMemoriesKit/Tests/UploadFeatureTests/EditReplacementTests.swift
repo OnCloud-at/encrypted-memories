@@ -642,6 +642,75 @@ final class EditReplacementTests: XCTestCase {
         XCTAssertEqual(Set(journal.entry(for: asset).retired), ["old", "old-video"])
     }
 
+    func testAnUnprovenEarlierEditWithoutRelatedFilesStaysWhenNoFileHoldsItsBytes() async throws {
+        // An earlier edit without related files, adopted again after a reinstall: only its main file holds the render.
+        let old = PhotoUID(volumeID: "vol", nodeID: "old")
+        try journal.addSuperseded(old, for: asset)
+        let remote = FakeEditReplacementRemote()
+        remote.active = [old, new]
+        checker.compoundsByMainLinkID["old"] = compound("old", related: [:])
+        checker.compoundsByMainLinkID["new"] = compound("new", related: ["new-original": "original"])
+
+        let outcome = try await makeReplacement(remote).replaceSuperseded(
+            of: asset, with: new, edited: true, holdsOriginal: true)
+
+        XCTAssertEqual(outcome, .kept)
+        XCTAssertTrue(remote.trashCalls.isEmpty, "the trash would take the only copy of the earlier edit along")
+    }
+
+    func testAFailedCompoundReadOfAnUnprovenPhotoRetriesTheReplacementLater() async throws {
+        let old = PhotoUID(volumeID: "vol", nodeID: "old")
+        try journal.addSuperseded(old, for: asset)
+        let remote = FakeEditReplacementRemote()
+        remote.active = [old, new]
+        checker.compoundsByMainLinkID["old"] = compound("old", related: ["old-video": "video"])
+        checker.compoundsByMainLinkID["new"] = compound(
+            "new", related: ["new-original": "old", "new-video": "video"])
+        checker.compoundErrorsByMainLinkID["old"] = [
+            UploadError.transport(code: NSURLErrorTimedOut, message: "offline"),
+            UploadError.retryableBackend(code: 503, message: "unavailable"),
+        ]
+
+        for _ in 0..<2 {
+            do {
+                try await makeReplacement(remote).replaceSuperseded(
+                    of: asset, with: new, edited: true, holdsOriginal: true)
+                XCTFail("a transient failure retries the replacement")
+            } catch {}
+            XCTAssertEqual(journal.entry(for: asset).superseded, [old], "the earlier photo still waits")
+            XCTAssertTrue(remote.trashCalls.isEmpty)
+        }
+
+        let outcome = try await makeReplacement(remote).replaceSuperseded(
+            of: asset, with: new, edited: true, holdsOriginal: true)
+        XCTAssertEqual(outcome, .replaced(retiredAny: true))
+        XCTAssertEqual(remote.trashCalls, [[old]])
+    }
+
+    func testAnIncompleteOrFinalCompoundAnswerKeepsAnUnprovenPhoto() async throws {
+        let old = PhotoUID(volumeID: "vol", nodeID: "old")
+        let remote = FakeEditReplacementRemote()
+        remote.active = [old, new]
+        checker.compoundsByMainLinkID["new"] = compound(
+            "new", related: ["new-original": "old", "new-video": "video"])
+
+        // The server state is incomplete: no compound.
+        try journal.addSuperseded(old, for: asset)
+        let incomplete = try await makeReplacement(remote).replaceSuperseded(
+            of: asset, with: new, edited: true, holdsOriginal: true)
+        XCTAssertEqual(incomplete, .kept)
+        XCTAssertTrue(journal.entry(for: asset).superseded.isEmpty)
+
+        // A failure that a retry cannot fix.
+        try journal.addSuperseded(old, for: asset)
+        checker.compoundErrorsByMainLinkID["old"] = [UploadError.backend("The name cannot be decrypted")]
+        let final = try await makeReplacement(remote).replaceSuperseded(
+            of: asset, with: new, edited: true, holdsOriginal: true)
+        XCTAssertEqual(final, .kept)
+        XCTAssertTrue(journal.entry(for: asset).superseded.isEmpty)
+        XCTAssertTrue(remote.trashCalls.isEmpty)
+    }
+
     func testOtherBytesOfAPhotoThatWasNeverEditedReplaceNothing() async throws {
         let (_, remote) = supersede("old")
 

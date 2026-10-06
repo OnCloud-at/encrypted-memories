@@ -288,8 +288,9 @@ public struct EditedPhotoReplacement: Sendable {
         return try await remote.activeUIDs(among: [replacement]).contains(replacement) ? .waiting : .replacementGone
     }
 
-    /// The compound of a main photo, or nil when the read fails or the server state is incomplete. The photo then
-    /// stays, so a read that fails for good never blocks the upload.
+    /// The compound of a main photo, or nil when the server state is incomplete or the read fails for good. The photo
+    /// then stays, so such a read never blocks the upload. A network or temporary service failure throws, so the
+    /// backup retries the whole replacement later, like a failed read of a proven photo.
     private func readCompound(ofMainLink linkID: String) async throws -> UploadRemoteCompound? {
         do {
             return try await relations.compound(ofMainLink: linkID)
@@ -297,6 +298,8 @@ public struct EditedPhotoReplacement: Sendable {
             throw CancellationError()
         } catch {
             try Task.checkCancellation()
+            if case UploadError.retryableBackend = error { throw error }
+            if BackupSyncRunner.isTransientNetwork(error) { throw error }
             return nil
         }
     }
