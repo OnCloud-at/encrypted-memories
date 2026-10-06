@@ -306,7 +306,8 @@ public struct PhotoLibraryCatalogSync: Sendable {
 
     /// Runs once per catalog. An earlier build can store an entry that lists a late rendered file next to a backup
     /// with the original as main photo; the scan then sees no change. This pass offers each stored edit that lists its
-    /// rendered file to `reopenBackedUpRevisions` and queues the revisions it re-opens. It reads only local stores.
+    /// rendered file to `reopenBackedUpRevisions` and queues the revisions it re-opens. It reads local stores, and the
+    /// remote proof only for a photo that an earlier build settled through it.
     /// The flag is set only after the last page, so a cancelled pass starts again.
     public func reconcileLateRendersOnce(engine: any UploadBackupCandidateEnqueueing) async throws {
         guard !store.hasReconciledLateRenders() else { return }

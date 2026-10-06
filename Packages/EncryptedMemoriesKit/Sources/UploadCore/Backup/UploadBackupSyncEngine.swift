@@ -208,15 +208,19 @@ public actor UploadBackupSyncEngine: UploadBackupCandidateEnqueueing {
 
     /// A complete revision becomes pending work again; its settled queue row goes away, so the next `enqueueBatch`
     /// queues the upload. A revision whose backup already holds the late file as main file, or that has no state,
-    /// keeps the usual classification.
+    /// keeps the usual classification. So does a revision that the remote proof settled on this device and still
+    /// settles.
     @discardableResult
     public func reopenBackedUpRevisions(
         _ reopenings: [UploadBackupReopening]
     ) async throws -> [UploadBackupAssetCandidate] {
         var pending: [UploadBackupAssetCandidate] = []
         let kept = Set(try withoutExcludedSources(reopenings.map(\.candidate)).map(\.snapshot.source))
-        for reopening in reopenings where kept.contains(reopening.candidate.snapshot.source) {
+        let offered = reopenings.filter { kept.contains($0.candidate.snapshot.source) }
+        let proven = try await settledByRemoteProof(offered)
+        for reopening in offered {
             let snapshot = reopening.candidate.snapshot
+            if proven.contains(snapshot.source) { continue }
             if await backupHoldsLateMain(snapshot.source, formerMain: reopening.formerMain) { continue }
             try Task.checkCancellation()
             guard try await preflight.reopen(snapshot) else { continue }
@@ -244,6 +248,46 @@ public actor UploadBackupSyncEngine: UploadBackupCandidateEnqueueing {
             return false
         }
         return former.sha1Hex != main.sha1Hex
+    }
+
+    /// The sources whose complete revision the remote proof settles. Only a revision that this device never hashed
+    /// qualifies: an earlier build settled it through the remote proof, so the manifest holds no record for its main
+    /// file or its former main file. The proof counts the files of the backup, so a backup without the late file
+    /// settles nothing. An identity that two photos share proves neither. Without a proof, the revision re-opens as
+    /// usual.
+    private func settledByRemoteProof(_ reopenings: [UploadBackupReopening]) async throws -> Set<UploadSourceIdentity> {
+        guard let remoteProofResolver else { return [] }
+        var unhashed: [UploadBackupExternalIdentity: [UploadBackupAssetSnapshot]] = [:]
+        for reopening in reopenings {
+            let snapshot = reopening.candidate.snapshot
+            guard let identity = snapshot.externalIdentity,
+                await remoteProofResolver.identityRecord(for: snapshot.source) == nil
+            else { continue }
+            if let formerMain = reopening.formerMain, await remoteProofResolver.identityRecord(for: formerMain) != nil {
+                continue
+            }
+            guard try await preflight.holdsCompleteState(snapshot) else { continue }
+            unhashed[identity, default: []].append(snapshot)
+        }
+        guard !unhashed.isEmpty else { return [] }
+        let proofs: [UploadBackupExternalIdentity: UploadRemoteAssetIndexRecord]
+        do {
+            proofs = try await remoteProofResolver.remoteAssetProofs(for: Array(unhashed.keys))
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            return []
+        }
+        try Task.checkCancellation()
+        var proven: Set<UploadSourceIdentity> = []
+        for (identity, snapshots) in unhashed {
+            guard snapshots.count == 1, let snapshot = snapshots.first,
+                let proof = proofs[identity], proof.externalIdentity == identity,
+                proof.resourceCount == snapshot.resourceCount
+            else { continue }
+            proven.insert(snapshot.source)
+        }
+        return proven
     }
 
     private func prepare(
