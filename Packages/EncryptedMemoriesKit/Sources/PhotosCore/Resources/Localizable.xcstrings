@@ -6236,13 +6236,6 @@
         "de": { "stringUnit": { "state": "translated", "value": "Bleibt: Favorit" } }
       }
     },
-    "duplicates.stays_backed_up_here": {
-      "comment": "Why the checked copy stays.",
-      "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "Stays: backed up from this device" } },
-        "de": { "stringUnit": { "state": "translated", "value": "Bleibt: von diesem Gerät gesichert" } }
-      }
-    },
     "duplicates.stays_oldest": {
       "comment": "Why the checked copy stays.",
       "localizations": {

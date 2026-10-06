@@ -586,7 +586,7 @@ final class ExactDuplicatesModelTests: XCTestCase {
             (facts(shared: true, album: true), facts(album: true), .badge(.shared)),
             (facts(album: true, favorite: true), facts(favorite: true), .badge(.album)),
             (facts(favorite: true, backedUp: true), facts(backedUp: true), .badge(.favorite)),
-            (facts(backedUp: true, date: late), facts(date: early), .badge(.backedUpHere)),
+            (facts(backedUp: true, date: early), facts(date: late), .oldest),
             (facts(favorite: true, date: early), facts(favorite: true, date: late), .oldest),
             (facts(album: true, date: early), facts(album: true, date: early), .identical),
             (facts(date: early), facts(), .identical),
@@ -594,6 +594,21 @@ final class ExactDuplicatesModelTests: XCTestCase {
         for (index, (first, second, reason)) in cases.enumerated() {
             XCTAssertEqual(rankedPair(first, second).stayReason, reason, "case \(index)")
         }
+    }
+
+    func testTheStayReasonNeverNamesTheBackupOfThisDevice() {
+        let early = date(0)
+        let late = date(60)
+        for kept in [facts(backedUp: true), facts(backedUp: true, date: early), facts(backedUp: true, date: late)] {
+            for other in [facts(), facts(date: early), facts(date: late), facts(backedUp: true)] {
+                let reason = rankedPair(kept, other).stayReason
+                XCTAssertNotEqual(reason, .badge(.backedUpHere), "\(kept) against \(other)")
+                XCTAssertNotEqual(reason?.text, "Stays: backed up from this device")
+            }
+        }
+        XCTAssertEqual(rankedPair(facts(backedUp: true), facts()).stayReason, .identical)
+        let badges = rankedPair(facts(backedUp: true), facts()).badges(of: a1)
+        XCTAssertEqual(badges, [.backedUpHere], "the badge stays as information")
     }
 
     func testAChosenCopyWithoutAnAdvantageStaysBecauseTheCopiesAreIdentical() {
@@ -989,6 +1004,28 @@ final class ExactDuplicatesModelTests: XCTestCase {
         XCTAssertEqual(Set(log.calls.first ?? []), [a2, a3, b2])
     }
 
+    func testEveryMergeTellsTheFinderWhetherThePersonChoseThePhotoToKeep() async {
+        let groupC = ExactDuplicateGroup(
+            contentHash: "C", hashKeyEpoch: "e",
+            members: [PhotoUID(volumeID: "v", nodeID: "c1"), PhotoUID(volumeID: "v", nodeID: "c2")])
+        let finder = FakeDuplicateFinder(scans: [.init(groups: [groupA, groupB, groupC], coverage: .complete)])
+        finder.outcomes = ["A": .skipped(.keptLeftLibrary), "B": .skipped(.keptLeftLibrary)]
+        let (model, _) = makeModel(finder)
+        await model.load()
+
+        await model.merge(groupID: "A")
+        XCTAssertEqual(finder.choices, ["A": false], "the screen preselected the photo")
+        XCTAssertEqual(model.group(withID: "A")?.isKeptChosen, false, "a merge makes no choice of the person")
+
+        model.keep(a2, inGroup: "A")
+        await model.merge(containing: a2)
+        XCTAssertEqual(finder.choices, ["A": true], "the viewer merges the photo that the person chose")
+
+        model.keep(b2, inGroup: "B")
+        await model.mergeAll()
+        XCTAssertEqual(finder.choices, ["A": true, "B": true, "C": false])
+    }
+
     func testMergeAllHandsEveryGroupToTheFinderInOneBatch() async {
         let finder = FakeDuplicateFinder(scans: [.init(groups: [groupA, groupB], coverage: .complete)])
         let (model, _) = makeModel(finder)
@@ -1307,6 +1344,7 @@ private final class FakeDuplicateFinder: ExactDuplicateMerging, @unchecked Senda
     private var _scanCalls = 0
     private var _rankCalls = 0
     private var _merges: [Merge] = []
+    private var _choices: [String: Bool] = [:]
     private var _batches: [[String]] = []
     private var _buildCalls = 0
     private var _rankedGroups: [[String]] = []
@@ -1355,6 +1393,8 @@ private final class FakeDuplicateFinder: ExactDuplicateMerging, @unchecked Senda
     var scanCalls: Int { lock.withLock { _scanCalls } }
     var rankCalls: Int { lock.withLock { _rankCalls } }
     var merges: [Merge] { lock.withLock { _merges } }
+    /// Whether the person chose the photo to keep, by group, as the last merge of the group told.
+    var choices: [String: Bool] { lock.withLock { _choices } }
     var batches: [[String]] { lock.withLock { _batches } }
     var buildCalls: Int { lock.withLock { _buildCalls } }
     var rankedGroups: [[String]] { lock.withLock { _rankedGroups } }
@@ -1448,10 +1488,11 @@ private final class FakeDuplicateFinder: ExactDuplicateMerging, @unchecked Senda
         }
     }
 
-    func merge(
-        _ requests: [(group: ExactDuplicateGroup, kept: PhotoUID)]
-    ) async -> [Result<ExactDuplicateMergeOutcome, any Error>] {
-        lock.withLock { _batches.append(requests.map(\.group.id)) }
+    func merge(_ requests: [ExactDuplicateMergeRequest]) async -> [Result<ExactDuplicateMergeOutcome, any Error>] {
+        lock.withLock {
+            _batches.append(requests.map(\.group.id))
+            for request in requests { _choices[request.group.id] = request.isKeptChosen }
+        }
         await mergeGate.pass()
         var results: [Result<ExactDuplicateMergeOutcome, any Error>] = []
         for request in requests {

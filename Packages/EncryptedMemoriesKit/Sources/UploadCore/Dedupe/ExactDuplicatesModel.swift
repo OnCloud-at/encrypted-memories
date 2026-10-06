@@ -24,9 +24,7 @@ public protocol ExactDuplicateMerging: Sendable {
     ) async
     /// Merges each group, keeping its photo. One result for each group, in order. After a cancellation, the groups
     /// without an outcome fail with `CancellationError`.
-    func merge(
-        _ requests: [(group: ExactDuplicateGroup, kept: PhotoUID)]
-    ) async -> [Result<ExactDuplicateMergeOutcome, any Error>]
+    func merge(_ requests: [ExactDuplicateMergeRequest]) async -> [Result<ExactDuplicateMergeOutcome, any Error>]
 }
 
 extension ExactDuplicateFinder: ExactDuplicateMerging {}
@@ -42,7 +40,8 @@ public enum ExactDuplicateBadge: CaseIterable, Equatable, Sendable {
     /// In one of the person's own albums.
     case album
     case favorite
-    /// A local source of this device counts the copy as its backup.
+    /// A local source of this device counts the copy as its backup. Only information: it never decides which copy
+    /// stays, because another device backs up other copies.
     case backedUpHere
 
     /// The spoken name of the badge.
@@ -63,6 +62,9 @@ public enum ExactDuplicateBadge: CaseIterable, Equatable, Sendable {
         case .backedUpHere: facts.isNamedByManifest
         }
     }
+
+    /// The fact ranks the copy to keep, so it can be the reason why a copy stays.
+    var ranksKeep: Bool { self != .backedUpHere }
 }
 
 /// Why the copy that a merge keeps stays instead of another copy.
@@ -79,9 +81,9 @@ public enum ExactDuplicateStayReason: Equatable, Sendable {
         case .badge(.shared): L10n.string("duplicates.stays_shared")
         case .badge(.album): L10n.string("duplicates.stays_album")
         case .badge(.favorite): L10n.string("duplicates.stays_favorite")
-        case .badge(.backedUpHere): L10n.string("duplicates.stays_backed_up_here")
         case .oldest: L10n.string("duplicates.stays_oldest")
-        case .identical: L10n.string("duplicates.stays_any")
+        // "Backed up here" never ranks, so it is never the reason.
+        case .identical, .badge(.backedUpHere): L10n.string("duplicates.stays_any")
         }
     }
 }
@@ -186,7 +188,7 @@ public final class ExactDuplicatesModel {
         public var stayReason: ExactDuplicateStayReason? {
             guard isRanked, let keptFacts = memberFacts[kept] else { return nil }
             let others = members.filter { $0 != kept }.map { memberFacts[$0] }
-            for badge in ExactDuplicateBadge.allCases where badge.applies(to: keptFacts) {
+            for badge in ExactDuplicateBadge.allCases where badge.ranksKeep && badge.applies(to: keptFacts) {
                 if others.contains(where: { other in !(other.map { badge.applies(to: $0) } ?? false) }) {
                     return .badge(badge)
                 }
@@ -1002,11 +1004,13 @@ public final class ExactDuplicatesModel {
         groups[index] = group
     }
 
-    /// Merges one group and keeps exactly the photo that the screen shows as kept.
+    /// Merges one group and keeps exactly the photo that the screen shows as kept. A photo that the screen
+    /// preselected stays a preselection for the finder, which keeps it only while it still ranks first.
     public func merge(groupID: String) async {
         guard canMerge, let index = groups.firstIndex(where: { $0.id == groupID }) else { return }
+        let preselected: Set<String> = groups[index].isKeptChosen ? [] : [groupID]
         groups[index].isKeptChosen = true
-        await merge([groups[index]], all: false)
+        await merge([groups[index]], all: false, preselected: preselected)
     }
 
     public func mergeAll() async {
@@ -1021,8 +1025,9 @@ public final class ExactDuplicatesModel {
     /// Merges `requested`. Every group reads the metadata of its copies first, because only copies with equal
     /// metadata merge. With `all`, every part of a requested group merges; otherwise a group that split or changed
     /// its kept photo meanwhile stays, so the person sees it first. A group whose metadata could not be read stays,
-    /// and the merge reports a failure.
-    private func merge(_ requested: [Group], all: Bool) async {
+    /// and the merge reports a failure. `preselected` names groups that hold their photo to keep for this merge only:
+    /// the person did not choose it, and afterwards the ranking may change it again.
+    private func merge(_ requested: [Group], all: Bool, preselected: Set<String> = []) async {
         isMerging = true
         notice = nil
         // The groups that nobody scrolled to rank page by page, with progress. The photo that the screen shows as kept
@@ -1055,9 +1060,16 @@ public final class ExactDuplicatesModel {
         var keptPhotoUnreadable = false
         var failed = selected.count < candidates.count
         var stale = false
-        let results = await finder.merge(selected.map { ($0.scanGroup, $0.kept) })
+        let results = await finder.merge(
+            selected.map {
+                ExactDuplicateMergeRequest(
+                    group: $0.scanGroup, kept: $0.kept, isKeptChosen: $0.isKeptChosen && !preselected.contains($0.id))
+            })
         // The outcome of every group is one change of the screen.
         var updated = groups
+        for index in updated.indices where preselected.contains(updated[index].id) {
+            updated[index].isKeptChosen = false
+        }
         for (group, result) in zip(selected, results) {
             do {
                 switch try result.get() {

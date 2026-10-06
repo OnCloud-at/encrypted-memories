@@ -111,9 +111,7 @@ private final class StressRankingFinder: ExactDuplicateMerging, @unchecked Senda
         await ranking.rankMembers(of: groups, ranked: ranked)
     }
 
-    func merge(
-        _ requests: [(group: ExactDuplicateGroup, kept: PhotoUID)]
-    ) async -> [Result<ExactDuplicateMergeOutcome, any Error>] {
+    func merge(_ requests: [ExactDuplicateMergeRequest]) async -> [Result<ExactDuplicateMergeOutcome, any Error>] {
         requests.map { _ in .failure(CancellationError()) }
     }
 }
