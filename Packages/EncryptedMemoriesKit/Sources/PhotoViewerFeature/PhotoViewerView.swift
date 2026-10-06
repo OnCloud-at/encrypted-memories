@@ -423,7 +423,10 @@ public struct PhotoViewerView: View {
     }
 
     /// The glass filmstrip panel at the bottom of the viewer, with an optional title above the photos and the spoken
-    /// name `label`.
+    /// name `label`. The panel fills the width it gets, 20 points in from each side; `areaWidth` sizes only the
+    /// photos. A panel width taken from the measured width became the minimum width of the viewer beside the native
+    /// inspector, so the viewer shrank by only 40 points in each layout pass: showing the sidebar then never finished
+    /// its layout, and AppKit stopped the app.
     private func filmstripPanel(
         items: [PhotoItem], selectedUID: PhotoUID, title: String?, label: String, areaWidth: CGFloat,
         onSelect: @escaping (Int) -> Void
@@ -453,8 +456,9 @@ public struct PhotoViewerView: View {
         .padding(.horizontal, 12)
         .padding(.top, 10)
         .padding(.bottom, 12)
-        .frame(width: width)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .glassEffect(in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .padding(.horizontal, 20)
         .padding(.bottom, 16)
     }
 
