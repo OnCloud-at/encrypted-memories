@@ -114,6 +114,39 @@ final class ExactDuplicateFingerprintTests: XCTestCase {
         XCTAssertEqual(group.split(by: fingerprints).map(\.id).first, "h", "without a primary the first part keeps it")
     }
 
+    func testASecondSplitNeverGivesTwoPartsTheSameID() {
+        let fourth = PhotoUID(volumeID: "v", nodeID: "fourth")
+        let other = ExactDuplicateFingerprint(captureTime: Date(timeIntervalSince1970: 1))
+        // A part that an earlier split named after its metadata `other`; now its checked copy has other metadata.
+        let part = ExactDuplicateGroup(
+            contentHash: "h", hashKeyEpoch: "e", members: [first, second, third, fourth], fingerprint: other,
+            id: "h/\(other.key)")
+        let fingerprints = [first: complete, second: other, third: other, fourth: complete]
+
+        let parts = part.split(by: fingerprints, keepingIDWith: fourth)
+
+        XCTAssertEqual(parts.map(\.members), [[first, fourth], [second, third]])
+        XCTAssertEqual(parts[0].id, part.id, "the part with the checked copy keeps the ID")
+        XCTAssertEqual(Set(parts.map(\.id)).count, 2, "the other part gets an ID of its own")
+
+        // The screen already shows a group under the ID that the metadata `complete` would give.
+        let shown: Set<String> = ["h/\(complete.key)"]
+        let both = ExactDuplicateGroup(contentHash: "h", hashKeyEpoch: "e", members: [first, second, third, fourth])
+            .split(by: fingerprints, keepingIDWith: second, avoiding: shown)
+        XCTAssertEqual(both.map(\.members), [[first, fourth], [second, third]])
+        XCTAssertEqual(both[1].id, "h")
+        XCTAssertFalse(shown.contains(both[0].id), "a part never takes an ID that the screen shows")
+        XCTAssertNotEqual(both[0].id, "h")
+    }
+
+    func testANodeWithoutPhotoMetadataMatchesOnlyItself() {
+        XCTAssertEqual(ExactDuplicateFingerprint.matchingOnly(first), .matchingOnly(first))
+        XCTAssertNotEqual(ExactDuplicateFingerprint.matchingOnly(first), .matchingOnly(second))
+        XCTAssertNotEqual(ExactDuplicateFingerprint.matchingOnly(first), ExactDuplicateFingerprint())
+        let group = ExactDuplicateGroup(contentHash: "h", hashKeyEpoch: "e", members: [first, second])
+        XCTAssertEqual(group.split(by: [first: .matchingOnly(first), second: .matchingOnly(second)]), [])
+    }
+
     func testAMemberWithoutAFingerprintIsInNoGroup() {
         let group = ExactDuplicateGroup(contentHash: "h", hashKeyEpoch: "e", members: [first, second, third])
 

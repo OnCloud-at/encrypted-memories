@@ -103,6 +103,21 @@ struct SDKAlbumCatalogBackendTests {
         #expect(metadata.device == "Camera")
     }
 
+    @Test func plainFileNodesWithTheSameMetadataNeverMatch() async throws {
+        let client = FakeSDKPhotoCatalogClient()
+        let files = ["file-1", "file-2"].map { fileNode(id: $0) }
+        await client.configureNodes(
+            Dictionary(uniqueKeysWithValues: files.map { ($0.uid.sdkCompatibleIdentifier, DriveNode.file($0)) }))
+        let uids = files.map { PhotoUID(volumeID: $0.uid.volumeID, nodeID: $0.uid.nodeID) }
+        let backend = SDKAlbumCatalogBackend(client: client)
+
+        let facts = try await backend.nodeFacts(of: uids)
+        let again = try await backend.nodeFacts(of: uids)
+
+        #expect(facts[uids[0]]?.fingerprint != facts[uids[1]]?.fingerprint, "a file has no capture time to compare")
+        #expect(facts[uids[0]]?.fingerprint == again[uids[0]]?.fingerprint, "a file still matches itself")
+    }
+
     @Test func seriesMemberCopyLeavesTheSourceAssetAndAppSectionsBehind() {
         let revision = FileRevision(
             uid: SDKRevisionUid(volumeID: "own", nodeID: "member", revisionID: "revision"),
@@ -805,6 +820,31 @@ private func albumNode(
         photoCount: photoCount,
         coverPhotoNodeUid: coverID.map { SDKNodeUid(volumeID: "volume", nodeID: $0) },
         lastActivityTime: 20
+    )
+}
+
+private func fileNode(id: String) -> FileNode {
+    FileNode(
+        uid: SDKNodeUid(volumeID: "volume", nodeID: id),
+        parentUid: nil,
+        name: .success("same.jpg"),
+        creationTime: 1,
+        trashTime: nil,
+        nameAuthor: Author(emailAddress: nil, signatureVerificationError: nil),
+        keyAuthor: Author(emailAddress: nil, signatureVerificationError: nil),
+        ownedBy: OwnedBy(email: nil, organization: nil),
+        directRole: .inherited,
+        membership: nil,
+        mediaType: "image/jpeg",
+        totalStorageSize: 1,
+        activeRevision: FileRevision(
+            uid: SDKRevisionUid(volumeID: "volume", nodeID: id, revisionID: "revision"),
+            state: .active, creationTime: 1, storageSize: 1, claimedSize: 1,
+            claimedDigests: FileContentDigests(sha1: nil, sha1Verified: false),
+            claimedModificationTime: nil, thumbnails: [], claimedAdditionalMetadata: nil, contentAuthor: nil),
+        isShared: false,
+        isSharedByUrl: false,
+        errors: []
     )
 }
 

@@ -411,11 +411,10 @@ struct SDKAlbumCatalogBackend: AlbumCatalogBackend {
                             captureTime: photo.captureTime, name: photo.name, mimeType: photo.mediaType,
                             revision: photo.activeRevision))
                 case .file(let file):
+                    // A plain file has no capture time, so two files cannot prove the same metadata.
                     fact = .init(
                         isShared: file.isShared || file.isSharedByUrl, byteSize: file.activeRevision.claimedSize,
-                        fingerprint: SDKPhotoMetadataReader.fingerprint(
-                            captureTime: nil, name: file.name, mimeType: file.mediaType,
-                            revision: file.activeRevision))
+                        fingerprint: .matchingOnly(PhotoUID(volumeID: sdkUID.volumeID, nodeID: sdkUID.nodeID)))
                 case .album, .folder: throw SDKAlbumCatalogError.unexpectedPhotoNode(Self.identifier(sdkUID))
                 case nil: throw SDKAlbumCatalogError.missingNode(Self.identifier(sdkUID))
                 }

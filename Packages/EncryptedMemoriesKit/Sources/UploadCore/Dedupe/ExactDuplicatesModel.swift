@@ -246,8 +246,8 @@ public final class ExactDuplicatesModel {
         /// The parts of this group whose members have equal metadata, two or more, as `ExactDuplicateGroup.split`
         /// forms them. The part with the photo shown as kept comes first and keeps the ID and the person's choice.
         /// Every other part keeps its first member until the ranking orders it.
-        func parts(by fingerprints: [PhotoUID: ExactDuplicateFingerprint]) -> [Group] {
-            let split = scanGroup.split(by: fingerprints, keepingIDWith: kept)
+        func parts(by fingerprints: [PhotoUID: ExactDuplicateFingerprint], avoiding taken: Set<String>) -> [Group] {
+            let split = scanGroup.split(by: fingerprints, keepingIDWith: kept, avoiding: taken)
             return (split.filter { $0.id == id } + split.filter { $0.id != id }).map { part in
                 var group = self
                 group.scanGroup = part
@@ -554,31 +554,49 @@ public final class ExactDuplicatesModel {
     /// The group with `id`. Nil after a merge removed it.
     public func group(withID id: String) -> Group? { groups.first { $0.id == id } }
 
-    /// The title of the action that keeps `member`: "Keep This Copy", or "Kept" when a merge keeps it already.
-    public func keepTitle(for member: PhotoUID, inGroup groupID: String) -> String {
-        group(withID: groupID)?.keepTitle(for: member) ?? L10n.string("duplicates.keep_this_copy")
-    }
-
     // MARK: - The viewer of a group
 
-    /// The symbol of the action that keeps `member`: a filled checkmark once a merge keeps it.
-    public func keepSymbol(for member: PhotoUID, inGroup groupID: String) -> String {
-        group(withID: groupID)?.kept == member ? "checkmark.circle.fill" : "checkmark.circle"
+    /// The group that holds `member` now. A group can split while the viewer shows one of its photos, so every action
+    /// of the viewer finds the group of the photo on screen when the person taps it.
+    public func group(containing member: PhotoUID) -> Group? {
+        groups.first { $0.members.contains(member) }
     }
 
-    /// The person can keep `member` instead: it is a member, not kept yet, and no merge runs.
-    public func canKeep(_ member: PhotoUID, inGroup groupID: String) -> Bool {
-        guard !isMerging, let group = group(withID: groupID) else { return false }
-        return group.members.contains(member) && group.kept != member
+    /// The title of the action that keeps `member`: "Keep This Copy", or "Kept" when a merge keeps it already.
+    public func keepTitle(for member: PhotoUID) -> String {
+        group(containing: member)?.keepTitle(for: member) ?? L10n.string("duplicates.keep_this_copy")
+    }
+
+    /// The symbol of the action that keeps `member`: a filled checkmark once a merge keeps it.
+    public func keepSymbol(for member: PhotoUID) -> String {
+        group(containing: member)?.kept == member ? "checkmark.circle.fill" : "checkmark.circle"
+    }
+
+    /// The person can keep `member` instead: it is in a group, not kept yet, and no merge runs.
+    public func canKeep(_ member: PhotoUID) -> Bool {
+        guard !isMerging, let group = group(containing: member) else { return false }
+        return group.kept != member
+    }
+
+    /// Keeps `member` instead of the photo shown as kept in its group.
+    public func keep(_ member: PhotoUID) {
+        guard let groupID = group(containing: member)?.id else { return }
+        keep(member, inGroup: groupID)
     }
 
     /// The title and the symbol of the action that merges a group.
     public var mergeTitle: String { L10n.string("duplicates.merge") }
     public var mergeSymbol: String { "arrow.triangle.merge" }
 
-    /// The group can be merged now: it is still shown and no merge or load runs.
-    public func canMerge(groupID: String) -> Bool {
-        canMerge && group(withID: groupID) != nil
+    /// The group of `member` can be merged now: the photo is still in a group, and no merge or load runs.
+    public func canMerge(containing member: PhotoUID) -> Bool {
+        canMerge && group(containing: member) != nil
+    }
+
+    /// Merges the group that holds `member` now, with the photo shown as kept.
+    public func merge(containing member: PhotoUID) async {
+        guard let groupID = group(containing: member)?.id else { return }
+        await merge(groupID: groupID)
     }
 
     /// The photos to show in the viewer when the person opens `member`: the members of its group that `item` finds,
@@ -681,19 +699,27 @@ public final class ExactDuplicatesModel {
             let dates = await finder.captureDates(of: scan.groups.flatMap(\.members))
             guard generation == loadGeneration, !isMerging else { return false }
             let earlier = Dictionary(groups.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+            let earlierByHash = Dictionary(grouping: groups, by: \.scanGroup.contentHash)
             var shown: [Group] = []
             shown.reserveCapacity(scan.groups.count)
+            var usedIDs: Set<String> = []
             for scanned in scan.groups {
                 let order = fallback[scanned.id] ?? scanned.members
-                for group in knownParts(of: scanned, earlier: earlier) {
+                for part in knownParts(of: scanned, earlier: earlier, avoiding: usedIDs) {
                     let groupDates = Dictionary(
-                        group.members.compactMap { member in dates[member].map { (member, $0) } },
+                        part.members.compactMap { member in dates[member].map { (member, $0) } },
                         uniquingKeysWith: { first, _ in first })
-                    let size = scan.byteSizes[group.contentHash]
-                    // A group keeps its ranking and the person's choice while its members and metadata stay.
-                    if let same = earlier[group.id], Set(same.members) == Set(group.members),
-                        same.scanGroup.fingerprint == group.fingerprint
-                    {
+                    let size = scan.byteSizes[part.contentHash]
+                    // A group keeps its ranking and the person's choice while its members and metadata stay, also when
+                    // another part of its bytes took its place meanwhile, for example after that part merged.
+                    let isSame = { (earlier: Group) in
+                        Set(earlier.members) == Set(part.members) && earlier.scanGroup.fingerprint == part.fingerprint
+                    }
+                    let same =
+                        earlier[part.id].flatMap { isSame($0) ? $0 : nil }
+                        ?? earlierByHash[part.contentHash]?.first(where: isSame)
+                    let group = Self.unique(part, preferring: same?.id ?? part.id, used: &usedIDs)
+                    if let same {
                         var kept = same
                         kept.scanGroup = group
                         kept.byteSize = size ?? same.byteSize
@@ -726,11 +752,23 @@ public final class ExactDuplicatesModel {
 
     /// The parts of a scanned group by the metadata that a ranking read already, so a screen that opens again reads
     /// nothing for them. The whole group while the metadata of a member are unknown.
-    private func knownParts(of scanned: ExactDuplicateGroup, earlier: [String: Group]) -> [ExactDuplicateGroup] {
+    private func knownParts(
+        of scanned: ExactDuplicateGroup, earlier: [String: Group], avoiding used: Set<String>
+    ) -> [ExactDuplicateGroup] {
         guard !knownFingerprints.isEmpty, scanned.members.allSatisfy({ knownFingerprints[$0] != nil }) else {
             return [scanned]
         }
-        return scanned.split(by: knownFingerprints, keepingIDWith: earlier[scanned.id]?.kept)
+        return scanned.split(by: knownFingerprints, keepingIDWith: earlier[scanned.id]?.kept, avoiding: used)
+    }
+
+    /// `group` under `preferred`, else under its own ID, else under an ID from its first member, whichever no group in
+    /// `used` has. Adds the ID to `used`.
+    private static func unique(
+        _ group: ExactDuplicateGroup, preferring preferred: String, used: inout Set<String>
+    ) -> ExactDuplicateGroup {
+        let id = [preferred, group.id].first { !used.contains($0) } ?? "\(group.id)#\(group.members[0].nodeID)"
+        used.insert(id)
+        return id == group.id ? group : group.withID(id)
     }
 
     private func showScan(_ progress: ExactDuplicateScanProgress, generation: Int) {
@@ -850,12 +888,14 @@ public final class ExactDuplicatesModel {
             changed = true
         }
         var replacements: [Int: [Group]] = [:]
+        var usedIDs = Set(positions.keys)
         for (id, order) in page.members {
-            guard let index = positions[id] else { continue }
+            // Without the metadata of its copies, the group stays whole and unranked, so no merge takes it.
+            guard let index = positions[id], let fingerprints = page.fingerprints[id] else { continue }
             let shownKept = updated[index].kept
-            let fingerprints = page.fingerprints[id] ?? [:]
             knownFingerprints.merge(fingerprints) { _, new in new }
-            var parts = updated[index].parts(by: fingerprints)
+            var parts = updated[index].parts(by: fingerprints, avoiding: usedIDs)
+            usedIDs.formUnion(parts.map(\.id))
             for position in parts.indices {
                 let showsKept = parts[position].kept == shownKept
                 parts[position].rank(

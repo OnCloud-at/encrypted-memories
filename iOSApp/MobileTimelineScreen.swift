@@ -752,10 +752,10 @@ struct MobileViewerPresentation: Identifiable {
     var duplicateGroup: MobileDuplicateViewerGroup?
 }
 
-/// The group of duplicates that a viewer shows, and the model that keeps and merges its photos.
+/// The model that keeps and merges the photos of a viewer of duplicates. The actions find the group of the photo on
+/// screen, because the group can split while the viewer is open.
 struct MobileDuplicateViewerGroup {
     let model: ExactDuplicatesModel
-    let groupID: String
 }
 
 /// A successful viewer mutation removes the current item from the collection that opened it. Filtered grids
