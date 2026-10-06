@@ -62,24 +62,31 @@
         }
 
         /// The shared viewer of a group of duplicates with its filmstrip, next to the same viewer as the library opens
-        /// it. The window toolbar with Keep This Copy and Merge belongs to the app and is not part of this render.
+        /// it, and the viewer of a burst with the same filmstrip panel. The window toolbar with Keep This Copy and Merge
+        /// belongs to the app and is not part of this render.
         func testRenderTheViewerOfAGroupNextToTheLibraryViewer() async throws {
             let directory = try outputDirectory()
             let members = (0..<3).map { PhotoUID(volumeID: "v", nodeID: "photo-\($0)") }
             let items = members.map {
                 PhotoItem(uid: $0, captureTime: Date(timeIntervalSince1970: 1_749_456_000), mediaType: "image/png")
             }
+            let burst = members.map {
+                PhotoItem(
+                    uid: $0, captureTime: Date(timeIntervalSince1970: 1_749_456_000), mediaType: "image/png",
+                    tags: [.bursts], burstMemberIDs: members.map(\.nodeID))
+            }
             let root = FileManager.default.temporaryDirectory
                 .appendingPathComponent("duplicates-viewer-\(UUID().uuidString)", isDirectory: true)
             try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
             defer { try? FileManager.default.removeItem(at: root) }
-            for (name, isGroup) in [("library", false), ("group", true)] {
+            for (name, isGroup) in [("library", false), ("group", true), ("burst", false)] {
+                let isBurst = name == "burst"
                 let viewer = PhotoViewerModel(
-                    items: items, index: 1,
+                    items: isBurst ? burst : items, index: 1,
                     feed: ThumbnailFeed(
                         cache: ThumbnailCache(namespace: "duplicates-viewer-\(UUID().uuidString)", rootDirectory: root),
                         loader: ColorThumbnails()),
-                    media: ColorMedia())
+                    media: ColorMedia(), burstProvider: isBurst ? BurstMembers(items: burst) : nil)
                 let view = PhotoViewerView(
                     model: viewer, onClose: {}, itemFilmstripLabel: isGroup ? "Identical copies" : nil
                 )
@@ -230,7 +237,7 @@
     }
 
     /// A plain color image for each photo, as PNG bytes.
-    private func colorPNG(for uid: PhotoUID, side: Int) -> Data {
+    func colorPNG(for uid: PhotoUID, side: Int) -> Data {
         let hue = Double(uid.nodeID.unicodeScalars.reduce(0) { $0 + Int($1.value) } % 100) / 100
         let image = NSImage(size: NSSize(width: side, height: side), flipped: false) { rect in
             NSColor(calibratedHue: hue, saturation: 0.45, brightness: 0.8, alpha: 1).setFill()
@@ -243,7 +250,7 @@
         return png
     }
 
-    private struct ColorThumbnails: ThumbnailBatchLoader {
+    struct ColorThumbnails: ThumbnailBatchLoader {
         func loadThumbnails(
             for uids: [PhotoUID], onLoaded: @Sendable @escaping (PhotoUID, Data) -> Void
         ) async -> ThumbnailBatchLoadResult {
@@ -252,7 +259,7 @@
         }
     }
 
-    private struct ColorMedia: FullMediaProvider {
+    struct ColorMedia: FullMediaProvider {
         func preview(for uid: PhotoUID) async throws -> Data { colorPNG(for: uid, side: 1_200) }
         func originalData(for uid: PhotoUID, onProgress: @escaping @Sendable (Double) -> Void) async throws -> Data {
             colorPNG(for: uid, side: 1_200)
