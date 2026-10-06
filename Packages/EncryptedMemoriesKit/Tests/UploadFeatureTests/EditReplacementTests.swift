@@ -605,6 +605,43 @@ final class EditReplacementTests: XCTestCase {
 
     private let new = PhotoUID(volumeID: "vol", nodeID: "new")
 
+    private func compound(_ main: String, related: [String: String]) -> UploadRemoteCompound {
+        func file(_ linkID: String, _ content: String) -> UploadRemoteCompound.File {
+            .init(linkID: linkID, contentHash: "ch(\(content))", nameHash: "nh(\(linkID))", mimeType: "image/jpeg")
+        }
+        return UploadRemoteCompound(
+            main: file(main, main), related: related.sorted { $0.key < $1.key }.map { file($0.key, $0.value) },
+            tags: [], externalIdentifier: nil, captureDate: nil, modificationDate: nil)
+    }
+
+    func testAnUnprovenEarlierPhotoStaysWhenOneOfItsFilesHasNoTwinUnderTheNewPhoto() async throws {
+        let old = PhotoUID(volumeID: "vol", nodeID: "old")
+        try journal.addSuperseded(old, for: asset)
+        let remote = FakeEditReplacementRemote()
+        remote.active = [old, new]
+        checker.compoundsByMainLinkID["old"] = compound(
+            "old", related: ["old-video": "video", "old-adjustments": "older-adjustments"])
+        checker.compoundsByMainLinkID["new"] = compound(
+            "new", related: ["new-original": "old", "new-video": "video"])
+
+        let outcome = try await makeReplacement(remote).replaceSuperseded(
+            of: asset, with: new, edited: true, holdsOriginal: true)
+
+        XCTAssertEqual(outcome, .kept)
+        XCTAssertTrue(remote.trashCalls.isEmpty, "the trash would take the only copy of the adjustments along")
+        XCTAssertTrue(journal.entry(for: asset).superseded.isEmpty)
+        XCTAssertTrue(checker.relatedLookups.isEmpty, "the compound names the related files")
+
+        // With a twin of each file the trash loses nothing, so the photo leaves.
+        try journal.addSuperseded(old, for: asset)
+        checker.compoundsByMainLinkID["old"] = compound("old", related: ["old-video": "video"])
+        let replaced = try await makeReplacement(remote).replaceSuperseded(
+            of: asset, with: new, edited: true, holdsOriginal: true)
+        XCTAssertEqual(replaced, .replaced(retiredAny: true))
+        XCTAssertEqual(remote.trashCalls, [[old]])
+        XCTAssertEqual(Set(journal.entry(for: asset).retired), ["old", "old-video"])
+    }
+
     func testOtherBytesOfAPhotoThatWasNeverEditedReplaceNothing() async throws {
         let (_, remote) = supersede("old")
 

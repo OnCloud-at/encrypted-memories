@@ -756,6 +756,36 @@ final class UploadLineageReplacementTests: XCTestCase {
         XCTAssertTrue(superseded().isEmpty)
     }
 
+    func testAnOwnLivePhotoUploadAdoptedAgainAfterAManifestResetIsReplaced() async throws {
+        // The adopted copy is this photo's own earlier upload: the edit uploaded its video again under the new photo.
+        let (earlier, video, replacement) = try await editAfterAdoptingALivePhoto(cloudID: nil)
+        let copy = try seed("motion", filename: "IMG_1.MOV", main: replacement, mimeType: "video/quicktime")
+
+        let outcome = try await settle(replacement)
+
+        XCTAssertEqual(outcome, .replaced(retiredAny: true))
+        XCTAssertEqual(server.links.first { $0.uid == earlier }?.state, .trashed)
+        XCTAssertTrue(server.steps.contains { $0.trashedByBackup == [earlier.nodeID] })
+        for uid in [replacement, copy] { XCTAssertEqual(server.links.first { $0.uid == uid }?.state, .active) }
+        XCTAssertTrue(journal.entry(for: source).retired.contains(video.nodeID))
+    }
+
+    func testAnAdoptedCopyWithARelatedFileWithoutATwinStays() async throws {
+        let (adopted, video, replacement) = try await editAfterAdoptingALivePhoto(cloudID: nil)
+        let adjustments = try seed(
+            "older-adjustments", filename: "Adjustments.plist", cloudID: nil, main: adopted,
+            mimeType: "application/xml")
+        _ = try seed("motion", filename: "IMG_1.MOV", main: replacement, mimeType: "video/quicktime")
+
+        let outcome = try await settle(replacement)
+
+        XCTAssertEqual(outcome, .kept)
+        for uid in [adopted, video, adjustments, replacement] {
+            XCTAssertEqual(server.links.first { $0.uid == uid }?.state, .active)
+        }
+        XCTAssertFalse(server.steps.contains { $0.trashedByBackup.contains(adopted.nodeID) })
+    }
+
     func testAnAdoptedCopyStaysWhenItsIdentityReadIsIncomplete() async throws {
         server.configureLineageIndex(incomplete: .external)
         let (adopted, video, replacement) = try await editAfterAdoptingALivePhoto(cloudID: "other-asset")
@@ -789,8 +819,10 @@ final class UploadLineageReplacementTests: XCTestCase {
         let copy = try seed("motion", filename: "IMG_1.MOV", main: replacement, mimeType: "video/quicktime")
         recordVideo(at: copy)
 
+        let reads = server.readCounts.compound
         let outcome = try await settle(replacement)
 
+        XCTAssertEqual(server.readCounts.compound, reads, "a proven earlier upload needs no compound read")
         XCTAssertEqual(outcome, .replaced(retiredAny: true))
         XCTAssertEqual(server.links.first { $0.uid == earlier }?.state, .trashed)
         XCTAssertTrue(server.steps.contains { $0.trashedByBackup == [earlier.nodeID] })

@@ -17,8 +17,9 @@ public protocol EditReplacementRemote: PhotoCarryOverRemote {
 ///
 /// An earlier photo stays when the new compound does not hold the original, when an original resource of the photo
 /// lives only under the earlier photo, when another local source still needs it or one of its related photos, or
-/// when it carries the new photo, or when nothing proves it an upload of this photo, like an adopted copy. Other bytes
-/// replace the earlier photo only as an edit or as the undo of an edit.
+/// when it carries the new photo. An adopted copy that nothing proves an upload of this photo also stays unless the
+/// new photo holds a twin of each of its files. Other bytes replace the earlier photo only as an edit or as the undo
+/// of an edit.
 public struct EditedPhotoReplacement: Sendable {
     public enum Outcome: Sendable, Equatable {
         case replaced(retiredAny: Bool)
@@ -160,9 +161,13 @@ public struct EditedPhotoReplacement: Sendable {
         var related = Set(
             targets.filter { !active.contains($0) }.flatMap { entry.retireIntent?[$0.nodeID] ?? [] })
         var intent: [String: [String]] = [:]
+        // Read at most once, and only for a target without proof.
+        var replacementCompound: UploadRemoteCompound?
+        var replacementRead = false
         for target in targets where active.contains(target) {
             try Task.checkCancellation()
             let linked: Set<String>
+            var unproven: UploadRemoteCompound?
             if remoteTargets.contains(target.nodeID) {
                 do {
                     guard let earlier = provenCompounds[target.nodeID],
@@ -190,14 +195,17 @@ public struct EditedPhotoReplacement: Sendable {
                     kept.insert(target.nodeID)
                     continue
                 }
+            } else if (entry.proven ?? []).contains(target.nodeID) {
+                linked = try await relations.relatedPhotoLinkIDs(ofMainLinkID: target.nodeID)
             } else {
-                // Only an upload of this photo proves itself. An adopted copy without proof can be another device's
-                // upload whose related files, such as a Live Photo video, exist only there.
-                guard (entry.proven ?? []).contains(target.nodeID) else {
+                // Nothing proves an upload of this photo: a reset manifest adopts an own upload again, but an adopted
+                // copy can also be another device's upload whose related files exist only there.
+                guard let earlier = try await readCompound(ofMainLink: target.nodeID) else {
                     kept.insert(target.nodeID)
                     continue
                 }
-                linked = try await relations.relatedPhotoLinkIDs(ofMainLinkID: target.nodeID)
+                unproven = earlier
+                linked = Set(earlier.related.map(\.linkID))
             }
             let links = linked.union([target.nodeID])
             // The trash takes related photos along: the server hides them with their main photo, a restore brings
@@ -212,6 +220,19 @@ public struct EditedPhotoReplacement: Sendable {
             guard !leavesOriginalBehind(links, of: source, primaryIsOriginal: !edited) else {
                 waiting.insert(target.nodeID)
                 continue
+            }
+            // An unproven photo leaves only when the trash loses no file: the new photo holds a twin of each.
+            if let earlier = unproven {
+                if !replacementRead {
+                    replacementCompound = try await readCompound(ofMainLink: replacement.nodeID)
+                    replacementRead = true
+                }
+                guard let newer = replacementCompound,
+                    UploadRemoteReplacementSafety.keepsEveryFile(of: earlier, under: newer)
+                else {
+                    kept.insert(target.nodeID)
+                    continue
+                }
             }
             trashable.append(target)
             related.formUnion(linked)
@@ -265,6 +286,19 @@ public struct EditedPhotoReplacement: Sendable {
     ) async throws -> Outcome {
         if edited { try recordUpload(of: source, edited: true) }
         return try await remote.activeUIDs(among: [replacement]).contains(replacement) ? .waiting : .replacementGone
+    }
+
+    /// The compound of a main photo, or nil when the read fails or the server state is incomplete. The photo then
+    /// stays, so a read that fails for good never blocks the upload.
+    private func readCompound(ofMainLink linkID: String) async throws -> UploadRemoteCompound? {
+        do {
+            return try await relations.compound(ofMainLink: linkID)
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            try Task.checkCancellation()
+            return nil
+        }
     }
 
     private func recordUpload(of source: UploadSourceIdentity, edited: Bool) throws {
@@ -382,6 +416,14 @@ enum UploadRemoteReplacementSafety {
             twins[file.linkID] = twin
         }
         return twins
+    }
+
+    /// True when the trash of `target` loses no file: each related file and the main file of `target` has its own
+    /// twin under `replacement`.
+    static func keepsEveryFile(of target: UploadRemoteCompound, under replacement: UploadRemoteCompound) -> Bool {
+        guard let twins = relatedTwins(of: target, under: replacement) else { return false }
+        var used = Set(twins.values.map(\.linkID))
+        return contentTwin(of: target.main, among: [replacement.main] + replacement.related, used: &used) != nil
     }
 
     static func isEditRole(_ resource: UploadSourceIdentity.Resource) -> Bool {

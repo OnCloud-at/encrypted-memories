@@ -170,6 +170,12 @@ final class FakeChecker: UploadDuplicateChecking, @unchecked Sendable {
 
     /// The main photos whose related files a caller asked for, in order.
     private(set) var relatedLookups: [String] = []
+    /// Compounds by main link. Other links have none.
+    var compoundsByMainLinkID: [String: UploadRemoteCompound] = [:]
+
+    func compound(ofMainLink linkID: String) async throws -> UploadRemoteCompound? {
+        lock.withLock { compoundsByMainLinkID[linkID] }
+    }
 
     func relatedPhotoLinkIDs(ofMainLinkID mainLinkID: String) async throws -> Set<String> {
         lock.withLock { relatedLookups.append(mainLinkID) }
