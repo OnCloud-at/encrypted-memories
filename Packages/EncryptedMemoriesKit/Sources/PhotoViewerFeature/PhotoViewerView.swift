@@ -431,7 +431,7 @@ public struct PhotoViewerView: View {
         items: [PhotoItem], selectedUID: PhotoUID, title: String?, label: String, areaWidth: CGFloat,
         onSelect: @escaping (Int) -> Void
     ) -> some View {
-        let width = max(areaWidth - 40, 320)
+        let width = max(areaWidth - 40, 0)
         let itemSide = burstFilmstripItemSide(panelWidth: width, itemCount: items.count)
         let needsScroller = burstFilmstripNeedsScroller(
             panelWidth: width, itemCount: items.count, itemSide: itemSide)
