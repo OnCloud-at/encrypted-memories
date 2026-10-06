@@ -126,7 +126,10 @@ import UploadCore
                     MobileFixtureDuplicates(
                         groups: groups,
                         captureDates: Dictionary(
-                            items.map { ($0.uid, $0.captureTime) }, uniquingKeysWith: { first, _ in first })))
+                            items.map { ($0.uid, $0.captureTime) }, uniquingKeysWith: { first, _ in first }),
+                        // Each batch of Merge All takes a while, so a UI test can stop it.
+                        mergeDelay: ProcessInfo.processInfo.arguments.contains(
+                            "-EncryptedMemoriesDuplicatesSlowMerge") ? .milliseconds(500) : nil))
             } else if ProcessInfo.processInfo.arguments.contains("-EncryptedMemoriesDuplicatesCheckingFixture") {
                 runtime.libraryModel.installIsolatedDuplicatesForTesting(
                     MobileFixtureDuplicates(groups: [], checking: true))
@@ -294,11 +297,13 @@ import UploadCore
         /// A scan after the count of the Collections entry and the first load of the screen leaves out the last
         /// group, so a UI test sees whether the screen scanned again.
         private let rescanDropsLastGroup: Bool
+        /// The time that each merge batch takes. Nil merges at once.
+        private let mergeDelay: Duration?
         private var scans = 0
 
         init(
             groups members: [[PhotoUID]], checking: Bool = false, captureDates: [PhotoUID: Date] = [:],
-            rescanDropsLastGroup: Bool = false
+            rescanDropsLastGroup: Bool = false, mergeDelay: Duration? = nil
         ) {
             groups = members.enumerated().map { index, members in
                 ExactDuplicateGroup(contentHash: "fixture-copies-\(index)", hashKeyEpoch: "fixture", members: members)
@@ -306,6 +311,7 @@ import UploadCore
             self.checking = checking
             dates = captureDates
             self.rescanDropsLastGroup = rescanDropsLastGroup
+            self.mergeDelay = mergeDelay
         }
 
         func duplicateGroups(
@@ -368,6 +374,7 @@ import UploadCore
         }
 
         func merge(_ requests: [ExactDuplicateMergeRequest]) async -> [Result<ExactDuplicateMergeOutcome, any Error>] {
+            if let mergeDelay { try? await Task.sleep(for: mergeDelay) }
             lock.withLock { groups.removeAll { group in requests.contains { $0.group.id == group.id } } }
             return requests.map { request in
                 .success(

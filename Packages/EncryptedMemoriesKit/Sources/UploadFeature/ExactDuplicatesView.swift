@@ -55,7 +55,7 @@ public struct ExactDuplicatesView<Cover: View>: View {
             ) {
                 Button(L10n.string("action.ok"), role: .cancel) { model.dismissNotice() }
             } message: {
-                Text(model.notice?.message ?? "")
+                if let message = model.notice?.message, !message.isEmpty { Text(message) }
             }
             .task { await model.load() }
             .onDisappear { model.screenDisappeared() }
@@ -127,18 +127,37 @@ public struct ExactDuplicatesView<Cover: View>: View {
     }
 }
 
-/// One progress line of the screen. Without its title, the surrounding view shows the title.
+/// One progress line of the screen. Without its title, the surrounding view shows the title. With `stop`, a Stop
+/// button follows the line; it stays disabled after the person stopped. `identifier` names the line only, so the Stop
+/// button keeps its own.
 private struct ExactDuplicatesProgressRow: View {
     let line: ExactDuplicatesModel.ProgressLine
     var showsTitle = true
     let accent: Color
+    var identifier: String?
+    var stop: (() -> Void)?
+    var canStop = true
 
     var body: some View {
-        ActivityProgressRow(
+        let row = ActivityProgressRow(
             title: showsTitle ? line.title : nil, detail: line.detail, fraction: line.fraction,
             showsIndeterminateProgress: true
         )
         .tint(accent)
+        .accessibilityIdentifier(identifier ?? "")
+        if let stop {
+            HStack(alignment: .center, spacing: 12) {
+                row
+                Button(L10n.string("duplicates.stop"), action: stop)
+                    .buttonStyle(.bordered)
+                    .buttonBorderShape(.capsule)
+                    .controlSize(.small)
+                    .disabled(!canStop)
+                    .accessibilityIdentifier("duplicates.stopMerge")
+            }
+        } else {
+            row
+        }
     }
 }
 
@@ -333,7 +352,8 @@ private struct ExactDuplicatesStatusRows: View {
     let margin: CGFloat
 
     private var hasRows: Bool {
-        model.checkLine != nil || model.stillCheckingNote != nil || model.rankingLine != nil
+        model.mergeAllLine != nil || model.checkLine != nil || model.stillCheckingNote != nil
+            || model.rankingLine != nil
             || model.uncheckedNote != nil || model.checkFailedNote != nil
     }
 
@@ -351,7 +371,19 @@ private struct ExactDuplicatesStatusRows: View {
         }
     }
 
+    /// Stops Merge All after its running batch. Nil outside Merge All.
+    private var stop: (() -> Void)? {
+        guard model.isMergingAll else { return nil }
+        let model = model
+        return { model.stopMergeAll() }
+    }
+
     @ViewBuilder private var rows: some View {
+        if let line = model.mergeAllLine {
+            ExactDuplicatesProgressRow(
+                line: line, accent: accent, identifier: "duplicates.mergeProgress", stop: stop,
+                canStop: model.canStopMergeAll)
+        }
         if let line = model.checkLine {
             ExactDuplicatesProgressRow(line: line, accent: accent).accessibilityIdentifier("duplicates.checkProgress")
         }
@@ -361,7 +393,10 @@ private struct ExactDuplicatesStatusRows: View {
                 .foregroundStyle(.secondary)
         }
         if let line = model.rankingLine {
-            ExactDuplicatesProgressRow(line: line, accent: accent).accessibilityIdentifier("duplicates.rankingProgress")
+            // Merge All ranks the groups that nobody scrolled to first; Stop already applies.
+            ExactDuplicatesProgressRow(
+                line: line, accent: accent, identifier: "duplicates.rankingProgress", stop: stop,
+                canStop: model.canStopMergeAll)
         }
         if let note = model.uncheckedNote {
             Label(note, systemImage: "exclamationmark.circle")
