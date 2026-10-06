@@ -347,10 +347,15 @@ import UploadCore
                 }
                 return (group.id, Dictionary(memberFacts, uniquingKeysWith: { first, _ in first }))
             }
+            // The copies of a group share their metadata, so every group stays whole.
+            let fingerprints = groups.map { group in
+                (group.id, Dictionary(uniqueKeysWithValues: group.members.map { ($0, ExactDuplicateFingerprint()) }))
+            }
             await ranked(
                 ExactDuplicateRankingPage(
                     members: Dictionary(uniqueKeysWithValues: groups.map { ($0.id, $0.members) }),
-                    groupCount: groups.count, facts: Dictionary(uniqueKeysWithValues: facts)))
+                    groupCount: groups.count, facts: Dictionary(uniqueKeysWithValues: facts),
+                    fingerprints: Dictionary(uniqueKeysWithValues: fingerprints)))
         }
 
         func prepareIndex(

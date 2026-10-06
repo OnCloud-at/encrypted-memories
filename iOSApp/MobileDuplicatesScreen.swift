@@ -53,6 +53,6 @@ struct MobileDuplicatesScreen: View {
         else { return }
         viewerRouter.presentation = MobileViewerPresentation(
             index: opened.index, items: opened.items, context: .library,
-            duplicateGroup: MobileDuplicateViewerGroup(model: model, groupID: groupID))
+            duplicateGroup: MobileDuplicateViewerGroup(model: model))
     }
 }

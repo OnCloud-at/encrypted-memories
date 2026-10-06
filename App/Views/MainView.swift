@@ -1656,32 +1656,33 @@ struct MainView: View {
     /// Keep This Copy for the photo shown, and Merge, which merges the group with the photo shown as kept.
     @ToolbarContentBuilder
     private func duplicateViewerToolbar(_ viewerModel: PhotoViewerModel) -> some ToolbarContent {
-        if let duplicates, let group = viewerGroup(of: viewerModel) {
+        if let duplicates, viewerGroup(of: viewerModel) != nil {
             let uid = viewerModel.baseCurrent.uid
-            let keepTitle = duplicates.keepTitle(for: uid, inGroup: group.groupID)
+            let keepTitle = duplicates.keepTitle(for: uid)
             let mergeTitle = duplicates.mergeTitle
             ToolbarItemGroup(placement: .primaryAction) {
                 Button {
-                    duplicates.keep(uid, inGroup: group.groupID)
+                    duplicates.keep(uid)
                 } label: {
-                    Label(keepTitle, systemImage: duplicates.keepSymbol(for: uid, inGroup: group.groupID))
+                    Label(keepTitle, systemImage: duplicates.keepSymbol(for: uid))
                         .labelStyle(.iconOnly)
                 }
                 .help(keepTitle)
                 .accessibilityLabel(keepTitle)
-                .disabled(!duplicates.canKeep(uid, inGroup: group.groupID))
+                .disabled(!duplicates.canKeep(uid))
                 .accessibilityIdentifier("duplicates.viewer.keep")
 
                 Button {
                     closePhoto()
-                    Task { await duplicates.merge(groupID: group.groupID) }
+                    // The group is found at the tap: it can have split since the viewer opened.
+                    Task { await duplicates.merge(containing: uid) }
                 } label: {
                     Label(mergeTitle, systemImage: duplicates.mergeSymbol)
                         .labelStyle(.iconOnly)
                 }
                 .help(mergeTitle)
                 .accessibilityLabel(mergeTitle)
-                .disabled(!duplicates.canMerge(groupID: group.groupID))
+                .disabled(!duplicates.canMerge(containing: uid))
                 .accessibilityIdentifier("duplicates.viewer.merge")
             }
             ToolbarSpacer(.fixed, placement: .primaryAction)
@@ -1699,7 +1700,7 @@ struct MainView: View {
         viewerFollowsReplacements = false
         zoom = nil
         viewerModel = viewer
-        duplicateViewerGroup = DuplicateViewerGroup(groupID: groupID, viewer: viewer)
+        duplicateViewerGroup = DuplicateViewerGroup(viewer: viewer)
     }
 
     /// The group of duplicates that `viewer` shows. Nil for a viewer opened anywhere else, also after the viewer of a
@@ -2826,9 +2827,9 @@ private extension View {
     }
 }
 
-/// The group of duplicates that one viewer shows. It holds the viewer weakly and compares it by identity, so a viewer
-/// opened elsewhere never shows the merge tools, even when it reuses the memory of a closed one.
+/// The viewer that shows a group of duplicates. It holds the viewer weakly and compares it by identity, so a viewer
+/// opened elsewhere never shows the merge tools, even when it reuses the memory of a closed one. The actions find the
+/// group of the photo on screen, because the group can split while the viewer is open.
 private struct DuplicateViewerGroup {
-    let groupID: String
     weak var viewer: PhotoViewerModel?
 }

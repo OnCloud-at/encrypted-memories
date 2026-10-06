@@ -6279,6 +6279,12 @@
         }
       }
     },
+    "duplicates.kept_reason_different_details": {
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Its date, place, or other details differ." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Datum, Ort oder andere Angaben weichen ab." } }
+      }
+    },
     "duplicates.kept_reason_related_file": {
       "localizations": {
         "en": { "stringUnit": { "state": "translated", "value": "A file such as a Live Photo video exists only with the duplicate." } },

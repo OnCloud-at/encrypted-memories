@@ -21,28 +21,42 @@ public struct ExactDuplicateNodeFacts: Sendable, Equatable {
     public let byteSize: Int64?
     /// Every album that contains the photo, shared albums included.
     public let albums: [SeriesAlbumReference]
+    /// The metadata of the photo that the app shows. A node without metadata has a fingerprint without values.
+    public let fingerprint: ExactDuplicateFingerprint
 
-    public init(isShared: Bool, byteSize: Int64?, albums: [SeriesAlbumReference] = []) {
+    public init(
+        isShared: Bool, byteSize: Int64?, albums: [SeriesAlbumReference] = [],
+        fingerprint: ExactDuplicateFingerprint = ExactDuplicateFingerprint()
+    ) {
         self.isShared = isShared
         self.byteSize = byteSize
         self.albums = albums
+        self.fingerprint = fingerprint
     }
 }
 
-/// Two or more main photos of the own library with the same bytes.
+/// Two or more main photos of the own library with the same bytes, and after the node reads also the same metadata.
 public struct ExactDuplicateGroup: Sendable, Equatable, Identifiable {
-    public var id: String { contentHash }
+    /// The content hash, until the group splits by metadata. See `split(by:keepingIDWith:)`.
+    public let id: String
     /// The keyed content hash that all members share.
     public let contentHash: String
     /// The key epoch of `contentHash`. A merge under another key reads nothing and writes nothing.
     public let hashKeyEpoch: String
     /// Active main photos, sorted by link ID.
     public let members: [PhotoUID]
+    /// The metadata that every member has. Nil while the members' nodes were not read, as after a scan.
+    public let fingerprint: ExactDuplicateFingerprint?
 
-    public init(contentHash: String, hashKeyEpoch: String, members: [PhotoUID]) {
+    public init(
+        contentHash: String, hashKeyEpoch: String, members: [PhotoUID],
+        fingerprint: ExactDuplicateFingerprint? = nil, id: String? = nil
+    ) {
+        self.id = id ?? contentHash
         self.contentHash = contentHash
         self.hashKeyEpoch = hashKeyEpoch
         self.members = members
+        self.fingerprint = fingerprint
     }
 }
 
@@ -57,8 +71,9 @@ public struct ExactDuplicateScanProgress: Sendable, Equatable {
     }
 }
 
-/// The members of some groups in the order of the photo to keep, with the number of groups that the page covers.
-/// A group whose facts could not be read is not in `members` and keeps its fallback order.
+/// The members of some groups in the order of the photo to keep, with the number of groups that the page covers. Every
+/// dictionary is keyed by group ID. A group whose facts could not be read is not in `members` and keeps its fallback
+/// order.
 public struct ExactDuplicateRankingPage: Sendable, Equatable {
     public let members: [String: [PhotoUID]]
     public let groupCount: Int
@@ -70,11 +85,15 @@ public struct ExactDuplicateRankingPage: Sendable, Equatable {
     public let facts: [String: [PhotoUID: ExactDuplicateKeepFacts]]
     /// The size of each member of each ranked group in bytes, where its node states one.
     public let memberByteSizes: [String: [PhotoUID: Int64]]
+    /// The metadata of each member of each ranked group. Only members with equal metadata are duplicates; a member
+    /// without an entry is no duplicate.
+    public let fingerprints: [String: [PhotoUID: ExactDuplicateFingerprint]]
 
     public init(
         members: [String: [PhotoUID]], groupCount: Int, byteSizes: [String: Int64] = [:],
         shared: [String: Set<PhotoUID>] = [:], facts: [String: [PhotoUID: ExactDuplicateKeepFacts]] = [:],
-        memberByteSizes: [String: [PhotoUID: Int64]] = [:]
+        memberByteSizes: [String: [PhotoUID: Int64]] = [:],
+        fingerprints: [String: [PhotoUID: ExactDuplicateFingerprint]] = [:]
     ) {
         self.members = members
         self.groupCount = groupCount
@@ -82,6 +101,7 @@ public struct ExactDuplicateRankingPage: Sendable, Equatable {
         self.shared = shared
         self.facts = facts
         self.memberByteSizes = memberByteSizes
+        self.fingerprints = fingerprints
     }
 }
 
@@ -122,6 +142,8 @@ public enum ExactDuplicateKeepReason: String, Sendable, Equatable {
     case neededByLocalSource
     /// The person shares the photo. A trash would end that sharing.
     case shared
+    /// The metadata of the photo, such as its date or place, differ from the kept photo, so it is no duplicate.
+    case differentDetails
 }
 
 public enum ExactDuplicateSkipReason: String, Sendable, Equatable {
@@ -138,6 +160,8 @@ public enum ExactDuplicateSkipReason: String, Sendable, Equatable {
     /// The photo to keep left the library while the merge moved the duplicates to the trash, for example by a merge
     /// on another device that kept another member. The merge restored its duplicates and moved their rows back.
     case keptLeftLibraryDuringMerge
+    /// The metadata of the photo to keep changed since the screen read them.
+    case keptDetailsChanged
 }
 
 public enum ExactDuplicateMergeOutcome: Sendable, Equatable {
@@ -169,7 +193,8 @@ public struct ExactDuplicateKeepFacts: Sendable, Equatable {
 /// Finds exact duplicates in the own Proton library and merges them, like Duplicates in Apple Photos.
 ///
 /// A group holds two or more active main photos with the same content hash in the current key epoch. The content
-/// index of the backup dedupe supplies the hashes, so the scan reads no media bytes. Related files, photos of shared
+/// index of the backup dedupe supplies the hashes, so the scan reads no media bytes. The node reads of the ranking add
+/// the metadata of each member (`ExactDuplicateFingerprint`); only members with equal metadata stay one group. Related files, photos of shared
 /// albums, trashed photos, and drafts are never members. A merge keeps one member, gives it the favorite tag and the
 /// own albums of the others, moves the rows of the upload manifest to it, and moves the others to Recently Deleted.
 /// Every merge reads the server state again, so a retry after a failure repeats no write.
@@ -313,7 +338,7 @@ public struct ExactDuplicateFinder: Sendable {
                 isInOwnAlbum: false, isFavorite: false, isNamedByManifest: false, captureDate: date)
         }
         return Dictionary(
-            groups.map { ($0.contentHash, Self.keepOrder($0.members, facts: facts)) },
+            groups.map { ($0.id, Self.keepOrder($0.members, facts: facts)) },
             uniquingKeysWith: { first, _ in first })
     }
 
@@ -322,8 +347,8 @@ public struct ExactDuplicateFinder: Sendable {
         await remote.captureDates(of: members)
     }
 
-    /// The members of each group by content hash, the photo to keep first. A group whose facts could not be read is
-    /// left out, so it keeps its fallback order.
+    /// The members of each group by group ID, the photo to keep first. A group whose facts could not be read is left
+    /// out, so it keeps its fallback order.
     public func rankedMembers(of groups: [ExactDuplicateGroup]) async -> [String: [PhotoUID]] {
         let collected = RankingCollector()
         await rankMembers(of: groups) { await collected.add($0.members) }
@@ -360,22 +385,24 @@ public struct ExactDuplicateFinder: Sendable {
             var sharedMembers: [String: Set<PhotoUID>] = [:]
             var pageFacts: [String: [PhotoUID: ExactDuplicateKeepFacts]] = [:]
             var memberSizes: [String: [PhotoUID: Int64]] = [:]
+            var fingerprints: [String: [PhotoUID: ExactDuplicateFingerprint]] = [:]
             for group in page {
-                guard let read = facts[group.contentHash] else {
+                guard let read = facts[group.id] else {
                     failed += 1
                     continue
                 }
                 let shared = Set(group.members.filter { read[$0]?.isShared == true })
-                if !shared.isEmpty { sharedMembers[group.contentHash] = shared }
+                if !shared.isEmpty { sharedMembers[group.id] = shared }
                 if let size = group.members.lazy.compactMap({ read[$0]?.byteSize }).first(where: { $0 > 0 }) {
-                    sizes[group.contentHash] = size
+                    sizes[group.id] = size
                 }
                 let known = group.members.compactMap { member in
                     read[member]?.byteSize.flatMap { $0 > 0 ? (member, $0) : nil }
                 }
                 if !known.isEmpty {
-                    memberSizes[group.contentHash] = Dictionary(known, uniquingKeysWith: { first, _ in first })
+                    memberSizes[group.id] = Dictionary(known, uniquingKeysWith: { first, _ in first })
                 }
+                fingerprints[group.id] = read.mapValues(\.fingerprint)
                 var memberFacts: [PhotoUID: ExactDuplicateKeepFacts] = [:]
                 for member in group.members {
                     memberFacts[member] = ExactDuplicateKeepFacts(
@@ -384,14 +411,14 @@ public struct ExactDuplicateFinder: Sendable {
                         isNamedByManifest: !(owners?[member.nodeID] ?? []).isEmpty,
                         captureDate: dates[member], isShared: shared.contains(member))
                 }
-                order[group.contentHash] = Self.keepOrder(group.members, facts: memberFacts)
-                pageFacts[group.contentHash] = memberFacts
+                order[group.id] = Self.keepOrder(group.members, facts: memberFacts)
+                pageFacts[group.id] = memberFacts
             }
             guard !Task.isCancelled else { return }
             await ranked(
                 ExactDuplicateRankingPage(
                     members: order, groupCount: page.count, byteSizes: sizes, shared: sharedMembers,
-                    facts: pageFacts, memberByteSizes: memberSizes))
+                    facts: pageFacts, memberByteSizes: memberSizes, fingerprints: fingerprints))
         }
         log(
             "[Duplicates] ranking groups=\(groups.count) members=\(members.count) failedGroups=\(failed) "
@@ -401,8 +428,8 @@ public struct ExactDuplicateFinder: Sendable {
 
     private typealias GroupFacts = [PhotoUID: ExactDuplicateNodeFacts]
 
-    /// The node facts of the members of each group, albums included, `rankingConcurrency` groups at once: one node
-    /// read for each member. A group whose read failed is missing.
+    /// The node facts of the members of each group by group ID, albums and metadata included, `rankingConcurrency`
+    /// groups at once: one node read for each member. A group whose read failed, or missed a member, is missing.
     private func groupFacts(of groups: [ExactDuplicateGroup]) async -> [String: GroupFacts] {
         let remote = remote
         let reads = await BoundedConcurrency.map(groups, limit: Self.rankingConcurrency) { group in
@@ -410,7 +437,7 @@ public struct ExactDuplicateFinder: Sendable {
         }
         var facts: [String: GroupFacts] = [:]
         for (group, read) in zip(groups, reads) {
-            if let read = read ?? nil { facts[group.contentHash] = read }
+            if let read = read ?? nil, group.members.allSatisfy({ read[$0] != nil }) { facts[group.id] = read }
         }
         return facts
     }
@@ -446,9 +473,9 @@ public struct ExactDuplicateFinder: Sendable {
 
     /// Keeps `kept` and moves the other members of `group` to Recently Deleted.
     ///
-    /// The merge reads every member again and leaves a member whose trash could lose data: a related file without a
-    /// copy under `kept`, a photo that the edit replacement still tracks, or a photo that a local source needs and
-    /// whose manifest row cannot move. The favorite tag and the own albums move to `kept` first, then the manifest
+    /// The merge reads every member again and leaves a member whose trash could lose data: a photo whose metadata
+    /// differ from `kept`, a related file without a copy under `kept`, a photo that the edit replacement still tracks,
+    /// or a photo that a local source needs and whose manifest row cannot move. The favorite tag and the own albums move to `kept` first, then the manifest
     /// rows, and then the trash. A crash after any step leaves the next step to a retry: the carried state reads as
     /// done, moved rows name `kept`, and trashed members are no members anymore. When `kept` left the library during
     /// the trash, the merge restores the duplicates, so one copy always stays.
@@ -539,10 +566,21 @@ public struct ExactDuplicateFinder: Sendable {
         else { return .skipped(.keptUnreadable) }
 
         var plan = PlannedMerge(kept: kept, contentHash: group.contentHash, epoch: epoch, volumeID: volumeID)
-        // A trash ends the sharing of a photo, so a shared duplicate stays. Only the members of this group are read.
-        let shared = Set(try await remote.nodeFacts(of: active).filter(\.value.isShared).keys)
+        // One node read for each member of this group gives the metadata and the sharing state.
+        let facts = try await remote.nodeFacts(of: active)
+        // The screen offered the group for the metadata that it read. When the kept photo has other metadata now, the
+        // screen reads the group again.
+        guard let keptFingerprint = facts[kept]?.fingerprint else { return .skipped(.keptUnreadable) }
+        if let shown = group.fingerprint, shown != keptFingerprint { return .skipped(.keptDetailsChanged) }
+        // A trash ends the sharing of a photo, so a shared duplicate stays.
+        let shared = Set(facts.filter(\.value.isShared).keys)
         for member in active where member != kept {
             try Task.checkCancellation()
+            // A copy with other metadata, such as another date or place, is no duplicate: its trash would lose them.
+            guard let fingerprint = facts[member]?.fingerprint, fingerprint == keptFingerprint else {
+                plan.keptDuplicates[member] = .differentDetails
+                continue
+            }
             guard !shared.contains(member) else {
                 plan.keptDuplicates[member] = .shared
                 continue

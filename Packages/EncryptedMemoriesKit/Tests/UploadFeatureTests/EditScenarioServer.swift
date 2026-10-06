@@ -71,6 +71,7 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
     private var healthOverride: UploadRemoteContentIndexHealth?
     private var sharedLinks: Set<String> = []
     private var nodeSizes: [String: Int64] = [:]
+    private var nodeFingerprints: [String: ExactDuplicateFingerprint] = [:]
     private var missingNodes: Set<String> = []
     private var covers: [String: String] = [:]
     private var failCoverWrite = false
@@ -755,7 +756,7 @@ extension EditScenarioServer: ExactDuplicateRemote {
                             isShared: sharedLinks.contains($0.nodeID), byteSize: nodeSizes[$0.nodeID],
                             albums: (table[$0.nodeID]?.albums ?? []).sorted {
                                 ($0.volumeID, $0.albumID) < ($1.volumeID, $1.albumID)
-                            })
+                            }, fingerprint: nodeFingerprints[$0.nodeID] ?? ExactDuplicateFingerprint())
                     )
                 })
         }
@@ -763,6 +764,11 @@ extension EditScenarioServer: ExactDuplicateRemote {
 
     /// The node of the photo states this file size.
     func setNodeSize(_ size: Int64, of uid: PhotoUID) { lock.withLock { nodeSizes[uid.nodeID] = size } }
+
+    /// The node of the photo carries this metadata. Without one, the node has no metadata.
+    func setFingerprint(_ fingerprint: ExactDuplicateFingerprint, of uid: PhotoUID) {
+        lock.withLock { nodeFingerprints[uid.nodeID] = fingerprint }
+    }
 
     /// The person shares the photo with other people or by a link.
     func share(_ uid: PhotoUID) { lock.withLock { _ = sharedLinks.insert(uid.nodeID) } }

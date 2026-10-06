@@ -354,29 +354,32 @@ struct MobilePhotoViewer: View {
     /// Keeps the photo shown when its group is merged. "Kept" with a filled checkmark once a merge keeps it.
     private func duplicateKeepButton(_ group: MobileDuplicateViewerGroup) -> some View {
         let uid = currentBaseItem?.uid
-        let title = uid.map { group.model.keepTitle(for: $0, inGroup: group.groupID) } ?? ""
-        let symbol = uid.map { group.model.keepSymbol(for: $0, inGroup: group.groupID) } ?? "checkmark.circle"
+        let title = uid.map { group.model.keepTitle(for: $0) } ?? ""
+        let symbol = uid.map { group.model.keepSymbol(for: $0) } ?? "checkmark.circle"
         return Button {
             guard let uid else { return }
-            group.model.keep(uid, inGroup: group.groupID)
+            group.model.keep(uid)
         } label: {
             Label(title, systemImage: symbol)
         }
-        .disabled(!(uid.map { group.model.canKeep($0, inGroup: group.groupID) } ?? false))
+        .disabled(!(uid.map { group.model.canKeep($0) } ?? false))
         .accessibilityLabel(title)
         .accessibilityIdentifier("duplicates.viewer.keep")
     }
 
-    /// Merges the group with the photo shown as kept, like Merge in Apple Photos, and closes the viewer.
+    /// Merges the group of the photo on screen with the photo shown as kept, like Merge in Apple Photos, and closes
+    /// the viewer. The group is found at the tap: it can have split since the viewer opened.
     private func duplicateMergeButton(_ group: MobileDuplicateViewerGroup) -> some View {
         let title = group.model.mergeTitle
+        let uid = currentBaseItem?.uid
         return Button {
+            guard let uid else { return }
             dismiss()
-            Task { await group.model.merge(groupID: group.groupID) }
+            Task { await group.model.merge(containing: uid) }
         } label: {
             Label(title, systemImage: group.model.mergeSymbol)
         }
-        .disabled(!group.model.canMerge(groupID: group.groupID))
+        .disabled(!(uid.map { group.model.canMerge(containing: $0) } ?? false))
         .accessibilityLabel(title)
         .accessibilityIdentifier("duplicates.viewer.merge")
     }

@@ -215,10 +215,17 @@
                             })
                     )
                 })
+            let fingerprints = Dictionary(
+                uniqueKeysWithValues: groups.map { group in
+                    (
+                        group.id,
+                        Dictionary(uniqueKeysWithValues: group.members.map { ($0, ExactDuplicateFingerprint()) })
+                    )
+                })
             await ranked(
                 ExactDuplicateRankingPage(
                     members: Dictionary(uniqueKeysWithValues: groups.map { ($0.id, $0.members) }),
-                    groupCount: groups.count, facts: facts))
+                    groupCount: groups.count, facts: facts, fingerprints: fingerprints))
         }
 
         func merge(
