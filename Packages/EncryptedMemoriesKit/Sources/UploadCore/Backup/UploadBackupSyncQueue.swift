@@ -262,8 +262,12 @@ public protocol UploadBackupSyncQueueStore: Sendable {
     /// Atomically reserves runnable rows for one runner. Returned entries keep their pre-claim
     /// state so the runner can mirror progress accurately; the store has already moved them to an
     /// active state, so another runner cannot take the same work. Crash recovery demotes these
-    /// active rows back to runnable via `requeueStaleActive`.
-    func claimRunnable(limit: Int, claimedAt: Date) -> [UploadBackupSyncQueueEntry]
+    /// active rows back to runnable via `requeueStaleActive`. Rows of a source in `excludedSources` (same kind and
+    /// identifier, any resource or revision) stay unclaimed: the runner passes the sources it processes, because
+    /// their rows can be runnable for a moment, for example while the paired video of an uploaded photo uploads.
+    func claimRunnable(
+        limit: Int, claimedAt: Date, excludingSourcesOf excludedSources: [UploadSourceIdentity]
+    ) -> [UploadBackupSyncQueueEntry]
     /// Rows currently in `state` whose `updatedAt` is older than `updatedBefore`, oldest first.
     /// The runner uses this to find parked `blockedByDraft` rows whose re-check backoff elapsed.
     func entries(in state: UploadBackupSyncQueueState, updatedBefore: Date, limit: Int) -> [UploadBackupSyncQueueEntry]
@@ -322,6 +326,10 @@ public protocol UploadBackupSyncQueueStore: Sendable {
 
 public extension UploadBackupSyncQueueStore {
     func isOperational() -> Bool { true }
+
+    func claimRunnable(limit: Int, claimedAt: Date) -> [UploadBackupSyncQueueEntry] {
+        claimRunnable(limit: limit, claimedAt: claimedAt, excludingSourcesOf: [])
+    }
 
     func upsertBatch(_ entries: [UploadBackupSyncQueueEntry]) -> Bool {
         entries.allSatisfy(upsert)
