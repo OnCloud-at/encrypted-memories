@@ -1030,8 +1030,10 @@ public final class ExactDuplicatesModel {
     private func merge(_ requested: [Group], all: Bool, preselected: Set<String> = []) async {
         isMerging = true
         notice = nil
-        // The groups that nobody scrolled to rank page by page, with progress. The photo that the screen shows as kept
-        // stays, unless only another member is shared.
+        // The groups that nobody scrolled to rank page by page, with progress. Merge All keeps the copy that the rule
+        // ranks first in such a group, as every device does: the person saw no preselection there, only the order
+        // that needs no request. A single merge keeps the photo that the screen shows as kept, unless only another
+        // member is shared. A photo that the person chose stays in both.
         let unranked = requested.filter { !$0.isRanked }.map(\.scanGroup)
         if !unranked.isEmpty {
             let token = UUID()
@@ -1039,7 +1041,7 @@ public final class ExactDuplicatesModel {
             rankingProgress = ExactDuplicateScanProgress(completed: 0, total: unranked.count)
             isRankingForMerge = true
             let apply: @Sendable (ExactDuplicateRankingPage) async -> Void = { [weak self] page in
-                await self?.apply(page, token: token, keepsShown: true)
+                await self?.apply(page, token: token, keepsShown: !all)
             }
             await finder.rankMembers(of: unranked, ranked: apply)
             isRankingForMerge = false

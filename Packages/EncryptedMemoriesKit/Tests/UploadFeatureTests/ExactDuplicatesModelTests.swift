@@ -162,7 +162,7 @@ final class ExactDuplicatesModelTests: XCTestCase {
         XCTAssertEqual(model.groups.map(\.isRanked), [false, true])
     }
 
-    func testMergeAllReadsTheFactsOfAnUnrankedGroupButKeepsThePhotoShownAsKept() async {
+    func testMergeAllReadsTheFactsOfAnUnrankedGroupAndKeepsTheFirstRankedOrTheChosenPhoto() async {
         let finder = FakeDuplicateFinder(scans: [.init(groups: [groupA, groupB], coverage: .complete)])
         finder.fallback = ["A": [a2, a1, a3], "B": [b2, b1]]
         finder.ranked = ["A": [a3, a1, a2], "B": [b1, b2]]
@@ -170,7 +170,7 @@ final class ExactDuplicatesModelTests: XCTestCase {
         let (model, _) = makeModel(finder)
         await model.load()
         finder.unreadableGroups = []
-        model.keep(b1, inGroup: "B")
+        model.keep(b2, inGroup: "B")
 
         await model.mergeAll()
 
@@ -178,8 +178,9 @@ final class ExactDuplicatesModelTests: XCTestCase {
             finder.rankedGroups.last, ["A", "B"],
             "Merge All reads the facts and the metadata of every unranked group first, a chosen one too")
         XCTAssertEqual(
-            finder.merges, [.init(group: "A", kept: a2), .init(group: "B", kept: b1)],
-            "the merge keeps the photo that the screen showed as kept")
+            finder.merges, [.init(group: "A", kept: a3), .init(group: "B", kept: b2)],
+            "the merge keeps the copy that ranks first, as every device does, unless the person chose another")
+        XCTAssertEqual(finder.choices, ["A": false, "B": true], "the ranked copy stays a preselection")
     }
 
     func testMergeAllKeepsASharedMemberInsteadOfTheShownPhotoAndShowsIt() async {
@@ -485,16 +486,21 @@ final class ExactDuplicatesModelTests: XCTestCase {
         finder.mergeGate.close()
         let merge = Task { await model.mergeAll() }
         await waitUntil({ finder.mergeGate.hasWaiters }, "the merge runs")
-        XCTAssertEqual(model.groups.first { $0.id == late.id }?.kept, shownKept, "Merge All keeps the shown photo")
+        // The person saw no ranking of the late group, so Merge All keeps the copy that its own ranking puts first.
+        let mergeKept = late.members.last
+        XCTAssertNotEqual(mergeKept, shownKept)
+        XCTAssertEqual(model.groups.first { $0.id == late.id }?.kept, mergeKept, "Merge All keeps the first copy")
 
+        // The held scroll ranking lands with another order.
+        finder.ranked = [late.id: late.members]
         finder.holdGate.open()
         await waitUntil({ finder.activeRankings == 0 }, "the scroll ranking lands")
 
         XCTAssertEqual(
-            model.groups.first { $0.id == late.id }?.kept, shownKept, "the screen shows what the merge keeps")
+            model.groups.first { $0.id == late.id }?.kept, mergeKept, "the screen shows what the merge keeps")
         finder.mergeGate.open()
         await merge.value
-        XCTAssertEqual(finder.merges.first { $0.group == late.id }?.kept, shownKept)
+        XCTAssertEqual(finder.merges.first { $0.group == late.id }?.kept, mergeKept)
     }
 
     func testAPhotoTrashedElsewhereLeavesItsGroupAndASingleCopyLeavesTheList() async {

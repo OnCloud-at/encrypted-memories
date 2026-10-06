@@ -532,17 +532,20 @@ public struct ExactDuplicateFinder: Sendable {
     /// every group without an outcome fails with `CancellationError`.
     ///
     /// A preselected photo to keep is ranked again with the favorites of now, from one listing for every such group:
-    /// the ranking of the screen can predate a favorite set since. A failed listing fails every group.
+    /// the ranking of the screen can predate a favorite set since. A failed listing fails every group. The carry-over
+    /// uses the same listing when it covers every photo that it writes.
     public func merge(
         _ requests: [ExactDuplicateMergeRequest]
     ) async -> [Result<ExactDuplicateMergeOutcome, any Error>] {
         await resolvePendingMerges()
         var results = [Result<ExactDuplicateMergeOutcome, any Error>?](repeating: nil, count: requests.count)
         var favorites: Set<PhotoUID> = []
+        var favoritesRead: Set<PhotoUID> = []
         let preselected = requests.filter { !$0.isKeptChosen }.flatMap(\.group.members)
         if !preselected.isEmpty, !Task.isCancelled {
             do {
                 favorites = try await remote.favoriteUIDs(among: preselected)
+                favoritesRead = Set(preselected)
             } catch {
                 return requests.map { _ in .failure(error) }
             }
@@ -578,8 +581,10 @@ public struct ExactDuplicateFinder: Sendable {
             let writes = plans.filter { !$0.plan.trashable.isEmpty }
             if !writes.isEmpty {
                 do {
-                    let favorites = try await remote.favoriteUIDs(
-                        among: writes.flatMap { $0.plan.trashable + [$0.plan.kept] })
+                    let written = writes.flatMap { $0.plan.trashable + [$0.plan.kept] }
+                    let favorites =
+                        favoritesRead.isSuperset(of: written)
+                        ? favorites.intersection(written) : try await remote.favoriteUIDs(among: written)
                     // One album listing serves every group: an own album whose cover leaves gets the kept photo.
                     let covers = try await albums.ownAlbumCovers()
                     await write(writes, favorites: favorites, covers: covers, into: &results)

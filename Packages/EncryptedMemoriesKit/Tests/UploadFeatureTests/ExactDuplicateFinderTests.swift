@@ -1686,6 +1686,64 @@ final class ExactDuplicateFinderTests: XCTestCase {
     }
 
     @MainActor
+    func testMergeAllKeepsTheRulesCopyOfGroupsThatNobodyScrolledToOnEveryDeviceInOnePress() async throws {
+        // More groups than the screen ranks when it opens, so the last ones show only the order that needs no request.
+        let pairs = (0..<60).map { index in
+            (server.seedLink(digest: digest("group-\(index)")), server.seedLink(digest: digest("group-\(index)")))
+        }
+        try await server.markFavorite(pairs.map(\.1))
+        var models: [ExactDuplicatesModel] = []
+        for index in 0..<3 {
+            let device = try device(index)
+            let model = ExactDuplicatesModel(finder: device.finder)
+            await model.load()
+            models.append(model)
+        }
+        for model in models {
+            let unranked = model.groups.filter { !$0.isRanked }
+            XCTAssertFalse(unranked.isEmpty, "some groups wait for their ranking")
+            XCTAssertTrue(unranked.allSatisfy { $0.kept == $0.members[0] && !pairs.map(\.1).contains($0.kept) })
+        }
+
+        await withTaskGroup(of: Void.self) { merges in
+            for model in models { merges.addTask { await model.mergeAll() } }
+        }
+
+        for (index, pair) in pairs.enumerated() {
+            XCTAssertEqual(activeMains(hash("group-\(index)")), [pair.1], "group \(index) keeps its favorite only")
+        }
+        for (index, model) in models.enumerated() {
+            XCTAssertEqual(model.groups.map(\.id), [], "device \(index) merged every group in one press")
+        }
+        XCTAssertEqual(violations, [])
+    }
+
+    func testAMergeOfPreselectedPhotosReadsTheFavoritesOnceAndCarriesThemOver() async throws {
+        let kept = server.seedLink(digest: digest("a"))
+        let favorite = server.seedLink(digest: digest("a"))
+        let otherKept = server.seedLink(digest: digest("b"))
+        let otherDuplicate = server.seedLink(digest: digest("b"))
+        try await server.addPhotos([kept], toOwnAlbum: "own-album")
+        try await server.markFavorite([favorite])
+        indexServer()
+        let groups = try await finder.duplicateGroups().groups
+        let readsBefore = server.readCounts.favorites
+
+        let results = await finder.merge(
+            groups.map { ExactDuplicateMergeRequest(group: $0, kept: $0.members[0], isKeptChosen: false) })
+
+        XCTAssertEqual(
+            try results.map { try $0.get() }.sorted { "\($0)" < "\($1)" },
+            [
+                .merged(kept: kept, trashed: [favorite], keptDuplicates: [:]),
+                .merged(kept: otherKept, trashed: [otherDuplicate], keptDuplicates: [:]),
+            ].sorted { "\($0)" < "\($1)" })
+        XCTAssertEqual(server.readCounts.favorites - readsBefore, 1, "the check and the carry-over share one listing")
+        XCTAssertEqual(server.links.first { $0.linkID == kept.nodeID }?.favorite, true, "the favorite moved")
+        XCTAssertEqual(violations, [])
+    }
+
+    @MainActor
     func testAFavoriteSetAfterTheScreenRankedMakesTheMergeSkipTheGroupInsteadOfTrashingTheNewFirstCopy() async throws {
         let first = server.seedLink(digest: digest("a"))
         let second = server.seedLink(digest: digest("a"))
