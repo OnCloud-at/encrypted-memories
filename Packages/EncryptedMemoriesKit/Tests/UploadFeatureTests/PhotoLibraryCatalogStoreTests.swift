@@ -715,7 +715,9 @@ final class PhotoLibraryCatalogStoreTests: XCTestCase {
         var reopened: [String] { lock.withLock { _reopened } }
         var enqueued: [String] { lock.withLock { _enqueued } }
 
-        func reopenBackedUpRevisions(_ reopenings: [UploadBackupReopening]) async -> [UploadBackupAssetCandidate] {
+        func reopenBackedUpRevisions(
+            _ reopenings: [UploadBackupReopening], deferringWithoutRemoteProof: Bool
+        ) async -> [UploadBackupAssetCandidate] {
             let isFirstCall = lock.withLock { () -> Bool in
                 defer { _reopened += reopenings.map(\.candidate.snapshot.source.identifier) }
                 return _reopened.isEmpty

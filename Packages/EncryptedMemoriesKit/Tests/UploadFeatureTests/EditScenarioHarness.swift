@@ -355,7 +355,11 @@ final class EditScenarioHarness {
 
     /// Seeds the values v1.0.5 wrote, then opens them again with today's stores and runner.
     /// `liveOff` turns the Live effect off before v1.0.5 backs the photo up. v1.0.5 did not read it.
-    convenience init(v105 fixture: V105Fixture, assetCount: Int = 1, live: Bool = false, liveOff: Bool = false) throws {
+    /// `remoteIdentity` stores the iCloud identity with each upload, so another device finds a remote proof.
+    convenience init(
+        v105 fixture: V105Fixture, assetCount: Int = 1, live: Bool = false, liveOff: Bool = false,
+        remoteIdentity: Bool = false
+    ) throws {
         try self.init(live: live)
         do {
             library.setLivePlaybackOff(liveOff)
@@ -374,7 +378,7 @@ final class EditScenarioHarness {
                 library.add("asset-2", basename: "IMG_2", original: try XCTUnwrap(library.snapshot.first).original)
             }
             for asset in library.snapshot {
-                try seedV105(asset)
+                try seedV105(asset, remoteIdentity: remoteIdentity)
             }
             // The index may have no compound proof. The local stores must still protect existing uploads.
             try relaunch()
@@ -393,7 +397,7 @@ final class EditScenarioHarness {
         }
     }
 
-    private func seedV105(_ asset: EditScenarioLibrary.Asset) throws {
+    private func seedV105(_ asset: EditScenarioLibrary.Asset, remoteIdentity: Bool = false) throws {
         // v1.0.5 did not read the Live effect, so it planned every Live Photo with its tagged paired video.
         var info = asset.info
         info.livePlaybackOff = false
@@ -412,7 +416,9 @@ final class EditScenarioHarness {
                 uid = existing.uid
                 wasDuplicate = true
             } else {
-                uid = server.seedV105Upload(descriptor, digest: digest, asset: asset, main: main)
+                uid = server.seedV105Upload(
+                    descriptor, digest: digest, asset: asset, main: main,
+                    externalIdentifier: remoteIdentity ? asset.info.cloudIdentifier : nil)
                 // v1.0.5 tagged a Live Photo and its paired video like today's runner does.
                 if plan.secondaries.contains(where: { $0.sourceResource == .livePairedVideo }),
                     item.sourceResource == .primary || item.sourceResource == .livePairedVideo
@@ -446,6 +452,23 @@ final class EditScenarioHarness {
                         remoteVolumeID: volumeID, remoteLinkID: uid.nodeID,
                         outcome: wasDuplicate ? "duplicateActive" : "uploaded", updatedAt: clock.now)))
         }
+        try seedV105States(asset, info: info, queueState: .completed)
+    }
+
+    /// v1.0.5 settled each photo through the remote proof of another device's upload: it wrote complete backup states
+    /// and a settled queue row, but no manifest record. Its catalog lists each photo as the library shows it now.
+    func seedV105RemoteProofSettlement() throws {
+        for asset in library.snapshot {
+            var info = asset.info
+            info.livePlaybackOff = false
+            try seedV105States(asset, info: info, queueState: .alreadyBackedUp)
+        }
+        try relaunch()
+    }
+
+    private func seedV105States(
+        _ asset: EditScenarioLibrary.Asset, info: PhotoBackupAssetInfo, queueState: UploadBackupSyncQueueState
+    ) throws {
         let candidate = try XCTUnwrap(PhotoBackupAssetPlanner.candidate(for: info))
         // v1.0.5 PhotoBackupAssetPlan.swift:167-170 uses the date even when the render is absent.
         let revision = UploadBackupRevision(date: asset.modificationDate)
@@ -463,7 +486,7 @@ final class EditScenarioHarness {
             queue.upsert(
                 UploadBackupSyncQueueEntry(
                     source: asset.source, revision: revision, originalFilename: candidate.originalFilename,
-                    state: .completed, updatedAt: clock.now)))
+                    state: queueState, updatedAt: clock.now)))
         var entry = PhotoLibraryCatalogMapper.entry(for: info, observedAt: clock.now)
         entry.metadataRevision = revision.rawValue
         XCTAssertTrue(catalog.upsertBatch([entry]))

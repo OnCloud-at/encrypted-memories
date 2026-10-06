@@ -37,15 +37,31 @@ public protocol UploadBackupCandidateEnqueueing: Sendable {
     @discardableResult
     func enqueueBatch(_ candidates: [UploadBackupAssetCandidate]) async throws -> UploadBackupSyncScanResult
     /// Re-opens the backed-up revision of each candidate, unless its backup already holds the file that the asset now
-    /// lists. Returns the candidates whose revision is pending work.
+    /// lists. Returns the candidates whose revision is pending work. With `deferringWithoutRemoteProof`, a remote proof
+    /// that cannot be read throws `UploadBackupRemoteProofUnavailable` and changes nothing; without it, the revisions
+    /// that only the proof could settle re-open.
     @discardableResult
-    func reopenBackedUpRevisions(_ reopenings: [UploadBackupReopening]) async throws -> [UploadBackupAssetCandidate]
+    func reopenBackedUpRevisions(
+        _ reopenings: [UploadBackupReopening], deferringWithoutRemoteProof: Bool
+    ) async throws -> [UploadBackupAssetCandidate]
+}
+
+/// The remote proof could not be read, so revisions that only the proof can settle stay as they are for now.
+public struct UploadBackupRemoteProofUnavailable: Error, Sendable {
+    public init() {}
 }
 
 public extension UploadBackupCandidateEnqueueing {
     @discardableResult
-    func reopenBackedUpRevisions(_ reopenings: [UploadBackupReopening]) async throws -> [UploadBackupAssetCandidate] {
+    func reopenBackedUpRevisions(
+        _ reopenings: [UploadBackupReopening], deferringWithoutRemoteProof: Bool
+    ) async throws -> [UploadBackupAssetCandidate] {
         []
+    }
+
+    @discardableResult
+    func reopenBackedUpRevisions(_ reopenings: [UploadBackupReopening]) async throws -> [UploadBackupAssetCandidate] {
+        try await reopenBackedUpRevisions(reopenings, deferringWithoutRemoteProof: false)
     }
 
     func enqueueBatch(_ candidates: [UploadBackupAssetCandidate]) async throws -> UploadBackupSyncScanResult {
@@ -208,15 +224,19 @@ public actor UploadBackupSyncEngine: UploadBackupCandidateEnqueueing {
 
     /// A complete revision becomes pending work again; its settled queue row goes away, so the next `enqueueBatch`
     /// queues the upload. A revision whose backup already holds the late file as main file, or that has no state,
-    /// keeps the usual classification.
+    /// keeps the usual classification. So does a revision that the remote proof settled on this device and still
+    /// settles.
     @discardableResult
     public func reopenBackedUpRevisions(
-        _ reopenings: [UploadBackupReopening]
+        _ reopenings: [UploadBackupReopening], deferringWithoutRemoteProof: Bool
     ) async throws -> [UploadBackupAssetCandidate] {
         var pending: [UploadBackupAssetCandidate] = []
         let kept = Set(try withoutExcludedSources(reopenings.map(\.candidate)).map(\.snapshot.source))
-        for reopening in reopenings where kept.contains(reopening.candidate.snapshot.source) {
+        let offered = reopenings.filter { kept.contains($0.candidate.snapshot.source) }
+        let proven = try await settledByRemoteProof(offered, deferringWithoutProof: deferringWithoutRemoteProof)
+        for reopening in offered {
             let snapshot = reopening.candidate.snapshot
+            if proven.contains(snapshot.source) { continue }
             if await backupHoldsLateMain(snapshot.source, formerMain: reopening.formerMain) { continue }
             try Task.checkCancellation()
             guard try await preflight.reopen(snapshot) else { continue }
@@ -244,6 +264,50 @@ public actor UploadBackupSyncEngine: UploadBackupCandidateEnqueueing {
             return false
         }
         return former.sha1Hex != main.sha1Hex
+    }
+
+    /// The sources whose complete revision the remote proof settles. A revision qualifies when this device holds no
+    /// manifest record for its former main file: such a record marks a backup with the late file as main file that
+    /// this device made, which `backupHoldsLateMain` checks. A record for the main file alone, such as the unedited
+    /// original hashed before another device uploaded the edit, does not tell what the backup holds. The proof counts
+    /// the files of the backup, so a backup without the late file settles nothing. An identity that two photos share
+    /// proves neither. When the proof cannot be read, `deferringWithoutProof` throws
+    /// `UploadBackupRemoteProofUnavailable` before anything changes; otherwise those revisions re-open as usual.
+    private func settledByRemoteProof(
+        _ reopenings: [UploadBackupReopening], deferringWithoutProof: Bool
+    ) async throws -> Set<UploadSourceIdentity> {
+        guard let remoteProofResolver, !reopenings.isEmpty else { return [] }
+        let complete = try await preflight.completeStates(reopenings.map(\.candidate.snapshot))
+        var unhashed: [UploadBackupExternalIdentity: [UploadBackupAssetSnapshot]] = [:]
+        for (reopening, isComplete) in zip(reopenings, complete) where isComplete {
+            try Task.checkCancellation()
+            let snapshot = reopening.candidate.snapshot
+            guard let identity = snapshot.externalIdentity else { continue }
+            if let formerMain = reopening.formerMain, await remoteProofResolver.identityRecord(for: formerMain) != nil {
+                continue
+            }
+            unhashed[identity, default: []].append(snapshot)
+        }
+        guard !unhashed.isEmpty else { return [] }
+        let proofs: [UploadBackupExternalIdentity: UploadRemoteAssetIndexRecord]
+        do {
+            proofs = try await remoteProofResolver.remoteAssetProofs(for: Array(unhashed.keys))
+        } catch {
+            // A cancelled index build ends the lookup with a cancellation error even when this pass goes on.
+            if Task.isCancelled { throw CancellationError() }
+            if deferringWithoutProof { throw UploadBackupRemoteProofUnavailable() }
+            return []
+        }
+        try Task.checkCancellation()
+        var proven: Set<UploadSourceIdentity> = []
+        for (identity, snapshots) in unhashed {
+            guard snapshots.count == 1, let snapshot = snapshots.first,
+                let proof = proofs[identity], proof.externalIdentity == identity,
+                proof.resourceCount == snapshot.resourceCount
+            else { continue }
+            proven.insert(snapshot.source)
+        }
+        return proven
     }
 
     private func prepare(
