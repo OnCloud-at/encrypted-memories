@@ -1209,6 +1209,8 @@ public final class ExactDuplicatesModel {
                 break
             }
         }
+        // A stop before the ranking reported a page leaves no group to merge, and the run still ends as stopped.
+        if all, isStoppingMergeAll, mergedGroups < candidates.count { stopped = true }
         mergingGroupIDs = []
         isMerging = false
         isMergingAll = false
@@ -1218,7 +1220,7 @@ public final class ExactDuplicatesModel {
         wakeMergeResumers()
         notice =
             stopped
-            ? .stopped(merged: mergedGroups, total: selected.count)
+            ? .stopped(merged: mergedGroups, total: candidates.count)
             : Self.notice(kept: kept, keptPhotoUnreadable: keptPhotoUnreadable, failed: failed)
         if stale {
             await load()

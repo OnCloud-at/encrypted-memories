@@ -1132,6 +1132,26 @@ final class ExactDuplicatesModelTests: XCTestCase {
         XCTAssertNil(model.rankingLine)
     }
 
+    func testStopBeforeTheRankingReportsAPageEndsAsStopped() async {
+        let groups = manyGroups(100)
+        let finder = FakeDuplicateFinder(scans: [.init(groups: groups, coverage: .complete)])
+        // No group is ranked yet when Merge All starts.
+        finder.unreadableGroups = Set(groups.map(\.id))
+        let (model, log) = makeModel(finder)
+        await model.load()
+        finder.unreadableGroups = []
+        finder.reportsNothingWhenCancelled = true
+        finder.rankGate.close()
+        let merge = Task { await model.mergeAll() }
+        await waitUntil({ finder.rankGate.hasWaiters }, "Merge All ranks")
+        model.stopMergeAll()
+        finder.rankGate.open()
+        await merge.value
+        XCTAssertTrue(finder.batches.isEmpty)
+        XCTAssertTrue(log.calls.isEmpty)
+        XCTAssertEqual(model.notice, .stopped(merged: 0, total: 100), "a stop is no failure")
+    }
+
     func testABatchInWhichNoGroupMergedStopsMergeAll() async {
         let (model, finder, log) = await loadedModel(groups: 75)
         let ids = model.groups.map(\.id)
@@ -1518,6 +1538,8 @@ private final class FakeDuplicateFinder: ExactDuplicateMerging, @unchecked Senda
     private var _activeRankings = 0
     private var _maximumConcurrentRankings = 0
     private var _cancelledRankings = 0
+    /// A cancelled ranking reports no page, as the finder does.
+    var reportsNothingWhenCancelled = false
     var scanProgress: [ExactDuplicateScanProgress] = []
     var fallback: [String: [PhotoUID]] = [:]
     /// Groups whose facts cannot be read.
@@ -1619,7 +1641,14 @@ private final class FakeDuplicateFinder: ExactDuplicateMerging, @unchecked Senda
         defer { lock.withLock { _activeRankings -= 1 } }
         let held = lock.withLock { !heldGroups.isDisjoint(with: groups.map(\.id)) }
         await rankGate.pass()
-        if Task.isCancelled { lock.withLock { _cancelledRankings += 1 } }
+        if Task.isCancelled {
+            let reportsNothing = lock.withLock {
+                _cancelledRankings += 1
+                return reportsNothingWhenCancelled
+            }
+            // The finder ends a cancelled ranking before its next page.
+            if reportsNothing { return }
+        }
         if held { await holdGate.pass() }
         let page = lock.withLock { () -> ExactDuplicateRankingPage in
             guard rankError == nil else { return ExactDuplicateRankingPage(members: [:], groupCount: groups.count) }
