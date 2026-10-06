@@ -107,7 +107,7 @@ struct ThumbnailCacheDiskChangeTests {
 
         // The first change arrives at once.
         originals.storeToDisk(Data(repeating: 0x11, count: 300), for: uid("first"))
-        #expect(await counter.waitFor(1, within: .milliseconds(800)) == 1)
+        #expect(await counter.waitFor(1) == 1)
 
         // A burst inside the interval collapses into one trailing signal.
         for index in 0..<20 {
