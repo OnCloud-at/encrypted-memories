@@ -381,6 +381,199 @@ final class EditUpgradeScenarioTests: XCTestCase {
         harness.assertQuiescent()
     }
 
+    /// Another device backed up the edit with its rendered file. v1.0.5 on this device settled the photo through the
+    /// remote proof, so this device holds backup states and no manifest record. The one-time pass over edits that list
+    /// their rendered file keeps the photo settled without reading its bytes; a later edit still replaces it.
+    func testV105EditSettledByTheRemoteProofOfAnotherDeviceStaysSettledWithoutReadingBytes() async throws {
+        let (deviceB, main) = try await secondDeviceSettledByTheRemoteProof()
+        defer { try? deviceB.cleanup() }
+        let candidate = try deviceB.library.candidate()
+        let uploadsBefore = uploads
+        let resolutions = deviceB.library.resolutions.count
+
+        let scan = try await deviceB.fullRescan()
+        XCTAssertEqual(scan.changed, 0)
+        XCTAssertEqual(scan.discovered, 0)
+        XCTAssertTrue(deviceB.catalog.hasReconciledLateRenders())
+        let row = try XCTUnwrap(
+            deviceB.queue.entry(for: candidate.snapshot.source, revision: candidate.snapshot.revision))
+        XCTAssertEqual(row.state, .alreadyBackedUp, "The remote proof still holds the rendered file")
+        await deviceB.drain()
+        XCTAssertEqual(deviceB.library.resolutions.count, resolutions, "No photo bytes should be requested")
+        XCTAssertEqual(uploads, uploadsBefore)
+        XCTAssertTrue(trashed.isEmpty)
+        XCTAssertEqual(activeMains, [main])
+
+        deviceB.library.edit("edit-after-upgrade", at: deviceB.clock.now)
+        let edit = try await deviceB.enqueue()
+        await deviceB.drain()
+        XCTAssertEqual(deviceB.state(of: edit), .completed)
+        XCTAssertGreaterThan(uploads, uploadsBefore, "A new edit still backs up")
+        XCTAssertEqual(trashed, [main.nodeID])
+        deviceB.assertQuiescent()
+    }
+
+    /// The remote proof cannot be read on the first launch, for example offline. The pass leaves the photo settled and
+    /// stops without marking itself done; a later pass with a readable proof finishes it. No pass reads photo bytes.
+    func testV105EditSettledByTheRemoteProofWaitsForAReadableProofWhenTheLookupFails() async throws {
+        let (deviceB, main) = try await secondDeviceSettledByTheRemoteProof()
+        defer { try? deviceB.cleanup() }
+        let candidate = try deviceB.library.candidate()
+        let uploadsBefore = uploads
+        let resolutions = deviceB.library.resolutions.count
+        func rowState() -> UploadBackupSyncQueueState? {
+            deviceB.queue.entry(for: candidate.snapshot.source, revision: candidate.snapshot.revision)?.state
+        }
+
+        deviceB.index.setProofLookupsFail(true)
+        _ = try await deviceB.fullRescan()
+        XCTAssertFalse(deviceB.catalog.hasReconciledLateRenders(), "A later pass checks the photo again")
+        XCTAssertEqual(rowState(), .alreadyBackedUp, "An unreadable proof re-opens nothing")
+        await deviceB.drain()
+        XCTAssertEqual(deviceB.library.resolutions.count, resolutions, "No photo bytes should be requested")
+
+        deviceB.index.setProofLookupsFail(false)
+        try deviceB.relaunch()
+        _ = try await deviceB.fullRescan()
+        XCTAssertTrue(deviceB.catalog.hasReconciledLateRenders())
+        XCTAssertEqual(rowState(), .alreadyBackedUp, "The remote proof still holds the rendered file")
+        await deviceB.drain()
+        XCTAssertEqual(deviceB.library.resolutions.count, resolutions, "No photo bytes should be requested")
+        XCTAssertEqual(uploads, uploadsBefore)
+        XCTAssertTrue(trashed.isEmpty)
+        XCTAssertEqual(activeMains, [main])
+    }
+
+    /// This device hashed and uploaded the unedited original. Another device then edited the photo and replaced the
+    /// upload, and v1.0.5 on this device settled the edit through the remote proof. The manifest still holds the record
+    /// of the unedited original, which says nothing about the edit's backup, so the remote proof keeps it settled.
+    func testV105EditSettledByTheRemoteProofStaysSettledOnTheDeviceThatHashedTheOriginal() async throws {
+        harness = try EditScenarioHarness()
+        try await harness.enqueue()
+        await harness.drain()
+        let original = try harness.liveMain()
+        let source = try harness.library.candidate().snapshot.source
+        XCTAssertEqual(harness.identities.record(for: source)?.remoteLinkID, original.nodeID)
+        let phone = try EditScenarioHarness(server: harness.server, library: harness.library)
+        defer { try? phone.cleanup() }
+        try await phone.enqueue()
+        await phone.pass()
+        phone.library.edit("phone-render", at: phone.clock.now)
+        try await phone.enqueue()
+        phone.clock.advance(by: 5)
+        await phone.drain()
+        let edit = try harness.liveMain()
+        XCTAssertNotEqual(edit, original)
+        XCTAssertEqual(trashed, [original.nodeID])
+
+        harness.index.refreshProofs()
+        let asset = try XCTUnwrap(harness.library.snapshot.first)
+        let candidate = try harness.library.candidate()
+        let identity = try XCTUnwrap(candidate.snapshot.externalIdentity)
+        let proof = try await harness.server.findRemoteAssetProofs(for: [identity])
+        XCTAssertEqual(proof[identity]?.resourceCount, candidate.snapshot.resourceCount)
+        try harness.seedV105RemoteProofSettlement()
+        XCTAssertNotNil(harness.identities.record(for: source), "The record of the unedited original stays")
+        let formerMain = try XCTUnwrap(PhotoBackupAssetPlanner.originalSecondarySource(for: asset.info))
+        XCTAssertNil(harness.identities.record(for: formerMain))
+        let uploadsBefore = uploads
+        let resolutions = harness.library.resolutions.count
+
+        let scan = try await harness.fullRescan()
+        XCTAssertEqual(scan.changed, 0)
+        XCTAssertTrue(harness.catalog.hasReconciledLateRenders())
+        let row = try XCTUnwrap(harness.queue.entry(for: source, revision: candidate.snapshot.revision))
+        XCTAssertEqual(row.state, .alreadyBackedUp, "The remote proof holds the rendered file")
+        await harness.drain()
+        XCTAssertEqual(harness.library.resolutions.count, resolutions, "No photo bytes should be requested")
+        XCTAssertEqual(uploads, uploadsBefore)
+        XCTAssertEqual(trashed, [original.nodeID])
+        XCTAssertEqual(activeMains, [edit])
+    }
+
+    /// Two photos list the same iCloud identity, and the backup of one of them matches it. The proof cannot tell which
+    /// photo it belongs to, so the pass re-opens both.
+    func testV105EditsThatShareOneRemoteIdentityReopenBecauseTheProofProvesNeither() async throws {
+        let (deviceB, _) = try await secondDeviceSettledByTheRemoteProof { library in
+            library.add("asset-2", basename: "IMG_2")
+            library.shareCloudIdentifier("cloud-asset-1", between: ["asset-1", "asset-2"])
+            library.edit("second-render", identifier: "asset-2", at: Date(timeIntervalSince1970: 1_720_000_100))
+        }
+        defer { try? deviceB.cleanup() }
+        let first = try deviceB.library.candidate()
+        let second = try deviceB.library.candidate("asset-2")
+        XCTAssertEqual(first.snapshot.externalIdentity, second.snapshot.externalIdentity)
+        XCTAssertEqual(first.snapshot.resourceCount, second.snapshot.resourceCount)
+
+        _ = try await deviceB.fullRescan()
+        XCTAssertTrue(deviceB.catalog.hasReconciledLateRenders())
+        for candidate in [first, second] {
+            XCTAssertEqual(
+                deviceB.queue.entry(for: candidate.snapshot.source, revision: candidate.snapshot.revision)?.state,
+                .queuedForUpload, "\(candidate.snapshot.source.identifier) re-opens")
+        }
+    }
+
+    /// Device A backs up an edit with its rendered file. Then `prepare` changes the shared library, and device B gets
+    /// the stores that v1.0.5 wrote after it settled every photo through the remote proof.
+    private func secondDeviceSettledByTheRemoteProof(
+        prepare: (EditScenarioLibrary) -> Void = { _ in }
+    ) async throws -> (EditScenarioHarness, PhotoUID) {
+        harness = try EditScenarioHarness()
+        harness.library.edit("first-device-render", at: harness.clock.now.addingTimeInterval(-121))
+        try await harness.enqueue()
+        await harness.drain()
+        let main = try harness.liveMain()
+        prepare(harness.library)
+        let deviceB = try EditScenarioHarness(server: harness.server, library: harness.library)
+        do {
+            let candidate = try deviceB.library.candidate()
+            let identity = try XCTUnwrap(candidate.snapshot.externalIdentity)
+            let proof = try await deviceB.server.findRemoteAssetProofs(for: [identity])
+            XCTAssertEqual(proof[identity]?.resourceCount, candidate.snapshot.resourceCount)
+            try deviceB.seedV105RemoteProofSettlement()
+            XCTAssertNil(deviceB.identities.record(for: candidate.snapshot.source))
+            XCTAssertFalse(deviceB.catalog.hasReconciledLateRenders())
+        } catch {
+            try? deviceB.cleanup()
+            throw error
+        }
+        return (deviceB, main)
+    }
+
+    /// The other device backed up the edit before Photos listed its rendered file. The remote proof counts one file
+    /// less than the photo lists now, so it settles nothing, and the rendered file backs up.
+    func testV105LateRenderSettledByTheRemoteProofOfAnotherDeviceStillBacksUpTheRenderedFile() async throws {
+        harness = try EditScenarioHarness(v105: .missingRender, remoteIdentity: true)
+        let deviceB = try EditScenarioHarness(server: harness.server, library: harness.library)
+        defer { try? deviceB.cleanup() }
+        let asset = try XCTUnwrap(deviceB.library.snapshot.first)
+        let revision = UploadBackupRevision(date: asset.modificationDate)
+        deviceB.library.publishRender("late-render")
+        let candidate = try deviceB.library.candidate()
+        XCTAssertEqual(candidate.snapshot.revision, revision)
+        let identity = try XCTUnwrap(candidate.snapshot.externalIdentity)
+        let proof = try await deviceB.server.findRemoteAssetProofs(for: [identity])
+        XCTAssertEqual(proof[identity]?.resourceCount, candidate.snapshot.resourceCount - 1)
+        // v1.0.5 settled the photo before Photos listed the rendered file, and scanned it again afterwards.
+        try deviceB.seedV105RemoteProofSettlement()
+        XCTAssertNil(deviceB.identities.record(for: candidate.snapshot.source))
+        let uploadsBefore = uploads
+
+        let scan = try await deviceB.fullRescan()
+        XCTAssertEqual(scan.changed, 0)
+        let reopened = try XCTUnwrap(deviceB.queue.entry(for: asset.source, revision: revision))
+        XCTAssertEqual(reopened.state, .queuedForUpload, "The remote backup holds no rendered file")
+        await deviceB.pass()
+        XCTAssertEqual(deviceB.state(of: reopened), .completed)
+        XCTAssertGreaterThan(uploads, uploadsBefore)
+        let renderHash = EditScenarioServer.contentHash(Data(Insecure.SHA1.hash(data: Data("late-render".utf8))))
+        XCTAssertTrue(
+            harness.server.links.contains {
+                $0.state == .active && $0.mainLinkID == nil && $0.contentHash == renderHash
+            }, "The rendered file is a main photo in Proton")
+    }
+
     /// Photos lists the rendered file later and leaves the dates alone, so the revision equals the v1.0.5 one.
     private func assertLateRenderUploads(file: StaticString = #filePath, line: UInt = #line) async throws {
         let asset = try XCTUnwrap(harness.library.snapshot.first)

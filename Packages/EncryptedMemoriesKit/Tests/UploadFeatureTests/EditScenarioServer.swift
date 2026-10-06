@@ -853,6 +853,7 @@ final class EditScenarioDeviceIndex: UploadDuplicateChecking, @unchecked Sendabl
     private var lineageSnapshotAt: Date
     private var lineageInvalidated = false
     private var ownUploads: [String: Date] = [:]
+    private var proofLookupsFail = false
 
     /// A device builds its index when it first opens the account.
     init(server: EditScenarioServer, staleLineage: Bool = false, now: @escaping @Sendable () -> Date = { Date() }) {
@@ -898,12 +899,24 @@ final class EditScenarioDeviceIndex: UploadDuplicateChecking, @unchecked Sendabl
         for identities: [UploadBackupExternalIdentity]
     ) async throws -> [UploadBackupExternalIdentity: UploadRemoteAssetIndexRecord] {
         server.noteProofLookup(identities)
+        if lock.withLock({ proofLookupsFail }) { throw UploadError.backend("The scenario device is offline") }
         let indexed = lock.withLock { proofs }
         let links = indexed.values.flatMap(\.remoteLinkIDs)
         let visibility = try await server.linkVisibility(of: links)
         let stale = indexed.filter { !$0.value.remoteLinkIDs.allSatisfy { visibility[$0]?.isActive == true } }.keys
         lock.withLock { for identity in stale { proofs[identity] = nil } }
         return lock.withLock { proofs.filter { identities.contains($0.key) } }
+    }
+
+    /// The device brings its stored index up to date with the server, as the remote events do.
+    func refreshProofs() {
+        let current = server.allRemoteAssetProofs()
+        lock.withLock { proofs = current }
+    }
+
+    /// The device cannot read its remote index, for example while it is offline.
+    func setProofLookupsFail(_ fail: Bool) {
+        lock.withLock { proofLookupsFail = fail }
     }
 
     func nameHash(forCorrectedName name: String) async throws -> String {

@@ -306,8 +306,10 @@ public struct PhotoLibraryCatalogSync: Sendable {
 
     /// Runs once per catalog. An earlier build can store an entry that lists a late rendered file next to a backup
     /// with the original as main photo; the scan then sees no change. This pass offers each stored edit that lists its
-    /// rendered file to `reopenBackedUpRevisions` and queues the revisions it re-opens. It reads only local stores.
-    /// The flag is set only after the last page, so a cancelled pass starts again.
+    /// rendered file to `reopenBackedUpRevisions` and queues the revisions it re-opens. It reads local stores, and the
+    /// remote proof only for a photo that an earlier build settled through it.
+    /// The flag is set only after the last page, so a cancelled pass starts again. When the remote proof cannot be
+    /// read, the pass stops without an error and leaves the flag unset; a later pass starts again.
     public func reconcileLateRendersOnce(engine: any UploadBackupCandidateEnqueueing) async throws {
         guard !store.hasReconciledLateRenders() else { return }
         var cursor: String?
@@ -328,7 +330,12 @@ public struct PhotoLibraryCatalogSync: Sendable {
                 return UploadBackupReopening(candidate: candidate, formerMain: formerMain)
             }
             if !reopenings.isEmpty {
-                let pending = try await engine.reopenBackedUpRevisions(reopenings)
+                let pending: [UploadBackupAssetCandidate]
+                do {
+                    pending = try await engine.reopenBackedUpRevisions(reopenings, deferringWithoutRemoteProof: true)
+                } catch is UploadBackupRemoteProofUnavailable {
+                    return
+                }
                 if !pending.isEmpty { _ = try await engine.enqueueBatch(pending) }
             }
             cursor = last.localIdentifier
