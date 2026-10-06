@@ -37,15 +37,31 @@ public protocol UploadBackupCandidateEnqueueing: Sendable {
     @discardableResult
     func enqueueBatch(_ candidates: [UploadBackupAssetCandidate]) async throws -> UploadBackupSyncScanResult
     /// Re-opens the backed-up revision of each candidate, unless its backup already holds the file that the asset now
-    /// lists. Returns the candidates whose revision is pending work.
+    /// lists. Returns the candidates whose revision is pending work. With `deferringWithoutRemoteProof`, a remote proof
+    /// that cannot be read throws `UploadBackupRemoteProofUnavailable` and changes nothing; without it, the revisions
+    /// that only the proof could settle re-open.
     @discardableResult
-    func reopenBackedUpRevisions(_ reopenings: [UploadBackupReopening]) async throws -> [UploadBackupAssetCandidate]
+    func reopenBackedUpRevisions(
+        _ reopenings: [UploadBackupReopening], deferringWithoutRemoteProof: Bool
+    ) async throws -> [UploadBackupAssetCandidate]
+}
+
+/// The remote proof could not be read, so revisions that only the proof can settle stay as they are for now.
+public struct UploadBackupRemoteProofUnavailable: Error, Sendable {
+    public init() {}
 }
 
 public extension UploadBackupCandidateEnqueueing {
     @discardableResult
-    func reopenBackedUpRevisions(_ reopenings: [UploadBackupReopening]) async throws -> [UploadBackupAssetCandidate] {
+    func reopenBackedUpRevisions(
+        _ reopenings: [UploadBackupReopening], deferringWithoutRemoteProof: Bool
+    ) async throws -> [UploadBackupAssetCandidate] {
         []
+    }
+
+    @discardableResult
+    func reopenBackedUpRevisions(_ reopenings: [UploadBackupReopening]) async throws -> [UploadBackupAssetCandidate] {
+        try await reopenBackedUpRevisions(reopenings, deferringWithoutRemoteProof: false)
     }
 
     func enqueueBatch(_ candidates: [UploadBackupAssetCandidate]) async throws -> UploadBackupSyncScanResult {
@@ -212,12 +228,12 @@ public actor UploadBackupSyncEngine: UploadBackupCandidateEnqueueing {
     /// settles.
     @discardableResult
     public func reopenBackedUpRevisions(
-        _ reopenings: [UploadBackupReopening]
+        _ reopenings: [UploadBackupReopening], deferringWithoutRemoteProof: Bool
     ) async throws -> [UploadBackupAssetCandidate] {
         var pending: [UploadBackupAssetCandidate] = []
         let kept = Set(try withoutExcludedSources(reopenings.map(\.candidate)).map(\.snapshot.source))
         let offered = reopenings.filter { kept.contains($0.candidate.snapshot.source) }
-        let proven = try await settledByRemoteProof(offered)
+        let proven = try await settledByRemoteProof(offered, deferringWithoutProof: deferringWithoutRemoteProof)
         for reopening in offered {
             let snapshot = reopening.candidate.snapshot
             if proven.contains(snapshot.source) { continue }
@@ -250,32 +266,36 @@ public actor UploadBackupSyncEngine: UploadBackupCandidateEnqueueing {
         return former.sha1Hex != main.sha1Hex
     }
 
-    /// The sources whose complete revision the remote proof settles. Only a revision that this device never hashed
-    /// qualifies: an earlier build settled it through the remote proof, so the manifest holds no record for its main
-    /// file or its former main file. The proof counts the files of the backup, so a backup without the late file
-    /// settles nothing. An identity that two photos share proves neither. Without a proof, the revision re-opens as
-    /// usual.
-    private func settledByRemoteProof(_ reopenings: [UploadBackupReopening]) async throws -> Set<UploadSourceIdentity> {
-        guard let remoteProofResolver else { return [] }
+    /// The sources whose complete revision the remote proof settles. A revision qualifies when this device holds no
+    /// manifest record for its former main file: such a record marks a backup with the late file as main file that
+    /// this device made, which `backupHoldsLateMain` checks. A record for the main file alone, such as the unedited
+    /// original hashed before another device uploaded the edit, does not tell what the backup holds. The proof counts
+    /// the files of the backup, so a backup without the late file settles nothing. An identity that two photos share
+    /// proves neither. When the proof cannot be read, `deferringWithoutProof` throws
+    /// `UploadBackupRemoteProofUnavailable` before anything changes; otherwise those revisions re-open as usual.
+    private func settledByRemoteProof(
+        _ reopenings: [UploadBackupReopening], deferringWithoutProof: Bool
+    ) async throws -> Set<UploadSourceIdentity> {
+        guard let remoteProofResolver, !reopenings.isEmpty else { return [] }
+        let complete = try await preflight.completeStates(reopenings.map(\.candidate.snapshot))
         var unhashed: [UploadBackupExternalIdentity: [UploadBackupAssetSnapshot]] = [:]
-        for reopening in reopenings {
+        for (reopening, isComplete) in zip(reopenings, complete) where isComplete {
+            try Task.checkCancellation()
             let snapshot = reopening.candidate.snapshot
-            guard let identity = snapshot.externalIdentity,
-                await remoteProofResolver.identityRecord(for: snapshot.source) == nil
-            else { continue }
+            guard let identity = snapshot.externalIdentity else { continue }
             if let formerMain = reopening.formerMain, await remoteProofResolver.identityRecord(for: formerMain) != nil {
                 continue
             }
-            guard try await preflight.holdsCompleteState(snapshot) else { continue }
             unhashed[identity, default: []].append(snapshot)
         }
         guard !unhashed.isEmpty else { return [] }
         let proofs: [UploadBackupExternalIdentity: UploadRemoteAssetIndexRecord]
         do {
             proofs = try await remoteProofResolver.remoteAssetProofs(for: Array(unhashed.keys))
-        } catch is CancellationError {
-            throw CancellationError()
         } catch {
+            // A cancelled index build ends the lookup with a cancellation error even when this pass goes on.
+            if Task.isCancelled { throw CancellationError() }
+            if deferringWithoutProof { throw UploadBackupRemoteProofUnavailable() }
             return []
         }
         try Task.checkCancellation()
