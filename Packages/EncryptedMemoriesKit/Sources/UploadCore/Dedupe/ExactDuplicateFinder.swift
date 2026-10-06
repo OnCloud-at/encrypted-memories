@@ -712,10 +712,12 @@ public struct ExactDuplicateFinder: Sendable {
                 switch try await resolve(plan.intent, restored: &restored) {
                 case .restored:
                     results[index] = .success(.skipped(.keptLeftLibraryDuringMerge))
-                case .kept:
+                case .kept(let duplicatesLeft):
+                    // Devices that merge the same group trash the same links. The trash of a device that comes second
+                    // can fail for links that are in the trash already, while the group holds its outcome.
                     let merged = ExactDuplicateMergeOutcome.merged(
                         kept: plan.kept, trashed: plan.trashable, keptDuplicates: plan.keptDuplicates)
-                    results[index] = trashError.map { .failure($0) } ?? .success(merged)
+                    results[index] = trashError.flatMap { duplicatesLeft ? .failure($0) : nil } ?? .success(merged)
                 }
             } catch {
                 results[index] = .failure(trashError ?? error)
@@ -747,7 +749,8 @@ public struct ExactDuplicateFinder: Sendable {
     /// What the check of the kept photo after the trash found.
     private enum MergeResolution {
         /// The kept photo is in the library, or the person trashed it long after the merge. The merge stands.
-        case kept
+        /// `duplicatesLeft` is true while a member that the trash should take is still in the library.
+        case kept(duplicatesLeft: Bool)
         /// The kept photo left the library during the merge. The duplicates are back, and their rows moved back.
         case restored
     }
@@ -768,7 +771,7 @@ public struct ExactDuplicateFinder: Sendable {
         // `kept` after its own trash, so at least one of them sees the other trash and restores its duplicates.
         if visibility[kept]?.isActiveMain == true || isLaterDeletion(of: kept, in: visibility, after: trashed) {
             _ = mergeJournal.clear([intent])
-            return .kept
+            return .kept(duplicatesLeft: trashed.contains { visibility[$0]?.isActive == true })
         }
         restored = true
         try await restore(trashed.filter { visibility[$0]?.isActiveMain != true }, volumeID: intent.volumeID)
@@ -781,7 +784,7 @@ public struct ExactDuplicateFinder: Sendable {
                 throw UploadError.backend("No copy of the merged duplicates is in the library")
             }
             _ = mergeJournal.clear([intent])
-            return .kept
+            return .kept(duplicatesLeft: false)
         }
         // The rows move back to the restored duplicates. Rows that named `kept` before the merge move to the first
         // active one: it holds the same bytes and stays in the library.

@@ -120,6 +120,18 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
     func applyNextTrashThenFail() { lock.withLock { failTrashAfterApplying = true } }
     private var failTrashAfterApplying = false
 
+    /// The next duplicate trash moves every photo except `linkID` and then fails, like a partial answer.
+    func failNextTrash(leaving linkID: String) { lock.withLock { trashLeavesActive = linkID } }
+    private var trashLeavesActive: String?
+
+    /// A duplicate trash refuses each link that is in the trash already, with an error for that link, and moves the
+    /// others. The real server's answer for such a link is unverified.
+    var rejectsTrashOfTrashedLinks: Bool {
+        get { lock.withLock { rejectTrashed } }
+        set { lock.withLock { rejectTrashed = newValue } }
+    }
+    private var rejectTrashed = false
+
     /// The next duplicate restore moves its photos back and then fails, like a lost response.
     func applyNextRestoreThenFail() { lock.withLock { failRestoreAfterApplying = true } }
     private var failRestoreAfterApplying = false
@@ -717,9 +729,14 @@ extension EditScenarioServer: ExactDuplicateRemote {
                 throw UploadError.backend("The scenario trash write failed once")
             }
             var violations: [String] = []
+            var refused: [String] = []
+            let left = trashLeavesActive
+            trashLeavesActive = nil
             let targets = Set(uids.map(\.nodeID))
             for uid in uids {
-                guard let target = table[uid.nodeID], target.state == .active else { continue }
+                if rejectTrashed, table[uid.nodeID]?.state == .trashed { refused.append(uid.nodeID) }
+                if uid.nodeID == left { refused.append(uid.nodeID) }
+                guard uid.nodeID != left, let target = table[uid.nodeID], target.state == .active else { continue }
                 if target.mainLinkID != nil {
                     violations.append("The duplicate trash targeted related file \(target.linkID)")
                 }
@@ -751,6 +768,9 @@ extension EditScenarioServer: ExactDuplicateRemote {
             if failTrashAfterApplying {
                 failTrashAfterApplying = false
                 throw UploadError.backend("The scenario trash moved the photos and its answer failed")
+            }
+            if !refused.isEmpty {
+                throw UploadError.backend("The scenario trash refused \(refused.count) links")
             }
         }
     }
