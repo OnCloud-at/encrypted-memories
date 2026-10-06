@@ -1159,8 +1159,9 @@ final class ExactDuplicateFinderTests: XCTestCase {
         for (seed, offset) in [("a", -2 * Int64(3600)), ("b", 2 * Int64(3600))] {
             let kept = server.seedLink(digest: digest(seed))
             let duplicate = server.seedLink(digest: digest(seed))
-            pending.append(
-                (kept, pendingIntent(kept: kept, duplicate: duplicate, seed: seed, trashedAt: server.serverTime + offset)))
+            let intent = pendingIntent(
+                kept: kept, duplicate: duplicate, seed: seed, trashedAt: server.serverTime + offset)
+            pending.append((kept, intent))
         }
         indexServer()
         // The merges trashed their duplicates, and the person emptied the trash: the server no longer knows them.
