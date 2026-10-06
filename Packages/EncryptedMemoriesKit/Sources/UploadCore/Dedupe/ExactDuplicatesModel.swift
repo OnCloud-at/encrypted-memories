@@ -1065,17 +1065,21 @@ public final class ExactDuplicatesModel {
         wakeMergeResumers()
     }
 
-    /// Merge All starts no further batch until `resumeMerging()`, and its ranking stops until then. Returns when no
-    /// batch of a merge runs any more, so the platform can hold the app awake until then.
-    public func pauseMerging() async {
-        if isMergingAll {
-            isMergePaused = true
-            if let mergeRanking {
-                mergeRankingInterrupted = true
-                mergeRanking.cancel()
-                await mergeRanking.value
-            }
+    /// Merge All starts no further batch until `resumeMerging()`, and its ranking stops until then. The pause applies at
+    /// once, so a `resumeMerging()` that follows always wins.
+    public func pauseMerging() {
+        guard isMergingAll else { return }
+        isMergePaused = true
+        if let mergeRanking {
+            mergeRankingInterrupted = true
+            mergeRanking.cancel()
         }
+    }
+
+    /// Returns when no batch of a merge and no stopped ranking runs any more, so the platform can hold the app awake
+    /// until then.
+    public func runningMergeWorkEnded() async {
+        if let mergeRanking { await mergeRanking.value }
         while isMergeBatchRunning {
             await withCheckedContinuation { batchWaiters.append($0) }
         }
