@@ -751,6 +751,14 @@ final class MobileLibraryModel {
         return await Task.detached { cache.diskSizeBytes() }.value
     }
 
+    /// Identifies the current thumbnail cache, so Settings observes the replacement after an account reload.
+    var cacheDiskIdentity: ObjectIdentifier? { thumbnailCache.map(ObjectIdentifier.init) }
+
+    /// Signals thumbnail-cache changes through the shared coalesced cache signal.
+    func cacheDiskChanges() -> AsyncStream<Void> {
+        ThumbnailCache.diskChanges(of: thumbnailCache.map { [$0] } ?? [])
+    }
+
     /// Clears the thumbnail cache and restarts prefetch. The feed keeps decoded thumbnails, and only the
     /// cache-owned directory is removed.
     func clearCache() async {

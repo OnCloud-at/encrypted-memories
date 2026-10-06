@@ -54,15 +54,11 @@ struct MobileSettingsScreen: View {
                     .mobileVisibilityPriority(.high)
                 }
             }
-            .task(id: scenePhase) {
+            .task(id: CacheSizeObservation(scenePhase: scenePhase, cache: libraryModel.cacheDiskIdentity)) {
                 guard scenePhase == .active else { return }
+                let changes = libraryModel.cacheDiskChanges()
                 await refreshCacheSize()
-                while !Task.isCancelled {
-                    do {
-                        try await Task.sleep(for: .seconds(10))
-                    } catch {
-                        return
-                    }
+                for await _ in changes {
                     await refreshCacheSize()
                 }
             }
@@ -302,6 +298,12 @@ struct MobileSettingsScreen: View {
             isClearingCache = false
         }
     }
+}
+
+/// Restarts the cache-size observation when the scene becomes active or the account reload replaces the cache.
+private struct CacheSizeObservation: Equatable {
+    let scenePhase: ScenePhase
+    let cache: ObjectIdentifier?
 }
 
 private struct MobileBugReportSheet: View {

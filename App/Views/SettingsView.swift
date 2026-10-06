@@ -493,10 +493,9 @@ private struct LibrarySettingsTab: View {
         .formStyle(.grouped)
         .observesStoragePressure($storagePressure)
         .task {
+            let changes = offline.cacheDiskChanges()
             await refreshSize()
-            while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(300))
-                guard !Task.isCancelled else { return }
+            for await _ in changes {
                 await refreshSize()
             }
         }
