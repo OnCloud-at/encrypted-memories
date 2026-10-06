@@ -853,7 +853,9 @@ final class ExactDuplicateFinderTests: XCTestCase {
 
         let outcomes = await withTaskGroup(of: Result<ExactDuplicateMergeOutcome, any Error>.self) { tasks in
             for finder in finders {
-                tasks.addTask { await finder.merge([(group, kept)])[0] }
+                tasks.addTask {
+                    await finder.merge([ExactDuplicateMergeRequest(group: group, kept: kept, isKeptChosen: true)])[0]
+                }
             }
             var outcomes: [Result<ExactDuplicateMergeOutcome, any Error>] = []
             for await outcome in tasks { outcomes.append(outcome) }
@@ -904,7 +906,8 @@ final class ExactDuplicateFinderTests: XCTestCase {
         server.trashAfterDuplicateTrash = kept.nodeID
         let stopping = TrashStoppingRemote(base: server)
         let first = finder(remote: stopping)
-        let merge = Task { await first.merge([(group, kept)]) }
+        let requests = chosen([(group, kept)])
+        let merge = Task { await first.merge(requests) }
         for _ in 0..<5_000 {
             if await stopping.gate.hasWaiters { break }
             try await Task.sleep(for: .milliseconds(1))
@@ -987,7 +990,7 @@ final class ExactDuplicateFinderTests: XCTestCase {
         server.failingVisibilityReadsAfterDuplicateTrash = ExactDuplicateFinder.keptReadAttempts
         var finder = finder()
         finder.keptReadRetryDelay = .zero
-        let results = await finder.merge(groups.map { ($0, $0.members.contains(keptA) ? keptA : keptB) })
+        let results = await finder.merge(chosen(groups.map { ($0, $0.members.contains(keptA) ? keptA : keptB) }))
         XCTAssertTrue(
             results.allSatisfy { (try? $0.get()) == nil }, "the merge cannot tell whether the kept photos stayed")
         // The person empties the trash, so the server no longer knows the trashed duplicates. Another device trashes
@@ -1639,6 +1642,7 @@ final class ExactDuplicateFinderTests: XCTestCase {
             checker: server,
             resolver: UploadDedupePipeline(store: manifest, checker: server, replacementJournal: journal),
             index: manifest, identities: manifest, journal: journal,
+            mergeJournal: ExactDuplicateMergeJournalFileStore(accountDataDirectory: folder),
             remote: TimelineDatesRemote(base: server, unknown: unknownDates), albums: server)
         return (finder, manifest)
     }
@@ -1783,7 +1787,8 @@ final class ExactDuplicateFinderTests: XCTestCase {
         let remote = DateReadCountingRemote(base: server)
         let finder = ExactDuplicateFinder(
             checker: server, resolver: UploadDedupePipeline(store: store, checker: server, replacementJournal: journal),
-            index: store, identities: store, journal: journal, remote: remote, albums: server)
+            index: store, identities: store, journal: journal, mergeJournal: mergeJournal, remote: remote,
+            albums: server)
 
         let results = await finder.merge(
             groups.map { ExactDuplicateMergeRequest(group: $0, kept: $0.members[0], isKeptChosen: false) })
