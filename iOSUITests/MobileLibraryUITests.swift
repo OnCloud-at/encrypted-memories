@@ -96,6 +96,49 @@ final class MobileLibraryUITests: XCTestCase {
         XCTAssertTrue(app.searchFields.firstMatch.waitForExistence(timeout: 10), "Search shows no search field")
     }
 
+    /// The end of the search suggestions scrolls clear of the bottom search field, so the Smart Search hint can be read
+    /// with the keyboard up and with the keyboard down.
+    func testTheSmartSearchHintScrollsAboveTheSearchField() {
+        XCTAssertTrue(firstPhoto.waitForExistence(timeout: 60))
+        app.tabBars.buttons["Search"].tap()
+        let searchField = app.searchFields.firstMatch
+        XCTAssertTrue(searchField.waitForExistence(timeout: 10), "Search shows no search field")
+        // The fixture account has Smart Search off, so the hint ends the suggestions.
+        let hint = app.staticTexts.matching(NSPredicate(format: "label BEGINSWITH 'Turn on Smart Search'")).firstMatch
+        XCTAssertTrue(hint.waitForExistence(timeout: 30), "the suggestions show no Smart Search hint")
+
+        // Recent searches make the suggestions longer than the space above the keyboard.
+        for query in ["Spring", "Winter", "Summer"] {
+            searchField.tap()
+            searchField.typeText(query + "\n")
+            let clear = searchField.buttons.firstMatch
+            if clear.waitForExistence(timeout: 5) { clear.tap() }
+        }
+        XCTAssertTrue(hint.waitForExistence(timeout: 10), "the suggestions did not return after the searches")
+        XCTAssertTrue(app.keyboards.firstMatch.exists, "the keyboard is not up")
+
+        scrollSuggestionsToTheEnd()
+        XCTAssertLessThanOrEqual(
+            hint.frame.maxY, searchField.frame.minY, "the search field above the keyboard covers the end of the list")
+
+        // Dragging the list down dismisses the keyboard; the field returns to the tab bar.
+        let top = app.windows.firstMatch.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.3))
+        top.press(forDuration: 0.05, thenDragTo: top.withOffset(CGVector(dx: 0, dy: 550)))
+        XCTAssertTrue(wait(for: app.keyboards.firstMatch, "exists == false"), "the keyboard did not close")
+        scrollSuggestionsToTheEnd()
+        XCTAssertLessThanOrEqual(
+            hint.frame.maxY, searchField.frame.minY, "the search field in the tab bar covers the end of the list")
+    }
+
+    private func scrollSuggestionsToTheEnd() {
+        let start = app.windows.firstMatch.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.4))
+        for _ in 0..<3 {
+            start.press(forDuration: 0.05, thenDragTo: start.withOffset(CGVector(dx: 0, dy: -250)))
+        }
+        // The list bounces back to its end before the frames are compared.
+        sleep(1)
+    }
+
     func testReturningFromBackgroundRestoresTheViewerWithPreviewProtection() {
         app.terminate()
         app.launchArguments += ["-EncryptedMemories.blurAppPreview", "YES"]
