@@ -36,6 +36,8 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
         var externalIdentifier: String?
         var mimeType = "image/jpeg"
         var tags: Set<Int> = []
+        /// The server time of the move to the trash, in seconds, where a person or a merge trashed the link.
+        var trashTime: Int64?
 
         var uid: PhotoUID { PhotoUID(volumeID: "vol", nodeID: linkID) }
         var duplicate: RemotePhotoDuplicate {
@@ -113,6 +115,48 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
     }
 
     func failNextTrash() { lock.withLock { failTrash = true } }
+
+    /// The next duplicate trash moves its photos and then fails, like a partial answer or a lost response.
+    func applyNextTrashThenFail() { lock.withLock { failTrashAfterApplying = true } }
+    private var failTrashAfterApplying = false
+
+    /// The next duplicate trash moves every photo except `linkID` and then fails, like a partial answer.
+    func failNextTrash(leaving linkID: String) { lock.withLock { trashLeavesActive = linkID } }
+    private var trashLeavesActive: String?
+
+    /// A duplicate trash refuses each link that is in the trash already, with an error for that link, and moves the
+    /// others. The real server's answer for such a link is unverified.
+    var rejectsTrashOfTrashedLinks: Bool {
+        get { lock.withLock { rejectTrashed } }
+        set { lock.withLock { rejectTrashed = newValue } }
+    }
+    private var rejectTrashed = false
+
+    /// The next duplicate restore moves its photos back and then fails, like a lost response.
+    func applyNextRestoreThenFail() { lock.withLock { failRestoreAfterApplying = true } }
+    private var failRestoreAfterApplying = false
+
+    /// A duplicate restore that names one of these links fails and moves nothing back.
+    var refusedRestores: Set<String> {
+        get { lock.withLock { refusedRestoreLinks } }
+        set { lock.withLock { refusedRestoreLinks = newValue } }
+    }
+    private var refusedRestoreLinks: Set<String> = []
+
+    /// A link that left the trash keeps the time of its last trash in its visibility, like a stale field.
+    var reportsTrashTimeOfRestoredLinks: Bool {
+        get { lock.withLock { staleTrashTime } }
+        set { lock.withLock { staleTrashTime = newValue } }
+    }
+    private var staleTrashTime = false
+
+    /// The server clock in seconds since 1970, from the device clock at the start. Every trash of a person or a merge
+    /// stamps it on the trashed link.
+    var serverTime: Int64 {
+        get { lock.withLock { clock } }
+        set { lock.withLock { clock = newValue } }
+    }
+    private var clock = Int64(Date().timeIntervalSince1970)
 
     /// The next favorites read fails.
     func failNextFavoritesRead() { lock.withLock { failFavoritesRead = true } }
@@ -444,7 +488,8 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
             for linkID in linkIDs {
                 guard let link = table[linkID], link.state != .deleted else { continue }
                 result[linkID] = RemoteLinkVisibility(
-                    isActive: link.state == .active, mainPhotoLinkID: link.mainLinkID)
+                    isActive: link.state == .active, mainPhotoLinkID: link.mainLinkID,
+                    trashTime: link.state == .trashed || staleTrashTime ? link.trashTime : nil)
             }
             return result
         }
@@ -592,6 +637,7 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
             guard let target = table[uid.nodeID] else { return }
             table[uid.nodeID]?.state = .trashed
             table[uid.nodeID]?.personDeleted = true
+            table[uid.nodeID]?.trashTime = clock
             let remaining = table.values.filter {
                 $0.assetID == target.assetID && $0.mainLinkID == nil && $0.state == .active
             }
@@ -698,9 +744,14 @@ extension EditScenarioServer: ExactDuplicateRemote {
                 throw UploadError.backend("The scenario trash write failed once")
             }
             var violations: [String] = []
+            var refused: [String] = []
+            let left = trashLeavesActive
+            trashLeavesActive = nil
             let targets = Set(uids.map(\.nodeID))
             for uid in uids {
-                guard let target = table[uid.nodeID], target.state == .active else { continue }
+                if rejectTrashed, table[uid.nodeID]?.state == .trashed { refused.append(uid.nodeID) }
+                if uid.nodeID == left { refused.append(uid.nodeID) }
+                guard uid.nodeID != left, let target = table[uid.nodeID], target.state == .active else { continue }
                 if target.mainLinkID != nil {
                     violations.append("The duplicate trash targeted related file \(target.linkID)")
                 }
@@ -717,21 +768,39 @@ extension EditScenarioServer: ExactDuplicateRemote {
                 }
                 table[uid.nodeID]?.state = .trashed
                 table[uid.nodeID]?.personDeleted = true
+                table[uid.nodeID]?.trashTime = clock
             }
             record("duplicate trash \(uids.map(\.nodeID))", violations: violations)
             if let other = pendingTrashAfterDuplicateTrash {
                 pendingTrashAfterDuplicateTrash = nil
                 table[other]?.state = .trashed
                 table[other]?.personDeleted = true
+                table[other]?.trashTime = clock
                 record("other device trash \(other)")
             }
             armedVisibilityFailures = visibilityFailuresAfterTrash
             visibilityFailuresAfterTrash = 0
+            if failTrashAfterApplying {
+                failTrashAfterApplying = false
+                throw UploadError.backend("The scenario trash moved the photos and its answer failed")
+            }
+            if !refused.isEmpty {
+                throw UploadError.backend("The scenario trash refused \(refused.count) links")
+            }
         }
     }
 
     func restoreDuplicates(_ uids: [PhotoUID]) async throws {
+        try lock.withLock {
+            guard uids.contains(where: { refusedRestoreLinks.contains($0.nodeID) }) else { return }
+            throw UploadError.backend("The scenario restore was refused")
+        }
         for uid in uids { personRestore(uid) }
+        try lock.withLock {
+            guard failRestoreAfterApplying else { return }
+            failRestoreAfterApplying = false
+            throw UploadError.backend("The scenario restore moved the photos back and its answer failed")
+        }
     }
 
     func captureDates(of uids: [PhotoUID]) async -> [PhotoUID: Date] {

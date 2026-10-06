@@ -55,7 +55,9 @@ final class ExactDuplicatesCheckMeasurementTests: XCTestCase {
                 checkpoint: .init(eventID: "event-1", refreshedAt: Date())))
         let finder = ExactDuplicateFinder(
             checker: server, resolver: UploadDedupePipeline(store: store, checker: server, replacementJournal: journal),
-            index: store, identities: store, journal: journal, remote: server, albums: server)
+            index: store, identities: store, journal: journal,
+            mergeJournal: ExactDuplicateMergeJournalFileStore(accountDataDirectory: directory), remote: server,
+            albums: server)
 
         var scans: [Duration] = []
         var checks: [Duration] = []

@@ -210,6 +210,8 @@ public final class ProtonClientFacade {
                     index: index,
                     identities: identities,
                     journal: journal,
+                    mergeJournal: ExactDuplicateMergeJournalFileStore(
+                        accountDataDirectory: bridge.uploadManifestURL.deletingLastPathComponent()),
                     remote: bridge,
                     albums: AlbumRepositorySeriesCarryOver(repository: albumsRepo),
                     log: { DebugLog.log($0) }

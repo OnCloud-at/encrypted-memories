@@ -437,7 +437,7 @@ public protocol UploadIdentityStore: Sendable {
 }
 
 /// One manifest move of the duplicate merge: rows that name `from` with this content name `to` afterwards.
-public struct UploadRemoteLinkMove: Sendable, Equatable {
+public struct UploadRemoteLinkMove: Sendable, Equatable, Codable {
     public var from: String
     public var to: String
     public var contentHash: String
