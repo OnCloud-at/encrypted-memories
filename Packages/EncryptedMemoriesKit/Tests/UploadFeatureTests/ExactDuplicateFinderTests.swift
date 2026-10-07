@@ -1497,6 +1497,64 @@ final class ExactDuplicateFinderTests: XCTestCase {
         XCTAssertEqual(violations, [])
     }
 
+    func testAFailedTrashOfManyGroupsRestoresOnlyTheGroupWhoseKeptPhotoLeftTheLibrary() async throws {
+        let (groups, sources) = try await threeGroups()
+        // Another device keeps the duplicate of the second group and trashes its kept photo meanwhile. The trash of
+        // this device moves every duplicate, and its answer fails.
+        server.trashAfterDuplicateTrash = groups[1].members[0].nodeID
+        server.applyNextTrashThenFail()
+
+        let results = await finder.merge(chosen(groups.map { ($0, $0.members[0]) }))
+
+        XCTAssertEqual(try? results[1].get(), .skipped(.keptLeftLibraryDuringMerge))
+        XCTAssertEqual(state(of: groups[1].members[1]), .active, "one copy stays")
+        XCTAssertEqual(store.record(for: sources[1])?.remoteLinkID, groups[1].members[1].nodeID, "the row moves back")
+        for index in [0, 2] {
+            XCTAssertEqual(
+                try? results[index].get(),
+                .merged(kept: groups[index].members[0], trashed: [groups[index].members[1]], keptDuplicates: [:]))
+            XCTAssertEqual(state(of: groups[index].members[0]), .active)
+            XCTAssertEqual(state(of: groups[index].members[1]), .trashed)
+        }
+        XCTAssertEqual(restores, ["person restore \(groups[1].members[1].nodeID)"])
+        XCTAssertEqual(mergeJournal.pendingMerges(), [], "every group was checked")
+        XCTAssertEqual(violations, [])
+    }
+
+    func testACancelledTrashOfManyGroupsRestoresTheGroupWhoseKeptPhotoLeftTheLibraryAtTheNextCheck() async throws {
+        let (groups, sources) = try await threeGroups()
+        server.trashAfterDuplicateTrash = groups[1].members[0].nodeID
+        let stopping = TrashStoppingRemote(base: server, throwsWhenCancelled: true)
+        let first = finder(remote: stopping)
+        let requests = chosen(groups.map { ($0, $0.members[0]) })
+        let merge = Task { await first.merge(requests) }
+        for _ in 0..<5_000 {
+            if await stopping.gate.hasWaiters { break }
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        let stopped = await stopping.gate.hasWaiters
+        XCTAssertTrue(stopped, "the trash moved the photos")
+        // The merge is cancelled while its trash runs, so its answer and every read after it end.
+        merge.cancel()
+        stopping.gate.open()
+        let results = await merge.value
+        XCTAssertTrue(results.allSatisfy { (try? $0.get()) == nil }, "no group knows its outcome")
+        XCTAssertEqual(restores, [], "no check ran")
+        XCTAssertEqual(mergeJournal.pendingMerges()?.count, groups.count, "every group waits for its check")
+
+        _ = try await finder().duplicateGroups()
+
+        XCTAssertEqual(state(of: groups[1].members[1]), .active, "one copy stays")
+        XCTAssertEqual(store.record(for: sources[1])?.remoteLinkID, groups[1].members[1].nodeID, "the row moves back")
+        for index in [0, 2] {
+            XCTAssertEqual(state(of: groups[index].members[0]), .active)
+            XCTAssertEqual(state(of: groups[index].members[1]), .trashed, "the merge of this group stands")
+        }
+        XCTAssertEqual(restores, ["person restore \(groups[1].members[1].nodeID)"])
+        XCTAssertEqual(mergeJournal.pendingMerges(), [])
+        XCTAssertEqual(violations, [])
+    }
+
     func testMergeAllWritesNothingWhenTheSharedFavoritesReadFails() async throws {
         let (groups, sources) = try await threeGroups()
         server.failNextFavoritesRead()
@@ -2197,12 +2255,18 @@ private final class FavoritesGatedRemote: ExactDuplicateRemote, @unchecked Senda
 private final class TrashStoppingRemote: ExactDuplicateRemote, @unchecked Sendable {
     let base: EditScenarioServer
     let gate = FinderGate()
+    /// A cancellation while the gate holds the trash fails its answer, as a cancelled request does.
+    let throwsWhenCancelled: Bool
 
-    init(base: EditScenarioServer) { self.base = base }
+    init(base: EditScenarioServer, throwsWhenCancelled: Bool = false) {
+        self.base = base
+        self.throwsWhenCancelled = throwsWhenCancelled
+    }
 
     func trashDuplicates(_ uids: [PhotoUID]) async throws {
         try await base.trashDuplicates(uids)
         await gate.pass()
+        if throwsWhenCancelled { try Task.checkCancellation() }
     }
     func restoreDuplicates(_ uids: [PhotoUID]) async throws { try await base.restoreDuplicates(uids) }
     func captureDates(of uids: [PhotoUID]) async -> [PhotoUID: Date] { await base.captureDates(of: uids) }
