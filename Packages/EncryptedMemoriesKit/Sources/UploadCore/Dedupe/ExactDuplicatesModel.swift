@@ -29,6 +29,9 @@ public protocol ExactDuplicateMerging: Sendable {
     func merge(
         _ requests: [ExactDuplicateMergeRequest], in run: ExactDuplicateMergeRun
     ) async -> [Result<ExactDuplicateMergeOutcome, any Error>]
+    /// Checks the merges that an earlier failure or the end of the process left open, and restores a copy of a group
+    /// that has none in the library. Reads nothing from the server while no merge is open.
+    func resolvePendingMerges() async
 }
 
 extension ExactDuplicateFinder: ExactDuplicateMerging {}
@@ -36,6 +39,9 @@ extension ExactDuplicateFinder: ExactDuplicateMerging {}
 extension ExactDuplicateMerging {
     /// Without a local timeline, no date is known.
     public func captureDates(of members: [PhotoUID]) async -> [PhotoUID: Date] { [:] }
+
+    /// Mergers without a merge journal leave no merge open.
+    public func resolvePendingMerges() async {}
 
     /// Mergers without shared listings merge each batch on its own.
     public func merge(
@@ -1030,6 +1036,12 @@ public final class ExactDuplicatesModel {
 
     private static func photoCount(_ completed: Int, of total: Int) -> String {
         L10n.string("duplicates.checking_progress \(completed.formatted()) \(total.formatted())")
+    }
+
+    /// Checks the merges that an earlier failure or the end of the process left open, without a scan. A platform calls
+    /// it at launch when it does not scan then.
+    public func resolvePendingMerges() async {
+        await finder.resolvePendingMerges()
     }
 
     /// Counts the duplicates for the entry without ranking them, once, before the screen has loaded.
