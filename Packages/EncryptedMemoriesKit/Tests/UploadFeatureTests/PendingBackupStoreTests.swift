@@ -512,7 +512,38 @@ final class PendingQueueIntegrationTests: XCTestCase {
         XCTAssertEqual(queue.makeRetryableWorkEligible(updatedAt: date), 0, "an empty bulk update stays silent")
 
         let expected = UploadBackupSyncQueueChange.sources([.photoLibraryAsset: ["a"]])
-        XCTAssertEqual(changes.values, [expected, expected, expected])
+        XCTAssertEqual(changes.values, [.enqueued([.photoLibraryAsset: ["a"]]), expected, expected])
+    }
+
+    func testOnlyInsertedOrReopenedRowsNotifyAnEnqueue() {
+        let changes = LockedChanges()
+        queue.setChangeObserver { changes.append($0) }
+        let runnable = entry("a", state: .discovered)
+        let sources: [UploadSourceIdentity.Kind: Set<String>] = [.photoLibraryAsset: ["a"]]
+
+        XCTAssertTrue(queue.upsert(runnable))
+        XCTAssertTrue(queue.upsert(runnable), "a repeated scan does not add work")
+        XCTAssertTrue(queue.upsert(entry("a", state: .completed)))
+        XCTAssertTrue(queue.upsertBatch([runnable]), "a scan cannot reopen a successful row")
+        XCTAssertEqual(queue.entry(for: runnable.source, revision: runnable.revision)?.state, .completed)
+        XCTAssertEqual(changes.values, [.enqueued(sources), .sources(sources), .sources(sources), .sources(sources)])
+
+        let failed = entry("b", state: .failed)
+        XCTAssertTrue(queue.upsert(failed))
+        XCTAssertTrue(queue.upsertBatch([entry("b", state: .discovered)]))
+        XCTAssertEqual(changes.values.last, .enqueued([.photoLibraryAsset: ["b"]]))
+
+        XCTAssertTrue(queue.upsert(entry("active", state: .uploading)))
+        XCTAssertTrue(queue.upsert(entry("active", state: .needsRemoteReconciliation)))
+        XCTAssertEqual(changes.values.last, .sources([.photoLibraryAsset: ["active"]]))
+        XCTAssertEqual(
+            queue.entry(for: entry("active", state: .uploading).source, revision: runnable.revision)?.state, .uploading)
+
+        var delayed = entry("waiting", state: .discovered)
+        delayed.updatedAt = date.addingTimeInterval(60)
+        XCTAssertTrue(queue.upsert(delayed))
+        XCTAssertTrue(queue.upsert(entry("waiting", state: .discovered)))
+        XCTAssertEqual(changes.values.last, .enqueued([.photoLibraryAsset: ["waiting"]]))
     }
 
     func testUnsettledRowsLeaveTerminalOutcomesOut() {

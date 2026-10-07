@@ -556,6 +556,45 @@ final class PhotoBackupOrchestrationTests: XCTestCase {
         XCTAssertNotNil(survivor.entry(for: f, revision: UploadBackupRevision(date: modDate)))
     }
 
+    func testRollbackJournalStoresAdvanceTheFullScanAndIncrementalTokens() async throws {
+        queue.close()
+        catalog.close()
+        let queueURL = tempDir.appendingPathComponent(UploadBackupSyncQueueManifestStore.databaseFileName)
+        let catalogURL = tempDir.appendingPathComponent(PhotoLibraryCatalogManifestStore.databaseFileName)
+        func pinRollbackJournal(_ url: URL, table: String) throws -> OpaquePointer {
+            var db: OpaquePointer?
+            XCTAssertEqual(sqlite3_open(url.path, &db), SQLITE_OK)
+            let handle = try XCTUnwrap(db)
+            XCTAssertEqual(sqlite3_exec(handle, "PRAGMA journal_mode=DELETE;", nil, nil, nil), SQLITE_OK)
+            XCTAssertEqual(sqlite3_exec(handle, "BEGIN; SELECT * FROM \(table);", nil, nil, nil), SQLITE_OK)
+            return handle
+        }
+        let queueReader = try pinRollbackJournal(queueURL, table: "backup_sync_queue")
+        defer { sqlite3_close(queueReader) }
+        let catalogReader = try pinRollbackJournal(catalogURL, table: "photo_catalog")
+        defer { sqlite3_close(catalogReader) }
+        let policy = LibraryDatabasePolicy(mmapBytes: 0, cacheSizeKiB: 2_048, busyTimeoutMs: 10)
+        queue = try XCTUnwrap(UploadBackupSyncQueueManifestStore(url: queueURL, policy: policy))
+        catalog = try XCTUnwrap(PhotoLibraryCatalogManifestStore(url: catalogURL, policy: policy))
+        XCTAssertEqual(sqlite3_exec(queueReader, "COMMIT;", nil, nil, nil), SQLITE_OK)
+        XCTAssertEqual(sqlite3_exec(catalogReader, "COMMIT;", nil, nil, nil), SQLITE_OK)
+        engine = UploadBackupSyncEngine(preflight: preflight, queue: queue, now: { [clock] in clock!.now })
+
+        let history = FakeChangeHistory()
+        enumerator.infos = [photoInfo("A")]
+        try await startScanPass(history: history)
+        XCTAssertTrue(catalog.hasCompletedFullScan())
+        XCTAssertFalse(history.prepare().changes.requiresFullRescan, "the full-scan token moves without a WAL")
+        enumerator.infos.append(photoInfo("B"))
+        history.record(changed: ["B"])
+        try await startScanPass(history: history)
+        XCTAssertTrue(history.prepare().changes.changedIdentifiers.isEmpty, "the incremental token moves too")
+        XCTAssertNotNil(
+            queue.entry(
+                for: .init(kind: .photoLibraryAsset, identifier: "B"),
+                revision: UploadBackupRevision(date: modDate)))
+    }
+
     /// When the queue cannot be synchronized because another connection still reads an older state, the token stays.
     /// The next pass reads the same changes again.
     func testBusyQueueCheckpointKeepsTheToken() async throws {
