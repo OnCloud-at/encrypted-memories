@@ -225,6 +225,13 @@ public protocol PhotoLibraryCatalogStore: Sendable {
     /// True once a full-library scan has completed at least once. An incremental (change-token) scan
     /// is only trusted after this; a token can exist before our own catalog knows the whole library.
     func hasCompletedFullScan() -> Bool
+    /// Records that a full scan is owed until `completeFullScan()`, so `hasCompletedFullScan()` is false again.
+    /// Set it before anything clears the previous scan: once the change token moves past the reason for the scan,
+    /// this marker is the only record that the scan is still owed.
+    @discardableResult
+    func markFullScanOwed() -> Bool
+    /// Makes every committed change survive a power loss. Returns false when that is not certain.
+    func synchronizeToDisk() -> Bool
     /// The in-progress full-scan epoch, or nil if none is underway (the next full scan starts fresh).
     /// A full scan of a large library rarely finishes in one foreground/BG window; persisting this lets
     /// an interrupted scan resume from `cursor` instead of restarting, so it converges instead of

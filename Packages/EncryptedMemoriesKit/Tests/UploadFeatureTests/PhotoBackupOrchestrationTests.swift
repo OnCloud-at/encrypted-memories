@@ -455,6 +455,94 @@ final class PhotoBackupOrchestrationTests: XCTestCase {
             "the edit that the expired history lost is found by the resumed rescan")
     }
 
+    /// A rescan request that leaves the change token valid (a live change without details) must not drop the open
+    /// rescan of an expired change history when its own snapshot fails. A photo from the expired gap that lies after
+    /// the saved position is still backed up.
+    func testFailedRescanSnapshotKeepsTheOwedScanOfAnExpiredChangeHistory() async throws {
+        enumerator.infos = ["A", "B", "C", "D", "E"].map { photoInfo($0) }
+        let history = FakeChangeHistory()
+        try await startScanPass(history: history)
+        XCTAssertTrue(catalog.hasCompletedFullScan())
+
+        // While the history is expired, G arrives with an older capture date, so it sorts after every other photo.
+        enumerator.infos.append(photoInfo("G", created: Date(timeIntervalSince1970: 1_500_000_000)))
+        history.expire()
+        enumerator.throwAfter = 2
+        let rescanFinished = try await startScanPass(history: history)
+        XCTAssertFalse(rescanFinished)
+        XCTAssertEqual(catalog.fullScanProgress()?.cursor, 2)
+        XCTAssertFalse(history.prepare().changes.requiresFullRescan, "the rescan stored a newer token")
+
+        enumerator.throwAfter = nil
+        history.requestRescanWithoutTokenChange()
+        enumerator.failsSnapshot = true
+        let failedFinished = try await startScanPass(history: history)
+        XCTAssertFalse(failedFinished)
+        XCTAssertNil(catalog.fullScanProgress(), "the failed snapshot cleared the earlier resume point")
+
+        // After a relaunch the live request is gone, and the change history since the token is empty.
+        history.relaunch()
+        enumerator.failsSnapshot = false
+        let finished = try await startScanPass(history: history)
+
+        XCTAssertTrue(finished)
+        XCTAssertNotNil(catalog.presentEntries(for: ["G"])["G"], "the owed scan runs and reads G")
+        XCTAssertTrue(catalog.hasCompletedFullScan())
+        _ = await runner.runUntilDrained()
+        XCTAssertTrue(uploader.requests.map(\.name).contains("IMG_G.HEIC"))
+    }
+
+    /// A power loss can drop WAL commits that were never synchronized, while the token file survives. Before the token
+    /// moves, the database file alone must already hold the owed scan and its published snapshot.
+    func testOwedScanAndSnapshotAreInTheDatabaseFileWhenTheTokenMoves() async throws {
+        enumerator.infos = ["A", "B", "C", "D", "E"].map { photoInfo($0) }
+        let history = FakeChangeHistory()
+        try await startScanPass(history: history)
+        history.expire()
+        enumerator.throwAfter = 2
+        let rescanFinished = try await startScanPass(history: history)
+        XCTAssertFalse(rescanFinished)
+        XCTAssertFalse(history.prepare().changes.requiresFullRescan, "the rescan stored a newer token")
+
+        // The database file next to an empty WAL: the state after the unsynchronized WAL commits are lost.
+        let survivorDirectory = tempDir.appendingPathComponent("power-loss", isDirectory: true)
+        try FileManager.default.createDirectory(at: survivorDirectory, withIntermediateDirectories: true)
+        let survivorURL = survivorDirectory.appendingPathComponent(PhotoLibraryCatalogManifestStore.databaseFileName)
+        try FileManager.default.copyItem(
+            at: tempDir.appendingPathComponent(PhotoLibraryCatalogManifestStore.databaseFileName), to: survivorURL)
+        try Data().write(to: URL(fileURLWithPath: survivorURL.path + "-wal"))
+        let survivor = try XCTUnwrap(PhotoLibraryCatalogManifestStore(url: survivorURL))
+        defer { survivor.close() }
+
+        XCTAssertFalse(survivor.hasCompletedFullScan(), "the rescan is still owed")
+        XCTAssertNotNil(survivor.fullScanProgress(), "the published snapshot survives")
+        XCTAssertEqual(survivor.fullScanSnapshotCount(), 5)
+    }
+
+    /// The token is read before the snapshot lists the library. A photo added after the listing but before the
+    /// snapshot is published is reported by the change history on the next pass.
+    func testPhotoAddedWhileTheSnapshotIsBuiltIsReadOnTheNextPass() async throws {
+        enumerator.infos = ["A", "B", "C"].map { photoInfo($0) }
+        let history = FakeChangeHistory()
+        let added = photoInfo("Z")
+        enumerator.afterIdentifierSnapshot = { [enumerator] in
+            enumerator!.infos.insert(added, at: 0)
+            history.record(changed: ["Z"])
+        }
+        try await startScanPass(history: history)
+        XCTAssertTrue(catalog.hasCompletedFullScan())
+        XCTAssertNil(catalog.presentEntries(for: ["Z"])["Z"], "Z is not in the snapshot of this scan")
+
+        enumerator.afterIdentifierSnapshot = nil
+        enumerator.readCount = 0
+        try await startScanPass(history: history)
+
+        XCTAssertEqual(enumerator.readCount, 1, "only Z is read")
+        XCTAssertNotNil(catalog.presentEntries(for: ["Z"])["Z"])
+        let z = UploadSourceIdentity(kind: .photoLibraryAsset, identifier: "Z")
+        XCTAssertNotNil(queue.entry(for: z, revision: UploadBackupRevision(date: modDate)))
+    }
+
     /// A photo taken/edited while a pass is already running must land in the durable queue and be
     /// drained this pass; not wait for the next. Models the controller's `reconcileWhileScanning`
     /// running concurrently with the scan, plus a targeted catalog sync firing from the change
@@ -668,6 +756,20 @@ final class PhotoBackupOrchestrationTests: XCTestCase {
         }
         private var remainingBeforeThrow: Int?
 
+        /// When true, the identifier snapshot stops before it lists anything.
+        var failsSnapshot: Bool {
+            get { lock.withLock { _failsSnapshot } }
+            set { lock.withLock { _failsSnapshot = newValue } }
+        }
+        private var _failsSnapshot = false
+
+        /// Runs after the identifier snapshot listed the library and before it streams the identifiers.
+        var afterIdentifierSnapshot: (@Sendable () -> Void)? {
+            get { lock.withLock { _afterIdentifierSnapshot } }
+            set { lock.withLock { _afterIdentifierSnapshot = newValue } }
+        }
+        private var _afterIdentifierSnapshot: (@Sendable () -> Void)?
+
         /// Assets whose metadata `infoChunks` read. The identifier snapshot is not counted.
         var readCount: Int {
             get { lock.withLock { _readCount } }
@@ -710,7 +812,13 @@ final class PhotoBackupOrchestrationTests: XCTestCase {
         func identifierChunks(chunkSize: Int) -> AsyncThrowingStream<PhotoLibraryIdentifierChunk, any Error> {
             onEnumerationStart?()
             let identifiers = infos.map(\.localIdentifier)
+            afterIdentifierSnapshot?()
+            let fails = failsSnapshot
             return AsyncThrowingStream { continuation in
+                if fails {
+                    continuation.finish(throwing: CancellationError())
+                    return
+                }
                 var index = 0
                 while index < identifiers.count {
                     let upper = min(index + max(1, chunkSize), identifiers.count)
@@ -738,6 +846,7 @@ final class PhotoBackupOrchestrationTests: XCTestCase {
         private var records: [(changed: Set<String>, deleted: Set<String>)] = []
         private var storedToken: Int?
         private var expired = false
+        private var liveRescanRequested = false
 
         func record(changed: Set<String> = [], deleted: Set<String> = []) {
             lock.withLock { records.append((changed, deleted)) }
@@ -745,6 +854,16 @@ final class PhotoBackupOrchestrationTests: XCTestCase {
 
         func expire() {
             lock.withLock { expired = true }
+        }
+
+        /// A live change without incremental details: it asks for a rescan and leaves the stored token valid.
+        func requestRescanWithoutTokenChange() {
+            lock.withLock { liveRescanRequested = true }
+        }
+
+        /// The live observer state does not survive a relaunch; the stored token and the history do.
+        func relaunch() {
+            lock.withLock { liveRescanRequested = false }
         }
 
         func prepare() -> Prepared {
@@ -765,7 +884,7 @@ final class PhotoBackupOrchestrationTests: XCTestCase {
                 return Prepared(
                     changes: .init(
                         changedIdentifiers: changed.sorted(), deletedIdentifiers: deleted.sorted(),
-                        requiresFullRescan: false),
+                        requiresFullRescan: liveRescanRequested),
                     token: current)
             }
         }
@@ -774,6 +893,7 @@ final class PhotoBackupOrchestrationTests: XCTestCase {
             lock.withLock {
                 storedToken = prepared.token
                 expired = false
+                liveRescanRequested = false
             }
         }
     }

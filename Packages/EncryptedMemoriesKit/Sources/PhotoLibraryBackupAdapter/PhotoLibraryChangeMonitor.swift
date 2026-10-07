@@ -1,5 +1,6 @@
 import Foundation
 import Photos
+import os
 
 struct PhotoLibraryLiveChangeBuffer {
     struct Snapshot: Equatable {
@@ -100,6 +101,7 @@ public final class PhotoLibraryChangeMonitor: NSObject, PHPhotoLibraryChangeObse
         fileprivate let liveGeneration: UInt64
     }
 
+    private static let logger = Logger(subsystem: "at.oncloud.encryptedmemories", category: "Backup")
     private let tokenURL: URL
     private let fetchObservedAssets: @Sendable () -> PHFetchResult<PHAsset>
     private let lock = NSLock()
@@ -284,12 +286,15 @@ public final class PhotoLibraryChangeMonitor: NSObject, PHPhotoLibraryChangeObse
         }
     }
 
-    /// Advances the persistent token after the caller has durably handled the prepared changes.
-    public func commit(_ prepared: PreparedChangeSet) {
-        store(token: prepared.commitToken)
+    /// Advances the persistent token after the caller has durably handled the prepared changes. When the token cannot
+    /// be written, the stored token and the live changes stay, so the next pass reports the changes again.
+    @discardableResult
+    public func commit(_ prepared: PreparedChangeSet) -> Bool {
+        guard store(token: prepared.commitToken) else { return false }
         lock.withLock {
             liveChanges.commit(through: prepared.liveGeneration)
         }
+        return true
     }
 
     private func loadToken() -> PHPersistentChangeToken? {
@@ -297,10 +302,16 @@ public final class PhotoLibraryChangeMonitor: NSObject, PHPhotoLibraryChangeObse
         return try? NSKeyedUnarchiver.unarchivedObject(ofClass: PHPersistentChangeToken.self, from: data)
     }
 
-    private func store(token: PHPersistentChangeToken) {
-        guard let data = try? NSKeyedArchiver.archivedData(withRootObject: token, requiringSecureCoding: true) else {
-            return
+    private func store(token: PHPersistentChangeToken) -> Bool {
+        do {
+            let data = try NSKeyedArchiver.archivedData(withRootObject: token, requiringSecureCoding: true)
+            try data.write(to: tokenURL, options: .atomic)
+            return true
+        } catch {
+            let error = error as NSError
+            Self.logger.error(
+                "Photo library change token could not be saved: \(error.domain, privacy: .public) \(error.code)")
+            return false
         }
-        try? data.write(to: tokenURL, options: .atomic)
     }
 }
