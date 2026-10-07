@@ -1555,6 +1555,32 @@ final class ExactDuplicateFinderTests: XCTestCase {
         XCTAssertEqual(violations, [])
     }
 
+    @MainActor
+    func testTheLaunchCheckRestoresAnOpenMergeWithoutAScanAndReadsNothingWithoutOne() async throws {
+        let kept = server.seedLink(digest: digest("a"))
+        let duplicate = server.seedLink(digest: digest("a"))
+        indexServer()
+        let model = ExactDuplicatesModel(finder: finder)
+        let readsBefore = server.readCounts
+
+        await model.resolvePendingMerges()
+
+        XCTAssertEqual(server.readCounts, readsBefore, "no open merge, no read")
+        // The app ended between the trash and its check, and another device trashed the kept photo meanwhile.
+        server.personTrash(duplicate)
+        server.personTrash(kept)
+        let intent = pendingIntent(kept: kept, duplicate: duplicate, seed: "a", trashedAt: server.serverTime)
+        XCTAssertTrue(mergeJournal.record([intent]))
+
+        await model.resolvePendingMerges()
+
+        XCTAssertEqual(state(of: duplicate), .active, "one copy comes back before the person opens Duplicates")
+        XCTAssertEqual(restores, ["person restore \(duplicate.nodeID)"])
+        XCTAssertEqual(mergeJournal.pendingMerges(), [])
+        XCTAssertEqual(server.readCounts.favorites, readsBefore.favorites, "no scan and no ranking")
+        XCTAssertEqual(model.groups.map(\.id), [])
+    }
+
     func testMergeAllWritesNothingWhenTheSharedFavoritesReadFails() async throws {
         let (groups, sources) = try await threeGroups()
         server.failNextFavoritesRead()

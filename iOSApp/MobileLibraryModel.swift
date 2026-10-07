@@ -224,6 +224,9 @@ final class MobileLibraryModel {
         didSet {
             guard facade !== oldValue else { return }
             duplicates = facade?.exactDuplicates.map { makeDuplicatesModel($0) }
+            // The Collections tab scans for duplicates only when it appears. A merge that the end of the app left open
+            // is checked now, so a group whose copies both left the library comes back without that visit.
+            if let duplicates { Task { await duplicates.resolvePendingMerges() } }
         }
     }
     /// The Duplicates screen of this account. Nil while the account cannot merge duplicates.
