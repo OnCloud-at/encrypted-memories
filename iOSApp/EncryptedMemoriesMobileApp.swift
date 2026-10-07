@@ -339,7 +339,8 @@ private struct MobileMainTabView: View {
                     smartSearch: libraryModel.smartSearch,
                     libraryIsSettled: libraryModel.allowsAutomaticSuggestionRefresh,
                     cacheContentIsSettled: libraryModel.allowsSuggestionCacheRestore,
-                    coordinateRevision: libraryModel.locationIndex.revision
+                    coordinateRevision: libraryModel.locationIndex.revision,
+                    locationEvidence: mapAndPlacesEnabled ? libraryModel.locationIndex.placeEvidence() : nil
                 )
             }
             .onChange(of: selection, initial: true) { _, _ in updateSearchActivity() }

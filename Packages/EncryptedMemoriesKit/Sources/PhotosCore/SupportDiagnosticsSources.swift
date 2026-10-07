@@ -14,6 +14,7 @@ public final class SupportDiagnosticsSources: @unchecked Sendable {
     private weak var library: (any LibrarySyncSupportSource)?
     private var queues: [WeakSource] = []
     private var journals: [WeakSource] = []
+    private weak var places: (any PhotoPlaceSupportSource)?
     private var pendingGrid = PendingGridSupportSnapshot()
     private let trail: SupportEventTrail
 
@@ -41,6 +42,15 @@ public final class SupportDiagnosticsSources: @unchecked Sendable {
         }
         // The trail holds identifiers of this account in memory.
         if unregistered { trail.clear() }
+    }
+
+    public func registerPlaces(_ source: any PhotoPlaceSupportSource) {
+        lock.withLock { places = source }
+    }
+
+    public func placeSnapshot() async -> [PlaceCandidateSupportSnapshot] {
+        let source = lock.withLock { places }
+        return await source?.photoPlaceSupportSnapshot() ?? []
     }
 
     public func registerQueue(_ source: any BackupQueueSupportSource, key: String) {

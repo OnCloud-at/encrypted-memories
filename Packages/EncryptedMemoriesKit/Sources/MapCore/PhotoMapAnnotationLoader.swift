@@ -89,6 +89,8 @@ public final class PhotoMapAnnotationLoader {
     private var annotationByUID: [PhotoUID: PhotoMapAnnotation] = [:]
     private var lastRevision = Int.min
     private var didFrame = false
+    private var frameTask: Task<Void, Never>?
+    private var framingRevision: Int?
     private var lastPlan: PhotoLocationAggregationPlan?
     private var lastViewportSize: PhotoLocationViewportSize?
     private var resizeTransitionDeadline: CFTimeInterval = 0
@@ -107,7 +109,10 @@ public final class PhotoMapAnnotationLoader {
         self.onRemoved = onRemoved
     }
 
-    deinit { reloadTask?.cancel() }
+    deinit {
+        reloadTask?.cancel()
+        frameTask?.cancel()
+    }
 
     public func attach(_ mapView: MKMapView) {
         self.mapView = mapView
@@ -129,8 +134,12 @@ public final class PhotoMapAnnotationLoader {
     public nonisolated static let framingPadding: CGFloat = 80
 
     /// The map area around the dense core of `coordinates`, which the map shows when it opens.
-    public nonisolated static func denseCoreMapRect(for coordinates: [PhotoCoordinate]) -> MKMapRect? {
-        guard let box = PhotoLocationFraming.denseBoundingBox(for: coordinates) else { return nil }
+    public nonisolated static func denseCoreMapRect(
+        for coordinates: [PhotoCoordinate], excluding positions: Set<PhotoExactPosition> = []
+    ) -> MKMapRect? {
+        guard let box = PhotoLocationFraming.denseBoundingBox(for: coordinates, excluding: positions) else {
+            return nil
+        }
         let a = MKMapPoint(CLLocationCoordinate2D(latitude: box.minLatitude, longitude: box.minLongitude))
         let b = MKMapPoint(CLLocationCoordinate2D(latitude: box.maxLatitude, longitude: box.maxLongitude))
         let rect = MKMapRect(x: min(a.x, b.x), y: min(a.y, b.y), width: abs(a.x - b.x), height: abs(a.y - b.y))
@@ -138,9 +147,22 @@ public final class PhotoMapAnnotationLoader {
     }
 
     public func frameToDenseCoreIfNeeded() {
-        guard !didFrame, let mapView, !index.coordinates.isEmpty,
-            let rect = Self.denseCoreMapRect(for: index.coordinates)
-        else { return }
+        guard !didFrame, mapView != nil, framingRevision != index.revision else { return }
+        let revision = index.revision
+        framingRevision = revision
+        let evidence = index.placeEvidence()
+        frameTask?.cancel()
+        frameTask = Task.detached(priority: .userInitiated) { [weak self] in
+            let excluded = evidence.excludedPositions()
+            guard !Task.isCancelled else { return }
+            let rect = Self.denseCoreMapRect(for: evidence.coordinates, excluding: excluded)
+            guard !Task.isCancelled else { return }
+            await self?.applyFraming(rect, revision: revision)
+        }
+    }
+
+    private func applyFraming(_ rect: MKMapRect?, revision: Int) {
+        guard index.revision == revision, !didFrame, let mapView, let rect else { return }
         let inset = Self.framingPadding
         #if canImport(UIKit)
             let padding = UIEdgeInsets(top: inset, left: inset, bottom: inset, right: inset)

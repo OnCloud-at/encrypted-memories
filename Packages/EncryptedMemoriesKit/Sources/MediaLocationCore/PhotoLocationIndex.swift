@@ -12,7 +12,7 @@ import PhotosCore
 /// coordinates. Platform-agnostic (no AppKit) - reused as-is by a future iOS/iPad map UI.
 @MainActor
 @Observable
-public final class PhotoLocationIndex {
+public final class PhotoLocationIndex: PhotoPlaceSupportSource {
     public private(set) var coordinates: [PhotoCoordinate] = []
     /// Bumped whenever `coordinates` changes. The map view observes this to re-derive annotations.
     public private(set) var revision = 0
@@ -26,11 +26,48 @@ public final class PhotoLocationIndex {
     /// coordinates that still belong to that library. `nil` preserves startup loading before identities arrive.
     @ObservationIgnored private var allowedUIDs: Set<PhotoUID>?
 
-    public init() {}
+    @ObservationIgnored private var cachedPlaceEvidence: PhotoPlaceEvidence?
+    @ObservationIgnored private var placeEvidenceWarmTask: Task<Void, Never>?
+
+    public init(supportSources: SupportDiagnosticsSources = .shared) {
+        supportSources.registerPlaces(self)
+    }
+
+    deinit { placeEvidenceWarmTask?.cancel() }
+
+    private func invalidatePlaceEvidence() {
+        placeEvidenceWarmTask?.cancel()
+        placeEvidenceWarmTask = nil
+        cachedPlaceEvidence = nil
+    }
+
+    private func warmPlaceEvidence() {
+        guard placeEvidenceWarmTask == nil else { return }
+        let evidence = placeEvidence()
+        placeEvidenceWarmTask = Task.detached(priority: .background) { [weak evidence] in
+            guard let evidence else { return }
+            evidence.prewarm()
+        }
+    }
+
+    /// Creation is constant-time. Detached consumers share one lazy analysis per coordinate revision.
+    public func placeEvidence() -> PhotoPlaceEvidence {
+        if let cachedPlaceEvidence { return cachedPlaceEvidence }
+        let evidence = PhotoPlaceEvidence(coordinates: coordinates)
+        cachedPlaceEvidence = evidence
+        return evidence
+    }
+
+    public func photoPlaceSupportSnapshot() async -> [PlaceCandidateSupportSnapshot] {
+        let evidence = placeEvidence()
+        return await Task.detached(priority: .utility) { evidence.supportSnapshot() }.value
+    }
 
     /// Published by `LocationCrawl` (start / batch cadence / completion) - never per item.
     public func updateScanProgress(_ progress: PhotoLocationScanProgress) {
         scanProgress = progress
+        // Crawl batches invalidate lazily. Warm only the settled snapshot, not every batch.
+        if progress.phase == .completed { warmPlaceEvidence() }
     }
 
     /// Replace the whole index - e.g. after decrypting the persisted snapshot at startup.
@@ -40,6 +77,7 @@ public final class PhotoLocationIndex {
 
     /// Replace the whole index, including the persisted negative-result cache.
     public func replaceAll(_ snapshot: PhotoLocationSnapshot) {
+        invalidatePlaceEvidence()
         allowedUIDs = nil
         coordinates = snapshot.coordinates
         seen = Set(coordinates.map(\.uid))
@@ -47,6 +85,7 @@ public final class PhotoLocationIndex {
         seen.formUnion(noLocationUIDs)
         rebuildBuckets()
         revision += 1
+        warmPlaceEvidence()
     }
 
     /// Merge newly-crawled coordinates, deduped by uid. Bumps `revision` only if something was added,
@@ -59,6 +98,8 @@ public final class PhotoLocationIndex {
             && (!seen.contains(c.uid) || noLocationUIDs.contains(c.uid))
         {
             guard Self.isValid(c) else { continue }
+            // Release the cached array before mutation, avoiding a copy for completed, unobserved snapshots.
+            if accepted.isEmpty { invalidatePlaceEvidence() }
             coordinates.append(c)
             seen.insert(c.uid)
             noLocationUIDs.remove(c.uid)
@@ -105,7 +146,9 @@ public final class PhotoLocationIndex {
             seen.formUnion(noLocationUIDs)
             rebuildBuckets()
             scanProgress.found = retained.count
+            invalidatePlaceEvidence()
             revision += 1
+            warmPlaceEvidence()
         }
         guard let store else { return }
         _ = await persist(to: store, sessionLease: sessionLease)
@@ -208,9 +251,11 @@ public struct PhotoLocationQuerySnapshot: Sendable {
     }
 
     private let buckets: [BucketID: [PhotoCoordinate]]
+    private let evidence: PhotoPlaceEvidence
 
-    fileprivate init(buckets: [BucketID: [PhotoCoordinate]]) {
+    fileprivate init(buckets: [BucketID: [PhotoCoordinate]], evidence: PhotoPlaceEvidence) {
         self.buckets = buckets
+        self.evidence = evidence
     }
 
     public func coordinates(in box: GeoBoundingBox) -> [PhotoCoordinate] {
@@ -241,13 +286,17 @@ public struct PhotoLocationQuerySnapshot: Sendable {
             ]
         }
 
+        let excluded = evidence.excludedPositions()
+        guard !Task.isCancelled else { return [] }
         var result: [PhotoCoordinate] = []
         for latitudeBucket in latitudeRange.0...latitudeRange.1 {
             for (lowerLongitude, upperLongitude) in longitudeRanges {
                 guard lowerLongitude <= upperLongitude else { continue }
                 for longitudeBucket in lowerLongitude...upperLongitude {
                     for coordinate in buckets[BucketID(latitude: latitudeBucket, longitude: longitudeBucket)] ?? []
-                    where box.contains(latitude: coordinate.latitude, longitude: coordinate.longitude) {
+                    where box.contains(latitude: coordinate.latitude, longitude: coordinate.longitude)
+                        && !excluded.contains(PhotoExactPosition(coordinate))
+                    {
                         result.append(coordinate)
                     }
                 }
@@ -292,7 +341,7 @@ public struct PhotoLocationQuerySnapshot: Sendable {
 public extension PhotoLocationIndex {
     /// Captures the bucket index for detached map aggregation.
     func querySnapshot() -> PhotoLocationQuerySnapshot {
-        PhotoLocationQuerySnapshot(buckets: buckets)
+        PhotoLocationQuerySnapshot(buckets: buckets, evidence: placeEvidence())
     }
 }
 

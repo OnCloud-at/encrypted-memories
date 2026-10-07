@@ -44,6 +44,7 @@ public enum SupportDiagnosticsExporter {
             let dropped: Int
         }
 
+        let placeCandidates: [PlaceCandidateSupportSnapshot]
         let librarySync: LibrarySyncSupportSnapshot
         let backup: Backup
         let recentEvents: RecentEvents
@@ -74,6 +75,7 @@ public enum SupportDiagnosticsExporter {
         // One salt per report: hashes link the events of one report, never two reports.
         let trailExport = trail.export(hashingWith: SupportReportIdentifierHasher())
         let report = Report(
+            placeCandidates: await sources.placeSnapshot(),
             librarySync: librarySync,
             backup: Report.Backup(
                 queues: sources.queueSnapshots(),
