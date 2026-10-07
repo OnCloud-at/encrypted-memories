@@ -302,7 +302,8 @@ let package = Package(
             dependencies: [
                 "UploadCore", "UploadFeature", "PhotosCore", "PhotoLibraryBackupAdapter",
                 // The Duplicates screenshots render the shared viewer with its merge tools.
-                "PhotoViewerFeature", "MediaCache", "MediaByteCache",
+                "PhotoViewerFeature", "MediaCache", "MediaByteCache", "ProtonDriveBackend",
+                .product(name: "ProtonCoreCryptoPatchedGoImplementation", package: "protoncore_ios"),
             ]),
         .target(
             name: "MapCore", dependencies: ["PhotosCore", "MediaLocationCore"],

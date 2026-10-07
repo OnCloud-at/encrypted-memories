@@ -430,6 +430,44 @@ public struct PhotoLibraryCatalogSync: Sendable {
         }
     }
 
+    /// Recovers unchanged catalog photos dropped by older builds or by a later missing-source discard.
+    /// Reads only local stores. A page advances only after durable conditional queue inserts.
+    /// A drop during the sweep changes the queue generation, so another pass checks the earlier pages again.
+    public func reconcileMissingSources(engine: any UploadBackupCandidateEnqueueing) async throws {
+        let generation = try await engine.missingSourceDiscardGeneration()
+        let completed = store.reconciledMissingSourceGeneration()
+        let progress = store.missingSourceSweepProgress()
+        guard store.isOperational() else { throw UploadError.backend("Photo library catalog could not be read") }
+        var sweep: PhotoLibraryMissingSourceSweepProgress
+        if let progress {
+            sweep = progress
+        } else {
+            guard completed != generation else { return }
+            sweep = PhotoLibraryMissingSourceSweepProgress(generation: generation)
+            guard store.recordMissingSourceSweepProgress(sweep) else {
+                throw UploadError.backend("Photo library catalog could not be updated")
+            }
+        }
+        while true {
+            try Task.checkCancellation()
+            let page = store.presentEntries(afterLocalIdentifier: sweep.afterLocalIdentifier, limit: chunkSize)
+            guard store.isOperational() else { throw UploadError.backend("Photo library catalog could not be read") }
+            guard let last = page.last else { break }
+            let candidates = page.compactMap {
+                PhotoBackupAssetPlanner.candidate(for: PhotoLibraryCatalogMapper.info(for: $0))
+            }
+            try await engine.enqueueMissingSources(candidates)
+            sweep.afterLocalIdentifier = last.localIdentifier
+            guard store.recordMissingSourceSweepProgress(sweep) else {
+                throw UploadError.backend("Photo library catalog could not be updated")
+            }
+            await Task.yield()
+        }
+        guard store.completeMissingSourceSweep(generation: sweep.generation) else {
+            throw UploadError.backend("Photo library catalog could not be updated")
+        }
+    }
+
     /// Classifies + enqueues one chunk, then durably advances the catalog. Queue rows are written
     /// before the catalog (`upsertBatch`) so a crash re-yields the asset rather than stranding it.
     private func ingest(

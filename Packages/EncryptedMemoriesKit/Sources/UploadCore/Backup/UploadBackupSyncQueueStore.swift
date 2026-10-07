@@ -733,27 +733,29 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
 
     @discardableResult
     private func removeUnobserved(source: UploadSourceIdentity, revision: UploadBackupRevision) -> Bool {
-        lock.withLock {
-            var stmt: OpaquePointer?
-            guard
-                requireOperational(
-                    sqlite3_prepare_v2(
-                        db,
-                        """
-                        DELETE FROM backup_sync_queue
-                        WHERE source_kind=? AND source_id=? AND resource=? AND revision_us=?;
-                        """,
-                        -1, &stmt, nil
-                    ) == SQLITE_OK)
-            else { return false }
-            defer { sqlite3_finalize(stmt) }
-            bindText(stmt, 1, source.kind.rawValue)
-            bindText(stmt, 2, source.identifier)
-            bindText(stmt, 3, source.resource.rawValue)
-            sqlite3_bind_int64(stmt, 4, revision.rawValue)
-            guard requireOperational(sqlite3_step(stmt) == SQLITE_DONE) else { return false }
-            return sqlite3_changes(db) > 0
-        }
+        lock.withLock { removeLocked(source: source, revision: revision) }
+    }
+
+    private func removeLocked(source: UploadSourceIdentity, revision: UploadBackupRevision) -> Bool {
+        var stmt: OpaquePointer?
+        guard
+            requireOperational(
+                sqlite3_prepare_v2(
+                    db,
+                    """
+                    DELETE FROM backup_sync_queue
+                    WHERE source_kind=? AND source_id=? AND resource=? AND revision_us=?;
+                    """,
+                    -1, &stmt, nil
+                ) == SQLITE_OK)
+        else { return false }
+        defer { sqlite3_finalize(stmt) }
+        bindText(stmt, 1, source.kind.rawValue)
+        bindText(stmt, 2, source.identifier)
+        bindText(stmt, 3, source.resource.rawValue)
+        sqlite3_bind_int64(stmt, 4, revision.rawValue)
+        guard requireOperational(sqlite3_step(stmt) == SQLITE_DONE) else { return false }
+        return sqlite3_changes(db) > 0
     }
 
     private func removeSettledRevisionsUnobserved(
@@ -974,6 +976,121 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
             sqlite3_bind_int(stmt, 2, Int32(state.rawValue))
             return requireOperational(sqlite3_step(stmt) == SQLITE_DONE)
         }
+    }
+
+    public func missingSourceDiscardGeneration() -> Int64? {
+        lock.withLock {
+            var stmt: OpaquePointer?
+            guard
+                requireOperational(
+                    sqlite3_prepare_v2(
+                        db,
+                        "SELECT value FROM backup_sync_queue_info WHERE key='missing_source_discard_generation';",
+                        -1, &stmt, nil) == SQLITE_OK)
+            else { return nil }
+            defer { sqlite3_finalize(stmt) }
+            let step = sqlite3_step(stmt)
+            if step == SQLITE_DONE { return 0 }
+            guard requireOperational(step == SQLITE_ROW) else { return nil }
+            return sqlite3_column_int64(stmt, 0)
+        }
+    }
+
+    public func sourcesWithEntries(_ sources: [UploadSourceIdentity]) -> Set<UploadSourceIdentity>? {
+        lock.withLock {
+            var stmt: OpaquePointer?
+            guard
+                requireOperational(
+                    sqlite3_prepare_v2(
+                        db,
+                        "SELECT 1 FROM backup_sync_queue WHERE source_kind=? AND source_id=? LIMIT 1;",
+                        -1, &stmt, nil) == SQLITE_OK)
+            else { return nil }
+            defer { sqlite3_finalize(stmt) }
+            var result: Set<UploadSourceIdentity> = []
+            for source in sources {
+                sqlite3_reset(stmt)
+                sqlite3_clear_bindings(stmt)
+                bindText(stmt, 1, source.kind.rawValue)
+                bindText(stmt, 2, source.identifier)
+                let step = sqlite3_step(stmt)
+                guard requireOperational(step == SQLITE_ROW || step == SQLITE_DONE) else { return nil }
+                if step == SQLITE_ROW { result.insert(source) }
+            }
+            return result
+        }
+    }
+
+    public func insertMissingSources(_ entries: [UploadBackupSyncQueueEntry]) -> Bool {
+        guard !entries.isEmpty else { return true }
+        let result = lock.withLock {
+            SQLiteStoreSchemaGate.withDurableCommits(db) {
+                var stmt: OpaquePointer?
+                guard
+                    requireOperational(
+                        sqlite3_prepare_v2(
+                            db,
+                            """
+                            INSERT INTO backup_sync_queue(
+                                source_kind, source_id, resource, revision_us, original_filename,
+                                byte_count, state, attempts, last_error, updated_at, remote_commit_reconciliation
+                            ) SELECT ?,?,?,?,?,?,?,?,?,?,? WHERE NOT EXISTS (
+                                SELECT 1 FROM backup_sync_queue WHERE source_kind=? AND source_id=?
+                            );
+                            """, -1, &stmt, nil) == SQLITE_OK),
+                    requireOperational(sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK)
+                else {
+                    sqlite3_finalize(stmt)
+                    return false
+                }
+                defer { sqlite3_finalize(stmt) }
+                for entry in entries {
+                    sqlite3_reset(stmt)
+                    sqlite3_clear_bindings(stmt)
+                    bind(entry, to: stmt)
+                    bindText(stmt, 12, entry.source.kind.rawValue)
+                    bindText(stmt, 13, entry.source.identifier)
+                    guard requireOperational(sqlite3_step(stmt) == SQLITE_DONE) else {
+                        sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
+                        return false
+                    }
+                }
+                guard requireOperational(sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK) else {
+                    sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
+                    return false
+                }
+                return true
+            } ?? requireOperational(false)
+        }
+        if result { notify(UploadBackupSyncQueueChange(sources: entries.map(\.source))) }
+        return result
+    }
+
+    public func removeMissingSource(source: UploadSourceIdentity, revision: UploadBackupRevision) -> Bool {
+        guard source.kind == .photoLibraryAsset else { return remove(source: source, revision: revision) }
+        let result = lock.withLock {
+            SQLiteStoreSchemaGate.withDurableCommits(db) {
+                guard requireOperational(sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK) else {
+                    return false
+                }
+                guard removeLocked(source: source, revision: revision),
+                    requireOperational(
+                        sqlite3_exec(
+                            db,
+                            """
+                            INSERT INTO backup_sync_queue_info(key, value) VALUES('missing_source_discard_generation', 1)
+                            ON CONFLICT(key) DO UPDATE SET value=value+1;
+                            """, nil, nil, nil) == SQLITE_OK),
+                    requireOperational(sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK)
+                else {
+                    sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
+                    return false
+                }
+                return true
+            } ?? requireOperational(false)
+        }
+        if result { notify(UploadBackupSyncQueueChange(sources: [source])) }
+        return result
     }
 
     public func runtimeIssue(for key: BackupRuntimeIssueKey) -> BackupIssueRecord? {
