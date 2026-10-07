@@ -18,6 +18,8 @@
 <p align="center">
   <a href="https://memories.oncloud.at/">Website</a>
   ·
+  <a href="https://testflight.apple.com/join/tUTca8Y5">Join the TestFlight beta</a>
+  ·
   <a href="https://github.com/OnCloud-at/encrypted-memories/wiki/Quick-Start">Get started</a>
   ·
   <a href="https://github.com/OnCloud-at/encrypted-memories/wiki/Device-and-Feature-Support">See supported features</a>
