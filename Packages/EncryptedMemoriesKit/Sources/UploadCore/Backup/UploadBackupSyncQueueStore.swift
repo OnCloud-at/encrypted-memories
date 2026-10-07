@@ -230,19 +230,21 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
         }
     }
 
-    public func nextRunnableDate() -> Date? {
-        lock.withLock {
+    public func nextRunnableDate(excludingSourcesOf excludedSources: [UploadSourceIdentity]) -> Date? {
+        let exclusion = SourceExclusion(excludedSources)
+        return lock.withLock {
             var stmt: OpaquePointer?
             guard
                 requireOperational(
                     sqlite3_prepare_v2(
                         db,
                         "SELECT MIN(updated_at) FROM backup_sync_queue "
-                            + "WHERE state IN (\(Self.runnableStateList));",
+                            + "WHERE state IN (\(Self.runnableStateList))\(exclusion.clause);",
                         -1, &stmt, nil
                     ) == SQLITE_OK)
             else { return nil }
             defer { sqlite3_finalize(stmt) }
+            _ = bind(exclusion, to: stmt, from: 1)
             let result = sqlite3_step(stmt)
             guard requireOperational(result == SQLITE_ROW) else { return nil }
             guard sqlite3_column_type(stmt, 0) != SQLITE_NULL else {
@@ -299,12 +301,7 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
         limit: Int, claimedAt: Date, excludedSources: [UploadSourceIdentity]
     ) -> [UploadBackupSyncQueueEntry] {
         let clampedLimit = max(1, limit)
-        var excludedKeys: [(kind: String, identifier: String)] = []
-        var seenKeys: Set<String> = []
-        for source in excludedSources where seenKeys.insert(source.kind.rawValue + "|" + source.identifier).inserted {
-            excludedKeys.append((source.kind.rawValue, source.identifier))
-        }
-        let exclusion = String(repeating: "\n  AND NOT (source_kind=? AND source_id=?)", count: excludedKeys.count)
+        let exclusion = SourceExclusion(excludedSources)
         return lock.withLock {
             guard requireOperational(sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK) else {
                 return []
@@ -320,7 +317,7 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
                                state, attempts, last_error, updated_at, remote_commit_reconciliation
                         FROM backup_sync_queue
                         WHERE state IN (\(Self.runnableStateList))
-                          AND updated_at <= ?\(exclusion)
+                          AND updated_at <= ?\(exclusion.clause)
                         ORDER BY revision_us DESC, updated_at ASC
                         LIMIT ?;
                         """,
@@ -331,13 +328,8 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
                 return []
             }
             sqlite3_bind_double(selectStmt, 1, claimedAt.timeIntervalSince1970)
-            var parameter: Int32 = 2
-            for key in excludedKeys {
-                bindText(selectStmt, parameter, key.kind)
-                bindText(selectStmt, parameter + 1, key.identifier)
-                parameter += 2
-            }
-            sqlite3_bind_int(selectStmt, parameter, Int32(clamping: clampedLimit))
+            let limitParameter = bind(exclusion, to: selectStmt, from: 2)
+            sqlite3_bind_int(selectStmt, limitParameter, Int32(clamping: clampedLimit))
             var selectResult = sqlite3_step(selectStmt)
             while selectResult == SQLITE_ROW {
                 guard let source = sourceFromColumns(selectStmt, kindColumn: 0, idColumn: 1, resourceColumn: 2) else {
@@ -1343,6 +1335,31 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
     }
 
     private let transient = SQLiteStoreSchemaGate.transientDestructor
+
+    /// Rows of these sources (same kind and identifier, any resource or revision) stay out of a runnable-set query.
+    private struct SourceExclusion {
+        var keys: [(kind: String, identifier: String)] = []
+
+        init(_ sources: [UploadSourceIdentity]) {
+            var seen: Set<String> = []
+            for source in sources where seen.insert(source.kind.rawValue + "|" + source.identifier).inserted {
+                keys.append((source.kind.rawValue, source.identifier))
+            }
+        }
+
+        var clause: String { String(repeating: "\n  AND NOT (source_kind=? AND source_id=?)", count: keys.count) }
+    }
+
+    /// Binds the exclusion's parameters from `first` on and returns the next free parameter index.
+    private func bind(_ exclusion: SourceExclusion, to stmt: OpaquePointer?, from first: Int32) -> Int32 {
+        var parameter = first
+        for key in exclusion.keys {
+            bindText(stmt, parameter, key.kind)
+            bindText(stmt, parameter + 1, key.identifier)
+            parameter += 2
+        }
+        return parameter
+    }
 
     private func bindText(_ stmt: OpaquePointer?, _ index: Int32, _ value: String) {
         sqlite3_bind_text(stmt, index, value, -1, transient)

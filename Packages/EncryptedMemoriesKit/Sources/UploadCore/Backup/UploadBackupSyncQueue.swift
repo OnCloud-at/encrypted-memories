@@ -251,9 +251,10 @@ public protocol UploadBackupSyncQueueStore: Sendable {
     /// queue state. A malformed non-null payload is an error, never ordinary no-receipt work.
     func entriesWithRemoteCommitReconciliation(limit: Int) throws -> [UploadBackupSyncQueueEntry]
     func nextRunnable(limit: Int) -> [UploadBackupSyncQueueEntry]
-    /// Earliest persisted eligibility time for any runnable row. Retry delays survive process death,
-    /// so a restarted runner can wait for due work instead of declaring the queue drained.
-    func nextRunnableDate() -> Date?
+    /// Earliest persisted eligibility time for any runnable row outside `excludedSources` (same kind and identifier,
+    /// as in `claimRunnable`). Retry delays survive process death, so a restarted runner can wait for due work
+    /// instead of declaring the queue drained.
+    func nextRunnableDate(excludingSourcesOf excludedSources: [UploadSourceIdentity]) -> Date?
     /// Earliest eligible/backoff row for status and scheduling. Unlike `nextRunnable(limit:)`, this
     /// is ordered by eligibility rather than newest-photo execution priority.
     func earliestRunnableEntry() -> UploadBackupSyncQueueEntry?
@@ -326,6 +327,10 @@ public protocol UploadBackupSyncQueueStore: Sendable {
 
 public extension UploadBackupSyncQueueStore {
     func isOperational() -> Bool { true }
+
+    func nextRunnableDate() -> Date? {
+        nextRunnableDate(excludingSourcesOf: [])
+    }
 
     func claimRunnable(limit: Int, claimedAt: Date) -> [UploadBackupSyncQueueEntry] {
         claimRunnable(limit: limit, claimedAt: claimedAt, excludingSourcesOf: [])
