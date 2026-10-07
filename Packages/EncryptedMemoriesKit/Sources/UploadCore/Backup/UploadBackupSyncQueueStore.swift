@@ -1048,6 +1048,7 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
 
     public func insertMissingSources(_ entries: [UploadBackupSyncQueueEntry]) -> Bool {
         guard !entries.isEmpty else { return true }
+        var enqueued = false
         let result = lock.withLock {
             SQLiteStoreSchemaGate.withDurableCommits(db) {
                 var stmt: OpaquePointer?
@@ -1079,6 +1080,9 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
                         sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
                         return false
                     }
+                    if sqlite3_changes(db) > 0, Self.runnableStates.contains(entry.state.rawValue) {
+                        enqueued = true
+                    }
                 }
                 guard requireOperational(sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK) else {
                     sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
@@ -1087,7 +1091,7 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
                 return true
             } ?? requireOperational(false)
         }
-        if result { notify(UploadBackupSyncQueueChange(sources: entries.map(\.source))) }
+        if result { notify(UploadBackupSyncQueueChange(sources: entries.map(\.source), enqueued: enqueued)) }
         return result
     }
 

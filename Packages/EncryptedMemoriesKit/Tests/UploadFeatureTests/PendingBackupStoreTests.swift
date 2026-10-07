@@ -546,6 +546,29 @@ final class PendingQueueIntegrationTests: XCTestCase {
         XCTAssertEqual(changes.values.last, .enqueued([.photoLibraryAsset: ["waiting"]]))
     }
 
+    func testMissingSourceInsertsNotifyOnlyNewRunnableRows() {
+        let changes = LockedChanges()
+        queue.setChangeObserver { changes.append($0) }
+        let runnable = entry("a", state: .discovered)
+        let sources: [UploadSourceIdentity.Kind: Set<String>] = [.photoLibraryAsset: ["a"]]
+
+        XCTAssertTrue(queue.insertMissingSources([runnable]))
+        XCTAssertEqual(changes.values.last, .enqueued(sources))
+        XCTAssertTrue(queue.insertMissingSources([runnable]), "an existing source adds no work")
+        XCTAssertEqual(changes.values.last, .sources(sources))
+
+        var newer = runnable
+        newer.revision = UploadBackupRevision(rawValue: 8)
+        XCTAssertTrue(queue.insertMissingSources([newer]), "the conditional insert preserves an existing source")
+        XCTAssertNil(queue.entry(for: newer.source, revision: newer.revision))
+        XCTAssertEqual(changes.values.last, .sources(sources))
+
+        XCTAssertTrue(queue.insertMissingSources([entry("settled", state: .completed)]))
+        XCTAssertEqual(changes.values.last, .sources([.photoLibraryAsset: ["settled"]]))
+        XCTAssertTrue(queue.insertMissingSources([runnable, entry("new", state: .discovered)]))
+        XCTAssertEqual(changes.values.last, .enqueued([.photoLibraryAsset: ["a", "new"]]))
+    }
+
     func testUnsettledRowsLeaveTerminalOutcomesOut() {
         XCTAssertTrue(
             queue.upsertBatch([

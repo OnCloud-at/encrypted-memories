@@ -4002,6 +4002,14 @@ extension BackupSyncRunnerTests {
     }
 
     func testNewBatchStartsWhileALongUploadHasNoWaitingRow() async throws {
+        try await assertNewWorkStartsWhileALongUploadHasNoWaitingRow(recoveringMissingSources: false)
+    }
+
+    func testRecoveredMissingSourceStartsWhileALongUploadHasNoWaitingRow() async throws {
+        try await assertNewWorkStartsWhileALongUploadHasNoWaitingRow(recoveringMissingSources: true)
+    }
+
+    private func assertNewWorkStartsWhileALongUploadHasNoWaitingRow(recoveringMissingSources: Bool) async throws {
         let slow = seedEntry("slow.mov", ageSeconds: 600)
         let initial = seedEntry("initial.jpg")
         let notifications = BackupEventLog()
@@ -4022,7 +4030,11 @@ extension BackupSyncRunnerTests {
         let candidate = UploadBackupAssetCandidate(
             snapshot: UploadBackupAssetSnapshot(source: source, revision: revision, resourceCount: 1),
             originalFilename: "new.jpg", byteCount: 4)
-        _ = try await engine.enqueueBatch([candidate])
+        if recoveringMissingSources {
+            try await engine.enqueueMissingSources([candidate])
+        } else {
+            _ = try await engine.enqueueBatch([candidate])
+        }
         let newFinished = await waitUntil(timeout: .seconds(2)) {
             self.queueStore.entry(for: source, revision: revision)?.state == .completed
         }
