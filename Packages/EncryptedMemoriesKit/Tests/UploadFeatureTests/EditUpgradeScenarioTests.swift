@@ -21,6 +21,54 @@ final class EditUpgradeScenarioTests: XCTestCase {
         Set(harness.server.links.filter { $0.mainLinkID == nil && $0.state == .active }.map(\.uid))
     }
 
+    func testV105DroppedPhotoReturnsWithoutAnEditAndUploadsOnlyOnce() async throws {
+        try await assertV105DroppedPhotoReturns(pending: false)
+    }
+
+    func testV105DroppedPhotoWithPendingStateReturnsWithoutAnEdit() async throws {
+        try await assertV105DroppedPhotoReturns(pending: true)
+    }
+
+    private func assertV105DroppedPhotoReturns(pending: Bool) async throws {
+        harness = try EditScenarioHarness(v105: .unchanged)
+        try harness.seedV105DroppedPhoto(pending: pending)
+        let candidate = try harness.library.candidate("dropped-photo")
+        XCTAssertNil(harness.queue.entry(for: candidate.snapshot.source, revision: candidate.snapshot.revision))
+        let scan = try await harness.fullRescan()
+        XCTAssertEqual(scan.changed, 0)
+        XCTAssertEqual(scan.discovered, 0)
+        let row = try XCTUnwrap(
+            harness.queue.entry(for: candidate.snapshot.source, revision: candidate.snapshot.revision))
+        XCTAssertTrue([.discovered, .queuedForUpload, .checking].contains(row.state))
+        await harness.drain()
+        XCTAssertEqual(harness.state(of: row), .completed)
+        XCTAssertEqual(uploads, 1)
+        XCTAssertTrue(trashed.isEmpty)
+        try harness.relaunch()
+        _ = try await harness.fullRescan()
+        await harness.drain()
+        XCTAssertEqual(uploads, 1)
+        XCTAssertEqual(harness.library.resolutions.filter { $0.source.identifier == "asset-1" }.count, 0)
+        harness.assertSafety()
+        harness.assertQuiescent()
+    }
+
+    func testRecoveredV105PhotoWithAnUploadManifestDoesNotUploadAgain() async throws {
+        harness = try EditScenarioHarness(v105: .unchanged)
+        let before = activeMains
+        let candidate = try harness.library.candidate()
+        XCTAssertNotNil(harness.identities.record(for: candidate.snapshot.source))
+        try harness.removeLocalBackupSettlement()
+        _ = try await harness.fullRescan()
+        XCTAssertNotNil(harness.queue.entry(for: candidate.snapshot.source, revision: candidate.snapshot.revision))
+        await harness.drain()
+        XCTAssertEqual(uploads, 0)
+        XCTAssertTrue(trashed.isEmpty)
+        XCTAssertEqual(activeMains, before)
+        harness.assertSafety()
+        harness.assertQuiescent()
+    }
+
     func testFirstFullRescanAfterV105ReopensNothingAndWritesNoJournal() async throws {
         harness = try EditScenarioHarness(v105: .unchanged, assetCount: 256)
         let before = activeMains

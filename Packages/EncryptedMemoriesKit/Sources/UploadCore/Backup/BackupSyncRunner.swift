@@ -2213,7 +2213,7 @@ public actor BackupSyncRunner {
         from oldState: UploadBackupSyncQueueState
     ) {
         endActiveExecution(key: Self.key(entry), publish: false)
-        guard queue.remove(source: entry.source, revision: entry.revision) else {
+        guard queue.removeMissingSource(source: entry.source, revision: entry.revision) else {
             if queue.entry(for: entry.source, revision: entry.revision) != nil {
                 stopRequested = true
             }

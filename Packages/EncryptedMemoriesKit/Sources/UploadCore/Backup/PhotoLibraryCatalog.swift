@@ -260,6 +260,14 @@ public protocol PhotoLibraryCatalogStore: Sendable {
     @discardableResult
     func recordLateRenderSweepResumePoint(_ localIdentifier: String) -> Bool
 
+    /// Missing-source reconciliation runs once on upgrade and again for each later discard generation.
+    func reconciledMissingSourceGeneration() -> Int64?
+    func missingSourceSweepProgress() -> PhotoLibraryMissingSourceSweepProgress?
+    @discardableResult
+    func recordMissingSourceSweepProgress(_ progress: PhotoLibraryMissingSourceSweepProgress) -> Bool
+    @discardableResult
+    func completeMissingSourceSweep(generation: Int64) -> Bool
+
     // MARK: Stable full-scan snapshot
     /// Starts replacing the in-progress scan snapshot. Appends are chunked to avoid one large in-memory
     /// identifier array.
@@ -275,6 +283,11 @@ public protocol PhotoLibraryCatalogStore: Sendable {
 }
 
 public extension PhotoLibraryCatalogStore {
+    func reconciledMissingSourceGeneration() -> Int64? { nil }
+    func missingSourceSweepProgress() -> PhotoLibraryMissingSourceSweepProgress? { nil }
+    func recordMissingSourceSweepProgress(_ progress: PhotoLibraryMissingSourceSweepProgress) -> Bool { false }
+    func completeMissingSourceSweep(generation: Int64) -> Bool { false }
+
     func isOperational() -> Bool { true }
 
     func presentEntries(afterLocalIdentifier: String?, limit: Int) -> [PhotoLibraryCatalogEntry] { [] }
@@ -295,5 +308,16 @@ public struct PhotoLibraryFullScanProgress: Sendable, Equatable {
     public init(epochStart: Date, cursor: Int) {
         self.epochStart = epochStart
         self.cursor = cursor
+    }
+}
+
+/// A sweep retains its original generation across interruptions. A later drop still requires another full sweep.
+public struct PhotoLibraryMissingSourceSweepProgress: Sendable, Equatable {
+    public var generation: Int64
+    public var afterLocalIdentifier: String?
+
+    public init(generation: Int64, afterLocalIdentifier: String? = nil) {
+        self.generation = generation
+        self.afterLocalIdentifier = afterLocalIdentifier
     }
 }

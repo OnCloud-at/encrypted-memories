@@ -46,6 +46,19 @@ final class UploadBackupSyncQueueDurabilityTests: XCTestCase {
             WALSyncRecorder.syncs(ofWALFor: queueURL), [], "state changes keep synchronous=NORMAL after an insert")
     }
 
+    func testRecoveryInsertsAndMissingSourceDiscardsSyncTheWALBeforeTheyReturn() throws {
+        let store = try XCTUnwrap(UploadBackupSyncQueueManifestStore(url: queueURL))
+        defer { store.close() }
+        XCTAssertTrue(store.upsert(entry("warmup")))
+        WALSyncRecorder.reset()
+        XCTAssertTrue(store.insertMissingSources([entry("A"), entry("B")]))
+        assertFullSyncs(WALSyncRecorder.syncs(ofWALFor: queueURL), "insertMissingSources")
+        WALSyncRecorder.reset()
+        XCTAssertTrue(store.removeMissingSource(source: source("A"), revision: revision))
+        assertFullSyncs(WALSyncRecorder.syncs(ofWALFor: queueURL), "removeMissingSource")
+        XCTAssertEqual(store.missingSourceDiscardGeneration(), 1)
+    }
+
     func testDurableCommitsRestoreTheConnectionSettings() throws {
         var db: OpaquePointer?
         XCTAssertEqual(sqlite3_open(tempDir.appendingPathComponent("plain.sqlite").path, &db), SQLITE_OK)
