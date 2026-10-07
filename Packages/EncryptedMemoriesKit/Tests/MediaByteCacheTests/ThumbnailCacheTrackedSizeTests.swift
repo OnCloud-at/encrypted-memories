@@ -77,6 +77,26 @@ struct ThumbnailCacheTrackedSizeTests {
         #expect(cache.trackedDiskSizeBytes() == cache.diskSizeBytes())
     }
 
+    @Test func blobsWrittenBetweenTheListingAndItsCloseCountOnce() throws {
+        let root = makeRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let cache = makeCache(root)
+        cache.storeToDisk(Data(repeating: 0x11, count: 900), for: uid("listed"))
+        cache.storeToDisk(Data(repeating: 0x22, count: 400), for: uid("kept"))
+
+        // The listing saw the first blob at its old size; it shrinks and a new blob arrives before the close.
+        cache.setSeedListingHookForTesting {
+            cache.storeToDisk(Data(repeating: 0x33, count: 50), for: uid("listed"))
+            cache.storeToDisk(Data(repeating: 0x44, count: 300), for: uid("added"))
+        }
+        #expect(cache.trackedDiskSizeBytes() == cache.diskSizeBytes())
+        cache.setSeedListingHookForTesting(nil)
+        #expect(cache.diskUsageExactForTesting() == cache.diskSizeBytes())
+
+        cache.storeToDisk(Data(repeating: 0x55, count: 700), for: uid("later"))
+        #expect(cache.trackedDiskSizeBytes() == cache.diskSizeBytes())
+    }
+
     @Test func firstMeasurementStaysExactWhileWritesLandDuringTheListing() async throws {
         for round in 0..<6 {
             let root = makeRoot()

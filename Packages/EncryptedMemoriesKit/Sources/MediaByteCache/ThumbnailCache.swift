@@ -778,45 +778,53 @@ public actor ThumbnailCache {
     public nonisolated func trackedDiskSizeBytes() -> Int64 {
         if let exact = diskUsage.exactBytes() { return exact }
         let generation = writerGeneration.capture()
-        let seed = diskUsage.beginExactScan()
-        let listed = listBlobSizes()
-        guard let seed else { return diskUsage.exactBytes() ?? listed?.total ?? 0 }
+        guard let seed = diskUsage.beginExactScan() else {
+            // Another measurement sets the total now; answer once from a listing unless it already finished.
+            return diskUsage.exactBytes() ?? Self.blobTotal(of: listDirectory() ?? [])
+        }
+        let listed = listDirectory()
+        #if DEBUG
+            diskUsage.runSeedListingHook()
+        #endif
         guard let listed,
             let changed = writerGeneration.performIfCurrent(generation, { diskUsage.closeExactScan(seed) }) ?? nil
         else {
             diskUsage.cancelExactScan(seed)
-            return listed?.total ?? 0
+            return Self.blobTotal(of: listed ?? [])
         }
         // A blob changed during the listing counts with its size after the last change, not the listed one.
         var total: Int64 = changed.values.reduce(0, +)
-        for (name, size) in listed.sizes where changed[name] == nil {
-            guard let size else {
+        for url in listed where url.pathExtension == "blob" && changed[url.lastPathComponent] == nil {
+            guard let size = try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize else {
                 diskUsage.cancelExactScan(seed)
-                return listed.total
+                return Self.blobTotal(of: listed)
             }
-            total += size
+            total += Int64(size)
         }
         return diskUsage.finishExactScan(seed, total: total)
     }
 
-    /// Lists the `.blob` files with their sizes (`nil` when unreadable), or `nil` when the directory is unreadable.
-    private nonisolated func listBlobSizes() -> (sizes: [(String, Int64?)], total: Int64)? {
-        guard
-            let urls = try? FileManager.default.contentsOfDirectory(
-                at: directory,
-                includingPropertiesForKeys: [.fileSizeKey],
-                options: [.skipsHiddenFiles]
-            )
-        else { return nil }
-        var sizes: [(String, Int64?)] = []
-        sizes.reserveCapacity(urls.count)
-        var total: Int64 = 0
-        for url in urls where url.pathExtension == "blob" {
-            let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize).map(Int64.init)
-            sizes.append((url.lastPathComponent, size))
-            total += size ?? 0
+    #if DEBUG
+        /// Runs `hook` after a measurement listed the directory and before it closes the listing.
+        package nonisolated func setSeedListingHookForTesting(_ hook: (@Sendable () -> Void)?) {
+            diskUsage.setSeedListingHook(hook)
         }
-        return (sizes, total)
+    #endif
+
+    /// Lists the directory with prefetched file sizes, or returns `nil` when it is unreadable.
+    private nonisolated func listDirectory() -> [URL]? {
+        try? FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: [.fileSizeKey],
+            options: [.skipsHiddenFiles]
+        )
+    }
+
+    private nonisolated static func blobTotal(of urls: [URL]) -> Int64 {
+        urls.reduce(Int64(0)) { total, url in
+            guard url.pathExtension == "blob" else { return total }
+            return total + Int64((try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
+        }
     }
 
     /// The size of the file at `url`: zero when it does not exist, `nil` when the size cannot be read.
@@ -1082,6 +1090,19 @@ package final class ThumbnailCacheDiskUsage: @unchecked Sendable {
             exactScanTail = nil
         }
     }
+
+    #if DEBUG
+        private var seedListingHook: (@Sendable () -> Void)?
+
+        package func setSeedListingHook(_ hook: (@Sendable () -> Void)?) {
+            lock.withLock { seedListingHook = hook }
+        }
+
+        package func runSeedListingHook() {
+            let hook = lock.withLock { seedListingHook }
+            hook?()
+        }
+    #endif
 
     private func loseExactBytes() {
         exactEpoch &+= 1
