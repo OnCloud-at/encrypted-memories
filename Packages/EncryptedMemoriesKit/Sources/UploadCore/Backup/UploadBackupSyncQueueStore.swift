@@ -57,8 +57,7 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
     /// returns false.
     public func synchronizeToDisk() -> Bool {
         lock.withLock {
-            guard db != nil, !operationFailed else { return false }
-            return SQLiteStoreSchemaGate.checkpointCompletely(db)
+            SQLiteStoreSchemaGate.synchronizeToDisk(db, operationFailed: operationFailed)
         }
     }
 
