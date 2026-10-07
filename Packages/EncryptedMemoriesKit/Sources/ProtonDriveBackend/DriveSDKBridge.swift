@@ -32,6 +32,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     private let timelineStore: TimelineMetadataStore?
     private let timelineOrderStore: TimelineOrderMetadataStore?
     private var metadataReconciliationGeneration: UInt64 = 0
+    private var activeMetadataInventory: TimelineOrderMetadataStore.InventorySignature?
     private var metadataReconciliationInput: (items: [PhotoItem], classified: Set<String>)?
     private var mimeFallbackInventory: (items: [PhotoItem], classified: Set<String>)?
     /// Drive key-derivation + block decryption for video streaming (built once at sign-in).
@@ -838,6 +839,9 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         items: [PhotoItem], alreadyClassifiedNodeIDs: Set<String>
     ) {
         guard timelineStore != nil, !isShutDown else { return }
+        let signature = TimelineOrderMetadataStore.InventorySignature(items)
+        guard mediaTypeReconciliationTask == nil || activeMetadataInventory != signature else { return }
+        activeMetadataInventory = signature
         mediaTypeReconciliationTask?.cancel()
         metadataReconciliationGeneration &+= 1
         let generation = metadataReconciliationGeneration
@@ -883,6 +887,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
             }
             if generation == metadataReconciliationGeneration {
                 mediaTypeReconciliationTask = nil
+                activeMetadataInventory = nil
                 mimeFallbackInventory = nil
             }
         }
@@ -1806,16 +1811,12 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     private func metadataImpl(for uid: PhotoUID) async throws -> PhotoMetadata {
         let read = try await SDKPhotoMetadataReader.read(for: uid, client: photosClient)
         let metadata = read.metadata
-        if let order = read.timelineOrder, let timelineOrderStore {
-            if timelineOrderStore.record([uid: order]) {
-                do { _ = try timelineOrderStore.publishCompletedSeconds() } catch {
-                    timelineOrderStore.rebuild()
-                    DebugLog.log("timeline: could not publish order resolved by viewer")
-                }
-            } else {
-                timelineOrderStore.rebuild()
-                DebugLog.log("timeline: could not persist order resolved by viewer")
-            }
+        if let timelineOrderStore,
+            !timelineOrderStore.recordResolvedMetadata(
+                for: uid, metadata: read.timelineOrder, isClassified: metadata.mimeType != nil)
+        {
+            timelineOrderStore.rebuild()
+            DebugLog.log("timeline: could not persist order resolved by viewer")
         }
         if let mimeType = metadata.mimeType {
             let result = timelineStore?.recordMediaTypeEvidence([uid: mimeType])

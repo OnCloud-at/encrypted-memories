@@ -18,6 +18,91 @@ final class TimelineOrderMetadataStoreTests: XCTestCase {
             captureTime: Date(timeIntervalSince1970: time), mediaType: "image/jpeg")
     }
 
+    func testUnchangedInventorySkipsTheWritePassEvenWhenInputOrderChanges() throws {
+        let url = try directory().appendingPathComponent("order.sqlite")
+        let policy = LibraryDatabasePolicy(mmapBytes: 0, cacheSizeKiB: 2_048, busyTimeoutMs: 0)
+        let store = try XCTUnwrap(TimelineOrderMetadataStore(url: url, policy: policy))
+        defer { store.close() }
+        let items = (0..<1_000).map { photo(String($0), time: Double(500 + $0 / 2)) }
+        let classified = Set(items.map(\.uid))
+        let syncPasses = PhotoDiagnostics.shared.counter("timeline.order.syncPass")
+        XCTAssertTrue(store.synchronize(items, classifiedUIDs: classified))
+        XCTAssertEqual(PhotoDiagnostics.shared.counter("timeline.order.syncPass"), syncPasses + 1)
+        var blocker: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(url.path, &blocker), SQLITE_OK)
+        defer { sqlite3_close(blocker) }
+        XCTAssertEqual(sqlite3_exec(blocker, "BEGIN IMMEDIATE;", nil, nil, nil), SQLITE_OK)
+        XCTAssertTrue(
+            store.synchronize(items.reversed(), classifiedUIDs: classified), "unchanged inventory needs no write pass")
+        XCTAssertEqual(PhotoDiagnostics.shared.counter("timeline.order.syncPass"), syncPasses + 1)
+        XCTAssertEqual(sqlite3_exec(blocker, "ROLLBACK;", nil, nil, nil), SQLITE_OK)
+        let added = photo("new-photo", time: 2_000)
+        XCTAssertTrue(store.synchronize(items + [added], classifiedUIDs: classified))
+        XCTAssertTrue(try store.nextPage(after: items.last?.uid).contains { $0.uid == added.uid })
+        XCTAssertEqual(PhotoDiagnostics.shared.counter("timeline.order.syncPass"), syncPasses + 2)
+        var retimed = items
+        retimed[0] = photo(items[0].uid.nodeID, time: 3_000)
+        XCTAssertTrue(store.synchronize(retimed, classifiedUIDs: classified))
+        XCTAssertEqual(PhotoDiagnostics.shared.counter("timeline.order.syncPass"), syncPasses + 3)
+    }
+
+    func testRepeatedMetadataReadsDoNotWriteOrScanPublicationAgain() throws {
+        let url = try directory().appendingPathComponent("order.sqlite")
+        let policy = LibraryDatabasePolicy(mmapBytes: 0, cacheSizeKiB: 2_048, busyTimeoutMs: 0)
+        let store = try XCTUnwrap(TimelineOrderMetadataStore(url: url, policy: policy))
+        defer { store.close() }
+        let items = [photo("a"), photo("b")]
+        let values = Dictionary(uniqueKeysWithValues: items.map { ($0.uid, TimelineOrderMetadata()) })
+        let recordWrites = PhotoDiagnostics.shared.counter("timeline.order.recordWrite")
+        let publishPasses = PhotoDiagnostics.shared.counter("timeline.order.publishPass")
+        XCTAssertTrue(store.synchronize(items, classifiedUIDs: Set(items.map(\.uid))))
+        XCTAssertTrue(store.record(values))
+        XCTAssertTrue(try store.publishCompletedSeconds())
+        var blocker: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(url.path, &blocker), SQLITE_OK)
+        defer { sqlite3_close(blocker) }
+        XCTAssertEqual(sqlite3_exec(blocker, "BEGIN IMMEDIATE;", nil, nil, nil), SQLITE_OK)
+        for _ in 0..<3 {
+            XCTAssertTrue(store.record(values), "already inspected metadata needs no write")
+            XCTAssertFalse(try store.publishCompletedSeconds(), "unchanged evidence needs no publication pass")
+        }
+        XCTAssertEqual(PhotoDiagnostics.shared.counter("timeline.order.recordWrite"), recordWrites + 1)
+        XCTAssertEqual(PhotoDiagnostics.shared.counter("timeline.order.publishPass"), publishPasses + 1)
+        XCTAssertEqual(sqlite3_exec(blocker, "ROLLBACK;", nil, nil, nil), SQLITE_OK)
+        let edited = photo("edit")
+        XCTAssertTrue(store.synchronize([items[0], edited], classifiedUIDs: [items[0].uid, edited.uid]))
+        XCTAssertTrue(store.record([edited.uid: .init(exactCaptureTime: Date(timeIntervalSince1970: 500.1))]))
+        XCTAssertTrue(try store.publishCompletedSeconds(), "new evidence must publish after a skipped read")
+        XCTAssertEqual(PhotoDiagnostics.shared.counter("timeline.order.recordWrite"), recordWrites + 2)
+        XCTAssertEqual(PhotoDiagnostics.shared.counter("timeline.order.publishPass"), publishPasses + 2)
+    }
+
+    func testFirstDetailInspectionsPublishOnlyTheirSecondsAndRepeatedReadsDoNoWork() throws {
+        let store = try XCTUnwrap(TimelineOrderMetadataStore(url: directory().appendingPathComponent("order.sqlite")))
+        defer { store.close() }
+        let items = (0..<1_000).map { photo(String($0), time: Double(500 + $0 / 2)) }
+        XCTAssertTrue(store.synchronize(items, classifiedUIDs: Set(items.map(\.uid))))
+        let fullPasses = PhotoDiagnostics.shared.counter("timeline.order.publishPass")
+        let secondPasses = PhotoDiagnostics.shared.counter("timeline.order.publishSecond")
+        let recordWrites = PhotoDiagnostics.shared.counter("timeline.order.recordWrite")
+        for item in items {
+            XCTAssertTrue(store.recordResolvedMetadata(for: item.uid, metadata: .init(), isClassified: true))
+        }
+        XCTAssertEqual(PhotoDiagnostics.shared.counter("timeline.order.publishPass"), fullPasses)
+        XCTAssertEqual(PhotoDiagnostics.shared.counter("timeline.order.publishSecond"), secondPasses + items.count)
+        XCTAssertEqual(PhotoDiagnostics.shared.counter("timeline.order.recordWrite"), recordWrites + items.count)
+        let revision = store.revision
+        XCTAssertEqual(revision, items.count / 2, "each complete second publishes once")
+        for item in items.reversed() {
+            XCTAssertTrue(store.recordResolvedMetadata(for: item.uid, metadata: .init(), isClassified: true))
+        }
+        XCTAssertEqual(PhotoDiagnostics.shared.counter("timeline.order.publishPass"), fullPasses)
+        XCTAssertEqual(PhotoDiagnostics.shared.counter("timeline.order.publishSecond"), secondPasses + items.count)
+        XCTAssertEqual(PhotoDiagnostics.shared.counter("timeline.order.recordWrite"), recordWrites + items.count)
+        XCTAssertEqual(store.revision, revision)
+        XCTAssertTrue(try store.nextPage().isEmpty)
+    }
+
     func testOnlyUnknownCollisionsAreReadAndASecondIsPublishedTogether() throws {
         let store = try XCTUnwrap(TimelineOrderMetadataStore(url: directory().appendingPathComponent("order.sqlite")))
         defer { store.close() }

@@ -15,6 +15,32 @@ public final class TimelineOrderMetadataStore {
     private let url: URL
     private let policy: LibraryDatabasePolicy
     private let transient = SQLiteStoreSchemaGate.transientDestructor
+    private var synchronizedInventory: InventorySignature?
+    private var needsPublication = true
+    private var lastRecordChangedOrder = false
+
+    /// Process-local identity of UID/time membership. It keeps no inventory copy and ignores listing order.
+    public struct InventorySignature: Equatable, Sendable {
+        private let count: Int
+        private let sum: UInt64
+        private let xor: UInt64
+
+        public init(_ items: [PhotoItem]) {
+            var sum: UInt64 = 0
+            var xor: UInt64 = 0
+            for item in items {
+                var hasher = Hasher()
+                hasher.combine(item.uid)
+                hasher.combine(item.captureTime.timeIntervalSince1970.bitPattern)
+                let value = UInt64(bitPattern: Int64(hasher.finalize()))
+                sum &+= value
+                xor ^= value
+            }
+            self.count = items.count
+            self.sum = sum
+            self.xor = xor
+        }
+    }
 
     public struct Candidate: Sendable {
         public let uid: PhotoUID
@@ -65,6 +91,8 @@ public final class TimelineOrderMetadataStore {
     public func close() {
         sqlite3_close(db)
         db = nil
+        synchronizedInventory = nil
+        needsPublication = true
     }
 
     /// Only this derived cache is removed. An unavailable replacement leaves ordering disabled.
@@ -101,6 +129,10 @@ public final class TimelineOrderMetadataStore {
 
     @discardableResult
     public func synchronize(_ items: [PhotoItem], isClassified: (PhotoUID) -> Bool) -> Bool {
+        guard db != nil, !Task.isCancelled else { return false }
+        let signature = InventorySignature(items)
+        guard synchronizedInventory != signature else { return true }
+        PhotoDiagnostics.shared.increment("timeline.order.syncPass")
         guard sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK else { return false }
         let setup =
             "CREATE TEMP TABLE IF NOT EXISTS incoming_order(vol TEXT,node TEXT,PRIMARY KEY(vol,node)); DELETE FROM incoming_order;"
@@ -147,6 +179,8 @@ public final class TimelineOrderMetadataStore {
         guard sqlite3_exec(db, sweep, nil, nil, nil) == SQLITE_OK,
             sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK
         else { return rollback() }
+        synchronizedInventory = signature
+        needsPublication = true
         return true
     }
 
@@ -191,6 +225,32 @@ public final class TimelineOrderMetadataStore {
     /// A nil exact time is an authenticated absent/unsupported value, not a decryption or transport failure.
     @discardableResult
     public func record(_ values: [PhotoUID: TimelineOrderMetadata], classifiedUIDs: Set<PhotoUID> = []) -> Bool {
+        lastRecordChangedOrder = false
+        guard db != nil else { return false }
+        var lookup: OpaquePointer?
+        guard
+            sqlite3_prepare_v2(
+                db, "SELECT inspected,mime_seen FROM photo_order WHERE vol=?1 AND node=?2;", -1, &lookup, nil)
+                == SQLITE_OK
+        else { return false }
+        defer { sqlite3_finalize(lookup) }
+        var needsWrite = false
+        for uid in values.keys {
+            sqlite3_reset(lookup)
+            bind(uid, to: lookup)
+            let step = sqlite3_step(lookup)
+            guard step == SQLITE_ROW || step == SQLITE_DONE else { return false }
+            needsWrite = needsWrite || (step == SQLITE_ROW && sqlite3_column_int(lookup, 0) == 0)
+        }
+        for uid in classifiedUIDs {
+            sqlite3_reset(lookup)
+            bind(uid, to: lookup)
+            let step = sqlite3_step(lookup)
+            guard step == SQLITE_ROW || step == SQLITE_DONE else { return false }
+            needsWrite = needsWrite || (step == SQLITE_ROW && sqlite3_column_int(lookup, 1) == 0)
+        }
+        guard needsWrite else { return true }
+        PhotoDiagnostics.shared.increment("timeline.order.recordWrite")
         guard sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK else { return false }
         var stmt: OpaquePointer?
         guard
@@ -200,6 +260,7 @@ public final class TimelineOrderMetadataStore {
                 -1, &stmt, nil) == SQLITE_OK
         else { return rollback() }
         defer { sqlite3_finalize(stmt) }
+        var recordedOrder = false
         for (uid, metadata) in values {
             sqlite3_reset(stmt)
             sqlite3_clear_bindings(stmt)
@@ -211,6 +272,7 @@ public final class TimelineOrderMetadataStore {
             }
             if let identity = metadata.stableIdentity { sqlite3_bind_text(stmt, 4, identity, -1, transient) }
             guard sqlite3_step(stmt) == SQLITE_DONE else { return rollback() }
+            recordedOrder = recordedOrder || sqlite3_changes(db) > 0
         }
         var mime: OpaquePointer?
         guard
@@ -225,19 +287,52 @@ public final class TimelineOrderMetadataStore {
             guard sqlite3_step(mime) == SQLITE_DONE else { return rollback() }
         }
         guard sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK else { return rollback() }
+        lastRecordChangedOrder = recordedOrder
+        needsPublication = needsPublication || recordedOrder
         return true
+    }
+
+    /// A detail read publishes only its own second. First inspections never scan the whole cache per photo.
+    public func recordResolvedMetadata(
+        for uid: PhotoUID, metadata: TimelineOrderMetadata?, isClassified: Bool
+    ) -> Bool {
+        let values: [PhotoUID: TimelineOrderMetadata] = metadata.map { [uid: $0] } ?? [:]
+        guard record(values, classifiedUIDs: isClassified ? [uid] : []) else { return false }
+        guard lastRecordChangedOrder else { return true }
+        do {
+            _ = try publishCompletedSeconds(containing: uid)
+            return true
+        } catch {
+            return false
+        }
     }
 
     /// Only completed seconds become visible. Published evidence stays available while a new member is inspected.
     public func publishCompletedSeconds() throws -> Bool {
-        guard db != nil, sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK else {
+        try publishCompletedSeconds(containing: nil)
+    }
+
+    private func publishCompletedSeconds(containing uid: PhotoUID?) throws -> Bool {
+        guard db != nil else { throw TimelineOrderMetadataError.unavailable }
+        guard needsPublication else { return false }
+        PhotoDiagnostics.shared.increment(uid == nil ? "timeline.order.publishPass" : "timeline.order.publishSecond")
+        guard sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK else {
             throw TimelineOrderMetadataError.unavailable
         }
+        let scope = uid == nil ? "" : "AND second=(SELECT second FROM photo_order WHERE vol=?1 AND node=?2)"
         let sql = """
             UPDATE photo_order AS o SET published=1 WHERE inspected=1 AND published=0
+              \(scope)
               AND NOT EXISTS(SELECT 1 FROM photo_order other WHERE other.second=o.second AND other.inspected=0);
             """
-        guard sqlite3_exec(db, sql, nil, nil, nil) == SQLITE_OK else {
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            _ = rollback()
+            throw TimelineOrderMetadataError.readFailed
+        }
+        defer { sqlite3_finalize(statement) }
+        if let uid { bind(uid, to: statement) }
+        guard sqlite3_step(statement) == SQLITE_DONE else {
             _ = rollback()
             throw TimelineOrderMetadataError.readFailed
         }
@@ -250,6 +345,7 @@ public final class TimelineOrderMetadataStore {
             _ = rollback()
             throw TimelineOrderMetadataError.readFailed
         }
+        if uid == nil { needsPublication = false }
         return changed
     }
 

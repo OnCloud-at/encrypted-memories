@@ -26,6 +26,12 @@ final class TimelineOrderRefinementPolicyTests: XCTestCase {
         XCTAssertEqual(decision([2, 3]), .deferVisibleCorrection)
         XCTAssertEqual(decision([]), .applyCorrection)
         XCTAssertEqual(decision([2, 3], old), .ordinaryUpdate)
+        var metadataOnly = old
+        for index in metadataOnly.indices {
+            metadataOnly[index].timelineOrder = .init(
+                exactCaptureTime: old[index].captureTime.addingTimeInterval(index.isMultiple(of: 2) ? 0.1 : 0.8))
+        }
+        XCTAssertEqual(decision([2, 3], metadataOnly), .applyCorrection)
         XCTAssertEqual(decision([2, 3], Array(corrected.dropLast())), .ordinaryUpdate)
         var replaced = corrected
         replaced[0] = PhotoItem(

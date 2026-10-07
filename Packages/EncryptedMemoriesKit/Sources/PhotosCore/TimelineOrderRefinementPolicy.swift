@@ -16,16 +16,14 @@ public enum TimelineOrderRefinementPolicy {
         guard incoming.count == previousCount else { return .ordinaryUpdate }
         var changedMetadata = false
         var movedVisiblePhoto = false
-        var changedOrder = false
         for (index, item) in incoming.enumerated() {
             guard let old = previous(item.uid), old.item.captureTime == item.captureTime else { return .ordinaryUpdate }
             changedMetadata = changedMetadata || old.item.timelineOrder != item.timelineOrder
             if old.index != index {
-                changedOrder = true
                 movedVisiblePhoto = movedVisiblePhoto || visibleIndices.contains(old.index)
             }
         }
-        guard changedMetadata && changedOrder else { return .ordinaryUpdate }
+        guard changedMetadata else { return .ordinaryUpdate }
         return movedVisiblePhoto ? .deferVisibleCorrection : .applyCorrection
     }
     /// A pending correction already has matching membership. Scroll callbacks only compare the visible slots.

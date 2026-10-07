@@ -307,7 +307,13 @@ struct MetalProductionGridView: NSViewRepresentable {
         ) {
             guard let host else { return }
             let routePending = routeGeneration != appliedRouteScrollGeneration
-            guard revision != dataRevision else { return }
+            guard revision != dataRevision else {
+                if deferredOrderUpdate == nil {
+                    allItems = items
+                    a11y?.items = items
+                }
+                return
+            }
             if !routePending, deferredOrderUpdate?.revision == revision { return }
             let update = OrderUpdate(items: items, revision: revision, markers: markers, makeSource: makeSource)
             let visible = Set(host.coordinator.visibleCells().map(\.flatIndex))
