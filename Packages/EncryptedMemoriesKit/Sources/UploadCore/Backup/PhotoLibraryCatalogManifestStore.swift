@@ -14,6 +14,7 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
     private static let fullScanCursorKey = "full_scan_cursor"
     private static let fullScanSnapshotReadyKey = "full_scan_snapshot_ready"
     private static let reconciledLateRendersKey = "reconciled_late_renders"
+    private static let lateRenderSweepResumePointKey = "late_render_sweep_resume_point"
     private var db: OpaquePointer?
     private var operationFailed = false
     private let lock = NSLock()
@@ -343,7 +344,30 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
 
     @discardableResult
     public func markLateRendersReconciled() -> Bool {
-        lock.withLock { writeInfoValue(Self.reconciledLateRendersKey, 1) }
+        lock.withLock {
+            guard requireOperational(sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK) else {
+                return false
+            }
+            let didWrite =
+                writeInfoValue(Self.reconciledLateRendersKey, 1)
+                && deleteInfoValue(Self.lateRenderSweepResumePointKey)
+            guard didWrite,
+                requireOperational(sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK)
+            else {
+                sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
+                return false
+            }
+            return true
+        }
+    }
+
+    public func lateRenderSweepResumePoint() -> String? {
+        lock.withLock { readInfoText(Self.lateRenderSweepResumePointKey) }
+    }
+
+    @discardableResult
+    public func recordLateRenderSweepResumePoint(_ localIdentifier: String) -> Bool {
+        lock.withLock { writeInfoText(Self.lateRenderSweepResumePointKey, localIdentifier) }
     }
 
     public func fullScanProgress() -> PhotoLibraryFullScanProgress? {
@@ -774,6 +798,47 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
         defer { sqlite3_finalize(stmt) }
         bindText(stmt, 1, key)
         sqlite3_bind_int64(stmt, 2, value)
+        return requireOperational(sqlite3_step(stmt) == SQLITE_DONE)
+    }
+
+    // Text info values are bound as a BLOB: the `value` column has INTEGER affinity, which would turn a numeric text
+    // such as "007" into the integer 7. A BLOB keeps its bytes.
+    private func readInfoText(_ key: String) -> String? {
+        var stmt: OpaquePointer?
+        guard
+            requireOperational(
+                sqlite3_prepare_v2(db, "SELECT value FROM photo_catalog_info WHERE key=?;", -1, &stmt, nil) == SQLITE_OK
+            )
+        else {
+            return nil
+        }
+        defer { sqlite3_finalize(stmt) }
+        bindText(stmt, 1, key)
+        let result = sqlite3_step(stmt)
+        if result == SQLITE_DONE { return nil }
+        guard requireOperational(result == SQLITE_ROW), sqlite3_column_type(stmt, 0) == SQLITE_BLOB else { return nil }
+        let count = Int(sqlite3_column_bytes(stmt, 0))
+        guard count > 0, let bytes = sqlite3_column_blob(stmt, 0) else { return nil }
+        return String(bytes: Data(bytes: bytes, count: count), encoding: .utf8)
+    }
+
+    @discardableResult
+    private func writeInfoText(_ key: String, _ value: String) -> Bool {
+        var stmt: OpaquePointer?
+        guard
+            requireOperational(
+                sqlite3_prepare_v2(
+                    db,
+                    "INSERT INTO photo_catalog_info(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value;",
+                    -1, &stmt, nil
+                ) == SQLITE_OK)
+        else { return false }
+        defer { sqlite3_finalize(stmt) }
+        bindText(stmt, 1, key)
+        let bytes = Array(value.utf8)
+        bytes.withUnsafeBytes { buffer in
+            _ = sqlite3_bind_blob(stmt, 2, buffer.baseAddress, Int32(buffer.count), transient)
+        }
         return requireOperational(sqlite3_step(stmt) == SQLITE_DONE)
     }
 

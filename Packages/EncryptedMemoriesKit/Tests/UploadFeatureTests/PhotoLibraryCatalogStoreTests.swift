@@ -669,6 +669,73 @@ final class PhotoLibraryCatalogStoreTests: XCTestCase {
         XCTAssertEqual(engine.enqueued, ["a", "b"], "re-opened revisions are queued")
     }
 
+    /// A failed proof read keeps the pages before it checked: the next pass, also after a relaunch, starts at the
+    /// failed page and repeats no lookups for the earlier pages (#343).
+    func testLateRenderReconciliationContinuesAtThePageWhoseProofReadFailed() async throws {
+        var store = try makeStore()
+        let infos = ["a", "b", "c", "d"].map(editInfo) + [photoInfo(id: "e")]
+        XCTAssertTrue(store.upsertBatch(infos.map { entry(from: $0, at: 100) }))
+        let engine = ReopeningEnqueuer(proofUnavailableAt: ["c", "c"])
+
+        try await PhotoLibraryCatalogSync(store: store, enumerator: StubEnumerator(infos: []), chunkSize: 1)
+            .reconcileLateRendersOnce(engine: engine)
+        XCTAssertFalse(store.hasReconciledLateRenders())
+        XCTAssertEqual(engine.reopened, ["a", "b", "c"])
+
+        store.close()
+        store = try makeStore()
+        let sync = PhotoLibraryCatalogSync(store: store, enumerator: StubEnumerator(infos: []), chunkSize: 1)
+        try await sync.reconcileLateRendersOnce(engine: engine)
+        XCTAssertFalse(store.hasReconciledLateRenders(), "the failed page stays pending")
+        XCTAssertEqual(engine.reopened, ["a", "b", "c", "c"])
+
+        try await sync.reconcileLateRendersOnce(engine: engine)
+        XCTAssertTrue(store.hasReconciledLateRenders())
+        try await sync.reconcileLateRendersOnce(engine: engine)
+        XCTAssertEqual(engine.reopened, ["a", "b", "c", "c", "c", "d"], "each page is checked until its proof is read")
+        XCTAssertEqual(engine.enqueued, ["a", "b", "c", "d"])
+    }
+
+    /// A failed first page leaves nothing behind; the retry starts at the first page and completes.
+    func testLateRenderReconciliationRetriesAFailedFirstPage() async throws {
+        let store = try makeStore()
+        XCTAssertTrue(store.upsertBatch(["a", "b"].map { entry(from: editInfo($0), at: 100) }))
+        let sync = PhotoLibraryCatalogSync(store: store, enumerator: StubEnumerator(infos: []), chunkSize: 1)
+        let engine = ReopeningEnqueuer(proofUnavailableAt: ["a"])
+
+        try await sync.reconcileLateRendersOnce(engine: engine)
+        XCTAssertFalse(store.hasReconciledLateRenders())
+        XCTAssertNil(store.lateRenderSweepResumePoint())
+        try await sync.reconcileLateRendersOnce(engine: engine)
+        XCTAssertTrue(store.hasReconciledLateRenders())
+        XCTAssertNil(store.lateRenderSweepResumePoint(), "a complete pass leaves no resume point")
+        XCTAssertEqual(engine.reopened, ["a", "a", "b"])
+        XCTAssertEqual(engine.enqueued, ["a", "b"])
+    }
+
+    /// The resume point survives a relaunch, and only the completing pass removes it.
+    func testLateRenderResumePointIsClearedWhenTheSweepCompletes() throws {
+        var store = try makeStore()
+        XCTAssertNil(store.lateRenderSweepResumePoint(), "a store without a resume point starts at the first page")
+        XCTAssertTrue(store.recordLateRenderSweepResumePoint("0042/L0/001"))
+        store.close()
+        store = try makeStore()
+        XCTAssertEqual(store.lateRenderSweepResumePoint(), "0042/L0/001")
+        XCTAssertFalse(store.hasReconciledLateRenders())
+        XCTAssertTrue(store.markLateRendersReconciled())
+        XCTAssertNil(store.lateRenderSweepResumePoint())
+        XCTAssertTrue(store.hasReconciledLateRenders())
+    }
+
+    private func editInfo(_ id: String) -> PhotoBackupAssetInfo {
+        info(
+            id: id,
+            resources: [
+                .init(role: .originalPhoto, originalFilename: "IMG_\(id).HEIC", mimeType: "image/heic"),
+                .init(role: .fullSizePhoto, originalFilename: "FullSizeRender.JPG", mimeType: "image/jpeg"),
+            ])
+    }
+
     private func runDriver(
         store: any PhotoLibraryCatalogStore,
         enumerator: any PhotoLibraryAssetEnumerator,
@@ -707,22 +774,37 @@ final class PhotoLibraryCatalogStoreTests: XCTestCase {
         }
     }
 
-    /// Re-opens every offered revision. Its first call cancels the pass that called it.
+    /// Re-opens every offered revision and records each offered photo, which the real engine looks up in the
+    /// state and identity stores. Without failures, its first call cancels the pass that called it. With failures,
+    /// each listed photo makes one call throw `UploadBackupRemoteProofUnavailable` in turn.
     private final class ReopeningEnqueuer: UploadBackupCandidateEnqueueing, @unchecked Sendable {
         private let lock = NSLock()
         private var _reopened: [String] = []
         private var _enqueued: [String] = []
+        private var proofUnavailableAt: [String]
+        private let cancelsFirstCall: Bool
         var reopened: [String] { lock.withLock { _reopened } }
         var enqueued: [String] { lock.withLock { _enqueued } }
 
+        init(proofUnavailableAt: [String] = []) {
+            self.proofUnavailableAt = proofUnavailableAt
+            cancelsFirstCall = proofUnavailableAt.isEmpty
+        }
+
         func reopenBackedUpRevisions(
             _ reopenings: [UploadBackupReopening], deferringWithoutRemoteProof: Bool
-        ) async -> [UploadBackupAssetCandidate] {
-            let isFirstCall = lock.withLock { () -> Bool in
-                defer { _reopened += reopenings.map(\.candidate.snapshot.source.identifier) }
-                return _reopened.isEmpty
+        ) async throws -> [UploadBackupAssetCandidate] {
+            let identifiers = reopenings.map(\.candidate.snapshot.source.identifier)
+            let (isFirstCall, proofUnavailable) = lock.withLock { () -> (Bool, Bool) in
+                defer { _reopened += identifiers }
+                guard let next = proofUnavailableAt.first, identifiers.contains(next) else {
+                    return (_reopened.isEmpty, false)
+                }
+                proofUnavailableAt.removeFirst()
+                return (_reopened.isEmpty, true)
             }
-            if isFirstCall { withUnsafeCurrentTask { $0?.cancel() } }
+            if proofUnavailable { throw UploadBackupRemoteProofUnavailable() }
+            if isFirstCall, cancelsFirstCall { withUnsafeCurrentTask { $0?.cancel() } }
             return reopenings.map(\.candidate)
         }
 
