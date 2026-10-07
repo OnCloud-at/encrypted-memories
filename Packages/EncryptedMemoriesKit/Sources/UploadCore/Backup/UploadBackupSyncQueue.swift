@@ -240,10 +240,14 @@ public protocol UploadBackupSyncQueueStore: Sendable {
     /// False after a SQLite operation failed or the store was closed. An empty read is safe to
     /// interpret as "drained" only while this remains true.
     func isOperational() -> Bool
+    /// Makes every committed change survive a power loss. Returns false when that is not certain.
+    func synchronizeToDisk() -> Bool
+    /// Persists one row. The row survives a power loss once this returns true.
     @discardableResult
     func upsert(_ entry: UploadBackupSyncQueueEntry) -> Bool
-    /// Persists one discovery chunk atomically. The default keeps test/fake stores source-compatible;
-    /// the SQLite store reuses one statement and one transaction for the whole chunk.
+    /// Persists one discovery chunk atomically. The rows survive a power loss once this returns true. The default
+    /// keeps test/fake stores source-compatible; the SQLite store reuses one statement and one transaction for the
+    /// whole chunk.
     @discardableResult
     func upsertBatch(_ entries: [UploadBackupSyncQueueEntry]) -> Bool
     func entry(for source: UploadSourceIdentity, revision: UploadBackupRevision) -> UploadBackupSyncQueueEntry?
