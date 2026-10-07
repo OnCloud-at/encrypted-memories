@@ -278,7 +278,9 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
                     nameHash: link.nameHash, mimeType: link.mimeType)
             }
             return UploadRemoteCompound(
-                main: file(main), related: resources.map(file), tags: main.tags,
+                // Proton lists a favorite with its favorite tag.
+                main: file(main), related: resources.map(file),
+                tags: main.favorite ? main.tags.union([PhotoTag.favorites.rawValue]) : main.tags,
                 externalIdentifier: main.externalIdentifier,
                 // The API returns CaptureTime in whole seconds.
                 captureDate: Date(timeIntervalSince1970: main.captureTime.timeIntervalSince1970.rounded(.down)),
@@ -547,6 +549,11 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
             }
             return Set(uids.filter { table[$0.nodeID]?.favorite == true })
         }
+    }
+
+    /// Another device sets or removes the favorite tag.
+    func setFavorite(_ favorite: Bool, of uid: PhotoUID) {
+        lock.withLock { table[uid.nodeID]?.favorite = favorite }
     }
 
     func markFavorite(_ uids: [PhotoUID]) async throws {

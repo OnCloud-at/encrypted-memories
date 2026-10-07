@@ -25,6 +25,10 @@ public protocol ExactDuplicateMerging: Sendable {
     /// Merges each group, keeping its photo. One result for each group, in order. After a cancellation, the groups
     /// without an outcome fail with `CancellationError`.
     func merge(_ requests: [ExactDuplicateMergeRequest]) async -> [Result<ExactDuplicateMergeOutcome, any Error>]
+    /// `merge(_:)` for one batch of `run`, which shares its listings across the batches.
+    func merge(
+        _ requests: [ExactDuplicateMergeRequest], in run: ExactDuplicateMergeRun
+    ) async -> [Result<ExactDuplicateMergeOutcome, any Error>]
 }
 
 extension ExactDuplicateFinder: ExactDuplicateMerging {}
@@ -32,6 +36,13 @@ extension ExactDuplicateFinder: ExactDuplicateMerging {}
 extension ExactDuplicateMerging {
     /// Without a local timeline, no date is known.
     public func captureDates(of members: [PhotoUID]) async -> [PhotoUID: Date] { [:] }
+
+    /// Mergers without shared listings merge each batch on its own.
+    public func merge(
+        _ requests: [ExactDuplicateMergeRequest], in run: ExactDuplicateMergeRun
+    ) async -> [Result<ExactDuplicateMergeOutcome, any Error>] {
+        await merge(requests)
+    }
 }
 
 /// A fact of one copy that the screens show as a small badge, in the order of the ranking.
@@ -1148,6 +1159,8 @@ public final class ExactDuplicatesModel {
         var mergedGroups = 0
         var handled = 0
         if all { mergeAllProgress = ExactDuplicateScanProgress(completed: 0, total: selected.count) }
+        // One favorites listing and one album listing serve every batch.
+        let run = ExactDuplicateMergeRun(members: selected.flatMap(\.scanGroup.members))
         while handled < selected.count {
             if all {
                 await waitWhileMergePaused()
@@ -1164,7 +1177,7 @@ public final class ExactDuplicatesModel {
                 batch.map {
                     ExactDuplicateMergeRequest(
                         group: $0.scanGroup, kept: $0.kept, isKeptChosen: $0.isKeptChosen)
-                })
+                }, in: run)
             isMergeBatchRunning = false
             let waiters = batchWaiters
             batchWaiters = []
