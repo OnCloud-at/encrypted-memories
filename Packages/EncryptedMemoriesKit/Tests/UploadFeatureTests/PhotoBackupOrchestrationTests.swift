@@ -597,6 +597,55 @@ final class PhotoBackupOrchestrationTests: XCTestCase {
         XCTAssertTrue(history.prepare().changes.changedIdentifiers.isEmpty, "the token moved past F and G")
     }
 
+    /// A power loss can happen at any moment of a scan. Queue rows survive it because their commits sync the queue
+    /// WAL; catalog commits may survive too, even unsynchronized. Right before each queue insert, every catalog row and
+    /// every photo before the saved scan position therefore needs its queue row already; otherwise the photo would
+    /// count as unchanged and never be queued again (#352).
+    func testEveryCatalogRowHasItsQueueRowBeforeTheNextQueueInsert() async throws {
+        let names = [
+            PhotoLibraryCatalogManifestStore.databaseFileName, UploadBackupSyncQueueManifestStore.databaseFileName,
+        ]
+        enumerator.infos = (0..<3_000).map { photoInfo(String(format: "P%04d", $0)) }
+        let copies = CommittedFilesLog(source: tempDir, names: names, every: 100)
+        let sync = PhotoLibraryCatalogSync(
+            store: catalog, enumerator: enumerator, chunkSize: 2, now: { [clock] in clock!.now })
+        _ = try await sync.run(engine: CopyingEnqueuer(engine: engine, copies: copies))
+
+        let directories = copies.directories
+        XCTAssertGreaterThanOrEqual(directories.count, 10)
+        var largestCatalog = 0
+        for directory in directories {
+            let survivingCatalog = try XCTUnwrap(
+                PhotoLibraryCatalogManifestStore(url: directory.appendingPathComponent(names[0])))
+            let survivingQueue = try XCTUnwrap(
+                UploadBackupSyncQueueManifestStore(url: directory.appendingPathComponent(names[1])))
+            defer {
+                survivingCatalog.close()
+                survivingQueue.close()
+            }
+            // The store reads at least one identifier, so a scan position of zero reads none here.
+            let cursor = survivingCatalog.fullScanProgress()?.cursor ?? 0
+            var identifiers = Set(
+                cursor > 0 ? survivingCatalog.fullScanSnapshotIdentifiers(startingAt: 0, limit: cursor) : [])
+            var after: String?
+            while true {
+                let page = survivingCatalog.presentEntries(afterLocalIdentifier: after, limit: 500)
+                guard let last = page.last else { break }
+                identifiers.formUnion(page.map(\.localIdentifier))
+                after = last.localIdentifier
+            }
+            largestCatalog = max(largestCatalog, identifiers.count)
+            let withoutQueueRow = identifiers.filter {
+                survivingQueue.entry(
+                    for: UploadSourceIdentity(kind: .photoLibraryAsset, identifier: $0),
+                    revision: UploadBackupRevision(date: modDate)) == nil
+            }
+            XCTAssertEqual(
+                withoutQueueRow.count, 0, "\(directory.lastPathComponent): \(withoutQueueRow.sorted().prefix(3))")
+        }
+        XCTAssertGreaterThanOrEqual(largestCatalog, 2_000, "the copies cover most of the scan")
+    }
+
     /// The queue is synchronized right before each change token commit, at both commit points.
     func testQueueSynchronizationPrecedesEveryTokenCommit() async throws {
         enumerator.infos = ["A", "B", "C"].map { photoInfo($0) }
@@ -1031,6 +1080,76 @@ final class PhotoBackupOrchestrationTests: XCTestCase {
             let synchronized = await engine.synchronizeQueueToDisk()
             events.append("queue sync")
             return synchronized
+        }
+    }
+
+    /// Forwards to the engine and copies the committed database files right before each queue insert.
+    private final class CopyingEnqueuer: UploadBackupCandidateEnqueueing, @unchecked Sendable {
+        private let engine: UploadBackupSyncEngine
+        private let copies: CommittedFilesLog
+
+        init(engine: UploadBackupSyncEngine, copies: CommittedFilesLog) {
+            self.engine = engine
+            self.copies = copies
+        }
+
+        func enqueue(_ candidate: UploadBackupAssetCandidate) async throws -> UploadBackupSyncScanResult {
+            try await enqueueBatch([candidate])
+        }
+
+        func enqueueBatch(_ candidates: [UploadBackupAssetCandidate]) async throws -> UploadBackupSyncScanResult {
+            copies.copy()
+            return try await engine.enqueueBatch(candidates)
+        }
+
+        func reopenBackedUpRevisions(
+            _ reopenings: [UploadBackupReopening], deferringWithoutRemoteProof: Bool
+        ) async throws -> [UploadBackupAssetCandidate] {
+            try await engine.reopenBackedUpRevisions(
+                reopenings, deferringWithoutRemoteProof: deferringWithoutRemoteProof)
+        }
+
+        func synchronizeQueueToDisk() async -> Bool {
+            await engine.synchronizeQueueToDisk()
+        }
+    }
+
+    /// Copies each database file with its WAL at every `every`-th call: every committed transaction survives.
+    private final class CommittedFilesLog: @unchecked Sendable {
+        private let source: URL
+        private let names: [String]
+        private let every: Int
+        private let lock = NSLock()
+        private var calls = 0
+        private var copies: [URL] = []
+        var directories: [URL] { lock.withLock { copies } }
+
+        init(source: URL, names: [String], every: Int) {
+            self.source = source
+            self.names = names
+            self.every = every
+        }
+
+        func copy() {
+            lock.withLock {
+                calls += 1
+                guard calls % every == 0 else { return }
+                let directory = source.appendingPathComponent("power-loss-\(calls)", isDirectory: true)
+                do {
+                    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                    for name in names {
+                        for suffix in ["", "-wal"] {
+                            let file = source.appendingPathComponent(name + suffix)
+                            guard FileManager.default.fileExists(atPath: file.path) else { continue }
+                            let copy = directory.appendingPathComponent(name + suffix)
+                            try FileManager.default.copyItem(at: file, to: copy)
+                        }
+                    }
+                    copies.append(directory)
+                } catch {
+                    XCTFail("copy failed: \(error)")
+                }
+            }
         }
     }
 
