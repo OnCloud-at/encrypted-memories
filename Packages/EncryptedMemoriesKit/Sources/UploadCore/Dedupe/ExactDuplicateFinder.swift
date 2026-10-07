@@ -651,6 +651,7 @@ public struct ExactDuplicateFinder: Sendable {
 
         var plan = PlannedMerge(kept: kept, contentHash: group.contentHash, epoch: epoch, volumeID: volumeID)
         if keptCompound.tags.contains(PhotoTag.favorites.rawValue) { plan.taggedFavorites.append(kept) }
+        var compounds: [PhotoUID: UploadRemoteCompound?] = [:]
         // One node read for each member of this group gives the metadata and the sharing state.
         let facts = try await remote.nodeFacts(of: active)
         // The screen offered the group for the metadata that it read. When the kept photo has other metadata now, the
@@ -659,7 +660,17 @@ public struct ExactDuplicateFinder: Sendable {
         if let shown = group.fingerprint, shown != keptFingerprint { return .skipped(.keptDetailsChanged) }
         // Every device ranks the same server facts, so every device that keeps the preselection keeps the same copy.
         // When another copy ranks first now, the screen reads the group again.
-        if let favorites = rankingFavorites {
+        if var favorites = rankingFavorites {
+            // The favorites of a run can predate a favorite that another device set since. The compound reads are
+            // fresh, so their favorite tags rank too.
+            for member in active where member != kept {
+                try Task.checkCancellation()
+                compounds[member] = try await checker.compound(ofMainLink: member.nodeID)
+            }
+            let fresh = compounds.merging([kept: keptCompound]) { first, _ in first }
+            for (member, compound) in fresh where compound?.tags.contains(PhotoTag.favorites.rawValue) == true {
+                favorites.insert(member)
+            }
             // The node states the capture time of a photo. Only a node without one needs the date that this device
             // knows.
             let undated = active.filter { facts[$0]?.fingerprint.captureTime == nil }
@@ -687,9 +698,13 @@ public struct ExactDuplicateFinder: Sendable {
                 plan.keptDuplicates[member] = .shared
                 continue
             }
-            guard let compound = try await checker.compound(ofMainLink: member.nodeID),
-                compound.main.contentHash == group.contentHash
-            else {
+            let read: UploadRemoteCompound?
+            if let cached = compounds[member] {
+                read = cached
+            } else {
+                read = try await checker.compound(ofMainLink: member.nodeID)
+            }
+            guard let compound = read, compound.main.contentHash == group.contentHash else {
                 plan.keptDuplicates[member] = .unreadable
                 continue
             }
