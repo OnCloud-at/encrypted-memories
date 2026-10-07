@@ -1038,13 +1038,13 @@ public final class ExactDuplicatesModel {
         L10n.string("duplicates.checking_progress \(completed.formatted()) \(total.formatted())")
     }
 
-    /// Counts the duplicates for the entry without ranking them, once, before the screen has loaded.
     /// Checks the merges that an earlier failure or the end of the process left open, without a scan. A platform calls
     /// it at launch when it does not scan then.
     public func resolvePendingMerges() async {
         await finder.resolvePendingMerges()
     }
 
+    /// Counts the duplicates for the entry without ranking them, once, before the screen has loaded.
     public func loadCountIfNeeded() async {
         guard phase == .idle, scannedDuplicateCount == nil else { return }
         guard let scan = try? await finder.duplicateGroups(progress: { _ in }), phase == .idle else { return }

@@ -225,12 +225,16 @@ final class MobileLibraryModel {
             guard facade !== oldValue else { return }
             duplicates = facade?.exactDuplicates.map { makeDuplicatesModel($0) }
             // The Collections tab scans for duplicates only when it appears. A merge that the end of the app left open
-            // is checked now, so a group whose copies both left the library comes back without that visit.
-            if let duplicates { Task { await duplicates.resolvePendingMerges() } }
+            // is checked now, so a group whose copies both left the library comes back without that visit. A new
+            // account or a sign-out ends the check of the earlier one; its merges stay open in its journal.
+            pendingMergeCheck?.cancel()
+            pendingMergeCheck = duplicates.map { duplicates in Task { await duplicates.resolvePendingMerges() } }
         }
     }
     /// The Duplicates screen of this account. Nil while the account cannot merge duplicates.
     private(set) var duplicates: ExactDuplicatesModel?
+    /// The check of the merges that the end of the app left open, started with the account.
+    @ObservationIgnored private var pendingMergeCheck: Task<Void, Never>?
     /// Shared create/list/add state machine used by every native album presentation in this session.
     private(set) var albumActions: AlbumActionCoordinator?
     /// Account-scoped Photos-library backup controller shared with macOS.
