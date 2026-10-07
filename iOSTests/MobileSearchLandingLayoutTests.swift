@@ -23,20 +23,26 @@ final class MobileSearchLandingLayoutTests: XCTestCase {
             previousKeyWindow?.makeKey()
         }
 
-        // A narrow iPad window uses the same compact placement as a phone. Reuse one host to test resizing too.
+        // Only regular width and height place the field at the top. Reuse one host to test resizing too.
+        let placements: [(width: UserInterfaceSizeClass, height: UserInterfaceSizeClass)] = [
+            (.compact, .regular), (.regular, .regular), (.regular, .compact),
+            (.compact, .compact), (.compact, .regular),
+        ]
         for size in [DynamicTypeSize.large, .accessibility5, .xSmall] {
-            for sizeClass in [UserInterfaceSizeClass.compact, .regular, .compact] {
+            for placement in placements {
                 host.rootView = AnyView(
                     MobileSearchLandingScreen(content: content)
                         .environment(model)
-                        .environment(\.horizontalSizeClass, sizeClass)
+                        .environment(\.horizontalSizeClass, placement.width)
+                        .environment(\.verticalSizeClass, placement.height)
                         .environment(\.dynamicTypeSize, size)
                         .ignoresSafeArea())
                 try await Task.sleep(for: .milliseconds(100))
                 host.view.layoutIfNeeded()
                 let scroll = try XCTUnwrap(scrollView(in: host.view))
                 XCTAssertEqual(
-                    scroll.contentInset.bottom, sizeClass == .compact ? 56 : 0, accuracy: 1,
+                    scroll.contentInset.bottom,
+                    placement.width == .regular && placement.height == .regular ? 0 : 56, accuracy: 1,
                     "Only a bottom search field needs clearance, at every text size")
             }
         }
