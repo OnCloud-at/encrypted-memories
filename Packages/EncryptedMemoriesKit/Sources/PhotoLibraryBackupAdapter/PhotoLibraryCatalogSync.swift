@@ -387,14 +387,14 @@ public struct PhotoLibraryCatalogSync: Sendable {
     /// with the original as main photo; the scan then sees no change. This pass offers each stored edit that lists its
     /// rendered file to `reopenBackedUpRevisions` and queues the revisions it re-opens. It reads local stores, and the
     /// remote proof only for a photo that an earlier build settled through it.
-    /// The flag is set only after the last page, so a cancelled pass starts again. When the remote proof cannot be
-    /// read, the pass stops without an error and leaves the flag unset; it saves the pages before the failed one as
-    /// checked, so a later pass continues at the failed page (#343).
+    /// The flag is set only after the last page. Each page is saved as checked once its revisions are queued, so a
+    /// later pass, also after a cancellation or a relaunch, continues after the last checked page (#356). When the
+    /// remote proof cannot be read, the pass stops without an error and leaves the flag unset; the next pass starts at
+    /// the failed page (#343).
     public func reconcileLateRendersOnce(engine: any UploadBackupCandidateEnqueueing) async throws {
         guard !store.hasReconciledLateRenders() else { return }
         // A failed read leaves the store not operational, and the first page below throws.
-        let resumePoint = store.lateRenderSweepResumePoint()
-        var cursor = resumePoint
+        var cursor = store.lateRenderSweepResumePoint()
         while true {
             try Task.checkCancellation()
             let page = store.presentEntries(afterLocalIdentifier: cursor, limit: chunkSize)
@@ -416,13 +416,14 @@ public struct PhotoLibraryCatalogSync: Sendable {
                 do {
                     pending = try await engine.reopenBackedUpRevisions(reopenings, deferringWithoutRemoteProof: true)
                 } catch is UploadBackupRemoteProofUnavailable {
-                    // A failed save marks the store not operational, like every other failed store write.
-                    if let cursor, cursor != resumePoint { store.recordLateRenderSweepResumePoint(cursor) }
                     return
                 }
                 if !pending.isEmpty { _ = try await engine.enqueueBatch(pending) }
             }
             cursor = last.localIdentifier
+            guard store.recordLateRenderSweepResumePoint(last.localIdentifier) else {
+                throw UploadError.backend("Photo library catalog could not be updated")
+            }
         }
         guard store.markLateRendersReconciled() else {
             throw UploadError.backend("Photo library catalog could not be updated")

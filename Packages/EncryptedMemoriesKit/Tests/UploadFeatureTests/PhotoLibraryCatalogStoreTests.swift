@@ -696,6 +696,33 @@ final class PhotoLibraryCatalogStoreTests: XCTestCase {
         XCTAssertEqual(engine.enqueued, ["a", "b", "c", "d"])
     }
 
+    /// A cancelled pass keeps the pages it finished: the next pass, also after a relaunch, continues after them and
+    /// checks the cancelled page again (#356).
+    func testLateRenderReconciliationContinuesAfterTheFinishedPagesOfACancelledPass() async throws {
+        let first = try makeStore()
+        let infos = ["a", "b", "c"].map(editInfo) + [photoInfo(id: "d")]
+        XCTAssertTrue(first.upsertBatch(infos.map { entry(from: $0, at: 100) }))
+        let engine = ReopeningEnqueuer(cancelsAt: "c")
+
+        do {
+            try await Task {
+                try await PhotoLibraryCatalogSync(store: first, enumerator: StubEnumerator(infos: []), chunkSize: 1)
+                    .reconcileLateRendersOnce(engine: engine)
+            }.value
+            XCTFail("the first pass is cancelled at the page of c")
+        } catch is CancellationError {}
+        XCTAssertFalse(first.hasReconciledLateRenders())
+        XCTAssertEqual(engine.reopened, ["a", "b", "c"])
+
+        first.close()
+        let store = try makeStore()
+        try await PhotoLibraryCatalogSync(store: store, enumerator: StubEnumerator(infos: []), chunkSize: 1)
+            .reconcileLateRendersOnce(engine: engine)
+        XCTAssertTrue(store.hasReconciledLateRenders())
+        XCTAssertEqual(engine.reopened, ["a", "b", "c", "c"], "the finished pages are not checked again")
+        XCTAssertEqual(engine.enqueued, ["a", "b", "c"], "the cancelled page is queued in the next pass")
+    }
+
     /// A failed first page leaves nothing behind; the retry starts at the first page and completes.
     func testLateRenderReconciliationRetriesAFailedFirstPage() async throws {
         let store = try makeStore()
@@ -785,18 +812,26 @@ final class PhotoLibraryCatalogStoreTests: XCTestCase {
         private var _enqueued: [String] = []
         private var proofUnavailableAt: [String]
         private let cancelsFirstCall: Bool
+        private var cancelsAt: String?
         var reopened: [String] { lock.withLock { _reopened } }
         var enqueued: [String] { lock.withLock { _enqueued } }
 
-        init(proofUnavailableAt: [String] = []) {
+        /// Without arguments, the first call cancels its task. `cancelsAt` cancels the call that offers that photo.
+        init(proofUnavailableAt: [String] = [], cancelsAt: String? = nil) {
             self.proofUnavailableAt = proofUnavailableAt
-            cancelsFirstCall = proofUnavailableAt.isEmpty
+            self.cancelsAt = cancelsAt
+            cancelsFirstCall = proofUnavailableAt.isEmpty && cancelsAt == nil
         }
 
         func reopenBackedUpRevisions(
             _ reopenings: [UploadBackupReopening], deferringWithoutRemoteProof: Bool
         ) async throws -> [UploadBackupAssetCandidate] {
             let identifiers = reopenings.map(\.candidate.snapshot.source.identifier)
+            let cancels = lock.withLock { () -> Bool in
+                guard let cancelsAt, identifiers.contains(cancelsAt) else { return false }
+                self.cancelsAt = nil
+                return true
+            }
             let (isFirstCall, proofUnavailable) = lock.withLock { () -> (Bool, Bool) in
                 defer { _reopened += identifiers }
                 guard let next = proofUnavailableAt.first, identifiers.contains(next) else {
@@ -806,7 +841,7 @@ final class PhotoLibraryCatalogStoreTests: XCTestCase {
                 return (_reopened.isEmpty, true)
             }
             if proofUnavailable { throw UploadBackupRemoteProofUnavailable() }
-            if isFirstCall, cancelsFirstCall { withUnsafeCurrentTask { $0?.cancel() } }
+            if (isFirstCall && cancelsFirstCall) || cancels { withUnsafeCurrentTask { $0?.cancel() } }
             return reopenings.map(\.candidate)
         }
 
