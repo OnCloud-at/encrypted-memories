@@ -19,6 +19,9 @@ public struct ExactDuplicateMergeIntent: Sendable, Equatable, Codable {
     /// The device clock at the trash, in seconds since 1970. It dates the trash of the merge when the server no longer
     /// knows the trashed members, for example after the person emptied the trash. Nil in records without the time.
     public let trashedAt: Int64?
+    /// The active main photos whose lineage named the kept photo as replaced before the trash. Such an edit cannot be
+    /// the reason why the kept photo left the library later. Nil when the read failed, and in records without it.
+    public var successors: [String]? = nil
 
     /// One intent for each group: the kept photo and the content of the group.
     var key: String { kept + "|" + contentHash }

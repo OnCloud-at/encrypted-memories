@@ -610,10 +610,10 @@ public struct ExactDuplicateFinder: Sendable {
         /// The trashable members with their moves, as `mergeJournal` records them.
         var members: [ExactDuplicateMergeIntent.Member] = []
 
-        func intent(trashedAt: Int64) -> ExactDuplicateMergeIntent {
+        func intent(trashedAt: Int64, successors: [String]?) -> ExactDuplicateMergeIntent {
             ExactDuplicateMergeIntent(
                 volumeID: volumeID, kept: kept.nodeID, contentHash: contentHash, hashKeyEpoch: epoch, members: members,
-                trashedAt: trashedAt)
+                trashedAt: trashedAt, successors: successors)
         }
     }
 
@@ -767,10 +767,14 @@ public struct ExactDuplicateFinder: Sendable {
             }
         }
         guard !trashing.isEmpty, !Task.isCancelled else { return }
+        // The edits that replaced a kept photo before the trash, so the check counts only a later edit.
+        var known: [[String]?] = []
+        for (_, plan) in trashing { known.append(await successors(of: plan.kept.nodeID)) }
+        guard !Task.isCancelled else { return }
         // The record survives a failed answer and the end of the process, so a later scan or merge restores a copy of
         // a group whose kept photo left the library during the trash.
         let trashedAt = Int64(Date().timeIntervalSince1970)
-        let intents = trashing.map { $0.plan.intent(trashedAt: trashedAt) }
+        let intents = zip(trashing, known).map { $0.plan.intent(trashedAt: trashedAt, successors: $1) }
         mergesInFlight.insert(intents)
         defer { mergesInFlight.remove(intents) }
         guard mergeJournal.record(intents) else {
@@ -843,7 +847,8 @@ public struct ExactDuplicateFinder: Sendable {
 
     /// What the check of the kept photo after the trash found.
     private enum MergeResolution {
-        /// The kept photo is in the library, or the person trashed it long after the merge. The merge stands.
+        /// The kept photo is in the library, the person trashed it long after the merge, or its edit replaced it. The
+        /// merge stands.
         /// `duplicatesLeft` is true while a member that the trash should take is still in the library.
         case kept(duplicatesLeft: Bool)
         /// The kept photo left the library during the merge. The duplicates are back, and their rows moved back.
@@ -900,9 +905,9 @@ public struct ExactDuplicateFinder: Sendable {
     }
 
     /// Checks the kept photo of `intent` in `visibility`, which was read after the trash. When the kept photo left the
-    /// library meanwhile, restores the duplicates that are not in the library and moves their rows back. When none of
-    /// them comes back, restores the kept photo. `restored` turns true once a restore was needed. Throws while no read
-    /// confirms an active copy.
+    /// library meanwhile, and no edit replaced it, restores the duplicates that are not in the library and moves their
+    /// rows back. When none of them comes back, restores the kept photo. `restored` turns true once a restore was
+    /// needed. Throws while no read confirms an active copy.
     /// The person can delete the kept photo for good on its own while the duplicates are still in the trash. The server
     /// then no longer knows the kept photo, and that looks like a trash of another merge at the same moment, so the
     /// duplicates come back.
@@ -921,6 +926,12 @@ public struct ExactDuplicateFinder: Sendable {
         if visibility[kept]?.isActiveMain == true
             || isLaterDeletion(of: kept, in: visibility, after: trashed, trashedAt: intent.trashedAt)
         {
+            return .kept(duplicatesLeft: trashed.contains { visibility[$0]?.isActive == true })
+        }
+        // An edit on another device can move `kept` to the trash within the window. Its edit then stands for the
+        // group, and a restored duplicate would show the unedited photo next to it.
+        if try await isReplacedByEdit(intent) {
+            log("[Duplicates] an edit replaced the kept photo of a merge; the duplicates stay in the trash")
             return .kept(duplicatesLeft: trashed.contains { visibility[$0]?.isActive == true })
         }
         restored = true
@@ -960,6 +971,65 @@ public struct ExactDuplicateFinder: Sendable {
         if let memberTrash { return keptTrash > memberTrash + Self.concurrentTrashWindow }
         guard let trashedAt else { return false }
         return keptTrash > trashedAt + Self.deviceClockTrashWindow
+    }
+
+    /// The active main photos whose lineage names `kept` as replaced. Nil when the read failed or the lineage index is
+    /// incomplete: an edit that it misses now would count as a later edit at the check.
+    private func successors(of kept: String) async -> [String]? {
+        do {
+            let read = try await checker.replacingMainLinkIDs(ofReplacedLink: kept)
+            guard read.complete else { return nil }
+            return read.links.sorted()
+        } catch {
+            log("[Duplicates] the lineage read before a merge failed; its check restores a copy")
+            return nil
+        }
+    }
+
+    /// True when an active main photo outside the group replaced the kept photo of `intent` by its lineage after the
+    /// trash was recorded, as the edit of the photo or the undo of one, and holds a twin of every file that the trash
+    /// took, such as the original under an edit. Then no file of the group is lost when the duplicates stay in the
+    /// trash. Only a positive read proves the edit: an edit known before the trash, an intent without that read, a
+    /// failed read, or a replacement without these files restores a copy as before. An incomplete lineage index can
+    /// only miss a replacement, and the reads of the state and of the files confirm each one that it names. A failed
+    /// connection throws, so the merge waits for the next check.
+    private func isReplacedByEdit(_ intent: ExactDuplicateMergeIntent) async throws -> Bool {
+        guard let known = intent.successors else { return false }
+        let excluded = Set([intent.kept] + intent.members.map(\.link) + known)
+        do {
+            let successors = try await checker.replacingMainLinkIDs(ofReplacedLink: intent.kept).links
+                .subtracting(excluded).sorted()
+            guard !successors.isEmpty else { return false }
+            let visibility = try await checker.linkVisibility(batching: successors)
+            for link in successors where visibility[link]?.isActiveMain == true {
+                guard let compound = try await checker.compound(ofMainLink: link) else { continue }
+                if Self.holdsEveryFile(of: intent.members, contentHash: intent.contentHash, in: compound) {
+                    return true
+                }
+            }
+        } catch let error where !Self.endsPendingChecks(error) {
+            log("[Duplicates] the edit check of a kept photo failed; the merge restores a copy")
+        }
+        return false
+    }
+
+    /// True when `compound` holds a twin of the main file and of each related file of every member, as their moves
+    /// name them. Two files of one member never share one twin.
+    private static func holdsEveryFile(
+        of members: [ExactDuplicateMergeIntent.Member], contentHash: String, in compound: UploadRemoteCompound
+    ) -> Bool {
+        let files = [compound.main] + compound.related
+        return members.allSatisfy { member in
+            let related = member.moves.filter { $0.from != member.link }.map(\.contentHash)
+            var used: Set<String> = []
+            return ([contentHash] + related).allSatisfy { hash in
+                guard let twin = files.first(where: { $0.contentHash == hash && !used.contains($0.linkID) }) else {
+                    return false
+                }
+                used.insert(twin.linkID)
+                return true
+            }
+        }
     }
 
     /// Restores `links`. Its answer decides nothing: a restore can apply before its answer fails, and the server's
