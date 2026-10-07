@@ -97,6 +97,12 @@ public final class PhotoMapAnnotationLoader {
     private var reloadGeneration = 0
     private var reloadTask: Task<Void, Never>?
 
+    #if DEBUG
+        var beforeFramingForTesting: (@Sendable () async -> Void)?
+        func waitForFramingForTesting() async { await frameTask?.value }
+        func waitForReloadForTesting() async { await reloadTask?.value }
+    #endif
+
     private let onRemoved: (Set<PhotoUID>) -> Void
 
     public init(
@@ -152,9 +158,15 @@ public final class PhotoMapAnnotationLoader {
         framingRevision = revision
         let evidence = index.placeEvidence()
         frameTask?.cancel()
+        #if DEBUG
+            let beforeFraming = beforeFramingForTesting
+        #endif
         frameTask = Task.detached(priority: .userInitiated) { [weak self] in
             let excluded = evidence.excludedPositions()
             guard !Task.isCancelled else { return }
+            #if DEBUG
+                await beforeFraming?()
+            #endif
             let rect = Self.denseCoreMapRect(for: evidence.coordinates, excluding: excluded)
             guard !Task.isCancelled else { return }
             await self?.applyFraming(rect, revision: revision)
@@ -162,7 +174,12 @@ public final class PhotoMapAnnotationLoader {
     }
 
     private func applyFraming(_ rect: MKMapRect?, revision: Int) {
-        guard index.revision == revision, !didFrame, let mapView, let rect else { return }
+        guard index.revision == revision, !didFrame, let mapView else { return }
+        frameTask = nil
+        guard let rect else {
+            reloadVisible()
+            return
+        }
         let inset = Self.framingPadding
         #if canImport(UIKit)
             let padding = UIEdgeInsets(top: inset, left: inset, bottom: inset, right: inset)
@@ -171,11 +188,13 @@ public final class PhotoMapAnnotationLoader {
         #endif
         mapView.setVisibleMapRect(rect, edgePadding: padding, animated: false)
         didFrame = true
+        reloadVisible()
     }
 
     /// Snapshot the value-type index on the main actor, then filter and aggregate in the cancellable
     /// detached task. Only the small annotation delta returns to the main actor.
     public func reloadVisible() {
+        guard didFrame || frameTask == nil else { return }
         guard let mapView else { return }
         let region = mapView.region
         let viewport = PhotoLocationViewport(
