@@ -93,6 +93,7 @@ public final class PhotoPlaceEvidence: @unchecked Sendable {
     private let lock = NSLock()
     private var cached: Analysis?
     #if DEBUG
+        private let statusLock = NSLock()
         private var completedOnMainThread: Bool?
     #endif
 
@@ -107,11 +108,9 @@ public final class PhotoPlaceEvidence: @unchecked Sendable {
 
     #if DEBUG
         public var hasAnalyzed: Bool {
-            guard lock.try() else { return false }
-            defer { lock.unlock() }
-            return cached != nil
+            statusLock.withLock { completedOnMainThread != nil }
         }
-        public var analyzedOnMainThread: Bool? { lock.withLock { completedOnMainThread } }
+        public var analyzedOnMainThread: Bool? { statusLock.withLock { completedOnMainThread } }
     #endif
 
     public static func isValid(_ point: PhotoCoordinate) -> Bool {
@@ -128,7 +127,7 @@ public final class PhotoPlaceEvidence: @unchecked Sendable {
                 try Task.checkCancellation()
                 cached = result
                 #if DEBUG
-                    completedOnMainThread = Thread.isMainThread
+                    statusLock.withLock { completedOnMainThread = Thread.isMainThread }
                 #endif
                 return result
             } catch {

@@ -766,6 +766,37 @@ import TimelineCore
         }
     }
 
+    @Test func placePolicyFingerprintKeepsTheExactSaltedDigest() throws {
+        struct Content: Encodable {
+            let items: [PhotoItem]
+            let favorites: [PhotoUID]
+            let coordinates: [PhotoCoordinate]
+            let day: Date
+            let calendar: String
+            let timeZone: String
+            let locale: String
+        }
+        let captured = Date(timeIntervalSince1970: 1_700_000_000)
+        let item = PhotoItem(
+            uid: PhotoUID(volumeID: "test", nodeID: "salted"), captureTime: captured, mediaType: "image/jpeg")
+        let points = [PhotoCoordinate(uid: item.uid, latitude: 20, longitude: 30, date: captured)]
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = try #require(TimeZone(secondsFromGMT: 0))
+        let locale = Locale(identifier: "en_US")
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = .sortedKeys
+        let data = try encoder.encode(
+            Content(
+                items: [item], favorites: [item.uid], coordinates: points, day: calendar.startOfDay(for: captured),
+                calendar: String(describing: calendar.identifier), timeZone: calendar.timeZone.identifier,
+                locale: locale.identifier + "|" + Locale.preferredLanguages.joined(separator: "|")))
+        let expected = Data(SHA256.hash(data: Data("place-evidence-v1|".utf8) + data))
+        let actual = try SmartSearchDiscoveryPersistence.fingerprint(
+            sections: [TimelineSection(id: "all", date: captured, title: "", items: [item])],
+            favorites: [item.uid], coordinates: points, now: captured, calendar: calendar, locale: locale)
+        #expect(actual == expected)
+    }
+
     @Test func legacyPlacePolicyCannotRestoreRowsBeforeNewCuration() async throws {
         let cache = SnapshotCache()
         let captured = Date(timeIntervalSince1970: 1_700_000_000)

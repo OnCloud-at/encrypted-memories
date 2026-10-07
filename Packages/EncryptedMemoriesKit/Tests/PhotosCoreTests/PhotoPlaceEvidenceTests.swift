@@ -94,6 +94,28 @@ import Testing
         #expect(evidence.analyzedOnMainThread == false)
     }
 
+    @Test func completedAnalysisRemainsReadyDuringConcurrentCacheReads() async {
+        let evidence = PhotoPlaceEvidence(coordinates: library())
+        await Task.detached { evidence.prewarm() }.value
+        let incompleteReads = await withTaskGroup(of: Int.self) { group in
+            for _ in 0..<8 {
+                group.addTask {
+                    var incomplete = 0
+                    for _ in 0..<10_000 {
+                        _ = evidence.excludedPositions()
+                        if !evidence.hasAnalyzed { incomplete += 1 }
+                    }
+                    return incomplete
+                }
+            }
+            var total = 0
+            for await count in group { total += count }
+            return total
+        }
+        #expect(incompleteReads == 0)
+        #expect(evidence.analyzedOnMainThread == false)
+    }
+
     private func library(
         count: Int = 60, days: Int = 30, spacing: Int = 7,
         contradictedDays: Int = 30, firstContraryDay: Int = 0, distant: Bool = true, varying: Bool = true

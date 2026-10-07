@@ -110,7 +110,10 @@ struct SmartSearchDiscoveryPersistence: Codable, Sendable {
                 calendar: String(describing: calendar.identifier), timeZone: calendar.timeZone.identifier,
                 locale: locale.identifier + "|" + Locale.preferredLanguages.joined(separator: "|")))
         // Old rows can name a default coordinate. Recurate them while retaining compatible visual evidence.
-        return Data(SHA256.hash(data: Data("place-evidence-v1|".utf8) + data))
+        var hasher = SHA256()
+        hasher.update(data: Data("place-evidence-v1|".utf8))
+        hasher.update(data: data)
+        return Data(hasher.finalize())
     }
 
     func encoded() throws -> Data {
