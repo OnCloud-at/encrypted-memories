@@ -222,6 +222,21 @@ public enum SQLiteStoreSchemaGate {
         }
     }
 
+    /// Makes every checkpoint of the connection sync with `F_FULLFSYNC`, automatic checkpoints included. The flag
+    /// belongs to the connection, so each open sets it again.
+    public static func enableFullSyncCheckpoints(_ db: OpaquePointer?) {
+        sqlite3_exec(db, "PRAGMA checkpoint_fullfsync=ON;", nil, nil, nil)
+    }
+
+    /// Copies every committed transaction from the WAL into the database file and syncs that file (a FULL
+    /// checkpoint). A busy, partial, or failed checkpoint returns false.
+    public static func checkpointCompletely(_ db: OpaquePointer?) -> Bool {
+        var logFrames: Int32 = -1
+        var checkpointedFrames: Int32 = -1
+        let result = sqlite3_wal_checkpoint_v2(db, "main", SQLITE_CHECKPOINT_FULL, &logFrames, &checkpointedFrames)
+        return result == SQLITE_OK && logFrames >= 0 && logFrames == checkpointedFrames
+    }
+
     public static func state(of db: OpaquePointer?) -> SQLiteStoreSchemaState {
         guard let objects = schemaObjects(in: db) else { return .unavailable }
         return objects.isEmpty ? .empty : .populated

@@ -44,6 +44,8 @@ public protocol UploadBackupCandidateEnqueueing: Sendable {
     func reopenBackedUpRevisions(
         _ reopenings: [UploadBackupReopening], deferringWithoutRemoteProof: Bool
     ) async throws -> [UploadBackupAssetCandidate]
+    /// Makes every queue row written so far survive a power loss. Returns false when that is not certain.
+    func synchronizeQueueToDisk() async -> Bool
 }
 
 /// The remote proof could not be read, so revisions that only the proof can settle stay as they are for now.
@@ -58,6 +60,8 @@ public extension UploadBackupCandidateEnqueueing {
     ) async throws -> [UploadBackupAssetCandidate] {
         []
     }
+
+    func synchronizeQueueToDisk() async -> Bool { true }
 
     @discardableResult
     func reopenBackedUpRevisions(_ reopenings: [UploadBackupReopening]) async throws -> [UploadBackupAssetCandidate] {
@@ -157,6 +161,10 @@ public actor UploadBackupSyncEngine: UploadBackupCandidateEnqueueing {
     @discardableResult
     public func enqueue(_ candidate: UploadBackupAssetCandidate) async throws -> UploadBackupSyncScanResult {
         try await enqueueBatch([candidate])
+    }
+
+    public func synchronizeQueueToDisk() -> Bool {
+        queue.synchronizeToDisk()
     }
 
     public func enqueueBatch(_ candidates: [UploadBackupAssetCandidate]) async throws -> UploadBackupSyncScanResult {

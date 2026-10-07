@@ -26,6 +26,8 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
         // Open failures must therefore fail closed and leave the database untouched for a
         // compatible future build or explicit recovery. Never replace it with an empty queue.
         guard let handle = Self.openOnce(url: url, policy: policy) else { return nil }
+        // An automatic checkpoint can copy frames before `synchronizeToDisk()` runs; they need the same sync.
+        SQLiteStoreSchemaGate.enableFullSyncCheckpoints(handle)
         db = handle
         SupportDiagnosticsSources.shared.registerQueue(self, key: url.standardizedFileURL.path)
     }
@@ -46,6 +48,16 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
                 return false
             }
             return true
+        }
+    }
+
+    /// A full checkpoint moves every committed transaction from the WAL into the database file and syncs that file;
+    /// `checkpoint_fullfsync`, set when the store opens, makes the sync an `F_FULLFSYNC`. A busy or partial checkpoint
+    /// returns false.
+    public func synchronizeToDisk() -> Bool {
+        lock.withLock {
+            guard db != nil, !operationFailed else { return false }
+            return SQLiteStoreSchemaGate.checkpointCompletely(db)
         }
     }
 
