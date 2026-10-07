@@ -24,6 +24,7 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
     public init?(url: URL, policy: LibraryDatabasePolicy = .conservative) {
         try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         guard let handle = Self.openVerified(url: url, policy: policy) else { return nil }
+        SQLiteStoreSchemaGate.enableFullSyncCheckpoints(handle)
         db = handle
     }
 
@@ -324,17 +325,12 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
     }
 
     /// A full checkpoint moves every committed transaction from the WAL into the database file and syncs that file;
-    /// `checkpoint_fullfsync` makes the sync an `F_FULLFSYNC`. A busy or partial checkpoint returns false.
+    /// `checkpoint_fullfsync`, set when the store opens, makes the sync an `F_FULLFSYNC`. A busy or partial checkpoint
+    /// returns false.
     public func synchronizeToDisk() -> Bool {
         lock.withLock {
             guard db != nil, !operationFailed else { return false }
-            sqlite3_exec(db, "PRAGMA checkpoint_fullfsync=ON;", nil, nil, nil)
-            defer { sqlite3_exec(db, "PRAGMA checkpoint_fullfsync=OFF;", nil, nil, nil) }
-            var logFrames: Int32 = -1
-            var checkpointedFrames: Int32 = -1
-            let result = sqlite3_wal_checkpoint_v2(
-                db, "main", SQLITE_CHECKPOINT_FULL, &logFrames, &checkpointedFrames)
-            return result == SQLITE_OK && logFrames >= 0 && logFrames == checkpointedFrames
+            return SQLiteStoreSchemaGate.checkpointCompletely(db)
         }
     }
 
