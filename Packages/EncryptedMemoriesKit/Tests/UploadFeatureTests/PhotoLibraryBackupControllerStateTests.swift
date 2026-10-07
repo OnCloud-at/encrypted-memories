@@ -898,6 +898,47 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
         await controller.shutdown()
     }
 
+    func testMissingSourceRecoveryFailureShowsTheLocalizedLocalStateMessage() async throws {
+        let suite = "backup-recovery-local-state-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(suite)
+        let pending = try XCTUnwrap(
+            PendingBackupManifestStore(
+                url: directory.appendingPathComponent(PendingBackupManifestStore.databaseFileName)))
+        defer {
+            pending.close()
+            defaults.removePersistentDomain(forName: suite)
+            try? FileManager.default.removeItem(at: directory)
+        }
+        let controller = PhotoLibraryBackupController(
+            configuration: .init(accountDataDirectory: directory, databasePolicy: .conservative, defaults: defaults),
+            identityResolver: FakeIdentityResolver(), uploader: MockUploader(), pendingStore: pending)
+        controller.setEnabledForTesting()
+        controller.setAccessStateForTesting(.full)
+        let catalog = try XCTUnwrap(
+            PhotoLibraryCatalogManifestStore(
+                url: directory.appendingPathComponent(PhotoLibraryBackupController.catalogDatabaseFileName)))
+        let info = PhotoBackupAssetInfo(
+            localIdentifier: "dropped-photo", creationDate: nil, modificationDate: Date(timeIntervalSince1970: 200),
+            pixelWidth: 10, pixelHeight: 10, durationSeconds: 0, isLivePhoto: false, isVideo: false,
+            resources: [.init(role: .originalPhoto, originalFilename: "photo.jpg", mimeType: "image/jpeg")])
+        XCTAssertTrue(catalog.upsertBatch([PhotoLibraryCatalogMapper.entry(for: info, observedAt: Date())]))
+        catalog.close()
+        controller.replaceScanForTesting { pending.close() }
+
+        controller.syncNow()
+        let finished = await waitUntil { !controller.isSyncing }
+
+        XCTAssertTrue(finished)
+        XCTAssertEqual(controller.lastMessage, L10n.string("backup.error_local_state_unavailable"))
+        let queue = try XCTUnwrap(
+            UploadBackupSyncQueueManifestStore(
+                url: directory.appendingPathComponent(PhotoLibraryBackupController.queueDatabaseFileName)))
+        XCTAssertEqual(queue.count(), 0, "unreadable exclusions must leave recovery pending")
+        queue.close()
+        await controller.shutdown()
+    }
+
     func testActivationDoesNotStartAPassWhileBackupIsPaused() async throws {
         let fixture = try makeControllerFixture(prefix: "photo-backup-activation-paused", enabled: true)
         defer { fixture.cleanup() }
