@@ -772,6 +772,8 @@ final class PhotoLibraryCatalogStoreTests: XCTestCase {
             lock.withLock { _enqueued.append(candidate.snapshot.source.identifier) }
             return UploadBackupSyncScanResult()
         }
+
+        func synchronizeQueueToDisk() -> Bool { true }
     }
 
     /// Re-opens every offered revision and records each offered photo, which the real engine looks up in the
@@ -812,6 +814,8 @@ final class PhotoLibraryCatalogStoreTests: XCTestCase {
             lock.withLock { _enqueued.append(candidate.snapshot.source.identifier) }
             return UploadBackupSyncScanResult()
         }
+
+        func synchronizeQueueToDisk() -> Bool { true }
     }
 
     /// Ignores cancellation until explicitly released, matching a PhotoKit/SDK callback that returns late.
@@ -820,6 +824,8 @@ final class PhotoLibraryCatalogStoreTests: XCTestCase {
         private var entryWaiters: [CheckedContinuation<Void, Never>] = []
         private var isReleased = false
         private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+
+        func synchronizeQueueToDisk() -> Bool { true }
 
         func enqueue(_ candidate: UploadBackupAssetCandidate) async -> UploadBackupSyncScanResult {
             entered = true
@@ -868,12 +874,16 @@ final class PhotoLibraryCatalogStoreTests: XCTestCase {
             lock.withLock { _absent[id] = absent }
             return UploadBackupSyncScanResult()
         }
+
+        func synchronizeQueueToDisk() -> Bool { true }
     }
 
     private struct FailingEnqueuer: UploadBackupCandidateEnqueueing {
         func enqueue(_ candidate: UploadBackupAssetCandidate) async throws -> UploadBackupSyncScanResult {
             throw UploadError.backend("forced queue failure")
         }
+
+        func synchronizeQueueToDisk() -> Bool { true }
     }
 
     private final class MemoryBackupStateStore: UploadBackupStateStore, @unchecked Sendable {

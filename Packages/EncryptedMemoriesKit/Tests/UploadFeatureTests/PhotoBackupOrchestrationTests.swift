@@ -559,19 +559,14 @@ final class PhotoBackupOrchestrationTests: XCTestCase {
     /// When the queue cannot be synchronized because another connection still reads an older state, the token stays.
     /// The next pass reads the same changes again.
     func testBusyQueueCheckpointKeepsTheToken() async throws {
-        let queueURL = tempDir.appendingPathComponent(UploadBackupSyncQueueManifestStore.databaseFileName)
-        queue.close()
-        queue = try XCTUnwrap(
-            UploadBackupSyncQueueManifestStore(
-                url: queueURL, policy: LibraryDatabasePolicy(mmapBytes: 0, cacheSizeKiB: 2_048, busyTimeoutMs: 10)))
-        engine = UploadBackupSyncEngine(preflight: preflight, queue: queue, now: { [clock] in clock!.now })
+        let queueURL = try useQueueWithShortBusyTimeout()
         enumerator.infos = ["A", "B", "C", "D", "E"].map { photoInfo($0) }
         let history = FakeChangeHistory()
         enumerator.throwAfter = 2
         try await startScanPass(history: history)
 
-        let reader = try openPinnedReader(at: queueURL)
-        defer { closePinnedReader(reader) }
+        var reader: OpaquePointer? = try openPinnedReader(at: queueURL)
+        defer { reader.map(closePinnedReader) }
 
         // Commit point after the published snapshot: the pass queues F, then stops before the scan completes.
         enumerator.infos.insert(photoInfo("F"), at: 0)
@@ -581,17 +576,130 @@ final class PhotoBackupOrchestrationTests: XCTestCase {
         XCTAssertFalse(resumedFinished)
         XCTAssertEqual(history.prepare().changes.changedIdentifiers, ["F"], "the token stays before F")
 
+        // The completing pass tries again, and the queue is still busy.
         enumerator.throwAfter = nil
         try await startScanPass(history: history)
         XCTAssertTrue(catalog.hasCompletedFullScan())
+        XCTAssertEqual(history.prepare().changes.changedIdentifiers, ["F"], "the completed scan keeps the token")
 
         // Commit point of a pass without a full scan.
         enumerator.infos.insert(photoInfo("G"), at: 0)
         history.record(changed: ["G"])
         try await startScanPass(history: history)
-        XCTAssertEqual(history.prepare().changes.changedIdentifiers, ["G"], "the token stays before G")
+        XCTAssertEqual(history.prepare().changes.changedIdentifiers, ["F", "G"], "the token stays before F and G")
         let g = UploadSourceIdentity(kind: .photoLibraryAsset, identifier: "G")
         XCTAssertNotNil(queue.entry(for: g, revision: UploadBackupRevision(date: modDate)))
+
+        // Once the queue checkpoint succeeds, the next pass moves the token.
+        reader.map(closePinnedReader)
+        reader = nil
+        try await startScanPass(history: history)
+        XCTAssertTrue(history.prepare().changes.changedIdentifiers.isEmpty, "the token moved past F and G")
+    }
+
+    /// The queue stays busy during a scan. The pass stops once ten synchronization intervals of photos wait, so the
+    /// catalog WAL stays bounded; the next pass continues from the saved position.
+    func testScanStopsWhenTheQueueStaysBusyForTenIntervals() async throws {
+        let queueURL = try useQueueWithShortBusyTimeout()
+        enumerator.infos = (0..<40).map { photoInfo(String(format: "P%02d", $0)) }
+        let sync = PhotoLibraryCatalogSync(
+            store: catalog, enumerator: enumerator, chunkSize: 2, synchronizationInterval: 2,
+            now: { [clock] in clock!.now })
+        enumerator.throwAfter = 2
+        do {
+            _ = try await sync.run(engine: engine)
+            XCTFail("the first scan is interrupted")
+        } catch is CancellationError {}
+
+        let reader = try openPinnedReader(at: queueURL)
+        defer { closePinnedReader(reader) }
+        enumerator.throwAfter = nil
+        do {
+            _ = try await sync.run(engine: engine)
+            XCTFail("the scan must stop while the queue stays busy")
+        } catch {
+            XCTAssertEqual(error as? UploadError, .backend("Photo library scan could not be saved to disk"))
+        }
+        XCTAssertEqual(catalog.fullScanProgress()?.cursor, 22, "two photos before, then ten intervals of two photos")
+    }
+
+    /// A power loss can happen at any moment of a scan. In the database files at that moment, every catalog row and
+    /// every photo before the saved scan position has its queue row; otherwise the photo would count as unchanged.
+    func testDatabaseFilesDuringAScanNeverHoldACatalogRowWithoutItsQueueRow() async throws {
+        let names = [
+            PhotoLibraryCatalogManifestStore.databaseFileName, UploadBackupSyncQueueManifestStore.databaseFileName,
+        ]
+        enumerator.infos = (0..<3_000).map { photoInfo(String(format: "P%04d", $0)) }
+        let copies = CopyLog(source: tempDir, names: names, every: 50)
+        enumerator.onEnumerationStart = { copies.copy() }
+        let sync = PhotoLibraryCatalogSync(
+            store: catalog, enumerator: enumerator, chunkSize: 2, now: { [clock] in clock!.now })
+        _ = try await sync.run(engine: engine)
+        enumerator.onEnumerationStart = nil
+
+        let directories = copies.directories
+        XCTAssertGreaterThan(directories.count, 20)
+        var largestCatalog = 0
+        for directory in directories {
+            let survivingCatalog = try XCTUnwrap(
+                PhotoLibraryCatalogManifestStore(url: directory.appendingPathComponent(names[0])))
+            let survivingQueue = try XCTUnwrap(
+                UploadBackupSyncQueueManifestStore(url: directory.appendingPathComponent(names[1])))
+            defer {
+                survivingCatalog.close()
+                survivingQueue.close()
+            }
+            // The store reads at least one identifier, so a scan position of zero reads none here.
+            let cursor = survivingCatalog.fullScanProgress()?.cursor ?? 0
+            var identifiers = Set(
+                cursor > 0 ? survivingCatalog.fullScanSnapshotIdentifiers(startingAt: 0, limit: cursor) : [])
+            var after: String?
+            while true {
+                let page = survivingCatalog.presentEntries(afterLocalIdentifier: after, limit: 500)
+                guard let last = page.last else { break }
+                identifiers.formUnion(page.map(\.localIdentifier))
+                after = last.localIdentifier
+            }
+            largestCatalog = max(largestCatalog, identifiers.count)
+            let withoutQueueRow = identifiers.filter {
+                survivingQueue.entry(
+                    for: UploadSourceIdentity(kind: .photoLibraryAsset, identifier: $0),
+                    revision: UploadBackupRevision(date: modDate)) == nil
+            }
+            XCTAssertEqual(
+                withoutQueueRow.count, 0, "\(directory.lastPathComponent): \(withoutQueueRow.sorted().prefix(3))")
+        }
+        XCTAssertGreaterThanOrEqual(largestCatalog, 1_000, "the scan synchronizes while it runs, not only at the end")
+    }
+
+    /// The queue is synchronized right before each change token commit, at both commit points.
+    func testQueueSynchronizationPrecedesEveryTokenCommit() async throws {
+        enumerator.infos = ["A", "B", "C"].map { photoInfo($0) }
+        let history = FakeChangeHistory()
+        let events = EventLog()
+        let recorder = SyncRecordingEnqueuer(engine: engine, events: events)
+        let sync = PhotoLibraryCatalogSync(
+            store: catalog, enumerator: enumerator, chunkSize: 2, now: { [clock] in clock!.now })
+        func pass() async throws {
+            let prepared = history.prepare()
+            try await sync.runPass(
+                engine: recorder, changes: prepared.changes,
+                commitChanges: {
+                    events.append("token commit")
+                    history.commit(prepared)
+                })
+        }
+        try await pass()
+        enumerator.infos.insert(photoInfo("D"), at: 0)
+        history.record(changed: ["D"])
+        try await pass()
+
+        let recorded = events.values
+        let commits = recorded.indices.filter { recorded[$0] == "token commit" }
+        XCTAssertEqual(commits.count, 2, "\(recorded)")
+        for index in commits {
+            XCTAssertEqual(index > 0 ? recorded[index - 1] : nil, "queue sync", "\(recorded)")
+        }
     }
 
     /// A catalog that cannot be read reports the localized error, also when the pass must mark a rescan owed.
@@ -610,6 +718,17 @@ final class PhotoBackupOrchestrationTests: XCTestCase {
     }
 
     /// The database file next to an empty WAL: the state after the unsynchronized WAL commits are lost.
+    /// Replaces the queue with one that waits only 10 ms for a busy checkpoint. Returns the queue file.
+    private func useQueueWithShortBusyTimeout() throws -> URL {
+        let queueURL = tempDir.appendingPathComponent(UploadBackupSyncQueueManifestStore.databaseFileName)
+        queue.close()
+        queue = try XCTUnwrap(
+            UploadBackupSyncQueueManifestStore(
+                url: queueURL, policy: LibraryDatabasePolicy(mmapBytes: 0, cacheSizeKiB: 2_048, busyTimeoutMs: 10)))
+        engine = UploadBackupSyncEngine(preflight: preflight, queue: queue, now: { [clock] in clock!.now })
+        return queueURL
+    }
+
     private func powerLossCopy(of databaseFileName: String) throws -> URL {
         let directory = tempDir.appendingPathComponent("power-loss-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -953,6 +1072,81 @@ final class PhotoBackupOrchestrationTests: XCTestCase {
 
     /// PhotoKit's persistent change history as the change monitor uses it: a stored token, the changes recorded
     /// after it, and an expired history that asks for a full rescan.
+    /// Copies the database files next to empty WAL files at every `every`-th call: the files after a power loss.
+    private final class CopyLog: @unchecked Sendable {
+        private let source: URL
+        private let names: [String]
+        private let every: Int
+        private let lock = NSLock()
+        private var calls = 0
+        private var copies: [URL] = []
+        var directories: [URL] { lock.withLock { copies } }
+
+        init(source: URL, names: [String], every: Int) {
+            self.source = source
+            self.names = names
+            self.every = every
+        }
+
+        func copy() {
+            lock.withLock {
+                calls += 1
+                guard calls % every == 0 else { return }
+                let directory = source.appendingPathComponent("power-loss-\(calls)", isDirectory: true)
+                do {
+                    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                    for name in names {
+                        let copy = directory.appendingPathComponent(name)
+                        try FileManager.default.copyItem(at: source.appendingPathComponent(name), to: copy)
+                        try Data().write(to: URL(fileURLWithPath: copy.path + "-wal"))
+                    }
+                    copies.append(directory)
+                } catch {
+                    XCTFail("copy failed: \(error)")
+                }
+            }
+        }
+    }
+
+    private final class EventLog: @unchecked Sendable {
+        private let lock = NSLock()
+        private var _values: [String] = []
+        var values: [String] { lock.withLock { _values } }
+        func append(_ value: String) { lock.withLock { _values.append(value) } }
+    }
+
+    /// Forwards to the engine and records each queue synchronization.
+    private final class SyncRecordingEnqueuer: UploadBackupCandidateEnqueueing, @unchecked Sendable {
+        private let engine: UploadBackupSyncEngine
+        private let events: EventLog
+
+        init(engine: UploadBackupSyncEngine, events: EventLog) {
+            self.engine = engine
+            self.events = events
+        }
+
+        func enqueue(_ candidate: UploadBackupAssetCandidate) async throws -> UploadBackupSyncScanResult {
+            try await engine.enqueue(candidate)
+        }
+
+        func enqueueBatch(_ candidates: [UploadBackupAssetCandidate]) async throws -> UploadBackupSyncScanResult {
+            try await engine.enqueueBatch(candidates)
+        }
+
+        func reopenBackedUpRevisions(
+            _ reopenings: [UploadBackupReopening], deferringWithoutRemoteProof: Bool
+        ) async throws -> [UploadBackupAssetCandidate] {
+            try await engine.reopenBackedUpRevisions(
+                reopenings, deferringWithoutRemoteProof: deferringWithoutRemoteProof)
+        }
+
+        func synchronizeQueueToDisk() async -> Bool {
+            let synchronized = await engine.synchronizeQueueToDisk()
+            events.append("queue sync")
+            return synchronized
+        }
+    }
+
     private final class FakeChangeHistory: @unchecked Sendable {
         struct Prepared: Sendable {
             var changes: PhotoLibraryChangeMonitor.ChangeSet

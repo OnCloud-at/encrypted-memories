@@ -334,8 +334,6 @@ public extension UploadBackupSyncQueueStore {
         nextRunnableDate(excludingSourcesOf: [])
     }
 
-    func synchronizeToDisk() -> Bool { true }
-
     func claimRunnable(limit: Int, claimedAt: Date) -> [UploadBackupSyncQueueEntry] {
         claimRunnable(limit: limit, claimedAt: claimedAt, excludingSourcesOf: [])
     }

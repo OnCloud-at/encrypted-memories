@@ -24,8 +24,10 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
     public init?(url: URL, policy: LibraryDatabasePolicy = .conservative) {
         try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         guard let handle = Self.openVerified(url: url, policy: policy) else { return nil }
-        // An automatic checkpoint can copy frames before `synchronizeToDisk()` runs; they need the same sync.
         SQLiteStoreSchemaGate.enableFullSyncCheckpoints(handle)
+        // Only `synchronizeToDisk()` checkpoints, after the backup queue is synchronized. An automatic checkpoint could
+        // write catalog rows to the database file before their queue rows (#352).
+        sqlite3_exec(handle, "PRAGMA wal_autocheckpoint=0;", nil, nil, nil)
         db = handle
     }
 

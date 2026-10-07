@@ -419,6 +419,8 @@ final class SpyQueueStore: UploadBackupSyncQueueStore, @unchecked Sendable {
         self.log = log
     }
 
+    func synchronizeToDisk() -> Bool { inner.synchronizeToDisk() }
+
     @discardableResult
     func upsert(_ entry: UploadBackupSyncQueueEntry) -> Bool {
         log.append("queue.upsert:\(entry.state.rawValue)")
@@ -497,6 +499,7 @@ final class ReenqueueOnFirstRetryQueueStore: UploadBackupSyncQueueStore, @unchec
     }
 
     func isOperational() -> Bool { inner.isOperational() }
+    func synchronizeToDisk() -> Bool { inner.synchronizeToDisk() }
     func upsert(_ entry: UploadBackupSyncQueueEntry) -> Bool { inner.upsert(entry) }
     func entry(for source: UploadSourceIdentity, revision: UploadBackupRevision) -> UploadBackupSyncQueueEntry? {
         inner.entry(for: source, revision: revision)

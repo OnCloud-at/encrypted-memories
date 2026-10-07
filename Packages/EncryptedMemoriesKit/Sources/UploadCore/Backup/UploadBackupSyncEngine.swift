@@ -61,8 +61,6 @@ public extension UploadBackupCandidateEnqueueing {
         []
     }
 
-    func synchronizeQueueToDisk() async -> Bool { true }
-
     @discardableResult
     func reopenBackedUpRevisions(_ reopenings: [UploadBackupReopening]) async throws -> [UploadBackupAssetCandidate] {
         try await reopenBackedUpRevisions(reopenings, deferringWithoutRemoteProof: false)
