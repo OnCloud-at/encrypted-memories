@@ -19,6 +19,12 @@
         "de": {"stringUnit": {"state": "translated", "value": "Die Kamera bearbeitet dieses Foto noch."}}
       }
     },
+    "backup.issue_source_unavailable": {
+      "localizations": {
+        "en": {"stringUnit": {"state": "translated", "value": "The photo is not available yet."}},
+        "de": {"stringUnit": {"state": "translated", "value": "Das Foto ist noch nicht verfügbar."}}
+      }
+    },
     "backup.issue_source_missing": {
       "localizations": {
         "en": {"stringUnit": {"state": "translated", "value": "This photo is no longer on this device."}},

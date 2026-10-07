@@ -6,21 +6,27 @@ import XCTest
 @testable import UploadCore
 
 final class PhotoLibraryResourceErrorTests: XCTestCase {
-    func testMissingPhotoKitResourceBecomesTerminalSourceError() {
-        let native = NSError(
-            domain: PHPhotosErrorDomain,
-            code: PHPhotosError.Code.missingResource.rawValue
-        )
+    func testPhotoKitErrorsThatProveTheResourceGoneBecomeTerminalSourceErrors() {
+        for code in [PHPhotosError.Code.identifierNotFound, .invalidResource] {
+            let native = NSError(domain: PHPhotosErrorDomain, code: code.rawValue)
 
-        let normalized = PhotoLibraryResourceResolver.normalizedPhotoKitError(
-            native,
-            filename: "IMG_0001.jpeg"
-        )
+            let normalized = PhotoLibraryResourceResolver.normalizedPhotoKitError(native, filename: "IMG_0001.jpeg")
 
-        XCTAssertEqual(normalized as? UploadError, .fileMissing("IMG_0001.jpeg"))
+            XCTAssertEqual(normalized as? UploadError, .fileMissing("IMG_0001.jpeg"), "\(code)")
+        }
     }
 
-    func testPhotoKitNetworkFailureRemainsRetryableTransportError() {
+    func testAMissingPhotoKitResourceIsCheckedAgainBeforeThePhotoCountsAsGone() {
+        // A download from iCloud that stops part-way can report a missing resource too.
+        let native = NSError(domain: PHPhotosErrorDomain, code: PHPhotosError.Code.missingResource.rawValue)
+
+        let normalized = PhotoLibraryResourceResolver.normalizedPhotoKitError(native, filename: "IMG_0001.jpeg")
+
+        XCTAssertEqual(normalized as? UploadError, .sourceReportedMissing("IMG_0001.jpeg"))
+        XCTAssertFalse(BackupSyncRunner.isTransientNetwork(normalized))
+    }
+
+    func testPhotoKitWaitsAreSourceWaitsNotProtonConnectionFailures() {
         let codes: [PHPhotosError.Code] = [
             .networkAccessRequired, .networkError, .libraryVolumeOffline, .operationInterrupted,
         ]
@@ -30,10 +36,9 @@ final class PhotoLibraryResourceErrorTests: XCTestCase {
 
             let normalized = PhotoLibraryResourceResolver.normalizedPhotoKitError(native, filename: "IMG_0002.mov")
 
-            XCTAssertEqual(
-                normalized as? UploadError, .transport(code: NSURLErrorCannotLoadFromNetwork, message: "offline"))
-            // Transient: the runner waits and retries without spending the photo's attempts.
-            XCTAssertTrue(BackupSyncRunner.isTransientNetwork(normalized), "\(code) must be transient")
+            XCTAssertEqual(normalized as? UploadError, .sourceUnavailable("IMG_0002.mov"), "\(code)")
+            // The wait is about Photos: it must not lower the upload concurrency for photos on the device.
+            XCTAssertFalse(BackupSyncRunner.isTransientNetwork(normalized), "\(code) is no connection failure")
         }
     }
 

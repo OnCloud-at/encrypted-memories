@@ -1998,6 +1998,37 @@ public actor BackupSyncRunner {
                     kind: .unknown, detail: "error.upload_source_not_ready", nextAttemptAt: recheck))
             return
         }
+        // Photos cannot hand out the file yet: it waits for iCloud, an offline library volume, or an interrupted read.
+        // That says nothing about the Proton connection, so the network streak stays and photos on the device keep
+        // their concurrency. The row waits like a network retry, without an attempt.
+        if case UploadError.sourceUnavailable = error {
+            let detail = BackupFailedItem.sourceUnavailableDetail
+            let attempt = min(32, Self.sourceWaits(of: entry, detail: detail) + 1)
+            let eligibleAt = now().addingTimeInterval(configuration.retry.delay(afterAttempts: attempt))
+            deferSource(
+                entry, from: oldState, until: eligibleAt,
+                issue: BackupIssueRecord(
+                    kind: .unknown, detail: detail, nextAttemptAt: eligibleAt, automaticRetryAttempt: attempt))
+            return
+        }
+        // Photos reports the file as missing. A short iCloud fault can report that too, and a removed row never
+        // comes back: the catalog counts the photo as unchanged. So the row checks again a few times, hours apart,
+        // before the photo counts as gone.
+        if case UploadError.sourceReportedMissing = error {
+            let detail = BackupFailedItem.sourceReportedMissingDetail
+            let checks = Self.sourceWaits(of: entry, detail: detail)
+            guard checks < Self.reportedMissingRechecks else {
+                discardMissingSource(entry, from: oldState)
+                return
+            }
+            let eligibleAt = now().addingTimeInterval(
+                Self.waitingReplacementDelay(afterWaits: checks, first: Self.reportedMissingRecheckDelay))
+            deferSource(
+                entry, from: oldState, until: eligibleAt,
+                issue: BackupIssueRecord(
+                    kind: .unknown, detail: detail, nextAttemptAt: eligibleAt, automaticRetryAttempt: checks + 1))
+            return
+        }
         let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
 
         // Disk-space pressure is not the item's fault: it must never burn the retry budget into a
@@ -2268,6 +2299,17 @@ public actor BackupSyncRunner {
 
     /// How long an item that did not fit into the Proton account waits before the next automatic check.
     static let accountStorageRecheckInterval: TimeInterval = 6 * 3600
+
+    /// How often a photo that Photos reports as missing is checked again before it counts as gone, and the first wait.
+    /// The waits double: one, two, and four hours.
+    static let reportedMissingRechecks = 3
+    static let reportedMissingRecheckDelay: TimeInterval = 3600
+
+    /// The waits that a row already spent for the reason `detail`; another reason starts again at zero.
+    private static func sourceWaits(of entry: UploadBackupSyncQueueEntry, detail: String) -> Int {
+        guard let previous = BackupIssueRecord.decode(entry.lastError), previous.detail == detail else { return 0 }
+        return previous.automaticRetryAttempt
+    }
 
     private static func issueKind(for error: Error) -> BackupIssueKind {
         if isTransientResourcePressure(error) { return .deviceStorage }

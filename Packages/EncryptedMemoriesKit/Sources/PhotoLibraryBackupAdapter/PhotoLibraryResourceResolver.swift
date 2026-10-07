@@ -546,7 +546,7 @@ public struct PhotoLibraryResourceResolver: BackupResourceResolving {
         return nil
     }
 
-    /// Converts stable PhotoKit failure codes into Core upload categories. Network and storage conditions stay
+    /// Converts stable PhotoKit failure codes into Core upload categories. Waits and storage conditions stay
     /// retryable; errors that prove the resource is gone remove it from backup work.
     static func normalizedPhotoKitError(_ error: Error, filename: String) -> Error {
         let nsError = error as NSError
@@ -555,16 +555,21 @@ public struct PhotoLibraryResourceResolver: BackupResourceResolving {
         else { return error }
 
         switch code {
-        case .missingResource, .identifierNotFound, .invalidResource:
+        case .identifierNotFound, .invalidResource:
             return UploadError.fileMissing(filename)
+        case .missingResource:
+            // A download from iCloud that stops part-way can also report a missing resource, so the photo is not
+            // treated as gone at once.
+            logger.notice("PhotoKit read reports a missing resource: PHPhotosError \(nsError.code, privacy: .public)")
+            return UploadError.sourceReportedMissing(filename)
         case .accessRestricted, .accessUserDenied:
             return UploadError.permissionDenied(filename)
         case .networkAccessRequired, .networkError, .libraryVolumeOffline, .operationInterrupted:
-            // The original is in iCloud or on an offline library volume: the backup waits and tries again by itself,
-            // so these failures must use a transport code that the runner treats as transient, not burn its attempts.
+            // The original is in iCloud or on an offline library volume: the backup waits and tries again by itself.
+            // The wait is about Photos, not the Proton connection, so it must not slow down photos on the device.
             // The PhotoKit code is logged first, because support needs it to tell the four causes apart.
             logger.notice("PhotoKit read waits: PHPhotosError \(nsError.code, privacy: .public)")
-            return UploadError.transport(code: NSURLErrorCannotLoadFromNetwork, message: nsError.localizedDescription)
+            return UploadError.sourceUnavailable(filename)
         case .notEnoughSpace:
             return BackupTempFileStore.BackupTempFileError.diskBudgetExceeded
         default:
