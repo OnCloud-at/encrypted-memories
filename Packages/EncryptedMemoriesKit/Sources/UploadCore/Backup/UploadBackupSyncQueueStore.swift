@@ -295,8 +295,16 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
         }
     }
 
-    private func claimRunnableUnobserved(limit: Int, claimedAt: Date) -> [UploadBackupSyncQueueEntry] {
+    private func claimRunnableUnobserved(
+        limit: Int, claimedAt: Date, excludedSources: [UploadSourceIdentity]
+    ) -> [UploadBackupSyncQueueEntry] {
         let clampedLimit = max(1, limit)
+        var excludedKeys: [(kind: String, identifier: String)] = []
+        var seenKeys: Set<String> = []
+        for source in excludedSources where seenKeys.insert(source.kind.rawValue + "|" + source.identifier).inserted {
+            excludedKeys.append((source.kind.rawValue, source.identifier))
+        }
+        let exclusion = String(repeating: "\n  AND NOT (source_kind=? AND source_id=?)", count: excludedKeys.count)
         return lock.withLock {
             guard requireOperational(sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK) else {
                 return []
@@ -312,7 +320,7 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
                                state, attempts, last_error, updated_at, remote_commit_reconciliation
                         FROM backup_sync_queue
                         WHERE state IN (\(Self.runnableStateList))
-                          AND updated_at <= ?
+                          AND updated_at <= ?\(exclusion)
                         ORDER BY revision_us DESC, updated_at ASC
                         LIMIT ?;
                         """,
@@ -323,7 +331,13 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
                 return []
             }
             sqlite3_bind_double(selectStmt, 1, claimedAt.timeIntervalSince1970)
-            sqlite3_bind_int(selectStmt, 2, Int32(clampedLimit))
+            var parameter: Int32 = 2
+            for key in excludedKeys {
+                bindText(selectStmt, parameter, key.kind)
+                bindText(selectStmt, parameter + 1, key.identifier)
+                parameter += 2
+            }
+            sqlite3_bind_int(selectStmt, parameter, Int32(clamping: clampedLimit))
             var selectResult = sqlite3_step(selectStmt)
             while selectResult == SQLITE_ROW {
                 guard let source = sourceFromColumns(selectStmt, kindColumn: 0, idColumn: 1, resourceColumn: 2) else {
@@ -1207,8 +1221,10 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
         return result
     }
 
-    public func claimRunnable(limit: Int, claimedAt: Date) -> [UploadBackupSyncQueueEntry] {
-        let claimed = claimRunnableUnobserved(limit: limit, claimedAt: claimedAt)
+    public func claimRunnable(
+        limit: Int, claimedAt: Date, excludingSourcesOf excludedSources: [UploadSourceIdentity]
+    ) -> [UploadBackupSyncQueueEntry] {
+        let claimed = claimRunnableUnobserved(limit: limit, claimedAt: claimedAt, excludedSources: excludedSources)
         if !claimed.isEmpty { notify(UploadBackupSyncQueueChange(sources: claimed.map(\.source))) }
         return claimed
     }

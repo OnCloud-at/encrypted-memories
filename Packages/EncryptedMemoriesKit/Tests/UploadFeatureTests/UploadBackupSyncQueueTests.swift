@@ -710,6 +710,33 @@ final class UploadBackupSyncQueueTests: XCTestCase {
         XCTAssertNil(store.nextRunnableDate())
     }
 
+    func testClaimSkipsEveryRowOfAnExcludedSource() throws {
+        let url = tempDir.appendingPathComponent(UploadBackupSyncQueueManifestStore.databaseFileName)
+        let store = try XCTUnwrap(UploadBackupSyncQueueManifestStore(url: url))
+        let rows = [
+            UploadBackupSyncQueueEntry(
+                source: source("running"), revision: revision(30), originalFilename: "running.heic",
+                state: .needsRemoteReconciliation, updatedAt: Date(timeIntervalSince1970: 10)),
+            UploadBackupSyncQueueEntry(
+                source: source("running", resource: .livePairedVideo), revision: revision(20),
+                originalFilename: "running.mov", state: .discovered, updatedAt: Date(timeIntervalSince1970: 10)),
+            UploadBackupSyncQueueEntry(
+                source: source("idle"), revision: revision(10), originalFilename: "idle.heic",
+                state: .discovered, updatedAt: Date(timeIntervalSince1970: 10)),
+        ]
+        for row in rows { XCTAssertTrue(store.upsert(row)) }
+        let now = Date(timeIntervalSince1970: 100)
+
+        let claimed = store.claimRunnable(limit: 10, claimedAt: now, excludingSourcesOf: [source("running")])
+
+        XCTAssertEqual(claimed.map(\.originalFilename), ["idle.heic"], "any resource of an excluded source stays")
+        XCTAssertEqual(store.entry(for: rows[0].source, revision: rows[0].revision)?.state, .needsRemoteReconciliation)
+        XCTAssertEqual(store.entry(for: rows[1].source, revision: rows[1].revision)?.state, .discovered)
+        XCTAssertEqual(
+            store.claimRunnable(limit: 10, claimedAt: now).map(\.originalFilename), ["running.heic", "running.mov"],
+            "the rows are claimable once the source is no longer excluded")
+    }
+
     func testConcurrentStoreInstancesNeverClaimTheSameRows() async throws {
         let url = tempDir.appendingPathComponent(UploadBackupSyncQueueManifestStore.databaseFileName)
         let first = try XCTUnwrap(UploadBackupSyncQueueManifestStore(url: url))

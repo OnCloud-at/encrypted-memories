@@ -433,9 +433,11 @@ final class SpyQueueStore: UploadBackupSyncQueueStore, @unchecked Sendable {
 
     func nextRunnableDate() -> Date? { inner.nextRunnableDate() }
 
-    func claimRunnable(limit: Int, claimedAt: Date) -> [UploadBackupSyncQueueEntry] {
+    func claimRunnable(
+        limit: Int, claimedAt: Date, excludingSourcesOf excludedSources: [UploadSourceIdentity]
+    ) -> [UploadBackupSyncQueueEntry] {
         log.append("queue.claimRunnable")
-        return inner.claimRunnable(limit: limit, claimedAt: claimedAt)
+        return inner.claimRunnable(limit: limit, claimedAt: claimedAt, excludingSourcesOf: excludedSources)
     }
 
     func entries(in state: UploadBackupSyncQueueState, updatedBefore: Date, limit: Int) -> [UploadBackupSyncQueueEntry]
@@ -499,8 +501,10 @@ final class ReenqueueOnFirstRetryQueueStore: UploadBackupSyncQueueStore, @unchec
     }
     func nextRunnable(limit: Int) -> [UploadBackupSyncQueueEntry] { inner.nextRunnable(limit: limit) }
     func nextRunnableDate() -> Date? { inner.nextRunnableDate() }
-    func claimRunnable(limit: Int, claimedAt: Date) -> [UploadBackupSyncQueueEntry] {
-        inner.claimRunnable(limit: limit, claimedAt: claimedAt)
+    func claimRunnable(
+        limit: Int, claimedAt: Date, excludingSourcesOf excludedSources: [UploadSourceIdentity]
+    ) -> [UploadBackupSyncQueueEntry] {
+        inner.claimRunnable(limit: limit, claimedAt: claimedAt, excludingSourcesOf: excludedSources)
     }
     func entries(in state: UploadBackupSyncQueueState, updatedBefore: Date, limit: Int) -> [UploadBackupSyncQueueEntry]
     {
@@ -3567,4 +3571,396 @@ extension BackupSyncRunnerTests {
         XCTAssertEqual(values, values.sorted(), "progress never moves backwards")
         XCTAssertTrue(values.allSatisfy { (0...BackupProgressStep.count).contains($0) })
     }
+}
+
+/// Holds the transfers of the named files until each is released; every other transfer takes its scripted
+/// duration. Records how many transfers ran at the start of each one, and calls `onStart` when one starts.
+final class HeldTransferUploader: PhotoUploading, @unchecked Sendable {
+    let capabilities = UploadBackendCapabilities.sdkUploader
+    private let inner: MockUploader
+    private let durations: [String: Duration]
+    private let lock = NSLock()
+    private var held: Set<String>
+    private var running = 0
+    private var _peakConcurrent = 0
+    private var _started: [(name: String, running: Int)] = []
+    private var _finished: [String] = []
+    private var _cancellations = 0
+    var onStart: (@Sendable () -> Void)?
+
+    init(
+        held: Set<String> = [], durations: [String: Duration] = [:], transientFailures: [String: Int] = [:]
+    ) {
+        self.held = held
+        self.durations = durations
+        inner = MockUploader(workDuration: .zero, deliverProgress: false, transientFailures: transientFailures)
+    }
+
+    var peakConcurrent: Int { lock.withLock { _peakConcurrent } }
+    var started: [String] { lock.withLock { _started.map(\.name) } }
+    /// The transfers that ran when `name` started, itself included.
+    func runningAtStart(of name: String) -> [Int] {
+        lock.withLock { _started.filter { $0.name == name }.map(\.running) }
+    }
+    var finished: [String] { lock.withLock { _finished } }
+    var cancellations: Int { lock.withLock { _cancellations } }
+
+    func release(_ name: String) { lock.withLock { _ = held.remove(name) } }
+    func releaseAll() { lock.withLock { held.removeAll() } }
+
+    func upload(
+        _ request: PhotoUploadRequest,
+        onProgress: @Sendable @escaping (UploadProgress) -> Void
+    ) async throws -> PhotoUID {
+        let onStart = lock.withLock {
+            running += 1
+            _peakConcurrent = max(_peakConcurrent, running)
+            _started.append((request.name, running))
+            return self.onStart
+        }
+        defer { lock.withLock { running -= 1 } }
+        onStart?()
+        while lock.withLock({ held.contains(request.name) }) {
+            try await Task.sleep(for: .milliseconds(2))
+        }
+        try await Task.sleep(for: durations[request.name] ?? .zero)
+        let uid = try await inner.upload(request, onProgress: onProgress)
+        lock.withLock { _finished.append(request.name) }
+        return uid
+    }
+
+    func cancel(token: UUID) async {
+        lock.withLock { _cancellations += 1 }
+        await inner.cancel(token: token)
+    }
+}
+
+/// Forwards to the real pipeline, but holds the manifest record of an upload of the named files until `releaseAll()`.
+final class RecordHoldingIdentityResolver: UploadIdentityResolving, @unchecked Sendable {
+    private let inner: UploadDedupePipeline
+    private let lock = NSLock()
+    private var held: Set<String>
+    private var holding = 0
+
+    init(inner: UploadDedupePipeline, held: Set<String>) {
+        self.inner = inner
+        self.held = held
+    }
+
+    /// True while a held record waits.
+    var holds: Bool { lock.withLock { holding > 0 } }
+    func releaseAll() { lock.withLock { held.removeAll() } }
+
+    func resolve(_ descriptor: UploadResourceDescriptor) async throws -> UploadPreflightResult {
+        try await inner.resolve(descriptor)
+    }
+
+    func revalidateKnownRemote(_ descriptor: UploadResourceDescriptor) async throws -> UploadDuplicateDecision? {
+        try await inner.revalidateKnownRemote(descriptor)
+    }
+
+    func remoteAssetProofs(
+        for identities: [UploadBackupExternalIdentity]
+    ) async throws -> [UploadBackupExternalIdentity: UploadRemoteAssetIndexRecord] {
+        try await inner.remoteAssetProofs(for: identities)
+    }
+
+    func prepareRemoteIndex(
+        progress: @escaping @Sendable (UploadRemoteIndexPreparationProgress) async -> Void
+    ) async throws {
+        try await inner.prepareRemoteIndex(progress: progress)
+    }
+
+    func remoteContentIndexHealth() async throws -> UploadRemoteContentIndexHealth {
+        try await inner.remoteContentIndexHealth()
+    }
+
+    func prime(_ descriptors: [UploadResourceDescriptor]) async { await inner.prime(descriptors) }
+
+    func recordUploaded(
+        _ descriptor: UploadResourceDescriptor, identity: UploadIdentity, remoteVolumeID: String, remoteLinkID: String
+    ) async throws {
+        if lock.withLock({ held.contains(descriptor.filename) }) {
+            lock.withLock { holding += 1 }
+            defer { lock.withLock { holding -= 1 } }
+            while lock.withLock({ held.contains(descriptor.filename) }) {
+                try? await Task.sleep(for: .milliseconds(2))
+            }
+        }
+        try await inner.recordUploaded(
+            descriptor, identity: identity, remoteVolumeID: remoteVolumeID, remoteLinkID: remoteLinkID)
+    }
+
+    func invalidateCachedRemoteState() async { await inner.invalidateCachedRemoteState() }
+    func remoteMainsChangedHere() async { await inner.remoteMainsChangedHere() }
+    func uploadDidFail(_ descriptor: UploadResourceDescriptor) async { await inner.uploadDidFail(descriptor) }
+
+    func remoteCommitNeedsReconciliation(_ descriptor: UploadResourceDescriptor) async {
+        await inner.remoteCommitNeedsReconciliation(descriptor)
+    }
+
+    func identityRecord(for source: UploadSourceIdentity) async -> UploadIdentityRecord? {
+        await inner.identityRecord(for: source)
+    }
+}
+
+/// The drain starts the next item as soon as one ends, instead of waiting for a whole group (#310).
+extension BackupSyncRunnerTests {
+    private func waitUntil(timeout: Duration = .seconds(5), _ predicate: () -> Bool) async -> Bool {
+        let deadline = ContinuousClock.now.advanced(by: timeout)
+        while ContinuousClock.now < deadline {
+            if predicate() { return true }
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+        return predicate()
+    }
+
+    private static let wiFi = LibraryNetworkState(
+        path: LibraryNetworkPath(isSatisfied: true, availableInterfaces: [.wifi]))
+
+    func testFastItemsKeepTheFreeSlotsBusyWhileASlowItemUploads() async throws {
+        let slow = seedEntry("slow.mov", ageSeconds: 600)
+        let fast = (0..<6).map { seedEntry("fast-\($0).jpg") }
+        let transfers = HeldTransferUploader(held: ["slow.mov"])
+        let runner = makeRunner(uploader: transfers, throttle: BackupThrottlePolicy(baseConcurrency: 2))
+        let pass = Task { await runner.runUntilDrained() }
+
+        let fastFinished = await waitUntil { fast.allSatisfy { self.state(of: $0) == .completed } }
+        let slowStillRunning = !transfers.finished.contains("slow.mov")
+        transfers.releaseAll()
+        let progress = await pass.value
+
+        XCTAssertTrue(fastFinished, "the fast photos use the free slot while the video uploads")
+        XCTAssertTrue(slowStillRunning)
+        XCTAssertEqual(state(of: slow), .completed)
+        XCTAssertEqual(progress.uploaded, 7)
+        XCTAssertEqual(progress.checking, 0)
+        XCTAssertLessThanOrEqual(transfers.peakConcurrent, 2)
+    }
+
+    func testAFailingItemFreesItsSlotAndRetriesAsBefore() async throws {
+        let slow = seedEntry("slow.mov", ageSeconds: 600)
+        let failing = seedEntry("flaky.jpg", ageSeconds: 300)
+        let fast = (0..<3).map { seedEntry("fast-\($0).jpg") }
+        let transfers = HeldTransferUploader(held: ["slow.mov"], transientFailures: ["flaky.jpg": 1])
+        let runner = makeRunner(uploader: transfers, throttle: BackupThrottlePolicy(baseConcurrency: 2))
+        let pass = Task { await runner.runUntilDrained() }
+
+        let othersFinished = await waitUntil { fast.allSatisfy { self.state(of: $0) == .completed } }
+        let failedRow = queueStore.entry(for: failing.source, revision: failing.revision)
+        transfers.releaseAll()
+        let progress = await pass.value
+
+        XCTAssertTrue(othersFinished, "a failed item frees its slot for the next one")
+        XCTAssertEqual(failedRow?.attempts, 1, "the failure spends one attempt")
+        XCTAssertNotNil(BackupIssueRecord.decode(failedRow?.lastError)?.nextAttemptAt, "and waits for its retry")
+        XCTAssertEqual(state(of: failing), .completed, "the retry uploads it")
+        XCTAssertEqual(transfers.started.filter { $0 == "flaky.jpg" }.count, 2)
+        XCTAssertEqual(state(of: slow), .completed)
+        XCTAssertEqual(progress.uploaded, 5)
+    }
+
+    func testNoMoreItemsThanTheLimitAreClaimedAtAnyMoment() async throws {
+        var durations: [String: Duration] = ["slow.mov": .milliseconds(120)]
+        _ = seedEntry("slow.mov", ageSeconds: 600)
+        for index in 0..<20 {
+            durations["photo-\(index).jpg"] = .milliseconds(index % 4 * 3)
+            _ = seedEntry("photo-\(index).jpg")
+        }
+        let transfers = HeldTransferUploader(durations: durations)
+        let activeRows = ActiveRowSamples()
+        transfers.onStart = { [queueStore] in activeRows.append(queueStore!.summary().active) }
+        let runner = makeRunner(uploader: transfers, throttle: BackupThrottlePolicy(baseConcurrency: 3))
+
+        let progress = await runner.runUntilDrained()
+
+        XCTAssertEqual(progress.uploaded, 21)
+        XCTAssertLessThanOrEqual(transfers.peakConcurrent, 3)
+        XCTAssertFalse(activeRows.values.isEmpty)
+        XCTAssertLessThanOrEqual(activeRows.values.max() ?? 0, 3, "claimed rows never exceed the limit")
+    }
+
+    func testALoweredLimitKeepsRunningItemsAndHoldsNewStarts() async throws {
+        let held = (0..<6).map { "held-\($0).jpg" }
+        for name in held { _ = seedEntry(name, ageSeconds: 600) }
+        let later = (0..<3).map { seedEntry("later-\($0).jpg") }
+        let throttle = BackupNetworkBox(.unconstrained)
+        let transfers = HeldTransferUploader(
+            held: Set(held),
+            durations: Dictionary(uniqueKeysWithValues: later.map { ($0.originalFilename, Duration.milliseconds(5)) }))
+        let runner = makeRunner(
+            uploader: transfers, throttle: BackupThrottlePolicy(baseConcurrency: 6),
+            throttleInputs: { throttle.current })
+        let pass = Task { await runner.runUntilDrained() }
+
+        let allStarted = await waitUntil { transfers.started.count == 6 }
+        throttle.set(BackupThrottleInputs(thermalLevel: .critical))
+        transfers.release(held[0])
+        _ = await waitUntil { transfers.finished.contains(held[0]) }
+        // Give a wrongly started item time to appear.
+        let startedTooEarly = await waitUntil(timeout: .milliseconds(200)) { transfers.started.count > 6 }
+        let cancellationsWhileLowered = transfers.cancellations
+        transfers.releaseAll()
+        let progress = await pass.value
+
+        XCTAssertTrue(allStarted)
+        XCTAssertFalse(startedTooEarly, "no new item starts while more items run than the lowered limit allows")
+        XCTAssertEqual(cancellationsWhileLowered, 0, "a lowered limit cancels no running item")
+        XCTAssertEqual(progress.uploaded, 9)
+        for entry in later {
+            XCTAssertEqual(transfers.runningAtStart(of: entry.originalFilename), [1], "one at a time after lowering")
+        }
+    }
+
+    func testARaisedLimitFillsTheNewSlotsWhileAnItemRuns() async throws {
+        let runtime = LibraryRuntimeState(initial: LibraryRuntimeSnapshot(thermalLevel: .critical, network: Self.wiFi))
+        _ = seedEntry("slow.mov", ageSeconds: 600)
+        let fast = (0..<4).map { seedEntry("fast-\($0).jpg") }
+        let transfers = HeldTransferUploader(held: ["slow.mov"])
+        let runner = makeRunner(
+            uploader: transfers, throttle: BackupThrottlePolicy(baseConcurrency: 6),
+            throttleInputs: { BackupThrottleInputs(runtime: runtime.snapshot(), usesMobileData: false) },
+            runtimeChanges: { runtime.updates() })
+        let pass = Task { await runner.runUntilDrained() }
+
+        let slowStarted = await waitUntil { transfers.started.contains("slow.mov") }
+        let othersWaited = transfers.started == ["slow.mov"]
+        runtime.update { $0.thermalLevel = .nominal }
+        let fastFinished = await waitUntil { fast.allSatisfy { self.state(of: $0) == .completed } }
+        transfers.releaseAll()
+        let progress = await pass.value
+
+        XCTAssertTrue(slowStarted)
+        XCTAssertTrue(othersWaited, "the critical limit runs one item")
+        XCTAssertTrue(fastFinished, "a raised limit fills the new slots while the video uploads")
+        XCTAssertEqual(progress.uploaded, 5)
+    }
+
+    /// A revision of a source that runs stays in the queue until that source's item ends; it never runs beside it.
+    func testAnotherRevisionOfARunningSourceStaysUnclaimedUntilItEnds() async throws {
+        let newer = seedEntry("edited.jpg", ageSeconds: 600, revisionOffset: 2)
+        let other = seedEntry("other.jpg", ageSeconds: 300)
+        let older = seedEntry("edited.jpg", ageSeconds: 10)
+        let transfers = HeldTransferUploader(held: ["edited.jpg"])
+        let runner = makeRunner(uploader: transfers, throttle: BackupThrottlePolicy(baseConcurrency: 2))
+        let pass = Task { await runner.runUntilDrained() }
+
+        _ = await waitUntil { self.state(of: other) == .completed }
+        let claimedTooEarly = await waitUntil(timeout: .milliseconds(200)) { self.state(of: older) != .discovered }
+        let resolvesWhileHeld = resolver.resolveCount(for: newer.source.identifier)
+        transfers.releaseAll()
+        _ = await pass.value
+
+        XCTAssertFalse(claimedTooEarly, "the free slot does not take a revision of the running source")
+        XCTAssertEqual(resolvesWhileHeld, 1, "the second revision starts only after the first ends")
+        XCTAssertEqual(transfers.started.filter { $0 == "edited.jpg" }.count, 1, "the same bytes upload once")
+        XCTAssertEqual(state(of: newer)?.isTerminalSuccess, true)
+        XCTAssertEqual(state(of: older)?.isTerminalSuccess, true)
+        XCTAssertEqual(queueStore.summary().active, 0)
+    }
+
+    /// Between the upload and its manifest record, the row is runnable (`needsRemoteReconciliation`), so a crash
+    /// reconciles it. A slot that frees in that moment must not take the same row a second time.
+    func testARowThatIsRunnableWhileItsItemRunsIsNotClaimedAgain() async throws {
+        let slow = seedEntry("slow.jpg", ageSeconds: 600)
+        let fast = (0..<3).map { seedEntry("fast-\($0).jpg") }
+        let identities = RecordHoldingIdentityResolver(inner: makePipeline(), held: ["slow.jpg"])
+        let runner = makeRunner(identityResolver: identities, throttle: BackupThrottlePolicy(baseConcurrency: 2))
+        let pass = Task { await runner.runUntilDrained() }
+
+        let recordStarted = await waitUntil { identities.holds }
+        let rowDuringTheRecord = state(of: slow)
+        _ = await waitUntil { fast.allSatisfy { self.state(of: $0) == .completed } }
+        identities.releaseAll()
+        let progress = await pass.value
+
+        XCTAssertTrue(recordStarted)
+        XCTAssertEqual(rowDuringTheRecord, .needsRemoteReconciliation, "the row is runnable while its item runs")
+        XCTAssertEqual(resolver.resolveCount(for: slow.source.identifier), 1, "the running row is never claimed again")
+        XCTAssertEqual(uploader.requests.map(\.name).filter { $0 == "slow.jpg" }.count, 1)
+        XCTAssertEqual(state(of: slow), .completed)
+        XCTAssertEqual(progress.uploaded, 4)
+    }
+
+    /// Two revisions of one source in the same claim run one after the other; a cancellation releases the second too.
+    func testCancellationAlsoReleasesARevisionThatWaitsForItsSource() async throws {
+        let newer = seedEntry("edited.jpg", ageSeconds: 600, revisionOffset: 2)
+        let older = seedEntry("edited.jpg", ageSeconds: 600)
+        _ = seedEntry("other.jpg", ageSeconds: 300)
+        let transfers = HeldTransferUploader(held: ["edited.jpg"])
+        let runner = makeRunner(uploader: transfers, throttle: BackupThrottlePolicy(baseConcurrency: 2))
+        let pass = Task { await runner.runUntilDrained() }
+
+        _ = await waitUntil { transfers.started.contains("edited.jpg") }
+        let olderWasClaimed = state(of: older) == .checking
+        let resolvesWhileHeld = resolver.resolveCount(for: newer.source.identifier)
+        pass.cancel()
+        _ = await pass.value
+
+        XCTAssertTrue(olderWasClaimed, "both revisions came in one claim")
+        XCTAssertEqual(resolvesWhileHeld, 1, "the second revision waits for the first")
+        XCTAssertEqual(queueStore.summary().active, 0, "every claimed row returns to the queue")
+        XCTAssertFalse(state(of: newer)?.isTerminalSuccess ?? true)
+        XCTAssertFalse(state(of: older)?.isTerminalSuccess ?? true)
+        XCTAssertEqual(queueStore.entry(for: newer.source, revision: newer.revision)?.attempts, 0)
+        XCTAssertEqual(queueStore.entry(for: older.source, revision: older.revision)?.attempts, 0)
+    }
+
+    func testStopWhileItemsFlowRevertsTheRunningItemAndStartsNoNewOne() async throws {
+        let slow = seedEntry("slow.mov", ageSeconds: 600)
+        let fast = (0..<3).map { seedEntry("fast-\($0).jpg") }
+        _ = (0..<3).map { seedEntry("rest-\($0).jpg", ageSeconds: 1) }
+        let transfers = HeldTransferUploader(
+            held: Set(["slow.mov"] + (0..<3).map { "rest-\($0).jpg" }))
+        let runner = makeRunner(uploader: transfers, throttle: BackupThrottlePolicy(baseConcurrency: 2))
+        let pass = Task { await runner.runUntilDrained() }
+
+        _ = await waitUntil { fast.allSatisfy { self.state(of: $0) == .completed } }
+        _ = await waitUntil { transfers.started.contains("slow.mov") }
+        // Every slot now holds a transfer that waits, so nothing else can start before the stop.
+        _ = await waitUntil(timeout: .seconds(1)) { transfers.started.count == 5 }
+        let startedBeforeStop = transfers.started.count
+        await runner.stop()
+        let progress = await pass.value
+
+        XCTAssertEqual(transfers.started.count, startedBeforeStop, "no new item starts after the stop")
+        XCTAssertEqual(state(of: slow), .queuedForUpload, "the running item returns to the queue")
+        XCTAssertEqual(queueStore.entry(for: slow.source, revision: slow.revision)?.attempts, 0)
+        XCTAssertEqual(queueStore.summary().active, 0, "no claimed row stays active")
+        XCTAssertEqual(progress.checking, 0)
+        XCTAssertTrue(transfers.finished.allSatisfy { $0.hasPrefix("fast-") })
+        XCTAssertGreaterThanOrEqual(transfers.cancellations, 1)
+    }
+
+    /// Total time for a simulated mixed library: one large video and 40 photos with fake transfer durations, at the
+    /// default limit. Runs only with `BACKUP_POOL_MEASURE=1` and prints the median of three rounds.
+    func testMeasureAMixedLibrary() async throws {
+        try XCTSkipUnless(
+            ProcessInfo.processInfo.environment["BACKUP_POOL_MEASURE"] == "1", "set BACKUP_POOL_MEASURE=1")
+        var rounds: [Duration] = []
+        for round in 0..<3 {
+            var durations: [String: Duration] = ["video-\(round).mov": .milliseconds(1_500)]
+            _ = seedEntry("video-\(round).mov", ageSeconds: 600)
+            for index in 0..<40 {
+                durations["photo-\(round)-\(index).jpg"] = .milliseconds(100)
+                _ = seedEntry("photo-\(round)-\(index).jpg")
+            }
+            let transfers = HeldTransferUploader(durations: durations)
+            let runner = makeRunner(uploader: transfers, throttle: BackupThrottlePolicy())
+            let start = ContinuousClock.now
+            let progress = await runner.runUntilDrained()
+            rounds.append(ContinuousClock.now - start)
+            XCTAssertEqual(progress.uploaded, 41 * (round + 1))
+        }
+        let median = rounds.sorted()[1]
+        print("[backup-pool-measure] 1 video (1.5 s) + 40 photos (0.1 s), limit 6: median \(median), rounds \(rounds)")
+    }
+}
+
+private final class ActiveRowSamples: @unchecked Sendable {
+    private let lock = NSLock()
+    private var samples: [Int] = []
+
+    var values: [Int] { lock.withLock { samples } }
+    func append(_ value: Int) { lock.withLock { samples.append(value) } }
 }
