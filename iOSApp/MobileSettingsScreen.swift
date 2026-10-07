@@ -1,6 +1,7 @@
 import DesignSystemCore
 import Foundation
 import MLSearchCore
+import MediaByteCache
 import PhotoLibraryBackupAdapter
 import PhotosCore
 import PrivacyFeature
@@ -54,13 +55,9 @@ struct MobileSettingsScreen: View {
                     .mobileVisibilityPriority(.high)
                 }
             }
-            .task(id: CacheSizeObservation(scenePhase: scenePhase, cache: libraryModel.cacheDiskIdentity)) {
+            .task(id: CacheSizeObservation(scenePhase: scenePhase, caches: libraryModel.diskCaches)) {
                 guard scenePhase == .active else { return }
-                let changes = libraryModel.cacheDiskChanges()
-                await refreshCacheSize()
-                for await _ in changes {
-                    await refreshCacheSize()
-                }
+                await libraryModel.diskCaches.followDiskChanges { await refreshCacheSize() }
             }
             .task(id: scenePhase) {
                 guard scenePhase == .active else { return }
@@ -287,7 +284,7 @@ struct MobileSettingsScreen: View {
     // MARK: - Actions
 
     private func refreshCacheSize() async {
-        cacheSize = await libraryModel.cacheDiskSizeBytes()
+        cacheSize = await libraryModel.diskCaches.diskSizeBytes()
     }
 
     private func clearCache() {
@@ -303,7 +300,7 @@ struct MobileSettingsScreen: View {
 /// Restarts the cache-size observation when the scene becomes active or the account reload replaces the cache.
 private struct CacheSizeObservation: Equatable {
     let scenePhase: ScenePhase
-    let cache: ObjectIdentifier?
+    let caches: ThumbnailCacheGroup
 }
 
 private struct MobileBugReportSheet: View {

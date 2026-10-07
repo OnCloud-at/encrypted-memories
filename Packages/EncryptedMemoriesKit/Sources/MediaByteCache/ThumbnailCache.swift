@@ -383,7 +383,10 @@ public actor ThumbnailCache {
                     return ThumbnailCacheStoreResult.storagePaused
                 }
                 do {
-                    try sealed.write(to: directory.appendingPathComponent(name), options: .atomic)
+                    let url = directory.appendingPathComponent(name)
+                    let previousBytes = Self.blobSize(at: url)
+                    try sealed.write(to: url, options: .atomic)
+                    diskUsage.record(name, from: previousBytes, to: Int64(sealed.count))
                     validated.insert(name, generation: generation)  // we just sealed it - it's decryptable
                     return ThumbnailCacheStoreResult.stored
                 } catch {
@@ -506,7 +509,9 @@ public actor ThumbnailCache {
             let removed =
                 writerGeneration.performIfCurrent(generation) {
                     do {
+                        let previousBytes = Self.blobSize(at: entry.url)
                         try FileManager.default.removeItem(at: entry.url)
+                        diskUsage.record(entry.url.lastPathComponent, from: previousBytes, to: 0)
                         validated.remove(entry.url.lastPathComponent, generation: generation)
                         return true
                     } catch {
@@ -743,6 +748,11 @@ public actor ThumbnailCache {
         diskUsage.get()
     }
 
+    /// The exact running total behind `trackedDiskSizeBytes()`, or `nil` while unknown. Test-only.
+    package nonisolated func diskUsageExactForTesting() -> Int64? {
+        diskUsage.exactBytes()
+    }
+
     public nonisolated func diskFileCount() -> Int {
         (try? FileManager.default.contentsOfDirectory(atPath: directory.path).count) ?? 0
     }
@@ -759,6 +769,69 @@ public actor ThumbnailCache {
             let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
             return total + Int64(size)
         }
+    }
+
+    /// The exact byte total of the encrypted blobs, for a size display. The cache counts each blob it writes,
+    /// replaces, and evicts, so this reads a running total. Only while that total is unknown (a new instance, or
+    /// a removal the cache could not measure) does this enumerate the directory, and that enumeration sets the
+    /// total again even while writes land, so a download burst costs one enumeration, not one per measurement.
+    public nonisolated func trackedDiskSizeBytes() -> Int64 {
+        if let exact = diskUsage.exactBytes() { return exact }
+        let generation = writerGeneration.capture()
+        guard let seed = diskUsage.beginExactScan() else {
+            // Another measurement sets the total now; answer once from a listing unless it already finished.
+            return diskUsage.exactBytes() ?? Self.blobTotal(of: listDirectory() ?? [])
+        }
+        let listed = listDirectory()
+        #if DEBUG
+            diskUsage.runSeedListingHook()
+        #endif
+        guard let listed,
+            let changed = writerGeneration.performIfCurrent(generation, { diskUsage.closeExactScan(seed) }) ?? nil
+        else {
+            diskUsage.cancelExactScan(seed)
+            return Self.blobTotal(of: listed ?? [])
+        }
+        // A blob changed during the listing counts with its size after the last change, not the listed one.
+        var total: Int64 = changed.values.reduce(0, +)
+        for url in listed where url.pathExtension == "blob" && changed[url.lastPathComponent] == nil {
+            guard let size = try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize else {
+                diskUsage.cancelExactScan(seed)
+                return Self.blobTotal(of: listed)
+            }
+            total += Int64(size)
+        }
+        return diskUsage.finishExactScan(seed, total: total)
+    }
+
+    #if DEBUG
+        /// Runs `hook` after a measurement listed the directory and before it closes the listing.
+        package nonisolated func setSeedListingHookForTesting(_ hook: (@Sendable () -> Void)?) {
+            diskUsage.setSeedListingHook(hook)
+        }
+    #endif
+
+    /// Lists the directory with prefetched file sizes, or returns `nil` when it is unreadable.
+    private nonisolated func listDirectory() -> [URL]? {
+        try? FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: [.fileSizeKey],
+            options: [.skipsHiddenFiles]
+        )
+    }
+
+    private nonisolated static func blobTotal(of urls: [URL]) -> Int64 {
+        urls.reduce(Int64(0)) { total, url in
+            guard url.pathExtension == "blob" else { return total }
+            return total + Int64((try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
+        }
+    }
+
+    /// The size of the file at `url`: zero when it does not exist, `nil` when the size cannot be read.
+    private nonisolated static func blobSize(at url: URL) -> Int64? {
+        var info = stat()
+        if lstat(url.path, &info) == 0 { return Int64(info.st_size) }
+        return errno == ENOENT ? 0 : nil
     }
 
     // MARK: - Keys
@@ -927,10 +1000,20 @@ private final class ValidatedPresence: @unchecked Sendable {
 /// skip enumerating the directory while under budget. Writes that land after a scan's listing are re-added to
 /// the scan result and a removal during a scan discards that result, so the estimate can only over-count; every
 /// removal path that does not recompute the total calls `invalidate()`.
+///
+/// It also keeps an exact total of the `.blob` files for size displays. Every write and eviction reports the
+/// blob's size before and after through `record`, while the writer fence is held, so these reports are ordered
+/// with the file changes. An enumeration sets the exact total through `beginExactScan`, `closeExactScan` (under
+/// the writer fence), and `finishExactScan`: a blob reported during the enumeration counts with its reported
+/// size, and a report after the close adds to the result.
 package final class ThumbnailCacheDiskUsage: @unchecked Sendable {
     package struct ScanToken {
         let invalidations: UInt64
         let addedBytes: Int64
+    }
+
+    package struct ExactScanToken {
+        let epoch: UInt64
     }
 
     private let lock = NSLock()
@@ -939,10 +1022,94 @@ package final class ThumbnailCacheDiskUsage: @unchecked Sendable {
     private var cumulativeAddedBytes: Int64 = 0
     private var observers: [UInt64: AsyncStream<Void>.Continuation] = [:]
     private var nextObserverID: UInt64 = 0
+    /// Exact `.blob` total, or `nil` when unknown.
+    private var exact: Int64?
+    /// Advances whenever the exact total becomes unknown or zero, so an enumeration that started before is discarded.
+    private var exactEpoch: UInt64 = 0
+    /// Sizes reported while an enumeration lists the directory, by filename.
+    private var exactScanChanges: [String: Int64]?
+    /// Size changes reported after an enumeration closed and before it finished.
+    private var exactScanTail: Int64?
 
     package init() {}
 
     package func get() -> Int64? { lock.withLock { knownBytes } }
+
+    package func exactBytes() -> Int64? { lock.withLock { exact.map { max(0, $0) } } }
+
+    /// Reports that blob `name` changed from `oldBytes` (zero when absent, `nil` when unknown) to `newBytes`.
+    /// Callers hold the writer fence across the file change and this report.
+    package func record(_ name: String, from oldBytes: Int64?, to newBytes: Int64) {
+        guard name.hasSuffix(".blob") else { return }
+        lock.withLock {
+            guard let oldBytes else {
+                loseExactBytes()
+                return
+            }
+            let delta = newBytes - oldBytes
+            if let current = exact { exact = current + delta }
+            if exactScanChanges != nil { exactScanChanges?[name] = newBytes }
+            if let tail = exactScanTail { exactScanTail = tail + delta }
+        }
+    }
+
+    /// Starts an enumeration that sets the exact total, or returns `nil` while another one runs.
+    package func beginExactScan() -> ExactScanToken? {
+        lock.withLock {
+            guard exactScanChanges == nil, exactScanTail == nil else { return nil }
+            exactScanChanges = [:]
+            return ExactScanToken(epoch: exactEpoch)
+        }
+    }
+
+    /// Ends the listing and returns the sizes reported during it. Callers hold the writer fence, so no file
+    /// change is between its file operation and its report.
+    package func closeExactScan(_ token: ExactScanToken) -> [String: Int64]? {
+        lock.withLock {
+            guard exactEpoch == token.epoch, let changes = exactScanChanges else { return nil }
+            exactScanChanges = nil
+            exactScanTail = 0
+            return changes
+        }
+    }
+
+    /// Sets the exact total from the closed enumeration and returns it.
+    package func finishExactScan(_ token: ExactScanToken, total: Int64) -> Int64 {
+        lock.withLock {
+            guard exactEpoch == token.epoch, let tail = exactScanTail else { return max(0, exact ?? total) }
+            exactScanTail = nil
+            exact = total + tail
+            return max(0, total + tail)
+        }
+    }
+
+    package func cancelExactScan(_ token: ExactScanToken) {
+        lock.withLock {
+            guard exactEpoch == token.epoch else { return }
+            exactScanChanges = nil
+            exactScanTail = nil
+        }
+    }
+
+    #if DEBUG
+        private var seedListingHook: (@Sendable () -> Void)?
+
+        package func setSeedListingHook(_ hook: (@Sendable () -> Void)?) {
+            lock.withLock { seedListingHook = hook }
+        }
+
+        package func runSeedListingHook() {
+            let hook = lock.withLock { seedListingHook }
+            hook?()
+        }
+    #endif
+
+    private func loseExactBytes() {
+        exactEpoch &+= 1
+        exact = nil
+        exactScanChanges = nil
+        exactScanTail = nil
+    }
 
     package func add(_ bytes: Int64) {
         lock.withLock {
@@ -956,6 +1123,7 @@ package final class ThumbnailCacheDiskUsage: @unchecked Sendable {
         lock.withLock {
             invalidations &+= 1
             knownBytes = nil
+            loseExactBytes()
         }
         notifyChange()
     }
@@ -965,6 +1133,8 @@ package final class ThumbnailCacheDiskUsage: @unchecked Sendable {
         lock.withLock {
             invalidations &+= 1
             knownBytes = 0
+            loseExactBytes()
+            exact = 0
         }
         notifyChange()
     }

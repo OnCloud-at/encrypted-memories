@@ -455,10 +455,8 @@ final class OfflineLibraryManager {
         }
     }
 
-    /// Signals changes of the three media caches that Settings measures, through the shared coalesced signal.
-    func cacheDiskChanges() -> AsyncStream<Void> {
-        ThumbnailCache.diskChanges(of: [cache, previewCache, originalsCache])
-    }
+    /// The three media caches whose size Settings shows.
+    var diskCaches: ThumbnailCacheGroup { ThumbnailCacheGroup([cache, previewCache, originalsCache]) }
 
     /// Clears the full-resolution originals cache when retention is disabled. Thumbnail and preview caches
     /// and the account key remain available to the grid.
@@ -502,10 +500,9 @@ final class OfflineLibraryManager {
                 // Revalidate the account owner after the asynchronous providers and before synchronous disk walks.
                 guard let current = await self?.statusReadContext(for: session) else { return nil }
 
-                let thumbnailFileCount = current.cache.diskFileCount()
-                let thumbnailSizeBytes = current.cache.diskSizeBytes()
-                let previewSizeBytes = current.previewCache.diskSizeBytes()
-                let originalsSizeBytes = current.originalsCache.diskSizeBytes()
+                let thumbnailSizeBytes = current.cache.trackedDiskSizeBytes()
+                let previewSizeBytes = current.previewCache.trackedDiskSizeBytes()
+                let originalsSizeBytes = current.originalsCache.trackedDiskSizeBytes()
                 let totalAssets = max(current.liveAssetCount, metadataRows)
                 var snapshot = OfflineCacheStatus()
                 snapshot.offlineEnabled = current.offlineEnabled
@@ -513,7 +510,7 @@ final class OfflineLibraryManager {
                 snapshot.metadataRows = metadataRows
                 // Source-aware feeds report coverage for the primary projection only. Physical cache bytes still
                 // include authorized analysis-only derivatives and remain reflected in `cacheSizeBytes` below.
-                snapshot.thumbnailsOnDisk = prefetch?.diskFileCount ?? thumbnailFileCount
+                snapshot.thumbnailsOnDisk = prefetch?.diskFileCount ?? current.cache.diskFileCount()
                 snapshot.thumbnailsMissing = max(0, totalAssets - snapshot.thumbnailsOnDisk)
                 snapshot.ramDecodedEstimate = prefetch?.ramDecodedCount ?? 0
                 snapshot.prefetchQueueDepth = prefetch?.currentQueueLength ?? 0

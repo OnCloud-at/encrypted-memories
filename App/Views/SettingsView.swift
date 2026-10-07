@@ -492,12 +492,8 @@ private struct LibrarySettingsTab: View {
         }
         .formStyle(.grouped)
         .observesStoragePressure($storagePressure)
-        .task {
-            let changes = offline.cacheDiskChanges()
-            await refreshSize()
-            for await _ in changes {
-                await refreshSize()
-            }
+        .task(id: offline.diskCaches) {
+            await offline.diskCaches.followDiskChanges { await refreshSize() }
         }
         .alert("alert.delete_offline_cache_title", isPresented: $confirmDelete) {
             Button(L10n.string("action.cancel"), role: .cancel) {}
