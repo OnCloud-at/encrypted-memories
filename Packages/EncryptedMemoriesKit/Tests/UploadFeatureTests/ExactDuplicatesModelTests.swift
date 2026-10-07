@@ -1371,6 +1371,36 @@ final class ExactDuplicatesModelTests: XCTestCase {
         XCTAssertEqual(finder.batches.count, 1)
     }
 
+    func testAQueuedMergeCannotStartAfterAccountRetirement() async throws {
+        for all in [false, true] {
+            for replacing in [false, true] {
+                let finder = FakeDuplicateFinder(scans: [.init(groups: manyGroups(1), coverage: .complete)])
+                let lifetime = ExactDuplicatesAccountLifetime()
+                let model = try XCTUnwrap(lifetime.replace(with: finder))
+                await model.load()
+                let group = try XCTUnwrap(model.groups.first)
+                XCTAssertTrue(model.canMerge)
+                // This task cannot start until the synchronous retirement below yields the main actor.
+                let merge = Task {
+                    if all {
+                        await model.mergeAll()
+                    } else {
+                        await model.merge(groupID: group.id)
+                    }
+                }
+                if replacing {
+                    _ = lifetime.replace(with: FakeDuplicateFinder(scans: []))
+                } else {
+                    lifetime.retire()
+                }
+                XCTAssertFalse(model.canMerge, "A retired account cannot admit another merge")
+                await merge.value
+                XCTAssertTrue(finder.batches.isEmpty, "A queued UI task cannot merge the retired account")
+                XCTAssertEqual(model.groups.count, 1)
+            }
+        }
+    }
+
     func testCurrentAccountReceivesEveryCompletedMergeBatch() async {
         let finder = FakeDuplicateFinder(scans: [.init(groups: manyGroups(60), coverage: .complete)])
         let lifetime = ExactDuplicatesAccountLifetime()

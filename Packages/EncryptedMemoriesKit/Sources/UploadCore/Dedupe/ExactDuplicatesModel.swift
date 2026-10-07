@@ -375,6 +375,8 @@ public final class ExactDuplicatesModel {
     public private(set) var isMergingAll = false
     /// The person stopped Merge All. The running batch finishes first.
     public private(set) var isStoppingMergeAll = false
+    /// Account retirement permanently prevents a queued action from starting another merge.
+    private var isRetired = false
     /// A merge waits for the facts of groups that nobody scrolled to. Only this ranking shows its progress; the
     /// ranking of the groups on screen runs silently, and its facts simply appear.
     private var isRankingForMerge = false
@@ -599,7 +601,7 @@ public final class ExactDuplicatesModel {
         phase == .loaded ? duplicateCount : scannedDuplicateCount
     }
 
-    public var canMerge: Bool { !isMerging && phase != .loading && !groups.isEmpty }
+    public var canMerge: Bool { !isRetired && !isMerging && phase != .loading && !groups.isEmpty }
 
     public var mergeAllTitle: String { L10n.string("duplicates.merge_all_title \(copyCount)") }
     public var mergeAllMessage: String { L10n.string("duplicates.merge_all_message \(duplicateCount)") }
@@ -1076,6 +1078,12 @@ public final class ExactDuplicatesModel {
     public func mergeAll() async {
         guard canMerge else { return }
         await merge(groups, all: true)
+    }
+
+    /// Ends this account's ownership. A running batch finishes; no queued action can start another merge.
+    func retire() {
+        isRetired = true
+        stopMergeAll()
     }
 
     /// Stops Merge All. The running batch finishes; a running ranking stops, and then nothing merges. The groups that

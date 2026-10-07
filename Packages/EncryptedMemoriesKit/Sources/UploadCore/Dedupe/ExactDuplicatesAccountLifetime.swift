@@ -35,7 +35,7 @@ public final class ExactDuplicatesAccountLifetime {
     /// Invalidates callbacks before waking a paused run. A running backend batch remains joined by its merge task.
     public func retire() {
         token = Token(id: UUID())
-        model?.stopMergeAll()
+        model?.retire()
         model = nil
     }
 }
