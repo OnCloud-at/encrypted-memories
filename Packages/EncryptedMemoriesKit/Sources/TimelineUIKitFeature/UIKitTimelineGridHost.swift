@@ -376,9 +376,9 @@
         /// visible photo can be captured against the layout that actually produced that offset, then re-resolved at
         /// the new width. A raw offset is not layout-invariant when rotation changes the column count.
         private var lastLaidOutViewportSize: CGSize = .zero
-        /// The photo that anchored the previous live resize. While it stays in the top visible row, later resizes keep
-        /// anchoring it instead of drifting to the row-first photo of a new column count. A real user scroll or a new
-        /// item set forgets it.
+        /// The photo that anchored the previous live resize. While its top stays below the top bar, later resizes keep
+        /// anchoring it instead of choosing again in each intermediate layout. A real user scroll, an explicit
+        /// placement, or a new item set forgets it.
         private var resizeAnchorItemID: PhotoUID?
         private var lastLaidOutSafeAreaInsets: UIEdgeInsets = .zero
         private var initialViewportPlacement: TimelineInitialViewportPlacement = .automatic
@@ -950,6 +950,7 @@
             scrollView.setContentOffset(CGPoint(x: 0, y: targetY), animated: false)
             isApplyingProgrammaticScroll = false
             needsInitialViewportPlacement = false
+            resizeAnchorItemID = nil
         }
 
         private var initialViewportOpensAtNewest: Bool {
@@ -984,6 +985,8 @@
         /// placement, not a learned user position, so later projection changes can still apply their own contract.
         public func scrollToTop(animated: Bool = false) {
             guard window != nil, bounds.height > 0, !itemUIDs.isEmpty else { return }
+            // An explicit placement chooses a new place, like a scroll; the next resize anchors at the top.
+            resizeAnchorItemID = nil
             let target = -safeAreaInsets.top
             guard abs(scrollView.contentOffset.y - target) > 0.5 else { return }
             isApplyingProgrammaticScroll = true
@@ -1015,7 +1018,7 @@
             return (displayMode, context.engine.contentModeToggleAvailable(level: context.level))
         }
 
-        /// Captures the top visible photo plus its sub-row offset. The shell can restore this after temporarily
+        /// Captures the first photo below the top bar plus its offset. The shell can restore this after temporarily
         /// replacing the item projection (for example while Smart Search is active) without guessing a raw offset.
         public func currentScrollAnchor() -> GridScrollAnchor<PhotoUID>? {
             guard bounds.width > 0, bounds.height > 0, !itemUIDs.isEmpty else { return nil }
@@ -1029,7 +1032,12 @@
                 overscan: 0,
                 columnPhase: committedPhase
             )
-            guard let top = plan.visibleSlots.min(by: { $0.slotRect.minY < $1.slotRect.minY }),
+            guard
+                let top = GridScrollAnchorPolicy.anchor(
+                    among: plan.visibleSlots,
+                    visibleTop: scrollView.contentOffset.y + safeAreaInsets.top,
+                    visibleBottom: scrollView.contentOffset.y + bounds.height - safeAreaInsets.bottom,
+                    frame: \.slotRect),
                 itemUIDs.indices.contains(top.index)
             else { return nil }
             return GridScrollAnchor(
@@ -1041,6 +1049,7 @@
         /// Re-resolves a captured photo through the current width, density and phase, then restores it to the
         /// same viewport position. If the item disappeared, the current position is left untouched.
         public func restoreScrollAnchor(_ anchor: GridScrollAnchor<PhotoUID>) {
+            resizeAnchorItemID = nil
             restoreScrollAnchor(anchor, marksTimelineAsScrolled: true)
         }
 
@@ -1080,7 +1089,7 @@
 
         /// Capture against the previous layout, not the already-mutated `bounds`: the scroll offset belongs to the
         /// previous column geometry until `refreshContentSize()` resolves the new one. Preserve the newest edge as an
-        /// edge; otherwise preserve the top visible photo identity plus its within-row offset.
+        /// edge; otherwise preserve the first photo below the top bar plus its distance to the bar.
         private func captureViewportResizePositionIfNeeded() -> ViewportResizePosition? {
             guard lastLaidOutViewportSize.width > 0,
                 lastLaidOutViewportSize.height > 0,
@@ -1111,25 +1120,27 @@
                 overscan: 0,
                 columnPhase: committedPhase
             )
-            guard let top = plan.visibleSlots.min(by: { $0.slotRect.minY < $1.slotRect.minY }),
-                itemUIDs.indices.contains(top.index)
+            // The usable area of the previous layout: below the translucent top bar, above the bottom bar. A rotation
+            // lays out several intermediate sizes, and repeated Split View or Stage Manager resizes follow each other;
+            // keep the photo anchored by the first of them while its top stays in that area, so the place does not
+            // creep with each layout or column count.
+            let visibleTop = scrollView.contentOffset.y + lastLaidOutSafeAreaInsets.top
+            let visibleBottom =
+                scrollView.contentOffset.y + lastLaidOutViewportSize.height - lastLaidOutSafeAreaInsets.bottom
+            let remembered = resizeAnchorItemID
+            guard
+                let anchorSlot = GridScrollAnchorPolicy.anchor(
+                    among: plan.visibleSlots, visibleTop: visibleTop, visibleBottom: visibleBottom,
+                    isKept: { [itemUIDs] in itemUIDs.indices.contains($0.index) && itemUIDs[$0.index] == remembered },
+                    frame: \.slotRect),
+                itemUIDs.indices.contains(anchorSlot.index)
             else { return nil }
-            // Repeated Split View / Stage Manager resizes: keep the photo the user anchored as long as it is still
-            // in the top row, so a changed column count does not creep the viewport up by a fraction of a row.
-            var anchorSlot = top
-            if let remembered = resizeAnchorItemID,
-                let slot = plan.visibleSlots.first(where: {
-                    itemUIDs.indices.contains($0.index) && itemUIDs[$0.index] == remembered
-                }),
-                abs(slot.slotRect.minY - top.slotRect.minY) < 0.5
-            {
-                anchorSlot = slot
-            }
             resizeAnchorItemID = itemUIDs[anchorSlot.index]
+            // Keep the photo's distance to the bar, not to the viewport top: rotation changes the bar height.
             return .anchor(
                 GridScrollAnchor(
                     itemID: itemUIDs[anchorSlot.index],
-                    topOffset: anchorSlot.slotRect.minY - scrollView.contentOffset.y
+                    topOffset: anchorSlot.slotRect.minY - visibleTop + safeAreaInsets.top
                 ))
         }
 
@@ -1175,10 +1186,12 @@
 
         /// The grid profile for the current layout size, rebuilt only when that size changes (never mid-scroll).
         /// The profile is a pure function of the usable layout size, so caching on it keeps a plain scroll frame
-        /// from re-resolving the density ladder every vsync.
+        /// from re-resolving the density ladder every vsync. It reads the host's own safe area: during a rotation the
+        /// Metal subview still reports the insets of the previous layout, which picked the other ladder for one pass
+        /// and moved the density and the place.
         func currentProfile() -> GridLevelProfile {
             let layoutSize = UIKitTimelineGridProfileAdapter.layoutSize(
-                forBounds: metalView.bounds, safeAreaInsets: metalView.safeAreaInsets)
+                forBounds: bounds, safeAreaInsets: safeAreaInsets)
             if let cachedProfile, cachedProfileLayoutSize == layoutSize { return cachedProfile }
             let previousProfile = cachedProfile
             let previousLayoutSize = cachedProfileLayoutSize
@@ -1186,7 +1199,7 @@
                 committedPhase = nil
                 cancelLiveZoomState()
             }
-            let profile = requestedProfile ?? profileAdapter.profile(for: metalView)
+            let profile = requestedProfile ?? profileAdapter.profile(for: self)
             if let previousProfile, previousProfile.id != profile.id,
                 previousLayoutSize.width > 0, layoutSize.width > 0
             {
