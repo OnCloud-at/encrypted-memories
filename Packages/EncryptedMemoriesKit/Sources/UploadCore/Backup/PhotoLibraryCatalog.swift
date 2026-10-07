@@ -251,8 +251,14 @@ public protocol PhotoLibraryCatalogStore: Sendable {
     // MARK: One-time upgrade reconciliation
     /// True once the sync driver checked every present row that lists a rendered file against its backup.
     func hasReconciledLateRenders() -> Bool
+    /// Marks the pass done and removes its resume point.
     @discardableResult
     func markLateRendersReconciled() -> Bool
+    /// The last local identifier of the pages that an unfinished pass already checked, or nil to start at the first
+    /// page.
+    func lateRenderSweepResumePoint() -> String?
+    @discardableResult
+    func recordLateRenderSweepResumePoint(_ localIdentifier: String) -> Bool
 
     // MARK: Stable full-scan snapshot
     /// Starts replacing the in-progress scan snapshot. Appends are chunked to avoid one large in-memory

@@ -377,10 +377,13 @@ public struct PhotoLibraryCatalogSync: Sendable {
     /// rendered file to `reopenBackedUpRevisions` and queues the revisions it re-opens. It reads local stores, and the
     /// remote proof only for a photo that an earlier build settled through it.
     /// The flag is set only after the last page, so a cancelled pass starts again. When the remote proof cannot be
-    /// read, the pass stops without an error and leaves the flag unset; a later pass starts again.
+    /// read, the pass stops without an error and leaves the flag unset; it saves the pages before the failed one as
+    /// checked, so a later pass continues at the failed page (#343).
     public func reconcileLateRendersOnce(engine: any UploadBackupCandidateEnqueueing) async throws {
         guard !store.hasReconciledLateRenders() else { return }
-        var cursor: String?
+        // A failed read leaves the store not operational, and the first page below throws.
+        let resumePoint = store.lateRenderSweepResumePoint()
+        var cursor = resumePoint
         while true {
             try Task.checkCancellation()
             let page = store.presentEntries(afterLocalIdentifier: cursor, limit: chunkSize)
@@ -402,6 +405,8 @@ public struct PhotoLibraryCatalogSync: Sendable {
                 do {
                     pending = try await engine.reopenBackedUpRevisions(reopenings, deferringWithoutRemoteProof: true)
                 } catch is UploadBackupRemoteProofUnavailable {
+                    // A failed save marks the store not operational, like every other failed store write.
+                    if let cursor, cursor != resumePoint { store.recordLateRenderSweepResumePoint(cursor) }
                     return
                 }
                 if !pending.isEmpty { _ = try await engine.enqueueBatch(pending) }
