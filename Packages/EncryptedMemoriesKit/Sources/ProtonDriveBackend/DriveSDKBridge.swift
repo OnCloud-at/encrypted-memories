@@ -30,6 +30,10 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     /// the macOS adapter: it chooses the path + desktop SQLite tuning and injects both; schema and
     /// save/load logic live in Core.
     private let timelineStore: TimelineMetadataStore?
+    private let timelineOrderStore: TimelineOrderMetadataStore?
+    private var metadataReconciliationGeneration: UInt64 = 0
+    private var metadataReconciliationInput: (items: [PhotoItem], classified: Set<String>)?
+    private var mimeFallbackInventory: (items: [PhotoItem], classified: Set<String>)?
     /// Drive key-derivation + block decryption for video streaming (built once at sign-in).
     private let crypto: DriveCrypto
     private let photosVolumeBootstrap: PhotosVolumeBootstrapService
@@ -150,6 +154,9 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
             url: libraryDirectory.appendingPathComponent(LibraryDatabaseLocation.databaseFileName),
             policy: policy.libraryDatabasePolicy
         )
+        self.timelineOrderStore = TimelineOrderMetadataStore(
+            url: libraryDirectory.appendingPathComponent(TimelineOrderMetadataStore.databaseFileName),
+            policy: policy.libraryDatabasePolicy)
         self.uploadManifestURL = libraryDirectory.appendingPathComponent(UploadIdentityManifestStore.databaseFileName)
         let recentlyDeletedStore = RecentlyDeletedListingStore(
             directory: libraryDirectory,
@@ -235,7 +242,10 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
 
         _ = await timelineTask?.result
         await reconciliationTask?.value
+        metadataReconciliationInput = nil
+        mimeFallbackInventory = nil
         await trashTask?.value
+        timelineOrderStore?.close()
         timelineStore?.close()
         await photosClient.shutdown()
     }
@@ -517,6 +527,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                     }
                 }
             }
+            sections = orderedSections(sections)
             var continuityRecoveryQualified = false
             let endEventToken: String
             if continuityRecoveryRequired {
@@ -659,7 +670,11 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     func cachedTimelineSnapshot() -> CachedTimelineSnapshot? {
         guard !isShutDown else { return nil }
         guard let store = timelineStore else { return nil }
-        let items = store.load()
+        let rawItems = store.load()
+        scheduleMediaTypeReconciliation(
+            items: rawItems,
+            alreadyClassifiedNodeIDs: Set(store.mediaTypeEvidence(volumeID: rawItems.first?.uid.volumeID ?? "").keys))
+        let items = timelineOrderStore?.enrich(rawItems) ?? rawItems
         let validationToken = store.validationToken()
         guard !items.isEmpty || validationToken != nil else { return nil }
         librarySupport.lastSuccessfulLoad = .init(timestamp: Date(), sourcePath: .cache)
@@ -783,7 +798,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     }
 
     private func monitorToken(remoteToken: String) -> String {
-        "\(remoteToken)#media=\(timelineStore?.mediaTypeEvidenceRevision() ?? 0)"
+        "\(remoteToken)#media=\(timelineStore?.mediaTypeEvidenceRevision() ?? 0)#order=\(timelineOrderStore?.revision ?? 0)"
     }
 
     /// Returns the files that the events after the cached inventory token made active or removed. The Photos
@@ -817,67 +832,170 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         }
     }
 
-    /// Starts at the newest items so recently uploaded videos repair first, then checkpoints every
-    /// successful metadata batch. `fetch_metadata` supports 150 links per call, so even a 35k
-    /// library is a few hundred bounded requests rather than one request per asset.
+    /// Shares existing MIME batches with order inspection. The initial inventory is released after SQLite sync;
+    /// the network pass holds only one 150-link page. A disabled order cache retains the existing MIME fallback.
     private func scheduleMediaTypeReconciliation(
-        items: [PhotoItem],
-        alreadyClassifiedNodeIDs: Set<String>
+        items: [PhotoItem], alreadyClassifiedNodeIDs: Set<String>
     ) {
-        guard timelineStore != nil, mediaTypeReconciliationTask == nil else { return }
-        let unknown = items.reversed().compactMap { item -> PhotoUID? in
-            let nodeID = item.uid.nodeID
-            guard !alreadyClassifiedNodeIDs.contains(nodeID) else { return nil }
-            return item.uid
-        }
-        guard !unknown.isEmpty else { return }
-        mediaTypeReconciliationTask = Task(priority: .utility) { [weak self] in
+        guard timelineStore != nil, !isShutDown else { return }
+        mediaTypeReconciliationTask?.cancel()
+        metadataReconciliationGeneration &+= 1
+        let generation = metadataReconciliationGeneration
+        metadataReconciliationInput = (items, alreadyClassifiedNodeIDs)
+        mimeFallbackInventory = nil
+        mediaTypeReconciliationTask = Task(priority: .background) { [weak self] in
             guard let self else { return }
-            await self.reconcileMediaTypes(unknown)
+            _ = try? await self.withOpenSession { bridge in
+                await bridge.reconcileTimelineMetadata(generation: generation)
+            }
         }
     }
 
-    private func reconcileMediaTypes(_ unknown: [PhotoUID]) async {
+    private func prepareTimelineOrderCache() -> Bool {
+        guard let inventory = metadataReconciliationInput else { return false }
+        defer { metadataReconciliationInput = nil }
+        let useOrderCache =
+            timelineOrderStore?.synchronize(
+                inventory.items, isClassified: { inventory.classified.contains($0.nodeID) }) == true
+        if !useOrderCache {
+            mimeFallbackInventory = inventory
+            if timelineOrderStore != nil, !Task.isCancelled {
+                timelineOrderStore?.rebuild()
+                DebugLog.log("timeline: order cache unavailable; MIME reconciliation remains available")
+            }
+        }
+        return useOrderCache
+    }
+
+    private func reconcileTimelineMetadata(generation: UInt64) async {
+        guard generation == metadataReconciliationGeneration, !Task.isCancelled else { return }
+        let useOrderCache = prepareTimelineOrderCache()
         var changed = false
         defer {
-            if changed, timelineStore?.publishMediaTypeEvidenceRevision() == false {
+            if !isShutDown, changed, timelineStore?.publishMediaTypeEvidenceRevision() == false {
                 DebugLog.log("timeline: could not publish reconciled media-type revision")
             }
-            mediaTypeReconciliationTask = nil
+            if !isShutDown, generation == metadataReconciliationGeneration, useOrderCache {
+                do { _ = try timelineOrderStore?.publishCompletedSeconds() } catch {
+                    timelineOrderStore?.rebuild()
+                    DebugLog.log("timeline: could not publish completed order evidence")
+                }
+            }
+            if generation == metadataReconciliationGeneration {
+                mediaTypeReconciliationTask = nil
+                mimeFallbackInventory = nil
+            }
         }
         do {
-            let context = try await photosShareContext()
-            var resolved = 0
-            for batch in Self.metadataBatches(unknown) {
+            try Task.checkCancellation()
+            var resolvedContext: PhotosShareContext?
+            var cursor: PhotoUID?
+            var offset = 0
+            var rootKey: UnlockableKey?
+            var attemptedRootKey = false
+            let decoder = TimelineOrderMetadataDecoder()
+            while true {
                 try Task.checkCancellation()
+                guard generation == metadataReconciliationGeneration else { throw CancellationError() }
+                let page: [TimelineOrderMetadataStore.Candidate]
+                if useOrderCache, let timelineOrderStore {
+                    page = try timelineOrderStore.nextPage(after: cursor)
+                } else {
+                    guard let inventory = mimeFallbackInventory, offset < inventory.items.count else { break }
+                    let end = min(offset + TimelineOrderMetadataStore.pageSize, inventory.items.count)
+                    page = inventory.items[offset..<end].compactMap { item in
+                        guard !inventory.classified.contains(item.uid.nodeID) else { return nil }
+                        return .init(uid: item.uid, captureTime: item.captureTime, needsOrder: false)
+                    }
+                    offset = end
+                    if page.isEmpty { continue }
+                }
+                guard !page.isEmpty else { break }
+                cursor = page.last?.uid
+                let context: PhotosShareContext
+                if let resolvedContext {
+                    context = resolvedContext
+                } else {
+                    context = try await photosShareContext()
+                    resolvedContext = context
+                }
+                let candidates = page.filter { $0.uid.volumeID == context.volumeID }
+                if candidates.isEmpty { continue }
                 let links = try await ProtonRequestContext.$priority.withValue(.maintenance) {
                     try await driveSession.fetchPhotoLinksMetadata(
-                        shareID: context.shareID,
-                        linkIDs: batch.map(\.nodeID)
-                    )
+                        shareID: context.shareID, linkIDs: candidates.map { $0.uid.nodeID })
                 }
-                let volumeID = batch[0].volumeID
+                try Task.checkCancellation()
                 let evidence = Dictionary(
                     uniqueKeysWithValues: Self.mimeTypes(in: links).map { nodeID, mimeType in
-                        (PhotoUID(volumeID: volumeID, nodeID: nodeID), mimeType)
-                    }
-                )
+                        (PhotoUID(volumeID: context.volumeID, nodeID: nodeID), mimeType)
+                    })
                 let result = timelineStore?.recordMediaTypeEvidence(evidence, publishRevision: false)
                 guard result?.succeeded != false else {
                     throw NSError(
-                        domain: "EncryptedMemories.MediaTypeReconciliation",
-                        code: 1,
-                        userInfo: [NSLocalizedDescriptionKey: "media type checkpoint could not be saved"]
-                    )
+                        domain: "EncryptedMemories.MediaTypeReconciliation", code: 1,
+                        userInfo: [NSLocalizedDescriptionKey: "media type checkpoint could not be saved"])
                 }
                 changed = changed || (result?.changedRows ?? 0) > 0
-                resolved += evidence.count
+                var order: [PhotoUID: TimelineOrderMetadata] = [:]
+                if candidates.contains(where: \.needsOrder) {
+                    if !attemptedRootKey {
+                        attemptedRootKey = true
+                        do {
+                            let source = try await fileSource()
+                            rootKey = try await ProtonRequestContext.$priority.withValue(.maintenance) {
+                                try await source.nodeKey(ofLinkID: context.rootLinkID)
+                            }
+                        } catch is CancellationError {
+                            throw CancellationError()
+                        } catch {
+                            DebugLog.log("timeline: order key unavailable; MIME reconciliation continues")
+                        }
+                    }
+                    let requested = Dictionary(uniqueKeysWithValues: candidates.map { ($0.uid.nodeID, $0) })
+                    for link in links {
+                        try Task.checkCancellation()
+                        guard let id = link.linkID, let candidate = requested[id], candidate.needsOrder,
+                            link.state == nil || link.state == 1
+                        else { continue }
+                        do {
+                            if let xattr = link.xAttr ?? link.fileProperties?.activeRevision?.xAttr {
+                                guard let key = link.nodeKey, let passphrase = link.nodePassphrase, let rootKey else {
+                                    continue
+                                }
+                                let unlocked = try crypto.unlockNode(key: key, passphrase: passphrase, parent: rootKey)
+                                order[candidate.uid] = decoder.decode(try crypto.decryptXAttr(xattr, node: unlocked))
+                            } else {
+                                order[candidate.uid] = TimelineOrderMetadata()
+                            }
+                        } catch {
+                            // A failed decryption stays unknown, so a later pass retries it. MIME evidence is independent.
+                            PhotoDiagnostics.shared.increment("timeline.order.decryptFailure")
+                        }
+                        await Task.yield()
+                    }
+                }
+                try Task.checkCancellation()
+                if useOrderCache, timelineOrderStore?.record(order, classifiedUIDs: Set(evidence.keys)) == false {
+                    throw TimelineOrderMetadataError.unavailable
+                }
             }
-            DebugLog.log("timeline: media-type reconciliation resolved \(resolved)/\(unknown.count) links ✓")
         } catch is CancellationError {
-            DebugLog.log("timeline: media-type reconciliation cancelled; persisted batches will resume")
+            DebugLog.log("timeline: metadata reconciliation cancelled; persisted pages will resume")
+        } catch is TimelineOrderMetadataError {
+            timelineOrderStore?.rebuild()
+            DebugLog.log("timeline: order cache rebuilt after a failed page")
         } catch {
-            DebugLog.log("timeline: media-type reconciliation paused after a recoverable failure - \(error)")
+            DebugLog.log("timeline: metadata reconciliation paused after a recoverable failure")
+        }
+    }
+
+    private func orderedSections(_ sections: [TimelineSection]) -> [TimelineSection] {
+        guard let timelineOrderStore else { return sections }
+        return sections.map { section in
+            TimelineSection(
+                id: section.id, date: section.date, title: section.title,
+                items: timelineOrderStore.enrich(section.items))
         }
     }
 
@@ -1603,7 +1721,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         let evidence = timelineStore?.mediaTypeEvidence(volumeID: volumeID) ?? [:]
         let motions = try await livePhotoMotions(
             of: Self.livePhotos(in: entries), volumeID: volumeID, evidence: evidence)
-        return Self.group(entries, volumeID: volumeID, mediaTypeOverrides: evidence, motions: motions)
+        return orderedSections(Self.group(entries, volumeID: volumeID, mediaTypeOverrides: evidence, motions: motions))
     }
 
     /// The related files of each Live Photo in `entries` in listing order, by link ID.
@@ -1686,7 +1804,19 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     }
 
     private func metadataImpl(for uid: PhotoUID) async throws -> PhotoMetadata {
-        let metadata = try await SDKPhotoMetadataReader.metadata(for: uid, client: photosClient)
+        let read = try await SDKPhotoMetadataReader.read(for: uid, client: photosClient)
+        let metadata = read.metadata
+        if let order = read.timelineOrder, let timelineOrderStore {
+            if timelineOrderStore.record([uid: order]) {
+                do { _ = try timelineOrderStore.publishCompletedSeconds() } catch {
+                    timelineOrderStore.rebuild()
+                    DebugLog.log("timeline: could not publish order resolved by viewer")
+                }
+            } else {
+                timelineOrderStore.rebuild()
+                DebugLog.log("timeline: could not persist order resolved by viewer")
+            }
+        }
         if let mimeType = metadata.mimeType {
             let result = timelineStore?.recordMediaTypeEvidence([uid: mimeType])
             if result?.succeeded == false {

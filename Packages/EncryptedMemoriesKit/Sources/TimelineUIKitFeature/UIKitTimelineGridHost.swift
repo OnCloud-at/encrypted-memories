@@ -264,6 +264,7 @@
         var thumbnailFeed: UIKitThumbnailFeed?
         private var items: [PhotoItem] = []
         private var configuredContentRevision: UInt64?
+        private var deferredOrderUpdate: (items: [PhotoItem], revision: UInt64?)?
         private var hasConfiguredContent = false
         /// Flat UID order for the current items, cached so the per-frame composer input never re-maps the library.
         var itemUIDs: [PhotoUID] = []
@@ -530,7 +531,7 @@
             }
             swipeSelection.updateEnabled()
             let feedChanged = wiredFeed !== thumbnailFeed
-            let contentChanged: Bool
+            var contentChanged: Bool
             if let contentRevision {
                 contentChanged =
                     feedChanged
@@ -540,6 +541,31 @@
                 // Collection and map grids can omit a revision. Array equality retains Swift's shared-storage fast
                 // path and preserves their existing behavior until their owners expose a monotonic identity.
                 contentChanged = feedChanged || !hasConfiguredContent || items != self.items
+            }
+            var isOrderCorrection = false
+            var orderAnchor: GridScrollAnchor<PhotoUID>?
+            if contentChanged, !feedChanged, hasConfiguredContent,
+                fillOrder == self.fillOrder, gridProfile == requestedProfile,
+                initialViewportPlacement == self.initialViewportPlacement
+            {
+                if let contentRevision, deferredOrderUpdate?.revision == contentRevision {
+                    contentChanged = false
+                } else {
+                    let visible = Set(accessibilityFramePlan()?.visibleSlots.map(\.index) ?? [])
+                    let decision = TimelineOrderRefinementPolicy.decision(
+                        incoming: items, previousCount: self.items.count, visibleIndices: visible,
+                        previous: { uid in self.itemIndexByUID[uid].map { ($0, self.items[$0]) } })
+                    isOrderCorrection = decision != .ordinaryUpdate
+                    if decision == .deferVisibleCorrection || (isOrderCorrection && !canRefineOrder) {
+                        deferredOrderUpdate = (items, contentRevision)
+                        contentChanged = false
+                    } else {
+                        deferredOrderUpdate = nil
+                        if isOrderCorrection { orderAnchor = currentScrollAnchor() }
+                    }
+                }
+            } else if contentChanged {
+                deferredOrderUpdate = nil
             }
             let newUIDs = contentChanged ? items.map(\.uid) : itemUIDs
             let uidsChanged = contentChanged && itemUIDs != newUIDs
@@ -553,7 +579,8 @@
                 // Do not let a later revision-bearing caller match an identity from an earlier surface by accident.
                 configuredContentRevision = nil
             }
-            let shouldPlaceInitialViewport = uidsChanged && !itemUIDs.isEmpty && !userHasScrolledTimeline
+            let shouldPlaceInitialViewport =
+                uidsChanged && !isOrderCorrection && !itemUIDs.isEmpty && !userHasScrolledTimeline
             self.thumbnailFeed = thumbnailFeed
             self.metadataProvider = metadataProvider
             if requestedProfile != gridProfile {
@@ -602,7 +629,7 @@
                 swipeSelection.cancel()
                 resizeAnchorItemID = nil
                 contentGeneration &+= 1
-                committedPhase = nil
+                if !isOrderCorrection { committedPhase = nil }
                 cancelLiveZoomState()
                 itemIndexByUID = Dictionary(
                     itemUIDs.enumerated().map { ($0.element, $0.offset) },
@@ -623,8 +650,31 @@
                 }
             }
             refreshContentSize()
+            if let orderAnchor { restoreScrollAnchor(orderAnchor, marksTimelineAsScrolled: false) }
             requestRender()
             invalidateAccessibilityElements()
+        }
+
+        private var canRefineOrder: Bool {
+            !pinchInputActive && !pinchSettling && zoomTransaction == nil && commitBridgeTransaction == nil
+                && !gridTransition.isActive && overviewDissolve == nil
+        }
+
+        /// A scroll inspects only visible slots. The pending array shares its storage with the publication.
+        func applyDeferredOrderIfOffscreen() {
+            guard let pending = deferredOrderUpdate, canRefineOrder, let thumbnailFeed else { return }
+            let visible = Set(accessibilityFramePlan()?.visibleSlots.map(\.index) ?? [])
+            guard
+                !TimelineOrderRefinementPolicy.movesVisiblePhoto(
+                    incoming: pending.items, visibleIndices: visible, previousUID: { self.itemUIDs[$0] })
+            else { return }
+            deferredOrderUpdate = nil
+            configure(
+                items: pending.items, contentRevision: pending.revision,
+                thumbnailFeed: thumbnailFeed, metadataProvider: metadataProvider,
+                level: levelOverride, gridProfile: requestedProfile, fillOrder: fillOrder,
+                initialViewportPlacement: initialViewportPlacement, displayMode: displayMode,
+                selectionMode: selectionMode, selectedUIDs: selectedUIDs, uploadBadges: uploadBadges)
         }
 
         /// Captures the currently presented Metal surface before a projection replacement.
@@ -1851,6 +1901,7 @@
                 if abs(dy) > 1 { scrollDirectionDown = dy > 0 }
             }
             lastScrollY = scrollView.contentOffset.y
+            if !isApplyingProgrammaticScroll { applyDeferredOrderIfOffscreen() }
             // Scroll deltas arrive faster than vsync - mark dirty only; the display link draws exactly once
             // per frame with whatever offset is current by then.
             perf.noteScrollEvent()

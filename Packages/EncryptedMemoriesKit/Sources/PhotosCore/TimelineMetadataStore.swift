@@ -4,14 +4,22 @@ import SQLite3
 
 // MARK: - Timeline ordering
 
-/// The canonical timeline total order: `(captureTime, volumeID, nodeID)` ascending. This is the
-/// same order the database index `idx_photos_timeline(t, vol, node)` produces, so in-memory sorts,
-/// persisted rows, and grid identity agree deterministically across launches, devices, and
-/// platforms. String keys compare as UTF-8 bytes (SQLite's BINARY collation), and capture times
-/// compare in the `timeIntervalSince1970` projection that is actually stored in the `t` column -
-/// never diverge from either, or equal-time rows can silently swap grid positions between runs.
+/// Canonical chronological order. Valid encrypted subsecond times refine the listing's capture second.
+/// Stable source identities break exact ties; missing evidence retains the volume/link fallback.
+/// The timeline database keeps its original `(t, vol, node)` index. The separate order cache overlays evidence.
 public enum TimelineOrder {
     public static func areInIncreasingOrder(_ a: PhotoItem, _ b: PhotoItem) -> Bool {
+        let ka = a.timelineOrder?.validated(for: a.captureTime)
+        let kb = b.timelineOrder?.validated(for: b.captureTime)
+        let ta = (ka?.exactCaptureTime ?? a.captureTime).timeIntervalSince1970
+        let tb = (kb?.exactCaptureTime ?? b.captureTime).timeIntervalSince1970
+        if ta != tb { return ta < tb }
+        let identity = compareUTF8(ka?.stableIdentity ?? "", kb?.stableIdentity ?? "")
+        if identity != 0 { return identity < 0 }
+        return areInBaseOrder(a, b)
+    }
+
+    static func areInBaseOrder(_ a: PhotoItem, _ b: PhotoItem) -> Bool {
         let ta = a.captureTime.timeIntervalSince1970
         let tb = b.captureTime.timeIntervalSince1970
         if ta != tb { return ta < tb }
@@ -20,8 +28,7 @@ public enum TimelineOrder {
         return compareUTF8(a.uid.nodeID, b.uid.nodeID) < 0
     }
 
-    /// memcmp-style UTF-8 byte comparison, matching SQLite's BINARY TEXT collation. Swift's
-    /// `String <` is Unicode-canonical and could disagree on non-ASCII input.
+    /// Matches SQLite's BINARY TEXT collation, including non-ASCII source identifiers.
     private static func compareUTF8(_ a: String, _ b: String) -> Int {
         if a.utf8.lexicographicallyPrecedes(b.utf8) { return -1 }
         if b.utf8.lexicographicallyPrecedes(a.utf8) { return 1 }
@@ -454,7 +461,7 @@ public final class TimelineMetadataStore {
         // Canonical order: identical input sets digest identically regardless of arrival order,
         // and rows persist in exactly the order load() returns them. The enumeration feeding save
         // is normally already in timeline order, so an O(n) precheck skips a redundant full sort.
-        let ordered = Self.isTimelineOrdered(items) ? items : items.sorted(by: TimelineOrder.areInIncreasingOrder)
+        let ordered = Self.isTimelineOrdered(items) ? items : items.sorted(by: TimelineOrder.areInBaseOrder)
         let digest = Self.timelineDigest(of: ordered)
         let generation = readMetaInt(Self.metaGenerationKey) ?? 0
 
@@ -659,7 +666,7 @@ public final class TimelineMetadataStore {
     private static func isTimelineOrdered(_ items: [PhotoItem]) -> Bool {
         var index = 1
         while index < items.count {
-            if TimelineOrder.areInIncreasingOrder(items[index], items[index - 1]) { return false }
+            if TimelineOrder.areInBaseOrder(items[index], items[index - 1]) { return false }
             index += 1
         }
         return true

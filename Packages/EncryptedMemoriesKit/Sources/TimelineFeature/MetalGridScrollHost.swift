@@ -1297,7 +1297,9 @@ final class MetalGridScrollHost: NSView {
         case .oldest:
             targetY = 0
         case .restore(let anchor):
-            if let rect = coordinator.cellContentRect(forUID: anchor.itemID) {
+            if let index = coordinator.flatIndex(forUID: anchor.itemID),
+                let rect = coordinator.cellContentRect(forFlatIndex: index)
+            {
                 targetY = min(max(0, rect.minY - anchor.topOffset), maxY)
             } else {
                 targetY = maxY  // If the anchor is gone, use the newest edge.
@@ -1326,7 +1328,10 @@ final class MetalGridScrollHost: NSView {
     /// Returns a layout-independent anchor for restoring the current route.
     func currentScrollAnchor() -> GridScrollAnchor<PhotoUID>? {
         let originY = scrollView.contentView.bounds.origin.y
-        guard let top = coordinator.visibleCells().min(by: { $0.rect.minY < $1.rect.minY }),
+        guard
+            let top = GridScrollAnchorPolicy.anchor(
+                among: coordinator.visibleCells(), visibleTop: originY + topBarInset,
+                visibleBottom: originY + scrollView.contentView.bounds.height, frame: \.rect),
             let uid = coordinator.uid(atFlatIndex: top.flatIndex)
         else { return nil }
         return GridScrollAnchor(itemID: uid, topOffset: top.rect.minY - originY)
@@ -1419,14 +1424,20 @@ final class MetalGridScrollHost: NSView {
     /// Install a new data source. For an incremental update, pass `.preserve` to keep the current scroll
     /// position. For a sidebar route switch, pass `.newest` to arm one-shot placement consumed by
     /// `applyContentSize` after geometry is valid. It does not scroll immediately or arm sticky bottom-pinning.
-    func setDataSource(_ source: MetalGridDataSource, initialViewport: GridInitialViewport = .preserve) {
+    func setDataSource(
+        _ source: MetalGridDataSource, initialViewport: GridInitialViewport = .preserve,
+        preservingColumnPhase: Bool = false
+    ) {
         installImageAvailabilityCallback(on: source)
         if initialViewport != .preserve {
             pendingInitialViewport = initialViewport
-            coordinator.resetCommittedPhase()  // canonical bottom-right phase, BEFORE the size callback
+            if !preservingColumnPhase {
+                coordinator.resetCommittedPhase()  // canonical bottom-right phase, BEFORE the size callback
+            }
         }
         coordinator.setUserInteractionActive(false, owner: interactionOwner)
-        coordinator.setDataSource(source)  // Rebuild, then apply content size from the callback.
+        // Rebuild before the size callback.
+        coordinator.setDataSource(source, preservingColumnPhase: preservingColumnPhase)
         reportedFeedInteractionActive = false
         updateFeedInteractionState()
         applyContentSize(coordinator.contentSize())  // pins to bottom when sticky / consumes a pending policy

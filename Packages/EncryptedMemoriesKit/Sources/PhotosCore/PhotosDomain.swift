@@ -19,6 +19,8 @@ public struct PhotoUID: Hashable, Sendable, Codable {
 public struct PhotoItem: Identifiable, Hashable, Sendable, Codable {
     public let uid: PhotoUID
     public let captureTime: Date
+    /// Optional subsecond order evidence; the server listing time remains unchanged.
+    public var timelineOrder: TimelineOrderMetadata?
     public let mediaType: String  // e.g. "image/jpeg", "video/quicktime"
     public let isLivePhoto: Bool
     /// For a Live Photo, the node ID (same volume) of the paired video file.
@@ -55,10 +57,12 @@ public struct PhotoItem: Identifiable, Hashable, Sendable, Codable {
         relatedVideoID: String? = nil,
         durationSeconds: Double? = nil,
         tags: Set<PhotoTag> = [],
-        burstMemberIDs: [String] = []
+        burstMemberIDs: [String] = [],
+        timelineOrder: TimelineOrderMetadata? = nil
     ) {
         self.uid = uid
         self.captureTime = captureTime
+        self.timelineOrder = timelineOrder
         self.mediaType = mediaType
         self.isLivePhoto = isLivePhoto
         self.relatedVideoID = relatedVideoID
@@ -68,13 +72,15 @@ public struct PhotoItem: Identifiable, Hashable, Sendable, Codable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case uid, captureTime, mediaType, isLivePhoto, relatedVideoID, durationSeconds, tags, burstMemberIDs
+        case uid, captureTime, mediaType, isLivePhoto, relatedVideoID, durationSeconds, tags, burstMemberIDs,
+            timelineOrder
     }
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         uid = try container.decode(PhotoUID.self, forKey: .uid)
         captureTime = try container.decode(Date.self, forKey: .captureTime)
+        timelineOrder = try container.decodeIfPresent(TimelineOrderMetadata.self, forKey: .timelineOrder)
         mediaType = try container.decode(String.self, forKey: .mediaType)
         isLivePhoto = try container.decodeIfPresent(Bool.self, forKey: .isLivePhoto) ?? false
         relatedVideoID = try container.decodeIfPresent(String.self, forKey: .relatedVideoID)
@@ -87,6 +93,7 @@ public struct PhotoItem: Identifiable, Hashable, Sendable, Codable {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(uid, forKey: .uid)
         try container.encode(captureTime, forKey: .captureTime)
+        try container.encodeIfPresent(timelineOrder, forKey: .timelineOrder)
         try container.encode(mediaType, forKey: .mediaType)
         try container.encode(isLivePhoto, forKey: .isLivePhoto)
         try container.encodeIfPresent(relatedVideoID, forKey: .relatedVideoID)
