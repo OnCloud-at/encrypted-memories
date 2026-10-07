@@ -794,7 +794,7 @@ private struct MacFailedBackupSheet: View {
 
     let source: Source
     @Environment(\.dismiss) private var dismiss
-    @State private var backupItems: [BackupFailedItem] = []
+    @State private var problemList = BackupProblemListModel()
 
     init(controller: PhotoLibraryBackupController) {
         source = .backup(controller)
@@ -810,7 +810,7 @@ private struct MacFailedBackupSheet: View {
 
     private var items: [BackupFailedItem] {
         switch source {
-        case .backup: backupItems
+        case .backup: problemList.items
         case .album(let albumSync, let albumID):
             albumSync.selectedAlbums.first { $0.id == albumID }?.problems ?? []
         }
@@ -849,62 +849,34 @@ private struct MacFailedBackupSheet: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 List {
-                    ForEach(BackupIssueSection.allCases) { section in
-                        let sectionItems = items.filter { $0.category.section == section }
-                        if !sectionItems.isEmpty {
-                            Section {
-                                ForEach(sectionItems) { item in
-                                    HStack(alignment: .top, spacing: 10) {
-                                        Image(systemName: item.category.symbolName)
-                                            .foregroundStyle(item.isPermanent ? Color.secondary : Color.orange)
-                                        VStack(alignment: .leading, spacing: 2) {
-                                            Text(item.filename)
-                                                .lineLimit(1)
-                                                .truncationMode(.middle)
-                                            Text(item.reason)
-                                                .font(.caption)
-                                                .foregroundStyle(.secondary)
-                                                .fixedSize(horizontal: false, vertical: true)
-                                            if let retryDescription = item.retryDescription {
-                                                Text(retryDescription)
-                                                    .font(.caption2)
-                                                    .foregroundStyle(.secondary)
-                                            }
-                                        }
-                                        Spacer(minLength: 8)
-                                        if let controller, item.issue == .deletedElsewhere {
-                                            Button(L10n.string("backup.keep_deleted")) {
-                                                controller.keepDeleted(item)
-                                                Task { backupItems = await controller.problemItems() }
-                                            }
-                                            .buttonStyle(.borderless)
-                                            .help(L10n.string("backup.keep_deleted"))
-                                            Button(L10n.string("backup.back_up_again")) {
-                                                controller.backUpAgain(item)
-                                                Task {
-                                                    backupItems = await controller.problemItems().filter {
-                                                        $0.id != item.id || $0.issue == .deletedElsewhere
-                                                    }
-                                                }
-                                            }
-                                            .buttonStyle(.borderless)
-                                            .help(L10n.string("backup.back_up_again"))
-                                        } else if let controller, item.isPermanent {
-                                            Button {
-                                                controller.dismissFailedItem(item)
-                                                backupItems.removeAll { $0.id == item.id }
-                                            } label: {
-                                                Image(systemName: "xmark.circle")
-                                            }
-                                            .buttonStyle(.borderless)
-                                            .help(L10n.string("backup.failed_item_dismiss"))
+                    BackupProblemSections(items: items) { item in
+                        BackupProblemRow(item: item) {
+                            if let controller, item.issue == .deletedElsewhere {
+                                Button(L10n.string("backup.keep_deleted")) {
+                                    controller.keepDeleted(item)
+                                    Task { await problemList.refresh { await controller.problemItems() } }
+                                }
+                                .buttonStyle(.borderless)
+                                .help(L10n.string("backup.keep_deleted"))
+                                Button(L10n.string("backup.back_up_again")) {
+                                    controller.backUpAgain(item)
+                                    Task {
+                                        await problemList.refresh(afterDecision: item) {
+                                            await controller.problemItems()
                                         }
                                     }
-                                    .padding(.vertical, 2)
                                 }
-                            } header: {
-                                Text(section.localizedTitle)
-                                    .accessibilityIdentifier("backup.issueSection.\(section.rawValue)")
+                                .buttonStyle(.borderless)
+                                .help(L10n.string("backup.back_up_again"))
+                            } else if let controller, item.isPermanent {
+                                Button {
+                                    controller.dismissFailedItem(item)
+                                    problemList.dismissItem(id: item.id)
+                                } label: {
+                                    Image(systemName: "xmark.circle")
+                                }
+                                .buttonStyle(.borderless)
+                                .help(L10n.string("backup.failed_item_dismiss"))
                             }
                         }
                     }
@@ -923,7 +895,7 @@ private struct MacFailedBackupSheet: View {
         // A photo can need the person while the list is open; Try again then appears.
         .task(id: controller?.status.problemListKey) {
             guard let controller else { return }
-            await controller.followProblemList { backupItems = $0 }
+            await controller.followProblemList { problemList.replaceItems($0) }
         }
     }
 }
