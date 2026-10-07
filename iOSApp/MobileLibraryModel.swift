@@ -745,19 +745,8 @@ final class MobileLibraryModel {
     /// The whole-library grid's snapshot: it also holds pending photos, so selections of them resolve.
     private var gridSnapshot: TimelineSnapshot { showsPendingPhotos ? pendingPresentation.snapshot : snapshot }
 
-    /// Returns the encrypted thumbnail-cache size without blocking the main actor on file I/O.
-    func cacheDiskSizeBytes() async -> Int64 {
-        guard let cache = thumbnailCache else { return 0 }
-        return await Task.detached { cache.diskSizeBytes() }.value
-    }
-
-    /// Identifies the current thumbnail cache, so Settings observes the replacement after an account reload.
-    var cacheDiskIdentity: ObjectIdentifier? { thumbnailCache.map(ObjectIdentifier.init) }
-
-    /// Signals thumbnail-cache changes through the shared coalesced cache signal.
-    func cacheDiskChanges() -> AsyncStream<Void> {
-        ThumbnailCache.diskChanges(of: thumbnailCache.map { [$0] } ?? [])
-    }
+    /// The cache whose size Settings shows. An account reload replaces it, which restarts the Settings observation.
+    var diskCaches: ThumbnailCacheGroup { ThumbnailCacheGroup(thumbnailCache.map { [$0] } ?? []) }
 
     /// Clears the thumbnail cache and restarts prefetch. The feed keeps decoded thumbnails, and only the
     /// cache-owned directory is removed.

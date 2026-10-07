@@ -594,6 +594,13 @@ public enum UploadError: LocalizedError, Equatable {
     /// row due at `until` without counting an attempt; the finished file usually arrives sooner as a new
     /// revision, which the platform's change notification enqueues.
     case sourceNotReady(String, until: Date)
+    /// Photos cannot hand out the file now: it waits for iCloud, an offline library volume, or an interrupted read.
+    /// The runner checks the row again after a backoff without an attempt. This says nothing about the Proton
+    /// connection, so other uploads keep their concurrency.
+    case sourceUnavailable(String)
+    /// Photos reports the file as missing. A short iCloud fault can report that too, so the runner checks the row
+    /// a few more times, hours apart, before it treats the photo as gone.
+    case sourceReportedMissing(String)
     /// The account's remaining Proton storage cannot hold the file. The item waits; freeing space or a larger plan
     /// and Back Up Now take it up again.
     case accountStorageFull(String, requiredBytes: Int64, availableBytes: Int64)
@@ -609,6 +616,7 @@ public enum UploadError: LocalizedError, Equatable {
         case .albumStep(let message): L10n.string("error.upload_album_step \(message)")
         case .cancelled: L10n.string("error.upload_cancelled")
         case .sourceNotReady(let name, _): L10n.string("error.upload_source_not_ready \(name)")
+        case .sourceUnavailable, .sourceReportedMissing: L10n.string("backup.issue_source_unavailable")
         case .accountStorageFull(let name, let required, let available):
             L10n.string(
                 "error.upload_account_storage_full \(name) \(L10n.fileSize(required)) \(L10n.fileSize(available))")

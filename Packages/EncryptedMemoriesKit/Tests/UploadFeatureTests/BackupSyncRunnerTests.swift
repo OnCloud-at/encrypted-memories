@@ -1,7 +1,9 @@
 import Foundation
+import Photos
 import PhotosCore
 import XCTest
 
+@testable import PhotoLibraryBackupAdapter
 @testable import UploadCore
 
 /// Fake time: `now` only advances when the runner sleeps, so backoff scheduling is fully
@@ -65,6 +67,9 @@ final class ScriptedBackupResolver: BackupResourceResolving, @unchecked Sendable
         /// Throw `BackupTempFileError.needsFreeSpace` from the first `times` copies for upload, after the duplicate
         /// check. Models a large video whose copy does not fit on the device.
         case needsFreeSpaceOnCopy(times: Int)
+        /// Throw `error` for the first `times` resolves, then behave like `.standard`. Models a PhotoKit read failure
+        /// as the photo library resolver reports it.
+        case failure(any Error, times: Int)
     }
 
     private let lock = NSLock()
@@ -158,6 +163,7 @@ final class ScriptedBackupResolver: BackupResourceResolving, @unchecked Sendable
             if case .diskPressure(let times) = behavior { remainingFailures[identifier] = times }
             if case .notReady(let times, _) = behavior { remainingFailures[identifier] = times }
             if case .needsFreeSpaceOnCopy(let times) = behavior { remainingFailures[identifier] = times }
+            if case .failure(_, let times) = behavior { remainingFailures[identifier] = times }
         }
     }
 
@@ -201,6 +207,8 @@ final class ScriptedBackupResolver: BackupResourceResolving, @unchecked Sendable
             if consumeFailure() { throw BackupTempFileStore.BackupTempFileError.diskBudgetExceeded }
         case .notReady(_, let until):
             if consumeFailure() { throw UploadError.sourceNotReady(id, until: until) }
+        case .failure(let error, _):
+            if consumeFailure() { throw error }
         case .standard, .needsFreeSpaceOnCopy:
             break
         }
@@ -1052,6 +1060,149 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertEqual(uploader.requests.count, 1)
         XCTAssertEqual(progress.failed, 0)
         XCTAssertEqual(resolver.resolveCount(for: entry.source.identifier), 8, "7 pressure failures, then success")
+    }
+
+    /// A PhotoKit read failure as the photo library resolver reports it.
+    private func photoKitFailure(_ code: PHPhotosError.Code, for name: String) -> any Error {
+        PhotoLibraryResourceResolver.normalizedPhotoKitError(
+            NSError(domain: PHPhotosErrorDomain, code: code.rawValue), filename: name)
+    }
+
+    func testPhotosThatWaitForICloudDoNotSlowDownPhotosOnTheDevice() async throws {
+        // Claimed first: the oldest rows of the same revision.
+        let waiting = (0..<2).map { seedEntry("cloud-\($0).heic", ageSeconds: 600) }
+        for entry in waiting {
+            resolver.set(
+                .failure(photoKitFailure(.networkAccessRequired, for: entry.originalFilename), times: 1),
+                for: entry.source.identifier)
+        }
+        let first = seedEntry("first.jpg", ageSeconds: 120)
+        let second = seedEntry("second.jpg")
+        let transfers = HeldTransferUploader(held: ["first.jpg"])
+        let runner = makeRunner(uploader: transfers, throttle: BackupThrottlePolicy(baseConcurrency: 2))
+        let pass = Task { await runner.runUntilDrained() }
+
+        let secondStarted = await waitUntil { transfers.started.contains("second.jpg") }
+        transfers.releaseAll()
+        let progress = await pass.value
+
+        XCTAssertTrue(secondStarted, "two photos on the device upload at once while two others wait for iCloud")
+        XCTAssertEqual(progress.uploaded, 4)
+        for entry in waiting + [first, second] {
+            XCTAssertEqual(state(of: entry), .completed)
+            XCTAssertEqual(queueStore.entry(for: entry.source, revision: entry.revision)?.attempts, 0)
+        }
+    }
+
+    func testAPhotoThatWaitsForICloudWaitsWithItsOwnReasonAndWithoutAnAttempt() async throws {
+        let entry = seedEntry("cloud.heic")
+        resolver.set(
+            .failure(photoKitFailure(.networkAccessRequired, for: "cloud.heic"), times: 2), for: entry.source.identifier
+        )
+
+        let runner = makeRunner()
+        _ = await runner.runUntilDrained(mode: .eligibleOnly)
+        let row = try XCTUnwrap(queueStore.entry(for: entry.source, revision: entry.revision))
+        XCTAssertEqual(row.state, .discovered, "a state that older builds know, never a failure")
+        XCTAssertEqual(row.attempts, 0)
+        let issue = try XCTUnwrap(BackupIssueRecord.decode(row.lastError))
+        XCTAssertEqual(issue.kind, .unknown, "Photos waits, not the connection")
+        XCTAssertEqual(issue.detail, BackupFailedItem.sourceUnavailableDetail)
+        XCTAssertEqual(issue.automaticRetryAttempt, 1)
+        XCTAssertEqual(issue.nextAttemptAt, row.updatedAt)
+        let item = BackupFailedItem(entry: row)
+        XCTAssertEqual(item.reason, L10n.string("backup.issue_source_unavailable"))
+        XCTAssertNotEqual(item.reason, L10n.string("backup.issue_network"))
+        XCTAssertEqual(item.category, .automatic)
+
+        // The wait grows like a network retry, and the photo uploads once Photos hands it out.
+        _ = await runner.runUntilDrained()
+        XCTAssertEqual(state(of: entry), .completed)
+        XCTAssertEqual(resolver.resolveCount(for: entry.source.identifier), 3)
+        XCTAssertEqual(clock.sleeps, [1, 2])
+        XCTAssertEqual(uploader.requests.count, 1)
+    }
+
+    func testAPhotoThatPhotosReportsMissingIsCheckedAgainHoursLaterAndBacksUp() async throws {
+        let entry = seedEntry("interrupted.heic")
+        resolver.set(
+            .failure(photoKitFailure(.missingResource, for: "interrupted.heic"), times: 2), for: entry.source.identifier
+        )
+        let runner = makeRunner()
+
+        for (checks, wait) in [(1, 3600.0), (2, 7200)] {
+            _ = await runner.runUntilDrained(mode: .eligibleOnly)
+            let row = try XCTUnwrap(
+                queueStore.entry(for: entry.source, revision: entry.revision),
+                "a short iCloud fault must not drop the photo from the backup")
+            XCTAssertEqual(row.state, .discovered)
+            XCTAssertEqual(row.attempts, 0)
+            let issue = try XCTUnwrap(BackupIssueRecord.decode(row.lastError))
+            XCTAssertEqual(issue.kind, .unknown)
+            XCTAssertEqual(issue.detail, BackupFailedItem.sourceReportedMissingDetail)
+            XCTAssertEqual(issue.automaticRetryAttempt, checks)
+            XCTAssertEqual(row.updatedAt.timeIntervalSince(clock.now), wait, accuracy: 0.001)
+            XCTAssertEqual(BackupFailedItem(entry: row).reason, L10n.string("backup.issue_source_unavailable"))
+            XCTAssertEqual(BackupFailedItem(entry: row).category, .automatic)
+            clock.advance(by: wait)
+        }
+        _ = await runner.runUntilDrained(mode: .eligibleOnly)
+
+        XCTAssertEqual(state(of: entry), .completed)
+        XCTAssertEqual(resolver.resolveCount(for: entry.source.identifier), 3)
+        XCTAssertEqual(uploader.requests.count, 1)
+    }
+
+    func testAPhotoThatStaysMissingLeavesTheBackupAfterThreeChecks() async throws {
+        let entry = seedEntry("gone.heic")
+        resolver.set(
+            .failure(photoKitFailure(.missingResource, for: "gone.heic"), times: 10), for: entry.source.identifier)
+        let runner = makeRunner()
+
+        for wait in [3600.0, 7200, 14_400] {
+            _ = await runner.runUntilDrained(mode: .eligibleOnly)
+            XCTAssertNotNil(queueStore.entry(for: entry.source, revision: entry.revision))
+            clock.advance(by: wait)
+        }
+        let progress = await runner.runUntilDrained(mode: .eligibleOnly)
+
+        XCTAssertNil(queueStore.entry(for: entry.source, revision: entry.revision))
+        XCTAssertEqual(resolver.resolveCount(for: entry.source.identifier), 4)
+        XCTAssertEqual(progress.needsAttention, 0)
+        XCTAssertTrue(uploader.requests.isEmpty)
+    }
+
+    func testBackUpNowDoesNotUseUpTheChecksOfAPhotoThatPhotosReportsMissing() async throws {
+        let entry = seedEntry("interrupted.heic")
+        let missing = photoKitFailure(.missingResource, for: "interrupted.heic")
+        resolver.set(.failure(missing, times: 10), for: entry.source.identifier)
+        let runner = makeRunner()
+        _ = await runner.runUntilDrained(mode: .eligibleOnly)
+        let planned = try XCTUnwrap(queueStore.entry(for: entry.source, revision: entry.revision)).updatedAt
+
+        // The person taps Back Up Now three times during the same iCloud fault.
+        for _ in 0..<3 {
+            clock.advance(by: 60)
+            _ = await runner.makeRetryableWorkEligibleNow()
+            _ = await runner.runUntilDrained(mode: .eligibleOnly)
+        }
+
+        let row = try XCTUnwrap(
+            queueStore.entry(for: entry.source, revision: entry.revision), "only checks hours apart remove the photo")
+        XCTAssertEqual(resolver.resolveCount(for: entry.source.identifier), 4)
+        XCTAssertEqual(BackupIssueRecord.decode(row.lastError)?.automaticRetryAttempt, 1)
+        XCTAssertEqual(row.updatedAt, planned, "the planned check keeps its time")
+    }
+
+    func testAPhotoThatPhotosNoLongerKnowsLeavesTheBackupAtOnce() async throws {
+        let entry = seedEntry("unknown.heic")
+        resolver.set(
+            .failure(photoKitFailure(.identifierNotFound, for: "unknown.heic"), times: 1), for: entry.source.identifier)
+
+        _ = await makeRunner().runUntilDrained(mode: .eligibleOnly)
+
+        XCTAssertNil(queueStore.entry(for: entry.source, revision: entry.revision))
+        XCTAssertEqual(resolver.resolveCount(for: entry.source.identifier), 1)
     }
 
     func testPhotoTheCameraStillProcessesWaitsForTheEndOfItsWindowWithoutPolling() async throws {
