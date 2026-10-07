@@ -1102,6 +1102,62 @@ final class ExactDuplicateFinderTests: XCTestCase {
         XCTAssertEqual(restores, [])
     }
 
+    /// A merge whose check failed, so it waits in the journal. Within the window, another device uploads `edit` and
+    /// trashes the kept photo. `holdingOriginal` gives the edit the bytes of the group as its original file.
+    private func pendingMergeReplacedByEdit(
+        holdingOriginal: Bool
+    ) async throws -> (kept: PhotoUID, duplicate: PhotoUID, edit: PhotoUID, finder: ExactDuplicateFinder) {
+        let kept = server.seedLink(digest: digest("a"))
+        let duplicate = server.seedLink(digest: digest("a"))
+        indexServer()
+        let group = try await onlyGroup()
+        server.failingVisibilityReadsAfterDuplicateTrash = ExactDuplicateFinder.keptReadAttempts
+        var finder = finder()
+        finder.keptReadRetryDelay = .zero
+        do {
+            _ = try await finder.merge(group, keeping: kept)
+            XCTFail("The merge cannot tell whether the kept photo stayed")
+        } catch {}
+        let edit = server.seedLink(digest: digest("a edited"))
+        _ = server.seedLink(digest: digest(holdingOriginal ? "a" : "a earlier edit"), main: edit)
+        server.markReplaces([kept.nodeID], by: edit)
+        server.personTrash(kept)
+        return (kept, duplicate, edit, finder)
+    }
+
+    func testAPendingMergeLeavesTheDuplicateInTheTrashWhenAnEditReplacedTheKeptPhoto() async throws {
+        let (kept, duplicate, edit, finder) = try await pendingMergeReplacedByEdit(holdingOriginal: true)
+
+        _ = try await finder.duplicateGroups()
+
+        XCTAssertEqual(state(of: duplicate), .trashed, "no unedited copy returns next to the edit")
+        XCTAssertEqual(state(of: kept), .trashed)
+        XCTAssertEqual(state(of: edit), .active)
+        XCTAssertEqual(restores, [])
+        XCTAssertEqual(mergeJournal.pendingMerges(), [], "the check ends")
+    }
+
+    func testAPendingMergeRestoresTheDuplicateWhenTheReplacementLacksTheBytesOfTheGroup() async throws {
+        let (_, duplicate, _, finder) = try await pendingMergeReplacedByEdit(holdingOriginal: false)
+
+        _ = try await finder.duplicateGroups()
+
+        XCTAssertEqual(state(of: duplicate), .active, "one copy of these bytes stays in the library")
+        XCTAssertEqual(restores, ["person restore \(duplicate.nodeID)"])
+        XCTAssertEqual(mergeJournal.pendingMerges(), [])
+    }
+
+    func testAPendingMergeRestoresTheDuplicateWhenTheLineageReadFails() async throws {
+        let (_, duplicate, _, finder) = try await pendingMergeReplacedByEdit(holdingOriginal: true)
+        server.configureLineageIndex(failing: true)
+
+        _ = try await finder.duplicateGroups()
+
+        XCTAssertEqual(state(of: duplicate), .active, "a read that proves nothing restores a copy")
+        XCTAssertEqual(restores, ["person restore \(duplicate.nodeID)"])
+        XCTAssertEqual(mergeJournal.pendingMerges(), [])
+    }
+
     /// A pending merge of `kept` and `duplicate`, recorded at the device time `trashedAt`.
     private func pendingIntent(
         kept: PhotoUID, duplicate: PhotoUID, seed: String, trashedAt: Int64?
