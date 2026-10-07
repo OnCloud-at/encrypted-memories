@@ -492,7 +492,7 @@ struct MobileFailedBackupSheet: View {
 
     let source: Source
     @Environment(\.dismiss) private var dismiss
-    @State private var backupItems: [BackupFailedItem] = []
+    @State private var problemList = BackupProblemListModel()
     @State private var deletionItem: BackupFailedItem?
 
     init(controller: PhotoLibraryBackupController) {
@@ -509,7 +509,7 @@ struct MobileFailedBackupSheet: View {
 
     private var items: [BackupFailedItem] {
         switch source {
-        case .backup: backupItems
+        case .backup: problemList.items
         case .album(let albumSync, let albumID):
             albumSync.selectedAlbums.first { $0.id == albumID }?.problems ?? []
         }
@@ -524,63 +524,33 @@ struct MobileFailedBackupSheet: View {
                     }
                 } else {
                     List {
-                        ForEach(BackupIssueSection.allCases) { section in
-                            let sectionItems = items.filter { $0.category.section == section }
-                            if !sectionItems.isEmpty {
-                                Section {
-                                    ForEach(sectionItems) { item in
-                                        HStack(alignment: .top, spacing: 12) {
-                                            Image(systemName: item.category.symbolName)
-                                                .foregroundStyle(item.isPermanent ? ProtonColor.textWeak : .orange)
-                                                .font(.body)
-                                            VStack(alignment: .leading, spacing: 2) {
-                                                Text(item.filename)
-                                                    .font(.subheadline)
-                                                    .lineLimit(1)
-                                                    .truncationMode(.middle)
-                                                Text(item.reason)
-                                                    .font(.caption)
-                                                    .foregroundStyle(ProtonColor.textWeak)
-                                                    .fixedSize(horizontal: false, vertical: true)
-                                                if let retryDescription = item.retryDescription {
-                                                    Text(retryDescription)
-                                                        .font(.caption2)
-                                                        .foregroundStyle(ProtonColor.textWeak)
-                                                }
-                                            }
-                                        }
-                                        .padding(.vertical, 2)
-                                        .contentShape(Rectangle())
-                                        .onTapGesture {
-                                            if offersDecision(item) { deletionItem = item }
-                                        }
-                                        .accessibilityElement(children: .combine)
-                                        .accessibilityAddTraits(offersDecision(item) ? .isButton : [])
-                                        .accessibilityIdentifier("backup.failedItem.\(item.filename)")
-                                        .contextMenu {
-                                            if offersDecision(item) {
-                                                deletionActions(for: item, place: "menu")
-                                            }
-                                        }
-                                        .swipeActions(edge: .trailing, allowsFullSwipe: true) {
-                                            if offersDecision(item) {
-                                                deletionActions(for: item, place: "swipe")
-                                            } else if item.isPermanent, let controller {
-                                                Button(L10n.string("backup.failed_item_dismiss")) {
-                                                    controller.dismissFailedItem(item)
-                                                    backupItems.removeAll { $0.id == item.id }
-                                                }
-                                                .tint(ProtonColor.textWeak)
-                                                .accessibilityIdentifier(
-                                                    "backup.dismissFailedItem.swipe.\(item.filename)")
-                                            }
-                                        }
-                                    }
-                                } header: {
-                                    Text(section.localizedTitle)
-                                        .accessibilityIdentifier("backup.issueSection.\(section.rawValue)")
+                        BackupProblemSections(items: items) { item in
+                            BackupProblemRow(item: item)
+                                .contentShape(Rectangle())
+                                .onTapGesture {
+                                    if offersDecision(item) { deletionItem = item }
                                 }
-                            }
+                                .accessibilityElement(children: .combine)
+                                .accessibilityAddTraits(offersDecision(item) ? .isButton : [])
+                                .accessibilityIdentifier("backup.failedItem.\(item.filename)")
+                                .contextMenu {
+                                    if offersDecision(item) {
+                                        deletionActions(for: item, place: "menu")
+                                    }
+                                }
+                                .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+                                    if offersDecision(item) {
+                                        deletionActions(for: item, place: "swipe")
+                                    } else if item.isPermanent, let controller {
+                                        Button(L10n.string("backup.failed_item_dismiss")) {
+                                            controller.dismissFailedItem(item)
+                                            problemList.dismissItem(id: item.id)
+                                        }
+                                        .tint(ProtonColor.textWeak)
+                                        .accessibilityIdentifier(
+                                            "backup.dismissFailedItem.swipe.\(item.filename)")
+                                    }
+                                }
                         }
                     }
                 }
@@ -620,7 +590,7 @@ struct MobileFailedBackupSheet: View {
         // A photo can need the person while the list is open; Try again then appears.
         .task(id: controller?.status.problemListKey) {
             guard let controller else { return }
-            await controller.followProblemList { backupItems = $0 }
+            await controller.followProblemList { problemList.replaceItems($0) }
         }
     }
 
@@ -650,7 +620,7 @@ struct MobileFailedBackupSheet: View {
     private func refreshAfterDecision(_ item: BackupFailedItem, controller: PhotoLibraryBackupController) {
         deletionItem = nil
         Task {
-            backupItems = await controller.problemItems().filter { $0.id != item.id || $0.issue == .deletedElsewhere }
+            await problemList.refresh(afterDecision: item) { await controller.problemItems() }
         }
     }
 }
