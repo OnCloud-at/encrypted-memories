@@ -287,11 +287,11 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
         }
     }
 
-    func setDataSource(_ newSource: MetalGridDataSource) {
+    func setDataSource(_ newSource: MetalGridDataSource, preservingColumnPhase: Bool = false) {
         contentReadyReported = false
         dataSource = newSource
         newSource.updateUploadBadges(uploadBadges)
-        rebuildIndex()
+        rebuildIndex(preservingColumnPhase: preservingColumnPhase)
         onContentSizeChange?(contentSize())
         requestRedraw()
     }
@@ -403,7 +403,7 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
     }
     func requestRedraw() { onRequestRedraw?() }
 
-    private func rebuildIndex() {
+    private func rebuildIndex(preservingColumnPhase: Bool = false) {
         var map: [PhotoUID: Int] = [:]
         map.reserveCapacity(dataSource.flatUIDs.count)
         for (i, uid) in dataSource.flatUIDs.enumerated() { map[uid] = i }
@@ -413,7 +413,7 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
             sectionCounts: dataSource.sectionCounts, profile: gridProfile,
             fillOrder: fillOrder)
         engine.topInset = topBarInset  // A new engine starts without the toolbar inset.
-        committedPhase = nil  // A prior phase may not fit the new data.
+        if !preservingColumnPhase { committedPhase = nil }  // A prior phase may not fit changed membership.
     }
 
     func flatIndex(forUID uid: PhotoUID) -> Int? { indexByUID[uid] }
