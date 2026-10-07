@@ -973,10 +973,13 @@ public struct ExactDuplicateFinder: Sendable {
         return keptTrash > trashedAt + Self.deviceClockTrashWindow
     }
 
-    /// The active main photos whose lineage names `kept` as replaced. Nil when the read failed.
+    /// The active main photos whose lineage names `kept` as replaced. Nil when the read failed or the lineage index is
+    /// incomplete: an edit that it misses now would count as a later edit at the check.
     private func successors(of kept: String) async -> [String]? {
         do {
-            return try await checker.replacingMainLinkIDs(ofReplacedLink: kept).links.sorted()
+            let read = try await checker.replacingMainLinkIDs(ofReplacedLink: kept)
+            guard read.complete else { return nil }
+            return read.links.sorted()
         } catch {
             log("[Duplicates] the lineage read before a merge failed; its check restores a copy")
             return nil
