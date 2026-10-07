@@ -86,6 +86,12 @@ public final class PhotoLibraryChangeMonitor: NSObject, PHPhotoLibraryChangeObse
         /// The stored token no longer resolves (expired history / first run) - callers fall back
         /// to a full cheap rescan, which preflight keeps mostly read-only.
         public var requiresFullRescan: Bool
+
+        public init(changedIdentifiers: [String], deletedIdentifiers: [String], requiresFullRescan: Bool) {
+            self.changedIdentifiers = changedIdentifiers
+            self.deletedIdentifiers = deletedIdentifiers
+            self.requiresFullRescan = requiresFullRescan
+        }
     }
 
     public struct PreparedChangeSet: @unchecked Sendable {

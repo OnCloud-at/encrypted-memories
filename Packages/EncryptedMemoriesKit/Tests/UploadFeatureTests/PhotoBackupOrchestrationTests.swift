@@ -300,6 +300,161 @@ final class PhotoBackupOrchestrationTests: XCTestCase {
         XCTAssertEqual(epochStart, epochStart, "epoch start is stable across resumed runs")
     }
 
+    /// Starts one backup scan pass the way the controller does after a launch: changes since the stored token,
+    /// then the shared pass. Returns false when the pass was interrupted.
+    @discardableResult
+    private func startScanPass(history: FakeChangeHistory) async throws -> Bool {
+        clock.advance(by: 60)
+        let prepared = history.prepare()
+        let sync = PhotoLibraryCatalogSync(
+            store: catalog, enumerator: enumerator, chunkSize: 2, now: { [clock] in clock!.now })
+        do {
+            try await sync.runPass(
+                engine: engine, changes: prepared.changes, commitChanges: { history.commit(prepared) })
+            return true
+        } catch is CancellationError {
+            return false
+        }
+    }
+
+    /// The first scan stops after two of five photos. The next launch reads only the three photos that remain (#309).
+    func testInterruptedFirstScanResumesWithoutReadingTheDonePartAgain() async throws {
+        enumerator.infos = ["A", "B", "C", "D", "E"].map { photoInfo($0) }
+        let history = FakeChangeHistory()
+
+        enumerator.throwAfter = 2
+        let firstFinished = try await startScanPass(history: history)
+        XCTAssertFalse(firstFinished)
+        XCTAssertEqual(enumerator.readCount, 2)
+        XCTAssertEqual(catalog.fullScanProgress()?.cursor, 2)
+
+        enumerator.throwAfter = nil
+        enumerator.readCount = 0
+        let secondFinished = try await startScanPass(history: history)
+
+        XCTAssertTrue(secondFinished)
+        XCTAssertEqual(enumerator.readCount, 3, "the resumed scan reads only the photos after the saved position")
+        XCTAssertTrue(catalog.hasCompletedFullScan())
+        XCTAssertNil(catalog.fullScanProgress())
+        XCTAssertEqual(catalog.snapshot(), PhotoLibraryCatalogSnapshot(total: 5, present: 5, removed: 0))
+        XCTAssertEqual(queue.summary().total, 5)
+    }
+
+    /// A photo added and a photo edited while the first scan was interrupted are queued after the resume.
+    func testPhotoAddedOrChangedDuringAnInterruptedFirstScanIsBackedUpAfterTheResume() async throws {
+        enumerator.infos = ["A", "B", "C", "D", "E"].map { photoInfo($0) }
+        let history = FakeChangeHistory()
+        enumerator.throwAfter = 2
+        try await startScanPass(history: history)
+        XCTAssertEqual(catalog.fullScanProgress()?.cursor, 2, "A and B were read before the interruption")
+
+        // While the app is closed: a new photo F arrives, and B, which the scan already read, is edited.
+        let edited = modDate.addingTimeInterval(3_600)
+        enumerator.infos = [photoInfo("F")] + ["A", "B", "C", "D", "E"].map { photoInfo($0) }
+        enumerator.infos[2] = photoInfo("B", modified: edited)
+        history.record(changed: ["F", "B"])
+        resolver.setModified(edited, for: "B")
+
+        enumerator.throwAfter = nil
+        enumerator.readCount = 0
+        let finished = try await startScanPass(history: history)
+
+        XCTAssertTrue(finished)
+        XCTAssertEqual(enumerator.readCount, 5, "F and B from the change history, then C, D, and E")
+        XCTAssertEqual(catalog.presentEntries(for: ["B"])["B"]?.modificationDate, edited)
+        let editedB = UploadSourceIdentity(kind: .photoLibraryAsset, identifier: "B")
+        XCTAssertNotNil(queue.entry(for: editedB, revision: UploadBackupRevision(date: edited)))
+        XCTAssertEqual(catalog.snapshot(), PhotoLibraryCatalogSnapshot(total: 6, present: 6, removed: 0))
+
+        _ = await runner.runUntilDrained()
+        XCTAssertTrue(uploader.requests.map(\.name).contains("IMG_F.HEIC"), "the new photo is backed up")
+        XCTAssertEqual(
+            uploader.requests.filter { $0.name == "IMG_B.HEIC" }.count, 1,
+            "only the edited version of B is backed up")
+    }
+
+    /// An older photo appears before the saved position and an earlier photo is deleted during the interruption.
+    /// Neither shifts the resume point: every photo is read once, the new one is queued, the deleted one is removed.
+    func testPhotoInsertedBeforeTheSavedPositionDuringTheInterruptionIsNotMissed() async throws {
+        enumerator.infos = ["A", "B", "C", "D", "E"].map { photoInfo($0) }
+        let history = FakeChangeHistory()
+        enumerator.throwAfter = 2
+        try await startScanPass(history: history)
+        XCTAssertEqual(catalog.fullScanProgress()?.cursor, 2)
+
+        // X, an imported photo with an older capture date, lands before the saved position. A, already read, is deleted.
+        enumerator.infos = [
+            photoInfo("X", created: Date(timeIntervalSince1970: 1_600_000_000)),
+            photoInfo("B"), photoInfo("C"), photoInfo("D"), photoInfo("E"),
+        ]
+        history.record(changed: ["X"], deleted: ["A"])
+
+        enumerator.throwAfter = nil
+        enumerator.readCount = 0
+        let finished = try await startScanPass(history: history)
+
+        XCTAssertTrue(finished)
+        XCTAssertEqual(enumerator.readCount, 4, "X from the change history, then C, D, and E")
+        let present = catalog.presentEntries(for: ["A", "B", "C", "D", "E", "X"])
+        XCTAssertEqual(Set(present.keys), ["B", "C", "D", "E", "X"])
+        XCTAssertEqual(catalog.snapshot(), PhotoLibraryCatalogSnapshot(total: 6, present: 5, removed: 1))
+        let x = UploadSourceIdentity(kind: .photoLibraryAsset, identifier: "X")
+        XCTAssertNotNil(queue.entry(for: x, revision: UploadBackupRevision(date: modDate)))
+        XCTAssertTrue(catalog.hasCompletedFullScan())
+    }
+
+    /// After a completed first scan, a later pass reads only the changed photos, and a pass without changes reads none.
+    func testCompletedFirstScanKeepsLaterPassesIncremental() async throws {
+        enumerator.infos = ["A", "B", "C"].map { photoInfo($0) }
+        let history = FakeChangeHistory()
+        try await startScanPass(history: history)
+        XCTAssertTrue(catalog.hasCompletedFullScan())
+        XCTAssertEqual(enumerator.readCount, 3)
+
+        enumerator.infos.insert(photoInfo("D"), at: 0)
+        history.record(changed: ["D"])
+        enumerator.readCount = 0
+        try await startScanPass(history: history)
+        XCTAssertEqual(enumerator.readCount, 1, "only the new photo is read")
+        XCTAssertNil(catalog.fullScanProgress(), "no full scan starts")
+        XCTAssertEqual(queue.summary().total, 4)
+
+        enumerator.readCount = 0
+        try await startScanPass(history: history)
+        XCTAssertEqual(enumerator.readCount, 0)
+    }
+
+    /// When the change history expired, the full rescan is the only proof that no photo was missed. An interrupted
+    /// rescan must resume on the next launch, even though a new change token is stored by then.
+    func testInterruptedRescanAfterExpiredChangeHistoryResumes() async throws {
+        enumerator.infos = ["A", "B", "C", "D", "E"].map { photoInfo($0) }
+        let history = FakeChangeHistory()
+        try await startScanPass(history: history)
+        XCTAssertTrue(catalog.hasCompletedFullScan())
+
+        // The history expires while E is edited, so no change record names E.
+        let edited = modDate.addingTimeInterval(3_600)
+        enumerator.infos[4] = photoInfo("E", modified: edited)
+        history.expire()
+
+        enumerator.throwAfter = 2
+        enumerator.readCount = 0
+        let rescanFinished = try await startScanPass(history: history)
+        XCTAssertFalse(rescanFinished)
+        XCTAssertEqual(catalog.fullScanProgress()?.cursor, 2)
+
+        enumerator.throwAfter = nil
+        enumerator.readCount = 0
+        let finished = try await startScanPass(history: history)
+
+        XCTAssertTrue(finished)
+        XCTAssertEqual(enumerator.readCount, 3, "the rescan resumes after A and B")
+        XCTAssertNil(catalog.fullScanProgress())
+        XCTAssertEqual(
+            catalog.presentEntries(for: ["E"])["E"]?.modificationDate, edited,
+            "the edit that the expired history lost is found by the resumed rescan")
+    }
+
     /// A photo taken/edited while a pass is already running must land in the durable queue and be
     /// drained this pass; not wait for the next. Models the controller's `reconcileWhileScanning`
     /// running concurrently with the scan, plus a targeted catalog sync firing from the change
@@ -477,10 +632,10 @@ final class PhotoBackupOrchestrationTests: XCTestCase {
         }
     }
 
-    private func photoInfo(_ id: String, modified: Date? = nil) -> PhotoBackupAssetInfo {
+    private func photoInfo(_ id: String, modified: Date? = nil, created: Date? = nil) -> PhotoBackupAssetInfo {
         PhotoBackupAssetInfo(
             localIdentifier: id,
-            creationDate: Date(timeIntervalSince1970: 1_699_000_000),
+            creationDate: created ?? Date(timeIntervalSince1970: 1_699_000_000),
             modificationDate: modified ?? modDate,
             pixelWidth: 4032, pixelHeight: 3024,
             durationSeconds: 0, isLivePhoto: false, isVideo: false,
@@ -513,6 +668,13 @@ final class PhotoBackupOrchestrationTests: XCTestCase {
         }
         private var remainingBeforeThrow: Int?
 
+        /// Assets whose metadata `infoChunks` read. The identifier snapshot is not counted.
+        var readCount: Int {
+            get { lock.withLock { _readCount } }
+            set { lock.withLock { _readCount = newValue } }
+        }
+        private var _readCount = 0
+
         func infoChunks(
             identifiers: [String]?, startOffset: Int, chunkSize: Int
         ) -> AsyncThrowingStream<[PhotoBackupAssetInfo], any Error> {
@@ -521,9 +683,13 @@ final class PhotoBackupOrchestrationTests: XCTestCase {
             let selectedAll = identifiers.map { ids in all.filter { Set(ids).contains($0.localIdentifier) } } ?? all
             let selected = Array(selectedAll.dropFirst(max(0, startOffset)))  // resume point
             let (allowedCount, shouldThrow) = lock.withLock { () -> (Int, Bool) in
-                guard let remainingBeforeThrow else { return (selected.count, false) }
+                guard let remainingBeforeThrow else {
+                    _readCount += selected.count
+                    return (selected.count, false)
+                }
                 let allowed = min(max(0, remainingBeforeThrow), selected.count)
                 self.remainingBeforeThrow = remainingBeforeThrow - allowed
+                _readCount += allowed
                 return (allowed, allowed < selected.count)
             }
             return AsyncThrowingStream { continuation in
@@ -556,6 +722,58 @@ final class PhotoBackupOrchestrationTests: XCTestCase {
                     index = upper
                 }
                 continuation.finish()
+            }
+        }
+    }
+
+    /// PhotoKit's persistent change history as the change monitor uses it: a stored token, the changes recorded
+    /// after it, and an expired history that asks for a full rescan.
+    private final class FakeChangeHistory: @unchecked Sendable {
+        struct Prepared: Sendable {
+            var changes: PhotoLibraryChangeMonitor.ChangeSet
+            var token: Int
+        }
+
+        private let lock = NSLock()
+        private var records: [(changed: Set<String>, deleted: Set<String>)] = []
+        private var storedToken: Int?
+        private var expired = false
+
+        func record(changed: Set<String> = [], deleted: Set<String> = []) {
+            lock.withLock { records.append((changed, deleted)) }
+        }
+
+        func expire() {
+            lock.withLock { expired = true }
+        }
+
+        func prepare() -> Prepared {
+            lock.withLock {
+                let current = records.count
+                guard let storedToken, !expired else {
+                    return Prepared(
+                        changes: .init(changedIdentifiers: [], deletedIdentifiers: [], requiresFullRescan: true),
+                        token: current)
+                }
+                var changed: Set<String> = []
+                var deleted: Set<String> = []
+                for record in records[storedToken..<current] {
+                    changed.formUnion(record.changed)
+                    deleted.formUnion(record.deleted)
+                }
+                changed.subtract(deleted)
+                return Prepared(
+                    changes: .init(
+                        changedIdentifiers: changed.sorted(), deletedIdentifiers: deleted.sorted(),
+                        requiresFullRescan: false),
+                    token: current)
+            }
+        }
+
+        func commit(_ prepared: Prepared) {
+            lock.withLock {
+                storedToken = prepared.token
+                expired = false
             }
         }
     }
