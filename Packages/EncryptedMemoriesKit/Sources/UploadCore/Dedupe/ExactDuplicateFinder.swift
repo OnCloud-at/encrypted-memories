@@ -588,7 +588,8 @@ public struct ExactDuplicateFinder: Sendable {
             if !writes.isEmpty {
                 do {
                     let written = writes.flatMap { $0.plan.trashable + [$0.plan.kept] }
-                    // The compound reads are fresh: they show a favorite that another device set during the run.
+                    // The compound reads are fresh: they show a favorite that another device set during the run. The
+                    // run takes them before it answers.
                     let tagged = Set(writes.flatMap(\.plan.taggedFavorites))
                     run.noteFavorites(tagged)
                     rankingContext.noteFavorites(tagged)
@@ -596,7 +597,7 @@ public struct ExactDuplicateFinder: Sendable {
                     // removed elsewhere, and the carry-over then must still tag it.
                     let kept = Set(writes.map(\.plan.kept))
                     let favorites = try await run.favorites(among: written, remote: remote).subtracting(kept)
-                        .union(tagged)
+                        .union(tagged.intersection(kept))
                     // One album listing serves the run: an own album whose cover leaves gets the kept photo.
                     let covers = try await run.covers(albums: albums)
                     await write(writes, favorites: favorites, covers: covers, run: run, into: &results)
