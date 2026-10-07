@@ -1172,6 +1172,28 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertTrue(uploader.requests.isEmpty)
     }
 
+    func testBackUpNowDoesNotUseUpTheChecksOfAPhotoThatPhotosReportsMissing() async throws {
+        let entry = seedEntry("interrupted.heic")
+        let missing = photoKitFailure(.missingResource, for: "interrupted.heic")
+        resolver.set(.failure(missing, times: 10), for: entry.source.identifier)
+        let runner = makeRunner()
+        _ = await runner.runUntilDrained(mode: .eligibleOnly)
+        let planned = try XCTUnwrap(queueStore.entry(for: entry.source, revision: entry.revision)).updatedAt
+
+        // The person taps Back Up Now three times during the same iCloud fault.
+        for _ in 0..<3 {
+            clock.advance(by: 60)
+            _ = await runner.makeRetryableWorkEligibleNow()
+            _ = await runner.runUntilDrained(mode: .eligibleOnly)
+        }
+
+        let row = try XCTUnwrap(
+            queueStore.entry(for: entry.source, revision: entry.revision), "only checks hours apart remove the photo")
+        XCTAssertEqual(resolver.resolveCount(for: entry.source.identifier), 4)
+        XCTAssertEqual(BackupIssueRecord.decode(row.lastError)?.automaticRetryAttempt, 1)
+        XCTAssertEqual(row.updatedAt, planned, "the planned check keeps its time")
+    }
+
     func testAPhotoThatPhotosNoLongerKnowsLeavesTheBackupAtOnce() async throws {
         let entry = seedEntry("unknown.heic")
         resolver.set(

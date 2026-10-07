@@ -483,8 +483,9 @@ public actor BackupSyncRunner {
                         break
                     }
                     if mode == .eligibleOnly { break }
-                    // Only an item waiting for Proton storage waits longer than any regular retry. A one-shot drain
-                    // the user waits for ends then instead of sleeping for hours.
+                    // Only long parks wait longer than any regular retry: Proton storage, an edit that waits for its
+                    // original, a photo that Photos reports as missing. A one-shot drain the user waits for ends then
+                    // instead of sleeping for hours.
                     if wait > longestRegularRetryWait { break }
                     do {
                         try await clock.sleep(for: wait)
@@ -662,8 +663,9 @@ public actor BackupSyncRunner {
         return min(delay, limit)
     }
 
-    /// The longest wait of a runnable retry other than a full Proton account: the retry policy's cap, its
-    /// 30-second minimum after low disk space, and the recheck of a photo the camera still processes.
+    /// The longest wait of a runnable retry other than a long park (a full Proton account, an edit that waits for its
+    /// original, a photo that Photos reports as missing): the retry policy's cap, its 30-second minimum after low disk
+    /// space, and the recheck of a photo the camera still processes.
     private var longestRegularRetryWait: TimeInterval {
         max(configuration.retry.maxDelay, 30, configuration.oneShotSourceRecheckInterval)
     }
@@ -2013,9 +2015,16 @@ public actor BackupSyncRunner {
         }
         // Photos reports the file as missing. A short iCloud fault can report that too, and a removed row never
         // comes back: the catalog counts the photo as unchanged. So the row checks again a few times, hours apart,
-        // before the photo counts as gone.
+        // before the photo counts as gone. A check that Back Up Now starts before the planned one does not count, so
+        // only checks hours apart can remove the photo.
         if case UploadError.sourceReportedMissing = error {
             let detail = BackupFailedItem.sourceReportedMissingDetail
+            if let previous = BackupIssueRecord.decode(entry.lastError), previous.detail == detail,
+                let planned = previous.nextAttemptAt, now() < planned
+            {
+                deferSource(entry, from: oldState, until: planned, issue: previous)
+                return
+            }
             let checks = Self.sourceWaits(of: entry, detail: detail)
             guard checks < Self.reportedMissingRechecks else {
                 discardMissingSource(entry, from: oldState)
