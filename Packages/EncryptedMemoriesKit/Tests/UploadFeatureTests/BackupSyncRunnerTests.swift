@@ -2153,6 +2153,61 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertFalse(progress.isRunning)
     }
 
+    func testMissingPhotoLibrarySourceRequestsPersistentCatalogRecoveryAfterThreeReportedMissingChecks() async throws {
+        let info = PhotoBackupAssetInfo(
+            localIdentifier: "reported-missing-photo", creationDate: resolver.defaultModified,
+            modificationDate: resolver.defaultModified, pixelWidth: 10, pixelHeight: 10,
+            durationSeconds: 0, isLivePhoto: false, isVideo: false,
+            resources: [.init(role: .originalPhoto, originalFilename: "missing.jpg", mimeType: "image/jpeg")])
+        let candidate = try XCTUnwrap(PhotoBackupAssetPlanner.candidate(for: info))
+        let catalog = try XCTUnwrap(
+            PhotoLibraryCatalogManifestStore(
+                url: tempDir.appendingPathComponent(PhotoLibraryCatalogManifestStore.databaseFileName)))
+        defer { catalog.close() }
+        XCTAssertTrue(catalog.upsertBatch([PhotoLibraryCatalogMapper.entry(for: info, observedAt: clock.now)]))
+        let entry = UploadBackupSyncQueueEntry(
+            source: candidate.snapshot.source, revision: candidate.snapshot.revision,
+            originalFilename: candidate.originalFilename, updatedAt: clock.now)
+        XCTAssertTrue(queueStore.upsert(entry))
+        let engine = UploadBackupSyncEngine(preflight: preflight, queue: queueStore)
+        let sync = PhotoLibraryCatalogSync(store: catalog)
+        try await sync.reconcileMissingSources(engine: engine)
+        XCTAssertEqual(catalog.reconciledMissingSourceGeneration(), 0)
+        resolver.set(
+            .failure(photoKitFailure(.missingResource, for: "missing.jpg"), times: 4),
+            for: entry.source.identifier)
+        let runner = makeRunner()
+        for wait in [3600.0, 7200, 14_400] {
+            _ = await runner.runUntilDrained(mode: .eligibleOnly)
+            XCTAssertEqual(queueStore.missingSourceDiscardGeneration(), 0)
+            clock.advance(by: wait)
+        }
+        _ = await runner.runUntilDrained(mode: .eligibleOnly)
+        XCTAssertNil(queueStore.entry(for: entry.source, revision: entry.revision))
+        XCTAssertEqual(queueStore.missingSourceDiscardGeneration(), 1)
+        try await sync.reconcileMissingSources(engine: engine)
+        XCTAssertNotNil(queueStore.entry(for: entry.source, revision: entry.revision))
+        XCTAssertEqual(catalog.reconciledMissingSourceGeneration(), 1)
+        XCTAssertEqual(resolver.resolveCount(for: entry.source.identifier), 4, "Recovery reads only local stores")
+        XCTAssertTrue(uploader.requests.isEmpty)
+    }
+
+    func testMissingPhotoLibrarySourceRequestsPersistentCatalogRecovery() async throws {
+        let source = UploadSourceIdentity(kind: .photoLibraryAsset, identifier: "reported-missing-photo")
+        let entry = UploadBackupSyncQueueEntry(
+            source: source, revision: UploadBackupRevision(date: resolver.defaultModified),
+            originalFilename: "missing.jpg", updatedAt: clock.now)
+        XCTAssertTrue(queueStore.upsert(entry))
+        resolver.set(.missing, for: source.identifier)
+        let progress = await makeRunner().runUntilDrained()
+        XCTAssertNil(queueStore.entry(for: source, revision: entry.revision))
+        XCTAssertEqual(progress.total, 0)
+        XCTAssertEqual(queueStore.missingSourceDiscardGeneration(), 1)
+        _ = await makeRunner().runUntilDrained()
+        XCTAssertEqual(queueStore.missingSourceDiscardGeneration(), 1)
+        XCTAssertEqual(uploader.requests.count, 0)
+    }
+
     func testSourceMissingIsRemovedWithoutFailure() async throws {
         let entry = seedEntry("gone.jpg")
         resolver.set(.missing, for: entry.source.identifier)

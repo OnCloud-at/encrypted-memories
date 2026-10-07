@@ -15,6 +15,9 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
     private static let fullScanSnapshotReadyKey = "full_scan_snapshot_ready"
     private static let reconciledLateRendersKey = "reconciled_late_renders"
     private static let lateRenderSweepResumePointKey = "late_render_sweep_resume_point"
+    private static let reconciledMissingSourceGenerationKey = "reconciled_missing_source_generation"
+    private static let missingSourceSweepGenerationKey = "missing_source_sweep_generation"
+    private static let missingSourceSweepResumePointKey = "missing_source_sweep_resume_point"
     private var db: OpaquePointer?
     private var operationFailed = false
     private let lock = NSLock()
@@ -99,6 +102,8 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
 
     public func presentEntries(afterLocalIdentifier: String?, limit: Int) -> [PhotoLibraryCatalogEntry] {
         let clampedLimit = max(1, limit)
+        // The primary-key range keeps pages bounded; the removal index would sort the remaining library per page.
+        let frontier = afterLocalIdentifier == nil ? "" : " AND local_id>?"
         return lock.withLock {
             var stmt: OpaquePointer?
             guard
@@ -109,17 +114,16 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
                         SELECT local_id, cloud_id, creation_date, modification_date, pixel_width, pixel_height,
                                duration_seconds, media_kind, is_live_photo, resources_json, content_fingerprint,
                                metadata_revision, first_seen_at, last_seen_at, is_removed, removed_at
-                        FROM photo_catalog
-                        WHERE is_removed=0 AND (? IS NULL OR local_id>?)
+                        FROM photo_catalog INDEXED BY sqlite_autoindex_photo_catalog_1
+                        WHERE is_removed=0\(frontier)
                         ORDER BY local_id LIMIT ?;
                         """,
                         -1, &stmt, nil
                     ) == SQLITE_OK)
             else { return [] }
             defer { sqlite3_finalize(stmt) }
-            bindOptionalText(stmt, 1, afterLocalIdentifier)
-            bindOptionalText(stmt, 2, afterLocalIdentifier)
-            sqlite3_bind_int(stmt, 3, Int32(clampedLimit))
+            if let afterLocalIdentifier { bindText(stmt, 1, afterLocalIdentifier) }
+            sqlite3_bind_int(stmt, afterLocalIdentifier == nil ? 1 : 2, Int32(clamping: clampedLimit))
             var entries: [PhotoLibraryCatalogEntry] = []
             var stepResult = sqlite3_step(stmt)
             while stepResult == SQLITE_ROW {
@@ -364,6 +368,56 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
     @discardableResult
     public func recordLateRenderSweepResumePoint(_ localIdentifier: String) -> Bool {
         lock.withLock { writeInfoText(Self.lateRenderSweepResumePointKey, localIdentifier) }
+    }
+
+    public func reconciledMissingSourceGeneration() -> Int64? {
+        lock.withLock { readInfoValue64(Self.reconciledMissingSourceGenerationKey) }
+    }
+
+    public func missingSourceSweepProgress() -> PhotoLibraryMissingSourceSweepProgress? {
+        lock.withLock {
+            guard let generation = readInfoValue64(Self.missingSourceSweepGenerationKey) else { return nil }
+            return PhotoLibraryMissingSourceSweepProgress(
+                generation: generation, afterLocalIdentifier: readInfoText(Self.missingSourceSweepResumePointKey))
+        }
+    }
+
+    public func recordMissingSourceSweepProgress(_ progress: PhotoLibraryMissingSourceSweepProgress) -> Bool {
+        lock.withLock {
+            guard requireOperational(sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK) else {
+                return false
+            }
+            let cursorSaved: Bool
+            if let cursor = progress.afterLocalIdentifier {
+                cursorSaved = writeInfoText(Self.missingSourceSweepResumePointKey, cursor)
+            } else {
+                cursorSaved = deleteInfoValue(Self.missingSourceSweepResumePointKey)
+            }
+            guard cursorSaved, writeInfoValue64(Self.missingSourceSweepGenerationKey, progress.generation),
+                requireOperational(sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK)
+            else {
+                sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
+                return false
+            }
+            return true
+        }
+    }
+
+    public func completeMissingSourceSweep(generation: Int64) -> Bool {
+        lock.withLock {
+            guard requireOperational(sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK) else {
+                return false
+            }
+            guard writeInfoValue64(Self.reconciledMissingSourceGenerationKey, generation),
+                deleteInfoValue(Self.missingSourceSweepGenerationKey),
+                deleteInfoValue(Self.missingSourceSweepResumePointKey),
+                requireOperational(sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK)
+            else {
+                sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
+                return false
+            }
+            return true
+        }
     }
 
     public func fullScanProgress() -> PhotoLibraryFullScanProgress? {

@@ -397,6 +397,32 @@ final class EditScenarioHarness {
         }
     }
 
+    /// A 1.0.5 resolver failure removed the queue row before any upload or complete backup state.
+    func seedV105DroppedPhoto(_ identifier: String = "dropped-photo", pending: Bool = false) throws {
+        library.add(identifier, basename: "DROPPED")
+        let asset = try XCTUnwrap(library.snapshot.first { $0.identifier == identifier })
+        XCTAssertTrue(catalog.upsertBatch([PhotoLibraryCatalogMapper.entry(for: asset.info, observedAt: clock.now)]))
+        if pending {
+            let candidate = try library.candidate(identifier)
+            XCTAssertTrue(
+                backupState.upsert(
+                    UploadBackupAssetRecord(
+                        source: candidate.snapshot.source, revision: candidate.snapshot.revision,
+                        resourceCount: candidate.snapshot.resourceCount,
+                        pendingResourceCount: candidate.snapshot.resourceCount,
+                        updatedAt: clock.now)))
+        }
+        try relaunch()
+    }
+
+    /// An unfinished local settlement keeps its upload manifest but loses the queue and backup state.
+    func removeLocalBackupSettlement(_ identifier: String = "asset-1") throws {
+        let candidate = try library.candidate(identifier)
+        XCTAssertTrue(queue.remove(source: candidate.snapshot.source, revision: candidate.snapshot.revision))
+        XCTAssertTrue(backupState.removeRecords(for: candidate.snapshot.source, keeping: []))
+        try relaunch()
+    }
+
     private func seedV105(_ asset: EditScenarioLibrary.Asset, remoteIdentity: Bool = false) throws {
         // v1.0.5 did not read the Live effect, so it planned every Live Photo with its tagged paired video.
         var info = asset.info
@@ -550,6 +576,7 @@ final class EditScenarioHarness {
     /// Like `PhotoLibraryBackupController.runScanPass`, the one-time reconciliation runs before the scan.
     func fullRescan() async throws -> PhotoLibraryCatalogProgress {
         let sync = PhotoLibraryCatalogSync(store: catalog, enumerator: library, now: { [clock] in clock.now })
+        try await sync.reconcileMissingSources(engine: engine)
         try await sync.reconcileLateRendersOnce(engine: engine)
         let result = try await sync.run(engine: engine)
         clock.advance(by: 1)

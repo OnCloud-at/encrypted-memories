@@ -44,6 +44,9 @@ public protocol UploadBackupCandidateEnqueueing: Sendable {
     func reopenBackedUpRevisions(
         _ reopenings: [UploadBackupReopening], deferringWithoutRemoteProof: Bool
     ) async throws -> [UploadBackupAssetCandidate]
+    /// Local-only recovery. Complete states and sources with any queue row stay untouched.
+    func enqueueMissingSources(_ candidates: [UploadBackupAssetCandidate]) async throws
+    func missingSourceDiscardGeneration() async throws -> Int64
     /// Makes every queue row written so far survive a power loss. Returns false when that is not certain.
     func synchronizeQueueToDisk() async -> Bool
 }
@@ -54,6 +57,13 @@ public struct UploadBackupRemoteProofUnavailable: Error, Sendable {
 }
 
 public extension UploadBackupCandidateEnqueueing {
+    func enqueueMissingSources(_ candidates: [UploadBackupAssetCandidate]) async throws {
+        throw UploadError.backend("Backup source recovery is unavailable")
+    }
+    func missingSourceDiscardGeneration() async throws -> Int64 {
+        throw UploadError.backend("Backup source recovery is unavailable")
+    }
+
     @discardableResult
     func reopenBackedUpRevisions(
         _ reopenings: [UploadBackupReopening], deferringWithoutRemoteProof: Bool
@@ -226,6 +236,34 @@ public actor UploadBackupSyncEngine: UploadBackupCandidateEnqueueing {
             throw UploadError.backend("Backup queue could not persist an asset batch")
         }
         return result
+    }
+
+    public func missingSourceDiscardGeneration() async throws -> Int64 {
+        guard let generation = queue.missingSourceDiscardGeneration(), queue.isOperational() else {
+            throw UploadError.backend("Backup queue could not be read")
+        }
+        return generation
+    }
+
+    public func enqueueMissingSources(_ candidates: [UploadBackupAssetCandidate]) async throws {
+        let included = try withoutExcludedSources(candidates)
+        guard !included.isEmpty else { return }
+        guard let existing = queue.sourcesWithEntries(included.map(\.snapshot.source)), queue.isOperational() else {
+            throw UploadError.backend("Backup queue could not be read")
+        }
+        let missing = included.filter { !existing.contains($0.snapshot.source) }
+        let decisions = try await preflight.classifyBatch(missing.map(\.snapshot))
+        try Task.checkCancellation()
+        guard decisions.count == missing.count else {
+            throw UploadError.backend("Backup preflight classification was incomplete")
+        }
+        let entries = zip(missing, decisions).compactMap { candidate, decision in
+            decision == .alreadyBackedUp ? nil : prepare(candidate, decision: decision).entry
+        }
+        // The conditional insert also protects a row added while the preflight actor was awaited.
+        guard queue.insertMissingSources(entries) else {
+            throw UploadError.backend("Backup queue could not persist missing sources")
+        }
     }
 
     /// A complete revision becomes pending work again; its settled queue row goes away, so the next `enqueueBatch`

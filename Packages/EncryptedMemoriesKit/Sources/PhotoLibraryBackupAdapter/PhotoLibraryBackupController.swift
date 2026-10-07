@@ -803,6 +803,14 @@ public final class PhotoLibraryBackupController {
 
             await scanDone.markDone()
             let waitedForWiFi = await reconcile  // drains the tail enqueued during the scan, then returns
+            do {
+                // Requeue drops after the runner stops. The next pass retries them without looping in this pass.
+                try await Self.reconcileMissingSources(
+                    PhotoLibraryCatalogSync(store: catalogStore), engine: engine)
+            } catch is CancellationError {
+            } catch {
+                self?.reportSyncMessage((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
+            }
             tempStore.sweep()  // every export is re-derivable; nothing to keep between passes
             self?.passWaitedForWiFi = waitedForWiFi
             await self?.finishSync(runID: runID)
@@ -872,6 +880,18 @@ public final class PhotoLibraryBackupController {
         }
     }
 
+    private nonisolated static func reconcileMissingSources(
+        _ sync: PhotoLibraryCatalogSync, engine: UploadBackupSyncEngine
+    ) async throws {
+        do {
+            try await sync.reconcileMissingSources(engine: engine)
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            throw UploadError.backend(L10n.string("backup.error_local_state_unavailable"))
+        }
+    }
+
     private nonisolated static func prepareChangesOffMainActor(
         _ monitor: PhotoLibraryChangeMonitor
     ) async -> PhotoLibraryChangeMonitor.PreparedChangeSet {
@@ -931,6 +951,7 @@ public final class PhotoLibraryBackupController {
                 _ = await runner.removePhotoLibraryAssets(identifiers)
             }
         )
+        try await Self.reconcileMissingSources(sync, engine: engine)
         try await sync.reconcileLateRendersOnce(engine: engine)
         try await sync.runPass(
             engine: engine,

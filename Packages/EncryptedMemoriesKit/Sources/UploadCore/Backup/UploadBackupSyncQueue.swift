@@ -286,6 +286,16 @@ public protocol UploadBackupSyncQueueStore: Sendable {
     /// is user intent, not a terminal backup failure.
     @discardableResult
     func remove(source: UploadSourceIdentity, revision: UploadBackupRevision) -> Bool
+    /// Removes a resolver-reported missing source and durably requests another catalog reconciliation.
+    @discardableResult
+    func removeMissingSource(source: UploadSourceIdentity, revision: UploadBackupRevision) -> Bool
+    /// Monotonic count of missing Photo Library sources removed from this queue. Nil means a failed read.
+    func missingSourceDiscardGeneration() -> Int64?
+    /// Sources with any queue row, across resources and revisions. Nil means a failed read.
+    func sourcesWithEntries(_ sources: [UploadSourceIdentity]) -> Set<UploadSourceIdentity>?
+    /// Inserts only sources without any queue row. Existing rows, including user decisions, stay untouched.
+    @discardableResult
+    func insertMissingSources(_ entries: [UploadBackupSyncQueueEntry]) -> Bool
     /// Removes the backed-up rows of every other revision of the source. An edit replaced its earlier upload, so a
     /// later return to an earlier revision, for example undoing the edit, must start as new work.
     @discardableResult
@@ -331,6 +341,14 @@ public protocol UploadBackupSyncQueueStore: Sendable {
 
 public extension UploadBackupSyncQueueStore {
     func isOperational() -> Bool { true }
+
+    func removeMissingSource(source: UploadSourceIdentity, revision: UploadBackupRevision) -> Bool {
+        remove(source: source, revision: revision)
+    }
+
+    func missingSourceDiscardGeneration() -> Int64? { 0 }
+    func sourcesWithEntries(_ sources: [UploadSourceIdentity]) -> Set<UploadSourceIdentity>? { nil }
+    func insertMissingSources(_ entries: [UploadBackupSyncQueueEntry]) -> Bool { false }
 
     func nextRunnableDate() -> Date? {
         nextRunnableDate(excludingSourcesOf: [])
