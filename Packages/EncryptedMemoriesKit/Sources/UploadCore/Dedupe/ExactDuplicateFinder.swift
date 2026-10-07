@@ -523,29 +523,35 @@ public struct ExactDuplicateFinder: Sendable {
         try await merge([ExactDuplicateMergeRequest(group: group, kept: kept, isKeptChosen: isKeptChosen)])[0].get()
     }
 
-    /// Merges each group like `merge(_:keeping:)`, with one manifest scan, one favorites listing, and one trash for
-    /// all groups.
+    /// Merges each group like `merge(_:keeping:)`, with one manifest scan, one favorites listing, one album listing,
+    /// and one trash for all groups.
+    public func merge(
+        _ requests: [ExactDuplicateMergeRequest]
+    ) async -> [Result<ExactDuplicateMergeOutcome, any Error>] {
+        await merge(requests, in: ExactDuplicateMergeRun(members: requests.flatMap(\.group.members)))
+    }
+
+    /// Merges each group like `merge(_:keeping:)`, with one manifest scan and one trash for all groups. The favorites
+    /// listing and the album listing come from `run`, which reads each once for all its batches.
     ///
     /// Every group reads its server state first. The local checks, the carry-over, and the row moves follow, group by
     /// group, and then one trash takes the duplicates of every group. Each group holds its outcome or its error; a
     /// failed trash fails every group that it should have taken. After a cancellation, no further group writes, and
     /// every group without an outcome fails with `CancellationError`.
     ///
-    /// A preselected photo to keep is ranked again with the favorites of now, from one listing for every such group:
-    /// the ranking of the screen can predate a favorite set since. A failed listing fails every group. The carry-over
-    /// uses the same listing when it covers every photo that it writes.
+    /// A preselected photo to keep is ranked again with the favorites of the run: the ranking of the screen can predate
+    /// a favorite set since. A failed listing fails every group. The carry-over also takes the favorite tags that the
+    /// compound reads of the group show, so a favorite set elsewhere during the run moves to the kept photo.
     public func merge(
-        _ requests: [ExactDuplicateMergeRequest]
+        _ requests: [ExactDuplicateMergeRequest], in run: ExactDuplicateMergeRun
     ) async -> [Result<ExactDuplicateMergeOutcome, any Error>] {
         await resolvePendingMerges()
         var results = [Result<ExactDuplicateMergeOutcome, any Error>?](repeating: nil, count: requests.count)
         var favorites: Set<PhotoUID> = []
-        var favoritesRead: Set<PhotoUID> = []
         let preselected = requests.filter { !$0.isKeptChosen }.flatMap(\.group.members)
         if !preselected.isEmpty, !Task.isCancelled {
             do {
-                favorites = try await remote.favoriteUIDs(among: preselected)
-                favoritesRead = Set(preselected)
+                favorites = try await run.favorites(among: preselected, remote: remote)
             } catch {
                 return requests.map { _ in .failure(error) }
             }
@@ -582,12 +588,14 @@ public struct ExactDuplicateFinder: Sendable {
             if !writes.isEmpty {
                 do {
                     let written = writes.flatMap { $0.plan.trashable + [$0.plan.kept] }
-                    let favorites =
-                        favoritesRead.isSuperset(of: written)
-                        ? favorites.intersection(written) : try await remote.favoriteUIDs(among: written)
-                    // One album listing serves every group: an own album whose cover leaves gets the kept photo.
-                    let covers = try await albums.ownAlbumCovers()
-                    await write(writes, favorites: favorites, covers: covers, into: &results)
+                    // The compound reads are fresh: they show a favorite that another device set during the run.
+                    let tagged = Set(writes.flatMap(\.plan.taggedFavorites))
+                    run.noteFavorites(tagged)
+                    rankingContext.noteFavorites(tagged)
+                    let favorites = try await run.favorites(among: written, remote: remote).union(tagged)
+                    // One album listing serves the run: an own album whose cover leaves gets the kept photo.
+                    let covers = try await run.covers(albums: albums)
+                    await write(writes, favorites: favorites, covers: covers, run: run, into: &results)
                 } catch {
                     for (index, _) in writes { results[index] = .failure(error) }
                 }
@@ -609,6 +617,8 @@ public struct ExactDuplicateFinder: Sendable {
         var moves: [UploadRemoteLinkMove] = []
         /// The trashable members with their moves, as `mergeJournal` records them.
         var members: [ExactDuplicateMergeIntent.Member] = []
+        /// The kept photo and the candidates whose compound read shows Proton's favorite tag.
+        var taggedFavorites: [PhotoUID] = []
 
         func intent(trashedAt: Int64, successors: [String]?) -> ExactDuplicateMergeIntent {
             ExactDuplicateMergeIntent(
@@ -640,6 +650,7 @@ public struct ExactDuplicateFinder: Sendable {
         else { return .skipped(.keptUnreadable) }
 
         var plan = PlannedMerge(kept: kept, contentHash: group.contentHash, epoch: epoch, volumeID: volumeID)
+        if keptCompound.tags.contains(PhotoTag.favorites.rawValue) { plan.taggedFavorites.append(kept) }
         // One node read for each member of this group gives the metadata and the sharing state.
         let facts = try await remote.nodeFacts(of: active)
         // The screen offered the group for the metadata that it read. When the kept photo has other metadata now, the
@@ -695,6 +706,7 @@ public struct ExactDuplicateFinder: Sendable {
                     }
                 }
             plan.candidates.append((member, Set([member.nodeID] + compound.related.map(\.linkID)), memberMoves))
+            if compound.tags.contains(PhotoTag.favorites.rawValue) { plan.taggedFavorites.append(member) }
         }
         return .planned(plan)
     }
@@ -725,14 +737,15 @@ public struct ExactDuplicateFinder: Sendable {
 
     /// Carries the favorite tag, the own albums, and the album covers over and moves the rows, group by group. One
     /// trash then takes the duplicates of every group, and the backup drops its cached remote state once. `favorites`
-    /// holds the favorites among the trashed and the kept photos; `covers` holds the cover link of each own album. A
-    /// group whose carry-over or row move fails takes no part in the trash.
+    /// holds the favorites among the trashed and the kept photos; `covers` holds the cover link of each own album. The
+    /// favorite tags and the covers that the carry-over writes update `run` and the ranking context. A group whose
+    /// carry-over or row move fails takes no part in the trash.
     /// A failed trash fails every group that took part: their rows already name `kept`, which holds the same bytes,
     /// so a retry finds them moved and writes them no second time. A failed trash can still have moved photos, so
     /// every group reads its kept photo after the trash, also after a failure.
     private func write(
         _ writes: [(index: Int, plan: PlannedMerge)], favorites: Set<PhotoUID>, covers: [String: String],
-        into results: inout [Result<ExactDuplicateMergeOutcome, any Error>?]
+        run: ExactDuplicateMergeRun, into results: inout [Result<ExactDuplicateMergeOutcome, any Error>?]
     ) async {
         // The trash needs its record, so the merge writes nothing while the journal cannot take one.
         switch mergeJournal.prepareForWrites() {
@@ -745,16 +758,23 @@ public struct ExactDuplicateFinder: Sendable {
         }
         var trashing: [(index: Int, plan: PlannedMerge)] = []
         for (index, plan) in writes where !Task.isCancelled {
+            // The carry-over tags the kept photo as favorite when a trashed duplicate is one.
+            let marksFavorite = !favorites.contains(plan.kept) && plan.trashable.contains(where: favorites.contains)
             do {
                 // The albums of the duplicates are read fresh: a cached read can predate an album added since.
                 try await remote.carryOver(
                     from: plan.trashable, to: plan.kept, ownVolumeID: plan.volumeID,
                     albums: CurrentAlbumCarryOver(base: albums), favorites: favorites)
+                if marksFavorite {
+                    run.noteFavorites([plan.kept])
+                    rankingContext.noteFavorites([plan.kept])
+                }
                 // The carry-over added the kept photo to these albums. A retry finds the kept photo as their cover.
                 let trashedLinks = Set(plan.trashable.map(\.nodeID))
                 for (albumID, cover) in covers.sorted(by: { $0.key < $1.key }) where trashedLinks.contains(cover) {
                     try Task.checkCancellation()
                     try await albums.setCover(plan.kept, ofOwnAlbum: albumID)
+                    run.noteCover(plan.kept.nodeID, ofOwnAlbum: albumID)
                 }
                 // The rows move before the trash: the kept photo holds the same bytes, and after the trash only the
                 // trashed links would name the related files that a retry has to move.
@@ -763,6 +783,11 @@ public struct ExactDuplicateFinder: Sendable {
                 }
                 trashing.append((index, plan))
             } catch {
+                // A failed carry-over can have tagged the kept photo, so the next read of the favorites tells.
+                if marksFavorite {
+                    run.forgetFavorites()
+                    rankingContext.invalidate()
+                }
                 results[index] = .failure(error)
             }
         }
@@ -792,8 +817,6 @@ public struct ExactDuplicateFinder: Sendable {
         // The backup's cached remote state names the trashed links as active backups. A running library check keeps
         // going: the trash is a later event, which the refresh after the check applies.
         await resolver.remoteMainsChangedHere()
-        // The carry-over can have tagged a kept photo as favorite.
-        rankingContext.invalidate()
         var restored = false
         let checks: [String: Result<MergeResolution, any Error>]
         do {
@@ -1117,5 +1140,60 @@ final class ExactDuplicateRankingContext: @unchecked Sendable {
 
     func invalidate() {
         lock.withLock { cached = nil }
+    }
+
+    /// Adds favorites that a fresh read or a write of a merge shows, so the next page needs no new listing.
+    func noteFavorites(_ uids: Set<PhotoUID>) {
+        guard !uids.isEmpty else { return }
+        lock.withLock { cached?.favorites.formUnion(uids) }
+    }
+}
+
+/// The favorites and the album covers of one run of merges, such as Merge All, read once and shared by its batches.
+/// The run updates both with the writes of its merges: the favorite tag that a carry-over gives a kept photo, and the
+/// covers that move to a kept photo. Another device can change them during the run, so a merge also takes the favorite
+/// tags of its fresh compound reads and never loses a favorite set elsewhere.
+public final class ExactDuplicateMergeRun: @unchecked Sendable {
+    private let lock = NSLock()
+    private let members: Set<PhotoUID>
+    private var favorites: (covered: Set<PhotoUID>, uids: Set<PhotoUID>)?
+    private var covers: [String: String]?
+
+    /// `members` holds the members of every group that the run can merge. One favorites listing covers them all.
+    public init(members: [PhotoUID]) {
+        self.members = Set(members)
+    }
+
+    /// The favorites among `uids`. The first call reads them for every member of the run.
+    func favorites(among uids: [PhotoUID], remote: any ExactDuplicateRemote) async throws -> Set<PhotoUID> {
+        if let cached = lock.withLock({ favorites }), cached.covered.isSuperset(of: uids) {
+            return cached.uids.intersection(uids)
+        }
+        let covered = members.union(uids)
+        let read = try await remote.favoriteUIDs(among: Array(covered))
+        lock.withLock { favorites = (covered, read) }
+        return read.intersection(uids)
+    }
+
+    /// The cover link of each own album that has one, by album ID. The first call reads them.
+    func covers(albums: any SeriesAlbumCarryOver) async throws -> [String: String] {
+        if let covers = lock.withLock({ covers }) { return covers }
+        let read = try await albums.ownAlbumCovers()
+        lock.withLock { covers = read }
+        return read
+    }
+
+    func noteFavorites(_ uids: Set<PhotoUID>) {
+        guard !uids.isEmpty else { return }
+        lock.withLock { favorites?.uids.formUnion(uids) }
+    }
+
+    /// The next call of `favorites(among:remote:)` reads them again.
+    func forgetFavorites() {
+        lock.withLock { favorites = nil }
+    }
+
+    func noteCover(_ link: String, ofOwnAlbum albumID: String) {
+        lock.withLock { covers?[albumID] = link }
     }
 }

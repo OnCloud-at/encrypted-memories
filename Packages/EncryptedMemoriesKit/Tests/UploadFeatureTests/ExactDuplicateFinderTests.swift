@@ -1856,6 +1856,82 @@ final class ExactDuplicateFinderTests: XCTestCase {
         XCTAssertEqual(violations, [])
     }
 
+    /// Groups in three batches of Merge All, two copies each, without favorites.
+    private func threeBatchesOfGroups() -> [(PhotoUID, PhotoUID)] {
+        let pairs = (0..<(2 * ExactDuplicatesModel.mergeBatchSize + 10)).map { index in
+            (server.seedLink(digest: digest("group-\(index)")), server.seedLink(digest: digest("group-\(index)")))
+        }
+        indexServer()
+        return pairs
+    }
+
+    @MainActor
+    func testMergeAllReadsTheFavoritesAndTheAlbumCoversOnceForAllItsBatches() async throws {
+        let pairs = threeBatchesOfGroups()
+        let model = ExactDuplicatesModel(finder: finder)
+        await model.load()
+        let readsBefore = server.readCounts
+
+        await model.mergeAll()
+
+        let reads = server.readCounts
+        XCTAssertEqual(reads.favorites - readsBefore.favorites, 1, "one favorites listing serves every batch")
+        XCTAssertEqual(reads.albumListings - readsBefore.albumListings, 1, "one album listing serves every batch")
+        for (index, pair) in pairs.enumerated() {
+            XCTAssertEqual(activeMains(hash("group-\(index)")), [pair.0])
+        }
+        XCTAssertEqual(model.groups.map(\.id), [])
+        XCTAssertEqual(violations, [])
+    }
+
+    @MainActor
+    func testMergeAllCarriesOverAFavoriteThatAnotherDeviceSetDuringTheRun() async throws {
+        let pairs = threeBatchesOfGroups()
+        let lastDuplicate = try XCTUnwrap(pairs.last?.1)
+        let server = server!
+        let marked = TrashedByDevice()
+        let model = ExactDuplicatesModel(finder: finder) { _ in
+            // After the first batch, another device marks a duplicate of the last batch as favorite.
+            guard marked.uids.isEmpty else { return }
+            marked.add([lastDuplicate])
+            try? await server.markFavorite([lastDuplicate])
+        }
+        await model.load()
+
+        await model.mergeAll()
+
+        let kept = try XCTUnwrap(pairs.last?.0)
+        XCTAssertEqual(activeMains(hash("group-\(pairs.count - 1)")), [kept])
+        XCTAssertEqual(server.links.first { $0.linkID == kept.nodeID }?.favorite, true, "the favorite moved over")
+        XCTAssertEqual(violations, [])
+    }
+
+    func testTheRankingAfterAMergeReadsNoNewFavoritesListingAndKnowsTheCarriedFavorite() async throws {
+        let kept = server.seedLink(digest: digest("a"))
+        let favorite = server.seedLink(digest: digest("a"))
+        _ = server.seedLink(digest: digest("b"))
+        _ = server.seedLink(digest: digest("b"))
+        try await server.markFavorite([favorite])
+        indexServer()
+        let finder = finder
+        let groups = try await finder.duplicateGroups().groups
+        XCTAssertEqual(groups.count, 2)
+        _ = await finder.rankedMembers(of: groups)
+        let merged = try XCTUnwrap(groups.first { $0.members.contains(kept) })
+        let other = try XCTUnwrap(groups.first { !$0.members.contains(kept) })
+
+        let outcome = try await finder.merge(merged, keeping: kept)
+        let readsBefore = server.readCounts.favorites
+        let pages = PageCollector()
+        await finder.rankMembers(of: [other, merged]) { await pages.add($0) }
+
+        XCTAssertEqual(outcome, .merged(kept: kept, trashed: [favorite], keptDuplicates: [:]))
+        XCTAssertEqual(server.readCounts.favorites, readsBefore, "the ranking keeps its favorites")
+        let facts = await pages.pages.flatMap { $0.facts.values.flatMap { $0 } }
+        XCTAssertEqual(facts.first { $0.key == kept }?.value.isFavorite, true, "the ranking knows the carried tag")
+        XCTAssertEqual(violations, [])
+    }
+
     /// More groups than the screen ranks when it opens, two copies each, the second one a favorite. The fallback
     /// order checks the first copy; the rule ranks the favorite first.
     @MainActor
