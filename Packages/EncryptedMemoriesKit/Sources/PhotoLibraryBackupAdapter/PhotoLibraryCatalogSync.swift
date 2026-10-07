@@ -1,5 +1,6 @@
 import Foundation
 import Photos
+import PhotosCore
 import UploadCore
 
 /// Streams PhotoKit asset metadata in bounded chunks. The offset allows an interrupted full scan to resume
@@ -160,6 +161,55 @@ public struct PhotoLibraryCatalogSync: Sendable {
         self.onRemoved = onRemoved
     }
 
+    /// One backup scan pass for the PhotoKit changes since the stored change token.
+    /// Recently added or changed assets are enqueued first, then the full scan runs when the catalog needs one.
+    /// `commitChanges` advances the change token once the changes are durably covered.
+    ///
+    /// A full scan commits the token as soon as its identifier snapshot is saved on disk: every asset that existed
+    /// before the token is in that snapshot, and the catalog keeps the scan owed until it completes. The change
+    /// history after the token then reports what changes while the scan is interrupted, so the next launch resumes
+    /// the snapshot instead of starting again (#309).
+    public func runPass(
+        engine: any UploadBackupCandidateEnqueueing,
+        changes: PhotoLibraryChangeMonitor.ChangeSet,
+        onLibraryChange: @Sendable () async -> Void = {},
+        commitChanges: @Sendable () -> Void
+    ) async throws {
+        // A rescan can follow a completed scan, for example after an expired change history. It is the only proof
+        // that no asset was missed, so it stays owed even when a later pass stores a newer token.
+        if changes.requiresFullRescan {
+            guard store.markFullScanOwed() else {
+                throw UploadError.backend("Photo library scan state could not be saved")
+            }
+        }
+        let needsFullScan = !store.hasCompletedFullScan()
+        guard store.isOperational() else {
+            throw UploadError.backend(L10n.string("backup.error_local_state_unavailable"))
+        }
+
+        // Enqueue recently added or changed assets first on every pass, including during backfill. A photo
+        // saved by another app or edited while the initial full scan runs must not wait for it.
+        if !changes.requiresFullRescan {
+            let targeted = Array(Set(changes.changedIdentifiers + changes.deletedIdentifiers))
+            if !targeted.isEmpty {
+                _ = try await run(engine: engine, identifiers: targeted)
+                await onLibraryChange()
+            }
+        }
+
+        guard needsFullScan else {
+            commitChanges()
+            return
+        }
+        if changes.requiresFullRescan {
+            guard store.clearFullScanResumePoint() else {
+                throw UploadError.backend("Photo library scan state could not be reset")
+            }
+        }
+        _ = try await runFullScan(engine: engine, onSnapshotReady: commitChanges)
+        await onLibraryChange()
+    }
+
     /// `identifiers == nil` = full library scan (resumable, mark-and-sweep removals); otherwise a
     /// targeted incremental scan (missing requested ids are marked removed). Returns the final tally.
     @discardableResult
@@ -198,6 +248,19 @@ public struct PhotoLibraryCatalogSync: Sendable {
             onProgress?(progress)
             return progress
         }
+
+        return try await runFullScan(engine: engine, onSnapshotReady: {})
+    }
+
+    /// The full library scan. `onSnapshotReady` runs once the identifier snapshot of the scan is saved and synchronized
+    /// to disk, before the first metadata read of this pass. When the synchronization fails, it runs after the scan
+    /// completes instead.
+    private func runFullScan(
+        engine: any UploadBackupCandidateEnqueueing,
+        onSnapshotReady: @Sendable () -> Void
+    ) async throws -> PhotoLibraryCatalogProgress {
+        let observedAt = now()
+        var progress = PhotoLibraryCatalogProgress()
 
         // Full library scan: stable and resumable across interruptions.
         // A numeric cursor over a live PHFetchResult is unsafe: deleting an earlier item shifts an
@@ -242,6 +305,10 @@ public struct PhotoLibraryCatalogSync: Sendable {
         guard store.isOperational() else {
             throw UploadError.backend("Photo library scan state is unavailable")
         }
+        // The token may move past the reason for this scan only when the owed scan and its snapshot survive a power
+        // loss; SQLite keeps WAL commits durable only across app crashes.
+        let snapshotIsDurable = store.synchronizeToDisk()
+        if snapshotIsDurable { onSnapshotReady() }
         let epochStart = resume.epochStart
         let total = store.fullScanSnapshotCount()
         guard store.isOperational() else {
@@ -299,6 +366,7 @@ public struct PhotoLibraryCatalogSync: Sendable {
         guard store.completeFullScan() else {
             throw UploadError.backend("Photo library scan could not be completed")
         }
+        if !snapshotIsDurable { onSnapshotReady() }
         progress.executionCompletedUnitCount = progress.executionTotalUnitCount ?? 0
         onProgress?(progress)
         return progress

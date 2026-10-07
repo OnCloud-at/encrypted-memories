@@ -315,6 +315,28 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
         lock.withLock { readInfoValue(Self.completedFullScanKey) == 1 }
     }
 
+    /// Stores the owed scan in the completion marker itself (value 0). An earlier build that reads the marker then
+    /// also runs the full scan, and a store without the key keeps its meaning.
+    @discardableResult
+    public func markFullScanOwed() -> Bool {
+        lock.withLock { writeInfoValue(Self.completedFullScanKey, 0) }
+    }
+
+    /// A full checkpoint moves every committed transaction from the WAL into the database file and syncs that file;
+    /// `checkpoint_fullfsync` makes the sync an `F_FULLFSYNC`. A busy or partial checkpoint returns false.
+    public func synchronizeToDisk() -> Bool {
+        lock.withLock {
+            guard db != nil, !operationFailed else { return false }
+            sqlite3_exec(db, "PRAGMA checkpoint_fullfsync=ON;", nil, nil, nil)
+            defer { sqlite3_exec(db, "PRAGMA checkpoint_fullfsync=OFF;", nil, nil, nil) }
+            var logFrames: Int32 = -1
+            var checkpointedFrames: Int32 = -1
+            let result = sqlite3_wal_checkpoint_v2(
+                db, "main", SQLITE_CHECKPOINT_FULL, &logFrames, &checkpointedFrames)
+            return result == SQLITE_OK && logFrames >= 0 && logFrames == checkpointedFrames
+        }
+    }
+
     public func hasReconciledLateRenders() -> Bool {
         lock.withLock { readInfoValue(Self.reconciledLateRendersKey) == 1 }
     }

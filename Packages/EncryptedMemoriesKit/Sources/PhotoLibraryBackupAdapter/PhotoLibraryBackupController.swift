@@ -790,9 +790,9 @@ public final class PhotoLibraryBackupController {
                         engine: engine,
                         runner: runner,
                         catalogStore: catalogStore,
-                        changes: preparedChanges.changes
+                        changes: preparedChanges.changes,
+                        commitChanges: { monitor.commit(preparedChanges) }
                     )
-                    monitor.commit(preparedChanges)
                 }
             } catch is CancellationError {
                 // The one-shot completion signal below releases the reconcile loop cleanly.
@@ -919,7 +919,8 @@ public final class PhotoLibraryBackupController {
         engine: UploadBackupSyncEngine,
         runner: BackupSyncRunner,
         catalogStore: PhotoLibraryCatalogManifestStore,
-        changes: PhotoLibraryChangeMonitor.ChangeSet
+        changes: PhotoLibraryChangeMonitor.ChangeSet,
+        commitChanges: @escaping @Sendable () -> Void
     ) async throws {
         let sync = PhotoLibraryCatalogSync(
             store: catalogStore,
@@ -930,31 +931,13 @@ public final class PhotoLibraryBackupController {
                 _ = await runner.removePhotoLibraryAssets(identifiers)
             }
         )
-        let needsFullScan = changes.requiresFullRescan || !catalogStore.hasCompletedFullScan()
-        guard catalogStore.isOperational() else {
-            throw UploadError.backend(L10n.string("backup.error_local_state_unavailable"))
-        }
         try await sync.reconcileLateRendersOnce(engine: engine)
-
-        // Enqueue recently added or changed assets first on every pass, including during backfill. A photo
-        // saved by another app or edited while the initial full scan runs must not wait for it.
-        if !changes.requiresFullRescan {
-            let targeted = Array(Set(changes.changedIdentifiers + changes.deletedIdentifiers))
-            if !targeted.isEmpty {
-                _ = try await sync.run(engine: engine, identifiers: targeted)
-                await noteLibraryChange()
-            }
-        }
-
-        if needsFullScan {
-            if changes.requiresFullRescan {
-                guard catalogStore.clearFullScanResumePoint() else {
-                    throw UploadError.backend("Photo library scan state could not be reset")
-                }
-            }
-            _ = try await sync.run(engine: engine, identifiers: nil)
-            await noteLibraryChange()
-        }
+        try await sync.runPass(
+            engine: engine,
+            changes: changes,
+            onLibraryChange: { [weak self] in await self?.noteLibraryChange() },
+            commitChanges: commitChanges
+        )
     }
 
     private func resumeEnabledBackupAfterLaunch() {
