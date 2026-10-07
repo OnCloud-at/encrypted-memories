@@ -109,7 +109,8 @@ public actor BackupSyncRunner {
     /// Keyed by `sourceKey`. A claim never takes rows of these sources: a running item can leave its row runnable
     /// for a moment, for example `needsRemoteReconciliation` while the paired video of its photo uploads.
     private var runningSources: [String: RunningSource] = [:]
-    /// Wakes the scheduling loop when an item settles, the runtime changes, or a waiting row becomes runnable.
+    /// Wakes the scheduling loop when a row is enqueued, an item settles, the runtime changes, or a waiting row
+    /// becomes runnable.
     private var schedulerWaiter: CheckedContinuation<Void, Never>?
     private var schedulerWakePending = false
     /// Identifies the current wait, so a timed wake that fires after the loop woke for another reason is ignored.
@@ -314,7 +315,11 @@ public actor BackupSyncRunner {
             emitProgress()
         }
         let runtimeWatch = watchRuntimeChanges()
-        defer { runtimeWatch?.cancel() }
+        let queueWatch = watchQueueChanges()
+        defer {
+            runtimeWatch?.cancel()
+            queueWatch?.cancel()
+        }
 
         // Crash recovery first: anything still marked active predates this run and must become
         // runnable again before this runner atomically claims new work.
@@ -487,11 +492,7 @@ public actor BackupSyncRunner {
                     // original, a photo that Photos reports as missing. A one-shot drain the user waits for ends then
                     // instead of sleeping for hours.
                     if wait > longestRegularRetryWait { break }
-                    do {
-                        try await clock.sleep(for: wait)
-                    } catch {
-                        break
-                    }
+                    await waitForSchedulerWake(orAfter: wait)
                     continue
                 }
                 // Free slots that the claim could not fill also wait for the earliest row that becomes runnable.
@@ -518,6 +519,19 @@ public actor BackupSyncRunner {
     }
 
     // MARK: - Scheduling
+
+    /// Uses the store's existing notifications without replacing the pending grid's subscriber. Subscribe before
+    /// the first queue read, so an enqueue between a claim and the wait cannot be lost.
+    private func watchQueueChanges() -> Task<Void, Never>? {
+        guard let observing = queue as? any UploadBackupSyncQueueObserving else { return nil }
+        let changes = observing.changes()
+        return Task { [weak self] in
+            for await change in changes {
+                guard !Task.isCancelled else { return }
+                if case .enqueued = change { await self?.wakeScheduler() }
+            }
+        }
+    }
 
     private func watchRuntimeChanges() -> Task<Void, Never>? {
         guard let runtimeChanges else { return nil }
@@ -622,7 +636,15 @@ public actor BackupSyncRunner {
                 await self.wakeScheduler(generation: generation)
             }
         }
-        await withCheckedContinuation { schedulerWaiter = $0 }
+        // Idle retry waits must end on cancellation. With running items, their settlement wakes the loop instead;
+        // waking every cancelled wait there would spin until those items finish.
+        let wakeWhenCancelled = claimedItemCount == 0
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { schedulerWaiter = $0 }
+        } onCancel: {
+            guard wakeWhenCancelled else { return }
+            Task { await self.wakeScheduler(generation: generation) }
+        }
         schedulerWaitGeneration &+= 1
         timer?.cancel()
     }

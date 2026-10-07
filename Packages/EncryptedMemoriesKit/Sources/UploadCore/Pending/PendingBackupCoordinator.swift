@@ -542,7 +542,7 @@ public actor PendingBackupCoordinator {
             for key in gone.subtracting(wasActive) where handoffs[key] == nil { dropSourceState(key) }
             reloadRows(for: Set(handoffs.keys.filter { $0.kind == kind }).subtracting(current).union(wasActive))
             dirty.formUnion(Set(previousRows.keys).union(current))
-        case .sources(let grouped):
+        case .sources(let grouped), .enqueued(let grouped):
             let identifiers = grouped[kind] ?? []
             let keys = Set(identifiers.map { PendingSourceKey(kind: kind, identifier: $0) })
             reloadRows(for: keys)

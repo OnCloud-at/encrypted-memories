@@ -14,7 +14,8 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
     private var operationFailed = false
     private let lock = NSLock()
     private let observerLock = NSLock()
-    private var changeObserver: (@Sendable (UploadBackupSyncQueueChange) -> Void)?
+    private let legacyObserverID = UUID()
+    private var changeObservers: [UUID: @Sendable (UploadBackupSyncQueueChange) -> Void] = [:]
     private let supportTrail: SupportEventTrail
 
     public init?(
@@ -71,56 +72,80 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
     }
 
     /// A new queue row survives a power loss once its commit returns. A catalog row written after it marks the photo
-    /// as seen, so a lost queue row would leave the photo out of the backup (#352). State changes of queued rows keep
-    /// `synchronous=NORMAL`: they run per item under the lock that reads also take.
-    @discardableResult
-    private func upsertUnobserved(_ entry: UploadBackupSyncQueueEntry) -> Bool {
+    /// as seen, so a lost queue row would leave the photo out of the backup (#352).
+    /// Classifies new work inside the same transaction that commits the upserts. An offered runnable state alone
+    /// is not an enqueue: an advanced row can keep its state, and an unchanged waiting row adds no work.
+    private func upsertBatchUnobserved(_ entries: [UploadBackupSyncQueueEntry]) -> UploadBackupSyncQueueChange? {
         lock.withLock {
-            SQLiteStoreSchemaGate.withDurableCommits(db) {
-                var stmt: OpaquePointer?
-                guard requireOperational(sqlite3_prepare_v2(db, Self.upsertSQL, -1, &stmt, nil) == SQLITE_OK) else {
-                    return false
-                }
-                defer { sqlite3_finalize(stmt) }
-                bind(entry, to: stmt)
-                return requireOperational(sqlite3_step(stmt) == SQLITE_DONE)
-            } ?? requireOperational(false)
-        }
-    }
-
-    /// Commits durably, like `upsertUnobserved`.
-    @discardableResult
-    private func upsertBatchUnobserved(_ entries: [UploadBackupSyncQueueEntry]) -> Bool {
-        guard !entries.isEmpty else { return true }
-        return lock.withLock {
-            SQLiteStoreSchemaGate.withDurableCommits(db) {
-                var stmt: OpaquePointer?
-                guard requireOperational(sqlite3_prepare_v2(db, Self.upsertSQL, -1, &stmt, nil) == SQLITE_OK),
-                    requireOperational(sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK)
-                else {
-                    sqlite3_finalize(stmt)
-                    return false
-                }
-                defer { sqlite3_finalize(stmt) }
-
-                var didPersist = true
-                for entry in entries {
-                    sqlite3_reset(stmt)
-                    sqlite3_clear_bindings(stmt)
-                    bind(entry, to: stmt)
-                    guard requireOperational(sqlite3_step(stmt) == SQLITE_DONE) else {
-                        didPersist = false
-                        break
+            let change =
+                SQLiteStoreSchemaGate.withDurableCommits(db) { () -> UploadBackupSyncQueueChange? in
+                    var write: OpaquePointer?
+                    var prior: OpaquePointer?
+                    guard requireOperational(sqlite3_prepare_v2(db, Self.upsertSQL, -1, &write, nil) == SQLITE_OK),
+                        requireOperational(
+                            sqlite3_prepare_v2(
+                                db,
+                                """
+                                SELECT state IN (\(Self.runnableStateList)), updated_at,
+                                       state IN (\(Self.upsertReplaceableStateList))
+                                FROM backup_sync_queue
+                                WHERE source_kind=? AND source_id=? AND resource=? AND revision_us=?;
+                                """, -1, &prior, nil) == SQLITE_OK),
+                        requireOperational(sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK)
+                    else {
+                        sqlite3_finalize(write)
+                        sqlite3_finalize(prior)
+                        return nil
                     }
-                }
-                guard didPersist,
-                    requireOperational(sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK)
-                else {
-                    sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
-                    return false
-                }
-                return true
-            } ?? requireOperational(false)
+                    defer {
+                        sqlite3_finalize(write)
+                        sqlite3_finalize(prior)
+                    }
+
+                    var enqueued = false
+                    var didPersist = true
+                    for entry in entries {
+                        if Self.runnableStates.contains(entry.state.rawValue) {
+                            sqlite3_reset(prior)
+                            sqlite3_clear_bindings(prior)
+                            bindText(prior, 1, entry.source.kind.rawValue)
+                            bindText(prior, 2, entry.source.identifier)
+                            bindText(prior, 3, entry.source.resource.rawValue)
+                            sqlite3_bind_int64(prior, 4, entry.revision.rawValue)
+                            let result = sqlite3_step(prior)
+                            if result == SQLITE_DONE {
+                                enqueued = true
+                            } else if result == SQLITE_ROW {
+                                let wasRunnable = sqlite3_column_int(prior, 0) != 0
+                                let wasReplaceable = sqlite3_column_int(prior, 2) != 0
+                                let becomesEarlier =
+                                    entry.updatedAt.timeIntervalSince1970 < sqlite3_column_double(prior, 1)
+                                enqueued = enqueued || (wasReplaceable && (!wasRunnable || becomesEarlier))
+                            } else {
+                                _ = requireOperational(false)
+                                didPersist = false
+                                break
+                            }
+                            sqlite3_reset(prior)
+                        }
+                        sqlite3_reset(write)
+                        sqlite3_clear_bindings(write)
+                        bind(entry, to: write)
+                        guard requireOperational(sqlite3_step(write) == SQLITE_DONE) else {
+                            didPersist = false
+                            break
+                        }
+                    }
+                    guard didPersist,
+                        requireOperational(sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK)
+                    else {
+                        sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
+                        return nil
+                    }
+                    return UploadBackupSyncQueueChange(sources: entries.map(\.source), enqueued: enqueued)
+                } ?? nil
+            if change == nil { _ = requireOperational(false) }
+            return change
         }
     }
 
@@ -1023,6 +1048,7 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
 
     public func insertMissingSources(_ entries: [UploadBackupSyncQueueEntry]) -> Bool {
         guard !entries.isEmpty else { return true }
+        var enqueued = false
         let result = lock.withLock {
             SQLiteStoreSchemaGate.withDurableCommits(db) {
                 var stmt: OpaquePointer?
@@ -1054,6 +1080,9 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
                         sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
                         return false
                     }
+                    if sqlite3_changes(db) > 0, Self.runnableStates.contains(entry.state.rawValue) {
+                        enqueued = true
+                    }
                 }
                 guard requireOperational(sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK) else {
                     sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
@@ -1062,7 +1091,7 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
                 return true
             } ?? requireOperational(false)
         }
-        if result { notify(UploadBackupSyncQueueChange(sources: entries.map(\.source))) }
+        if result { notify(UploadBackupSyncQueueChange(sources: entries.map(\.source), enqueued: enqueued)) }
         return result
     }
 
@@ -1141,6 +1170,9 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
         }
     }
 
+    private static let upsertReplaceableStateList =
+        "'discovered','queuedForUpload','failed','paused','sourceMissing','blockedByDraft','skippedRemoteDeletion'"
+
     private static let upsertSQL = """
         INSERT INTO backup_sync_queue(
           source_kind, source_id, resource, revision_us, original_filename,
@@ -1150,24 +1182,15 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
           original_filename=excluded.original_filename,
           byte_count=excluded.byte_count,
           state=CASE
-            WHEN backup_sync_queue.state IN (
-              'discovered','queuedForUpload','failed','paused',
-              'sourceMissing','blockedByDraft','skippedRemoteDeletion'
-            ) THEN excluded.state
+            WHEN backup_sync_queue.state IN (\(upsertReplaceableStateList)) THEN excluded.state
             ELSE backup_sync_queue.state
           END,
           attempts=CASE
-            WHEN backup_sync_queue.state IN (
-              'discovered','queuedForUpload','failed','paused',
-              'sourceMissing','blockedByDraft','skippedRemoteDeletion'
-            ) THEN excluded.attempts
+            WHEN backup_sync_queue.state IN (\(upsertReplaceableStateList)) THEN excluded.attempts
             ELSE backup_sync_queue.attempts
           END,
           last_error=CASE
-            WHEN backup_sync_queue.state IN (
-              'discovered','queuedForUpload','failed','paused',
-              'sourceMissing','blockedByDraft','skippedRemoteDeletion'
-            ) THEN excluded.last_error
+            WHEN backup_sync_queue.state IN (\(upsertReplaceableStateList)) THEN excluded.last_error
             ELSE backup_sync_queue.last_error
           END,
           remote_commit_reconciliation=CASE
@@ -1338,16 +1361,15 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
 
     @discardableResult
     public func upsert(_ entry: UploadBackupSyncQueueEntry) -> Bool {
-        let result = upsertUnobserved(entry)
-        if result { notify(UploadBackupSyncQueueChange(sources: [entry.source])) }
-        return result
+        upsertBatch([entry])
     }
 
     @discardableResult
     public func upsertBatch(_ entries: [UploadBackupSyncQueueEntry]) -> Bool {
-        let result = upsertBatchUnobserved(entries)
-        if result, !entries.isEmpty { notify(UploadBackupSyncQueueChange(sources: entries.map(\.source))) }
-        return result
+        guard !entries.isEmpty else { return true }
+        guard let change = upsertBatchUnobserved(entries) else { return false }
+        notify(change)
+        return true
     }
 
     public func claimRunnable(
@@ -1467,8 +1489,8 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
     }
 
     private func notify(_ change: UploadBackupSyncQueueChange) {
-        let observer = observerLock.withLock { changeObserver }
-        observer?(change)
+        let observers = observerLock.withLock { Array(changeObservers.values) }
+        for observer in observers { observer(change) }
     }
 
     private let transient = SQLiteStoreSchemaGate.transientDestructor
@@ -1554,7 +1576,18 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
 
 extension UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueObserving {
     public func setChangeObserver(_ observer: (@Sendable (UploadBackupSyncQueueChange) -> Void)?) {
-        observerLock.withLock { changeObserver = observer }
+        observerLock.withLock { changeObservers[legacyObserverID] = observer }
+    }
+
+    public func changes() -> AsyncStream<UploadBackupSyncQueueChange> {
+        let id = UUID()
+        return AsyncStream { continuation in
+            observerLock.withLock { changeObservers[id] = { continuation.yield($0) } }
+            continuation.onTermination = { [weak self] _ in
+                guard let self else { return }
+                _ = self.observerLock.withLock { self.changeObservers.removeValue(forKey: id) }
+            }
+        }
     }
 
     public func unsettledRows() -> [UploadBackupQueueRowState] {

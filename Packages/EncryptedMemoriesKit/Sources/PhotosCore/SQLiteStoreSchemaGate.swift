@@ -1,4 +1,5 @@
 import Foundation
+import OSLog
 import SQLite3
 
 /// Classifies an opened SQLite connection before a store applies persistent pragmas or schema DDL.
@@ -30,6 +31,7 @@ private enum SQLiteStoreOpenResult {
 /// produced by this build's schema SQL. This keeps schema changes explicit and prevents markerless or
 /// future files from being modified while an older build tries to open them.
 public enum SQLiteStoreSchemaGate {
+    private static let logger = Logger(subsystem: "at.oncloud.encryptedmemories", category: "SQLiteStore")
     /// `SQLITE_TRANSIENT`: SQLite copies bound text and blobs before the bind call returns.
     public static var transientDestructor: sqlite3_destructor_type {
         unsafeBitCast(-1, to: sqlite3_destructor_type.self)
@@ -207,15 +209,24 @@ public enum SQLiteStoreSchemaGate {
         policy: LibraryDatabasePolicy,
         includeMemoryTuning: Bool = true
     ) {
+        sqlite3_exec(db, "PRAGMA journal_mode=WAL;", nil, nil, nil)
+        let usesWAL = pragmaValue("journal_mode", in: db) == "wal"
+        // EXTRA also syncs the containing directory after deleting a rollback journal. FULL alone does not guarantee
+        // power-loss durability in DELETE mode (https://www.sqlite.org/pragma.html#pragma_synchronous).
+        if !usesWAL { logger.warning("WAL unavailable; using durable rollback-journal commits.") }
+        let sync = usesWAL ? "NORMAL" : "EXTRA"
+        if sqlite3_exec(db, "PRAGMA synchronous=\(sync);", nil, nil, nil) != SQLITE_OK
+            || sqlite3_exec(db, "PRAGMA fullfsync=\(usesWAL ? "OFF" : "ON");", nil, nil, nil) != SQLITE_OK
+        {
+            logger.error("SQLite refused the commit synchronization settings.")
+        }
         var pragmas = [
-            "PRAGMA journal_mode=WAL;",
-            "PRAGMA synchronous=NORMAL;",
             "PRAGMA busy_timeout=\(policy.busyTimeoutMs);",
             "PRAGMA journal_size_limit=\(policy.journalSizeLimitBytes);",
         ]
         if includeMemoryTuning {
-            pragmas.insert("PRAGMA cache_size=-\(max(0, policy.cacheSizeKiB));", at: 3)
-            pragmas.insert("PRAGMA mmap_size=\(max(0, policy.mmapBytes));", at: 4)
+            pragmas.append("PRAGMA cache_size=-\(max(0, policy.cacheSizeKiB));")
+            pragmas.append("PRAGMA mmap_size=\(max(0, policy.mmapBytes));")
         }
         for pragma in pragmas {
             sqlite3_exec(db, pragma, nil, nil, nil)
@@ -228,26 +239,60 @@ public enum SQLiteStoreSchemaGate {
         sqlite3_exec(db, "PRAGMA checkpoint_fullfsync=ON;", nil, nil, nil)
     }
 
-    /// Runs `body` with commits that survive a power loss, then returns the connection to `synchronous=NORMAL`.
+    /// Runs `body` with commits that survive a power loss, then restores the connection's previous settings.
     /// In WAL mode, `synchronous=FULL` syncs the WAL after each commit, and `fullfsync` makes that sync an
     /// `F_FULLFSYNC` on Apple platforms (https://www.sqlite.org/pragma.html#pragma_synchronous). The caller holds the
     /// lock of its connection and calls this outside a transaction: SQLite refuses the change inside one. Returns nil
     /// without running `body` when the connection refuses the setting.
     public static func withDurableCommits<T>(_ db: OpaquePointer?, _ body: () throws -> T) rethrows -> T? {
-        guard sqlite3_exec(db, "PRAGMA synchronous=FULL;", nil, nil, nil) == SQLITE_OK else { return nil }
-        defer { sqlite3_exec(db, "PRAGMA synchronous=NORMAL;", nil, nil, nil) }
+        guard let synchronous = pragmaValue("synchronous", in: db).flatMap(Int.init),
+            let fullfsync = pragmaValue("fullfsync", in: db).flatMap(Int.init),
+            sqlite3_exec(db, "PRAGMA synchronous=\(max(2, synchronous));", nil, nil, nil) == SQLITE_OK
+        else { return nil }
+        defer { sqlite3_exec(db, "PRAGMA synchronous=\(synchronous);", nil, nil, nil) }
         guard sqlite3_exec(db, "PRAGMA fullfsync=ON;", nil, nil, nil) == SQLITE_OK else { return nil }
-        defer { sqlite3_exec(db, "PRAGMA fullfsync=OFF;", nil, nil, nil) }
+        defer { sqlite3_exec(db, "PRAGMA fullfsync=\(fullfsync);", nil, nil, nil) }
         return try body()
     }
 
     /// Copies every committed transaction from the WAL into the database file and syncs that file (a FULL
-    /// checkpoint). A busy, partial, or failed checkpoint returns false.
+    /// checkpoint). Rollback-journal commits need no checkpoint when their connection already commits durably.
+    /// A busy, partial, or failed checkpoint returns false.
     public static func checkpointCompletely(_ db: OpaquePointer?) -> Bool {
+        guard let db, let journal = pragmaValue("journal_mode", in: db), sqlite3_get_autocommit(db) != 0 else {
+            logger.error("SQLite synchronization failed: no readable connection or an open transaction.")
+            return false
+        }
+        if journal != "wal" {
+            guard ["delete", "truncate", "persist"].contains(journal),
+                let synchronous = pragmaValue("synchronous", in: db).flatMap(Int.init), synchronous >= 2,
+                pragmaValue("fullfsync", in: db) == "1"
+            else {
+                logger.error("SQLite synchronization failed: non-WAL commits are not durable.")
+                return false
+            }
+            // Rollback-journal commits already sync the database. There is no WAL to checkpoint.
+            return true
+        }
         var logFrames: Int32 = -1
         var checkpointedFrames: Int32 = -1
         let result = sqlite3_wal_checkpoint_v2(db, "main", SQLITE_CHECKPOINT_FULL, &logFrames, &checkpointedFrames)
-        return result == SQLITE_OK && logFrames >= 0 && logFrames == checkpointedFrames
+        guard result == SQLITE_OK && logFrames >= 0 && logFrames == checkpointedFrames else {
+            logger.error(
+                "SQLite synchronization failed: checkpoint result \(result), frames \(checkpointedFrames)/\(logFrames)."
+            )
+            return false
+        }
+        return true
+    }
+
+    private static func pragmaValue(_ name: String, in db: OpaquePointer?) -> String? {
+        guard let db else { return nil }
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, "PRAGMA \(name);", -1, &statement, nil) == SQLITE_OK else { return nil }
+        defer { sqlite3_finalize(statement) }
+        guard sqlite3_step(statement) == SQLITE_ROW, let value = sqlite3_column_text(statement, 0) else { return nil }
+        return String(cString: value)
     }
 
     public static func state(of db: OpaquePointer?) -> SQLiteStoreSchemaState {

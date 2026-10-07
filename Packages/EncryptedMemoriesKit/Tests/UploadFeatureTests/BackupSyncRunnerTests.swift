@@ -33,6 +33,41 @@ final class BackupTestClock: BackupSchedulerClock, @unchecked Sendable {
     }
 }
 
+/// Holds scheduler sleeps until the test releases them, so an insert must wake the runner itself.
+final class HeldBackupSleepClock: BackupSchedulerClock, @unchecked Sendable {
+    private let clock: BackupTestClock
+    private let lock = NSLock()
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+    private var released = false
+
+    init(clock: BackupTestClock) { self.clock = clock }
+
+    var isWaiting: Bool { lock.withLock { !waiters.isEmpty } }
+
+    func sleep(for seconds: TimeInterval) async throws {
+        await withCheckedContinuation { continuation in
+            let resume = lock.withLock {
+                if released { return true }
+                waiters.append(continuation)
+                return false
+            }
+            if resume { continuation.resume() }
+        }
+        try Task.checkCancellation()
+        clock.advance(by: seconds)
+    }
+
+    func releaseAll() {
+        let pending = lock.withLock {
+            released = true
+            let pending = waiters
+            waiters.removeAll()
+            return pending
+        }
+        for waiter in pending { waiter.resume() }
+    }
+}
+
 /// Records the tags that backup adds to existing photos; can fail every call.
 final class SpyTagAdder: PhotoTagAdding, @unchecked Sendable {
     private let lock = NSLock()
@@ -491,6 +526,20 @@ final class SpyQueueStore: UploadBackupSyncQueueStore, @unchecked Sendable {
 
     func summary() -> UploadBackupSyncQueueSummary { inner.summary() }
     func count() -> Int { inner.count() }
+}
+
+extension SpyQueueStore: UploadBackupSyncQueueObserving {
+    func setChangeObserver(_ observer: (@Sendable (UploadBackupSyncQueueChange) -> Void)?) {
+        inner.setChangeObserver(observer)
+    }
+    func changes() -> AsyncStream<UploadBackupSyncQueueChange> { inner.changes() }
+    func unsettledRows() -> [UploadBackupQueueRowState] { inner.unsettledRows() }
+    func backedUpRevisions(kind: UploadSourceIdentity.Kind) -> [String: UploadBackupRevision] {
+        inner.backedUpRevisions(kind: kind)
+    }
+    func rows(kind: UploadSourceIdentity.Kind, identifiers: Set<String>) -> [UploadBackupQueueRowState] {
+        inner.rows(kind: kind, identifiers: identifiers)
+    }
 }
 
 /// Simulates a scan upsert racing the runner immediately after it persisted a future retry. The
@@ -1813,7 +1862,8 @@ final class BackupSyncRunnerTests: XCTestCase {
         resourceCoordinator: LibraryResourceCoordinator = .shared,
         events: (any BackupItemEventSink)? = nil,
         throttleInputs: @Sendable @escaping () -> BackupThrottleInputs = { .unconstrained },
-        runtimeChanges: (@Sendable () -> AsyncStream<LibraryRuntimeSnapshot>)? = nil
+        runtimeChanges: (@Sendable () -> AsyncStream<LibraryRuntimeSnapshot>)? = nil,
+        schedulerClock: (any BackupSchedulerClock)? = nil
     ) -> BackupSyncRunner {
         BackupSyncRunner(
             queue: queue ?? queueStore,
@@ -1832,7 +1882,7 @@ final class BackupSyncRunnerTests: XCTestCase {
             ),
             throttleInputs: throttleInputs,
             runtimeChanges: runtimeChanges,
-            clock: clock,
+            clock: schedulerClock ?? clock,
             events: events,
             now: { [clock] in clock!.now }
         )
@@ -3949,6 +3999,106 @@ extension BackupSyncRunnerTests {
         XCTAssertEqual(progress.uploaded, 7)
         XCTAssertEqual(progress.checking, 0)
         XCTAssertLessThanOrEqual(transfers.peakConcurrent, 2)
+    }
+
+    func testNewBatchStartsWhileALongUploadHasNoWaitingRow() async throws {
+        try await assertNewWorkStartsWhileALongUploadHasNoWaitingRow(recoveringMissingSources: false)
+    }
+
+    func testRecoveredMissingSourceStartsWhileALongUploadHasNoWaitingRow() async throws {
+        try await assertNewWorkStartsWhileALongUploadHasNoWaitingRow(recoveringMissingSources: true)
+    }
+
+    private func assertNewWorkStartsWhileALongUploadHasNoWaitingRow(recoveringMissingSources: Bool) async throws {
+        let slow = seedEntry("slow.mov", ageSeconds: 600)
+        let initial = seedEntry("initial.jpg")
+        let notifications = BackupEventLog()
+        queueStore.setChangeObserver { change in
+            if case .enqueued = change { notifications.append("enqueued") }
+        }
+        let transfers = HeldTransferUploader(held: ["slow.mov"])
+        let runner = makeRunner(uploader: transfers, throttle: BackupThrottlePolicy(baseConcurrency: 2))
+        let engine = UploadBackupSyncEngine(preflight: preflight, queue: queueStore, now: { [clock] in clock!.now })
+        let pass = Task { await runner.runUntilDrained(mode: .eligibleOnly) }
+        let initialFinished = await waitUntil { self.state(of: initial) == .completed }
+        XCTAssertTrue(initialFinished)
+        // Let the settlement wake finish before inserting work into the otherwise idle queue.
+        for _ in 0..<100 { await Task.yield() }
+
+        let source = UploadSourceIdentity.file(URL(fileURLWithPath: "/backup/new.jpg"))
+        let revision = UploadBackupRevision(date: resolver.defaultModified)
+        let candidate = UploadBackupAssetCandidate(
+            snapshot: UploadBackupAssetSnapshot(source: source, revision: revision, resourceCount: 1),
+            originalFilename: "new.jpg", byteCount: 4)
+        if recoveringMissingSources {
+            try await engine.enqueueMissingSources([candidate])
+        } else {
+            _ = try await engine.enqueueBatch([candidate])
+        }
+        let newFinished = await waitUntil(timeout: .seconds(2)) {
+            self.queueStore.entry(for: source, revision: revision)?.state == .completed
+        }
+        let slowStillRunning = !transfers.finished.contains("slow.mov")
+        let waits = clock.sleeps
+        transfers.releaseAll()
+        let progress = await pass.value
+
+        XCTAssertTrue(newFinished, "newly queued photos fill the free slot before the long upload ends")
+        XCTAssertTrue(slowStillRunning)
+        XCTAssertEqual(notifications.events, ["enqueued"], "the existing subscriber still receives one enqueue")
+        XCTAssertEqual(waits, [], "queue inserts need no polling timer")
+        XCTAssertEqual(transfers.started.filter { $0 == "new.jpg" }.count, 1)
+        XCTAssertEqual(state(of: slow), .completed)
+        XCTAssertEqual(progress.uploaded, 3)
+        XCTAssertLessThanOrEqual(transfers.peakConcurrent, 2)
+    }
+
+    func testNewBatchInterruptsTheRetryWaitWhenNoUploadRuns() async throws {
+        let delayed = seedEntry("later.jpg", ageSeconds: -60)
+        let heldClock = HeldBackupSleepClock(clock: clock)
+        let runner = makeRunner(schedulerClock: heldClock)
+        let engine = UploadBackupSyncEngine(preflight: preflight, queue: queueStore, now: { [clock] in clock!.now })
+        let pass = Task { await runner.runUntilDrained() }
+        let waiting = await waitUntil { heldClock.isWaiting }
+        XCTAssertTrue(waiting)
+
+        let source = UploadSourceIdentity.file(URL(fileURLWithPath: "/backup/now.jpg"))
+        let revision = UploadBackupRevision(date: resolver.defaultModified)
+        _ = try await engine.enqueueBatch([
+            UploadBackupAssetCandidate(
+                snapshot: UploadBackupAssetSnapshot(source: source, revision: revision, resourceCount: 1),
+                originalFilename: "now.jpg", byteCount: 4)
+        ])
+        let newFinished = await waitUntil(timeout: .seconds(2)) {
+            self.queueStore.entry(for: source, revision: revision)?.state == .completed
+        }
+        let delayedStillWaiting = state(of: delayed) == .discovered
+        await runner.stop()
+        heldClock.releaseAll()
+        _ = await pass.value
+
+        XCTAssertTrue(newFinished, "an insert interrupts the retry wait while all upload slots are free")
+        XCTAssertTrue(delayedStillWaiting)
+    }
+
+    func testCancellationEndsAnIdleRetryWait() async throws {
+        _ = seedEntry("later.jpg", ageSeconds: -60)
+        let heldClock = HeldBackupSleepClock(clock: clock)
+        let runner = makeRunner(schedulerClock: heldClock)
+        let finished = BackupEventLog()
+        let pass = Task {
+            let result = await runner.runUntilDrained()
+            finished.append("finished")
+            return result
+        }
+        let waiting = await waitUntil { heldClock.isWaiting }
+        XCTAssertTrue(waiting)
+        pass.cancel()
+        let endedBeforeTheRetry = await waitUntil(timeout: .seconds(2)) { !finished.events.isEmpty }
+        heldClock.releaseAll()
+        _ = await pass.value
+
+        XCTAssertTrue(endedBeforeTheRetry, "cancellation does not wait for a later retry")
     }
 
     func testAFailingItemFreesItsSlotAndRetriesAsBefore() async throws {
