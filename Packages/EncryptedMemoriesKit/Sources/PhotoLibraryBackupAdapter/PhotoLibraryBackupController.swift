@@ -1201,8 +1201,6 @@ public final class PhotoLibraryBackupController {
         heartbeatTask?.cancel()
         heartbeatTask = nil
         tempStore.sweep()
-        // Closing a store checkpoints its WAL. The queue closes before the catalog, so no catalog row reaches the
-        // database file before its queue row (#352).
         queueStore?.close()
         stateStore?.close()
         catalogStore?.close()

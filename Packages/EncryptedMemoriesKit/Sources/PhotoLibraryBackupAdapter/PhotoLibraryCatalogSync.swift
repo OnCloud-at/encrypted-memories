@@ -134,17 +134,13 @@ public struct PhotoKitAssetEnumerator: PhotoLibraryAssetEnumerator {
 
 /// Scans the photo library and persists observations in bounded chunks.
 /// It enqueues candidates only for new or changed assets.
-/// Queue rows are written before catalog rows, so a crash replays the chunk safely.
+/// Queue rows are written, and synced to disk, before catalog rows, so a crash or power loss replays the chunk safely.
 /// Removed assets are marked in the catalog and removed from queued or in-flight work.
 /// PhotoKit enumeration and SQLite writes run off the main actor.
 public struct PhotoLibraryCatalogSync: Sendable {
-    /// A pass stops when this many synchronization intervals of photos wait for a busy queue checkpoint.
-    private static let unsynchronizedIntervalLimit = 10
-
     private let store: any PhotoLibraryCatalogStore
     private let enumerator: any PhotoLibraryAssetEnumerator
     private let chunkSize: Int
-    private let synchronizationInterval: Int
     private let now: @Sendable () -> Date
     private let onProgress: (@Sendable (PhotoLibraryCatalogProgress) -> Void)?
     private let onRemoved: (@Sendable ([String]) async -> Void)?
@@ -153,7 +149,6 @@ public struct PhotoLibraryCatalogSync: Sendable {
         store: any PhotoLibraryCatalogStore,
         enumerator: any PhotoLibraryAssetEnumerator = PhotoKitAssetEnumerator(),
         chunkSize: Int = 200,
-        synchronizationInterval: Int = 1_000,
         now: @Sendable @escaping () -> Date = { Date() },
         onProgress: (@Sendable (PhotoLibraryCatalogProgress) -> Void)? = nil,
         onRemoved: (@Sendable ([String]) async -> Void)? = nil
@@ -161,7 +156,6 @@ public struct PhotoLibraryCatalogSync: Sendable {
         self.store = store
         self.enumerator = enumerator
         self.chunkSize = max(1, chunkSize)
-        self.synchronizationInterval = max(1, synchronizationInterval)
         self.now = now
         self.onProgress = onProgress
         self.onRemoved = onRemoved
@@ -236,13 +230,10 @@ public struct PhotoLibraryCatalogSync: Sendable {
             progress.executionTotalUnitCount = Int64(identifiers.count)
             onProgress?(progress)
             var seen: Set<String>? = []
-            var unsynchronized = 0
             for try await chunk in enumerator.infoChunks(identifiers: identifiers, startOffset: 0, chunkSize: chunkSize)
             {
                 try Task.checkCancellation()
                 try await ingest(chunk, observedAt: observedAt, engine: engine, progress: &progress, seen: &seen)
-                unsynchronized += chunk.count
-                try await synchronizeWhenDue(unsynchronized: &unsynchronized, engine: engine)
                 progress.executionCompletedUnitCount = Int64(min(identifiers.count, seen?.count ?? 0))
                 onProgress?(progress)
             }
@@ -317,9 +308,8 @@ public struct PhotoLibraryCatalogSync: Sendable {
         guard store.isOperational() else {
             throw UploadError.backend("Photo library scan state is unavailable")
         }
-        // The token may move past the reason for this scan only when the owed scan, its snapshot, and the queue rows of
-        // this pass survive a power loss; SQLite keeps WAL commits durable only across app crashes. The queue goes
-        // first: a durable catalog row without its queue row is never queued again.
+        // The token may move past the reason for this scan only when the owed scan, its snapshot, and the queue of this
+        // pass survive a power loss; SQLite keeps most WAL commits durable only across app crashes.
         let snapshotIsDurable = await synchronizeQueueThenCatalog(engine: engine)
         if snapshotIsDurable { onSnapshotReady() }
         let epochStart = resume.epochStart
@@ -332,7 +322,6 @@ public struct PhotoLibraryCatalogSync: Sendable {
         progress.executionTotalUnitCount = Int64(total + metadataWorkBase)
         progress.executionCompletedUnitCount = Int64(metadataWorkBase + cursor)
         onProgress?(progress)
-        var unsynchronized = 0
         while cursor < total {
             try Task.checkCancellation()
             let identifiers = store.fullScanSnapshotIdentifiers(startingAt: cursor, limit: chunkSize)
@@ -366,8 +355,6 @@ public struct PhotoLibraryCatalogSync: Sendable {
             else {
                 throw UploadError.backend("Photo library scan progress could not be saved")
             }
-            unsynchronized += identifiers.count
-            try await synchronizeWhenDue(unsynchronized: &unsynchronized, engine: engine)
             progress.executionCompletedUnitCount = Int64(metadataWorkBase + cursor)
             onProgress?(progress)
         }
@@ -390,27 +377,10 @@ public struct PhotoLibraryCatalogSync: Sendable {
         return progress
     }
 
-    /// Makes the queue durable first and then the catalog. The catalog store never checkpoints by itself, so a catalog
-    /// row or scan position reaches the database file only after the queue rows written before it (#352).
+    /// Makes the queue durable first and then the catalog, before the change token moves. Queue rows of new or changed
+    /// photos are already durable when their commit returns, so a catalog row on disk never lacks its queue row (#352).
     private func synchronizeQueueThenCatalog(engine: any UploadBackupCandidateEnqueueing) async -> Bool {
         await engine.synchronizeQueueToDisk() && store.synchronizeToDisk()
-    }
-
-    /// Synchronizes once `synchronizationInterval` photos were written since the last success, so the catalog WAL stays
-    /// small. A failed attempt is tried again after the next chunk. When the queue stays busy for
-    /// `unsynchronizedIntervalLimit` intervals, the pass stops: the catalog WAL then holds at most that many photos, and
-    /// the next pass continues from the saved position.
-    private func synchronizeWhenDue(
-        unsynchronized: inout Int, engine: any UploadBackupCandidateEnqueueing
-    ) async throws {
-        guard unsynchronized >= synchronizationInterval else { return }
-        if await synchronizeQueueThenCatalog(engine: engine) {
-            unsynchronized = 0
-            return
-        }
-        guard unsynchronized < synchronizationInterval * Self.unsynchronizedIntervalLimit else {
-            throw UploadError.backend("Photo library scan could not be saved to disk")
-        }
     }
 
     /// Runs once per catalog. An earlier build can store an entry that lists a late rendered file next to a backup

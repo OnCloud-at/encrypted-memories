@@ -228,6 +228,19 @@ public enum SQLiteStoreSchemaGate {
         sqlite3_exec(db, "PRAGMA checkpoint_fullfsync=ON;", nil, nil, nil)
     }
 
+    /// Runs `body` with commits that survive a power loss, then returns the connection to `synchronous=NORMAL`.
+    /// In WAL mode, `synchronous=FULL` syncs the WAL after each commit, and `fullfsync` makes that sync an
+    /// `F_FULLFSYNC` on Apple platforms (https://www.sqlite.org/pragma.html#pragma_synchronous). The caller holds the
+    /// lock of its connection and calls this outside a transaction: SQLite refuses the change inside one. Returns nil
+    /// without running `body` when the connection refuses the setting.
+    public static func withDurableCommits<T>(_ db: OpaquePointer?, _ body: () throws -> T) rethrows -> T? {
+        guard sqlite3_exec(db, "PRAGMA synchronous=FULL;", nil, nil, nil) == SQLITE_OK else { return nil }
+        defer { sqlite3_exec(db, "PRAGMA synchronous=NORMAL;", nil, nil, nil) }
+        guard sqlite3_exec(db, "PRAGMA fullfsync=ON;", nil, nil, nil) == SQLITE_OK else { return nil }
+        defer { sqlite3_exec(db, "PRAGMA fullfsync=OFF;", nil, nil, nil) }
+        return try body()
+    }
+
     /// Copies every committed transaction from the WAL into the database file and syncs that file (a FULL
     /// checkpoint). A busy, partial, or failed checkpoint returns false.
     public static func checkpointCompletely(_ db: OpaquePointer?) -> Bool {

@@ -70,49 +70,57 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
         }
     }
 
+    /// A new queue row survives a power loss once its commit returns. A catalog row written after it marks the photo
+    /// as seen, so a lost queue row would leave the photo out of the backup (#352). State changes of queued rows keep
+    /// `synchronous=NORMAL`: they run per item under the lock that reads also take.
     @discardableResult
     private func upsertUnobserved(_ entry: UploadBackupSyncQueueEntry) -> Bool {
         lock.withLock {
-            var stmt: OpaquePointer?
-            guard requireOperational(sqlite3_prepare_v2(db, Self.upsertSQL, -1, &stmt, nil) == SQLITE_OK) else {
-                return false
-            }
-            defer { sqlite3_finalize(stmt) }
-            bind(entry, to: stmt)
-            return requireOperational(sqlite3_step(stmt) == SQLITE_DONE)
+            SQLiteStoreSchemaGate.withDurableCommits(db) {
+                var stmt: OpaquePointer?
+                guard requireOperational(sqlite3_prepare_v2(db, Self.upsertSQL, -1, &stmt, nil) == SQLITE_OK) else {
+                    return false
+                }
+                defer { sqlite3_finalize(stmt) }
+                bind(entry, to: stmt)
+                return requireOperational(sqlite3_step(stmt) == SQLITE_DONE)
+            } ?? requireOperational(false)
         }
     }
 
+    /// Commits durably, like `upsertUnobserved`.
     @discardableResult
     private func upsertBatchUnobserved(_ entries: [UploadBackupSyncQueueEntry]) -> Bool {
         guard !entries.isEmpty else { return true }
         return lock.withLock {
-            var stmt: OpaquePointer?
-            guard requireOperational(sqlite3_prepare_v2(db, Self.upsertSQL, -1, &stmt, nil) == SQLITE_OK),
-                requireOperational(sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK)
-            else {
-                sqlite3_finalize(stmt)
-                return false
-            }
-            defer { sqlite3_finalize(stmt) }
-
-            var didPersist = true
-            for entry in entries {
-                sqlite3_reset(stmt)
-                sqlite3_clear_bindings(stmt)
-                bind(entry, to: stmt)
-                guard requireOperational(sqlite3_step(stmt) == SQLITE_DONE) else {
-                    didPersist = false
-                    break
+            SQLiteStoreSchemaGate.withDurableCommits(db) {
+                var stmt: OpaquePointer?
+                guard requireOperational(sqlite3_prepare_v2(db, Self.upsertSQL, -1, &stmt, nil) == SQLITE_OK),
+                    requireOperational(sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK)
+                else {
+                    sqlite3_finalize(stmt)
+                    return false
                 }
-            }
-            guard didPersist,
-                requireOperational(sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK)
-            else {
-                sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
-                return false
-            }
-            return true
+                defer { sqlite3_finalize(stmt) }
+
+                var didPersist = true
+                for entry in entries {
+                    sqlite3_reset(stmt)
+                    sqlite3_clear_bindings(stmt)
+                    bind(entry, to: stmt)
+                    guard requireOperational(sqlite3_step(stmt) == SQLITE_DONE) else {
+                        didPersist = false
+                        break
+                    }
+                }
+                guard didPersist,
+                    requireOperational(sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK)
+                else {
+                    sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
+                    return false
+                }
+                return true
+            } ?? requireOperational(false)
         }
     }
 
