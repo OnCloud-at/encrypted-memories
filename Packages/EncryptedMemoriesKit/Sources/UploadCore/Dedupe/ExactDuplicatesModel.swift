@@ -381,7 +381,7 @@ public final class ExactDuplicatesModel {
     /// Merge All starts no further batch until `resumeMerging()`, for example while the app is in the background.
     @ObservationIgnored private var isMergePaused = false
     /// Merge All waits here while it is paused.
-    @ObservationIgnored private var mergeResumers: [CheckedContinuation<Void, Never>] = []
+    @ObservationIgnored private var mergeResumers: [UUID: CheckedContinuation<Void, Never>] = [:]
     /// A batch of a merge is with the finder.
     @ObservationIgnored private var isMergeBatchRunning = false
     /// They wait until the running batch finished.
@@ -1115,14 +1115,28 @@ public final class ExactDuplicatesModel {
     }
 
     private func wakeMergeResumers() {
-        let resumers = mergeResumers
-        mergeResumers = []
+        let resumers = mergeResumers.values
+        mergeResumers = [:]
         resumers.forEach { $0.resume() }
     }
 
     private func waitWhileMergePaused() async {
-        while isMergePaused, !isStoppingMergeAll {
-            await withCheckedContinuation { mergeResumers.append($0) }
+        while isMergePaused, !isStoppingMergeAll, !Task.isCancelled {
+            let id = UUID()
+            await withTaskCancellationHandler {
+                await withCheckedContinuation { continuation in
+                    guard !Task.isCancelled else {
+                        continuation.resume()
+                        return
+                    }
+                    mergeResumers[id] = continuation
+                }
+            } onCancel: { [weak self] in
+                Task { @MainActor [weak self] in
+                    // Removal makes cancellation, resume and stop retire this waiter only once.
+                    self?.mergeResumers.removeValue(forKey: id)?.resume()
+                }
+            }
         }
     }
 
@@ -1177,7 +1191,7 @@ public final class ExactDuplicatesModel {
             if all {
                 await waitWhileMergePaused()
                 // A stop during the ranking merges nothing.
-                if isStoppingMergeAll {
+                if isStoppingMergeAll || Task.isCancelled {
                     stopped = true
                     break
                 }
@@ -1239,7 +1253,7 @@ public final class ExactDuplicatesModel {
             }
         }
         // A stop before the ranking reported a page leaves no group to merge, and the run still ends as stopped.
-        if all, isStoppingMergeAll, mergedGroups < candidates.count { stopped = true }
+        if all, isStoppingMergeAll || Task.isCancelled, mergedGroups < candidates.count { stopped = true }
         mergingGroupIDs = []
         isMerging = false
         isMergingAll = false
@@ -1277,15 +1291,19 @@ public final class ExactDuplicatesModel {
         var pending = unranked
         while !pending.isEmpty {
             await waitWhileMergePaused()
-            if isStoppingMergeAll { return }
+            if isStoppingMergeAll || Task.isCancelled { return }
             mergeRankingInterrupted = false
             let page = pending
             let task = Task { await finder.rankMembers(of: page, ranked: apply) }
             mergeRanking = task
-            await task.value
+            await withTaskCancellationHandler {
+                await task.value
+            } onCancel: {
+                task.cancel()
+            }
             mergeRanking = nil
             // Only a pause ranks again; a group whose facts cannot be read stays unranked.
-            guard mergeRankingInterrupted, !isStoppingMergeAll else { return }
+            guard mergeRankingInterrupted, !isStoppingMergeAll, !Task.isCancelled else { return }
             let unrankedIDs = Set(groups.filter { !$0.isRanked }.map(\.id))
             pending = pending.filter { unrankedIDs.contains($0.id) }
         }

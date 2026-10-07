@@ -35,6 +35,21 @@ final class BackupStatusProjectorTests: XCTestCase {
         try? FileManager.default.removeItem(at: tempDirectory)
     }
 
+    func testStopReleasesTheProjectorAndItsCallbackOwner() async {
+        var projector: BackupStatusProjector? = BackupStatusProjector(queue: queue)
+        var recorder: Recorder? = Recorder()
+        weak var releasedProjector = projector
+        weak var releasedRecorder = recorder
+        await projector?.start(generation: UUID(), context: BackupStatusProjectionContext()) { [recorder] projection in
+            recorder?.append(projection)
+        }
+        recorder = nil
+        await projector?.stop()
+        XCTAssertNil(releasedRecorder, "Stop must detach the callback owner")
+        projector = nil
+        XCTAssertNil(releasedProjector)
+    }
+
     func testStartProjectsDurableQueueTruth() async throws {
         XCTAssertTrue(queue.upsert(entry(id: "durable", state: .discovered)))
         let projector = BackupStatusProjector(queue: queue)

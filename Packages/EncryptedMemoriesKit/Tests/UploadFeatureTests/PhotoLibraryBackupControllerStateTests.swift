@@ -7,6 +7,31 @@ import XCTest
 
 @MainActor
 final class PhotoLibraryBackupControllerStateTests: XCTestCase {
+    func testShutdownReleasesTheControllerAndItsRuntimeSignals() async throws {
+        var runtime: LibraryRuntimeState? = LibraryRuntimeState()
+        weak var releasedRuntime = runtime
+        var fixture: ControllerFixture? = try makeControllerFixture(
+            prefix: "backup-deallocation",
+            runtimeSignals: BackupRuntimeSignalSource(
+                current: { [state = runtime!] in BackupThrottleInputs(runtime: state.snapshot(), usesMobileData: false)
+                },
+                updates: { [state = runtime!] in state.updates() }))
+        let defaults = fixture!.defaults
+        let suite = fixture!.suite
+        let directory = fixture!.directory
+        defer {
+            defaults.removePersistentDomain(forName: suite)
+            try? FileManager.default.removeItem(at: directory)
+        }
+        weak var releasedController = fixture?.controller
+        await fixture?.controller.shutdown()
+        fixture = nil
+        runtime = nil
+        _ = await waitUntil { releasedController == nil && releasedRuntime == nil }
+        XCTAssertNil(releasedController)
+        XCTAssertNil(releasedRuntime, "The network observer must release its signal source after shutdown")
+    }
+
     func testFailedItemsClassifyReasonsWithoutDisplayingTechnicalDetails() async throws {
         let fixture = try makeControllerFixture(prefix: "backup-issue-projection")
         defer { fixture.cleanup() }

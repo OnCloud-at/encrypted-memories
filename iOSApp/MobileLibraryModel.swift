@@ -223,7 +223,7 @@ final class MobileLibraryModel {
     private(set) var facade: ProtonClientFacade? {
         didSet {
             guard facade !== oldValue else { return }
-            duplicates = facade?.exactDuplicates.map { makeDuplicatesModel($0) }
+            replaceDuplicates(using: facade?.exactDuplicates)
             // The Collections tab scans for duplicates only when it appears. A merge that the end of the app left open
             // is checked now, so a group whose copies both left the library comes back without that visit. A new
             // account or a sign-out ends the check of the earlier one; its merges stay open in its journal.
@@ -233,6 +233,7 @@ final class MobileLibraryModel {
     }
     /// The Duplicates screen of this account. Nil while the account cannot merge duplicates.
     private(set) var duplicates: ExactDuplicatesModel?
+    @ObservationIgnored private let duplicatesLifetime = ExactDuplicatesAccountLifetime()
     /// The check of the merges that the end of the app left open, started with the account.
     @ObservationIgnored private var pendingMergeCheck: Task<Void, Never>?
     /// Shared create/list/add state machine used by every native album presentation in this session.
@@ -593,9 +594,9 @@ final class MobileLibraryModel {
         try requireCurrentMutation(mutationLease)
     }
 
-    private func makeDuplicatesModel(_ finder: any ExactDuplicateMerging) -> ExactDuplicatesModel {
-        ExactDuplicatesModel(finder: finder) { [weak self] trashed in
-            await self?.removeMergedDuplicates(Set(trashed))
+    private func replaceDuplicates(using finder: (any ExactDuplicateMerging)?) {
+        duplicates = duplicatesLifetime.replace(with: finder) { [weak self] trashed, token in
+            await self?.removeMergedDuplicates(Set(trashed), account: token)
         }
     }
 
@@ -603,14 +604,18 @@ final class MobileLibraryModel {
     /// photos show the favorite tag that the merge carried over. The optimistic removal advances the timeline
     /// mutation generation, which rejects an initial load in flight, so it waits for that load. The overlay hides
     /// the photos from every listing that starts meanwhile.
-    private func removeMergedDuplicates(_ uids: Set<PhotoUID>) async {
+    private func removeMergedDuplicates(_ uids: Set<PhotoUID>, account: ExactDuplicatesAccountLifetime.Token) async {
+        guard duplicatesLifetime.isCurrent(account) else { return }
         timelineRemovals.trashed(uids)
         var awaitedLoad: Task<Void, Never>?
         while !initialLibraryLoadSettled, let load = loadTask, load != awaitedLoad {
             awaitedLoad = load
             await load.value
+            guard duplicatesLifetime.isCurrent(account) else { return }
         }
+        guard duplicatesLifetime.isCurrent(account) else { return }
         try? await removeFromVisibleLibrary(uids) {}
+        guard duplicatesLifetime.isCurrent(account) else { return }
         await reloadFavorites(trashed: uids)
     }
 
@@ -1283,6 +1288,7 @@ final class MobileLibraryModel {
         initialLibraryLoadSettled = false
         primaryInventoryAuthority = .hydrating
         backend = nil
+        replaceDuplicates(using: nil)
         facade = nil
         albumActions = nil
         PhotoBackupBackgroundCoordinator.shared.backupStopped()
@@ -1379,6 +1385,7 @@ final class MobileLibraryModel {
         session = nil
         cacheContext = nil
         backend = nil
+        replaceDuplicates(using: nil)
         facade = nil
         albumActions = nil
         PhotoBackupBackgroundCoordinator.shared.backupStopped()
@@ -2012,7 +2019,7 @@ final class MobileLibraryModel {
         }
 
         func installIsolatedDuplicatesForTesting(_ finder: any ExactDuplicateMerging) {
-            duplicates = makeDuplicatesModel(finder)
+            replaceDuplicates(using: finder)
         }
 
         /// Stands for an initial library load that runs until `load` returns and settles then.

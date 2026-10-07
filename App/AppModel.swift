@@ -45,7 +45,12 @@ final class AppModel {
     private(set) var auth: AuthState = .checking
     private(set) var backend: BackendState = .idle
     /// High-level client composition (uploads + albums), built alongside the backend.
-    private(set) var facade: ProtonClientFacade?
+    private(set) var facade: ProtonClientFacade? {
+        didSet {
+            if facade !== oldValue { duplicatesLifetime.retire() }
+        }
+    }
+    @ObservationIgnored private let duplicatesLifetime = ExactDuplicatesAccountLifetime()
     /// macOS folder-backup composition. This type owns folder access and lifecycle; sync semantics stay in core.
     private(set) var backupController: FolderBackupController?
     private(set) var photoBackupController: PhotoLibraryBackupController?
@@ -494,7 +499,20 @@ final class AppModel {
         Task { await runtime.refresh() }
     }
 
+    func makeDuplicatesModel(
+        for facade: ProtonClientFacade,
+        didTrash: @escaping @MainActor ([PhotoUID], ExactDuplicatesAccountLifetime.Token) async -> Void
+    ) -> ExactDuplicatesModel? {
+        guard self.facade === facade, case .ready = backend else { return nil }
+        return duplicatesLifetime.replace(with: facade.exactDuplicates, didTrash: didTrash)
+    }
+
+    func isCurrentDuplicatesAccount(_ token: ExactDuplicatesAccountLifetime.Token) -> Bool {
+        duplicatesLifetime.isCurrent(token)
+    }
+
     private func prepareBackend(_ session: ProtonSession) {
+        duplicatesLifetime.retire()
         LibraryRuntimeState.shared.beginNewGeneration()
         backendTask?.cancel()
         libraryReady = false

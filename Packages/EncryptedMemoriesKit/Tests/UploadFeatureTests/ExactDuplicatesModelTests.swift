@@ -1206,6 +1206,184 @@ final class ExactDuplicatesModelTests: XCTestCase {
         XCTAssertNil(model.notice)
     }
 
+    func testCancellingAPausedMergeAllEndsTheRunAndReleasesTheModel() async {
+        let finished = expectation(description: "The cancelled merge finishes")
+        var loaded: (ExactDuplicatesModel, FakeDuplicateFinder, TrashLog)? = await loadedModel(groups: 60)
+        weak var released = loaded?.0
+        let finder = loaded!.1
+        var model: ExactDuplicatesModel? = loaded?.0
+        loaded = nil
+        finder.mergeGate.close()
+        let merge = Task { [model] in
+            await model?.mergeAll()
+            finished.fulfill()
+        }
+        await waitUntil({ finder.mergeGate.hasWaiters }, "the first batch runs")
+        model?.pauseMerging()
+        finder.mergeGate.open()
+        await model?.runningMergeWorkEnded()
+        // The run is paused between batches; cancelling it must finish its waiter without a resume action.
+        merge.cancel()
+        await fulfillment(of: [finished], timeout: 2)
+        XCTAssertFalse(model?.isMerging ?? true)
+        XCTAssertEqual(finder.batches.count, 1, "cancellation must not start another batch")
+        // Also clean up the deliberately broken implementation during the negative control.
+        model?.stopMergeAll()
+        await merge.value
+        model?.screenDisappeared()
+        model = nil
+        XCTAssertNil(released)
+    }
+
+    func testCancellingMergeAllAlsoCancelsItsRunningRanking() async {
+        let (model, finder, log) = await loadedModel(groups: 100)
+        finder.rankGate.close()
+        let merge = Task { await model.mergeAll() }
+        await waitUntil({ finder.rankGate.hasWaiters }, "Merge All ranks")
+
+        merge.cancel()
+        finder.rankGate.open()
+        await merge.value
+
+        XCTAssertEqual(finder.cancelledRankings, 1, "the merge must cancel its ranking before joining it")
+        XCTAssertTrue(finder.batches.isEmpty, "a cancelled merge must not start a batch")
+        XCTAssertTrue(log.calls.isEmpty)
+        XCTAssertEqual(model.groups.count, 100)
+        XCTAssertFalse(model.isMerging)
+        XCTAssertEqual(model.notice, .stopped(merged: 0, total: 100))
+    }
+
+    func testCancellationResumeAndStopRetireEachPauseWaiterOnce() async {
+        for order in 0..<4 {
+            let (model, finder, _) = await loadedModel(groups: 60)
+            finder.mergeGate.close()
+            let merge = Task { await model.mergeAll() }
+            await waitUntil({ finder.mergeGate.hasWaiters }, "the first batch runs")
+            model.pauseMerging()
+            if order == 3 { merge.cancel() }
+            finder.mergeGate.open()
+            await model.runningMergeWorkEnded()
+
+            switch order {
+            case 0:
+                merge.cancel()
+                model.resumeMerging()
+                model.stopMergeAll()
+            case 1:
+                model.resumeMerging()
+                merge.cancel()
+                model.stopMergeAll()
+            case 2:
+                model.stopMergeAll()
+                merge.cancel()
+                model.resumeMerging()
+            default:
+                model.resumeMerging()
+                model.stopMergeAll()
+            }
+            merge.cancel()
+            await merge.value
+            XCTAssertFalse(model.isMerging)
+            XCTAssertEqual(finder.batches.count, 1, "no batch starts after cancellation")
+            XCTAssertEqual(model.notice, .stopped(merged: 25, total: 60))
+        }
+    }
+
+    func testAccountReplacementStopsTheOldMergeAndReleasesTheModel() async {
+        for paused in [false, true] {
+            for replacing in [false, true] {
+                let finished = expectation(description: "The old account's merge finishes")
+                let finder = FakeDuplicateFinder(scans: [.init(groups: manyGroups(60), coverage: .complete)])
+                let lifetime = ExactDuplicatesAccountLifetime()
+                var model = lifetime.replace(with: finder)
+                weak var released = model
+                await model?.load()
+                finder.mergeGate.close()
+                let merge = Task { [model] in
+                    await model?.mergeAll()
+                    finished.fulfill()
+                }
+                await waitUntil({ finder.mergeGate.hasWaiters }, "the old account's first batch runs")
+                if paused {
+                    model?.pauseMerging()
+                    finder.mergeGate.open()
+                    await model?.runningMergeWorkEnded()
+                }
+                if replacing {
+                    _ = lifetime.replace(with: FakeDuplicateFinder(scans: []))
+                } else {
+                    lifetime.retire()
+                }
+                if !paused {
+                    XCTAssertTrue(model?.isMerging ?? false, "Stop must join the running batch")
+                    finder.mergeGate.open()
+                }
+                model?.screenDisappeared()
+                model = nil
+                await fulfillment(of: [finished], timeout: 2)
+                XCTAssertEqual(finder.batches.count, 1, "Account replacement starts no further batch")
+                XCTAssertNil(released, "The completed old run must release its model")
+                // Also retire the deliberately broken implementation during the negative control.
+                released?.stopMergeAll()
+                await merge.value
+            }
+        }
+    }
+
+    func testRetiredBatchCannotPublishWithAReplacementAccountToken() async {
+        let finder = FakeDuplicateFinder(scans: [.init(groups: manyGroups(60), coverage: .complete)])
+        let lifetime = ExactDuplicatesAccountLifetime()
+        var published = 0
+        let model = lifetime.replace(with: finder) { _, _ in published += 1 }!
+        await model.load()
+        finder.mergeGate.close()
+        let merge = Task { await model.mergeAll() }
+        await waitUntil({ finder.mergeGate.hasWaiters }, "the first batch runs")
+
+        _ = lifetime.replace(with: FakeDuplicateFinder(scans: []))
+        finder.mergeGate.open()
+        await merge.value
+
+        XCTAssertEqual(published, 0, "A retired batch cannot enter its publication callback")
+        XCTAssertEqual(finder.batches.count, 1)
+    }
+
+    func testAccountReplacementInvalidatesAnAlreadySuspendedCallback() async {
+        let finder = FakeDuplicateFinder(scans: [.init(groups: manyGroups(60), coverage: .complete)])
+        let lifetime = ExactDuplicatesAccountLifetime()
+        let callback = BuildGate()
+        callback.close()
+        var published = 0
+        let model = lifetime.replace(with: finder) { _, token in
+            XCTAssertTrue(lifetime.isCurrent(token))
+            await callback.pass()
+            if lifetime.isCurrent(token) { published += 1 }
+        }!
+        await model.load()
+        let merge = Task { await model.mergeAll() }
+        await waitUntil({ callback.hasWaiters }, "the callback suspended before publishing")
+
+        _ = lifetime.replace(with: FakeDuplicateFinder(scans: []))
+        callback.open()
+        await merge.value
+
+        XCTAssertEqual(published, 0, "Every publication after suspension must reject the retired token")
+        XCTAssertEqual(finder.batches.count, 1)
+    }
+
+    func testCurrentAccountReceivesEveryCompletedMergeBatch() async {
+        let finder = FakeDuplicateFinder(scans: [.init(groups: manyGroups(60), coverage: .complete)])
+        let lifetime = ExactDuplicatesAccountLifetime()
+        var published = 0
+        let model = lifetime.replace(with: finder) { _, token in
+            XCTAssertTrue(lifetime.isCurrent(token))
+            published += 1
+        }!
+        await model.load()
+        await model.mergeAll()
+        XCTAssertEqual(published, 3)
+    }
+
     func testAResumeRightAfterThePauseKeepsMergeAllRunning() async {
         let (model, finder, _) = await loadedModel(groups: 60)
         finder.mergeGate.close()
