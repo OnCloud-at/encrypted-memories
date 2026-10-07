@@ -162,12 +162,18 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
     func failNextFavoritesRead() { lock.withLock { failFavoritesRead = true } }
     private var failFavoritesRead = false
 
-    func configureLineageIndex(incomplete: LineageRead? = nil, failing: Bool = false) {
+    /// `error` is what a failing lineage read throws.
+    func configureLineageIndex(
+        incomplete: LineageRead? = nil, failing: Bool = false,
+        error: any Error = UploadError.backend("The scenario lineage read failed")
+    ) {
         lock.withLock {
             incompleteLineageRead = incomplete
             failLineageRead = failing
+            lineageReadError = error
         }
     }
+    private var lineageReadError: any Error = UploadError.backend("The scenario lineage read failed")
 
     func configureOptionalReads(
         visibilityFails: Bool = false, compoundFails: Bool = false, compoundCancels: Bool = false
@@ -288,7 +294,7 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
         forExternalIdentifier identifier: String
     ) async throws -> (links: Set<String>, complete: Bool) {
         try lock.withLock {
-            if failLineageRead { throw UploadError.backend("The scenario lineage read failed") }
+            if failLineageRead { throw lineageReadError }
             return (
                 Set(
                     table.values.filter {
@@ -300,7 +306,7 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
 
     func replacingMainLinkIDs(ofReplacedLink linkID: String) async throws -> (links: Set<String>, complete: Bool) {
         try lock.withLock {
-            if failLineageRead { throw UploadError.backend("The scenario lineage read failed") }
+            if failLineageRead { throw lineageReadError }
             return (
                 Set(
                     table.values.filter {
@@ -312,7 +318,7 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
 
     func externalIdentifier(ofMainLink linkID: String) async throws -> (identifier: String?, complete: Bool) {
         try lock.withLock {
-            if failLineageRead { throw UploadError.backend("The scenario lineage read failed") }
+            if failLineageRead { throw lineageReadError }
             let link = table[linkID]
             let identifier =
                 link?.state == .active && link?.mainLinkID == nil ? link?.externalIdentifier : nil
@@ -322,7 +328,7 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
 
     func replacedLinkIDs(ofReplacingMain linkID: String) async throws -> (links: Set<String>, complete: Bool) {
         try lock.withLock {
-            if failLineageRead { throw UploadError.backend("The scenario lineage read failed") }
+            if failLineageRead { throw lineageReadError }
             let link = table[linkID]
             return (
                 link?.state == .active && link?.mainLinkID == nil ? link?.replacedLinkIDs ?? [] : [],
