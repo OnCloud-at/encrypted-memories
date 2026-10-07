@@ -1083,6 +1083,7 @@ public final class ExactDuplicatesModel {
     /// Ends this account's ownership. A running batch finishes; no queued action can start another merge.
     func retire() {
         isRetired = true
+        mergeRanking?.cancel()
         stopMergeAll()
     }
 
@@ -1203,6 +1204,10 @@ public final class ExactDuplicatesModel {
                     stopped = true
                     break
                 }
+            }
+            if isRetired {
+                stopped = true
+                break
             }
             let batch = selected[handled..<min(handled + Self.mergeBatchSize, selected.count)]
             handled += batch.count

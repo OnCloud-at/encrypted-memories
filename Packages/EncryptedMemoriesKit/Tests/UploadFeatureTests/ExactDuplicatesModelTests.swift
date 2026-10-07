@@ -1330,6 +1330,40 @@ final class ExactDuplicatesModelTests: XCTestCase {
         }
     }
 
+    func testAccountRetirementWhileASingleMergeRanksStartsNoBatch() async throws {
+        for replacing in [false, true] {
+            let finder = FakeDuplicateFinder(scans: [.init(groups: manyGroups(100), coverage: .complete)])
+            let lifetime = ExactDuplicatesAccountLifetime()
+            var model = lifetime.replace(with: finder)
+            weak var released = model
+            await model?.load()
+            let group = try XCTUnwrap(model?.groups.first { !$0.isRanked })
+            finder.rankGate.close()
+            let merge = Task { [model] in await model?.merge(groupID: group.id) }
+            await waitUntil({ finder.rankGate.hasWaiters }, "The single merge ranks before its batch")
+            XCTAssertTrue(model?.isMerging ?? false)
+            XCTAssertFalse(model?.isMergingAll ?? true)
+
+            if replacing {
+                _ = lifetime.replace(with: FakeDuplicateFinder(scans: []))
+            } else {
+                lifetime.retire()
+            }
+            finder.rankGate.open()
+            await merge.value
+
+            XCTAssertEqual(finder.cancelledRankings, 1, "Account retirement cancels single-merge ranking")
+            XCTAssertTrue(
+                finder.batches.isEmpty, "No old-account batch starts after retirement, even with a late ranking page")
+            XCTAssertEqual(model?.groups.count, 100)
+            XCTAssertFalse(model?.isMerging ?? true)
+            XCTAssertFalse(model?.canMerge ?? true)
+            model?.screenDisappeared()
+            model = nil
+            XCTAssertNil(released, "The completed single merge releases its retired model")
+        }
+    }
+
     func testRetiredBatchCannotPublishWithAReplacementAccountToken() async {
         let finder = FakeDuplicateFinder(scans: [.init(groups: manyGroups(60), coverage: .complete)])
         let lifetime = ExactDuplicatesAccountLifetime()
