@@ -592,7 +592,11 @@ public struct ExactDuplicateFinder: Sendable {
                     let tagged = Set(writes.flatMap(\.plan.taggedFavorites))
                     run.noteFavorites(tagged)
                     rankingContext.noteFavorites(tagged)
-                    let favorites = try await run.favorites(among: written, remote: remote).union(tagged)
+                    // A kept photo counts as favorite only by its fresh tag: the listing can predate a favorite
+                    // removed elsewhere, and the carry-over then must still tag it.
+                    let kept = Set(writes.map(\.plan.kept))
+                    let favorites = try await run.favorites(among: written, remote: remote).subtracting(kept)
+                        .union(tagged)
                     // One album listing serves the run: an own album whose cover leaves gets the kept photo.
                     let covers = try await run.covers(albums: albums)
                     await write(writes, favorites: favorites, covers: covers, run: run, into: &results)
@@ -660,17 +664,19 @@ public struct ExactDuplicateFinder: Sendable {
         if let shown = group.fingerprint, shown != keptFingerprint { return .skipped(.keptDetailsChanged) }
         // Every device ranks the same server facts, so every device that keeps the preselection keeps the same copy.
         // When another copy ranks first now, the screen reads the group again.
-        if var favorites = rankingFavorites {
-            // The favorites of a run can predate a favorite that another device set since. The compound reads are
-            // fresh, so their favorite tags rank too.
+        if let listed = rankingFavorites {
+            // The favorites of a run can predate a favorite that another device set or removed since. The compound
+            // reads are fresh, so their favorite tags rank. Only a member without a compound ranks by the listing.
             for member in active where member != kept {
                 try Task.checkCancellation()
                 compounds[member] = try await checker.compound(ofMainLink: member.nodeID)
             }
             let fresh = compounds.merging([kept: keptCompound]) { first, _ in first }
-            for (member, compound) in fresh where compound?.tags.contains(PhotoTag.favorites.rawValue) == true {
-                favorites.insert(member)
-            }
+            let favorites = Set(
+                active.filter { member in
+                    guard let compound = fresh[member] ?? nil else { return listed.contains(member) }
+                    return compound.tags.contains(PhotoTag.favorites.rawValue)
+                })
             // The node states the capture time of a photo. Only a node without one needs the date that this device
             // knows.
             let undated = active.filter { facts[$0]?.fingerprint.captureTime == nil }

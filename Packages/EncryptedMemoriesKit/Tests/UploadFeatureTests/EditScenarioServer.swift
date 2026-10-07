@@ -551,6 +551,11 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
         }
     }
 
+    /// Another device sets or removes the favorite tag.
+    func setFavorite(_ favorite: Bool, of uid: PhotoUID) {
+        lock.withLock { table[uid.nodeID]?.favorite = favorite }
+    }
+
     func markFavorite(_ uids: [PhotoUID]) async throws {
         lock.withLock {
             for uid in uids { table[uid.nodeID]?.favorite = true }
