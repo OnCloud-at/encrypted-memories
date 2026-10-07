@@ -9,6 +9,25 @@ import UploadCore
 
 @Suite("SDK album catalog")
 struct SDKAlbumCatalogBackendTests {
+    @Test func detailReadUsesOneRequestForDisplayAndOrderMetadata() async throws {
+        let client = FakeSDKPhotoCatalogClient()
+        let photo = photoNode(
+            id: "detail", albumIDs: [],
+            additionalMetadata: [
+                AdditionalMetadata(
+                    name: "Camera",
+                    utf8JsonValue: Data(#"{"CaptureTime":"2023-11-14T22:13:20.125Z","Device":"Test camera"}"#.utf8)),
+                AdditionalMetadata(name: "iOS.photos", utf8JsonValue: Data(#"{"ICloudID":"source-photo"}"#.utf8)),
+            ])
+        await client.configureNodes([photo.uid.sdkCompatibleIdentifier: DriveNode(photoNode: photo)])
+        let read = try await SDKPhotoMetadataReader.read(
+            for: PhotoUID(volumeID: "volume", nodeID: "detail"), client: client)
+        #expect(read.metadata.device == "Test camera")
+        #expect(read.timelineOrder?.exactCaptureTime == Date(timeIntervalSince1970: 1_700_000_000.125))
+        #expect(read.timelineOrder?.stableIdentity == "source-photo")
+        #expect(await client.getNodeCalls == 1)
+    }
+
     @Test func photoMetadataUsesForeignVolumeAndKeepsMissingAttributesOptional() async throws {
         let client = FakeSDKPhotoCatalogClient()
         let photo = photoNode(id: "same-node", albumIDs: [], volumeID: "foreign-volume")

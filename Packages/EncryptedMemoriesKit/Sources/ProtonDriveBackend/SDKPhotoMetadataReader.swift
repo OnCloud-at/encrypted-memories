@@ -5,7 +5,17 @@ import UploadCore
 
 /// Reads the volume-qualified SDK node. A shared photo cannot use the account's own Photos share key chain.
 enum SDKPhotoMetadataReader {
+    struct ReadResult: Sendable {
+        let metadata: PhotoMetadata
+        let timelineOrder: TimelineOrderMetadata?
+    }
+
     static func metadata(for uid: PhotoUID, client: any SDKPhotoCatalogClient) async throws -> PhotoMetadata {
+        try await read(for: uid, client: client).metadata
+    }
+
+    /// Reuses the SDK's decrypted sections from the same node read as the Info panel.
+    static func read(for uid: PhotoUID, client: any SDKPhotoCatalogClient) async throws -> ReadResult {
         let node = try await SDKCancellableOperation.run { token in
             try await client.getNode(
                 nodeUid: SDKNodeUid(volumeID: uid.volumeID, nodeID: uid.nodeID), cancellationToken: token)
@@ -15,12 +25,23 @@ enum SDKPhotoMetadataReader {
         try Task.checkCancellation()
         switch node {
         case .photo(let photo):
-            return metadata(name: photo.name, mimeType: photo.mediaType, revision: photo.activeRevision)
+            return read(name: photo.name, mimeType: photo.mediaType, revision: photo.activeRevision)
         case .file(let file):
-            return metadata(name: file.name, mimeType: file.mediaType, revision: file.activeRevision)
+            return read(name: file.name, mimeType: file.mediaType, revision: file.activeRevision)
         default:
             throw CocoaError(.fileReadUnknown)
         }
+    }
+
+    private static func read(
+        name: Result<String, ProtonDriveSDKDriveError>, mimeType: String, revision: FileRevision
+    ) -> ReadResult {
+        let order = revision.claimedAdditionalMetadata.map { additional in
+            TimelineOrderMetadataDecoder().decode(
+                camera: additional.first { $0.name == "Camera" }?.utf8JsonValue,
+                source: additional.first { $0.name == "iOS.photos" }?.utf8JsonValue)
+        }
+        return ReadResult(metadata: metadata(name: name, mimeType: mimeType, revision: revision), timelineOrder: order)
     }
 
     /// What a standalone copy of a series member keeps. The node must be a photo: only a photo node carries
