@@ -431,7 +431,9 @@ final class SpyQueueStore: UploadBackupSyncQueueStore, @unchecked Sendable {
 
     func nextRunnable(limit: Int) -> [UploadBackupSyncQueueEntry] { inner.nextRunnable(limit: limit) }
 
-    func nextRunnableDate() -> Date? { inner.nextRunnableDate() }
+    func nextRunnableDate(excludingSourcesOf excludedSources: [UploadSourceIdentity]) -> Date? {
+        inner.nextRunnableDate(excludingSourcesOf: excludedSources)
+    }
 
     func claimRunnable(
         limit: Int, claimedAt: Date, excludingSourcesOf excludedSources: [UploadSourceIdentity]
@@ -500,7 +502,9 @@ final class ReenqueueOnFirstRetryQueueStore: UploadBackupSyncQueueStore, @unchec
         inner.entry(for: source, revision: revision)
     }
     func nextRunnable(limit: Int) -> [UploadBackupSyncQueueEntry] { inner.nextRunnable(limit: limit) }
-    func nextRunnableDate() -> Date? { inner.nextRunnableDate() }
+    func nextRunnableDate(excludingSourcesOf excludedSources: [UploadSourceIdentity]) -> Date? {
+        inner.nextRunnableDate(excludingSourcesOf: excludedSources)
+    }
     func claimRunnable(
         limit: Int, claimedAt: Date, excludingSourcesOf excludedSources: [UploadSourceIdentity]
     ) -> [UploadBackupSyncQueueEntry] {
@@ -3747,17 +3751,62 @@ extension BackupSyncRunnerTests {
         let pass = Task { await runner.runUntilDrained() }
 
         let othersFinished = await waitUntil { fast.allSatisfy { self.state(of: $0) == .completed } }
-        let failedRow = queueStore.entry(for: failing.source, revision: failing.revision)
         transfers.releaseAll()
         let progress = await pass.value
 
         XCTAssertTrue(othersFinished, "a failed item frees its slot for the next one")
-        XCTAssertEqual(failedRow?.attempts, 1, "the failure spends one attempt")
-        XCTAssertNotNil(BackupIssueRecord.decode(failedRow?.lastError)?.nextAttemptAt, "and waits for its retry")
         XCTAssertEqual(state(of: failing), .completed, "the retry uploads it")
         XCTAssertEqual(transfers.started.filter { $0 == "flaky.jpg" }.count, 2)
         XCTAssertEqual(state(of: slow), .completed)
         XCTAssertEqual(progress.uploaded, 5)
+    }
+
+    /// A free slot retries a failed item when its backoff ends, not only when a long item ends (#350).
+    func testAFailedItemRetriesOnTimeWhileASlowItemUploads() async throws {
+        let slow = seedEntry("slow.mov", ageSeconds: 600)
+        let failing = seedEntry("flaky.jpg", ageSeconds: 300)
+        let transfers = HeldTransferUploader(held: ["slow.mov"], transientFailures: ["flaky.jpg": 1])
+        let runner = makeRunner(uploader: transfers, throttle: BackupThrottlePolicy(baseConcurrency: 2))
+        let pass = Task { await runner.runUntilDrained() }
+
+        let retriedWhileSlowRuns = await waitUntil { self.state(of: failing) == .completed }
+        let slowStillRunning = !transfers.finished.contains("slow.mov")
+        let waitsWhileSlowRuns = clock.sleeps
+        transfers.releaseAll()
+        let progress = await pass.value
+
+        XCTAssertTrue(retriedWhileSlowRuns, "the retry starts when its backoff ends")
+        XCTAssertTrue(slowStillRunning)
+        XCTAssertEqual(waitsWhileSlowRuns.count, 1, "one timed wake")
+        XCTAssertGreaterThanOrEqual(waitsWhileSlowRuns.first ?? 0, 1, "it waits for the whole backoff")
+        XCTAssertEqual(transfers.started.filter { $0 == "flaky.jpg" }.count, 2)
+        XCTAssertEqual(state(of: slow), .completed)
+        XCTAssertEqual(progress.uploaded, 2)
+    }
+
+    /// Without a waiting row, the loop wakes only when an item settles: no timer and no extra claim.
+    func testNoTimedWakeWhenNoRowWaits() async throws {
+        let slow = seedEntry("slow.mov", ageSeconds: 600)
+        let fast = seedEntry("fast.jpg")
+        let log = BackupEventLog()
+        let transfers = HeldTransferUploader(held: ["slow.mov"])
+        let runner = makeRunner(
+            uploader: transfers, queue: SpyQueueStore(inner: queueStore, log: log),
+            throttle: BackupThrottlePolicy(baseConcurrency: 2))
+        let pass = Task { await runner.runUntilDrained() }
+        let claims = { log.events.filter { $0 == "queue.claimRunnable" }.count }
+
+        _ = await waitUntil { self.state(of: fast) == .completed }
+        // Give a wrong wake time to claim again.
+        let claimedAgain = await waitUntil(timeout: .milliseconds(200)) { claims() > 2 }
+        let sleepsWhileSlowRuns = clock.sleeps
+        transfers.releaseAll()
+        _ = await pass.value
+
+        XCTAssertFalse(claimedAgain, "one claim at the start, one after the photo settles")
+        XCTAssertEqual(sleepsWhileSlowRuns, [], "no timer runs while nothing waits")
+        XCTAssertEqual(claims(), 3, "the last claim follows the video")
+        XCTAssertEqual(state(of: slow), .completed)
     }
 
     func testNoMoreItemsThanTheLimitAreClaimedAtAnyMoment() async throws {

@@ -109,9 +109,11 @@ public actor BackupSyncRunner {
     /// Keyed by `sourceKey`. A claim never takes rows of these sources: a running item can leave its row runnable
     /// for a moment, for example `needsRemoteReconciliation` while the paired video of its photo uploads.
     private var runningSources: [String: RunningSource] = [:]
-    /// Wakes the scheduling loop when an item settles or the runtime changes.
+    /// Wakes the scheduling loop when an item settles, the runtime changes, or a waiting row becomes runnable.
     private var schedulerWaiter: CheckedContinuation<Void, Never>?
     private var schedulerWakePending = false
+    /// Identifies the current wait, so a timed wake that fires after the loop woke for another reason is ignored.
+    private var schedulerWaitGeneration = 0
     /// Consecutive transport-level network failures since the last successful settle. Subtracted from
     /// the throttle's concurrency so the drain backs off a marginal/looping connection instead of
     /// hammering it with parallel requests, and ramps back up as items succeed. Capped so it can
@@ -491,7 +493,8 @@ public actor BackupSyncRunner {
                     }
                     continue
                 }
-                await waitForSchedulerWake()
+                // Free slots that the claim could not fill also wait for the earliest row that becomes runnable.
+                await waitForSchedulerWake(orAfter: claimedItemCount < limit ? waitUntilNextWaitingRow() : nil)
             }
         }
         if storeFailed { stopRequested = true }
@@ -602,14 +605,30 @@ public actor BackupSyncRunner {
         }
     }
 
-    /// Suspends the scheduling loop until an item settles or the runtime changes. A wake that arrives while the
-    /// loop works is kept, so the loop never misses a free slot.
-    private func waitForSchedulerWake() async {
+    /// Suspends the scheduling loop until an item settles or the runtime changes, or after `timedWake` seconds. A
+    /// wake that arrives while the loop works is kept, so the loop never misses a free slot.
+    private func waitForSchedulerWake(orAfter timedWake: TimeInterval? = nil) async {
         if schedulerWakePending {
             schedulerWakePending = false
             return
         }
+        schedulerWaitGeneration &+= 1
+        let generation = schedulerWaitGeneration
+        let timer = timedWake.map { wait in
+            Task { [clock] in
+                try? await clock.sleep(for: wait)
+                guard !Task.isCancelled else { return }
+                await self.wakeScheduler(generation: generation)
+            }
+        }
         await withCheckedContinuation { schedulerWaiter = $0 }
+        schedulerWaitGeneration &+= 1
+        timer?.cancel()
+    }
+
+    private func wakeScheduler(generation: Int) {
+        guard generation == schedulerWaitGeneration else { return }
+        wakeScheduler()
     }
 
     private func wakeScheduler() {
@@ -647,6 +666,21 @@ public actor BackupSyncRunner {
     /// 30-second minimum after low disk space, and the recheck of a photo the camera still processes.
     private var longestRegularRetryWait: TimeInterval {
         max(configuration.retry.maxDelay, 30, configuration.oneShotSourceRecheckInterval)
+    }
+
+    /// The wait until the earliest row outside the running sources becomes runnable: a retry after its backoff, or
+    /// a parked draft row at its re-check. Nil when no row waits, when the wait exceeds `longestRegularRetryWait`
+    /// (the pass ends before it once the running items settle), or when a due row stays unclaimable, so the loop
+    /// never spins.
+    private func waitUntilNextWaitingRow() -> TimeInterval? {
+        let currentTime = now()
+        let dates = [
+            queue.nextRunnableDate(excludingSourcesOf: runningSources.values.map(\.source)),
+            queue.earliestEntry(in: .blockedByDraft)?.updatedAt,
+        ]
+        guard let next = dates.compactMap({ $0 }).filter({ $0 > currentTime }).min() else { return nil }
+        let wait = next.timeIntervalSince(currentTime)
+        return wait <= longestRegularRetryWait ? wait : nil
     }
 
     /// The wait until the next persisted retry becomes eligible, or nil when none is pending.

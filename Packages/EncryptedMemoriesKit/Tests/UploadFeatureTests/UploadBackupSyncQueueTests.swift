@@ -737,6 +737,30 @@ final class UploadBackupSyncQueueTests: XCTestCase {
             "the rows are claimable once the source is no longer excluded")
     }
 
+    /// The runner times its next wake from the rows it can claim, so a running source's row never sets that time.
+    func testNextRunnableDateSkipsExcludedSources() throws {
+        let url = tempDir.appendingPathComponent(UploadBackupSyncQueueManifestStore.databaseFileName)
+        let store = try XCTUnwrap(UploadBackupSyncQueueManifestStore(url: url))
+        let rows = [
+            UploadBackupSyncQueueEntry(
+                source: source("running"), revision: revision(30), originalFilename: "running.heic",
+                state: .needsRemoteReconciliation, updatedAt: Date(timeIntervalSince1970: 10)),
+            UploadBackupSyncQueueEntry(
+                source: source("running", resource: .livePairedVideo), revision: revision(20),
+                originalFilename: "running.mov", state: .discovered, updatedAt: Date(timeIntervalSince1970: 20)),
+            UploadBackupSyncQueueEntry(
+                source: source("waiting"), revision: revision(10), originalFilename: "waiting.heic",
+                state: .queuedForUpload, updatedAt: Date(timeIntervalSince1970: 300)),
+        ]
+        for row in rows { XCTAssertTrue(store.upsert(row)) }
+
+        XCTAssertEqual(store.nextRunnableDate(), Date(timeIntervalSince1970: 10))
+        XCTAssertEqual(
+            store.nextRunnableDate(excludingSourcesOf: [source("running")]), Date(timeIntervalSince1970: 300),
+            "any resource of an excluded source stays out")
+        XCTAssertNil(store.nextRunnableDate(excludingSourcesOf: [source("running"), source("waiting")]))
+    }
+
     func testConcurrentStoreInstancesNeverClaimTheSameRows() async throws {
         let url = tempDir.appendingPathComponent(UploadBackupSyncQueueManifestStore.databaseFileName)
         let first = try XCTUnwrap(UploadBackupSyncQueueManifestStore(url: url))
