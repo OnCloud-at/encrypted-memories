@@ -74,9 +74,9 @@ class PullRequestWorkflowTests < Minitest::Test
       refute (YAML.load_file(path)["on"] || YAML.load_file(path).fetch(true)).key?("merge_group"), File.basename(path)
     end
   end
-  def test_full_verification_uses_three_mac_runners_without_hygiene_waits
+  def test_full_verification_uses_four_mac_runners_without_hygiene_waits
     mac_jobs = @workflow.fetch("jobs").select { |_, job| job["runs-on"] == "xcode-27" }
-    assert_equal ["ios-verification", "macos-verification", "package-verification"], mac_jobs.keys.sort
+    assert_equal ["ios-ui-verification", "ios-verification", "macos-verification", "package-verification"], mac_jobs.keys.sort
     mac_jobs.each_value { |job| refute job.key?("needs") }
   end
 
