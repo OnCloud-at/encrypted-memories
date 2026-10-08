@@ -949,6 +949,61 @@ final class ExactDuplicatesModelTests: XCTestCase {
         XCTAssertEqual(finder.scanCalls, 1, "the entry counts once")
     }
 
+    func testALateCollectionsTaskDoesNotCountAfterAccountRetirement() async throws {
+        for replacing in [false, true] {
+            let finder = FakeDuplicateFinder(scans: [.init(groups: [groupA, groupB], coverage: .complete)])
+            let lifetime = ExactDuplicatesAccountLifetime()
+            var model: ExactDuplicatesModel? = try XCTUnwrap(lifetime.replace(with: finder))
+            weak var released = model
+            let taskGate = BuildGate()
+            taskGate.close()
+            let count = Task { [model] in
+                await taskGate.pass()
+                await model?.loadCountIfNeeded()
+            }
+            await waitUntil({ taskGate.hasWaiters }, "The Collections task holds the idle account model")
+            XCTAssertEqual(finder.scanCalls, 0)
+            if replacing {
+                _ = lifetime.replace(with: FakeDuplicateFinder(scans: []))
+            } else {
+                lifetime.retire()
+            }
+            taskGate.open()
+            await count.value
+            XCTAssertEqual(finder.scanCalls, 0, "A late Collections task starts no retired-account scan")
+            XCTAssertEqual(finder.rankCalls, 0)
+            XCTAssertEqual(finder.buildCalls, 0)
+            XCTAssertNil(model?.knownDuplicateCount, "The retired entry has no count")
+            model = nil
+            XCTAssertNil(released, "The finished Collections task releases its retired model")
+        }
+    }
+
+    func testAnEntryCountScanDiscardsItsResultAfterAccountRetirement() async throws {
+        for replacing in [false, true] {
+            let finder = FakeDuplicateFinder(scans: [.init(groups: [groupA, groupB], coverage: .complete)])
+            finder.scanGate.close()
+            let lifetime = ExactDuplicatesAccountLifetime()
+            var model: ExactDuplicatesModel? = try XCTUnwrap(lifetime.replace(with: finder))
+            weak var released = model
+            let count = Task { [model] in await model?.loadCountIfNeeded() }
+            await waitUntil({ finder.scanGate.hasWaiters }, "The entry count already scans the old account")
+            if replacing {
+                _ = lifetime.replace(with: FakeDuplicateFinder(scans: []))
+            } else {
+                lifetime.retire()
+            }
+            finder.scanGate.open()
+            await count.value
+            XCTAssertEqual(finder.scanCalls, 1, "The admitted scan finishes")
+            XCTAssertEqual(finder.rankCalls, 0)
+            XCTAssertEqual(finder.buildCalls, 0)
+            XCTAssertNil(model?.knownDuplicateCount, "A late scan cannot publish the retired account's count")
+            model = nil
+            XCTAssertNil(released, "The finished scan releases its retired model")
+        }
+    }
+
     // MARK: - The photo to keep
 
     func testTheRankedFirstMemberIsKeptByDefault() async {
