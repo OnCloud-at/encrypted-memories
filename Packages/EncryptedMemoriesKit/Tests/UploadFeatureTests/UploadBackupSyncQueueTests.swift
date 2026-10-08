@@ -1103,6 +1103,233 @@ final class UploadBackupSyncQueueTests: XCTestCase {
         XCTAssertEqual(persistedDecision, .alreadyBackedUp)
     }
 
+    func testRemoteProofRetiresOlderFailuresAndPreservesPendingWork() async throws {
+        try await assertSuccessfulRevisionCleanup(path: .remoteProof)
+    }
+
+    func testPreflightCompletionRetiresOlderFailuresAndPreservesPendingWork() async throws {
+        try await assertSuccessfulRevisionCleanup(path: .preflight)
+    }
+
+    func testExplicitCompletionRetiresOlderFailuresAndPreservesPendingWork() async throws {
+        try await assertSuccessfulRevisionCleanup(path: .completion)
+    }
+
+    private enum SuccessfulRevisionPath {
+        case remoteProof, preflight, completion
+    }
+
+    private func assertSuccessfulRevisionCleanup(path: SuccessfulRevisionPath) async throws {
+        let url = tempDir.appendingPathComponent("successful-revision.sqlite")
+        let queue = try XCTUnwrap(UploadBackupSyncQueueManifestStore(url: url))
+        let identity = UploadBackupExternalIdentity(identifier: "fixture-cloud-photo", revision: revision(100))
+        let latest = candidate(id: "returned", revision: 100, externalIdentity: identity)
+        func entry(_ seconds: TimeInterval, _ state: UploadBackupSyncQueueState) -> UploadBackupSyncQueueEntry {
+            UploadBackupSyncQueueEntry(
+                source: latest.snapshot.source, revision: revision(seconds), originalFilename: latest.originalFilename,
+                state: state, updatedAt: Date(timeIntervalSince1970: 500))
+        }
+        var obsolete = [
+            entry(1, .sourceMissing), entry(2, .failedPermanent), entry(3, .dismissedFailure),
+            entry(4, .skippedRemoteDeletion),
+        ]
+        for (offset, state) in [UploadBackupSyncQueueState.discovered, .checking].enumerated() {
+            var marker = entry(TimeInterval(5 + offset), state)
+            marker.lastError = BackupIssueRecord(kind: .sourceMissing, detail: "acknowledged missing").persistedValue
+            obsolete.append(marker)
+        }
+        var protected = [
+            entry(10, .discovered), entry(11, .checking), entry(12, .hashing), entry(13, .duplicateChecking),
+            entry(14, .queuedForUpload), entry(15, .uploading), entry(16, .finalizing), entry(17, .failed),
+            entry(18, .blockedByDraft), entry(19, .paused), entry(20, .completed), entry(21, .alreadyBackedUp),
+            entry(101, .failedPermanent),
+        ]
+        var otherPhoto = entry(22, .failedPermanent)
+        otherPhoto.source = source("another-photo")
+        protected.append(otherPhoto)
+        var otherKind = entry(23, .failedPermanent)
+        otherKind.source = .init(kind: .fileURL, identifier: latest.snapshot.source.identifier)
+        protected.append(otherKind)
+        var otherResource = entry(24, .failedPermanent)
+        otherResource.source = source("returned", resource: .livePairedVideo)
+        protected.append(otherResource)
+        for (offset, state) in [UploadBackupSyncQueueState.needsRemoteReconciliation, .dismissedFailure].enumerated() {
+            var committed = entry(TimeInterval(25 + offset), state)
+            committed.remoteCommitReconciliation = UploadRemoteCommitReconciliation(
+                source: committed.source,
+                identity: UploadIdentity(
+                    correctedName: committed.originalFilename, nameHash: "fixture-name",
+                    sha1Hex: String(repeating: "ab", count: 20), sha1Digest: Data(repeating: 0xAB, count: 20),
+                    contentHash: "fixture-content"),
+                receipt: .init(remoteVolumeID: "fixture-volume", remoteLinkID: "fixture-link"))
+            protected.append(committed)
+        }
+        XCTAssertTrue(queue.upsertBatch(obsolete + protected))
+        let index = UploadBackupPreflightIndex(store: MemoryBackupStore())
+        let proof = UploadRemoteAssetIndexRecord(
+            externalIdentity: identity, resourceCount: 1, remoteLinkIDs: ["fixture-link"], hashKeyEpoch: "fixture-epoch"
+        )
+        let engine = UploadBackupSyncEngine(
+            preflight: index, queue: queue,
+            remoteProofResolver: path == .remoteProof ? RemoteProofResolver(proofs: [identity: proof]) : nil)
+        switch path {
+        case .preflight:
+            try await index.markBackedUp(latest.snapshot)
+            let result = try await engine.enqueue(latest)
+            XCTAssertEqual(result.alreadyBackedUp, 1)
+            XCTAssertEqual(result.queuedForWork, 0)
+        case .remoteProof:
+            let result = try await engine.enqueueBatch([latest])
+            XCTAssertEqual(result.alreadyBackedUp, 1)
+            XCTAssertEqual(result.queuedForWork, 0)
+        case .completion:
+            try await engine.markCompleted(latest)
+        }
+        let expectedState: UploadBackupSyncQueueState = path == .completion ? .completed : .alreadyBackedUp
+        XCTAssertEqual(
+            queue.entry(for: latest.snapshot.source, revision: latest.snapshot.revision)?.state, expectedState)
+        for old in obsolete {
+            XCTAssertNil(queue.entry(for: old.source, revision: old.revision), "obsolete \(old.state) must not count")
+        }
+        for kept in protected {
+            XCTAssertEqual(queue.entry(for: kept.source, revision: kept.revision), kept)
+        }
+        XCTAssertEqual(queue.count(), protected.count + 1)
+        XCTAssertEqual(queue.missingSourceDiscardGeneration(), 0)
+        queue.close()
+        let reopened = try XCTUnwrap(UploadBackupSyncQueueManifestStore(url: url))
+        for old in obsolete {
+            XCTAssertNil(reopened.entry(for: old.source, revision: old.revision))
+        }
+        for kept in protected {
+            XCTAssertEqual(reopened.entry(for: kept.source, revision: kept.revision), kept)
+        }
+        XCTAssertEqual(reopened.count(), protected.count + 1)
+        XCTAssertEqual(reopened.missingSourceDiscardGeneration(), 0)
+    }
+
+    func testMixedDiscoveryCleansOnlyTheBackedUpCandidates() async throws {
+        let queue = try XCTUnwrap(
+            UploadBackupSyncQueueManifestStore(url: tempDir.appendingPathComponent("mixed-cleanup.sqlite")))
+        let index = UploadBackupPreflightIndex(store: MemoryBackupStore())
+        let known = candidate(id: "locally-proven", revision: 10)
+        let identity = UploadBackupExternalIdentity(identifier: "fixture-remote", revision: revision(200))
+        let remote = candidate(id: "remotely-proven", revision: 200, externalIdentity: identity)
+        let pending = candidate(id: "still-pending", revision: 50)
+        var old: [UploadBackupSyncQueueEntry] = []
+        for (latest, seconds) in [(known, 1.0), (remote, 100.0), (pending, 1.0)] {
+            old.append(
+                UploadBackupSyncQueueEntry(
+                    source: latest.snapshot.source, revision: revision(seconds),
+                    originalFilename: latest.originalFilename,
+                    state: .failedPermanent, updatedAt: Date(timeIntervalSince1970: 500)))
+        }
+        XCTAssertTrue(queue.upsertBatch(old))
+        try await index.markBackedUp(known.snapshot)
+        try await index.markPending(pending.snapshot)
+        let proof = UploadRemoteAssetIndexRecord(
+            externalIdentity: identity, resourceCount: 1, remoteLinkIDs: ["fixture-link"], hashKeyEpoch: "fixture-epoch"
+        )
+        let engine = UploadBackupSyncEngine(
+            preflight: index, queue: queue, remoteProofResolver: RemoteProofResolver(proofs: [identity: proof]))
+
+        let result = try await engine.enqueueBatch([known, pending, remote])
+
+        XCTAssertEqual(result.scanned, 3)
+        XCTAssertEqual(result.alreadyBackedUp, 2)
+        XCTAssertEqual(result.queuedForWork, 1)
+        for settled in [known, remote] {
+            XCTAssertEqual(
+                queue.entry(for: settled.snapshot.source, revision: settled.snapshot.revision)?.state, .alreadyBackedUp)
+        }
+        XCTAssertEqual(
+            queue.entry(for: pending.snapshot.source, revision: pending.snapshot.revision)?.state, .queuedForUpload)
+        XCTAssertNil(queue.entry(for: old[0].source, revision: old[0].revision))
+        XCTAssertNil(queue.entry(for: old[1].source, revision: old[1].revision))
+        XCTAssertEqual(queue.entry(for: old[2].source, revision: old[2].revision), old[2])
+    }
+
+    func testDiscoveryReportsCleanupFailureAndKeepsTheFailureUntilRetry() async throws {
+        try await assertCleanupFailureIsReported(path: .preflight)
+    }
+
+    func testExplicitCompletionReportsCleanupFailureAndKeepsTheFailureUntilRetry() async throws {
+        try await assertCleanupFailureIsReported(path: .completion)
+    }
+
+    private func assertCleanupFailureIsReported(path: SuccessfulRevisionPath) async throws {
+        let url = tempDir.appendingPathComponent("failed-cleanup.sqlite")
+        let queue = try XCTUnwrap(UploadBackupSyncQueueManifestStore(url: url))
+        let latest = candidate(id: "cleanup-failure", revision: 10)
+        let old = UploadBackupSyncQueueEntry(
+            source: latest.snapshot.source, revision: revision(1), originalFilename: latest.originalFilename,
+            state: .failedPermanent, updatedAt: Date(timeIntervalSince1970: 500))
+        XCTAssertTrue(queue.upsert(old))
+        var handle: OpaquePointer?
+        XCTAssertEqual(sqlite3_open_v2(url.path, &handle, SQLITE_OPEN_READWRITE, nil), SQLITE_OK)
+        let db = try XCTUnwrap(handle)
+        defer { sqlite3_close(db) }
+        XCTAssertEqual(
+            sqlite3_exec(
+                db,
+                "CREATE TRIGGER fixture_cleanup_failure BEFORE DELETE ON backup_sync_queue BEGIN SELECT RAISE(ABORT, 'fixture cleanup failure'); END;",
+                nil, nil, nil),
+            SQLITE_OK)
+        let index = UploadBackupPreflightIndex(store: MemoryBackupStore())
+        if path == .preflight { try await index.markBackedUp(latest.snapshot) }
+        let engine = UploadBackupSyncEngine(preflight: index, queue: queue)
+
+        do {
+            if path == .completion {
+                try await engine.markCompleted(latest)
+            } else {
+                _ = try await engine.enqueue(latest)
+            }
+            XCTFail("A failed cleanup must stop the caller")
+        } catch UploadError.backend {
+            XCTAssertFalse(queue.isOperational())
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+        XCTAssertEqual(queue.entry(for: old.source, revision: old.revision), old)
+        XCTAssertEqual(
+            queue.entry(for: latest.snapshot.source, revision: latest.snapshot.revision)?.state,
+            path == .completion ? .completed : .alreadyBackedUp)
+        XCTAssertEqual(sqlite3_exec(db, "DROP TRIGGER fixture_cleanup_failure;", nil, nil, nil), SQLITE_OK)
+        queue.close()
+        let reopened = try XCTUnwrap(UploadBackupSyncQueueManifestStore(url: url))
+        XCTAssertEqual(reopened.entry(for: old.source, revision: old.revision), old)
+        let retry = UploadBackupSyncEngine(preflight: index, queue: reopened)
+        let result = try await retry.enqueue(latest)
+        XCTAssertEqual(result.alreadyBackedUp, 1)
+        XCTAssertNil(reopened.entry(for: old.source, revision: old.revision))
+        XCTAssertEqual(reopened.count(), 1)
+    }
+
+    func testIncompleteRemoteProofDoesNotRetireOlderFailures() async throws {
+        let queue = try XCTUnwrap(
+            UploadBackupSyncQueueManifestStore(url: tempDir.appendingPathComponent("incomplete-proof.sqlite")))
+        let identity = UploadBackupExternalIdentity(identifier: "fixture-compound", revision: revision(100))
+        let latest = candidate(id: "unproven", revision: 100, externalIdentity: identity, resourceCount: 2)
+        let old = UploadBackupSyncQueueEntry(
+            source: latest.snapshot.source, revision: revision(1), originalFilename: latest.originalFilename,
+            state: .failedPermanent, updatedAt: Date(timeIntervalSince1970: 500))
+        XCTAssertTrue(queue.upsert(old))
+        let proof = UploadRemoteAssetIndexRecord(
+            externalIdentity: identity, resourceCount: 1, remoteLinkIDs: ["fixture-link"], hashKeyEpoch: "fixture-epoch"
+        )
+        let engine = UploadBackupSyncEngine(
+            preflight: UploadBackupPreflightIndex(store: MemoryBackupStore()), queue: queue,
+            remoteProofResolver: RemoteProofResolver(proofs: [identity: proof]))
+
+        let result = try await engine.enqueue(latest)
+
+        XCTAssertEqual(result.alreadyBackedUp, 0)
+        XCTAssertEqual(result.queuedForWork, 1)
+        XCTAssertEqual(queue.entry(for: latest.snapshot.source, revision: latest.snapshot.revision)?.state, .discovered)
+        XCTAssertEqual(queue.entry(for: old.source, revision: old.revision), old)
+    }
+
     func testRemoteProofCancellationDoesNotPersistQueueRows() async throws {
         let queue = try XCTUnwrap(
             UploadBackupSyncQueueManifestStore(

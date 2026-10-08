@@ -268,6 +268,9 @@ public actor UploadBackupSyncEngine: UploadBackupCandidateEnqueueing {
         guard queue.upsertBatch(entries) else {
             throw UploadError.backend("Backup queue could not persist an asset batch")
         }
+        for entry in entries where entry.state == .alreadyBackedUp {
+            try removeUnsavedEarlierRevisions(of: entry)
+        }
         return result
     }
 
@@ -457,8 +460,19 @@ public actor UploadBackupSyncEngine: UploadBackupCandidateEnqueueing {
     public func markCompleted(_ candidate: UploadBackupAssetCandidate) async throws {
         try await preflight.markBackedUp(candidate.snapshot)
         try Task.checkCancellation()
-        guard queue.upsert(entry(for: candidate, state: .completed)) else {
+        let completed = entry(for: candidate, state: .completed)
+        guard queue.upsert(completed) else {
             throw UploadError.backend("Backup queue could not persist completion")
+        }
+        try removeUnsavedEarlierRevisions(of: completed)
+    }
+
+    private func removeUnsavedEarlierRevisions(of entry: UploadBackupSyncQueueEntry) throws {
+        guard
+            queue.removeUnsavedEarlierRevisions(
+                of: entry.source, through: entry.revision, except: entry.revision)
+        else {
+            throw UploadError.backend("Backup queue could not remove obsolete failures")
         }
     }
 
