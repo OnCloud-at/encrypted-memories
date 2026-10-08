@@ -79,6 +79,74 @@ final class TimelineOrderFirstLaunchTests: XCTestCase {
         await resumed.close()
     }
 
+    func testReaderRebuildDuringSynchronizationResumesWithoutDeletingFreshEvidence() async throws {
+        let owner = try CacheOwner(url: directory().appendingPathComponent("order.sqlite"))
+        let items = Self.photos(10_000)
+        let task = await owner.start(items, action: .readerRebuild)
+        let succeeded = await task.value
+        let probe = await owner.probeResult()
+        XCTAssertLessThan(probe.classified, items.count)
+        XCTAssertTrue(probe.recorded, "the reader must rebuild and checkpoint the fresh cache")
+        XCTAssertTrue(succeeded, "the pass must resume on the reader's replacement cache")
+        let rows = await owner.rowCount()
+        XCTAssertEqual(rows, items.count)
+        let firstUnknown = try await owner.firstUnknown()
+        XCTAssertEqual(firstUnknown, items[2].uid, "a second rebuild must not erase fresh evidence")
+        await owner.close()
+    }
+
+    func testASecondReaderRebuildDoesNotRestartTheSamePassAgain() async throws {
+        let owner = try CacheOwner(url: directory().appendingPathComponent("order.sqlite"))
+        let task = await owner.start(Self.photos(10_000), action: .readerRebuildTwice)
+        let succeeded = await task.value
+        XCTAssertFalse(succeeded, "a pass may resume after only one reader rebuild")
+        _ = await owner.probeResult()
+        let rebuilds = await owner.rebuildCount()
+        XCTAssertEqual(rebuilds, 2, "the fixture must rebuild during both synchronization attempts")
+        let rows = await owner.rowCount()
+        XCTAssertEqual(rows, 2, "a third synchronization must not replace the second reader's checkpoint")
+        await owner.close()
+    }
+
+    func testCancellationAfterReaderRebuildDoesNotBeginAnotherSQLPass() async throws {
+        let owner = try CacheOwner(url: directory().appendingPathComponent("order.sqlite"))
+        let syncPasses = PhotoDiagnostics.shared.counter("timeline.order.syncPass")
+        let task = await owner.start(Self.photos(10_000), action: .readerRebuildCancel)
+        let succeeded = await task.value
+        XCTAssertFalse(succeeded)
+        _ = await owner.probeResult()
+        let rebuilds = await owner.rebuildCount()
+        XCTAssertEqual(rebuilds, 1)
+        XCTAssertEqual(
+            PhotoDiagnostics.shared.counter("timeline.order.syncPass"), syncPasses + 1,
+            "cancellation must reject new SQL preparation on the replacement cache")
+        let rows = await owner.rowCount()
+        XCTAssertEqual(rows, 2)
+        await owner.close()
+    }
+
+    func testReaderRebuildDoesNotLetTheOldPassReplaceANewerInventory() async throws {
+        let owner = try CacheOwner(url: directory().appendingPathComponent("order.sqlite"))
+        let task = await owner.start(Self.photos(10_000), action: .readerRebuildReplace)
+        let succeeded = await task.value
+        XCTAssertFalse(succeeded)
+        _ = await owner.probeResult()
+        let rows = await owner.rowCount()
+        XCTAssertEqual(rows, 2, "the old inventory must not restart over the replacement")
+        let firstUnknown = try await owner.firstUnknown()
+        XCTAssertNil(firstUnknown, "replacement evidence must remain intact")
+        await owner.close()
+    }
+
+    func testReaderRebuildDoesNotLetTheOldPassReopenAClosedOwner() async throws {
+        let owner = try CacheOwner(url: directory().appendingPathComponent("order.sqlite"))
+        let task = await owner.start(Self.photos(10_000), action: .readerRebuildClose)
+        let succeeded = await task.value
+        XCTAssertFalse(succeeded)
+        let closed = await owner.isClosed
+        XCTAssertTrue(closed)
+    }
+
     func testReplacementInventoryCannotBeOverwrittenByASuspendedPass() async throws {
         let owner = try CacheOwner(url: directory().appendingPathComponent("order.sqlite"))
         let task = await owner.start(Self.photos(10_000), action: .replace)
@@ -181,7 +249,10 @@ final class TimelineOrderFirstLaunchTests: XCTestCase {
 }
 
 private actor CacheOwner {
-    enum Action: Sendable, Equatable { case observe, measure, cancel, replace, shutdown }
+    enum Action: Sendable, Equatable {
+        case observe, measure, cancel, replace, shutdown, readerRebuild, readerRebuildReplace, readerRebuildClose
+        case readerRebuildTwice, readerRebuildCancel
+    }
     struct Probe: Sendable {
         var classified = 0
         var rows = 0
@@ -220,7 +291,10 @@ private actor CacheOwner {
             items,
             isClassified: { _ in
                 self.classified += 1
-                if self.classified == probeAfter {
+                if self.classified == probeAfter
+                    || (action == .readerRebuildTwice
+                        && self.classified == probeAfter + TimelineOrderMetadataStore.synchronizationChunkSize)
+                {
                     let queuedAt = Date()
                     self.probe = Task(priority: .userInitiated) {
                         await self.inspect(items[0], action: action, queuedAt: queuedAt)
@@ -234,13 +308,42 @@ private actor CacheOwner {
         let revision = store.revision
         let recorded =
             action != .measure && store.recordResolvedMetadata(for: item.uid, metadata: .init(), isClassified: true)
+        var readerRecorded = false
+        if [.readerRebuild, .readerRebuildReplace, .readerRebuildClose, .readerRebuildTwice, .readerRebuildCancel]
+            .contains(action)
+        {
+            var db: OpaquePointer?
+            if sqlite3_open(url.path, &db) == SQLITE_OK {
+                _ = sqlite3_exec(db, "DROP TABLE photo_order;", nil, nil, nil)
+            }
+            sqlite3_close(db)
+            _ = store.enrich([item])
+            // A detail checkpoint can arrive after the reader rebuild and before synchronization resumes.
+            db = nil
+            if sqlite3_open(url.path, &db) == SQLITE_OK {
+                _ = sqlite3_exec(
+                    db,
+                    "INSERT INTO photo_order(vol,node,t,second,mime_seen) VALUES('volume','000000',500,500,1),('volume','000001',500,500,1);",
+                    nil, nil, nil)
+            }
+            sqlite3_close(db)
+            readerRecorded = store.record([
+                item.uid: .init(exactCaptureTime: item.captureTime.addingTimeInterval(0.8)),
+                PhotoUID(volumeID: "volume", nodeID: "000001"): .init(
+                    exactCaptureTime: item.captureTime.addingTimeInterval(0.1)),
+            ])
+        }
         let result = Probe(
-            classified: classified, rows: rowCount(), recorded: recorded,
+            classified: classified, rows: rowCount(), recorded: action == .readerRebuild ? readerRecorded : recorded,
             published: ((try? store.publishCompletedSeconds()) ?? false) || store.revision != revision,
             waitMs: Date().timeIntervalSince(queuedAt) * 1000)
         switch action {
-        case .observe, .measure: break
-        case .cancel: task?.cancel()
+        case .observe, .measure, .readerRebuild, .readerRebuildTwice: break
+        case .readerRebuildReplace:
+            _ = await store.synchronizeInChunks(
+                TimelineOrderFirstLaunchTests.photos(2), isClassified: { _ in true })
+        case .readerRebuildClose: close()
+        case .cancel, .readerRebuildCancel: task?.cancel()
         case .replace:
             _ = await store.synchronizeInChunks(
                 [TimelineOrderFirstLaunchTests.photos(1)[0]], isClassified: { _ in true })
@@ -265,6 +368,7 @@ private actor CacheOwner {
 
     func probeResult() async -> Probe { await probe?.value ?? Probe() }
     func waitForShutdown() async { await shutdownTask?.value }
+    func rebuildCount() -> UInt64 { store.rebuildRevision }
     func firstUnknown() throws -> PhotoUID? { try store.nextPage().first?.uid }
     func enriched(_ items: [PhotoItem]) -> [PhotoItem] { store.enrich(items) }
     func storedUIDs() -> Set<PhotoUID> {

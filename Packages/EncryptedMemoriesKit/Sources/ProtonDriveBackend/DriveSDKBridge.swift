@@ -31,10 +31,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     /// save/load logic live in Core.
     private let timelineStore: TimelineMetadataStore?
     private let timelineOrderStore: TimelineOrderMetadataStore?
-    private var metadataReconciliationGeneration: UInt64 = 0
-    private var activeMetadataInventory: TimelineOrderMetadataStore.InventorySignature?
-    private var metadataReconciliationInput: (items: [PhotoItem], classified: Set<String>)?
-    private var mimeFallbackInventory: (items: [PhotoItem], classified: Set<String>)?
+    private let metadataReconciliation = TimelineMetadataReconciliation()
     /// Drive key-derivation + block decryption for video streaming (built once at sign-in).
     private let crypto: DriveCrypto
     private let photosVolumeBootstrap: PhotosVolumeBootstrapService
@@ -57,9 +54,6 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     private var continuityRecovery = TimelineContinuityRecoveryCoordinator()
     /// Primary uploads returned by the SDK but not yet observed in an authoritative photos listing.
     private var pendingUploadedNodeIDs = Set<String>()
-    /// Low-priority, resumable reconciliation of lossy timeline tags with authoritative link MIME types.
-    /// One task per bridge keeps lifecycle refreshes from starting duplicate scans.
-    private var mediaTypeReconciliationTask: Task<Void, Never>?
     private var isShutDown = false
     private nonisolated let shutdownGate = JoinedShutdownGate()
     /// Receives the identities of a listing that no source inventory contains, currently the volume trash.
@@ -208,7 +202,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
             timelineLoadGeneration &+= 1
             shutdownGate.closeAdmission()
             timelineLoadTask?.task.cancel()
-            mediaTypeReconciliationTask?.cancel()
+            metadataReconciliation.retire()
             trashListingTask?.cancel()
             quotaRefresh?.cancel()
         }
@@ -234,17 +228,13 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         timelineLoadTask = nil
         timelineTask?.cancel()
 
-        let reconciliationTask = mediaTypeReconciliationTask
-        mediaTypeReconciliationTask = nil
-        reconciliationTask?.cancel()
+        metadataReconciliation.retire()
         let trashTask = trashListingTask
         trashListingTask = nil
         trashTask?.cancel()
 
         _ = await timelineTask?.result
-        await reconciliationTask?.value
-        metadataReconciliationInput = nil
-        mimeFallbackInventory = nil
+        await metadataReconciliation.waitForCurrentPass()
         await trashTask?.value
         timelineOrderStore?.close()
         timelineStore?.close()
@@ -833,67 +823,57 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         }
     }
 
-    /// Shares existing MIME batches with order inspection. The initial inventory is released after SQLite sync;
-    /// the network pass holds only one 150-link page. A disabled order cache retains the existing MIME fallback.
+    /// Shares existing MIME batches with order inspection over one complete inventory snapshot.
     private func scheduleMediaTypeReconciliation(
         items: [PhotoItem], alreadyClassifiedNodeIDs: Set<String>
     ) {
         guard timelineStore != nil, !isShutDown else { return }
-        let signature = TimelineOrderMetadataStore.InventorySignature(items)
-        guard mediaTypeReconciliationTask == nil || activeMetadataInventory != signature else { return }
-        activeMetadataInventory = signature
-        mediaTypeReconciliationTask?.cancel()
-        metadataReconciliationGeneration &+= 1
-        let generation = metadataReconciliationGeneration
-        metadataReconciliationInput = (items, alreadyClassifiedNodeIDs)
-        mimeFallbackInventory = nil
-        mediaTypeReconciliationTask = Task(priority: .background) { [weak self] in
+        let inventory = TimelineMetadataReconciliation.Inventory(
+            items: items, classifiedNodeIDs: alreadyClassifiedNodeIDs,
+            libraryID: items.first?.uid.volumeID ?? photosRoot?.volumeID)
+        metadataReconciliation.schedule(inventory) { [weak self] pass in
             guard let self else { return }
             _ = try? await self.withOpenSession { bridge in
-                await bridge.reconcileTimelineMetadata(generation: generation)
+                await bridge.reconcileTimelineMetadata(pass: pass)
             }
         }
     }
 
-    private func prepareTimelineOrderCache(generation: UInt64) async -> Bool {
-        guard let inventory = metadataReconciliationInput else { return false }
-        metadataReconciliationInput = nil
+    private func prepareTimelineOrderCache(pass: TimelineMetadataReconciliation.Pass) async -> Bool {
+        let inventory = pass.inventory
+        let initialRebuildRevision = timelineOrderStore?.rebuildRevision ?? 0
         let useOrderCache =
             await timelineOrderStore?.synchronizeInChunks(
-                inventory.items, isClassified: { inventory.classified.contains($0.nodeID) }) == true
-        guard generation == metadataReconciliationGeneration, !isShutDown, !Task.isCancelled else { return false }
-        if !useOrderCache {
-            mimeFallbackInventory = inventory
-            if timelineOrderStore != nil, !Task.isCancelled {
-                timelineOrderStore?.rebuild()
-                DebugLog.log("timeline: order cache unavailable; MIME reconciliation remains available")
-            }
+                inventory.items, isClassified: { inventory.classifiedNodeIDs.contains($0.nodeID) }) == true
+        guard metadataReconciliation.isCurrent(pass), !isShutDown, !Task.isCancelled else { return false }
+        if !useOrderCache, let timelineOrderStore,
+            timelineOrderStore.rebuildRevision == initialRebuildRevision
+        {
+            timelineOrderStore.rebuild()
+            DebugLog.log("timeline: order cache unavailable; MIME reconciliation remains available")
         }
         return useOrderCache
     }
 
-    private func reconcileTimelineMetadata(generation: UInt64) async {
-        guard generation == metadataReconciliationGeneration, !Task.isCancelled else { return }
+    private func reconcileTimelineMetadata(pass: TimelineMetadataReconciliation.Pass) async {
+        guard metadataReconciliation.isCurrent(pass), !Task.isCancelled else { return }
         var useOrderCache = false
         var changed = false
         defer {
-            if !isShutDown, changed, timelineStore?.publishMediaTypeEvidenceRevision() == false {
+            if !isShutDown, !Task.isCancelled, metadataReconciliation.isCurrent(pass), changed,
+                timelineStore?.publishMediaTypeEvidenceRevision() == false
+            {
                 DebugLog.log("timeline: could not publish reconciled media-type revision")
             }
-            if !isShutDown, generation == metadataReconciliationGeneration, useOrderCache {
+            if !isShutDown, !Task.isCancelled, metadataReconciliation.isCurrent(pass), useOrderCache {
                 do { _ = try timelineOrderStore?.publishCompletedSeconds() } catch {
                     timelineOrderStore?.rebuild()
                     DebugLog.log("timeline: could not publish completed order evidence")
                 }
             }
-            if generation == metadataReconciliationGeneration {
-                mediaTypeReconciliationTask = nil
-                activeMetadataInventory = nil
-                mimeFallbackInventory = nil
-            }
         }
-        useOrderCache = await prepareTimelineOrderCache(generation: generation)
-        guard generation == metadataReconciliationGeneration, !isShutDown, !Task.isCancelled else { return }
+        useOrderCache = await prepareTimelineOrderCache(pass: pass)
+        guard metadataReconciliation.isCurrent(pass), !isShutDown, !Task.isCancelled else { return }
         do {
             try Task.checkCancellation()
             var resolvedContext: PhotosShareContext?
@@ -904,15 +884,16 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
             let decoder = TimelineOrderMetadataDecoder()
             while true {
                 try Task.checkCancellation()
-                guard generation == metadataReconciliationGeneration else { throw CancellationError() }
+                guard metadataReconciliation.isCurrent(pass) else { throw CancellationError() }
                 let page: [TimelineOrderMetadataStore.Candidate]
                 if useOrderCache, let timelineOrderStore {
                     page = try timelineOrderStore.nextPage(after: cursor)
                 } else {
-                    guard let inventory = mimeFallbackInventory, offset < inventory.items.count else { break }
+                    let inventory = pass.inventory
+                    guard offset < inventory.items.count else { break }
                     let end = min(offset + TimelineOrderMetadataStore.pageSize, inventory.items.count)
                     page = inventory.items[offset..<end].compactMap { item in
-                        guard !inventory.classified.contains(item.uid.nodeID) else { return nil }
+                        guard !inventory.classifiedNodeIDs.contains(item.uid.nodeID) else { return nil }
                         return .init(uid: item.uid, captureTime: item.captureTime, needsOrder: false)
                     }
                     offset = end
