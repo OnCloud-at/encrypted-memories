@@ -1215,9 +1215,9 @@ final class BackupSyncRunnerTests: XCTestCase {
         }
         let progress = await runner.runUntilDrained(mode: .eligibleOnly)
 
-        XCTAssertNil(queueStore.entry(for: entry.source, revision: entry.revision))
+        XCTAssertEqual(queueStore.entry(for: entry.source, revision: entry.revision)?.state, .sourceMissing)
         XCTAssertEqual(resolver.resolveCount(for: entry.source.identifier), 4)
-        XCTAssertEqual(progress.needsAttention, 0)
+        XCTAssertEqual(progress.needsAttention, 1)
         XCTAssertTrue(uploader.requests.isEmpty)
     }
 
@@ -2233,11 +2233,12 @@ final class BackupSyncRunnerTests: XCTestCase {
             clock.advance(by: wait)
         }
         _ = await runner.runUntilDrained(mode: .eligibleOnly)
-        XCTAssertNil(queueStore.entry(for: entry.source, revision: entry.revision))
-        XCTAssertEqual(queueStore.missingSourceDiscardGeneration(), 1)
+        let terminal = try XCTUnwrap(queueStore.entry(for: entry.source, revision: entry.revision))
+        XCTAssertEqual(terminal.state, .sourceMissing)
+        XCTAssertEqual(queueStore.missingSourceDiscardGeneration(), 0)
         try await sync.reconcileMissingSources(engine: engine)
-        XCTAssertNotNil(queueStore.entry(for: entry.source, revision: entry.revision))
-        XCTAssertEqual(catalog.reconciledMissingSourceGeneration(), 1)
+        XCTAssertEqual(queueStore.entry(for: entry.source, revision: entry.revision), terminal)
+        XCTAssertEqual(catalog.reconciledMissingSourceGeneration(), 0)
         XCTAssertEqual(resolver.resolveCount(for: entry.source.identifier), 4, "Recovery reads only local stores")
         XCTAssertTrue(uploader.requests.isEmpty)
     }
