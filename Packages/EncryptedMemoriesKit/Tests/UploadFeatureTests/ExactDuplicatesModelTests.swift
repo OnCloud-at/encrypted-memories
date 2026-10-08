@@ -1330,6 +1330,40 @@ final class ExactDuplicatesModelTests: XCTestCase {
         }
     }
 
+    func testAccountRetirementRejectsALateGroupAppearanceDuringAJoinedMerge() async {
+        for replacing in [false, true] {
+            let groups = manyGroups(100)
+            let finder = FakeDuplicateFinder(scans: [.init(groups: groups, coverage: .complete)])
+            let lifetime = ExactDuplicatesAccountLifetime()
+            var model = lifetime.replace(with: finder)
+            weak var released = model
+            await model?.load()
+            finder.mergeGate.close()
+            let merge = Task { [model] in await model?.merge(groupID: groups[0].id) }
+            await waitUntil({ finder.mergeGate.hasWaiters }, "The old account's batch runs")
+            XCTAssertFalse(model?.groups.last?.isRanked ?? true, "The late group still needs ranking")
+            let rankings = finder.rankCalls
+            finder.rankGate.close()
+            if replacing {
+                _ = lifetime.replace(with: FakeDuplicateFinder(scans: []))
+            } else {
+                lifetime.retire()
+            }
+            // A delayed view callback arrives after retirement stopped the previous appearance follower.
+            model?.groupAppeared(groups[99].id)
+            try? await Task.sleep(for: ExactDuplicatesModel.appearancePause * 3)
+            XCTAssertEqual(finder.rankCalls, rankings, "A late appearance starts no retired-account ranking")
+            XCTAssertTrue(model?.isMerging ?? false, "Retirement still joins the running batch")
+            model?.screenDisappeared()
+            finder.rankGate.open()
+            await waitUntil({ finder.activeRankings == 0 }, "Cleanup joins any incorrect ranking")
+            model = nil
+            finder.mergeGate.open()
+            await merge.value
+            await waitUntil({ released == nil }, "The joined merge releases its retired model")
+        }
+    }
+
     func testAccountRetirementDiscardsARescanPendingAfterAMerge() async {
         await assertRetirementStartsNoMergeFollowup(buildChanged: true)
     }
