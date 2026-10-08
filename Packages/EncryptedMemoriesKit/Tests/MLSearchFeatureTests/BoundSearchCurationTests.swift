@@ -130,6 +130,67 @@ import TimelineCore
         #expect(scheduler.discovery.forYou.contains { $0.kind == .place && $0.id != places.first?.id })
     }
 
+    @Test func emptyPlacePreviewsStayVisibleWhileReplacementEvidenceIsRetired() async throws {
+        let scheduler = SmartSearchDiscoveryScheduler(runtimeState: LibraryRuntimeState(), debounce: .zero) {
+            latitude, _ in latitude < 30 ? "First place" : "Replacement place"
+        }
+        defer { scheduler.reset() }
+        let coordinates = points(0..<8)
+        let originalUIDs = Set(coordinates.map(\.uid))
+        let descriptor = MLModelDescriptor(identifier: "fixture", version: 1, embeddingDimension: 3)
+        let snapshot = MLSmartSearchSnapshot(
+            isEnabled: true, selectedModelID: MLModelID("fixture"),
+            phase: .ready(MLIndexCoverage(total: 9, indexed: 9, permanentlyUnindexable: 0)),
+            installedModelBytes: 0, availableModels: [], isSearchAvailable: true,
+            indexingState: .ready(
+                MLSmartSearchAggregateProgress(totalWorkUnits: 9, settledWorkUnits: 9, permanentlyUnavailableAssets: 0))
+        )
+        func apply(_ location: PhotoPlaceEvidence, revision: Int, addsSafePhoto: Bool) {
+            let photos = addsSafePhoto ? points(0..<9) : coordinates
+            let evidence = MLSearchBatchResults(
+                results: MLSearchConceptCatalog.sensitivePrompts.map {
+                    MLSearchResults(
+                        descriptor: descriptor, queryText: $0,
+                        results: originalUIDs.map { MLSearchResult(uid: $0, score: 1) })
+                }
+                    + MLSearchConceptCatalog.curated.map {
+                        MLSearchResults(descriptor: descriptor, queryText: $0.prompt, results: [])
+                    }, scannedUIDs: MLScannedUIDMembership(Set(photos.map(\.uid))))
+            scheduler.update(
+                sections: sections(photos), timelineRevision: addsSafePhoto ? 2 : 1,
+                favoriteUIDs: Set(photos.map(\.uid)), coordinates: location.coordinates,
+                snapshot: snapshot, indexedAssetCount: { photos.count }, searchEvidence: { evidence },
+                placeRevision: revision, locationEvidence: location)
+        }
+        apply(PhotoPlaceEvidence(coordinates: coordinates), revision: 1, addsSafePhoto: false)
+        await scheduler.waitForRefreshForTesting()
+        let places = scheduler.discovery.forYou.filter { $0.kind == .place || $0.kind == .placeSeason }
+        try #require(!places.isEmpty)
+        try #require(scheduler.discovery.forYou.allSatisfy { $0.representativeUIDs.isEmpty && $0.kind != .concept })
+        let replacement = PhotoPlaceEvidence(coordinates: points(0..<8, latitude: 40))
+        let retired = Task<Void, Never> {}
+        retired.cancel()
+        await retired.value
+        replacement.registerWarmingTask(retired)
+        apply(replacement, revision: 2, addsSafePhoto: true)
+        #expect(scheduler.discovery.forYou.filter { $0.kind == .place || $0.kind == .placeSeason } == places)
+        await scheduler.waitForRefreshForTesting()
+        #expect(scheduler.discovery.forYou.filter { $0.kind == .place || $0.kind == .placeSeason } == places)
+        let runs = scheduler.curationRunCount
+        let metadata = scheduler.metadataPassCount
+        await scheduler.waitForRefreshForTesting()
+        #expect(scheduler.curationRunCount == runs)
+        #expect(scheduler.metadataPassCount == metadata)
+        #expect(replacement.analysisStartsForTesting == 0)
+        apply(PhotoPlaceEvidence(coordinates: points(0..<8, latitude: 40)), revision: 3, addsSafePhoto: true)
+        await scheduler.waitForRefreshForTesting()
+        #expect(scheduler.discovery.lastRefreshCompleted)
+        #expect(scheduler.discovery.forYou.contains { $0.kind == .place && $0.title == "Replacement place" })
+        #expect(!scheduler.discovery.forYou.contains { $0.id == places.first?.id })
+        #expect(scheduler.discovery.forYou.contains { !$0.representativeUIDs.isEmpty })
+        #expect(scheduler.discovery.forYou.flatMap(\.representativeUIDs).allSatisfy { !originalUIDs.contains($0) })
+    }
+
     @Test(arguments: [false, true]) func crawlStillInvalidatesLibraryAndFavoritesImmediately(favorites: Bool) async {
         let runtime = LibraryRuntimeState()
         let scheduler = SmartSearchDiscoveryScheduler(runtimeState: runtime, debounce: .zero) { _, _ in "Test place" }
