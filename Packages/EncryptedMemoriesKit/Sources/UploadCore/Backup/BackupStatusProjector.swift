@@ -180,10 +180,10 @@ public actor BackupStatusProjector {
             || previous?.sourceMissing != event.progress.sourceMissing
         let previousOutstanding =
             (previous?.waiting ?? 0) + (previous?.checking ?? 0)
-            + (previous?.uploading ?? 0) + (previous?.blocked ?? 0)
+            + (previous?.uploading ?? 0) + (previous?.blocked ?? 0) + (previous?.pendingSourceRechecks ?? 0)
         let currentOutstanding =
             event.progress.waiting + event.progress.checking
-            + event.progress.uploading + event.progress.blocked
+            + event.progress.uploading + event.progress.blocked + event.progress.pendingSourceRechecks
         let drained = previousOutstanding > 0 && currentOutstanding == 0
         let terminal = !event.progress.isRunning
 
@@ -232,6 +232,7 @@ public actor BackupStatusProjector {
         progress.blocked = summary.blocked
         progress.failed = summary.failed
         progress.dismissedFailures = summary.dismissedFailures
+        progress.pendingSourceRechecks = summary.pendingSourceRechecks
         progress.paused = summary.paused
         // A Photo Library pass repeatedly invokes short eligible-only runner drains while its scan
         // runs concurrently. The controller's run context is therefore the stable activity truth;
@@ -288,7 +289,7 @@ public actor BackupStatusProjector {
         summary: UploadBackupSyncQueueSummary,
         isRunning: Bool
     ) -> BackupOutstandingSnapshot {
-        let count = summary.waiting + summary.active + summary.blocked
+        let count = summary.waiting + summary.active + summary.blocked + summary.pendingSourceRechecks
         guard count > 0 else { return BackupOutstandingSnapshot() }
         guard !isRunning else { return BackupOutstandingSnapshot(count: count) }
 

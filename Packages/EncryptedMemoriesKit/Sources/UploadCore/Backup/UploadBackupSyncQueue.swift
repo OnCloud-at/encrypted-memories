@@ -138,6 +138,20 @@ public struct UploadBackupSyncQueueEntry: Sendable, Equatable {
     }
 }
 
+public extension UploadBackupSyncQueueEntry {
+    /// A durable check request, not upload permission. Preserve the acknowledged missing reason until bytes return.
+    var isDismissedSourceRecheck: Bool {
+        Self.isDismissedSourceRecheck(sourceKind: source.kind, state: state, lastError: lastError)
+    }
+
+    static func isDismissedSourceRecheck(
+        sourceKind: UploadSourceIdentity.Kind, state: UploadBackupSyncQueueState, lastError: String?
+    ) -> Bool {
+        sourceKind == .photoLibraryAsset && (state == .discovered || state == .checking)
+            && BackupIssueRecord.decode(lastError)?.kind == .sourceMissing
+    }
+}
+
 public struct UploadBackupSyncQueueSummary: Sendable, Equatable {
     public var total = 0
     public var waiting = 0
@@ -157,6 +171,8 @@ public struct UploadBackupSyncQueueSummary: Sendable, Equatable {
     public var blocked = 0
     public var failed = 0
     public var dismissedFailures = 0
+    /// Subset of dismissedFailures that still owes an admitted source check. Never another photo or upload.
+    public var pendingSourceRechecks = 0
     public var paused = 0
 
     public init() {}
@@ -250,6 +266,11 @@ public protocol UploadBackupSyncQueueStore: Sendable {
     /// whole chunk.
     @discardableResult
     func upsertBatch(_ entries: [UploadBackupSyncQueueEntry]) -> Bool
+    /// Conditional durable transition for an acknowledged missing-source check. Nil means a failed write;
+    /// false means the row changed or gained a remote receipt. Only the runner can release the saved reason.
+    func updateDismissedSourceRecheck(
+        _ entry: UploadBackupSyncQueueEntry, matchingState: UploadBackupSyncQueueState, matchingLastError: String
+    ) -> Bool?
     func entry(for source: UploadSourceIdentity, revision: UploadBackupRevision) -> UploadBackupSyncQueueEntry?
     /// Bounded, strict scan of every row carrying durable remote-commit evidence, independent of
     /// queue state. A malformed non-null payload is an error, never ordinary no-receipt work.
@@ -340,6 +361,10 @@ public protocol UploadBackupSyncQueueStore: Sendable {
 }
 
 public extension UploadBackupSyncQueueStore {
+    func updateDismissedSourceRecheck(
+        _ entry: UploadBackupSyncQueueEntry, matchingState: UploadBackupSyncQueueState, matchingLastError: String
+    ) -> Bool? { nil }
+
     func isOperational() -> Bool { true }
 
     func removeMissingSource(source: UploadSourceIdentity, revision: UploadBackupRevision) -> Bool {
