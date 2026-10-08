@@ -1050,8 +1050,8 @@ public final class ExactDuplicatesModel {
 
     /// Counts the duplicates for the entry without ranking them, once, before the screen has loaded.
     public func loadCountIfNeeded() async {
-        guard phase == .idle, scannedDuplicateCount == nil else { return }
-        guard let scan = try? await finder.duplicateGroups(progress: { _ in }), phase == .idle else { return }
+        guard !isRetired, phase == .idle, scannedDuplicateCount == nil else { return }
+        guard let scan = try? await finder.duplicateGroups(progress: { _ in }), !isRetired, phase == .idle else { return }
         scannedDuplicateCount = scan.groups.reduce(0) { $0 + $1.members.count - 1 }
     }
 
