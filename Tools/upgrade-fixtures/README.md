@@ -16,7 +16,7 @@ The script creates a detached worktree beside this checkout. It applies only a r
 Historical production sources remain unchanged. The SDK restore uses that release's `update-proton-sdk.sh` and a disposable build root.
 For v1.0.5, VendorPatches pins SDK 0.29.1 at `8c21d3f7277bcb7a8506ac3576b51e1cf569de79` with two patches.
 
-Each scenario takes a separate `build-turn.sh` turn and acquires the canonical build lock.
+Each scenario takes a separate build turn and acquires the canonical build lock.
 The first turn builds. Later turns use `--skip-build`.
 The historical SwiftPM scratch lives under `$ENCRYPTED_MEMORIES_BUILD_ROOT/UpgradeFixtures.noindex/<release>/SPM.noindex`.
 Its separate dependency cache lives beside it. Later recordings reuse these caches for the same release.
