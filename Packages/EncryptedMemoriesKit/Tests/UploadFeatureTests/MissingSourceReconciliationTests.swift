@@ -64,10 +64,10 @@ final class MissingSourceReconciliationTests: XCTestCase {
             originalFilename: candidate.originalFilename, state: state, updatedAt: Date(timeIntervalSince1970: 300))
     }
 
-    private func engine(proof: ProofSpy? = nil) -> UploadBackupSyncEngine {
+    private func engine(proof: ProofSpy? = nil, clock: BackupTestClock? = nil) -> UploadBackupSyncEngine {
         UploadBackupSyncEngine(
             preflight: UploadBackupPreflightIndex(store: state), queue: queue,
-            remoteProofResolver: proof, exclusions: exclusions)
+            remoteProofResolver: proof, exclusions: exclusions, now: { clock?.now ?? Date() })
     }
 
     func testOnlyPresentUnbackedSourcesWithoutAnyQueueRowReturnAndTheSweepReadsNoRemoteProof() async throws {
@@ -106,6 +106,188 @@ final class MissingSourceReconciliationTests: XCTestCase {
         XCTAssertTrue(queue.remove(source: missing.snapshot.source, revision: missing.snapshot.revision))
         try await sync.reconcileMissingSources(engine: engine(proof: proof))
         XCTAssertNil(queue.entry(for: missing.snapshot.source, revision: missing.snapshot.revision))
+    }
+
+    func testPermanentlyMissingPhotoStaysRecordedWithoutAnotherSweepOrAttemptAfterRelaunch() async throws {
+        let candidate = try candidate("permanent")
+        XCTAssertTrue(queue.upsert(row(candidate)))
+        let tracked = PageCatalog(inner: catalog)
+        let sync = PhotoLibraryCatalogSync(store: tracked)
+        try await sync.reconcileMissingSources(engine: engine())
+        XCTAssertEqual(tracked.pages, 2)
+        let clock = BackupTestClock()
+        let resolver = ScriptedBackupResolver(defaultModified: Date(timeIntervalSince1970: 200))
+        resolver.set(.failure(UploadError.sourceReportedMissing("permanent.jpg"), times: 10), for: "permanent")
+        let runner = runner(clock: clock, resolver: resolver)
+        for wait in [3600.0, 7200, 14_400] {
+            _ = await runner.runUntilDrained(mode: .eligibleOnly)
+            clock.advance(by: wait)
+        }
+        let progress = await runner.runUntilDrained(mode: .eligibleOnly)
+        XCTAssertEqual(progress.sourceMissing, 1)
+        let terminal = try XCTUnwrap(queue.entry(for: candidate.snapshot.source, revision: candidate.snapshot.revision))
+        XCTAssertEqual(terminal.state, .sourceMissing)
+        XCTAssertNil(BackupIssueRecord.decode(terminal.lastError)?.nextAttemptAt)
+        XCTAssertEqual(queue.missingSourceDiscardGeneration(), 0)
+        try await sync.reconcileMissingSources(engine: engine())
+        XCTAssertEqual(tracked.pages, 2, "The final missing report must not start another catalog sweep")
+        XCTAssertEqual(queue.count(), 1)
+        XCTAssertEqual(queue.entry(for: terminal.source, revision: terminal.revision), terminal)
+
+        closeStores()
+        try openStores()
+        let relaunchedCatalog = PageCatalog(inner: catalog)
+        try await PhotoLibraryCatalogSync(store: relaunchedCatalog).reconcileMissingSources(engine: engine())
+        XCTAssertEqual(relaunchedCatalog.pages, 0)
+        let relaunched = self.runner(clock: clock, resolver: resolver)
+        let retries = await relaunched.makeRetryableWorkEligibleNow()
+        XCTAssertEqual(retries, 0, "Back Up Now must not reset the missing-source checks")
+        _ = await relaunched.runUntilDrained(mode: .eligibleOnly)
+        XCTAssertEqual(resolver.resolveCount(for: "permanent"), 4)
+        XCTAssertEqual(queue.entry(for: terminal.source, revision: terminal.revision), terminal)
+
+        // A sweep owed for another source also leaves the terminal row untouched.
+        let dropped = try self.candidate("older-drop")
+        XCTAssertTrue(queue.upsert(row(dropped)))
+        XCTAssertTrue(queue.removeMissingSource(source: dropped.snapshot.source, revision: dropped.snapshot.revision))
+        try await PhotoLibraryCatalogSync(store: relaunchedCatalog).reconcileMissingSources(engine: engine())
+        XCTAssertEqual(queue.count(), 2)
+        XCTAssertEqual(queue.entry(for: terminal.source, revision: terminal.revision), terminal)
+        XCTAssertNotNil(queue.entry(for: dropped.snapshot.source, revision: dropped.snapshot.revision))
+    }
+
+    func testAChangedPhotoReopensATerminalMissingRowAtTheSameOrANewRevision() async throws {
+        for newRevision in [false, true] {
+            let id = newRevision ? "new-revision" : "same-revision"
+            let candidate = try candidate(id)
+            XCTAssertTrue(queue.upsert(row(candidate, state: .sourceMissing)))
+            var info = PhotoLibraryCatalogMapper.info(for: try XCTUnwrap(catalog.entry(for: id)))
+            info.resources[0].originalFilename = "available.jpg"
+            if newRevision { info.modificationDate = Date(timeIntervalSince1970: 201) }
+            let changed = try XCTUnwrap(PhotoBackupAssetPlanner.candidate(for: info))
+            XCTAssertEqual(changed.snapshot.revision == candidate.snapshot.revision, !newRevision)
+            let sync = PhotoLibraryCatalogSync(store: catalog, enumerator: ChangedEnumerator(info: info))
+            let progress = try await sync.run(engine: engine(), identifiers: [id])
+            XCTAssertEqual(progress.changed, 1)
+            XCTAssertEqual(
+                queue.entry(for: changed.snapshot.source, revision: changed.snapshot.revision)?.state, .discovered)
+            let clock = BackupTestClock(start: Date())
+            let resolver = ScriptedBackupResolver(defaultModified: try XCTUnwrap(info.modificationDate))
+            let uploaded = await runner(clock: clock, resolver: resolver).runUntilDrained(mode: .eligibleOnly)
+            XCTAssertEqual(uploaded.uploaded, newRevision ? 2 : 1)
+            XCTAssertEqual(
+                queue.entry(for: changed.snapshot.source, revision: changed.snapshot.revision)?.state, .completed)
+            XCTAssertEqual(queue.summary().sourceMissing, 0)
+        }
+    }
+
+    func testPhotosChangeReopensMissingSourceEvenWhenCatalogMetadataIsUnchanged() async throws {
+        let candidate = try candidate("available-again")
+        let info = PhotoLibraryCatalogMapper.info(for: try XCTUnwrap(catalog.entry(for: "available-again")))
+        let terminal = row(candidate, state: .sourceMissing)
+        XCTAssertTrue(queue.upsert(terminal))
+        let sync = PhotoLibraryCatalogSync(store: catalog, enumerator: ChangedEnumerator(info: info))
+        _ = try await sync.run(engine: engine())
+        XCTAssertEqual(
+            queue.entry(for: terminal.source, revision: terminal.revision), terminal,
+            "An unchanged full scan must keep the terminal missing record")
+        try await sync.runPass(
+            engine: engine(),
+            changes: .init(
+                changedIdentifiers: [info.localIdentifier], deletedIdentifiers: [], requiresFullRescan: false),
+            commitChanges: {})
+        XCTAssertEqual(
+            queue.entry(for: terminal.source, revision: terminal.revision)?.state, .discovered,
+            "A Photos change must retry the file even when dates and listed resources stay the same")
+        let clock = BackupTestClock(start: Date())
+        let resolver = ScriptedBackupResolver(defaultModified: Date(timeIntervalSince1970: 200))
+        let progress = await runner(clock: clock, resolver: resolver).runUntilDrained(mode: .eligibleOnly)
+        XCTAssertEqual(progress.uploaded, 1)
+        XCTAssertEqual(queue.summary().sourceMissing, 0)
+    }
+
+    func testRepeatedPhotosChangesForABrokenFileNeverStartAnotherMissingSourceSweep() async throws {
+        let candidate = try candidate("still-broken")
+        let info = PhotoLibraryCatalogMapper.info(for: try XCTUnwrap(catalog.entry(for: "still-broken")))
+        XCTAssertTrue(queue.upsert(row(candidate, state: .sourceMissing)))
+        let clock = BackupTestClock()
+        let engine = engine(clock: clock)
+        let initialSync = PhotoLibraryCatalogSync(store: catalog, enumerator: ChangedEnumerator(info: info))
+        _ = try await initialSync.run(engine: engine)
+        try await initialSync.reconcileMissingSources(engine: engine)
+        let tracked = PageCatalog(inner: catalog)
+        let sync = PhotoLibraryCatalogSync(store: tracked, enumerator: ChangedEnumerator(info: info))
+        let resolver = ScriptedBackupResolver(defaultModified: Date(timeIntervalSince1970: 200))
+        resolver.set(
+            .failure(UploadError.sourceReportedMissing("still-broken.jpg"), times: 100), for: info.localIdentifier)
+        let runner = runner(clock: clock, resolver: resolver)
+        for round in 1...3 {
+            try await sync.runPass(
+                engine: engine,
+                changes: .init(
+                    changedIdentifiers: [info.localIdentifier], deletedIdentifiers: [], requiresFullRescan: false),
+                commitChanges: {})
+            for wait in [3600.0, 7200, 14_400] {
+                _ = await runner.runUntilDrained(mode: .eligibleOnly)
+                let waiting = try XCTUnwrap(
+                    queue.entry(for: candidate.snapshot.source, revision: candidate.snapshot.revision))
+                XCTAssertEqual(waiting.state, .discovered)
+                // Another signal during a planned check must not reset its count or due date.
+                try await sync.runPass(
+                    engine: engine,
+                    changes: .init(
+                        changedIdentifiers: [info.localIdentifier], deletedIdentifiers: [], requiresFullRescan: false),
+                    commitChanges: {})
+                XCTAssertEqual(queue.entry(for: waiting.source, revision: waiting.revision), waiting)
+                clock.advance(by: wait)
+            }
+            _ = await runner.runUntilDrained(mode: .eligibleOnly)
+            XCTAssertEqual(
+                queue.entry(for: candidate.snapshot.source, revision: candidate.snapshot.revision)?.state,
+                .sourceMissing)
+            XCTAssertEqual(
+                resolver.resolveCount(for: info.localIdentifier), round * 4,
+                "Each terminal reopening permits one attempt and only three scheduled rechecks")
+            XCTAssertEqual(queue.missingSourceDiscardGeneration(), 0)
+            try await sync.reconcileMissingSources(engine: engine)
+            XCTAssertEqual(tracked.pages, 0, "Repeated Photos changes must not trigger a full recovery sweep")
+            XCTAssertEqual(queue.count(), 1)
+        }
+    }
+
+    func testAnAbsentDiscardDoesNotRequestAnotherSweep() throws {
+        let candidate = try candidate("absent")
+        XCTAssertFalse(
+            queue.removeMissingSource(source: candidate.snapshot.source, revision: candidate.snapshot.revision))
+        XCTAssertEqual(queue.missingSourceDiscardGeneration(), 0)
+        XCTAssertTrue(queue.upsert(row(candidate)))
+        XCTAssertTrue(
+            queue.removeMissingSource(source: candidate.snapshot.source, revision: candidate.snapshot.revision))
+        XCTAssertEqual(queue.missingSourceDiscardGeneration(), 1)
+        XCTAssertFalse(
+            queue.removeMissingSource(source: candidate.snapshot.source, revision: candidate.snapshot.revision))
+        XCTAssertEqual(queue.missingSourceDiscardGeneration(), 1)
+    }
+
+    private func runner(clock: BackupTestClock, resolver: ScriptedBackupResolver) -> BackupSyncRunner {
+        BackupSyncRunner(
+            queue: queue, preflight: UploadBackupPreflightIndex(store: state), resolver: resolver,
+            identityResolver: UploadDedupePipeline(
+                store: FakeIdentityStore(), hasher: FakeHasher(), checker: FakeChecker()),
+            uploader: MockUploader(workDuration: .milliseconds(1), deliverProgress: false),
+            clock: clock, now: { clock.now })
+    }
+
+    private struct ChangedEnumerator: PhotoLibraryAssetEnumerator {
+        let info: PhotoBackupAssetInfo
+        func infoChunks(
+            identifiers: [String]?, startOffset: Int, chunkSize: Int
+        ) -> AsyncThrowingStream<[PhotoBackupAssetInfo], any Error> {
+            AsyncThrowingStream { continuation in
+                continuation.yield([info])
+                continuation.finish()
+            }
+        }
     }
 
     func testCancelledSweepResumesAfterItsDurablePageAndDoesNotLoseALaterDropBehindTheCursor() async throws {
