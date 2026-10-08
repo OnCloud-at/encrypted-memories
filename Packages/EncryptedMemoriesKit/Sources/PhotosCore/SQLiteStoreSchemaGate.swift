@@ -26,10 +26,10 @@ private enum SQLiteStoreOpenResult {
 
 /// Exact-schema gate for operational and user-authored stores.
 ///
-/// Existing files are inspected without writes. Only a database with no application schema may be
-/// initialized. A populated database must contain the exact tables, columns, constraints, and indexes
-/// produced by this build's schema SQL. This keeps schema changes explicit and prevents markerless or
-/// future files from being modified while an older build tries to open them.
+/// Existing files are inspected read-only. If that fails, only a temporary copy permits recovery writes.
+/// A recovered copy must have no schema objects. A populated database must contain the exact tables,
+/// columns, constraints, and indexes produced by this build's schema SQL. This keeps schema changes explicit
+/// and prevents markerless or future files from being modified while an older build tries to open them.
 public enum SQLiteStoreSchemaGate {
     private static let logger = Logger(subsystem: "at.oncloud.encryptedmemories", category: "SQLiteStore")
     /// `SQLITE_TRANSIENT`: SQLite copies bound text and blobs before the bind call returns.
@@ -171,8 +171,8 @@ public enum SQLiteStoreSchemaGate {
     }
 
     /// Inspects an existing database through a read-only connection. Missing files are empty stores.
-    /// The caller can therefore reject a populated incompatible file before any read-write open,
-    /// WAL recovery, persistent pragma, schema DDL, or version stamp can modify it.
+    /// If inspection fails, a read-write inspection of a temporary copy can prove the recovered database empty.
+    /// Populated or unreadable copies remain unavailable; recovery never modifies the original during inspection.
     public static func compatibility(
         at url: URL,
         schemaSQL: String,
@@ -186,7 +186,7 @@ public enum SQLiteStoreSchemaGate {
             let inspection
         else {
             sqlite3_close(inspection)
-            return .unavailable
+            return compatibilityOfWritableCopy(at: url, busyTimeoutMs: busyTimeoutMs)
         }
         defer { sqlite3_close(inspection) }
         sqlite3_busy_timeout(inspection, Int32(clamping: busyTimeoutMs))
@@ -199,8 +199,67 @@ public enum SQLiteStoreSchemaGate {
                 && matchesCurrentSchema(inspection, schemaSQL: schemaSQL)
                 ? .current : .incompatible
         case .unavailable:
+            return compatibilityOfWritableCopy(at: url, busyTimeoutMs: busyTimeoutMs)
+        }
+    }
+
+    /// A read-write schema read can roll back a hot journal. Preserve the original and all its sidecars,
+    /// even when recovery finds a populated database that this build must refuse to open.
+    private static func compatibilityOfWritableCopy(
+        at url: URL,
+        busyTimeoutMs: Int
+    ) -> SQLiteStoreSchemaCompatibility {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("SQLiteStoreInspection-\(UUID().uuidString)", isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(
+                at: directory, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+        } catch {
+            logger.error("SQLite could not create its temporary recovery inspection.")
             return .unavailable
         }
+
+        var compatibility = SQLiteStoreSchemaCompatibility.unavailable
+        do {
+            let copy = directory.appendingPathComponent("store.sqlite")
+            for suffix in ["", "-journal", "-wal", "-shm"] {
+                let original = URL(fileURLWithPath: url.path + suffix)
+                if suffix.isEmpty || FileManager.default.fileExists(atPath: original.path) {
+                    try FileManager.default.copyItem(at: original, to: URL(fileURLWithPath: copy.path + suffix))
+                }
+            }
+            compatibility = emptyCompatibility(at: copy, busyTimeoutMs: busyTimeoutMs)
+        } catch {
+            logger.error("SQLite could not copy the database and journals for recovery inspection.")
+        }
+        do {
+            try FileManager.default.removeItem(at: directory)
+        } catch {
+            logger.error("SQLite could not remove its temporary recovery inspection.")
+            return .unavailable
+        }
+        return compatibility
+    }
+
+    private static func emptyCompatibility(at url: URL, busyTimeoutMs: Int) -> SQLiteStoreSchemaCompatibility {
+        var inspection: OpaquePointer?
+        guard sqlite3_open_v2(url.path, &inspection, SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX, nil) == SQLITE_OK,
+            let inspection
+        else {
+            sqlite3_close(inspection)
+            return .unavailable
+        }
+        defer { sqlite3_close(inspection) }
+        sqlite3_busy_timeout(inspection, Int32(clamping: busyTimeoutMs))
+        // Include SQLite's own objects, such as sqlite_sequence. Any remaining object forbids initialization.
+        guard userVersion(of: inspection) == 0 else { return .unavailable }
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(inspection, "SELECT 1 FROM sqlite_schema LIMIT 1;", -1, &statement, nil) == SQLITE_OK
+        else {
+            return .unavailable
+        }
+        defer { sqlite3_finalize(statement) }
+        return sqlite3_step(statement) == SQLITE_DONE ? .empty : .unavailable
     }
 
     /// Applies connection-local tuning only after the caller accepts the existing schema.
