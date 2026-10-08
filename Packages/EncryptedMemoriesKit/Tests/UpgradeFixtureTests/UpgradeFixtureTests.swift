@@ -281,14 +281,6 @@ import XCTest
         }
 
         private func knownFailure(_ scenario: String, snapshot: Snapshot) -> (issue: String, signature: String)? {
-            if ["model", "index"].contains(scenario), snapshot.event.id == 14,
-                snapshot.event.path == "/SmartSearch/tmp/staging-synthetic-model-r1/install.json"
-            {
-                return (
-                    "Issue #390: interrupted staging install record prevents recovery",
-                    "installation: ambiguousModelArtifact"
-                )
-            }
             return nil
         }
 
