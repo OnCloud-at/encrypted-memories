@@ -36,7 +36,7 @@ import TimelineCore
             analyzed[ObjectIdentifier(evidence)] = evidence
             scheduler.update(
                 sections: sections, timelineRevision: 1, favoriteUIDs: [], coordinates: index.coordinates,
-                smartSearch: nil, coordinateRevision: index.revision, locationEvidence: evidence)
+                smartSearch: nil, placeRevision: index.placeRevision, locationEvidence: evidence)
             await scheduler.waitForRefreshForTesting()
         }
         await curate()
@@ -428,19 +428,19 @@ import TimelineCore
             latitude > 45 ? "Vienna" : "Rome"
         }
         defer { scheduler.reset() }
-        func apply(latitude: Double, coordinateRevision: Int) {
+        func apply(latitude: Double, placeRevision: Int) {
             scheduler.update(
                 sections: [TimelineSection(id: "all", date: Date(), title: "", items: items)],
                 timelineRevision: 1, favoriteUIDs: [],
                 coordinates: items.map {
                     PhotoCoordinate(uid: $0.uid, latitude: latitude, longitude: 16, date: $0.captureTime)
                 }, snapshot: .disabled, indexedAssetCount: { 0 }, searchEvidence: nil,
-                coordinateRevision: coordinateRevision)
+                placeRevision: placeRevision)
         }
-        apply(latitude: 48, coordinateRevision: 1)
+        apply(latitude: 48, placeRevision: 1)
         for _ in 0..<200 where !scheduler.discovery.lastRefreshCompleted { try await Task.sleep(for: .milliseconds(5)) }
         try #require(scheduler.discovery.forYou.contains { $0.title == "Vienna" })
-        apply(latitude: 42, coordinateRevision: 2)
+        apply(latitude: 42, placeRevision: 2)
         for _ in 0..<200 where !scheduler.discovery.forYou.contains(where: { $0.title == "Rome" }) {
             try await Task.sleep(for: .milliseconds(5))
         }
@@ -644,7 +644,7 @@ import TimelineCore
                     PhotoCoordinate(uid: $0.uid, latitude: latitude, longitude: 16.3, date: $0.captureTime)
                 }, snapshot: visualSnapshot(settled: 8, ready: true), indexedAssetCount: { 8 },
                 searchEvidence: { await probe.query(sensitive: items[0].uid, conceptUIDs: items.map(\.uid)) },
-                cacheAccess: { await cache.access() }, coordinateRevision: Int(latitude))
+                cacheAccess: { await cache.access() }, placeRevision: Int(latitude))
         }
         func waitForSave(_ count: Int) async throws {
             for _ in 0..<400 where await cache.saves < count || scheduler.isRefreshing {

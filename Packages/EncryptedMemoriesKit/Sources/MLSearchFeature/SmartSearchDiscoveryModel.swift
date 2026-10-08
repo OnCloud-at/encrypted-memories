@@ -137,6 +137,7 @@ public final class SmartSearchDiscoveryModel {
     /// Only the current refresh may publish after an asynchronous boundary.
     @ObservationIgnored private var refreshGeneration: UInt64 = 0
     @ObservationIgnored private(set) var lastRefreshCompleted = false
+    @ObservationIgnored private(set) var lastRefreshWaitsForPlaces = false
     @ObservationIgnored private var metadata = TimelineSearchDiscoveryResult()
     @ObservationIgnored private var places: [TimelineSearchSuggestion] = []
     @ObservationIgnored private var concepts: [TimelineSearchSuggestion] = []
@@ -145,6 +146,11 @@ public final class SmartSearchDiscoveryModel {
     @ObservationIgnored private var sensitiveUIDs: Set<PhotoUID> = []
     @ObservationIgnored private var conceptKey: String?
     @ObservationIgnored private var conceptEvidence: [MLSearchConceptEvidence] = []
+
+    #if DEBUG
+        var metadataDidRunForTesting: (() -> Void)?
+        var clusteringDidRunForTesting: (() -> Void)?
+    #endif
 
     public convenience init(refreshPolicy: RefreshPolicy = .continuous, placeName: @escaping PlaceNameResolver) {
         self.init(refreshPolicy: refreshPolicy, placeName: placeName, libraryRows: SmartSearchLibraryRowsCache())
@@ -510,6 +516,7 @@ public final class SmartSearchDiscoveryModel {
         let content = SmartSearchContentIdentity(timelineRevision: timelineRevision, favoriteUIDs: favoriteUIDs)
         showsSmartSearchHint = snapshot?.isEnabled != true
         lastRefreshCompleted = false
+        lastRefreshWaitsForPlaces = false
         settledBeforeInvalidation = nil
         refreshGeneration &+= 1
         let generation = refreshGeneration
@@ -606,6 +613,9 @@ public final class SmartSearchDiscoveryModel {
             places = []
             concepts = []
         }
+        #if DEBUG
+            metadataDidRunForTesting?()
+        #endif
         metadata = newMetadata
         publish(content: content)
         previewsDidPublish?()
@@ -679,8 +689,15 @@ public final class SmartSearchDiscoveryModel {
         }
 
         // Stage 4: only centroids of photo clusters are named.
-        if let locationEvidence, !(await locationEvidence.waitForWarming()) { return }
+        if let locationEvidence, !(await locationEvidence.waitForWarming()) {
+            guard !Task.isCancelled, generation == refreshGeneration else { return }
+            lastRefreshWaitsForPlaces = true
+            return
+        }
         guard !Task.isCancelled, generation == refreshGeneration else { return }
+        #if DEBUG
+            clusteringDidRunForTesting?()
+        #endif
         let candidates = await Self.background {
             TimelineSearchDiscovery.placeCandidates(coordinates: coordinates, evidence: locationEvidence)
         }
