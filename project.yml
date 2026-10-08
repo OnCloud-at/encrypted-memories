@@ -304,3 +304,15 @@ schemes:
       config: Debug
       targets:
         - EncryptedMemoriesMobileUITests
+
+  EncryptedMemoriesMobileCI:
+    build:
+      targets:
+        EncryptedMemoriesMobile: all
+        EncryptedMemoriesMobileTests: [test]
+        EncryptedMemoriesMobileUITests: [test]
+    test:
+      config: Debug
+      targets:
+        - EncryptedMemoriesMobileTests
+        - EncryptedMemoriesMobileUITests

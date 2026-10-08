@@ -3,18 +3,34 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEVELOPER_DIR="${DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Developer}"
+export DEVELOPER_DIR
 source "$ROOT/scripts/build-paths.sh"
 DERIVED_DATA="${ENCRYPTED_MEMORIES_IOS_TEST_DERIVED_DATA:-$ENCRYPTED_MEMORIES_BUILD_ROOT/DD.tests.ios.noindex}"
 # No argument runs the hosted tests. `ui` runs the UI tests, which launch the app on the offline fixture account and
 # tap through it in the simulator.
 case "${1:-hosted}" in
-  hosted) SCHEME="EncryptedMemoriesMobileTests" ;;
-  ui) SCHEME="EncryptedMemoriesMobileUITests" ;;
+  hosted) TEST_TARGET="EncryptedMemoriesMobileTests" ;;
+  ui) TEST_TARGET="EncryptedMemoriesMobileUITests" ;;
   *)
     echo "usage: $0 [hosted|ui]" >&2
     exit 64
     ;;
 esac
+SCHEME="${IOS_TEST_SCHEME:-$TEST_TARGET}"
+ACTION="${IOS_TEST_ACTION:-test}"
+PREPARED="${IOS_TEST_PREPARED:-0}"
+case "$ACTION" in
+  test|build-for-testing|test-without-building) ;;
+  *) echo "[ios-tests] unsupported IOS_TEST_ACTION." >&2; exit 64 ;;
+esac
+case "$PREPARED" in
+  0|1) ;;
+  *) echo "[ios-tests] IOS_TEST_PREPARED must be 0 or 1." >&2; exit 64 ;;
+esac
+if [[ -n "${IOS_TEST_PARALLEL_WORKERS:-}" && ! "$IOS_TEST_PARALLEL_WORKERS" =~ ^[1-9][0-9]*$ ]]; then
+  echo "[ios-tests] IOS_TEST_PARALLEL_WORKERS must be a positive integer." >&2
+  exit 64
+fi
 # The runner image decides which iPhone simulators exist, and Apple renames the lineup every year. A
 # pinned device name therefore fails as "Unable to find a device matching the provided destination
 # specifier" on a new image. Resolve an installed iPhone instead; IOS_TEST_DESTINATION still overrides it.
@@ -82,29 +98,36 @@ export DEVELOPER_DIR
 
 encryptedmemories_acquire_build_lock "verify-ios-app-tests ${1:-hosted}"
 
-if ! command -v xcodegen >/dev/null 2>&1; then
-  echo "[ios-tests] xcodegen is required to generate EncryptedMemories.xcodeproj." >&2
-  exit 69
+# CI prepares the pinned graph once for both test bundles. Local commands still generate and resolve it.
+if [[ "$PREPARED" == "1" ]]; then
+  cmp "$ROOT/BuildSupport/Package.resolved" \
+    "$ROOT/EncryptedMemories.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved"
+else
+  if ! command -v xcodegen >/dev/null 2>&1; then
+    echo "[ios-tests] xcodegen is required to generate EncryptedMemories.xcodeproj." >&2
+    exit 69
+  fi
+
+  echo "[ios-tests] generating project"
+  (cd "$ROOT" && xcodegen generate)
+  encryptedmemories_pin_generated_project_packages "$ROOT"
+
+  echo "[ios-tests] resolving pinned packages into shared cache"
+  xcrun xcodebuild \
+    -resolvePackageDependencies \
+    -project "$ROOT/EncryptedMemories.xcodeproj" \
+    -scheme "$SCHEME" \
+    -clonedSourcePackagesDirPath "$ENCRYPTED_MEMORIES_XCODE_SOURCE_PACKAGES" \
+    -packageCachePath "$ENCRYPTED_MEMORIES_XCODE_PACKAGE_CACHE" \
+    -packageAuthorizationProvider netrc \
+    -onlyUsePackageVersionsFromResolvedFile
+
 fi
-
-echo "[ios-tests] generating project"
-(cd "$ROOT" && xcodegen generate)
-encryptedmemories_pin_generated_project_packages "$ROOT"
-
-echo "[ios-tests] resolving pinned packages into shared cache"
-xcrun xcodebuild \
-  -resolvePackageDependencies \
-  -project "$ROOT/EncryptedMemories.xcodeproj" \
-  -scheme "$SCHEME" \
-  -clonedSourcePackagesDirPath "$ENCRYPTED_MEMORIES_XCODE_SOURCE_PACKAGES" \
-  -packageCachePath "$ENCRYPTED_MEMORIES_XCODE_PACKAGE_CACHE" \
-  -packageAuthorizationProvider netrc \
-  -onlyUsePackageVersionsFromResolvedFile
 
 # Without this, xcodebuild boots a cold simulator on demand and the first test launches the app while the
 # boot still runs; on CI that launch times out ("Failed to get background assertion"). Boot first and wait
 # until the boot, data migration included, is complete.
-if [[ -n "${SIMULATOR_UDID:-}" ]]; then
+if [[ "$ACTION" != "build-for-testing" && -n "${SIMULATOR_UDID:-}" ]]; then
   echo "[ios-tests] booting $SIMULATOR_NAME and waiting until it is ready"
   # macOS has no `timeout`; perl's alarm ends a boot that hangs after 10 minutes.
   if ! perl -e 'alarm shift; exec @ARGV' 600 xcrun simctl bootstatus "$SIMULATOR_UDID" -b; then
@@ -114,7 +137,7 @@ if [[ -n "${SIMULATOR_UDID:-}" ]]; then
 fi
 
 echo "[ios-tests] scheme: $SCHEME, destination: $DESTINATION"
-xcrun xcodebuild \
+set -- xcrun xcodebuild \
   -project "$ROOT/EncryptedMemories.xcodeproj" \
   -scheme "$SCHEME" \
   -destination "$DESTINATION" \
@@ -123,5 +146,14 @@ xcrun xcodebuild \
   -packageCachePath "$ENCRYPTED_MEMORIES_XCODE_PACKAGE_CACHE" \
   -disableAutomaticPackageResolution \
   -skipPackagePluginValidation \
-  CODE_SIGNING_ALLOWED=NO \
-  test
+  CODE_SIGNING_ALLOWED=NO
+if [[ "$ACTION" != "build-for-testing" && "$SCHEME" == "EncryptedMemoriesMobileCI" ]]; then
+  set -- "$@" "-only-testing:$TEST_TARGET"
+fi
+if [[ "$TEST_TARGET" == "EncryptedMemoriesMobileUITests" && -n "${IOS_TEST_PARALLEL_WORKERS:-}" ]]; then
+  set -- "$@" -parallel-testing-enabled YES -parallel-testing-worker-count "$IOS_TEST_PARALLEL_WORKERS"
+fi
+if [[ -n "${IOS_TEST_RESULT_BUNDLE_PATH:-}" ]]; then
+  set -- "$@" -resultBundlePath "$IOS_TEST_RESULT_BUNDLE_PATH"
+fi
+"$@" "$ACTION"
