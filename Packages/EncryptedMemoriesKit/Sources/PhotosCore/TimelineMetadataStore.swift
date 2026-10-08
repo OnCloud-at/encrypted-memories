@@ -28,6 +28,34 @@ public enum TimelineOrder {
         return compareUTF8(a.uid.nodeID, b.uid.nodeID) < 0
     }
 
+    /// Chronological input needs only an O(n) scan plus sorting of disordered capture-second groups.
+    /// Refined evidence cannot move a photo into another second. Arbitrary input keeps the full-sort fallback.
+    static func orderedByCaptureSecond(
+        _ items: [PhotoItem], by precedes: (PhotoItem, PhotoItem) -> Bool,
+        fullSort: () -> Void = {}
+    ) -> [PhotoItem] {
+        var result = items
+        var start = 0
+        while start < items.count {
+            let second = floor(items[start].captureTime.timeIntervalSince1970)
+            var end = start + 1
+            var disordered = false
+            while end < items.count, floor(items[end].captureTime.timeIntervalSince1970) == second {
+                disordered = disordered || precedes(items[end], items[end - 1])
+                end += 1
+            }
+            if end < items.count, floor(items[end].captureTime.timeIntervalSince1970) < second {
+                fullSort()
+                return items.sorted(by: precedes)
+            }
+            if disordered {
+                result.replaceSubrange(start..<end, with: items[start..<end].sorted(by: precedes))
+            }
+            start = end
+        }
+        return result
+    }
+
     /// Matches SQLite's BINARY TEXT collation, including non-ASCII source identifiers.
     private static func compareUTF8(_ a: String, _ b: String) -> Int {
         if a.utf8.lexicographicallyPrecedes(b.utf8) { return -1 }
@@ -416,6 +444,10 @@ public final class TimelineMetadataStore {
         return result
     }
 
+    #if DEBUG
+        private(set) var fullSaveSortCount = 0
+    #endif
+
     // MARK: Save
 
     /// Saves a full enumeration with digest no-op detection and changed-row upserts.
@@ -461,7 +493,11 @@ public final class TimelineMetadataStore {
         // Canonical order: identical input sets digest identically regardless of arrival order,
         // and rows persist in exactly the order load() returns them. The enumeration feeding save
         // is normally already in timeline order, so an O(n) precheck skips a redundant full sort.
-        let ordered = Self.isTimelineOrdered(items) ? items : items.sorted(by: TimelineOrder.areInBaseOrder)
+        let ordered = TimelineOrder.orderedByCaptureSecond(items, by: TimelineOrder.areInBaseOrder) {
+            #if DEBUG
+                fullSaveSortCount += 1
+            #endif
+        }
         let digest = Self.timelineDigest(of: ordered)
         let generation = readMetaInt(Self.metaGenerationKey) ?? 0
 
@@ -658,18 +694,6 @@ public final class TimelineMetadataStore {
                 + "(vol TEXT NOT NULL, node TEXT NOT NULL, PRIMARY KEY(vol, node)) WITHOUT ROWID;",
             nil, nil, nil
         ) == SQLITE_OK
-    }
-
-    /// True when `items` is already in canonical `(t, vol, node)` order - the common case, because
-    /// the enumeration feeding `save` is pre-sorted by the bridge. Lets `save` skip a redundant
-    /// O(n log n) resort via an O(n) scan; any out-of-order input falls back to a full sort.
-    private static func isTimelineOrdered(_ items: [PhotoItem]) -> Bool {
-        var index = 1
-        while index < items.count {
-            if TimelineOrder.areInBaseOrder(items[index], items[index - 1]) { return false }
-            index += 1
-        }
-        return true
     }
 
     /// Feature tables are rewritten wholesale inside the save transaction. Their row counts scale

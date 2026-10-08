@@ -855,12 +855,13 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         }
     }
 
-    private func prepareTimelineOrderCache() -> Bool {
+    private func prepareTimelineOrderCache(generation: UInt64) async -> Bool {
         guard let inventory = metadataReconciliationInput else { return false }
-        defer { metadataReconciliationInput = nil }
+        metadataReconciliationInput = nil
         let useOrderCache =
-            timelineOrderStore?.synchronize(
+            await timelineOrderStore?.synchronizeInChunks(
                 inventory.items, isClassified: { inventory.classified.contains($0.nodeID) }) == true
+        guard generation == metadataReconciliationGeneration, !isShutDown, !Task.isCancelled else { return false }
         if !useOrderCache {
             mimeFallbackInventory = inventory
             if timelineOrderStore != nil, !Task.isCancelled {
@@ -873,7 +874,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
 
     private func reconcileTimelineMetadata(generation: UInt64) async {
         guard generation == metadataReconciliationGeneration, !Task.isCancelled else { return }
-        let useOrderCache = prepareTimelineOrderCache()
+        var useOrderCache = false
         var changed = false
         defer {
             if !isShutDown, changed, timelineStore?.publishMediaTypeEvidenceRevision() == false {
@@ -891,6 +892,8 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                 mimeFallbackInventory = nil
             }
         }
+        useOrderCache = await prepareTimelineOrderCache(generation: generation)
+        guard generation == metadataReconciliationGeneration, !isShutDown, !Task.isCancelled else { return }
         do {
             try Task.checkCancellation()
             var resolvedContext: PhotosShareContext?
