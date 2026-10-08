@@ -1572,9 +1572,13 @@ struct MainView: View {
 
     /// Reads the server favorites, also after a trash or restore changed which photos can carry them. When the
     /// read fails, the `trashed` photos still lose their hearts.
-    private func reloadFavorites(trashed: Set<PhotoUID> = []) async {
+    private func reloadFavorites(
+        trashed: Set<PhotoUID> = [], isCurrent: @MainActor () -> Bool = { true }
+    ) async {
+        guard isCurrent() else { return }
         let read = favoriteState.beginLoad()
         let loaded = try? await backend.favoriteUIDs()
+        guard isCurrent() else { return }
         guard !Task.isCancelled else {
             favoriteState.cancelLoad(read)
             return
@@ -1712,8 +1716,8 @@ struct MainView: View {
 
     /// Builds the Duplicates route for this account, or leaves it when the account cannot merge duplicates.
     private func installDuplicates() async {
-        duplicates = facade.exactDuplicates.map { finder in
-            ExactDuplicatesModel(finder: finder) { trashed in await commitDuplicateTrash(trashed) }
+        duplicates = model.makeDuplicatesModel(for: facade) { trashed, token in
+            await commitDuplicateTrash(trashed, account: token)
         }
         guard let duplicates else {
             if selection == .duplicates { selection = .all }
@@ -1723,15 +1727,19 @@ struct MainView: View {
     }
 
     /// The finder already moved the copies to Recently Deleted; the library and its derived state stop showing them.
-    private func commitDuplicateTrash(_ uids: [PhotoUID]) async {
+    private func commitDuplicateTrash(_ uids: [PhotoUID], account: ExactDuplicatesAccountLifetime.Token) async {
+        guard model.isCurrentDuplicatesAccount(account) else { return }
         let trashed = Set(uids)
         await timelineModel.commitTrash(uids: trashed)
+        guard model.isCurrentDuplicatesAccount(account) else { return }
         await OfflineLibraryManager.shared.reconcileLocations(
             items: timelineModel.wholeLibraryItemsForViewer,
             metadata: backend,
-            recrawlRestoredItems: false
+            recrawlRestoredItems: false,
+            isCurrent: { model.isCurrentDuplicatesAccount(account) }
         )
-        await reloadFavorites(trashed: trashed)
+        guard model.isCurrentDuplicatesAccount(account) else { return }
+        await reloadFavorites(trashed: trashed, isCurrent: { model.isCurrentDuplicatesAccount(account) })
     }
 
     private func trashPhotos(_ items: [PhotoItem], closeViewer: Bool) {

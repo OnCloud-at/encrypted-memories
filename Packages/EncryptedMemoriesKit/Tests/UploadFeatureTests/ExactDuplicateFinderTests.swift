@@ -1272,6 +1272,26 @@ final class ExactDuplicateFinderTests: XCTestCase {
         XCTAssertEqual(mergeJournal.pendingMerges(), [first], "the refused merge waits for the next scan")
     }
 
+    func testLateJournalWritesCannotRecreateAPurgedAccountDirectory() throws {
+        let kept = server.seedLink(digest: digest("a"))
+        let duplicate = server.seedLink(digest: digest("a"))
+        let intent = pendingIntent(kept: kept, duplicate: duplicate, seed: "a", trashedAt: nil)
+        let retained = mergeJournal
+        XCTAssertTrue(retained.record([intent]))
+        XCTAssertEqual(retained.prepareForWrites(), .ready)
+        // A merge can hold this journal across an asynchronous read after prepareForWrites.
+        // The production purge removes the whole account root after its stores have closed.
+        store = nil
+        let purge = BackupLocalDataPurge.purgeAllLocalAccountData(roots: [directory])
+        XCTAssertTrue(purge.succeeded)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: directory.path))
+
+        XCTAssertFalse(retained.record([intent]), "A late record cannot create its missing parent directory")
+        XCTAssertTrue(retained.clear([intent]))
+        XCTAssertEqual(retained.prepareForWrites(), .unavailable)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: directory.path))
+    }
+
     func testAJournalThatCannotBeReadStaysAndTakesNoWrite() throws {
         let kept = server.seedLink(digest: digest("a"))
         let duplicate = server.seedLink(digest: digest("a"))

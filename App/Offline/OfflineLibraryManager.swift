@@ -421,11 +421,14 @@ final class OfflineLibraryManager {
     func reconcileLocations(
         items: [PhotoItem],
         metadata: any PhotoMetadataProvider,
-        recrawlRestoredItems: Bool
+        recrawlRestoredItems: Bool,
+        isCurrent: @MainActor () -> Bool = { true }
     ) async {
+        let lease = locationStore.captureSessionLease()
         let uids = await Task.detached(priority: .userInitiated) { Set(items.map(\.uid)) }.value
-        await locationIndex.retainOnly(uids, persistTo: locationStore)
-        guard recrawlRestoredItems, locationCrawlStarted else { return }
+        guard isCurrent() else { return }
+        await locationIndex.retainOnly(uids, persistTo: locationStore, sessionLease: lease)
+        guard isCurrent(), recrawlRestoredItems, locationCrawlStarted else { return }
         locationCrawlStarted = false
         startLocationCrawl(items: items, metadata: metadata)
     }
