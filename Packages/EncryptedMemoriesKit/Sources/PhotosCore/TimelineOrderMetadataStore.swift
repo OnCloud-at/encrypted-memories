@@ -22,6 +22,8 @@ public final class TimelineOrderMetadataStore {
     private var synchronization: Synchronization?
     private var synchronizationGeneration: UInt64 = 0
     private var inventoryComplete = false
+    /// Process-local rebuild identity; it does not change the persisted order revision.
+    public private(set) var rebuildRevision: UInt64 = 0
 
     private struct Synchronization {
         let generation: UInt64
@@ -112,6 +114,7 @@ public final class TimelineOrderMetadataStore {
     /// Only this derived cache is removed. An unavailable replacement leaves ordering disabled.
     @discardableResult
     public func rebuild() -> Bool {
+        rebuildRevision &+= 1
         close()
         guard SQLiteStoreSchemaGate.removeDatabaseFiles(at: url) else { return false }
         let replacement = TimelineOrderMetadataStore(url: url, policy: policy)
@@ -163,13 +166,26 @@ public final class TimelineOrderMetadataStore {
         guard db != nil, !Task.isCancelled else { return false }
         let signature = InventorySignature(items)
         guard synchronizedInventory != signature else { return true }
-        guard let generation = beginSynchronization(signature: signature) else { return false }
+        let initialRebuildRevision = rebuildRevision
+        guard var generation = beginSynchronization(signature: signature) else { return false }
+        var resumedAfterRebuild = false
         defer { finishSynchronization(generation: generation) }
-        while let complete = synchronizeChunk(items, isClassified: isClassified, generation: generation) {
-            if complete { return true }
-            await Task.yield()
+        while true {
+            while let complete = synchronizeChunk(items, isClassified: isClassified, generation: generation) {
+                if complete { return true }
+                await Task.yield()
+            }
+            // A reader can replace the connection during a yield. Retry that fresh cache once.
+            // A close or replacement inventory must never restart the old pass.
+            guard !resumedAfterRebuild, db != nil, !Task.isCancelled,
+                synchronizationGeneration == generation &+ 1,
+                rebuildRevision == initialRebuildRevision &+ 1
+            else { return false }
+            finishSynchronization(generation: generation)
+            guard let nextGeneration = beginSynchronization(signature: signature) else { return false }
+            generation = nextGeneration
+            resumedAfterRebuild = true
         }
-        return false
     }
 
     private func beginSynchronization(signature: InventorySignature) -> UInt64? {
