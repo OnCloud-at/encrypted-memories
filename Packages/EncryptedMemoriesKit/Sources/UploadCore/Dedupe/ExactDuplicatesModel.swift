@@ -692,7 +692,7 @@ public final class ExactDuplicatesModel {
     /// to date, both at once. Reads the groups again when the index changed. A choice of the person and the ranking of
     /// a group with the same members stay, so a screen that opens again reads nothing for them.
     public func load() async {
-        guard !isMerging else { return }
+        guard !isRetired, !isMerging else { return }
         loadGeneration += 1
         let generation = loadGeneration
         phase = .loading
@@ -845,6 +845,7 @@ public final class ExactDuplicatesModel {
 
     /// Queues the unranked groups of two pages from the page of each of `indices`. Returns the ranking that reads them.
     private func requestRanking(around indices: [Int]) -> Task<Void, Never>? {
+        guard !isRetired else { return nil }
         let size = Self.rankingPageSize
         var wanted: [String] = []
         for index in indices {
@@ -972,6 +973,7 @@ public final class ExactDuplicatesModel {
     }
 
     private func buildAndRescan(generation: Int) async {
+        guard !isRetired, generation == loadGeneration else { return }
         let changed: Bool
         do {
             changed = try await buildIndex()
@@ -1083,6 +1085,10 @@ public final class ExactDuplicatesModel {
     /// Ends this account's ownership. A running batch finishes; no queued action can start another merge.
     func retire() {
         isRetired = true
+        // Invalidate suspended reads without cancelling the joined index build.
+        loadGeneration += 1
+        rescanAfterMerge = false
+        stopRanking()
         mergeRanking?.cancel()
         stopMergeAll()
     }
@@ -1278,6 +1284,7 @@ public final class ExactDuplicatesModel {
             stopped
             ? .stopped(merged: mergedGroups, total: candidates.count)
             : Self.notice(kept: kept, keptPhotoUnreadable: keptPhotoUnreadable, failed: failed)
+        guard !isRetired else { return }
         if stale {
             await load()
             return
