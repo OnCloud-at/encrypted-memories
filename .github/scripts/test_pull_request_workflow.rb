@@ -112,4 +112,18 @@ class PullRequestWorkflowTests < Minitest::Test
     assert_equal ["EncryptedMemoriesMobileTests", "EncryptedMemoriesMobileUITests"], scheme.fetch("test").fetch("targets")
   end
 
+  def test_xcode_cache_measurement_has_only_one_writer
+    ios = @workflow.fetch("jobs").fetch("ios-verification").fetch("steps")
+      .find { |step| step["uses"] == "./.github/actions/prepare-apple-build" }
+    macos = @workflow.fetch("jobs").fetch("macos-verification").fetch("steps")
+      .find { |step| step["uses"] == "./.github/actions/prepare-apple-build" }
+    assert_equal "false", macos.fetch("with").fetch("save-cache")
+    refute macos.fetch("with").fetch("measure-cache", false)
+    refute_equal "false", ios.fetch("with").fetch("save-cache", "true")
+    assert_includes ios.fetch("with").fetch("measure-cache"), "inputs.measure_cache"
+    action = YAML.load_file(File.join(WORKFLOWS, "../actions/prepare-apple-build/action.yml"))
+    save = action.fetch("runs").fetch("steps").find { |step| step["name"] == "Save resolved Xcode dependencies" }
+    assert_includes save.fetch("if"), "inputs.save-cache != 'false'"
+  end
+
 end

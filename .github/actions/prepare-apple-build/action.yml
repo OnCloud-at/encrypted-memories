@@ -15,6 +15,10 @@ inputs:
     description: Dependency graphs to prepare (app, package, or all).
     required: false
     default: all
+  save-cache:
+    description: Publish resolved dependencies after a cache miss.
+    required: false
+    default: "true"
   measure-cache:
     description: Restore the populated dependency cache again to measure its cost.
     required: false
@@ -166,14 +170,14 @@ runs:
           -onlyUsePackageVersionsFromResolvedFile
 
     - name: Save resolved SwiftPM dependencies
-      if: ${{ inputs.build-profile != 'app' && steps.spm-cache.outputs.cache-hit != 'true' }}
+      if: ${{ inputs.save-cache != 'false' && inputs.build-profile != 'app' && steps.spm-cache.outputs.cache-hit != 'true' }}
       uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: ~/Developer/xcode/EncryptedMemories/SwiftPMCache.noindex
         key: ${{ steps.dependency-cache-key.outputs.key }}-spm-v2
 
     - name: Save resolved Xcode dependencies
-      if: ${{ inputs.build-profile != 'package' && steps.xcode-cache.outputs.cache-hit != 'true' }}
+      if: ${{ inputs.save-cache != 'false' && inputs.build-profile != 'package' && steps.xcode-cache.outputs.cache-hit != 'true' }}
       uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: |
