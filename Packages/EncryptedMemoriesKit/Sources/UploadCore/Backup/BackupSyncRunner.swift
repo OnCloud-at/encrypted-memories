@@ -99,7 +99,7 @@ public actor BackupSyncRunner {
     /// new item and ends the pass (rows stay runnable) instead of spinning against a genuinely full volume.
     private var resourcePressureStreak = 0
     /// Claimed rows that have not settled: running items plus the revisions that wait behind another revision of
-    /// their source. New rows are claimed only while this count is below the current limit.
+    /// their source. The drain ends only after every claimed row settles.
     private var claimedItemCount = 0
     /// A source with a running item, and the revisions of it that the same claim returned, in claim order.
     private struct RunningSource {
@@ -457,8 +457,8 @@ public actor BackupSyncRunner {
                     startsSincePrime = 0
                 }
 
-                if claimedItemCount < limit {
-                    let claimed = claimEligible(limit: limit - claimedItemCount)
+                if runningSources.count < limit {
+                    let claimed = claimEligible(limit: limit - runningSources.count)
                     startsSincePrime += claimed.count
                     for entry in claimed {
                         claimedItemCount += 1
@@ -476,6 +476,9 @@ public actor BackupSyncRunner {
                                 startingWith: entry, sourceKey: sourceKey, workIntent: workIntent)
                         }
                     }
+                    // A claim can contain several revisions of one source. Fill the remaining photo slots before
+                    // waiting; those revisions share one worker and do not consume the other slots.
+                    if !claimed.isEmpty, runningSources.count < limit { continue }
                 }
 
                 if claimedItemCount == 0 {
@@ -483,7 +486,7 @@ public actor BackupSyncRunner {
                         storeFailed = true
                         continue
                     }
-                    guard let wait = shortestPendingWait() else {
+                    guard let wait = shortestPendingWait(policy: .idleScheduledRetries) else {
                         if !queue.isOperational() { storeFailed = true }
                         break
                     }
@@ -496,7 +499,12 @@ public actor BackupSyncRunner {
                     continue
                 }
                 // Free slots that the claim could not fill also wait for the earliest row that becomes runnable.
-                await waitForSchedulerWake(orAfter: claimedItemCount < limit ? waitUntilNextWaitingRow() : nil)
+                let wait =
+                    runningSources.count < limit
+                    ? shortestPendingWait(
+                        policy: .freeUploadSlots, excludingSourcesOf: runningSources.values.map(\.source))
+                    : nil
+                await waitForSchedulerWake(orAfter: wait)
             }
         }
         if storeFailed { stopRequested = true }
@@ -599,7 +607,7 @@ public actor BackupSyncRunner {
     }
 
     /// Processes a claimed row, then the other revisions of its source that the same claim returned. Each settled
-    /// row frees one slot and wakes the scheduling loop.
+    /// row wakes the scheduling loop; its source frees one upload slot only after the last revision settles.
     private func processRevisions(
         startingWith first: UploadBackupSyncQueueEntry,
         sourceKey: String,
@@ -692,28 +700,35 @@ public actor BackupSyncRunner {
         max(configuration.retry.maxDelay, 30, configuration.oneShotSourceRecheckInterval)
     }
 
-    /// The wait until the earliest row outside the running sources becomes runnable: a retry after its backoff, or
-    /// a parked draft row at its re-check. Nil when no row waits, when the wait exceeds `longestRegularRetryWait`
-    /// (the pass ends before it once the running items settle), or when a due row stays unclaimable, so the loop
-    /// never spins.
-    private func waitUntilNextWaitingRow() -> TimeInterval? {
-        let currentTime = now()
-        let dates = [
-            queue.nextRunnableDate(excludingSourcesOf: runningSources.values.map(\.source)),
-            queue.earliestEntry(in: .blockedByDraft)?.updatedAt,
-        ]
-        guard let next = dates.compactMap({ $0 }).filter({ $0 > currentTime }).min() else { return nil }
-        let wait = next.timeIntervalSince(currentTime)
-        return wait <= longestRegularRetryWait ? wait : nil
+    private enum PendingWaitPolicy: Equatable {
+        /// A draft alone ends the drain, so each pass checks it once rather than using up its retries.
+        case idleScheduledRetries
+        /// While other photos run, a free slot also wakes for a draft's next check.
+        case freeUploadSlots
     }
 
-    /// The wait until the next persisted retry becomes eligible, or nil when none is pending.
-    private func shortestPendingWait() -> TimeInterval? {
+    /// Both policies use persisted dates. Free slots ignore due, unclaimable rows and long parks to avoid spinning;
+    /// an idle drain keeps its minimum retry wait and lets the caller decide whether a long park ends the pass.
+    private func shortestPendingWait(
+        policy: PendingWaitPolicy,
+        excludingSourcesOf excludedSources: [UploadSourceIdentity] = []
+    ) -> TimeInterval? {
         let currentTime = now()
-        if let persisted = queue.nextRunnableDate() {
-            return max(0.05, persisted.timeIntervalSince(currentTime))
+        var dates = [queue.nextRunnableDate(excludingSourcesOf: excludedSources)]
+        if policy == .freeUploadSlots {
+            dates.append(queue.earliestEntry(in: .blockedByDraft)?.updatedAt)
         }
-        return nil
+        let eligibleDates = dates.compactMap { $0 }.filter {
+            policy == .idleScheduledRetries || $0 > currentTime
+        }
+        guard let next = eligibleDates.min() else { return nil }
+        let wait = next.timeIntervalSince(currentTime)
+        switch policy {
+        case .idleScheduledRetries:
+            return max(0.05, wait)
+        case .freeUploadSlots:
+            return wait <= longestRegularRetryWait ? wait : nil
+        }
     }
 
     /// One due-based re-check for parked draft rows: a row blocked N times re-enters the queue once

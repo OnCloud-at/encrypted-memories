@@ -255,6 +255,13 @@ public enum SQLiteStoreSchemaGate {
         return try body()
     }
 
+    /// Synchronizes an operational store while its caller holds the connection lock. A closed or failed store
+    /// cannot prove that its data is durable.
+    public static func synchronizeToDisk(_ db: OpaquePointer?, operationFailed: Bool) -> Bool {
+        guard let db, !operationFailed else { return false }
+        return checkpointCompletely(db)
+    }
+
     /// Copies every committed transaction from the WAL into the database file and syncs that file (a FULL
     /// checkpoint). Rollback-journal commits need no checkpoint when their connection already commits durably.
     /// A busy, partial, or failed checkpoint returns false.

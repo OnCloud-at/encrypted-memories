@@ -3981,6 +3981,35 @@ extension BackupSyncRunnerTests {
     private static let wiFi = LibraryNetworkState(
         path: LibraryNetworkPath(isSatisfied: true, availableInterfaces: [.wifi]))
 
+    func testClaimedRevisionsOfOnePhotoUseOnlyOneUploadSlot() async throws {
+        let newer = seedEntry("edited.jpg", ageSeconds: 600, revisionOffset: 2)
+        let older = seedEntry("edited.jpg", ageSeconds: 600)
+        let others = (0..<4).map { seedEntry("other-\($0).jpg", ageSeconds: 300) }
+        let transfers = HeldTransferUploader(held: ["edited.jpg"])
+        let runner = makeRunner(uploader: transfers, throttle: BackupThrottlePolicy(baseConcurrency: 2))
+        let pass = Task { await runner.runUntilDrained() }
+
+        let started = await waitUntil { transfers.started.contains("edited.jpg") }
+        let olderWasClaimed = state(of: older) == .checking
+        let othersFinished = await waitUntil { others.allSatisfy { self.state(of: $0) == .completed } }
+        let resolvesWhileHeld = resolver.resolveCount(for: newer.source.identifier)
+        let slowStillRunning = !transfers.finished.contains("edited.jpg")
+        transfers.releaseAll()
+        let progress = await pass.value
+
+        XCTAssertTrue(started)
+        XCTAssertTrue(olderWasClaimed, "both revisions came in one claim")
+        XCTAssertTrue(othersFinished, "waiting revisions do not occupy the other photo's upload slot")
+        XCTAssertTrue(slowStillRunning)
+        XCTAssertEqual(resolvesWhileHeld, 1, "the revisions still run in order")
+        XCTAssertEqual(transfers.peakConcurrent, 2)
+        XCTAssertEqual(transfers.started.filter { $0 == "edited.jpg" }.count, 1)
+        XCTAssertEqual(state(of: newer)?.isTerminalSuccess, true)
+        XCTAssertEqual(state(of: older)?.isTerminalSuccess, true)
+        XCTAssertEqual(progress.backedUp, 6, "the drain settles every claimed revision")
+        XCTAssertEqual(queueStore.summary().active, 0)
+    }
+
     func testFastItemsKeepTheFreeSlotsBusyWhileASlowItemUploads() async throws {
         let slow = seedEntry("slow.mov", ageSeconds: 600)
         let fast = (0..<6).map { seedEntry("fast-\($0).jpg") }
