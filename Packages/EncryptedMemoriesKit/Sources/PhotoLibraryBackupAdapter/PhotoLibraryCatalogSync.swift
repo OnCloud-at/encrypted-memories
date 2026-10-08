@@ -233,7 +233,9 @@ public struct PhotoLibraryCatalogSync: Sendable {
             for try await chunk in enumerator.infoChunks(identifiers: identifiers, startOffset: 0, chunkSize: chunkSize)
             {
                 try Task.checkCancellation()
-                try await ingest(chunk, observedAt: observedAt, engine: engine, progress: &progress, seen: &seen)
+                try await ingest(
+                    chunk, observedAt: observedAt, engine: engine, progress: &progress, seen: &seen,
+                    recheckMissingSources: true)
                 progress.executionCompletedUnitCount = Int64(min(identifiers.count, seen?.count ?? 0))
                 onProgress?(progress)
             }
@@ -475,7 +477,8 @@ public struct PhotoLibraryCatalogSync: Sendable {
         observedAt: Date,
         engine: any UploadBackupCandidateEnqueueing,
         progress: inout PhotoLibraryCatalogProgress,
-        seen: inout Set<String>?
+        seen: inout Set<String>?,
+        recheckMissingSources: Bool = false
     ) async throws {
         let entries = chunk.map { PhotoLibraryCatalogMapper.entry(for: $0, observedAt: observedAt) }
         let changes = store.classifyBatch(entries)
@@ -484,6 +487,7 @@ public struct PhotoLibraryCatalogSync: Sendable {
         }
         var candidates: [UploadBackupAssetCandidate] = []
         var reopened: [UploadBackupReopening] = []
+        var unchanged: [UploadBackupAssetCandidate] = []
         candidates.reserveCapacity(entries.count)
         for (info, change) in zip(chunk, changes) {
             progress.scanned += 1
@@ -491,7 +495,11 @@ public struct PhotoLibraryCatalogSync: Sendable {
             switch change {
             case .inserted: progress.discovered += 1
             case .changed: progress.changed += 1
-            case .unchanged: continue
+            case .unchanged:
+                if recheckMissingSources, let candidate = PhotoBackupAssetPlanner.candidate(for: info) {
+                    unchanged.append(candidate)
+                }
+                continue
             }
             if let candidate = PhotoBackupAssetPlanner.candidate(for: info) {
                 candidates.append(candidate)
@@ -507,6 +515,7 @@ public struct PhotoLibraryCatalogSync: Sendable {
             throw UploadError.backend("Photo library catalog could not be read")
         }
         if !reopened.isEmpty { try await engine.reopenBackedUpRevisions(reopened) }
+        if !unchanged.isEmpty { try await engine.enqueueChangedMissingSources(unchanged) }
         _ = try await engine.enqueueBatch(candidates)
         try Task.checkCancellation()
         guard store.upsertBatch(entries) else {

@@ -821,7 +821,7 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
                         """
                         DELETE FROM backup_sync_queue
                         WHERE source_kind=? AND source_id=? AND resource=? AND revision_us<=? AND revision_us<>?
-                          AND state IN ('skippedRemoteDeletion','failedPermanent','dismissedFailure');
+                          AND state IN ('skippedRemoteDeletion','sourceMissing','failedPermanent','dismissedFailure');
                         """,
                         -1, &stmt, nil
                     ) == SQLITE_OK)

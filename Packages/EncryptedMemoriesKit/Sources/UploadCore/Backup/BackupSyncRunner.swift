@@ -2050,10 +2050,10 @@ public actor BackupSyncRunner {
                     kind: .unknown, detail: detail, nextAttemptAt: eligibleAt, automaticRetryAttempt: attempt))
             return
         }
-        // Photos reports the file as missing. A short iCloud fault can report that too, and a removed row never
-        // comes back: the catalog counts the photo as unchanged. So the row checks again a few times, hours apart,
-        // before the photo counts as gone. A check that Back Up Now starts before the planned one does not count, so
-        // only checks hours apart can remove the photo.
+        // Photos reports the file as missing. A short iCloud fault can report that too, so the row checks again
+        // a few times, hours apart. The final check keeps a terminal missing row: removing it would let catalog
+        // recovery restart the checks indefinitely. A Photos change can reopen the row through the normal upsert.
+        // A check that Back Up Now starts before the planned one does not count.
         if case UploadError.sourceReportedMissing = error {
             let detail = BackupFailedItem.sourceReportedMissingDetail
             if let previous = BackupIssueRecord.decode(entry.lastError), previous.detail == detail,
@@ -2064,7 +2064,20 @@ public actor BackupSyncRunner {
             }
             let checks = Self.sourceWaits(of: entry, detail: detail)
             guard checks < Self.reportedMissingRechecks else {
-                discardMissingSource(entry, from: oldState)
+                guard
+                    queue.updateState(
+                        source: entry.source, revision: entry.revision,
+                        state: .sourceMissing, attempts: entry.attempts,
+                        lastError: BackupIssueRecord(
+                            kind: .sourceMissing, detail: detail, automaticRetryAttempt: checks
+                        ).persistedValue,
+                        updatedAt: now())
+                else {
+                    stopRequested = true
+                    return
+                }
+                adjustProgress(from: oldState, to: .sourceMissing)
+                emitProgress()
                 return
             }
             let eligibleAt = now().addingTimeInterval(

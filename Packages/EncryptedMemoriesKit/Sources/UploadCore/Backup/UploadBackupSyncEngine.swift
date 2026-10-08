@@ -44,6 +44,9 @@ public protocol UploadBackupCandidateEnqueueing: Sendable {
     func reopenBackedUpRevisions(
         _ reopenings: [UploadBackupReopening], deferringWithoutRemoteProof: Bool
     ) async throws -> [UploadBackupAssetCandidate]
+    /// Requeues terminal missing rows for explicit Photos changes, even when their revision is unchanged.
+    /// Waiting, successful, dismissed, and absent rows stay untouched.
+    func enqueueChangedMissingSources(_ candidates: [UploadBackupAssetCandidate]) async throws
     /// Local-only recovery. Complete states and sources with any queue row stay untouched.
     func enqueueMissingSources(_ candidates: [UploadBackupAssetCandidate]) async throws
     func missingSourceDiscardGeneration() async throws -> Int64
@@ -57,6 +60,8 @@ public struct UploadBackupRemoteProofUnavailable: Error, Sendable {
 }
 
 public extension UploadBackupCandidateEnqueueing {
+    func enqueueChangedMissingSources(_ candidates: [UploadBackupAssetCandidate]) async throws {}
+
     func enqueueMissingSources(_ candidates: [UploadBackupAssetCandidate]) async throws {
         throw UploadError.backend("Backup source recovery is unavailable")
     }
@@ -243,6 +248,17 @@ public actor UploadBackupSyncEngine: UploadBackupCandidateEnqueueing {
             throw UploadError.backend("Backup queue could not be read")
         }
         return generation
+    }
+
+    public func enqueueChangedMissingSources(_ candidates: [UploadBackupAssetCandidate]) async throws {
+        var missing: [UploadBackupAssetCandidate] = []
+        for candidate in candidates {
+            try Task.checkCancellation()
+            let row = queue.entry(for: candidate.snapshot.source, revision: candidate.snapshot.revision)
+            guard queue.isOperational() else { throw UploadError.backend("Backup queue could not be read") }
+            if row?.state == .sourceMissing { missing.append(candidate) }
+        }
+        if !missing.isEmpty { _ = try await enqueueBatch(missing) }
     }
 
     public func enqueueMissingSources(_ candidates: [UploadBackupAssetCandidate]) async throws {
