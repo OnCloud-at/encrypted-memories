@@ -168,6 +168,7 @@ public final class TimelineOrderMetadataStore {
         guard synchronizedInventory != signature else { return true }
         let initialRebuildRevision = rebuildRevision
         guard var generation = beginSynchronization(signature: signature) else { return false }
+        var resumedAfterRebuild = false
         defer { finishSynchronization(generation: generation) }
         while true {
             while let complete = synchronizeChunk(items, isClassified: isClassified, generation: generation) {
@@ -176,13 +177,14 @@ public final class TimelineOrderMetadataStore {
             }
             // A reader can replace the connection during a yield. Retry that fresh cache once.
             // A close or replacement inventory must never restart the old pass.
-            guard !Task.isCancelled,
+            guard !resumedAfterRebuild, db != nil, !Task.isCancelled,
                 synchronizationGeneration == generation &+ 1,
                 rebuildRevision == initialRebuildRevision &+ 1
             else { return false }
             finishSynchronization(generation: generation)
             guard let nextGeneration = beginSynchronization(signature: signature) else { return false }
             generation = nextGeneration
+            resumedAfterRebuild = true
         }
     }
 
