@@ -70,6 +70,7 @@ Its signature and behavior stay unchanged; `@testable import` reaches the actual
 The synthetic PhotoKit boundary stores no change token, so it supplies the real missing-token full-scan fallback with an empty change list. It substitutes external photo, backend, transport, inference, and location boundaries.
 It checks historical complete revisions before scanning. An independent oracle comes from the copied historical database and synthetic server state.
 It rejects duplicate queue identities and new upload work from complete revisions. Terminal `alreadyBackedUp` bookkeeping adds no upload work. It then drains recovered work and checks that server commits are not repeated.
+The checker reads the recorded enable intent before startup. Enabled states must recover without explicit enable or retry.
 The installer must verify an artifact before the runtime reads it. Each index recovery may execute at most one synthetic inventory.
 Cache reads may return the original complete bytes or no bytes. Location crawling must complete the synthetic inventory.
 
@@ -100,9 +101,9 @@ The final local gate runtime is recorded in the pull request.
 Strict `XCTExpectFailure` blocks retain these recorded defects without changing production behavior:
 
 - #390: model and index boundary 14, after the staging install record and before promotion.
-- #391: backup boundaries 3/4, 20/21, 33/34, and 71/72; model 18/19; index 66/67.
+- #391: backup boundaries 3/4, 20/21, 33/34, and 71/72; model 18/19; index 18/19 and 66/67.
   The new empty database has switched to WAL before its WAL file exists, so read-only schema inspection fails.
 
 Only each exact failure signature is expected. A different error remains a failure.
 An unexpected pass fails too; remove the matching expectation when its separate fix lands.
-The other 772 boundaries pass without an expected failure.
+The other 770 boundaries pass without an expected failure.

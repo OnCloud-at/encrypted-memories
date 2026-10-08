@@ -183,8 +183,10 @@ import XCTest
                             } else if !text.contains("Verified upgrade scenario: \(scenario)") {
                                 results.append("\(scenario): worker did not verify any recorded boundaries")
                             } else {
-                                let expected = text.components(separatedBy: "Expected failure").count - 1
-                                print("Verified upgrade scenario: \(scenario), expected failures: \(expected)")
+                                let marker = "Verified upgrade scenario: \(scenario)"
+                                if let range = text.range(of: marker) {
+                                    print(text[range.lowerBound...].split(separator: "\n").first ?? Substring(marker))
+                                }
                             }
                         }
                     } catch { results.append("\(scenario): \(error)") }
@@ -203,6 +205,7 @@ import XCTest
             else { return }
             let snapshots = try XCTUnwrap(try manifest().scenarios[scenario])
             let pool = URL(fileURLWithPath: poolPath)
+            var expectedFailures = 0
             for snapshot in snapshots {
                 let root = pool.appendingPathComponent("data-\(scenario)")
                 print(
@@ -266,12 +269,15 @@ import XCTest
                             "\(scenario) boundary \(snapshot.event.id): \(known.signature)")
                     }
                     XCTExpectFailure(known.issue, options: options) { reportFailure() }
+                    if let failure, String(describing: failure) == known.signature { expectedFailures += 1 }
                 } else {
                     reportFailure()
                 }
                 try FileManager.default.removeItem(at: root)
             }
-            print("Verified upgrade scenario: \(scenario), boundaries: \(snapshots.count)")
+            print(
+                "Verified upgrade scenario: \(scenario), boundaries: \(snapshots.count), expected failures: \(expectedFailures)"
+            )
         }
 
         private func knownFailure(_ scenario: String, snapshot: Snapshot) -> (issue: String, signature: String)? {
@@ -289,12 +295,12 @@ import XCTest
                     33: "identity manifest", 34: "identity manifest", 71: "catalog", 72: "catalog",
                 ],
                 "model": [18: "semantic index", 19: "semantic index"],
-                "index": [66: "native index", 67: "native index"],
+                "index": [18: "semantic index", 19: "semantic index", 66: "native index", 67: "native index"],
             ]
             guard let store = failures[scenario]?[snapshot.event.id] else { return nil }
             return (
                 "Issue #391: empty WAL database cannot pass read-only schema inspection",
-                store == "semantic index" ? "storage: index store unavailable" : "Fatal store open: \(store)"
+                "Fatal store open: \(store)"
             )
         }
 

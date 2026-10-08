@@ -107,6 +107,7 @@ enum FixtureWorkloads {
             let rows = UploadBackupSyncQueueState.allCases.flatMap {
                 queue.entries(in: $0, updatedBefore: now.addingTimeInterval(1000), limit: 1000)
             }
+            try fixtureRequire(queue.isOperational(), "Backup queue failed during enumeration")
             let keys = rows.map { "\($0.source.identifier)|\($0.source.resource.rawValue)|\($0.revision.rawValue)" }
             try fixtureRequire(Set(keys).count == keys.count, "Duplicate photo revision in queue")
             for row in rows
@@ -141,6 +142,7 @@ enum FixtureWorkloads {
             _ = await runner.runUntilDrained(mode: .eligibleOnly)
         } else {
             let summary = queue.summary()
+            try fixtureRequire(await runner.isQueueOperational(), "Backup queue failed during recovery")
             try fixtureRequire(
                 summary.waiting + summary.active + summary.failed + summary.blocked == 0, "Backup queue did not recover"
             )
@@ -179,10 +181,24 @@ enum FixtureWorkloads {
 
     static func smartSearch(_ root: URL, recording: Bool, index: Bool) async throws {
         let layout = MLModelInstallLayout(rootDirectory: try directory(root, "SmartSearch"))
+        struct RecordedIntent: Decodable { let isEnabled: Bool }
+        let expectedEnabled: Bool
+        if !recording, FileManager.default.fileExists(atPath: layout.stateFileURL.path) {
+            expectedEnabled = try JSONDecoder().decode(
+                RecordedIntent.self, from: Data(contentsOf: layout.stateFileURL)
+            ).isEnabled
+        } else {
+            expectedEnabled = false
+        }
         let transport = FixtureTransport(interruptFirst: recording)
         let installer = MLModelInstaller(layout: layout, transport: transport, availableCapacity: { _ in .max })
         let provider = FixtureRuntime()
         let stores = SQLiteMLIndexStoreProvider(url: layout.indexDatabaseURL, cipher: FixtureVectorCipher())
+        #if !UPGRADE_RECORDING
+            // Inspect the actual store before lifecycle tasks can repair an empty WAL header concurrently.
+            _ = try requireStore(stores.openStore(), "semantic index")
+            defer { stores.closeStore() }
+        #endif
         let state = FileMLSmartSearchStateStore(layout: layout)
         let lifecycle = MLSmartSearchLifecycle(
             dependencies: .init(
@@ -191,10 +207,15 @@ enum FixtureWorkloads {
                 assetsProvider: { .authoritative(index ? assets : []) }, governor: MLAlwaysPermitsIndexing(),
                 allowsDeveloperModels: false), configuration: .init(indexRetryDelay: .milliseconds(10)))
         await lifecycle.start()
-        if recording { await lifecycle.enable(with: modelEntry.id) }
-        // A kill before the enable intent is persisted correctly opens disabled. Exercise the next explicit enable too.
-        if !(await lifecycle.currentSnapshot().isEnabled) { await lifecycle.enable(with: modelEntry.id) }
-        await lifecycle.retry()
+        if recording {
+            await lifecycle.enable(with: modelEntry.id)
+            await lifecycle.retry()
+        } else {
+            let startup = await lifecycle.currentSnapshot()
+            try fixtureRequire(startup.isEnabled == expectedEnabled, "Smart Search lost its recorded enable intent")
+            // Only a kill before persisted enable intent needs the next explicit user action.
+            if !expectedEnabled { await lifecycle.enable(with: modelEntry.id) }
+        }
         let deadline = ContinuousClock.now + .seconds(5)
         var ready = false
         var terminalFailure: String?
