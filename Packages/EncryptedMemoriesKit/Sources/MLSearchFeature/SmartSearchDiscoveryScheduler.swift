@@ -15,6 +15,7 @@ public final class SmartSearchDiscoveryScheduler {
         let revision: UInt64
         let favorites: Set<PhotoUID>
         let coordinates: [PhotoCoordinate]
+        let locationEvidence: PhotoPlaceEvidence?
         let controller: MLSmartSearchController?
         let snapshot: MLSmartSearchSnapshot?
         let key: String
@@ -59,6 +60,7 @@ public final class SmartSearchDiscoveryScheduler {
     @ObservationIgnored private var persistenceWriteFailures = 0
 
     #if DEBUG
+        func waitForRefreshForTesting() async { await task?.value }
         var cachedEvidenceAssetCount: Int { evidence?.scannedUIDs.count ?? 0 }
         var libraryRowBuildCount: Int { libraryRows.buildCount }
     #endif
@@ -128,7 +130,7 @@ public final class SmartSearchDiscoveryScheduler {
     public func update(
         sections: [TimelineSection], timelineRevision: UInt64, favoriteUIDs: Set<PhotoUID>,
         coordinates: [PhotoCoordinate], smartSearch: MLSmartSearchController?, libraryIsSettled: Bool = true,
-        cacheContentIsSettled: Bool = true, coordinateRevision: Int = 0
+        cacheContentIsSettled: Bool = true, coordinateRevision: Int = 0, locationEvidence: PhotoPlaceEvidence? = nil
     ) {
         let lifecycle = smartSearch?.lifecycleActor
         let searchEvidence: (@Sendable () async throws -> MLSearchBatchResults)?
@@ -146,7 +148,7 @@ public final class SmartSearchDiscoveryScheduler {
             indexedAssetCount: { await lifecycle?.semanticIndexedAssetCount() ?? 0 },
             searchEvidence: searchEvidence, libraryIsSettled: libraryIsSettled,
             cacheContentIsSettled: cacheContentIsSettled,
-            cacheAccess: cacheAccess, coordinateRevision: coordinateRevision)
+            cacheAccess: cacheAccess, coordinateRevision: coordinateRevision, locationEvidence: locationEvidence)
     }
 
     func update(
@@ -156,8 +158,10 @@ public final class SmartSearchDiscoveryScheduler {
         searchEvidence: (@Sendable () async throws -> MLSearchBatchResults)?, libraryIsSettled: Bool = true,
         cacheContentIsSettled: Bool = true,
         cacheAccess: (@Sendable () async -> MLSearchSuggestionCacheAccess?)? = nil,
-        coordinateRevision: Int = 0
+        coordinateRevision: Int = 0, locationEvidence: PhotoPlaceEvidence? = nil
     ) {
+        // Coordinates and eligibility must describe the same classified snapshot during a crawl.
+        let coordinates = locationEvidence?.coordinates ?? coordinates
         if let input, input.controller !== smartSearch { reset() }
         let visualKey = Self.visualEvidenceKey(
             timelineRevision: timelineRevision, snapshot: snapshot)
@@ -225,7 +229,8 @@ public final class SmartSearchDiscoveryScheduler {
             ])
         input = Input(
             sections: sections, revision: timelineRevision, favorites: favoriteUIDs,
-            coordinates: coordinates, controller: smartSearch, snapshot: snapshot, key: key,
+            coordinates: coordinates, locationEvidence: locationEvidence, controller: smartSearch, snapshot: snapshot,
+            key: key,
             contentKey: contentKey, visualKey: visualKey, cacheKey: cacheKey, libraryIsSettled: libraryIsSettled,
             cacheContentIsSettled: cacheContentIsSettled,
             indexedAssetCount: indexedAssetCount, searchEvidence: searchEvidence, cacheAccess: cacheAccess)
@@ -673,7 +678,8 @@ public final class SmartSearchDiscoveryScheduler {
             sections: input.sections, timelineRevision: input.revision, favoriteUIDs: input.favorites,
             coordinates: input.coordinates, snapshot: input.snapshot, indexedAssetCount: { covered },
             search: nil, includeVisualConcepts: false,
-            metadataOnly: SmartSearchDiscoveryModel.visualConceptsAvailable(input.snapshot)
+            metadataOnly: SmartSearchDiscoveryModel.visualConceptsAvailable(input.snapshot),
+            locationEvidence: input.locationEvidence
         )
         guard !Task.isCancelled else { return false }
         guard SmartSearchDiscoveryModel.visualConceptsAvailable(input.snapshot), covered > 0,
@@ -729,7 +735,8 @@ public final class SmartSearchDiscoveryScheduler {
                     model.forYou.contains(where: { !$0.representativeUIDs.isEmpty })
                 else { return }
                 self.discovery = model
-            }
+            },
+            locationEvidence: input.locationEvidence
         )
         guard !Task.isCancelled, model.lastRefreshCompleted else { return false }
         discovery = model

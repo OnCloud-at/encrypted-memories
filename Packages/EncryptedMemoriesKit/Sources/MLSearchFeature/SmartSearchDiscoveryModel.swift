@@ -503,7 +503,8 @@ public final class SmartSearchDiscoveryModel {
         includeVisualConcepts: Bool = true,
         metadataOnly: Bool = false,
         allowsRepresentative: (@Sendable (PhotoUID) -> Bool)? = nil,
-        previewsDidPublish: (@MainActor () -> Void)? = nil
+        previewsDidPublish: (@MainActor () -> Void)? = nil,
+        locationEvidence: PhotoPlaceEvidence? = nil
     ) async {
         let visualAvailable = Self.visualConceptsAvailable(snapshot)
         let content = SmartSearchContentIdentity(timelineRevision: timelineRevision, favoriteUIDs: favoriteUIDs)
@@ -678,8 +679,10 @@ public final class SmartSearchDiscoveryModel {
         }
 
         // Stage 4: only centroids of photo clusters are named.
+        if let locationEvidence, !(await locationEvidence.waitForWarming()) { return }
+        guard !Task.isCancelled, generation == refreshGeneration else { return }
         let candidates = await Self.background {
-            TimelineSearchDiscovery.placeCandidates(coordinates: coordinates)
+            TimelineSearchDiscovery.placeCandidates(coordinates: coordinates, evidence: locationEvidence)
         }
         guard !Task.isCancelled, generation == refreshGeneration else { return }
         for candidate in candidates where placeNames[candidate.id] == nil {

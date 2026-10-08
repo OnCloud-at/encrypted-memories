@@ -1,4 +1,6 @@
+import CryptoKit
 import Foundation
+import MediaLocationCore
 import PhotosCore
 import Testing
 import TimelineCore
@@ -7,6 +9,57 @@ import TimelineCore
 @testable import MLSearchFeature
 
 @MainActor @Suite struct SmartSearchDiscoverySchedulerTests {
+    @Test func crawlingSearchAndSupportShareBoundedClassifications() async throws {
+        let index = PhotoLocationIndex()
+        var time: TimeInterval = 0
+        index.nowForTesting = { time }
+        func points(_ range: Range<Int>) -> [PhotoCoordinate] {
+            range.map {
+                PhotoCoordinate(
+                    uid: PhotoUID(volumeID: "test", nodeID: "search-crawl-\($0)"),
+                    latitude: 20, longitude: 30, date: Date(timeIntervalSince1970: 1_700_000_000))
+            }
+        }
+        index.replaceAll(points(0..<1000))
+        index.updateScanProgress(PhotoLocationScanProgress(phase: .scanning))
+        let scheduler = SmartSearchDiscoveryScheduler(runtimeState: LibraryRuntimeState(), debounce: .zero) { _, _ in
+            "Test place"
+        }
+        defer { scheduler.reset() }
+        let items = points(0..<2050).map { PhotoItem(uid: $0.uid, captureTime: $0.date, mediaType: "image/jpeg") }
+        let sections = [TimelineSection(id: "all", date: items[0].captureTime, title: "", items: items)]
+        var analyzed: [ObjectIdentifier: PhotoPlaceEvidence] = [:]
+        func curate() async {
+            _ = index.placeEvidence()
+            await index.waitForPlaceEvidenceForTesting()
+            let evidence = index.placeEvidence()
+            analyzed[ObjectIdentifier(evidence)] = evidence
+            scheduler.update(
+                sections: sections, timelineRevision: 1, favoriteUIDs: [], coordinates: index.coordinates,
+                smartSearch: nil, coordinateRevision: index.revision, locationEvidence: evidence)
+            await scheduler.waitForRefreshForTesting()
+        }
+        await curate()
+        for batch in 1...20 {
+            time = Double(batch)
+            index.merge(points((1000 + (batch - 1) * 50)..<(1000 + batch * 50)))
+            await curate()
+            let count = scheduler.discovery.forYou.filter { $0.kind == .place }.reduce(0) { $0 + ($1.matchCount ?? 0) }
+            #expect(count == (batch < 10 ? 1000 : batch < 20 ? 1500 : 2000))
+        }
+        #expect(analyzed.values.reduce(0) { $0 + $1.analysisStartsForTesting } == 3)
+        time = 40
+        index.merge(points(2000..<2050))
+        await curate()
+        let support = await index.photoPlaceSupportSnapshot()
+        #expect(support.first?.photoCount == 2000, "Support must share the last classified snapshot during a crawl")
+        #expect(analyzed.values.reduce(0) { $0 + $1.analysisStartsForTesting } == 3)
+        index.updateScanProgress(PhotoLocationScanProgress(phase: .completed))
+        await curate()
+        #expect(analyzed.values.reduce(0) { $0 + $1.analysisStartsForTesting } == 4)
+        #expect((await index.photoPlaceSupportSnapshot()).first?.photoCount == 2050)
+    }
+
     @Test(arguments: [
         "selection", "missingModel", "download", "modelFailure", "nativeFailure", "nativePartialFailure",
         "nativeOnlyFailure",
@@ -762,6 +815,133 @@ import TimelineCore
         #expect(bytes < 64 * 1_024 * 1_024)
         if itemCount == 50_000 {
             print("Suggestion cache fixture: assets=50000 bytes=\(bytes) restore=\(restoreStarted.duration(to: .now))")
+        }
+    }
+
+    @Test func placePolicyFingerprintKeepsTheExactSaltedDigest() throws {
+        struct Content: Encodable {
+            let items: [PhotoItem]
+            let favorites: [PhotoUID]
+            let coordinates: [PhotoCoordinate]
+            let day: Date
+            let calendar: String
+            let timeZone: String
+            let locale: String
+        }
+        let captured = Date(timeIntervalSince1970: 1_700_000_000)
+        let item = PhotoItem(
+            uid: PhotoUID(volumeID: "test", nodeID: "salted"), captureTime: captured, mediaType: "image/jpeg")
+        let points = [PhotoCoordinate(uid: item.uid, latitude: 20, longitude: 30, date: captured)]
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = try #require(TimeZone(secondsFromGMT: 0))
+        let locale = Locale(identifier: "en_US")
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = .sortedKeys
+        let data = try encoder.encode(
+            Content(
+                items: [item], favorites: [item.uid], coordinates: points, day: calendar.startOfDay(for: captured),
+                calendar: String(describing: calendar.identifier), timeZone: calendar.timeZone.identifier,
+                locale: locale.identifier + "|" + Locale.preferredLanguages.joined(separator: "|")))
+        let expected = Data(SHA256.hash(data: Data("place-evidence-v1|".utf8) + data))
+        let actual = try SmartSearchDiscoveryPersistence.fingerprint(
+            sections: [TimelineSection(id: "all", date: captured, title: "", items: [item])],
+            favorites: [item.uid], coordinates: points, now: captured, calendar: calendar, locale: locale)
+        #expect(actual == expected)
+    }
+
+    @Test func legacyPlacePolicyCannotRestoreRowsBeforeNewCuration() async throws {
+        let cache = SnapshotCache()
+        let captured = Date(timeIntervalSince1970: 1_700_000_000)
+        let items = (0..<8).map {
+            PhotoItem(uid: PhotoUID(volumeID: "test", nodeID: "\($0)"), captureTime: captured, mediaType: "image/jpeg")
+        }
+        let sections = [TimelineSection(id: "all", date: captured, title: "", items: items)]
+        let coordinates = items.map { PhotoCoordinate(uid: $0.uid, latitude: 20, longitude: 30, date: captured) }
+        func apply(_ scheduler: SmartSearchDiscoveryScheduler) {
+            scheduler.update(
+                sections: sections, timelineRevision: 1, favoriteUIDs: [], coordinates: coordinates,
+                snapshot: .disabled, indexedAssetCount: { 0 }, searchEvidence: nil,
+                cacheAccess: { await cache.access() })
+        }
+        let first = SmartSearchDiscoveryScheduler(runtimeState: LibraryRuntimeState(), debounce: .zero) { _, _ in
+            "Place"
+        }
+        apply(first)
+        for _ in 0..<200 where await cache.saves == 0 { try await Task.sleep(for: .milliseconds(5)) }
+        let saved = try PropertyListDecoder().decode(
+            SmartSearchDiscoveryPersistence.self, from: try #require(await cache.data))
+        try #require(saved.snapshot.candidates.contains { $0.kind == .place })
+        first.reset()
+
+        // This is the exact pre-filter fingerprint payload, with no policy salt.
+        struct LegacyContent: Encodable {
+            let items: [PhotoItem]
+            let favorites: [PhotoUID] = []
+            let coordinates: [PhotoCoordinate]
+            let day = Calendar.current.startOfDay(for: Date())
+            let calendar = String(describing: Calendar.current.identifier)
+            let timeZone = Calendar.current.timeZone.identifier
+            let locale = Locale.current.identifier + "|" + Locale.preferredLanguages.joined(separator: "|")
+        }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = .sortedKeys
+        let legacy = Data(SHA256.hash(data: try encoder.encode(LegacyContent(items: items, coordinates: coordinates))))
+        await cache.save(
+            try SmartSearchDiscoveryPersistence(
+                version: saved.version, modelKey: saved.modelKey, fingerprint: legacy,
+                snapshot: saved.snapshot, evidence: saved.evidence, assetFingerprint: saved.assetFingerprint
+            ).encoded())
+        let runtime = LibraryRuntimeState()
+        runtime.update { $0.activeSearchCount = 1 }
+        let next = SmartSearchDiscoveryScheduler(runtimeState: runtime, debounce: .zero) { _, _ in "Place" }
+        defer { next.reset() }
+        apply(next)
+        for _ in 0..<200 where await cache.reads < 2 { try await Task.sleep(for: .milliseconds(5)) }
+        try await Task.sleep(for: .milliseconds(50))
+        #expect(!next.discovery.hasComputed)
+        #expect(next.discovery.forYou.isEmpty)
+    }
+
+    @Test func disabledSmartSearchNamesOnlyEligibleCoordinatesAndReusesTheIndexEvidence() async throws {
+        let coordinates = (0..<60).flatMap { offset in
+            let captured = Date(timeIntervalSince1970: 1_700_000_000 + Double(offset / 2 * 7) * 86_400)
+            return [
+                PhotoCoordinate(
+                    uid: PhotoUID(volumeID: "test", nodeID: "fixed-\(offset)"),
+                    latitude: 20.123456789, longitude: 30.123456789, date: captured),
+                PhotoCoordinate(
+                    uid: PhotoUID(volumeID: "test", nodeID: "gps-\(offset)"),
+                    latitude: -20 + Double(offset) * 0.0001, longitude: -30, date: captured),
+            ]
+        }
+        let items = coordinates.map { PhotoItem(uid: $0.uid, captureTime: $0.date, mediaType: "image/jpeg") }
+        let evidence = PhotoPlaceEvidence(coordinates: coordinates)
+        let placeProbe = PlaceRequestProbe()
+        let scheduler = SmartSearchDiscoveryScheduler(runtimeState: LibraryRuntimeState(), debounce: .zero) { lat, _ in
+            await placeProbe.name(latitude: lat)
+        }
+        defer { scheduler.reset() }
+        scheduler.update(
+            sections: [TimelineSection(id: "all", date: items[0].captureTime, title: "", items: items)],
+            timelineRevision: 1, favoriteUIDs: [], coordinates: coordinates, snapshot: .disabled,
+            indexedAssetCount: { 0 }, searchEvidence: nil, locationEvidence: evidence)
+        for _ in 0..<200 where !scheduler.discovery.lastRefreshCompleted {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        try #require(scheduler.discovery.lastRefreshCompleted)
+        let namedLatitudes = await placeProbe.latitudes
+        #expect(namedLatitudes.count == 1 && namedLatitudes.allSatisfy { $0 < 0 })
+        #expect(evidence.hasAnalyzed)
+        let places = scheduler.discovery.forYou.filter { $0.kind == .place || $0.kind == .placeSeason }
+        #expect(!places.isEmpty)
+        #expect(places.allSatisfy { $0.matchingUIDs?.allSatisfy { $0.nodeID.hasPrefix("gps-") } == true })
+    }
+
+    private actor PlaceRequestProbe {
+        var latitudes: [Double] = []
+        func name(latitude: Double) -> String {
+            latitudes.append(latitude)
+            return "Place"
         }
     }
 

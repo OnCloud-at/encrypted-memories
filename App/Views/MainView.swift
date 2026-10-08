@@ -1998,7 +1998,9 @@ struct MainView: View {
                     smartSearch: model.smartSearch,
                     libraryIsSettled: librarySettled && !backgroundLibraryActivityActive,
                     cacheContentIsSettled: suggestionCacheContentReady,
-                    coordinateRevision: OfflineLibraryManager.shared.locationIndex.revision
+                    coordinateRevision: OfflineLibraryManager.shared.locationIndex.revision,
+                    locationEvidence: mapAndPlacesEnabled
+                        ? OfflineLibraryManager.shared.locationIndex.placeEvidence() : nil
                 )
             }
     }
@@ -2051,6 +2053,7 @@ struct MainView: View {
         ) + "|librarySettled:\(librarySettled)|thumbnailWork:\(backgroundLibraryActivityActive)"
             + "|cacheContentSettled:\(suggestionCacheContentReady)"
             + "|mapAndPlaces:\(mapAndPlacesEnabled)"
+            + "|places:\(OfflineLibraryManager.shared.locationIndex.placeRevision)"
     }
 
     private var suggestionCacheContentReady: Bool {
