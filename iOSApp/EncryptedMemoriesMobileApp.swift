@@ -295,12 +295,11 @@ private struct MobileMainTabView: View {
     private var suggestionsRevision: String {
         SmartSearchDiscoveryScheduler.revisionKey(
             timelineRevision: libraryModel.timelineRevision, favoriteUIDs: libraryModel.favoriteUIDs,
-            coordinateCount: libraryModel.locationIndex.coordinates.count, smartSearch: libraryModel.smartSearch,
-            coordinateRevision: libraryModel.locationIndex.revision
+            smartSearch: libraryModel.smartSearch,
+            placeRevision: mapAndPlacesEnabled ? libraryModel.locationIndex.placeRevision : nil
         ) + "|librarySettled:\(libraryModel.allowsAutomaticSuggestionRefresh)"
             + "|cacheContentSettled:\(libraryModel.allowsSuggestionCacheRestore)"
             + "|mapAndPlaces:\(mapAndPlacesEnabled)"
-            + "|places:\(libraryModel.locationIndex.placeRevision)"
     }
 
     private func updateSearchActivity() {
@@ -340,7 +339,7 @@ private struct MobileMainTabView: View {
                     smartSearch: libraryModel.smartSearch,
                     libraryIsSettled: libraryModel.allowsAutomaticSuggestionRefresh,
                     cacheContentIsSettled: libraryModel.allowsSuggestionCacheRestore,
-                    coordinateRevision: libraryModel.locationIndex.revision,
+                    placeRevision: mapAndPlacesEnabled ? libraryModel.locationIndex.placeRevision : nil,
                     locationEvidence: mapAndPlacesEnabled ? libraryModel.locationIndex.placeEvidence() : nil
                 )
             }

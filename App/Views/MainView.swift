@@ -1998,7 +1998,7 @@ struct MainView: View {
                     smartSearch: model.smartSearch,
                     libraryIsSettled: librarySettled && !backgroundLibraryActivityActive,
                     cacheContentIsSettled: suggestionCacheContentReady,
-                    coordinateRevision: OfflineLibraryManager.shared.locationIndex.revision,
+                    placeRevision: mapAndPlacesEnabled ? OfflineLibraryManager.shared.locationIndex.placeRevision : nil,
                     locationEvidence: mapAndPlacesEnabled
                         ? OfflineLibraryManager.shared.locationIndex.placeEvidence() : nil
                 )
@@ -2048,12 +2048,12 @@ struct MainView: View {
     private var searchDiscoveryTaskKey: String {
         SmartSearchDiscoveryScheduler.revisionKey(
             timelineRevision: UInt64(truncatingIfNeeded: timelineModel.contentRevision),
-            favoriteUIDs: favorites, coordinateCount: OfflineLibraryManager.shared.locationIndex.coordinates.count,
-            smartSearch: model.smartSearch, coordinateRevision: OfflineLibraryManager.shared.locationIndex.revision
+            favoriteUIDs: favorites,
+            smartSearch: model.smartSearch,
+            placeRevision: mapAndPlacesEnabled ? OfflineLibraryManager.shared.locationIndex.placeRevision : nil
         ) + "|librarySettled:\(librarySettled)|thumbnailWork:\(backgroundLibraryActivityActive)"
             + "|cacheContentSettled:\(suggestionCacheContentReady)"
             + "|mapAndPlaces:\(mapAndPlacesEnabled)"
-            + "|places:\(OfflineLibraryManager.shared.locationIndex.placeRevision)"
     }
 
     private var suggestionCacheContentReady: Bool {
