@@ -1330,6 +1330,119 @@ final class ExactDuplicatesModelTests: XCTestCase {
         }
     }
 
+    func testAccountRetirementRejectsALateGroupAppearanceDuringAJoinedMerge() async {
+        for replacing in [false, true] {
+            let groups = manyGroups(100)
+            let finder = FakeDuplicateFinder(scans: [.init(groups: groups, coverage: .complete)])
+            let lifetime = ExactDuplicatesAccountLifetime()
+            var model = lifetime.replace(with: finder)
+            weak var released = model
+            await model?.load()
+            finder.mergeGate.close()
+            let merge = Task { [model] in await model?.merge(groupID: groups[0].id) }
+            await waitUntil({ finder.mergeGate.hasWaiters }, "The old account's batch runs")
+            XCTAssertFalse(model?.groups.last?.isRanked ?? true, "The late group still needs ranking")
+            let rankings = finder.rankCalls
+            finder.rankGate.close()
+            if replacing {
+                _ = lifetime.replace(with: FakeDuplicateFinder(scans: []))
+            } else {
+                lifetime.retire()
+            }
+            // A delayed view callback arrives after retirement stopped the previous appearance follower.
+            model?.groupAppeared(groups[99].id)
+            try? await Task.sleep(for: ExactDuplicatesModel.appearancePause * 3)
+            XCTAssertEqual(finder.rankCalls, rankings, "A late appearance starts no retired-account ranking")
+            XCTAssertTrue(model?.isMerging ?? false, "Retirement still joins the running batch")
+            model?.screenDisappeared()
+            finder.rankGate.open()
+            await waitUntil({ finder.activeRankings == 0 }, "Cleanup joins any incorrect ranking")
+            model = nil
+            finder.mergeGate.open()
+            await merge.value
+            await waitUntil({ released == nil }, "The joined merge releases its retired model")
+        }
+    }
+
+    func testAccountRetirementDiscardsARescanPendingAfterAMerge() async {
+        await assertRetirementStartsNoMergeFollowup(buildChanged: true)
+    }
+
+    func testAccountRetirementDoesNotReloadAfterAStaleMergeResult() async {
+        await assertRetirementStartsNoMergeFollowup(stale: true)
+    }
+
+    func testAccountRetirementDoesNotRestartAnInterruptedCheckAfterAMerge() async {
+        await assertRetirementStartsNoMergeFollowup(interrupted: true)
+    }
+
+    func testAccountRetirementDiscardsAnIndexCompletionAfterTheBatch() async {
+        for interrupted in [false, true] {
+            await assertRetirementStartsNoMergeFollowup(
+                buildChanged: true, interrupted: interrupted, finishesBeforeRetirement: false)
+        }
+    }
+
+    private func assertRetirementStartsNoMergeFollowup(
+        buildChanged: Bool = false, stale: Bool = false, interrupted: Bool = false,
+        finishesBeforeRetirement: Bool = true
+    ) async {
+        for replacing in [false, true] {
+            for all in [false, true] {
+                let finder = FakeDuplicateFinder(scans: [
+                    .init(groups: [groupA], coverage: .indexing),
+                    .init(groups: [groupB], coverage: .complete),
+                ])
+                finder.buildChanged = buildChanged
+                finder.buildError = interrupted ? CancellationError() : nil
+                if stale { finder.outcomes["A"] = .skipped(.keyChanged) }
+                finder.buildGate.close()
+                let lifetime = ExactDuplicatesAccountLifetime()
+                var model = lifetime.replace(with: finder)
+                weak var released = model
+                let load = Task { [model] in await model?.load() }
+                await waitUntil({ finder.buildGate.hasWaiters }, "The old account builds its index")
+                await waitUntil({ model?.groups.first?.isRanked == true }, "The merge's group is ranked")
+                finder.mergeGate.close()
+                let merge = Task { [model] in
+                    if all { await model?.mergeAll() } else { await model?.merge(groupID: "A") }
+                }
+                await waitUntil({ finder.mergeGate.hasWaiters }, "The old account's batch runs")
+                if finishesBeforeRetirement {
+                    finder.buildGate.open()
+                    await load.value
+                }
+                XCTAssertEqual(finder.scanCalls, 1, "The running merge holds the rescan")
+                let rankings = finder.rankCalls
+                // Hold any incorrect restart so weak-nil also detects its retained model.
+                if interrupted { finder.buildGate.close() }
+                if replacing {
+                    _ = lifetime.replace(with: FakeDuplicateFinder(scans: []))
+                } else {
+                    lifetime.retire()
+                }
+                XCTAssertTrue(model?.isMerging ?? false, "Retirement still joins the running batch")
+                model?.screenDisappeared()
+                model = nil
+                XCTAssertNotNil(released, "The running batch still owns the old model")
+                finder.mergeGate.open()
+                await merge.value
+                if !finishesBeforeRetirement {
+                    XCTAssertNotNil(released, "Retirement also joins the index build already in progress")
+                    finder.buildGate.open()
+                    await load.value
+                }
+                await waitUntil({ released == nil }, "The joined work releases its retired model")
+                XCTAssertEqual(finder.batches.count, 1, "Retirement admits no further backend batch")
+                XCTAssertEqual(finder.scanCalls, 1, "Retirement starts no scan or reload")
+                XCTAssertEqual(finder.rankCalls, rankings, "Retirement starts no ranking")
+                XCTAssertEqual(finder.buildCalls, 1, "Retirement starts no index build")
+                finder.buildGate.open()
+                await waitUntil({ released == nil }, "Cleanup releases an incorrect index restart")
+            }
+        }
+    }
+
     func testAccountRetirementWhileASingleMergeRanksStartsNoBatch() async throws {
         for replacing in [false, true] {
             let finder = FakeDuplicateFinder(scans: [.init(groups: manyGroups(100), coverage: .complete)])
