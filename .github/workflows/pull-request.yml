@@ -5,6 +5,11 @@ on:
   merge_group:
     types: [checks_requested]
   workflow_dispatch:
+    inputs:
+      measure_cache:
+        description: Measure populated dependency cache restores.
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -27,6 +32,12 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+
+      - name: Require the merge queue for reduced pull request verification
+        if: ${{ github.event_name == 'pull_request' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/require_merge_queue.py "$GITHUB_REPOSITORY"
 
       - name: Check whitespace
         env:
@@ -88,6 +99,8 @@ jobs:
       - name: Test GitHub automation
         run: |
           set -euo pipefail
+          python3 .github/scripts/test_require_merge_queue.py
+          python3 .github/scripts/test_ios_test_commands.py
           python3 .github/scripts/test_remind_llm_key_expiry.py
           python3 .github/scripts/test_triage_issue.py
           python3 .github/scripts/test_review_pull_request.py
@@ -108,23 +121,24 @@ jobs:
           tar -xzf "$archive" -C "$RUNNER_TEMP" actionlint
           "$RUNNER_TEMP/actionlint" -color
 
-  code-quality:
-    name: Swift style
+  package-verification:
+    name: Package verification and style
     runs-on: xcode-27
-    timeout-minutes: 15
+    timeout-minutes: 90
+    outputs:
+      style: ${{ steps.style.outcome }}
+      tests: ${{ steps.tests.outcome }}
     steps:
       - name: Check out source
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           fetch-depth: 0
           persist-credentials: false
-
       - uses: ./.github/actions/install-swiftlint
-
       - name: Select Xcode 27
         run: sudo xcode-select --switch /Applications/Xcode.app
-
-      - name: Lint changed Swift files
+      - name: Verify Swift style
+        id: style
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha || github.sha }}
@@ -135,130 +149,207 @@ jobs:
           else
             bash scripts/lint-swift.sh --all
           fi
+          bash scripts/check-swift-format.sh --all
+      - uses: ./.github/actions/prepare-apple-build
+        id: prepare
+        if: ${{ !cancelled() && github.event_name != 'pull_request' }}
+        with:
+          build-profile: package
+          measure-cache: ${{ github.event_name == 'workflow_dispatch' && inputs.measure_cache }}
+      - name: Run all package and SDK tests
+        id: tests
+        if: ${{ !cancelled() && github.event_name != 'pull_request' && steps.prepare.outcome == 'success' }}
+        run: bash ./scripts/verify-tests.sh
+      - if: ${{ always() && github.event_name != 'pull_request' }}
+        run: bash ./scripts/report-build-storage.sh
 
-      - name: Check Swift formatting
-        run: bash scripts/check-swift-format.sh --all
+  ios-verification:
+    name: iOS verification
+    if: ${{ github.event_name != 'pull_request' }}
+    runs-on: xcode-27
+    timeout-minutes: 120
+    outputs:
+      architecture: ${{ steps.architecture.outcome }}
+      shell: ${{ steps.shell.outcome }}
+      tests: ${{ steps.tests.outcome }}
+      ui: ${{ steps.ui.outcome }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/prepare-apple-build
+        id: prepare
+        with:
+          build-profile: app
+          measure-cache: ${{ github.event_name == 'workflow_dispatch' && inputs.measure_cache }}
+      - name: Verify iOS shared architecture
+        id: architecture
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        run: bash ./scripts/verify-universal-core.sh build-ios
+      - name: Build the iOS app shell
+        id: shell
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        env:
+          SKIP_XCODEGEN: "1"
+        run: DERIVED_DATA_PATH="$HOME/Developer/xcode/EncryptedMemories/core-gate-dd.noindex/iOS" bash ./scripts/verify-ios-app-shell.sh
+      - name: Build the app and both simulator test bundles once
+        id: test-build
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        env:
+          IOS_TEST_ACTION: build-for-testing
+          IOS_TEST_SCHEME: EncryptedMemoriesMobileCI
+          IOS_TEST_PREPARED: "1"
+        run: bash ./scripts/verify-ios-app-tests.sh
+      - name: Run all hosted tests without building
+        id: tests
+        if: ${{ !cancelled() && steps.test-build.outcome == 'success' }}
+        env:
+          IOS_TEST_ACTION: test-without-building
+          IOS_TEST_SCHEME: EncryptedMemoriesMobileCI
+          IOS_TEST_PREPARED: "1"
+          IOS_TEST_RESULT_BUNDLE_PATH: ${{ runner.temp }}/ios-hosted.xcresult
+        run: bash ./scripts/verify-ios-app-tests.sh
+      - name: Run all UI tests on two simulator workers without building
+        id: ui
+        if: ${{ !cancelled() && steps.test-build.outcome == 'success' }}
+        env:
+          IOS_TEST_ACTION: test-without-building
+          IOS_TEST_SCHEME: EncryptedMemoriesMobileCI
+          IOS_TEST_PREPARED: "1"
+          IOS_TEST_PARALLEL_WORKERS: "2"
+          IOS_TEST_RESULT_BUNDLE_PATH: ${{ runner.temp }}/ios-ui.xcresult
+        run: bash ./scripts/verify-ios-app-tests.sh ui
+      - name: Report simulator test counts
+        if: ${{ !cancelled() && steps.tests.outcome == 'success' && steps.ui.outcome == 'success' }}
+        env:
+          RESULT_ROOT: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          for suite in hosted ui; do
+            xcrun xcresulttool get test-results summary --path "$RESULT_ROOT/ios-$suite.xcresult" |
+              python3 -c 'import json,sys; r=json.load(sys.stdin); print(sys.argv[1], {k:r[k] for k in ["totalTestCount", "passedTests", "failedTests", "skippedTests"]})' "$suite"
+          done
+      - if: always()
+        run: bash ./scripts/report-build-storage.sh
+
+  macos-verification:
+    name: macOS verification
+    if: ${{ github.event_name != 'pull_request' }}
+    runs-on: xcode-27
+    timeout-minutes: 60
+    outputs:
+      architecture: ${{ steps.architecture.outcome }}
+      shell: ${{ steps.shell.outcome }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/prepare-apple-build
+        id: prepare
+        with:
+          build-profile: app
+          measure-cache: ${{ github.event_name == 'workflow_dispatch' && inputs.measure_cache }}
+      - name: Verify macOS shared architecture
+        id: architecture
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        run: bash ./scripts/verify-universal-core.sh build-macos
+      - name: Build the macOS app shell
+        id: shell
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        env:
+          SKIP_XCODEGEN: "1"
+        run: DERIVED_DATA_PATH="$HOME/Developer/xcode/EncryptedMemories/core-gate-dd.noindex/macOS" bash ./scripts/verify-macos-app-shell.sh
+      - if: always()
+        run: bash ./scripts/report-build-storage.sh
+
+  code-quality:
+    name: Swift style
+    needs: [package-verification]
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require Swift style
+        env:
+          RESULT: ${{ needs.package-verification.outputs.style }}
+        run: test "$RESULT" = success
 
   package-tests:
     name: Swift package tests
-    needs: [repository-hygiene, code-quality]
-    runs-on: xcode-27
-    timeout-minutes: 90
+    needs: [package-verification]
+    if: ${{ always() && github.event_name != 'pull_request' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
     steps:
-      - name: Check out source
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
-        with:
-          persist-credentials: false
-      - uses: ./.github/actions/prepare-apple-build
-      - run: bash ./scripts/verify-tests.sh
-      - if: always()
-        run: bash ./scripts/report-build-storage.sh
-
-  ios-app-tests:
-    name: iOS app tests
-    needs: [repository-hygiene, code-quality]
-    runs-on: xcode-27
-    timeout-minutes: 90
-    steps:
-      - name: Check out source
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
-        with:
-          persist-credentials: false
-      - uses: ./.github/actions/prepare-apple-build
-      - run: bash ./scripts/verify-ios-app-tests.sh
-      - if: always()
-        run: bash ./scripts/report-build-storage.sh
-
-  ios-ui-tests:
-    name: iOS UI tests
-    needs: [repository-hygiene, code-quality]
-    runs-on: xcode-27
-    timeout-minutes: 90
-    steps:
-      - name: Check out source
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
-        with:
-          persist-credentials: false
-      - uses: ./.github/actions/prepare-apple-build
-      - run: bash ./scripts/verify-ios-app-tests.sh ui
-      - if: always()
-        run: bash ./scripts/report-build-storage.sh
-
-  architecture-builds:
-    name: Shared architecture (${{ matrix.platform }})
-    needs: [repository-hygiene, code-quality]
-    runs-on: xcode-27
-    timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      max-parallel: 2
-      matrix:
-        include:
-          - platform: iOS
-            mode: build-ios
-          - platform: macOS
-            mode: build-macos
-    steps:
-      - name: Check out source
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
-        with:
-          persist-credentials: false
-      - uses: ./.github/actions/prepare-apple-build
-      - name: Verify ${{ matrix.platform }} shared architecture
-        run: bash ./scripts/verify-universal-core.sh "${{ matrix.mode }}"
-      - if: always()
-        run: bash ./scripts/report-build-storage.sh
+      - name: Require all package and SDK tests
+        env:
+          RESULT: ${{ needs.package-verification.outputs.tests }}
+        run: test "$RESULT" = success
 
   architecture:
     name: Shared architecture
-    needs: [package-tests, architecture-builds]
-    if: ${{ always() }}
+    needs: [package-verification, ios-verification, macos-verification]
+    if: ${{ always() && github.event_name != 'pull_request' }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 5
     steps:
       - name: Require contracts and both platform builds
         env:
-          PACKAGE_TESTS_RESULT: ${{ needs.package-tests.result }}
-          ARCHITECTURE_BUILDS_RESULT: ${{ needs.architecture-builds.result }}
+          PACKAGE_RESULT: ${{ needs.package-verification.outputs.tests }}
+          IOS_RESULT: ${{ needs.ios-verification.outputs.architecture }}
+          MACOS_RESULT: ${{ needs.macos-verification.outputs.architecture }}
         run: |
           set -euo pipefail
-          if [[ "$PACKAGE_TESTS_RESULT" != "success" ]]; then
-            echo "Swift package tests did not pass: $PACKAGE_TESTS_RESULT" >&2
-            exit 1
-          fi
-          if [[ "$ARCHITECTURE_BUILDS_RESULT" != "success" ]]; then
-            echo "One or more platform architecture builds did not pass: $ARCHITECTURE_BUILDS_RESULT" >&2
-            exit 1
-          fi
+          test "$PACKAGE_RESULT" = success
+          test "$IOS_RESULT" = success
+          test "$MACOS_RESULT" = success
+
+  ios-app-tests:
+    name: iOS app tests
+    needs: [ios-verification]
+    if: ${{ always() && github.event_name != 'pull_request' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require hosted tests
+        env:
+          RESULT: ${{ needs.ios-verification.outputs.tests }}
+        run: test "$RESULT" = success
+
+  ios-ui-tests:
+    name: iOS UI tests
+    needs: [ios-verification]
+    if: ${{ always() && github.event_name != 'pull_request' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require UI tests
+        env:
+          RESULT: ${{ needs.ios-verification.outputs.ui }}
+        run: test "$RESULT" = success
 
   macos-app-shell:
     name: macOS app shell
-    needs: [repository-hygiene, code-quality]
-    runs-on: xcode-27
-    timeout-minutes: 90
+    needs: [macos-verification]
+    if: ${{ always() && github.event_name != 'pull_request' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
     steps:
-      - name: Check out source
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
-        with:
-          persist-credentials: false
-      - uses: ./.github/actions/prepare-apple-build
-      - name: Build macOS app
-        run: bash ./scripts/verify-macos-app-shell.sh
-      - if: always()
-        run: bash ./scripts/report-build-storage.sh
+      - name: Require macOS app shell
+        env:
+          RESULT: ${{ needs.macos-verification.outputs.shell }}
+        run: test "$RESULT" = success
 
   ios-app-shell:
     name: iOS app shell
-    needs: [repository-hygiene, code-quality]
-    runs-on: xcode-27
-    timeout-minutes: 90
+    needs: [ios-verification]
+    if: ${{ always() && github.event_name != 'pull_request' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
     steps:
-      - name: Check out source
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
-        with:
-          persist-credentials: false
-      - uses: ./.github/actions/prepare-apple-build
-      - name: Build iOS app
-        run: bash ./scripts/verify-ios-app-shell.sh
-      - if: always()
-        run: bash ./scripts/report-build-storage.sh
+      - name: Require iOS app shell
+        env:
+          RESULT: ${{ needs.ios-verification.outputs.shell }}
+        run: test "$RESULT" = success
