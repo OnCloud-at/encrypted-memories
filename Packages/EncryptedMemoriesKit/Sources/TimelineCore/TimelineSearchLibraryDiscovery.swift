@@ -435,6 +435,7 @@ extension TimelineSearchDiscovery {
         minimumCount: Int = 6,
         evidence: PhotoPlaceEvidence? = nil
     ) -> [TimelineSearchPlaceCandidate] {
+        let coordinates = evidence?.coordinates ?? coordinates
         guard !coordinates.isEmpty else { return [] }
         var cells: [PhotoPlaceEvidence.Cell: [PhotoCoordinate]] = [:]
         let excluded = (evidence ?? PhotoPlaceEvidence(coordinates: coordinates)).excludedPositions()

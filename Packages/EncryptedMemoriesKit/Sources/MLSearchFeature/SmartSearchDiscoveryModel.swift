@@ -679,6 +679,8 @@ public final class SmartSearchDiscoveryModel {
         }
 
         // Stage 4: only centroids of photo clusters are named.
+        if let locationEvidence, !(await locationEvidence.waitForWarming()) { return }
+        guard !Task.isCancelled, generation == refreshGeneration else { return }
         let candidates = await Self.background {
             TimelineSearchDiscovery.placeCandidates(coordinates: coordinates, evidence: locationEvidence)
         }

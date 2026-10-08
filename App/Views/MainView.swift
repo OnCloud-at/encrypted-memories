@@ -2045,6 +2045,7 @@ struct MainView: View {
         ) + "|librarySettled:\(librarySettled)|thumbnailWork:\(backgroundLibraryActivityActive)"
             + "|cacheContentSettled:\(suggestionCacheContentReady)"
             + "|mapAndPlaces:\(mapAndPlacesEnabled)"
+            + "|places:\(OfflineLibraryManager.shared.locationIndex.placeRevision)"
     }
 
     private var suggestionCacheContentReady: Bool {

@@ -91,10 +91,15 @@ public final class PhotoPlaceEvidence: @unchecked Sendable {
 
     public let coordinates: [PhotoCoordinate]
     private let lock = NSLock()
+    private let warmingLock = NSLock()
+    private var warmingTask: Task<Void, Never>?
+    private var analysisCompleted = false
     private var cached: Analysis?
     #if DEBUG
         private let statusLock = NSLock()
         private var completedOnMainThread: Bool?
+        private var analysisStarts = 0
+        private var beforeAnalysis: (@Sendable () -> Void)?
     #endif
 
     public init(coordinates: [PhotoCoordinate]) { self.coordinates = coordinates }
@@ -102,11 +107,30 @@ public final class PhotoPlaceEvidence: @unchecked Sendable {
     /// Canceled work does not publish or cache a partial classification.
     public func prewarm() { _ = analysis() }
 
+    /// The index owns this independent task; cancelling a reader does not cancel classification.
+    public func registerWarmingTask(_ task: Task<Void, Never>) {
+        warmingLock.withLock { warmingTask = task }
+    }
+
+    public var warmingIsRetired: Bool {
+        warmingLock.withLock { !analysisCompleted && warmingTask?.isCancelled == true }
+    }
+
+    public func waitForWarming() async -> Bool {
+        let task = warmingLock.withLock { warmingTask }
+        await task?.value
+        return !warmingIsRetired
+    }
+
     public func excludedPositions() -> Set<PhotoExactPosition> { analysis().excluded }
 
     public func supportSnapshot() -> [PlaceCandidateSupportSnapshot] { analysis().diagnostics }
 
     #if DEBUG
+        public func setBeforeAnalysisForTesting(_ hook: @escaping @Sendable () -> Void) {
+            statusLock.withLock { beforeAnalysis = hook }
+        }
+        public var analysisStartsForTesting: Int { statusLock.withLock { analysisStarts } }
         public var hasAnalyzed: Bool {
             statusLock.withLock { completedOnMainThread != nil }
         }
@@ -122,10 +146,19 @@ public final class PhotoPlaceEvidence: @unchecked Sendable {
     private func analysis() -> Analysis {
         lock.withLock {
             if let cached { return cached }
+            guard !warmingIsRetired else { return Analysis() }
             do {
+                #if DEBUG
+                    let beforeAnalysis = statusLock.withLock {
+                        analysisStarts += 1
+                        return self.beforeAnalysis
+                    }
+                    beforeAnalysis?()
+                #endif
                 let result = try analyze()
                 try Task.checkCancellation()
                 cached = result
+                warmingLock.withLock { analysisCompleted = true }
                 #if DEBUG
                     statusLock.withLock { completedOnMainThread = Thread.isMainThread }
                 #endif

@@ -300,6 +300,7 @@ private struct MobileMainTabView: View {
         ) + "|librarySettled:\(libraryModel.allowsAutomaticSuggestionRefresh)"
             + "|cacheContentSettled:\(libraryModel.allowsSuggestionCacheRestore)"
             + "|mapAndPlaces:\(mapAndPlacesEnabled)"
+            + "|places:\(libraryModel.locationIndex.placeRevision)"
     }
 
     private func updateSearchActivity() {

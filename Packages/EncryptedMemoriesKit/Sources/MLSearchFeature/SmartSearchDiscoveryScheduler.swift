@@ -60,6 +60,7 @@ public final class SmartSearchDiscoveryScheduler {
     @ObservationIgnored private var persistenceWriteFailures = 0
 
     #if DEBUG
+        func waitForRefreshForTesting() async { await task?.value }
         var cachedEvidenceAssetCount: Int { evidence?.scannedUIDs.count ?? 0 }
         var libraryRowBuildCount: Int { libraryRows.buildCount }
     #endif
@@ -159,6 +160,8 @@ public final class SmartSearchDiscoveryScheduler {
         cacheAccess: (@Sendable () async -> MLSearchSuggestionCacheAccess?)? = nil,
         coordinateRevision: Int = 0, locationEvidence: PhotoPlaceEvidence? = nil
     ) {
+        // Coordinates and eligibility must describe the same classified snapshot during a crawl.
+        let coordinates = locationEvidence?.coordinates ?? coordinates
         if let input, input.controller !== smartSearch { reset() }
         let visualKey = Self.visualEvidenceKey(
             timelineRevision: timelineRevision, snapshot: snapshot)

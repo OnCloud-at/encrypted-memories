@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import MediaLocationCore
 import PhotosCore
 import Testing
 import TimelineCore
@@ -8,6 +9,57 @@ import TimelineCore
 @testable import MLSearchFeature
 
 @MainActor @Suite struct SmartSearchDiscoverySchedulerTests {
+    @Test func crawlingSearchAndSupportShareBoundedClassifications() async throws {
+        let index = PhotoLocationIndex()
+        var time: TimeInterval = 0
+        index.nowForTesting = { time }
+        func points(_ range: Range<Int>) -> [PhotoCoordinate] {
+            range.map {
+                PhotoCoordinate(
+                    uid: PhotoUID(volumeID: "test", nodeID: "search-crawl-\($0)"),
+                    latitude: 20, longitude: 30, date: Date(timeIntervalSince1970: 1_700_000_000))
+            }
+        }
+        index.replaceAll(points(0..<1000))
+        index.updateScanProgress(PhotoLocationScanProgress(phase: .scanning))
+        let scheduler = SmartSearchDiscoveryScheduler(runtimeState: LibraryRuntimeState(), debounce: .zero) { _, _ in
+            "Test place"
+        }
+        defer { scheduler.reset() }
+        let items = points(0..<2050).map { PhotoItem(uid: $0.uid, captureTime: $0.date, mediaType: "image/jpeg") }
+        let sections = [TimelineSection(id: "all", date: items[0].captureTime, title: "", items: items)]
+        var analyzed: [ObjectIdentifier: PhotoPlaceEvidence] = [:]
+        func curate() async {
+            _ = index.placeEvidence()
+            await index.waitForPlaceEvidenceForTesting()
+            let evidence = index.placeEvidence()
+            analyzed[ObjectIdentifier(evidence)] = evidence
+            scheduler.update(
+                sections: sections, timelineRevision: 1, favoriteUIDs: [], coordinates: index.coordinates,
+                smartSearch: nil, coordinateRevision: index.revision, locationEvidence: evidence)
+            await scheduler.waitForRefreshForTesting()
+        }
+        await curate()
+        for batch in 1...20 {
+            time = Double(batch)
+            index.merge(points((1000 + (batch - 1) * 50)..<(1000 + batch * 50)))
+            await curate()
+            let count = scheduler.discovery.forYou.filter { $0.kind == .place }.reduce(0) { $0 + ($1.matchCount ?? 0) }
+            #expect(count == (batch < 10 ? 1000 : batch < 20 ? 1500 : 2000))
+        }
+        #expect(analyzed.values.reduce(0) { $0 + $1.analysisStartsForTesting } == 3)
+        time = 40
+        index.merge(points(2000..<2050))
+        await curate()
+        let support = await index.photoPlaceSupportSnapshot()
+        #expect(support.first?.photoCount == 2000, "Support must share the last classified snapshot during a crawl")
+        #expect(analyzed.values.reduce(0) { $0 + $1.analysisStartsForTesting } == 3)
+        index.updateScanProgress(PhotoLocationScanProgress(phase: .completed))
+        await curate()
+        #expect(analyzed.values.reduce(0) { $0 + $1.analysisStartsForTesting } == 4)
+        #expect((await index.photoPlaceSupportSnapshot()).first?.photoCount == 2050)
+    }
+
     @Test(arguments: [
         "selection", "missingModel", "download", "modelFailure", "nativeFailure", "nativePartialFailure",
         "nativeOnlyFailure",
