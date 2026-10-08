@@ -821,7 +821,7 @@ public final class PhotoLibraryBackupController {
 
     /// Replays durable inventory only when the queue may be incomplete.
     /// Catalog sync writes queue rows before advancing the catalog, so replay is safe and idempotent.
-    private nonisolated static func replayCatalogIfQueueNeedsRecovery(
+    nonisolated static func replayCatalogIfQueueNeedsRecovery(
         catalogStore: PhotoLibraryCatalogManifestStore,
         queueStore: UploadBackupSyncQueueManifestStore,
         engine: UploadBackupSyncEngine

@@ -73,6 +73,15 @@ let package = Package(
         .package(url: "https://github.com/ProtonMail/protoncore_ios.git", exact: "37.3.0"),
     ],
     targets: [
+        .testTarget(
+            name: "UpgradeFixtureTests",
+            dependencies: [
+                "PhotosCore", "UploadCore", "PhotoLibraryBackupAdapter", "MLSearchCore", "MediaByteCache",
+                "MediaLocationCore",
+            ],
+            resources: [.copy("Fixtures")],
+            swiftSettings: disableDynamicActorIsolation
+        ),
         // PhotosCore owns the package-wide localization catalog.
         .target(name: "PhotosCore", resources: [.process("Resources")], swiftSettings: disableDynamicActorIsolation),
         .testTarget(name: "PhotosCoreTests", dependencies: ["PhotosCore"], swiftSettings: disableDynamicActorIsolation),
