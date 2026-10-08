@@ -741,7 +741,7 @@ public final class SmartSearchDiscoveryScheduler {
         let matchesByPrompt = Dictionary(
             uniqueKeysWithValues: evidence.results.map { ($0.queryText, $0.results.map(\.uid)) })
         let replacesEmptyPreviews = !previous.forYou.contains {
-            !$0.representativeUIDs.isEmpty || $0.kind == .concept
+            !$0.representativeUIDs.isEmpty || $0.kind == .concept || $0.kind == .place || $0.kind == .placeSeason
         }
         await model.refresh(
             sections: input.sections, timelineRevision: input.revision, favoriteUIDs: input.favorites,
@@ -752,7 +752,7 @@ public final class SmartSearchDiscoveryScheduler {
             },
             allowsRepresentative: { evidence.scannedUIDs.contains($0) },
             previewsDidPublish: {
-                // First usable metadata or concept previews need not wait for geocoding. Preserve an already useful publication.
+                // First usable previews need not wait for geocoding. Keep existing places even without preview photos.
                 guard replacesEmptyPreviews, !Task.isCancelled, self.input?.contentKey == input.contentKey,
                     Self.permitsRefresh(self.runtimeState.snapshot()),
                     model.forYou.contains(where: { !$0.representativeUIDs.isEmpty })
