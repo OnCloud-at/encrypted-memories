@@ -14,8 +14,54 @@ import tempfile
 from pathlib import Path
 
 BUDGET = 15_000_000
+MINIMUM_PUBLIC_RELEASE = 'v1.0.5'
 SCENARIOS = ('backup', 'model', 'index', 'cache', 'location')
 PRIVATE = re.compile(rb'/Users/|/home/[a-z]|/Volumes/|/private/|/var/folders/|file://|[.]ts[.]net|[.]lan\b|[A-Za-z0-9_-]+\.local\b|(?:192\.168|10\.\d+|172\.(?:1[6-9]|2\d|3[01])|100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7]))\.\d+\.\d+')
+
+def release_version(tag):
+    if not re.fullmatch(r'v(0|[1-9][0-9]*)[.](0|[1-9][0-9]*)[.](0|[1-9][0-9]*)', tag):
+        raise ValueError('Use a stable release tag without leading zeroes')
+    version = tuple(map(int, tag[1:].split('.')))
+    if version < (1, 0, 5):
+        raise ValueError('v1.0.5 is the first public release; earlier tags are admission tests')
+    return version
+
+def release_catalog(destination, metadata):
+    entry = dict(tag=metadata['release'], commit=metadata['commit'], sdk=metadata['sdk'])
+    release_version(entry['tag'])
+    if destination.name != entry['tag']:
+        raise ValueError('The corpus must use its release folder')
+    path = destination.parent / 'releases.json'
+    catalog = json.loads(path.read_text()) if path.exists() else dict(format=1, minimumPublicRelease=MINIMUM_PUBLIC_RELEASE, releases=[])
+    if catalog['format'] != 1 or catalog['minimumPublicRelease'] != MINIMUM_PUBLIC_RELEASE:
+        raise ValueError('Invalid public release list')
+    if len({record['tag'] for record in catalog['releases']}) != len(catalog['releases']):
+        raise ValueError('Duplicate release in the public release list')
+    entries = {}
+    for record in catalog['releases'] + [entry]:
+        release_version(record['tag'])
+        if not re.fullmatch(r'[0-9a-f]{40}', record['commit']) or not re.fullmatch(r'[0-9]+[.][0-9]+[.][0-9]+', record['sdk']):
+            raise ValueError('Invalid recorded commit or SDK')
+        previous = entries.get(record['tag'])
+        if previous is not None and previous != record:
+            raise ValueError('A recorded release must not change commit or SDK')
+        entries[record['tag']] = record
+    if MINIMUM_PUBLIC_RELEASE not in entries:
+        raise ValueError('Retain the first public release corpus')
+    for tag, record in entries.items():
+        if tag == entry['tag']:
+            continue
+        folder = destination.parent / tag
+        manifest = json.loads((folder / 'manifest.json').read_text())
+        if any(manifest[key] != record[field] for key, field in [('release', 'tag'), ('commit', 'commit'), ('sdk', 'sdk')]):
+            raise ValueError('Existing release metadata differs from the release list')
+        if not all((folder / name).is_file() for name in ('corpus.tar.gz', 'wal-policy-proof.json')):
+            raise ValueError('Existing release corpus is incomplete')
+    folders = {p.name for p in destination.parent.iterdir() if p.is_dir()}
+    if folders - {entry['tag']} != set(entries) - {entry['tag']}:
+        raise ValueError('Release folders and release list differ')
+    catalog['releases'] = sorted(entries.values(), key=lambda record: release_version(record['tag']))
+    return catalog
 
 def check_bytes(data, label, strict_issues=False):
     if PRIVATE.search(data):
@@ -71,6 +117,7 @@ def safe_rows(tree, name, unreadable, sql):
 def pack(recorded, destination):
     blobs = {}
     manifest = dict(format=1, **json.loads((recorded.parent / 'recording.json').read_text()), scenarios={})
+    catalog = release_catalog(destination, manifest)
     for scenario in SCENARIOS:
         folder = recorded / scenario
         events = [json.loads(line) for line in (folder / 'events.jsonl').read_text().splitlines()]
@@ -142,11 +189,23 @@ def pack(recorded, destination):
     size = sum(path.stat().st_size for path in destination.rglob('*') if path.is_file())
     if size > BUDGET:
         raise ValueError(f'Corpus exceeds hard 15 MB budget: {size}')
+    catalog_path = destination.parent / 'releases.json'
+    encoded_catalog = json.dumps(catalog, indent=2) + '\n'
+    check_bytes(encoded_catalog.encode(), 'release list')
+    temporary_catalog = catalog_path.with_suffix('.json.tmp')
+    temporary_catalog.write_text(encoded_catalog)
+    temporary_catalog.replace(catalog_path)
     print(json.dumps({'snapshots': {key: len(value) for key, value in manifest['scenarios'].items()}, 'blobs': len(blobs), 'archiveBytes': archive.stat().st_size, 'manifestBytes': len(encoded), 'totalBytes': size}, indent=2))
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('recorded', type=Path)
-    parser.add_argument('destination', type=Path)
+    parser.add_argument('recorded', type=Path, nargs='?')
+    parser.add_argument('destination', type=Path, nargs='?')
+    parser.add_argument('--check-release')
     args = parser.parse_args()
-    pack(args.recorded, args.destination)
+    if args.check_release is not None:
+        release_version(args.check_release)
+    elif args.recorded is None or args.destination is None:
+        parser.error('recorded and destination are required')
+    else:
+        pack(args.recorded, args.destination)

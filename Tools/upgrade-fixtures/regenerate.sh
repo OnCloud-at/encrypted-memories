@@ -3,18 +3,24 @@
 set -euo pipefail
 current="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 release="${1:-v1.0.5}"
-[[ "$release" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo 'Use a stable release tag.' >&2; exit 64; }
-historical="$(dirname "$current")/upgrade-fixtures-$release"
+python3 "$current/Tools/upgrade-fixtures/corpus.py" --check-release "$release" || exit 64
+source "$current/scripts/build-paths.sh"
+historical="$ENCRYPTED_MEMORIES_BUILD_ROOT/UpgradeFixtures.noindex/src-$release"
+mkdir -p "$(dirname "$historical")"
 [[ ! -e "$historical" ]] || { echo 'The historical worktree path must be unused.' >&2; exit 73; }
-commit="$(git -C "$current" rev-parse "$release^{commit}")"
-git -C "$current" worktree add --detach "$historical" "$release"
+commit="$(git -C "$current" rev-parse "refs/tags/$release^{commit}")"
+git -C "$current" worktree add --detach "$historical" "$commit"
 cleanup() {
   # Only this script's disposable checkout contains the overlay and vendored SDK.
   git -C "$current" worktree remove --force "$historical"
+  if git -C "$current" worktree list --porcelain | /usr/bin/grep -Fxq "worktree $historical"; then
+    echo 'Historical worktree remains registered after cleanup.' >&2
+    return 70
+  fi
 }
 trap cleanup EXIT
 python3 "$current/Tools/upgrade-fixtures/apply-overlay.py" "$current" "$historical" "$commit"
-source "$current/scripts/build-paths.sh"
+export UPGRADE_FIXTURE_RELEASE="$release"
 mkdir -p "$ENCRYPTED_MEMORIES_BUILD_ROOT/UpgradeFixtures.noindex/$release"
 run_directory="$(mktemp -d "$ENCRYPTED_MEMORIES_BUILD_ROOT/UpgradeFixtures.noindex/$release/run.XXXXXX")"
 export UPGRADE_FIXTURE_RUN_ID="${run_directory##*/}"
@@ -33,4 +39,4 @@ done
   bash "$current/Tools/upgrade-fixtures/verify-observer.sh" "$current" "$release"
 python3 "$current/Tools/upgrade-fixtures/corpus.py" \
   "$run_directory/recorded" \
-  "$current/Packages/EncryptedMemoriesKit/Tests/UpgradeFixtureTests/Fixtures"
+  "$current/Packages/EncryptedMemoriesKit/Tests/UpgradeFixtureTests/Fixtures/$release"
