@@ -289,19 +289,7 @@ import XCTest
                     "installation: ambiguousModelArtifact"
                 )
             }
-            let failures: [String: [Int: String]] = [
-                "backup": [
-                    3: "queue", 4: "queue", 20: "backup state", 21: "backup state",
-                    33: "identity manifest", 34: "identity manifest", 71: "catalog", 72: "catalog",
-                ],
-                "model": [18: "semantic index", 19: "semantic index"],
-                "index": [18: "semantic index", 19: "semantic index", 66: "native index", 67: "native index"],
-            ]
-            guard let store = failures[scenario]?[snapshot.event.id] else { return nil }
-            return (
-                "Issue #391: empty WAL database cannot pass read-only schema inspection",
-                "Fatal store open: \(store)"
-            )
+            return nil
         }
 
         private func auxiliaryUsage(_ root: URL, snapshot: Snapshot) throws -> (files: Int, bytes: Int) {
