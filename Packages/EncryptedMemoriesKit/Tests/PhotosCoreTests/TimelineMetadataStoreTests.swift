@@ -50,6 +50,33 @@ final class TimelineMetadataStoreTests: XCTestCase {
         )
     }
 
+    func testRefinedSameSecondSavesKeepTheLegacyDigestWithoutAFullLibrarySort() throws {
+        let (store, url) = try makeStore(in: makeTempDir())
+        defer { store.close() }
+        let items = (0..<10_000).map { makeItem(node: String(format: "%06d", $0), t: Double(1000 + $0 / 2)) }
+        XCTAssertTrue(store.save(items).succeeded)
+        let digestSQL = "SELECT value FROM store_meta WHERE key='timeline.digest';"
+        let legacyDigest = rawRows(url, digestSQL)
+        XCTAssertEqual(legacyDigest, [["c6fffba523f8ba6359231d501cab22c03da0bb0d7421cfb1c01a2918f51768d3"]])
+        let fullSorts = store.fullSaveSortCount
+        var refined = items
+        for index in stride(from: 0, to: items.count, by: 2) {
+            refined[index].timelineOrder = .init(exactCaptureTime: items[index].captureTime.addingTimeInterval(0.8))
+            refined[index + 1].timelineOrder = .init(exactCaptureTime: items[index].captureTime.addingTimeInterval(0.1))
+            refined.swapAt(index, index + 1)
+        }
+        let saved = store.save(refined, validationToken: "cursor")
+        XCTAssertTrue(saved.succeeded)
+        XCTAssertTrue(saved.skippedUnchanged)
+        XCTAssertEqual(store.fullSaveSortCount, fullSorts, "same-second correction must not sort the full library")
+        XCTAssertEqual(rawRows(url, digestSQL), legacyDigest)
+        XCTAssertEqual(store.load(), items)
+        XCTAssertEqual(store.validationToken(), "cursor")
+        // Truly unordered seconds still need the original canonical fallback.
+        XCTAssertTrue(store.save(Array(refined.reversed())).skippedUnchanged)
+        XCTAssertEqual(rawRows(url, digestSQL), legacyDigest)
+    }
+
     func testStoredCursorTimestampSurvivesReopenAndUnchangedSaves() throws {
         let directory = try makeTempDir()
         let (store, url) = try makeStore(in: directory)

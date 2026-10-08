@@ -11,6 +11,7 @@ public enum TimelineOrderMetadataError: Error {
 public final class TimelineOrderMetadataStore {
     public static let databaseFileName = "timeline-order-v1.sqlite"
     public static let pageSize = 150
+    public static let synchronizationChunkSize = 1_000
     private var db: OpaquePointer?
     private let url: URL
     private let policy: LibraryDatabasePolicy
@@ -18,6 +19,16 @@ public final class TimelineOrderMetadataStore {
     private var synchronizedInventory: InventorySignature?
     private var needsPublication = true
     private var lastRecordChangedOrder = false
+    private var synchronization: Synchronization?
+    private var synchronizationGeneration: UInt64 = 0
+    private var inventoryComplete = false
+
+    private struct Synchronization {
+        let generation: UInt64
+        let signature: InventorySignature
+        var offset = 0
+        var sweepCursor: PhotoUID?
+    }
 
     /// Process-local identity of UID/time membership. It keeps no inventory copy and ignores listing order.
     public struct InventorySignature: Equatable, Sendable {
@@ -92,6 +103,9 @@ public final class TimelineOrderMetadataStore {
         sqlite3_close(db)
         db = nil
         synchronizedInventory = nil
+        synchronization = nil
+        synchronizationGeneration &+= 1
+        inventoryComplete = false
         needsPublication = true
     }
 
@@ -132,13 +146,106 @@ public final class TimelineOrderMetadataStore {
         guard db != nil, !Task.isCancelled else { return false }
         let signature = InventorySignature(items)
         guard synchronizedInventory != signature else { return true }
+        guard let generation = beginSynchronization(signature: signature) else { return false }
+        defer { finishSynchronization(generation: generation) }
+        while let complete = synchronizeChunk(items, isClassified: isClassified, generation: generation) {
+            if complete { return true }
+        }
+        return false
+    }
+
+    /// Commits bounded writes and sweeps before each yield. The connection stays on its owning actor.
+    /// A replacement pass invalidates the old scratch keys. Interrupted rows replay idempotently on restart.
+    public func synchronizeInChunks(
+        _ items: [PhotoItem], isClassified: (PhotoUID) -> Bool,
+        isolation: isolated (any Actor)? = #isolation
+    ) async -> Bool {
+        guard db != nil, !Task.isCancelled else { return false }
+        let signature = InventorySignature(items)
+        guard synchronizedInventory != signature else { return true }
+        guard let generation = beginSynchronization(signature: signature) else { return false }
+        defer { finishSynchronization(generation: generation) }
+        while let complete = synchronizeChunk(items, isClassified: isClassified, generation: generation) {
+            if complete { return true }
+            await Task.yield()
+        }
+        return false
+    }
+
+    private func beginSynchronization(signature: InventorySignature) -> UInt64? {
+        synchronizationGeneration &+= 1
+        synchronization = nil
+        synchronizedInventory = nil
+        inventoryComplete = false
+        let setup = """
+            DROP TABLE IF EXISTS temp.incoming_order;
+            CREATE TEMP TABLE incoming_order(vol TEXT,node TEXT,PRIMARY KEY(vol,node)) WITHOUT ROWID;
+            """
+        guard sqlite3_exec(db, setup, nil, nil, nil) == SQLITE_OK else { return nil }
+        synchronization = Synchronization(generation: synchronizationGeneration, signature: signature)
         PhotoDiagnostics.shared.increment("timeline.order.syncPass")
-        guard sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK else { return false }
-        let setup =
-            "CREATE TEMP TABLE IF NOT EXISTS incoming_order(vol TEXT,node TEXT,PRIMARY KEY(vol,node)); DELETE FROM incoming_order;"
-        guard sqlite3_exec(db, setup, nil, nil, nil) == SQLITE_OK else { return rollback() }
+        return synchronizationGeneration
+    }
+
+    private func finishSynchronization(generation: UInt64) {
+        if synchronization?.generation == generation { synchronization = nil }
+    }
+
+    /// nil means failure or retirement; true means the complete inventory and sweep committed.
+    private func synchronizeChunk(
+        _ items: [PhotoItem], isClassified: (PhotoUID) -> Bool, generation: UInt64
+    ) -> Bool? {
+        guard db != nil, !Task.isCancelled, var progress = synchronization,
+            progress.generation == generation
+        else { return nil }
+        guard sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK else { return nil }
+        let complete: Bool
+        if progress.offset < items.count {
+            let end = min(progress.offset + Self.synchronizationChunkSize, items.count)
+            guard upsertSynchronizationChunk(items[progress.offset..<end], isClassified: isClassified) else {
+                _ = rollback()
+                return nil
+            }
+            progress.offset = end
+            complete = false
+        } else {
+            let page: [PhotoUID]
+            do { page = try synchronizationSweepPage(after: progress.sweepCursor) } catch {
+                _ = rollback()
+                return nil
+            }
+            if let last = page.last {
+                guard sweepSynchronizationChunk(after: progress.sweepCursor, through: last) else {
+                    _ = rollback()
+                    return nil
+                }
+                progress.sweepCursor = last
+                complete = false
+            } else {
+                complete = true
+            }
+        }
+        guard !Task.isCancelled, sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK else {
+            _ = rollback()
+            return nil
+        }
+        PhotoDiagnostics.shared.increment("timeline.order.syncChunk")
+        synchronization = progress
+        if complete {
+            synchronizedInventory = progress.signature
+            inventoryComplete = true
+            needsPublication = true
+        }
+        return complete
+    }
+
+    private func upsertSynchronizationChunk(_ items: ArraySlice<PhotoItem>, isClassified: (PhotoUID) -> Bool) -> Bool {
         var incoming: OpaquePointer?
         var upsert: OpaquePointer?
+        defer {
+            sqlite3_finalize(incoming)
+            sqlite3_finalize(upsert)
+        }
         let sql = """
             INSERT INTO photo_order(vol,node,t,second,mime_seen) VALUES(?1,?2,?3,?4,?5)
             ON CONFLICT(vol,node) DO UPDATE SET t=excluded.t, second=excluded.second, mime_seen=excluded.mime_seen,
@@ -152,36 +259,57 @@ public final class TimelineOrderMetadataStore {
             sqlite3_prepare_v2(db, "INSERT OR IGNORE INTO incoming_order VALUES(?,?);", -1, &incoming, nil)
                 == SQLITE_OK,
             sqlite3_prepare_v2(db, sql, -1, &upsert, nil) == SQLITE_OK
-        else {
-            sqlite3_finalize(incoming)
-            sqlite3_finalize(upsert)
-            return rollback()
-        }
-        defer {
-            sqlite3_finalize(incoming)
-            sqlite3_finalize(upsert)
-        }
+        else { return false }
         for item in items {
-            if Task.isCancelled { return rollback() }
+            if Task.isCancelled { return false }
             sqlite3_reset(incoming)
             bind(item.uid, to: incoming)
-            guard sqlite3_step(incoming) == SQLITE_DONE else { return rollback() }
+            guard sqlite3_step(incoming) == SQLITE_DONE else { return false }
             sqlite3_reset(upsert)
             bind(item.uid, to: upsert)
             let time = item.captureTime.timeIntervalSince1970
             sqlite3_bind_double(upsert, 3, time)
             sqlite3_bind_double(upsert, 4, floor(time))
             sqlite3_bind_int(upsert, 5, isClassified(item.uid) ? 1 : 0)
-            guard sqlite3_step(upsert) == SQLITE_DONE else { return rollback() }
+            guard sqlite3_step(upsert) == SQLITE_DONE else { return false }
         }
-        let sweep =
-            "DELETE FROM photo_order WHERE NOT EXISTS(SELECT 1 FROM incoming_order i WHERE i.vol=photo_order.vol AND i.node=photo_order.node);"
-        guard sqlite3_exec(db, sweep, nil, nil, nil) == SQLITE_OK,
-            sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK
-        else { return rollback() }
-        synchronizedInventory = signature
-        needsPublication = true
         return true
+    }
+
+    private func synchronizationSweepPage(after cursor: PhotoUID?) throws -> [PhotoUID] {
+        var stmt: OpaquePointer?
+        let sql = "SELECT vol,node FROM photo_order WHERE (vol,node)>(?1,?2) ORDER BY vol,node LIMIT ?3;"
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw TimelineOrderMetadataError.readFailed
+        }
+        defer { sqlite3_finalize(stmt) }
+        bind(cursor ?? PhotoUID(volumeID: "", nodeID: ""), to: stmt)
+        sqlite3_bind_int(stmt, 3, Int32(Self.synchronizationChunkSize))
+        var result: [PhotoUID] = []
+        var step = sqlite3_step(stmt)
+        while step == SQLITE_ROW {
+            guard let vol = string(stmt, 0), let node = string(stmt, 1) else {
+                throw TimelineOrderMetadataError.readFailed
+            }
+            result.append(PhotoUID(volumeID: vol, nodeID: node))
+            step = sqlite3_step(stmt)
+        }
+        guard step == SQLITE_DONE else { throw TimelineOrderMetadataError.readFailed }
+        return result
+    }
+
+    private func sweepSynchronizationChunk(after cursor: PhotoUID?, through end: PhotoUID) -> Bool {
+        var stmt: OpaquePointer?
+        let sql = """
+            DELETE FROM photo_order WHERE (vol,node)>(?1,?2) AND (vol,node)<=(?3,?4)
+              AND NOT EXISTS(SELECT 1 FROM incoming_order i WHERE i.vol=photo_order.vol AND i.node=photo_order.node);
+            """
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return false }
+        defer { sqlite3_finalize(stmt) }
+        bind(cursor ?? PhotoUID(volumeID: "", nodeID: ""), to: stmt)
+        sqlite3_bind_text(stmt, 3, end.volumeID, -1, transient)
+        sqlite3_bind_text(stmt, 4, end.nodeID, -1, transient)
+        return sqlite3_step(stmt) == SQLITE_DONE
     }
 
     private static let collision = """
@@ -314,7 +442,7 @@ public final class TimelineOrderMetadataStore {
 
     private func publishCompletedSeconds(containing uid: PhotoUID?) throws -> Bool {
         guard db != nil else { throw TimelineOrderMetadataError.unavailable }
-        guard needsPublication else { return false }
+        guard inventoryComplete, needsPublication else { return false }
         PhotoDiagnostics.shared.increment(uid == nil ? "timeline.order.publishPass" : "timeline.order.publishSecond")
         guard sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK else {
             throw TimelineOrderMetadataError.unavailable
@@ -359,15 +487,27 @@ public final class TimelineOrderMetadataStore {
     /// One indexed cache scan merges into the existing timeline. No full-library metadata dictionary is built.
     public func enrich(_ items: [PhotoItem]) -> [PhotoItem] {
         guard !items.isEmpty else { return items }
-        var result = items.sorted(by: TimelineOrder.areInBaseOrder)
+        var result = TimelineOrder.orderedByCaptureSecond(items, by: TimelineOrder.areInBaseOrder)
         var stmt: OpaquePointer?
         let sql =
-            "SELECT vol,node,t,exact,identity FROM photo_order INDEXED BY order_timeline WHERE t>=?1 AND t<=?2 AND published=1 AND exact IS NOT NULL ORDER BY t,vol,node;"
+            "SELECT vol,node,t,exact,identity FROM photo_order INDEXED BY order_timeline WHERE t>=?1 AND t<=?2 AND published=1 AND exact IS NOT NULL ORDER BY t,vol,node LIMIT ?3;"
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
             sqlite3_finalize(stmt)
             rebuild()
             return items
         }
+        // Execute with a zero limit to validate SQLite's schema without scanning a new cache.
+        guard revision > 0 else {
+            sqlite3_bind_int(stmt, 3, 0)
+            let step = sqlite3_step(stmt)
+            sqlite3_finalize(stmt)
+            guard step == SQLITE_DONE else {
+                rebuild()
+                return items
+            }
+            return TimelineOrder.orderedByCaptureSecond(result, by: TimelineOrder.areInIncreasingOrder)
+        }
+        sqlite3_bind_int(stmt, 3, -1)
         var readFailed = false
         defer {
             sqlite3_finalize(stmt)
@@ -400,8 +540,7 @@ public final class TimelineOrderMetadataStore {
             readFailed = true
             return items
         }
-        result.sort(by: TimelineOrder.areInIncreasingOrder)
-        return result
+        return TimelineOrder.orderedByCaptureSecond(result, by: TimelineOrder.areInIncreasingOrder)
     }
 
     public func workQueryPlan() -> String {
