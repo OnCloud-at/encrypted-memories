@@ -210,14 +210,14 @@ jobs:
           IOS_TEST_PREPARED: "1"
           IOS_TEST_RESULT_BUNDLE_PATH: ${{ runner.temp }}/ios-hosted.xcresult
         run: bash ./scripts/verify-ios-app-tests.sh
-      - name: Run all UI tests on two simulator workers without building
+      # One simulator: two clones on a hosted runner ran twice as long and timed out UI waits.
+      - name: Run all UI tests without building
         id: ui
         if: ${{ !cancelled() && steps.test-build.outcome == 'success' }}
         env:
           IOS_TEST_ACTION: test-without-building
           IOS_TEST_SCHEME: EncryptedMemoriesMobileCI
           IOS_TEST_PREPARED: "1"
-          IOS_TEST_PARALLEL_WORKERS: "2"
           IOS_TEST_RESULT_BUNDLE_PATH: ${{ runner.temp }}/ios-ui.xcresult
         run: bash ./scripts/verify-ios-app-tests.sh ui
       - name: Report simulator test counts
