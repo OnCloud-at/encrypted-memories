@@ -37,6 +37,32 @@ import UploadCore
         store.close()
     }
 
+    @Test func closingTheGridReleasesItsSessionAndBackupController() async throws {
+        let suite = "pending-grid-deallocation-\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suite))
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(suite, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer {
+            defaults.removePersistentDomain(forName: suite)
+            try? FileManager.default.removeItem(at: directory)
+        }
+        let store = try #require(PendingGridSession.openStore(accountDataDirectory: directory, policy: .conservative))
+        var controller: PhotoLibraryBackupController? = PhotoLibraryBackupController(
+            configuration: .init(accountDataDirectory: directory, databasePolicy: .conservative, defaults: defaults),
+            identityResolver: nil, uploader: MockUploader(), pendingStore: store, requiresPendingStore: true)
+        var session: PendingGridSession? = try #require(
+            PendingGridSession(store: store, photoBackup: controller!, remote: NoRemoteEffects()))
+        weak var releasedSession = session
+        weak var releasedController = controller
+        session?.start()
+        await session?.close()
+        await controller?.shutdown()
+        session = nil
+        controller = nil
+        #expect(await eventually { releasedSession == nil && releasedController == nil })
+        store.close()
+    }
+
     private func eventually(_ condition: () -> Bool) async -> Bool {
         for _ in 0..<200 {
             if condition() { return true }

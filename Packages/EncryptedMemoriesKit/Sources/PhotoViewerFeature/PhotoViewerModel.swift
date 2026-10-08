@@ -206,14 +206,14 @@ public final class PhotoViewerModel {
         }
         let item = current
         isLoadingAlbumMemberships = true
-        albumMembershipTask = Task { [albumMembershipProvider] in
+        albumMembershipTask = Task { [weak self, albumMembershipProvider] in
             do {
                 let titles = try await albumMembershipProvider.albumMembershipTitles(for: item.uid)
-                guard !Task.isCancelled, self.isDisplaying(item) else { return }
+                guard !Task.isCancelled, let self, self.isDisplaying(item) else { return }
                 self.albumTitles = titles
                 self.isLoadingAlbumMemberships = false
             } catch {
-                guard !Task.isCancelled, self.isDisplaying(item) else { return }
+                guard !Task.isCancelled, let self, self.isDisplaying(item) else { return }
                 self.isLoadingAlbumMemberships = false
                 self.albumMembershipsLoadFailed = true
             }
@@ -230,9 +230,9 @@ public final class PhotoViewerModel {
             return
         }
         metadataLoadState = .loading
-        metadataTask = Task {
+        metadataTask = Task { [weak self, titleMetadataCoordinator] in
             let resolution = await titleMetadataCoordinator.resolve(item)
-            guard !Task.isCancelled, self.isDisplaying(item) else { return }
+            guard !Task.isCancelled, let self, self.isDisplaying(item) else { return }
             self.metadataLoadState = resolution.metadataLoadState
         }
     }
@@ -243,9 +243,9 @@ public final class PhotoViewerModel {
         placeTask?.cancel()
         titleMetadataCoordinator.prepare(items: items, around: index)
         titleMetadataState = titleMetadataCoordinator.state(for: item.uid)
-        placeTask = Task {
+        placeTask = Task { [weak self, titleMetadataCoordinator] in
             let resolution = await titleMetadataCoordinator.resolve(item)
-            guard !Task.isCancelled, self.isDisplaying(item) else { return }
+            guard !Task.isCancelled, let self, self.isDisplaying(item) else { return }
             self.titleMetadataState = .resolved(resolution)
             if self.showInfo, let metadata = resolution.metadata {
                 self.metadataLoadState = .loaded(metadata)
@@ -571,13 +571,13 @@ public final class PhotoViewerModel {
 
     private func loadBurstGroupIfNeeded(for item: PhotoItem) {
         guard let burstProvider, burstSelection.beginLoadingIfCandidate(item) else { return }
-        burstTask = Task { [burstProvider] in
+        burstTask = Task { [weak self, burstProvider] in
             do {
                 let group = try await burstProvider.burstGroup(containing: item.uid)
-                guard !Task.isCancelled, self.isBaseCurrent(item) else { return }
+                guard !Task.isCancelled, let self, self.isBaseCurrent(item) else { return }
                 self.burstSelection.applyLoadedGroup(group, containing: item)
             } catch {
-                guard !Task.isCancelled, self.isBaseCurrent(item) else { return }
+                guard !Task.isCancelled, let self, self.isBaseCurrent(item) else { return }
                 self.burstSelection.failLoading()
             }
         }
