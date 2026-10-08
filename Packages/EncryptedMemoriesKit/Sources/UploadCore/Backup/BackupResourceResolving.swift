@@ -190,6 +190,9 @@ public struct BackupResolvedResource: BackupResourceMaterializing {
     }
 }
 
+/// Rechecks the runner's admission immediately before a source read starts network access.
+public typealias BackupResourceReadAdmission = @Sendable () throws -> Void
+
 /// Platform seam: turn a persisted queue entry back into a readable local resource.
 /// Contract: return `nil` when the source is verifiably gone, which removes its queue work.
 /// Throw for transient problems so the runner applies its retry policy.
@@ -199,9 +202,23 @@ public protocol BackupResourceResolving: Sendable {
         _ entry: UploadBackupSyncQueueEntry,
         onPreparationProgress: @escaping BackupResourcePreparationHandler
     ) async throws -> BackupResolvedResource?
+    func resolve(
+        _ entry: UploadBackupSyncQueueEntry,
+        onPreparationProgress: @escaping BackupResourcePreparationHandler,
+        readAdmission: @escaping BackupResourceReadAdmission
+    ) async throws -> BackupResolvedResource?
 }
 
 public extension BackupResourceResolving {
+    func resolve(
+        _ entry: UploadBackupSyncQueueEntry,
+        onPreparationProgress: @escaping BackupResourcePreparationHandler,
+        readAdmission: @escaping BackupResourceReadAdmission
+    ) async throws -> BackupResolvedResource? {
+        try readAdmission()
+        return try await resolve(entry, onPreparationProgress: onPreparationProgress)
+    }
+
     func resolve(
         _ entry: UploadBackupSyncQueueEntry,
         onPreparationProgress: @escaping BackupResourcePreparationHandler
@@ -234,6 +251,18 @@ public struct CompositeBackupResourceResolver: BackupResourceResolving {
             throw UploadError.backend("no backup resolver registered for source kind \(entry.source.kind.rawValue)")
         }
         return try await resolver.resolve(entry, onPreparationProgress: onPreparationProgress)
+    }
+
+    public func resolve(
+        _ entry: UploadBackupSyncQueueEntry,
+        onPreparationProgress: @escaping BackupResourcePreparationHandler,
+        readAdmission: @escaping BackupResourceReadAdmission
+    ) async throws -> BackupResolvedResource? {
+        guard let resolver = resolvers[entry.source.kind] else {
+            throw UploadError.backend("no backup resolver registered for source kind \(entry.source.kind.rawValue)")
+        }
+        return try await resolver.resolve(
+            entry, onPreparationProgress: onPreparationProgress, readAdmission: readAdmission)
     }
 }
 

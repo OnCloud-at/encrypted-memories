@@ -3,6 +3,7 @@ import SQLite3
 import XCTest
 
 @testable import PhotoLibraryBackupAdapter
+@testable import PhotosCore
 @testable import UploadCore
 
 final class MissingSourceReconciliationTests: XCTestCase {
@@ -867,6 +868,354 @@ final class MissingSourceReconciliationTests: XCTestCase {
         XCTAssertEqual(queue.missingSourceDiscardGeneration(), 0)
     }
 
+    func testManualEligibilityPreservesADismissedSourceRechecksReadinessAndBackoff() async throws {
+        let offered = try candidate("manual-recheck")
+        let clock = BackupTestClock()
+        let due = clock.now.addingTimeInterval(900)
+        var pending = row(offered)
+        pending.updatedAt = due
+        pending.lastError =
+            BackupIssueRecord(
+                kind: .sourceMissing, detail: "acknowledged missing", nextAttemptAt: due, automaticRetryAttempt: 12
+            ).persistedValue
+        XCTAssertTrue(queue.upsert(pending))
+        for _ in 0..<3 {
+            XCTAssertEqual(queue.makeRetryableWorkEligible(updatedAt: clock.now), 0)
+            let defaults = SpyQueueStore(inner: queue, log: BackupEventLog())
+            XCTAssertEqual(defaults.makeRetryableWorkEligible(updatedAt: clock.now), 0)
+            XCTAssertEqual(queue.entry(for: pending.source, revision: pending.revision), pending)
+        }
+        closeStores()
+        try openStores()
+        XCTAssertEqual(queue.entry(for: pending.source, revision: pending.revision), pending)
+        let premature = AvailabilityResolver(candidate: offered)
+        _ = await availabilityRunner(clock: clock, resolver: premature).runUntilDrained(mode: .eligibleOnly)
+        XCTAssertEqual(premature.calls, 0)
+        XCTAssertEqual(queue.entry(for: pending.source, revision: pending.revision), pending)
+        try await assertDeferredDismissalPresentation(clock: clock, due: due)
+    }
+
+    func testManualEligibilityStillRedatesOrdinaryUploadRetriesAndKeepsTheirReasons() throws {
+        let clock = BackupTestClock()
+        var expected: [UploadBackupSyncQueueEntry] = []
+        for (index, state) in [
+            UploadBackupSyncQueueState.discovered, .queuedForUpload, .failed, .blockedByDraft,
+        ].enumerated() {
+            let offered = try candidate("manual-ordinary-\(index)")
+            var entry = row(offered, state: state)
+            entry.updatedAt = clock.now.addingTimeInterval(900)
+            entry.attempts = 7
+            entry.lastError =
+                BackupIssueRecord(
+                    kind: .network, detail: "temporary upload error", nextAttemptAt: entry.updatedAt,
+                    automaticRetryAttempt: 12
+                ).persistedValue
+            XCTAssertTrue(queue.upsert(entry))
+            entry.updatedAt = clock.now
+            if state == .failed { entry.attempts = 0 }
+            if state == .failed || state == .blockedByDraft { entry.state = .discovered }
+            expected.append(entry)
+        }
+        XCTAssertEqual(queue.makeRetryableWorkEligible(updatedAt: clock.now), expected.count)
+        for entry in expected {
+            XCTAssertEqual(queue.entry(for: entry.source, revision: entry.revision), entry)
+        }
+        let defaults = SpyQueueStore(inner: queue, log: BackupEventLog())
+        clock.advance(by: 2)
+        XCTAssertEqual(defaults.makeRetryableWorkEligible(updatedAt: clock.now), expected.count)
+        for var entry in expected {
+            entry.updatedAt = clock.now
+            XCTAssertEqual(queue.entry(for: entry.source, revision: entry.revision), entry)
+        }
+        let claimed = queue.claimRunnable(limit: expected.count, claimedAt: clock.now)
+        XCTAssertEqual(Set(claimed.map(\.source)), Set(expected.map(\.source)))
+        XCTAssertEqual(claimed.count, expected.count)
+    }
+
+    func testNewerSuccessfulRevisionRetiresAnOlderSourceRecheckBeforeItsLateResult() async throws {
+        let old = try candidate("superseded-recheck")
+        let clock = BackupTestClock()
+        try dismiss(old, issue: .init(kind: .sourceMissing, detail: "acknowledged missing"))
+        try await engine(clock: clock).enqueueChangedMissingSources([old])
+        let started = UploadTestBarrier(participantCount: 2)
+        let release = UploadTestBarrier(participantCount: 2)
+        let oldAvailability = AvailabilityResolver(candidate: old)
+        let held = HeldAvailabilityResolver(inner: oldAvailability, started: started, release: release)
+        let queue = try XCTUnwrap(self.queue)
+        let oldUploader = MockUploader(workDuration: .milliseconds(1), deliverProgress: false)
+        let oldRunner = availabilityRunner(
+            clock: clock, resolver: held, uploader: oldUploader,
+            resourceCoordinator: .init(runtimeState: LibraryRuntimeState()))
+        let oldRun = Task { await oldRunner.runUntilDrained(mode: .eligibleOnly) }
+        await started.arriveAndWait()
+        XCTAssertEqual(queue.entry(for: old.snapshot.source, revision: old.snapshot.revision)?.state, .checking)
+        let newer = UploadBackupAssetCandidate(
+            snapshot: .init(
+                source: old.snapshot.source,
+                revision: .init(rawValue: old.snapshot.revision.rawValue + 1),
+                editRevision: old.snapshot.editRevision, resourceCount: 1),
+            originalFilename: old.originalFilename)
+        var next = row(newer)
+        next.updatedAt = clock.now
+        XCTAssertTrue(queue.upsert(next))
+        let returned = AvailabilityResolver(candidate: newer)
+        let completed = await availabilityRunner(
+            clock: clock, resolver: returned, resourceCoordinator: .init(runtimeState: LibraryRuntimeState())
+        ).runUntilDrained(mode: .eligibleOnly)
+        XCTAssertEqual(completed.uploaded, 1)
+        XCTAssertEqual(queue.entry(for: next.source, revision: next.revision)?.state, .completed)
+        XCTAssertNil(queue.entry(for: old.snapshot.source, revision: old.snapshot.revision))
+        XCTAssertEqual(queue.summary().pendingSourceRechecks, 0)
+        await release.arriveAndWait()
+        let late = await oldRun.value
+        XCTAssertEqual(oldUploader.uploaded.count, 0)
+        XCTAssertEqual(late.uploaded, 1, "Progress includes the newer successful row in the shared queue")
+        XCTAssertEqual(oldAvailability.calls, 1)
+        XCTAssertEqual(oldAvailability.cleanups, 1)
+        XCTAssertNil(queue.entry(for: old.snapshot.source, revision: old.snapshot.revision))
+        XCTAssertEqual(queue.count(), 1)
+        XCTAssertEqual(queue.summary().dismissedFailures, 0)
+        XCTAssertEqual(queue.summary().pendingSourceRechecks, 0)
+        XCTAssertEqual(queue.missingSourceDiscardGeneration(), 0)
+    }
+
+    func testSuccessfulCleanupProtectsUploadsOtherSourcesResourcesFutureRevisionsAndReceipts() throws {
+        let offered = try candidate("cleanup-boundary")
+        let clock = BackupTestClock()
+        let keptRevision = UploadBackupRevision(rawValue: offered.snapshot.revision.rawValue + 1)
+        var success = row(offered, state: .completed)
+        success.revision = keptRevision
+        XCTAssertTrue(queue.upsert(success))
+        let reason = BackupIssueRecord(kind: .sourceMissing, detail: "acknowledged missing").persistedValue
+        var obsolete = row(offered)
+        obsolete.lastError = reason
+        XCTAssertTrue(queue.upsert(obsolete))
+        var protected: [UploadBackupSyncQueueEntry] = []
+        for (offset, state) in [UploadBackupSyncQueueState.discovered, .checking, .queuedForUpload].enumerated() {
+            var pending = row(offered, state: state)
+            pending.revision = .init(rawValue: offered.snapshot.revision.rawValue - Int64(offset) - 1)
+            pending.updatedAt = clock.now.addingTimeInterval(900)
+            pending.lastError = BackupIssueRecord(kind: .network, detail: "pending upload retry").persistedValue
+            protected.append(pending)
+        }
+        var future = obsolete
+        future.revision = .init(rawValue: keptRevision.rawValue + 1)
+        protected.append(future)
+        var secondary = obsolete
+        secondary.source = .init(
+            kind: offered.snapshot.source.kind, identifier: offered.snapshot.source.identifier,
+            resource: .livePairedVideo)
+        protected.append(secondary)
+        let other = try candidate("other-cleanup-source")
+        var otherMarker = row(other)
+        otherMarker.lastError = reason
+        protected.append(otherMarker)
+        var foreignKind = obsolete
+        foreignKind.source = .init(kind: .fileURL, identifier: offered.snapshot.source.identifier)
+        foreignKind.state = .failedPermanent
+        protected.append(foreignKind)
+        var receipt = obsolete
+        receipt.revision = .init(rawValue: offered.snapshot.revision.rawValue - 10)
+        receipt.remoteCommitReconciliation = UploadRemoteCommitReconciliation(
+            source: receipt.source,
+            identity: UploadIdentity(
+                correctedName: receipt.originalFilename, nameHash: "fixture-name-hash",
+                sha1Hex: String(repeating: "ab", count: 20), sha1Digest: Data(repeating: 0xAB, count: 20),
+                contentHash: "fixture-content-hash"),
+            receipt: UploadRemoteCommitReceipt(remoteVolumeID: "fixture-volume", remoteLinkID: "fixture-link"))
+        protected.append(receipt)
+        var terminalReceipt = receipt
+        terminalReceipt.revision = .init(rawValue: receipt.revision.rawValue - 1)
+        terminalReceipt.state = .dismissedFailure
+        protected.append(terminalReceipt)
+        XCTAssertTrue(queue.upsertBatch(protected))
+        XCTAssertTrue(
+            queue.removeUnsavedEarlierRevisions(
+                of: offered.snapshot.source, through: keptRevision, except: keptRevision))
+        XCTAssertNil(queue.entry(for: obsolete.source, revision: obsolete.revision))
+        XCTAssertEqual(queue.entry(for: success.source, revision: success.revision), success)
+        for entry in protected {
+            XCTAssertEqual(queue.entry(for: entry.source, revision: entry.revision), entry)
+        }
+        XCTAssertEqual(queue.count(), protected.count + 1)
+        XCTAssertEqual(queue.missingSourceDiscardGeneration(), 0)
+    }
+
+    private struct HeldAvailabilityResolver: BackupResourceResolving {
+        let inner: AvailabilityResolver
+        let started: UploadTestBarrier
+        let release: UploadTestBarrier
+
+        func resolve(_ entry: UploadBackupSyncQueueEntry) async throws -> BackupResolvedResource? {
+            await started.arriveAndWait()
+            await release.arriveAndWait()
+            return try await inner.resolve(entry)
+        }
+    }
+
+    func testSourceRecheckNetworkFallbackRechecksAdmissionAfterItsLocalReadFails() async throws {
+        try await verifySourceRecheckNetworkFallback(permissionCloses: true, composite: false)
+    }
+
+    func testCompositeSourceRecheckRetainsAdmissionAtTheNetworkFallback() async throws {
+        try await verifySourceRecheckNetworkFallback(permissionCloses: true, composite: true)
+    }
+
+    func testSourceRecheckNetworkFallbackStillReadsWithPermission() async throws {
+        try await verifySourceRecheckNetworkFallback(permissionCloses: false, composite: false)
+    }
+
+    private func verifySourceRecheckNetworkFallback(permissionCloses: Bool, composite: Bool) async throws {
+        let offered = try candidate("gated-network-recheck")
+        let clock = BackupTestClock()
+        let queue = try XCTUnwrap(self.queue)
+        try dismiss(offered, issue: .init(kind: .sourceMissing, detail: "acknowledged missing"))
+        try await engine(clock: clock).enqueueChangedMissingSources([offered])
+        let locallyRead = UploadTestBarrier(participantCount: 2)
+        let allowFallback = UploadTestBarrier(participantCount: 2)
+        let fallback = NetworkFallbackAvailabilityResolver(
+            inner: AvailabilityResolver(candidate: offered), locallyRead: locallyRead, allowFallback: allowFallback)
+        let resolver: any BackupResourceResolving =
+            composite
+            ? CompositeBackupResourceResolver([.photoLibraryAsset: fallback]) : fallback
+        let network = BackupNetworkBox(.unconstrained)
+        let runner = availabilityRunner(clock: clock, resolver: resolver, network: network)
+        let run = Task { await runner.runUntilDrained(mode: .eligibleOnly) }
+        await locallyRead.arriveAndWait()
+        XCTAssertEqual(fallback.requests, [false])
+        XCTAssertEqual(queue.entry(for: offered.snapshot.source, revision: offered.snapshot.revision)?.state, .checking)
+        if permissionCloses { network.set(.init(isNetworkExpensive: true, usesMobileData: false)) }
+        await allowFallback.arriveAndWait()
+        let progress = await run.value
+        XCTAssertEqual(fallback.requests, permissionCloses ? [false] : [false, true])
+        XCTAssertEqual(progress.uploaded, permissionCloses ? 0 : 1)
+        XCTAssertEqual(progress.needsAttention, 0)
+        if permissionCloses {
+            let pending = try XCTUnwrap(queue.entry(for: offered.snapshot.source, revision: offered.snapshot.revision))
+            XCTAssertEqual(pending.state, .discovered)
+            XCTAssertEqual(BackupIssueRecord.decode(pending.lastError)?.kind, .sourceMissing)
+            XCTAssertEqual(BackupIssueRecord.decode(pending.lastError)?.automaticRetryAttempt, 0)
+            XCTAssertEqual(progress.dismissedFailures, 1)
+        } else {
+            XCTAssertEqual(
+                queue.entry(for: offered.snapshot.source, revision: offered.snapshot.revision)?.state, .completed)
+            XCTAssertEqual(progress.dismissedFailures, 0)
+        }
+        XCTAssertEqual(queue.missingSourceDiscardGeneration(), 0)
+    }
+
+    private final class NetworkFallbackAvailabilityResolver: BackupResourceResolving, @unchecked Sendable {
+        let inner: AvailabilityResolver
+        let locallyRead: UploadTestBarrier
+        let allowFallback: UploadTestBarrier
+        private let lock = NSLock()
+        private var flags: [Bool] = []
+        var requests: [Bool] { lock.withLock { flags } }
+
+        init(inner: AvailabilityResolver, locallyRead: UploadTestBarrier, allowFallback: UploadTestBarrier) {
+            self.inner = inner
+            self.locallyRead = locallyRead
+            self.allowFallback = allowFallback
+        }
+
+        func resolve(_ entry: UploadBackupSyncQueueEntry) async throws -> BackupResolvedResource? {
+            try await resolve(entry, onPreparationProgress: { _ in }, readAdmission: {})
+        }
+
+        func resolve(
+            _ entry: UploadBackupSyncQueueEntry, onPreparationProgress: @escaping BackupResourcePreparationHandler,
+            readAdmission: @escaping @Sendable () throws -> Void
+        ) async throws -> BackupResolvedResource? {
+            let local = PhotoKitResourceRequestLivenessGuard<Int>(
+                automaticallyStartsWatchdog: false, cancelRequest: { _ in })
+            do {
+                try await local.waitForCompletion {
+                    self.lock.withLock { self.flags.append(false) }
+                    local.complete(error: UploadError.sourceUnavailable("network access required"))
+                    return 1
+                }
+                XCTFail("The local request must require the network fallback")
+            } catch let error as UploadError {
+                XCTAssertEqual(error, .sourceUnavailable("network access required"))
+            }
+            await locallyRead.arriveAndWait()
+            await allowFallback.arriveAndWait()
+            let network = PhotoKitResourceRequestLivenessGuard<Int>(
+                automaticallyStartsWatchdog: false, requestAdmission: readAdmission, cancelRequest: { _ in })
+            try await network.waitForCompletion {
+                self.lock.withLock { self.flags.append(true) }
+                network.complete(error: nil)
+                return 2
+            }
+            return try await inner.resolve(entry)
+        }
+    }
+
+    func testDismissedSourceRecheckReadinessLaterThanBackoffPreventsAnEarlyReadAcrossRelaunch() async throws {
+        try await verifyDismissedSourceReadiness(previousAttempt: 0, readinessWait: 600)
+    }
+
+    func testDismissedSourceRecheckReadinessEarlierThanBackoffPreservesTheBackoffAcrossRelaunch() async throws {
+        try await verifyDismissedSourceReadiness(previousAttempt: 10, readinessWait: 30)
+    }
+
+    private func verifyDismissedSourceReadiness(previousAttempt: Int, readinessWait: TimeInterval) async throws {
+        let offered = try candidate("readiness-recheck")
+        let clock = BackupTestClock()
+        let retry = BackupRetryPolicy()
+        let acknowledged = BackupIssueRecord(
+            kind: .sourceMissing, detail: "acknowledged missing", automaticRetryAttempt: previousAttempt)
+        try dismiss(offered, issue: acknowledged)
+        try await engine(clock: clock).enqueueChangedMissingSources([offered])
+        let readyAt = clock.now.addingTimeInterval(readinessWait)
+        let due = max(readyAt, clock.now.addingTimeInterval(retry.delay(afterAttempts: previousAttempt + 1)))
+        let processing = AvailabilityResolver(
+            candidate: offered, failure: UploadError.sourceNotReady("Photos still processing", until: readyAt))
+        let progress = await availabilityRunner(clock: clock, resolver: processing).runUntilDrained(mode: .eligibleOnly)
+        XCTAssertEqual(processing.calls, 1)
+        XCTAssertEqual(progress.needsAttention, 0)
+        XCTAssertEqual(progress.dismissedFailures, 1)
+        let pending = try XCTUnwrap(queue.entry(for: offered.snapshot.source, revision: offered.snapshot.revision))
+        let savedReason = try XCTUnwrap(BackupIssueRecord.decode(pending.lastError))
+        XCTAssertEqual(pending.state, .discovered)
+        XCTAssertEqual(pending.updatedAt, due)
+        XCTAssertEqual(savedReason.nextAttemptAt, due)
+        XCTAssertEqual(savedReason.automaticRetryAttempt, previousAttempt + 1)
+        XCTAssertEqual(savedReason.kind, acknowledged.kind)
+        XCTAssertEqual(savedReason.detail, acknowledged.detail)
+        try await assertDeferredDismissalPresentation(clock: clock, due: due)
+        let metadata = UploadBackupAssetCandidate(
+            snapshot: offered.snapshot, originalFilename: "changed-readiness.jpg", byteCount: 300)
+        _ = try await engine(clock: clock).enqueueBatch([metadata])
+        try await engine(clock: clock).enqueueChangedMissingSources([offered])
+        XCTAssertEqual(queue.entry(for: pending.source, revision: pending.revision), pending)
+        closeStores()
+        try openStores()
+        _ = try await engine(clock: clock).enqueueBatch([metadata])
+        try await engine(clock: clock).enqueueChangedMissingSources([offered])
+        XCTAssertEqual(queue.entry(for: pending.source, revision: pending.revision), pending)
+        try await assertDeferredDismissalPresentation(clock: clock, due: due)
+        clock.advance(by: due.timeIntervalSince(clock.now) - 0.25)
+        let premature = AvailabilityResolver(candidate: offered)
+        _ = await availabilityRunner(clock: clock, resolver: premature).runUntilDrained(mode: .eligibleOnly)
+        XCTAssertEqual(premature.calls, 0, "Neither Photos readiness nor persisted backoff permits an earlier read")
+        XCTAssertEqual(queue.entry(for: pending.source, revision: pending.revision), pending)
+        clock.advance(by: 0.25)
+        let returned = AvailabilityResolver(candidate: offered)
+        let completed = await availabilityRunner(clock: clock, resolver: returned).runUntilDrained(mode: .eligibleOnly)
+        XCTAssertEqual(returned.calls, 1)
+        XCTAssertEqual(returned.cleanups, 1)
+        XCTAssertEqual(completed.uploaded, 1)
+        XCTAssertEqual(completed.needsAttention, 0)
+        XCTAssertEqual(completed.dismissedFailures, 0)
+        XCTAssertEqual(queue.summary().pendingSourceRechecks, 0)
+        XCTAssertEqual(queue.count(), 1)
+        XCTAssertEqual(queue.missingSourceDiscardGeneration(), 0)
+        let settled = try XCTUnwrap(queue.entry(for: pending.source, revision: pending.revision))
+        XCTAssertEqual(settled.state, .completed)
+        XCTAssertNil(settled.lastError)
+    }
+
     func testDismissedSourceRecheckBackoffGrowsAcrossPhotosWaitsAndRelaunchWithoutChangingPresentation() async throws {
         let offered = try candidate("backed-off-recheck")
         let clock = BackupTestClock()
@@ -883,7 +1232,8 @@ final class MissingSourceReconciliationTests: XCTestCase {
                 : UploadError.sourceUnavailable("iCloud read interrupted")
             let availability = AvailabilityResolver(candidate: offered, failure: failure)
             let failedAt = clock.now
-            let due = failedAt.addingTimeInterval(retry.delay(afterAttempts: attempt))
+            let backoffDue = failedAt.addingTimeInterval(retry.delay(afterAttempts: attempt))
+            let due = attempt.isMultiple(of: 2) ? max(backoffDue, failedAt.addingTimeInterval(600)) : backoffDue
             let progress = await availabilityRunner(clock: clock, resolver: availability).runUntilDrained(
                 mode: .eligibleOnly)
             XCTAssertEqual(availability.calls, 1)
@@ -911,7 +1261,7 @@ final class MissingSourceReconciliationTests: XCTestCase {
                 XCTAssertEqual(queue.entry(for: pending.source, revision: pending.revision), pending)
                 try await assertDeferredDismissalPresentation(clock: clock, due: due)
             }
-            clock.advance(by: retry.delay(afterAttempts: attempt) - 0.25)
+            clock.advance(by: due.timeIntervalSince(clock.now) - 0.25)
             let premature = AvailabilityResolver(candidate: offered)
             _ = await availabilityRunner(clock: clock, resolver: premature).runUntilDrained(mode: .eligibleOnly)
             XCTAssertEqual(premature.calls, 0, "No Photos read may run before the persisted due date")
@@ -1016,14 +1366,17 @@ final class MissingSourceReconciliationTests: XCTestCase {
     private func availabilityRunner(
         clock: BackupTestClock, resolver: any BackupResourceResolving,
         network: BackupNetworkBox = BackupNetworkBox(.unconstrained),
-        identityResolver: (any UploadIdentityResolving)? = nil
+        identityResolver: (any UploadIdentityResolving)? = nil,
+        uploader: MockUploader = MockUploader(workDuration: .milliseconds(1), deliverProgress: false),
+        resourceCoordinator: LibraryResourceCoordinator = .shared
     ) -> BackupSyncRunner {
         BackupSyncRunner(
             queue: queue, preflight: UploadBackupPreflightIndex(store: state), resolver: resolver,
             identityResolver: identityResolver
                 ?? UploadDedupePipeline(store: FakeIdentityStore(), hasher: FakeHasher(), checker: FakeChecker()),
-            uploader: MockUploader(workDuration: .milliseconds(1), deliverProgress: false),
-            throttleInputs: { network.current }, clock: clock, now: { clock.now })
+            uploader: uploader,
+            resourceCoordinator: resourceCoordinator, throttleInputs: { network.current }, clock: clock,
+            now: { clock.now })
     }
 
     private func dismiss(_ candidate: UploadBackupAssetCandidate, issue: BackupIssueRecord?) throws {

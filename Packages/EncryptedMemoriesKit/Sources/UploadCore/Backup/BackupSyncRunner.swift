@@ -836,6 +836,12 @@ public actor BackupSyncRunner {
             let resolver = self.resolver
             let policy = configuration.throttle
             let inputs = throttleInputs
+            let readAdmission: BackupResourceReadAdmission = {
+                try Task.checkCancellation()
+                if isSourceRecheck {
+                    guard policy.maxConcurrentItems(for: inputs()) > 0 else { throw CancellationError() }
+                }
+            }
             resolved = try await resourceCoordinator.withHeavyPermit(
                 LibraryWorkRequest(
                     workload: .backupMaterialization,
@@ -843,11 +849,9 @@ public actor BackupSyncRunner {
                     memoryClass: .large
                 )
             ) { _ in
-                if isSourceRecheck {
-                    try Task.checkCancellation()
-                    guard policy.maxConcurrentItems(for: inputs()) > 0 else { throw CancellationError() }
-                }
-                return try await resolver.resolve(resolvingEntry, onPreparationProgress: preparationProgress)
+                try readAdmission()
+                return try await resolver.resolve(
+                    resolvingEntry, onPreparationProgress: preparationProgress, readAdmission: readAdmission)
             }
         } catch is CancellationError {
             if isSourceRecheck {
@@ -871,7 +875,13 @@ public actor BackupSyncRunner {
                     let failedRead =
                         !definitiveMissing && !stopRequested && !Task.isCancelled
                         && configuration.throttle.maxConcurrentItems(for: throttleInputs()) > 0
-                    preserveDismissedSourceRecheck(checkingEntry, failedRead: failedRead)
+                    let readyAt: Date?
+                    if case .sourceNotReady(_, let until) = error as? UploadError {
+                        readyAt = until
+                    } else {
+                        readyAt = nil
+                    }
+                    preserveDismissedSourceRecheck(checkingEntry, failedRead: failedRead, readyAt: readyAt)
                 }
                 return
             }
@@ -2005,7 +2015,13 @@ public actor BackupSyncRunner {
             // to it that ended without a backup is obsolete, and the drifted row below is written fresh.
             let resolvedRevision =
                 resolved.map { max($0.candidate.snapshot.revision, entry.revision) } ?? entry.revision
-            queue.removeUnsavedEarlierRevisions(of: entry.source, through: resolvedRevision, except: entry.revision)
+            guard
+                queue.removeUnsavedEarlierRevisions(
+                    of: entry.source, through: resolvedRevision, except: entry.revision)
+            else {
+                stopRequested = true
+                return
+            }
         }
         adjustProgress(from: oldState, to: terminal)
         if let resolved { closeDriftedRevisionRow(entry, resolved: resolved, as: terminal) }
@@ -2088,7 +2104,9 @@ public actor BackupSyncRunner {
         _ = transitionDismissedSourceRecheck(retained, matching: entry)
     }
 
-    private func preserveDismissedSourceRecheck(_ entry: UploadBackupSyncQueueEntry, failedRead: Bool = false) {
+    private func preserveDismissedSourceRecheck(
+        _ entry: UploadBackupSyncQueueEntry, failedRead: Bool = false, readyAt: Date? = nil
+    ) {
         guard var issue = BackupIssueRecord.decode(entry.lastError) else {
             stopRequested = true
             return
@@ -2100,6 +2118,9 @@ public actor BackupSyncRunner {
             let deferredUntil = now().addingTimeInterval(
                 configuration.retry.delay(afterAttempts: max(1, issue.automaticRetryAttempt)))
             issue.nextAttemptAt = max(issue.nextAttemptAt ?? deferredUntil, deferredUntil)
+        }
+        if let readyAt {
+            issue.nextAttemptAt = max(issue.nextAttemptAt ?? now(), readyAt)
         }
         var pending = entry
         pending.state = .discovered

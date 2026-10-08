@@ -452,6 +452,7 @@ public extension UploadBackupSyncQueueStore {
             .needsRemoteReconciliation,
         ] {
             for entry in entries(in: state, updatedBefore: .distantFuture, limit: .max) {
+                guard !entry.isDismissedSourceRecheck else { continue }
                 let target: UploadBackupSyncQueueState =
                     switch state {
                     case .failed, .blockedByDraft: .discovered
