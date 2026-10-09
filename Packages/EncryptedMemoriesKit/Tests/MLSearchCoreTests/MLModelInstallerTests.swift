@@ -187,6 +187,123 @@ import Testing
         #expect(transport.downloadCount(url) == 1)
     }
 
+    @Test func interruptedRecordWritePromotesVerifiedStagingWithoutDownloading() async throws {
+        let root = try makeRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let layout = MLModelInstallLayout(rootDirectory: root)
+        let payload = Data("verified-staging".utf8)
+        let url = URL(string: "https://example.test/staging.bin")!
+        let testEntry = entry(id: "model-staging", plan: plan(files: [("weights.bin", payload, url)]))
+        let original = try MLInterruptedInstallFixture.write(
+            entry: testEntry, layout: layout, payloads: [url: payload])
+        let staging = layout.stagingDirectory(for: testEntry.id, revision: "rev1")
+        let recordData = try Data(contentsOf: staging.appendingPathComponent("install.json"))
+        let transport = ScriptedTransport(payloads: [:])
+        let installer = MLModelInstaller(layout: layout, transport: transport, availableCapacity: { _ in 0 })
+        #expect(installer.installedRecord(for: testEntry, revision: "rev1") == nil)
+
+        let recovered = try await installer.install(testEntry) { _ in }
+
+        #expect(recovered == original)
+        #expect(installer.installedRecord(for: testEntry, revision: "rev1") == original)
+        #expect(try Data(contentsOf: layout.installRecordURL(for: testEntry.id, revision: "rev1")) == recordData)
+        #expect(!FileManager.default.fileExists(atPath: staging.path))
+        #expect(transport.downloadCount(url) == 0)
+    }
+
+    @Test func currentInstallRecordRecoversAfterDirectoryPromotionWasInterrupted() async throws {
+        let root = try makeRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let layout = MLModelInstallLayout(rootDirectory: root)
+        let payload = Data("current-staging".utf8)
+        let url = URL(string: "https://example.test/current-staging.bin")!
+        let testEntry = entry(id: "model-current", plan: plan(files: [("weights.bin", payload, url)]))
+        let first = MLModelInstaller(layout: layout, transport: ScriptedTransport(payloads: [url: payload]))
+        let original = try await first.install(testEntry) { _ in }
+        let staging = layout.stagingDirectory(for: testEntry.id, revision: "rev1")
+        try FileManager.default.moveItem(
+            at: layout.installDirectory(for: testEntry.id, revision: "rev1"), to: staging)
+        let transport = ScriptedTransport(payloads: [:])
+        let restarted = MLModelInstaller(layout: layout, transport: transport)
+        #expect(restarted.installedRecord(for: testEntry, revision: "rev1") == nil)
+
+        let recovered = try await restarted.install(testEntry) { _ in }
+
+        #expect(recovered == original)
+        #expect(restarted.installedRecord(for: testEntry, revision: "rev1") == original)
+        #expect(!FileManager.default.fileExists(atPath: staging.path))
+        #expect(transport.downloadCount(url) == 0)
+    }
+
+    @Test(arguments: [
+        "missing", "checksum", "record", "record-directory", "record-symlink", "revision", "compatibility", "extra",
+        "symlink",
+    ])
+    func interruptedUnverifiableRecordDiscardsStagingAndDownloadsEveryArtifact(damage: String) async throws {
+        let root = try makeRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let layout = MLModelInstallLayout(rootDirectory: root)
+        let payload = Data("good-weights".utf8)
+        let metadata = Data("metadata".utf8)
+        let url = URL(string: "https://example.test/recover-weights.bin")!
+        let metadataURL = URL(string: "https://example.test/recover-metadata.bin")!
+        let testEntry = entry(
+            id: "model-damaged",
+            plan: plan(files: [("weights.bin", payload, url), ("metadata.bin", metadata, metadataURL)]))
+        let payloads = [url: payload, metadataURL: metadata]
+        _ = try MLInterruptedInstallFixture.write(entry: testEntry, layout: layout, payloads: payloads)
+        let staging = layout.stagingDirectory(for: testEntry.id, revision: "rev1")
+        let weights = staging.appendingPathComponent("Model.mlmodelc/weights.bin")
+        let recordURL = staging.appendingPathComponent("install.json")
+        switch damage {
+        case "missing":
+            try FileManager.default.removeItem(at: weights)
+        case "checksum":
+            try Data(repeating: 0, count: payload.count).write(to: weights)
+        case "record":
+            try Data("{interrupted".utf8).write(to: recordURL)
+        case "record-directory":
+            try FileManager.default.removeItem(at: recordURL)
+            try FileManager.default.createDirectory(at: recordURL, withIntermediateDirectories: false)
+        case "record-symlink":
+            try FileManager.default.removeItem(at: recordURL)
+            try FileManager.default.createSymbolicLink(
+                at: recordURL, withDestinationURL: root.appendingPathComponent("absent-record.json"))
+        case "revision", "compatibility":
+            var json = try #require(JSONSerialization.jsonObject(with: Data(contentsOf: recordURL)) as? [String: Any])
+            if damage == "revision" {
+                json["revision"] = "another-revision"
+            } else {
+                var compatibility = try #require(json["compatibility"] as? [String: Any])
+                compatibility["tokenizerID"] = "another-tokenizer"
+                json["compatibility"] = compatibility
+            }
+            try JSONSerialization.data(withJSONObject: json).write(to: recordURL, options: .atomic)
+        case "extra":
+            try Data("unlisted".utf8).write(to: staging.appendingPathComponent("extra.bin"))
+        case "symlink":
+            let outside = root.appendingPathComponent("outside.bin")
+            try payload.write(to: outside)
+            try FileManager.default.removeItem(at: weights)
+            try FileManager.default.createSymbolicLink(at: weights, withDestinationURL: outside)
+        default:
+            Issue.record("unknown damage")
+        }
+        let transport = ScriptedTransport(payloads: payloads)
+        let installer = MLModelInstaller(layout: layout, transport: transport)
+        #expect(installer.installedRecord(for: testEntry, revision: "rev1") == nil)
+
+        let recovered = try await installer.install(testEntry) { _ in }
+
+        #expect(installer.installedRecord(for: testEntry, revision: "rev1") == recovered)
+        #expect(transport.downloadCount(url) == 1)
+        #expect(transport.downloadCount(metadataURL) == 1, "discard the complete invalid tree, including valid files")
+        #expect(!FileManager.default.fileExists(atPath: staging.path))
+        if damage == "symlink" {
+            #expect(try Data(contentsOf: root.appendingPathComponent("outside.bin")) == payload)
+        }
+    }
+
     @Test func releaseReadinessUsesTrustedDistributionNotOptionalEvidence() {
         let payload = Data("model".utf8)
         let url = URL(string: "https://example.test/model.bin")!

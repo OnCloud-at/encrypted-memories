@@ -14,15 +14,20 @@ import Testing
         private let lock = NSLock()
         private var payloads: [URL: Data]
         private var failuresRemaining: [URL: Int]
+        private let failure: any Error
         private(set) var downloads = 0
         private var blocksNext = false
         private var blocked = false
         private var release: CheckedContinuation<Void, Never>?
         private var cancelledWhileBlocked = false
 
-        init(payloads: [URL: Data], failFirst: [URL: Int] = [:]) {
+        init(
+            payloads: [URL: Data], failFirst: [URL: Int] = [:],
+            failure: any Error = URLError(.networkConnectionLost)
+        ) {
             self.payloads = payloads
             self.failuresRemaining = failFirst
+            self.failure = failure
         }
 
         func download(
@@ -62,7 +67,7 @@ import Testing
                 downloads += 1
                 if let remaining = failuresRemaining[url], remaining > 0 {
                     failuresRemaining[url] = remaining - 1
-                    throw URLError(.networkConnectionLost)
+                    throw failure
                 }
                 guard let data = payloads[url] else { throw URLError(.fileDoesNotExist) }
                 return data
@@ -1418,6 +1423,85 @@ import Testing
         #expect(ready.hasActivatedModel)
         #expect(try harness.stateStore.load()?.selectedModelID == largeEntry.id)
         #expect(!FileManager.default.fileExists(atPath: harness.layout.modelDirectory(for: smallEntry.id).path))
+    }
+
+    @Test(arguments: [false, true])
+    func interruptedInstallRecoversAtColdStartWithoutReset(incomplete: Bool) async throws {
+        let payload = Data("cold-start-staging".utf8)
+        let (entry, url) = downloadableEntry(id: "cold-staging", payload: payload)
+        let harness = try makeHarness(
+            catalog: MLModelCatalog(entries: [entry]), payloads: [url: payload], assets: [uid("asset")])
+        defer { try? FileManager.default.removeItem(at: harness.layout.rootDirectory) }
+        _ = try MLInterruptedInstallFixture.write(entry: entry, layout: harness.layout, payloads: [url: payload])
+        let staging = harness.layout.stagingDirectory(for: entry.id, revision: "rev1")
+        if incomplete {
+            try payload.prefix(3).write(to: staging.appendingPathComponent("Model.mlmodelc/weights.bin"))
+        }
+        try harness.stateStore.save(MLSmartSearchPersistentState(isEnabled: true, selectedModelID: entry.id))
+        #expect(harness.provider.attemptCount == 0)
+
+        await harness.lifecycle.start()
+
+        let snapshot = await harness.lifecycle.currentSnapshot()
+        #expect(snapshot.isEnabled)
+        #expect(snapshot.selectedModelID == entry.id)
+        #expect(snapshot.hasActivatedModel)
+        guard snapshot.hasActivatedModel else {
+            await harness.lifecycle.shutdown()
+            return
+        }
+        #expect(!MLSmartSearchModelPresentation(snapshot: snapshot).canRetry)
+        #expect(harness.provider.builtCount == 1)
+        #expect(harness.transport.downloadCount == (incomplete ? 1 : 0))
+        #expect(!FileManager.default.fileExists(atPath: staging.path))
+        #expect(await waitForCompleteIndex(harness, total: 1))
+        #expect(!(try await harness.lifecycle.search("anything", limit: 3)).isEmpty)
+        await harness.lifecycle.shutdown()
+    }
+
+    @Test(arguments: [false, true])
+    func interruptedInstallRecoversOnRetryWithoutReset(incomplete: Bool) async throws {
+        let payload = Data("retry-staging".utf8)
+        let (entry, url) = downloadableEntry(id: "retry-staging", payload: payload)
+        let harness = try makeHarness(
+            catalog: MLModelCatalog(entries: [entry]), payloads: [url: payload], assets: [uid("asset")],
+            transportOverride: ScriptedTransport(
+                payloads: [url: payload], failFirst: [url: 1], failure: MLModelInstallError.installRecordUnreadable))
+        defer { try? FileManager.default.removeItem(at: harness.layout.rootDirectory) }
+        await harness.lifecycle.start()
+        await harness.lifecycle.enable(with: entry.id)
+        let failed = await harness.lifecycle.currentSnapshot()
+        guard case .failed(let failure) = failed.phase else {
+            Issue.record("the first transfer must fail")
+            await harness.lifecycle.shutdown()
+            return
+        }
+        #expect(failure.kind == .installation)
+        #expect(failure.isRetryable)
+        #expect(MLSmartSearchModelPresentation(snapshot: failed).canRetry)
+        #expect(harness.provider.attemptCount == 0, "an incomplete installation never reaches the runtime")
+        _ = try MLInterruptedInstallFixture.write(entry: entry, layout: harness.layout, payloads: [url: payload])
+        let staging = harness.layout.stagingDirectory(for: entry.id, revision: "rev1")
+        if incomplete {
+            try payload.prefix(3).write(to: staging.appendingPathComponent("Model.mlmodelc/weights.bin"))
+        }
+
+        await harness.lifecycle.retry()
+
+        let snapshot = await harness.lifecycle.currentSnapshot()
+        #expect(snapshot.isEnabled)
+        #expect(snapshot.hasActivatedModel)
+        guard snapshot.hasActivatedModel else {
+            await harness.lifecycle.shutdown()
+            return
+        }
+        #expect(!MLSmartSearchModelPresentation(snapshot: snapshot).canRetry)
+        #expect(harness.provider.builtCount == 1)
+        #expect(harness.transport.downloadCount == (incomplete ? 2 : 1))
+        #expect(!FileManager.default.fileExists(atPath: staging.path))
+        #expect(await waitForCompleteIndex(harness, total: 1))
+        #expect(!(try await harness.lifecycle.search("anything", limit: 3)).isEmpty)
+        await harness.lifecycle.shutdown()
     }
 
     @Test func aModelChosenDuringTheFirstDownloadSurvivesAFailedDownloadAndARelaunch() async throws {
