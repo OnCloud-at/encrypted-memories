@@ -880,18 +880,18 @@ final class TimelineMetadataStoreTests: XCTestCase {
                 publishRevision: false
             ).changedRows, 1)
         XCTAssertEqual(store.mediaTypeEvidenceRevision(), 1)
-        XCTAssertEqual(store.mediaTypeEvidence(volumeID: "vol1")["fresh-upload"], "video/quicktime")
+        XCTAssertEqual(try XCTUnwrap(store.mediaTypeEvidence(volumeID: "vol1"))["fresh-upload"], "video/quicktime")
         XCTAssertEqual(store.unmaterializedMediaTypeEvidenceNodeIDs(volumeID: "vol1"), ["fresh-upload"])
 
         XCTAssertTrue(store.pruneUnmaterializedMediaTypeEvidence(volumeID: "vol1"))
         XCTAssertTrue(store.unmaterializedMediaTypeEvidenceNodeIDs(volumeID: "vol1").isEmpty)
-        XCTAssertNil(store.mediaTypeEvidence(volumeID: "vol1")["fresh-upload"])
-        XCTAssertEqual(store.mediaTypeEvidence(volumeID: "vol1")["missed-video"], "video/quicktime")
+        XCTAssertNil(try XCTUnwrap(store.mediaTypeEvidence(volumeID: "vol1"))["fresh-upload"])
+        XCTAssertEqual(try XCTUnwrap(store.mediaTypeEvidence(volumeID: "vol1"))["missed-video"], "video/quicktime")
 
         store.close()
         let reopened = try XCTUnwrap(TimelineMetadataStore(url: url))
         XCTAssertEqual(reopened.mediaTypeEvidenceRevision(), 1)
-        XCTAssertEqual(reopened.mediaTypeEvidence(volumeID: "vol1")["missed-video"], "video/quicktime")
+        XCTAssertEqual(try XCTUnwrap(reopened.mediaTypeEvidence(volumeID: "vol1"))["missed-video"], "video/quicktime")
         XCTAssertTrue(reopened.load().first(where: { $0.uid == missedVideo.uid })?.isVideo == true)
         reopened.close()
     }

@@ -28,7 +28,9 @@ public final class TimelineMetadataPageReader {
         // A queued inventory can predate checkpoints committed by the preceding pass.
         if let timelineStore {
             let volumeID = inventory.libraryID ?? inventory.items.first?.uid.volumeID ?? ""
-            classifiedNodeIDs = Set(timelineStore.mediaTypeEvidence(volumeID: volumeID).keys)
+            if let evidence = timelineStore.mediaTypeEvidence(volumeID: volumeID) {
+                classifiedNodeIDs.formUnion(evidence.keys)
+            }
         }
         let initialRebuildRevision = orderStore?.rebuildRevision ?? 0
         useOrderCache =

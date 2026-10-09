@@ -744,8 +744,10 @@ public final class TimelineMetadataStore {
     /// One-pass read of every MIME type resolved from Drive link metadata for `volumeID`. Timeline
     /// listings expose tags but can omit/misclassify videos; this table is the durable, local
     /// authority used to overlay those lossy listing rows on every subsequent refresh.
-    public func mediaTypeEvidence(volumeID: String) -> [String: String] {
+    /// Returns nil for a failed or incomplete read; an empty dictionary is a complete empty read.
+    public func mediaTypeEvidence(volumeID: String) -> [String: String]? {
         var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
         guard
             sqlite3_prepare_v2(
                 db,
@@ -754,15 +756,24 @@ public final class TimelineMetadataStore {
                 &stmt,
                 nil
             ) == SQLITE_OK
-        else { return [:] }
-        defer { sqlite3_finalize(stmt) }
-        sqlite3_bind_text(stmt, 1, volumeID, -1, transient)
+        else { return nil }
+        guard sqlite3_bind_text(stmt, 1, volumeID, -1, transient) == SQLITE_OK else { return nil }
         var result: [String: String] = [:]
-        while sqlite3_step(stmt) == SQLITE_ROW {
-            guard let node = sqlite3_column_text(stmt, 0), let mime = sqlite3_column_text(stmt, 1) else { continue }
+        var step = sqlite3_step(stmt)
+        while step == SQLITE_ROW {
+            guard let node = sqlite3_column_text(stmt, 0), let mime = sqlite3_column_text(stmt, 1) else { return nil }
             result[String(cString: node)] = String(cString: mime)
+            step = sqlite3_step(stmt)
         }
+        guard step == SQLITE_DONE else { return nil }
         return result
+    }
+
+    /// Keeps cached photo types usable for display after a failed read, without authorizing new MIME requests.
+    public func mediaTypeEvidenceForDisplay(volumeID: String) -> (types: [String: String], canRefine: Bool) {
+        if let evidence = mediaTypeEvidence(volumeID: volumeID) { return (evidence, true) }
+        let cached = load().lazy.filter { $0.uid.volumeID == volumeID }
+        return (Dictionary(uniqueKeysWithValues: cached.map { ($0.uid.nodeID, $0.mediaType) }), false)
     }
 
     /// Upload completion records MIME evidence before the new node can appear in a timeline row.
