@@ -918,57 +918,68 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
         }
     }
 
-    /// Returns the number of removed rows, or nil when the store failed.
+    private struct ObsoleteRevisionScope {
+        let source: UploadSourceIdentity
+        let through: UploadBackupRevision
+        let kept: UploadBackupRevision
+    }
+
+    /// Returns changed sources only after the whole cleanup batch commits, or nil on failure.
     private func removeUnsavedEarlierRevisionsUnobserved(
-        of source: UploadSourceIdentity, through revision: UploadBackupRevision, except kept: UploadBackupRevision
-    ) -> Int? {
-        lock.withLock {
-            let removed =
-                SQLiteStoreSchemaGate.withDurableCommits(db) { () -> Int? in
+        _ scopes: [ObsoleteRevisionScope]
+    ) -> Set<UploadSourceIdentity>? {
+        guard !scopes.isEmpty else { return [] }
+        return lock.withLock {
+            let changed =
+                SQLiteStoreSchemaGate.withDurableCommits(db) { () -> Set<UploadSourceIdentity>? in
                     guard requireOperational(sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK) else {
                         return nil
                     }
                     var committed = false
                     defer { if !committed { sqlite3_exec(db, "ROLLBACK;", nil, nil, nil) } }
-                    let scope = """
-                        source_kind=? AND source_id=? AND resource=? AND revision_us<=? AND revision_us<>?
-                        AND remote_commit_reconciliation IS NULL
-                        """
-                    let bindScope: (OpaquePointer?) -> Void = { stmt in
-                        self.bindText(stmt, 1, source.kind.rawValue)
-                        self.bindText(stmt, 2, source.identifier)
-                        self.bindText(stmt, 3, source.resource.rawValue)
-                        sqlite3_bind_int64(stmt, 4, revision.rawValue)
-                        sqlite3_bind_int64(stmt, 5, kept.rawValue)
+                    var changed: Set<UploadSourceIdentity> = []
+                    for cleanup in scopes {
+                        let scope = """
+                            source_kind=? AND source_id=? AND resource=? AND revision_us<=? AND revision_us<>?
+                            AND remote_commit_reconciliation IS NULL
+                            """
+                        let bindScope: (OpaquePointer?) -> Void = { stmt in
+                            self.bindText(stmt, 1, cleanup.source.kind.rawValue)
+                            self.bindText(stmt, 2, cleanup.source.identifier)
+                            self.bindText(stmt, 3, cleanup.source.resource.rawValue)
+                            sqlite3_bind_int64(stmt, 4, cleanup.through.rawValue)
+                            sqlite3_bind_int64(stmt, 5, cleanup.kept.rawValue)
+                        }
+                        guard let markers = dismissedSourceRecheckRowIDsLocked(matching: scope, bindScope: bindScope)
+                        else {
+                            return nil
+                        }
+                        let markerMatch =
+                            markers.isEmpty ? "0" : "rowid IN (\(markers.map(String.init).joined(separator: ",")))"
+                        var stmt: OpaquePointer?
+                        guard
+                            requireOperational(
+                                sqlite3_prepare_v2(
+                                    db,
+                                    """
+                                    DELETE FROM backup_sync_queue WHERE \(scope)
+                                      AND (state IN ('skippedRemoteDeletion','sourceMissing','failedPermanent','dismissedFailure')
+                                           OR \(markerMatch));
+                                    """, -1, &stmt, nil) == SQLITE_OK)
+                        else { return nil }
+                        defer { sqlite3_finalize(stmt) }
+                        bindScope(stmt)
+                        guard requireOperational(sqlite3_step(stmt) == SQLITE_DONE) else { return nil }
+                        if sqlite3_changes(db) > 0 { changed.insert(cleanup.source) }
                     }
-                    guard let markers = dismissedSourceRecheckRowIDsLocked(matching: scope, bindScope: bindScope) else {
-                        return nil
-                    }
-                    let markerMatch =
-                        markers.isEmpty ? "0" : "rowid IN (\(markers.map(String.init).joined(separator: ",")))"
-                    var stmt: OpaquePointer?
-                    guard
-                        requireOperational(
-                            sqlite3_prepare_v2(
-                                db,
-                                """
-                                DELETE FROM backup_sync_queue WHERE \(scope)
-                                  AND (state IN ('skippedRemoteDeletion','sourceMissing','failedPermanent','dismissedFailure')
-                                       OR \(markerMatch));
-                                """, -1, &stmt, nil) == SQLITE_OK)
-                    else { return nil }
-                    defer { sqlite3_finalize(stmt) }
-                    bindScope(stmt)
-                    guard requireOperational(sqlite3_step(stmt) == SQLITE_DONE) else { return nil }
-                    let count = Int(sqlite3_changes(db))
                     guard requireOperational(sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK) else {
                         return nil
                     }
                     committed = true
-                    return count
+                    return changed
                 } ?? nil
-            if removed == nil { _ = requireOperational(false) }
-            return removed
+            if changed == nil { _ = requireOperational(false) }
+            return changed
         }
     }
 
@@ -1605,10 +1616,18 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
     public func removeUnsavedEarlierRevisions(
         of source: UploadSourceIdentity, through revision: UploadBackupRevision, except kept: UploadBackupRevision
     ) -> Bool {
-        guard let removed = removeUnsavedEarlierRevisionsUnobserved(of: source, through: revision, except: kept)
-        else { return false }
-        // Most backups remove nothing; only a real change reaches the observers.
-        if removed > 0 { notify(UploadBackupSyncQueueChange(sources: [source])) }
+        removeUnsavedEarlierRevisions([.init(source: source, through: revision, kept: kept)])
+    }
+
+    @discardableResult
+    public func removeUnsavedEarlierRevisions(of entries: [UploadBackupSyncQueueEntry]) -> Bool {
+        removeUnsavedEarlierRevisions(entries.map { .init(source: $0.source, through: $0.revision, kept: $0.revision) })
+    }
+
+    private func removeUnsavedEarlierRevisions(_ scopes: [ObsoleteRevisionScope]) -> Bool {
+        guard let changed = removeUnsavedEarlierRevisionsUnobserved(scopes) else { return false }
+        // Most backups remove nothing; only committed changes reach the observers.
+        if !changed.isEmpty { notify(UploadBackupSyncQueueChange(sources: Array(changed))) }
         return true
     }
 

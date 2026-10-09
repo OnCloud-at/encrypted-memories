@@ -327,6 +327,9 @@ public protocol UploadBackupSyncQueueStore: Sendable {
     func removeUnsavedEarlierRevisions(
         of source: UploadSourceIdentity, through revision: UploadBackupRevision, except kept: UploadBackupRevision
     ) -> Bool
+    /// Applies the same obsolete-revision rules to each successful entry in a scan batch.
+    @discardableResult
+    func removeUnsavedEarlierRevisions(of entries: [UploadBackupSyncQueueEntry]) -> Bool
     /// Removes every queued revision/resource for the supplied source identifiers. This is used by
     /// live catalog change delivery so a deletion also cancels work already claimed by the runner.
     @discardableResult
@@ -483,6 +486,16 @@ public extension UploadBackupSyncQueueStore {
         of source: UploadSourceIdentity, through revision: UploadBackupRevision, except kept: UploadBackupRevision
     ) -> Bool {
         true
+    }
+
+    func removeUnsavedEarlierRevisions(of entries: [UploadBackupSyncQueueEntry]) -> Bool {
+        for entry in entries {
+            guard removeUnsavedEarlierRevisions(of: entry.source, through: entry.revision, except: entry.revision)
+            else {
+                return false
+            }
+        }
+        return true
     }
 
     func removeSources(kind: UploadSourceIdentity.Kind, identifiers: [String]) -> Int { 0 }

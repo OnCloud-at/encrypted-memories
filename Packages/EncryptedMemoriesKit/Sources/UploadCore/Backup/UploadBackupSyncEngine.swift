@@ -1,4 +1,5 @@
 import Foundation
+import PhotosCore
 
 public struct UploadBackupAssetCandidate: Sendable, Equatable {
     public let snapshot: UploadBackupAssetSnapshot
@@ -187,12 +188,12 @@ public actor UploadBackupSyncEngine: UploadBackupCandidateEnqueueing {
         var candidates: [UploadBackupAssetCandidate] = []
         var result = UploadBackupSyncScanResult()
         let mayHaveDismissals = queue.containsAny(in: [.dismissedFailure, .discovered, .checking])
-        guard queue.isOperational() else { throw UploadError.backend("Backup queue could not be read") }
+        guard queue.isOperational() else { throw Self.localStateError("Backup queue could not be read") }
         for candidate in included {
             try Task.checkCancellation()
             if mayHaveDismissals {
                 let row = queue.entry(for: candidate.snapshot.source, revision: candidate.snapshot.revision)
-                guard queue.isOperational() else { throw UploadError.backend("Backup queue could not be read") }
+                guard queue.isOperational() else { throw Self.localStateError("Backup queue could not be read") }
                 if let row, row.isDismissedSourceRecheck || row.state == .dismissedFailure {
                     result.scanned += 1
                     if row.state == .dismissedFailure, row.source.kind == .photoLibraryAsset,
@@ -205,7 +206,7 @@ public actor UploadBackupSyncEngine: UploadBackupCandidateEnqueueing {
                         guard
                             queue.updateDismissedSourceRecheck(
                                 pending, matchingState: .dismissedFailure, matchingLastError: reason) != nil
-                        else { throw UploadError.backend("Backup queue could not persist a source check") }
+                        else { throw Self.localStateError("Backup queue could not persist a source check") }
                     }
                     continue
                 }
@@ -266,17 +267,15 @@ public actor UploadBackupSyncEngine: UploadBackupCandidateEnqueueing {
         }
         try Task.checkCancellation()
         guard queue.upsertBatch(entries) else {
-            throw UploadError.backend("Backup queue could not persist an asset batch")
+            throw Self.localStateError("Backup queue could not persist an asset batch")
         }
-        for entry in entries where entry.state == .alreadyBackedUp {
-            try removeUnsavedEarlierRevisions(of: entry)
-        }
+        try removeUnsavedEarlierRevisions(of: entries.filter { $0.state == .alreadyBackedUp })
         return result
     }
 
     public func missingSourceDiscardGeneration() async throws -> Int64 {
         guard let generation = queue.missingSourceDiscardGeneration(), queue.isOperational() else {
-            throw UploadError.backend("Backup queue could not be read")
+            throw Self.localStateError("Backup queue could not be read")
         }
         return generation
     }
@@ -286,7 +285,7 @@ public actor UploadBackupSyncEngine: UploadBackupCandidateEnqueueing {
         for candidate in candidates {
             try Task.checkCancellation()
             let row = queue.entry(for: candidate.snapshot.source, revision: candidate.snapshot.revision)
-            guard queue.isOperational() else { throw UploadError.backend("Backup queue could not be read") }
+            guard queue.isOperational() else { throw Self.localStateError("Backup queue could not be read") }
             if row?.state == .sourceMissing || row?.state == .dismissedFailure { missing.append(candidate) }
         }
         if !missing.isEmpty { _ = try await enqueueBatch(missing) }
@@ -296,7 +295,7 @@ public actor UploadBackupSyncEngine: UploadBackupCandidateEnqueueing {
         let included = try withoutExcludedSources(candidates)
         guard !included.isEmpty else { return }
         guard let existing = queue.sourcesWithEntries(included.map(\.snapshot.source)), queue.isOperational() else {
-            throw UploadError.backend("Backup queue could not be read")
+            throw Self.localStateError("Backup queue could not be read")
         }
         let missing = included.filter { !existing.contains($0.snapshot.source) }
         let decisions = try await preflight.classifyBatch(missing.map(\.snapshot))
@@ -309,7 +308,7 @@ public actor UploadBackupSyncEngine: UploadBackupCandidateEnqueueing {
         }
         // The conditional insert also protects a row added while the preflight actor was awaited.
         guard queue.insertMissingSources(entries) else {
-            throw UploadError.backend("Backup queue could not persist missing sources")
+            throw Self.localStateError("Backup queue could not persist missing sources")
         }
     }
 
@@ -334,10 +333,10 @@ public actor UploadBackupSyncEngine: UploadBackupCandidateEnqueueing {
             pending.append(reopening.candidate)
             try Task.checkCancellation()
             let row = queue.entry(for: snapshot.source, revision: snapshot.revision)
-            guard queue.isOperational() else { throw UploadError.backend("Backup queue could not be read") }
+            guard queue.isOperational() else { throw Self.localStateError("Backup queue could not be read") }
             guard let row, row.state == .completed || row.state == .alreadyBackedUp else { continue }
             guard queue.remove(source: snapshot.source, revision: snapshot.revision) else {
-                throw UploadError.backend("Backup queue could not re-open an asset")
+                throw Self.localStateError("Backup queue could not re-open an asset")
             }
         }
         return pending
@@ -462,18 +461,24 @@ public actor UploadBackupSyncEngine: UploadBackupCandidateEnqueueing {
         try Task.checkCancellation()
         let completed = entry(for: candidate, state: .completed)
         guard queue.upsert(completed) else {
-            throw UploadError.backend("Backup queue could not persist completion")
+            throw Self.localStateError("Backup queue could not persist completion")
         }
-        try removeUnsavedEarlierRevisions(of: completed)
+        try removeUnsavedEarlierRevisions(of: [completed])
     }
 
-    private func removeUnsavedEarlierRevisions(of entry: UploadBackupSyncQueueEntry) throws {
-        guard
-            queue.removeUnsavedEarlierRevisions(
-                of: entry.source, through: entry.revision, except: entry.revision)
-        else {
-            throw UploadError.backend("Backup queue could not remove obsolete failures")
+    private func removeUnsavedEarlierRevisions(of entries: [UploadBackupSyncQueueEntry]) throws {
+        for start in stride(from: 0, to: entries.count, by: Self.scanBatchSize) {
+            let batch = Array(entries[start..<min(start + Self.scanBatchSize, entries.count)])
+            guard queue.removeUnsavedEarlierRevisions(of: batch) else {
+                throw Self.localStateError("Backup queue could not remove obsolete failures")
+            }
         }
+    }
+
+    private static func localStateError(_ diagnostic: StaticString) -> UploadError {
+        PhotoDiagnostics.shared.increment("backup.queue.localStateUnavailable")
+        PhotoDiagnostics.shared.emitDebug("BackupSync", ["error": String(describing: diagnostic)])
+        return .backend(L10n.string("backup.error_local_state_unavailable"))
     }
 
     public func summary() -> UploadBackupSyncQueueSummary {
