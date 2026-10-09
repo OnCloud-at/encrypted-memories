@@ -889,7 +889,7 @@ jobs:
         run: |
           set -euo pipefail
           executable="$(bash scripts/install-xcodegen.sh "$RUNNER_TEMP/xcodegen-install")"
-          echo "$(dirname "$executable")" >> "$GITHUB_PATH"
+          dirname "$executable" >> "$GITHUB_PATH"
           "$executable" --version
 
       - name: Record upgrade toolchain
