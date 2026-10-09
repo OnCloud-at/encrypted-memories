@@ -264,6 +264,15 @@ jobs:
           set -euo pipefail
           xcrun xcresulttool get test-results summary --path "$RESULT_ROOT/ios-ui.xcresult" |
             python3 -c 'import json,sys; r=json.load(sys.stdin); print(sys.argv[1], {k:r[k] for k in ["totalTestCount", "passedTests", "failedTests", "skippedTests"]})' ui
+      - name: Retain failed UI test results
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ios-ui-xcresult-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ios-ui.xcresult
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 7
       - if: always()
         run: bash ./scripts/report-build-storage.sh
 

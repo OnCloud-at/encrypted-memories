@@ -35,7 +35,7 @@ final class MobileDuplicatesUITests: XCTestCase {
     }
 
     private func group(_ index: Int) -> XCUIElement {
-        app.descendants(matching: .any).matching(identifier: "duplicates.group.\(index)").firstMatch
+        app.scrollViews["duplicates.group.\(index)"].firstMatch
     }
 
     private func waitUntilGone(_ element: XCUIElement, _ message: String) {
@@ -48,10 +48,10 @@ final class MobileDuplicatesUITests: XCTestCase {
 
         XCTAssertTrue(app.staticTexts["Checking Your Library"].waitForExistence(timeout: 10))
         XCTAssertTrue(app.staticTexts["Duplicates appear here when it is done."].exists)
-        let progress = app.descendants(matching: .any).matching(identifier: "duplicates.checkProgress").firstMatch
+        let progress = app.progressIndicators["duplicates.checkProgress"].firstMatch
         XCTAssertTrue(progress.waitForExistence(timeout: 5), "the check shows its progress")
         XCTAssertTrue(
-            app.descendants(matching: .any).matching(NSPredicate(format: "label CONTAINS '1,234 of 15,000 photos'"))
+            app.staticTexts.matching(NSPredicate(format: "label CONTAINS '1,234 of 15,000 photos'"))
                 .firstMatch.exists
                 || (progress.value as? String)?.contains("1,234 of 15,000 photos") == true,
             "the progress counts the checked photos")
@@ -89,7 +89,7 @@ final class MobileDuplicatesUITests: XCTestCase {
     /// A grid photo whose frame lies completely below the top bars. The first grid photo can sit partly under them,
     /// and a tap there scrolls the grid instead of opening the photo.
     private func libraryPhotoBelowTheBars() -> XCUIElement {
-        let photos = app.descendants(matching: .any).matching(NSPredicate(format: "label BEGINSWITH 'Photo, '"))
+        let photos = app.buttons.matching(NSPredicate(format: "label BEGINSWITH 'Photo, '"))
         XCTAssertTrue(photos.firstMatch.waitForExistence(timeout: 20))
         let window = app.windows.firstMatch.frame
         for index in 0..<min(photos.count, 40) {
