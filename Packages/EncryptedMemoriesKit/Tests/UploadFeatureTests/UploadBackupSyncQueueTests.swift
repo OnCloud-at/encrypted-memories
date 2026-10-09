@@ -1,4 +1,5 @@
 import Foundation
+import PhotosCore
 import SQLite3
 import XCTest
 
@@ -1257,7 +1258,272 @@ final class UploadBackupSyncQueueTests: XCTestCase {
         try await assertCleanupFailureIsReported(path: .completion)
     }
 
-    private func assertCleanupFailureIsReported(path: SuccessfulRevisionPath) async throws {
+    func testCleanupFailureUsesTheLocalStateMessageInEnglishAndGerman() async throws {
+        let failuresBefore = PhotoDiagnostics.shared.counter("backup.queue.localStateUnavailable")
+        try await assertCleanupFailureIsReported(path: .preflight, checkLocalizedMessage: true)
+        XCTAssertEqual(PhotoDiagnostics.shared.counter("backup.queue.localStateUnavailable"), failuresBefore + 1)
+    }
+
+    func testCompletionCleanupFailureUsesTheLocalStateMessageInEnglishAndGerman() async throws {
+        try await assertCleanupFailureIsReported(path: .completion, checkLocalizedMessage: true)
+    }
+
+    func testQueueReadFailureUsesTheLocalStateMessageInEnglishAndGerman() async throws {
+        let queue = try XCTUnwrap(
+            UploadBackupSyncQueueManifestStore(url: tempDir.appendingPathComponent("read-failure.sqlite")))
+        queue.close()
+        let engine = UploadBackupSyncEngine(
+            preflight: UploadBackupPreflightIndex(store: MemoryBackupStore()), queue: queue)
+        do {
+            _ = try await engine.enqueue(candidate(id: "unreadable", revision: 10))
+            XCTFail("An unreadable queue must stop discovery")
+        } catch {
+            try assertLocalStateMessage(error)
+        }
+    }
+
+    func testSourceRecheckWriteFailureUsesTheLocalStateMessageInEnglishAndGerman() async throws {
+        let url = tempDir.appendingPathComponent("source-check-failure.sqlite")
+        let queue = try XCTUnwrap(UploadBackupSyncQueueManifestStore(url: url))
+        let item = candidate(id: "source-check", revision: 10)
+        let dismissed = UploadBackupSyncQueueEntry(
+            source: item.snapshot.source, revision: item.snapshot.revision, originalFilename: item.originalFilename,
+            state: .dismissedFailure,
+            lastError: BackupIssueRecord(kind: .sourceMissing, detail: "source unavailable").persistedValue,
+            updatedAt: Date(timeIntervalSince1970: 500))
+        XCTAssertTrue(queue.upsert(dismissed))
+        var handle: OpaquePointer?
+        XCTAssertEqual(sqlite3_open_v2(url.path, &handle, SQLITE_OPEN_READWRITE, nil), SQLITE_OK)
+        let db = try XCTUnwrap(handle)
+        defer { sqlite3_close(db) }
+        XCTAssertEqual(
+            sqlite3_exec(
+                db,
+                "CREATE TRIGGER fixture_source_check_failure BEFORE UPDATE ON backup_sync_queue BEGIN SELECT RAISE(ABORT, 'fixture source check failure'); END;",
+                nil, nil, nil), SQLITE_OK)
+        let engine = UploadBackupSyncEngine(
+            preflight: UploadBackupPreflightIndex(store: MemoryBackupStore()), queue: queue)
+        do {
+            _ = try await engine.enqueue(item)
+            XCTFail("An unsuccessful recheck write must stop discovery")
+        } catch {
+            try assertLocalStateMessage(error)
+        }
+        XCTAssertEqual(queue.entry(for: dismissed.source, revision: dismissed.revision), dismissed)
+    }
+
+    func testBatchedCleanupMatchesSingleCleanupAndPreservesEveryProtectedRow() throws {
+        let singleURL = tempDir.appendingPathComponent("single-cleanup.sqlite")
+        let batchURL = tempDir.appendingPathComponent("batch-cleanup.sqlite")
+        let single = try XCTUnwrap(UploadBackupSyncQueueManifestStore(url: singleURL))
+        let batch = try XCTUnwrap(UploadBackupSyncQueueManifestStore(url: batchURL))
+        let items = [candidate(id: "first", revision: 100), candidate(id: "second", revision: 100)]
+        var obsolete: [UploadBackupSyncQueueEntry] = []
+        var protected: [UploadBackupSyncQueueEntry] = []
+        for item in items {
+            func row(_ seconds: TimeInterval, _ state: UploadBackupSyncQueueState) -> UploadBackupSyncQueueEntry {
+                .init(
+                    source: item.snapshot.source, revision: revision(seconds), originalFilename: item.originalFilename,
+                    state: state, updatedAt: Date(timeIntervalSince1970: 500))
+            }
+            obsolete += [
+                row(1, .sourceMissing), row(2, .failedPermanent), row(3, .dismissedFailure),
+                row(4, .skippedRemoteDeletion),
+            ]
+            for (offset, state) in [UploadBackupSyncQueueState.discovered, .checking].enumerated() {
+                var marker = row(TimeInterval(5 + offset), state)
+                marker.lastError =
+                    BackupIssueRecord(kind: .sourceMissing, detail: "acknowledged missing").persistedValue
+                obsolete.append(marker)
+            }
+            protected += [
+                row(7, .discovered), row(8, .queuedForUpload), row(9, .failed), row(10, .hashing),
+                row(11, .completed), row(12, .alreadyBackedUp), row(100, .failedPermanent), row(101, .sourceMissing),
+            ]
+            var otherReason = row(13, .checking)
+            otherReason.lastError = BackupIssueRecord(kind: .unknown, detail: "source unavailable").persistedValue
+            protected.append(otherReason)
+            for (offset, state) in [UploadBackupSyncQueueState.failedPermanent, .discovered].enumerated() {
+                var committed = row(TimeInterval(14 + offset), state)
+                committed.lastError =
+                    BackupIssueRecord(kind: .sourceMissing, detail: "receipt must survive").persistedValue
+                committed.remoteCommitReconciliation = UploadRemoteCommitReconciliation(
+                    source: committed.source,
+                    identity: UploadIdentity(
+                        correctedName: committed.originalFilename, nameHash: "fixture-name",
+                        sha1Hex: String(repeating: "ab", count: 20), sha1Digest: Data(repeating: 0xAB, count: 20),
+                        contentHash: "fixture-content"),
+                    receipt: .init(remoteVolumeID: "fixture-volume", remoteLinkID: "fixture-link"))
+                protected.append(committed)
+            }
+            protected.append(
+                .init(
+                    source: .init(kind: .fileURL, identifier: item.snapshot.source.identifier),
+                    revision: revision(1), originalFilename: "other-kind.heic", state: .sourceMissing,
+                    updatedAt: Date(timeIntervalSince1970: 500)))
+            protected.append(
+                .init(
+                    source: source(item.snapshot.source.identifier, resource: .livePairedVideo),
+                    revision: revision(1), originalFilename: "other-resource.mov", state: .failedPermanent,
+                    updatedAt: Date(timeIntervalSince1970: 500)))
+        }
+        protected.append(
+            .init(
+                source: source("other-photo"), revision: revision(1), originalFilename: "other.heic",
+                state: .sourceMissing, updatedAt: Date(timeIntervalSince1970: 500)))
+        let fixture = obsolete + protected
+        XCTAssertTrue(single.upsertBatch(fixture))
+        XCTAssertTrue(batch.upsertBatch(fixture))
+        let successes = items.map {
+            UploadBackupSyncQueueEntry(
+                source: $0.snapshot.source, revision: $0.snapshot.revision,
+                originalFilename: $0.originalFilename, state: .alreadyBackedUp,
+                updatedAt: Date(timeIntervalSince1970: 500))
+        }
+        for entry in successes {
+            XCTAssertTrue(
+                single.removeUnsavedEarlierRevisions(of: entry.source, through: entry.revision, except: entry.revision))
+        }
+        XCTAssertTrue(batch.removeUnsavedEarlierRevisions(of: successes))
+        single.close()
+        batch.close()
+        let reopenedSingle = try XCTUnwrap(UploadBackupSyncQueueManifestStore(url: singleURL))
+        let reopenedBatch = try XCTUnwrap(UploadBackupSyncQueueManifestStore(url: batchURL))
+        for row in fixture {
+            let expected = protected.contains(row) ? row : nil
+            XCTAssertEqual(reopenedSingle.entry(for: row.source, revision: row.revision), expected)
+            XCTAssertEqual(reopenedBatch.entry(for: row.source, revision: row.revision), expected)
+            XCTAssertEqual(
+                reopenedBatch.entry(for: row.source, revision: row.revision),
+                reopenedSingle.entry(for: row.source, revision: row.revision))
+        }
+        XCTAssertEqual(reopenedSingle.count(), protected.count)
+        XCTAssertEqual(reopenedBatch.count(), protected.count)
+    }
+
+    func testBatchedCleanupRollsBackEarlierDeletesAndReportsTheLocalizedMessage() async throws {
+        try await assertScanCleanupFailure(itemCount: 2, failingIndex: 1, committedCount: 0)
+    }
+
+    func testCleanupKeepsItsTransactionInsideTheExistingScanBatch() async throws {
+        try await assertScanCleanupFailure(itemCount: 129, failingIndex: 128, committedCount: 128)
+    }
+
+    private func assertScanCleanupFailure(itemCount: Int, failingIndex: Int, committedCount: Int) async throws {
+        let url = tempDir.appendingPathComponent("atomic-cleanup.sqlite")
+        let queue = try XCTUnwrap(UploadBackupSyncQueueManifestStore(url: url))
+        let items = (0..<itemCount).map { candidate(id: "batch-\($0)", revision: 100) }
+        let old = items.map {
+            UploadBackupSyncQueueEntry(
+                source: $0.snapshot.source, revision: revision(1),
+                originalFilename: $0.originalFilename, state: .failedPermanent,
+                updatedAt: Date(timeIntervalSince1970: 500))
+        }
+        XCTAssertTrue(queue.upsertBatch(old))
+        let index = UploadBackupPreflightIndex(store: MemoryBackupStore())
+        try await index.markBackedUpBatch(items.map(\.snapshot))
+        var handle: OpaquePointer?
+        XCTAssertEqual(sqlite3_open_v2(url.path, &handle, SQLITE_OPEN_READWRITE, nil), SQLITE_OK)
+        let db = try XCTUnwrap(handle)
+        defer { sqlite3_close(db) }
+        XCTAssertEqual(
+            sqlite3_exec(
+                db,
+                "CREATE TRIGGER fixture_batch_cleanup_failure BEFORE DELETE ON backup_sync_queue WHEN OLD.source_id='batch-\(failingIndex)' BEGIN SELECT RAISE(ABORT, 'fixture batch cleanup failure'); END;",
+                nil, nil, nil), SQLITE_OK)
+        let engine = UploadBackupSyncEngine(preflight: index, queue: queue)
+        do {
+            _ = try await engine.enqueueBatch(items)
+            XCTFail("A failed batch cleanup must stop the scan")
+        } catch {
+            try assertLocalStateMessage(error)
+        }
+        XCTAssertEqual(sqlite3_exec(db, "DROP TRIGGER fixture_batch_cleanup_failure;", nil, nil, nil), SQLITE_OK)
+        queue.close()
+        let reopened = try XCTUnwrap(UploadBackupSyncQueueManifestStore(url: url))
+        for (index, row) in old.enumerated() {
+            XCTAssertEqual(reopened.entry(for: row.source, revision: row.revision), index < committedCount ? nil : row)
+        }
+        for item in items {
+            XCTAssertEqual(
+                reopened.entry(for: item.snapshot.source, revision: item.snapshot.revision)?.state, .alreadyBackedUp)
+        }
+        XCTAssertEqual(reopened.count(), itemCount * 2 - committedCount)
+    }
+
+    func testMeasureCleanupOfFiftyThousandBackedUpItems() async throws {
+        guard ProcessInfo.processInfo.environment["BACKUP_CLEANUP_MEASURE"] == "1" else {
+            throw XCTSkip("Set BACKUP_CLEANUP_MEASURE=1 for the 50,000-item cleanup measurement")
+        }
+        let queue = try XCTUnwrap(
+            UploadBackupSyncQueueManifestStore(url: tempDir.appendingPathComponent("cleanup-measure.sqlite")))
+        let items = (0..<50_000).map { candidate(id: "fixture-\($0)", revision: 10) }
+        let old = items.map { item in
+            UploadBackupSyncQueueEntry(
+                source: item.snapshot.source, revision: revision(1), originalFilename: item.originalFilename,
+                state: .failedPermanent, updatedAt: Date(timeIntervalSince1970: 500))
+        }
+        XCTAssertTrue(queue.upsertBatch(old))
+        let index = UploadBackupPreflightIndex(store: MemoryBackupStore())
+        try await index.markBackedUpBatch(items.map(\.snapshot))
+        let engine = UploadBackupSyncEngine(preflight: index, queue: queue)
+        let start = DispatchTime.now().uptimeNanoseconds
+        let result = try await engine.scan(StaticCatalog(items: items))
+        let seconds = Double(DispatchTime.now().uptimeNanoseconds - start) / 1_000_000_000
+        print("CLEANUP_MEASUREMENT items=50000 oldFailures=50000 scanBatch=128 seconds=\(seconds)")
+        XCTAssertEqual(result.scanned, 50_000)
+        XCTAssertEqual(result.alreadyBackedUp, 50_000)
+        XCTAssertEqual(queue.count(), 50_000)
+        XCTAssertEqual(queue.summary().failed, 0)
+        XCTAssertTrue(queue.isOperational())
+        XCTAssertTrue(queue.upsertBatch(old))
+        XCTAssertEqual(queue.count(), 100_000)
+        let cleanupStart = DispatchTime.now().uptimeNanoseconds
+        let successes = items.map {
+            UploadBackupSyncQueueEntry(
+                source: $0.snapshot.source, revision: $0.snapshot.revision,
+                originalFilename: $0.originalFilename, state: .alreadyBackedUp,
+                updatedAt: Date(timeIntervalSince1970: 500))
+        }
+        for start in stride(from: 0, to: successes.count, by: 128) {
+            XCTAssertTrue(
+                queue.removeUnsavedEarlierRevisions(of: Array(successes[start..<min(start + 128, successes.count)])))
+        }
+        let cleanupSeconds = Double(DispatchTime.now().uptimeNanoseconds - cleanupStart) / 1_000_000_000
+        print("CLEANUP_ONLY_MEASUREMENT items=50000 oldFailures=50000 seconds=\(cleanupSeconds)")
+        XCTAssertEqual(queue.count(), 50_000)
+        XCTAssertEqual(queue.summary().failed, 0)
+    }
+
+    private func assertLocalStateMessage(_ error: Error, file: StaticString = #filePath, line: UInt = #line) throws {
+        let key = "backup.error_local_state_unavailable"
+        XCTAssertEqual(
+            error.localizedDescription, L10n.string("backup.error_local_state_unavailable"), file: file, line: line)
+        for (language, expected) in [
+            ("en", "The backup cannot continue on this device right now. Please restart the app."),
+            ("de", "Das Backup kann auf diesem Gerät gerade nicht weitermachen. Bitte starte die App neu."),
+        ] {
+            let bundle = L10n.resourceBundle
+            let translated: String?
+            if let path = bundle.path(forResource: language, ofType: "lproj"), let localized = Bundle(path: path) {
+                translated = localized.localizedString(forKey: key, value: nil, table: nil)
+            } else {
+                let url = try XCTUnwrap(bundle.url(forResource: "Localizable", withExtension: "xcstrings"))
+                let catalog = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any])
+                let strings = catalog["strings"] as? [String: Any]
+                let entry = strings?[key] as? [String: Any]
+                let localizations = entry?["localizations"] as? [String: Any]
+                let localization = localizations?[language] as? [String: Any]
+                translated = (localization?["stringUnit"] as? [String: Any])?["value"] as? String
+            }
+            XCTAssertEqual(translated, expected, language, file: file, line: line)
+            XCTAssertFalse(error.localizedDescription.contains("Backup queue"), language, file: file, line: line)
+        }
+    }
+
+    private func assertCleanupFailureIsReported(
+        path: SuccessfulRevisionPath, checkLocalizedMessage: Bool = false
+    ) async throws {
         let url = tempDir.appendingPathComponent("failed-cleanup.sqlite")
         let queue = try XCTUnwrap(UploadBackupSyncQueueManifestStore(url: url))
         let latest = candidate(id: "cleanup-failure", revision: 10)
@@ -1286,8 +1552,9 @@ final class UploadBackupSyncQueueTests: XCTestCase {
                 _ = try await engine.enqueue(latest)
             }
             XCTFail("A failed cleanup must stop the caller")
-        } catch UploadError.backend {
+        } catch UploadError.backend(let message) {
             XCTAssertFalse(queue.isOperational())
+            if checkLocalizedMessage { try assertLocalStateMessage(UploadError.backend(message)) }
         } catch {
             XCTFail("Unexpected error: \(error)")
         }
