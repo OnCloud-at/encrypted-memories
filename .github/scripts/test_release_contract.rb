@@ -4,6 +4,7 @@
 require "minitest/autorun"
 require "tmpdir"
 require_relative "release_contract"
+require_relative "test_release_upgrade_workflow"
 
 class GitHubReleaseContractTest < Minitest::Test
   def payload(tag: "v1.2.0", prerelease: false, body: valid_body)

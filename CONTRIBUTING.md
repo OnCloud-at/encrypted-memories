@@ -202,3 +202,76 @@ It enables the public link of the external group and shows the link in the job s
 It uses the `testflight-external` environment.
 `TESTFLIGHT_EXTERNAL_GROUP_NAME` optionally overrides `External Testers`.
 Stable and prerelease release tags can be promoted externally.
+
+## Release upgrade verification
+
+The Apple release workflow finishes both distribution builds before it tests installed upgrades.
+Both uploads depend on successful upgrade tests on iOS Simulator and macOS.
+This gate runs for stable releases and prereleases. It does not add a pull request check.
+Full verification runs in the merge queue.
+
+The source list includes every published stable GitHub release from `v1.0.5` onward.
+`OLDEST_SUPPORTED_STABLE` in `.github/scripts/release_upgrade.py` defines this lower bound:
+1.0.5 was the first public App Store version; earlier releases were admission tests.
+A prerelease also checks the previous published beta.
+Only `v1.1.0-beta.2` can be excluded, and only as the previous beta.
+The job summary states `nicht getestet: v1.1.0-beta.2 (kein Prüfeinstieg)`.
+Beta 2 had only testers. The full verification in the merge queue checks the 1.0.5 state fixtures.
+Any other predecessor without the test entry or a matching versioned overlay fails the gate.
+
+The test apps use Release optimization and the exact release commit, with
+`ENCRYPTED_MEMORIES_UPGRADE_TEST` set only for these separate builds.
+The archive and upload configurations never enable the synthetic account.
+Storage, migrations, and task algorithms run through their existing implementations.
+Bundle metadata parity with shipping artifacts remains a separate limitation in [#411](https://github.com/OnCloud-at/encrypted-memories/issues/411).
+These journeys verify commit, storage, and task paths. They do not verify bundle metadata
+or external authentication headers. Tracked versions and build numbers remain unchanged.
+Synthetic photos, inference, and a loopback server replace external inputs and services.
+The server records uploads independently of app data. Duplicate uploads fail the journey.
+The journey kills the old app during backup claim, remote receipt, and local completion;
+model download, install record, and promotion; index embedding and commits; and thumbnail loading and storage.
+The new app must load the saved session, retain preferences, and finish the work through the native UI.
+
+The backup journey starts from consent that is already saved on disk.
+At the held task boundary, it waits within the existing preparation budget for
+`photoBackup.enabled.v1 == true` in the exact owned app container's preferences.
+Missing consent or unreadable preferences fail the gate. The task remains held until SIGKILL.
+The journey compares the saved consent before the kill, after install-over, and after UI verification.
+It neither writes preferences nor enables backup in the replacement app.
+The v1.0.5 Enable tap can reach a task boundary before its preference reaches disk;
+the immediate tap-to-SIGKILL case is a known historical limit and is not covered by this journey.
+
+Each source runs its own `scripts/update-proton-sdk.sh` in separate source and SDK scratch directories.
+The `v1.0.5` overlay is pinned to its published commit and must apply cleanly.
+Later releases carry their inactive test entry and require no overlay.
+Only completed builds enter the cache, keyed by source, toolchain, architecture, platform, and test-build inputs.
+A typical cold run needs two app builds per platform; cached historical products remove one build per source.
+
+The iOS journey installs the new app with `simctl install` over the existing app.
+It never removes the app or resets its data between the old and new phases.
+The new phase does not seed a session: loss of the real simulator Keychain entry fails the journey.
+Both macOS installations use one temporary self-signed identity, without release credentials.
+Only the synthetic macOS session persists outside the Data Protection Keychain.
+Production Keychain access groups must match the last supported stable release.
+
+macOS-Keychain-Persistenz über das Update wird nicht im Prüfbau geprüft; abgedeckt durch iOS-Simulator und Entitlement-Vergleich.
+
+For a local rehearsal, run these commands through the configured shared build queue:
+
+```bash
+bash scripts/test-release-upgrade.sh --target HEAD --sources v1.0.5 --platform iOS --working-copy
+bash scripts/test-release-upgrade.sh --target HEAD --sources v1.0.5 --platform macOS --working-copy
+```
+
+These commands create no release or tag and perform no Apple upload.
+They use only an owned simulator and the macOS host. Never install them on a physical iPhone or iPad.
+Omit `--working-copy` to test an exact committed revision.
+Use `--points` with one or more named interruption points for focused diagnosis.
+Logs, UI result bundles, and the server ledger remain under the shared build root's `UpgradeCheck/evidence` directory.
+The release workflow uses trusted default-branch automation, so its changes take effect after merge.
+
+A failed upgrade stops both uploads and records its cause in the job summary.
+A maintainer can retry the run after fixing the cause.
+To deliberately override the gate, dispatch `Apple release` from `main` with an existing published
+`release_tag`, the same value in `upgrade_override_tag`, and a nonempty `upgrade_override_reason`.
+The summary records the override and its reason. Automatic release events cannot override the gate.

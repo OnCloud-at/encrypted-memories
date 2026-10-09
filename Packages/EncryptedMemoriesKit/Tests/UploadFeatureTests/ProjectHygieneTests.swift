@@ -35,6 +35,19 @@ final class ProjectHygieneTests: XCTestCase {
         return String(tail[..<next])
     }
 
+    /// The offline account must never enter the distributed archive.
+    func testUpgradeFixtureFlagIsAbsentFromArchiveConfiguration() throws {
+        let marker = "ENCRYPTED_MEMORIES_UPGRADE_TEST"
+        for path in ["project.yml", "Packages/EncryptedMemoriesKit/Package.swift"] {
+            let contents = try String(contentsOf: repoRoot.appendingPathComponent(path), encoding: .utf8)
+            XCTAssertFalse(contents.contains(marker), "\(path) enables an offline entry in the shipping build")
+        }
+        let workflow = try String(
+            contentsOf: repoRoot.appendingPathComponent(".github/workflows/testflight-internal.yml"), encoding: .utf8)
+        // The isolated builder supplies the flag. Workflow, job, and step environments must not inherit it.
+        XCTAssertFalse(workflow.contains(marker), "The release workflow enables an offline entry in the shipping build")
+    }
+
     // Production app target uses no known private Apple API or framework.
     func testNoPrivateAppleAPIInProductionTarget() {
         let banned = ["PPApplePrivate", "loadPrivateFrameworks", "filterWithType:", "CAFilterClassNames"]

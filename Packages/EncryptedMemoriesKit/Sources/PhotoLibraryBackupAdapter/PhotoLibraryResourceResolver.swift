@@ -45,6 +45,9 @@ public struct PhotoLibraryResourceResolver: BackupResourceResolving {
         readAdmission: @escaping BackupResourceReadAdmission
     ) async throws -> BackupResolvedResource? {
         try readAdmission()
+        #if ENCRYPTED_MEMORIES_UPGRADE_TEST
+            if UpgradeTestProbe.isRequested { return try await UpgradeTestPhotoLibrary.resolve(entry) }
+        #endif
         guard entry.source.kind == .photoLibraryAsset else {
             throw UploadError.backend("photo resolver received source kind \(entry.source.kind.rawValue)")
         }

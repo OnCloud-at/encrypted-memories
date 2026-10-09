@@ -24,7 +24,11 @@ public struct SessionKeychainStore: Sendable {
     private let keychain: any AppleKeychainStoring
 
     public init(service: String = Self.defaultService, account: String = "default") {
-        self.init(service: service, account: account, keychain: SystemAppleKeychainStore())
+        #if ENCRYPTED_MEMORIES_UPGRADE_TEST && os(macOS)
+            self.init(service: service, account: account, keychain: UpgradeTestSessionFile())
+        #else
+            self.init(service: service, account: account, keychain: SystemAppleKeychainStore())
+        #endif
     }
 
     public init(service: String, account: String, keychain: any AppleKeychainStoring) {
@@ -36,12 +40,41 @@ public struct SessionKeychainStore: Sendable {
         self.keychain = keychain
     }
 
-    public static let defaultService = "at.oncloud.encryptedmemories.session"
+    private static let productionService = "at.oncloud.encryptedmemories.session"
+    #if ENCRYPTED_MEMORIES_UPGRADE_TEST
+        public static let defaultService = productionService + ".upgrade-test"
+    #else
+        public static let defaultService = productionService
+    #endif
 
     public func load() throws -> ProtonSession? {
+        #if ENCRYPTED_MEMORIES_UPGRADE_TEST
+            guard UpgradeTestProbe.isRequested else { throw SessionKeychainError.invalidPayload }
+            UpgradeTestProbe.rejectExternalNetwork()
+            if UpgradeTestProbe.seedsAccount,
+                UserDefaults.standard.string(forKey: "upgrade.fixture.seeded")
+                    != UpgradeTestProbe.endpoint.absoluteString
+            {
+                guard let domain = Bundle.main.bundleIdentifier, domain.hasSuffix(".upgrade-test") else {
+                    throw SessionKeychainError.invalidPayload
+                }
+                UserDefaults.standard.removePersistentDomain(forName: domain)
+                try clear()
+                try save(
+                    ProtonSession(
+                        uid: UpgradeTestProbe.accountUID, accessToken: "synthetic-access",
+                        refreshToken: "synthetic-refresh", keyPassword: "synthetic-key"))
+                UserDefaults.standard.set(UpgradeTestProbe.endpoint.absoluteString, forKey: "upgrade.fixture.seeded")
+            }
+        #endif
         guard let data = try keychain.data(for: item) else { return nil }
         do {
-            return try JSONDecoder().decode(ProtonSession.self, from: data)
+            let session = try JSONDecoder().decode(ProtonSession.self, from: data)
+            #if ENCRYPTED_MEMORIES_UPGRADE_TEST
+                guard session.uid == UpgradeTestProbe.accountUID else { throw SessionKeychainError.invalidPayload }
+                UpgradeTestProbe.checkpoint("session.loaded")
+            #endif
+            return session
         } catch {
             throw SessionKeychainError.invalidPayload
         }
