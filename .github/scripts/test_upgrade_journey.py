@@ -14,6 +14,8 @@ import signal
 import os
 import uuid
 import select
+import time
+from contextlib import nullcontext
 
 from urllib.request import Request, urlopen
 
@@ -500,6 +502,142 @@ else:
         ui_log = (servers[0].directory / 'verify-ui.log').read_text()
         self.assertIn('The saved index did not return all eight photos', ui_log)
         print('PASS: a held native query cannot use the eight retained library elements', flush=True)
+
+    @unittest.skipUnless(os.environ.get('UPGRADE_NATIVE_SEED_TARGET'), 'Native seed regression is opt-in')
+    def test_native_seed_identity_survives_restarts_and_reseeds_changed_cases_or_servers(self):
+        handlers = {value: signal.getsignal(value) for value in [signal.SIGINT, signal.SIGTERM]}
+        try:
+            for value in handlers:
+                signal.signal(value, run_journey.terminate)
+            from build_apps import build_app
+            repo = Path(__file__).resolve().parents[2]
+            root = Path(os.environ.get('ENCRYPTED_MEMORIES_BUILD_ROOT',
+                        str(Path.home() / 'Developer/xcode/EncryptedMemories'))) / 'UpgradeCheck'
+            (root / 'scratch').mkdir(parents=True, exist_ok=True)
+            evidence = root / 'evidence' / uuid.uuid4().hex
+            evidence.mkdir(parents=True)
+            platform = os.environ.get('UPGRADE_NATIVE_SEED_PLATFORM', 'macOS')
+            (evidence / 'toolchain.json').write_text(json.dumps({
+                'xcode': run_journey.output(['xcodebuild', '-version']), 'platform': platform}) + '\n')
+            target = os.environ['UPGRADE_NATIVE_SEED_TARGET']
+            for tag in [target, 'v1.0.5']:
+                with self.subTest(tag=tag):
+                    build = build_app(repo, repo, tag, platform, root,
+                        working_copy=tag == target and os.environ.get('UPGRADE_NATIVE_WORKING_COPY') == '1')
+                    case = evidence / platform / tag
+                    case.mkdir(parents=True)
+                    identity = run_journey.SigningIdentity(root) if platform == 'macOS' else nullcontext()
+                    with identity as signer, FixtureServer(case / 'server', 'session.loaded') as server:
+                        app = run_journey.InstalledApp(platform, case, signer)
+                        try:
+                            app.install(build.app)
+                            def session_file():
+                                return app.preferences_path.parents[2] / 'Library/Application Support/EncryptedMemories' / (
+                                    'upgrade-fixture-account-' + app.case_id) / 'upgrade-fixture-session.json'
+
+                            def launch(endpoint, seed=True):
+                                endpoint.reached.clear()
+                                endpoint.release.clear()
+                                app.launch(endpoint, seed=seed)
+                                expected = {'server': endpoint.url, 'account': 'upgrade-fixture-account-' + app.case_id}
+                                process, log = None, None
+                                if platform == 'macOS':
+                                    info = plistlib.loads((app.installed / 'Contents/Info.plist').read_bytes())
+                                    binary = app.installed / 'Contents/MacOS' / info['CFBundleExecutable']
+                                    log = (case / (uuid.uuid4().hex + '.log')).open('w')
+                                    process = run_journey.owned_process([str(binary), *app.launch_arguments], log)
+                                try:
+                                    endpoint.wait_checkpoint(timeout=20)
+                                    # Read the app's own flush before interruption. Never repair its marker here.
+                                    deadline = time.monotonic() + 20
+                                    while True:
+                                        try:
+                                            marker = plistlib.loads(app.preferences_path.read_bytes()).get('upgrade.fixture.seeded')
+                                        except FileNotFoundError:
+                                            marker = None
+                                        if marker == expected:
+                                            break
+                                        if time.monotonic() >= deadline:
+                                            self.fail('The case/server seed marker did not reach the owned preferences file')
+                                        time.sleep(0.2)
+                                    (case / (uuid.uuid4().hex + '-marker.json')).write_text(json.dumps(marker) + '\n')
+                                finally:
+                                    if process is not None:
+                                        if process.poll() is None:
+                                            process.terminate()
+                                        try:
+                                            process.wait(timeout=10)
+                                        except subprocess.TimeoutExpired:
+                                            if process.poll() is None:
+                                                process.kill()
+                                            process.wait(timeout=10)
+                                    else:
+                                        app.kill_app()
+                                    if log:
+                                        log.close()
+                                    endpoint.release.set()
+
+                            if platform == 'iOS':
+                                # A fresh owned device has never loaded this preference domain.
+                                preferences = app.preferences_path
+                                preferences.parent.mkdir(parents=True, exist_ok=True)
+                                preferences.write_bytes(plistlib.dumps({'upgrade.fixture.seeded': server.url}))
+                                self.assertEqual(plistlib.loads(preferences.read_bytes())['upgrade.fixture.seeded'], server.url)
+                            launch(server)
+                            first = app.case_id
+                            app.case_id = uuid.uuid4().hex
+                            self.assertNotEqual(first, app.case_id)
+                            launch(server)  # Same port, different case: the original regression.
+                            if platform == 'macOS':
+                                path = session_file()
+                                retained = json.loads(path.read_text())
+                                retained['accessToken'] = 'synthetic-retained-access'
+                                path.write_text(json.dumps(retained))
+                            launch(server)
+                            launch(server, seed=False)
+                            if platform == 'macOS':
+                                self.assertEqual(json.loads(path.read_text()), retained, 'An unchanged identity reseeded the session')
+
+                            with FixtureServer(case / 'changed-server', 'session.loaded') as other:
+                                self.assertNotEqual(server.url, other.url)
+                                launch(other)  # Same case, different server.
+                                if platform == 'macOS':
+                                    self.assertEqual(json.loads(path.read_text())['accessToken'], 'synthetic-access',
+                                                     'A changed server did not reseed the session')
+                        finally:
+                            if platform == 'iOS':
+                                app.close()
+                    print('PASS: native case/server reseeding and unchanged restart: ' + platform + ' / ' + tag, flush=True)
+        finally:
+            for value, handler in handlers.items():
+                signal.signal(value, handler)
+
+    @unittest.skipUnless(os.environ.get('UPGRADE_NATIVE_PROBES') == '1', 'Native identifier validation is opt-in')
+    def test_native_case_identifier_accepts_only_exactly_32_ascii_hex_characters(self):
+        repo = Path(__file__).resolve().parents[2]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            main = root / 'main.swift'
+            # PhotoUID is unused by this probe; identity validation uses the real compiled source.
+            main.write_text('public struct PhotoUID { public init(volumeID: String, nodeID: String) {} }\n'
+                            'print(UpgradeTestProbe.accountUID)\n')
+            binary = root / 'identity'
+            subprocess.run(['xcrun', 'swiftc', '-O', '-D', 'ENCRYPTED_MEMORIES_UPGRADE_TEST',
+                str(repo / 'Packages/EncryptedMemoriesKit/Sources/PhotosCore/UpgradeTestProbe.swift'),
+                str(main), '-o', str(binary)], check=True, env=run_journey.clean_environment())
+            for identifier in ['0123456789abcdef' * 2, '0123456789ABCDEF' * 2]:
+                result = subprocess.run([str(binary), '-EncryptedMemoriesUpgradeCase', identifier],
+                    capture_output=True, text=True, env=run_journey.clean_environment())
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(), 'upgrade-fixture-account-' + identifier)
+            for arguments in [[], ['-EncryptedMemoriesUpgradeCase']] + [
+                ['-EncryptedMemoriesUpgradeCase', value]
+                for value in ['', 'a' * 31, 'a' * 33, 'g' * 32, '../' + 'a' * 29, 'Ａ' * 32, 'a' * 31 + '\n']
+            ]:
+                result = subprocess.run([str(binary), *arguments], capture_output=True, text=True,
+                    env=run_journey.clean_environment())
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('exactly 32 ASCII hexadecimal characters', result.stderr)
 
     def test_historical_overlays_apply_to_the_exact_published_tag(self):
         repo = Path(__file__).resolve().parents[2]
