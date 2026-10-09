@@ -2,6 +2,10 @@ import Foundation
 import Photos
 import os
 
+#if ENCRYPTED_MEMORIES_UPGRADE_TEST
+    import PhotosCore
+#endif
+
 struct PhotoLibraryLiveChangeBuffer {
     struct Snapshot: Equatable {
         var changedIdentifiers: Set<String>
@@ -97,7 +101,11 @@ public final class PhotoLibraryChangeMonitor: NSObject, PHPhotoLibraryChangeObse
 
     public struct PreparedChangeSet: @unchecked Sendable {
         public let changes: ChangeSet
-        fileprivate let commitToken: PHPersistentChangeToken
+        #if ENCRYPTED_MEMORIES_UPGRADE_TEST
+            fileprivate let commitToken: PHPersistentChangeToken?
+        #else
+            fileprivate let commitToken: PHPersistentChangeToken
+        #endif
         fileprivate let liveGeneration: UInt64
     }
 
@@ -137,6 +145,9 @@ public final class PhotoLibraryChangeMonitor: NSObject, PHPhotoLibraryChangeObse
     /// library changes while the app runs. The initial full-library fetch runs on a utility task
     /// so a foreground controller never blocks its actor while PhotoKit creates the snapshot.
     public func startObserving(_ handler: @Sendable @escaping () -> Void) {
+        #if ENCRYPTED_MEMORIES_UPGRADE_TEST
+            if UpgradeTestProbe.isRequested { return }
+        #endif
         let generation: UInt64? = lock.withLock {
             onLibraryChange = handler
             guard !isObserving, !isStarting else { return nil }
@@ -224,6 +235,15 @@ public final class PhotoLibraryChangeMonitor: NSObject, PHPhotoLibraryChangeObse
     /// Changes since the stored token. This deliberately does not advance the stored token. Callers
     /// must commit the returned value only after their durable scan/enqueue work succeeds.
     public func prepareChanges() -> PreparedChangeSet {
+        #if ENCRYPTED_MEMORIES_UPGRADE_TEST
+            if UpgradeTestProbe.isRequested {
+                return PreparedChangeSet(
+                    changes: ChangeSet(
+                        changedIdentifiers: [], deletedIdentifiers: [],
+                        requiresFullRescan: !FileManager.default.fileExists(atPath: tokenURL.path)),
+                    commitToken: nil, liveGeneration: 0)
+            }
+        #endif
         let library = PHPhotoLibrary.shared()
         let live = lock.withLock { liveChanges.snapshot() }
         let currentToken = library.currentChangeToken
@@ -290,7 +310,18 @@ public final class PhotoLibraryChangeMonitor: NSObject, PHPhotoLibraryChangeObse
     /// be written, the stored token and the live changes stay, so the next pass reports the changes again.
     @discardableResult
     public func commit(_ prepared: PreparedChangeSet) -> Bool {
-        guard store(token: prepared.commitToken) else { return false }
+        #if ENCRYPTED_MEMORIES_UPGRADE_TEST
+            if UpgradeTestProbe.isRequested {
+                do { try Data("synthetic-token".utf8).write(to: tokenURL, options: .atomic) } catch {
+                    fatalError("The synthetic PhotoKit token was not saved")
+                }
+                return true
+            }
+            guard let token = prepared.commitToken else { fatalError("Missing PhotoKit token") }
+        #else
+            let token = prepared.commitToken
+        #endif
+        guard store(token: token) else { return false }
         lock.withLock {
             liveChanges.commit(through: prepared.liveGeneration)
         }

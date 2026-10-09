@@ -690,6 +690,10 @@ public actor MLModelInstaller {
             try recordData.write(
                 to: staging.appendingPathComponent(MLModelInstallLayout.installRecordFileName), options: .atomic)
         }
+        #if ENCRYPTED_MEMORIES_UPGRADE_TEST
+            UpgradeTestProbe.checkpoint("model.installRecord")
+        #endif
+
         guard
             validateInstallTree(
                 at: staging,
@@ -704,6 +708,10 @@ public actor MLModelInstaller {
         try fm.createDirectory(at: installDir.deletingLastPathComponent(), withIntermediateDirectories: true)
         try? fm.removeItem(at: installDir)
         try fm.moveItem(at: staging, to: installDir)
+        #if ENCRYPTED_MEMORIES_UPGRADE_TEST
+            UpgradeTestProbe.checkpoint("model.promoted")
+        #endif
+
         return record
     }
 

@@ -386,6 +386,10 @@ public actor ThumbnailCache {
                     let url = directory.appendingPathComponent(name)
                     let previousBytes = Self.blobSize(at: url)
                     try sealed.write(to: url, options: .atomic)
+                    #if ENCRYPTED_MEMORIES_UPGRADE_TEST
+                        UpgradeTestProbe.checkpoint("thumbnail.stored")
+                    #endif
+
                     diskUsage.record(name, from: previousBytes, to: Int64(sealed.count))
                     validated.insert(name, generation: generation)  // we just sealed it - it's decryptable
                     return ThumbnailCacheStoreResult.stored

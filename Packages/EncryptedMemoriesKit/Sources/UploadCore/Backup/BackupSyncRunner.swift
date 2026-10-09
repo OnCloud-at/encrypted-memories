@@ -798,6 +798,9 @@ public actor BackupSyncRunner {
     // MARK: - Per-entry processing
 
     private func process(_ queuedEntry: UploadBackupSyncQueueEntry, workIntent: LibraryWorkIntent) async {
+        #if ENCRYPTED_MEMORIES_UPGRADE_TEST
+            UpgradeTestProbe.checkpoint("backup.claimed")
+        #endif
         var checkingEntry = queuedEntry
         let isSourceRecheck = checkingEntry.isDismissedSourceRecheck
         let key = Self.key(checkingEntry)
@@ -1657,6 +1660,9 @@ public actor BackupSyncRunner {
         }
         do {
             try await preflight.markBackedUp(resolved.candidate.snapshot)
+            #if ENCRYPTED_MEMORIES_UPGRADE_TEST
+                UpgradeTestProbe.checkpoint("backup.localRecord")
+            #endif
         } catch {
             retryOrPark(entry, from: persistedState, error: error)
             return

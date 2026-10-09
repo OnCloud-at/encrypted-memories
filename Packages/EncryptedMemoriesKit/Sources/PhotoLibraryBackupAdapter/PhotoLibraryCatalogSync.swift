@@ -65,6 +65,12 @@ public struct PhotoKitAssetEnumerator: PhotoLibraryAssetEnumerator {
     public func infoChunks(
         identifiers: [String]?, startOffset: Int, chunkSize: Int
     ) -> AsyncThrowingStream<[PhotoBackupAssetInfo], any Error> {
+        #if ENCRYPTED_MEMORIES_UPGRADE_TEST
+            if UpgradeTestProbe.isRequested {
+                return UpgradeTestPhotoLibrary.infoChunks(
+                    identifiers: identifiers, startOffset: startOffset, chunkSize: chunkSize)
+            }
+        #endif
         let chunkSize = max(1, chunkSize)
         return AsyncThrowingStream { continuation in
             let task = Task.detached(priority: .utility) {
@@ -102,6 +108,11 @@ public struct PhotoKitAssetEnumerator: PhotoLibraryAssetEnumerator {
     }
 
     public func identifierChunks(chunkSize: Int) -> AsyncThrowingStream<PhotoLibraryIdentifierChunk, any Error> {
+        #if ENCRYPTED_MEMORIES_UPGRADE_TEST
+            if UpgradeTestProbe.isRequested {
+                return UpgradeTestPhotoLibrary.identifierChunks(chunkSize: chunkSize)
+            }
+        #endif
         let chunkSize = max(1, chunkSize)
         return AsyncThrowingStream { continuation in
             let task = Task.detached(priority: .utility) {

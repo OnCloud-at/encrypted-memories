@@ -249,3 +249,49 @@ public final class ProtonClientFacade {
         await shutdownGate.run { await handler() }
     }
 }
+
+#if ENCRYPTED_MEMORIES_UPGRADE_TEST
+    extension ProtonClientFacade {
+        static func makeUpgradeTestFacade(
+            accountUID: String, keyPassword: String, policy: ProtonDriveBackendPolicy
+        ) async throws -> ProtonClientFacade {
+            let backend = UpgradeTestBackend()
+            let directory = LibraryDatabaseLocation.prepareAccountDirectory(uid: accountUID)
+            guard
+                let identities = UploadIdentityManifestStore(
+                    url: directory.appendingPathComponent(UploadIdentityManifestStore.databaseFileName),
+                    policy: policy.libraryDatabasePolicy)
+            else { throw UploadError.backend("The upgrade identity store did not open") }
+            let sources = LibrarySourceCoordinator(
+                remote: backend, thumbnailLoader: backend,
+                inventoryStore: LibrarySourceInventoryStore(
+                    directory: directory, accountUID: accountUID,
+                    encryptionKey: LibrarySourceInventoryKeyDerivation.key(
+                        accountUID: accountUID, keyPassword: keyPassword), policy: policy.libraryDatabasePolicy))
+            await sources.prepare()
+            let albums = AlbumsRepository(
+                catalogBackend: backend, writeBackend: backend,
+                capabilities: .init(canList: true, canCreate: false, canAddPhotos: false, canSetCover: false))
+            let pipeline = UploadDedupePipeline(store: identities, checker: backend)
+            let manager = UploadManager(
+                uploader: backend, albums: AlbumAttachingAdapter(albums: albums), identityResolver: pipeline)
+            let coordinator = UploadCoordinator(
+                manager: manager, uploadCapabilities: backend.capabilities,
+                canCreateAlbum: false, canAddToAlbum: false, canSetAlbumCover: false)
+            return ProtonClientFacade(
+                backend: backend, librarySources: sources, albums: albums, uploads: manager,
+                uploadCoordinator: coordinator, photoUploader: backend, photoTagAdder: backend,
+                seriesDissolution: nil,
+                editedPhotoReplacement: nil,
+                exactDuplicates: nil,
+                uploadIdentityResolver: pipeline, accountDataDirectory: directory,
+                accountDatabasePolicy: policy.libraryDatabasePolicy, albumSyncRemoteOps: UpgradeTestAlbumSync(),
+                accountInfoRefresher: {},
+                shutdownHandler: {
+                    await sources.shutdown()
+                    await manager.shutdown()
+                    identities.close()
+                })
+        }
+    }
+#endif
