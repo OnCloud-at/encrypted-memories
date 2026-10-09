@@ -1845,7 +1845,7 @@ extension UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueObserving {
 }
 
 extension UploadBackupSyncQueueManifestStore: BackupQueueSupportSource {
-    /// Group only local scalar columns. No source, filename, receipt, or backend detail can leave this method.
+    /// Group only local scalar columns. No source identifier, filename, receipt, or backend detail leaves this method.
     public func backupSupportSnapshot() -> BackupQueueSupportSnapshot {
         lock.withLock {
             guard db != nil, !operationFailed else { return BackupQueueSupportSnapshot() }
@@ -1853,7 +1853,10 @@ extension UploadBackupSyncQueueManifestStore: BackupQueueSupportSource {
             guard
                 sqlite3_prepare_v2(
                     db,
-                    "SELECT state, resource, last_error, COUNT(*) FROM backup_sync_queue GROUP BY state, resource, last_error;",
+                    """
+                    SELECT state, resource, last_error, source_kind, COUNT(*) FROM backup_sync_queue
+                    GROUP BY state, resource, last_error, source_kind;
+                    """,
                     -1, &stmt, nil
                 ) == SQLITE_OK
             else { return BackupQueueSupportSnapshot() }
@@ -1865,10 +1868,19 @@ extension UploadBackupSyncQueueManifestStore: BackupQueueSupportSource {
             var total = 0
             var step = sqlite3_step(stmt)
             while step == SQLITE_ROW {
-                let state = BackupQueueSupportSnapshot.State(rawValue: columnText(stmt, 0) ?? "") ?? .unknown
+                let rawState = columnText(stmt, 0) ?? ""
+                let lastError = columnText(stmt, 2)
+                var state = BackupQueueSupportSnapshot.State(rawValue: rawState) ?? .unknown
+                if let sourceKind = columnText(stmt, 3).flatMap(UploadSourceIdentity.Kind.init(rawValue:)),
+                    let queueState = UploadBackupSyncQueueState(rawValue: rawState),
+                    UploadBackupSyncQueueEntry.isDismissedSourceRecheck(
+                        sourceKind: sourceKind, state: queueState, lastError: lastError)
+                {
+                    state = .dismissedFailure
+                }
                 let resource = Self.supportResourceKind(columnText(stmt, 1) ?? "")
-                let reason = Self.supportReason(columnText(stmt, 2))
-                let count = Int(sqlite3_column_int64(stmt, 3))
+                let reason = Self.supportReason(lastError)
+                let count = Int(sqlite3_column_int64(stmt, 4))
                 total += count
                 states[state, default: 0] += count
                 resources[resource, default: 0] += count
