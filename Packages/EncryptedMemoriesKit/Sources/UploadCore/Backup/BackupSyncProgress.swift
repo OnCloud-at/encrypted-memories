@@ -58,6 +58,8 @@ public struct BackupSyncProgress: Sendable, Equatable {
     public var failed = 0
     /// Permanent failures the user acknowledged. Still not backed up, but no longer attention work.
     public var dismissedFailures = 0
+    /// Work still owed for acknowledged missing photos, already counted in dismissedFailures.
+    public var pendingSourceRechecks = 0
     public var paused = 0
     /// The file currently being processed, for "wird geprüft: IMG_0042.HEIC" style rows.
     public var currentItemName: String?
@@ -108,7 +110,7 @@ public struct BackupSyncProgress: Sendable, Equatable {
     public var needsAttention: Int { failed + sourceMissing }
 
     public var hasOutstandingWork: Bool {
-        waiting + checking + uploading + blocked > 0
+        waiting + checking + uploading + blocked + pendingSourceRechecks > 0
     }
 
     /// Seeds the queue-derived counters from a summary; live fields stay as set by the runner.
@@ -130,6 +132,7 @@ public struct BackupSyncProgress: Sendable, Equatable {
         blocked = summary.blocked
         failed = summary.failed
         dismissedFailures = summary.dismissedFailures
+        pendingSourceRechecks = summary.pendingSourceRechecks
         paused = summary.paused
         self.currentItemName = currentItemName
         self.isRunning = isRunning

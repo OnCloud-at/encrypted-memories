@@ -1052,6 +1052,32 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
 
     // MARK: - Waiting for Wi-Fi
 
+    func testDismissedMissingSourceRecheckStillSchedulesAnAutomaticWakeWithoutAPendingUpload() async throws {
+        let signals = FakeBackupRuntimeSignals(waitsForWiFi: true)
+        let fixture = try makeWiFiWaitFixture(
+            prefix: "backup-dismissed-source-wake", signals: signals, dismissedSourceRecheck: true)
+        defer { fixture.cleanup() }
+        let controller = fixture.controller
+        let scans = PassCounter()
+        controller.replaceScanForTesting { _ = scans.increment() }
+
+        controller.syncNow()
+
+        let waiting = await waitUntil {
+            !controller.isSyncing && controller.isAutoResumeScheduledForTesting
+                && controller.status.phase == .waitingForWiFi
+        }
+        XCTAssertTrue(waiting, "The deferred source check must keep its automatic wake")
+        XCTAssertEqual(scans.count, 1)
+        XCTAssertEqual(controller.status.dismissedFailures, 1)
+        XCTAssertEqual(controller.status.needsAttentionCount, 0)
+        XCTAssertEqual(controller.status.waitingRetry, 0)
+        XCTAssertEqual(controller.status.notBackedUpCount, 1)
+        XCTAssertEqual(controller.status.outstandingCount, 1)
+        XCTAssertNotNil(controller.nextAutomaticAttemptAt)
+        await controller.shutdown()
+    }
+
     func testWiFiReturningDuringTheScanStartsTheNextPassAtOnce() async throws {
         let signals = FakeBackupRuntimeSignals(waitsForWiFi: true)
         let fixture = try makeWiFiWaitFixture(prefix: "backup-wifi-returns", signals: signals)
@@ -1139,7 +1165,9 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
     }
 
     /// A backup with one runnable row whose scan never touches PhotoKit; only the runner drains.
-    private func makeWiFiWaitFixture(prefix: String, signals: FakeBackupRuntimeSignals) throws -> ControllerFixture {
+    private func makeWiFiWaitFixture(
+        prefix: String, signals: FakeBackupRuntimeSignals, dismissedSourceRecheck: Bool = false
+    ) throws -> ControllerFixture {
         let fixture = try makeControllerFixture(
             prefix: prefix, identityResolver: FakeIdentityResolver(), runtimeSignals: signals.source)
         fixture.controller.setEnabledForTesting()
@@ -1150,8 +1178,11 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
         XCTAssertTrue(
             queue.upsert(
                 .init(
-                    source: .init(kind: .fileURL, identifier: "waiting-photo"), revision: .init(rawValue: 1),
-                    originalFilename: "waiting-photo.jpg", state: .discovered,
+                    source: .init(
+                        kind: dismissedSourceRecheck ? .photoLibraryAsset : .fileURL, identifier: "waiting-photo"),
+                    revision: .init(rawValue: 1), originalFilename: "waiting-photo.jpg", state: .discovered,
+                    lastError: dismissedSourceRecheck
+                        ? BackupIssueRecord(kind: .sourceMissing, detail: "acknowledged missing").persistedValue : nil,
                     updatedAt: Date().addingTimeInterval(-60))))
         queue.close()
         return fixture

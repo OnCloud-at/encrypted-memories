@@ -125,6 +125,37 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         snapshot.tiles.map(\.key.identifier)
     }
 
+    func testDismissedMissingSourceRecheckStaysHiddenThroughIncrementalReloadAndRelaunch() async throws {
+        enqueue("acknowledged", state: .discovered)
+        await coordinator.start()
+        _ = await waitForSnapshot("the ordinary unchecked source starts visible") { $0.tiles.count == 1 }
+        let reason = BackupIssueRecord(kind: .sourceMissing, detail: "acknowledged missing").persistedValue
+        XCTAssertTrue(
+            queue.updateState(
+                source: source("acknowledged"), revision: revision, state: .discovered,
+                attempts: nil, lastError: reason, updatedAt: date))
+        _ = await waitForSnapshot("the incremental marker projection hides the tile") { $0.tiles.isEmpty }
+        let pending = try XCTUnwrap(queue.entry(for: source("acknowledged"), revision: revision))
+        await coordinator.close()
+        coordinator = makeCoordinator()
+        await coordinator.start()
+        let relaunched = await coordinator.currentSnapshot()
+        XCTAssertTrue(relaunched.tiles.isEmpty, "The complete reload must preserve the dismissal")
+        var ordinary = pending
+        ordinary.lastError = nil
+        ordinary.state = .queuedForUpload
+        XCTAssertTrue(queue.upsert(ordinary))
+        XCTAssertEqual(queue.entry(for: pending.source, revision: pending.revision), pending)
+        var released = pending
+        released.state = .checking
+        XCTAssertEqual(queue.claimRunnable(limit: 1, claimedAt: date).count, 1)
+        released.lastError = nil
+        XCTAssertEqual(
+            queue.updateDismissedSourceRecheck(released, matchingState: .checking, matchingLastError: reason), true)
+        let visible = await waitForSnapshot("the proof release permits exactly one tile") { $0.tiles.count == 1 }
+        XCTAssertEqual(tileIDs(visible), ["acknowledged"])
+    }
+
     // MARK: - Edits of backed-up photos
 
     private let edit = UploadBackupRevision(rawValue: 10)

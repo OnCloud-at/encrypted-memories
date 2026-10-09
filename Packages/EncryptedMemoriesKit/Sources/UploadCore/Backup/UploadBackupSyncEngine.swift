@@ -45,7 +45,7 @@ public protocol UploadBackupCandidateEnqueueing: Sendable {
         _ reopenings: [UploadBackupReopening], deferringWithoutRemoteProof: Bool
     ) async throws -> [UploadBackupAssetCandidate]
     /// Requeues terminal missing rows for explicit Photos changes, even when their revision is unchanged.
-    /// Waiting, successful, dismissed, and absent rows stay untouched.
+    /// Dismissed missing rows retain their reason until the runner proves their bytes returned.
     func enqueueChangedMissingSources(_ candidates: [UploadBackupAssetCandidate]) async throws
     /// Local-only recovery. Complete states and sources with any queue row stay untouched.
     func enqueueMissingSources(_ candidates: [UploadBackupAssetCandidate]) async throws
@@ -182,8 +182,37 @@ public actor UploadBackupSyncEngine: UploadBackupCandidateEnqueueing {
 
     public func enqueueBatch(_ candidates: [UploadBackupAssetCandidate]) async throws -> UploadBackupSyncScanResult {
         // A photo the person deleted before upload stays out of the backup, also when a rescan offers it again.
-        let candidates = try withoutExcludedSources(candidates)
-        guard !candidates.isEmpty else { return UploadBackupSyncScanResult() }
+        let included = try withoutExcludedSources(candidates)
+        guard !included.isEmpty else { return UploadBackupSyncScanResult() }
+        var candidates: [UploadBackupAssetCandidate] = []
+        var result = UploadBackupSyncScanResult()
+        let mayHaveDismissals = queue.containsAny(in: [.dismissedFailure, .discovered, .checking])
+        guard queue.isOperational() else { throw UploadError.backend("Backup queue could not be read") }
+        for candidate in included {
+            try Task.checkCancellation()
+            if mayHaveDismissals {
+                let row = queue.entry(for: candidate.snapshot.source, revision: candidate.snapshot.revision)
+                guard queue.isOperational() else { throw UploadError.backend("Backup queue could not be read") }
+                if let row, row.isDismissedSourceRecheck || row.state == .dismissedFailure {
+                    result.scanned += 1
+                    if row.state == .dismissedFailure, row.source.kind == .photoLibraryAsset,
+                        let reason = row.lastError, BackupIssueRecord.decode(reason)?.kind == .sourceMissing,
+                        row.remoteCommitReconciliation == nil
+                    {
+                        var pending = row
+                        pending.state = .discovered
+                        pending.updatedAt = now()
+                        guard
+                            queue.updateDismissedSourceRecheck(
+                                pending, matchingState: .dismissedFailure, matchingLastError: reason) != nil
+                        else { throw UploadError.backend("Backup queue could not persist a source check") }
+                    }
+                    continue
+                }
+            }
+            candidates.append(candidate)
+        }
+        guard !candidates.isEmpty else { return result }
         var decisions = try await preflight.classifyBatch(candidates.map(\.snapshot))
         try Task.checkCancellation()
         guard decisions.count == candidates.count else {
@@ -228,7 +257,6 @@ public actor UploadBackupSyncEngine: UploadBackupCandidateEnqueueing {
                 }
             }
         }
-        var result = UploadBackupSyncScanResult()
         var entries: [UploadBackupSyncQueueEntry] = []
         entries.reserveCapacity(candidates.count)
         for (candidate, decision) in zip(candidates, decisions) {
@@ -256,7 +284,7 @@ public actor UploadBackupSyncEngine: UploadBackupCandidateEnqueueing {
             try Task.checkCancellation()
             let row = queue.entry(for: candidate.snapshot.source, revision: candidate.snapshot.revision)
             guard queue.isOperational() else { throw UploadError.backend("Backup queue could not be read") }
-            if row?.state == .sourceMissing { missing.append(candidate) }
+            if row?.state == .sourceMissing || row?.state == .dismissedFailure { missing.append(candidate) }
         }
         if !missing.isEmpty { _ = try await enqueueBatch(missing) }
     }

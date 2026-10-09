@@ -36,6 +36,15 @@ public struct PhotoLibraryResourceResolver: BackupResourceResolving {
         _ entry: UploadBackupSyncQueueEntry,
         onPreparationProgress: @escaping BackupResourcePreparationHandler
     ) async throws -> BackupResolvedResource? {
+        try await resolve(entry, onPreparationProgress: onPreparationProgress, readAdmission: {})
+    }
+
+    public func resolve(
+        _ entry: UploadBackupSyncQueueEntry,
+        onPreparationProgress: @escaping BackupResourcePreparationHandler,
+        readAdmission: @escaping BackupResourceReadAdmission
+    ) async throws -> BackupResolvedResource? {
+        try readAdmission()
         guard entry.source.kind == .photoLibraryAsset else {
             throw UploadError.backend("photo resolver received source kind \(entry.source.kind.rawValue)")
         }
@@ -100,7 +109,7 @@ public struct PhotoLibraryResourceResolver: BackupResourceResolving {
         let primaryIdentity = try await readIdentity(
             primaryResource,
             filename: plan.primary.uploadFilename,
-            tracking: exportedURLs
+            tracking: exportedURLs, readAdmission: readAdmission
         ) { fraction in
             identityProgress(0, fraction)
         }
@@ -136,6 +145,7 @@ public struct PhotoLibraryResourceResolver: BackupResourceResolving {
                     sourceUnchanged: currentAsset.modificationDate == modifiedAtResolve,
                     tempStore: tempStore,
                     tracking: exportedURLs,
+                    readAdmission: readAdmission,
                     onProgress: {
                         progress(
                             .init(
@@ -181,7 +191,7 @@ public struct PhotoLibraryResourceResolver: BackupResourceResolving {
                 throw UploadError.fileMissing(item.uploadFilename)
             }
             let identity = try await readIdentity(
-                resource, filename: item.uploadFilename, tracking: exportedURLs
+                resource, filename: item.uploadFilename, tracking: exportedURLs, readAdmission: readAdmission
             ) { fraction in
                 identityProgress(secondaryIndex + 1, fraction)
             }
@@ -215,6 +225,7 @@ public struct PhotoLibraryResourceResolver: BackupResourceResolving {
                     sourceUnchanged: currentAsset.modificationDate == ownerModifiedAtResolve,
                     tempStore: tempStore,
                     tracking: exportedURLs,
+                    readAdmission: readAdmission,
                     onProgress: {
                         progress(
                             .init(
@@ -386,6 +397,7 @@ public struct PhotoLibraryResourceResolver: BackupResourceResolving {
         _ resource: PHAssetResource,
         filename: String,
         tracking exported: ExportedURLBox,
+        readAdmission: @escaping BackupResourceReadAdmission,
         onProgress: @escaping @Sendable (Double) -> Void
     ) async throws -> IdentityResult {
         let progressGate = FractionProgressGate(onProgress)
@@ -415,7 +427,7 @@ public struct PhotoLibraryResourceResolver: BackupResourceResolving {
         let sink = PhotoKitStagingSink(tempStore: tempStore, filename: filename, expectedBytes: exactSize)
         do {
             try await Self.requestData(
-                for: resource, networkAccessAllowed: true, progressGate: progressGate
+                for: resource, networkAccessAllowed: true, progressGate: progressGate, readAdmission: readAdmission
             ) { data in
                 sink.receive(data)
             }
@@ -446,6 +458,7 @@ public struct PhotoLibraryResourceResolver: BackupResourceResolving {
         sourceUnchanged: Bool,
         tempStore: BackupTempFileStore,
         tracking exported: ExportedURLBox,
+        readAdmission: @escaping BackupResourceReadAdmission,
         onProgress: @escaping @Sendable (Double) -> Void
     ) async throws -> ExportResult {
         if let export = staged.take() {
@@ -476,7 +489,7 @@ public struct PhotoLibraryResourceResolver: BackupResourceResolving {
             let box = WriteBox()
             do {
                 try await requestData(
-                    for: resource, networkAccessAllowed: true, progressGate: progressGate
+                    for: resource, networkAccessAllowed: true, progressGate: progressGate, readAdmission: readAdmission
                 ) { data in
                     try tempStore.recordWrite(to: partialURL, byteCount: data.count)
                     try handle.write(contentsOf: data)
@@ -507,12 +520,17 @@ public struct PhotoLibraryResourceResolver: BackupResourceResolving {
         for resource: PHAssetResource,
         networkAccessAllowed: Bool,
         progressGate: FractionProgressGate,
+        readAdmission: @escaping BackupResourceReadAdmission = {},
         receive: @escaping (Data) throws -> Void
     ) async throws {
         let options = PHAssetResourceRequestOptions()
         options.isNetworkAccessAllowed = networkAccessAllowed
         let manager = PHAssetResourceManager.default()
+        let networkAdmission: BackupResourceReadAdmission = {
+            if networkAccessAllowed { try readAdmission() }
+        }
         let liveness = PhotoKitResourceRequestLivenessGuard<PHAssetResourceDataRequestID>(
+            requestAdmission: networkAdmission,
             cancelRequest: { manager.cancelDataRequest($0) }
         )
         options.progressHandler = {

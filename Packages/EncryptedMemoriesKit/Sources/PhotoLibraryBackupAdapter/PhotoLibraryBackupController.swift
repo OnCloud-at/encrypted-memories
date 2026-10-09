@@ -1597,7 +1597,7 @@ public final class PhotoLibraryBackupController {
             catalogStore?.isOperational() == true
         else { return }
         let p = progress ?? lastProjectedProgress
-        guard p.waiting + p.checking + p.uploading + p.blocked > 0 else { return }  // No work remains.
+        guard p.hasOutstandingWork else { return }  // No work remains.
         let currentTime = Date()
         guard
             let wakeAt = BackupAutomaticRetryPlanner.nextAttempt(

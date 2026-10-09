@@ -780,6 +780,7 @@ public actor BackupSyncRunner {
         if peek.count < Self.primeBatch {
             peek += queue.entries(in: .queuedForUpload, updatedBefore: cutoff, limit: Self.primeBatch - peek.count)
         }
+        peek.removeAll { $0.isDismissedSourceRecheck }
         guard !peek.isEmpty else { return }
         let descriptors = peek.map { entry in
             UploadResourceDescriptor(
@@ -796,13 +797,15 @@ public actor BackupSyncRunner {
 
     // MARK: - Per-entry processing
 
-    private func process(_ entry: UploadBackupSyncQueueEntry, workIntent: LibraryWorkIntent) async {
-        let key = Self.key(entry)
+    private func process(_ queuedEntry: UploadBackupSyncQueueEntry, workIntent: LibraryWorkIntent) async {
+        var checkingEntry = queuedEntry
+        let isSourceRecheck = checkingEntry.isDismissedSourceRecheck
+        let key = Self.key(checkingEntry)
         let executionGeneration = UUID()
         activeExecutions[key] = ActiveExecution(
             generation: executionGeneration,
-            source: entry.source,
-            revision: entry.revision,
+            source: checkingEntry.source,
+            revision: checkingEntry.revision,
             preparationFraction: 0,
             uploadFraction: 0
         )
@@ -810,26 +813,35 @@ public actor BackupSyncRunner {
         // `claimRunnable` already moved this row to `.checking` in the same transaction that
         // reserved it. Mirror that persisted transition without paying a second SQLite write.
         let persistedState: UploadBackupSyncQueueState = .checking
-        inFlightNames[key] = entry.originalFilename
-        progress.currentItemName = entry.originalFilename
+        inFlightNames[key] = checkingEntry.originalFilename
+        progress.currentItemName = checkingEntry.originalFilename
         // Released the instant this entry settles, so temp exports never accumulate across a pass.
         var resourceCleanup: (@Sendable () -> Void)?
         defer {
             resourceCleanup?()
             endActiveExecution(key: key, generation: executionGeneration)
             inFlightNames[key] = nil
-            if progress.currentItemName == entry.originalFilename {
+            if progress.currentItemName == checkingEntry.originalFilename {
                 progress.currentItemName = inFlightNames.values.first
             }
             emitProgress()
         }
 
-        adjustProgress(from: entry.state, to: .checking)
+        if !isSourceRecheck { adjustProgress(from: checkingEntry.state, to: .checking) }
         emitProgress()
 
         let resolved: BackupResolvedResource?
         do {
+            let resolvingEntry = checkingEntry
             let resolver = self.resolver
+            let policy = configuration.throttle
+            let inputs = throttleInputs
+            let readAdmission: BackupResourceReadAdmission = {
+                try Task.checkCancellation()
+                if isSourceRecheck {
+                    guard policy.maxConcurrentItems(for: inputs()) > 0 else { throw CancellationError() }
+                }
+            }
             resolved = try await resourceCoordinator.withHeavyPermit(
                 LibraryWorkRequest(
                     workload: .backupMaterialization,
@@ -837,34 +849,87 @@ public actor BackupSyncRunner {
                     memoryClass: .large
                 )
             ) { _ in
-                try await resolver.resolve(entry, onPreparationProgress: preparationProgress)
+                try readAdmission()
+                return try await resolver.resolve(
+                    resolvingEntry, onPreparationProgress: preparationProgress, readAdmission: readAdmission)
             }
         } catch is CancellationError {
-            revert(entry, from: persistedState)
+            if isSourceRecheck {
+                preserveDismissedSourceRecheck(checkingEntry)
+                return
+            }
+            revert(checkingEntry, from: persistedState)
             return
         } catch {
+            if isSourceRecheck {
+                let definitiveMissing: Bool
+                switch error as? UploadError {
+                case .sourceReportedMissing, .fileMissing: definitiveMissing = true
+                default: definitiveMissing = false
+                }
+                if definitiveMissing, !stopRequested, !Task.isCancelled,
+                    configuration.throttle.maxConcurrentItems(for: throttleInputs()) > 0
+                {
+                    retainDismissedSourceRecheck(checkingEntry)
+                } else {
+                    let failedRead =
+                        !definitiveMissing && !stopRequested && !Task.isCancelled
+                        && configuration.throttle.maxConcurrentItems(for: throttleInputs()) > 0
+                    let readyAt: Date?
+                    if case .sourceNotReady(_, let until) = error as? UploadError {
+                        readyAt = until
+                    } else {
+                        readyAt = nil
+                    }
+                    preserveDismissedSourceRecheck(checkingEntry, failedRead: failedRead, readyAt: readyAt)
+                }
+                return
+            }
             if stopRequested {
-                revert(entry, from: persistedState)
+                revert(checkingEntry, from: persistedState)
             } else {
-                retryOrPark(entry, from: persistedState, error: error)
+                retryOrPark(checkingEntry, from: persistedState, error: error)
             }
             return
         }
 
         // A resolve can already hold temp files, such as an iCloud original its identity pass staged.
         resourceCleanup = resolved?.cleanup
-        if sourceWasRemoved(entry) { return }
+        if sourceWasRemoved(checkingEntry) { return }
 
+        if isSourceRecheck {
+            guard !stopRequested, !Task.isCancelled,
+                configuration.throttle.maxConcurrentItems(for: throttleInputs()) > 0
+            else {
+                preserveDismissedSourceRecheck(checkingEntry)
+                return
+            }
+            guard let resolved else {
+                retainDismissedSourceRecheck(checkingEntry)
+                return
+            }
+            guard Self.provesReturnedSource(resolved, for: checkingEntry) else {
+                preserveDismissedSourceRecheck(checkingEntry, failedRead: true)
+                return
+            }
+            var released = checkingEntry
+            released.state = .checking
+            released.lastError = nil
+            released.updatedAt = now()
+            guard transitionDismissedSourceRecheck(released, matching: checkingEntry) else { return }
+            checkingEntry = released
+        }
         guard let resolved else {
-            discardMissingSource(entry, from: persistedState)
+            discardMissingSource(checkingEntry, from: persistedState)
             return
         }
         resourcePressureStreak = 0  // A successful export indicates available volume space.
         if stopRequested {
-            revert(entry, from: persistedState)
+            revert(checkingEntry, from: persistedState)
             return
         }
 
+        let entry = checkingEntry
         if let reconciliation = entry.remoteCommitReconciliation {
             await reconcileRemoteCommit(
                 reconciliation,
@@ -1950,7 +2015,13 @@ public actor BackupSyncRunner {
             // to it that ended without a backup is obsolete, and the drifted row below is written fresh.
             let resolvedRevision =
                 resolved.map { max($0.candidate.snapshot.revision, entry.revision) } ?? entry.revision
-            queue.removeUnsavedEarlierRevisions(of: entry.source, through: resolvedRevision, except: entry.revision)
+            guard
+                queue.removeUnsavedEarlierRevisions(
+                    of: entry.source, through: resolvedRevision, except: entry.revision)
+            else {
+                stopRequested = true
+                return
+            }
         }
         adjustProgress(from: oldState, to: terminal)
         if let resolved { closeDriftedRevisionRow(entry, resolved: resolved, as: terminal) }
@@ -2009,6 +2080,69 @@ public actor BackupSyncRunner {
         }
         adjustProgress(from: oldState, to: .discovered)
         emitProgress()
+    }
+
+    /// A PhotoKit identity pass streams every resource. Metadata or a partial compound is insufficient.
+    private static func provesReturnedSource(
+        _ resolved: BackupResolvedResource, for entry: UploadBackupSyncQueueEntry
+    ) -> Bool {
+        let snapshot = resolved.candidate.snapshot
+        let descriptors = [resolved.descriptor] + resolved.secondaries.map(\.descriptor)
+        return snapshot.source == entry.source && snapshot.revision == entry.revision
+            && resolved.descriptor.source == entry.source && descriptors.count == snapshot.resourceCount
+            && Set(descriptors.map(\.source)).count == descriptors.count
+            && descriptors.allSatisfy {
+                $0.source.kind == entry.source.kind && $0.source.identifier == entry.source.identifier
+                    && $0.precomputedSHA1Digest?.count == 20
+            }
+    }
+
+    private func retainDismissedSourceRecheck(_ entry: UploadBackupSyncQueueEntry) {
+        var retained = entry
+        retained.state = .dismissedFailure
+        retained.updatedAt = now()
+        _ = transitionDismissedSourceRecheck(retained, matching: entry)
+    }
+
+    private func preserveDismissedSourceRecheck(
+        _ entry: UploadBackupSyncQueueEntry, failedRead: Bool = false, readyAt: Date? = nil
+    ) {
+        guard var issue = BackupIssueRecord.decode(entry.lastError) else {
+            stopRequested = true
+            return
+        }
+        if failedRead {
+            issue = automaticRetryIssue(kind: issue.kind, detail: issue.detail, previous: issue)
+        } else {
+            // Policy denial and cancellation owe the same check, without spending a Photos read attempt.
+            let deferredUntil = now().addingTimeInterval(
+                configuration.retry.delay(afterAttempts: max(1, issue.automaticRetryAttempt)))
+            issue.nextAttemptAt = max(issue.nextAttemptAt ?? deferredUntil, deferredUntil)
+        }
+        if let readyAt {
+            issue.nextAttemptAt = max(issue.nextAttemptAt ?? now(), readyAt)
+        }
+        var pending = entry
+        pending.state = .discovered
+        pending.lastError = issue.persistedValue
+        pending.updatedAt = issue.nextAttemptAt ?? now()
+        _ = transitionDismissedSourceRecheck(pending, matching: entry)
+    }
+
+    private func transitionDismissedSourceRecheck(
+        _ replacement: UploadBackupSyncQueueEntry, matching entry: UploadBackupSyncQueueEntry
+    ) -> Bool {
+        guard let reason = entry.lastError,
+            let changed = queue.updateDismissedSourceRecheck(
+                replacement, matchingState: .checking, matchingLastError: reason)
+        else {
+            stopRequested = true
+            return false
+        }
+        // Until proof succeeds the row was counted only as dismissed, even while claimed.
+        refreshProgressFromQueue()
+        emitProgress()
+        return changed
     }
 
     private func retryOrPark(
