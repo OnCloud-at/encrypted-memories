@@ -234,53 +234,55 @@ private final class LocationWriteBarrier: @unchecked Sendable {
         #expect(store.load().isEmpty)
     }
 
-    @Test func accountReplacementDuringBlockedReconcileRejectsLateWrite() async {
-        let dir = tempDir()
-        defer { try? FileManager.default.removeItem(at: dir) }
-        let store = PhotoLocationStore(directory: dir)
-        let staleLease = store.configure(accountUID: "old", key: SymmetricKey(size: .bits256))
-        let index = PhotoLocationIndex()
-        index.merge([coord("old", 1, 1)])
-        let barrier = LocationWriteBarrier()
-        store.setBeforeWriteHook { barrier.block() }
+    #if DEBUG
+        @Test func accountReplacementDuringBlockedReconcileRejectsLateWrite() async {
+            let dir = tempDir()
+            defer { try? FileManager.default.removeItem(at: dir) }
+            let store = PhotoLocationStore(directory: dir)
+            let staleLease = store.configure(accountUID: "old", key: SymmetricKey(size: .bits256))
+            let index = PhotoLocationIndex()
+            index.merge([coord("old", 1, 1)])
+            let barrier = LocationWriteBarrier()
+            store.setBeforeWriteHook { barrier.block() }
 
-        let reconcile = Task {
-            await index.retainOnly([uid("old")], persistTo: store, sessionLease: staleLease)
+            let reconcile = Task {
+                await index.retainOnly([uid("old")], persistTo: store, sessionLease: staleLease)
+            }
+            await Task.detached { barrier.waitUntilEntered() }.value
+            store.configure(accountUID: "new", key: SymmetricKey(size: .bits256))
+            barrier.release()
+            await reconcile.value
+            store.setBeforeWriteHook(nil)
+
+            #expect(store.load().isEmpty)
         }
-        await Task.detached { barrier.waitUntilEntered() }.value
-        store.configure(accountUID: "new", key: SymmetricKey(size: .bits256))
-        barrier.release()
-        await reconcile.value
-        store.setBeforeWriteHook(nil)
 
-        #expect(store.load().isEmpty)
-    }
+        @Test func olderSameAccountSnapshotCannotOverwriteNewerReconcile() async {
+            let dir = tempDir()
+            defer { try? FileManager.default.removeItem(at: dir) }
+            let store = PhotoLocationStore(directory: dir)
+            let lease = store.configure(accountUID: "acct", key: SymmetricKey(size: .bits256))
+            let index = PhotoLocationIndex()
+            index.merge([coord("keep", 1, 1), coord("delete", 2, 2)])
+            let barrier = LocationWriteBarrier()
+            store.setBeforeWriteHook { barrier.blockFirst() }
 
-    @Test func olderSameAccountSnapshotCannotOverwriteNewerReconcile() async {
-        let dir = tempDir()
-        defer { try? FileManager.default.removeItem(at: dir) }
-        let store = PhotoLocationStore(directory: dir)
-        let lease = store.configure(accountUID: "acct", key: SymmetricKey(size: .bits256))
-        let index = PhotoLocationIndex()
-        index.merge([coord("keep", 1, 1), coord("delete", 2, 2)])
-        let barrier = LocationWriteBarrier()
-        store.setBeforeWriteHook { barrier.blockFirst() }
+            let older = Task {
+                await index.retainOnly(
+                    [uid("keep"), uid("delete")],
+                    persistTo: store,
+                    sessionLease: lease
+                )
+            }
+            await Task.detached { barrier.waitUntilEntered() }.value
+            await index.retainOnly([uid("keep")], persistTo: store, sessionLease: lease)
+            barrier.release()
+            await older.value
+            store.setBeforeWriteHook(nil)
 
-        let older = Task {
-            await index.retainOnly(
-                [uid("keep"), uid("delete")],
-                persistTo: store,
-                sessionLease: lease
-            )
+            #expect(store.load().map(\.uid) == [uid("keep")])
         }
-        await Task.detached { barrier.waitUntilEntered() }.value
-        await index.retainOnly([uid("keep")], persistTo: store, sessionLease: lease)
-        barrier.release()
-        await older.value
-        store.setBeforeWriteHook(nil)
-
-        #expect(store.load().map(\.uid) == [uid("keep")])
-    }
+    #endif
 
     @Test func boundingBoxFiltersToVisibleRegion() {
         let index = PhotoLocationIndex()

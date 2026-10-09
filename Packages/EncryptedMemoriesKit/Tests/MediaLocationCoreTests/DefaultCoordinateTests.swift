@@ -61,7 +61,9 @@ import Testing
         let evidence = index.placeEvidence()
         #expect(index.placeEvidence() === evidence)
         _ = await index.photoPlaceSupportSnapshot()
-        #expect(evidence.hasAnalyzed)
+        #if DEBUG
+            #expect(evidence.hasAnalyzed)
+        #endif
         _ = index.querySnapshot().coordinates(
             in: GeoBoundingBox(minLatitude: -90, maxLatitude: 90, minLongitude: -180, maxLongitude: 180))
         #expect(index.placeEvidence() === evidence)
@@ -117,36 +119,40 @@ import Testing
         print("Place evidence fixture: photos=100000 firstQuery=\(started.duration(to: .now))")
         #expect(count == 99_940)
         #expect(index.placeEvidence() === evidence)
-        #expect(evidence.hasAnalyzed)
+        #if DEBUG
+            #expect(evidence.hasAnalyzed)
+        #endif
         let viewport = PhotoLocationViewport(
             centerLatitude: 20, centerLongitude: 30, latitudeDelta: 1, longitudeDelta: 1)
         #expect(index.coordinates(in: viewport, policy: .standard).isEmpty)
         #expect(index.placeEvidence() === evidence)
     }
 
-    @Test func replacingSnapshotWarmsTheSharedEvidenceWithoutAConsumer() async throws {
-        let index = PhotoLocationIndex()
-        index.replaceAll(Self.library())
-        let evidence = index.placeEvidence()
-        for _ in 0..<200 where !evidence.hasAnalyzed { try await Task.sleep(for: .milliseconds(5)) }
-        try #require(evidence.hasAnalyzed)
-        #expect(evidence.analyzedOnMainThread == false)
-        #expect(index.placeEvidence() === evidence)
-        #expect(evidence.excludedPositions().count == 1)
-    }
+    #if DEBUG
+        @Test func replacingSnapshotWarmsTheSharedEvidenceWithoutAConsumer() async throws {
+            let index = PhotoLocationIndex()
+            index.replaceAll(Self.library())
+            let evidence = index.placeEvidence()
+            for _ in 0..<200 where !evidence.hasAnalyzed { try await Task.sleep(for: .milliseconds(5)) }
+            try #require(evidence.hasAnalyzed)
+            #expect(evidence.analyzedOnMainThread == false)
+            #expect(index.placeEvidence() === evidence)
+            #expect(evidence.excludedPositions().count == 1)
+        }
 
-    @Test func crawlWarmsOnlyTheCompletedSnapshot() async throws {
-        let index = PhotoLocationIndex()
-        index.updateScanProgress(PhotoLocationScanProgress(phase: .scanning))
-        index.merge(Self.library())
-        let evidence = index.placeEvidence()
-        #expect(!evidence.hasAnalyzed)
-        index.updateScanProgress(PhotoLocationScanProgress(phase: .completed))
-        for _ in 0..<200 where !evidence.hasAnalyzed { try await Task.sleep(for: .milliseconds(5)) }
-        try #require(evidence.hasAnalyzed)
-        #expect(evidence.analyzedOnMainThread == false)
-        #expect(index.placeEvidence() === evidence)
-    }
+        @Test func crawlWarmsOnlyTheCompletedSnapshot() async throws {
+            let index = PhotoLocationIndex()
+            index.updateScanProgress(PhotoLocationScanProgress(phase: .scanning))
+            index.merge(Self.library())
+            let evidence = index.placeEvidence()
+            #expect(!evidence.hasAnalyzed)
+            index.updateScanProgress(PhotoLocationScanProgress(phase: .completed))
+            for _ in 0..<200 where !evidence.hasAnalyzed { try await Task.sleep(for: .milliseconds(5)) }
+            try #require(evidence.hasAnalyzed)
+            #expect(evidence.analyzedOnMainThread == false)
+            #expect(index.placeEvidence() === evidence)
+        }
+    #endif
 
     static func library() -> [PhotoCoordinate] {
         (0..<60).flatMap { offset in
