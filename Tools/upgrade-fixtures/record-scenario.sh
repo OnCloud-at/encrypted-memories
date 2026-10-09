@@ -8,7 +8,11 @@ export DEVELOPER_DIR="${DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Develope
 unset SDKROOT
 source "$current/scripts/build-paths.sh"
 encryptedmemories_acquire_build_lock "upgrade-fixture-$scenario"
-release="$(git -C "$historical" describe --tags --exact-match)"
+release="${UPGRADE_FIXTURE_RELEASE:?Use regenerate.sh to select the stable release}"
+[[ "$(git -C "$historical" rev-parse "refs/tags/$release^{commit}")" == "$(git -C "$historical" rev-parse HEAD)" ]] || {
+  echo 'Historical checkout differs from the requested release tag.' >&2
+  exit 65
+}
 changes="$(git -C "$historical" diff HEAD --name-only)"
 [[ "$changes" == "Packages/EncryptedMemoriesKit/Package.swift" ]] || {
   echo 'Historical tracked sources must remain unchanged outside the recorder target declaration.' >&2
@@ -23,8 +27,9 @@ if not match:
 print(match.group(1))
 EOF
 )"
-historical_build="$ENCRYPTED_MEMORIES_BUILD_ROOT/UpgradeFixtures.noindex/$release"
-fixture_build="$historical_build"
+release_build="$ENCRYPTED_MEMORIES_BUILD_ROOT/UpgradeFixtures.noindex/$release"
+historical_build="$release_build/sdk-$sdk"
+fixture_build="$release_build"
 if [[ -n "${UPGRADE_FIXTURE_RUN_ID:-}" ]]; then
   [[ "$UPGRADE_FIXTURE_RUN_ID" =~ ^run\.[A-Za-z0-9]+$ ]] || { echo 'Invalid recording run ID.' >&2; exit 64; }
   fixture_build="$fixture_build/$UPGRADE_FIXTURE_RUN_ID"

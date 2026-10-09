@@ -1,6 +1,8 @@
 # Upgrade interruption fixtures
 
-Issue #380 checks disk states written by a stable release when an update terminates the app.
+The checker opens disk states written by every recorded stable release when an update terminates the app.
+v1.0.5 is the first public App Store release and the oldest supported source.
+Versions 1.0.0 through 1.0.4 were admission tests. No user installed them.
 The corpus contains synthetic photos, server records, encrypted cache bytes, and tiny synthetic model artifacts.
 No transport opens a network connection. The recording process also runs with network access denied.
 
@@ -12,19 +14,22 @@ Run from the repository root:
 ./Tools/upgrade-fixtures/regenerate.sh v1.0.5
 ```
 
-The script creates a detached worktree beside this checkout. It applies only a recorder target.
+The script creates a detached worktree under `$ENCRYPTED_MEMORIES_BUILD_ROOT/UpgradeFixtures.noindex/src-<release>`. It applies only a recorder target.
 Historical production sources remain unchanged. The SDK restore uses that release's `update-proton-sdk.sh` and a disposable build root.
 For v1.0.5, VendorPatches pins SDK 0.29.1 at `8c21d3f7277bcb7a8506ac3576b51e1cf569de79` with two patches.
 
 Each scenario takes a separate build turn and acquires the canonical build lock.
 The first turn builds. Later turns use `--skip-build`.
-The historical SwiftPM scratch lives under `$ENCRYPTED_MEMORIES_BUILD_ROOT/UpgradeFixtures.noindex/<release>/SPM.noindex`.
+The historical SwiftPM scratch lives under `$ENCRYPTED_MEMORIES_BUILD_ROOT/UpgradeFixtures.noindex/<release>/sdk-<sdk>/SPM.noindex`.
 Its separate dependency cache lives beside it. Later recordings reuse these caches for the same release.
-The script removes its historical worktree after recording. Build output and raw snapshots may remain in that scratch.
+The script removes its historical worktree after recording and verifies its registration is gone. Build output and raw snapshots may remain in that scratch.
 Each regeneration creates a fresh run directory. Never share the current package's scratch with the release build.
 
 To test the next release, pass its stable tag. Check the overlay against its public Core interfaces.
-Update the checker's expected baseline tag, commit, and SDK after regeneration.
+The script writes `Fixtures/<release>/` and updates `Fixtures/releases.json` with the tag, commit, and SDK.
+It retains other release folders. The checker discovers them without a source-code release list.
+A recorded tag cannot change its commit or SDK. Prereleases and tags before v1.0.5 are rejected.
+Fetch the stable tag before recording. Do not create fixtures from an unreleased commit.
 Run the format check, privacy protection, and package tests before committing the new corpus.
 CI verifies committed fixtures. It does not rebuild historical releases.
 
@@ -53,7 +58,7 @@ Capture does not open SQLite, close a store, checkpoint a source, or repair a fi
 The corpus packer reads SQLite only in disposable copies.
 
 The archive deduplicates identical file contents by SHA-256. It retains every event and reconstructs every directory independently.
-The hard budget is 15 MB (15,000,000 bytes) for the complete committed fixture directory, including the archive and manifests.
+The target is at most 10 MB per release. The hard budget is 15,000,000 bytes per release folder, including the archive and manifests.
 The packer checks raw file bytes and recovered SQLite values for private paths, hostnames, and private network addresses.
 
 ## Scenarios and verification
@@ -74,15 +79,15 @@ The checker reads the recorded enable intent before startup. Enabled states must
 The installer must verify an artifact before the runtime reads it. Each index recovery may execute at most one synthetic inventory.
 Cache reads may return the original complete bytes or no bytes. Location crawling must complete the synthetic inventory.
 
-On macOS, one bounded child process checks each scenario with network access denied. Up to three processes run concurrently.
-The parent reports crashes, failing assertions, and timeouts. Each scenario has a 120-second deadline.
-The complete verification has a 300-second budget.
+On macOS, one bounded child process checks each release and scenario with network access denied. Up to three processes run concurrently.
+The parent reports crashes, failing assertions, and timeouts. All workers share one 120-second deadline for the complete verification.
+The checker rejects missing corpora, unlisted release folders, and manifest metadata that differs from the release list.
 The package test target compiles on supported Apple platforms; process isolation runs in the macOS package gate.
 
 This checks Core first launch after process termination. Native host startup, PhotoKit authorization, real service behavior, physical devices, and power loss remain separate checks.
 Production behavior and stored formats do not change here.
 
-## Committed corpus
+## Committed v1.0.5 corpus
 
 | Scenario | Boundaries |
 | --- | ---: |
@@ -94,16 +99,10 @@ Production behavior and stored formats do not change here.
 | Total | 786 |
 
 The archive contains 805 distinct byte blobs. It uses 5,725,886 compressed bytes.
-The complete fixture directory uses 8,562,258 bytes, including the manifests and WAL policy proof.
-A local focused verification took about 12 seconds after compilation, within the five-minute CI allowance.
+The release folder uses 8,562,130 bytes, including the manifest and WAL policy proof.
+Its three files remain byte-identical to the original corpus. The release list adds 192 bytes.
+A local focused verification took about 15 seconds after compilation, within the two-minute verification budget.
 The final local gate runtime is recorded in the pull request.
 
-Strict `XCTExpectFailure` blocks retain these recorded defects without changing production behavior:
-
-- #390: model and index boundary 14, after the staging install record and before promotion.
-- #391: backup boundaries 3/4, 20/21, 33/34, and 71/72; model 18/19; index 18/19 and 66/67.
-  The new empty database has switched to WAL before its WAL file exists, so read-only schema inspection fails.
-
-Only each exact failure signature is expected. A different error remains a failure.
-An unexpected pass fails too; remove the matching expectation when its separate fix lands.
-The other 770 boundaries pass without an expected failure.
+The interrupted staging-install and empty-WAL-store defects found in this corpus were fixed in #399 and #400.
+Their expected-failure markers are removed. Every recorded boundary must now pass the same invariants.
