@@ -67,7 +67,7 @@ public struct BackupStatusPresentation: Sendable, Equatable {
     public var detailLayout: DetailLayout {
         guard total > 0 else { return .compact }
         switch headlineKey {
-        case "backup.phase_checking", "backup.phase_uploading", "backup.phase_paused":
+        case "backup.phase_checking", "backup.phase_checking_photos", "backup.phase_uploading", "backup.phase_paused":
             return .progress
         default:
             return .compact
@@ -121,7 +121,7 @@ public struct BackupStatusPresentation: Sendable, Equatable {
 
         case .checking:
             self.init(
-                headlineKey: "backup.phase_checking",
+                headlineKey: status.titleKey,
                 isActive: true, accessory: .activity,
                 progressFraction: status.fractionCompleted,
                 backedUp: status.backedUp, total: backupTarget,
@@ -151,21 +151,26 @@ public struct BackupStatusPresentation: Sendable, Equatable {
                 skippedRemoteDeletions: status.skippedRemoteDeletions)
 
         case .waiting:
-            let headlineKey =
-                switch status.outstandingIssue {
-                case .network: "backup.phase_waiting_network"
-                case .remoteService: "backup.phase_waiting_proton"
-                case .deviceStorage: "backup.phase_waiting_storage"
-                case .accountStorage: "backup.phase_waiting_account_storage"
-                case .remoteDraft: "backup.phase_waiting_draft"
-                case .deletedElsewhere: "backup.phase_attention"
-                default: "backup.phase_waiting"
-                }
+            let headlineKey: String
+            if status.hasOnlyDismissedSourceRechecks {
+                headlineKey = status.titleKey
+            } else {
+                headlineKey =
+                    switch status.outstandingIssue {
+                    case .network: "backup.phase_waiting_network"
+                    case .remoteService: "backup.phase_waiting_proton"
+                    case .deviceStorage: "backup.phase_waiting_storage"
+                    case .accountStorage: "backup.phase_waiting_account_storage"
+                    case .remoteDraft: "backup.phase_waiting_draft"
+                    case .deletedElsewhere: "backup.phase_attention"
+                    default: "backup.phase_waiting"
+                    }
+            }
             self.init(
                 headlineKey: headlineKey, isActive: false, accessory: .waiting,
                 progressFraction: status.fractionCompleted,
                 backedUp: status.backedUp, total: backupTarget,
-                waitingCount: status.outstandingCount,
+                waitingCount: max(0, status.outstandingCount - status.pendingSourceRechecks),
                 skippedRemoteDeletions: status.skippedRemoteDeletions,
                 nextAttemptAt: status.nextAttemptAt)
 
@@ -218,10 +223,12 @@ public struct BackupStatusPresentation: Sendable, Equatable {
         switch headlineKey {
         case "backup.phase_scanning": return L10n.string("backup.phase_scanning")
         case "backup.phase_checking": return L10n.string("backup.phase_checking")
+        case "backup.phase_checking_photos": return L10n.string("backup.phase_checking_photos")
         case "backup.phase_uploading": return L10n.string("backup.phase_uploading")
         case "backup.phase_paused": return L10n.string("backup.phase_paused")
         case "backup.phase_waiting_wifi": return L10n.string("backup.phase_waiting_wifi")
         case "backup.phase_waiting": return L10n.string("backup.phase_waiting")
+        case "backup.phase_waiting_photos": return L10n.string("backup.phase_waiting_photos")
         case "backup.phase_waiting_proton": return L10n.string("backup.phase_waiting_proton")
         case "backup.phase_waiting_network": return L10n.string("backup.phase_waiting_network")
         case "backup.phase_waiting_storage": return L10n.string("backup.phase_waiting_storage")

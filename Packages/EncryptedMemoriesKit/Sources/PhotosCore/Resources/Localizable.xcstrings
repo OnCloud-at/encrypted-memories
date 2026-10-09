@@ -842,6 +842,13 @@
         "de": { "stringUnit": { "state": "translated", "value": "Es wird geprüft, was bereits gesichert ist" } }
       }
     },
+    "backup.phase_checking_photos": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Checking Photos" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Fotos wird geprüft" } }
+      }
+    },
     "backup.phase_completed": {
       "extractionState": "manual",
       "localizations": {
@@ -900,6 +907,13 @@
       "localizations": {
         "en": { "stringUnit": { "state": "translated", "value": "Backup incomplete" } },
         "de": { "stringUnit": { "state": "translated", "value": "Backup unvollständig" } }
+      }
+    },
+    "backup.phase_waiting_photos": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Waiting to check Photos" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Warten auf Prüfung in Fotos" } }
       }
     },
     "backup.phase_waiting_network": {
