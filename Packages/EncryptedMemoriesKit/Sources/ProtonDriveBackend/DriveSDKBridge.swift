@@ -315,7 +315,10 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
             let startEventToken = try eventCursor(from: startEventProbe)
             try checkTimelineLoad(generation: generation)
             DebugLog.log("timeline: photos root \(root.volumeID.prefix(8))…/\(root.nodeID.prefix(8))… - enumerating")
-            let mediaTypeEvidence = timelineStore?.mediaTypeEvidence(volumeID: root.volumeID) ?? [:]
+            let mediaTypeRead =
+                timelineStore?.mediaTypeEvidenceForDisplay(volumeID: root.volumeID)
+                ?? (types: [:], canRefine: true)
+            let mediaTypeEvidence = mediaTypeRead.types
             let currentValidationToken = TimelineInventoryValidationTokenPolicy.persistedToken(
                 remoteEventToken: startEventToken
             )
@@ -419,7 +422,8 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                 burstMemberIDs = Self.burstMemberLookup(from: entries)
                 burstEntries = entries
                 let motions = try await livePhotoMotions(
-                    of: Self.livePhotos(in: entries), volumeID: root.volumeID, evidence: mediaTypeEvidence)
+                    of: Self.livePhotos(in: entries), volumeID: root.volumeID, evidence: mediaTypeEvidence,
+                    allowMetadataRequests: mediaTypeRead.canRefine)
                 sections = Self.group(
                     entries,
                     volumeID: root.volumeID,
@@ -470,7 +474,8 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                 var liveMotions: [String: LivePhotoMotion] = [:]
                 if let lives = enrichment.livePhotos.value {
                     liveMotions = try await livePhotoMotions(
-                        of: lives, volumeID: root.volumeID, evidence: mediaTypeEvidence)
+                        of: lives, volumeID: root.volumeID, evidence: mediaTypeEvidence,
+                        allowMetadataRequests: mediaTypeRead.canRefine)
                 } else {
                     enrichmentComplete = false
                     if let error = enrichment.livePhotos.errorDescription {
@@ -594,10 +599,12 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                 burstCatalogEntries = burstEntries
                 burstCatalogLookup = burstMemberIDs
             }
-            scheduleMediaTypeReconciliation(
-                items: reconciliationItems,
-                alreadyClassifiedNodeIDs: Set(mediaTypeEvidence.keys)
-            )
+            if mediaTypeRead.canRefine {
+                scheduleMediaTypeReconciliation(
+                    items: reconciliationItems,
+                    alreadyClassifiedNodeIDs: Set(mediaTypeEvidence.keys)
+                )
+            }
             // Read before the awaits below: the media-type reconciliation may publish a newer revision meanwhile,
             // and the token must describe the evidence these sections were grouped with.
             let validationToken = monitorToken(remoteToken: commit.monitorBaseline)
@@ -662,9 +669,12 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         guard !isShutDown else { return nil }
         guard let store = timelineStore else { return nil }
         let rawItems = store.load()
-        scheduleMediaTypeReconciliation(
-            items: rawItems,
-            alreadyClassifiedNodeIDs: Set(store.mediaTypeEvidence(volumeID: rawItems.first?.uid.volumeID ?? "").keys))
+        if let evidence = store.mediaTypeEvidence(volumeID: rawItems.first?.uid.volumeID ?? "") {
+            scheduleMediaTypeReconciliation(items: rawItems, alreadyClassifiedNodeIDs: Set(evidence.keys))
+        } else {
+            DebugLog.log(
+                "timeline: MIME evidence unavailable; cached photos remain visible without a new metadata pass")
+        }
         let items = timelineOrderStore?.enrich(rawItems) ?? rawItems
         let validationToken = store.validationToken()
         guard !items.isEmpty || validationToken != nil else { return nil }
@@ -1682,9 +1692,11 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     /// Sections of a tag filter or an album. A failed type read leaves a Live Photo with several related files without
     /// its motion; the next open reads again.
     private func filteredSections(_ entries: [PhotosListEntry], volumeID: String) async throws -> [TimelineSection] {
-        let evidence = timelineStore?.mediaTypeEvidence(volumeID: volumeID) ?? [:]
+        let read = timelineStore?.mediaTypeEvidenceForDisplay(volumeID: volumeID) ?? (types: [:], canRefine: true)
+        let evidence = read.types
         let motions = try await livePhotoMotions(
-            of: Self.livePhotos(in: entries), volumeID: volumeID, evidence: evidence)
+            of: Self.livePhotos(in: entries), volumeID: volumeID, evidence: evidence,
+            allowMetadataRequests: read.canRefine)
         return orderedSections(Self.group(entries, volumeID: volumeID, mediaTypeOverrides: evidence, motions: motions))
     }
 
@@ -1700,10 +1712,13 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     /// time. A failed read leaves those motions unknown without holding back the timeline cache: an unknown motion saves
     /// no related video, so the next refresh reads exactly those photos again.
     private func livePhotoMotions(
-        of livePhotos: [String: [String]], volumeID: String, evidence: [String: String]
+        of livePhotos: [String: [String]], volumeID: String, evidence: [String: String],
+        allowMetadataRequests: Bool
     ) async throws -> [String: LivePhotoMotion] {
         let stored = LivePhotoMotionLinks.storedMotions(of: livePhotos, volumeID: volumeID, in: timelineStore)
-        let answer = try await livePhotoMotionLinks.motions(of: livePhotos, stored: stored, evidence: evidence) {
+        let answer = try await livePhotoMotionLinks.motions(
+            of: livePhotos, stored: stored, evidence: evidence, allowFetch: allowMetadataRequests
+        ) {
             [driveSession, photosShareID] linkIDs in
             guard let shareID = photosShareID else { throw DriveBridgeError.noPhotosShare }
             let start = Date()

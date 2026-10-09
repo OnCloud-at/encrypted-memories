@@ -357,7 +357,7 @@ private actor MIMEReconciliationFixture {
     }
 
     func result() throws -> (requests: [[[PhotoUID]]], classified: Int, images: Int, videos: Int, pending: [PhotoUID]) {
-        let evidence = timeline.mediaTypeEvidence(volumeID: "first")
+        let evidence = try XCTUnwrap(timeline.mediaTypeEvidence(volumeID: "first"))
         return (
             requests, evidence.count,
             evidence.values.filter { $0 == "image/jpeg" }.count,
