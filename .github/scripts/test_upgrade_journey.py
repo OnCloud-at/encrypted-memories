@@ -177,6 +177,8 @@ with SigningIdentity(root) as signer:
                     patch.object(run_journey, 'output', return_value='arm64'), \
                     patch.object(run_journey, 'command') as command:
                 run_journey.main()
+            toolchain = next((root / 'evidence').glob('*/toolchain.json'))
+            self.assertEqual(json.loads(toolchain.read_text()), {'xcode': 'arm64', 'platform': 'macOS', 'target': 'HEAD'})
             invocation = command.call_args.args[0]
             self.assertEqual(invocation[:3], ['xcrun', 'xcodebuild', 'build-for-testing'])
             self.assertIn('UpgradeJourney', invocation)
@@ -227,6 +229,29 @@ with SigningIdentity(root) as signer:
             configured = plistlib.loads((root / 'prepare.xctestrun').read_bytes())
             environment = configured['Tests']['EnvironmentVariables']
             self.assertEqual(json.loads(environment['UPGRADE_APP_ARGUMENTS']), arguments)
+
+    def test_simulator_preparation_uses_screenshots_when_its_ui_group_is_interrupted(self):
+        for destination, phase, capture in [
+            ('platform=iOS Simulator,id=OWN-DEVICE', 'prepare', 'screenshots'),
+            ('platform=iOS Simulator,id=OWN-DEVICE', 'verify', 'screenRecording'),
+            ('platform=macOS', 'prepare', 'screenRecording'),
+        ]:
+            with self.subTest(destination=destination, phase=phase), tempfile.TemporaryDirectory() as root:
+                root = Path(root)
+                runner = root / 'runner.xctestrun'
+                runner.write_bytes(plistlib.dumps({'TestConfigurations': [{'TestTargets': [
+                    {'IsUITestBundle': True, 'PreferredScreenCaptureFormat': 'screenRecording'},
+                    {'IsUITestBundle': False},
+                ]}]}))
+                with patch.object(run_journey, 'owned_process'):
+                    _, log = run_journey.ui_run(runner, destination, 'backup.claimed', phase, root)
+                    log.close()
+                configured = plistlib.loads((root / (phase + '.xctestrun')).read_bytes())
+                ui, unit = configured['TestConfigurations'][0]['TestTargets']
+                self.assertEqual(ui['PreferredScreenCaptureFormat'], capture)
+                self.assertNotIn('PreferredScreenCaptureFormat', unit)
+                self.assertEqual(ui['EnvironmentVariables']['UPGRADE_POINT'], 'backup.claimed')
+                self.assertEqual(ui['EnvironmentVariables']['UPGRADE_PHASE'], phase)
 
     @unittest.skipUnless(os.environ.get('UPGRADE_NATIVE_PROBES') == '1', 'Native signing and checkpoint probes are opt-in')
     def test_temporary_identity_signs_both_installations_and_is_removed(self):
@@ -296,11 +321,14 @@ with SigningIdentity(root) as signer:
             operation = args[2] if args[:2] == ['xcrun', 'simctl'] else 'ps'
             if operation == 'list':
                 if args[3] == 'runtimes':
-                    return json.dumps({'runtimes': [{'isAvailable': True, 'identifier':
-                        'com.apple.CoreSimulator.SimRuntime.iOS-27-0', 'version': '27.0'}]})
+                    return json.dumps({'runtimes': [
+                        {'isAvailable': True, 'identifier': 'com.apple.CoreSimulator.SimRuntime.iOS-27-1', 'version': '27.1'},
+                        {'isAvailable': True, 'identifier': 'com.apple.CoreSimulator.SimRuntime.iOS-27-0', 'version': '27.0'},
+                    ]})
                 return json.dumps({'devicetypes': [{'name': 'iPhone 17', 'identifier': 'phone'}]})
             if operation == 'create':
                 self.assertRegex(args[3], r'^EncryptedMemoriesUpgrade-[a-f0-9]{32}$')
+                self.assertEqual(args[-1], 'com.apple.CoreSimulator.SimRuntime.iOS-27-0')
                 devices['OWN-DEVICE'] = 'Shutdown'
                 return 'OWN-DEVICE'
             self.assertEqual(args[3], 'OWN-DEVICE') if operation != 'ps' else None
@@ -324,6 +352,10 @@ with SigningIdentity(root) as signer:
         with tempfile.TemporaryDirectory() as directory, patch.object(run_journey, 'output', side_effect=output), \
                 patch.object(run_journey, 'command', side_effect=command), patch.object(run_journey.os, 'kill') as kill:
             app = run_journey.InstalledApp('iOS', Path(directory))
+            runtime = json.loads((Path(directory) / 'simulator-runtime.json').read_text())
+            self.assertEqual(runtime['identifier'], 'com.apple.CoreSimulator.SimRuntime.iOS-27-0')
+            self.assertEqual(runtime['version'], '27.0')
+            self.assertEqual(app.destination, 'platform=iOS Simulator,id=OWN-DEVICE')
             app.install(Path('/old.app'))
             app.launch(type('Server', (), {'url': 'http://127.0.0.1:1234'})(), seed=True)
             app.kill_app()

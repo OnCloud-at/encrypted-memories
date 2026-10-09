@@ -169,6 +169,8 @@ class InstalledApp:
             self.simulator = output(['xcrun', 'simctl', 'create', 'EncryptedMemoriesUpgrade-' + self.case_id, phones[-1]['identifier'], runtime['identifier']])
             try:
                 (directory / 'simulator.txt').write_text(self.simulator + '\n')
+                (directory / 'simulator-runtime.json').write_text(json.dumps(runtime) + '\n')
+                print('Owned iOS Simulator runtime: ' + runtime['identifier'] + ' (' + runtime['version'] + ')', flush=True)
                 print('Owned iOS Simulator: ' + self.simulator, flush=True)
                 command(['xcrun', 'simctl', 'boot', self.simulator])
                 command(['xcrun', 'simctl', 'bootstatus', self.simulator, '-b'])
@@ -274,6 +276,9 @@ def ui_run(runner, destination, point, phase, evidence, app_path=None, launch_ar
     def configure(value):
         if isinstance(value, dict):
             if value.get('IsUITestBundle'):
+                if phase == 'prepare' and destination.startswith('platform=iOS Simulator,'):
+                    # Interrupting XCTest's recording can crash SimRenderServer before install-over.
+                    value['PreferredScreenCaptureFormat'] = 'screenshots'
                 value.setdefault('EnvironmentVariables', {}).update(
                     UPGRADE_POINT=point, UPGRADE_PHASE=phase, UPGRADE_APP_PATH=str(app_path or ''),
                     UPGRADE_APP_ARGUMENTS=json.dumps(launch_arguments or []),
@@ -304,6 +309,8 @@ def main():
     parser.add_argument('--points', nargs='+', choices=POINTS, default=POINTS)
     parser.add_argument('--working-copy', action='store_true')
     args = parser.parse_args()
+    toolchain = output(['xcodebuild', '-version'])
+    summary('Xcode toolchain: ' + toolchain.replace('\n', '; '))
     summary(CONSENT_LIMITATION)
     summary(LIMITATION)
     summary(METADATA_LIMITATION)
@@ -346,6 +353,9 @@ def main():
         signer.__enter__()
     evidence_root = args.root / 'evidence' / uuid.uuid4().hex
     try:
+        evidence_root.mkdir(parents=True)
+        (evidence_root / 'toolchain.json').write_text(json.dumps({
+            'xcode': toolchain, 'platform': args.platform, 'target': args.target}) + '\n')
         def execute(tag, point):
             case = evidence_root / args.platform / tag / point
             case.mkdir(parents=True, exist_ok=True)

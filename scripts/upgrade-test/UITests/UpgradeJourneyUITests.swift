@@ -11,6 +11,25 @@ final class UpgradeJourneyUITests: XCTestCase {
             return XCUIApplication(bundleIdentifier: "at.oncloud.encryptedmemories.upgrade-test")
         #endif
     }()
+    private static func switchIsEnabled(_ value: Any?) -> Bool {
+        if let value = value as? String { return value == "1" }
+        if let value = value as? NSNumber { return value == NSNumber(value: 1) }
+        return false
+    }
+
+    func testSwitchValueRequiresExactOne() {
+        for value: Any in ["1", NSNumber(value: 1)] {
+            XCTAssertTrue(Self.switchIsEnabled(value), "Enabled value rejected: \(value)")
+        }
+        let disabled: [Any?] = [
+            "0", NSNumber(value: 0), nil, "01", "true", NSNumber(value: 2),
+            NSNumber(value: 1.5), NSNull(), [1], NSObject(),
+        ]
+        for value in disabled {
+            XCTAssertFalse(Self.switchIsEnabled(value), "Unexpected enabled value: \(String(describing: value))")
+        }
+    }
+
     private var point: String { ProcessInfo.processInfo.environment["UPGRADE_POINT"]! }
     private var verifiesUpgrade: Bool { ProcessInfo.processInfo.environment["UPGRADE_PHASE"] == "verify" }
 
@@ -153,14 +172,10 @@ final class UpgradeJourneyUITests: XCTestCase {
                 #endif
             }
         } else {
-            #if os(macOS)
-                let toggle = app.checkBoxes["smartsearch.toggle"]
-            #else
-                let toggle = app.switches["smartsearch.toggle"]
-            #endif
+            let toggle = app.switches["smartsearch.toggle"]
             XCTAssertTrue(toggle.waitForExistence(timeout: 10))
             if verifiesUpgrade {
-                XCTAssertEqual(toggle.value as? String, "1", "The saved Smart Search preference was lost")
+                XCTAssertTrue(Self.switchIsEnabled(toggle.value), "The saved Smart Search preference was lost")
                 XCTAssertTrue(
                     app.staticTexts["Smart Search is ready"].waitForExistence(timeout: 180),
                     "Smart Search did not resume its download and index")
