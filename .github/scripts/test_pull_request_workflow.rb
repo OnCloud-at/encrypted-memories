@@ -1,5 +1,7 @@
 require "minitest/autorun"
 require "yaml"
+require "open3"
+require "tmpdir"
 
 class PullRequestWorkflowTests < Minitest::Test
   WORKFLOWS = File.expand_path("../workflows", __dir__)
@@ -18,7 +20,7 @@ class PullRequestWorkflowTests < Minitest::Test
     # These workflow expressions contain only context lookups and boolean operators.
     source = expression.sub(/\A\$\{\{\s*/, "").sub(/\s*\}\}\z/, "")
     source = source.gsub("always()", "true").gsub("!cancelled()", "true")
-    source = source.gsub(/github\.[a-z_.]+/) { |path| context.fetch(path, nil).inspect }
+    source = source.gsub(/(?:github|inputs|runner)\.[a-z_.]+/) { |path| context.fetch(path, nil).inspect }
     eval(source)
   end
 
@@ -140,4 +142,58 @@ class PullRequestWorkflowTests < Minitest::Test
     assert_includes inputs.fetch("name"), "github.run_id"
     assert_includes inputs.fetch("name"), "github.run_attempt"
   end
+  def diagnostic_steps
+    steps = @workflow.fetch("jobs").fetch("ios-ui-verification").fetch("steps")
+    [steps.find { |step| step["name"] == "Configure UI latency diagnostics" },
+      steps.find { |step| step["id"] == "ui" },
+      steps.find { |step| step["name"] == "Retain UI latency diagnostics" }]
+  end
+
+  def test_ui_diagnostics_default_to_disabled
+    inputs = (@workflow["on"] || @workflow.fetch(true)).fetch("workflow_dispatch").fetch("inputs")
+    diagnostics = inputs.fetch("collect_ui_diagnostics", {})
+    assert_equal "boolean", diagnostics["type"]
+    assert_equal false, diagnostics["default"]
+  end
+
+  def test_ui_diagnostics_skip_default_and_non_dispatch_runs
+    configure, ui, upload = diagnostic_steps
+    refute ui.fetch("env").key?("IOS_TEST_DIAGNOSTICS_PATH"), "The test command must not enable collection unconditionally"
+    refute_nil configure
+    ["pull_request", "merge_group", "workflow_dispatch"].each do |event|
+      [nil, false, true].each do |opt_in|
+        next if event == "workflow_dispatch" && opt_in == true
+        context = {"github.event_name" => event, "inputs.collect_ui_diagnostics" => opt_in}
+        refute evaluate(configure.fetch("if"), context), "Unexpected collector for #{event}, opt-in #{opt_in.inspect}"
+        refute evaluate(upload.fetch("if"), context), "Unexpected upload for #{event}, opt-in #{opt_in.inspect}"
+      end
+    end
+  end
+
+  def test_ui_diagnostics_collect_and_retain_only_on_opted_in_dispatch
+    configure, ui, upload = diagnostic_steps
+    refute_nil configure
+    refute_nil upload
+    context = {"github.event_name" => "workflow_dispatch", "inputs.collect_ui_diagnostics" => true}
+    assert evaluate(configure.fetch("if"), context)
+    assert evaluate(upload.fetch("if"), context)
+    assert_equal true, configure["continue-on-error"], "Diagnostic setup errors must not fail the UI job"
+    assert_equal true, upload.fetch("continue-on-error")
+    assert_equal 7, upload.fetch("with").fetch("retention-days")
+    assert_equal "warn", upload.fetch("with").fetch("if-no-files-found")
+    Dir.mktmpdir("ui-diagnostic-workflow") do |directory|
+      context["runner.temp"] = directory
+      environment_file = File.join(directory, "github-env")
+      variables = configure.fetch("env").transform_values do |value|
+        value.gsub(/\$\{\{.*?\}\}/) { |expression| evaluate(expression, context).to_s }
+      end
+      output, status = Open3.capture2e(variables.merge("GITHUB_ENV" => environment_file), "bash", "-c", configure.fetch("run"))
+      assert status.success?, output
+      exported = File.readlines(environment_file, chomp: true).to_h { |line| line.split("=", 2) }
+      expected_path = upload.fetch("with").fetch("path").gsub(/\$\{\{.*?\}\}/) { |expression| evaluate(expression, context).to_s }
+      assert_equal expected_path, exported.fetch("IOS_TEST_DIAGNOSTICS_PATH")
+      refute ui.fetch("env").key?("IOS_TEST_DIAGNOSTICS_PATH"), "The test command must retain the conditional exported value"
+    end
+  end
+
 end

@@ -581,41 +581,56 @@ public final class PhotoLibraryBackupController {
     }
 
     public func backUpAgain(_ item: BackupFailedItem) {
-        if resolveRemoteDeletion(item, keepDeleted: false) { syncNow() }
+        PhotoPerformanceSignposts.database.interval("BackupBackUpAgain") {
+            if resolveRemoteDeletion(item, keepDeleted: false) { syncNow() }
+        }
     }
 
     @discardableResult
     private func resolveRemoteDeletion(_ item: BackupFailedItem, keepDeleted: Bool) -> Bool {
         guard item.issue == .deletedElsewhere, let source = item.source, let revision = item.revision,
             let queueStore, let journal = pendingReplacementJournal,
-            let row = queueStore.entry(for: source, revision: revision), row.state == .failedPermanent,
+            let row = PhotoPerformanceSignposts.database.interval(
+                "BackupDecisionEntry",
+                {
+                    queueStore.entry(for: source, revision: revision)
+                }), row.state == .failedPermanent,
             BackupIssueRecord.decode(row.lastError)?.kind == .deletedElsewhere
         else { return false }
         // The choice is about the photo, so it settles every revision of it that waits for the same question.
-        let parked = queueStore.rows(kind: source.kind, identifiers: [source.identifier]).filter {
-            $0.source == source && $0.state == .failedPermanent
-                && BackupIssueRecord.decode(queueStore.entry(for: source, revision: $0.revision)?.lastError)?.kind
-                    == .deletedElsewhere
-        }.map(\.revision)
+        let parked = PhotoPerformanceSignposts.database.interval("BackupDecisionRows") {
+            queueStore.rows(kind: source.kind, identifiers: [source.identifier]).filter {
+                $0.source == source && $0.state == .failedPermanent
+                    && BackupIssueRecord.decode(queueStore.entry(for: source, revision: $0.revision)?.lastError)?.kind
+                        == .deletedElsewhere
+            }.map(\.revision)
+        }
         let newest = parked.max() ?? revision
         do {
-            if keepDeleted {
-                try journal.keepDeleted(for: source)
-            } else {
-                try journal.backUpAgain(revision: newest, for: source)
+            try PhotoPerformanceSignposts.database.interval("BackupDecisionJournal") {
+                if keepDeleted {
+                    try journal.keepDeleted(for: source)
+                } else {
+                    try journal.backUpAgain(revision: newest, for: source)
+                }
             }
             for parkedRevision in Set(parked + [revision]) {
                 let reopens = !keepDeleted && parkedRevision == newest
                 let state: UploadBackupSyncQueueState =
                     keepDeleted ? .skippedRemoteDeletion : reopens ? .discovered : .dismissedFailure
                 guard
-                    queueStore.updateState(
-                        source: source, revision: parkedRevision, state: state, attempts: nil,
-                        lastError: keepDeleted
-                            ? BackupIssueRecord(
-                                kind: .remoteDeletion, detail: L10n.string("backup.state_skipped_remote_deletion")
-                            ).persistedValue : nil,
-                        updatedAt: Date())
+                    PhotoPerformanceSignposts.database.interval(
+                        "BackupDecisionQueueWrite",
+                        {
+                            queueStore.updateState(
+                                source: source, revision: parkedRevision, state: state, attempts: nil,
+                                lastError: keepDeleted
+                                    ? BackupIssueRecord(
+                                        kind: .remoteDeletion,
+                                        detail: L10n.string("backup.state_skipped_remote_deletion")
+                                    ).persistedValue : nil,
+                                updatedAt: Date())
+                        })
                 else { throw UploadError.backend(L10n.string("backup.error_local_state_unavailable")) }
             }
             SupportEventTrail.shared.record(

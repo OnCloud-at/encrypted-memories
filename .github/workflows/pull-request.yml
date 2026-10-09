@@ -10,6 +10,10 @@ on:
         description: Measure populated dependency cache restores.
         type: boolean
         default: false
+      collect_ui_diagnostics:
+        description: Capture app and runner timing during deleted-backup UI waits.
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -100,6 +104,7 @@ jobs:
         run: |
           set -euo pipefail
           python3 .github/scripts/test_require_merge_queue.py
+          python3 -B .github/scripts/test_collect_ui_wait_diagnostics.py
           python3 .github/scripts/test_ios_test_commands.py
           python3 .github/scripts/test_remind_llm_key_expiry.py
           python3 .github/scripts/test_triage_issue.py
@@ -247,6 +252,12 @@ jobs:
           IOS_TEST_SCHEME: EncryptedMemoriesMobileCI
           IOS_TEST_PREPARED: "1"
         run: bash ./scripts/verify-ios-app-tests.sh
+      - name: Configure UI latency diagnostics
+        continue-on-error: true
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.collect_ui_diagnostics }}
+        env:
+          DIAGNOSTIC_ROOT: ${{ runner.temp }}/ios-ui-diagnostics
+        run: echo "IOS_TEST_DIAGNOSTICS_PATH=$DIAGNOSTIC_ROOT" >> "$GITHUB_ENV"
       - name: Run all UI tests without building
         id: ui
         if: ${{ !cancelled() && steps.test-build.outcome == 'success' }}
@@ -270,6 +281,16 @@ jobs:
         with:
           name: ios-ui-xcresult-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/ios-ui.xcresult
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 7
+      - name: Retain UI latency diagnostics
+        if: ${{ always() && github.event_name == 'workflow_dispatch' && inputs.collect_ui_diagnostics }}
+        continue-on-error: true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ios-ui-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ios-ui-diagnostics
           include-hidden-files: true
           if-no-files-found: warn
           retention-days: 7

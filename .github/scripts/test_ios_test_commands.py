@@ -101,6 +101,34 @@ if sys.argv[1:4] == ['simctl', 'list', 'devices']:
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse(any(command and command[0] == 'xcodebuild' for command in self.commands))
 
+    def test_ui_diagnostics_wrap_the_complete_command_and_force_one_simulator(self):
+        scripts = self.root / '.github/scripts'
+        scripts.mkdir(parents=True)
+        (scripts / 'collect_ui_wait_diagnostics.py').write_text(
+            "import json, os, subprocess, sys\n"
+            "from pathlib import Path\n"
+            "Path(os.environ['TEST_ROOT'] + '/diagnostics.json').write_text(json.dumps(sys.argv[1:]))\n"
+            "raise SystemExit(subprocess.call(sys.argv[sys.argv.index('--') + 1:]))\n")
+        result = self.run_script('ui', IOS_TEST_ACTION='test-without-building', IOS_TEST_PREPARED='1',
+                                 IOS_TEST_SCHEME='EncryptedMemoriesMobileCI',
+                                 IOS_TEST_DIAGNOSTICS_PATH=str(self.root / 'diagnostics'))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        arguments = json.loads((self.root / 'diagnostics.json').read_text())
+        self.assertEqual(arguments[arguments.index('--simulator') + 1], 'simulator-test')
+        self.assertEqual(arguments[arguments.index('--output') + 1], str(self.root / 'diagnostics'))
+        self.assertIn('-only-testing:EncryptedMemoriesMobileUITests', self.commands[-1])
+        self.assertEqual(self.commands[-1][self.commands[-1].index('-parallel-testing-enabled') + 1], 'NO')
+
+    def test_diagnostics_reject_parallel_clones_and_unknown_destination_ownership(self):
+        for options in [{'IOS_TEST_PARALLEL_WORKERS': '2'},
+                        {'IOS_TEST_DESTINATION': 'platform=iOS Simulator,name=iPhone 17'}]:
+            with self.subTest(options=options):
+                result = self.run_script('ui', IOS_TEST_PREPARED='1',
+                                         IOS_TEST_DIAGNOSTICS_PATH=str(self.root / 'diagnostics'), **options)
+                self.assertEqual(result.returncode, 64)
+                self.assertIn('diagnostics require one simulator', result.stderr)
+                self.assertFalse(any(command and command[0] == 'xcodebuild' for command in self.commands))
+
 
 if __name__ == '__main__':
     unittest.main()

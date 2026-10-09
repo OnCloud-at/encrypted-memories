@@ -156,4 +156,15 @@ fi
 if [[ -n "${IOS_TEST_RESULT_BUNDLE_PATH:-}" ]]; then
   set -- "$@" -resultBundlePath "$IOS_TEST_RESULT_BUNDLE_PATH"
 fi
-"$@" "$ACTION"
+if [[ "$TEST_TARGET" == "EncryptedMemoriesMobileUITests" && -n "${IOS_TEST_DIAGNOSTICS_PATH:-}" ]]; then
+  if [[ "${IOS_TEST_PARALLEL_WORKERS:-1}" != "1" || "$DESTINATION" != *",id="* ]]; then
+    echo "[ios-tests] diagnostics require one simulator with an explicit device ID." >&2
+    exit 64
+  fi
+  DIAGNOSTIC_SIMULATOR="${DESTINATION##*,id=}"
+  python3 "$ROOT/.github/scripts/collect_ui_wait_diagnostics.py" \
+    --simulator "$DIAGNOSTIC_SIMULATOR" --output "$IOS_TEST_DIAGNOSTICS_PATH" -- \
+    "$@" -parallel-testing-enabled NO "$ACTION"
+else
+  "$@" "$ACTION"
+fi
