@@ -41,6 +41,36 @@ final class UpgradeJourneyUITests: XCTestCase {
         }
     }
 
+    /// Query the native search surface to prove that all eight saved index entries are usable.
+    private func verifyIndexedSearchResults() throws {
+        #if os(iOS)
+            app.navigationBars.buttons.firstMatch.tap()
+            let done = app.buttons["Done"]
+            XCTAssertTrue(done.waitForExistence(timeout: 10))
+            done.tap()
+            app.tabBars.buttons["Search"].tap()
+        #else
+            app.typeKey("w", modifierFlags: .command)
+        #endif
+        let search = app.searchFields.firstMatch
+        XCTAssertTrue(search.waitForExistence(timeout: 10), "The native search field is missing")
+        #if os(macOS)
+            search.click()
+        #else
+            search.tap()
+        #endif
+        search.typeText("fixture query\n")
+        let results = app.descendants(matching: .any)
+            .matching(NSPredicate(format: "label BEGINSWITH 'Photo, '"))
+        let indexed = XCTNSPredicateExpectation(
+            predicate: NSPredicate { _, _ in results.count == 8 }, object: nil)
+        let result = XCTWaiter.wait(for: [indexed], timeout: 60)
+        let attachment = XCTAttachment(screenshot: app.screenshot())
+        attachment.lifetime = .keepAlways
+        add(attachment)
+        XCTAssertEqual(result, .completed, "The saved index did not return all eight photos")
+    }
+
     func testInstalledAppJourney() throws {
         continueAfterFailure = false
         #if os(iOS)
@@ -132,8 +162,9 @@ final class UpgradeJourneyUITests: XCTestCase {
             if verifiesUpgrade {
                 XCTAssertEqual(toggle.value as? String, "1", "The saved Smart Search preference was lost")
                 XCTAssertTrue(
-                    app.staticTexts["8 photos and videos are searchable."].waitForExistence(timeout: 180),
+                    app.staticTexts["Smart Search is ready"].waitForExistence(timeout: 180),
                     "Smart Search did not resume its download and index")
+                try verifyIndexedSearchResults()
             } else {
                 #if os(macOS)
                     toggle.click()
