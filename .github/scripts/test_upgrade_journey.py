@@ -417,6 +417,39 @@ with SigningIdentity(root) as signer:
             finally:
                 run_journey.command(['xcrun', 'simctl', 'delete', sentinel])
 
+    def test_native_query_control_restores_handlers_after_owned_group_cancellation(self):
+        with tempfile.TemporaryDirectory() as root:
+            marker = Path(root) / 'owned-resource'
+            marker.touch()
+            script = """
+import os, signal, sys
+from pathlib import Path
+from unittest.mock import patch
+os.environ['UPGRADE_NATIVE_QUERY_TARGET'] = 'HEAD'
+sys.path.insert(0, sys.argv[1])
+from test_upgrade_journey import UpgradeJourneyTests
+import run_journey
+original = {value: signal.getsignal(value) for value in [signal.SIGINT, signal.SIGTERM]}
+marker = Path(sys.argv[2])
+def cancelled_main():
+    try:
+        os.killpg(os.getpid(), signal.SIGTERM)
+    finally:
+        marker.unlink()
+try:
+    with patch.object(run_journey, 'main', cancelled_main):
+        UpgradeJourneyTests().test_native_pending_query_cannot_pass_with_the_retained_library()
+except KeyboardInterrupt:
+    assert not marker.exists()
+    assert all(signal.getsignal(value) == handler for value, handler in original.items())
+else:
+    raise AssertionError('Cancellation did not propagate')
+"""
+            result = subprocess.run([sys.executable, '-c', script, str(Path(__file__).resolve().parent), str(marker)],
+                                    start_new_session=True, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(marker.exists(), 'Owned cancellation interrupted cleanup')
+
     @unittest.skipUnless(os.environ.get('UPGRADE_NATIVE_QUERY_TARGET'), 'Native pending-query control is opt-in')
     def test_native_pending_query_cannot_pass_with_the_retained_library(self):
         servers = []
@@ -439,7 +472,9 @@ with SigningIdentity(root) as signer:
         argv = ['run_journey.py', '--repo', str(repo), '--automation', str(repo), '--root', str(root),
                 '--target', os.environ['UPGRADE_NATIVE_QUERY_TARGET'], '--sources', 'v1.0.5',
                 '--platform', os.environ.get('UPGRADE_NATIVE_QUERY_PLATFORM', 'macOS'),
-                '--points', 'model.partial', '--working-copy']
+                '--points', 'model.partial']
+        if os.environ.get('UPGRADE_NATIVE_WORKING_COPY') == '1':
+            argv.append('--working-copy')
         owned_process = run_journey.owned_process
 
         def installed_journey_only(args, *remaining, **kwargs):
@@ -448,10 +483,17 @@ with SigningIdentity(root) as signer:
                 '-only-testing:UpgradeJourneyUITests/UpgradeJourneyUITests/testInstalledAppJourney'],
                 *remaining, **kwargs)
 
-        with patch.object(run_journey, 'FixtureServer', PendingQueryServer), \
-                patch.object(run_journey, 'owned_process', installed_journey_only), patch.object(sys, 'argv', argv):
-            with self.assertRaisesRegex(JourneyError, 'UI verification failed'):
-                run_journey.main()
+        handlers = {value: signal.getsignal(value) for value in [signal.SIGINT, signal.SIGTERM]}
+        try:
+            for value in handlers:
+                signal.signal(value, run_journey.terminate)
+            with patch.object(run_journey, 'FixtureServer', PendingQueryServer), \
+                    patch.object(run_journey, 'owned_process', installed_journey_only), patch.object(sys, 'argv', argv):
+                with self.assertRaisesRegex(JourneyError, 'UI verification failed'):
+                    run_journey.main()
+        finally:
+            for value, handler in handlers.items():
+                signal.signal(value, handler)
         self.assertEqual(len(servers), 1)
         self.assertTrue(any(request['phase'] == 'new' and request['path'] == '/checkpoint/query.encoded'
                             for request in servers[0].requests), 'The negative control never held a real query')
