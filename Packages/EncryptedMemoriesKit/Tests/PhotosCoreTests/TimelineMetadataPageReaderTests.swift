@@ -210,6 +210,79 @@ final class TimelineMetadataPageReaderTests: XCTestCase {
     }
 
     @MainActor
+    func testFailedPreparationDoesNotEraseAReaderReplacement() async throws {
+        let fixture = try fixture()
+        defer {
+            fixture.order.close()
+            fixture.timeline.close()
+        }
+        fixture.order.close()
+        let reader = TimelineMetadataPageReader(inventory: fixture.inventory, orderStore: fixture.order)
+        let replacement = fixture.inventory.items[0]
+        var checks = 0
+        // Replace the failed connection at the completion boundary, before the fallback decision.
+        try await reader.prepare(isCurrent: {
+            checks += 1
+            if checks == 2 {
+                fixture.order.rebuild()
+                XCTAssertTrue(fixture.order.synchronize([replacement], classifiedUIDs: []))
+            }
+            return true
+        })
+        XCTAssertFalse(reader.useOrderCache)
+        XCTAssertEqual(fixture.order.rebuildRevision, 1, "failed preparation must preserve a reader replacement")
+        XCTAssertEqual(try fixture.order.nextPage().map(\.uid), [replacement.uid])
+    }
+
+    @MainActor
+    func testRecoveryReadsItsPageBeforeAnEnqueuedReaderCanRebuildAgain() async throws {
+        let fixture = try fixture()
+        defer {
+            fixture.order.close()
+            fixture.timeline.close()
+        }
+        let reader = TimelineMetadataPageReader(inventory: fixture.inventory, orderStore: fixture.order)
+        try await reader.prepare(isCurrent: { true })
+        _ = try await reader.nextPage(isCurrent: { true })
+        try rebuildThroughReader(fixture)
+        var queuedReader: Task<Void, Never>?
+        var checks = 0
+        let page = try await reader.nextPage(isCurrent: {
+            checks += 1
+            if checks == 3 {
+                // Queue a competing actor job at the final recovery check, immediately before return.
+                queuedReader = Task(priority: .high) { @MainActor in fixture.order.rebuild() }
+            }
+            return true
+        })
+        XCTAssertEqual(page.count, 150, "same-actor recovery must read before the queued actor job")
+        XCTAssertEqual(page.first?.uid, fixture.inventory.items.first?.uid)
+        let queued = try XCTUnwrap(queuedReader)
+        await queued.value
+        XCTAssertEqual(fixture.order.rebuildRevision, 2, "the competing reader really ran")
+    }
+
+    @MainActor
+    func testRetiredFallbackStopsBetweenEmptyMIMEChunks() async throws {
+        let fixture = try fixture()
+        defer {
+            fixture.order.close()
+            fixture.timeline.close()
+        }
+        let reader = TimelineMetadataPageReader(inventory: fixture.inventory, orderStore: nil)
+        try await reader.prepare(isCurrent: { true })
+        var checks = 0
+        do {
+            _ = try await reader.nextPage(isCurrent: {
+                checks += 1
+                return checks < 3
+            })
+            XCTFail("retirement between empty MIME chunks must stop the scan")
+        } catch is CancellationError {} catch { XCTFail("unexpected error: \(error)") }
+        XCTAssertEqual(checks, 3)
+    }
+
+    @MainActor
     private func fixture() throws -> (
         inventory: TimelineMetadataReconciliation.Inventory,
         order: TimelineOrderMetadataStore, timeline: TimelineMetadataStore, url: URL

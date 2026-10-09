@@ -45,6 +45,7 @@ public final class TimelineMetadataPageReader {
             return page
         }
         while offset < inventory.items.count {
+            guard isCurrent(), !Task.isCancelled else { throw CancellationError() }
             let end = min(offset + TimelineOrderMetadataStore.pageSize, inventory.items.count)
             let page = inventory.items[offset..<end].compactMap { item -> TimelineOrderMetadataStore.Candidate? in
                 guard !inventory.classifiedNodeIDs.contains(item.uid.nodeID) else { return nil }
