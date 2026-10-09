@@ -43,15 +43,6 @@ final class MobileDuplicatesUITests: XCTestCase {
         XCTAssertEqual(XCTWaiter.wait(for: [gone], timeout: 20), .completed, message)
     }
 
-    /// The system dialog lists its buttons twice in the accessibility tree; only one copy is hittable.
-    private func dialogButton(_ identifier: String) -> XCUIElement {
-        let matches = app.buttons.matching(identifier: identifier)
-        for index in 0..<matches.count where matches.element(boundBy: index).isHittable {
-            return matches.element(boundBy: index)
-        }
-        return matches.firstMatch
-    }
-
     func testTheLibraryCheckShowsItsTitleAndProgressWhileNoDuplicateIsFound() {
         openDuplicates(fixture: "-EncryptedMemoriesDuplicatesCheckingFixture")
 
@@ -125,30 +116,30 @@ final class MobileDuplicatesUITests: XCTestCase {
         XCTAssertTrue(group(0).exists, "the other group stays")
     }
 
-    func testMergeAllMergesEveryGroupAfterTheConfirmation() {
+    func testMergeAllMergesEveryGroupAfterTheConfirmation() throws {
         openDuplicates()
         let mergeAll = app.buttons["duplicates.mergeAll"]
         XCTAssertTrue(mergeAll.waitForExistence(timeout: 5))
         mergeAll.tap()
 
-        let confirm = dialogButton("duplicates.mergeAll.dialog")
+        let confirm = app.buttons["duplicates.mergeAll.dialog"].firstMatch
         XCTAssertTrue(confirm.waitForExistence(timeout: 10))
-        confirm.tap()
+        try app.tapDialogButton("duplicates.mergeAll.dialog")
 
         waitUntilGone(group(0), "every group leaves the list")
         XCTAssertTrue(app.staticTexts["No Duplicates"].waitForExistence(timeout: 5))
     }
 
-    func testStopEndsMergeAllAfterTheRunningBatchAndKeepsTheOtherGroups() {
+    func testStopEndsMergeAllAfterTheRunningBatchAndKeepsTheOtherGroups() throws {
         openDuplicates(
             fixture: "-EncryptedMemoriesDuplicatesLargeFixture", extra: ["-EncryptedMemoriesDuplicatesSlowMerge"])
         XCTAssertTrue(group(0).waitForExistence(timeout: 30))
         let mergeAll = app.buttons["duplicates.mergeAll"]
         XCTAssertTrue(mergeAll.waitForExistence(timeout: 5))
         mergeAll.tap()
-        let confirm = dialogButton("duplicates.mergeAll.dialog")
+        let confirm = app.buttons["duplicates.mergeAll.dialog"].firstMatch
         XCTAssertTrue(confirm.waitForExistence(timeout: 10))
-        confirm.tap()
+        try app.tapDialogButton("duplicates.mergeAll.dialog")
 
         XCTAssertTrue(app.staticTexts["Merging Duplicates"].waitForExistence(timeout: 30), "the progress row shows")
         let stop = app.buttons["duplicates.stopMerge"]
