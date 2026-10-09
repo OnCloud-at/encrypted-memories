@@ -69,6 +69,8 @@ public struct BackupStatus: Sendable, Equatable {
     public var failed = 0
     /// Permanent failures whose warning the user acknowledged. They remain outside `backedUp`.
     public var dismissedFailures = 0
+    /// Acknowledged missing photos still owed a check; already counted in dismissedFailures.
+    public var pendingSourceRechecks = 0
     /// Proven prior Proton copies that were deleted there and deliberately not re-uploaded.
     public var skippedRemoteDeletions = 0
     /// Local files that disappeared before backup.
@@ -130,6 +132,12 @@ public struct BackupStatus: Sendable, Equatable {
         guard let totalConsidered else { return needsAttentionCount + waitingRetry }
         return max(0, totalConsidered - backedUp - skippedRemoteDeletions)
     }
+    /// Only Photos checks remain, without a separate remote-index operation or failure.
+    var hasOnlyDismissedSourceRechecks: Bool {
+        pendingSourceRechecks > 0 && outstandingCount == pendingSourceRechecks
+            && !isPreparingRemoteIndex && !remoteIndexPreparationFailed && remoteIndexPreparationIssue == nil
+    }
+
     public var isActive: Bool {
         phase == .scanning || phase == .checking || phase == .uploading
     }
@@ -153,6 +161,7 @@ public struct BackupStatus: Sendable, Equatable {
         uploaded = progress.uploaded
         failed = progress.failed
         dismissedFailures = progress.dismissedFailures
+        pendingSourceRechecks = progress.pendingSourceRechecks
         skippedRemoteDeletions = progress.skippedRemoteDeletions
         sourceMissing = progress.sourceMissing
         waitingRetry = progress.blocked
@@ -265,11 +274,13 @@ public struct BackupStatus: Sendable, Equatable {
         switch phase {
         case .idle: "backup.phase_idle"
         case .scanning: "backup.phase_scanning"
-        case .checking: "backup.phase_checking"
+        case .checking:
+            hasOnlyDismissedSourceRechecks ? "backup.phase_checking_photos" : "backup.phase_checking"
         case .uploading: "backup.phase_uploading"
         case .paused: "backup.phase_paused"
         case .waitingForWiFi: "backup.phase_waiting_wifi"
-        case .waiting: "backup.phase_waiting"
+        case .waiting:
+            hasOnlyDismissedSourceRechecks ? "backup.phase_waiting_photos" : "backup.phase_waiting"
         case .completed:
             dismissedFailures > 0 ? "backup.phase_completed_with_omissions" : "backup.phase_completed"
         case .needsAttention: "backup.phase_attention"
@@ -280,11 +291,15 @@ public struct BackupStatus: Sendable, Equatable {
         switch phase {
         case .idle: L10n.string("backup.phase_idle")
         case .scanning: L10n.string("backup.phase_scanning")
-        case .checking: L10n.string("backup.phase_checking")
+        case .checking:
+            hasOnlyDismissedSourceRechecks
+                ? L10n.string("backup.phase_checking_photos") : L10n.string("backup.phase_checking")
         case .uploading: L10n.string("backup.phase_uploading")
         case .paused: L10n.string("backup.phase_paused")
         case .waitingForWiFi: L10n.string("backup.phase_waiting_wifi")
-        case .waiting: L10n.string("backup.phase_waiting")
+        case .waiting:
+            hasOnlyDismissedSourceRechecks
+                ? L10n.string("backup.phase_waiting_photos") : L10n.string("backup.phase_waiting")
         case .completed:
             dismissedFailures > 0
                 ? L10n.string("backup.phase_completed_with_omissions")
@@ -307,12 +322,14 @@ public struct BackupStatus: Sendable, Equatable {
                 }
                 return L10n.string("backup.detail_preparing_index_indeterminate")
             }
+            guard !hasOnlyDismissedSourceRechecks else { return nil }
             guard let total = totalConsidered, total > 0 else { return currentItemName }
             return L10n.string("backup.detail_checked \(checked) \(total)")
         case .uploading:
             guard let total = totalConsidered, total > 0 else { return nil }
             return L10n.string("backup.detail_backed_up \(backedUp) \(total)")
         case .waiting:
+            guard !hasOnlyDismissedSourceRechecks else { return nil }
             return L10n.string(
                 "backup.detail_waiting \(uploadQueued + waitingRetry + max(0, (totalConsidered ?? 0) - checked))")
         case .completed:
