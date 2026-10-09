@@ -15,15 +15,6 @@ final class MobileDeletedBackupUITests: XCTestCase {
 
     override func tearDown() { app.terminate() }
 
-    /// The system dialog can list a button twice in the accessibility tree; the visible copy is the hittable one.
-    private func dialogButton(_ identifier: String) -> XCUIElement {
-        let matches = app.buttons.matching(identifier: identifier)
-        for index in 0..<matches.count where matches.element(boundBy: index).isHittable {
-            return matches.element(boundBy: index)
-        }
-        return matches.firstMatch
-    }
-
     private func openDecision() {
         let settings = app.buttons["Proton Account and Settings"]
         XCTAssertTrue(settings.waitForExistence(timeout: 60))
@@ -43,9 +34,14 @@ final class MobileDeletedBackupUITests: XCTestCase {
         XCTAssertTrue(app.buttons["backup.backUpAgain.dialog"].firstMatch.exists)
     }
 
-    func testKeepDeletedRemovesDecisionRowAndAttentionCount() {
+    func testDialogActionCannotResolveBeforeTheDecisionIsPresented() throws {
+        XCTAssertTrue(app.buttons["Proton Account and Settings"].waitForExistence(timeout: 60))
+        XCTAssertThrowsError(try app.hittableDialogButton("backup.backUpAgain.dialog"))
+    }
+
+    func testKeepDeletedRemovesDecisionRowAndAttentionCount() throws {
         openDecision()
-        dialogButton("backup.keepDeleted.dialog").tap()
+        try app.tapDialogButton("backup.keepDeleted.dialog")
         XCTAssertTrue(app.staticTexts["Nothing needs attention."].waitForExistence(timeout: 5))
         app.buttons["Done"].tap()
         let attention = app.buttons["backup.failedItems"]
@@ -56,9 +52,42 @@ final class MobileDeletedBackupUITests: XCTestCase {
         XCTAssertTrue((deletionCount.value as? String)?.contains("1") == true)
     }
 
-    func testBackUpAgainRemovesPermanentDecisionRow() {
+    func testBackUpAgainRetriesAnUnacknowledgedTap() throws {
+        var taps = 0
+        try backUpAgain { button in
+            taps += 1
+            if taps > 1 { button.tap() }
+        }
+        XCTAssertEqual(taps, 2, "Only an unacknowledged tap may be repeated")
+    }
+
+    func testBackUpAgainRemovesPermanentDecisionRow() throws {
+        try backUpAgain()
+    }
+
+    func testAcknowledgedBackUpAgainTapIsNotRepeated() throws {
+        var taps = 0
+        try backUpAgain { _ in
+            taps += 1
+            // Confirm native input before returning, so the outer helper sees acknowledgement on its first callback.
+            do {
+                try app.tapDialogButton("backup.backUpAgain.dialog")
+            } catch {
+                XCTFail("The input callback must acknowledge the action: \(error)")
+            }
+            XCTAssertFalse(app.buttons["backup.backUpAgain.dialog"].firstMatch.exists)
+        }
+        XCTAssertEqual(taps, 1, "An acknowledged tap must not be repeated")
+    }
+
+    private func backUpAgain(tap: (XCUIElement) -> Void = { $0.tap() }) throws {
         openDecision()
-        dialogButton("backup.backUpAgain.dialog").tap()
+        try app.tapDialogButton("backup.backUpAgain.dialog", tap: tap)
+        assertBackUpAgainResolved()
+    }
+
+    private func assertBackUpAgainResolved() {
+        XCTAssertTrue(app.staticTexts["Nothing needs attention."].waitForExistence(timeout: 5))
         let row = app.descendants(matching: .any).matching(identifier: "backup.failedItem.Deleted fixture.heic")
             .firstMatch
         let gone = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: row)
