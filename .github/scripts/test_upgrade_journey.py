@@ -365,6 +365,18 @@ with SigningIdentity(root) as signer:
         self.assertEqual(devices, {'FOREIGN-DEVICE': 'Booted'})
         self.assertEqual([args[2] for args in operations], ['boot', 'bootstatus', 'install', 'install', 'shutdown', 'delete'])
 
+    def test_ambiguous_selected_runtime_fails_before_creating_a_simulator(self):
+        runtimes = {'runtimes': [
+            {'isAvailable': True, 'identifier': 'com.apple.CoreSimulator.SimRuntime.iOS-27-0', 'version': '27.0', 'buildversion': build}
+            for build in ['first', 'second']
+        ]}
+        replies = [json.dumps(runtimes), json.dumps({'devicetypes': [{'name': 'iPhone 17', 'identifier': 'phone'}]}), 'OWN-DEVICE']
+        with tempfile.TemporaryDirectory() as root, patch.object(run_journey, 'output', side_effect=replies) as output, \
+                patch.object(run_journey, 'command'):
+            with self.assertRaisesRegex(JourneyError, 'Ambiguous Simulator runtime identifier: com.apple.CoreSimulator.SimRuntime.iOS-27-0'):
+                run_journey.InstalledApp('iOS', Path(root))
+            self.assertFalse(any(call.args[0][2] == 'create' for call in output.call_args_list))
+
     def test_boot_failure_still_deletes_only_the_owned_simulator(self):
         replies = [json.dumps({'runtimes': [{'isAvailable': True, 'identifier':
             'com.apple.CoreSimulator.SimRuntime.iOS-27-0', 'version': '27.0'}]}),

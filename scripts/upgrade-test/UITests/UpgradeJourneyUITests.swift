@@ -13,7 +13,9 @@ final class UpgradeJourneyUITests: XCTestCase {
     }()
     private static func switchIsEnabled(_ value: Any?) -> Bool {
         if let value = value as? String { return value == "1" }
-        if let value = value as? NSNumber { return value == NSNumber(value: 1) }
+        if let value, type(of: value) is NSNumber.Type, let number = value as? NSNumber {
+            return number == NSNumber(value: 1)
+        }
         return false
     }
 
@@ -23,7 +25,7 @@ final class UpgradeJourneyUITests: XCTestCase {
         }
         let disabled: [Any?] = [
             "0", NSNumber(value: 0), nil, "01", "true", NSNumber(value: 2),
-            NSNumber(value: 1.5), NSNull(), [1], NSObject(),
+            NSNumber(value: 1.5), NSNull(), [1], NSObject(), 1, 1.0, true,
         ]
         for value in disabled {
             XCTAssertFalse(Self.switchIsEnabled(value), "Unexpected enabled value: \(String(describing: value))")

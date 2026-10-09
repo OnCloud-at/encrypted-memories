@@ -162,6 +162,8 @@ class InstalledApp:
             if not available:
                 raise JourneyError('No installed iOS Simulator runtime is available')
             runtime = min(available, key=lambda r: tuple(map(int, r['version'].split('.'))))
+            if sum(r['identifier'] == runtime['identifier'] for r in runtimes) != 1:
+                raise JourneyError('Ambiguous Simulator runtime identifier: ' + runtime['identifier'])
             types = json.loads(output(['xcrun', 'simctl', 'list', 'devicetypes', '--json']))['devicetypes']
             phones = [d for d in types if d['name'] == 'iPhone 17']
             if not phones:
