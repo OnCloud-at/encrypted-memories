@@ -126,4 +126,18 @@ class PullRequestWorkflowTests < Minitest::Test
     assert_includes save.fetch("if"), "inputs.save-cache != 'false'"
   end
 
+  def test_failed_ui_jobs_retain_the_complete_result_bundle
+    steps = @workflow.fetch("jobs").fetch("ios-ui-verification").fetch("steps")
+    ui = steps.find { |step| step["id"] == "ui" }
+    upload = steps.find { |step| step["uses"].to_s.start_with?("actions/upload-artifact@") }
+    refute_nil upload, "A failed UI job must retain its result bundle"
+    assert_equal "failure()", upload.fetch("if")
+    inputs = upload.fetch("with")
+    assert_equal ui.fetch("env").fetch("IOS_TEST_RESULT_BUNDLE_PATH"), inputs.fetch("path")
+    assert_equal true, inputs.fetch("include-hidden-files")
+    assert_equal "warn", inputs.fetch("if-no-files-found")
+    assert_equal 7, inputs.fetch("retention-days")
+    assert_includes inputs.fetch("name"), "github.run_id"
+    assert_includes inputs.fetch("name"), "github.run_attempt"
+  end
 end

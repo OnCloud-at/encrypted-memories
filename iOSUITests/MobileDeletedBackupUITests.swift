@@ -26,8 +26,7 @@ final class MobileDeletedBackupUITests: XCTestCase {
         XCTAssertTrue(attention.waitForExistence(timeout: 10))
         XCTAssertTrue(attention.label.contains("1"), "One parked photo must need attention")
         attention.tap()
-        let row = app.descendants(matching: .any).matching(identifier: "backup.failedItem.Deleted fixture.heic")
-            .firstMatch
+        let row = decisionRow
         XCTAssertTrue(row.waitForExistence(timeout: 10))
         row.tap()
         XCTAssertTrue(app.buttons["backup.keepDeleted.dialog"].firstMatch.waitForExistence(timeout: 5))
@@ -86,12 +85,24 @@ final class MobileDeletedBackupUITests: XCTestCase {
         assertBackUpAgainResolved()
     }
 
+    private var decisionRow: XCUIElement {
+        app.buttons["backup.failedItem.Deleted fixture.heic"].firstMatch
+    }
+
+    func testRowRemovalWaitRejectsAnUnresolvedDecision() {
+        openDecision()
+        XCTAssertEqual(waitForDecisionRowRemoval(), .timedOut, "An unresolved decision must remain in the list")
+        XCTAssertTrue(decisionRow.exists)
+    }
+
+    private func waitForDecisionRowRemoval() -> XCTWaiter.Result {
+        let gone = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: decisionRow)
+        return XCTWaiter.wait(for: [gone], timeout: 5)
+    }
+
     private func assertBackUpAgainResolved() {
         XCTAssertTrue(app.staticTexts["Nothing needs attention."].waitForExistence(timeout: 5))
-        let row = app.descendants(matching: .any).matching(identifier: "backup.failedItem.Deleted fixture.heic")
-            .firstMatch
-        let gone = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: row)
-        XCTAssertEqual(XCTWaiter.wait(for: [gone], timeout: 5), .completed)
+        XCTAssertEqual(waitForDecisionRowRemoval(), .completed)
         XCTAssertFalse(app.buttons["backup.keepDeleted.dialog"].firstMatch.exists)
         XCTAssertFalse(app.buttons["backup.backUpAgain.dialog"].firstMatch.exists)
         app.buttons["Done"].tap()
