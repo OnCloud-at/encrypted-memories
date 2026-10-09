@@ -1571,79 +1571,81 @@ struct ThumbnailFeedCoreTests {
         await feed.stopPrefetch()  // frozen clock never expires the backoff; don't leave the worker looping
     }
 
-    @Test func endOfCrawlCoverageRescanIsBoundedNotFullLibraryScan() async throws {
-        // Concurrency invariant: a single end-of-crawl coverage step stats only a bounded chunk, never the
-        // whole library, so no worker (and not the whole stampede of them) can hold the serial feed actor for
-        // an O(library) scan that would starve a visible warm decode. Proven directly on the incremental scan.
-        let feed = ThumbnailFeedCore(
-            cache: Self.cache("coverage-bound"), loader: RecordingLoader(), configuration: Self.configuration())
-        let library = (0..<5000).map { Self.uid("cov-\($0)") }
+    #if DEBUG
+        @Test func endOfCrawlCoverageRescanIsBoundedNotFullLibraryScan() async throws {
+            // Concurrency invariant: a single end-of-crawl coverage step stats only a bounded chunk, never the
+            // whole library, so no worker (and not the whole stampede of them) can hold the serial feed actor for
+            // an O(library) scan that would starve a visible warm decode. Proven directly on the incremental scan.
+            let feed = ThumbnailFeedCore(
+                cache: Self.cache("coverage-bound"), loader: RecordingLoader(), configuration: Self.configuration())
+            let library = (0..<5000).map { Self.uid("cov-\($0)") }
 
-        let statsInOneStep = await feed.coverageScanStepStatCountForTesting(seeding: library)
+            let statsInOneStep = await feed.coverageScanStepStatCountForTesting(seeding: library)
 
-        #expect(statsInOneStep < library.count)  // one actor-held step never scans the whole 5000-item library
-        #expect(statsInOneStep == 512)  // it advances exactly one bounded chunk
-    }
+            #expect(statsInOneStep < library.count)  // one actor-held step never scans the whole 5000-item library
+            #expect(statsInOneStep == 512)  // it advances exactly one bounded chunk
+        }
 
-    @Test func coverageScanAbortsImmediatelyWhenViewportIsLive() async throws {
-        // A live viewport aborts the coverage re-scan before it stats a single item, so a visible warm decode is
-        // never blocked behind coverage maintenance. With a frozen clock, the demand stays "recent".
-        let frozen = Date(timeIntervalSince1970: 5000)
-        let feed = ThumbnailFeedCore(
-            cache: Self.cache("coverage-abort"), loader: RecordingLoader(),
-            configuration: Self.configuration(), clock: { frozen })
-        feed.noteVisibleDemand()  // synchronous (nonisolated); frozen clock keeps it recent
-        let library = (0..<5000).map { Self.uid("abort-\($0)") }
+        @Test func coverageScanAbortsImmediatelyWhenViewportIsLive() async throws {
+            // A live viewport aborts the coverage re-scan before it stats a single item, so a visible warm decode is
+            // never blocked behind coverage maintenance. With a frozen clock, the demand stays "recent".
+            let frozen = Date(timeIntervalSince1970: 5000)
+            let feed = ThumbnailFeedCore(
+                cache: Self.cache("coverage-abort"), loader: RecordingLoader(),
+                configuration: Self.configuration(), clock: { frozen })
+            feed.noteVisibleDemand()  // synchronous (nonisolated); frozen clock keeps it recent
+            let library = (0..<5000).map { Self.uid("abort-\($0)") }
 
-        let scanned = await feed.coverageScanStepStatCountForTesting(seeding: library)
+            let scanned = await feed.coverageScanStepStatCountForTesting(seeding: library)
 
-        #expect(scanned == 0)  // aborted before the first `cache.has` stat
-    }
+            #expect(scanned == 0)  // aborted before the first `cache.has` stat
+        }
 
-    @Test func endOfCrawlCoverageRefreshIsSingleFlightAndSkipsRedundantScan() async throws {
-        // Many workers reach the drained end together, but the coverage refresh is single-flight: exactly one
-        // runs. The crawl's per-item
-        // `diskPresence` tracking already established full coverage during the drain, that one refresh settles
-        // from the known state without a redundant full `cache.has` re-scan.
-        let uids = (0..<40).map { Self.uid("single-flight-\($0)") }
-        let cache = Self.cache("single-flight")
-        let png = Self.pngData(width: 8, height: 8)
-        for uid in uids { cache.storeToDisk(png, for: uid) }
-        let feed = ThumbnailFeedCore(
-            cache: cache, loader: RecordingLoader(),
-            configuration: Self.configuration(downloadConcurrencyLimit: 8))
+        @Test func endOfCrawlCoverageRefreshIsSingleFlightAndSkipsRedundantScan() async throws {
+            // Many workers reach the drained end together, but the coverage refresh is single-flight: exactly one
+            // runs. The crawl's per-item
+            // `diskPresence` tracking already established full coverage during the drain, that one refresh settles
+            // from the known state without a redundant full `cache.has` re-scan.
+            let uids = (0..<40).map { Self.uid("single-flight-\($0)") }
+            let cache = Self.cache("single-flight")
+            let png = Self.pngData(width: 8, height: 8)
+            for uid in uids { cache.storeToDisk(png, for: uid) }
+            let feed = ThumbnailFeedCore(
+                cache: cache, loader: RecordingLoader(),
+                configuration: Self.configuration(downloadConcurrencyLimit: 8))
 
-        await feed.startPrefetch(uids)
-        try await Self.waitUntil { await feed.coverageRefreshStartCountForTesting() >= 1 }
-        try await Task.sleep(for: .milliseconds(120))  // give any stampede a chance to (wrongly) start more
+            await feed.startPrefetch(uids)
+            try await Self.waitUntil { await feed.coverageRefreshStartCountForTesting() >= 1 }
+            try await Task.sleep(for: .milliseconds(120))  // give any stampede a chance to (wrongly) start more
 
-        #expect(await feed.coverageRefreshStartCountForTesting() == 1)  // one refresh, not one per worker
-        #expect(await feed.coverageFullScanCountForTesting() == 0)  // Known state means no redundant full sweep.
-        #expect(await feed.prefetchStatus().diskThumbnailCoverageFraction >= 1.0)  // and coverage is correct
-        await feed.stopPrefetch()
-    }
+            #expect(await feed.coverageRefreshStartCountForTesting() == 1)  // one refresh, not one per worker
+            #expect(await feed.coverageFullScanCountForTesting() == 0)  // Known state means no redundant full sweep.
+            #expect(await feed.prefetchStatus().diskThumbnailCoverageFraction >= 1.0)  // and coverage is correct
+            await feed.stopPrefetch()
+        }
 
-    @Test func coverageRefreshResumesAfterVisibleDemandQuiets() async throws {
-        let clock = MutableClock(Date(timeIntervalSince1970: 1000))
-        let uids = (0..<20).map { Self.uid("resume-\($0)") }
-        let cache = Self.cache("coverage-resume")
-        let png = Self.pngData(width: 8, height: 8)
-        for uid in uids { cache.storeToDisk(png, for: uid) }
-        let feed = ThumbnailFeedCore(
-            cache: cache, loader: RecordingLoader(),
-            configuration: Self.configuration(downloadConcurrencyLimit: 4),
-            clock: { clock.read() })
+        @Test func coverageRefreshResumesAfterVisibleDemandQuiets() async throws {
+            let clock = MutableClock(Date(timeIntervalSince1970: 1000))
+            let uids = (0..<20).map { Self.uid("resume-\($0)") }
+            let cache = Self.cache("coverage-resume")
+            let png = Self.pngData(width: 8, height: 8)
+            for uid in uids { cache.storeToDisk(png, for: uid) }
+            let feed = ThumbnailFeedCore(
+                cache: cache, loader: RecordingLoader(),
+                configuration: Self.configuration(downloadConcurrencyLimit: 4),
+                clock: { clock.read() })
 
-        feed.noteVisibleDemand()  // The live viewport at T=1000 keeps coverage refresh gated.
-        await feed.startPrefetch(uids)
-        try await Task.sleep(for: .milliseconds(150))
-        #expect(await feed.coverageRefreshStartCountForTesting() == 0)  // no refresh while demand is recent
+            feed.noteVisibleDemand()  // The live viewport at T=1000 keeps coverage refresh gated.
+            await feed.startPrefetch(uids)
+            try await Task.sleep(for: .milliseconds(150))
+            #expect(await feed.coverageRefreshStartCountForTesting() == 0)  // no refresh while demand is recent
 
-        clock.advance(1.0)  // demand quiets
-        try await Self.waitUntil { await feed.coverageRefreshStartCountForTesting() >= 1 }
-        #expect(await feed.coverageRefreshStartCountForTesting() >= 1)  // coverage refresh resumes once idle
-        await feed.stopPrefetch()
-    }
+            clock.advance(1.0)  // demand quiets
+            try await Self.waitUntil { await feed.coverageRefreshStartCountForTesting() >= 1 }
+            #expect(await feed.coverageRefreshStartCountForTesting() >= 1)  // coverage refresh resumes once idle
+            await feed.stopPrefetch()
+        }
+    #endif
 
     @Test func decodedCacheHitAndMissKeyedByPhotoUID() {
         let cache = DecodedThumbnailCache(costLimit: 1_000_000)
@@ -1656,65 +1658,67 @@ struct ThumbnailFeedCoreTests {
         #expect(!cache.contains(b))
     }
 
-    @Test func decodedCacheEvictsLruWhenOverBudgetAndKeepsRecentlyUsed() {
-        // Budget holds exactly two 10×10×4=400-byte entries; the third eviction targets the LRU.
-        let cache = DecodedThumbnailCache(costLimit: 800)
-        let ids = (0..<3).map { Self.uid("dc-lru-\($0)") }
-        cache.set(Self.decodedThumb(10, 10), for: ids[0], decodePixelCap: 320)
-        cache.set(Self.decodedThumb(10, 10), for: ids[1], decodePixelCap: 320)
-        // Touch the first item so the second becomes the eviction candidate.
-        _ = cache.image(for: ids[0])
-        cache.set(Self.decodedThumb(10, 10), for: ids[2], decodePixelCap: 320)
+    #if DEBUG
+        @Test func decodedCacheEvictsLruWhenOverBudgetAndKeepsRecentlyUsed() {
+            // Budget holds exactly two 10×10×4=400-byte entries; the third eviction targets the LRU.
+            let cache = DecodedThumbnailCache(costLimit: 800)
+            let ids = (0..<3).map { Self.uid("dc-lru-\($0)") }
+            cache.set(Self.decodedThumb(10, 10), for: ids[0], decodePixelCap: 320)
+            cache.set(Self.decodedThumb(10, 10), for: ids[1], decodePixelCap: 320)
+            // Touch the first item so the second becomes the eviction candidate.
+            _ = cache.image(for: ids[0])
+            cache.set(Self.decodedThumb(10, 10), for: ids[2], decodePixelCap: 320)
 
-        #expect(cache.image(for: ids[0]) != nil)  // recently used survives
-        #expect(cache.image(for: ids[1]) == nil)  // least-recently used evicted
-        #expect(cache.image(for: ids[2]) != nil)  // just-inserted survives
-        #expect(cache.snapshotForTesting().count == 2)
-    }
+            #expect(cache.image(for: ids[0]) != nil)  // recently used survives
+            #expect(cache.image(for: ids[1]) == nil)  // least-recently used evicted
+            #expect(cache.image(for: ids[2]) != nil)  // just-inserted survives
+            #expect(cache.snapshotForTesting().count == 2)
+        }
 
-    @Test func decodedCacheReplaceUpdatesRunningCost() {
-        let cache = DecodedThumbnailCache(costLimit: 10_000_000)
-        let a = Self.uid("dc-rep")
-        cache.set(Self.decodedThumb(10, 10), for: a, decodePixelCap: 320)  // 400
-        #expect(cache.snapshotForTesting().cost == 400)
-        cache.set(Self.decodedThumb(20, 20), for: a, decodePixelCap: 320)
-        #expect(cache.snapshotForTesting().count == 1)
-        #expect(cache.snapshotForTesting().cost == 1600)
-    }
+        @Test func decodedCacheReplaceUpdatesRunningCost() {
+            let cache = DecodedThumbnailCache(costLimit: 10_000_000)
+            let a = Self.uid("dc-rep")
+            cache.set(Self.decodedThumb(10, 10), for: a, decodePixelCap: 320)  // 400
+            #expect(cache.snapshotForTesting().cost == 400)
+            cache.set(Self.decodedThumb(20, 20), for: a, decodePixelCap: 320)
+            #expect(cache.snapshotForTesting().count == 1)
+            #expect(cache.snapshotForTesting().cost == 1600)
+        }
 
-    @Test func decodedCacheKeepsSingleOverBudgetItemThenReclaims() {
-        // An item alone larger than the whole budget is kept (transiently over budget), then reclaimed
-        // when a newer item arrives.
-        let cache = DecodedThumbnailCache(costLimit: 100)
-        let a = Self.uid("dc-big-a")
-        cache.set(Self.decodedThumb(10, 10), for: a, decodePixelCap: 320)  // 400 > 100, so the entry is kept.
-        #expect(cache.image(for: a) != nil)
-        #expect(cache.snapshotForTesting().count == 1)
-        let b = Self.uid("dc-big-b")
-        cache.set(Self.decodedThumb(10, 10), for: b, decodePixelCap: 320)  // Keeping b evicts the LRU (a).
-        #expect(cache.image(for: b) != nil)
-        #expect(cache.image(for: a) == nil)
-    }
+        @Test func decodedCacheKeepsSingleOverBudgetItemThenReclaims() {
+            // An item alone larger than the whole budget is kept (transiently over budget), then reclaimed
+            // when a newer item arrives.
+            let cache = DecodedThumbnailCache(costLimit: 100)
+            let a = Self.uid("dc-big-a")
+            cache.set(Self.decodedThumb(10, 10), for: a, decodePixelCap: 320)  // 400 > 100, so the entry is kept.
+            #expect(cache.image(for: a) != nil)
+            #expect(cache.snapshotForTesting().count == 1)
+            let b = Self.uid("dc-big-b")
+            cache.set(Self.decodedThumb(10, 10), for: b, decodePixelCap: 320)  // Keeping b evicts the LRU (a).
+            #expect(cache.image(for: b) != nil)
+            #expect(cache.image(for: a) == nil)
+        }
 
-    @Test func decodedCacheSetCostLimitEvictsDownToBudget() {
-        let cache = DecodedThumbnailCache(costLimit: 10_000_000)
-        let ids = (0..<3).map { Self.uid("dc-shrink-\($0)") }
-        for id in ids { cache.set(Self.decodedThumb(10, 10), for: id, decodePixelCap: 320) }  // 3×400 = 1200
-        cache.setCostLimit(800)  // shrink to evict oldest down to ≤800
-        #expect(cache.snapshotForTesting().count == 2)
-        #expect(cache.snapshotForTesting().cost <= 800)
-        #expect(cache.image(for: ids[2]) != nil)  // newest survives
-        #expect(cache.image(for: ids[0]) == nil)  // oldest evicted
-    }
+        @Test func decodedCacheSetCostLimitEvictsDownToBudget() {
+            let cache = DecodedThumbnailCache(costLimit: 10_000_000)
+            let ids = (0..<3).map { Self.uid("dc-shrink-\($0)") }
+            for id in ids { cache.set(Self.decodedThumb(10, 10), for: id, decodePixelCap: 320) }  // 3×400 = 1200
+            cache.setCostLimit(800)  // shrink to evict oldest down to ≤800
+            #expect(cache.snapshotForTesting().count == 2)
+            #expect(cache.snapshotForTesting().cost <= 800)
+            #expect(cache.image(for: ids[2]) != nil)  // newest survives
+            #expect(cache.image(for: ids[0]) == nil)  // oldest evicted
+        }
 
-    @Test func decodedCacheRemoveAllClears() {
-        let cache = DecodedThumbnailCache(costLimit: 10_000_000)
-        cache.set(Self.decodedThumb(10, 10), for: Self.uid("dc-x"), decodePixelCap: 320)
-        cache.removeAll()
-        #expect(cache.snapshotForTesting().count == 0)
-        #expect(cache.snapshotForTesting().cost == 0)
-        #expect(cache.image(for: Self.uid("dc-x")) == nil)
-    }
+        @Test func decodedCacheRemoveAllClears() {
+            let cache = DecodedThumbnailCache(costLimit: 10_000_000)
+            cache.set(Self.decodedThumb(10, 10), for: Self.uid("dc-x"), decodePixelCap: 320)
+            cache.removeAll()
+            #expect(cache.snapshotForTesting().count == 0)
+            #expect(cache.snapshotForTesting().cost == 0)
+            #expect(cache.image(for: Self.uid("dc-x")) == nil)
+        }
+    #endif
 
     @Test func visibleDiskDemandBeforeAuthorizationRecoversWithoutAnotherViewport() async throws {
         let old = Self.uid("old-viewport")
@@ -2288,18 +2292,20 @@ struct ThumbnailFeedCoreTests {
         #expect(!feed.decodedNeedsSharperSource(uid, forPixels: 18))  // A value within hysteresis is adequate.
     }
 
-    @Test func decodedCacheRejectsLateLowerResolutionAndReportsTheCurrentSource() {
-        let cache = DecodedThumbnailCache(costLimit: 10_000_000)
-        let a = Self.uid("dc-upgrade")
-        #expect(cache.set(Self.decodedThumb(10, 10), for: a, decodePixelCap: 16))  // 400 bytes
-        #expect(cache.set(Self.decodedThumb(20, 20), for: a, decodePixelCap: 320))
-        #expect(cache.snapshotForTesting().count == 1)
-        #expect(cache.snapshotForTesting().cost == 1600)
-        // The false result prevents onDecoded consumers from treating this rejected source as current.
-        #expect(!cache.set(Self.decodedThumb(10, 10), for: a, decodePixelCap: 16))
-        #expect(cache.snapshotForTesting().cost == 1600)
-        #expect(cache.image(for: a)?.pixelWidth == 20)
-    }
+    #if DEBUG
+        @Test func decodedCacheRejectsLateLowerResolutionAndReportsTheCurrentSource() {
+            let cache = DecodedThumbnailCache(costLimit: 10_000_000)
+            let a = Self.uid("dc-upgrade")
+            #expect(cache.set(Self.decodedThumb(10, 10), for: a, decodePixelCap: 16))  // 400 bytes
+            #expect(cache.set(Self.decodedThumb(20, 20), for: a, decodePixelCap: 320))
+            #expect(cache.snapshotForTesting().count == 1)
+            #expect(cache.snapshotForTesting().cost == 1600)
+            // The false result prevents onDecoded consumers from treating this rejected source as current.
+            #expect(!cache.set(Self.decodedThumb(10, 10), for: a, decodePixelCap: 16))
+            #expect(cache.snapshotForTesting().cost == 1600)
+            #expect(cache.image(for: a)?.pixelWidth == 20)
+        }
+    #endif
 
     @Test func decodedRamTierRespondsToMemoryPressureThroughFeed() async throws {
         // End-to-end through the feed: warmDecoded stores into the decoded tier; a critical pressure purge
@@ -2824,30 +2830,32 @@ struct ThumbnailFeedCoreTests {
         await feed.stopPrefetch()
     }
 
-    @Test func staleDiskProbeCannotPublishAfterAccountSwitch() async throws {
-        let uid = Self.uid("stale-disk-probe-after-account-switch")
-        let cache = Self.cache("stale-disk-probe-after-account-switch")
-        let store = RecordingCoverageStore()
-        let feed = ThumbnailFeedCore(
-            cache: cache,
-            loader: RecordingLoader(),
-            configuration: Self.configuration(downloadConcurrencyLimit: 1, batchSize: 1),
-            coverageStore: store
-        )
-        let probeGate = BlockingDiskProbeHook()
-        feed.setDiskProbeHookForTesting { probeGate.wait() }
+    #if DEBUG
+        @Test func staleDiskProbeCannotPublishAfterAccountSwitch() async throws {
+            let uid = Self.uid("stale-disk-probe-after-account-switch")
+            let cache = Self.cache("stale-disk-probe-after-account-switch")
+            let store = RecordingCoverageStore()
+            let feed = ThumbnailFeedCore(
+                cache: cache,
+                loader: RecordingLoader(),
+                configuration: Self.configuration(downloadConcurrencyLimit: 1, batchSize: 1),
+                coverageStore: store
+            )
+            let probeGate = BlockingDiskProbeHook()
+            feed.setDiskProbeHookForTesting { probeGate.wait() }
 
-        await feed.startPrefetch([uid])
-        try await Self.waitUntil { probeGate.hasEntered }
+            await feed.startPrefetch([uid])
+            try await Self.waitUntil { probeGate.hasEntered }
 
-        cache.configure(accountUID: "acct-B", key: feedCacheTestKey)
-        cache.storeToDisk(Self.pngData(width: 8, height: 8), for: uid)
-        probeGate.release.signal()
-        try await Self.waitUntil { probeGate.hasExited }
-        await feed.stopPrefetch()
+            cache.configure(accountUID: "acct-B", key: feedCacheTestKey)
+            cache.storeToDisk(Self.pngData(width: 8, height: 8), for: uid)
+            probeGate.release.signal()
+            try await Self.waitUntil { probeGate.hasExited }
+            await feed.stopPrefetch()
 
-        #expect(store.snapshot.isEmpty, "an old feed must not checkpoint a post-switch disk probe")
-    }
+            #expect(store.snapshot.isEmpty, "an old feed must not checkpoint a post-switch disk probe")
+        }
+    #endif
 
     @Test func prefetchStatusReportsIncrementalDiskCoverage() async throws {
         let cached = (0..<2).map { Self.uid("coverage-cached-\($0)") }

@@ -447,25 +447,28 @@ final class DeletedPhotoTests: XCTestCase {
         XCTAssertEqual(parts.queue.entry(for: source, revision: current)?.state, .completed)
     }
 
-    @MainActor
-    func testControllerBackUpAgainStartsAPass() async throws {
-        let suite = "deletion-controller-pass-\(UUID().uuidString)"
-        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
-        defer { defaults.removePersistentDomain(forName: suite) }
-        let controller = PhotoLibraryBackupController(
-            configuration: .init(accountDataDirectory: directory, databasePolicy: .conservative, defaults: defaults),
-            identityResolver: FakeIdentityResolver(), uploader: MockUploader(), replacementJournal: journal)
-        XCTAssertTrue(controller.installDeletedElsewhereFixtureForTesting())
-        controller.setAccessStateForTesting(.full)
-        // A real scan would ask PhotoKit, which waits for an authorization answer on a machine without access.
-        controller.replacePassBodyForTesting {}
-        let item = try XCTUnwrap(controller.failedItems().first)
-        XCTAssertFalse(controller.isSyncing)
-        controller.backUpAgain(item)
-        XCTAssertTrue(controller.isSyncing)
-        XCTAssertNotNil(controller.activeExecutionRunID)
-        await controller.shutdown()
-    }
+    #if DEBUG
+        @MainActor
+        func testControllerBackUpAgainStartsAPass() async throws {
+            let suite = "deletion-controller-pass-\(UUID().uuidString)"
+            let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+            defer { defaults.removePersistentDomain(forName: suite) }
+            let controller = PhotoLibraryBackupController(
+                configuration: .init(
+                    accountDataDirectory: directory, databasePolicy: .conservative, defaults: defaults),
+                identityResolver: FakeIdentityResolver(), uploader: MockUploader(), replacementJournal: journal)
+            XCTAssertTrue(controller.installDeletedElsewhereFixtureForTesting())
+            controller.setAccessStateForTesting(.full)
+            // A real scan would ask PhotoKit, which waits for an authorization answer on a machine without access.
+            controller.replacePassBodyForTesting {}
+            let item = try XCTUnwrap(controller.failedItems().first)
+            XCTAssertFalse(controller.isSyncing)
+            controller.backUpAgain(item)
+            XCTAssertTrue(controller.isSyncing)
+            XCTAssertNotNil(controller.activeExecutionRunID)
+            await controller.shutdown()
+        }
+    #endif
 
     @MainActor
     func testControllerMapsDecisionRowsAndWritesBothChoicesWithoutDismissal() async throws {

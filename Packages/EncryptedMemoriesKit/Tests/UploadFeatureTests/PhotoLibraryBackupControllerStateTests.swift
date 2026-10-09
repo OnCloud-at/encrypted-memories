@@ -292,43 +292,45 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
         XCTAssertTrue(items.offersUserRetry)
     }
 
-    func testAnOpenProblemListFollowsANewReasonWhileAPassRuns() async throws {
-        let fixture = try makeControllerFixture(prefix: "backup-problem-follow")
-        defer { fixture.cleanup() }
-        let queue = try XCTUnwrap(
-            UploadBackupSyncQueueManifestStore(
-                url: fixture.directory.appendingPathComponent(PhotoLibraryBackupController.queueDatabaseFileName)))
-        let pass = Task<Void, Never> {
-            while !Task.isCancelled { await Task.yield() }
-        }
-        XCTAssertTrue(fixture.controller.installSyncRunForTesting(runID: "run", task: pass))
-        let shown = ShownProblemLists()
-        let follow = Task {
-            await fixture.controller.followProblemList(interval: .milliseconds(10)) { shown.lists.append($0) }
-        }
-        while shown.lists.isEmpty { await Task.yield() }
-        XCTAssertFalse(shown.lists[0].offersUserRetry)
+    #if DEBUG
+        func testAnOpenProblemListFollowsANewReasonWhileAPassRuns() async throws {
+            let fixture = try makeControllerFixture(prefix: "backup-problem-follow")
+            defer { fixture.cleanup() }
+            let queue = try XCTUnwrap(
+                UploadBackupSyncQueueManifestStore(
+                    url: fixture.directory.appendingPathComponent(PhotoLibraryBackupController.queueDatabaseFileName)))
+            let pass = Task<Void, Never> {
+                while !Task.isCancelled { await Task.yield() }
+            }
+            XCTAssertTrue(fixture.controller.installSyncRunForTesting(runID: "run", task: pass))
+            let shown = ShownProblemLists()
+            let follow = Task {
+                await fixture.controller.followProblemList(interval: .milliseconds(10)) { shown.lists.append($0) }
+            }
+            while shown.lists.isEmpty { await Task.yield() }
+            XCTAssertFalse(shown.lists[0].offersUserRetry)
 
-        // The pass gives a photo a reason that the person resolves; no count of the status changes.
-        XCTAssertTrue(
-            queue.upsert(
-                .init(
-                    source: .init(kind: .photoLibraryAsset, identifier: "quota"), revision: .init(rawValue: 1),
-                    originalFilename: "quota.heic", state: .discovered,
-                    lastError: BackupIssueRecord(kind: .accountStorage, detail: "full").persistedValue,
-                    updatedAt: Date().addingTimeInterval(3_600))))
-        let deadline = Date().addingTimeInterval(10)
-        while shown.lists.last?.offersUserRetry != true, Date() < deadline {
-            try await Task.sleep(for: .milliseconds(5))
-        }
-        XCTAssertEqual(shown.lists.last?.offersUserRetry, true, "Try again appears while the pass runs")
+            // The pass gives a photo a reason that the person resolves; no count of the status changes.
+            XCTAssertTrue(
+                queue.upsert(
+                    .init(
+                        source: .init(kind: .photoLibraryAsset, identifier: "quota"), revision: .init(rawValue: 1),
+                        originalFilename: "quota.heic", state: .discovered,
+                        lastError: BackupIssueRecord(kind: .accountStorage, detail: "full").persistedValue,
+                        updatedAt: Date().addingTimeInterval(3_600))))
+            let deadline = Date().addingTimeInterval(10)
+            while shown.lists.last?.offersUserRetry != true, Date() < deadline {
+                try await Task.sleep(for: .milliseconds(5))
+            }
+            XCTAssertEqual(shown.lists.last?.offersUserRetry, true, "Try again appears while the pass runs")
 
-        pass.cancel()
-        await fixture.controller.finishSyncForTesting(runID: "run")
-        await follow.value
-        XCTAssertFalse(fixture.controller.isSyncing, "following ends with the pass")
-        await fixture.controller.shutdown()
-    }
+            pass.cancel()
+            await fixture.controller.finishSyncForTesting(runID: "run")
+            await follow.value
+            XCTAssertFalse(fixture.controller.isSyncing, "following ends with the pass")
+            await fixture.controller.shutdown()
+        }
+    #endif
 
     @MainActor private final class ShownProblemLists {
         var lists: [[BackupFailedItem]] = []
@@ -372,410 +374,412 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
         XCTAssertNil(item.retryDescription, "the list promises no automatic attempt")
     }
 
-    func testUserResolvableRetryStartsAManualPassWithoutClearingTheSystemIssue() async throws {
-        let fixture = try makeControllerFixture(
-            prefix: "backup-manual-retry", enabled: true, identityResolver: FakeIdentityResolver())
-        defer { fixture.cleanup() }
-        fixture.controller.setAccessStateForTesting(.full)
-        // A real scan would ask PhotoKit, which waits for an authorization answer on a machine without access.
-        fixture.controller.replacePassBodyForTesting {}
-        let queue = try XCTUnwrap(
-            UploadBackupSyncQueueManifestStore(
-                url: fixture.directory.appendingPathComponent(PhotoLibraryBackupController.queueDatabaseFileName)))
-        let issue = BackupIssueRecord(
-            kind: .remoteService, detail: "index unavailable", nextAttemptAt: Date().addingTimeInterval(3_600))
-        XCTAssertTrue(queue.setRuntimeIssue(issue, for: .remoteIndexPreparation))
-        XCTAssertTrue(
-            queue.upsert(
-                .init(
-                    source: .init(kind: .photoLibraryAsset, identifier: "quota"), revision: .init(rawValue: 1),
-                    originalFilename: "quota", state: .discovered,
-                    lastError: BackupIssueRecord(kind: .accountStorage, detail: "quota").persistedValue,
-                    updatedAt: Date().addingTimeInterval(3_600))))
-        await fixture.controller.retryUserResolvableWork()
-        XCTAssertTrue(fixture.controller.isSyncing, "manual intent starts despite the system issue's future date")
-        XCTAssertNotNil(fixture.controller.activeExecutionRunID)
-        XCTAssertEqual(queue.runtimeIssue(for: .remoteIndexPreparation), issue)
-        await fixture.controller.shutdown()
-    }
-
-    func testRunnerStopIsRetainedDeduplicatedAndBlocksCompletion() async throws {
-        let fixture = try makeControllerFixture(prefix: "photo-backup-runner-stop")
-        defer { fixture.cleanup() }
-        let stop = DelayedRunnerStop()
-        fixture.controller.installRunnerStopOperationForTesting {
-            await stop.stop()
-        }
-        let orchestration = Task {
-            while !Task.isCancelled {
-                await Task.yield()
-            }
-        }
-        XCTAssertTrue(
-            fixture.controller.installSyncRunForTesting(runID: "run", task: orchestration))
-
-        fixture.controller.stopSync()
-        fixture.controller.stopSync()
-        await stop.waitUntilStarted()
-
-        let stopCalls = await stop.callCount()
-        XCTAssertEqual(stopCalls, 1)
-        XCTAssertEqual(fixture.controller.runnerStopRunIDForTesting, "run")
-        XCTAssertTrue(fixture.controller.isRunnerStopPendingForTesting)
-
-        let finishTask = Task { @MainActor in
-            await fixture.controller.finishSyncForTesting(runID: "run")
-        }
-        await Task.yield()
-        XCTAssertTrue(fixture.controller.isSyncing)
-        XCTAssertTrue(fixture.controller.isRunnerStopPendingForTesting)
-
-        await stop.release()
-        await finishTask.value
-        await orchestration.value
-
-        XCTAssertFalse(fixture.controller.isSyncing)
-        XCTAssertFalse(fixture.controller.isRunnerStopPendingForTesting)
-    }
-
-    func testShutdownAwaitsTheExistingRunnerStopTask() async throws {
-        let fixture = try makeControllerFixture(prefix: "photo-backup-runner-stop-shutdown")
-        defer { fixture.cleanup() }
-        let stop = DelayedRunnerStop()
-        fixture.controller.installRunnerStopOperationForTesting {
-            await stop.stop()
-        }
-        let orchestration = Task {
-            while !Task.isCancelled {
-                await Task.yield()
-            }
-        }
-        XCTAssertTrue(
-            fixture.controller.installSyncRunForTesting(runID: "run", task: orchestration))
-
-        fixture.controller.stopSync()
-        await stop.waitUntilStarted()
-        let shutdownReturned = CompletionLatch()
-        let shutdownTask = Task { @MainActor in
+    #if DEBUG
+        func testUserResolvableRetryStartsAManualPassWithoutClearingTheSystemIssue() async throws {
+            let fixture = try makeControllerFixture(
+                prefix: "backup-manual-retry", enabled: true, identityResolver: FakeIdentityResolver())
+            defer { fixture.cleanup() }
+            fixture.controller.setAccessStateForTesting(.full)
+            // A real scan would ask PhotoKit, which waits for an authorization answer on a machine without access.
+            fixture.controller.replacePassBodyForTesting {}
+            let queue = try XCTUnwrap(
+                UploadBackupSyncQueueManifestStore(
+                    url: fixture.directory.appendingPathComponent(PhotoLibraryBackupController.queueDatabaseFileName)))
+            let issue = BackupIssueRecord(
+                kind: .remoteService, detail: "index unavailable", nextAttemptAt: Date().addingTimeInterval(3_600))
+            XCTAssertTrue(queue.setRuntimeIssue(issue, for: .remoteIndexPreparation))
+            XCTAssertTrue(
+                queue.upsert(
+                    .init(
+                        source: .init(kind: .photoLibraryAsset, identifier: "quota"), revision: .init(rawValue: 1),
+                        originalFilename: "quota", state: .discovered,
+                        lastError: BackupIssueRecord(kind: .accountStorage, detail: "quota").persistedValue,
+                        updatedAt: Date().addingTimeInterval(3_600))))
+            await fixture.controller.retryUserResolvableWork()
+            XCTAssertTrue(fixture.controller.isSyncing, "manual intent starts despite the system issue's future date")
+            XCTAssertNotNil(fixture.controller.activeExecutionRunID)
+            XCTAssertEqual(queue.runtimeIssue(for: .remoteIndexPreparation), issue)
             await fixture.controller.shutdown()
-            await shutdownReturned.markCompleted()
         }
 
-        await Task.yield()
-        let returnedBeforeRelease = await shutdownReturned.isCompleted()
-        XCTAssertFalse(returnedBeforeRelease)
-        let stopCalls = await stop.callCount()
-        XCTAssertEqual(stopCalls, 1)
+        func testRunnerStopIsRetainedDeduplicatedAndBlocksCompletion() async throws {
+            let fixture = try makeControllerFixture(prefix: "photo-backup-runner-stop")
+            defer { fixture.cleanup() }
+            let stop = DelayedRunnerStop()
+            fixture.controller.installRunnerStopOperationForTesting {
+                await stop.stop()
+            }
+            let orchestration = Task {
+                while !Task.isCancelled {
+                    await Task.yield()
+                }
+            }
+            XCTAssertTrue(
+                fixture.controller.installSyncRunForTesting(runID: "run", task: orchestration))
 
-        await stop.release()
-        await shutdownTask.value
-        let returnedAfterRelease = await shutdownReturned.isCompleted()
-        XCTAssertTrue(returnedAfterRelease)
-        await orchestration.value
-    }
+            fixture.controller.stopSync()
+            fixture.controller.stopSync()
+            await stop.waitUntilStarted()
 
-    func testRunScopedStopCannotCancelAnotherOwner() async throws {
-        let fixture = try makeControllerFixture(prefix: "photo-backup-run-owner")
-        defer { fixture.cleanup() }
-        let cancellation = CompletionLatch()
-        let task = Task {
-            while !Task.isCancelled {
+            let stopCalls = await stop.callCount()
+            XCTAssertEqual(stopCalls, 1)
+            XCTAssertEqual(fixture.controller.runnerStopRunIDForTesting, "run")
+            XCTAssertTrue(fixture.controller.isRunnerStopPendingForTesting)
+
+            let finishTask = Task { @MainActor in
+                await fixture.controller.finishSyncForTesting(runID: "run")
+            }
+            await Task.yield()
+            XCTAssertTrue(fixture.controller.isSyncing)
+            XCTAssertTrue(fixture.controller.isRunnerStopPendingForTesting)
+
+            await stop.release()
+            await finishTask.value
+            await orchestration.value
+
+            XCTAssertFalse(fixture.controller.isSyncing)
+            XCTAssertFalse(fixture.controller.isRunnerStopPendingForTesting)
+        }
+
+        func testShutdownAwaitsTheExistingRunnerStopTask() async throws {
+            let fixture = try makeControllerFixture(prefix: "photo-backup-runner-stop-shutdown")
+            defer { fixture.cleanup() }
+            let stop = DelayedRunnerStop()
+            fixture.controller.installRunnerStopOperationForTesting {
+                await stop.stop()
+            }
+            let orchestration = Task {
+                while !Task.isCancelled {
+                    await Task.yield()
+                }
+            }
+            XCTAssertTrue(
+                fixture.controller.installSyncRunForTesting(runID: "run", task: orchestration))
+
+            fixture.controller.stopSync()
+            await stop.waitUntilStarted()
+            let shutdownReturned = CompletionLatch()
+            let shutdownTask = Task { @MainActor in
+                await fixture.controller.shutdown()
+                await shutdownReturned.markCompleted()
+            }
+
+            await Task.yield()
+            let returnedBeforeRelease = await shutdownReturned.isCompleted()
+            XCTAssertFalse(returnedBeforeRelease)
+            let stopCalls = await stop.callCount()
+            XCTAssertEqual(stopCalls, 1)
+
+            await stop.release()
+            await shutdownTask.value
+            let returnedAfterRelease = await shutdownReturned.isCompleted()
+            XCTAssertTrue(returnedAfterRelease)
+            await orchestration.value
+        }
+
+        func testRunScopedStopCannotCancelAnotherOwner() async throws {
+            let fixture = try makeControllerFixture(prefix: "photo-backup-run-owner")
+            defer { fixture.cleanup() }
+            let cancellation = CompletionLatch()
+            let task = Task {
+                while !Task.isCancelled {
+                    await Task.yield()
+                }
+                await cancellation.markCompleted()
+            }
+            XCTAssertTrue(fixture.controller.installSyncRunForTesting(runID: "foreground", task: task))
+
+            fixture.controller.stopSync(runID: "background")
+            await Task.yield()
+            let cancelledByOtherOwner = await cancellation.isCompleted()
+            XCTAssertFalse(cancelledByOtherOwner)
+
+            fixture.controller.stopSync(runID: "foreground")
+            await task.value
+            let cancelledByOwner = await cancellation.isCompleted()
+            XCTAssertTrue(cancelledByOwner)
+            await fixture.controller.shutdown()
+        }
+
+        func testBackgroundCatchUpDoesNotAdoptAnExistingRun() async throws {
+            let fixture = try makeControllerFixture(prefix: "photo-backup-run-stand-down")
+            defer { fixture.cleanup() }
+            let writer = NonCooperativeWriterLatch()
+            let task = makeNonCooperativeWriter(writer)
+            XCTAssertTrue(fixture.controller.installSyncRunForTesting(runID: "foreground", task: task))
+            await writer.waitUntilStarted()
+            await writer.waitUntilBlocked()
+
+            var reportedRunID: String?
+            let started = ContinuousClock.now
+            await fixture.controller.backgroundCatchUp(owner: .iOSBackgroundTask) { runID in
+                reportedRunID = runID
+            }
+            XCTAssertLessThan(started.duration(to: ContinuousClock.now), .milliseconds(250))
+            XCTAssertNil(reportedRunID)
+            XCTAssertEqual(fixture.controller.activeExecutionRunID, "foreground")
+            let adoptedForegroundRun = await writer.isCompleted()
+            XCTAssertFalse(adoptedForegroundRun)
+
+            await writer.release()
+            await task.value
+            await fixture.controller.shutdown()
+        }
+
+        func testRetirementJoinsChangePreparationAndRejectsItsLateWriter() async throws {
+            let fixture = try makeControllerFixture(prefix: "photo-backup-preparation-retirement")
+            defer { fixture.cleanup() }
+            let preparation = NonCooperativeWriterLatch()
+            let consumed = CompletionLatch()
+            let orchestration = Task { while !Task.isCancelled { await Task.yield() } }
+            XCTAssertTrue(fixture.controller.installSyncRunForTesting(runID: "prepared-run", task: orchestration))
+            XCTAssertTrue(
+                fixture.controller.startPreparedInstantWorkForTesting(
+                    prepare: {
+                        XCTAssertFalse(Thread.isMainThread)
+                        await preparation.markStarted()
+                        await preparation.waitUntilReleased()
+                    },
+                    consume: { await consumed.markCompleted() }
+                ))
+            await preparation.waitUntilBlocked()
+            // Reaching this actor while preparation is blocked also proves UI work remains runnable.
+            await fixture.controller.retireInstantWorkForTesting()
+            XCTAssertTrue(fixture.controller.isRetiringInstantWorkForTesting)
+            await preparation.release()
+            await fixture.controller.waitForInstantWorkRetirementForTesting()
+            let didConsume = await consumed.isCompleted()
+            XCTAssertFalse(didConsume, "a preparation from a retired pass must never enqueue work")
+            await fixture.controller.shutdown()
+            await orchestration.value
+        }
+
+        func testPreparedChangesAreConsumedForTheActiveRun() async throws {
+            let fixture = try makeControllerFixture(prefix: "photo-backup-preparation-current")
+            defer { fixture.cleanup() }
+            let consumed = CompletionLatch()
+            let orchestration = Task { while !Task.isCancelled { await Task.yield() } }
+            XCTAssertTrue(fixture.controller.installSyncRunForTesting(runID: "current-run", task: orchestration))
+            XCTAssertTrue(
+                fixture.controller.startPreparedInstantWorkForTesting(
+                    prepare: { XCTAssertFalse(Thread.isMainThread) },
+                    consume: { await consumed.markCompleted() }
+                ))
+            await consumed.waitUntilCompleted()
+            await fixture.controller.shutdown()
+            await orchestration.value
+        }
+
+        func testExpirationTracksEveryConcurrentWriterAndRetiresUntilBothReturn() async throws {
+            let suite = "photo-backup-controller-retirement-\(UUID().uuidString)"
+            let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+            let directory = FileManager.default.temporaryDirectory
+                .appendingPathComponent(suite, isDirectory: true)
+            defer {
+                defaults.removePersistentDomain(forName: suite)
+                try? FileManager.default.removeItem(at: directory)
+            }
+
+            let controller = PhotoLibraryBackupController(
+                configuration: .init(
+                    accountDataDirectory: directory,
+                    databasePolicy: .conservative,
+                    defaults: defaults
+                ),
+                identityResolver: nil,
+                uploader: MockUploader()
+            )
+            let first = NonCooperativeWriterLatch()
+            let second = NonCooperativeWriterLatch()
+            let firstTask = makeNonCooperativeWriter(first)
+            let secondTask = makeNonCooperativeWriter(second)
+            XCTAssertTrue(controller.installInstantWorkTaskForTesting(firstTask))
+            XCTAssertTrue(controller.installInstantWorkTaskForTesting(secondTask))
+
+            await first.waitUntilStarted()
+            await second.waitUntilStarted()
+            await first.waitUntilBlocked()
+            await second.waitUntilBlocked()
+
+            let expirationStarted = ContinuousClock.now
+            await controller.retireInstantWorkForTesting()
+            let expirationDuration = expirationStarted.duration(to: ContinuousClock.now)
+            XCTAssertLessThan(
+                expirationDuration,
+                PhotoLibraryBackupController.instantWorkRetirementTimeout + .milliseconds(500),
+                "expiration must return after its bounded wait instead of joining writers"
+            )
+            XCTAssertTrue(controller.isRetiringInstantWorkForTesting)
+
+            await first.release()
+            await firstTask.value
+            XCTAssertTrue(controller.isRetiringInstantWorkForTesting)
+
+            await second.release()
+            await secondTask.value
+            await controller.waitForInstantWorkRetirementForTesting()
+            XCTAssertFalse(controller.isRetiringInstantWorkForTesting)
+            await controller.shutdown()
+        }
+
+        func testRetirementRejectsNewTargetedWriter() async throws {
+            let suite = "photo-backup-controller-retirement-guard-\(UUID().uuidString)"
+            let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+            let directory = FileManager.default.temporaryDirectory
+                .appendingPathComponent(suite, isDirectory: true)
+            defer {
+                defaults.removePersistentDomain(forName: suite)
+                try? FileManager.default.removeItem(at: directory)
+            }
+
+            let controller = PhotoLibraryBackupController(
+                configuration: .init(
+                    accountDataDirectory: directory,
+                    databasePolicy: .conservative,
+                    defaults: defaults
+                ),
+                identityResolver: nil,
+                uploader: MockUploader()
+            )
+            let writer = NonCooperativeWriterLatch()
+            let writerTask = makeNonCooperativeWriter(writer)
+            XCTAssertTrue(controller.installInstantWorkTaskForTesting(writerTask))
+            await writer.waitUntilStarted()
+            await writer.waitUntilBlocked()
+
+            let expiration = Task { @MainActor in
+                await controller.retireInstantWorkForTesting()
+            }
+            while !controller.isRetiringInstantWorkForTesting {
                 await Task.yield()
             }
-            await cancellation.markCompleted()
-        }
-        XCTAssertTrue(fixture.controller.installSyncRunForTesting(runID: "foreground", task: task))
 
-        fixture.controller.stopSync(runID: "background")
-        await Task.yield()
-        let cancelledByOtherOwner = await cancellation.isCompleted()
-        XCTAssertFalse(cancelledByOtherOwner)
-
-        fixture.controller.stopSync(runID: "foreground")
-        await task.value
-        let cancelledByOwner = await cancellation.isCompleted()
-        XCTAssertTrue(cancelledByOwner)
-        await fixture.controller.shutdown()
-    }
-
-    func testBackgroundCatchUpDoesNotAdoptAnExistingRun() async throws {
-        let fixture = try makeControllerFixture(prefix: "photo-backup-run-stand-down")
-        defer { fixture.cleanup() }
-        let writer = NonCooperativeWriterLatch()
-        let task = makeNonCooperativeWriter(writer)
-        XCTAssertTrue(fixture.controller.installSyncRunForTesting(runID: "foreground", task: task))
-        await writer.waitUntilStarted()
-        await writer.waitUntilBlocked()
-
-        var reportedRunID: String?
-        let started = ContinuousClock.now
-        await fixture.controller.backgroundCatchUp(owner: .iOSBackgroundTask) { runID in
-            reportedRunID = runID
-        }
-        XCTAssertLessThan(started.duration(to: ContinuousClock.now), .milliseconds(250))
-        XCTAssertNil(reportedRunID)
-        XCTAssertEqual(fixture.controller.activeExecutionRunID, "foreground")
-        let adoptedForegroundRun = await writer.isCompleted()
-        XCTAssertFalse(adoptedForegroundRun)
-
-        await writer.release()
-        await task.value
-        await fixture.controller.shutdown()
-    }
-
-    func testRetirementJoinsChangePreparationAndRejectsItsLateWriter() async throws {
-        let fixture = try makeControllerFixture(prefix: "photo-backup-preparation-retirement")
-        defer { fixture.cleanup() }
-        let preparation = NonCooperativeWriterLatch()
-        let consumed = CompletionLatch()
-        let orchestration = Task { while !Task.isCancelled { await Task.yield() } }
-        XCTAssertTrue(fixture.controller.installSyncRunForTesting(runID: "prepared-run", task: orchestration))
-        XCTAssertTrue(
-            fixture.controller.startPreparedInstantWorkForTesting(
-                prepare: {
-                    XCTAssertFalse(Thread.isMainThread)
-                    await preparation.markStarted()
-                    await preparation.waitUntilReleased()
+            let rejectedWriter = NonCooperativeWriterLatch()
+            XCTAssertFalse(
+                controller.startInstantWorkForTesting {
+                    await rejectedWriter.markStarted()
                 },
-                consume: { await consumed.markCompleted() }
-            ))
-        await preparation.waitUntilBlocked()
-        // Reaching this actor while preparation is blocked also proves UI work remains runnable.
-        await fixture.controller.retireInstantWorkForTesting()
-        XCTAssertTrue(fixture.controller.isRetiringInstantWorkForTesting)
-        await preparation.release()
-        await fixture.controller.waitForInstantWorkRetirementForTesting()
-        let didConsume = await consumed.isCompleted()
-        XCTAssertFalse(didConsume, "a preparation from a retired pass must never enqueue work")
-        await fixture.controller.shutdown()
-        await orchestration.value
-    }
-
-    func testPreparedChangesAreConsumedForTheActiveRun() async throws {
-        let fixture = try makeControllerFixture(prefix: "photo-backup-preparation-current")
-        defer { fixture.cleanup() }
-        let consumed = CompletionLatch()
-        let orchestration = Task { while !Task.isCancelled { await Task.yield() } }
-        XCTAssertTrue(fixture.controller.installSyncRunForTesting(runID: "current-run", task: orchestration))
-        XCTAssertTrue(
-            fixture.controller.startPreparedInstantWorkForTesting(
-                prepare: { XCTAssertFalse(Thread.isMainThread) },
-                consume: { await consumed.markCompleted() }
-            ))
-        await consumed.waitUntilCompleted()
-        await fixture.controller.shutdown()
-        await orchestration.value
-    }
-
-    func testExpirationTracksEveryConcurrentWriterAndRetiresUntilBothReturn() async throws {
-        let suite = "photo-backup-controller-retirement-\(UUID().uuidString)"
-        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
-        let directory = FileManager.default.temporaryDirectory
-            .appendingPathComponent(suite, isDirectory: true)
-        defer {
-            defaults.removePersistentDomain(forName: suite)
-            try? FileManager.default.removeItem(at: directory)
-        }
-
-        let controller = PhotoLibraryBackupController(
-            configuration: .init(
-                accountDataDirectory: directory,
-                databasePolicy: .conservative,
-                defaults: defaults
-            ),
-            identityResolver: nil,
-            uploader: MockUploader()
-        )
-        let first = NonCooperativeWriterLatch()
-        let second = NonCooperativeWriterLatch()
-        let firstTask = makeNonCooperativeWriter(first)
-        let secondTask = makeNonCooperativeWriter(second)
-        XCTAssertTrue(controller.installInstantWorkTaskForTesting(firstTask))
-        XCTAssertTrue(controller.installInstantWorkTaskForTesting(secondTask))
-
-        await first.waitUntilStarted()
-        await second.waitUntilStarted()
-        await first.waitUntilBlocked()
-        await second.waitUntilBlocked()
-
-        let expirationStarted = ContinuousClock.now
-        await controller.retireInstantWorkForTesting()
-        let expirationDuration = expirationStarted.duration(to: ContinuousClock.now)
-        XCTAssertLessThan(
-            expirationDuration,
-            PhotoLibraryBackupController.instantWorkRetirementTimeout + .milliseconds(500),
-            "expiration must return after its bounded wait instead of joining writers"
-        )
-        XCTAssertTrue(controller.isRetiringInstantWorkForTesting)
-
-        await first.release()
-        await firstTask.value
-        XCTAssertTrue(controller.isRetiringInstantWorkForTesting)
-
-        await second.release()
-        await secondTask.value
-        await controller.waitForInstantWorkRetirementForTesting()
-        XCTAssertFalse(controller.isRetiringInstantWorkForTesting)
-        await controller.shutdown()
-    }
-
-    func testRetirementRejectsNewTargetedWriter() async throws {
-        let suite = "photo-backup-controller-retirement-guard-\(UUID().uuidString)"
-        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
-        let directory = FileManager.default.temporaryDirectory
-            .appendingPathComponent(suite, isDirectory: true)
-        defer {
-            defaults.removePersistentDomain(forName: suite)
-            try? FileManager.default.removeItem(at: directory)
-        }
-
-        let controller = PhotoLibraryBackupController(
-            configuration: .init(
-                accountDataDirectory: directory,
-                databasePolicy: .conservative,
-                defaults: defaults
-            ),
-            identityResolver: nil,
-            uploader: MockUploader()
-        )
-        let writer = NonCooperativeWriterLatch()
-        let writerTask = makeNonCooperativeWriter(writer)
-        XCTAssertTrue(controller.installInstantWorkTaskForTesting(writerTask))
-        await writer.waitUntilStarted()
-        await writer.waitUntilBlocked()
-
-        let expiration = Task { @MainActor in
-            await controller.retireInstantWorkForTesting()
-        }
-        while !controller.isRetiringInstantWorkForTesting {
+                "retirement must reject a new targeted writer"
+            )
             await Task.yield()
-        }
+            let rejectedWriterStarted = await rejectedWriter.isStarted()
+            XCTAssertFalse(rejectedWriterStarted)
 
-        let rejectedWriter = NonCooperativeWriterLatch()
-        XCTAssertFalse(
-            controller.startInstantWorkForTesting {
-                await rejectedWriter.markStarted()
-            },
-            "retirement must reject a new targeted writer"
-        )
-        await Task.yield()
-        let rejectedWriterStarted = await rejectedWriter.isStarted()
-        XCTAssertFalse(rejectedWriterStarted)
-
-        await expiration.value
-        await writer.release()
-        await writerTask.value
-        await controller.waitForInstantWorkRetirementForTesting()
-        XCTAssertFalse(controller.isRetiringInstantWorkForTesting)
-        await controller.shutdown()
-    }
-
-    func testShutdownJoinsRetirementAndAllTrackedWriters() async throws {
-        let suite = "photo-backup-controller-retirement-shutdown-\(UUID().uuidString)"
-        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
-        let directory = FileManager.default.temporaryDirectory
-            .appendingPathComponent(suite, isDirectory: true)
-        defer {
-            defaults.removePersistentDomain(forName: suite)
-            try? FileManager.default.removeItem(at: directory)
-        }
-
-        let controller = PhotoLibraryBackupController(
-            configuration: .init(
-                accountDataDirectory: directory,
-                databasePolicy: .conservative,
-                defaults: defaults
-            ),
-            identityResolver: nil,
-            uploader: MockUploader()
-        )
-        let first = NonCooperativeWriterLatch()
-        let second = NonCooperativeWriterLatch()
-        let firstTask = makeNonCooperativeWriter(first)
-        let secondTask = makeNonCooperativeWriter(second)
-        XCTAssertTrue(controller.installInstantWorkTaskForTesting(firstTask))
-        XCTAssertTrue(controller.installInstantWorkTaskForTesting(secondTask))
-        await first.waitUntilStarted()
-        await second.waitUntilStarted()
-        await first.waitUntilBlocked()
-        await second.waitUntilBlocked()
-        await controller.retireInstantWorkForTesting()
-        XCTAssertTrue(controller.isRetiringInstantWorkForTesting)
-
-        let shutdownReturned = CompletionLatch()
-        let shutdownTask = Task { @MainActor in
+            await expiration.value
+            await writer.release()
+            await writerTask.value
+            await controller.waitForInstantWorkRetirementForTesting()
+            XCTAssertFalse(controller.isRetiringInstantWorkForTesting)
             await controller.shutdown()
-            await shutdownReturned.markCompleted()
-        }
-        await Task.yield()
-        let returnedBeforeFirstRelease = await shutdownReturned.isCompleted()
-        XCTAssertFalse(returnedBeforeFirstRelease)
-
-        await first.release()
-        await firstTask.value
-        await Task.yield()
-        let returnedBeforeSecondRelease = await shutdownReturned.isCompleted()
-        XCTAssertFalse(returnedBeforeSecondRelease)
-
-        await second.release()
-        await secondTask.value
-        await shutdownTask.value
-        let returnedAfterWriters = await shutdownReturned.isCompleted()
-        XCTAssertTrue(returnedAfterWriters)
-    }
-
-    func testShutdownDoesNotReturnBeforeNonCooperativeInstantWriterCompletes() async throws {
-        let suite = "photo-backup-controller-shutdown-\(UUID().uuidString)"
-        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
-        let directory = FileManager.default.temporaryDirectory
-            .appendingPathComponent(suite, isDirectory: true)
-        defer {
-            defaults.removePersistentDomain(forName: suite)
-            try? FileManager.default.removeItem(at: directory)
         }
 
-        let controller = PhotoLibraryBackupController(
-            configuration: .init(
-                accountDataDirectory: directory,
-                databasePolicy: .conservative,
-                defaults: defaults
-            ),
-            identityResolver: nil,
-            uploader: MockUploader()
-        )
-        let writer = NonCooperativeWriterLatch()
-        let writeTask = Task.detached(priority: .utility) {
-            await writer.markStarted()
-            await writer.waitUntilReleased()
-            await writer.markCompleted()
-        }
-        controller.installInstantWorkTaskForTesting(writeTask)
+        func testShutdownJoinsRetirementAndAllTrackedWriters() async throws {
+            let suite = "photo-backup-controller-retirement-shutdown-\(UUID().uuidString)"
+            let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+            let directory = FileManager.default.temporaryDirectory
+                .appendingPathComponent(suite, isDirectory: true)
+            defer {
+                defaults.removePersistentDomain(forName: suite)
+                try? FileManager.default.removeItem(at: directory)
+            }
 
-        let shutdownStarted = CompletionLatch()
-        let shutdownReturned = CompletionLatch()
-        let shutdownTask = Task { @MainActor in
-            await shutdownStarted.markCompleted()
-            await controller.shutdown()
-            await shutdownReturned.markCompleted()
+            let controller = PhotoLibraryBackupController(
+                configuration: .init(
+                    accountDataDirectory: directory,
+                    databasePolicy: .conservative,
+                    defaults: defaults
+                ),
+                identityResolver: nil,
+                uploader: MockUploader()
+            )
+            let first = NonCooperativeWriterLatch()
+            let second = NonCooperativeWriterLatch()
+            let firstTask = makeNonCooperativeWriter(first)
+            let secondTask = makeNonCooperativeWriter(second)
+            XCTAssertTrue(controller.installInstantWorkTaskForTesting(firstTask))
+            XCTAssertTrue(controller.installInstantWorkTaskForTesting(secondTask))
+            await first.waitUntilStarted()
+            await second.waitUntilStarted()
+            await first.waitUntilBlocked()
+            await second.waitUntilBlocked()
+            await controller.retireInstantWorkForTesting()
+            XCTAssertTrue(controller.isRetiringInstantWorkForTesting)
+
+            let shutdownReturned = CompletionLatch()
+            let shutdownTask = Task { @MainActor in
+                await controller.shutdown()
+                await shutdownReturned.markCompleted()
+            }
+            await Task.yield()
+            let returnedBeforeFirstRelease = await shutdownReturned.isCompleted()
+            XCTAssertFalse(returnedBeforeFirstRelease)
+
+            await first.release()
+            await firstTask.value
+            await Task.yield()
+            let returnedBeforeSecondRelease = await shutdownReturned.isCompleted()
+            XCTAssertFalse(returnedBeforeSecondRelease)
+
+            await second.release()
+            await secondTask.value
+            await shutdownTask.value
+            let returnedAfterWriters = await shutdownReturned.isCompleted()
+            XCTAssertTrue(returnedAfterWriters)
         }
 
-        await shutdownStarted.waitUntilCompleted()
-        await writer.waitUntilStarted()
-        await writer.waitUntilBlocked()
-        await Task.yield()
-        let returnedBeforeRelease = await shutdownReturned.isCompleted()
-        XCTAssertFalse(
-            returnedBeforeRelease,
-            "shutdown must not return while the non-cooperative writer remains blocked"
-        )
-        await writer.release()
-        await writeTask.value
-        await shutdownTask.value
-        let writerCompleted = await writer.isCompleted()
-        let returnedAfterRelease = await shutdownReturned.isCompleted()
-        XCTAssertTrue(writerCompleted)
-        XCTAssertTrue(returnedAfterRelease)
-    }
+        func testShutdownDoesNotReturnBeforeNonCooperativeInstantWriterCompletes() async throws {
+            let suite = "photo-backup-controller-shutdown-\(UUID().uuidString)"
+            let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+            let directory = FileManager.default.temporaryDirectory
+                .appendingPathComponent(suite, isDirectory: true)
+            defer {
+                defaults.removePersistentDomain(forName: suite)
+                try? FileManager.default.removeItem(at: directory)
+            }
+
+            let controller = PhotoLibraryBackupController(
+                configuration: .init(
+                    accountDataDirectory: directory,
+                    databasePolicy: .conservative,
+                    defaults: defaults
+                ),
+                identityResolver: nil,
+                uploader: MockUploader()
+            )
+            let writer = NonCooperativeWriterLatch()
+            let writeTask = Task.detached(priority: .utility) {
+                await writer.markStarted()
+                await writer.waitUntilReleased()
+                await writer.markCompleted()
+            }
+            controller.installInstantWorkTaskForTesting(writeTask)
+
+            let shutdownStarted = CompletionLatch()
+            let shutdownReturned = CompletionLatch()
+            let shutdownTask = Task { @MainActor in
+                await shutdownStarted.markCompleted()
+                await controller.shutdown()
+                await shutdownReturned.markCompleted()
+            }
+
+            await shutdownStarted.waitUntilCompleted()
+            await writer.waitUntilStarted()
+            await writer.waitUntilBlocked()
+            await Task.yield()
+            let returnedBeforeRelease = await shutdownReturned.isCompleted()
+            XCTAssertFalse(
+                returnedBeforeRelease,
+                "shutdown must not return while the non-cooperative writer remains blocked"
+            )
+            await writer.release()
+            await writeTask.value
+            await shutdownTask.value
+            let writerCompleted = await writer.isCompleted()
+            let returnedAfterRelease = await shutdownReturned.isCompleted()
+            XCTAssertTrue(writerCompleted)
+            XCTAssertTrue(returnedAfterRelease)
+        }
+    #endif
 
     func testBackgroundExecutionCompositionReservesDiscoveryAndQueuePhases() throws {
         let catalog = BackupExecutionProgress(completedUnitCount: 50, totalUnitCount: 100)
@@ -889,138 +893,141 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
         )
     }
 
-    func testBackupDoesNotStartWhenTheRequiredPendingStoreIsMissing() async throws {
-        let suite = "photo-backup-controller-pending-store-\(UUID().uuidString)"
-        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
-        let directory = FileManager.default.temporaryDirectory
-            .appendingPathComponent(suite, isDirectory: true)
-        defer {
-            defaults.removePersistentDomain(forName: suite)
-            try? FileManager.default.removeItem(at: directory)
+    #if DEBUG
+        func testBackupDoesNotStartWhenTheRequiredPendingStoreIsMissing() async throws {
+            let suite = "photo-backup-controller-pending-store-\(UUID().uuidString)"
+            let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+            let directory = FileManager.default.temporaryDirectory
+                .appendingPathComponent(suite, isDirectory: true)
+            defer {
+                defaults.removePersistentDomain(forName: suite)
+                try? FileManager.default.removeItem(at: directory)
+            }
+            defaults.set(true, forKey: "photoBackup.enabled.v1")
+
+            let controller = PhotoLibraryBackupController(
+                configuration: .init(
+                    accountDataDirectory: directory,
+                    databasePolicy: .conservative,
+                    defaults: defaults
+                ),
+                identityResolver: FakeIdentityResolver(),
+                uploader: MockUploader(),
+                pendingStore: nil,
+                requiresPendingStore: true
+            )
+            controller.setAccessStateForTesting(.full)
+
+            // Without the exclusions an excluded photo could upload, so no pass may start.
+            controller.syncNow()
+            await controller.retryFailedAndSync()
+
+            XCTAssertFalse(controller.isAvailable)
+            XCTAssertFalse(controller.isSyncing)
+            XCTAssertEqual(controller.lastMessage, L10n.string("backup.error_local_state_unavailable"))
+            await controller.shutdown()
         }
-        defaults.set(true, forKey: "photoBackup.enabled.v1")
 
-        let controller = PhotoLibraryBackupController(
-            configuration: .init(
-                accountDataDirectory: directory,
-                databasePolicy: .conservative,
-                defaults: defaults
-            ),
-            identityResolver: FakeIdentityResolver(),
-            uploader: MockUploader(),
-            pendingStore: nil,
-            requiresPendingStore: true
-        )
-        controller.setAccessStateForTesting(.full)
+        func testMissingSourceRecoveryFailureShowsTheLocalizedLocalStateMessage() async throws {
+            let suite = "backup-recovery-local-state-\(UUID().uuidString)"
+            let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(suite)
+            let pending = try XCTUnwrap(
+                PendingBackupManifestStore(
+                    url: directory.appendingPathComponent(PendingBackupManifestStore.databaseFileName)))
+            defer {
+                pending.close()
+                defaults.removePersistentDomain(forName: suite)
+                try? FileManager.default.removeItem(at: directory)
+            }
+            let controller = PhotoLibraryBackupController(
+                configuration: .init(
+                    accountDataDirectory: directory, databasePolicy: .conservative, defaults: defaults),
+                identityResolver: FakeIdentityResolver(), uploader: MockUploader(), pendingStore: pending)
+            controller.setEnabledForTesting()
+            controller.setAccessStateForTesting(.full)
+            let catalog = try XCTUnwrap(
+                PhotoLibraryCatalogManifestStore(
+                    url: directory.appendingPathComponent(PhotoLibraryBackupController.catalogDatabaseFileName)))
+            let info = PhotoBackupAssetInfo(
+                localIdentifier: "dropped-photo", creationDate: nil, modificationDate: Date(timeIntervalSince1970: 200),
+                pixelWidth: 10, pixelHeight: 10, durationSeconds: 0, isLivePhoto: false, isVideo: false,
+                resources: [.init(role: .originalPhoto, originalFilename: "photo.jpg", mimeType: "image/jpeg")])
+            XCTAssertTrue(catalog.upsertBatch([PhotoLibraryCatalogMapper.entry(for: info, observedAt: Date())]))
+            catalog.close()
+            controller.replaceScanForTesting { pending.close() }
 
-        // Without the exclusions an excluded photo could upload, so no pass may start.
-        controller.syncNow()
-        await controller.retryFailedAndSync()
+            controller.syncNow()
+            let finished = await waitUntil { !controller.isSyncing }
 
-        XCTAssertFalse(controller.isAvailable)
-        XCTAssertFalse(controller.isSyncing)
-        XCTAssertEqual(controller.lastMessage, L10n.string("backup.error_local_state_unavailable"))
-        await controller.shutdown()
-    }
-
-    func testMissingSourceRecoveryFailureShowsTheLocalizedLocalStateMessage() async throws {
-        let suite = "backup-recovery-local-state-\(UUID().uuidString)"
-        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(suite)
-        let pending = try XCTUnwrap(
-            PendingBackupManifestStore(
-                url: directory.appendingPathComponent(PendingBackupManifestStore.databaseFileName)))
-        defer {
-            pending.close()
-            defaults.removePersistentDomain(forName: suite)
-            try? FileManager.default.removeItem(at: directory)
+            XCTAssertTrue(finished)
+            XCTAssertEqual(controller.lastMessage, L10n.string("backup.error_local_state_unavailable"))
+            let queue = try XCTUnwrap(
+                UploadBackupSyncQueueManifestStore(
+                    url: directory.appendingPathComponent(PhotoLibraryBackupController.queueDatabaseFileName)))
+            XCTAssertEqual(queue.count(), 0, "unreadable exclusions must leave recovery pending")
+            queue.close()
+            await controller.shutdown()
         }
-        let controller = PhotoLibraryBackupController(
-            configuration: .init(accountDataDirectory: directory, databasePolicy: .conservative, defaults: defaults),
-            identityResolver: FakeIdentityResolver(), uploader: MockUploader(), pendingStore: pending)
-        controller.setEnabledForTesting()
-        controller.setAccessStateForTesting(.full)
-        let catalog = try XCTUnwrap(
-            PhotoLibraryCatalogManifestStore(
-                url: directory.appendingPathComponent(PhotoLibraryBackupController.catalogDatabaseFileName)))
-        let info = PhotoBackupAssetInfo(
-            localIdentifier: "dropped-photo", creationDate: nil, modificationDate: Date(timeIntervalSince1970: 200),
-            pixelWidth: 10, pixelHeight: 10, durationSeconds: 0, isLivePhoto: false, isVideo: false,
-            resources: [.init(role: .originalPhoto, originalFilename: "photo.jpg", mimeType: "image/jpeg")])
-        XCTAssertTrue(catalog.upsertBatch([PhotoLibraryCatalogMapper.entry(for: info, observedAt: Date())]))
-        catalog.close()
-        controller.replaceScanForTesting { pending.close() }
 
-        controller.syncNow()
-        let finished = await waitUntil { !controller.isSyncing }
+        func testActivationDoesNotStartAPassWhileBackupIsPaused() async throws {
+            let fixture = try makeControllerFixture(prefix: "photo-backup-activation-paused", enabled: true)
+            defer { fixture.cleanup() }
+            fixture.controller.setAccessStateForTesting(.full)
+            fixture.controller.pauseBackup()
 
-        XCTAssertTrue(finished)
-        XCTAssertEqual(controller.lastMessage, L10n.string("backup.error_local_state_unavailable"))
-        let queue = try XCTUnwrap(
-            UploadBackupSyncQueueManifestStore(
-                url: directory.appendingPathComponent(PhotoLibraryBackupController.queueDatabaseFileName)))
-        XCTAssertEqual(queue.count(), 0, "unreadable exclusions must leave recovery pending")
-        queue.close()
-        await controller.shutdown()
-    }
+            fixture.controller.applicationDidBecomeActive()
 
-    func testActivationDoesNotStartAPassWhileBackupIsPaused() async throws {
-        let fixture = try makeControllerFixture(prefix: "photo-backup-activation-paused", enabled: true)
-        defer { fixture.cleanup() }
-        fixture.controller.setAccessStateForTesting(.full)
-        fixture.controller.pauseBackup()
+            XCTAssertFalse(fixture.controller.isSyncing)
+            await fixture.controller.shutdown()
+        }
 
-        fixture.controller.applicationDidBecomeActive()
+        func testActivationDoesNotStartAPassWhileBackupIsOff() async throws {
+            let fixture = try makeControllerFixture(prefix: "photo-backup-activation-off")
+            defer { fixture.cleanup() }
+            fixture.controller.setAccessStateForTesting(.full)
 
-        XCTAssertFalse(fixture.controller.isSyncing)
-        await fixture.controller.shutdown()
-    }
+            fixture.controller.applicationDidBecomeActive()
 
-    func testActivationDoesNotStartAPassWhileBackupIsOff() async throws {
-        let fixture = try makeControllerFixture(prefix: "photo-backup-activation-off")
-        defer { fixture.cleanup() }
-        fixture.controller.setAccessStateForTesting(.full)
+            XCTAssertFalse(fixture.controller.isSyncing)
+            await fixture.controller.shutdown()
+        }
 
-        fixture.controller.applicationDidBecomeActive()
+        /// The excluded list checks its photos again on every activation, also while no pass may start.
+        func testActivationTellsThePendingGridWhileBackupIsPaused() async throws {
+            let fixture = try makeControllerFixture(prefix: "photo-backup-activation-pending")
+            defer { fixture.cleanup() }
+            fixture.controller.setEnabledForTesting()
+            fixture.controller.setAccessStateForTesting(.full)
+            fixture.controller.pauseBackup()
+            var changes = 0
+            fixture.controller.onLibraryChange = { changes += 1 }
 
-        XCTAssertFalse(fixture.controller.isSyncing)
-        await fixture.controller.shutdown()
-    }
+            fixture.controller.applicationDidBecomeActive()
 
-    /// The excluded list checks its photos again on every activation, also while no pass may start.
-    func testActivationTellsThePendingGridWhileBackupIsPaused() async throws {
-        let fixture = try makeControllerFixture(prefix: "photo-backup-activation-pending")
-        defer { fixture.cleanup() }
-        fixture.controller.setEnabledForTesting()
-        fixture.controller.setAccessStateForTesting(.full)
-        fixture.controller.pauseBackup()
-        var changes = 0
-        fixture.controller.onLibraryChange = { changes += 1 }
+            XCTAssertEqual(changes, 1)
+            XCTAssertFalse(fixture.controller.isSyncing)
+            await fixture.controller.shutdown()
+        }
 
-        fixture.controller.applicationDidBecomeActive()
+        func testActivationKeepsTheRunningPass() async throws {
+            let fixture = try makeControllerFixture(prefix: "photo-backup-activation-running", enabled: true)
+            defer { fixture.cleanup() }
+            let writer = NonCooperativeWriterLatch()
+            let task = makeNonCooperativeWriter(writer)
+            XCTAssertTrue(fixture.controller.installSyncRunForTesting(runID: "foreground", task: task))
+            await writer.waitUntilStarted()
+            await writer.waitUntilBlocked()
 
-        XCTAssertEqual(changes, 1)
-        XCTAssertFalse(fixture.controller.isSyncing)
-        await fixture.controller.shutdown()
-    }
+            fixture.controller.applicationDidBecomeActive()
 
-    func testActivationKeepsTheRunningPass() async throws {
-        let fixture = try makeControllerFixture(prefix: "photo-backup-activation-running", enabled: true)
-        defer { fixture.cleanup() }
-        let writer = NonCooperativeWriterLatch()
-        let task = makeNonCooperativeWriter(writer)
-        XCTAssertTrue(fixture.controller.installSyncRunForTesting(runID: "foreground", task: task))
-        await writer.waitUntilStarted()
-        await writer.waitUntilBlocked()
-
-        fixture.controller.applicationDidBecomeActive()
-
-        XCTAssertEqual(fixture.controller.activeExecutionRunID, "foreground")
-        XCTAssertFalse(fixture.controller.isRunnerStopPendingForTesting)
-        await writer.release()
-        await task.value
-        await fixture.controller.shutdown()
-    }
+            XCTAssertEqual(fixture.controller.activeExecutionRunID, "foreground")
+            XCTAssertFalse(fixture.controller.isRunnerStopPendingForTesting)
+            await writer.release()
+            await task.value
+            await fixture.controller.shutdown()
+        }
+    #endif
 
     func testDisablingBackupClearsPersistedUserPause() throws {
         let suite = "photo-backup-controller-tests-\(UUID().uuidString)"
@@ -1050,143 +1057,146 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
         XCTAssertFalse(defaults.bool(forKey: "photoBackup.userPaused.v1"))
     }
 
-    // MARK: - Waiting for Wi-Fi
+    #if DEBUG
+        // MARK: - Waiting for Wi-Fi
 
-    func testDismissedMissingSourceRecheckStillSchedulesAnAutomaticWakeWithoutAPendingUpload() async throws {
-        let signals = FakeBackupRuntimeSignals(waitsForWiFi: true)
-        let fixture = try makeWiFiWaitFixture(
-            prefix: "backup-dismissed-source-wake", signals: signals, dismissedSourceRecheck: true)
-        defer { fixture.cleanup() }
-        let controller = fixture.controller
-        let scans = PassCounter()
-        controller.replaceScanForTesting { _ = scans.increment() }
+        func testDismissedMissingSourceRecheckStillSchedulesAnAutomaticWakeWithoutAPendingUpload() async throws {
+            let signals = FakeBackupRuntimeSignals(waitsForWiFi: true)
+            let fixture = try makeWiFiWaitFixture(
+                prefix: "backup-dismissed-source-wake", signals: signals, dismissedSourceRecheck: true)
+            defer { fixture.cleanup() }
+            let controller = fixture.controller
+            let scans = PassCounter()
+            controller.replaceScanForTesting { _ = scans.increment() }
 
-        controller.syncNow()
-
-        let waiting = await waitUntil {
-            !controller.isSyncing && controller.isAutoResumeScheduledForTesting
-                && controller.status.phase == .waitingForWiFi
-        }
-        XCTAssertTrue(waiting, "The deferred source check must keep its automatic wake")
-        XCTAssertEqual(scans.count, 1)
-        XCTAssertEqual(controller.status.dismissedFailures, 1)
-        XCTAssertEqual(controller.status.needsAttentionCount, 0)
-        XCTAssertEqual(controller.status.waitingRetry, 0)
-        XCTAssertEqual(controller.status.notBackedUpCount, 1)
-        XCTAssertEqual(controller.status.outstandingCount, 1)
-        XCTAssertNotNil(controller.nextAutomaticAttemptAt)
-        await controller.shutdown()
-    }
-
-    func testWiFiReturningDuringTheScanStartsTheNextPassAtOnce() async throws {
-        let signals = FakeBackupRuntimeSignals(waitsForWiFi: true)
-        let fixture = try makeWiFiWaitFixture(prefix: "backup-wifi-returns", signals: signals)
-        defer { fixture.cleanup() }
-        let controller = fixture.controller
-        let scans = PassCounter()
-        controller.replaceScanForTesting {
-            // The runner already found the cellular network; Wi-Fi returns while this pass still scans.
-            if scans.increment() == 1 {
-                await signals.waitUntilRead()
-                signals.setWaitsForWiFi(false)
-            }
-        }
-
-        controller.syncNow()
-
-        let restarted = await waitUntil { scans.count >= 2 }
-        XCTAssertTrue(restarted, "the next pass must not wait for the fallback timer")
-        let settled = await waitUntil { scans.count >= 2 && !controller.isSyncing }
-        XCTAssertTrue(settled)
-        XCTAssertNotEqual(controller.status.phase, .waitingForWiFi, "the status must not stay on Wi-Fi")
-        await controller.shutdown()
-    }
-
-    func testWiFiWaitDoesNotStretchTheFallback() async throws {
-        let signals = FakeBackupRuntimeSignals(waitsForWiFi: true)
-        let fixture = try makeWiFiWaitFixture(prefix: "backup-wifi-fallback", signals: signals)
-        defer { fixture.cleanup() }
-        let controller = fixture.controller
-        let scans = PassCounter()
-        controller.replaceScanForTesting { _ = scans.increment() }
-
-        for pass in 1...8 {
             controller.syncNow()
-            let finished = await waitUntil {
-                scans.count == pass && !controller.isSyncing && controller.isAutoResumeScheduledForTesting
+
+            let waiting = await waitUntil {
+                !controller.isSyncing && controller.isAutoResumeScheduledForTesting
+                    && controller.status.phase == .waitingForWiFi
             }
-            XCTAssertTrue(finished, "pass \(pass)")
+            XCTAssertTrue(waiting, "The deferred source check must keep its automatic wake")
+            XCTAssertEqual(scans.count, 1)
+            XCTAssertEqual(controller.status.dismissedFailures, 1)
+            XCTAssertEqual(controller.status.needsAttentionCount, 0)
+            XCTAssertEqual(controller.status.waitingRetry, 0)
+            XCTAssertEqual(controller.status.notBackedUpCount, 1)
+            XCTAssertEqual(controller.status.outstandingCount, 1)
+            XCTAssertNotNil(controller.nextAutomaticAttemptAt)
+            await controller.shutdown()
         }
 
-        let waiting = await waitUntil { controller.status.phase == .waitingForWiFi }
-        XCTAssertTrue(waiting)
-        let wakeAt = try XCTUnwrap(controller.nextAutomaticAttemptAt)
-        XCTAssertLessThanOrEqual(
-            wakeAt.timeIntervalSinceNow, 31, "eight Wi-Fi waits are no failures and keep the shortest fallback")
-        await controller.shutdown()
-    }
+        func testWiFiReturningDuringTheScanStartsTheNextPassAtOnce() async throws {
+            let signals = FakeBackupRuntimeSignals(waitsForWiFi: true)
+            let fixture = try makeWiFiWaitFixture(prefix: "backup-wifi-returns", signals: signals)
+            defer { fixture.cleanup() }
+            let controller = fixture.controller
+            let scans = PassCounter()
+            controller.replaceScanForTesting {
+                // The runner already found the cellular network; Wi-Fi returns while this pass still scans.
+                if scans.increment() == 1 {
+                    await signals.waitUntilRead()
+                    signals.setWaitsForWiFi(false)
+                }
+            }
 
-    func testNetworkChangeEndsTheWiFiWaitWithANewPass() async throws {
-        try await assertWiFiWaitEnds(prefix: "backup-wifi-network") { _, signals in signals.announceChange() }
-    }
+            controller.syncNow()
 
-    func testTurningMobileDataOnEndsTheWiFiWaitWithANewPass() async throws {
-        try await assertWiFiWaitEnds(prefix: "backup-wifi-setting") { controller, _ in
-            controller.mobileDataSettingDidChange()
+            let restarted = await waitUntil { scans.count >= 2 }
+            XCTAssertTrue(restarted, "the next pass must not wait for the fallback timer")
+            let settled = await waitUntil { scans.count >= 2 && !controller.isSyncing }
+            XCTAssertTrue(settled)
+            XCTAssertNotEqual(controller.status.phase, .waitingForWiFi, "the status must not stay on Wi-Fi")
+            await controller.shutdown()
         }
-    }
 
-    private func assertWiFiWaitEnds(
-        prefix: String,
-        _ end: (PhotoLibraryBackupController, FakeBackupRuntimeSignals) -> Void
-    ) async throws {
-        let signals = FakeBackupRuntimeSignals(waitsForWiFi: true)
-        let fixture = try makeWiFiWaitFixture(prefix: prefix, signals: signals)
-        defer { fixture.cleanup() }
-        let controller = fixture.controller
-        let scans = PassCounter()
-        controller.replaceScanForTesting { _ = scans.increment() }
+        func testWiFiWaitDoesNotStretchTheFallback() async throws {
+            let signals = FakeBackupRuntimeSignals(waitsForWiFi: true)
+            let fixture = try makeWiFiWaitFixture(prefix: "backup-wifi-fallback", signals: signals)
+            defer { fixture.cleanup() }
+            let controller = fixture.controller
+            let scans = PassCounter()
+            controller.replaceScanForTesting { _ = scans.increment() }
 
-        controller.syncNow()
-        let waiting = await waitUntil {
-            !controller.isSyncing && controller.isAutoResumeScheduledForTesting
-                && controller.status.phase == .waitingForWiFi
+            for pass in 1...8 {
+                controller.syncNow()
+                let finished = await waitUntil {
+                    scans.count == pass && !controller.isSyncing && controller.isAutoResumeScheduledForTesting
+                }
+                XCTAssertTrue(finished, "pass \(pass)")
+            }
+
+            let waiting = await waitUntil { controller.status.phase == .waitingForWiFi }
+            XCTAssertTrue(waiting)
+            let wakeAt = try XCTUnwrap(controller.nextAutomaticAttemptAt)
+            XCTAssertLessThanOrEqual(
+                wakeAt.timeIntervalSinceNow, 31, "eight Wi-Fi waits are no failures and keep the shortest fallback")
+            await controller.shutdown()
         }
-        XCTAssertTrue(waiting, "the pass ends waiting for Wi-Fi")
-        end(controller, signals)
-        XCTAssertEqual(scans.count, 1, "nothing starts while the wait holds")
 
-        signals.setWaitsForWiFi(false)
-        end(controller, signals)
+        func testNetworkChangeEndsTheWiFiWaitWithANewPass() async throws {
+            try await assertWiFiWaitEnds(prefix: "backup-wifi-network") { _, signals in signals.announceChange() }
+        }
 
-        let restarted = await waitUntil { scans.count >= 2 }
-        XCTAssertTrue(restarted, "the end of the wait starts a pass without the fallback timer")
-        await controller.shutdown()
-    }
+        func testTurningMobileDataOnEndsTheWiFiWaitWithANewPass() async throws {
+            try await assertWiFiWaitEnds(prefix: "backup-wifi-setting") { controller, _ in
+                controller.mobileDataSettingDidChange()
+            }
+        }
 
-    /// A backup with one runnable row whose scan never touches PhotoKit; only the runner drains.
-    private func makeWiFiWaitFixture(
-        prefix: String, signals: FakeBackupRuntimeSignals, dismissedSourceRecheck: Bool = false
-    ) throws -> ControllerFixture {
-        let fixture = try makeControllerFixture(
-            prefix: prefix, identityResolver: FakeIdentityResolver(), runtimeSignals: signals.source)
-        fixture.controller.setEnabledForTesting()
-        fixture.controller.setAccessStateForTesting(.full)
-        let queue = try XCTUnwrap(
-            UploadBackupSyncQueueManifestStore(
-                url: fixture.directory.appendingPathComponent(PhotoLibraryBackupController.queueDatabaseFileName)))
-        XCTAssertTrue(
-            queue.upsert(
-                .init(
-                    source: .init(
-                        kind: dismissedSourceRecheck ? .photoLibraryAsset : .fileURL, identifier: "waiting-photo"),
-                    revision: .init(rawValue: 1), originalFilename: "waiting-photo.jpg", state: .discovered,
-                    lastError: dismissedSourceRecheck
-                        ? BackupIssueRecord(kind: .sourceMissing, detail: "acknowledged missing").persistedValue : nil,
-                    updatedAt: Date().addingTimeInterval(-60))))
-        queue.close()
-        return fixture
-    }
+        private func assertWiFiWaitEnds(
+            prefix: String,
+            _ end: (PhotoLibraryBackupController, FakeBackupRuntimeSignals) -> Void
+        ) async throws {
+            let signals = FakeBackupRuntimeSignals(waitsForWiFi: true)
+            let fixture = try makeWiFiWaitFixture(prefix: prefix, signals: signals)
+            defer { fixture.cleanup() }
+            let controller = fixture.controller
+            let scans = PassCounter()
+            controller.replaceScanForTesting { _ = scans.increment() }
+
+            controller.syncNow()
+            let waiting = await waitUntil {
+                !controller.isSyncing && controller.isAutoResumeScheduledForTesting
+                    && controller.status.phase == .waitingForWiFi
+            }
+            XCTAssertTrue(waiting, "the pass ends waiting for Wi-Fi")
+            end(controller, signals)
+            XCTAssertEqual(scans.count, 1, "nothing starts while the wait holds")
+
+            signals.setWaitsForWiFi(false)
+            end(controller, signals)
+
+            let restarted = await waitUntil { scans.count >= 2 }
+            XCTAssertTrue(restarted, "the end of the wait starts a pass without the fallback timer")
+            await controller.shutdown()
+        }
+
+        /// A backup with one runnable row whose scan never touches PhotoKit; only the runner drains.
+        private func makeWiFiWaitFixture(
+            prefix: String, signals: FakeBackupRuntimeSignals, dismissedSourceRecheck: Bool = false
+        ) throws -> ControllerFixture {
+            let fixture = try makeControllerFixture(
+                prefix: prefix, identityResolver: FakeIdentityResolver(), runtimeSignals: signals.source)
+            fixture.controller.setEnabledForTesting()
+            fixture.controller.setAccessStateForTesting(.full)
+            let queue = try XCTUnwrap(
+                UploadBackupSyncQueueManifestStore(
+                    url: fixture.directory.appendingPathComponent(PhotoLibraryBackupController.queueDatabaseFileName)))
+            XCTAssertTrue(
+                queue.upsert(
+                    .init(
+                        source: .init(
+                            kind: dismissedSourceRecheck ? .photoLibraryAsset : .fileURL, identifier: "waiting-photo"),
+                        revision: .init(rawValue: 1), originalFilename: "waiting-photo.jpg", state: .discovered,
+                        lastError: dismissedSourceRecheck
+                            ? BackupIssueRecord(kind: .sourceMissing, detail: "acknowledged missing").persistedValue
+                            : nil,
+                        updatedAt: Date().addingTimeInterval(-60))))
+            queue.close()
+            return fixture
+        }
+    #endif
 
     private func waitUntil(timeout: Duration = .seconds(5), _ predicate: () -> Bool) async -> Bool {
         let deadline = ContinuousClock.now.advanced(by: timeout)

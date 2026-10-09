@@ -87,34 +87,40 @@ import Testing
         }
         canceled.cancel()
         await canceled.value
-        #expect(!evidence.hasAnalyzed)
+        #if DEBUG
+            #expect(!evidence.hasAnalyzed)
+        #endif
         let excluded = await Task.detached { evidence.excludedPositions() }.value
         #expect(excluded.count == 1)
-        #expect(evidence.hasAnalyzed)
-        #expect(evidence.analyzedOnMainThread == false)
+        #if DEBUG
+            #expect(evidence.hasAnalyzed)
+            #expect(evidence.analyzedOnMainThread == false)
+        #endif
     }
 
-    @Test func completedAnalysisRemainsReadyDuringConcurrentCacheReads() async {
-        let evidence = PhotoPlaceEvidence(coordinates: library())
-        await Task.detached { evidence.prewarm() }.value
-        let incompleteReads = await withTaskGroup(of: Int.self) { group in
-            for _ in 0..<8 {
-                group.addTask {
-                    var incomplete = 0
-                    for _ in 0..<10_000 {
-                        _ = evidence.excludedPositions()
-                        if !evidence.hasAnalyzed { incomplete += 1 }
+    #if DEBUG
+        @Test func completedAnalysisRemainsReadyDuringConcurrentCacheReads() async {
+            let evidence = PhotoPlaceEvidence(coordinates: library())
+            await Task.detached { evidence.prewarm() }.value
+            let incompleteReads = await withTaskGroup(of: Int.self) { group in
+                for _ in 0..<8 {
+                    group.addTask {
+                        var incomplete = 0
+                        for _ in 0..<10_000 {
+                            _ = evidence.excludedPositions()
+                            if !evidence.hasAnalyzed { incomplete += 1 }
+                        }
+                        return incomplete
                     }
-                    return incomplete
                 }
+                var total = 0
+                for await count in group { total += count }
+                return total
             }
-            var total = 0
-            for await count in group { total += count }
-            return total
+            #expect(incompleteReads == 0)
+            #expect(evidence.analyzedOnMainThread == false)
         }
-        #expect(incompleteReads == 0)
-        #expect(evidence.analyzedOnMainThread == false)
-    }
+    #endif
 
     private func library(
         count: Int = 60, days: Int = 30, spacing: Int = 7,
