@@ -839,25 +839,9 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         }
     }
 
-    private func prepareTimelineOrderCache(pass: TimelineMetadataReconciliation.Pass) async -> Bool {
-        let inventory = pass.inventory
-        let initialRebuildRevision = timelineOrderStore?.rebuildRevision ?? 0
-        let useOrderCache =
-            await timelineOrderStore?.synchronizeInChunks(
-                inventory.items, isClassified: { inventory.classifiedNodeIDs.contains($0.nodeID) }) == true
-        guard metadataReconciliation.isCurrent(pass), !isShutDown, !Task.isCancelled else { return false }
-        if !useOrderCache, let timelineOrderStore,
-            timelineOrderStore.rebuildRevision == initialRebuildRevision
-        {
-            timelineOrderStore.rebuild()
-            DebugLog.log("timeline: order cache unavailable; MIME reconciliation remains available")
-        }
-        return useOrderCache
-    }
-
     private func reconcileTimelineMetadata(pass: TimelineMetadataReconciliation.Pass) async {
         guard metadataReconciliation.isCurrent(pass), !Task.isCancelled else { return }
-        var useOrderCache = false
+        let pageReader = TimelineMetadataPageReader(inventory: pass.inventory, orderStore: timelineOrderStore)
         var changed = false
         defer {
             if !isShutDown, !Task.isCancelled, metadataReconciliation.isCurrent(pass), changed,
@@ -865,42 +849,30 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
             {
                 DebugLog.log("timeline: could not publish reconciled media-type revision")
             }
-            if !isShutDown, !Task.isCancelled, metadataReconciliation.isCurrent(pass), useOrderCache {
+            if !isShutDown, !Task.isCancelled, metadataReconciliation.isCurrent(pass), pageReader.useOrderCache {
                 do { _ = try timelineOrderStore?.publishCompletedSeconds() } catch {
                     timelineOrderStore?.rebuild()
                     DebugLog.log("timeline: could not publish completed order evidence")
                 }
             }
         }
-        useOrderCache = await prepareTimelineOrderCache(pass: pass)
-        guard metadataReconciliation.isCurrent(pass), !isShutDown, !Task.isCancelled else { return }
         do {
+            try await pageReader.prepare(isCurrent: { !self.isShutDown && self.metadataReconciliation.isCurrent(pass) })
+            if !pageReader.useOrderCache, timelineOrderStore != nil {
+                DebugLog.log("timeline: order cache unavailable; MIME reconciliation remains available")
+            }
             try Task.checkCancellation()
             var resolvedContext: PhotosShareContext?
-            var cursor: PhotoUID?
-            var offset = 0
             var rootKey: UnlockableKey?
             var attemptedRootKey = false
             let decoder = TimelineOrderMetadataDecoder()
             while true {
                 try Task.checkCancellation()
                 guard metadataReconciliation.isCurrent(pass) else { throw CancellationError() }
-                let page: [TimelineOrderMetadataStore.Candidate]
-                if useOrderCache, let timelineOrderStore {
-                    page = try timelineOrderStore.nextPage(after: cursor)
-                } else {
-                    let inventory = pass.inventory
-                    guard offset < inventory.items.count else { break }
-                    let end = min(offset + TimelineOrderMetadataStore.pageSize, inventory.items.count)
-                    page = inventory.items[offset..<end].compactMap { item in
-                        guard !inventory.classifiedNodeIDs.contains(item.uid.nodeID) else { return nil }
-                        return .init(uid: item.uid, captureTime: item.captureTime, needsOrder: false)
-                    }
-                    offset = end
-                    if page.isEmpty { continue }
-                }
+                let page = try await pageReader.nextPage(isCurrent: {
+                    !self.isShutDown && self.metadataReconciliation.isCurrent(pass)
+                })
                 guard !page.isEmpty else { break }
-                cursor = page.last?.uid
                 let context: PhotosShareContext
                 if let resolvedContext {
                     context = resolvedContext
@@ -965,7 +937,9 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                     }
                 }
                 try Task.checkCancellation()
-                if useOrderCache, timelineOrderStore?.record(order, classifiedUIDs: Set(evidence.keys)) == false {
+                if pageReader.useOrderCache,
+                    timelineOrderStore?.record(order, classifiedUIDs: Set(evidence.keys)) == false
+                {
                     throw TimelineOrderMetadataError.unavailable
                 }
             }
