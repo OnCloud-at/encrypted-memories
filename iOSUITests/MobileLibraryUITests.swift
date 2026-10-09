@@ -45,7 +45,8 @@ final class MobileLibraryUITests: XCTestCase {
         let middle = app.windows.firstMatch.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.4))
         middle.press(forDuration: 0.05, thenDragTo: middle.withOffset(CGVector(dx: 0, dy: 400)))
 
-        XCTAssertTrue(wait(for: app.buttons["Close"], "exists == false"), "swiping down did not close the viewer")
+        XCTAssertTrue(
+            wait(for: app.buttons["Close"], "exists == false", timeout: 20), "swiping down did not close the viewer")
         XCTAssertTrue(firstVideo.waitForExistence(timeout: 10), "the library did not return")
     }
 
@@ -60,7 +61,7 @@ final class MobileLibraryUITests: XCTestCase {
         XCTAssertTrue(album.waitForExistence(timeout: 10), "the album list did not open")
         XCTAssertTrue(album.isEnabled, "the photo is in the album before it was added")
         album.tap()
-        XCTAssertTrue(wait(for: album, "exists == false"), "adding the photo did not close the album list")
+        XCTAssertTrue(wait(for: album, "exists == false", timeout: 20), "adding the photo did not close the album list")
 
         // The album list opens again and marks the album that already holds the photo.
         addToAlbum.tap()
@@ -86,7 +87,8 @@ final class MobileLibraryUITests: XCTestCase {
         XCTAssertTrue(firstPhoto.waitForExistence(timeout: 60))
 
         app.tabBars.buttons["Collections"].tap()
-        XCTAssertTrue(wait(for: firstPhoto, "exists == false"), "the library grid stays visible under Collections")
+        XCTAssertTrue(
+            wait(for: firstPhoto, "exists == false", timeout: 20), "the library grid stays visible under Collections")
 
         app.tabBars.buttons["Library"].tap()
         XCTAssertTrue(firstPhoto.waitForExistence(timeout: 10), "the library did not return")
@@ -124,7 +126,7 @@ final class MobileLibraryUITests: XCTestCase {
         // Dragging the list down dismisses the keyboard; the field returns to the tab bar.
         let top = app.windows.firstMatch.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.3))
         top.press(forDuration: 0.05, thenDragTo: top.withOffset(CGVector(dx: 0, dy: 550)))
-        XCTAssertTrue(wait(for: app.keyboards.firstMatch, "exists == false"), "the keyboard did not close")
+        XCTAssertTrue(wait(for: app.keyboards.firstMatch, "exists == false", timeout: 20), "the keyboard did not close")
         scrollSuggestionsToTheEnd()
         XCTAssertLessThanOrEqual(
             hint.frame.maxY, searchField.frame.minY, "the search field in the tab bar covers the end of the list")
@@ -192,7 +194,7 @@ final class MobileLibraryUITests: XCTestCase {
         app.buttons["Settings"].tap()
         app.buttons["Done"].tap()
 
-        XCTAssertTrue(wait(for: app.tabBars.buttons["Map"], "exists == false"))
+        XCTAssertTrue(wait(for: app.tabBars.buttons["Map"], "exists == false", timeout: 20))
         XCTAssertTrue(app.tabBars.buttons["Library"].exists)
     }
 

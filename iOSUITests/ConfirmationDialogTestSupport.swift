@@ -29,7 +29,8 @@ extension XCUIApplication {
             let acknowledged = XCTNSPredicateExpectation(
                 predicate: NSPredicate(format: "exists == false"), object: buttons[identifier].firstMatch
             )
-            if XCTWaiter.wait(for: [acknowledged], timeout: 5) == .completed { return }
+            // A hosted accessibility snapshot took 4.2 s; allow several snapshots before retrying input.
+            if XCTWaiter.wait(for: [acknowledged], timeout: 15) == .completed { return }
         }
         throw ConfirmationDialogTestError.notAcknowledged(identifier)
     }
