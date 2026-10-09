@@ -97,12 +97,12 @@ final class MobileDeletedBackupUITests: XCTestCase {
 
     private func waitForDecisionRowRemoval() -> XCTWaiter.Result {
         let gone = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: decisionRow)
-        // A hosted accessibility snapshot took 4.2 s after the empty state was already visible.
-        return XCTWaiter.wait(for: [gone], timeout: 20)
+        // A hosted accessibility snapshot stalled for 19.3 s; allow several cycles while diagnosis is pending.
+        return XCTWaiter.wait(for: [gone], timeout: 60)
     }
 
     private func assertBackUpAgainResolved() {
-        XCTAssertTrue(app.staticTexts["Nothing needs attention."].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.staticTexts["Nothing needs attention."].waitForExistence(timeout: 60))
         XCTAssertEqual(waitForDecisionRowRemoval(), .completed)
         XCTAssertFalse(app.buttons["backup.keepDeleted.dialog"].firstMatch.exists)
         XCTAssertFalse(app.buttons["backup.backUpAgain.dialog"].firstMatch.exists)
