@@ -29,6 +29,7 @@ class FixtureServer:
         self.directory.mkdir(parents=True, exist_ok=True)
         self.point = point
         self.phase = "old"
+        self.hold_phase = "old"
         self.links = []
         self.duplicates = 0
         self.requests = []
@@ -57,7 +58,7 @@ class FixtureServer:
                     fixture.requests.append({"phase": fixture.phase, "path": self.path,
                                              "range": self.headers.get("Range")})
                     fixture.save()
-                    hold = fixture.phase == "old" and self.path == "/checkpoint/" + fixture.point
+                    hold = fixture.phase == fixture.hold_phase and self.path == "/checkpoint/" + fixture.point
                 if self.path.startswith("/checkpoint/"):
                     if hold:
                         fixture.reached.set()

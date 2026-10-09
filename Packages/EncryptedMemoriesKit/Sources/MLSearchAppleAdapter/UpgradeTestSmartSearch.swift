@@ -62,7 +62,8 @@
         }
 
         func encode(text: String, descriptor: MLModelDescriptor) async throws -> ContiguousArray<Float32> {
-            [1, 0, 0, 0]
+            UpgradeTestProbe.checkpoint("query.encoded")
+            return [1, 0, 0, 0]
         }
     }
 #endif

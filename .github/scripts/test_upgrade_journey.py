@@ -417,6 +417,48 @@ with SigningIdentity(root) as signer:
             finally:
                 run_journey.command(['xcrun', 'simctl', 'delete', sentinel])
 
+    @unittest.skipUnless(os.environ.get('UPGRADE_NATIVE_QUERY_TARGET'), 'Native pending-query control is opt-in')
+    def test_native_pending_query_cannot_pass_with_the_retained_library(self):
+        servers = []
+
+        class PendingQueryServer(FixtureServer):
+            def __init__(self, *args):
+                super().__init__(*args)
+                servers.append(self)
+
+            def begin_upgrade(self):
+                super().begin_upgrade()
+                with self.lock:
+                    self.point = 'query.encoded'
+                    self.hold_phase = 'new'
+                    self.release.clear()
+
+        repo = Path(__file__).resolve().parents[2]
+        root = Path(os.environ.get('ENCRYPTED_MEMORIES_BUILD_ROOT',
+                    str(Path.home() / 'Developer/xcode/EncryptedMemories'))) / 'UpgradeCheck'
+        argv = ['run_journey.py', '--repo', str(repo), '--automation', str(repo), '--root', str(root),
+                '--target', os.environ['UPGRADE_NATIVE_QUERY_TARGET'], '--sources', 'v1.0.5',
+                '--platform', os.environ.get('UPGRADE_NATIVE_QUERY_PLATFORM', 'macOS'),
+                '--points', 'model.partial', '--working-copy']
+        owned_process = run_journey.owned_process
+
+        def installed_journey_only(args, *remaining, **kwargs):
+            # Keep the negative control independent of the standalone oracle's unit tests.
+            return owned_process(args + [
+                '-only-testing:UpgradeJourneyUITests/UpgradeJourneyUITests/testInstalledAppJourney'],
+                *remaining, **kwargs)
+
+        with patch.object(run_journey, 'FixtureServer', PendingQueryServer), \
+                patch.object(run_journey, 'owned_process', installed_journey_only), patch.object(sys, 'argv', argv):
+            with self.assertRaisesRegex(JourneyError, 'UI verification failed'):
+                run_journey.main()
+        self.assertEqual(len(servers), 1)
+        self.assertTrue(any(request['phase'] == 'new' and request['path'] == '/checkpoint/query.encoded'
+                            for request in servers[0].requests), 'The negative control never held a real query')
+        ui_log = (servers[0].directory / 'verify-ui.log').read_text()
+        self.assertIn('The saved index did not return all eight photos', ui_log)
+        print('PASS: a held native query cannot use the eight retained library elements', flush=True)
+
     def test_historical_overlays_apply_to_the_exact_published_tag(self):
         repo = Path(__file__).resolve().parents[2]
         overlay = repo / 'scripts/upgrade-test/overlays'

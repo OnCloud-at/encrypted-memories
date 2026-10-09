@@ -62,6 +62,43 @@ final class UpgradeJourneyUITests: XCTestCase {
         }
     }
 
+    private func indexedSearchIsComplete(resultCount: Int, visiblePhotoPNG: Data) -> Bool {
+        resultCount == 8 && hasSyntheticPixels(visiblePhotoPNG)
+    }
+
+    private func visiblePhoto(in photos: XCUIElementQuery) -> XCUIElement? {
+        #if os(iOS)
+            let window = app.windows.firstMatch.frame
+            let top = app.navigationBars.allElementsBoundByIndex.map { $0.frame.maxY }.max() ?? window.minY
+            return photos.allElementsBoundByIndex.first {
+                !$0.frame.isEmpty && window.contains($0.frame) && $0.frame.minY > top
+            }
+        #else
+            let photo = photos.firstMatch
+            return photo.exists ? photo : nil
+        #endif
+    }
+
+    func testPendingSearchCannotUseTheRetainedLibrary() throws {
+        let photo = try XCTUnwrap(
+            Data(
+                base64Encoded:
+                    "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAKklEQVR4nGNQCNhCU8QwasGoBaMWjFowasGoBaMW"
+                    + "jFowasGoBaMWDBULAFr4kD3OWQ/uAAAAAElFTkSuQmCC"))
+        let pendingOverlay = try XCTUnwrap(
+            Data(
+                base64Encoded:
+                    "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAJklEQVR4nO3NMQ0AAAwDoPo33arYsQQMkB6LQCAQ"
+                    + "CAQCgUAg+BIMi1X0pjxKe0gAAAAASUVORK5CYII="))
+        XCTAssertFalse(
+            indexedSearchIsComplete(resultCount: 8, visiblePhotoPNG: pendingOverlay),
+            "Eight retained accessibility elements beneath an opaque loading overlay are not completed results")
+        XCTAssertTrue(indexedSearchIsComplete(resultCount: 8, visiblePhotoPNG: photo))
+        for count in [0, 7, 9] {
+            XCTAssertFalse(indexedSearchIsComplete(resultCount: count, visiblePhotoPNG: photo))
+        }
+    }
+
     /// Query the native search surface to prove that all eight saved index entries are usable.
     private func verifyIndexedSearchResults() throws {
         #if os(iOS)
@@ -84,11 +121,16 @@ final class UpgradeJourneyUITests: XCTestCase {
         let results = app.descendants(matching: .any)
             .matching(NSPredicate(format: "label BEGINSWITH 'Photo, '"))
         let indexed = XCTNSPredicateExpectation(
-            predicate: NSPredicate { _, _ in results.count == 8 }, object: nil)
+            predicate: NSPredicate { _, _ in
+                guard results.count == 8, let photo = self.visiblePhoto(in: results) else { return false }
+                return self.indexedSearchIsComplete(
+                    resultCount: results.count, visiblePhotoPNG: photo.screenshot().pngRepresentation)
+            }, object: nil)
         let result = XCTWaiter.wait(for: [indexed], timeout: 60)
-        let attachment = XCTAttachment(screenshot: app.screenshot())
-        attachment.lifetime = .keepAlways
-        add(attachment)
+        for attachment in [XCTAttachment(screenshot: app.screenshot()), XCTAttachment(string: app.debugDescription)] {
+            attachment.lifetime = .keepAlways
+            add(attachment)
+        }
         XCTAssertEqual(result, .completed, "The saved index did not return all eight photos")
     }
 
@@ -119,18 +161,10 @@ final class UpgradeJourneyUITests: XCTestCase {
         XCTAssertTrue(photo.waitForExistence(timeout: 60), "The saved account did not open its library")
         if point.hasPrefix("thumbnail.") {
             if verifiesUpgrade {
-                #if os(iOS)
-                    let photos = app.descendants(matching: .any)
-                        .matching(NSPredicate(format: "label BEGINSWITH 'Photo, '"))
-                    let window = app.windows.firstMatch.frame
-                    let top = app.navigationBars.allElementsBoundByIndex.map { $0.frame.maxY }.max() ?? window.minY
-                    let visiblePhoto = try XCTUnwrap(
-                        photos.allElementsBoundByIndex.first {
-                            !$0.frame.isEmpty && window.contains($0.frame) && $0.frame.minY > top
-                        }, "No complete photo tile is visible below the navigation bar")
-                #else
-                    let visiblePhoto = photo
-                #endif
+                let photos = app.descendants(matching: .any)
+                    .matching(NSPredicate(format: "label BEGINSWITH 'Photo, '"))
+                let visiblePhoto = try XCTUnwrap(
+                    self.visiblePhoto(in: photos), "No complete photo tile is visible below the navigation bar")
                 let rendered = XCTNSPredicateExpectation(
                     predicate: NSPredicate { _, _ in
                         self.hasSyntheticPixels(visiblePhoto.screenshot().pngRepresentation)

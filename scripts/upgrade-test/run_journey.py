@@ -279,7 +279,7 @@ def ui_run(runner, destination, point, phase, evidence, app_path=None, launch_ar
         if isinstance(value, dict):
             if value.get('IsUITestBundle'):
                 if phase == 'prepare' and destination.startswith('platform=iOS Simulator,'):
-                    # Interrupting XCTest's recording can crash SimRenderServer before install-over.
+                    # XCTest's automatic recording ended at the kill point, and SimRenderServer crashed in both runs at that moment.
                     value['PreferredScreenCaptureFormat'] = 'screenshots'
                 value.setdefault('EnvironmentVariables', {}).update(
                     UPGRADE_POINT=point, UPGRADE_PHASE=phase, UPGRADE_APP_PATH=str(app_path or ''),
