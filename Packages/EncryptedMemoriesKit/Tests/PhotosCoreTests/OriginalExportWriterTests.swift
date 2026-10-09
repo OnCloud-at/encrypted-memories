@@ -5,7 +5,7 @@ import Testing
 
 /// Behavior of the shared original export: staged destination writes, archive naming, failure cleanup, and
 /// the low-disk guard. The Mac export uses these writes; iOS and iPadOS share the naming.
-@Suite struct OriginalExportWriterTests {
+@Suite(.serialized) struct OriginalExportWriterTests {
     private static let heicHeader = Data([0, 0, 0, 0x18]) + Data("ftypheic".utf8) + Data(repeating: 0, count: 52)
     private static let jpegHeader = Data([0xFF, 0xD8, 0xFF, 0xE0]) + Data(repeating: 1, count: 60)
 
@@ -150,18 +150,50 @@ import Testing
     }
 
     @Test func writeDataLeavesNoStagingDirectory() throws {
+        // SwiftPM may not forward parallel flags to the test process. The package gate uses --no-parallel;
+        // .serialized serializes this suite's tests; other suites must also run serially.
+        try #require(
+            !CommandLine.arguments.contains("--parallel"),
+            "This test changes process state and cannot run with --parallel."
+        )
+        let originalProcessName = ProcessInfo.processInfo.processName
+        let stagingOwner = "ExportCleanup-\(UUID().uuidString)"
+        ProcessInfo.processInfo.processName = stagingOwner
+        defer { ProcessInfo.processInfo.processName = originalProcessName }
         let directory = try makeDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
         let destination = directory.appendingPathComponent("Support.json")
         let staging = try OriginalExportWriter.stagingDirectory(for: destination)
+        defer { try? FileManager.default.removeItem(at: staging) }
+        let stagingName = staging.lastPathComponent
+        let ownerRange = try #require(stagingName.range(of: stagingOwner))
+        let stagingPrefix = String(stagingName[..<ownerRange.upperBound])
         let stagingParent = staging.deletingLastPathComponent()
         try FileManager.default.removeItem(at: staging)
         let before = Set(try FileManager.default.contentsOfDirectory(atPath: stagingParent.path))
+        defer {
+            if let entries = try? FileManager.default.contentsOfDirectory(atPath: stagingParent.path) {
+                for entry in entries where entry.hasPrefix(stagingPrefix) && !before.contains(entry) {
+                    try? FileManager.default.removeItem(at: stagingParent.appendingPathComponent(entry))
+                }
+            }
+        }
 
         try OriginalExportWriter.writeData(Data("report".utf8), to: destination)
 
+        // Another process can create these entries while the export completes.
+        let foreignFile = stagingParent.appendingPathComponent("settings-reset-\(UUID().uuidString).plist")
+        let foreignDirectory = stagingParent.appendingPathComponent("NSIRD_foreign-\(UUID().uuidString)")
+        defer {
+            try? FileManager.default.removeItem(at: foreignFile)
+            try? FileManager.default.removeItem(at: foreignDirectory)
+        }
+        try Data("unrelated".utf8).write(to: foreignFile)
+        try FileManager.default.createDirectory(at: foreignDirectory, withIntermediateDirectories: false)
+        #expect(try Data(contentsOf: destination) == Data("report".utf8))
+
         let after = Set(try FileManager.default.contentsOfDirectory(atPath: stagingParent.path))
-        #expect(after.subtracting(before).isEmpty)
+        #expect(after.subtracting(before).filter { $0.hasPrefix(stagingPrefix) }.isEmpty)
     }
 
     @Test func failedArchiveExportRemovesThePartialArchive() async throws {
