@@ -841,7 +841,8 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
 
     private func reconcileTimelineMetadata(pass: TimelineMetadataReconciliation.Pass) async {
         guard metadataReconciliation.isCurrent(pass), !Task.isCancelled else { return }
-        let pageReader = TimelineMetadataPageReader(inventory: pass.inventory, orderStore: timelineOrderStore)
+        let pageReader = TimelineMetadataPageReader(
+            inventory: pass.inventory, orderStore: timelineOrderStore, timelineStore: timelineStore)
         var changed = false
         defer {
             if !isShutDown, !Task.isCancelled, metadataReconciliation.isCurrent(pass), changed,

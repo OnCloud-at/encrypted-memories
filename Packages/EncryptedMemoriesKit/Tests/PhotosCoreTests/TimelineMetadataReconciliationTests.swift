@@ -40,6 +40,46 @@ final class TimelineMetadataReconciliationTests: XCTestCase {
         await fixture.close()
     }
 
+    func testQueuedPassDoesNotRepeatCompletedMIMERequests() async throws {
+        try await assertQueuedMIMERequests(useOrderCache: true)
+    }
+
+    func testQueuedMIMEFallbackDoesNotRepeatCompletedRequests() async throws {
+        try await assertQueuedMIMERequests(useOrderCache: false)
+    }
+
+    private func assertQueuedMIMERequests(useOrderCache: Bool) async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let fixture = try MIMEReconciliationFixture(directory: directory, useOrderCache: useOrderCache)
+        let reconciliation = TimelineMetadataReconciliation()
+        let initial = inventory(302)
+        let latest = inventory(303)
+        let operation: @Sendable (TimelineMetadataReconciliation.Pass) async -> Void = {
+            await fixture.run($0, reconciliation: reconciliation)
+        }
+        reconciliation.schedule(initial, operation: operation)
+        await fulfillment(of: [fixture.requested], timeout: 10)
+        // B is queued before A commits its first MIME response.
+        reconciliation.schedule(latest, operation: operation)
+        let before = try await fixture.result()
+        XCTAssertEqual(before.requests.map(\.count), [1])
+        XCTAssertEqual(before.classified, 0)
+        await fixture.release()
+        await reconciliation.waitForCurrentPass()
+        let result = try await fixture.result()
+        XCTAssertEqual(result.requests.map(\.count), [3, 1], "B must request only the newly added photo")
+        XCTAssertEqual(result.requests.last?.flatMap { $0 }, [latest.items.last!.uid])
+        XCTAssertEqual(
+            result.requests.flatMap { $0 }.flatMap { $0 }.count, 303, "completed MIME checks must not repeat")
+        XCTAssertEqual(result.classified, 303)
+        XCTAssertEqual(result.images, 152)
+        XCTAssertEqual(result.videos, 151)
+        XCTAssertTrue(result.pending.isEmpty, "completed checkpoints must remain complete")
+        await fixture.close()
+    }
+
     func testReturningToTheActiveInventoryDropsAnObsoleteFollowUp() async throws {
         let fixture = try fixture()
         let reconciliation = TimelineMetadataReconciliation()
@@ -261,5 +301,73 @@ private actor ReconciliationFixture {
     func close() async {
         await admission.closeAdmissionAndJoin()
         store.close()
+    }
+}
+
+private actor MIMEReconciliationFixture {
+    nonisolated let requested = XCTestExpectation(description: "first MIME request awaits its response")
+    private let timeline: TimelineMetadataStore
+    private let order: TimelineOrderMetadataStore?
+    private var requests: [[[PhotoUID]]] = []
+    private var response: CheckedContinuation<Void, Never>?
+    private var released = false
+
+    init(directory: URL, useOrderCache: Bool) throws {
+        timeline = try XCTUnwrap(TimelineMetadataStore(url: directory.appendingPathComponent("library.sqlite")))
+        order =
+            useOrderCache
+            ? try XCTUnwrap(TimelineOrderMetadataStore(url: directory.appendingPathComponent("order.sqlite"))) : nil
+    }
+
+    func run(_ pass: TimelineMetadataReconciliation.Pass, reconciliation: TimelineMetadataReconciliation) async {
+        let reader = TimelineMetadataPageReader(inventory: pass.inventory, orderStore: order, timelineStore: timeline)
+        requests.append([])
+        let index = requests.count - 1
+        do {
+            try await reader.prepare(isCurrent: { reconciliation.isCurrent(pass) })
+            while true {
+                let page = try await reader.nextPage(isCurrent: { reconciliation.isCurrent(pass) })
+                if page.isEmpty { break }
+                requests[index].append(page.map(\.uid))
+                if index == 0, requests[index].count == 1, !released {
+                    await withCheckedContinuation {
+                        response = $0
+                        requested.fulfill()
+                    }
+                }
+                let evidence = Dictionary(
+                    uniqueKeysWithValues: page.map {
+                        ($0.uid, Int($0.uid.nodeID)!.isMultiple(of: 2) ? "image/jpeg" : "video/mp4")
+                    })
+                XCTAssertTrue(timeline.recordMediaTypeEvidence(evidence, publishRevision: false).succeeded)
+                if let order {
+                    let metadata = Dictionary(
+                        uniqueKeysWithValues: page.filter(\.needsOrder).map { ($0.uid, TimelineOrderMetadata()) })
+                    XCTAssertTrue(order.record(metadata, classifiedUIDs: Set(evidence.keys)))
+                }
+            }
+            if let order { _ = try order.publishCompletedSeconds() }
+        } catch { XCTFail("unexpected MIME reconciliation failure: \(error)") }
+    }
+
+    func release() {
+        released = true
+        response?.resume()
+        response = nil
+    }
+
+    func result() throws -> (requests: [[[PhotoUID]]], classified: Int, images: Int, videos: Int, pending: [PhotoUID]) {
+        let evidence = timeline.mediaTypeEvidence(volumeID: "first")
+        return (
+            requests, evidence.count,
+            evidence.values.filter { $0 == "image/jpeg" }.count,
+            evidence.values.filter { $0 == "video/mp4" }.count,
+            try order?.nextPage().map(\.uid) ?? []
+        )
+    }
+
+    func close() {
+        order?.close()
+        timeline.close()
     }
 }
