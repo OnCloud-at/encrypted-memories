@@ -2470,6 +2470,48 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertTrue(try XCTUnwrap(uploader.requests.first).overrideExistingDraft)
     }
 
+    func testSuccessfulUploadRetiresEveryOlderTerminalFailure() async throws {
+        try await assertRunnerRetiresOlderFailures(activeDuplicate: false)
+    }
+
+    func testActiveDuplicateRetiresEveryOlderTerminalFailure() async throws {
+        try await assertRunnerRetiresOlderFailures(activeDuplicate: true)
+    }
+
+    private func assertRunnerRetiresOlderFailures(activeDuplicate: Bool) async throws {
+        let current = seedEntry("recovered.jpg")
+        let terminalStates: [UploadBackupSyncQueueState] = [
+            .sourceMissing, .failedPermanent, .dismissedFailure, .skippedRemoteDeletion,
+        ]
+        let old = terminalStates.enumerated().map { offset, state in
+            seedEntry("recovered.jpg", state: state, revisionOffset: -Int64(offset) - 1)
+        }
+        var pending = current
+        pending.revision = .init(rawValue: current.revision.rawValue - 10)
+        pending.state = .failed
+        pending.updatedAt = clock.now.addingTimeInterval(900)
+        XCTAssertTrue(queueStore.upsert(pending))
+        if activeDuplicate {
+            let hashes = expectedHashes(id: "recovered.jpg")
+            checker.remoteItemsByNameHash[hashes.nameHash] = [
+                RemotePhotoDuplicate(
+                    nameHash: hashes.nameHash, contentHash: hashes.contentHash, linkState: .active,
+                    linkID: "fixture-remote")
+            ]
+        }
+
+        _ = await makeRunner().runUntilDrained(mode: .eligibleOnly)
+
+        XCTAssertEqual(state(of: current), activeDuplicate ? .alreadyBackedUp : .completed)
+        XCTAssertEqual(uploader.requests.count, activeDuplicate ? 0 : 1)
+        for entry in old {
+            XCTAssertNil(queueStore.entry(for: entry.source, revision: entry.revision))
+        }
+        XCTAssertEqual(queueStore.entry(for: pending.source, revision: pending.revision), pending)
+        XCTAssertEqual(queueStore.count(), 2)
+        XCTAssertEqual(queueStore.missingSourceDiscardGeneration(), 0)
+    }
+
     func testActiveDuplicateBecomesAlreadyBackedUpWithoutUpload() async throws {
         let entry = seedEntry("dup.jpg")
         let hashes = expectedHashes(id: "dup.jpg")
