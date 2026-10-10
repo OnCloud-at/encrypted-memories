@@ -48,7 +48,7 @@ jobs:
         run: |
           set -euo pipefail
           bash scripts/test-release-upgrade.sh --target HEAD --release-tag v1.1.0-beta.3 \
-            --sources v1.0.5 --platform macOS --points backup.claimed --working-copy 2>&1 | tee "$RUNNER_TEMP/release-upgrade.log"
+            --sources v1.0.5 --platform macOS --working-copy 2>&1 | tee "$RUNNER_TEMP/release-upgrade.log"
 
       - name: Print retained journey evidence
         if: always()
@@ -133,7 +133,8 @@ jobs:
                   raise SystemExit('Expected one owned backup.claimed preparation result')
               log_path = cases[0].parent / 'prepare-ui.log'
               diagnostic_lines = [line.split('SETTINGS_DIAGNOSTIC ', 1)[1]
-                                  for line in log_path.read_text().splitlines() if 'SETTINGS_DIAGNOSTIC ' in line]
+                                  for path in sorted(root.rglob('*-ui.log'))
+                                  for line in path.read_text().splitlines() if 'SETTINGS_DIAGNOSTIC ' in line]
               if not diagnostic_lines:
                   raise SystemExit('The preparation produced no Settings diagnostic facts')
               print('::group::Checked Settings strategy and frame facts')
@@ -171,3 +172,12 @@ jobs:
           if __name__ == '__main__':
               main()
           PYTHON
+
+      - name: Retain the single runner system-dialog crop
+        if: always() && github.ref == 'refs/heads/work/upgrade-macos-metal-hosted' && runner.os == 'macOS'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: runner-system-dialog
+          path: ~/Developer/xcode/EncryptedMemories/UpgradeCheck/evidence/system-dialog.png
+          retention-days: 3
+          if-no-files-found: error
