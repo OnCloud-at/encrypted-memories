@@ -22,6 +22,7 @@ public final class PhotoAlbumBackupExecutor: AlbumSyncBackupExecuting, @unchecke
     private let injectedResourceResolver: (any BackupResourceResolving)?
     private let stopFenceAcquired: (@Sendable () async -> Void)?
     private let stopFenceBarrier: (@Sendable () async -> Void)?
+    private let runtimeSignals: BackupRuntimeSignalSource
 
     private let lock = NSLock()
     private struct ActiveOperation {
@@ -45,6 +46,7 @@ public final class PhotoAlbumBackupExecutor: AlbumSyncBackupExecuting, @unchecke
         injectedResourceResolver = nil
         stopFenceAcquired = nil
         stopFenceBarrier = nil
+        runtimeSignals = .apple
     }
 
     init(
@@ -54,7 +56,8 @@ public final class PhotoAlbumBackupExecutor: AlbumSyncBackupExecuting, @unchecke
         uploader: any PhotoUploading,
         resourceResolver: any BackupResourceResolving,
         stopFenceAcquired: (@Sendable () async -> Void)? = nil,
-        stopFenceBarrier: (@Sendable () async -> Void)? = nil
+        stopFenceBarrier: (@Sendable () async -> Void)? = nil,
+        runtimeSignals: BackupRuntimeSignalSource = .apple
     ) {
         self.accountDataDirectory = accountDataDirectory
         self.databasePolicy = databasePolicy
@@ -63,6 +66,7 @@ public final class PhotoAlbumBackupExecutor: AlbumSyncBackupExecuting, @unchecke
         injectedResourceResolver = resourceResolver
         self.stopFenceAcquired = stopFenceAcquired
         self.stopFenceBarrier = stopFenceBarrier
+        self.runtimeSignals = runtimeSignals
     }
 
     public func ensureBackedUp(
@@ -166,8 +170,8 @@ public final class PhotoAlbumBackupExecutor: AlbumSyncBackupExecuting, @unchecke
             resolver: resourceResolver,
             identityResolver: identityResolver,
             uploader: uploader,
-            throttleInputs: BackupRuntimeSignalSource.apple.current,
-            runtimeChanges: BackupRuntimeSignalSource.apple.updates
+            throttleInputs: runtimeSignals.current,
+            runtimeChanges: runtimeSignals.updates
         )
         lock.withLock { activeRunner = runner }
         defer { lock.withLock { activeRunner = nil } }
