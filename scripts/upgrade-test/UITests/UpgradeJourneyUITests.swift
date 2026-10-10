@@ -78,8 +78,12 @@ final class UpgradeJourneyUITests: XCTestCase {
                 !$0.frame.isEmpty && window.contains($0.frame) && $0.frame.minY > top
             }
         #else
-            let photo = photos.firstMatch
-            return photo.exists ? photo : nil
+            guard let obstacles = try? foreignObstacleFrames() else { return nil }
+            let display = CGDisplayBounds(CGMainDisplayID())
+            return photos.allElementsBoundByIndex.first { photo in
+                !photo.frame.isEmpty && display.contains(photo.frame)
+                    && !obstacles.contains(where: { $0.intersects(photo.frame) })
+            }
         #endif
     }
 
@@ -117,7 +121,7 @@ final class UpgradeJourneyUITests: XCTestCase {
         let search = app.searchFields.firstMatch
         XCTAssertTrue(search.waitForExistence(timeout: 10), "The native search field is missing")
         #if os(macOS)
-            search.click()
+            try clickUncovered(search, name: "search field")
         #else
             search.tap()
         #endif
@@ -139,7 +143,7 @@ final class UpgradeJourneyUITests: XCTestCase {
     }
 
     #if os(macOS)
-        func testSettingsWindowDragUsesOnlyForeignVisibleNormalAndModalWindows() throws {
+        func testForeignWindowDragUncoversOnlyTheTargetWithSafePressAndRelease() throws {
             let screen = CGRect(x: 0, y: 0, width: 1024, height: 768)
             let frame = CGRect(x: 232, y: 94, width: 560, height: 608)
             let tab = CGRect(x: 565, y: 126, width: 55, height: 56)
@@ -159,30 +163,91 @@ final class UpgradeJourneyUITests: XCTestCase {
             let offscreen = SettingsWindowPlacement.Window(pid: 2, layer: 8, isOnscreen: false, frame: screen)
             XCTAssertTrue(SettingsWindowPlacement.obstacles([transparent, offscreen], ownedPID: 1).isEmpty)
 
+            let usable = CGRect(x: 8, y: 32, width: 1008, height: 728)
             let plan = try XCTUnwrap(
                 SettingsWindowPlacement.plan(
-                    settings: frame, tab: tab, screen: screen, obstacles: [dialog.frame],
+                    window: frame, target: tab, screen: screen, obstacles: [dialog.frame],
                     titleBarObstacles: [dialog.frame]))
             XCTAssertFalse(dialog.frame.contains(plan.start), "The drag must not press the system window")
-            XCTAssertTrue(CGRect(x: frame.minX, y: frame.minY, width: frame.width, height: 32).contains(plan.start))
-            XCTAssertTrue(screen.contains(plan.window))
-            XCTAssertFalse(plan.tab.intersects(dialog.frame), "The complete tab must leave the dialog")
-            XCTAssertEqual(plan.window.minX, 456)
+            XCTAssertFalse(dialog.frame.contains(plan.end), "The drag must not release over the system window")
+            XCTAssertTrue(SettingsWindowPlacement.titleBar(of: frame).contains(plan.start))
+            XCTAssertTrue(SettingsWindowPlacement.titleBar(of: plan.window).contains(plan.end))
+            XCTAssertTrue(usable.contains(plan.target))
+            XCTAssertFalse(plan.target.intersects(dialog.frame), "The complete tab must leave the dialog")
+            XCTAssertEqual(plan.window.origin, CGPoint(x: 317, y: 94), "The shortest uncovering move wins")
+
+            let button = CGRect(x: plan.window.minX + 28, y: plan.window.minY + 168, width: 140, height: 22)
+            let beside = try XCTUnwrap(
+                SettingsWindowPlacement.plan(
+                    window: plan.window, target: button, screen: screen, obstacles: [dialog.frame],
+                    titleBarObstacles: [dialog.frame]))
+            XCTAssertEqual(beside.target.maxX, dialog.frame.minX - 8)
+            XCTAssertTrue(usable.contains(beside.target))
+            XCTAssertFalse(beside.target.intersects(dialog.frame))
+
+            let row = CGRect(x: plan.window.minX + 28, y: plan.window.minY + 168, width: 400, height: 22)
+            let lower = try XCTUnwrap(
+                SettingsWindowPlacement.plan(
+                    window: plan.window, target: row, screen: screen, obstacles: [dialog.frame],
+                    titleBarObstacles: [dialog.frame]))
+            XCTAssertEqual(lower.target.minY, dialog.frame.maxY + 8)
+            XCTAssertFalse(lower.target.intersects(dialog.frame))
+            XCTAssertTrue(usable.contains(lower.target))
+            XCTAssertTrue(usable.contains(SettingsWindowPlacement.titleBar(of: lower.window)))
+            XCTAssertGreaterThan(lower.window.maxY, screen.maxY, "Only the window bottom may leave the display")
+
+            let releaseBlocker = CGRect(x: 590, y: 100, width: 20, height: 12)
+            let safeRelease = try XCTUnwrap(
+                SettingsWindowPlacement.plan(
+                    window: frame, target: tab, screen: screen, obstacles: [dialog.frame],
+                    titleBarObstacles: [dialog.frame, releaseBlocker]))
+            XCTAssertFalse(releaseBlocker.contains(safeRelease.start))
+            XCTAssertFalse(releaseBlocker.contains(safeRelease.end))
+
             XCTAssertNil(
                 SettingsWindowPlacement.plan(
-                    settings: frame, tab: tab, screen: screen, obstacles: [], titleBarObstacles: []))
+                    window: frame, target: tab, screen: screen, obstacles: [], titleBarObstacles: []))
             XCTAssertNil(
                 SettingsWindowPlacement.plan(
-                    settings: frame, tab: tab, screen: screen, obstacles: [screen], titleBarObstacles: []))
+                    window: frame, target: tab, screen: screen, obstacles: [screen], titleBarObstacles: []))
             XCTAssertNil(
                 SettingsWindowPlacement.plan(
-                    settings: frame, tab: tab, screen: screen, obstacles: [dialog.frame], titleBarObstacles: [screen]))
+                    window: frame, target: tab, screen: screen, obstacles: [dialog.frame],
+                    titleBarObstacles: [screen]))
+        }
+
+        func testFailureIssueCarriesTheAppHierarchy() {
+            let issue = XCTIssue(type: .assertionFailure, compactDescription: "fixture failure")
+            let recorded = Self.issue(issue, withHierarchy: "Window, title: 'Settings'")
+            XCTAssertEqual(recorded.attachments.map(\.name), ["App UI hierarchy - failure"])
+            XCTAssertEqual(recorded.attachments.first?.lifetime, .keepAlways)
+            XCTAssertEqual(recorded.compactDescription, "fixture failure")
+        }
+
+        static func issue(_ issue: XCTIssue, withHierarchy hierarchy: String) -> XCTIssue {
+            var issue = issue
+            let attachment = XCTAttachment(string: hierarchy)
+            attachment.name = "App UI hierarchy - failure"
+            attachment.lifetime = .keepAlways
+            issue.add(attachment)
+            return issue
+        }
+
+        /// Every failing journey keeps the app hierarchy, including errors thrown before an assertion.
+        override func record(_ issue: XCTIssue) {
+            guard !recordsFailureHierarchy, ProcessInfo.processInfo.environment["UPGRADE_APP_PATH"] != nil else {
+                return super.record(issue)
+            }
+            recordsFailureHierarchy = true
+            defer { recordsFailureHierarchy = false }
+            super.record(Self.issue(issue, withHierarchy: app.debugDescription))
         }
     #endif
 
     #if os(macOS)
-        @MainActor
-        private func moveSettingsAwayFromForeignWindows(settings: XCUIElement, tab: XCUIElement) throws {
+        private var recordsFailureHierarchy = false
+
+        private func ownedProcessIdentifier() throws -> Int32 {
             let appPath = try XCTUnwrap(ProcessInfo.processInfo.environment["UPGRADE_APP_PATH"])
             let ownedURL = URL(fileURLWithPath: appPath).standardizedFileURL
             let instances = NSWorkspace.shared.runningApplications.filter {
@@ -191,86 +256,114 @@ final class UpgradeJourneyUITests: XCTestCase {
             guard instances.count == 1, let instance = instances.first else {
                 throw SettingsWindowPlacement.failure("The exact owned app instance is missing or ambiguous")
             }
+            return instance.processIdentifier
+        }
+
+        private func foreignWindows() throws -> [SettingsWindowPlacement.Window] {
             let windows = try SettingsWindowPlacement.windows()
-            let matches = windows.filter {
-                $0.pid == instance.processIdentifier && $0.layer == 0
-                    && abs($0.frame.minX - settings.frame.minX) < 2
-                    && abs($0.frame.minY - settings.frame.minY) < 2
-                    && abs($0.frame.width - settings.frame.width) < 2
-                    && abs($0.frame.height - settings.frame.height) < 2
+            captureRunnerSystemDialog(windows)
+            return windows
+        }
+
+        private func foreignObstacleFrames() throws -> [CGRect] {
+            SettingsWindowPlacement.obstacles(try foreignWindows(), ownedPID: try ownedProcessIdentifier()).map(\.frame)
+        }
+
+        /// Clicks an owned control only while no foreign window covers it; it never sends input to that window.
+        private func clickUncovered(_ control: XCUIElement, name: String) throws {
+            guard !(try foreignObstacleFrames()).contains(where: { $0.intersects(control.frame) }) else {
+                throw SettingsWindowPlacement.failure("A foreign window covers the \(name) control")
             }
-            guard matches.count == 1, let ownWindow = matches.first else {
-                throw SettingsWindowPlacement.failure("CoreGraphics did not identify the exact Settings window")
-            }
-            let obstacles = SettingsWindowPlacement.obstacles(windows, ownedPID: instance.processIdentifier)
-            SettingsWindowPlacement.log("before Settings placement", windows: windows, settings: settings, tab: tab)
-            retainSettingsHierarchy("before placement")
-            try captureRunnerSystemDialog(windows)
-            if obstacles.contains(where: { $0.frame.intersects(tab.frame) }) {
+            control.click()
+        }
+
+        /// Drags the owned window by an uncovered title-bar point until no foreign window covers the target.
+        @MainActor
+        private func uncover(_ target: XCUIElement, in window: XCUIElement, name: String) throws {
+            let pid = try ownedProcessIdentifier()
+            let windows = try foreignWindows()
+            let obstacles = SettingsWindowPlacement.obstacles(windows, ownedPID: pid)
+            if obstacles.contains(where: { $0.frame.intersects(target.frame) }) {
+                let matches = windows.filter {
+                    $0.pid == pid && $0.layer == 0
+                        && abs($0.frame.minX - window.frame.minX) < 2
+                        && abs($0.frame.minY - window.frame.minY) < 2
+                        && abs($0.frame.width - window.frame.width) < 2
+                        && abs($0.frame.height - window.frame.height) < 2
+                }
+                guard matches.count == 1, let ownWindow = matches.first else {
+                    throw SettingsWindowPlacement.failure("CoreGraphics did not identify the exact owned window")
+                }
+                SettingsWindowPlacement.log(
+                    "before \(name) placement", windows: windows, window: window, target: target)
+                retainHierarchy("before \(name) placement")
                 let titleBarObstacles = windows.filter {
                     $0.order < ownWindow.order && SettingsWindowPlacement.isObstacleSurface($0)
                 }.map(\.frame)
                 guard
                     let plan = SettingsWindowPlacement.plan(
-                        settings: settings.frame, tab: tab.frame,
+                        window: window.frame, target: target.frame,
                         screen: CGDisplayBounds(CGMainDisplayID()), obstacles: obstacles.map(\.frame),
                         titleBarObstacles: titleBarObstacles)
                 else {
                     throw SettingsWindowPlacement.failure(
-                        "No uncovered Settings title-bar point or unobstructed on-screen tab position is available")
+                        "No uncovered title-bar point or unobstructed on-screen \(name) position is available")
                 }
-                let origin = settings.coordinate(withNormalizedOffset: .zero)
+                let origin = window.coordinate(withNormalizedOffset: .zero)
                 let start = origin.withOffset(
-                    CGVector(
-                        dx: plan.start.x - settings.frame.minX, dy: plan.start.y - settings.frame.minY))
+                    CGVector(dx: plan.start.x - window.frame.minX, dy: plan.start.y - window.frame.minY))
                 let end = origin.withOffset(
-                    CGVector(
-                        dx: plan.end.x - settings.frame.minX, dy: plan.end.y - settings.frame.minY))
+                    CGVector(dx: plan.end.x - window.frame.minX, dy: plan.end.y - window.frame.minY))
                 start.click(forDuration: 0.5, thenDragTo: end)
                 SettingsWindowPlacement.log(
-                    "after Settings drag", windows: try SettingsWindowPlacement.windows(), settings: settings, tab: tab)
-                retainSettingsHierarchy("after drag")
+                    "after \(name) drag", windows: try foreignWindows(), window: window, target: target)
+                retainHierarchy("after \(name) drag")
             }
-            let hittable = XCTNSPredicateExpectation(
-                predicate: NSPredicate { _, _ in tab.exists && tab.isHittable }, object: nil)
-            guard XCTWaiter.wait(for: [hittable], timeout: 10) == .completed else {
-                throw SettingsWindowPlacement.failure("The Settings tab did not become hittable before its click")
+            let uncovered = XCTNSPredicateExpectation(
+                predicate: NSPredicate { _, _ in
+                    guard target.exists, target.isHittable, let current = try? SettingsWindowPlacement.windows()
+                    else { return false }
+                    return !SettingsWindowPlacement.obstacles(current, ownedPID: pid)
+                        .contains(where: { $0.frame.intersects(target.frame) })
+                }, object: nil)
+            guard XCTWaiter.wait(for: [uncovered], timeout: 10) == .completed else {
+                throw SettingsWindowPlacement.failure("The \(name) control did not become uncovered and hittable")
             }
         }
 
-        private func retainSettingsHierarchy(_ stage: String) {
+        private func retainHierarchy(_ stage: String) {
             let attachment = XCTAttachment(string: app.debugDescription)
-            attachment.name = "App UI hierarchy - Settings placement - " + stage
+            attachment.name = "App UI hierarchy - placement - " + stage
             attachment.lifetime = .keepAlways
             add(attachment)
         }
 
-        // This capture belongs only to the authorized throw-away diagnostic branch.
-        private func captureRunnerSystemDialog(_ windows: [SettingsWindowPlacement.Window]) throws {
+        // This capture belongs only to the authorized throw-away diagnostic branch. It uses XCTest's screen
+        // capture, never sends input, and cannot decide the journey result.
+        private func captureRunnerSystemDialog(_ windows: [SettingsWindowPlacement.Window]) {
             let path = FileManager.default.homeDirectoryForCurrentUser
                 .appendingPathComponent("Developer/xcode/EncryptedMemories/UpgradeCheck/evidence/system-dialog.png")
-            guard !FileManager.default.fileExists(atPath: path.path) else { return }
-            guard
+            guard !FileManager.default.fileExists(atPath: path.path),
                 let dialog = windows.first(where: {
                     $0.owner == "UserNotificationCenter" && SettingsWindowPlacement.isObstacleSurface($0)
                 })
             else { return }
-            guard CGDisplayBounds(CGMainDisplayID()).contains(dialog.frame), !dialog.frame.isEmpty else {
-                throw SettingsWindowPlacement.failure("The system dialog crop is outside the main display")
-            }
-            try FileManager.default.createDirectory(
+            let display = CGDisplayBounds(CGMainDisplayID())
+            guard display.contains(dialog.frame), !dialog.frame.isEmpty,
+                let image = XCUIScreen.main.screenshot().image.cgImage(forProposedRect: nil, context: nil, hints: nil)
+            else { return print("SYSTEM_DIALOG_CAPTURE unavailable") }
+            let scale = CGFloat(image.width) / display.width
+            let pixels = CGRect(
+                x: (dialog.frame.minX - display.minX) * scale, y: (dialog.frame.minY - display.minY) * scale,
+                width: dialog.frame.width * scale, height: dialog.frame.height * scale
+            ).integral
+            try? FileManager.default.createDirectory(
                 at: path.deletingLastPathComponent(), withIntermediateDirectories: true)
-            let crop = dialog.frame
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
-            process.arguments = [
-                "-x", "-R\(Int(crop.minX)),\(Int(crop.minY)),\(Int(crop.width)),\(Int(crop.height))", path.path,
-            ]
-            try process.run()
-            process.waitUntilExit()
-            guard process.terminationStatus == 0, FileManager.default.fileExists(atPath: path.path) else {
-                throw SettingsWindowPlacement.failure("The single system-dialog crop failed")
-            }
+            guard let crop = image.cropping(to: pixels),
+                let destination = CGImageDestinationCreateWithURL(path as CFURL, "public.png" as CFString, 1, nil)
+            else { return print("SYSTEM_DIALOG_CAPTURE crop unavailable") }
+            CGImageDestinationAddImage(destination, crop, nil)
+            print("SYSTEM_DIALOG_CAPTURE " + (CGImageDestinationFinalize(destination) ? "written" : "failed"))
         }
     #endif
 
@@ -295,7 +388,7 @@ final class UpgradeJourneyUITests: XCTestCase {
             app.menuItems["Library"].click()
             let larger = app.buttons["Larger thumbnails"]
             XCTAssertTrue(larger.waitForExistence(timeout: 60))
-            larger.click()
+            try clickUncovered(larger, name: "Larger thumbnails")
         #else
             app.activate()
         #endif
@@ -355,7 +448,7 @@ final class UpgradeJourneyUITests: XCTestCase {
                     click: {
                         guard placementError == nil else { return }
                         do {
-                            try self.moveSettingsAwayFromForeignWindows(settings: settings, tab: tab)
+                            try self.uncover(tab, in: settings, name: title + " tab")
                             tab.click()
                         } catch { placementError = error }
                     },
@@ -378,6 +471,7 @@ final class UpgradeJourneyUITests: XCTestCase {
             } else {
                 XCTAssertTrue(enable.waitForExistence(timeout: 10))
                 #if os(macOS)
+                    try uncover(enable, in: app.windows["Settings"], name: "Enable Photos backup")
                     enable.click()
                 #else
                     enable.tap()
@@ -394,6 +488,7 @@ final class UpgradeJourneyUITests: XCTestCase {
                 try verifyIndexedSearchResults()
             } else {
                 #if os(macOS)
+                    try uncover(toggle, in: app.windows["Settings"], name: "Smart Search switch")
                     toggle.click()
                 #else
                     toggle.coordinate(withNormalizedOffset: CGVector(dx: 0.9, dy: 0.5)).tap()
@@ -419,7 +514,7 @@ final class UpgradeJourneyUITests: XCTestCase {
             var start: CGPoint
             var end: CGPoint
             var window: CGRect
-            var tab: CGRect
+            var target: CGRect
         }
 
         static func isObstacleSurface(_ window: Window) -> Bool {
@@ -431,32 +526,49 @@ final class UpgradeJourneyUITests: XCTestCase {
             windows.filter { $0.pid != ownedPID && isObstacleSurface($0) }
         }
 
+        static func titleBar(of window: CGRect) -> CGRect {
+            CGRect(x: window.minX, y: window.minY, width: window.width, height: 32)
+        }
+
+        /// Plans the shortest drag that moves a covered target clear of every obstacle. The title bar and the
+        /// target stay on the display; only the bottom of the window may leave it. Press and release avoid
+        /// every window in front of the owned window and every obstacle.
         static func plan(
-            settings: CGRect, tab: CGRect, screen: CGRect,
+            window: CGRect, target: CGRect, screen: CGRect,
             obstacles: [CGRect], titleBarObstacles: [CGRect]
         ) -> Drag? {
-            guard !settings.isEmpty, !tab.isEmpty, obstacles.contains(where: { $0.intersects(tab) }) else { return nil }
-            let titleBarPoints = [0.5, 0.25, 0.75, 0.4, 0.6].map {
-                CGPoint(x: settings.minX + settings.width * $0, y: settings.minY + 12)
+            guard !window.isEmpty, !target.isEmpty, obstacles.contains(where: { $0.intersects(target) }) else {
+                return nil
             }
-            guard
-                let start = titleBarPoints.first(where: { point in
-                    !titleBarObstacles.contains(where: { $0.contains(point) })
-                })
-            else { return nil }
             let usable = CGRect(
                 x: screen.minX + 8, y: screen.minY + 32, width: screen.width - 16, height: screen.height - 40)
-            guard settings.width <= usable.width, settings.height <= usable.height else { return nil }
-            for y in [settings.minY, usable.minY, usable.maxY - settings.height] {
-                for x in [usable.maxX - settings.width, usable.minX] {
-                    let moved = CGRect(x: x, y: y, width: settings.width, height: settings.height)
-                    let dx = x - settings.minX
-                    let dy = y - settings.minY
-                    let movedTab = tab.offsetBy(dx: dx, dy: dy)
-                    if usable.contains(moved), !obstacles.contains(where: { $0.intersects(movedTab) }) {
-                        return Drag(
-                            start: start, end: CGPoint(x: start.x + dx, y: start.y + dy),
-                            window: moved, tab: movedTab)
+            let offset = CGPoint(x: target.minX - window.minX, y: target.minY - window.minY)
+            var xs = [window.minX, usable.maxX - window.width, usable.minX]
+            var ys = [window.minY, usable.minY]
+            for obstacle in obstacles {
+                xs += [obstacle.maxX + 8 - offset.x, obstacle.minX - 8 - target.width - offset.x]
+                ys += [obstacle.maxY + 8 - offset.y, obstacle.minY - 8 - target.height - offset.y]
+            }
+            let candidates = ys.flatMap { y in xs.map { x in CGPoint(x: x, y: y) } }.sorted {
+                let left = hypot($0.x - window.minX, $0.y - window.minY)
+                let right = hypot($1.x - window.minX, $1.y - window.minY)
+                return left != right ? left < right : ($0.y, $0.x) < ($1.y, $1.x)
+            }
+            let starts = [0.5, 0.25, 0.75, 0.4, 0.6].map {
+                CGPoint(x: window.minX + window.width * $0, y: window.minY + 12)
+            }
+            let blocked = obstacles + titleBarObstacles
+            for origin in candidates {
+                let moved = CGRect(origin: origin, size: window.size)
+                let movedTarget = target.offsetBy(dx: origin.x - window.minX, dy: origin.y - window.minY)
+                guard moved.minX >= usable.minX, moved.maxX <= usable.maxX,
+                    usable.contains(titleBar(of: moved)), usable.contains(movedTarget),
+                    !obstacles.contains(where: { $0.intersects(movedTarget) })
+                else { continue }
+                for start in starts where !titleBarObstacles.contains(where: { $0.contains(start) }) {
+                    let end = CGPoint(x: start.x + origin.x - window.minX, y: start.y + origin.y - window.minY)
+                    if !blocked.contains(where: { $0.contains(end) }) {
+                        return Drag(start: start, end: end, window: moved, target: movedTarget)
                     }
                 }
             }
@@ -481,10 +593,10 @@ final class UpgradeJourneyUITests: XCTestCase {
             }
         }
 
-        static func log(_ stage: String, windows: [Window], settings: XCUIElement, tab: XCUIElement) {
+        static func log(_ stage: String, windows: [Window], window: XCUIElement, target: XCUIElement) {
             let facts: [String: Any] = [
-                "stage": stage, "settingsFrame": NSStringFromRect(settings.frame),
-                "tabFrame": NSStringFromRect(tab.frame), "tabIsHittable": tab.isHittable,
+                "stage": stage, "windowFrame": NSStringFromRect(window.frame),
+                "targetFrame": NSStringFromRect(target.frame), "targetIsHittable": target.isHittable,
                 "onScreenWindowsFrontToBack": windows.map {
                     [
                         "frontToBackIndex": $0.order, "ownerPID": $0.pid, "ownerName": $0.owner,

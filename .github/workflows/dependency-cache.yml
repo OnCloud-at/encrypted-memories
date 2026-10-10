@@ -67,7 +67,7 @@ jobs:
           PYTHON
 
 
-      - name: Print the checked Settings diagnostic subtrees
+      - name: Print the checked failure hierarchies
         if: always() && github.ref == 'refs/heads/work/upgrade-macos-metal-hosted' && runner.os == 'macOS'
         run: |
           python3 - <<'PYTHON'
@@ -84,7 +84,7 @@ jobs:
               re.IGNORECASE)
 
 
-          def settings_subtree(hierarchy):
+          def hierarchy_elements(hierarchy):
               elements = []
               for line in hierarchy.splitlines():
                   element = re.match(r'^(\s*)([A-Za-z][A-Za-z ]*)(?: \([^)]*\))?, ', line)
@@ -95,11 +95,15 @@ jobs:
                   for field in re.finditer(r"\b(identifier|title|label|value):\s*(?:'([^']*)'|([^,]*))", content):
                       attributes[field[1]] = (field[2] if field[2] is not None else field[3]).strip()
                   elements.append((len(element[1]), element[2], attributes))
-              starts = [index for index, (_, role, attributes) in enumerate(elements)
-                        if role == 'Window' and 'Settings' in [attributes.get(key) for key in ('identifier', 'title', 'label')]]
-              if len(starts) != 1:
-                  raise ValueError('Expected one Settings window in the failure hierarchy')
-              start = starts[0]
+              return elements
+
+
+          def settings_starts(elements):
+              return [index for index, (_, role, attributes) in enumerate(elements)
+                      if role == 'Window' and 'Settings' in [attributes.get(key) for key in ('identifier', 'title', 'label')]]
+
+
+          def project(elements, start):
               depth = elements[start][0]
               result = []
               for index, (indent, role, attributes) in enumerate(elements[start:], start):
@@ -109,7 +113,29 @@ jobs:
                            'title': attributes.get('title', attributes.get('label', ''))[:60],
                            'value': attributes.get('value', '')[:60]}
                   result.append(' ' * (indent - depth) + json.dumps(entry, ensure_ascii=False))
-              return '\n'.join(result)
+              return result
+
+
+          def settings_subtree(hierarchy):
+              elements = hierarchy_elements(hierarchy)
+              starts = settings_starts(elements)
+              if len(starts) != 1:
+                  raise ValueError('Expected one Settings window in the failure hierarchy')
+              return '\n'.join(project(elements, starts[0]))
+
+
+          def failure_projection(hierarchy):
+              """Projects the Settings window when it is open; a point without Settings projects every window."""
+              elements = hierarchy_elements(hierarchy)
+              starts = settings_starts(elements)
+              if len(starts) > 1:
+                  raise ValueError('Expected at most one Settings window in the failure hierarchy')
+              if starts:
+                  return '\n'.join(project(elements, starts[0]))
+              windows = [index for index, (_, role, _) in enumerate(elements) if role == 'Window']
+              if not windows:
+                  raise ValueError('The failure hierarchy contains no window')
+              return '\n'.join(line for index in windows for line in project(elements, index)[:300])
 
 
           def rejection_category(text):
@@ -128,45 +154,52 @@ jobs:
 
           def main():
               root = Path.home() / 'Developer/xcode/EncryptedMemories/UpgradeCheck/evidence'
-              cases = list(root.glob('*/macOS/v1.0.5/backup.claimed/prepare.xcresult'))
-              if len(cases) != 1:
-                  raise SystemExit('Expected one owned backup.claimed preparation result')
-              log_path = cases[0].parent / 'prepare-ui.log'
+              logs = sorted(root.glob('*/macOS/*/*/*-ui.log'))
               diagnostic_lines = [line.split('SETTINGS_DIAGNOSTIC ', 1)[1]
-                                  for path in sorted(root.rglob('*-ui.log'))
-                                  for line in path.read_text().splitlines() if 'SETTINGS_DIAGNOSTIC ' in line]
-              if not diagnostic_lines:
-                  raise SystemExit('The preparation produced no Settings diagnostic facts')
-              print('::group::Checked Settings strategy and frame facts')
+                                  for path in logs
+                                  for line in path.read_text(errors='replace').splitlines()
+                                  if 'SETTINGS_DIAGNOSTIC ' in line]
+              print('::group::Checked window placement facts')
               for text in diagnostic_lines:
                   category = rejection_category(text)
                   if category:
-                      print('Rejected diagnostic facts: file=prepare-ui.log; category=' + category)
+                      print('Rejected diagnostic facts: file=*-ui.log; category=' + category)
                       print('Data-check pattern: ' + forbidden.pattern.decode())
-                      raise SystemExit('Settings diagnostic facts failed the data check')
+                      raise SystemExit('Window placement facts failed the data check')
                   print(text)
               print('::endgroup::')
-              destination = cases[0].parent / 'hierarchy-export'
-              subprocess.run(['xcrun', 'xcresulttool', 'export', 'attachments', '--path', str(cases[0]),
-                              '--output-path', str(destination),
-                              '--test-id', 'UpgradeJourneyUITests/testInstalledAppJourney()',
-                              '--filter', '*App UI hierarchy*'], check=True)
-              attachments = sorted(destination.glob('*.txt'))
-              if not attachments:
-                  raise SystemExit('The failing point has no App UI hierarchy text attachment')
-              records = json.loads((destination / 'manifest.json').read_text())
-              names = {entry['exportedFileName']: entry.get('suggestedHumanReadableName', entry['exportedFileName'])
-                       for record in records for entry in record['attachments']}
-              for attachment in attachments:
-                  text = settings_subtree(attachment.read_text())
-                  category = rejection_category(text)
-                  if category:
-                      print('Rejected Settings subtree: file=' + attachment.name + '; category=' + category)
-                      print('Data-check pattern: ' + forbidden.pattern.decode())
-                      raise SystemExit('Settings subtree failed the data check')
-                  print('::group::Backup preparation Settings subtree (' + names[attachment.name] + ')')
-                  print(text)
-                  print('::endgroup::')
+              failing = [path for path in logs
+                         if any(' error: ' in line or line.startswith('** TEST EXECUTE FAILED')
+                                for line in path.read_text(errors='replace').splitlines())]
+              if not failing:
+                  print('No upgrade point failed; no failure hierarchy is printed.')
+                  return
+              for log_path in failing:
+                  point = '/'.join(log_path.relative_to(root).parts[1:-1]) + '/' + log_path.name
+                  bundle = log_path.with_name(log_path.name.removesuffix('-ui.log') + '.xcresult')
+                  if not bundle.is_dir():
+                      raise SystemExit('The failing point has no result bundle: ' + point)
+                  destination = log_path.with_name(log_path.name.removesuffix('-ui.log') + '-hierarchy-export')
+                  subprocess.run(['xcrun', 'xcresulttool', 'export', 'attachments', '--path', str(bundle),
+                                  '--output-path', str(destination),
+                                  '--test-id', 'UpgradeJourneyUITests/testInstalledAppJourney()',
+                                  '--filter', '*App UI hierarchy*'], check=True)
+                  attachments = sorted(destination.glob('*.txt'))
+                  if not attachments:
+                      raise SystemExit('The failing point has no App UI hierarchy text attachment: ' + point)
+                  records = json.loads((destination / 'manifest.json').read_text())
+                  names = {entry['exportedFileName']: entry.get('suggestedHumanReadableName', entry['exportedFileName'])
+                           for record in records for entry in record['attachments']}
+                  for attachment in attachments:
+                      text = failure_projection(attachment.read_text())
+                      category = rejection_category(text)
+                      if category:
+                          print('Rejected hierarchy projection: file=' + attachment.name + '; category=' + category)
+                          print('Data-check pattern: ' + forbidden.pattern.decode())
+                          raise SystemExit('Hierarchy projection failed the data check')
+                      print('::group::' + point + ' hierarchy (' + names[attachment.name] + ')')
+                      print(text)
+                      print('::endgroup::')
 
 
           if __name__ == '__main__':
@@ -180,4 +213,4 @@ jobs:
           name: runner-system-dialog
           path: ~/Developer/xcode/EncryptedMemories/UpgradeCheck/evidence/system-dialog.png
           retention-days: 3
-          if-no-files-found: error
+          if-no-files-found: warn
