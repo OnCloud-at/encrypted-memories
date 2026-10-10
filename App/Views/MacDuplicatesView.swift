@@ -26,10 +26,7 @@ struct MacDuplicatesView: View {
 
     /// The thumbnails come from the bounded decoded tier of the shared feed; the screen keeps none of its own.
     private var thumbnails: ExactDuplicateThumbnails {
-        let feed = thumbnailFeed
-        return ExactDuplicateThumbnails(
-            read: { uid in feed.memoryImage(for: uid).map { Image(nsImage: $0) } },
-            load: { uid in _ = await feed.feedCore.visibleDecoded(for: uid) })
+        ExactDuplicateThumbnails(feedCore: thumbnailFeed.feedCore)
     }
 
     var body: some View {

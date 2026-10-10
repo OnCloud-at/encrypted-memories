@@ -5895,6 +5895,13 @@
         "en": { "stringUnit": { "state": "translated", "value": "Loading suggestions" } }
       }
     },
+    "duplicates.thumbnail_unavailable": {
+      "comment": "VoiceOver label of a Duplicates tile whose photo has no thumbnail.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Thumbnail unavailable" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Vorschaubild nicht verfügbar" } }
+      }
+    },
     "duplicates.title": {
       "comment": "Collections and sidebar entry, and the screen title, like Apple Photos.",
       "localizations": {

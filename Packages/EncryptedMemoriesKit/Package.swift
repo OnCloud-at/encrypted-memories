@@ -261,7 +261,8 @@ let package = Package(
         .target(
             name: "PhotoViewerFeature",
             dependencies: [
-                "PhotosCore", "AlbumCore", "DesignSystem", "MediaCache", "MediaByteCache", "PhotoViewerCore",
+                "PhotosCore", "AlbumCore", "DesignSystem", "MediaCache", "MediaByteCache", "MediaFeedCore",
+                "PhotoViewerCore",
             ],
             swiftSettings: disableDynamicActorIsolation
         ),
@@ -299,7 +300,8 @@ let package = Package(
         .testTarget(
             name: "DeviceRootAppleAdapterTests", dependencies: ["DeviceRootAppleAdapter", "DeviceRootCore"]),
         .target(name: "UploadCore", dependencies: ["PhotosCore"]),
-        .target(name: "UploadFeature", dependencies: ["UploadCore", "PhotosCore", "DesignSystemCore"]),
+        .target(
+            name: "UploadFeature", dependencies: ["UploadCore", "PhotosCore", "DesignSystemCore", "MediaFeedCore"]),
         // PhotoLibraryBackupAdapter is the package boundary for PhotoKit.
         .target(
             name: "PhotoLibraryBackupAdapter",

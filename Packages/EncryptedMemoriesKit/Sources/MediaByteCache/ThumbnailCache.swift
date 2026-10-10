@@ -271,8 +271,18 @@ public actor ThumbnailCache {
     /// Direct disk read + decrypt (no in-memory layer). Returns plaintext bytes, or `nil` on a miss, a
     /// missing key, or an authentication failure (the corrupt blob is then deleted so it re-fetches).
     public nonisolated func diskData(for uid: PhotoUID) -> Data? {
-        guard retentionAuthorization.isAllowed(uid) else { return nil }
-        let generation = writerGeneration.capture()
+        diskData(for: uid, authorizing: { [retentionAuthorization] in retentionAuthorization.isAllowed(uid) })
+    }
+
+    /// A foreground surface owns this revocable, identity-specific read independently of the grid inventory.
+    /// The session and writer fences still apply before plaintext can leave the cache.
+    package nonisolated func diskData(
+        for uid: PhotoUID, ifCurrent expectedGeneration: CacheWriterGeneration.Token? = nil,
+        authorizing: @Sendable () -> Bool
+    ) -> Data? {
+        guard authorizing() else { return nil }
+        let generation = expectedGeneration ?? writerGeneration.capture()
+        guard writerGeneration.isCurrent(generation) else { return nil }
         let (cipher, account) = crypto.snapshot()
         guard let cipher else { return nil }  // locked
         let name = filename(uid: uid, account: account)
@@ -297,12 +307,12 @@ public actor ThumbnailCache {
             writerGeneration.performIfCurrent(
                 generation,
                 {
-                    guard retentionAuthorization.isAllowed(uid) else { return false }
+                    guard authorizing() else { return false }
                     validated.insert(name, generation: generation)
                     return true
                 }) == true
         else { return nil }
-        return retentionAuthorization.isAllowed(uid) ? plaintext : nil
+        return authorizing() ? plaintext : nil
     }
 
     /// URL of the on-disk encrypted blob (bytes are ciphertext - not directly decodable).
@@ -366,7 +376,17 @@ public actor ThumbnailCache {
         for uid: PhotoUID,
         ifCurrent generation: CacheWriterGeneration.Token
     ) -> ThumbnailCacheStoreResult {
-        guard retentionAuthorization.isAllowed(uid) else { return .stale }
+        storeToDisk(data, for: uid, ifCurrent: generation) { [retentionAuthorization] in
+            retentionAuthorization.isAllowed(uid)
+        }
+    }
+
+    /// Foreground writes use the same live authorization as their read, without authorizing grid consumers.
+    package nonisolated func storeToDisk(
+        _ data: Data, for uid: PhotoUID, ifCurrent generation: CacheWriterGeneration.Token,
+        authorizing: @Sendable () -> Bool
+    ) -> ThumbnailCacheStoreResult {
+        guard authorizing() else { return .stale }
         guard runtimeState.snapshot().storagePressure.permitsDiskWrite(for: storageKind) else {
             return .storagePaused
         }
@@ -376,7 +396,7 @@ public actor ThumbnailCache {
         let name = filename(uid: uid, account: account)
         let result: ThumbnailCacheStoreResult =
             writerGeneration.performIfCurrent(generation) {
-                guard retentionAuthorization.isAllowed(uid) else {
+                guard authorizing() else {
                     return ThumbnailCacheStoreResult.stale
                 }
                 guard runtimeState.snapshot().storagePressure.permitsDiskWrite(for: storageKind) else {

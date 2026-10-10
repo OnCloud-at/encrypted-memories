@@ -4,6 +4,7 @@ import AppKit
 import Foundation
 import MediaByteCache
 import MediaCache
+import MediaFeedCore
 import PhotoViewerCore
 import PhotosCore
 import VisionKit
@@ -81,6 +82,8 @@ public final class PhotoViewerModel {
     }
 
     private let feed: ThumbnailFeed
+    public let allowsVisibleDuplicateThumbnails: Bool
+    private let visibleThumbnail: VisibleThumbnailSession?
     private var pageIndex: ViewerPageIndex
     private let media: FullMediaProvider
     private let originalByteStreamer: (any OriginalByteStreamProvider)?
@@ -124,12 +127,15 @@ public final class PhotoViewerModel {
         knownLocationUIDs: Set<PhotoUID> = [],
         burstProvider: BurstGroupProvider? = nil,
         previewCache: ThumbnailCache? = nil, originalsCache: ThumbnailCache? = nil,
-        cacheOriginals: Bool = false, originalsCapBytes: Int64? = nil
+        cacheOriginals: Bool = false, originalsCapBytes: Int64? = nil,
+        allowsVisibleDuplicateThumbnails: Bool = false
     ) {
         self.items = items
         self.index = index
         self.pageIndex = ViewerPageIndex(orderedUIDs: items.map(\.uid))
         self.feed = feed
+        self.allowsVisibleDuplicateThumbnails = allowsVisibleDuplicateThumbnails
+        self.visibleThumbnail = allowsVisibleDuplicateThumbnails ? VisibleThumbnailSession(feed: feed.feedCore) : nil
         self.media = media
         self.originalByteStreamer = media as? any OriginalByteStreamProvider
         self.streamer = streamer
@@ -284,6 +290,7 @@ public final class PhotoViewerModel {
     /// Called when the viewer closes: cancels any in-flight load and tears the player down so closing
     /// stops playback/audio immediately and cancels unnecessary streaming/download work.
     public func stop() {
+        visibleThumbnail?.end()
         originalLoadGeneration &+= 1
         loadTask?.cancel()
         burstTask?.cancel()
@@ -509,6 +516,7 @@ public final class PhotoViewerModel {
     }
 
     private func loadDisplayedItem(_ item: PhotoItem) {
+        visibleThumbnail?.select(item.uid)
         originalLoadGeneration &+= 1
         loadTask?.cancel()
         liveTextAnalysis = nil
@@ -543,17 +551,26 @@ public final class PhotoViewerModel {
         // Otherwise show the thumbnail synchronously so rapid arrow navigation always shows something
         // immediately), and defer the heavy load so flicking past photos doesn't fire a network
         // storm - only the photo you actually land on loads its preview/original.
-        image = feed.memoryImage(for: item.uid)
+        if let visibleThumbnail {
+            image = visibleThumbnail.memoryImage(for: item.uid)
+        } else {
+            image = feed.memoryImage(for: item.uid)
+        }
         isSharp = false
 
         loadTask = Task {
             try? await Task.sleep(for: .milliseconds(160))  // debounce: skip work for photos flicked past
             guard !Task.isCancelled, self.isDisplaying(item), self.sessionIsCurrent() else { return }
 
-            if self.image == nil, let thumb = await self.feed.image(for: item.uid), self.isDisplaying(item),
-                self.sessionIsCurrent()
-            {
-                self.image = thumb
+            if self.image == nil {
+                // A Duplicates copy reads only its cached thumbnail here, so the preview below never waits for it.
+                let thumb: NSImage?
+                if let visibleThumbnail = self.visibleThumbnail {
+                    thumb = await visibleThumbnail.cachedImage(for: item.uid)
+                } else {
+                    thumb = await self.feed.image(for: item.uid)
+                }
+                if let thumb, !Task.isCancelled, self.isDisplaying(item), self.sessionIsCurrent() { self.image = thumb }
             }
             // Larger preview for a crisper interim image (disk-cached for offline browsing).
             var hasDisplayPreview = false
