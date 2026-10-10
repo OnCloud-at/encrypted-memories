@@ -223,9 +223,13 @@ The test apps use Release optimization and the exact release commit, with
 `ENCRYPTED_MEMORIES_UPGRADE_TEST` set only for these separate builds.
 The archive and upload configurations never enable the synthetic account.
 Storage, migrations, and task algorithms run through their existing implementations.
-Bundle metadata parity with shipping artifacts remains a separate limitation in [#411](https://github.com/OnCloud-at/encrypted-memories/issues/411).
-These journeys verify commit, storage, and task paths. They do not verify bundle metadata
-or external authentication headers. Tracked versions and build numbers remain unchanged.
+Metadata parity means exact string equality of `CFBundleShortVersionString` and `CFBundleVersion`
+with each published GitHub release's authoritative version and build number.
+The shared release identity helper and the existing build-number helper supply both archive and probe values.
+Each built, cached, and installed probe must match before its old or new journey phase starts.
+Evidence records the expected release, source commit, and actual bundle values.
+These journeys also verify commit, storage, and task paths. External authentication-header
+acceptance remains unverified. Tracked versions and build numbers remain unchanged.
 Synthetic photos, inference, and a loopback server replace external inputs and services.
 The server records uploads independently of app data. Duplicate uploads fail the journey.
 The journey kills the old app during backup claim, remote receipt, and local completion;
@@ -246,6 +250,8 @@ The `v1.0.5` overlay is pinned to its published commit and must apply cleanly.
 Later releases carry their inactive test entry and require no overlay.
 Only completed builds enter the cache, keyed by source, toolchain, architecture, platform, and test-build inputs.
 A typical cold run needs two app builds per platform; cached historical products remove one build per source.
+Release metadata also keys the cache,
+so distinct releases on one commit cannot reuse the wrong version or build number.
 
 The iOS journey installs the new app with `simctl install` over the existing app.
 It never removes the app or resets its data between the old and new phases.
@@ -268,10 +274,14 @@ macOS-Keychain-Persistenz über das Update wird nicht im Prüfbau geprüft; abge
 For a local rehearsal, run these commands through the configured shared build queue:
 
 ```bash
-bash scripts/test-release-upgrade.sh --target HEAD --sources v1.0.5 --platform iOS --working-copy
-bash scripts/test-release-upgrade.sh --target HEAD --sources v1.0.5 --platform macOS --working-copy
+bash scripts/test-release-upgrade.sh --target HEAD --release-tag "$CANDIDATE_RELEASE_TAG" --sources v1.0.5 --platform iOS --working-copy
+bash scripts/test-release-upgrade.sh --target HEAD --release-tag "$CANDIDATE_RELEASE_TAG" --sources v1.0.5 --platform macOS --working-copy
 ```
 
+Set `CANDIDATE_RELEASE_TAG` to an existing published app release. The local working-copy rehearsal
+uses that release's metadata and reports its separate source identity; it is not a shipping artifact.
+Without `--working-copy`, the source commit must match the published tag. Missing or mismatched
+GitHub releases fail; no project fallback supplies metadata.
 These commands create no release or tag and perform no Apple upload.
 They use only an owned simulator and the macOS host. Never install them on a physical iPhone or iPad.
 Omit `--working-copy` to test an exact committed revision.

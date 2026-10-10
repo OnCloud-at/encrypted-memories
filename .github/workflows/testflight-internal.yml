@@ -865,7 +865,7 @@ jobs:
           {
             echo 'macOS-Keychain-Persistenz über das Update wird nicht im Prüfbau geprüft; abgedeckt durch iOS-Simulator und Entitlement-Vergleich.'
             echo 'The backup journey requires consent already saved on disk. The immediate v1.0.5 Enable-to-SIGKILL case is a known historical limit and is not tested here.'
-            echo 'Bundle metadata parity with shipping artifacts is pending in #411. These journeys verify commit, storage, and task paths. They do not verify bundle metadata or external authentication headers.'
+            echo 'The gate requires installed CFBundleShortVersionString and CFBundleVersion to equal the published release data string-for-string before every old and new probe starts. External authentication-header acceptance remains unverified.'
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Check out trusted upgrade automation
@@ -905,15 +905,17 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/Developer/xcode/EncryptedMemories/UpgradeCheck/products
-          key: release-upgrade-${{ matrix.platform }}-${{ steps.toolchain.outputs.key }}-${{ hashFiles('scripts/upgrade-test/build_apps.py', 'scripts/upgrade-test/overlays/**', 'Packages/EncryptedMemoriesKit/Sources/**/UpgradeTest*.swift') }}-${{ needs.prepare.outputs.tag }}
+          key: release-upgrade-${{ matrix.platform }}-${{ steps.toolchain.outputs.key }}-${{ hashFiles('scripts/upgrade-test/build_apps.py', '.github/scripts/release_identity.rb', '.github/scripts/release_build_number.rb', 'scripts/upgrade-test/overlays/**', 'Packages/EncryptedMemoriesKit/Sources/**/UpgradeTest*.swift') }}-${{ needs.prepare.outputs.tag }}
           restore-keys: |
-            release-upgrade-${{ matrix.platform }}-${{ steps.toolchain.outputs.key }}-${{ hashFiles('scripts/upgrade-test/build_apps.py', 'scripts/upgrade-test/overlays/**', 'Packages/EncryptedMemoriesKit/Sources/**/UpgradeTest*.swift') }}-
+            release-upgrade-${{ matrix.platform }}-${{ steps.toolchain.outputs.key }}-${{ hashFiles('scripts/upgrade-test/build_apps.py', '.github/scripts/release_identity.rb', '.github/scripts/release_build_number.rb', 'scripts/upgrade-test/overlays/**', 'Packages/EncryptedMemoriesKit/Sources/**/UpgradeTest*.swift') }}-
 
       - name: Test installed upgrades
         id: journey
         if: needs.prepare.outputs.upgrade_overridden != 'true'
         env:
           TARGET_COMMIT: ${{ needs.prepare.outputs.commit_sha }}
+          TARGET_RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          GH_TOKEN: ${{ github.token }}
           UPGRADE_SOURCES: ${{ needs.prepare.outputs.upgrade_sources }}
           UPGRADE_PLATFORM: ${{ matrix.platform }}
         run: |
@@ -923,7 +925,7 @@ jobs:
           sources=()
           while IFS= read -r tag; do [[ -z "$tag" ]] || sources+=("$tag"); done < "$mapfile_path"
           [[ "${#sources[@]}" -gt 0 ]] || { echo "::error::No supported upgrade source selected"; exit 1; }
-          bash scripts/test-release-upgrade.sh --target "$TARGET_COMMIT" --sources "${sources[@]}" --platform "$UPGRADE_PLATFORM" 2>&1 | tee "$RUNNER_TEMP/release-upgrade.log"
+          bash scripts/test-release-upgrade.sh --target "$TARGET_COMMIT" --release-tag "$TARGET_RELEASE_TAG" --sources "${sources[@]}" --platform "$UPGRADE_PLATFORM" 2>&1 | tee "$RUNNER_TEMP/release-upgrade.log"
 
       - name: Report blocked release
         if: failure() || cancelled()
