@@ -40,6 +40,7 @@ jobs:
           sw_vers
           python3 -B .github/scripts/test_upgrade_metal.py
           python3 -B .github/scripts/test_upgrade_metadata.py
+          python3 -B .github/scripts/test_upgrade_journey.py UpgradeJourneyTests.test_native_macos_settings_pane_retries_only_unacknowledged_clicks
 
       - name: Test installed upgrades
         env:
@@ -47,7 +48,7 @@ jobs:
         run: |
           set -euo pipefail
           bash scripts/test-release-upgrade.sh --target HEAD --release-tag v1.1.0-beta.3 \
-            --sources v1.0.5 --platform macOS --points backup.claimed --working-copy 2>&1 | tee "$RUNNER_TEMP/release-upgrade.log"
+            --sources v1.0.5 --platform macOS --working-copy 2>&1 | tee "$RUNNER_TEMP/release-upgrade.log"
 
       - name: Print retained journey evidence
         if: always()
