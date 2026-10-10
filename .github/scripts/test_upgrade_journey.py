@@ -267,10 +267,16 @@ with SigningIdentity(root) as signer:
             ui = source / 'UpgradeUITests'
             ui.mkdir(parents=True)
             (ui / 'SettingsPaneTestSupport.swift').write_text('cached support')
+            (ui / 'RemovedSupport.swift').write_text('removed support')
             products = source.parent / 'build/DerivedData.noindex/Build/Products'
             products.mkdir(parents=True)
             (products / 'runner.xctestrun').touch()
-            cached = Build(root / 'fixture.app', source)
+            metadata = {'tag': 'v1.0.5', 'version': '1.0.5', 'build_number': '397223379', 'commit': 'a' * 40}
+            bundle = root / 'fixture.app/Contents'
+            bundle.mkdir(parents=True)
+            (bundle / 'Info.plist').write_bytes(plistlib.dumps({'CFBundleIdentifier': run_journey.BUNDLE,
+                'CFBundleShortVersionString': '1.0.5', 'CFBundleVersion': '397223379'}))
+            cached = Build(root / 'fixture.app', source, metadata, 'a' * 40)
             arguments = ['run_journey', '--repo', str(repo), '--automation', str(automation),
                          '--root', str(root), '--target', 'HEAD', '--sources', 'v1.0.5',
                          '--platform', 'macOS', '--working-copy']
@@ -279,9 +285,11 @@ with SigningIdentity(root) as signer:
             def command(args, **kwargs):
                 if args[:3] == ['xcrun', 'xcodebuild', 'build-for-testing']:
                     compiled.append((ui / 'SettingsPaneTestSupport.swift').read_text())
+                    self.assertFalse((ui / 'RemovedSupport.swift').exists(), 'A removed UI-test file survived')
                     self.assertEqual((ui / 'UpgradeJourneyUITests.swift').read_text(), 'current journey')
 
             with patch.object(sys, 'argv', arguments), patch.object(run_journey, 'build_app', return_value=cached), \
+                    patch.object(run_journey, 'release_metadata', return_value=metadata), \
                     patch('keychain_entitlements.snapshot', return_value={}), \
                     patch.object(run_journey, 'SigningIdentity'), patch.object(run_journey, 'run_cases'), \
                     patch.object(run_journey, 'output', return_value='arm64'), \
