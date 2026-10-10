@@ -382,6 +382,9 @@
         /// placement, or a new item set forgets it.
         private var resizeAnchorItemID: PhotoUID?
         private var lastLaidOutSafeAreaInsets: UIEdgeInsets = .zero
+        /// The active reserved regions (iPhone Duo fold, camera) in viewport coordinates; selection badges avoid
+        /// them. Read on every layout; a hinge change asks for a layout.
+        private(set) var reservedRegionLayout: ReservedRegionLayout = .none
         private var initialViewportPlacement: TimelineInitialViewportPlacement = .automatic
         private var needsInitialViewportPlacement = true
         var userHasScrolledTimeline = false
@@ -748,6 +751,7 @@
             restoreViewportResizePosition(resizePosition)
             lastLaidOutViewportSize = bounds.size
             lastLaidOutSafeAreaInsets = safeAreaInsets
+            reservedRegionLayout = currentReservedRegionLayout()
             requestRender()
             invalidateAccessibilityElements()
         }
@@ -824,6 +828,7 @@
             backgroundColor = .black
             isAccessibilityElement = false
             shouldGroupAccessibilityChildren = true
+            observeHingeForReservedRegions()
             // Scene lifecycle, filtered to this grid's own window scene. The application-level notifications
             // would only fire when every window is hidden.
             NotificationCenter.default.addObserver(
@@ -1852,6 +1857,35 @@
             return items[slot.index]
         }
 
+        /// The metal view fills the host, so the host's reserved regions are already in viewport coordinates.
+        private func currentReservedRegionLayout() -> ReservedRegionLayout {
+            #if canImport(UIKit, _version: 9127.0.85)
+                if #available(iOS 27.1, *) {
+                    let kinds: [(UIView.ReservedRegion.Kind, ReservedRegionArea.Kind)] = [
+                        (.division, .division), (.occlusion, .occlusion),
+                    ]
+                    return ReservedRegionLayout(
+                        areas: kinds.flatMap { kind, area in
+                            reservedRegions(kind: kind).map {
+                                ReservedRegionArea(kind: area, frame: $0.frame, isActive: $0.isActive)
+                            }
+                        },
+                        bounds: CGRect(origin: .zero, size: bounds.size))
+                }
+            #endif
+            return .none
+        }
+
+        /// UIKit reports no separate change of reserved regions. Folding or opening iPhone Duo changes the hinge, so
+        /// the hinge update only asks for a layout, which reads the regions again. The angle itself decides nothing.
+        private func observeHingeForReservedRegions() {
+            #if canImport(UIKit, _version: 9127.0.85)
+                if #available(iOS 27.1, *) {
+                    addInteraction(UIHingeInteraction { [weak self] _, _ in self?.setNeedsLayout() })
+                }
+            #endif
+        }
+
         private func productionDecorations() -> MetalGridDecorations<PhotoUID> {
             let accent = SIMD4<Float>(Float(0x6D) / 255, Float(0x4A) / 255, Float(0xFF) / 255, 1)
             // One time for the whole frame, so every badge of the frame animates in step.
@@ -1868,7 +1902,8 @@
                 overlay: { [thumbnailOverlayResolver] uid in thumbnailOverlayResolver.overlay(for: uid) },
                 uploadBadgeFrame: { [uploadBadgeAnimator] uid, badge in
                     uploadBadgeAnimator.frame(for: uid, target: badge, now: frameTime)
-                }
+                },
+                reservedRegions: reservedRegionLayout
             )
         }
     }
