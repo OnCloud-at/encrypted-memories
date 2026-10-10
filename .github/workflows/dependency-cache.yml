@@ -1,20 +1,6 @@
-name: Warm Apple dependency cache
+name: Verify hosted macOS upgrade probes
 
 on:
-  push:
-    branches:
-      - main
-    paths:
-      - ".github/actions/prepare-apple-build/action.yml"
-      - "BuildSupport/**"
-      - "Package.swift"
-      - "Packages/**/Package.swift"
-      - "Packages/**/Package.resolved"
-      - "VendorPatches/**"
-      - "project.yml"
-      - "scripts/build-paths.sh"
-      - "scripts/install-xcodegen.sh"
-      - "scripts/update-proton-sdk.sh"
   workflow_dispatch:
 
 permissions:
@@ -24,17 +10,57 @@ env:
   DEVELOPER_DIR: /Applications/Xcode.app/Contents/Developer
 
 jobs:
-  warm:
-    name: Warm dependency cache
+  upgrade:
+    name: Test twelve macOS upgrade points
     runs-on: xcode-27
-    timeout-minutes: 30
+    timeout-minutes: 180
     steps:
-      - name: Check out source
+      - name: Check out the upload-free rehearsal
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
+          fetch-depth: 0
           persist-credentials: false
 
-      - uses: ./.github/actions/prepare-apple-build
+      - name: Set up Python
+        uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: '3.14'
 
-      - if: always()
-        run: bash ./scripts/report-build-storage.sh
+      - name: Install pinned XcodeGen
+        run: |
+          set -euo pipefail
+          executable="$(bash scripts/install-xcodegen.sh "$RUNNER_TEMP/xcodegen-install")"
+          dirname "$executable" >> "$GITHUB_PATH"
+          "$executable" --version
+
+      - name: Test compile controls and metadata checks
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          sw_vers
+          python3 -B .github/scripts/test_upgrade_metal.py
+          python3 -B .github/scripts/test_upgrade_metadata.py
+
+      - name: Test installed upgrades
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          bash scripts/test-release-upgrade.sh --target HEAD --release-tag v1.1.0-beta.3 \
+            --sources v1.0.5 --platform macOS --working-copy 2>&1 | tee "$RUNNER_TEMP/release-upgrade.log"
+
+      - name: Print retained journey evidence
+        if: always()
+        run: |
+          python3 - <<'PYTHON'
+          from pathlib import Path
+          root = Path.home() / 'Developer/xcode/EncryptedMemories/UpgradeCheck/evidence'
+          for path in sorted(root.rglob('*.json')):
+              if path.name in {'toolchain.json', 'build-metadata.json', 'old-bundle.json', 'new-bundle.json', 'backup-consent.json'}:
+                  print(str(path.relative_to(root)), path.read_text(), flush=True)
+          for path in sorted(root.rglob('*-ui.log')):
+              lines = path.read_text(errors='replace').splitlines()
+              errors = [line for line in lines if 'error:' in line or 'failed' in line.lower()]
+              if errors:
+                  print(str(path.relative_to(root)), '\n'.join(errors[-30:]), flush=True)
+          PYTHON

@@ -227,9 +227,13 @@ Only macOS upgrade probes admit devices without Metal 3 under
 `#if ENCRYPTED_MEMORIES_UPGRADE_TEST && os(macOS)`; shipping hardware admission stays unchanged.
 The journey logs the real Metal devices and their Metal 3 support. It retains the production
 grid and all rendered-pixel assertions, so failed rendering still fails the gate.
-Bundle metadata parity with shipping artifacts remains a separate limitation in [#411](https://github.com/OnCloud-at/encrypted-memories/issues/411).
-These journeys verify commit, storage, and task paths. They do not verify bundle metadata
-or external authentication headers. Tracked versions and build numbers remain unchanged.
+Metadata parity means exact string equality of `CFBundleShortVersionString` and `CFBundleVersion`
+with each published GitHub release's authoritative version and build number.
+The shared release identity helper and the existing build-number helper supply both archive and probe values.
+Each built, cached, and installed probe must match before its old or new journey phase starts.
+Evidence records the expected release, source commit, and actual bundle values.
+These journeys also verify commit, storage, and task paths. External authentication-header
+acceptance remains unverified. Tracked versions and build numbers remain unchanged.
 Synthetic photos, inference, and a loopback server replace external inputs and services.
 The server records uploads independently of app data. Duplicate uploads fail the journey.
 The journey kills the old app during backup claim, remote receipt, and local completion;
@@ -250,6 +254,8 @@ The `v1.0.5` overlay is pinned to its published commit and must apply cleanly.
 Later releases carry their inactive test entry and require no overlay.
 Only completed builds enter the cache, keyed by source, toolchain, architecture, platform, and test-build inputs.
 A typical cold run needs two app builds per platform; cached historical products remove one build per source.
+Release metadata also keys the cache,
+so distinct releases on one commit cannot reuse the wrong version or build number.
 
 The iOS journey installs the new app with `simctl install` over the existing app.
 It never removes the app or resets its data between the old and new phases.
@@ -259,10 +265,13 @@ A validated case identifier contains exactly 32 ASCII hexadecimal characters (`0
 The test entry rejects every other identifier with an explicit error before it can become an account path component.
 A changed case or server, or an old URL-only marker, requires a new seed.
 An unchanged case and server retain the existing session.
-The native seed regression uses `UPGRADE_NATIVE_SEED_TARGET=HEAD` and `UPGRADE_NATIVE_WORKING_COPY=1`
+The native seed regression uses `UPGRADE_NATIVE_SEED_TARGET=HEAD`, `UPGRADE_NATIVE_WORKING_COPY=1`,
+and `UPGRADE_RELEASE_TAG` set to an existing published release for the candidate metadata
 with `.github/scripts/test_upgrade_journey.py UpgradeJourneyTests.test_native_seed_identity_survives_restarts_and_reseeds_changed_cases_or_servers`.
 Set `UPGRADE_NATIVE_SEED_PLATFORM=iOS` to include the old-format file in a fresh owned simulator container.
 The default macOS run also checks that an unchanged identity preserves the saved session contents.
+The opt-in simulator-isolation regression also passes `UPGRADE_RELEASE_TAG` explicitly.
+Both regressions require published metadata even when the source is an untagged working-copy revision.
 Both macOS installations use one temporary self-signed identity, without release credentials.
 Only the synthetic macOS session persists outside the Data Protection Keychain.
 Production Keychain access groups must match the last supported stable release.
@@ -272,10 +281,14 @@ macOS-Keychain-Persistenz über das Update wird nicht im Prüfbau geprüft; abge
 For a local rehearsal, run these commands through the configured shared build queue:
 
 ```bash
-bash scripts/test-release-upgrade.sh --target HEAD --sources v1.0.5 --platform iOS --working-copy
-bash scripts/test-release-upgrade.sh --target HEAD --sources v1.0.5 --platform macOS --working-copy
+bash scripts/test-release-upgrade.sh --target HEAD --release-tag "$CANDIDATE_RELEASE_TAG" --sources v1.0.5 --platform iOS --working-copy
+bash scripts/test-release-upgrade.sh --target HEAD --release-tag "$CANDIDATE_RELEASE_TAG" --sources v1.0.5 --platform macOS --working-copy
 ```
 
+Set `CANDIDATE_RELEASE_TAG` to an existing published app release. The local working-copy rehearsal
+uses that release's metadata and reports its separate source identity; it is not a shipping artifact.
+Without `--working-copy`, the source commit must match the published tag. Missing or mismatched
+GitHub releases fail; no project fallback supplies metadata.
 These commands create no release or tag and perform no Apple upload.
 They use only an owned simulator and the macOS host. Never install them on a physical iPhone or iPad.
 Omit `--working-copy` to test an exact committed revision.
