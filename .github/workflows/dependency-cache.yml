@@ -1,21 +1,16 @@
-name: Warm Apple dependency cache
+name: Measure hosted macOS Metal devices
 
 on:
-  push:
-    branches:
-      - main
-    paths:
-      - ".github/actions/prepare-apple-build/action.yml"
-      - "BuildSupport/**"
-      - "Package.swift"
-      - "Packages/**/Package.swift"
-      - "Packages/**/Package.resolved"
-      - "VendorPatches/**"
-      - "project.yml"
-      - "scripts/build-paths.sh"
-      - "scripts/install-xcodegen.sh"
-      - "scripts/update-proton-sdk.sh"
   workflow_dispatch:
+    inputs:
+      runner_label:
+        description: Hosted runner label to measure.
+        required: true
+        type: choice
+        options:
+          - xcode-27
+          - xcode-27-xlarge
+        default: xcode-27
 
 permissions:
   contents: read
@@ -24,17 +19,49 @@ env:
   DEVELOPER_DIR: /Applications/Xcode.app/Contents/Developer
 
 jobs:
-  warm:
-    name: Warm dependency cache
-    runs-on: xcode-27
-    timeout-minutes: 30
+  measure:
+    name: Measure Metal on ${{ inputs.runner_label }}
+    runs-on: ${{ inputs.runner_label }}
+    timeout-minutes: 3
     steps:
-      - name: Check out source
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
-        with:
-          persist-credentials: false
+      - name: Record toolchain and operating system
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          sw_vers
+          uname -m
 
-      - uses: ./.github/actions/prepare-apple-build
+      - name: Enumerate Metal devices
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/metal-devices.swift" <<'SWIFT'
+          import Foundation
+          import Metal
 
-      - if: always()
-        run: bash ./scripts/report-build-storage.sh
+          func describe(_ device: any MTLDevice) -> [String: Any] {
+              [
+                  "name": device.name,
+                  "supportsFamilyMetal3": device.supportsFamily(.metal3),
+                  "registryID": String(device.registryID),
+                  "isLowPower": device.isLowPower,
+                  "hasUnifiedMemory": device.hasUnifiedMemory,
+              ]
+          }
+
+          var report: [String: Any] = [
+              "allDevices": MTLCopyAllDevices().map(describe),
+              "defaultDevice": NSNull(),
+          ]
+          if let device = MTLCreateSystemDefaultDevice() {
+              report["defaultDevice"] = describe(device)
+          }
+          let data = try JSONSerialization.data(
+              withJSONObject: report, options: [.prettyPrinted, .sortedKeys]
+          )
+          print(String(decoding: data, as: UTF8.self))
+          SWIFT
+          xcrun swift "$RUNNER_TEMP/metal-devices.swift"
+
+      - name: Report display hardware
+        if: always()
+        run: system_profiler SPDisplaysDataType
