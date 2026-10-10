@@ -30,8 +30,11 @@ public final class TimelineMetadataReconciliation: @unchecked Sendable {
         )?
     private var task: Task<Void, Never>?
     private var retired = false
+    private let startGate: TimelineMetadataStartGate?
 
-    public init() {}
+    public init(startGate: TimelineMetadataStartGate? = nil) {
+        self.startGate = startGate
+    }
 
     /// Repeated offers for the active inventory do not repeat its metadata requests.
     public func schedule(
@@ -54,6 +57,7 @@ public final class TimelineMetadataReconciliation: @unchecked Sendable {
             input = inventory
             let runGeneration = generation
             task = Task(priority: .background) { [self] in
+                await startGate?.wait()
                 while let pass = takeInput(generation: runGeneration) {
                     await operation(pass)
                     finish(pass)

@@ -31,7 +31,9 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     /// save/load logic live in Core.
     private let timelineStore: TimelineMetadataStore?
     private let timelineOrderStore: TimelineOrderMetadataStore?
-    private let metadataReconciliation = TimelineMetadataReconciliation()
+    /// Holds the timeline metadata pass while the first full remote index build of this launch runs.
+    private nonisolated let firstIndexBuildGate: TimelineMetadataStartGate
+    private let metadataReconciliation: TimelineMetadataReconciliation
     /// Drive key-derivation + block decryption for video streaming (built once at sign-in).
     private let crypto: DriveCrypto
     private let photosVolumeBootstrap: PhotosVolumeBootstrapService
@@ -149,6 +151,9 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
             url: libraryDirectory.appendingPathComponent(LibraryDatabaseLocation.databaseFileName),
             policy: policy.libraryDatabasePolicy
         )
+        let firstIndexBuildGate = TimelineMetadataStartGate()
+        self.firstIndexBuildGate = firstIndexBuildGate
+        self.metadataReconciliation = TimelineMetadataReconciliation(startGate: firstIndexBuildGate)
         self.timelineOrderStore = TimelineOrderMetadataStore(
             url: libraryDirectory.appendingPathComponent(TimelineOrderMetadataStore.databaseFileName),
             policy: policy.libraryDatabasePolicy)
@@ -2169,6 +2174,7 @@ extension DriveSDKBridge: PhotoUploading {
     nonisolated func makeUploadIdentityResolver() -> UploadIdentityResolverComposition {
         guard let store = UploadIdentityManifestStore(url: uploadManifestURL, policy: uploadManifestPolicy) else {
             DebugLog.log("[Dedupe] manifest store unavailable - uploads disabled")
+            firstIndexBuildGate.open()
             return UploadIdentityResolverComposition(
                 resolver: ShutdownGatedUploadIdentityResolver(
                     base: DedupeUnavailableIdentityResolver(),
@@ -2196,7 +2202,8 @@ extension DriveSDKBridge: PhotoUploading {
             crypto: crypto,
             photosClient: photosClient,
             contentIndexStore: store,
-            lineageIndexStore: lineageStore
+            lineageIndexStore: lineageStore,
+            firstBuildGate: firstIndexBuildGate
         ) { [self] in
             try await photosShareContext()
         }
