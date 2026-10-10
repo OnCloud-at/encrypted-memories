@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import PhotosCore
 import ProtonAuth
 import ProtonCoreCryptoGoInterface
 import ProtonCoreCryptoPatchedGoImplementation
@@ -669,13 +670,153 @@ extension DriveSessionStubSuite {
             }
         }
 
+        /// At the first launch after the update the lineage index has no checkpoint, so the index preparation runs the
+        /// first full build. The timeline metadata pass reads the whole library too; it starts after the build ends.
+        @Test func theFirstFullBuildHoldsTheTimelineMetadataPassUntilItEnds() async throws {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let content = try #require(
+                UploadIdentityManifestStore(url: directory.appendingPathComponent("content.sqlite")))
+            defer { content.close() }
+            let lineage = try #require(
+                UploadRemoteLineageIndexStore(url: directory.appendingPathComponent("lineage.sqlite")))
+            defer { lineage.close() }
+            #expect(
+                content.replaceRemoteContentIndex(
+                    [.init(contentHash: "hash", hashKeyEpoch: "epoch", remoteLinkID: "main")],
+                    unresolvedIssues: [], hashKeyEpoch: "epoch", checkpoint: checkpoint("one")))
+            StubURLProtocol.reset()
+            routeEmptyEvents(from: "one", to: "two")
+            StubURLProtocol.route("GET /drive/volumes/vol1/events/latest", json: #"{"Code":1000,"EventID":"two"}"#)
+            StubURLProtocol.route("GET /drive/volumes/vol1/photos", json: #"{"Code":1000,"Photos":[]}"#)
+            // The build outlasts the start limit, which applies only until a build starts.
+            let gate = TimelineMetadataStartGate(startLimit: .seconds(1), limit: .seconds(60))
+            let service = makeService(content: content, lineage: lineage, firstBuildGate: gate)
+            let reconciliation = TimelineMetadataReconciliation(startGate: gate)
+            let events = BuildOrderLog()
+            reconciliation.schedule(timelineInventory) { _ in await events.append("metadata pass") }
+
+            try await service.prepareRemoteIndex { step in
+                await events.append("build \(step.phase)")
+                if step.phase == .indexing { try? await Task.sleep(for: .milliseconds(1_500)) }
+            }
+            #expect(await passStart(events, reconciliation) != nil)
+
+            let log = await events.entries
+            #expect(log.contains("build indexing"), "\(log)")
+            #expect(Array(log.suffix(2)) == ["build ready", "metadata pass"], "\(log)")
+        }
+
+        @Test func aFailedFirstBuildReleasesTheTimelineMetadataPass() async throws {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let content = try #require(
+                UploadIdentityManifestStore(url: directory.appendingPathComponent("content.sqlite")))
+            defer { content.close() }
+            let lineage = try #require(
+                UploadRemoteLineageIndexStore(url: directory.appendingPathComponent("lineage.sqlite")))
+            defer { lineage.close() }
+            StubURLProtocol.reset()
+            let gate = TimelineMetadataStartGate(startLimit: .seconds(20), limit: .seconds(20))
+            let service = makeService(content: content, lineage: lineage, firstBuildGate: gate)
+            let reconciliation = TimelineMetadataReconciliation(startGate: gate)
+            let events = BuildOrderLog()
+            reconciliation.schedule(timelineInventory) { _ in await events.append("metadata pass") }
+
+            await #expect(throws: (any Error).self) {
+                try await service.prepareRemoteIndex { step in
+                    await events.append("build \(step.phase)")
+                    try? await Task.sleep(for: .milliseconds(300))
+                }
+            }
+
+            #expect(await passStart(events, reconciliation) != nil, "the failed build must release the pass")
+            let log = await events.entries
+            #expect(log.first == "build loading", "\(log)")
+            #expect(log.last == "metadata pass", "the pass waits for the failure: \(log)")
+        }
+
+        /// Only the launch that created the lineage index holds the pass. A later launch, also one whose earlier build
+        /// never ran, and a launch without a writable lineage index start the pass as before.
+        @Test func aLaterLaunchStartsTheTimelineMetadataPassAtOnce() async throws {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let content = try #require(
+                UploadIdentityManifestStore(url: directory.appendingPathComponent("content.sqlite")))
+            defer { content.close() }
+            for mode in ["absent", "without checkpoint", "with checkpoint", "closed"] {
+                let url = directory.appendingPathComponent("\(mode).sqlite")
+                var lineage: UploadRemoteLineageIndexStore?
+                if mode != "absent" {
+                    let earlier = try #require(UploadRemoteLineageIndexStore(url: url))
+                    #expect(earlier.createdFile, "\(mode)")
+                    if mode == "with checkpoint" {
+                        #expect(
+                            earlier.replaceRows(
+                                identities: [], lineage: [], hashKeyEpoch: "epoch", eventID: "one",
+                                unresolvedRemoteLinkIDs: []))
+                    }
+                    if mode == "closed" {
+                        earlier.close()
+                        lineage = earlier
+                    } else {
+                        earlier.close()
+                        lineage = try #require(UploadRemoteLineageIndexStore(url: url))
+                        #expect(lineage?.createdFile == false, "\(mode)")
+                    }
+                }
+                defer { lineage?.close() }
+                let gate = TimelineMetadataStartGate(startLimit: .seconds(20), limit: .seconds(20))
+                _ = makeService(content: content, lineage: lineage, firstBuildGate: gate)
+                let reconciliation = TimelineMetadataReconciliation(startGate: gate)
+                let events = BuildOrderLog()
+
+                reconciliation.schedule(timelineInventory) { _ in await events.append("metadata pass") }
+
+                let waited = await passStart(events, reconciliation)
+                #expect(waited.map { $0 < .seconds(5) } == true, "\(mode): a later launch must not hold the pass")
+            }
+        }
+
+        /// Waits at most ten seconds for the pass, then retires the scheduler so a held pass cannot outlive the test.
+        private func passStart(
+            _ events: BuildOrderLog, _ reconciliation: TimelineMetadataReconciliation
+        ) async -> Duration? {
+            let clock = ContinuousClock()
+            let begin = clock.now
+            var started: Duration?
+            while started == nil, clock.now - begin < .seconds(10) {
+                if await events.entries.contains("metadata pass") {
+                    started = clock.now - begin
+                } else {
+                    try? await Task.sleep(for: .milliseconds(20))
+                }
+            }
+            reconciliation.retire()
+            await reconciliation.waitForCurrentPass()
+            return started
+        }
+
+        private var timelineInventory: TimelineMetadataReconciliation.Inventory {
+            .init(
+                items: [
+                    PhotoItem(
+                        uid: PhotoUID(volumeID: "vol1", nodeID: "photo"), captureTime: Date(timeIntervalSince1970: 1),
+                        mediaType: "image/jpeg")
+                ], classifiedNodeIDs: [], libraryID: "vol1")
+        }
+
         private func makeService(
-            content: UploadIdentityManifestStore, lineage: UploadRemoteLineageIndexStore?
+            content: UploadIdentityManifestStore, lineage: UploadRemoteLineageIndexStore?,
+            firstBuildGate: TimelineMetadataStartGate? = nil
         ) -> ProtonUploadDedupeService {
             ProtonUploadDedupeService(
                 session: makeSession(), crypto: DriveCrypto(addressKeys: [], signers: []),
                 photosClient: NoPhotoDuplicates(), contentIndexStore: content, lineageIndexStore: lineage,
-                material: material
+                material: material, firstBuildGate: firstBuildGate
             ) { throw UploadError.backend("The test material is resolved") }
         }
 
@@ -827,6 +968,11 @@ extension DriveSessionStubSuite {
 private struct NoPhotoDuplicates: SDKPhotoDuplicatesClient {
     func findPhotoDuplicates(name: String, sha1: Data, cancellationToken: UUID) async throws -> [SDKNodeUid] { [] }
     func cancelFindPhotoDuplicates(cancellationToken: UUID) async throws {}
+}
+
+private actor BuildOrderLog {
+    private(set) var entries: [String] = []
+    func append(_ entry: String) { entries.append(entry) }
 }
 
 private actor PreparationLog {

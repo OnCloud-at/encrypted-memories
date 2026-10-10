@@ -40,6 +40,9 @@ public final class UploadRemoteLineageIndexStore: @unchecked Sendable {
     private let lock = NSLock()
     private var lookupFailed = false
     private let storePath: String
+    /// True when this open created the database file, as on the first launch after an update from a version without
+    /// the lineage index.
+    public let createdFile: Bool
     /// Repair sweeps of this process for each key epoch: the last link read and the earliest start of the next sweep.
     private var repairCursors: [String: String] = [:]
     private var nextRepairSweeps: [String: Date] = [:]
@@ -67,6 +70,7 @@ public final class UploadRemoteLineageIndexStore: @unchecked Sendable {
         url: URL, policy: LibraryDatabasePolicy = .conservative, clock: @escaping @Sendable () -> Date = { Date() }
     ) {
         storePath = url.standardizedFileURL.path
+        createdFile = !FileManager.default.fileExists(atPath: storePath)
         self.clock = clock
         let schema = """
             CREATE TABLE remote_link_identity(

@@ -52,6 +52,7 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
     private let contentIndexStore: any UploadRemoteContentIndexStore
     private let lineageIndexStore: UploadRemoteLineageIndexStore?
     private let contextProvider: @Sendable () async throws -> PhotosShareContext
+    private let firstBuildGate: TimelineMetadataStartGate?
 
     struct Material: Sendable {
         let context: PhotosShareContext
@@ -89,8 +90,10 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
         contentIndexStore: any UploadRemoteContentIndexStore,
         lineageIndexStore: UploadRemoteLineageIndexStore? = nil,
         material: Material? = nil,
+        firstBuildGate: TimelineMetadataStartGate? = nil,
         contextProvider: @Sendable @escaping () async throws -> PhotosShareContext
     ) {
+        self.firstBuildGate = firstBuildGate
         self.material = material
         self.session = session
         self.crypto = crypto
@@ -98,6 +101,10 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
         self.contentIndexStore = contentIndexStore
         self.lineageIndexStore = lineageIndexStore
         self.contextProvider = contextProvider
+        // Only the launch that created the lineage index runs the first full build; any other launch opens at once.
+        if lineageIndexStore?.acceptsWrites != true || lineageIndexStore?.createdFile != true {
+            firstBuildGate?.open()
+        }
     }
 
     // MARK: UploadDuplicateChecking
@@ -364,6 +371,9 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
     ) async throws {
         let token = UUID()
         remoteIndexProgressHandlers[token] = progress
+        firstBuildGate?.buildStarted()
+        // A finished or failed preparation releases the timeline metadata pass held for the first full build.
+        defer { firstBuildGate?.open() }
         await progress(.init(phase: .loading))
         defer { remoteIndexProgressHandlers[token] = nil }
         let material = try await resolveMaterial()
