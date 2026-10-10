@@ -7,6 +7,7 @@ import DesignSystemCore
 import MapUIKitAdapter
 import MediaByteCache
 import MediaCacheUIKitAdapter
+import MediaFeedCore
 import MediaLocationCore
 import PhotoViewerCore
 import PhotoViewerUIKitAdapter
@@ -76,6 +77,8 @@ struct MobilePhotoViewer: View {
     /// the shared `PhotoViewerUIKitAdapter` store, wired to the feed's RAM tier via a closure so the
     /// adapter never depends on a concrete feed type.
     @State private var imageStore: UIKitViewerImageStore
+    /// Read access to the cached thumbnail of the shown Duplicates copy, which can lie outside the library.
+    @State private var visibleThumbnail: VisibleThumbnailSession?
 
     init(
         items: [PhotoItem],
@@ -103,6 +106,9 @@ struct MobilePhotoViewer: View {
                 placeNameResolver: NativePlaceNameResolver.shared
             ))
         let feed = libraryModel.thumbnailFeed
+        let visibleThumbnail = duplicateGroup == nil ? nil : feed.map { VisibleThumbnailSession(feed: $0.feedCore) }
+        if items.indices.contains(startIndex) { visibleThumbnail?.select(items[startIndex].uid) }
+        _visibleThumbnail = State(initialValue: visibleThumbnail)
         // Seed/reuse the E2EE originals cache via the shared helper, injected as a closure so the viewer
         // adapter stays decoupled from the cache layer. When the viewer decrypts an original (a no-preview
         // item), it lands in the encrypted cache and later opens / shares reuse it before the network.
@@ -124,7 +130,10 @@ struct MobilePhotoViewer: View {
         _imageStore = State(
             initialValue: UIKitViewerImageStore(
                 thumbnailProvider: { feed?.memoryImage(for: $0) },
-                cachedThumbnailProvider: { await feed?.cachedImage(for: $0) },
+                cachedThumbnailProvider: { uid in
+                    if let visibleThumbnail { return await visibleThumbnail.cachedImage(for: uid) }
+                    return await feed?.cachedImage(for: uid)
+                },
                 media: media,
                 originalDataOverride: originalFetch))
     }
@@ -280,13 +289,15 @@ struct MobilePhotoViewer: View {
             Button(L10n.string("action.ok"), role: .cancel) { saveToLibraryMessage = nil }
         }
         .albumActionFailureAlert(libraryModel.albumActions)
-        .onChange(of: currentBaseItem?.uid) { _, _ in
+        .onChange(of: currentBaseItem?.uid) { _, uid in
             cancelViewerMutationPresentation()
             liveTextHighlighted = false
+            visibleThumbnail?.select(uid)
         }
         .onDisappear {
             cancelViewerMutationPresentation()
             titleMetadataCoordinator.cancelAll()
+            visibleThumbnail?.end()
         }
         .animation(
             MobileViewerMotionPolicy.animation(.smooth(duration: 0.24), reduceMotion: reduceMotion),
@@ -305,6 +316,7 @@ struct MobilePhotoViewer: View {
                 selectedUID: currentBaseItem?.uid,
                 feed: libraryModel.thumbnailFeed,
                 itemSide: min(46, profile.filmstripHeight),
+                allowsVisibleDuplicateThumbnails: duplicateGroup != nil,
                 onSelect: selectPage
             )
             .frame(height: profile.filmstripHeight)

@@ -92,6 +92,12 @@ final class LocalizationTests: XCTestCase {
         }
     }
 
+    func testDuplicateThumbnailUnavailableLabelIsEnglishAndGerman() throws {
+        let key = "duplicates.thumbnail_unavailable"
+        XCTAssertEqual(try localizedValue(key, language: "en", in: packageCatalog), "Thumbnail unavailable")
+        XCTAssertEqual(try localizedValue(key, language: "de", in: packageCatalog), "Vorschaubild nicht verfügbar")
+    }
+
     func testSharedLibraryTitleLivesInCore() throws {
         XCTAssertEqual(try localizedValue("library.title", language: "en", in: packageCatalog), "Library")
         XCTAssertEqual(try localizedValue("library.title", language: "de", in: packageCatalog), "Mediathek")

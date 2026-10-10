@@ -609,6 +609,152 @@ struct ThumbnailFeedCoreTests {
         #expect(feed.memoryDecoded(for: uid) != nil, "the image stays in the bounded decoded tier, not in a view")
     }
 
+    @Test func duplicateCachedOutsideTheLibraryScopeAppearsWithinOneSecond() async throws {
+        let listed = Self.uid("duplicates-listed")
+        let duplicate = Self.uid("duplicates-outside-scope")
+        let cache = Self.cache("duplicates-outside-scope")
+        let loader = RecordingLoader()
+        let feed = ThumbnailFeedCore(cache: cache, loader: loader, configuration: Self.configuration())
+        await feed.setPrefetchEnabled(false)
+        cache.storeToDisk(Self.pngData(width: 24, height: 24), for: duplicate)
+        #expect(cache.diskData(for: duplicate) != nil, "a blank tile is backed by an encrypted disk thumbnail")
+        let graph = LibrarySourceGraph()
+        let source = LibrarySource(id: SourceID("duplicates-cached-library"), capabilities: .readThumbnail)
+        _ = graph.commitSourceSet([source], using: graph.beginSourceSetRefresh())
+        let change = try #require(graph.installCachedInventory(Self.sourceItems([listed]), for: source.id))
+        #expect(await feed.bindDerivedDataEpoch(graph.runtimeEpoch))
+        _ = await feed.reconcile(
+            selected: change.selectedScope, analysis: change.analysisScope,
+            retention: change.thumbnailRetentionScope)
+        #expect(cache.diskFileCount() == 1, "partial inventory must keep the encrypted thumbnail")
+        #expect(!change.thumbnailRetentionScope.uids.contains(duplicate))
+        #expect(await feed.requestPriority(duplicate) == false, "the library grid must stay fail-closed")
+        #expect(await feed.decoded(for: duplicate) == nil, "without an access the tile stays blank (#439)")
+        let access = feed.beginVisibleThumbnailAccess(for: duplicate)
+        defer { access.end() }
+        let tile = Task { await feed.visibleDecoded(for: duplicate, access: access) }
+        let appeared = ContinuousClock.now
+        while appeared.duration(to: .now) < .milliseconds(900),
+            feed.memoryDecoded(for: duplicate, access: access) == nil
+        {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(
+            feed.memoryDecoded(for: duplicate, access: access) != nil,
+            "the visible duplicate must show its cached thumbnail")
+        #expect(appeared.duration(to: .now) < .seconds(1))
+        tile.cancel()
+        _ = await tile.value
+        #expect(await loader.requestCount() == 0, "cached tiles need no network request")
+        #expect(feed.memoryDecoded(for: duplicate) == nil, "the grant never widens the library grid's read")
+        let other = feed.beginVisibleThumbnailAccess(for: listed)
+        #expect(feed.memoryDecoded(for: duplicate, access: other) == nil, "an access reads only its own photo")
+        other.end()
+        #expect(feed.openVisibleThumbnailAccessUIDs == [duplicate])
+        access.end()
+        #expect(feed.memoryDecoded(for: duplicate, access: access) == nil, "the tile left the screen")
+        #expect(await feed.cachedDecoded(for: duplicate, access: access) == nil)
+        #expect(feed.openVisibleThumbnailAccessUIDs.isEmpty)
+        await feed.stopPrefetchAndWait()
+    }
+
+    @Test func adoptedPhotoOutsideTheCacheScopeKeepsTheCacheReadCheck() async throws {
+        let local = PhotoUID(localPending: .photoLibrary, identifier: "asset-cache-scope")
+        let remote = Self.uid("adopted-outside-cache-scope")
+        let listed = Self.uid("adopted-cache-scope-listed")
+        let cache = Self.cache("adopted-outside-cache-scope")
+        cache.storeToDisk(Self.pngData(width: 24, height: 24), for: remote)
+        let feed = ThumbnailFeedCore(cache: cache, loader: RecordingLoader(), configuration: Self.configuration())
+        await feed.setPrefetchEnabled(false)
+        let graph = LibrarySourceGraph()
+        let source = LibrarySource(id: SourceID("adopted-cache-scope"), capabilities: .readThumbnail)
+        _ = graph.commitSourceSet([source], using: graph.beginSourceSetRefresh())
+        let change = try #require(graph.installCachedInventory(Self.sourceItems([listed]), for: source.id))
+        #expect(await feed.bindDerivedDataEpoch(graph.runtimeEpoch))
+        _ = await feed.reconcile(
+            selected: change.selectedScope, analysis: change.analysisScope,
+            retention: change.thumbnailRetentionScope)
+        #expect(cache.diskFileCount() == 1)
+        await feed.setLocalThumbnailLoader(StubLocalThumbnails(image: Self.decodedThumb(16, 16)))
+        await feed.setLocalAuthorization([local])
+        _ = await feed.decoded(for: local)
+        #expect(await feed.adoptDecoded(from: local, to: remote), "the feed authorizes the adopted photo")
+        feed.applyDecodedMemoryPressure(scale: 1, purge: true)
+        #expect(feed.memoryDecoded(for: remote) == nil)
+        #expect(
+            await feed.cachedDecoded(for: remote) == nil,
+            "a grid read without an access keeps the cache's own retention check")
+        await feed.stopPrefetchAndWait()
+    }
+
+    @Test func visibleThumbnailAccessEndsWithTheFeedStopAndTheCacheClear() async throws {
+        let duplicate = Self.uid("duplicates-access-fences")
+        let cache = Self.cache("duplicates-access-fences")
+        cache.storeToDisk(Self.pngData(width: 24, height: 24), for: duplicate)
+        let feed = ThumbnailFeedCore(cache: cache, loader: RecordingLoader(), configuration: Self.configuration())
+        await feed.setPrefetchEnabled(false)
+        let stopped = feed.beginVisibleThumbnailAccess(for: duplicate)
+        #expect(await feed.cachedDecoded(for: duplicate, access: stopped) != nil)
+        await feed.stopPrefetchAndWait()
+        #expect(feed.memoryDecoded(for: duplicate, access: stopped) == nil, "a feed stop revokes every access")
+        #expect(await feed.cachedDecoded(for: duplicate, access: stopped) == nil)
+
+        let cleared = feed.beginVisibleThumbnailAccess(for: duplicate)
+        #expect(await feed.cachedDecoded(for: duplicate, access: cleared) != nil)
+        await cache.clear()
+        #expect(feed.memoryDecoded(for: duplicate, access: cleared) == nil, "a cache clear revokes every access")
+        #expect(await feed.cachedDecoded(for: duplicate, access: cleared) == nil)
+        stopped.end()
+        cleared.end()
+        #expect(feed.openVisibleThumbnailAccessUIDs.isEmpty)
+    }
+
+    @MainActor @Test func visibleThumbnailSessionKeepsAccessOnlyForTheShownPhoto() async throws {
+        let first = Self.uid("duplicates-session-first")
+        let second = Self.uid("duplicates-session-second")
+        let cache = Self.cache("duplicates-session")
+        cache.storeToDisk(Self.pngData(width: 24, height: 24), for: first)
+        cache.storeToDisk(Self.pngData(width: 24, height: 24), for: second)
+        let feed = ThumbnailFeedCore(cache: cache, loader: RecordingLoader(), configuration: Self.configuration())
+        await feed.setPrefetchEnabled(false)
+        let session = VisibleThumbnailSession(feed: feed)
+        session.select(first)
+        #expect(await session.cachedDecoded(for: first) != nil, "the shown copy reads its cached thumbnail")
+        #expect(await session.cachedDecoded(for: second) == nil, "a copy that is not shown has no access")
+        session.select(second)
+        #expect(feed.openVisibleThumbnailAccessUIDs == [second], "a new selection revokes the previous copy")
+        #expect(session.memoryDecoded(for: first) == nil)
+        #expect(await session.visibleDecoded(for: second) != nil)
+        session.end()
+        #expect(feed.openVisibleThumbnailAccessUIDs.isEmpty, "closing the viewer revokes its access")
+        #expect(session.memoryDecoded(for: second) == nil)
+        await feed.stopPrefetchAndWait()
+    }
+
+    @Test func cachedDuplicateSurvivesLibraryViewportReplacement() async throws {
+        let duplicate = Self.uid("duplicates-viewport")
+        let cache = Self.cache("duplicates-viewport")
+        cache.storeToDisk(Self.pngData(width: 24, height: 24), for: duplicate)
+        let loader = RecordingLoader()
+        let feed = ThumbnailFeedCore(cache: cache, loader: loader, configuration: Self.configuration())
+        await feed.setPrefetchEnabled(false)
+        #expect(await feed.requestPriority(duplicate))
+        _ = await feed.replaceVisiblePriorityDemand([])
+        #expect(await feed.prefetchStatus().currentQueueLength == 0, "the grid drops unowned visible priority")
+        let appeared = ContinuousClock.now
+        let tile = Task { await feed.visibleDecoded(for: duplicate) }
+        for _ in 0..<90 where feed.memoryDecoded(for: duplicate) == nil {
+            _ = await feed.replaceVisiblePriorityDemand([])
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(feed.memoryDecoded(for: duplicate) != nil, "direct disk decode does not depend on the queue")
+        #expect(appeared.duration(to: .now) < .seconds(1))
+        tile.cancel()
+        _ = await tile.value
+        #expect(await loader.requestCount() == 0)
+        await feed.stopPrefetchAndWait()
+    }
+
     @Test func visibleDecodedStopsWithoutAnImageWhenTheViewLeaves() async throws {
         let uid = Self.uid("visible-decoded-cancel")
         let loader = RecordingLoader(payloads: [:], delayMilliseconds: 0)

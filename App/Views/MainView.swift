@@ -1078,7 +1078,9 @@ struct MainView: View {
         return nil
     }
 
-    private func makeViewer(_ item: PhotoItem, _ items: [PhotoItem]) -> PhotoViewerModel {
+    private func makeViewer(
+        _ item: PhotoItem, _ items: [PhotoItem], allowsVisibleDuplicateThumbnails: Bool = false
+    ) -> PhotoViewerModel {
         let index = items.firstIndex(of: item) ?? 0
         let offline = OfflineLibraryManager.shared
         // Pending photos that are not in Proton yet open from Apple Photos; everything else from Proton.
@@ -1093,7 +1095,8 @@ struct MainView: View {
             previewCache: offline.previewCache,
             originalsCache: offline.originalsCache,
             cacheOriginals: offline.offlineEnabled,
-            originalsCapBytes: offline.originalsCapBytes)
+            originalsCapBytes: offline.originalsCapBytes,
+            allowsVisibleDuplicateThumbnails: allowsVisibleDuplicateThumbnails)
     }
 
     /// Shows local photos on their way to Proton in the whole-library grid.
@@ -1700,7 +1703,7 @@ struct MainView: View {
             timelineModel.allLibraryItems(matching: Set(members)).map { ($0.uid, $0) },
             uniquingKeysWith: { first, _ in first })
         guard let opened = duplicates?.viewerItems(opening: uid, inGroup: groupID, item: { found[$0] }) else { return }
-        let viewer = makeViewer(opened.items[opened.index], opened.items)
+        let viewer = makeViewer(opened.items[opened.index], opened.items, allowsVisibleDuplicateThumbnails: true)
         viewerFollowsReplacements = false
         zoom = nil
         viewerModel = viewer

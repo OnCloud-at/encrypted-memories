@@ -448,6 +448,7 @@ public struct PhotoViewerView: View {
                 feed: model.thumbnailFeed,
                 itemSide: itemSide,
                 showsHorizontalScroller: needsScroller,
+                allowsVisibleDuplicateThumbnails: model.allowsVisibleDuplicateThumbnails,
                 onSelect: onSelect
             )
             .frame(height: itemSide + (needsScroller ? 18 : 0))

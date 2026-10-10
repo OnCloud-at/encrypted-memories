@@ -380,4 +380,36 @@ final class ProjectHygieneTests: XCTestCase {
             "macOS and iOS/iPadOS targets must embed the one shared privacy manifest"
         )
     }
+
+    /// A literal key that no catalog owns renders as the raw key, for example as a VoiceOver label.
+    func testEveryLiteralLocalizationKeyHasACatalogEntry() throws {
+        var known = Set<String>()
+        for path in [
+            "App/Localizable.xcstrings", "iOSApp/Localizable.xcstrings",
+            "Packages/EncryptedMemoriesKit/Sources/PhotosCore/Resources/Localizable.xcstrings",
+        ] {
+            let data = try Data(contentsOf: repoRoot.appendingPathComponent(path))
+            let catalog = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+            known.formUnion(try XCTUnwrap(catalog["strings"] as? [String: Any]).keys)
+        }
+        let literal = try NSRegularExpression(pattern: #"L10n\.string\(\s*"((?:[^"\\]|\\.)*)""#)
+        var checked = 0
+        var missing: [String] = []
+        for root in ["App", "iOSApp", "Packages/EncryptedMemoriesKit/Sources"] {
+            for url in sourceFiles(in: repoRoot.appendingPathComponent(root)) where url.pathExtension == "swift" {
+                let text = try String(contentsOf: url, encoding: .utf8)
+                let range = NSRange(text.startIndex..., in: text)
+                for match in literal.matches(in: text, range: range) {
+                    guard let keyRange = Range(match.range(at: 1), in: text) else { continue }
+                    let key = String(text[keyRange])
+                    // An interpolated key resolves to a format key such as "a11y.grid.position %lld %lld".
+                    guard !key.contains("\\(") else { continue }
+                    checked += 1
+                    if !known.contains(key) { missing.append("\(url.lastPathComponent): \(key)") }
+                }
+            }
+        }
+        XCTAssertGreaterThan(checked, 100, "the scan must find the literal keys")
+        XCTAssertEqual(missing, [], "literal keys without a catalog entry")
+    }
 }

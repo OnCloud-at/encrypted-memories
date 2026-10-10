@@ -40,10 +40,7 @@ struct MobileDuplicatesScreen: View {
     }
 
     private var thumbnails: ExactDuplicateThumbnails {
-        let feed = feed
-        return ExactDuplicateThumbnails(
-            read: { uid in feed?.memoryImage(for: uid).map { Image(uiImage: $0) } },
-            load: { uid in _ = await feed?.feedCore.visibleDecoded(for: uid) })
+        ExactDuplicateThumbnails(feedCore: feed?.feedCore)
     }
 
     /// Opens `uid` with the other photos of its group that the library shows.
