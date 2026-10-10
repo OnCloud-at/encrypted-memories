@@ -100,7 +100,7 @@ def test_project(source, automation, platform):
     text = text.replace(shipping_id, 'PRODUCT_BUNDLE_IDENTIFIER: at.oncloud.encryptedmemories.upgrade-test\n')
     ui = source / 'UpgradeUITests'
     ui.mkdir()
-    shutil.copy2(automation / 'scripts/upgrade-test/UITests/UpgradeJourneyUITests.swift', ui)
+    shutil.copytree(automation / 'scripts/upgrade-test/UITests', ui, dirs_exist_ok=True)
     target = f'''  UpgradeJourneyUITests:
     type: bundle.ui-testing
     platform: {platform}
