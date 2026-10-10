@@ -22,12 +22,10 @@ final class MobileDuplicateCachedThumbnailTests: XCTestCase {
                 MobileDuplicatesScreen(model: duplicates, feed: fixture.feed)
                     .environment(fixture.library).environment(MobileViewerRouter())
             })
-        let start = ContinuousClock.now
-        while start.duration(to: .now) < .milliseconds(900), !hasRedPixels(fixture.root.view) {
-            try await Task.sleep(for: .milliseconds(10))
-        }
+        // The backend has no thumbnail or preview bytes, so a red image can only come from the encrypted cache.
+        XCTAssertTrue(fixture.backend.thumbnails.isEmpty)
+        try await waitUntil { hasRedPixels(fixture.root.view) }
         XCTAssertTrue(hasRedPixels(fixture.root.view), "the cached Duplicates tile must replace the loading glyph")
-        XCTAssertLessThan(start.duration(to: .now), .seconds(1))
         XCTAssertNil(fixture.feed.memoryImage(for: fixture.item.uid), "the library grid remains unauthorized")
         XCTAssertTrue(fixture.feed.feedCore.openVisibleThumbnailAccessUIDs.contains(fixture.item.uid))
         fixture.show(Color.black)
@@ -45,12 +43,10 @@ final class MobileDuplicateCachedThumbnailTests: XCTestCase {
                 items: [fixture.item], startIndex: 0, context: .library,
                 libraryModel: fixture.library, viewerRouter: MobileViewerRouter(),
                 duplicateGroup: MobileDuplicateViewerGroup(model: duplicates)))
-        let start = ContinuousClock.now
-        while start.duration(to: .now) < .milliseconds(900), !viewerHasRedImage(fixture.root.view) {
-            try await Task.sleep(for: .milliseconds(10))
-        }
+        // The backend has no thumbnail or preview bytes, so a red image can only come from the encrypted cache.
+        XCTAssertTrue(fixture.backend.thumbnails.isEmpty)
+        try await waitUntil { viewerHasRedImage(fixture.root.view) }
         XCTAssertTrue(viewerHasRedImage(fixture.root.view), "the first frame must come from the cached thumbnail")
-        XCTAssertLessThan(start.duration(to: .now), .seconds(1))
         fixture.show(Color.black)
         try await waitUntilRevoked(fixture.feed)
         let accepted = await fixture.feed.feedCore.requestPriority(fixture.item.uid)
@@ -64,13 +60,11 @@ final class MobileDuplicateCachedThumbnailTests: XCTestCase {
             MobileViewerFilmstrip(
                 items: [fixture.item], selectedUID: fixture.item.uid, feed: fixture.feed, itemSide: 64,
                 allowsVisibleDuplicateThumbnails: true, onSelect: { _ in }))
-        let start = ContinuousClock.now
-        while start.duration(to: .now) < .milliseconds(900), !filmstripHasRedImage(fixture.root.view) {
-            try await Task.sleep(for: .milliseconds(10))
-        }
+        // The backend has no thumbnail or preview bytes, so a red image can only come from the encrypted cache.
+        XCTAssertTrue(fixture.backend.thumbnails.isEmpty)
+        try await waitUntil { filmstripHasRedImage(fixture.root.view) }
         XCTAssertTrue(
             filmstripHasRedImage(fixture.root.view), "the visible filmstrip copy must render its encrypted cache")
-        XCTAssertLessThan(start.duration(to: .now), .seconds(1))
         XCTAssertEqual(fixture.feed.feedCore.openVisibleThumbnailAccessUIDs, [fixture.item.uid])
         fixture.show(Color.black)
         try await waitUntilRevoked(fixture.feed)
@@ -78,12 +72,18 @@ final class MobileDuplicateCachedThumbnailTests: XCTestCase {
         XCTAssertFalse(accepted)
     }
 
-    /// SwiftUI tears a removed view down on a later main-actor turn.
-    private func waitUntilRevoked(_ feed: UIKitThumbnailFeed) async throws {
+    /// Polls until the condition holds. The limit only guards against a hang; a saturated hosted runner may need
+    /// several seconds, so the tests prove the image source instead of measuring time.
+    private func waitUntil(_ condition: () -> Bool) async throws {
         let start = ContinuousClock.now
-        while start.duration(to: .now) < .seconds(1), !feed.feedCore.openVisibleThumbnailAccessUIDs.isEmpty {
+        while start.duration(to: .now) < .seconds(10), !condition() {
             try await Task.sleep(for: .milliseconds(10))
         }
+    }
+
+    /// SwiftUI tears a removed view down on a later main-actor turn.
+    private func waitUntilRevoked(_ feed: UIKitThumbnailFeed) async throws {
+        try await waitUntil { feed.feedCore.openVisibleThumbnailAccessUIDs.isEmpty }
         XCTAssertEqual(feed.feedCore.openVisibleThumbnailAccessUIDs, [], "a removed surface revokes its access")
     }
 
@@ -144,6 +144,7 @@ final class MobileDuplicateCachedThumbnailTests: XCTestCase {
         let seed: MobileSignedInFixture
         let library = MobileLibraryModel()
         let feed: UIKitThumbnailFeed
+        let backend: MobileFixtureBackend
         let item: PhotoItem
         let root = UIHostingController(rootView: AnyView(Color.black))
         let window: UIWindow
@@ -161,7 +162,7 @@ final class MobileDuplicateCachedThumbnailTests: XCTestCase {
                 context.fill(CGRect(x: 0, y: 0, width: 24, height: 24))
             }
             cache.storeToDisk(try XCTUnwrap(red.pngData()), for: item.uid)
-            let backend = MobileFixtureBackend(sections: seed.sections, thumbnails: [:])
+            backend = MobileFixtureBackend(sections: seed.sections, thumbnails: [:])
             feed = UIKitThumbnailFeed(cache: cache, loader: backend)
             await feed.feedCore.setPrefetchEnabled(false)
             seed.install(

@@ -6,6 +6,9 @@ enum ConfirmationDialogTestError: Error {
 }
 
 extension XCUIApplication {
+    /// Hosted snapshot stalls reached 19.3 s; allow several cycles for each dialog wait.
+    static let dialogWaitTimeout: TimeInterval = 45
+
     /// The system dialog can list an action twice; wait for a hittable copy instead of using a hidden fallback.
     func hittableDialogButton(_ identifier: String) throws -> XCUIElement {
         let matches = buttons.matching(identifier: identifier)
@@ -13,7 +16,7 @@ extension XCUIApplication {
             predicate: NSPredicate { _, _ in matches.allElementsBoundByIndex.contains { $0.isHittable } },
             object: nil
         )
-        guard XCTWaiter.wait(for: [ready], timeout: 5) == .completed,
+        guard XCTWaiter.wait(for: [ready], timeout: Self.dialogWaitTimeout) == .completed,
             let button = matches.allElementsBoundByIndex.first(where: { $0.isHittable })
         else { throw ConfirmationDialogTestError.notHittable(identifier) }
         return button
@@ -29,8 +32,8 @@ extension XCUIApplication {
             let acknowledged = XCTNSPredicateExpectation(
                 predicate: NSPredicate(format: "exists == false"), object: buttons[identifier].firstMatch
             )
-            // Hosted snapshot stalls reached 19.3 s; allow several cycles before retrying input.
-            if XCTWaiter.wait(for: [acknowledged], timeout: 45) == .completed { return }
+            // Allow several snapshot cycles before retrying input.
+            if XCTWaiter.wait(for: [acknowledged], timeout: Self.dialogWaitTimeout) == .completed { return }
         }
         throw ConfirmationDialogTestError.notAcknowledged(identifier)
     }
