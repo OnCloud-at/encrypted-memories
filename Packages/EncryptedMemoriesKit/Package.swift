@@ -290,9 +290,10 @@ let package = Package(
         .testTarget(
             name: "AlbumSyncCoreTests", dependencies: ["AlbumSyncCore", "AlbumCore", "UploadCore", "PhotosCore"],
             swiftSettings: disableDynamicActorIsolation),
-        // The account state that all of the owner's devices agree on: hidden photos and account settings. Pure Core.
-        .target(name: "AccountStateCore", dependencies: ["PhotosCore"]),
-        .testTarget(name: "AccountStateCoreTests", dependencies: ["AccountStateCore", "PhotosCore"]),
+        // The account state that all of the owner's devices agree on, and its coordinator. Pure Core.
+        .target(name: "AccountStateCore", dependencies: ["PhotosCore", "DeviceRootCore"]),
+        .testTarget(
+            name: "AccountStateCoreTests", dependencies: ["AccountStateCore", "PhotosCore", "DeviceRootCore"]),
         .target(name: "DeviceRootCore"),
         .testTarget(name: "DeviceRootCoreTests", dependencies: ["DeviceRootCore"]),
         .target(name: "DeviceRootAppleAdapter", dependencies: ["DeviceRootCore"]),

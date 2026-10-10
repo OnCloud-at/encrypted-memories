@@ -118,8 +118,8 @@ final class CoreArchitectureGateTests: XCTestCase {
         ),
         CoreTargetRule(
             name: "AccountStateCore",
-            allowedImports: ["Foundation", "PhotosCore"],
-            expectedDependencies: ["PhotosCore"],
+            allowedImports: ["Foundation", "PhotosCore", "DeviceRootCore"],
+            expectedDependencies: ["PhotosCore", "DeviceRootCore"],
             extraForbiddenTokens: []
         ),
         CoreTargetRule(
