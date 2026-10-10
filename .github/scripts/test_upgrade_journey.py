@@ -27,6 +27,68 @@ import run_journey
 
 
 class UpgradeJourneyTests(unittest.TestCase):
+    @unittest.skipUnless(sys.platform == 'darwin', 'Native Settings controls require macOS')
+    def test_native_macos_settings_pane_retries_only_unacknowledged_clicks(self):
+        repo = Path(__file__).resolve().parents[2]
+        scratch = Path(os.environ.get('ENCRYPTED_MEMORIES_BUILD_ROOT',
+            str(Path.home() / 'Developer/xcode/EncryptedMemories'))) / 'UpgradeSettings'
+        scratch.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=scratch) as temporary:
+            root = Path(temporary)
+            main = root / 'main.swift'
+            main.write_text(r"""
+for pane in ["Backup", "Smart Search"] {
+    for dropped in 0...2 {
+        var clicks = 0
+        var acknowledged = false
+        var success = false
+        do {
+            try SettingsPaneTestSupport.select(pane, click: {
+                clicks += 1
+                if clicks > dropped { acknowledged = true }
+            }, isAcknowledged: { acknowledged }, waitForAcknowledgement: { acknowledged })
+            success = true
+        } catch SettingsPaneTestError.notAcknowledged(let name) {
+            precondition(name == pane)
+            precondition(String(describing: SettingsPaneTestError.notAcknowledged(name))
+                == "Settings did not select the \(pane) pane after two clicks")
+        } catch {
+            fatalError("Unexpected Settings control error: \(error)")
+        }
+        print("\(pane)|\(dropped)|\(clicks)|\(success)")
+    }
+    var clicks = 0
+    var checks = 0
+    var success = false
+    do {
+        try SettingsPaneTestSupport.select(pane, click: { clicks += 1 }, isAcknowledged: {
+            checks += 1
+            return true
+        }, waitForAcknowledgement: { false })
+        success = true
+    } catch SettingsPaneTestError.notAcknowledged(let name) {
+        precondition(name == pane)
+    } catch {
+        fatalError("Unexpected Settings control error: \(error)")
+    }
+    print("\(pane)|late|\(clicks)|\(checks)|\(success)")
+}
+""")
+            binary = root / 'settings-controls'
+            subprocess.run(['xcrun', 'swiftc', '-O',
+                str(repo / 'scripts/upgrade-test/UITests/SettingsPaneTestSupport.swift'),
+                str(main), '-o', str(binary)], check=True, capture_output=True, text=True)
+            result = subprocess.run([str(binary)], check=True, capture_output=True, text=True)
+            rows = [line.split('|') for line in result.stdout.splitlines()]
+            expected = []
+            for pane in ['Backup', 'Smart Search']:
+                expected.extend([[pane, '0', '1', 'true'], [pane, '1', '2', 'true'],
+                                 [pane, '2', '2', 'false'], [pane, 'late', '1', '1', 'true']])
+            self.assertEqual(len(rows), len(expected))
+            for actual, wanted in zip(rows, expected):
+                with self.subTest(pane=wanted[0], dropped=wanted[1]):
+                    self.assertEqual(actual, wanted)
+
     def test_repeated_cancellation_does_not_interrupt_owned_cleanup(self):
         with tempfile.TemporaryDirectory() as root:
             root = Path(root)
@@ -181,10 +243,47 @@ with SigningIdentity(root) as signer:
                 run_journey.main()
             toolchain = next((root / 'evidence').glob('*/toolchain.json'))
             self.assertEqual(json.loads(toolchain.read_text()), {'xcode': 'arm64', 'platform': 'macOS', 'target': 'HEAD'})
+            command.assert_any_call(['xcrun', 'swift', str(repo / 'scripts/upgrade-test/metal_devices.swift')])
             invocation = command.call_args.args[0]
             self.assertEqual(invocation[:3], ['xcrun', 'xcodebuild', 'build-for-testing'])
             self.assertIn('UpgradeJourney', invocation)
             self.assertIn('ENABLE_HARDENED_RUNTIME=NO', invocation)
+
+    def test_cached_ui_runner_refreshes_support_files_before_each_compile(self):
+        repo = Path(__file__).resolve().parents[2]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            automation = root / 'automation'
+            inputs = automation / 'scripts/upgrade-test/UITests'
+            inputs.mkdir(parents=True)
+            (inputs / 'UpgradeJourneyUITests.swift').write_text('current journey')
+            source = root / 'cached/source'
+            ui = source / 'UpgradeUITests'
+            ui.mkdir(parents=True)
+            (ui / 'SettingsPaneTestSupport.swift').write_text('cached support')
+            products = source.parent / 'build/DerivedData.noindex/Build/Products'
+            products.mkdir(parents=True)
+            (products / 'runner.xctestrun').touch()
+            cached = Build(root / 'fixture.app', source)
+            arguments = ['run_journey', '--repo', str(repo), '--automation', str(automation),
+                         '--root', str(root), '--target', 'HEAD', '--sources', 'v1.0.5',
+                         '--platform', 'macOS', '--working-copy']
+            compiled = []
+
+            def command(args, **kwargs):
+                if args[:3] == ['xcrun', 'xcodebuild', 'build-for-testing']:
+                    compiled.append((ui / 'SettingsPaneTestSupport.swift').read_text())
+                    self.assertEqual((ui / 'UpgradeJourneyUITests.swift').read_text(), 'current journey')
+
+            with patch.object(sys, 'argv', arguments), patch.object(run_journey, 'build_app', return_value=cached), \
+                    patch('keychain_entitlements.snapshot', return_value={}), \
+                    patch.object(run_journey, 'SigningIdentity'), patch.object(run_journey, 'run_cases'), \
+                    patch.object(run_journey, 'output', return_value='arm64'), \
+                    patch.object(run_journey, 'command', side_effect=command):
+                for version in ['first support', 'edited support']:
+                    (inputs / 'SettingsPaneTestSupport.swift').write_text(version)
+                    run_journey.main()
+            self.assertEqual(compiled, ['first support', 'edited support'])
 
     def test_macos_launch_passes_the_same_case_to_the_ui_runner_without_a_second_launcher(self):
         with tempfile.TemporaryDirectory() as root:

@@ -223,6 +223,10 @@ The test apps use Release optimization and the exact release commit, with
 `ENCRYPTED_MEMORIES_UPGRADE_TEST` set only for these separate builds.
 The archive and upload configurations never enable the synthetic account.
 Storage, migrations, and task algorithms run through their existing implementations.
+Only macOS upgrade probes admit devices without Metal 3 under
+`#if ENCRYPTED_MEMORIES_UPGRADE_TEST && os(macOS)`; shipping hardware admission stays unchanged.
+The journey logs the real Metal devices and their Metal 3 support. It retains the production
+grid and all rendered-pixel assertions, so failed rendering still fails the gate.
 Bundle metadata parity with shipping artifacts remains a separate limitation in [#411](https://github.com/OnCloud-at/encrypted-memories/issues/411).
 These journeys verify commit, storage, and task paths. They do not verify bundle metadata
 or external authentication headers. Tracked versions and build numbers remain unchanged.

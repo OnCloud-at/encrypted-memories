@@ -313,6 +313,8 @@ def main():
     args = parser.parse_args()
     toolchain = output(['xcodebuild', '-version'])
     summary('Xcode toolchain: ' + toolchain.replace('\n', '; '))
+    if args.platform == 'macOS':
+        command(['xcrun', 'swift', str(args.automation / 'scripts/upgrade-test/metal_devices.swift')])
     summary(CONSENT_LIMITATION)
     summary(LIMITATION)
     summary(METADATA_LIMITATION)
@@ -334,7 +336,7 @@ def main():
     source = current.source
     if source is None:
         raise JourneyError('The current build has no source for its UI runner')
-    shutil.copy2(args.automation / 'scripts/upgrade-test/UITests/UpgradeJourneyUITests.swift', source / 'UpgradeUITests')
+    shutil.copytree(args.automation / 'scripts/upgrade-test/UITests', source / 'UpgradeUITests', dirs_exist_ok=True)
     dd = source.parent / 'build/DerivedData.noindex'
     sdk = 'iphonesimulator' if args.platform == 'iOS' else 'macosx'
     command(['xcrun', 'xcodebuild', 'build-for-testing', '-project', 'EncryptedMemories.xcodeproj',
