@@ -27,6 +27,68 @@ import run_journey
 
 
 class UpgradeJourneyTests(unittest.TestCase):
+    @unittest.skipUnless(sys.platform == 'darwin', 'Native Settings controls require macOS')
+    def test_native_macos_settings_pane_retries_only_unacknowledged_clicks(self):
+        repo = Path(__file__).resolve().parents[2]
+        scratch = Path(os.environ.get('ENCRYPTED_MEMORIES_BUILD_ROOT',
+            str(Path.home() / 'Developer/xcode/EncryptedMemories'))) / 'UpgradeSettings'
+        scratch.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=scratch) as temporary:
+            root = Path(temporary)
+            main = root / 'main.swift'
+            main.write_text(r"""
+for pane in ["Backup", "Smart Search"] {
+    for dropped in 0...2 {
+        var clicks = 0
+        var acknowledged = false
+        var success = false
+        do {
+            try SettingsPaneTestSupport.select(pane, click: {
+                clicks += 1
+                if clicks > dropped { acknowledged = true }
+            }, isAcknowledged: { acknowledged }, waitForAcknowledgement: { acknowledged })
+            success = true
+        } catch SettingsPaneTestError.notAcknowledged(let name) {
+            precondition(name == pane)
+            precondition(String(describing: SettingsPaneTestError.notAcknowledged(name))
+                == "Settings did not select the \(pane) pane after two clicks")
+        } catch {
+            fatalError("Unexpected Settings control error: \(error)")
+        }
+        print("\(pane)|\(dropped)|\(clicks)|\(success)")
+    }
+    var clicks = 0
+    var checks = 0
+    var success = false
+    do {
+        try SettingsPaneTestSupport.select(pane, click: { clicks += 1 }, isAcknowledged: {
+            checks += 1
+            return true
+        }, waitForAcknowledgement: { false })
+        success = true
+    } catch SettingsPaneTestError.notAcknowledged(let name) {
+        precondition(name == pane)
+    } catch {
+        fatalError("Unexpected Settings control error: \(error)")
+    }
+    print("\(pane)|late|\(clicks)|\(checks)|\(success)")
+}
+""")
+            binary = root / 'settings-controls'
+            subprocess.run(['xcrun', 'swiftc', '-O',
+                str(repo / 'scripts/upgrade-test/UITests/SettingsPaneTestSupport.swift'),
+                str(main), '-o', str(binary)], check=True, capture_output=True, text=True)
+            result = subprocess.run([str(binary)], check=True, capture_output=True, text=True)
+            rows = [line.split('|') for line in result.stdout.splitlines()]
+            expected = []
+            for pane in ['Backup', 'Smart Search']:
+                expected.extend([[pane, '0', '1', 'true'], [pane, '1', '2', 'true'],
+                                 [pane, '2', '2', 'false'], [pane, 'late', '1', '1', 'true']])
+            self.assertEqual(len(rows), len(expected))
+            for actual, wanted in zip(rows, expected):
+                with self.subTest(pane=wanted[0], dropped=wanted[1]):
+                    self.assertEqual(actual, wanted)
+
     def test_repeated_cancellation_does_not_interrupt_owned_cleanup(self):
         with tempfile.TemporaryDirectory() as root:
             root = Path(root)

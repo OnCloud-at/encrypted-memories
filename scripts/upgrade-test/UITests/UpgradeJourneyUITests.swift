@@ -188,10 +188,36 @@ final class UpgradeJourneyUITests: XCTestCase {
             feature.tap()
         #else
             app.typeKey(",", modifierFlags: .command)
-            let tab = app.windows["Settings"].toolbars.buttons[
-                point.hasPrefix("backup.") ? "Backup" : "Smart Search"]
+            let settings = app.windows["Settings"]
+            XCTAssertTrue(settings.waitForExistence(timeout: 10), "The Settings window is missing")
+            let ready = XCTNSPredicateExpectation(
+                predicate: NSPredicate { _, _ in settings.exists && settings.isHittable }, object: nil)
+            XCTAssertEqual(
+                XCTWaiter.wait(for: [ready], timeout: 10), .completed,
+                "The Settings window did not become hittable")
+            app.activate()
+            let title = point.hasPrefix("backup.") ? "Backup" : "Smart Search"
+            let tab = settings.toolbars.buttons[title]
             XCTAssertTrue(tab.waitForExistence(timeout: 10))
-            tab.click()
+            let acknowledged = {
+                if title == "Backup" {
+                    return tab.isSelected || settings.buttons["Enable Photos backup…"].exists
+                }
+                return settings.switches["smartsearch.toggle"].exists
+            }
+            var clicks = 0
+            try SettingsPaneTestSupport.select(
+                title,
+                click: {
+                    clicks += 1
+                    if clicks == 2 { print("Settings pane \(title): repeat the unacknowledged toolbar click once") }
+                    tab.click()
+                }, isAcknowledged: acknowledged,
+                waitForAcknowledgement: {
+                    let selected = XCTNSPredicateExpectation(
+                        predicate: NSPredicate { _, _ in acknowledged() }, object: nil)
+                    return XCTWaiter.wait(for: [selected], timeout: 10) == .completed
+                })
         #endif
         if point.hasPrefix("backup.") {
             let enable = app.buttons["Enable Photos backup…"]
