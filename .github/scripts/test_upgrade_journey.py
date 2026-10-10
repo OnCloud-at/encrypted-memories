@@ -170,10 +170,16 @@ with SigningIdentity(root) as signer:
             products = source.parent / 'build/DerivedData.noindex/Build/Products'
             products.mkdir(parents=True)
             (products / 'runner.xctestrun').touch()
-            build = Build(root / 'fixture.app', source)
+            metadata = {'tag': 'v1.0.5', 'version': '1.0.5', 'build_number': '397223379', 'commit': 'a' * 40}
+            bundle = root / 'fixture.app/Contents'
+            bundle.mkdir(parents=True)
+            (bundle / 'Info.plist').write_bytes(plistlib.dumps({'CFBundleIdentifier': run_journey.BUNDLE,
+                'CFBundleShortVersionString': '1.0.5', 'CFBundleVersion': '397223379'}))
+            build = Build(root / 'fixture.app', source, metadata, 'a' * 40)
             arguments = ['run_journey', '--repo', str(repo), '--automation', str(repo),
                          '--root', str(root), '--target', 'HEAD', '--sources', 'v1.0.5', '--platform', 'macOS']
             with patch.object(sys, 'argv', arguments), patch.object(run_journey, 'build_app', return_value=build), \
+                    patch.object(run_journey, 'release_metadata', return_value=metadata), \
                     patch('keychain_entitlements.snapshot', return_value={}), \
                     patch.object(run_journey, 'SigningIdentity'), patch.object(run_journey, 'run_cases'), \
                     patch.object(run_journey, 'output', return_value='arm64'), \
@@ -404,7 +410,9 @@ with SigningIdentity(root) as signer:
             marker.write_bytes(b'separate booted device remains unchanged')
             repo = Path(__file__).resolve().parents[2]
             args = ['bash', str(repo / 'scripts/test-release-upgrade.sh'), '--target',
-                    os.environ['UPGRADE_NATIVE_TARGET'], '--sources', 'v1.0.5', '--platform', 'iOS']
+                    os.environ['UPGRADE_NATIVE_TARGET'], '--release-tag',
+                    os.environ.get('UPGRADE_RELEASE_TAG') or os.environ['UPGRADE_NATIVE_TARGET'],
+                    '--sources', 'v1.0.5', '--platform', 'iOS']
             if os.environ.get('UPGRADE_NATIVE_WORKING_COPY') == '1':
                 args.append('--working-copy')
             run_journey.command(args, cwd=repo)
@@ -522,7 +530,8 @@ else:
             target = os.environ['UPGRADE_NATIVE_SEED_TARGET']
             for tag in [target, 'v1.0.5']:
                 with self.subTest(tag=tag):
-                    build = build_app(repo, repo, tag, platform, root,
+                    metadata = run_journey.release_metadata(repo, repo, os.environ.get('UPGRADE_RELEASE_TAG') or target) if tag == target else None
+                    build = build_app(repo, repo, tag, platform, root, metadata=metadata,
                         working_copy=tag == target and os.environ.get('UPGRADE_NATIVE_WORKING_COPY') == '1')
                     case = evidence / platform / tag
                     case.mkdir(parents=True)
