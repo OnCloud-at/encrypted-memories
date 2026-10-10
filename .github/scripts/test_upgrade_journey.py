@@ -181,6 +181,7 @@ with SigningIdentity(root) as signer:
                 run_journey.main()
             toolchain = next((root / 'evidence').glob('*/toolchain.json'))
             self.assertEqual(json.loads(toolchain.read_text()), {'xcode': 'arm64', 'platform': 'macOS', 'target': 'HEAD'})
+            command.assert_any_call(['xcrun', 'swift', str(repo / 'scripts/upgrade-test/metal_devices.swift')])
             invocation = command.call_args.args[0]
             self.assertEqual(invocation[:3], ['xcrun', 'xcodebuild', 'build-for-testing'])
             self.assertIn('UpgradeJourney', invocation)

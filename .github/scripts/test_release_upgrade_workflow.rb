@@ -12,7 +12,7 @@ class ReleaseUpgradeWorkflowTest < Minitest::Test
   end
 
   def test_upgrade_script_behavior
-    %w[test_release_upgrade.py test_keychain_entitlements.py test_upgrade_journey.py].each do |script|
+    %w[test_release_upgrade.py test_keychain_entitlements.py test_upgrade_journey.py test_upgrade_metal.py].each do |script|
       assert system("python3", File.expand_path(script, __dir__)), "#{script} failed"
     end
   end

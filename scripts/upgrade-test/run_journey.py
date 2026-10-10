@@ -313,6 +313,8 @@ def main():
     args = parser.parse_args()
     toolchain = output(['xcodebuild', '-version'])
     summary('Xcode toolchain: ' + toolchain.replace('\n', '; '))
+    if args.platform == 'macOS':
+        command(['xcrun', 'swift', str(args.automation / 'scripts/upgrade-test/metal_devices.swift')])
     summary(CONSENT_LIMITATION)
     summary(LIMITATION)
     summary(METADATA_LIMITATION)
