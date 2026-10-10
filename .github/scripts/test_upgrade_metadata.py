@@ -246,6 +246,50 @@ class UpgradeMetadataTests(unittest.TestCase):
                 with self.assertRaisesRegex(JourneyError, 'explicit release tag'):
                     build_apps.release_metadata(REPO, REPO, 'HEAD')
 
+    def test_native_seed_caller_uses_explicit_release_metadata_for_untagged_head(self):
+        import inspect
+        from test_upgrade_journey import UpgradeJourneyTests
+
+        class ReachedCandidateBuild(Exception):
+            pass
+
+        def build(repo, automation, tag, platform, root, **kwargs):
+            self.assertEqual(tag, 'HEAD')
+            self.assertEqual(kwargs.get('metadata'), RELEASE,
+                             'The native seed caller must resolve the explicit published release')
+            raise ReachedCandidateBuild()
+
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {
+                'UPGRADE_NATIVE_SEED_TARGET': 'HEAD', 'UPGRADE_NATIVE_WORKING_COPY': '1',
+                'UPGRADE_RELEASE_TAG': RELEASE['tag'], 'ENCRYPTED_MEMORIES_BUILD_ROOT': directory}), \
+                patch.object(run_journey, 'output', return_value='Xcode fixture'), \
+                patch.object(run_journey, 'release_metadata', return_value=RELEASE) as metadata, \
+                patch.object(build_apps, 'build_app', side_effect=build):
+            with self.assertRaises(ReachedCandidateBuild):
+                inspect.unwrap(UpgradeJourneyTests.test_native_seed_identity_survives_restarts_and_reseeds_changed_cases_or_servers)(
+                    UpgradeJourneyTests())
+            metadata.assert_called_once_with(REPO, REPO, RELEASE['tag'])
+
+    def test_native_isolation_caller_passes_release_tag_as_an_argument(self):
+        import inspect
+        from test_upgrade_journey import UpgradeJourneyTests
+
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory) / 'OWN-SENTINEL'
+            (home / 'tmp').mkdir(parents=True)
+            devices = {'devices': {'runtime': [{'udid': 'OWN-SENTINEL', 'state': 'Booted'}]}}
+            with patch.dict(os.environ, {'UPGRADE_NATIVE_TARGET': 'HEAD',
+                    'UPGRADE_NATIVE_WORKING_COPY': '1', 'UPGRADE_RELEASE_TAG': RELEASE['tag']}), \
+                    patch.object(run_journey, 'output', side_effect=['OWN-SENTINEL', str(home), json.dumps(devices)]), \
+                    patch.object(run_journey, 'command') as command:
+                inspect.unwrap(UpgradeJourneyTests.test_native_journey_keeps_another_booted_simulator)(
+                    UpgradeJourneyTests())
+                journeys = [call.args[0] for call in command.call_args_list if call.args[0][0] == 'bash']
+                self.assertEqual(len(journeys), 1)
+                self.assertIn('--release-tag', journeys[0])
+                self.assertEqual(journeys[0][journeys[0].index('--release-tag') + 1], RELEASE['tag'])
+                self.assertNotIn('UPGRADE_RELEASE_TAG', run_journey.clean_environment())
+
 
 if __name__ == '__main__':
     unittest.main()

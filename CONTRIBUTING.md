@@ -261,10 +261,13 @@ A validated case identifier contains exactly 32 ASCII hexadecimal characters (`0
 The test entry rejects every other identifier with an explicit error before it can become an account path component.
 A changed case or server, or an old URL-only marker, requires a new seed.
 An unchanged case and server retain the existing session.
-The native seed regression uses `UPGRADE_NATIVE_SEED_TARGET=HEAD` and `UPGRADE_NATIVE_WORKING_COPY=1`
+The native seed regression uses `UPGRADE_NATIVE_SEED_TARGET=HEAD`, `UPGRADE_NATIVE_WORKING_COPY=1`,
+and `UPGRADE_RELEASE_TAG` set to an existing published release for the candidate metadata
 with `.github/scripts/test_upgrade_journey.py UpgradeJourneyTests.test_native_seed_identity_survives_restarts_and_reseeds_changed_cases_or_servers`.
 Set `UPGRADE_NATIVE_SEED_PLATFORM=iOS` to include the old-format file in a fresh owned simulator container.
 The default macOS run also checks that an unchanged identity preserves the saved session contents.
+The opt-in simulator-isolation regression also passes `UPGRADE_RELEASE_TAG` explicitly.
+Both regressions require published metadata even when the source is an untagged working-copy revision.
 Both macOS installations use one temporary self-signed identity, without release credentials.
 Only the synthetic macOS session persists outside the Data Protection Keychain.
 Production Keychain access groups must match the last supported stable release.

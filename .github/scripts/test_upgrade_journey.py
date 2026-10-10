@@ -410,7 +410,9 @@ with SigningIdentity(root) as signer:
             marker.write_bytes(b'separate booted device remains unchanged')
             repo = Path(__file__).resolve().parents[2]
             args = ['bash', str(repo / 'scripts/test-release-upgrade.sh'), '--target',
-                    os.environ['UPGRADE_NATIVE_TARGET'], '--sources', 'v1.0.5', '--platform', 'iOS']
+                    os.environ['UPGRADE_NATIVE_TARGET'], '--release-tag',
+                    os.environ.get('UPGRADE_RELEASE_TAG') or os.environ['UPGRADE_NATIVE_TARGET'],
+                    '--sources', 'v1.0.5', '--platform', 'iOS']
             if os.environ.get('UPGRADE_NATIVE_WORKING_COPY') == '1':
                 args.append('--working-copy')
             run_journey.command(args, cwd=repo)
@@ -528,7 +530,8 @@ else:
             target = os.environ['UPGRADE_NATIVE_SEED_TARGET']
             for tag in [target, 'v1.0.5']:
                 with self.subTest(tag=tag):
-                    build = build_app(repo, repo, tag, platform, root,
+                    metadata = run_journey.release_metadata(repo, repo, os.environ.get('UPGRADE_RELEASE_TAG') or target) if tag == target else None
+                    build = build_app(repo, repo, tag, platform, root, metadata=metadata,
                         working_copy=tag == target and os.environ.get('UPGRADE_NATIVE_WORKING_COPY') == '1')
                     case = evidence / platform / tag
                     case.mkdir(parents=True)
