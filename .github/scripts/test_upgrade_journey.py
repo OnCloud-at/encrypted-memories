@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Exercise the loopback oracle and the fail-closed upgrade journey."""
 import json
+import re
 import plistlib
 from pathlib import Path
 import sys
@@ -330,8 +331,9 @@ with SigningIdentity(root) as signer:
             if operation == 'list':
                 if args[3] == 'runtimes':
                     return json.dumps({'runtimes': [
-                        {'isAvailable': True, 'identifier': 'com.apple.CoreSimulator.SimRuntime.iOS-27-1', 'version': '27.1'},
-                        {'isAvailable': True, 'identifier': 'com.apple.CoreSimulator.SimRuntime.iOS-27-0', 'version': '27.0'},
+                        {'isAvailable': True, 'identifier': 'com.apple.CoreSimulator.SimRuntime.iOS-27-1', 'version': '27.1',
+                         'buildversion': 'NEWER'},
+                        dict(run_journey.IOS_RUNTIME, isAvailable=True),
                     ]})
                 return json.dumps({'devicetypes': [{'name': 'iPhone 17', 'identifier': 'phone'}]})
             if operation == 'create':
@@ -363,6 +365,7 @@ with SigningIdentity(root) as signer:
             runtime = json.loads((Path(directory) / 'simulator-runtime.json').read_text())
             self.assertEqual(runtime['identifier'], 'com.apple.CoreSimulator.SimRuntime.iOS-27-0')
             self.assertEqual(runtime['version'], '27.0')
+            self.assertEqual(runtime['buildversion'], '24A434', 'The pin is the build measured on the hosted runner')
             self.assertEqual(app.destination, 'platform=iOS Simulator,id=OWN-DEVICE')
             app.install(Path('/old.app'))
             app.launch(type('Server', (), {'url': 'http://127.0.0.1:1234'})(), seed=True)
@@ -385,9 +388,34 @@ with SigningIdentity(root) as signer:
                 run_journey.InstalledApp('iOS', Path(root))
             self.assertFalse(any(call.args[0][2] == 'create' for call in output.call_args_list))
 
+    def test_pinned_runtime_failures_name_the_expected_and_installed_runtime_before_creating_a_simulator(self):
+        pinned = dict(run_journey.IOS_RUNTIME, isAvailable=True)
+        expected = re.escape(run_journey.IOS_RUNTIME['buildversion'])
+        newer = {'isAvailable': True, 'identifier': 'com.apple.CoreSimulator.SimRuntime.iOS-27-1', 'version': '27.1',
+                 'buildversion': 'NEWER'}
+        cases = [
+            ('missing', [newer],
+             'not installed: expected .*build ' + expected + r'\), installed .*iOS-27-1 \(27\.1, build NEWER, available\)'),
+            ('other version', [dict(pinned, version='27.0.1')], r'differs from the pin: .*installed 27\.0\.1, build'),
+            ('other build', [dict(pinned, buildversion='OTHER')],
+             'differs from the pin: expected .*build ' + expected + r'\), installed 27\.0, build OTHER'),
+            ('unavailable', [dict(pinned, isAvailable=False)], 'installed but unavailable'),
+            ('duplicate', [pinned, dict(pinned, buildversion='OTHER')], 'Ambiguous .* 2 times with builds'),
+            ('duplicate with the same build', [pinned, dict(pinned)], 'Ambiguous .* 2 times with builds'),
+        ]
+        for name, runtimes, message in cases:
+            with self.subTest(name), tempfile.TemporaryDirectory() as root, \
+                    patch.object(run_journey, 'output', side_effect=[json.dumps({'runtimes': runtimes})]) as output, \
+                    patch.object(run_journey, 'command') as command:
+                with self.assertRaisesRegex(JourneyError, message):
+                    run_journey.InstalledApp('iOS', Path(root))
+                self.assertEqual(output.call_count, 1, 'No device query or creation may follow')
+                command.assert_not_called()
+        self.assertEqual(run_journey.select_ios_runtime([newer, pinned]), pinned,
+                         'A newer extra runtime must not change the selection')
+
     def test_boot_failure_still_deletes_only_the_owned_simulator(self):
-        replies = [json.dumps({'runtimes': [{'isAvailable': True, 'identifier':
-            'com.apple.CoreSimulator.SimRuntime.iOS-27-0', 'version': '27.0'}]}),
+        replies = [json.dumps({'runtimes': [dict(run_journey.IOS_RUNTIME, isAvailable=True)]}),
             json.dumps({'devicetypes': [{'name': 'iPhone 17', 'identifier': 'phone'}]}), 'OWN-DEVICE']
         with tempfile.TemporaryDirectory() as directory, patch.object(run_journey, 'output', side_effect=replies), \
                 patch.object(run_journey, 'command', side_effect=[JourneyError('boot failed'), None, None]) as command:
@@ -400,7 +428,7 @@ with SigningIdentity(root) as signer:
         sentinel = run_journey.output(['xcrun', 'simctl', 'create',
             'EncryptedMemoriesUpgradeIsolation-' + uuid.uuid4().hex,
             'com.apple.CoreSimulator.SimDeviceType.iPhone-17',
-            'com.apple.CoreSimulator.SimRuntime.iOS-27-0'])
+            run_journey.IOS_RUNTIME['identifier']])
         try:
             run_journey.command(['xcrun', 'simctl', 'boot', sentinel])
             run_journey.command(['xcrun', 'simctl', 'bootstatus', sentinel, '-b'])

@@ -28,9 +28,39 @@ LIMITATION = ('macOS-Keychain-Persistenz über das Update wird nicht im Prüfbau
 CONSENT_LIMITATION = ('The backup journey requires consent already saved on disk. The immediate v1.0.5 '
                      'Enable-to-SIGKILL case is a known historical limit and is not tested here.')
 
+# The exact iOS Simulator runtime that the journey evidence names. Measured on the hosted xcode-27 runner
+# with Xcode 27.0 (27A266a), image 20261006.0244.1. A runner image that changes it must fail visibly until
+# this pin is updated deliberately.
+IOS_RUNTIME = {'identifier': 'com.apple.CoreSimulator.SimRuntime.iOS-27-0', 'version': '27.0',
+               'buildversion': '24A434'}
+
 METADATA_SCOPE = ('The gate requires installed CFBundleShortVersionString and CFBundleVersion to equal '
                   'the published release data string-for-string before every old and new probe starts. '
                   'External authentication-header acceptance remains unverified.')
+
+
+def select_ios_runtime(runtimes, expected=IOS_RUNTIME):
+    """Return the pinned runtime; fail before any device exists when it is missing, ambiguous or different."""
+    name = f"{expected['identifier']} ({expected['version']}, build {expected['buildversion']})"
+    matches = [r for r in runtimes if r.get('identifier') == expected['identifier']]
+    if not matches:
+        installed = [f"{r.get('identifier')} ({r.get('version')}, build {r.get('buildversion')}, "
+                     f"{'available' if r.get('isAvailable') else 'unavailable'})" for r in runtimes
+                     if str(r.get('identifier', '')).startswith('com.apple.CoreSimulator.SimRuntime.iOS-')]
+        raise JourneyError('The pinned iOS Simulator runtime is not installed: expected ' + name + ', installed '
+                           + (', '.join(installed) or 'no iOS runtime'))
+    if len(matches) != 1:
+        raise JourneyError('Ambiguous Simulator runtime identifier: ' + expected['identifier'] + ' is installed '
+                           + str(len(matches)) + ' times with builds '
+                           + ', '.join(str(r.get('buildversion')) for r in matches) + '; expected ' + name)
+    runtime = matches[0]
+    installed = f"{runtime.get('version')}, build {runtime.get('buildversion')}"
+    if runtime.get('version') != expected['version'] or runtime.get('buildversion') != expected['buildversion']:
+        raise JourneyError('The installed iOS Simulator runtime differs from the pin: expected ' + name
+                           + ', installed ' + installed + '. Update IOS_RUNTIME in run_journey.py deliberately.')
+    if not runtime.get('isAvailable'):
+        raise JourneyError('The pinned iOS Simulator runtime is installed but unavailable: ' + name)
+    return runtime
 
 
 def summary(message):
@@ -157,13 +187,7 @@ class InstalledApp:
         self.case_id = uuid.uuid4().hex
         self.simulator = None
         if platform == 'iOS':
-            runtimes = json.loads(output(['xcrun', 'simctl', 'list', 'runtimes', '--json']))['runtimes']
-            available = [r for r in runtimes if r.get('isAvailable') and r['identifier'].startswith('com.apple.CoreSimulator.SimRuntime.iOS-') and r['version'].split('.')[0] == '27']
-            if not available:
-                raise JourneyError('No installed iOS Simulator runtime is available')
-            runtime = min(available, key=lambda r: tuple(map(int, r['version'].split('.'))))
-            if sum(r['identifier'] == runtime['identifier'] for r in runtimes) != 1:
-                raise JourneyError('Ambiguous Simulator runtime identifier: ' + runtime['identifier'])
+            runtime = select_ios_runtime(json.loads(output(['xcrun', 'simctl', 'list', 'runtimes', '--json']))['runtimes'])
             types = json.loads(output(['xcrun', 'simctl', 'list', 'devicetypes', '--json']))['devicetypes']
             phones = [d for d in types if d['name'] == 'iPhone 17']
             if not phones:
@@ -172,7 +196,8 @@ class InstalledApp:
             try:
                 (directory / 'simulator.txt').write_text(self.simulator + '\n')
                 (directory / 'simulator-runtime.json').write_text(json.dumps(runtime) + '\n')
-                print('Owned iOS Simulator runtime: ' + runtime['identifier'] + ' (' + runtime['version'] + ')', flush=True)
+                print('Owned iOS Simulator runtime: ' + runtime['identifier'] + ' (' + runtime['version'] + ', build '
+                      + runtime['buildversion'] + ')', flush=True)
                 print('Owned iOS Simulator: ' + self.simulator, flush=True)
                 command(['xcrun', 'simctl', 'boot', self.simulator])
                 command(['xcrun', 'simctl', 'bootstatus', self.simulator, '-b'])

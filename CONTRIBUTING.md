@@ -255,6 +255,8 @@ so distinct releases on one commit cannot reuse the wrong version or build numbe
 
 The iOS journey installs the new app with `simctl install` over the existing app.
 It never removes the app or resets its data between the old and new phases.
+It runs on the Simulator runtime pinned in `IOS_RUNTIME` of `scripts/upgrade-test/run_journey.py` (iOS 27.0, build 24A434).
+A missing, ambiguous, unavailable, or different runtime fails before a device exists; the message names the expected and the installed build.
 The new phase does not seed a session: loss of the real simulator Keychain entry fails the journey.
 The seed marker records both the loopback server URL and the case-specific account UID.
 A validated case identifier contains exactly 32 ASCII hexadecimal characters (`0-9`, `a-f`, `A-F`); its maximum length is 32.
