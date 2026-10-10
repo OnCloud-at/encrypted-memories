@@ -38,6 +38,20 @@ import Testing
         return String(decoding: data, as: UTF8.self).split(separator: "\n").map(String.init)
     }
 
+    /// These byte-preservation fixtures opt out of sanitizing their synthetic, undecodable media headers.
+    private func keepLocationForThisTest() -> () -> Void {
+        let defaults = UserDefaults.standard
+        let original = defaults.object(forKey: AppSettingsKey.removeLocationWhenSharing)
+        defaults.set(false, forKey: AppSettingsKey.removeLocationWhenSharing)
+        return {
+            if let original {
+                defaults.set(original, forKey: AppSettingsKey.removeLocationWhenSharing)
+            } else {
+                defaults.removeObject(forKey: AppSettingsKey.removeLocationWhenSharing)
+            }
+        }
+    }
+
     // MARK: - Naming
 
     @Test func decryptedFilenameWinsOverTheHeader() throws {
@@ -84,6 +98,8 @@ import Testing
     // MARK: - Destination writes
 
     @Test func singleExportInstallsTheCompleteOriginalAndReplacesAnExistingFile() async throws {
+        let restorePreference = keepLocationForThisTest()
+        defer { restorePreference() }
         let directory = try makeDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
         let destination = directory.appendingPathComponent("IMG_0001.HEIC")
@@ -112,6 +128,8 @@ import Testing
     }
 
     @Test func archiveExportNamesEveryEntryUniquelyAndReportsCompletion() async throws {
+        let restorePreference = keepLocationForThisTest()
+        defer { restorePreference() }
         let directory = try makeDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
         let destination = directory.appendingPathComponent("Export.zip")
@@ -197,6 +215,8 @@ import Testing
     }
 
     @Test func failedArchiveExportRemovesThePartialArchive() async throws {
+        let restorePreference = keepLocationForThisTest()
+        defer { restorePreference() }
         let directory = try makeDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
         let destination = directory.appendingPathComponent("Export.zip")
