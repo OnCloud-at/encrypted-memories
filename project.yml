@@ -244,6 +244,7 @@ targets:
     deploymentTarget: "26.0"
     sources:
       - iOSTests
+      - Packages/EncryptedMemoriesKit/Tests/PhotosCoreTests/AppSettingsDefaultTests.swift
     dependencies:
       - target: EncryptedMemoriesMobile
     settings:

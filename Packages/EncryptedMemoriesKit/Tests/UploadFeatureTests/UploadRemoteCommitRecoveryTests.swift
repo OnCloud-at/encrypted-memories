@@ -1,5 +1,6 @@
 import AlbumSyncCore
 import Foundation
+import PhotosCore
 import SQLite3
 import XCTest
 
@@ -35,6 +36,15 @@ private final class RecoveryTestLatch: @unchecked Sendable {
     }
 
     var isSignaled: Bool { lock.withLock { signaled } }
+}
+
+private final class RecoveryResultBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: Result<AlbumSyncBackupReport, any Error>?
+
+    var value: Result<AlbumSyncBackupReport, any Error>? { lock.withLock { stored } }
+
+    func set(_ value: Result<AlbumSyncBackupReport, any Error>) { lock.withLock { stored = value } }
 }
 
 private final class RecoveryControlledBarrier: @unchecked Sendable {
@@ -744,7 +754,8 @@ final class UploadRemoteCommitRecoveryTests: XCTestCase {
             databasePolicy: .conservative,
             identityResolver: recorder,
             uploader: uploader,
-            resourceResolver: resolver
+            resourceResolver: resolver,
+            runtimeSignals: .wiFiWithMobileDataOff
         )
 
         let report = try await executor.ensureBackedUp(
@@ -777,7 +788,8 @@ final class UploadRemoteCommitRecoveryTests: XCTestCase {
             databasePolicy: .conservative,
             identityResolver: recorder,
             uploader: uploader,
-            resourceResolver: resolver
+            resourceResolver: resolver,
+            runtimeSignals: .wiFiWithMobileDataOff
         )
 
         let report = try await executor.ensureBackedUp(localIdentifiers: [], onProgress: { _ in })
@@ -788,6 +800,92 @@ final class UploadRemoteCommitRecoveryTests: XCTestCase {
         XCTAssertTrue(uploader.requests.isEmpty)
         let resetQueue = try XCTUnwrap(UploadBackupSyncQueueManifestStore(url: albumQueueURL()))
         XCTAssertEqual(resetQueue.count(), 0)
+    }
+
+    // MARK: - Network signals
+
+    /// A regression must fail within the timeout instead of hanging the package job. The run has a runnable row, so the
+    /// runner reads its network limit.
+    func testAlbumExecutorFinishesOnWiFiWithMobileDataOff() async throws {
+        let uploader = MockUploader()
+        let recorder = RecoveryIdentityRecorder()
+        let executor = try networkExecutor(signals: .wiFiWithMobileDataOff, recorder: recorder, uploader: uploader)
+        let finished = expectation(description: "the album backup returns on Wi-Fi")
+        let result = RecoveryResultBox()
+        let run = Task {
+            result.set(await Self.ensureBackedUp(executor, onProgress: { _ in }))
+            finished.fulfill()
+        }
+        defer { run.cancel() }
+
+        await fulfillment(of: [finished], timeout: 30)
+
+        XCTAssertEqual(try result.value?.get(), AlbumSyncBackupReport())
+        XCTAssertEqual(recorder.records.count, 1)
+        XCTAssertTrue(uploader.requests.isEmpty)
+    }
+
+    func testAlbumExecutorWaitsForWiFiBeforeTheFirstNetworkPathAndFinishesOnWiFi() async throws {
+        let runtime = LibraryRuntimeState(initial: LibraryRuntimeSnapshot(network: .undetermined))
+        let uploader = MockUploader()
+        let recorder = RecoveryIdentityRecorder()
+        let executor = try networkExecutor(signals: .mobileDataOff(runtime), recorder: recorder, uploader: uploader)
+        let waiting = expectation(description: "the album backup reports the Wi-Fi wait")
+        waiting.assertForOverFulfill = false
+        let finished = expectation(description: "the album backup returns after the Wi-Fi path")
+        let result = RecoveryResultBox()
+        let run = Task {
+            let outcome = await Self.ensureBackedUp(executor) { progress in
+                if progress.isPausedByPolicy, progress.isWaitingForWiFi { waiting.fulfill() }
+            }
+            result.set(outcome)
+            finished.fulfill()
+        }
+        defer { run.cancel() }
+
+        await fulfillment(of: [waiting], timeout: 30)
+        XCTAssertNil(result.value, "an unknown network with mobile data off holds the album backup")
+        XCTAssertTrue(uploader.requests.isEmpty)
+
+        runtime.update { $0.network = LibraryNetworkState(isReachable: true, isExpensive: false) }
+
+        // The paused runner checks the network again after its poll interval of 30 seconds.
+        await fulfillment(of: [finished], timeout: 60)
+        XCTAssertEqual(try result.value?.get(), AlbumSyncBackupReport())
+        XCTAssertEqual(recorder.records.count, 1)
+        XCTAssertTrue(uploader.requests.isEmpty)
+    }
+
+    /// The album run of `testAlbumExecutorRecoversBeforeResetKeepsCurrentRunCountsAndNeverCallsUploader`: a saved
+    /// receipt and a photo that is not in the library.
+    private func networkExecutor(
+        signals: BackupRuntimeSignalSource, recorder: RecoveryIdentityRecorder, uploader: MockUploader
+    ) throws -> PhotoAlbumBackupExecutor {
+        let source = source("network")
+        let descriptor = descriptor(source: source, filename: "network.heic", fileExists: false)
+        let entry = seedEntry(source: source, reconciliation: reconciliation(descriptor: descriptor))
+        try persist(entry, at: albumQueueURL())
+        return PhotoAlbumBackupExecutor(
+            accountDataDirectory: tempDirectory,
+            databasePolicy: .conservative,
+            identityResolver: recorder,
+            uploader: uploader,
+            resourceResolver: RecoveryResourceResolver(.failure(UploadError.backend("must not resolve"))),
+            runtimeSignals: signals
+        )
+    }
+
+    private static func ensureBackedUp(
+        _ executor: PhotoAlbumBackupExecutor,
+        onProgress: @Sendable @escaping (BackupSyncProgress) -> Void
+    ) async -> Result<AlbumSyncBackupReport, any Error> {
+        do {
+            return .success(
+                try await executor.ensureBackedUp(
+                    localIdentifiers: ["D4-nonexistent-\(UUID().uuidString)"], onProgress: onProgress))
+        } catch {
+            return .failure(error)
+        }
     }
 
     func testAlbumExecutorMalformedReceiptFailsBeforeScratchReset() async throws {
@@ -807,7 +905,8 @@ final class UploadRemoteCommitRecoveryTests: XCTestCase {
             databasePolicy: .conservative,
             identityResolver: RecoveryIdentityRecorder(),
             uploader: uploader,
-            resourceResolver: RecoveryResourceResolver(.failure(UploadError.backend("must not resolve")))
+            resourceResolver: RecoveryResourceResolver(.failure(UploadError.backend("must not resolve"))),
+            runtimeSignals: .wiFiWithMobileDataOff
         )
 
         do {
@@ -836,7 +935,8 @@ final class UploadRemoteCommitRecoveryTests: XCTestCase {
             databasePolicy: .conservative,
             identityResolver: blocker,
             uploader: uploader,
-            resourceResolver: RecoveryResourceResolver(.failure(UploadError.backend("must not resolve")))
+            resourceResolver: RecoveryResourceResolver(.failure(UploadError.backend("must not resolve"))),
+            runtimeSignals: .wiFiWithMobileDataOff
         )
         let ensure = Task {
             try await executor.ensureBackedUp(
@@ -881,7 +981,8 @@ final class UploadRemoteCommitRecoveryTests: XCTestCase {
             identityResolver: recorder,
             uploader: MockUploader(),
             resourceResolver: RecoveryResourceResolver(.failure(UploadError.backend("must not resolve"))),
-            stopFenceBarrier: { await fenceRelease.wait() }
+            stopFenceBarrier: { await fenceRelease.wait() },
+            runtimeSignals: .wiFiWithMobileDataOff
         )
         let ensure = Task {
             try await executor.ensureBackedUp(localIdentifiers: ["not-scanned"], onProgress: { _ in })
@@ -929,7 +1030,8 @@ final class UploadRemoteCommitRecoveryTests: XCTestCase {
             uploader: MockUploader(),
             resourceResolver: RecoveryResourceResolver(.failure(UploadError.backend("must not resolve"))),
             stopFenceAcquired: { await acquired.wait() },
-            stopFenceBarrier: { await releasing.wait() }
+            stopFenceBarrier: { await releasing.wait() },
+            runtimeSignals: .wiFiWithMobileDataOff
         )
         let ensure = Task {
             try await executor.ensureBackedUp(localIdentifiers: ["not-scanned"], onProgress: { _ in })
@@ -982,7 +1084,8 @@ final class UploadRemoteCommitRecoveryTests: XCTestCase {
             databasePolicy: .conservative,
             identityResolver: RecoveryIdentityRecorder(),
             uploader: uploader,
-            resourceResolver: RecoveryResourceResolver(.failure(UploadError.backend("must not resolve")))
+            resourceResolver: RecoveryResourceResolver(.failure(UploadError.backend("must not resolve"))),
+            runtimeSignals: .wiFiWithMobileDataOff
         )
 
         let attempt = Task {

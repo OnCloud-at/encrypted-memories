@@ -108,30 +108,33 @@ struct TimelineContextMenuTests {
     }
 
     @Test func copiedProviderOutlivesItsGridController() async throws {
-        let pasteboard = UIPasteboard.withUniqueName()
-        defer { UIPasteboard.remove(withName: pasteboard.name) }
-        var host: UIKitTimelineGridHostView? = UIKitTimelineGridHostView()
-        host?.dragOutProvider = TestOriginalProvider()
-        weak let weakController = host?.dragOutController
-        let photo = PhotoItem(
-            uid: PhotoUID(volumeID: "menu-test", nodeID: "copy"),
-            captureTime: Date(), mediaType: "image/jpeg")
-        host?.dragOutController?.copyToPasteboard(items: [photo], pasteboard: pasteboard)
-        host = nil
-        #expect(weakController == nil)
-        let provider = try #require(pasteboard.itemProviders.first)
-        let data: Data = try await withCheckedThrowingContinuation { continuation in
-            _ = provider.loadFileRepresentation(forTypeIdentifier: "public.jpeg") { url, error in
-                do {
-                    if let error { throw error }
-                    guard let url else { throw CocoaError(.fileNoSuchFile) }
-                    continuation.resume(returning: try Data(contentsOf: url))
-                } catch {
-                    continuation.resume(throwing: error)
+        // Synthetic JPEG bytes are not decodable; this test keeps location to test the copied provider.
+        try await SharingLocationPreferenceLease.with(storedValue: false) {
+            let pasteboard = UIPasteboard.withUniqueName()
+            defer { UIPasteboard.remove(withName: pasteboard.name) }
+            var host: UIKitTimelineGridHostView? = UIKitTimelineGridHostView()
+            host?.dragOutProvider = TestOriginalProvider()
+            weak let weakController = host?.dragOutController
+            let photo = PhotoItem(
+                uid: PhotoUID(volumeID: "menu-test", nodeID: "copy"),
+                captureTime: Date(), mediaType: "image/jpeg")
+            host?.dragOutController?.copyToPasteboard(items: [photo], pasteboard: pasteboard)
+            host = nil
+            #expect(weakController == nil)
+            let provider = try #require(pasteboard.itemProviders.first)
+            let data: Data = try await withCheckedThrowingContinuation { continuation in
+                _ = provider.loadFileRepresentation(forTypeIdentifier: "public.jpeg") { url, error in
+                    do {
+                        if let error { throw error }
+                        guard let url else { throw CocoaError(.fileNoSuchFile) }
+                        continuation.resume(returning: try Data(contentsOf: url))
+                    } catch {
+                        continuation.resume(throwing: error)
+                    }
                 }
             }
+            #expect(data == Data([1, 2, 3]))
         }
-        #expect(data == Data([1, 2, 3]))
     }
 
     @Test func contextActionsPresentExplicitItems() {
