@@ -1449,6 +1449,98 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             await controller.shutdown()
         }
 
+        func testAnExpiringBackgroundWindowKeepsADeferredForegroundPass() async throws {
+            let runtime = LibraryRuntimeState.makeProcessState()
+            let fixture = try makeWiFiWaitFixture(
+                prefix: "backup-first-path-background-foreground", source: .mobileDataOff(runtime),
+                firstNetworkPathWait: .seconds(60))
+            defer { fixture.cleanup() }
+            let controller = fixture.controller
+            let scans = PassCounter()
+            let owners = OwnerRecorder()
+            controller.replaceScanForTesting {
+                _ = scans.increment()
+                owners.record(await MainActor.run { controller.executionOwnerForTesting })
+            }
+            controller.syncNow()
+            let windowEnds = PassCounter()
+            let window = Task { @MainActor in
+                await controller.backgroundCatchUp(owner: .iOSBackgroundTask)
+                _ = windowEnds.increment()
+            }
+            try await Task.sleep(for: .milliseconds(300))
+            window.cancel()
+            let ended = await waitUntil(timeout: .seconds(2)) { windowEnds.count == 1 }
+            XCTAssertTrue(ended)
+
+            runtime.update { $0.network = LibraryNetworkState(isReachable: true, isExpensive: false) }
+
+            let started = await waitUntil(timeout: .seconds(5)) { scans.count == 1 }
+            XCTAssertTrue(started, "the foreground pass that waited for the path still runs")
+            XCTAssertEqual(owners.values, [.foreground])
+            await controller.shutdown()
+        }
+
+        func testABackgroundWindowNeverOwnsADeferredManualPass() async throws {
+            let runtime = LibraryRuntimeState.makeProcessState()
+            let fixture = try makeWiFiWaitFixture(
+                prefix: "backup-first-path-background-manual", source: .mobileDataOff(runtime),
+                firstNetworkPathWait: .seconds(60))
+            defer { fixture.cleanup() }
+            let controller = fixture.controller
+            let scans = PassCounter()
+            let owners = OwnerRecorder()
+            controller.replaceScanForTesting {
+                _ = scans.increment()
+                owners.record(await MainActor.run { controller.executionOwnerForTesting })
+            }
+            await controller.retryUserResolvableWork()
+            let runs = PassCounter()
+            let windowEnds = PassCounter()
+            let window = Task { @MainActor in
+                await controller.backgroundCatchUp(owner: .iOSBackgroundTask) { _ in _ = runs.increment() }
+                _ = windowEnds.increment()
+            }
+            try await Task.sleep(for: .milliseconds(300))
+
+            runtime.update { $0.network = LibraryNetworkState(isReachable: true, isExpensive: false) }
+
+            let ended = await waitUntil(timeout: .seconds(5)) { windowEnds.count == 1 && scans.count == 1 }
+            XCTAssertTrue(ended)
+            XCTAssertEqual(runs.count, 0, "the window cannot stop the explicit pass at its expiration")
+            XCTAssertEqual(owners.values, [.manual])
+            await window.value
+            await controller.shutdown()
+        }
+
+        func testABackgroundWindowCancelledBeforeItWaitsDropsItsDeferredPass() async throws {
+            let runtime = LibraryRuntimeState.makeProcessState()
+            let fixture = try makeWiFiWaitFixture(
+                prefix: "backup-first-path-background-precancelled", source: .mobileDataOff(runtime),
+                firstNetworkPathWait: .seconds(60))
+            defer { fixture.cleanup() }
+            let controller = fixture.controller
+            let scans = PassCounter()
+            controller.replaceScanForTesting { _ = scans.increment() }
+            let release = LockedFlag(false)
+            let windowEnds = PassCounter()
+            let window = Task { @MainActor in
+                while !release.value { await Task.yield() }
+                await controller.backgroundCatchUp(owner: .iOSBackgroundTask)
+                _ = windowEnds.increment()
+            }
+            // The window expires before it reaches the wait.
+            window.cancel()
+            release.value = true
+
+            let ended = await waitUntil(timeout: .seconds(2)) { windowEnds.count == 1 }
+            XCTAssertTrue(ended)
+            runtime.update { $0.network = LibraryNetworkState(isReachable: true, isExpensive: false) }
+            try await Task.sleep(for: .milliseconds(500))
+            XCTAssertEqual(scans.count, 0, "the pass of the expired window does not run after it")
+            await controller.shutdown()
+        }
+
         private func runtimeSource(_ runtime: LibraryRuntimeState, usesMobileData: Bool) -> BackupRuntimeSignalSource {
             BackupRuntimeSignalSource(
                 current: { BackupThrottleInputs(runtime: runtime.snapshot(), usesMobileData: usesMobileData) },
