@@ -51,9 +51,12 @@ public struct SessionKeychainStore: Sendable {
         #if ENCRYPTED_MEMORIES_UPGRADE_TEST
             guard UpgradeTestProbe.isRequested else { throw SessionKeychainError.invalidPayload }
             UpgradeTestProbe.rejectExternalNetwork()
+            let seedIdentity = [
+                "server": UpgradeTestProbe.endpoint.absoluteString,
+                "account": UpgradeTestProbe.accountUID,
+            ]
             if UpgradeTestProbe.seedsAccount,
-                UserDefaults.standard.string(forKey: "upgrade.fixture.seeded")
-                    != UpgradeTestProbe.endpoint.absoluteString
+                UserDefaults.standard.dictionary(forKey: "upgrade.fixture.seeded") as? [String: String] != seedIdentity
             {
                 guard let domain = Bundle.main.bundleIdentifier, domain.hasSuffix(".upgrade-test") else {
                     throw SessionKeychainError.invalidPayload
@@ -64,7 +67,7 @@ public struct SessionKeychainStore: Sendable {
                     ProtonSession(
                         uid: UpgradeTestProbe.accountUID, accessToken: "synthetic-access",
                         refreshToken: "synthetic-refresh", keyPassword: "synthetic-key"))
-                UserDefaults.standard.set(UpgradeTestProbe.endpoint.absoluteString, forKey: "upgrade.fixture.seeded")
+                UserDefaults.standard.set(seedIdentity, forKey: "upgrade.fixture.seeded")
             }
         #endif
         guard let data = try keychain.data(for: item) else { return nil }

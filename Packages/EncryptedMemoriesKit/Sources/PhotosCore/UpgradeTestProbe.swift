@@ -14,8 +14,15 @@
         public static var accountUID: String {
             let args = ProcessInfo.processInfo.arguments
             guard let index = args.firstIndex(of: "-EncryptedMemoriesUpgradeCase"), index + 1 < args.count,
-                args[index + 1].count == 32, args[index + 1].allSatisfy({ $0.isHexDigit })
-            else { fatalError("The upgrade fixture requires a stable case identity") }
+                args[index + 1].utf8.count == 32,
+                args[index + 1].utf8.allSatisfy({
+                    (48...57).contains($0) || (65...70).contains($0) || (97...102).contains($0)
+                })
+            else {
+                fatalError(
+                    "The upgrade fixture case identifier must contain exactly 32 ASCII hexadecimal characters (0-9, a-f, A-F)"
+                )
+            }
             return "upgrade-fixture-account-" + args[index + 1]
         }
         public static let assets = (0..<8).map { PhotoUID(volumeID: "upgrade-fixture", nodeID: "asset-\($0)") }
