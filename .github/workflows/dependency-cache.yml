@@ -11,7 +11,7 @@ env:
 
 jobs:
   upgrade:
-    name: Test twelve macOS upgrade points
+    name: Diagnose hosted macOS Settings toolbar
     runs-on: xcode-27
     timeout-minutes: 180
     steps:
@@ -48,7 +48,7 @@ jobs:
         run: |
           set -euo pipefail
           bash scripts/test-release-upgrade.sh --target HEAD --release-tag v1.1.0-beta.3 \
-            --sources v1.0.5 --platform macOS --working-copy 2>&1 | tee "$RUNNER_TEMP/release-upgrade.log"
+            --sources v1.0.5 --platform macOS --points backup.claimed --working-copy 2>&1 | tee "$RUNNER_TEMP/release-upgrade.log"
 
       - name: Print retained journey evidence
         if: always()
@@ -67,8 +67,8 @@ jobs:
           PYTHON
 
 
-      - name: Print the checked Settings failure subtree
-        if: failure() && github.ref == 'refs/heads/work/upgrade-macos-metal-hosted' && runner.os == 'macOS'
+      - name: Print the checked Settings diagnostic subtrees
+        if: always() && github.ref == 'refs/heads/work/upgrade-macos-metal-hosted' && runner.os == 'macOS'
         run: |
           python3 - <<'PYTHON'
           import json
@@ -131,6 +131,20 @@ jobs:
               cases = list(root.glob('*/macOS/v1.0.5/backup.claimed/prepare.xcresult'))
               if len(cases) != 1:
                   raise SystemExit('Expected one owned backup.claimed preparation result')
+              log_path = cases[0].parent / 'prepare-ui.log'
+              diagnostic_lines = [line.split('SETTINGS_DIAGNOSTIC ', 1)[1]
+                                  for line in log_path.read_text().splitlines() if 'SETTINGS_DIAGNOSTIC ' in line]
+              if not diagnostic_lines:
+                  raise SystemExit('The preparation produced no Settings diagnostic facts')
+              print('::group::Checked Settings strategy and frame facts')
+              for text in diagnostic_lines:
+                  category = rejection_category(text)
+                  if category:
+                      print('Rejected diagnostic facts: file=prepare-ui.log; category=' + category)
+                      print('Data-check pattern: ' + forbidden.pattern.decode())
+                      raise SystemExit('Settings diagnostic facts failed the data check')
+                  print(text)
+              print('::endgroup::')
               destination = cases[0].parent / 'hierarchy-export'
               subprocess.run(['xcrun', 'xcresulttool', 'export', 'attachments', '--path', str(cases[0]),
                               '--output-path', str(destination),
@@ -139,6 +153,9 @@ jobs:
               attachments = sorted(destination.glob('*.txt'))
               if not attachments:
                   raise SystemExit('The failing point has no App UI hierarchy text attachment')
+              records = json.loads((destination / 'manifest.json').read_text())
+              names = {entry['exportedFileName']: entry.get('suggestedHumanReadableName', entry['exportedFileName'])
+                       for record in records for entry in record['attachments']}
               for attachment in attachments:
                   text = settings_subtree(attachment.read_text())
                   category = rejection_category(text)
@@ -146,7 +163,7 @@ jobs:
                       print('Rejected Settings subtree: file=' + attachment.name + '; category=' + category)
                       print('Data-check pattern: ' + forbidden.pattern.decode())
                       raise SystemExit('Settings subtree failed the data check')
-                  print('::group::Backup preparation Settings subtree (' + attachment.name + ')')
+                  print('::group::Backup preparation Settings subtree (' + names[attachment.name] + ')')
                   print(text)
                   print('::endgroup::')
 

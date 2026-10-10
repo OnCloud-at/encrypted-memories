@@ -134,6 +134,9 @@ final class UpgradeJourneyUITests: XCTestCase {
         XCTAssertEqual(result, .completed, "The saved index did not return all eight photos")
     }
 
+    #if os(macOS)
+        @MainActor
+    #endif
     func testInstalledAppJourney() throws {
         continueAfterFailure = false
         #if os(iOS)
@@ -205,14 +208,9 @@ final class UpgradeJourneyUITests: XCTestCase {
                 }
                 return settings.switches["smartsearch.toggle"].exists
             }
-            var clicks = 0
-            try SettingsPaneTestSupport.select(
-                title,
-                click: {
-                    clicks += 1
-                    if clicks == 2 { print("Settings pane \(title): repeat the unacknowledged toolbar click once") }
-                    tab.click()
-                }, isAcknowledged: acknowledged,
+            try SettingsToolbarDiagnostics.run(
+                self, app: app, settings: settings, tab: tab, title: title,
+                isAcknowledged: acknowledged,
                 waitForAcknowledgement: {
                     let selected = XCTNSPredicateExpectation(
                         predicate: NSPredicate { _, _ in acknowledged() }, object: nil)
