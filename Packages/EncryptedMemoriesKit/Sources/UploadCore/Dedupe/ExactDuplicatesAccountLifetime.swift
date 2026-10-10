@@ -10,8 +10,20 @@ public final class ExactDuplicatesAccountLifetime {
 
     private var token = Token(id: UUID())
     private weak var model: ExactDuplicatesModel?
+    private var pendingMergeCheck: Task<Void, Never>?
 
     public init() {}
+
+    /// Checks the merges that the end of the app left open, without a scan, for the account that the app installs, and
+    /// ends the check of the previous account. Nil only ends that check, for example at sign-out. The apps call it once
+    /// for each account change, because the Duplicates screen scans only when it opens; a replaced Duplicates model of
+    /// the same account keeps the check running.
+    @discardableResult
+    public func checkPendingMerges(of finder: (any ExactDuplicateMerging)?) -> Task<Void, Never>? {
+        pendingMergeCheck?.cancel()
+        pendingMergeCheck = finder.map { finder in Task { await finder.resolvePendingMerges() } }
+        return pendingMergeCheck
+    }
 
     public func isCurrent(_ token: Token) -> Bool { self.token == token }
 

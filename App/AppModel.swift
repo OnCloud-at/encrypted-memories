@@ -47,7 +47,11 @@ final class AppModel {
     /// High-level client composition (uploads + albums), built alongside the backend.
     private(set) var facade: ProtonClientFacade? {
         didSet {
-            if facade !== oldValue { duplicatesLifetime.retire() }
+            guard facade !== oldValue else { return }
+            duplicatesLifetime.retire()
+            // The Duplicates screen scans only when it opens, and a library window may not be open. A merge that the
+            // end of the app left open is checked now; a new account or a sign-out ends the check of the earlier one.
+            duplicatesLifetime.checkPendingMerges(of: facade?.exactDuplicates)
         }
     }
     @ObservationIgnored private let duplicatesLifetime = ExactDuplicatesAccountLifetime()
