@@ -47,7 +47,7 @@ jobs:
         run: |
           set -euo pipefail
           bash scripts/test-release-upgrade.sh --target HEAD --release-tag v1.1.0-beta.3 \
-            --sources v1.0.5 --platform macOS --working-copy 2>&1 | tee "$RUNNER_TEMP/release-upgrade.log"
+            --sources v1.0.5 --platform macOS --points backup.claimed --working-copy 2>&1 | tee "$RUNNER_TEMP/release-upgrade.log"
 
       - name: Print retained journey evidence
         if: always()
@@ -64,3 +64,48 @@ jobs:
               if errors:
                   print(str(path.relative_to(root)), '\n'.join(errors[-30:]), flush=True)
           PYTHON
+
+      - name: Check the synthetic failure evidence before upload
+        if: failure() && github.ref == 'refs/heads/work/upgrade-macos-metal-hosted' && runner.os == 'macOS'
+        run: |
+          python3 - <<'PYTHON'
+          import re
+          import shutil
+          import subprocess
+          from pathlib import Path
+          root = Path.home() / 'Developer/xcode/EncryptedMemories/UpgradeCheck/evidence'
+          cases = list(root.glob('*/macOS/v1.0.5/backup.claimed'))
+          if len(cases) != 1:
+              raise SystemExit('Expected one owned backup.claimed failure directory')
+          case = cases[0]
+          files = [case / 'prepare-ui.log', case / 'prepare.xcresult']
+          if not files[0].is_file() or not files[1].is_dir():
+              raise SystemExit('The preparation log or result bundle is missing')
+          result = subprocess.check_output([
+              'xcrun', 'xcresulttool', 'get', 'object', '--legacy',
+              '--path', str(files[1]), '--format', 'json'])
+          forbidden = re.compile(
+              rb'gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}'
+              rb'|-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----'
+              rb'|/Users/(?!runner/)[^/\s"]+'
+              rb'|[A-Za-z0-9._%+-]+@(?!example\.invalid|ui-test\.invalid)[A-Za-z0-9.-]+\.[A-Za-z]{2,}',
+              re.IGNORECASE)
+          payloads = [result, files[0].read_bytes()]
+          payloads.extend(p.read_bytes() for p in files[1].rglob('*') if p.is_file())
+          if any(forbidden.search(payload) for payload in payloads):
+              raise SystemExit('Failure evidence rejected: credential, personal email, or non-runner user path')
+          destination = Path('hosted-macos-failure-evidence')
+          destination.mkdir()
+          shutil.copy2(files[0], destination / files[0].name)
+          shutil.copytree(files[1], destination / files[1].name)
+          print('Synthetic fixture only; credential, personal-email and user-path checks passed.')
+          PYTHON
+
+      - name: Retain the checked macOS preparation failure
+        if: failure() && github.ref == 'refs/heads/work/upgrade-macos-metal-hosted' && runner.os == 'macOS'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: hosted-macos-backup-claimed-failure
+          path: hosted-macos-failure-evidence/
+          if-no-files-found: error
+          retention-days: 3
