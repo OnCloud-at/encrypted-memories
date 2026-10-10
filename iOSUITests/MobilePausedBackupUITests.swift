@@ -44,7 +44,7 @@ final class MobilePausedBackupUITests: XCTestCase {
         XCTAssertFalse(tile(labelContaining: "Backup paused").exists, "the photo still says that the backup is paused")
     }
 
-    func testCellularDataSwitchIsOnByDefaultAndCanBeTurnedOff() {
+    func testCellularDataSwitchIsOffByDefaultAndCanBeTurnedOn() {
         let settings = app.buttons["Proton Account and Settings"]
         XCTAssertTrue(settings.waitForExistence(timeout: 60))
         settings.tap()
@@ -55,11 +55,11 @@ final class MobilePausedBackupUITests: XCTestCase {
         let cellular = app.switches["backup.useMobileData"]
         XCTAssertTrue(cellular.waitForExistence(timeout: 10), "the backup settings offer no cellular data switch")
         XCTAssertEqual(cellular.label, "Use Cellular Data")
-        XCTAssertEqual(cellular.value as? String, "1", "the backup uses cellular data by default")
+        XCTAssertEqual(cellular.value as? String, "0", "the backup waits for Wi-Fi by default")
         cellular.coordinate(withNormalizedOffset: CGVector(dx: 0.9, dy: 0.5)).tap()
-        XCTAssertTrue(wait(for: cellular, "value == '0'"), "the switch does not turn off")
+        XCTAssertTrue(wait(for: cellular, "value == '1'"), "the switch does not turn on")
         cellular.coordinate(withNormalizedOffset: CGVector(dx: 0.9, dy: 0.5)).tap()
-        XCTAssertTrue(wait(for: cellular, "value == '1'"))
+        XCTAssertTrue(wait(for: cellular, "value == '0'"))
     }
 
     private func wait(for element: XCUIElement, _ predicate: String, timeout: TimeInterval = 5) -> Bool {

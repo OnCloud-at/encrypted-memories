@@ -9,16 +9,90 @@ import XCTest
 @testable import PhotosCore
 
 final class PrivacyExportPolicyTests: XCTestCase {
-    func testRemoveLocationDefaultsOffAndReadsSavedPreference() throws {
+    func testRemoveLocationDefaultsOnAndReadsSavedPreference() throws {
         let suiteName = "PrivacyExportPolicyTests.\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
 
-        XCTAssertFalse(PrivacyExportPolicy.isEnabled(defaults: defaults))
+        XCTAssertTrue(PrivacyExportPolicy.isEnabled(defaults: defaults))
         defaults.set(true, forKey: AppSettingsKey.removeLocationWhenSharing)
         XCTAssertTrue(PrivacyExportPolicy.isEnabled(defaults: defaults))
         defaults.set(false, forKey: AppSettingsKey.removeLocationWhenSharing)
         XCTAssertFalse(PrivacyExportPolicy.isEnabled(defaults: defaults))
+    }
+
+    func testSingleExportWithUnsetPreferenceRemovesGPSAndKeepsOriginal() async throws {
+        try await assertLocationCopy(drag: false, storedPreference: nil)
+    }
+
+    func testDragOutWithUnsetPreferenceRemovesGPSAndKeepsOriginal() async throws {
+        try await assertLocationCopy(drag: true, storedPreference: nil)
+    }
+
+    func testSingleExportWithExplicitOptOutKeepsGPSAndOriginalBytes() async throws {
+        try await assertLocationCopy(drag: false, storedPreference: false)
+    }
+
+    func testDragOutWithExplicitOptOutKeepsGPSAndOriginalBytes() async throws {
+        try await assertLocationCopy(drag: true, storedPreference: false)
+    }
+
+    private func assertLocationCopy(drag: Bool, storedPreference: Bool?) async throws {
+        let defaults = UserDefaults.standard
+        let key = AppSettingsKey.removeLocationWhenSharing
+        let previous = defaults.object(forKey: key)
+        defer {
+            if let previous { defaults.set(previous, forKey: key) } else { defaults.removeObject(forKey: key) }
+        }
+        if let storedPreference {
+            defaults.set(storedPreference, forKey: key)
+        } else {
+            defaults.removeObject(forKey: key)
+            XCTAssertNil(defaults.object(forKey: key), "exercise the unset default, not an explicit opt-in")
+        }
+
+        let directory = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let original = directory.appendingPathComponent("original.jpg")
+        try makeGPSImage(at: original)
+        let originalBytes = try Data(contentsOf: original)
+        let provider = GPSFileProvider(original: original)
+        let photo = PhotoItem(
+            uid: PhotoUID(volumeID: "test-volume", nodeID: "test-photo"), captureTime: .now, mediaType: "image/jpeg")
+        let output: URL
+        if drag {
+            let stager = DragOutStager(
+                fileProvider: provider, stagingDirectory: directory.appendingPathComponent("drag"), safetyMarginBytes: 0
+            )
+            let decision = await stager.beginPrefetch(items: [photo])
+            XCTAssertTrue(decision.isAllowed)
+            output = try await stager.awaitStaged(uid: photo.uid).get()
+        } else {
+            output = directory.appendingPathComponent("export.jpg")
+            try await OriginalExportWriter.writeSingle(item: photo, to: output, provider: provider) { _ in }
+        }
+
+        if storedPreference == false {
+            XCTAssertNotNil(gpsProperties(at: output))
+            XCTAssertEqual(try Data(contentsOf: output), originalBytes)
+        } else {
+            XCTAssertNil(gpsProperties(at: output))
+            XCTAssertNil(iptcCity(at: output))
+            XCTAssertEqual(lensModel(at: output), Self.lensModel)
+        }
+        XCTAssertNotNil(gpsProperties(at: original))
+        XCTAssertEqual(try Data(contentsOf: original), originalBytes)
+    }
+
+    private struct GPSFileProvider: OriginalFileProvider {
+        let original: URL
+
+        func writeOriginal(
+            for uid: PhotoUID, to destination: URL, onProgress: @escaping @Sendable (Double) -> Void
+        ) async throws {
+            try Data(contentsOf: original).write(to: destination)
+            onProgress(1)
+        }
     }
 
     func testImageCopyDropsGPSWhileStoredOriginalKeepsIt() async throws {

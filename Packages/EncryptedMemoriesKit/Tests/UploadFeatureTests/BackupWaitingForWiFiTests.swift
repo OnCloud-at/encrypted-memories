@@ -5,7 +5,7 @@ import XCTest
 @testable import UploadCore
 
 /// "Use Cellular Data" off: the backup waits on cellular data and Personal Hotspot, says "Waiting for Wi-Fi", and
-/// never looks offline. With the setting on (the default), nothing changes.
+/// never looks offline. With the setting on, cellular backup remains available.
 final class BackupWaitingForWiFiTests: XCTestCase {
     private let policy = BackupThrottlePolicy(baseConcurrency: 6)
 
@@ -68,16 +68,41 @@ final class BackupWaitingForWiFiTests: XCTestCase {
         XCTAssertFalse(allowed.isNetworkExpensive, "with the setting on, nothing changes")
     }
 
-    func testSettingIsOnByDefaultAndPersistsWhenTurnedOff() throws {
+    func testSettingIsOffByDefaultAndReadsSavedPreference() throws {
         let suite = "BackupWaitingForWiFiTests.\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
         defer { defaults.removePersistentDomain(forName: suite) }
 
-        XCTAssertTrue(BackupMobileDataPolicy.isEnabled(defaults: defaults), "an update must not change the backup")
+        XCTAssertFalse(BackupMobileDataPolicy.isEnabled(defaults: defaults))
         defaults.set(false, forKey: AppSettingsKey.backupUsesMobileData)
         XCTAssertFalse(BackupMobileDataPolicy.isEnabled(defaults: defaults))
         defaults.set(true, forKey: AppSettingsKey.backupUsesMobileData)
         XCTAssertTrue(BackupMobileDataPolicy.isEnabled(defaults: defaults))
+    }
+
+    func testUnsetPreferenceWaitsOnCellularAndResumesOnWiFiOrExplicitOptIn() throws {
+        let suite = "BackupWaitingForWiFiTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let cellular = inputs(expensive: true, usesMobileData: BackupMobileDataPolicy.isEnabled(defaults: defaults))
+        XCTAssertTrue(cellular.waitsForWiFi)
+        XCTAssertEqual(policy.maxConcurrentItems(for: cellular), 0)
+        let status = BackupStatus(
+            progress: waitingProgress(running: false, waitsForWiFi: cellular.waitsForWiFi), isScanning: false)
+        XCTAssertEqual(status.phase, .waitingForWiFi)
+        let display = BackupStatusPresentation(status)
+        XCTAssertEqual(display.localizedHeadline, L10n.string("backup.phase_waiting_wifi"))
+        XCTAssertEqual(display.localizedWaitingForWiFiDetail, L10n.string("backup.detail_waiting_wifi"))
+        XCTAssertNil(display.localizedRetryDetail)
+
+        let wifi = inputs(expensive: false, usesMobileData: BackupMobileDataPolicy.isEnabled(defaults: defaults))
+        XCTAssertTrue(status.endsWiFiWait(for: wifi))
+        XCTAssertEqual(policy.maxConcurrentItems(for: wifi), 6)
+        defaults.set(true, forKey: AppSettingsKey.backupUsesMobileData)
+        let allowed = inputs(expensive: true, usesMobileData: BackupMobileDataPolicy.isEnabled(defaults: defaults))
+        XCTAssertTrue(status.endsWiFiWait(for: allowed))
+        XCTAssertEqual(policy.maxConcurrentItems(for: allowed), 1)
     }
 
     // MARK: - Status
