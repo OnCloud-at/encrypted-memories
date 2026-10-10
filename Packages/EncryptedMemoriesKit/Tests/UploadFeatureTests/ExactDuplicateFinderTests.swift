@@ -1601,6 +1601,51 @@ final class ExactDuplicateFinderTests: XCTestCase {
         XCTAssertEqual(model.groups.map(\.id), [])
     }
 
+    /// A check clears only the record that it read: a newer merge of the same group keeps its record for its own check.
+    func testAJournalClearKeepsANewerRecordOfTheSameGroup() throws {
+        let kept = server.seedLink(digest: digest("a"))
+        let duplicate = server.seedLink(digest: digest("a"))
+        let read = pendingIntent(kept: kept, duplicate: duplicate, seed: "a", trashedAt: 100)
+        XCTAssertTrue(mergeJournal.record([read]))
+        let checked = try XCTUnwrap(mergeJournal.pendingMerges())
+        XCTAssertEqual(checked, [read])
+
+        let newer = pendingIntent(kept: kept, duplicate: duplicate, seed: "a", trashedAt: 200)
+        XCTAssertTrue(mergeJournal.record([newer]))
+        XCTAssertTrue(mergeJournal.clear(checked))
+
+        XCTAssertEqual(mergeJournal.pendingMerges(), [newer], "the newer merge still waits for its check")
+        XCTAssertTrue(mergeJournal.clear([newer]))
+        XCTAssertEqual(mergeJournal.pendingMerges(), [])
+    }
+
+    func testAPendingCheckThatFinishesLateKeepsTheRecordOfANewerMerge() async throws {
+        let kept = server.seedLink(digest: digest("a"))
+        let duplicate = server.seedLink(digest: digest("a"))
+        indexServer()
+        let read = pendingIntent(kept: kept, duplicate: duplicate, seed: "a", trashedAt: 100)
+        XCTAssertTrue(mergeJournal.record([read]))
+        // The check reads the open merge, and its first read of the kept photo fails, so it waits for its retry.
+        server.configureOptionalReads(visibilityFails: true)
+        var checker = finder
+        checker.keptReadRetryDelay = .milliseconds(400)
+        let check = Task { [checker] in await checker.resolvePendingMerges() }
+        for _ in 0..<200 where server.readCounts.visibility == 0 {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertGreaterThan(server.readCounts.visibility, 0, "the check read the open merge")
+
+        // Meanwhile the person merges the same group again, and that merge records its trash.
+        let newer = pendingIntent(kept: kept, duplicate: duplicate, seed: "a", trashedAt: 200)
+        XCTAssertTrue(mergeJournal.record([newer]))
+        server.configureOptionalReads(visibilityFails: false)
+        await check.value
+
+        // The first read failed and its retry read the kept photo, so the check finished and cleared its record.
+        XCTAssertEqual(server.readCounts.visibility, 2, "the check finished with its retry")
+        XCTAssertEqual(mergeJournal.pendingMerges(), [newer], "the late check must not clear the newer merge")
+    }
+
     func testMergeAllWritesNothingWhenTheSharedFavoritesReadFails() async throws {
         let (groups, sources) = try await threeGroups()
         server.failNextFavoritesRead()

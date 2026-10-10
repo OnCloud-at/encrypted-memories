@@ -45,7 +45,8 @@ public protocol ExactDuplicateMergeJournaling: Sendable {
     func pendingMerges() -> [ExactDuplicateMergeIntent]?
     /// Records `intents` in place of earlier intents of the same groups. False when the write failed.
     func record(_ intents: [ExactDuplicateMergeIntent]) -> Bool
-    /// Removes the intents of these groups. False when the write failed.
+    /// Removes exactly these intents. A newer intent of the same group, which a later merge recorded meanwhile, stays for
+    /// its own check. False when the write failed.
     func clear(_ intents: [ExactDuplicateMergeIntent]) -> Bool
 }
 
@@ -93,8 +94,7 @@ public final class ExactDuplicateMergeJournalFileStore: ExactDuplicateMergeJourn
     }
 
     public func clear(_ intents: [ExactDuplicateMergeIntent]) -> Bool {
-        let keys = Set(intents.map(\.key))
-        return update { $0.removeAll { keys.contains($0.key) } }
+        update { $0.removeAll { intents.contains($0) } }
     }
 
     private enum Read {
