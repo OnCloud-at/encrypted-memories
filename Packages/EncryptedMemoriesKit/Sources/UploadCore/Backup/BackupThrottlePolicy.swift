@@ -29,6 +29,9 @@ public struct BackupThrottleInputs: Sendable, Equatable {
     public var isNetworkExpensive: Bool
     /// The "Use Cellular Data" setting. When false, an expensive network holds the backup until Wi-Fi or Ethernet.
     public var usesMobileData: Bool
+    /// False until the platform reported its first network path since launch. The other network values are then only
+    /// defaults.
+    public var isNetworkDetermined: Bool
 
     public init(
         thermalLevel: BackupThermalLevel = .nominal,
@@ -36,7 +39,8 @@ public struct BackupThrottleInputs: Sendable, Equatable {
         isNetworkAvailable: Bool = true,
         isNetworkConstrained: Bool = false,
         isNetworkExpensive: Bool = false,
-        usesMobileData: Bool = true
+        usesMobileData: Bool = true,
+        isNetworkDetermined: Bool = true
     ) {
         self.thermalLevel = thermalLevel
         self.isLowPowerMode = isLowPowerMode
@@ -44,6 +48,7 @@ public struct BackupThrottleInputs: Sendable, Equatable {
         self.isNetworkConstrained = isNetworkConstrained
         self.isNetworkExpensive = isNetworkExpensive
         self.usesMobileData = usesMobileData
+        self.isNetworkDetermined = isNetworkDetermined
     }
 
     /// Maps the shared runtime snapshot of a platform adapter, so every backup upload path reads the same signals.
@@ -62,7 +67,8 @@ public struct BackupThrottleInputs: Sendable, Equatable {
             isNetworkAvailable: snapshot.network.isReachable,
             isNetworkConstrained: snapshot.network.isConstrained,
             isNetworkExpensive: snapshot.network.isExpensive || (!snapshot.network.isDetermined && !usesMobileData),
-            usesMobileData: usesMobileData
+            usesMobileData: usesMobileData,
+            isNetworkDetermined: snapshot.network.isDetermined
         )
     }
 
@@ -70,6 +76,12 @@ public struct BackupThrottleInputs: Sendable, Equatable {
     /// This is never "offline": viewing and downloading keep working.
     public var waitsForWiFi: Bool {
         isNetworkAvailable && isNetworkExpensive && !usesMobileData
+    }
+
+    /// No network path has arrived yet, and mobile data is off. Uploads stay held, but a backup pass waits for the
+    /// first path instead of reporting "Waiting for Wi-Fi": the network is often Wi-Fi.
+    public var waitsForFirstNetworkPath: Bool {
+        !isNetworkDetermined && !usesMobileData
     }
 
     public static let unconstrained = BackupThrottleInputs()

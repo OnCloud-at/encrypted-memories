@@ -455,7 +455,8 @@ final class DeletedPhotoTests: XCTestCase {
             defer { defaults.removePersistentDomain(forName: suite) }
             let controller = PhotoLibraryBackupController(
                 configuration: .init(
-                    accountDataDirectory: directory, databasePolicy: .conservative, defaults: defaults),
+                    accountDataDirectory: directory, databasePolicy: .conservative, defaults: defaults,
+                    runtimeSignals: .wiFiWithMobileDataOff),
                 identityResolver: FakeIdentityResolver(), uploader: MockUploader(), replacementJournal: journal)
             XCTAssertTrue(controller.installDeletedElsewhereFixtureForTesting())
             controller.setAccessStateForTesting(.full)

@@ -57,17 +57,22 @@ public final class PhotoLibraryBackupController {
         public var databasePolicy: LibraryDatabasePolicy
         public var defaults: UserDefaults
         public var runtimeSignals: BackupRuntimeSignalSource
+        /// How long a pass waits for the first network path before it starts anyway. The Apple path monitor reports
+        /// a first path soon after launch; this bound keeps a missing report from holding the backup silently.
+        public var firstNetworkPathWait: Duration
 
         public init(
             accountDataDirectory: URL,
             databasePolicy: LibraryDatabasePolicy,
             defaults: UserDefaults = .standard,
-            runtimeSignals: BackupRuntimeSignalSource = .apple
+            runtimeSignals: BackupRuntimeSignalSource = .apple,
+            firstNetworkPathWait: Duration = .seconds(10)
         ) {
             self.accountDataDirectory = accountDataDirectory
             self.databasePolicy = databasePolicy
             self.defaults = defaults
             self.runtimeSignals = runtimeSignals
+            self.firstNetworkPathWait = firstNetworkPathWait
         }
     }
 
@@ -188,6 +193,13 @@ public final class PhotoLibraryBackupController {
     @ObservationIgnored var onLibraryChange: (@MainActor () -> Void)?
     /// The runner ended the current pass waiting for Wi-Fi. Reset when a pass starts.
     private var passWaitedForWiFi = false
+    /// A pass did not start because no network path had arrived yet; the first path, the setting, or the end of
+    /// `firstNetworkPathWait` starts it.
+    private var startsAfterFirstNetworkPath = false
+    private let firstNetworkPathWait: Duration
+    private var firstNetworkPathWaitTask: Task<Void, Never>?
+    /// The wait for the first path ended without a path. Passes then run, and uploads still wait for Wi-Fi.
+    private var firstNetworkPathWaitEnded = false
     private var consecutiveNoProgressRuns = 0
     private var backedUpAtRunStart = 0
     private var lastObservedUploadedCount: Int?
@@ -243,6 +255,7 @@ public final class PhotoLibraryBackupController {
         defaults = configuration.defaults
         let runtimeSignals = configuration.runtimeSignals
         self.runtimeSignals = runtimeSignals
+        firstNetworkPathWait = configuration.firstNetworkPathWait
         let retryPolicy = BackupRetryPolicy()
         self.retryPolicy = retryPolicy
         accessState = PhotoLibraryAuthorization.currentState()
@@ -440,6 +453,7 @@ public final class PhotoLibraryBackupController {
     /// The "Use Cellular Data" setting changed. A backup that waits for Wi-Fi starts again when the wait no longer
     /// holds; the setting itself persists in the shared defaults that every upload path reads.
     public func mobileDataSettingDidChange() {
+        startAfterFirstNetworkPath()
         resumeIfWiFiWaitEnded()
     }
 
@@ -696,6 +710,12 @@ public final class PhotoLibraryBackupController {
         guard queueStore.isOperational(), catalogStore.isOperational(), pendingStoreIsReady else {
             lastMessage = L10n.string("backup.error_local_state_unavailable")
             refreshFromQueue()
+            return nil
+        }
+        guard !waitsForFirstNetworkPath else {
+            // A pass before the first network path would end as "Waiting for Wi-Fi" on Wi-Fi, too.
+            startsAfterFirstNetworkPath = true
+            startFirstNetworkPathWait()
             return nil
         }
         if owner != .manual,
@@ -1190,6 +1210,7 @@ public final class PhotoLibraryBackupController {
 
         internal var isRetiringInstantWorkForTesting: Bool { isRetiringInstantWork }
         internal var isAutoResumeScheduledForTesting: Bool { autoResumeTask != nil }
+        internal var consecutiveNoProgressRunsForTesting: Int { consecutiveNoProgressRuns }
 
         internal func retireInstantWorkForTesting() async {
             guard !isRetiringInstantWork else { return }
@@ -1214,6 +1235,8 @@ public final class PhotoLibraryBackupController {
         statusRefreshTask = nil
         autoResumeTask?.cancel()
         autoResumeTask = nil
+        firstNetworkPathWaitTask?.cancel()
+        firstNetworkPathWaitTask = nil
         networkObservationTask?.cancel()
         networkObservationTask = nil
         instantEnqueueTask?.cancel()
@@ -1303,9 +1326,34 @@ public final class PhotoLibraryBackupController {
         networkObservationTask = Task { @MainActor [weak self] in
             for await _ in updates {
                 guard let self, !Task.isCancelled else { return }
+                self.startAfterFirstNetworkPath()
                 self.resumeIfWiFiWaitEnded()
             }
         }
+    }
+
+    private var waitsForFirstNetworkPath: Bool {
+        !firstNetworkPathWaitEnded && runtimeSignals.current().waitsForFirstNetworkPath
+    }
+
+    private func startFirstNetworkPathWait() {
+        guard firstNetworkPathWaitTask == nil else { return }
+        let wait = firstNetworkPathWait
+        firstNetworkPathWaitTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: wait)
+            guard let self, !Task.isCancelled else { return }
+            self.firstNetworkPathWaitTask = nil
+            self.firstNetworkPathWaitEnded = true
+            self.startAfterFirstNetworkPath()
+        }
+    }
+
+    private func startAfterFirstNetworkPath() {
+        guard !isShuttingDown, startsAfterFirstNetworkPath, !waitsForFirstNetworkPath else { return }
+        startsAfterFirstNetworkPath = false
+        firstNetworkPathWaitTask?.cancel()
+        firstNetworkPathWaitTask = nil
+        syncNow()
     }
 
     private func resumeIfWiFiWaitEnded() {
@@ -1614,6 +1662,16 @@ public final class PhotoLibraryBackupController {
         let p = progress ?? lastProjectedProgress
         guard p.hasOutstandingWork else { return }  // No work remains.
         let currentTime = Date()
+        if p.isPausedByPolicy, p.isWaitingForWiFi {
+            // Wi-Fi returning or the mobile-data setting ends this wait and starts the next pass; a timer would only
+            // repeat the whole pass while every upload still waits for Wi-Fi.
+            nextAutomaticAttemptAt = nil
+            status = BackupStatus(
+                progress: p, isScanning: false, isUserPaused: isUserPaused,
+                executionOpportunityIssue: executionOpportunityIssue
+            )
+            return
+        }
         guard
             let wakeAt = BackupAutomaticRetryPlanner.nextAttempt(
                 outstandingCount: p.outstanding.count,
