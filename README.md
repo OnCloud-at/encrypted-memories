@@ -103,6 +103,10 @@ Proton Drive's end-to-end encryption protects your photos in Proton Drive. Encry
 - The app does not encrypt its library and backup bookkeeping databases. They hold photo IDs, capture times, media types, and dimensions, and for backups also local filenames and file hashes. They hold no photos. FileVault or iOS Data Protection and the app sandbox protect them.
 - Decrypted photos are written to disk only when you share, drag out, or export them. The app removes its temporary share and drag files automatically.
 
+Cellular backup is off by default. Shared and exported copies have standard GPS metadata removed by default.
+On iPhone and iPad, the app preview is hidden in the App Switcher by default. Map and Places stays on by default.
+These defaults apply whenever no choice is saved, including existing installations. Saved choices remain unchanged.
+
 **Network**
 
 - The app connects to Proton for sign-in and for Proton Drive.

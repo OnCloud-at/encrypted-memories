@@ -92,6 +92,20 @@ final class LocalizationTests: XCTestCase {
         }
     }
 
+    func testWiFiWaitExplainsThatCellularBackupIsOffInEnglishAndGerman() throws {
+        let texts = [
+            ("backup.phase_waiting_wifi", "Waiting for Wi-Fi", "Wartet auf WLAN"),
+            (
+                "backup.detail_waiting_wifi", "Cellular data is off for backups.",
+                "Mobile Daten sind für Sicherungen aus."
+            ),
+        ]
+        for (key, english, german) in texts {
+            XCTAssertEqual(try localizedValue(key, language: "en", in: packageCatalog), english)
+            XCTAssertEqual(try localizedValue(key, language: "de", in: packageCatalog), german)
+        }
+    }
+
     func testSharedLibraryTitleLivesInCore() throws {
         XCTAssertEqual(try localizedValue("library.title", language: "en", in: packageCatalog), "Library")
         XCTAssertEqual(try localizedValue("library.title", language: "de", in: packageCatalog), "Mediathek")

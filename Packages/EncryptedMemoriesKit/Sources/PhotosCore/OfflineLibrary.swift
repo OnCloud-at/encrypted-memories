@@ -39,10 +39,15 @@ public enum AppSettingsKey {
     public static let backupUsesMobileData = "EncryptedMemories.backupUsesMobileData"
 }
 
+/// Fallbacks for preferences with no stored value, including on existing installations.
+/// An explicit saved choice always wins; reading a fallback does not migrate preferences.
 public enum AppSettingsDefault {
-    public static let removeLocationWhenSharing = false
+    /// Remove standard GPS metadata from shared and exported copies unless explicitly disabled.
+    public static let removeLocationWhenSharing = true
+    /// Keep Map and Places available unless explicitly disabled.
     public static let mapAndPlacesEnabled = true
-    public static let blurAppPreview = false
+    /// Hide the iOS and iPadOS App Switcher preview unless explicitly disabled.
+    public static let blurAppPreview = true
     /// Offline Photo Library is **on by default**: viewed originals are kept locally (encrypted) up to the cap.
     /// Thumbnails are always crawled while signed in, regardless of this value.
     public static let offlineLibraryEnabled = true
@@ -52,8 +57,8 @@ public enum AppSettingsDefault {
     public static let offlineOriginalsCapGB = 5.0
     /// Auto-lock remains enabled unless the user explicitly opts in for a large foreground import.
     public static let keepDisplayAwakeDuringForegroundBackup = false
-    /// On by default, so the backup keeps running on cellular data after the update.
-    public static let backupUsesMobileData = true
+    /// Wait for Wi-Fi on expensive networks unless cellular backup is explicitly enabled.
+    public static let backupUsesMobileData = false
 }
 
 /// One preference gate for every backup upload on an expensive network.
