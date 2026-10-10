@@ -65,47 +65,91 @@ jobs:
                   print(str(path.relative_to(root)), '\n'.join(errors[-30:]), flush=True)
           PYTHON
 
-      - name: Check the synthetic failure evidence before upload
+
+      - name: Print the checked Settings failure subtree
         if: failure() && github.ref == 'refs/heads/work/upgrade-macos-metal-hosted' && runner.os == 'macOS'
         run: |
           python3 - <<'PYTHON'
+          import json
           import re
-          import shutil
           import subprocess
           from pathlib import Path
-          root = Path.home() / 'Developer/xcode/EncryptedMemories/UpgradeCheck/evidence'
-          cases = list(root.glob('*/macOS/v1.0.5/backup.claimed'))
-          if len(cases) != 1:
-              raise SystemExit('Expected one owned backup.claimed failure directory')
-          case = cases[0]
-          files = [case / 'prepare-ui.log', case / 'prepare.xcresult']
-          if not files[0].is_file() or not files[1].is_dir():
-              raise SystemExit('The preparation log or result bundle is missing')
-          result = subprocess.check_output([
-              'xcrun', 'xcresulttool', 'get', 'object', '--legacy',
-              '--path', str(files[1]), '--format', 'json'])
+
           forbidden = re.compile(
               rb'gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}'
               rb'|-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----'
-              rb'|/Users/(?!runner/)[^/\s"]+'
+              rb'|/Users/(?!runner(?:/|[\s\x22\x27]|$))[^/\s"]+'
               rb'|[A-Za-z0-9._%+-]+@(?!example\.invalid|ui-test\.invalid)[A-Za-z0-9.-]+\.[A-Za-z]{2,}',
               re.IGNORECASE)
-          payloads = [result, files[0].read_bytes()]
-          payloads.extend(p.read_bytes() for p in files[1].rglob('*') if p.is_file())
-          if any(forbidden.search(payload) for payload in payloads):
-              raise SystemExit('Failure evidence rejected: credential, personal email, or non-runner user path')
-          destination = Path('hosted-macos-failure-evidence')
-          destination.mkdir()
-          shutil.copy2(files[0], destination / files[0].name)
-          shutil.copytree(files[1], destination / files[1].name)
-          print('Synthetic fixture only; credential, personal-email and user-path checks passed.')
-          PYTHON
 
-      - name: Retain the checked macOS preparation failure
-        if: failure() && github.ref == 'refs/heads/work/upgrade-macos-metal-hosted' && runner.os == 'macOS'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: hosted-macos-backup-claimed-failure
-          path: hosted-macos-failure-evidence/
-          if-no-files-found: error
-          retention-days: 3
+
+          def settings_subtree(hierarchy):
+              elements = []
+              for line in hierarchy.splitlines():
+                  element = re.match(r'^(\s*)([A-Za-z][A-Za-z ]*)(?: \([^)]*\))?, ', line)
+                  if not element:
+                      continue
+                  attributes = {}
+                  content = line.split(' <AX ', 1)[0].split(' <App ', 1)[0]
+                  for field in re.finditer(r"\b(identifier|title|label|value):\s*(?:'([^']*)'|([^,]*))", content):
+                      attributes[field[1]] = (field[2] if field[2] is not None else field[3]).strip()
+                  elements.append((len(element[1]), element[2], attributes))
+              starts = [index for index, (_, role, attributes) in enumerate(elements)
+                        if role == 'Window' and 'Settings' in [attributes.get(key) for key in ('identifier', 'title', 'label')]]
+              if len(starts) != 1:
+                  raise ValueError('Expected one Settings window in the failure hierarchy')
+              start = starts[0]
+              depth = elements[start][0]
+              result = []
+              for index, (indent, role, attributes) in enumerate(elements[start:], start):
+                  if index > start and indent <= depth:
+                      break
+                  entry = {'role': role[:60], 'identifier': attributes.get('identifier', '')[:60],
+                           'title': attributes.get('title', attributes.get('label', ''))[:60],
+                           'value': attributes.get('value', '')[:60]}
+                  result.append(' ' * (indent - depth) + json.dumps(entry, ensure_ascii=False))
+              return '\n'.join(result)
+
+
+          def rejection_category(text):
+              match = forbidden.search(text.encode())
+              if match is None:
+                  return None
+              value = match.group().lower()
+              if value.startswith(b'/users/'):
+                  return 'non-runner user path'
+              if value.startswith(b'-----begin'):
+                  return 'private key'
+              if value.startswith((b'ghp_', b'gho_', b'ghu_', b'ghs_', b'ghr_', b'github_pat_')):
+                  return 'credential'
+              return 'personal email'
+
+
+          def main():
+              root = Path.home() / 'Developer/xcode/EncryptedMemories/UpgradeCheck/evidence'
+              cases = list(root.glob('*/macOS/v1.0.5/backup.claimed/prepare.xcresult'))
+              if len(cases) != 1:
+                  raise SystemExit('Expected one owned backup.claimed preparation result')
+              destination = cases[0].parent / 'hierarchy-export'
+              subprocess.run(['xcrun', 'xcresulttool', 'export', 'attachments', '--path', str(cases[0]),
+                              '--output-path', str(destination),
+                              '--test-id', 'UpgradeJourneyUITests/testInstalledAppJourney()',
+                              '--filter', '*App UI hierarchy*'], check=True)
+              attachments = sorted(destination.glob('*.txt'))
+              if not attachments:
+                  raise SystemExit('The failing point has no App UI hierarchy text attachment')
+              for attachment in attachments:
+                  text = settings_subtree(attachment.read_text())
+                  category = rejection_category(text)
+                  if category:
+                      print('Rejected Settings subtree: file=' + attachment.name + '; category=' + category)
+                      print('Data-check pattern: ' + forbidden.pattern.decode())
+                      raise SystemExit('Settings subtree failed the data check')
+                  print('::group::Backup preparation Settings subtree (' + attachment.name + ')')
+                  print(text)
+                  print('::endgroup::')
+
+
+          if __name__ == '__main__':
+              main()
+          PYTHON
