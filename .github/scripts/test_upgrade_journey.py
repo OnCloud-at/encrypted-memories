@@ -249,6 +249,42 @@ with SigningIdentity(root) as signer:
             self.assertIn('UpgradeJourney', invocation)
             self.assertIn('ENABLE_HARDENED_RUNTIME=NO', invocation)
 
+    def test_cached_ui_runner_refreshes_support_files_before_each_compile(self):
+        repo = Path(__file__).resolve().parents[2]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            automation = root / 'automation'
+            inputs = automation / 'scripts/upgrade-test/UITests'
+            inputs.mkdir(parents=True)
+            (inputs / 'UpgradeJourneyUITests.swift').write_text('current journey')
+            source = root / 'cached/source'
+            ui = source / 'UpgradeUITests'
+            ui.mkdir(parents=True)
+            (ui / 'SettingsPaneTestSupport.swift').write_text('cached support')
+            products = source.parent / 'build/DerivedData.noindex/Build/Products'
+            products.mkdir(parents=True)
+            (products / 'runner.xctestrun').touch()
+            cached = Build(root / 'fixture.app', source)
+            arguments = ['run_journey', '--repo', str(repo), '--automation', str(automation),
+                         '--root', str(root), '--target', 'HEAD', '--sources', 'v1.0.5',
+                         '--platform', 'macOS', '--working-copy']
+            compiled = []
+
+            def command(args, **kwargs):
+                if args[:3] == ['xcrun', 'xcodebuild', 'build-for-testing']:
+                    compiled.append((ui / 'SettingsPaneTestSupport.swift').read_text())
+                    self.assertEqual((ui / 'UpgradeJourneyUITests.swift').read_text(), 'current journey')
+
+            with patch.object(sys, 'argv', arguments), patch.object(run_journey, 'build_app', return_value=cached), \
+                    patch('keychain_entitlements.snapshot', return_value={}), \
+                    patch.object(run_journey, 'SigningIdentity'), patch.object(run_journey, 'run_cases'), \
+                    patch.object(run_journey, 'output', return_value='arm64'), \
+                    patch.object(run_journey, 'command', side_effect=command):
+                for version in ['first support', 'edited support']:
+                    (inputs / 'SettingsPaneTestSupport.swift').write_text(version)
+                    run_journey.main()
+            self.assertEqual(compiled, ['first support', 'edited support'])
+
     def test_macos_launch_passes_the_same_case_to_the_ui_runner_without_a_second_launcher(self):
         with tempfile.TemporaryDirectory() as root:
             app = run_journey.InstalledApp('macOS', Path(root))

@@ -336,7 +336,7 @@ def main():
     source = current.source
     if source is None:
         raise JourneyError('The current build has no source for its UI runner')
-    shutil.copy2(args.automation / 'scripts/upgrade-test/UITests/UpgradeJourneyUITests.swift', source / 'UpgradeUITests')
+    shutil.copytree(args.automation / 'scripts/upgrade-test/UITests', source / 'UpgradeUITests', dirs_exist_ok=True)
     dd = source.parent / 'build/DerivedData.noindex'
     sdk = 'iphonesimulator' if args.platform == 'iOS' else 'macosx'
     command(['xcrun', 'xcodebuild', 'build-for-testing', '-project', 'EncryptedMemories.xcodeproj',
