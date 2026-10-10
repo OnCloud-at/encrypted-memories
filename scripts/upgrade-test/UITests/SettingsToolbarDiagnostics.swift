@@ -9,7 +9,10 @@
         private struct Window {
             let order: Int
             let pid: pid_t
+            let owner: String
             let layer: Int
+            let alpha: Double
+            let isOnscreen: Bool?
             let frame: CGRect
         }
 
@@ -41,7 +44,9 @@
                     "tabFrame": NSStringFromRect(tab.frame), "isHittable": tab.isHittable,
                     "isEnabled": tab.isEnabled, "isSelected": tab.isSelected,
                     "acknowledged": isAcknowledged(), "settingsFrame": NSStringFromRect(settings.frame),
-                    "windowCount": app.windows.count,
+                    "windowCount": app.windows.count, "appIsEnabled": app.isEnabled,
+                    "settingsIsEnabled": settings.isEnabled, "toolbarIsEnabled": settings.toolbars.firstMatch.isEnabled,
+                    "toolbarFrame": NSStringFromRect(settings.toolbars.firstMatch.frame),
                     "mainDisplayFrame": NSScreen.main.map { NSStringFromRect($0.frame) } ?? "unavailable",
                 ])
             }
@@ -63,6 +68,8 @@
                 ])
                 try capture(strategy + " after")
             }
+
+            try inspectSystemOwners(settings: settings, tab: tab)
 
             // This attempt precedes every explicit activation after Cmd+comma.
             try attempt("f no activation then click") { tab.click() }
@@ -152,25 +159,125 @@
             return try records.enumerated().map { index, record in
                 guard let pid = record[kCGWindowOwnerPID as String] as? NSNumber,
                     let layer = record[kCGWindowLayer as String] as? NSNumber,
+                    let alpha = record[kCGWindowAlpha as String] as? NSNumber,
                     let bounds = record[kCGWindowBounds as String] as? NSDictionary,
                     let frame = CGRect(dictionaryRepresentation: bounds as CFDictionary)
                 else { throw failure("CoreGraphics returned incomplete window geometry") }
-                return Window(order: index, pid: pid.int32Value, layer: layer.intValue, frame: frame)
+                return Window(
+                    order: index, pid: pid.int32Value,
+                    owner: record[kCGWindowOwnerName as String] as? String ?? "unavailable",
+                    layer: layer.intValue, alpha: alpha.doubleValue,
+                    isOnscreen: record[kCGWindowIsOnscreen as String] as? Bool, frame: frame)
             }
         }
 
         private static func logWindowOrder(_ stage: String, instance: NSRunningApplication, windows: [Window]) {
             log([
                 "stage": stage, "ownedAppPID": instance.processIdentifier, "ownedAppIsActive": instance.isActive,
-                "ownedWindowsFrontToBack": windows.filter { $0.pid == instance.processIdentifier }.map {
+                "onScreenWindowsFrontToBack": windows.map {
                     [
-                        "frontToBackIndex": $0.order, "layer": $0.layer,
+                        "frontToBackIndex": $0.order, "ownerPID": $0.pid, "ownerName": $0.owner,
+                        "layer": $0.layer, "alpha": $0.alpha,
+                        "isOnscreen": $0.isOnscreen.map { $0 as Any } ?? "unavailable",
                         "bounds": [
                             "X": $0.frame.minX, "Y": $0.frame.minY, "Width": $0.frame.width, "Height": $0.frame.height,
                         ],
                     ] as [String: Any]
                 },
             ])
+        }
+
+        private static func inspectSystemOwners(settings: XCUIElement, tab: XCUIElement) throws {
+            let owners = [
+                "com.apple.UserNotificationCenter", "com.apple.notificationcenterui",
+                "com.apple.systempreferences", "com.apple.SecurityAgent",
+                "com.apple.accessibility.universalAccessAuthWarn",
+            ]
+            let instance = try ownedApplication()
+            let order = try windows()
+            let settingsOrder = order.first {
+                $0.pid == instance.processIdentifier && $0.layer == 0
+                    && abs($0.frame.minX - settings.frame.minX) < 2
+                    && abs($0.frame.minY - settings.frame.minY) < 2
+                    && abs($0.frame.width - settings.frame.width) < 2
+                    && abs($0.frame.height - settings.frame.height) < 2
+            }?.order
+            var candidates: [[String: Any]] = []
+            for identifier in owners {
+                let instances = NSWorkspace.shared.runningApplications.filter { $0.bundleIdentifier == identifier }
+                guard !instances.isEmpty else {
+                    log(["strategy": "j system owner", "bundleIdentifier": identifier, "status": "not running"])
+                    continue
+                }
+                let system = XCUIApplication(bundleIdentifier: identifier)
+                let state = system.state
+                guard state != .notRunning && state != .unknown else {
+                    log([
+                        "strategy": "j system owner", "bundleIdentifier": identifier,
+                        "state": state.rawValue, "status": "No running XCTest application; no window query",
+                    ])
+                    continue
+                }
+                let pids = instances.map(\.processIdentifier)
+                let windows = system.windows.allElementsBoundByIndex
+                let alerts = system.alerts.count
+                var buttons: [[String: Any]] = []
+                var windowFacts: [[String: Any]] = []
+                for (index, window) in windows.enumerated() {
+                    windowFacts.append([
+                        "index": index, "frame": NSStringFromRect(window.frame),
+                        "isEnabled": window.isEnabled, "isHittable": window.isHittable,
+                    ])
+                    for button in window.buttons.allElementsBoundByIndex {
+                        buttons.append([
+                            "windowIndex": index, "title": buttonTitle(button),
+                            "frame": NSStringFromRect(button.frame),
+                            "isEnabled": button.isEnabled, "isHittable": button.isHittable,
+                        ])
+                    }
+                }
+                // Window titles and full system hierarchies must never enter the diagnostic output.
+                let coversTab = settingsOrder.map { settingsIndex in
+                    order.contains {
+                        pids.contains($0.pid) && $0.order < settingsIndex && $0.alpha > 0
+                            && $0.frame.contains(CGPoint(x: tab.frame.midX, y: tab.frame.midY))
+                    }
+                }
+                let facts: [String: Any] = [
+                    "strategy": "j system owner", "bundleIdentifier": identifier, "ownerPIDs": pids,
+                    "state": state.rawValue, "alertCount": alerts, "windows": windowFacts, "buttons": buttons,
+                    "coversTabCenterAboveSettings": coversTab.map { $0 as Any } ?? "unverified",
+                ]
+                log(facts)
+                if alerts > 0 || coversTab == true {
+                    candidates.append([
+                        "strategy": "k known system alert or covering window", "bundleIdentifier": identifier,
+                        "alertCount": alerts,
+                        "coversTabCenterAboveSettings": coversTab.map { $0 as Any } ?? "unverified",
+                        "buttons": buttons, "action": "No system button clicked; blocking status requires evidence",
+                    ])
+                }
+            }
+            if candidates.isEmpty {
+                log([
+                    "strategy": "k",
+                    "status": "No alert or covering window found among the five known owners; no system input",
+                ])
+            } else {
+                candidates.forEach(log)
+            }
+        }
+
+        private static func buttonTitle(_ button: XCUIElement) -> String {
+            if !button.label.isEmpty { return String(button.label.prefix(60)) }
+            let description = button.debugDescription
+            let expression = try! NSRegularExpression(pattern: "title: '(.*?)'(?=, | <|$)")
+            guard
+                let match = expression.firstMatch(
+                    in: description, range: NSRange(description.startIndex..., in: description)),
+                let range = Range(match.range(at: 1), in: description)
+            else { return "unavailable" }
+            return String(description[range].prefix(60))
         }
 
         private static func failure(_ message: String) -> NSError {

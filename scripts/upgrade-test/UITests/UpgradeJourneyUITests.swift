@@ -151,6 +151,7 @@ final class UpgradeJourneyUITests: XCTestCase {
                 "The owned app launch arguments are missing")
             app.launchArguments = try JSONDecoder().decode([String].self, from: arguments)
             app.launch()
+            try SettingsToolbarDiagnostics.captureWindowOrder("after launch")
             app.menuBars.menuBarItems["Window"].click()
             app.menuItems["Library"].click()
             let larger = app.buttons["Larger thumbnails"]
