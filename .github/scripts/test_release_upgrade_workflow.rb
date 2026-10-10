@@ -4,6 +4,7 @@
 require "minitest/autorun"
 require "yaml"
 require "tmpdir"
+require_relative "test_release_identity"
 
 class ReleaseUpgradeWorkflowTest < Minitest::Test
   def setup
@@ -12,7 +13,7 @@ class ReleaseUpgradeWorkflowTest < Minitest::Test
   end
 
   def test_upgrade_script_behavior
-    %w[test_release_upgrade.py test_keychain_entitlements.py test_upgrade_journey.py].each do |script|
+    %w[test_release_upgrade.py test_keychain_entitlements.py test_upgrade_journey.py test_upgrade_metadata.py].each do |script|
       assert system("python3", File.expand_path(script, __dir__)), "#{script} failed"
     end
   end
@@ -42,6 +43,8 @@ class ReleaseUpgradeWorkflowTest < Minitest::Test
     assert_equal "needs.prepare.outputs.upgrade_overridden != 'true'", run.fetch("if")
     assert_includes run.fetch("env").fetch("TARGET_COMMIT"), "needs.prepare.outputs.commit_sha"
     assert_equal "xcode-27", upgrade.fetch("runs-on")
+    assert_includes run.fetch("env").fetch("TARGET_RELEASE_TAG"), "needs.prepare.outputs.tag"
+    assert_includes run.fetch("run"), '--release-tag "$TARGET_RELEASE_TAG"'
   end
 
   def test_approved_limits_and_setup_failures_are_always_reported
@@ -55,9 +58,9 @@ class ReleaseUpgradeWorkflowTest < Minitest::Test
       summary = File.read(report)
       assert_includes summary, "macOS-Keychain-Persistenz über das Update wird nicht im Prüfbau geprüft"
       assert_includes summary, "immediate v1.0.5 Enable-to-SIGKILL"
-      assert_includes summary, "#411"
-      assert_includes summary, "bundle metadata"
-      assert_includes summary, "external authentication headers"
+      assert_includes summary, "CFBundleShortVersionString and CFBundleVersion"
+      assert_includes summary, "string-for-string"
+      assert_includes summary, "External authentication-header acceptance remains unverified"
     end
     failure = steps.find { |step| step["name"] == "Report blocked release" }
     refute_nil failure

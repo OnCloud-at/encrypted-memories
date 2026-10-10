@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import tarfile
 import tempfile
+from urllib.parse import quote
 
 from journey import JourneyError
 
@@ -25,7 +26,8 @@ FLAG = 'ENCRYPTED_MEMORIES_UPGRADE_TEST'
 class Build:
     app: Path
     source: Path | None
-
+    metadata: dict | None = None
+    commit: str | None = None
 
 
 def clean_environment():
@@ -40,12 +42,55 @@ def command(args, cwd=None, env=None):
     subprocess.run(args, cwd=cwd, env=env or clean_environment(), check=True)
 
 
-def output(args, cwd=None):
-    return subprocess.check_output(args, cwd=cwd, env=clean_environment(), text=True).strip()
+def output(args, cwd=None, env=None):
+    return subprocess.check_output(args, cwd=cwd, env=env or clean_environment(), text=True).strip()
+
+
+def release_metadata(repo, automation, tag):
+    sha = output(['git', 'rev-parse', '--verify', '--end-of-options', tag + '^{commit}'], repo)
+    if not tag.startswith('v'):
+        tags = [value for value in output(['git', 'tag', '--points-at', sha], repo).splitlines() if value.startswith('v')]
+        if len(tags) != 1:
+            raise JourneyError('The candidate needs an explicit release tag; no unique tag matches its commit')
+        tag = tags[0]
+    environment = clean_environment()
+    if os.environ.get('GH_TOKEN'):
+        environment['GH_TOKEN'] = os.environ['GH_TOKEN']
+    try:
+        payload = json.loads(output(['gh', 'api', 'repos/{owner}/{repo}/releases/tags/' + quote(tag, safe='')],
+                                    repo, env=environment))
+    except (subprocess.CalledProcessError, OSError, ValueError) as error:
+        raise JourneyError(f'{tag}: no readable published GitHub release for this tag') from error
+    if not isinstance(payload, dict) or payload.get('tag_name') != tag:
+        raise JourneyError(f'{tag}: the published GitHub release does not match this tag')
+    if payload.get('draft') is not False or not payload.get('published_at'):
+        raise JourneyError(f'{tag}: not a published GitHub release')
+    result = subprocess.run(['ruby', str(automation / '.github/scripts/release_identity.rb'), sha],
+                            input=json.dumps(payload), cwd=repo, env=clean_environment(),
+                            capture_output=True, text=True, timeout=60)
+    if result.returncode:
+        raise JourneyError(f'{tag}: {result.stderr.strip()}')
+    return json.loads(result.stdout)
+
+
+def verify_bundle_metadata(app, platform, release, stage):
+    path = app / ('Info.plist' if platform == 'iOS' else 'Contents/Info.plist')
+    try:
+        info = plistlib.loads(path.read_bytes())
+    except (OSError, ValueError) as error:
+        raise JourneyError(f'{release["tag"]}: unreadable {stage} bundle metadata') from error
+    expected = {'CFBundleShortVersionString': release['version'], 'CFBundleVersion': release['build_number']}
+    if not isinstance(info, dict) or info.get('CFBundleIdentifier') != 'at.oncloud.encryptedmemories.upgrade-test':
+        raise JourneyError(f'{release["tag"]}: {stage} bundle does not have the test identifier')
+    for key, value in expected.items():
+        if type(info.get(key)) is not str or info[key] != value:
+            raise JourneyError(f'{release["tag"]}: {stage} {key} must equal {value!r}; got {info.get(key)!r}')
+    return {key: info[key] for key in expected}
 
 
 def harness_digest(automation):
-    files = [automation / 'scripts/upgrade-test/build_apps.py']
+    files = [automation / name for name in ['scripts/upgrade-test/build_apps.py',
+             '.github/scripts/release_identity.rb', '.github/scripts/release_build_number.rb']]
     files += list((automation / 'scripts/upgrade-test/overlays').rglob('*'))
     files += [automation / 'Packages/EncryptedMemoriesKit/Sources' / name for name in PAYLOAD]
     digest = hashlib.sha256()
@@ -135,11 +180,14 @@ def test_project(source, automation, platform):
         path.write_bytes(plistlib.dumps(value))
 
 
-def build_app(repo, automation, tag, platform, root, historical=True, working_copy=False):
+def build_app(repo, automation, tag, platform, root, historical=True, working_copy=False, metadata=None):
     sha = output(['git', 'rev-parse', tag + '^{commit}'], repo)
+    metadata = metadata or release_metadata(repo, automation, tag)
+    if metadata['commit'] != sha and not working_copy:
+        raise JourneyError(f'{tag}: the source commit does not match published release {metadata["tag"]}')
     toolchain = output(['xcodebuild', '-version'])
     identity = hashlib.sha256((sha + toolchain + platform + output(['uname', '-m'])
-                               + harness_digest(automation)).encode()).hexdigest()
+                               + harness_digest(automation) + json.dumps(metadata, sort_keys=True)).encode()).hexdigest()
     if working_copy:
         app_paths = ['App', 'iOSApp', 'Shared', 'Packages', 'project.yml',
                      'scripts/update-proton-sdk.sh', 'scripts/build-paths.sh']
@@ -152,13 +200,14 @@ def build_app(repo, automation, tag, platform, root, historical=True, working_co
         identity = hashlib.sha256((identity + digest.hexdigest()).encode()).hexdigest()
     product = root / 'products' / platform / identity
     if (product / 'complete.json').exists():
-        metadata = json.loads((product / 'complete.json').read_text())
-        app = product / metadata['app']
-        if metadata['identity'] != identity or not app.is_dir():
+        cached = json.loads((product / 'complete.json').read_text())
+        app = product / cached['app']
+        if cached['identity'] != identity or cached.get('commit') != sha or cached.get('release') != metadata or not app.is_dir():
             raise JourneyError(f'{tag}: invalid historical app cache')
-        source = Path(metadata['source']) if metadata.get('source') else None
+        verify_bundle_metadata(app, platform, metadata, 'cached')
+        source = Path(cached['source']) if cached.get('source') else None
         if historical or (source and source.is_dir()):
-            return Build(app, None if historical else source)
+            return Build(app, None if historical else source, metadata, sha)
     scratch = Path(tempfile.mkdtemp(prefix=f'{tag.replace("/", "_")}-{platform}-', dir=root / 'scratch'))
     source = scratch / 'source'
     source_tree(repo, sha, source, working_copy=working_copy)
@@ -187,21 +236,21 @@ def build_app(repo, automation, tag, platform, root, historical=True, working_co
              '-packageCachePath', str(scratch / 'build/XcodePackageCache.noindex'),
              '-disableAutomaticPackageResolution', '-onlyUsePackageVersionsFromResolvedFile',
              '-skipPackagePluginValidation', '-skipMacroValidation',
-             *signing, 'SWIFT_ACTIVE_COMPILATION_CONDITIONS=' + FLAG,
+             *signing, 'MARKETING_VERSION=' + metadata['version'],
+             'CURRENT_PROJECT_VERSION=' + metadata['build_number'],
+             'SWIFT_ACTIVE_COMPILATION_CONDITIONS=' + FLAG,
              'SWIFT_OPTIMIZATION_LEVEL=-O', 'ARCHS=' + output(['uname', '-m']), 'ONLY_ACTIVE_ARCH=YES'], cwd=source, env=env)
     built = dd / 'Build/Products' / ('Release-iphonesimulator' if platform == 'iOS' else 'Release')
     apps = [path for path in built.glob('*.app') if 'Runner' not in path.name]
     if len(apps) != 1:
         raise JourneyError(f'{tag}: expected one built app, found {len(apps)}')
-    info = plistlib.loads((apps[0] / ('Info.plist' if platform == 'iOS' else 'Contents/Info.plist')).read_bytes())
-    if info['CFBundleIdentifier'] != 'at.oncloud.encryptedmemories.upgrade-test':
-        raise JourneyError('The test product has the shipping bundle identifier')
+    verify_bundle_metadata(apps[0], platform, metadata, 'built')
     # Only finished products enter the historical cache. Source, SDK and partial builds remain separate.
     product.mkdir(parents=True, exist_ok=True)
     app = product / apps[0].name
     shutil.copytree(apps[0], app, symlinks=True, dirs_exist_ok=True)
-    (product / 'complete.json').write_text(json.dumps({'identity': identity, 'commit': sha, 'app': app.name, 'source': str(source) if not historical else None}) + '\n')
-    return Build(app, source)
+    (product / 'complete.json').write_text(json.dumps({'identity': identity, 'commit': sha, 'app': app.name, 'source': str(source) if not historical else None, 'release': metadata}) + '\n')
+    return Build(app, source, metadata, sha)
 
 
 if __name__ == '__main__':
@@ -212,7 +261,9 @@ if __name__ == '__main__':
     parser.add_argument('--platform', choices=['iOS', 'macOS'], required=True)
     parser.add_argument('--tag', required=True)
     parser.add_argument('--working-copy', action='store_true')
+    parser.add_argument('--release-tag', help='Published metadata for the candidate; required when its commit has no unique tag')
     args = parser.parse_args()
     (args.root / 'scratch').mkdir(parents=True, exist_ok=True)
     print(build_app(args.repo.resolve(), args.automation.resolve(), args.tag, args.platform,
-                    args.root.resolve(), historical=not args.working_copy, working_copy=args.working_copy).app)
+                    args.root.resolve(), historical=not args.working_copy, working_copy=args.working_copy,
+                    metadata=release_metadata(args.repo.resolve(), args.automation.resolve(), args.release_tag or args.tag)).app)

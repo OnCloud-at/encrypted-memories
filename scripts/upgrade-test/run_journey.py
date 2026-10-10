@@ -14,7 +14,7 @@ import sys
 import uuid
 import time
 
-from build_apps import build_app, clean_environment, command, output
+from build_apps import build_app, clean_environment, command, output, release_metadata, verify_bundle_metadata
 from journey import JourneyError, run_cases
 from server import FixtureServer
 
@@ -28,9 +28,9 @@ LIMITATION = ('macOS-Keychain-Persistenz über das Update wird nicht im Prüfbau
 CONSENT_LIMITATION = ('The backup journey requires consent already saved on disk. The immediate v1.0.5 '
                      'Enable-to-SIGKILL case is a known historical limit and is not tested here.')
 
-METADATA_LIMITATION = ('Bundle metadata parity with shipping artifacts is pending in #411. '
-                       'These journeys verify commit, storage, and task paths. '
-                       'They do not verify bundle metadata or external authentication headers.')
+METADATA_SCOPE = ('The gate requires installed CFBundleShortVersionString and CFBundleVersion to equal '
+                  'the published release data string-for-string before every old and new probe starts. '
+                  'External authentication-header acceptance remains unverified.')
 
 
 def summary(message):
@@ -203,6 +203,13 @@ class InstalledApp:
                 'com.apple.security.personal-information.photos-library': True}))
             self.signer.sign(self.installed, entitlements)
 
+    def verify_metadata(self, release, phase, source_commit=None):
+        bundle = Path(output(['xcrun', 'simctl', 'get_app_container', self.simulator, BUNDLE, 'app'])) if self.simulator else self.installed
+        actual = verify_bundle_metadata(bundle, self.platform, release, 'installed ' + phase)
+        (self.directory / (phase + '-bundle.json')).write_text(json.dumps({
+            'expected': release, 'source_commit': source_commit, 'installed': actual}, indent=2) + '\n')
+        summary(f'{self.platform} {phase} bundle: {release["tag"]}, version {actual["CFBundleShortVersionString"]}, build {actual["CFBundleVersion"]}')
+
     @property
     def preferences_path(self):
         if self.simulator:
@@ -310,12 +317,14 @@ def main():
     parser.add_argument('--platform', choices=['iOS', 'macOS'], required=True)
     parser.add_argument('--points', nargs='+', choices=POINTS, default=POINTS)
     parser.add_argument('--working-copy', action='store_true')
+    parser.add_argument('--release-tag', default=os.environ.get('UPGRADE_RELEASE_TAG'),
+                        help='Published metadata for the candidate; required when its commit has no unique tag')
     args = parser.parse_args()
     toolchain = output(['xcodebuild', '-version'])
     summary('Xcode toolchain: ' + toolchain.replace('\n', '; '))
     summary(CONSENT_LIMITATION)
     summary(LIMITATION)
-    summary(METADATA_LIMITATION)
+    summary(METADATA_SCOPE)
     for path in [args.root / 'scratch', args.root / 'evidence']:
         path.mkdir(parents=True, exist_ok=True)
     sys.path.insert(0, str(args.automation / '.github/scripts'))
@@ -327,8 +336,11 @@ def main():
     compare_groups(snapshot(args.repo, previous),
                    snapshot(args.repo, None if args.working_copy else args.target))
     summary(f'Keychain access groups match {previous} (macOS and iOS).')
+    metadata = release_metadata(args.repo, args.automation, args.release_tag or args.target)
+    if args.working_copy:
+        summary(f'Local working-copy rehearsal uses published metadata from {metadata["tag"]}; its source changes are not a shipping artifact.')
     current = build_app(args.repo, args.automation, args.target, args.platform, args.root,
-                        historical=False, working_copy=args.working_copy)
+                        historical=False, working_copy=args.working_copy, metadata=metadata)
     predecessors = {tag: build_app(args.repo, args.automation, tag, args.platform, args.root) for tag in args.sources}
     # Build the standalone UI runner from the current release, without an app dependency.
     source = current.source
@@ -358,6 +370,10 @@ def main():
         evidence_root.mkdir(parents=True)
         (evidence_root / 'toolchain.json').write_text(json.dumps({
             'xcode': toolchain, 'platform': args.platform, 'target': args.target}) + '\n')
+        (evidence_root / 'build-metadata.json').write_text(json.dumps({
+            name: {'source_commit': build.commit, 'release': build.metadata,
+                   'built': verify_bundle_metadata(build.app, args.platform, build.metadata, 'built evidence')}
+            for name, build in [('candidate', current), *predecessors.items()]}, indent=2) + '\n')
         def execute(tag, point):
             case = evidence_root / args.platform / tag / point
             case.mkdir(parents=True, exist_ok=True)
@@ -366,6 +382,7 @@ def main():
                 preparing = None
                 try:
                     app.install(predecessors[tag].app)
+                    app.verify_metadata(predecessors[tag].metadata, 'old', predecessors[tag].commit)
                     app.launch(server, seed=True)
                     preparation_deadline = time.monotonic() + 180
                     preparing, prepare_log = ui_run(runner, app.destination, point, 'prepare', case, getattr(app, 'installed', None), app.launch_arguments)
@@ -381,6 +398,7 @@ def main():
                     prepare_log.close()
                     server.begin_upgrade()
                     app.install(current.app)
+                    app.verify_metadata(current.metadata, 'new', current.commit)
                     if saved_consent is not None:
                         consent_evidence['after_install_over'] = verify_saved_backup_consent(app.preferences_path, saved_consent)
                         (case / 'backup-consent.json').write_text(json.dumps(consent_evidence) + '\n')
