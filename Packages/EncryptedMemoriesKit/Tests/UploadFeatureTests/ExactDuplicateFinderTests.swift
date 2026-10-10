@@ -1575,15 +1575,16 @@ final class ExactDuplicateFinderTests: XCTestCase {
         XCTAssertEqual(violations, [])
     }
 
+    /// The check that both apps start when they install an account, on macOS also without a library window.
     @MainActor
-    func testTheLaunchCheckRestoresAnOpenMergeWithoutAScanAndReadsNothingWithoutOne() async throws {
+    func testTheAccountCheckRestoresAnOpenMergeWithoutDuplicatesAndReadsNothingWithoutOne() async throws {
         let kept = server.seedLink(digest: digest("a"))
         let duplicate = server.seedLink(digest: digest("a"))
         indexServer()
-        let model = ExactDuplicatesModel(finder: finder)
+        let lifetime = ExactDuplicatesAccountLifetime()
         let readsBefore = server.readCounts
 
-        await model.resolvePendingMerges()
+        await lifetime.checkPendingMerges(of: finder)?.value
 
         XCTAssertEqual(server.readCounts, readsBefore, "no open merge, no read")
         // The app ended between the trash and its check, and another device trashed the kept photo meanwhile.
@@ -1592,13 +1593,28 @@ final class ExactDuplicateFinderTests: XCTestCase {
         let intent = pendingIntent(kept: kept, duplicate: duplicate, seed: "a", trashedAt: server.serverTime)
         XCTAssertTrue(mergeJournal.record([intent]))
 
-        await model.resolvePendingMerges()
+        // The next account start checks again; no Duplicates screen or model exists.
+        await lifetime.checkPendingMerges(of: finder)?.value
 
         XCTAssertEqual(state(of: duplicate), .active, "one copy comes back before the person opens Duplicates")
         XCTAssertEqual(restores, ["person restore \(duplicate.nodeID)"])
         XCTAssertEqual(mergeJournal.pendingMerges(), [])
         XCTAssertEqual(server.readCounts.favorites, readsBefore.favorites, "no scan and no ranking")
-        XCTAssertEqual(model.groups.map(\.id), [])
+    }
+
+    @MainActor
+    func testTheAccountCheckEndsWithTheAccountButNotWithANewDuplicatesModel() {
+        let lifetime = ExactDuplicatesAccountLifetime()
+        let check = lifetime.checkPendingMerges(of: finder)
+        XCTAssertNotNil(check)
+
+        // The Mac library window builds the Duplicates model of the same account after the account start.
+        _ = lifetime.replace(with: finder)
+        XCTAssertEqual(check?.isCancelled, false, "a new Duplicates model keeps the account check")
+
+        // A sign-out or a new account ends the check of the earlier account.
+        XCTAssertNil(lifetime.checkPendingMerges(of: nil))
+        XCTAssertEqual(check?.isCancelled, true)
     }
 
     func testMergeAllWritesNothingWhenTheSharedFavoritesReadFails() async throws {
