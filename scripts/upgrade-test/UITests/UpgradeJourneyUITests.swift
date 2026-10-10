@@ -191,6 +191,7 @@ final class UpgradeJourneyUITests: XCTestCase {
             feature.tap()
         #else
             app.typeKey(",", modifierFlags: .command)
+            try SettingsToolbarDiagnostics.captureWindowOrder("after Cmd+comma")
             let settings = app.windows["Settings"]
             XCTAssertTrue(settings.waitForExistence(timeout: 10), "The Settings window is missing")
             let ready = XCTNSPredicateExpectation(
@@ -198,7 +199,7 @@ final class UpgradeJourneyUITests: XCTestCase {
             XCTAssertEqual(
                 XCTWaiter.wait(for: [ready], timeout: 10), .completed,
                 "The Settings window did not become hittable")
-            app.activate()
+            try SettingsToolbarDiagnostics.captureWindowOrder("after Settings-ready wait")
             let title = point.hasPrefix("backup.") ? "Backup" : "Smart Search"
             let tab = settings.toolbars.buttons[title]
             XCTAssertTrue(tab.waitForExistence(timeout: 10))
