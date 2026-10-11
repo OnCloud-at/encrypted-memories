@@ -14,11 +14,12 @@ from unittest.mock import patch
 import signal
 import os
 import uuid
-import threading
 import select
+import socket
 import time
 from contextlib import nullcontext
 
+from http.client import HTTPConnection
 from urllib.request import Request, urlopen
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'scripts/upgrade-test'))
@@ -805,22 +806,27 @@ else:
         with tempfile.TemporaryDirectory() as root:
             server = FixtureServer(Path(root), 'backup.claimed')
             results = []
-
-            def fetch():
+            # A loaded runner accepts late: the app's parallel thumbnail requests wait in the listen backlog. Beyond
+            # it, macOS resets connections and Linux drops them, so every connection opens before the server accepts.
+            connections = []
+            for _ in range(40):
                 try:
-                    with urlopen(server.url + '/thumbnail/asset-1', timeout=30) as response:
-                        results.append(response.status)
+                    connection = socket.create_connection(('127.0.0.1', server.http.server_port), timeout=2)
+                    connection.settimeout(30)
+                    connections.append(connection)
                 except OSError as error:
                     results.append(type(error).__name__)
-
-            # A loaded runner accepts late: the app's parallel thumbnail requests queue in the listen backlog.
-            requests = [threading.Thread(target=fetch) for _ in range(40)]
-            for request in requests:
-                request.start()
-            time.sleep(1)
             with server:
-                for request in requests:
-                    request.join()
+                for connection in connections:
+                    request = HTTPConnection('127.0.0.1', server.http.server_port)
+                    request.sock = connection
+                    try:
+                        request.request('GET', '/thumbnail/asset-1')
+                        results.append(request.getresponse().status)
+                    except OSError as error:
+                        results.append(type(error).__name__)
+                    finally:
+                        request.close()
             self.assertEqual(results, [200] * 40)
 
     def test_upload_ledger_survives_app_replacement_and_exposes_duplicates(self):
