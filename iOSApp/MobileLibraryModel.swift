@@ -233,6 +233,8 @@ final class MobileLibraryModel {
     /// The Duplicates screen of this account. Nil while the account cannot merge duplicates.
     private(set) var duplicates: ExactDuplicatesModel?
     @ObservationIgnored private let duplicatesLifetime = ExactDuplicatesAccountLifetime()
+    /// The merger of the Duplicates screen, which Empty Recently Deleted asks before it deletes anything.
+    @ObservationIgnored private var duplicateFinder: (any ExactDuplicateMerging)?
     /// Shared create/list/add state machine used by every native album presentation in this session.
     private(set) var albumActions: AlbumActionCoordinator?
     /// Account-scoped Photos-library backup controller shared with macOS.
@@ -592,6 +594,7 @@ final class MobileLibraryModel {
     }
 
     private func replaceDuplicates(using finder: (any ExactDuplicateMerging)?) {
+        duplicateFinder = finder
         duplicates = duplicatesLifetime.replace(with: finder) { [weak self] trashed, token in
             await self?.removeMergedDuplicates(Set(trashed), account: token)
         }
@@ -719,7 +722,9 @@ final class MobileLibraryModel {
                 throw CancellationError()
             }
         }
-        if includesProtonTrash { try await backend.emptyTrash() }
+        if includesProtonTrash {
+            try await RecentlyDeletedEmptying.empty(backend, checkingMergesWith: duplicateFinder)
+        }
     }
 
     /// Deletes only the album container through the shared AlbumCore facade. The backend deliberately uses

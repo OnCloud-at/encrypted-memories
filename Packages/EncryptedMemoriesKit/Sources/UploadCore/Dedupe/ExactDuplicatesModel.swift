@@ -32,6 +32,9 @@ public protocol ExactDuplicateMerging: Sendable {
     /// Checks the merges that an earlier failure or the end of the process left open, and restores a copy of a group
     /// that has none in the library. Reads nothing from the server while no merge is open.
     func resolvePendingMerges() async
+    /// Checks the open merges and answers whether none is left. False while the journal cannot be read or a merge still
+    /// waits for its check: emptying Recently Deleted then could delete the last copy of a group for good.
+    func confirmNoPendingMerges() async -> Bool
 }
 
 extension ExactDuplicateFinder: ExactDuplicateMerging {}
@@ -42,6 +45,9 @@ extension ExactDuplicateMerging {
 
     /// Mergers without a merge journal leave no merge open.
     public func resolvePendingMerges() async {}
+
+    /// Mergers without a merge journal leave no merge open.
+    public func confirmNoPendingMerges() async -> Bool { true }
 
     /// Mergers without shared listings merge each batch on its own.
     public func merge(

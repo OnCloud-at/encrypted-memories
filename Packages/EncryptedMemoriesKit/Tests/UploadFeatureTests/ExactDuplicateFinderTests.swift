@@ -1602,6 +1602,83 @@ final class ExactDuplicateFinderTests: XCTestCase {
         XCTAssertEqual(server.readCounts.favorites, readsBefore.favorites, "no scan and no ranking")
     }
 
+    // MARK: - Empty Recently Deleted
+
+    func testEmptyingTheTrashFirstRestoresAnOpenMergeWhoseKeptPhotoLeftTheLibrary() async throws {
+        let kept = server.seedLink(digest: digest("a"))
+        let duplicate = server.seedLink(digest: digest("a"))
+        indexServer()
+        // The app ended between the trash and its check, and another device trashed the kept photo meanwhile.
+        server.personTrash(duplicate)
+        server.personTrash(kept)
+        let intent = pendingIntent(kept: kept, duplicate: duplicate, seed: "a", trashedAt: server.serverTime)
+        XCTAssertTrue(mergeJournal.record([intent]))
+
+        let confirmed = await finder.confirmNoPendingMerges()
+
+        XCTAssertTrue(confirmed)
+        XCTAssertEqual(state(of: duplicate), .active, "one copy is back before the trash is emptied")
+        XCTAssertEqual(mergeJournal.pendingMerges(), [])
+    }
+
+    func testEmptyingTheTrashWaitsWhileAnOpenMergeCannotBeChecked() async throws {
+        let kept = server.seedLink(digest: digest("a"))
+        let duplicate = server.seedLink(digest: digest("a"))
+        indexServer()
+        let intent = pendingIntent(kept: kept, duplicate: duplicate, seed: "a", trashedAt: server.serverTime)
+        XCTAssertTrue(mergeJournal.record([intent]))
+        server.configureOptionalReads(visibilityFails: true)
+        var finder = finder
+        finder.keptReadRetryDelay = .zero
+
+        let confirmed = await finder.confirmNoPendingMerges()
+
+        XCTAssertFalse(confirmed, "the trash can hold the last copy of the group")
+        XCTAssertEqual(mergeJournal.pendingMerges(), [intent], "the merge waits for its next check")
+    }
+
+    func testEmptyingTheTrashReadsNothingWithoutAnOpenMerge() async {
+        _ = server.seedLink(digest: digest("a"))
+        let readsBefore = server.readCounts
+
+        let confirmed = await finder.confirmNoPendingMerges()
+
+        XCTAssertTrue(confirmed)
+        XCTAssertEqual(server.readCounts, readsBefore, "no open merge, no read")
+    }
+
+    func testEmptyingTheTrashWaitsWhileTheMergeJournalCannotBeRead() async throws {
+        try Data("not a journal".utf8).write(
+            to: directory.appendingPathComponent(ExactDuplicateMergeJournalFileStore.fileName))
+
+        let confirmed = await finder.confirmNoPendingMerges()
+
+        XCTAssertFalse(confirmed, "an unreadable journal can hold open merges")
+    }
+
+    func testTheSharedEmptyStepEmptiesOnlyAfterTheMergeCheck() async throws {
+        let kept = server.seedLink(digest: digest("a"))
+        let duplicate = server.seedLink(digest: digest("a"))
+        indexServer()
+        let trash = CountingTrash()
+        try await RecentlyDeletedEmptying.empty(trash, checkingMergesWith: finder)
+        try await RecentlyDeletedEmptying.empty(trash, checkingMergesWith: nil)
+        XCTAssertEqual(trash.emptied, 2, "without an open merge, and without Duplicates, the trash is emptied")
+
+        let intent = pendingIntent(kept: kept, duplicate: duplicate, seed: "a", trashedAt: server.serverTime)
+        XCTAssertTrue(mergeJournal.record([intent]))
+        server.configureOptionalReads(visibilityFails: true)
+        var finder = finder
+        finder.keptReadRetryDelay = .zero
+        do {
+            try await RecentlyDeletedEmptying.empty(trash, checkingMergesWith: finder)
+            XCTFail("an open merge that cannot be checked keeps the trash")
+        } catch {
+            XCTAssertTrue(error is RecentlyDeletedEmptying.PendingMergeCheck)
+        }
+        XCTAssertEqual(trash.emptied, 2, "nothing was deleted")
+    }
+
     @MainActor
     func testTheAccountCheckEndsWithTheAccountButNotWithANewDuplicatesModel() {
         let lifetime = ExactDuplicatesAccountLifetime()
@@ -2534,6 +2611,17 @@ private actor PageCollector {
 private actor ProgressLog {
     private(set) var steps: [UploadRemoteIndexPreparationProgress] = []
     func append(_ step: UploadRemoteIndexPreparationProgress) { steps.append(step) }
+}
+
+private final class CountingTrash: TrashProvider, @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+
+    var emptied: Int { lock.withLock { count } }
+
+    func trash(_ uids: [PhotoUID]) async throws {}
+    func restore(_ uids: [PhotoUID]) async throws {}
+    func emptyTrash() async throws { lock.withLock { count += 1 } }
 }
 
 private final class CountingIdentityStore: UploadIdentityStore, @unchecked Sendable {

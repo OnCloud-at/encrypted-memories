@@ -867,6 +867,12 @@ public struct ExactDuplicateFinder: Sendable {
         if restored { await resolver.remoteMainsChangedHere() }
     }
 
+    /// Runs `resolvePendingMerges()` and answers true only when the journal is readable and holds no merge afterwards.
+    public func confirmNoPendingMerges() async -> Bool {
+        await resolvePendingMerges()
+        return mergeJournal.pendingMerges()?.isEmpty == true
+    }
+
     /// Checks the merges that a failed trash, a failed read, or the end of the process left in `mergeJournal`, with one
     /// read of all their links. A failed read or a connection failure ends the check, so an offline scan waits for one
     /// read and its retries; the merges then stay for the next scan or merge. Any other failure of one merge leaves the

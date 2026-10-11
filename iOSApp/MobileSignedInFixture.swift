@@ -300,11 +300,13 @@ import UploadCore
         private let rescanDropsLastGroup: Bool
         /// The time that each merge batch takes. Nil merges at once.
         private let mergeDelay: Duration?
+        /// False stands for a merge whose check cannot run yet, which keeps Recently Deleted from being emptied.
+        private let confirmsNoPendingMerges: Bool
         private var scans = 0
 
         init(
             groups members: [[PhotoUID]], checking: Bool = false, captureDates: [PhotoUID: Date] = [:],
-            rescanDropsLastGroup: Bool = false, mergeDelay: Duration? = nil
+            rescanDropsLastGroup: Bool = false, mergeDelay: Duration? = nil, confirmsNoPendingMerges: Bool = true
         ) {
             groups = members.enumerated().map { index, members in
                 ExactDuplicateGroup(contentHash: "fixture-copies-\(index)", hashKeyEpoch: "fixture", members: members)
@@ -313,7 +315,10 @@ import UploadCore
             dates = captureDates
             self.rescanDropsLastGroup = rescanDropsLastGroup
             self.mergeDelay = mergeDelay
+            self.confirmsNoPendingMerges = confirmsNoPendingMerges
         }
+
+        func confirmNoPendingMerges() async -> Bool { confirmsNoPendingMerges }
 
         func duplicateGroups(
             progress: @escaping @Sendable (ExactDuplicateScanProgress) async -> Void
@@ -426,6 +431,16 @@ import UploadCore
         func setAlbumCover(albumID: AlbumID, photoUID: PhotoUID) async throws { throw MobileFixtureError.unavailable }
     }
 
+    final class MobileFixtureTrashState: @unchecked Sendable {
+        private let lock = NSLock()
+        private var emptied = false
+
+        var isEmptied: Bool {
+            get { lock.withLock { emptied } }
+            set { lock.withLock { emptied = newValue } }
+        }
+    }
+
     /// Every provider of the account backend, answered from memory. Media beyond thumbnails is unavailable, which
     /// the production viewer handles like an offline account.
     struct MobileFixtureBackend: PhotosBackend {
@@ -433,9 +448,14 @@ import UploadCore
         let thumbnails: [PhotoUID: Data]
         var favoriteLoader: (@Sendable () async throws -> Set<PhotoUID>)? = nil
         var favoriteWriter: (@Sendable ([PhotoUID], Bool) async throws -> Void)? = nil
+        var trashEmptier: (@Sendable () async throws -> Void)? = nil
+        /// Recently Deleted lists every fixture photo until it is emptied.
+        let trashState = MobileFixtureTrashState()
 
         func loadTimeline() async throws -> [TimelineSection] { sections }
-        func timeline(filter: PhotoFilter) async throws -> [TimelineSection] { sections }
+        func timeline(filter: PhotoFilter) async throws -> [TimelineSection] {
+            filter == .trash && trashState.isEmptied ? [] : sections
+        }
 
         func thumbnail(for uid: PhotoUID) async throws -> Data {
             guard let data = thumbnails[uid] else { throw MobileFixtureError.unavailable }
@@ -497,7 +517,10 @@ import UploadCore
         }
         func trash(_ uids: [PhotoUID]) async throws {}
         func restore(_ uids: [PhotoUID]) async throws {}
-        func emptyTrash() async throws {}
+        func emptyTrash() async throws {
+            try await trashEmptier?()
+            trashState.isEmptied = true
+        }
         func metadataRowCount() async -> Int { sections.reduce(0) { $0 + $1.items.count } }
         func recordDimensions(_ batch: [PhotoUID: PhotoPixelDimensions]) async {}
     }
