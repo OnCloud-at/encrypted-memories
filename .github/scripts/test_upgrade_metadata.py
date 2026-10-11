@@ -160,6 +160,7 @@ class UpgradeMetadataTests(unittest.TestCase):
 
                 class ServerFixture:
                     requests = [{'phase': 'new', 'path': '/checkpoint/session.loaded'}]
+                    reached = None
                     def __init__(self, *args):
                         pass
                     def __enter__(self):

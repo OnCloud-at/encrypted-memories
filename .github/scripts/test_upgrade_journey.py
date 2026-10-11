@@ -15,6 +15,7 @@ import signal
 import os
 import uuid
 import select
+import threading
 import socket
 import time
 from contextlib import nullcontext
@@ -468,22 +469,42 @@ with SigningIdentity(root) as signer:
                 devices['OWN-DEVICE'] = 'Shutdown'
             elif args[2] == 'delete':
                 del devices['OWN-DEVICE']
+        class LogStream:
+            def __init__(self, args, log):
+                self.args = args
+                operations.append(args)
+
+        def stop(stream):
+            operations.append(['stop-log-stream'])
+
         with tempfile.TemporaryDirectory() as directory, patch.object(run_journey, 'output', side_effect=output), \
-                patch.object(run_journey, 'command', side_effect=command), patch.object(run_journey.os, 'kill') as kill:
+                patch.object(run_journey, 'command', side_effect=command), patch.object(run_journey.os, 'kill') as kill, \
+                patch.object(run_journey, 'owned_process', LogStream), patch.object(run_journey, 'stop_group', stop):
+            bundles = {}
+            for name in ['old', 'new']:
+                bundles[name] = Path(directory) / (name + '.app')
+                bundles[name].mkdir()
+                (bundles[name] / 'Info.plist').write_bytes(plistlib.dumps({'CFBundleExecutable': 'App'}))
             app = run_journey.InstalledApp('iOS', Path(directory))
             runtime = json.loads((Path(directory) / 'simulator-runtime.json').read_text())
             self.assertEqual(runtime['identifier'], 'com.apple.CoreSimulator.SimRuntime.iOS-27-0')
             self.assertEqual(runtime['version'], '27.0')
             self.assertEqual(runtime['buildversion'], '24A434', 'The pin is the build measured on the hosted runner')
             self.assertEqual(app.destination, 'platform=iOS Simulator,id=OWN-DEVICE')
-            app.install(Path('/old.app'))
+            app.install(bundles['old'])
             app.launch(type('Server', (), {'url': 'http://127.0.0.1:1234'})(), seed=True)
             app.kill_app()
-            app.install(Path('/new.app'))
+            app.install(bundles['new'])
             app.close()
             kill.assert_called_once_with(42, signal.SIGKILL)
         self.assertEqual(devices, {'FOREIGN-DEVICE': 'Booted'})
-        self.assertEqual([args[2] for args in operations], ['boot', 'bootstatus', 'install', 'install', 'shutdown', 'delete'])
+        self.assertEqual([args[2] for args in operations if args[:2] == ['xcrun', 'simctl']],
+                         ['boot', 'bootstatus', 'install', 'spawn', 'install', 'shutdown', 'delete'])
+        # One app log stream runs inside the owned device for both phases and stops before the device shuts down.
+        streams = [args for args in operations if args[2:3] == ['spawn']]
+        self.assertEqual(streams, [['xcrun', 'simctl', 'spawn', 'OWN-DEVICE', 'log', 'stream', '--style', 'compact',
+                                    '--predicate', 'process == "App"']])
+        self.assertLess(operations.index(['stop-log-stream']), operations.index(next(a for a in operations if a[2:3] == ['shutdown'])))
 
     def test_ambiguous_selected_runtime_fails_before_creating_a_simulator(self):
         runtimes = {'runtimes': [
@@ -932,6 +953,137 @@ else:
         with tempfile.TemporaryDirectory() as root, FixtureServer(Path(root), 'index.beforeCommit') as server:
             with self.assertRaisesRegex(JourneyError, 'index.beforeCommit'):
                 server.wait_checkpoint(timeout=0.01)
+
+    def run_case_on_a_virtual_clock(self, prepare_startup, verify_startup, act=20):
+        """Run index.embed through run_journey.main() with UI runs whose first test case starts after the given seconds.
+
+        Each UI run acts `act` seconds after its first test case started; None never starts a test case."""
+        clock = {'now': 0.0}
+        runs, events = [], []
+
+        def advance(seconds):
+            clock['now'] += seconds
+            for run in runs:
+                if run.start_at is not None and clock['now'] >= run.start_at and not run.announced:
+                    run.announced = True
+                    with open(run.log, 'a') as log:
+                        log.write("Test Case '-[UpgradeJourneyUITests.UpgradeJourneyUITests testInstalledAppJourney]' started.\n")
+
+        class Clock:
+            strftime = staticmethod(time.strftime)
+            monotonic = staticmethod(lambda: clock['now'])
+            sleep = staticmethod(advance)
+
+        class Run:
+            def __init__(self, log, startup):
+                self.log, self.announced, self.stopped = log, False, False
+                self.start_at = None if startup is None else clock['now'] + startup
+                log.write_text('Running tests...\n')
+
+            def remaining(self):
+                return float('inf') if self.start_at is None else max(0, self.start_at + act - clock['now'])
+
+            def poll(self):
+                return 0 if self.stopped else None
+
+            def wait(self, timeout):
+                if self.remaining() > timeout:
+                    advance(timeout)
+                    raise subprocess.TimeoutExpired('xcodebuild', timeout)
+                advance(self.remaining())
+                self.stopped = True
+                return 0
+
+        class Server:
+            def __init__(self, case, point):
+                self.reached = threading.Event()
+                self.requests = [{'phase': 'new', 'path': '/checkpoint/session.loaded'}]
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                pass
+
+            def wait_checkpoint(self, timeout, preparing=None):
+                if preparing.remaining() > timeout:
+                    advance(timeout)
+                    raise JourneyError('The historical app did not reach index.embed')
+                advance(preparing.remaining())
+                self.reached.set()
+
+            def begin_upgrade(self):
+                pass
+
+        class App:
+            destination = 'platform=iOS Simulator,id=fixture'
+            launch_arguments = []
+
+            def __init__(self, *_):
+                pass
+
+            def install(self, bundle):
+                pass
+
+            def verify_metadata(self, *_):
+                pass
+
+            def launch(self, server, seed=False):
+                pass
+
+            def kill_app(self):
+                events.append('kill-old')
+
+            def close(self):
+                pass
+
+        def ui(runner, destination, point, phase, case, *_):
+            runs.append(Run(case / (phase + '-ui.log'), prepare_startup if phase == 'prepare' else verify_startup))
+            events.append('ui-' + phase)
+            return runs[-1], io.StringIO()
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / 'source'
+            (source / 'UpgradeUITests').mkdir(parents=True)
+            products = root / 'build/DerivedData.noindex/Build/Products'
+            products.mkdir(parents=True)
+            (products / 'runner.xctestrun').touch()
+            builds = [Build(root / 'new.app', source, {'tag': 'v1.1.0'}, 'a' * 40), Build(root / 'old.app', None, {'tag': 'v1.0.5'}, 'b' * 40)]
+            arguments = ['run_journey', '--repo', str(root), '--automation', str(Path(__file__).resolve().parents[2]),
+                         '--root', str(root), '--target', 'HEAD', '--release-tag', 'v1.1.0', '--sources', 'v1.0.5',
+                         '--platform', 'iOS', '--points', 'index.embed']
+            with patch.object(sys, 'argv', arguments), patch.object(run_journey, 'release_metadata', return_value={'tag': 'v1.1.0'}), \
+                    patch.object(run_journey, 'build_app', side_effect=builds), patch.object(run_journey, 'command'), \
+                    patch.object(run_journey, 'output', return_value='arm64'), patch.object(run_journey, 'verify_bundle_metadata', return_value={}), \
+                    patch.object(run_journey, 'InstalledApp', App), patch.object(run_journey, 'FixtureServer', Server), \
+                    patch.object(run_journey, 'ui_run', side_effect=ui), patch.object(run_journey, 'stop_group', lambda run: setattr(run, 'stopped', True)), \
+                    patch.object(run_journey, 'sample_load'), patch.object(run_journey, 'time', Clock), \
+                    patch('keychain_entitlements.snapshot', return_value={}):
+                try:
+                    run_journey.main()
+                    error = None
+                except JourneyError as failure:
+                    error = failure
+                timing = next(root.glob('evidence/*/iOS/v1.0.5/index.embed/timing.json'), None)
+                return error, events, clock['now'], json.loads(timing.read_text()) if timing else None
+
+    def test_slow_ui_runner_startup_keeps_the_full_preparation_and_verification_budgets(self):
+        # Release run 38171860265: the UI runner needed 160 s to start, and the 180 s budget expired before it acted.
+        error, events, _, timing = self.run_case_on_a_virtual_clock(prepare_startup=170, verify_startup=300)
+        self.assertIsNone(error)
+        self.assertEqual(events, ['ui-prepare', 'kill-old', 'ui-verify'])
+        self.assertEqual((timing['prepare_ui_startup_s'], timing['verify_ui_startup_s']), (170, 300))
+
+    def test_ui_runner_budgets_stay_bounded(self):
+        for prepare, verify, act, message, elapsed in [
+                (None, 1, 20, 'index.embed preparation: xcodebuild did not start the UI test within 600 s', 600),
+                (1, None, 20, 'index.embed verification: xcodebuild did not start the UI test within 600 s', 621),
+                (10, 1, 181, 'did not reach index.embed', 190)]:
+            with self.subTest(prepare=prepare, verify=verify, act=act):
+                error, events, now, _ = self.run_case_on_a_virtual_clock(prepare, verify, act)
+                self.assertRegex(str(error), message)
+                self.assertAlmostEqual(now, elapsed, delta=1)
 
 
 if __name__ == '__main__':

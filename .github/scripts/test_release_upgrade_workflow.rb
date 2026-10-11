@@ -24,13 +24,30 @@ class ReleaseUpgradeWorkflowTest < Minitest::Test
     assert_includes Array(@jobs.fetch("upload").fetch("needs")), "build"
     refute @jobs.fetch("upgrade").key?("if"), "Stable releases and betas both require the gate"
     refute @jobs.fetch("upload").key?("if"), "Upload must use the default successful-needs barrier"
-    assert_equal ["iOS", "macOS"], @jobs.fetch("upgrade").dig("strategy", "matrix", "platform")
+    assert_equal %w[iOS macOS], @jobs.fetch("upgrade").dig("strategy", "matrix", "include").map { |shard| shard.fetch("platform") }.uniq.sort
     build = @jobs.fetch("build").fetch("steps").map { |step| step["run"].to_s }.join("\n")
     assert_includes build, "xcodebuild archive"
     refute_includes build, "altool --upload-package"
     upload = @jobs.fetch("upload").fetch("steps").map { |step| step["run"].to_s }.join("\n")
     assert_includes upload, "altool --upload-package"
     refute_includes upload, "xcodebuild archive"
+  end
+
+  def test_the_shards_of_each_platform_cover_every_interruption_point_exactly_once
+    script = "import sys; sys.path.insert(0, sys.argv[1]); import run_journey; print(' '.join(run_journey.POINTS))"
+    points = IO.popen(["python3", "-c", script, File.expand_path("../../scripts/upgrade-test", __dir__)], &:read).split
+    assert_equal 12, points.length
+    shards = @jobs.fetch("upgrade").dig("strategy", "matrix", "include")
+    shards.group_by { |shard| shard.fetch("platform") }.each do |platform, group|
+      covered = group.flat_map { |shard| shard.fetch("points").split }
+      assert_equal points.sort, covered.sort, "#{platform} shards must cover every point exactly once"
+    end
+    assert_equal shards.length, shards.map { |shard| [shard.fetch("platform"), shard.fetch("shard")] }.uniq.length
+    run = @jobs.fetch("upgrade").fetch("steps").find { |step| step["name"] == "Test installed upgrades" }
+    assert_equal "${{ matrix.points }}", run.fetch("env").fetch("UPGRADE_POINTS")
+    assert_includes run.fetch("run"), '--points "${points[@]}"'
+    artifact = @jobs.fetch("upgrade").fetch("steps").find { |step| step["name"] == "Retain upgrade evidence" }
+    assert_includes artifact.dig("with", "name"), "${{ matrix.shard }}"
   end
 
   def test_upgrade_gate_has_no_release_secrets_or_implicit_failure_override
