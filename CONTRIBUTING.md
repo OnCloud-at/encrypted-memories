@@ -257,7 +257,8 @@ the immediate tap-to-SIGKILL case is a known historical limit and is not covered
 
 Each source runs its own `scripts/update-proton-sdk.sh` in separate source and SDK scratch directories.
 The `v1.0.5` overlay is pinned to its published commit and must apply cleanly.
-Later releases carry their inactive test entry and require no overlay.
+Later releases carry their inactive test entry and require no overlay, with one exception:
+`v1.1.0-beta.3` predates the hosted Metal admission, so its pinned overlay adds only that test-only admission.
 Only completed builds enter the cache, keyed by source, toolchain, architecture, platform, and test-build inputs.
 A typical cold run needs two app builds per platform; cached historical products remove one build per source.
 Release metadata also keys the cache,

@@ -795,6 +795,30 @@ else:
                     tree.extractall(root, filter='data')
                 subprocess.run(['git', 'apply', '--check', '--unidiff-zero', str(overlay / (tag + '.patch'))], cwd=root, check=True)
 
+    def test_release_with_its_own_test_entry_applies_only_its_reviewed_patch(self):
+        repo = Path(__file__).resolve().parents[2]
+        sha = subprocess.check_output(['git', 'rev-parse', 'v1.1.0-beta.3^{commit}'], cwd=repo, text=True).strip()
+        sources = 'Packages/EncryptedMemoriesKit/Sources'
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            archive = subprocess.check_output(['git', 'archive', sha, sources], cwd=repo)
+            with tarfile.open(fileobj=io.BytesIO(archive)) as tree:
+                tree.extractall(root, filter='data')
+            before = {path.relative_to(root): path.read_bytes() for path in root.rglob('*') if path.is_file()}
+            apply_overlay(root, repo, 'v1.1.0-beta.3', sha)
+            after = {path.relative_to(root): path.read_bytes() for path in root.rglob('*') if path.is_file()}
+            metal = Path(sources) / 'MetalRenderingCore/Metal3RuntimeCapability.swift'
+            self.assertEqual(sorted(path for path in after if after[path] != before.get(path)), [metal],
+                             'The release keeps its own test entry; only the reviewed patch changes')
+            self.assertIn('#if ENCRYPTED_MEMORIES_UPGRADE_TEST && os(macOS)', after[metal].decode())
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            (root / sources / 'PhotosCore').mkdir(parents=True)
+            (root / sources / 'PhotosCore/UpgradeTestProbe.swift').touch()
+            with self.assertRaisesRegex(JourneyError, 'no reviewed overlay'):
+                apply_overlay(root, repo, 'v1.1.0-beta.3', 'a' * 40)
+            apply_overlay(root, repo, 'v1.1.0', 'b' * 40)
+
     def test_unknown_predecessor_without_entry_fails(self):
         with tempfile.TemporaryDirectory() as root:
             with self.assertRaisesRegex(JourneyError, 'no reviewed overlay'):
