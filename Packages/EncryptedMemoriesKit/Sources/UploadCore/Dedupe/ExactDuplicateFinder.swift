@@ -868,9 +868,10 @@ public struct ExactDuplicateFinder: Sendable {
     }
 
     /// Runs `resolvePendingMerges()` and answers true only when the journal is readable and holds no merge afterwards.
+    /// A journal file that does not decode is moved aside, so a later answer can be true.
     public func confirmNoPendingMerges() async -> Bool {
         await resolvePendingMerges()
-        return mergeJournal.pendingMerges()?.isEmpty == true
+        return mergeJournal.confirmsNoOpenMerge()
     }
 
     /// Checks the merges that a failed trash, a failed read, or the end of the process left in `mergeJournal`, with one

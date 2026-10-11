@@ -17,8 +17,8 @@ public enum RecentlyDeletedEmptying {
         if let duplicates {
             noOpenMerge = await duplicates.confirmNoPendingMerges()
         } else if let accountDataDirectory {
-            let journal = ExactDuplicateMergeJournalFileStore(accountDataDirectory: accountDataDirectory)
-            noOpenMerge = journal.pendingMerges()?.isEmpty == true
+            noOpenMerge = ExactDuplicateMergeJournalFileStore(accountDataDirectory: accountDataDirectory)
+                .confirmsNoOpenMerge()
         } else {
             noOpenMerge = true
         }

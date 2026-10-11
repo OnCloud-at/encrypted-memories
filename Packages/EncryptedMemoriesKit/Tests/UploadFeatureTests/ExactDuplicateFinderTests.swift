@@ -1688,16 +1688,56 @@ final class ExactDuplicateFinderTests: XCTestCase {
 
         await assertKeepsTheTrash(
             try await RecentlyDeletedEmptying.empty(trash, checkingMergesWith: nil, accountDataDirectory: directory))
-        try Data("not a journal".utf8).write(
-            to: directory.appendingPathComponent(ExactDuplicateMergeJournalFileStore.fileName))
-        await assertKeepsTheTrash(
-            try await RecentlyDeletedEmptying.empty(trash, checkingMergesWith: nil, accountDataDirectory: directory))
-        XCTAssertEqual(trash.emptied, 0, "an open or unreadable journal keeps the trash")
+        XCTAssertEqual(trash.emptied, 0, "an open merge keeps the trash")
 
-        try FileManager.default.removeItem(
-            at: directory.appendingPathComponent(ExactDuplicateMergeJournalFileStore.fileName))
+        XCTAssertTrue(mergeJournal.clear(mergeJournal.pendingMerges() ?? []))
         try await RecentlyDeletedEmptying.empty(trash, checkingMergesWith: nil, accountDataDirectory: directory)
-        XCTAssertEqual(trash.emptied, 1, "without a journal entry the trash is emptied")
+        XCTAssertEqual(trash.emptied, 1, "without an open merge the trash is emptied")
+    }
+
+    func testADamagedMergeJournalBlocksOneEmptyAndMovesAside() async throws {
+        for merger in [true, false] {
+            let trash = CountingTrash()
+            let damaged = Data("not a journal".utf8)
+            try damaged.write(to: directory.appendingPathComponent(ExactDuplicateMergeJournalFileStore.fileName))
+            let duplicates: (any ExactDuplicateMerging)? = merger ? finder : nil
+
+            await assertKeepsTheTrash(
+                try await RecentlyDeletedEmptying.empty(
+                    trash, checkingMergesWith: duplicates, accountDataDirectory: directory))
+            XCTAssertEqual(trash.emptied, 0, "the attempt that finds the damaged file deletes nothing")
+            let aside = try FileManager.default.contentsOfDirectory(atPath: directory.path).filter {
+                $0.hasPrefix("exact-duplicate-merge-intents-v1.unreadable-")
+            }
+            XCTAssertEqual(aside.count, 1, "the damaged file stays for diagnostics, merger: \(merger)")
+            XCTAssertEqual(try aside.first.map { try Data(contentsOf: directory.appendingPathComponent($0)) }, damaged)
+
+            try await RecentlyDeletedEmptying.empty(
+                trash, checkingMergesWith: duplicates, accountDataDirectory: directory)
+            XCTAssertEqual(trash.emptied, 1, "the next attempt empties, merger: \(merger)")
+            for name in aside { try FileManager.default.removeItem(at: directory.appendingPathComponent(name)) }
+        }
+    }
+
+    func testAMergeJournalThatCannotBeReadKeepsTheTrashEveryTime() async throws {
+        let kept = server.seedLink(digest: digest("a"))
+        let duplicate = server.seedLink(digest: digest("a"))
+        XCTAssertTrue(mergeJournal.record([pendingIntent(kept: kept, duplicate: duplicate, seed: "a", trashedAt: 100)]))
+        let file = directory.appendingPathComponent(ExactDuplicateMergeJournalFileStore.fileName)
+        let saved = try Data(contentsOf: file)
+        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: file.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path) }
+        let trash = CountingTrash()
+
+        for merger in [true, false, true] {
+            await assertKeepsTheTrash(
+                try await RecentlyDeletedEmptying.empty(
+                    trash, checkingMergesWith: merger ? finder : nil, accountDataDirectory: directory))
+        }
+
+        XCTAssertEqual(trash.emptied, 0, "a file that cannot be read can hold open merges")
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+        XCTAssertEqual(try Data(contentsOf: file), saved, "the file stays where it is")
     }
 
     private func assertKeepsTheTrash(

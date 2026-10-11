@@ -50,6 +50,19 @@ public protocol ExactDuplicateMergeJournaling: Sendable {
     func clear(_ intents: [ExactDuplicateMergeIntent]) -> Bool
 }
 
+extension ExactDuplicateMergeJournaling {
+    /// True only when the journal is readable and holds no merge. A file that does not decode protects nothing, so it is
+    /// moved aside as before a merge: this answer stays false, and the next one can be true. A file that cannot be read
+    /// stays, because it can hold merges.
+    func confirmsNoOpenMerge() -> Bool {
+        guard let pending = pendingMerges() else {
+            _ = prepareForWrites()
+            return false
+        }
+        return pending.isEmpty
+    }
+}
+
 /// The journal of the account in one small JSON file, `fileName`, next to the upload manifest. A sign-out removes it
 /// with the account's other files. Each call reads the file again, so two stores of one file agree.
 public final class ExactDuplicateMergeJournalFileStore: ExactDuplicateMergeJournaling {
