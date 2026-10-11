@@ -107,13 +107,19 @@ final class MobileGridRotationTests: XCTestCase {
         }
         let rotate: (UIInterfaceOrientation) async throws -> Void = { orientation in
             let mask: UIInterfaceOrientationMask = orientation.isLandscape ? .landscapeRight : .portrait
-            scene.requestGeometryUpdate(.iOS(interfaceOrientations: mask)) { error in
-                XCTFail("rotation failed: \(error.localizedDescription)")
+            // The system can report an error and still rotate, for example BSActionErrorDomain error 2 on a busy
+            // runner. The reached orientation decides; a missed rotation is requested once more before the test fails.
+            var errors: [String] = []
+            for attempt in 1...2 where attempt == 1 || scene.interfaceOrientation != orientation {
+                scene.requestGeometryUpdate(.iOS(interfaceOrientations: mask)) { error in
+                    errors.append(error.localizedDescription)
+                }
+                for _ in 0..<50 where scene.interfaceOrientation != orientation {
+                    try await Task.sleep(for: .milliseconds(100))
+                }
             }
-            for _ in 0..<50 where scene.interfaceOrientation != orientation {
-                try await Task.sleep(for: .milliseconds(100))
-            }
-            XCTAssertEqual(scene.interfaceOrientation, orientation)
+            XCTAssertEqual(
+                scene.interfaceOrientation, orientation, "rotation failed: \(errors.joined(separator: "; "))")
             try await Task.sleep(for: .milliseconds(1_000))
         }
         if originalOrientation != .portrait { try await rotate(.portrait) }
