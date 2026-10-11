@@ -8,7 +8,7 @@ final class MobileDuplicatesPerformanceTests: XCTestCase {
         try XCTSkipUnless(
             ProcessInfo.processInfo.environment["DUPLICATES_PERF"] == "1", "Set DUPLICATES_PERF=1 to measure.")
         continueAfterFailure = false
-        let app = XCUIApplication()
+        let app = UITestApplication.make()
         app.launchArguments = [
             "-EncryptedMemoriesUITestFixture", "-EncryptedMemoriesDuplicatesLargeFixture", "-AppleLanguages", "(en)",
             "-AppleLocale", "en_US",

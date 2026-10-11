@@ -5,7 +5,7 @@ final class MobileDeletedBackupUITests: XCTestCase {
 
     override func setUp() {
         continueAfterFailure = false
-        app = XCUIApplication()
+        app = UITestApplication.make()
         app.launchArguments = [
             "-EncryptedMemoriesUITestFixture", "-EncryptedMemoriesDeletedBackupFixture",
             "-AppleLanguages", "(en)", "-AppleLocale", "en_US",

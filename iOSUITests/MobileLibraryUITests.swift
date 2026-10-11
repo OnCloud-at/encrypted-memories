@@ -7,7 +7,7 @@ final class MobileLibraryUITests: XCTestCase {
 
     override func setUp() {
         continueAfterFailure = false
-        app = XCUIApplication()
+        app = UITestApplication.make()
         app.launchArguments += [
             "-EncryptedMemoriesUITestFixture",
             "-AppleLanguages", "(en)",

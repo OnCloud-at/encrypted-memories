@@ -5,7 +5,7 @@ final class MobilePausedBackupUITests: XCTestCase {
 
     override func setUp() {
         continueAfterFailure = false
-        app = XCUIApplication()
+        app = UITestApplication.make()
         app.launchArguments = [
             "-EncryptedMemoriesUITestFixture", "-EncryptedMemoriesPausedBackupFixture",
             "-AppleLanguages", "(en)", "-AppleLocale", "en_US",

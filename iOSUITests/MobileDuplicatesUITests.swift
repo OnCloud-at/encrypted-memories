@@ -5,7 +5,7 @@ final class MobileDuplicatesUITests: XCTestCase {
 
     override func setUp() {
         continueAfterFailure = false
-        app = XCUIApplication()
+        app = UITestApplication.make()
     }
 
     override func tearDown() { app.terminate() }
