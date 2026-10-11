@@ -223,6 +223,16 @@ The test apps use Release optimization and the exact release commit, with
 `ENCRYPTED_MEMORIES_UPGRADE_TEST` set only for these separate builds.
 The archive and upload configurations never enable the synthetic account.
 Storage, migrations, and task algorithms run through their existing implementations.
+Only macOS upgrade probes admit devices without Metal 3 under
+`#if ENCRYPTED_MEMORIES_UPGRADE_TEST && os(macOS)`; shipping hardware admission stays unchanged.
+The journey logs the real Metal devices and their Metal 3 support. It retains the production
+grid and all rendered-pixel assertions, so failed rendering still fails the gate.
+The macOS journey does not click a visible window of another process at normal or modal-panel level.
+A system dialog can cover the app.
+Before each Settings click, the journey drags the Settings window by an uncovered title-bar point
+until the control keeps 32 points from every foreign window, preferably with the whole window clear.
+A covered library control fails the journey.
+The pixel checks use a photo that no foreign window covers.
 Metadata parity means exact string equality of `CFBundleShortVersionString` and `CFBundleVersion`
 with each published GitHub release's authoritative version and build number.
 The shared release identity helper and the existing build-number helper supply both archive and probe values.
