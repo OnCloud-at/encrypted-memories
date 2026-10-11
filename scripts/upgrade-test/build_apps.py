@@ -122,15 +122,19 @@ def source_tree(repo, sha, destination, working_copy=False):
 
 
 def apply_overlay(source, automation, tag, sha):
-    sentinel = source / 'Packages/EncryptedMemoriesKit/Sources/PhotosCore/UpgradeTestProbe.swift'
-    if sentinel.exists():
-        return
     manifest = json.loads((automation / 'scripts/upgrade-test/overlays/versions.json').read_text())
+    sentinel = source / 'Packages/EncryptedMemoriesKit/Sources/PhotosCore/UpgradeTestProbe.swift'
+    # A release with its own test entry needs an overlay only when its tag has a reviewed one.
+    has_test_entry = sentinel.exists()
+    if has_test_entry and tag not in manifest:
+        return
     if tag not in manifest or manifest[tag]['commit'] != sha:
         raise JourneyError(f'{tag}: no reviewed overlay for commit {sha}')
     patch = automation / 'scripts/upgrade-test/overlays' / (tag + '.patch')
     command(['git', 'apply', '--check', '--unidiff-zero', str(patch)], cwd=source)
     command(['git', 'apply', '--unidiff-zero', str(patch)], cwd=source)
+    if has_test_entry:
+        return
     for relative in PAYLOAD:
         target = source / 'Packages/EncryptedMemoriesKit/Sources' / relative
         shutil.copy2(automation / 'Packages/EncryptedMemoriesKit/Sources' / relative, target)

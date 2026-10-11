@@ -52,19 +52,23 @@ print(Metal3RuntimeCapability.supports(device: ControlledDevice(false)))
 print(Metal3RuntimeCapability.supports(device: ControlledDevice(true)))
 """)
         relative = 'Packages/EncryptedMemoriesKit/Sources/MetalRenderingCore/Metal3RuntimeCapability.swift'
-        historical = cls.root / 'historical'
-        historical.mkdir()
         manifest = json.loads((cls.repo / 'scripts/upgrade-test/overlays/versions.json').read_text())
-        sha = cls.run_command(['git', 'rev-parse', 'v1.0.5^{commit}']).stdout.strip()
-        if sha != manifest['v1.0.5']['commit']:
-            raise AssertionError('v1.0.5 differs from the pinned published commit')
-        archive = subprocess.check_output(['git', 'archive', sha,
-            'Packages/EncryptedMemoriesKit/Sources'], cwd=cls.repo)
-        with tarfile.open(fileobj=io.BytesIO(archive)) as tree:
-            tree.extractall(historical, filter='data')
-        apply_overlay(historical, cls.repo, 'v1.0.5', sha)
+        cls.tags = sorted(manifest)
+        sources = [('candidate', cls.repo / relative)]
+        for tag in cls.tags:
+            sha = cls.run_command(['git', 'rev-parse', tag + '^{commit}']).stdout.strip()
+            if sha != manifest[tag]['commit']:
+                raise AssertionError(tag + ' differs from the pinned published commit')
+            historical = cls.root / tag
+            historical.mkdir()
+            archive = subprocess.check_output(['git', 'archive', sha,
+                'Packages/EncryptedMemoriesKit/Sources'], cwd=cls.repo)
+            with tarfile.open(fileobj=io.BytesIO(archive)) as tree:
+                tree.extractall(historical, filter='data')
+            apply_overlay(historical, cls.repo, tag, sha)
+            sources.append((tag, historical / relative))
         cls.results = {}
-        for name, source in [('candidate', cls.repo / relative), ('v1.0.5', historical / relative)]:
+        for name, source in sources:
             for flagged in [False, True]:
                 binary = cls.root / (name + ('-probe' if flagged else '-production'))
                 flags = ['-D', 'ENCRYPTED_MEMORIES_UPGRADE_TEST'] if flagged else []
@@ -89,14 +93,21 @@ print(Metal3RuntimeCapability.supports(device: ControlledDevice(true)))
     def test_candidate_without_flag_requires_a_metal3_device(self):
         self.assertEqual(self.results['candidate', False], ['false', 'false', 'true', 'false', 'true'])
 
+    def test_every_historical_overlay_is_covered(self):
+        self.assertEqual(self.tags, ['v1.0.5', 'v1.1.0-beta.3'])
+
     def test_historical_without_flag_requires_a_metal3_device(self):
-        self.assertEqual(self.results['v1.0.5', False], ['false', 'false', 'true', 'false', 'true'])
+        for tag in self.tags:
+            with self.subTest(tag=tag):
+                self.assertEqual(self.results[tag, False], ['false', 'false', 'true', 'false', 'true'])
 
     def test_candidate_probe_admits_missing_and_unsupported_devices_without_relaxing_renderer_query(self):
         self.assertEqual(self.results['candidate', True], ['true', 'true', 'true', 'false', 'true'])
 
     def test_historical_probe_admits_missing_and_unsupported_devices_without_relaxing_renderer_query(self):
-        self.assertEqual(self.results['v1.0.5', True], ['true', 'true', 'true', 'false', 'true'])
+        for tag in self.tags:
+            with self.subTest(tag=tag):
+                self.assertEqual(self.results[tag, True], ['true', 'true', 'true', 'false', 'true'])
 
 
 if __name__ == '__main__':
