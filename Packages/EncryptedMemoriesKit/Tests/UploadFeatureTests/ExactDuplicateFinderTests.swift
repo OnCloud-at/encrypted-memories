@@ -1635,6 +1635,21 @@ final class ExactDuplicateFinderTests: XCTestCase {
         XCTAssertEqual(mergeJournal.pendingMerges(), [])
     }
 
+    /// Merge All records one trash time for every group of a batch. Clearing one group keeps the other groups' records.
+    func testAJournalClearKeepsTheOtherGroupsOfTheSameBatch() throws {
+        let keptA = server.seedLink(digest: digest("a"))
+        let duplicateA = server.seedLink(digest: digest("a"))
+        let keptB = server.seedLink(digest: digest("b"))
+        let duplicateB = server.seedLink(digest: digest("b"))
+        let first = pendingIntent(kept: keptA, duplicate: duplicateA, seed: "a", trashedAt: 100)
+        let second = pendingIntent(kept: keptB, duplicate: duplicateB, seed: "b", trashedAt: 100)
+        XCTAssertTrue(mergeJournal.record([first, second]))
+
+        XCTAssertTrue(mergeJournal.clear([first]))
+
+        XCTAssertEqual(mergeJournal.pendingMerges(), [second], "the other group of the batch still waits for its check")
+    }
+
     func testAPendingCheckThatFinishesLateKeepsTheRecordOfANewerMerge() async throws {
         let kept = server.seedLink(digest: digest("a"))
         let duplicate = server.seedLink(digest: digest("a"))

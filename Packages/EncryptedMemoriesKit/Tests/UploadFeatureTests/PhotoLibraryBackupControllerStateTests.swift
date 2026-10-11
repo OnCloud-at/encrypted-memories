@@ -1541,6 +1541,129 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             await controller.shutdown()
         }
 
+        func testAManualStartOutranksAForegroundStartThatAlreadyWaitsForTheFirstPath() async throws {
+            let runtime = LibraryRuntimeState.makeProcessState()
+            let fixture = try makeWiFiWaitFixture(
+                prefix: "backup-first-path-foreground-then-manual", source: .mobileDataOff(runtime),
+                firstNetworkPathWait: .seconds(60))
+            defer { fixture.cleanup() }
+            let controller = fixture.controller
+            let scans = PassCounter()
+            let owners = OwnerRecorder()
+            controller.replaceScanForTesting {
+                _ = scans.increment()
+                owners.record(await MainActor.run { controller.executionOwnerForTesting })
+            }
+            // A system issue with a later retry date holds automatic passes; only an explicit action passes it.
+            try holdAutomaticPasses(in: fixture)
+
+            controller.syncNow()
+            await controller.retryUserResolvableWork()
+            runtime.update { $0.network = LibraryNetworkState(isReachable: true, isExpensive: false) }
+
+            let started = await waitUntil(timeout: .seconds(5)) { scans.count == 1 && owners.values.count == 1 }
+            XCTAssertTrue(started, "the explicit action that waited behind the automatic start runs")
+            XCTAssertEqual(owners.values, [.manual])
+            await controller.shutdown()
+        }
+
+        func testAnExpiringBackgroundWindowKeepsTheBoundOfADeferredForegroundPass() async throws {
+            // The path monitor never reports, so only the bounded wait can start the foreground pass.
+            let runtime = LibraryRuntimeState.makeProcessState()
+            let fixture = try makeWiFiWaitFixture(
+                prefix: "backup-first-path-background-bound", source: .mobileDataOff(runtime),
+                firstNetworkPathWait: .seconds(2))
+            defer { fixture.cleanup() }
+            let controller = fixture.controller
+            let scans = PassCounter()
+            controller.replaceScanForTesting { _ = scans.increment() }
+            controller.syncNow()
+            let windowEnds = PassCounter()
+            let window = Task { @MainActor in
+                await controller.backgroundCatchUp(owner: .iOSBackgroundTask)
+                _ = windowEnds.increment()
+            }
+            try await Task.sleep(for: .milliseconds(300))
+            XCTAssertEqual(windowEnds.count, 0, "the window waits for its deferred pass")
+            window.cancel()
+            let ended = await waitUntil(timeout: .seconds(2)) { windowEnds.count == 1 }
+            XCTAssertTrue(ended)
+
+            let started = await waitUntil(timeout: .seconds(5)) { scans.count == 1 }
+            XCTAssertTrue(started, "the foreground pass still starts when its bounded wait ends")
+            await controller.shutdown()
+        }
+
+        func testABackgroundWindowThatCannotStartDoesNotWaitForAnotherWindowsDeferral() async throws {
+            let runtime = LibraryRuntimeState.makeProcessState()
+            let fixture = try makeWiFiWaitFixture(
+                prefix: "backup-first-path-second-window", source: .mobileDataOff(runtime),
+                firstNetworkPathWait: .seconds(60))
+            defer { fixture.cleanup() }
+            let controller = fixture.controller
+            controller.replaceScanForTesting {}
+            let firstEnds = PassCounter()
+            let first = Task { @MainActor in
+                await controller.backgroundCatchUp(owner: .iOSBackgroundTask)
+                _ = firstEnds.increment()
+            }
+            defer { first.cancel() }
+            try await Task.sleep(for: .milliseconds(300))
+            XCTAssertEqual(firstEnds.count, 0, "the first window waits for its deferred pass")
+
+            // The person pauses the backup, so the next window has nothing to start and nothing to wait for.
+            controller.pauseBackup()
+            let secondEnds = PassCounter()
+            let second = Task { @MainActor in
+                await controller.backgroundCatchUp(owner: .macOSBackgroundActivity)
+                _ = secondEnds.increment()
+            }
+            defer { second.cancel() }
+
+            let ended = await waitUntil(timeout: .seconds(2)) { secondEnds.count == 1 }
+            XCTAssertTrue(ended, "a window that cannot start ends at once instead of waiting for the first path")
+            await controller.shutdown()
+        }
+
+        func testShutdownEndsABackgroundWindowThatWaitsForTheFirstPath() async throws {
+            let runtime = LibraryRuntimeState.makeProcessState()
+            let fixture = try makeWiFiWaitFixture(
+                prefix: "backup-first-path-background-shutdown", source: .mobileDataOff(runtime),
+                firstNetworkPathWait: .seconds(60))
+            defer { fixture.cleanup() }
+            let controller = fixture.controller
+            let scans = PassCounter()
+            controller.replaceScanForTesting { _ = scans.increment() }
+            let runs = PassCounter()
+            let windowEnds = PassCounter()
+            // macOS gives a background activity no expiration, so only the shutdown can end this window.
+            let window = Task { @MainActor in
+                await controller.backgroundCatchUp(owner: .macOSBackgroundActivity) { _ in _ = runs.increment() }
+                _ = windowEnds.increment()
+            }
+            defer { window.cancel() }
+            try await Task.sleep(for: .milliseconds(300))
+            XCTAssertEqual(windowEnds.count, 0, "the window waits for its deferred pass")
+
+            await controller.shutdown()
+
+            let ended = await waitUntil(timeout: .seconds(2)) { windowEnds.count == 1 }
+            XCTAssertTrue(ended, "a sign-out ends the waiting window")
+            XCTAssertEqual(runs.count, 0)
+            XCTAssertEqual(scans.count, 0)
+        }
+
+        /// Records a remote index issue with a retry date in an hour, which holds every pass except an explicit one.
+        private func holdAutomaticPasses(in fixture: ControllerFixture) throws {
+            let queue = try XCTUnwrap(
+                UploadBackupSyncQueueManifestStore(
+                    url: fixture.directory.appendingPathComponent(PhotoLibraryBackupController.queueDatabaseFileName)))
+            defer { queue.close() }
+            let issue = BackupIssueRecord(
+                kind: .remoteService, detail: "index unavailable", nextAttemptAt: Date().addingTimeInterval(3_600))
+            XCTAssertTrue(queue.setRuntimeIssue(issue, for: .remoteIndexPreparation))
+        }
+
         private func runtimeSource(_ runtime: LibraryRuntimeState, usesMobileData: Bool) -> BackupRuntimeSignalSource {
             BackupRuntimeSignalSource(
                 current: { BackupThrottleInputs(runtime: runtime.snapshot(), usesMobileData: usesMobileData) },
