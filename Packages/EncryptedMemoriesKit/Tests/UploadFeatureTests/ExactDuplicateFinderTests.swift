@@ -1602,6 +1602,156 @@ final class ExactDuplicateFinderTests: XCTestCase {
         XCTAssertEqual(server.readCounts.favorites, readsBefore.favorites, "no scan and no ranking")
     }
 
+    // MARK: - Empty Recently Deleted
+
+    func testEmptyingTheTrashFirstRestoresAnOpenMergeWhoseKeptPhotoLeftTheLibrary() async throws {
+        let kept = server.seedLink(digest: digest("a"))
+        let duplicate = server.seedLink(digest: digest("a"))
+        indexServer()
+        // The app ended between the trash and its check, and another device trashed the kept photo meanwhile.
+        server.personTrash(duplicate)
+        server.personTrash(kept)
+        let intent = pendingIntent(kept: kept, duplicate: duplicate, seed: "a", trashedAt: server.serverTime)
+        XCTAssertTrue(mergeJournal.record([intent]))
+
+        let confirmed = await finder.confirmNoPendingMerges()
+
+        XCTAssertTrue(confirmed)
+        XCTAssertEqual(state(of: duplicate), .active, "one copy is back before the trash is emptied")
+        XCTAssertEqual(mergeJournal.pendingMerges(), [])
+    }
+
+    func testEmptyingTheTrashWaitsWhileAnOpenMergeCannotBeChecked() async throws {
+        let kept = server.seedLink(digest: digest("a"))
+        let duplicate = server.seedLink(digest: digest("a"))
+        indexServer()
+        let intent = pendingIntent(kept: kept, duplicate: duplicate, seed: "a", trashedAt: server.serverTime)
+        XCTAssertTrue(mergeJournal.record([intent]))
+        server.configureOptionalReads(visibilityFails: true)
+        var finder = finder
+        finder.keptReadRetryDelay = .zero
+
+        let confirmed = await finder.confirmNoPendingMerges()
+
+        XCTAssertFalse(confirmed, "the trash can hold the last copy of the group")
+        XCTAssertEqual(mergeJournal.pendingMerges(), [intent], "the merge waits for its next check")
+    }
+
+    func testEmptyingTheTrashReadsNothingWithoutAnOpenMerge() async {
+        _ = server.seedLink(digest: digest("a"))
+        let readsBefore = server.readCounts
+
+        let confirmed = await finder.confirmNoPendingMerges()
+
+        XCTAssertTrue(confirmed)
+        XCTAssertEqual(server.readCounts, readsBefore, "no open merge, no read")
+    }
+
+    func testEmptyingTheTrashWaitsOnceForADamagedMergeJournal() async throws {
+        try Data("not a journal".utf8).write(
+            to: directory.appendingPathComponent(ExactDuplicateMergeJournalFileStore.fileName))
+
+        let confirmed = await finder.confirmNoPendingMerges()
+
+        XCTAssertFalse(confirmed, "the attempt that finds a damaged journal keeps the trash")
+    }
+
+    func testTheSharedEmptyStepEmptiesOnlyAfterTheMergeCheck() async throws {
+        let kept = server.seedLink(digest: digest("a"))
+        let duplicate = server.seedLink(digest: digest("a"))
+        indexServer()
+        let trash = CountingTrash()
+        try await RecentlyDeletedEmptying.empty(trash, checkingMergesWith: finder, accountDataDirectory: directory)
+        try await RecentlyDeletedEmptying.empty(trash, checkingMergesWith: nil, accountDataDirectory: directory)
+        XCTAssertEqual(trash.emptied, 2, "without an open merge, and without Duplicates, the trash is emptied")
+
+        let intent = pendingIntent(kept: kept, duplicate: duplicate, seed: "a", trashedAt: server.serverTime)
+        XCTAssertTrue(mergeJournal.record([intent]))
+        server.configureOptionalReads(visibilityFails: true)
+        var finder = finder
+        finder.keptReadRetryDelay = .zero
+        do {
+            try await RecentlyDeletedEmptying.empty(trash, checkingMergesWith: finder, accountDataDirectory: directory)
+            XCTFail("an open merge that cannot be checked keeps the trash")
+        } catch {
+            XCTAssertTrue(error is RecentlyDeletedEmptying.PendingMergeCheck)
+        }
+        XCTAssertEqual(trash.emptied, 2, "nothing was deleted")
+    }
+
+    /// The account's upload stores did not open, so no merger exists. The journal of an earlier session still counts.
+    func testTheSharedEmptyStepReadsTheMergeJournalWhenNoMergerExists() async throws {
+        let kept = server.seedLink(digest: digest("a"))
+        let duplicate = server.seedLink(digest: digest("a"))
+        let trash = CountingTrash()
+        XCTAssertTrue(mergeJournal.record([pendingIntent(kept: kept, duplicate: duplicate, seed: "a", trashedAt: 100)]))
+
+        await assertKeepsTheTrash(
+            try await RecentlyDeletedEmptying.empty(trash, checkingMergesWith: nil, accountDataDirectory: directory))
+        XCTAssertEqual(trash.emptied, 0, "an open merge keeps the trash")
+
+        XCTAssertTrue(mergeJournal.clear(mergeJournal.pendingMerges() ?? []))
+        try await RecentlyDeletedEmptying.empty(trash, checkingMergesWith: nil, accountDataDirectory: directory)
+        XCTAssertEqual(trash.emptied, 1, "without an open merge the trash is emptied")
+    }
+
+    func testADamagedMergeJournalBlocksOneEmptyAndMovesAside() async throws {
+        for merger in [true, false] {
+            let trash = CountingTrash()
+            let damaged = Data("not a journal".utf8)
+            try damaged.write(to: directory.appendingPathComponent(ExactDuplicateMergeJournalFileStore.fileName))
+            let duplicates: (any ExactDuplicateMerging)? = merger ? finder : nil
+
+            await assertKeepsTheTrash(
+                try await RecentlyDeletedEmptying.empty(
+                    trash, checkingMergesWith: duplicates, accountDataDirectory: directory))
+            XCTAssertEqual(trash.emptied, 0, "the attempt that finds the damaged file deletes nothing")
+            let aside = try FileManager.default.contentsOfDirectory(atPath: directory.path).filter {
+                $0.hasPrefix("exact-duplicate-merge-intents-v1.unreadable-")
+            }
+            XCTAssertEqual(aside.count, 1, "the damaged file stays for diagnostics, merger: \(merger)")
+            XCTAssertEqual(try aside.first.map { try Data(contentsOf: directory.appendingPathComponent($0)) }, damaged)
+
+            try await RecentlyDeletedEmptying.empty(
+                trash, checkingMergesWith: duplicates, accountDataDirectory: directory)
+            XCTAssertEqual(trash.emptied, 1, "the next attempt empties, merger: \(merger)")
+            for name in aside { try FileManager.default.removeItem(at: directory.appendingPathComponent(name)) }
+        }
+    }
+
+    func testAMergeJournalThatCannotBeReadKeepsTheTrashEveryTime() async throws {
+        try XCTSkipIf(getuid() == 0, "root reads a file without read permission")
+        let kept = server.seedLink(digest: digest("a"))
+        let duplicate = server.seedLink(digest: digest("a"))
+        XCTAssertTrue(mergeJournal.record([pendingIntent(kept: kept, duplicate: duplicate, seed: "a", trashedAt: 100)]))
+        let file = directory.appendingPathComponent(ExactDuplicateMergeJournalFileStore.fileName)
+        let saved = try Data(contentsOf: file)
+        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: file.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path) }
+        let trash = CountingTrash()
+
+        for merger in [true, false, true] {
+            await assertKeepsTheTrash(
+                try await RecentlyDeletedEmptying.empty(
+                    trash, checkingMergesWith: merger ? finder : nil, accountDataDirectory: directory))
+        }
+
+        XCTAssertEqual(trash.emptied, 0, "a file that cannot be read can hold open merges")
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+        XCTAssertEqual(try Data(contentsOf: file), saved, "the file stays where it is")
+    }
+
+    private func assertKeepsTheTrash(
+        _ expression: @autoclosure () async throws -> Void, file: StaticString = #filePath, line: UInt = #line
+    ) async {
+        do {
+            try await expression()
+            XCTFail("no error was thrown", file: file, line: line)
+        } catch {
+            XCTAssertTrue(error is RecentlyDeletedEmptying.PendingMergeCheck, file: file, line: line)
+        }
+    }
+
     @MainActor
     func testTheAccountCheckEndsWithTheAccountButNotWithANewDuplicatesModel() {
         let lifetime = ExactDuplicatesAccountLifetime()
@@ -2549,6 +2699,17 @@ private actor PageCollector {
 private actor ProgressLog {
     private(set) var steps: [UploadRemoteIndexPreparationProgress] = []
     func append(_ step: UploadRemoteIndexPreparationProgress) { steps.append(step) }
+}
+
+private final class CountingTrash: TrashProvider, @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+
+    var emptied: Int { lock.withLock { count } }
+
+    func trash(_ uids: [PhotoUID]) async throws {}
+    func restore(_ uids: [PhotoUID]) async throws {}
+    func emptyTrash() async throws { lock.withLock { count += 1 } }
 }
 
 private final class CountingIdentityStore: UploadIdentityStore, @unchecked Sendable {
