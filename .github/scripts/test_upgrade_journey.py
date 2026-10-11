@@ -24,7 +24,7 @@ from http.client import HTTPConnection
 from urllib.request import Request, urlopen
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'scripts/upgrade-test'))
-from build_apps import apply_overlay, Build, PAYLOAD
+from build_apps import apply_overlay, Build, PAYLOAD, publish_product
 from journey import JourneyError, run_cases
 from server import FixtureServer
 import run_journey
@@ -858,6 +858,29 @@ else:
                     self.assertEqual((root / sources / relative).read_bytes(), (repo / sources / relative).read_bytes())
             metal = (root / sources / 'MetalRenderingCore/Metal3RuntimeCapability.swift').read_text()
             self.assertIn('#if ENCRYPTED_MEMORIES_UPGRADE_TEST && os(macOS)', metal)
+
+    def test_a_rebuilt_product_replaces_its_restored_copy(self):
+        # Release run 38171860265 saved the macOS candidate product. A later gate restored it without its source,
+        # rebuilt the candidate, and copying over the restored framework symlinks failed with "File exists".
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            def bundle(name, binary):
+                framework = root / name / 'Encrypted Memories.app/Contents/Frameworks/Sentry.framework'
+                (framework / 'Versions/A/Resources').mkdir(parents=True)
+                (framework / 'Versions/A/Sentry').write_text(binary)
+                os.symlink('A', framework / 'Versions/Current')
+                os.symlink('Versions/Current/Resources', framework / 'Resources')
+                os.symlink('Versions/Current/Sentry', framework / 'Sentry')
+                return root / name / 'Encrypted Memories.app'
+            product = root / 'products/macOS/identity'
+            restored = publish_product(bundle('first', 'restored'), product, {'source': '/gone'})
+            (restored / 'Contents/stale.txt').write_text('left by the restored copy')
+            app = publish_product(bundle('second', 'rebuilt'), product, {'source': '/current'})
+            framework = app / 'Contents/Frameworks/Sentry.framework'
+            self.assertEqual((framework / 'Sentry').read_text(), 'rebuilt')
+            self.assertEqual(os.readlink(framework / 'Versions/Current'), 'A')
+            self.assertFalse((app / 'Contents/stale.txt').exists())
+            self.assertEqual(json.loads((product / 'complete.json').read_text()), {'source': '/current'})
 
     def test_unknown_predecessor_without_entry_fails(self):
         with tempfile.TemporaryDirectory() as root:
