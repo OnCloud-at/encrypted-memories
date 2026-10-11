@@ -57,17 +57,22 @@ public final class PhotoLibraryBackupController {
         public var databasePolicy: LibraryDatabasePolicy
         public var defaults: UserDefaults
         public var runtimeSignals: BackupRuntimeSignalSource
+        /// How long a pass waits for the first network path before it starts anyway. The Apple path monitor reports
+        /// a first path soon after launch; this bound keeps a missing report from holding the backup silently.
+        public var firstNetworkPathWait: Duration
 
         public init(
             accountDataDirectory: URL,
             databasePolicy: LibraryDatabasePolicy,
             defaults: UserDefaults = .standard,
-            runtimeSignals: BackupRuntimeSignalSource = .apple
+            runtimeSignals: BackupRuntimeSignalSource = .apple,
+            firstNetworkPathWait: Duration = .seconds(10)
         ) {
             self.accountDataDirectory = accountDataDirectory
             self.databasePolicy = databasePolicy
             self.defaults = defaults
             self.runtimeSignals = runtimeSignals
+            self.firstNetworkPathWait = firstNetworkPathWait
         }
     }
 
@@ -188,6 +193,21 @@ public final class PhotoLibraryBackupController {
     @ObservationIgnored var onLibraryChange: (@MainActor () -> Void)?
     /// The runner ended the current pass waiting for Wi-Fi. Reset when a pass starts.
     private var passWaitedForWiFi = false
+    /// The owner of a foreground or explicit pass that did not start because no network path had arrived yet. The
+    /// first path, the setting, or the end of `firstNetworkPathWait` starts it. An explicit action outranks an
+    /// automatic foreground start.
+    private var deferredStartOwner: BackupExecutionOwner?
+    /// The owner of a deferred background window pass. It runs only inside its window, and only when no foreground or
+    /// explicit pass is deferred, because a window must never own or stop such a run.
+    private var deferredBackgroundOwner: BackupExecutionOwner?
+    /// Background windows that wait for their deferred pass, so that the OS task ends only when that pass ends.
+    private var deferredStartWaiters: [UUID: CheckedContinuation<StartedBackupRun?, Never>] = [:]
+    /// The last `startSync` call deferred its pass to the first network path.
+    private var lastStartWasDeferred = false
+    private let firstNetworkPathWait: Duration
+    private var firstNetworkPathWaitTask: Task<Void, Never>?
+    /// The wait for the first path ended without a path. Passes then run, and uploads still wait for Wi-Fi.
+    private var firstNetworkPathWaitEnded = false
     private var consecutiveNoProgressRuns = 0
     private var backedUpAtRunStart = 0
     private var lastObservedUploadedCount: Int?
@@ -243,6 +263,7 @@ public final class PhotoLibraryBackupController {
         defaults = configuration.defaults
         let runtimeSignals = configuration.runtimeSignals
         self.runtimeSignals = runtimeSignals
+        firstNetworkPathWait = configuration.firstNetworkPathWait
         let retryPolicy = BackupRetryPolicy()
         self.retryPolicy = retryPolicy
         accessState = PhotoLibraryAuthorization.currentState()
@@ -440,6 +461,7 @@ public final class PhotoLibraryBackupController {
     /// The "Use Cellular Data" setting changed. A backup that waits for Wi-Fi starts again when the wait no longer
     /// holds; the setting itself persists in the shared defaults that every upload path reads.
     public func mobileDataSettingDidChange() {
+        startAfterFirstNetworkPath()
         resumeIfWiFiWaitEnded()
     }
 
@@ -680,7 +702,12 @@ public final class PhotoLibraryBackupController {
         owner: BackupExecutionOwner = .background,
         onRunStarted: (@MainActor (String) -> Void)? = nil
     ) async {
-        guard let run = startSync(owner: owner) else { return }
+        var started = startSync(owner: owner)
+        if started == nil, lastStartWasDeferred {
+            // The pass waits for the first network path. The window stays open until that pass ends.
+            started = await waitForDeferredStart()
+        }
+        guard let run = started else { return }
         onRunStarted?(run.runID)
         await run.task.value
     }
@@ -689,6 +716,7 @@ public final class PhotoLibraryBackupController {
     /// draining: a crashed/expired owner's stale lock is reaped here, and a live lock held by a
     /// different run makes this call stand down instead of starting a second drainer.
     private func startSync(owner: BackupExecutionOwner) -> StartedBackupRun? {
+        lastStartWasDeferred = false
         guard !isShuttingDown, isEnabled, !isUserPaused, accessState.allowsBackup, !isSyncing,
             !isRetiringInstantWork, runnerStopTask == nil,
             let engine, let runner, let queueStore, let catalogStore
@@ -696,6 +724,17 @@ public final class PhotoLibraryBackupController {
         guard queueStore.isOperational(), catalogStore.isOperational(), pendingStoreIsReady else {
             lastMessage = L10n.string("backup.error_local_state_unavailable")
             refreshFromQueue()
+            return nil
+        }
+        guard !waitsForFirstNetworkPath else {
+            // A pass before the first network path would end as "Waiting for Wi-Fi" on Wi-Fi, too.
+            if owner != .foreground, owner != .manual {
+                if deferredBackgroundOwner == nil { deferredBackgroundOwner = owner }
+            } else if owner == .manual || deferredStartOwner == nil {
+                deferredStartOwner = owner
+            }
+            lastStartWasDeferred = true
+            startFirstNetworkPathWait()
             return nil
         }
         if owner != .manual,
@@ -1190,6 +1229,8 @@ public final class PhotoLibraryBackupController {
 
         internal var isRetiringInstantWorkForTesting: Bool { isRetiringInstantWork }
         internal var isAutoResumeScheduledForTesting: Bool { autoResumeTask != nil }
+        internal var consecutiveNoProgressRunsForTesting: Int { consecutiveNoProgressRuns }
+        internal var executionOwnerForTesting: BackupExecutionOwner? { lockStore?.currentLock()?.owner }
 
         internal func retireInstantWorkForTesting() async {
             guard !isRetiringInstantWork else { return }
@@ -1214,6 +1255,11 @@ public final class PhotoLibraryBackupController {
         statusRefreshTask = nil
         autoResumeTask?.cancel()
         autoResumeTask = nil
+        firstNetworkPathWaitTask?.cancel()
+        firstNetworkPathWaitTask = nil
+        deferredStartOwner = nil
+        deferredBackgroundOwner = nil
+        resumeDeferredStartWaiters(with: nil)
         networkObservationTask?.cancel()
         networkObservationTask = nil
         instantEnqueueTask?.cancel()
@@ -1303,9 +1349,83 @@ public final class PhotoLibraryBackupController {
         networkObservationTask = Task { @MainActor [weak self] in
             for await _ in updates {
                 guard let self, !Task.isCancelled else { return }
+                self.startAfterFirstNetworkPath()
                 self.resumeIfWiFiWaitEnded()
             }
         }
+    }
+
+    private var waitsForFirstNetworkPath: Bool {
+        !firstNetworkPathWaitEnded && runtimeSignals.current().waitsForFirstNetworkPath
+    }
+
+    private func startFirstNetworkPathWait() {
+        guard firstNetworkPathWaitTask == nil else { return }
+        let wait = firstNetworkPathWait
+        firstNetworkPathWaitTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: wait)
+            guard let self, !Task.isCancelled else { return }
+            self.firstNetworkPathWaitTask = nil
+            self.firstNetworkPathWaitEnded = true
+            self.startAfterFirstNetworkPath()
+        }
+    }
+
+    private func startAfterFirstNetworkPath() {
+        guard !isShuttingDown, deferredStartOwner != nil || deferredBackgroundOwner != nil, !waitsForFirstNetworkPath
+        else { return }
+        let sessionOwner = deferredStartOwner
+        let backgroundOwner = deferredBackgroundOwner
+        deferredStartOwner = nil
+        deferredBackgroundOwner = nil
+        firstNetworkPathWaitTask?.cancel()
+        firstNetworkPathWaitTask = nil
+        if let sessionOwner {
+            // The foreground or explicit pass runs on its own; a waiting window ends without owning it.
+            _ = startSync(owner: sessionOwner)
+            resumeDeferredStartWaiters(with: nil)
+        } else if let backgroundOwner {
+            resumeDeferredStartWaiters(with: startSync(owner: backgroundOwner))
+        }
+    }
+
+    /// Waits for the deferred pass of a background window. Cancellation, for example at the OS expiration, ends the
+    /// wait at once, and the deferred pass of a background window does not outlive it.
+    private func waitForDeferredStart() async -> StartedBackupRun? {
+        let id = UUID()
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                guard !Task.isCancelled, deferredBackgroundOwner != nil else {
+                    continuation.resume(returning: nil)
+                    dropUnwaitedBackgroundDeferral()
+                    return
+                }
+                deferredStartWaiters[id] = continuation
+            }
+        } onCancel: {
+            Task { @MainActor [weak self] in self?.cancelDeferredStartWait(id) }
+        }
+    }
+
+    private func cancelDeferredStartWait(_ id: UUID) {
+        guard let continuation = deferredStartWaiters.removeValue(forKey: id) else { return }
+        continuation.resume(returning: nil)
+        dropUnwaitedBackgroundDeferral()
+    }
+
+    private func dropUnwaitedBackgroundDeferral() {
+        guard deferredStartWaiters.isEmpty, deferredBackgroundOwner != nil else { return }
+        deferredBackgroundOwner = nil
+        // A deferred foreground or explicit pass keeps its wait.
+        guard deferredStartOwner == nil else { return }
+        firstNetworkPathWaitTask?.cancel()
+        firstNetworkPathWaitTask = nil
+    }
+
+    private func resumeDeferredStartWaiters(with run: StartedBackupRun?) {
+        let waiters = deferredStartWaiters.values
+        deferredStartWaiters.removeAll()
+        waiters.forEach { $0.resume(returning: run) }
     }
 
     private func resumeIfWiFiWaitEnded() {
@@ -1614,6 +1734,17 @@ public final class PhotoLibraryBackupController {
         let p = progress ?? lastProjectedProgress
         guard p.hasOutstandingWork else { return }  // No work remains.
         let currentTime = Date()
+        if p.isPausedByPolicy, p.isWaitingForWiFi, runtimeSignals.current().waitsForWiFi {
+            // Wi-Fi returning or the mobile-data setting ends this wait and starts the next pass; a timer would only
+            // repeat the whole pass while every upload still waits for Wi-Fi. A wait that already ended keeps the
+            // timer, because its restart could not start.
+            nextAutomaticAttemptAt = nil
+            status = BackupStatus(
+                progress: p, isScanning: false, isUserPaused: isUserPaused,
+                executionOpportunityIssue: executionOpportunityIssue
+            )
+            return
+        }
         guard
             let wakeAt = BackupAutomaticRetryPlanner.nextAttempt(
                 outstandingCount: p.outstanding.count,

@@ -377,7 +377,8 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
     #if DEBUG
         func testUserResolvableRetryStartsAManualPassWithoutClearingTheSystemIssue() async throws {
             let fixture = try makeControllerFixture(
-                prefix: "backup-manual-retry", enabled: true, identityResolver: FakeIdentityResolver())
+                prefix: "backup-manual-retry", enabled: true, identityResolver: FakeIdentityResolver(),
+                runtimeSignals: .wiFiWithMobileDataOff)
             defer { fixture.cleanup() }
             fixture.controller.setAccessStateForTesting(.full)
             // A real scan would ask PhotoKit, which waits for an authorization answer on a machine without access.
@@ -942,7 +943,8 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             }
             let controller = PhotoLibraryBackupController(
                 configuration: .init(
-                    accountDataDirectory: directory, databasePolicy: .conservative, defaults: defaults),
+                    accountDataDirectory: directory, databasePolicy: .conservative, defaults: defaults,
+                    runtimeSignals: .wiFiWithMobileDataOff),
                 identityResolver: FakeIdentityResolver(), uploader: MockUploader(), pendingStore: pending)
             controller.setEnabledForTesting()
             controller.setAccessStateForTesting(.full)
@@ -1060,10 +1062,10 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
     #if DEBUG
         // MARK: - Waiting for Wi-Fi
 
-        func testDismissedMissingSourceRecheckStillSchedulesAnAutomaticWakeWithoutAPendingUpload() async throws {
+        func testDismissedMissingSourceRecheckKeepsTheWiFiWaitWithoutAPendingUpload() async throws {
             let signals = FakeBackupRuntimeSignals(waitsForWiFi: true)
             let fixture = try makeWiFiWaitFixture(
-                prefix: "backup-dismissed-source-wake", signals: signals, dismissedSourceRecheck: true)
+                prefix: "backup-dismissed-source-wake", source: signals.source, dismissedSourceRecheck: true)
             defer { fixture.cleanup() }
             let controller = fixture.controller
             let scans = PassCounter()
@@ -1071,24 +1073,21 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
 
             controller.syncNow()
 
-            let waiting = await waitUntil {
-                !controller.isSyncing && controller.isAutoResumeScheduledForTesting
-                    && controller.status.phase == .waitingForWiFi
-            }
-            XCTAssertTrue(waiting, "The deferred source check must keep its automatic wake")
+            let waiting = await waitUntil { !controller.isSyncing && controller.status.phase == .waitingForWiFi }
+            XCTAssertTrue(waiting, "The deferred source check is outstanding work, so the backup waits for Wi-Fi")
+            try await assertNoAutomaticResume(controller, "Wi-Fi returning resumes the deferred source check")
             XCTAssertEqual(scans.count, 1)
             XCTAssertEqual(controller.status.dismissedFailures, 1)
             XCTAssertEqual(controller.status.needsAttentionCount, 0)
             XCTAssertEqual(controller.status.waitingRetry, 0)
             XCTAssertEqual(controller.status.notBackedUpCount, 1)
             XCTAssertEqual(controller.status.outstandingCount, 1)
-            XCTAssertNotNil(controller.nextAutomaticAttemptAt)
             await controller.shutdown()
         }
 
         func testWiFiReturningDuringTheScanStartsTheNextPassAtOnce() async throws {
             let signals = FakeBackupRuntimeSignals(waitsForWiFi: true)
-            let fixture = try makeWiFiWaitFixture(prefix: "backup-wifi-returns", signals: signals)
+            let fixture = try makeWiFiWaitFixture(prefix: "backup-wifi-returns", source: signals.source)
             defer { fixture.cleanup() }
             let controller = fixture.controller
             let scans = PassCounter()
@@ -1110,9 +1109,9 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             await controller.shutdown()
         }
 
-        func testWiFiWaitDoesNotStretchTheFallback() async throws {
+        func testWiFiWaitSchedulesNoAutomaticResumeAndDoesNotStretchTheFallback() async throws {
             let signals = FakeBackupRuntimeSignals(waitsForWiFi: true)
-            let fixture = try makeWiFiWaitFixture(prefix: "backup-wifi-fallback", signals: signals)
+            let fixture = try makeWiFiWaitFixture(prefix: "backup-wifi-fallback", source: signals.source)
             defer { fixture.cleanup() }
             let controller = fixture.controller
             let scans = PassCounter()
@@ -1121,17 +1120,30 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             for pass in 1...8 {
                 controller.syncNow()
                 let finished = await waitUntil {
-                    scans.count == pass && !controller.isSyncing && controller.isAutoResumeScheduledForTesting
+                    scans.count == pass && !controller.isSyncing && controller.status.phase == .waitingForWiFi
                 }
                 XCTAssertTrue(finished, "pass \(pass)")
+                try await assertNoAutomaticResume(controller, "pass \(pass)")
             }
 
-            let waiting = await waitUntil { controller.status.phase == .waitingForWiFi }
-            XCTAssertTrue(waiting)
-            let wakeAt = try XCTUnwrap(controller.nextAutomaticAttemptAt)
-            XCTAssertLessThanOrEqual(
-                wakeAt.timeIntervalSinceNow, 31, "eight Wi-Fi waits are no failures and keep the shortest fallback")
+            XCTAssertEqual(scans.count, 8, "only the requested passes ran")
+            XCTAssertEqual(
+                controller.consecutiveNoProgressRunsForTesting, 0, "eight Wi-Fi waits are no failures")
             await controller.shutdown()
+        }
+
+        /// The end of the wait is an event: a timer would repeat the whole pass, and on iOS its date would also arm the
+        /// background processing request.
+        private func assertNoAutomaticResume(
+            _ controller: PhotoLibraryBackupController, _ message: String,
+            file: StaticString = #filePath, line: UInt = #line
+        ) async throws {
+            // The pass schedules its wake right after it ends; give a wrongly scheduled timer that time.
+            try await Task.sleep(for: .milliseconds(300))
+            XCTAssertFalse(controller.isAutoResumeScheduledForTesting, message, file: file, line: line)
+            XCTAssertFalse(
+                (controller.nextAutomaticAttemptAt ?? .distantPast) > Date(), message, file: file, line: line)
+            XCTAssertEqual(controller.status.phase, .waitingForWiFi, message, file: file, line: line)
         }
 
         func testNetworkChangeEndsTheWiFiWaitWithANewPass() async throws {
@@ -1149,18 +1161,16 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             _ end: (PhotoLibraryBackupController, FakeBackupRuntimeSignals) -> Void
         ) async throws {
             let signals = FakeBackupRuntimeSignals(waitsForWiFi: true)
-            let fixture = try makeWiFiWaitFixture(prefix: prefix, signals: signals)
+            let fixture = try makeWiFiWaitFixture(prefix: prefix, source: signals.source)
             defer { fixture.cleanup() }
             let controller = fixture.controller
             let scans = PassCounter()
             controller.replaceScanForTesting { _ = scans.increment() }
 
             controller.syncNow()
-            let waiting = await waitUntil {
-                !controller.isSyncing && controller.isAutoResumeScheduledForTesting
-                    && controller.status.phase == .waitingForWiFi
-            }
+            let waiting = await waitUntil { !controller.isSyncing && controller.status.phase == .waitingForWiFi }
             XCTAssertTrue(waiting, "the pass ends waiting for Wi-Fi")
+            try await assertNoAutomaticResume(controller, "the wait ends only by the event below")
             end(controller, signals)
             XCTAssertEqual(scans.count, 1, "nothing starts while the wait holds")
 
@@ -1172,12 +1182,379 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             await controller.shutdown()
         }
 
+        // MARK: - First network path
+
+        func testUndeterminedNetworkThenWiFiStartsThePassWithoutTheWiFiMessage() async throws {
+            let runtime = LibraryRuntimeState.makeProcessState()
+            // The bounded wait outlasts the test, so only the first path can start the pass.
+            let fixture = try makeWiFiWaitFixture(
+                prefix: "backup-first-path-wifi", source: .mobileDataOff(runtime),
+                firstNetworkPathWait: .seconds(60))
+            defer { fixture.cleanup() }
+            let controller = fixture.controller
+            let scans = PassCounter()
+            controller.replaceScanForTesting { _ = scans.increment() }
+
+            controller.syncNow()
+            try await Task.sleep(for: .milliseconds(300))
+            XCTAssertEqual(scans.count, 0, "no pass starts before the first network path")
+            XCTAssertFalse(controller.isSyncing)
+            XCTAssertNotEqual(controller.status.phase, .waitingForWiFi)
+
+            runtime.update { $0.network = LibraryNetworkState(isReachable: true, isExpensive: false) }
+
+            let finished = await waitUntil(timeout: .seconds(5)) { scans.count == 1 && !controller.isSyncing }
+            XCTAssertTrue(finished, "the first path reports Wi-Fi and the pass starts at once")
+            XCTAssertNotEqual(controller.status.phase, .waitingForWiFi)
+            await controller.shutdown()
+        }
+
+        func testUndeterminedNetworkThenCellularWithMobileDataOffWaitsForWiFi() async throws {
+            let runtime = LibraryRuntimeState.makeProcessState()
+            let fixture = try makeWiFiWaitFixture(
+                prefix: "backup-first-path-cellular", source: .mobileDataOff(runtime),
+                firstNetworkPathWait: .seconds(60))
+            defer { fixture.cleanup() }
+            let controller = fixture.controller
+            let scans = PassCounter()
+            controller.replaceScanForTesting { _ = scans.increment() }
+
+            controller.syncNow()
+            try await Task.sleep(for: .milliseconds(300))
+            XCTAssertEqual(scans.count, 0)
+
+            runtime.update {
+                $0.network = LibraryNetworkState(
+                    isReachable: true, isExpensive: true, usedInterfaces: [.cellular], availableInterfaces: [.cellular])
+            }
+
+            let waiting = await waitUntil(timeout: .seconds(5)) {
+                scans.count == 1 && !controller.isSyncing && controller.status.phase == .waitingForWiFi
+            }
+            XCTAssertTrue(waiting, "a cellular first path with mobile data off waits for Wi-Fi")
+            try await assertNoAutomaticResume(controller, "cellular wait")
+            await controller.shutdown()
+        }
+
+        func testCellularWithMobileDataOnStartsThePass() async throws {
+            let cellular = LibraryNetworkState(isReachable: true, isExpensive: true)
+            for initial in [LibraryNetworkState.undetermined, cellular] {
+                let runtime = LibraryRuntimeState(initial: LibraryRuntimeSnapshot(network: initial))
+                let fixture = try makeWiFiWaitFixture(
+                    prefix: "backup-first-path-mobile-data", source: runtimeSource(runtime, usesMobileData: true))
+                defer { fixture.cleanup() }
+                let controller = fixture.controller
+                let scans = PassCounter()
+                controller.replaceScanForTesting { _ = scans.increment() }
+
+                controller.syncNow()
+
+                let finished = await waitUntil(timeout: .seconds(10)) { scans.count == 1 && !controller.isSyncing }
+                XCTAssertTrue(finished, "mobile data on starts at once, determined: \(initial.isDetermined)")
+                XCTAssertNotEqual(controller.status.phase, .waitingForWiFi)
+                await controller.shutdown()
+            }
+        }
+
+        func testTurningMobileDataOnBeforeTheFirstNetworkPathStartsThePass() async throws {
+            let runtime = LibraryRuntimeState.makeProcessState()
+            let usesMobileData = LockedFlag(false)
+            let fixture = try makeWiFiWaitFixture(
+                prefix: "backup-first-path-setting",
+                source: BackupRuntimeSignalSource(
+                    current: {
+                        BackupThrottleInputs(runtime: runtime.snapshot(), usesMobileData: usesMobileData.value)
+                    },
+                    updates: { runtime.updates() }),
+                firstNetworkPathWait: .seconds(60))
+            defer { fixture.cleanup() }
+            let controller = fixture.controller
+            let scans = PassCounter()
+            controller.replaceScanForTesting { _ = scans.increment() }
+
+            controller.syncNow()
+            try await Task.sleep(for: .milliseconds(300))
+            XCTAssertEqual(scans.count, 0)
+
+            usesMobileData.value = true
+            controller.mobileDataSettingDidChange()
+
+            let finished = await waitUntil(timeout: .seconds(5)) { scans.count == 1 && !controller.isSyncing }
+            XCTAssertTrue(finished, "turning mobile data on ends the wait for the first path")
+            await controller.shutdown()
+        }
+
+        func testMissingFirstNetworkPathEndsInTheWiFiWaitAfterTheBoundedWait() async throws {
+            // The path monitor never reports: the process state stays undetermined and mobile data is off.
+            let runtime = LibraryRuntimeState.makeProcessState()
+            let fixture = try makeWiFiWaitFixture(
+                prefix: "backup-first-path-missing", source: .mobileDataOff(runtime),
+                firstNetworkPathWait: .milliseconds(500))
+            defer { fixture.cleanup() }
+            let controller = fixture.controller
+            let scans = PassCounter()
+            controller.replaceScanForTesting { _ = scans.increment() }
+
+            controller.syncNow()
+            try await Task.sleep(for: .milliseconds(200))
+            XCTAssertEqual(scans.count, 0, "the pass first waits for the path")
+
+            let waiting = await waitUntil(timeout: .seconds(10)) {
+                scans.count == 1 && !controller.isSyncing && controller.status.phase == .waitingForWiFi
+            }
+            XCTAssertTrue(waiting, "after the bounded wait the pass runs and holds uploads, as without a path")
+            try await assertNoAutomaticResume(controller, "the late first path resumes the wait")
+
+            runtime.update { $0.network = LibraryNetworkState(isReachable: true, isExpensive: false) }
+            let resumed = await waitUntil(timeout: .seconds(10)) { scans.count == 2 }
+            XCTAssertTrue(resumed, "a first path that arrives late ends the Wi-Fi wait")
+            await controller.shutdown()
+        }
+
+        func testAnEndedWiFiWaitKeepsItsWakeWhenTheNextPassCannotStart() async throws {
+            let signals = FakeBackupRuntimeSignals(waitsForWiFi: true)
+            let fixture = try makeWiFiWaitFixture(prefix: "backup-wifi-ended-declined", source: signals.source)
+            defer { fixture.cleanup() }
+            let controller = fixture.controller
+            let scans = PassCounter()
+            controller.replaceScanForTesting { _ = scans.increment() }
+            controller.syncNow()
+            let waiting = await waitUntil { !controller.isSyncing && controller.status.phase == .waitingForWiFi }
+            XCTAssertTrue(waiting)
+            try await assertNoAutomaticResume(controller, "the wait holds")
+
+            // Wi-Fi returns, but a system issue with a later retry date declines the next automatic pass.
+            let queue = try XCTUnwrap(
+                UploadBackupSyncQueueManifestStore(
+                    url: fixture.directory.appendingPathComponent(PhotoLibraryBackupController.queueDatabaseFileName)))
+            defer { queue.close() }
+            let issue = BackupIssueRecord(
+                kind: .remoteService, detail: "index unavailable", nextAttemptAt: Date().addingTimeInterval(3_600))
+            XCTAssertTrue(queue.setRuntimeIssue(issue, for: .remoteIndexPreparation))
+            signals.setWaitsForWiFi(false)
+            controller.syncNow()
+
+            let armed = await waitUntil { controller.isAutoResumeScheduledForTesting }
+            XCTAssertTrue(armed, "the declined pass still needs its automatic wake")
+            XCTAssertEqual(scans.count, 1)
+            await controller.shutdown()
+        }
+
+        func testAManualStartBeforeTheFirstNetworkPathStaysManual() async throws {
+            let runtime = LibraryRuntimeState.makeProcessState()
+            let fixture = try makeWiFiWaitFixture(
+                prefix: "backup-first-path-manual", source: .mobileDataOff(runtime),
+                firstNetworkPathWait: .seconds(60))
+            defer { fixture.cleanup() }
+            let controller = fixture.controller
+            let scans = PassCounter()
+            controller.replaceScanForTesting { _ = scans.increment() }
+            // A system issue with a later retry date holds automatic passes; only an explicit action passes it.
+            let queue = try XCTUnwrap(
+                UploadBackupSyncQueueManifestStore(
+                    url: fixture.directory.appendingPathComponent(PhotoLibraryBackupController.queueDatabaseFileName)))
+            defer { queue.close() }
+            let issue = BackupIssueRecord(
+                kind: .remoteService, detail: "index unavailable", nextAttemptAt: Date().addingTimeInterval(3_600))
+            XCTAssertTrue(queue.setRuntimeIssue(issue, for: .remoteIndexPreparation))
+
+            // This explicit action keeps the system issue, unlike "Back up now".
+            await controller.retryUserResolvableWork()
+            try await Task.sleep(for: .milliseconds(300))
+            XCTAssertEqual(scans.count, 0, "the explicit pass waits for the first path")
+
+            runtime.update { $0.network = LibraryNetworkState(isReachable: true, isExpensive: false) }
+
+            let started = await waitUntil(timeout: .seconds(5)) { scans.count == 1 }
+            XCTAssertTrue(started, "the first path starts the explicit pass, which passes the system issue")
+            await controller.shutdown()
+        }
+
+        func testABackgroundWindowBeforeTheFirstNetworkPathRunsItsPassWhenThePathArrives() async throws {
+            try await assertBackgroundWindowRunsTheDeferredPass(deliverPath: true)
+        }
+
+        func testABackgroundWindowWithoutANetworkPathRunsItsPassAfterTheBoundedWait() async throws {
+            try await assertBackgroundWindowRunsTheDeferredPass(deliverPath: false)
+        }
+
+        /// The OS task of a background window ends when `backgroundCatchUp` returns. It must return once, after the
+        /// deferred pass of the same kind ran inside the window.
+        private func assertBackgroundWindowRunsTheDeferredPass(deliverPath: Bool) async throws {
+            let runtime = LibraryRuntimeState.makeProcessState()
+            let fixture = try makeWiFiWaitFixture(
+                prefix: "backup-first-path-background", source: .mobileDataOff(runtime),
+                firstNetworkPathWait: deliverPath ? .seconds(60) : .milliseconds(800))
+            defer { fixture.cleanup() }
+            let controller = fixture.controller
+            let scans = PassCounter()
+            let owners = OwnerRecorder()
+            controller.replaceScanForTesting {
+                _ = scans.increment()
+                owners.record(await MainActor.run { controller.executionOwnerForTesting })
+            }
+            let runs = PassCounter()
+            let windowEnds = PassCounter()
+            let window = Task { @MainActor in
+                await controller.backgroundCatchUp(owner: .iOSBackgroundTask) { _ in _ = runs.increment() }
+                _ = windowEnds.increment()
+            }
+
+            try await Task.sleep(for: .milliseconds(300))
+            XCTAssertEqual(scans.count, 0, "the pass waits for the first path")
+            XCTAssertEqual(windowEnds.count, 0, "the window stays open while its pass waits")
+            if deliverPath {
+                runtime.update { $0.network = LibraryNetworkState(isReachable: true, isExpensive: false) }
+            }
+
+            let ended = await waitUntil(timeout: .seconds(5)) { windowEnds.count == 1 }
+            XCTAssertTrue(ended, "the window ends after its pass")
+            XCTAssertEqual(scans.count, 1, "the deferred pass scanned inside the window")
+            XCTAssertEqual(runs.count, 1, "the window received exactly one run")
+            XCTAssertEqual(owners.values, [.iOSBackgroundTask], "the pass keeps the kind of the background window")
+            await window.value
+            try await Task.sleep(for: .milliseconds(200))
+            XCTAssertEqual(windowEnds.count, 1, "the window ends exactly once")
+            await controller.shutdown()
+        }
+
+        func testAnExpiringBackgroundWindowEndsAtOnceAndDropsItsDeferredPass() async throws {
+            let runtime = LibraryRuntimeState.makeProcessState()
+            let fixture = try makeWiFiWaitFixture(
+                prefix: "backup-first-path-background-expired", source: .mobileDataOff(runtime),
+                firstNetworkPathWait: .seconds(60))
+            defer { fixture.cleanup() }
+            let controller = fixture.controller
+            let scans = PassCounter()
+            controller.replaceScanForTesting { _ = scans.increment() }
+            let runs = PassCounter()
+            let windowEnds = PassCounter()
+            let window = Task { @MainActor in
+                await controller.backgroundCatchUp(owner: .iOSBackgroundTask) { _ in _ = runs.increment() }
+                _ = windowEnds.increment()
+            }
+            try await Task.sleep(for: .milliseconds(300))
+            XCTAssertEqual(windowEnds.count, 0)
+
+            // The iOS expiration handler cancels the work of the window.
+            window.cancel()
+
+            let ended = await waitUntil(timeout: .seconds(2)) { windowEnds.count == 1 }
+            XCTAssertTrue(ended, "an expired window ends at once")
+            XCTAssertEqual(runs.count, 0)
+            runtime.update { $0.network = LibraryNetworkState(isReachable: true, isExpensive: false) }
+            try await Task.sleep(for: .milliseconds(500))
+            XCTAssertEqual(scans.count, 0, "the pass of the expired window does not run after it")
+            XCTAssertEqual(windowEnds.count, 1, "the window ends exactly once")
+            await controller.shutdown()
+        }
+
+        func testAnExpiringBackgroundWindowKeepsADeferredForegroundPass() async throws {
+            let runtime = LibraryRuntimeState.makeProcessState()
+            let fixture = try makeWiFiWaitFixture(
+                prefix: "backup-first-path-background-foreground", source: .mobileDataOff(runtime),
+                firstNetworkPathWait: .seconds(60))
+            defer { fixture.cleanup() }
+            let controller = fixture.controller
+            let scans = PassCounter()
+            let owners = OwnerRecorder()
+            controller.replaceScanForTesting {
+                _ = scans.increment()
+                owners.record(await MainActor.run { controller.executionOwnerForTesting })
+            }
+            controller.syncNow()
+            let windowEnds = PassCounter()
+            let window = Task { @MainActor in
+                await controller.backgroundCatchUp(owner: .iOSBackgroundTask)
+                _ = windowEnds.increment()
+            }
+            try await Task.sleep(for: .milliseconds(300))
+            window.cancel()
+            let ended = await waitUntil(timeout: .seconds(2)) { windowEnds.count == 1 }
+            XCTAssertTrue(ended)
+
+            runtime.update { $0.network = LibraryNetworkState(isReachable: true, isExpensive: false) }
+
+            let started = await waitUntil(timeout: .seconds(5)) { scans.count == 1 }
+            XCTAssertTrue(started, "the foreground pass that waited for the path still runs")
+            XCTAssertEqual(owners.values, [.foreground])
+            await controller.shutdown()
+        }
+
+        func testABackgroundWindowNeverOwnsADeferredManualPass() async throws {
+            let runtime = LibraryRuntimeState.makeProcessState()
+            let fixture = try makeWiFiWaitFixture(
+                prefix: "backup-first-path-background-manual", source: .mobileDataOff(runtime),
+                firstNetworkPathWait: .seconds(60))
+            defer { fixture.cleanup() }
+            let controller = fixture.controller
+            let scans = PassCounter()
+            let owners = OwnerRecorder()
+            controller.replaceScanForTesting {
+                _ = scans.increment()
+                owners.record(await MainActor.run { controller.executionOwnerForTesting })
+            }
+            await controller.retryUserResolvableWork()
+            let runs = PassCounter()
+            let windowEnds = PassCounter()
+            let window = Task { @MainActor in
+                await controller.backgroundCatchUp(owner: .iOSBackgroundTask) { _ in _ = runs.increment() }
+                _ = windowEnds.increment()
+            }
+            try await Task.sleep(for: .milliseconds(300))
+
+            runtime.update { $0.network = LibraryNetworkState(isReachable: true, isExpensive: false) }
+
+            let ended = await waitUntil(timeout: .seconds(5)) { windowEnds.count == 1 && scans.count == 1 }
+            XCTAssertTrue(ended)
+            XCTAssertEqual(runs.count, 0, "the window cannot stop the explicit pass at its expiration")
+            XCTAssertEqual(owners.values, [.manual])
+            await window.value
+            await controller.shutdown()
+        }
+
+        func testABackgroundWindowCancelledBeforeItWaitsDropsItsDeferredPass() async throws {
+            let runtime = LibraryRuntimeState.makeProcessState()
+            let fixture = try makeWiFiWaitFixture(
+                prefix: "backup-first-path-background-precancelled", source: .mobileDataOff(runtime),
+                firstNetworkPathWait: .seconds(60))
+            defer { fixture.cleanup() }
+            let controller = fixture.controller
+            let scans = PassCounter()
+            controller.replaceScanForTesting { _ = scans.increment() }
+            let release = LockedFlag(false)
+            let windowEnds = PassCounter()
+            let window = Task { @MainActor in
+                while !release.value { await Task.yield() }
+                await controller.backgroundCatchUp(owner: .iOSBackgroundTask)
+                _ = windowEnds.increment()
+            }
+            // The window expires before it reaches the wait.
+            window.cancel()
+            release.value = true
+
+            let ended = await waitUntil(timeout: .seconds(2)) { windowEnds.count == 1 }
+            XCTAssertTrue(ended)
+            runtime.update { $0.network = LibraryNetworkState(isReachable: true, isExpensive: false) }
+            try await Task.sleep(for: .milliseconds(500))
+            XCTAssertEqual(scans.count, 0, "the pass of the expired window does not run after it")
+            await controller.shutdown()
+        }
+
+        private func runtimeSource(_ runtime: LibraryRuntimeState, usesMobileData: Bool) -> BackupRuntimeSignalSource {
+            BackupRuntimeSignalSource(
+                current: { BackupThrottleInputs(runtime: runtime.snapshot(), usesMobileData: usesMobileData) },
+                updates: { runtime.updates() })
+        }
+
         /// A backup with one runnable row whose scan never touches PhotoKit; only the runner drains.
         private func makeWiFiWaitFixture(
-            prefix: String, signals: FakeBackupRuntimeSignals, dismissedSourceRecheck: Bool = false
+            prefix: String, source: BackupRuntimeSignalSource, dismissedSourceRecheck: Bool = false,
+            firstNetworkPathWait: Duration = .seconds(10)
         ) throws -> ControllerFixture {
             let fixture = try makeControllerFixture(
-                prefix: prefix, identityResolver: FakeIdentityResolver(), runtimeSignals: signals.source)
+                prefix: prefix, identityResolver: FakeIdentityResolver(), runtimeSignals: source,
+                firstNetworkPathWait: firstNetworkPathWait)
             fixture.controller.setEnabledForTesting()
             fixture.controller.setAccessStateForTesting(.full)
             let queue = try XCTUnwrap(
@@ -1221,7 +1598,7 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
 
     private func makeControllerFixture(
         prefix: String, enabled: Bool = false, identityResolver: (any UploadIdentityResolving)? = nil,
-        runtimeSignals: BackupRuntimeSignalSource = .apple
+        runtimeSignals: BackupRuntimeSignalSource = .apple, firstNetworkPathWait: Duration = .seconds(10)
     ) throws -> ControllerFixture {
         let suite = "\(prefix)-\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
@@ -1233,7 +1610,8 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
                 accountDataDirectory: directory,
                 databasePolicy: .conservative,
                 defaults: defaults,
-                runtimeSignals: runtimeSignals
+                runtimeSignals: runtimeSignals,
+                firstNetworkPathWait: firstNetworkPathWait
             ),
             identityResolver: identityResolver,
             uploader: MockUploader()
@@ -1419,6 +1797,27 @@ private final class FakeBackupRuntimeSignals: @unchecked Sendable {
             reads += 1
             return BackupThrottleInputs(isNetworkExpensive: waitsForWiFi, usesMobileData: !waitsForWiFi)
         }
+    }
+}
+
+private final class OwnerRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var recorded: [BackupExecutionOwner?] = []
+
+    var values: [BackupExecutionOwner?] { lock.withLock { recorded } }
+
+    func record(_ owner: BackupExecutionOwner?) { lock.withLock { recorded.append(owner) } }
+}
+
+private final class LockedFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: Bool
+
+    init(_ value: Bool) { stored = value }
+
+    var value: Bool {
+        get { lock.withLock { stored } }
+        set { lock.withLock { stored = newValue } }
     }
 }
 
