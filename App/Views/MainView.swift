@@ -1846,7 +1846,9 @@ struct MainView: View {
                 return
             }
             do {
-                try await RecentlyDeletedEmptying.empty(backend, checkingMergesWith: facade.exactDuplicates)
+                try await RecentlyDeletedEmptying.empty(
+                    backend, checkingMergesWith: facade.exactDuplicates,
+                    accountDataDirectory: facade.accountDataDirectory)
                 timelineModel.commitEmptyTrash(uids)
                 selectedUIDs = []
                 selectionMode = false

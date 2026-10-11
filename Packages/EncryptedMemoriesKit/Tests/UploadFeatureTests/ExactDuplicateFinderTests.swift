@@ -1661,8 +1661,8 @@ final class ExactDuplicateFinderTests: XCTestCase {
         let duplicate = server.seedLink(digest: digest("a"))
         indexServer()
         let trash = CountingTrash()
-        try await RecentlyDeletedEmptying.empty(trash, checkingMergesWith: finder)
-        try await RecentlyDeletedEmptying.empty(trash, checkingMergesWith: nil)
+        try await RecentlyDeletedEmptying.empty(trash, checkingMergesWith: finder, accountDataDirectory: directory)
+        try await RecentlyDeletedEmptying.empty(trash, checkingMergesWith: nil, accountDataDirectory: directory)
         XCTAssertEqual(trash.emptied, 2, "without an open merge, and without Duplicates, the trash is emptied")
 
         let intent = pendingIntent(kept: kept, duplicate: duplicate, seed: "a", trashedAt: server.serverTime)
@@ -1671,12 +1671,44 @@ final class ExactDuplicateFinderTests: XCTestCase {
         var finder = finder
         finder.keptReadRetryDelay = .zero
         do {
-            try await RecentlyDeletedEmptying.empty(trash, checkingMergesWith: finder)
+            try await RecentlyDeletedEmptying.empty(trash, checkingMergesWith: finder, accountDataDirectory: directory)
             XCTFail("an open merge that cannot be checked keeps the trash")
         } catch {
             XCTAssertTrue(error is RecentlyDeletedEmptying.PendingMergeCheck)
         }
         XCTAssertEqual(trash.emptied, 2, "nothing was deleted")
+    }
+
+    /// The account's upload stores did not open, so no merger exists. The journal of an earlier session still counts.
+    func testTheSharedEmptyStepReadsTheMergeJournalWhenNoMergerExists() async throws {
+        let kept = server.seedLink(digest: digest("a"))
+        let duplicate = server.seedLink(digest: digest("a"))
+        let trash = CountingTrash()
+        XCTAssertTrue(mergeJournal.record([pendingIntent(kept: kept, duplicate: duplicate, seed: "a", trashedAt: 100)]))
+
+        await assertKeepsTheTrash(
+            try await RecentlyDeletedEmptying.empty(trash, checkingMergesWith: nil, accountDataDirectory: directory))
+        try Data("not a journal".utf8).write(
+            to: directory.appendingPathComponent(ExactDuplicateMergeJournalFileStore.fileName))
+        await assertKeepsTheTrash(
+            try await RecentlyDeletedEmptying.empty(trash, checkingMergesWith: nil, accountDataDirectory: directory))
+        XCTAssertEqual(trash.emptied, 0, "an open or unreadable journal keeps the trash")
+
+        try FileManager.default.removeItem(
+            at: directory.appendingPathComponent(ExactDuplicateMergeJournalFileStore.fileName))
+        try await RecentlyDeletedEmptying.empty(trash, checkingMergesWith: nil, accountDataDirectory: directory)
+        XCTAssertEqual(trash.emptied, 1, "without a journal entry the trash is emptied")
+    }
+
+    private func assertKeepsTheTrash(
+        _ expression: @autoclosure () async throws -> Void, file: StaticString = #filePath, line: UInt = #line
+    ) async {
+        do {
+            try await expression()
+            XCTFail("no error was thrown", file: file, line: line)
+        } catch {
+            XCTAssertTrue(error is RecentlyDeletedEmptying.PendingMergeCheck, file: file, line: line)
+        }
     }
 
     @MainActor

@@ -7,10 +7,22 @@ public enum RecentlyDeletedEmptying {
     /// Thrown when an open merge could not be checked. Nothing was deleted; a later attempt checks again.
     public struct PendingMergeCheck: Error, Equatable {}
 
+    /// `accountDataDirectory` holds the merge journal. Without a merger, for example when the account's upload stores
+    /// did not open, the journal is read directly: an earlier session can have left a merge open in it.
     public static func empty(
-        _ trash: any TrashProvider, checkingMergesWith duplicates: (any ExactDuplicateMerging)?
+        _ trash: any TrashProvider, checkingMergesWith duplicates: (any ExactDuplicateMerging)?,
+        accountDataDirectory: URL?
     ) async throws {
-        guard await duplicates?.confirmNoPendingMerges() ?? true else { throw PendingMergeCheck() }
+        let noOpenMerge: Bool
+        if let duplicates {
+            noOpenMerge = await duplicates.confirmNoPendingMerges()
+        } else if let accountDataDirectory {
+            let journal = ExactDuplicateMergeJournalFileStore(accountDataDirectory: accountDataDirectory)
+            noOpenMerge = journal.pendingMerges()?.isEmpty == true
+        } else {
+            noOpenMerge = true
+        }
+        guard noOpenMerge else { throw PendingMergeCheck() }
         try await trash.emptyTrash()
     }
 }

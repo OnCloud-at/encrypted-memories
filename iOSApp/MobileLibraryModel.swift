@@ -723,7 +723,8 @@ final class MobileLibraryModel {
             }
         }
         if includesProtonTrash {
-            try await RecentlyDeletedEmptying.empty(backend, checkingMergesWith: duplicateFinder)
+            try await RecentlyDeletedEmptying.empty(
+                backend, checkingMergesWith: duplicateFinder, accountDataDirectory: facade?.accountDataDirectory)
         }
     }
 
