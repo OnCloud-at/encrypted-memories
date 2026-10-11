@@ -14,6 +14,7 @@ from unittest.mock import patch
 import signal
 import os
 import uuid
+import threading
 import select
 import time
 from contextlib import nullcontext
@@ -799,6 +800,28 @@ else:
         with tempfile.TemporaryDirectory() as root:
             with self.assertRaisesRegex(JourneyError, 'no reviewed overlay'):
                 apply_overlay(Path(root), Path(__file__).resolve().parents[2], 'v1.2.0', 'a' * 40)
+
+    def test_fixture_server_keeps_a_burst_of_connections_while_its_accept_loop_is_busy(self):
+        with tempfile.TemporaryDirectory() as root:
+            server = FixtureServer(Path(root), 'backup.claimed')
+            results = []
+
+            def fetch():
+                try:
+                    with urlopen(server.url + '/thumbnail/asset-1', timeout=30) as response:
+                        results.append(response.status)
+                except OSError as error:
+                    results.append(type(error).__name__)
+
+            # A loaded runner accepts late: the app's parallel thumbnail requests queue in the listen backlog.
+            requests = [threading.Thread(target=fetch) for _ in range(40)]
+            for request in requests:
+                request.start()
+            time.sleep(1)
+            with server:
+                for request in requests:
+                    request.join()
+            self.assertEqual(results, [200] * 40)
 
     def test_upload_ledger_survives_app_replacement_and_exposes_duplicates(self):
         with tempfile.TemporaryDirectory() as root, FixtureServer(Path(root), 'backup.claimed') as server:
