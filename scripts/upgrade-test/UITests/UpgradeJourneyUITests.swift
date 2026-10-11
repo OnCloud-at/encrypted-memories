@@ -10,10 +10,16 @@ import XCTest
 final class UpgradeJourneyUITests: XCTestCase {
     private lazy var app: XCUIApplication = {
         #if os(macOS)
-            return XCUIApplication(url: URL(fileURLWithPath: ProcessInfo.processInfo.environment["UPGRADE_APP_PATH"]!))
+            let path = ProcessInfo.processInfo.environment["UPGRADE_APP_PATH"]!
+            let app = XCUIApplication(url: URL(fileURLWithPath: path))
         #else
-            return XCUIApplication(bundleIdentifier: "at.oncloud.encryptedmemories.upgrade-test")
+            let app = XCUIApplication(bundleIdentifier: "at.oncloud.encryptedmemories.upgrade-test")
         #endif
+        // XCTest launches the app with OS_ACTIVITY_DT_MODE set, which mirrors the system log, including XCTest's own
+        // per-attribute automation log inside the app, to stderr. On a loaded runner those writes block accessibility
+        // queries. The system log keeps every entry. The iOS app is launched by simctl and only activated here.
+        app.launchEnvironment["OS_ACTIVITY_DT_MODE"] = "NO"
+        return app
     }()
     private static func switchIsEnabled(_ value: Any?) -> Bool {
         if let value = value as? String { return value == "1" }
